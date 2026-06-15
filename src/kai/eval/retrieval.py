@@ -662,6 +662,76 @@ def _detach_capture(capture: _RecallLogCapture) -> None:
         logger.setLevel(capture._saved_level)
 
 
+async def legacy_retrieve_hits(question: str, user_id: str) -> tuple[list[dict[str, Any]], int]:
+    """
+    Run the legacy recall pipeline for one question and return its hits.
+
+    Wraps the attach/format_context/drain/detach pattern used inside
+    `_run_one_probe` so external callers (e.g. the collision-probe
+    generator at `kai.eval.gen_collision_probes`) can reuse the
+    legacy harness as a verification gate without reaching into
+    `_attach_capture` / `_detach_capture` directly.
+
+    Why a public helper and not just exposing the captures:
+    callers need the attach / call / drain / detach invariant
+    intact. Three of the four steps are bookkeeping around one
+    awaited call that can raise; the only way to guarantee the
+    capture handler is removed from `kai.memory`'s logger on every
+    exit path is to keep the try/finally in one place. A naive caller
+    that attaches and forgets to detach pollutes the logger for the
+    rest of the process and silently corrupts the next probe by
+    delivering its `memory.recall` record to two handlers.
+
+    The single-payload check matches the legacy harness's contract
+    (`format_context` emits exactly one `memory.recall` line per
+    call). Zero indicates the logger never received the record
+    (level filter, missing handler, removed log statement); more
+    than one indicates a logging-discipline regression. Both are
+    raised loudly because silently picking one would make every
+    downstream score wrong in ways nothing else would catch.
+
+    Args:
+        question: The probe question text. Passed verbatim to
+            `kai.memory.format_context`.
+        user_id: Kai user id (Telegram chat id as a string for
+            production callers). Scopes the recall to one user.
+
+    Returns:
+        A 2-tuple of (hits, latency_ms) drawn from the captured
+        `memory.recall` payload. `hits` is the raw list of hit dicts
+        in the order the pipeline ranked them; `latency_ms` is the
+        end-to-end retrieval latency the pipeline measured.
+
+    Raises:
+        RuntimeError: If zero or more than one `memory.recall` log
+            records are captured for the call.
+    """
+    # Deferred import: mirrors `_run_one_probe`. `kai.memory` pulls in
+    # PyTorch / sentence-transformers when memory is enabled, which is
+    # too expensive to load at module-import time for callers that may
+    # not actually invoke the helper.
+    from kai.memory import format_context
+
+    capture = _attach_capture()
+    try:
+        await format_context(question, user_id=user_id)
+        payloads = capture.drain()
+        if len(payloads) != 1:
+            raise RuntimeError(
+                f"expected exactly one memory.recall log per probe, got {len(payloads)} for question {question!r}"
+            )
+        payload = payloads[0]
+        return list(payload.get("hits", [])), int(payload.get("latency_ms", 0))
+    finally:
+        # try/finally is the entire reason this helper exists. An
+        # exception inside `format_context` (or inside the count
+        # check) must NOT leave the capture handler attached to
+        # `kai.memory`'s logger; the next probe in the process would
+        # then double-capture and the harness would abort with
+        # "expected one log, got two."
+        _detach_capture(capture)
+
+
 async def _score_against_store(
     scored: list[Probe],
     drifted: list[Probe],

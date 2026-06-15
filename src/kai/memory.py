@@ -1529,6 +1529,75 @@ def is_scoped_recall_enabled() -> bool:
     return _config is not None and _config.memory_scoped_recall_enabled
 
 
+def _embed_via_configured_embedder(texts: list[str]) -> list[list[float]]:
+    """
+    Embed a batch of texts using the Mem0-wired embedder.
+
+    The ONLY function in the module that touches Mem0's private
+    `embedding_model` attribute. Every external caller goes through
+    `embed_texts` (below) so a future Mem0 upgrade that renames or
+    relocates the embedder attribute updates exactly one site.
+
+    Mem0's `HuggingFaceEmbedding.embed(text, memory_action=None)`
+    takes a single string and returns one vector per call; batching
+    is done client-side by looping. The underlying SentenceTransformer
+    could accept a list and batch internally, but reaching past Mem0's
+    `embed()` wrapper into `embedding_model.model.encode(...)` would
+    couple to two layers of internals instead of one. The loop is
+    fine: callers feed at most a few hundred texts per pair in the
+    collision-probe generator's centroid pass, and the embedder is
+    GPU-or-MPS-warm after the first call.
+
+    Precondition: `init_memory(config)` has run successfully and
+    `_memory` is set. The caller-facing `embed_texts` enforces this.
+    """
+    # Local alias to make the private-attribute hop explicit; reads
+    # better than chaining `_memory.embedding_model.embed(t)` inline.
+    embedder = _memory.embedding_model  # type: ignore[union-attr]
+    return [embedder.embed(t) for t in texts]
+
+
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    """
+    Embed a batch of texts via the configured memory embedder.
+
+    Public boundary for external callers that need vectors in the
+    same embedding space the memory pipeline uses for search
+    (e.g. `kai.eval.gen_collision_probes` computing per-project
+    centroids for collision-candidate discovery). Going through this
+    helper keeps callers off Mem0 internals: the actual attribute
+    hop lives in `_embed_via_configured_embedder` so a future Mem0
+    rename touches one function, not every caller.
+
+    The vectors returned here use the same model as live recall
+    (`Config.memory_embedding_model`, validated at init for the
+    Qdrant 384-dim collection), so cosine similarities computed
+    over them are directly comparable to whatever the search
+    pipeline computes internally.
+
+    Args:
+        texts: List of text strings to embed. An empty list returns
+            an empty list (no embedder call).
+
+    Returns:
+        One embedding vector per input text, in the same order.
+
+    Raises:
+        RuntimeError: If `init_memory(config)` has not been called
+            (or failed). The same failure mode as every other
+            embedder-dependent function in this module, but raised
+            explicitly rather than silently returning an empty list,
+            because a caller asking for embeddings on a disabled
+            store should see the misconfiguration, not get vacuous
+            zero-vectors that silently corrupt downstream math.
+    """
+    if _memory is None:
+        raise RuntimeError("init_memory() not called; embed_texts cannot run")
+    if not texts:
+        return []
+    return _embed_via_configured_embedder(texts)
+
+
 def search(query: str, *, user_id: str, limit: int | None = None) -> list[MemoryResult]:
     """
     Search for memories semantically similar to the query.

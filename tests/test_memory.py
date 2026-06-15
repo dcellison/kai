@@ -6374,3 +6374,91 @@ class TestReadTranscriptProvenance:
         )
         assert same_day.date_end is None
         assert cross.date_end == "2026-06-14"
+
+
+class TestEmbedTexts:
+    """Public embedder boundary used by external callers.
+
+    `embed_texts` is the only path the rest of the codebase should
+    take to embed arbitrary strings (the collision-probe generator
+    uses it for per-project centroid computation). The internals it
+    delegates to (`_embed_via_configured_embedder`) reach into
+    Mem0's `embedding_model` attribute; these tests pin the public
+    contract so a future Mem0 upgrade that renames the attribute
+    only needs to update the one internal site without breaking
+    every caller's expectations.
+    """
+
+    def test_raises_runtime_error_when_init_memory_not_called(self):
+        """Memory disabled or never initialized must surface as RuntimeError.
+
+        Returning [] silently would let callers compute meaningful-
+        looking similarities over zero vectors and silently corrupt
+        downstream math (centroid of empty list, NaN cosine, etc).
+        Raising forces the misconfiguration to the caller.
+        """
+        import kai.memory as mem_mod
+
+        # `_clean_memory_state` autouse fixture sets `_memory = None`
+        # before each test, so we just assert the precondition fires.
+        assert mem_mod._memory is None
+        with pytest.raises(RuntimeError, match="init_memory"):
+            mem_mod.embed_texts(["any text"])
+
+    def test_empty_list_returns_empty_list_without_calling_embedder(self):
+        """The cheap-input fast path must NOT touch the embedder.
+
+        Callers passing [] should not pay the cost of allocating a
+        Mem0 embed call (and the empty-list path is the easiest place
+        for a silent IndexError to hide if the embedder is touched
+        anyway). MagicMock with a .called assertion catches both.
+        """
+        import kai.memory as mem_mod
+
+        mock_mem = MagicMock()
+        # Wire an embedder mock so we can assert it is NOT called for
+        # the empty-input case. The assertion is on the embed method,
+        # not on `embedding_model` access, because the attribute lookup
+        # is harmless; only an actual call would be the regression.
+        mock_mem.embedding_model.embed = MagicMock()
+        mem_mod._memory = mock_mem
+
+        try:
+            result = mem_mod.embed_texts([])
+            assert result == []
+            assert mock_mem.embedding_model.embed.call_count == 0
+        finally:
+            mem_mod._memory = None
+
+    def test_returns_one_vector_per_text_via_configured_embedder(self):
+        """Happy path: each text passes through Mem0's embed() and yields one vector."""
+        import kai.memory as mem_mod
+
+        # Mem0's HuggingFaceEmbedding.embed(text) returns a single
+        # vector per call (the public mem0.embeddings API; batching
+        # is client-side). Mock that shape so the test exercises the
+        # actual public contract we built `embed_texts` against, not
+        # a fictional batch interface.
+        mock_mem = MagicMock()
+
+        def fake_embed(text):
+            # Deterministic per-text vector so test asserts are stable
+            # and order-preservation is verifiable.
+            return [float(len(text)), 0.0, 0.0]
+
+        mock_mem.embedding_model.embed = MagicMock(side_effect=fake_embed)
+        mem_mod._memory = mock_mem
+
+        try:
+            vectors = mem_mod.embed_texts(["abc", "de", "fghi"])
+        finally:
+            mem_mod._memory = None
+
+        assert vectors == [
+            [3.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+        ]
+        # Order matters: callers (centroid computation) rely on
+        # vectors lining up with the input texts by index.
+        assert mock_mem.embedding_model.embed.call_count == 3
