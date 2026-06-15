@@ -838,11 +838,21 @@ def _row_matches_project(
     if not row_metadata:
         return False
     pid = row_metadata.get("project_id")
-    if pid == project.project_id:
-        return True
-    # Fallback: match by workspace_root for rows missing project_id.
-    # Stringify both sides because workspace_root in metadata is
-    # always a string while MemoryProjectConfig holds Path objects.
+    if pid:
+        # project_id is the authoritative owner when present. A row
+        # whose project_id explicitly names a different project must
+        # NOT match here even if its workspace_root happens to point
+        # at this project's root (which can happen after a workspace
+        # rename if the row's workspace_root metadata is stale).
+        # Falling through to the workspace_root fallback in that case
+        # would contaminate this project's row pool with rows that
+        # belong to a sibling.
+        return pid == project.project_id
+    # Fallback: match by workspace_root for rows missing project_id
+    # entirely (legacy rows written before project_id became a
+    # stored field). Stringify both sides because workspace_root in
+    # metadata is always a string while MemoryProjectConfig holds
+    # Path objects.
     workspace_root = row_metadata.get("workspace_root")
     if not workspace_root:
         return False
@@ -2724,6 +2734,17 @@ async def _run_reject(
             file=sys.stderr,
         )
         return 2
+
+    # Bootstrap the merged registry's DB layer before self-grade.
+    # Self-grade runs the scoped evaluator, which detects each
+    # probe's active project against the merged registry; without
+    # this call, a probe pinned to a chat-registered project
+    # workspace degrades silently to global-only and self-grade
+    # measures different state than _run_generate would. Mirrors
+    # the same call in _run_generate.
+    from kai.memory_projects import load_project_registry
+
+    await load_project_registry(config)
 
     found, missing = _apply_rejects_to_jsonl(_DRYRUN_PROBES_PATH, gen_config.reject_ids)
     print(

@@ -166,6 +166,16 @@ class TestRowMatchesProject:
         assert gcp._row_matches_project(None, proj) is False
         assert gcp._row_matches_project({}, proj) is False
 
+    def test_explicit_project_id_owns_row_even_if_workspace_root_matches_sibling(self):
+        # A row whose project_id explicitly names project phi must NOT
+        # leak into project anvil's pool, even if its (stale)
+        # workspace_root happens to match anvil's registered root.
+        # The workspace_root fallback exists for rows MISSING
+        # project_id; it must not override an explicit assignment.
+        proj_anvil = _project("anvil", root="/work/anvil")
+        row_md = {"project_id": "phi", "workspace_root": "/work/anvil"}
+        assert gcp._row_matches_project(row_md, proj_anvil) is False
+
 
 class TestTFIDF:
     def test_rare_token_outranks_common_token(self):
