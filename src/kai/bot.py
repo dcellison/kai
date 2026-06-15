@@ -54,7 +54,7 @@ from telegram.ext import (
     filters,
 )
 
-from kai import github_api, memory_command, services, sessions, webhook
+from kai import github_api, memory_command, review, services, sessions, webhook
 from kai.backend import resolve_home_workspace
 from kai.config import (
     DATA_DIR,
@@ -62,10 +62,12 @@ from kai.config import (
     OPEN_ENDED_PROVIDERS,
     PROVIDER_DEFAULTS,
     Config,
+    ModelRole,
     WorkspaceConfig,
     get_effective_provider,
     get_user_backend_and_provider,
     models_for_backend,
+    resolve_user_model,
     validate_model_for_backend,
 )
 from kai.history import LogEntry, log_message
@@ -3375,6 +3377,212 @@ async def handle_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text("\n".join(lines))
 
 
+# Canonical local directory for the /review command's review artifact.
+# The path `/tmp/pr-<N>-review.md` is a deliberate echo of the
+# operator's chat-review-loop convention so manual and product-generated
+# review artifacts land where the operator already expects them. Kept
+# as a module-level constant so tests can redirect to a tmp_path
+# without colliding with locally-owned `/tmp/pr-<N>-review.md` files.
+_REVIEW_TMP_DIR = Path("/tmp")
+
+
+async def _resolve_review_repo(
+    chat_id: int,
+    pool: "SubprocessPool",
+    config: Config,
+) -> str:
+    """
+    Resolve the short-form `/review <pr-number>` to an `owner/name` repo.
+
+    Walks the conservative ladder per the spec:
+
+    1. If the active workspace is a git checkout whose `origin` remote
+       normalizes to exactly one repo in the user's effective GitHub
+       repo list, return that repo.
+    2. Otherwise, if the user's effective GitHub repo list contains
+       exactly one repo, return that repo.
+    3. Otherwise, return the empty string so the caller can prompt
+       for the explicit `owner/repo` form.
+
+    No fallback to ``Config.github_repo`` (deprecated), no
+    first-of-list, and no new workspace-to-repo mapping.
+    """
+    user_config = config.get_user_config(chat_id)
+    yaml_repos = user_config.github_repos if user_config else []
+    effective_repos = await sessions.get_effective_repos(chat_id, yaml_repos)
+    effective_lower = {r.lower() for r in effective_repos}
+
+    workspace = str(await pool.get_effective_workspace(chat_id))
+    workspace_remote = await review._resolve_workspace_remote_repo(workspace)
+    if workspace_remote and workspace_remote.lower() in effective_lower:
+        return workspace_remote.lower()
+
+    if len(effective_repos) == 1:
+        return effective_repos[0].lower()
+
+    return ""
+
+
+@_require_auth
+async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle the /review command; run a deep PR review on demand.
+
+    Shapes:
+
+        /review <pr-number>              repository is inferred from
+                                         the active workspace's git
+                                         remote (when it matches one
+                                         of the user's effective
+                                         GitHub repos) or from the
+                                         sole effective repo.
+        /review <owner/repo> <pr-number> explicit repository.
+
+    Auth + TOTP gate mirrors content-invoking commands. The review
+    runs inside the update handler (per the spec: not a detached
+    background task). On success the review text lands at
+    ``/tmp/pr-<N>-review.md`` as the canonical artifact, a
+    timestamped copy is staged under the chat's file area via
+    ``_save_upload()``, and the staged copy is uploaded to Telegram
+    as a document attachment so phone-only use can read the full
+    review. No GitHub comment is posted; the webhook cooldown map is
+    untouched.
+    """
+    assert update.message is not None
+
+    # TOTP gate: same precedent as content-invoking commands that run
+    # a user-scoped backend subprocess (handle_photo, handle_document,
+    # handle_voice). The review backend consumes the user's
+    # OAuth-authed subprocess, so the gate applies here too.
+    if not await _check_totp(update, context):
+        return
+
+    chat_id = _chat_id(update)
+    config: Config = context.bot_data["config"]
+    pool = _get_pool(context)
+
+    args = list(context.args or [])
+    usage = "Usage: /review [owner/repo] <pr-number>"
+
+    # Two shapes: one arg (PR number, inferred repo) or two args
+    # (explicit repo + PR number). Anything else is a usage error.
+    repo: str = ""
+    pr_number: int = 0
+    if len(args) == 1:
+        try:
+            pr_number = int(args[0])
+        except ValueError:
+            await update.message.reply_text(usage)
+            return
+        repo = await _resolve_review_repo(chat_id, pool, config)
+        if not repo:
+            await update.message.reply_text(
+                f"{usage}\n"
+                "Could not infer the repository from your active workspace or your "
+                "effective GitHub repo list."
+            )
+            return
+    elif len(args) == 2:
+        candidate = args[0].lower()
+        if not _REPO_PATTERN.match(candidate):
+            await update.message.reply_text("Invalid repo format. Expected: owner/repo (e.g., dcellison/kai)")
+            return
+        repo = candidate
+        try:
+            pr_number = int(args[1])
+        except ValueError:
+            await update.message.reply_text(usage)
+            return
+    else:
+        await update.message.reply_text(usage)
+        return
+
+    # Per-user backend / provider / claude-user / model-override
+    # resolution mirrors the webhook PR review path so a manual
+    # review behaves the same as the automatic one for the same user.
+    user_config = config.get_user_config(chat_id)
+    claude_user = user_config.os_user if user_config and user_config.os_user else None
+    if user_config and user_config.agent_backend:
+        agent_backend = user_config.agent_backend
+    else:
+        agent_backend = config.agent_backend
+    if user_config and user_config.llm_provider:
+        provider = user_config.llm_provider
+    else:
+        provider = config.llm_provider
+    model_override = resolve_user_model(ModelRole.PR_REVIEW, user_config, config)
+    workspace = str(await pool.get_effective_workspace(chat_id))
+
+    # Start ack: always sent before the backend invocation; a single
+    # review can run up to PR_REVIEW_TIMEOUT_S seconds and silent
+    # Telegram during that wait would be confusing.
+    await update.message.reply_text(f"Reviewing {repo}#{pr_number}…")
+
+    try:
+        result = await review.generate_pr_review(
+            repo,
+            pr_number,
+            local_repo_path=workspace,
+            spec_dir=config.spec_dir,
+            include_prior_comments=True,
+            claude_user=claude_user,
+            agent_backend=agent_backend,
+            provider=provider,
+            timeout_s=config.pr_review_timeout_s,
+            model_override=model_override,
+        )
+    except Exception as exc:
+        log.exception("Manual review failed for %s#%d", repo, pr_number)
+        await update.message.reply_text(f"Review failed for {repo}#{pr_number}: {exc}")
+        return
+
+    if not result.review_text.strip():
+        await update.message.reply_text(f"Review returned no output for {repo}#{pr_number}.")
+        return
+
+    # File body: short metadata header in front of the raw review
+    # text so the standalone artifact identifies the PR it covers.
+    body = f"# PR #{pr_number} review\n\nRepository: {repo}\nURL: {result.pr_url}\n\n{result.review_text}\n"
+
+    canonical = _REVIEW_TMP_DIR / f"pr-{pr_number}-review.md"
+    canonical.write_text(body)
+
+    # Stage a timestamped copy under DATA_DIR/files/<chat_id>/ using
+    # the existing upload-file naming convention so the staged
+    # artifact composes with the per-chat file area and never
+    # overwrites a previous review's staged copy.
+    staged = _save_upload(body.encode(), f"pr-{pr_number}-review.md", user_id=chat_id)
+
+    # Upload the staged Markdown file to Telegram so phone-only use
+    # can read the full review. The staged file is the upload source
+    # rather than /tmp because the send-file allowlist may reject
+    # /tmp and the staged path lives under the configured per-chat
+    # data area.
+    try:
+        with open(staged, "rb") as f:
+            await context.bot.send_document(
+                chat_id,
+                document=f,
+                caption=f"PR #{pr_number} review\n{canonical}",
+                filename=f"pr-{pr_number}-review.md",
+            )
+    except Exception:
+        # Document upload is best-effort; the canonical /tmp path is
+        # always available so the reviewer can read the review even
+        # if the attachment fails (Telegram size limits, network
+        # blips, etc.).
+        log.exception("Failed to upload staged review document for %s#%d", repo, pr_number)
+
+    # Reply with the absolute path so the operator can open it in
+    # the chat-review-loop convention, plus any collection warnings
+    # so they know what context was incomplete.
+    if result.collection_warnings:
+        warnings_text = "\n".join(f"  [{w.source}] {w.message}" for w in result.collection_warnings)
+        await update.message.reply_text(f"Review written to {canonical}\nWarnings:\n{warnings_text}")
+    else:
+        await update.message.reply_text(f"Review written to {canonical}")
+
+
 @_require_auth
 async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /help — show all available commands."""
@@ -3415,6 +3623,8 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/github token [<token>] - Manage access token\n"
         "/github add <repo> - Watch a repo\n"
         "/github remove <repo> - Unwatch a repo\n"
+        "/review <pr-number> - Review a PR on the inferred repo\n"
+        "/review <owner/repo> <pr-number> - Review an explicit PR\n"
         "\n"
         "/memory - Browse remembered facts and episodes\n"
         "/memory search <q> - Semantic search over memories\n"
@@ -4363,6 +4573,7 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
     app.add_handler(CommandHandler("voices", handle_voices))
     app.add_handler(CommandHandler("webhooks", handle_webhooks))
     app.add_handler(CommandHandler("github", handle_github))
+    app.add_handler(CommandHandler("review", handle_review_command))
     app.add_handler(CommandHandler("memory", memory_command.handle_memory_command))
     app.add_handler(CommandHandler("stop", handle_stop))
 

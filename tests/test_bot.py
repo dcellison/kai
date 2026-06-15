@@ -59,6 +59,7 @@ from kai.bot import (
     handle_models,
     handle_new,
     handle_photo,
+    handle_review_command,
     handle_settings,
     handle_start,
     handle_stats,
@@ -74,6 +75,7 @@ from kai.bot import (
     handle_workspaces,
 )
 from kai.config import PROVIDER_MODELS, Config, UserConfig
+from kai.review import CollectionWarning, PRReviewResult
 from kai.tts import DEFAULT_VOICE, VOICES
 from kai.workspace_utils import is_workspace_allowed
 
@@ -426,12 +428,14 @@ class TestSaveUpload:
     def test_creates_files_directory(self, tmp_path, monkeypatch):
         """Automatically creates the files/ subdirectory if missing."""
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         _save_upload(b"hello", "test.txt")
         assert (tmp_path / "files").is_dir()
 
     def test_saves_content_correctly(self, tmp_path, monkeypatch):
         """Written bytes match the input exactly."""
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         data = b"binary content here"
         result = _save_upload(data, "doc.pdf")
         assert result.read_bytes() == data
@@ -439,12 +443,14 @@ class TestSaveUpload:
     def test_filename_contains_original_name(self, tmp_path, monkeypatch):
         """Saved filename preserves the original name after the timestamp."""
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         result = _save_upload(b"x", "report.pdf")
         assert "report.pdf" in result.name
 
     def test_timestamp_prefix_format(self, tmp_path, monkeypatch):
         """Filename starts with YYYYMMDD_HHMMSS_ffffff timestamp."""
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         result = _save_upload(b"x", "file.txt")
         # Format: YYYYMMDD_HHMMSS_ffffff_file.txt
         parts = result.name.split("_", 3)
@@ -455,6 +461,7 @@ class TestSaveUpload:
     def test_sanitizes_slashes_and_spaces(self, tmp_path, monkeypatch):
         """Slashes and spaces in filenames are replaced with underscores."""
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         result = _save_upload(b"x", "my file/name.txt")
         assert "/" not in result.name
         assert " " not in result.name
@@ -462,6 +469,7 @@ class TestSaveUpload:
     def test_returns_absolute_path(self, tmp_path, monkeypatch):
         """Returned path is absolute and points to an existing file."""
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         result = _save_upload(b"x", "test.txt")
         assert result.is_absolute()
         assert result.is_file()
@@ -5781,3 +5789,399 @@ class TestWorkspaceNewAutoRegister:
         switch.assert_awaited_once()
         replies = [c.args[0] for c in update.message.reply_text.call_args_list]
         assert any("memory project not registered" in r for r in replies)
+
+
+# ── handle_review_command (Telegram manual review) ─────────────────────
+
+
+def _review_result(text: str = "review output", warnings=()) -> PRReviewResult:
+    """Build a PRReviewResult fixture for the manual command tests."""
+    return PRReviewResult(
+        repo="dcellison/kai",
+        pr_number=681,
+        pr_title="Test PR",
+        pr_url="https://github.com/dcellison/kai/pull/681",
+        review_text=text,
+        collection_warnings=tuple(warnings),
+    )
+
+
+class TestHandleReviewCommand:
+    """
+    Manual /review command. The handler shares the bundle path with
+    the webhook bot via generate_pr_review(); these tests cover the
+    Telegram-specific surface (repo resolution, start ack, file
+    staging, document upload, no-GitHub-comment, no-cooldown-touch,
+    warning surfacing).
+    """
+
+    @pytest.mark.asyncio
+    async def test_short_form_uses_workspace_git_remote_match(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update()
+        config = _make_config(
+            user_configs={
+                12345: UserConfig(
+                    telegram_id=12345,
+                    name="op",
+                    github_repos=["dcellison/kai", "dcellison/other"],
+                ),
+            }
+        )
+        ctx = _make_context(config=config, args=["681"])
+        ctx.bot.send_document = AsyncMock()
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch(
+                "kai.review._resolve_workspace_remote_repo",
+                new=AsyncMock(return_value="dcellison/kai"),
+            ),
+            patch(
+                "kai.sessions.get_effective_repos",
+                new=AsyncMock(return_value=["dcellison/kai", "dcellison/other"]),
+            ),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(return_value=_review_result()),
+            ) as mock_generate,
+        ):
+            await handle_review_command(update, ctx)
+
+        assert mock_generate.call_args.args == ("dcellison/kai", 681)
+
+    @pytest.mark.asyncio
+    async def test_short_form_falls_back_to_sole_effective_repo(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update()
+        # Workspace remote doesn't match the single effective repo;
+        # the sole-effective fallback kicks in.
+        config = _make_config(
+            user_configs={
+                12345: UserConfig(
+                    telegram_id=12345,
+                    name="op",
+                    github_repos=["dcellison/kai"],
+                ),
+            }
+        )
+        ctx = _make_context(config=config, args=["681"])
+        ctx.bot.send_document = AsyncMock()
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch("kai.review._resolve_workspace_remote_repo", new=AsyncMock(return_value="")),
+            patch(
+                "kai.sessions.get_effective_repos",
+                new=AsyncMock(return_value=["dcellison/kai"]),
+            ),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(return_value=_review_result()),
+            ) as mock_generate,
+        ):
+            await handle_review_command(update, ctx)
+
+        assert mock_generate.call_args.args == ("dcellison/kai", 681)
+
+    @pytest.mark.asyncio
+    async def test_short_form_usage_error_when_unresolved(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update()
+        # Multi-repo + no workspace match → usage error.
+        config = _make_config(
+            user_configs={
+                12345: UserConfig(
+                    telegram_id=12345,
+                    name="op",
+                    github_repos=["dcellison/kai", "dcellison/other"],
+                ),
+            }
+        )
+        ctx = _make_context(config=config, args=["681"])
+        ctx.bot.send_document = AsyncMock()
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch("kai.review._resolve_workspace_remote_repo", new=AsyncMock(return_value="")),
+            patch(
+                "kai.sessions.get_effective_repos",
+                new=AsyncMock(return_value=["dcellison/kai", "dcellison/other"]),
+            ),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(),
+            ) as mock_generate,
+        ):
+            await handle_review_command(update, ctx)
+
+        mock_generate.assert_not_called()
+        replies = [c.args[0] for c in update.message.reply_text.call_args_list]
+        assert any("Usage: /review" in r for r in replies)
+
+    @pytest.mark.asyncio
+    async def test_explicit_owner_repo_form(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update()
+        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx.bot.send_document = AsyncMock()
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(return_value=_review_result()),
+            ) as mock_generate,
+        ):
+            await handle_review_command(update, ctx)
+
+        assert mock_generate.call_args.args == ("dcellison/kai", 681)
+
+    @pytest.mark.asyncio
+    async def test_invalid_repo_format_returns_error(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update()
+        ctx = _make_context(args=["not-a-repo", "681"])
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(),
+            ) as mock_generate,
+        ):
+            await handle_review_command(update, ctx)
+
+        mock_generate.assert_not_called()
+        replies = [c.args[0] for c in update.message.reply_text.call_args_list]
+        assert any("Invalid repo format" in r for r in replies)
+
+    @pytest.mark.asyncio
+    async def test_invalid_pr_number_returns_usage(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update()
+        ctx = _make_context(args=["dcellison/kai", "not-a-number"])
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(),
+            ) as mock_generate,
+        ):
+            await handle_review_command(update, ctx)
+
+        mock_generate.assert_not_called()
+        replies = [c.args[0] for c in update.message.reply_text.call_args_list]
+        assert any("Usage: /review" in r for r in replies)
+
+    @pytest.mark.asyncio
+    async def test_start_ack_before_backend(self, tmp_path, monkeypatch):
+        # The start ack must fire BEFORE generate_pr_review returns.
+        # We assert ordering by checking the reply_text call sequence.
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update()
+        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx.bot.send_document = AsyncMock()
+
+        ack_at_call: list[int] = []
+
+        async def _capture(*_args, **_kwargs):
+            # Snapshot reply count at the moment the backend runs.
+            ack_at_call.append(len(update.message.reply_text.call_args_list))
+            return _review_result()
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch("kai.bot.review.generate_pr_review", new=AsyncMock(side_effect=_capture)),
+        ):
+            await handle_review_command(update, ctx)
+
+        assert ack_at_call == [1], "start ack must be sent before generate_pr_review runs"
+
+    @pytest.mark.asyncio
+    async def test_writes_canonical_tmp_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update()
+        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx.bot.send_document = AsyncMock()
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(return_value=_review_result(text="bundle review body")),
+            ),
+        ):
+            await handle_review_command(update, ctx)
+
+        canonical = tmp_path / "pr-681-review.md"
+        assert canonical.exists()
+        body = canonical.read_text()
+        assert "bundle review body" in body
+        assert "Repository: dcellison/kai" in body
+
+    @pytest.mark.asyncio
+    async def test_stages_timestamped_copy_under_chat_files(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update(chat_id=12345)
+        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx.bot.send_document = AsyncMock()
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(return_value=_review_result()),
+            ),
+        ):
+            await handle_review_command(update, ctx)
+
+        staged_dir = tmp_path / "files" / "12345"
+        assert staged_dir.is_dir()
+        staged = list(staged_dir.glob("*_pr-681-review.md"))
+        assert len(staged) == 1, f"expected one timestamped staged copy, got {staged}"
+
+    @pytest.mark.asyncio
+    async def test_uploads_staged_file_to_telegram(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update(chat_id=12345)
+        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx.bot.send_document = AsyncMock()
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(return_value=_review_result()),
+            ),
+        ):
+            await handle_review_command(update, ctx)
+
+        ctx.bot.send_document.assert_awaited_once()
+        kwargs = ctx.bot.send_document.await_args.kwargs
+        assert kwargs["filename"] == "pr-681-review.md"
+        caption = kwargs["caption"]
+        assert "pr-681-review.md" in caption
+
+    @pytest.mark.asyncio
+    async def test_does_not_post_to_github(self, tmp_path, monkeypatch):
+        # post_review_comment lives in review.py; the manual command
+        # must never call it directly. The webhook path goes through
+        # review_pr; the Telegram path must NOT.
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update()
+        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx.bot.send_document = AsyncMock()
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(return_value=_review_result()),
+            ),
+            patch("kai.review.post_review_comment", new=AsyncMock()) as mock_post,
+        ):
+            await handle_review_command(update, ctx)
+
+        mock_post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_does_not_touch_webhook_cooldown(self, tmp_path, monkeypatch):
+        # The webhook cooldown map is private to webhook.py. The
+        # manual command runs as explicit user action and must not
+        # update it; a manual review at T must not suppress an
+        # automatic review on a later push.
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update()
+        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx.bot.send_document = AsyncMock()
+
+        from kai.webhook import _review_cooldowns
+
+        baseline = dict(_review_cooldowns)
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(return_value=_review_result()),
+            ),
+        ):
+            await handle_review_command(update, ctx)
+
+        assert dict(_review_cooldowns) == baseline
+
+    @pytest.mark.asyncio
+    async def test_collection_warnings_surface_in_reply(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update()
+        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx.bot.send_document = AsyncMock()
+
+        warnings = (CollectionWarning(source="related_search", message="search unavailable for repo"),)
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(return_value=_review_result(warnings=warnings)),
+            ),
+        ):
+            await handle_review_command(update, ctx)
+
+        replies = [c.args[0] for c in update.message.reply_text.call_args_list]
+        assert any("Warnings:" in r and "search unavailable" in r for r in replies)
+
+    @pytest.mark.asyncio
+    async def test_backend_failure_replies_with_error(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update()
+        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx.bot.send_document = AsyncMock()
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(side_effect=RuntimeError("backend timeout")),
+            ),
+        ):
+            await handle_review_command(update, ctx)
+
+        replies = [c.args[0] for c in update.message.reply_text.call_args_list]
+        assert any("Review failed" in r for r in replies)
+        ctx.bot.send_document.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_args_returns_usage(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update()
+        ctx = _make_context(args=[])
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(),
+            ) as mock_generate,
+        ):
+            await handle_review_command(update, ctx)
+
+        mock_generate.assert_not_called()
+        replies = [c.args[0] for c in update.message.reply_text.call_args_list]
+        assert any("Usage: /review" in r for r in replies)
