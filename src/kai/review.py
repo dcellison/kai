@@ -83,18 +83,23 @@ _MAX_PRIOR_COMMENTS_CHARS = 50_000
 # ── Bundle budget constants ──────────────────────────────────────────
 #
 # Per-section caps used by the deterministic budgeter that backs
-# build_pr_review_context() / build_review_prompt_from_context(). These
-# are v1 guardrails sized to keep the rendered prompt within the
-# common-case context window of every configured review backend; the
-# numbers are not magic-correct values and can be tuned later. The
-# drop ladder (see _apply_budget_ladder) decides the order in which
-# sections are reduced when the rendered prompt would otherwise
-# exceed _MAX_REVIEW_CONTEXT_CHARS. Backend dispatch is symmetric;
-# per-backend ceilings are only introduced if a configured backend
-# cannot fit the shared one.
-_MAX_REVIEW_CONTEXT_CHARS = 240_000
+# build_pr_review_context() / build_review_prompt_from_context(). The
+# v1 numbers (240K global / 90K changed-files / 200K per-file) were
+# tuned conservatively, and a manual acceptance pass against a real
+# kai PR (3 commits touching `bot.py` and `test_bot.py`) showed both
+# changed files dropped to notes: `test_bot.py` exceeded the 200K
+# per-file cap and `bot.py` exceeded the 90K section cap. That left
+# the bundle reviewer relying on the patch alone for the very files
+# the bundle was supposed to broaden context around. The realistic
+# kai codebase has several modules in the 150-220K-char range
+# (`bot.py`, `webhook.py`, `config.py`, `sessions.py`, `review.py`,
+# `pool.py`, the larger test files); any PR touching one of those
+# would hit the same drop. Caps are rebalanced here so realistic PRs
+# carry full file contents through to the reviewer, with the
+# cross-section drop ladder still enforcing the global ceiling.
+_MAX_REVIEW_CONTEXT_CHARS = 360_000
 _MAX_PATCH_CHARS = 80_000
-_MAX_CHANGED_FILES_CHARS = 90_000
+_MAX_CHANGED_FILES_CHARS = 250_000
 _MAX_RELATED_CONTEXT_CHARS = 35_000
 _MAX_LINKED_ISSUES_CHARS = 30_000
 _MAX_COMMITS_CHARS = 20_000
@@ -1179,8 +1184,13 @@ async def fetch_linked_issues(
 # stops a single 900 KiB JSON fixture from eating the entire
 # changed-files budget before the deterministic budgeter can apply
 # its drop ladder. Files over this cap are recorded with a `note`
-# instead of inline content.
-_MAX_CHANGED_FILE_BYTES = 200_000
+# instead of inline content. Sized to fit realistic kai-shaped
+# modules (the largest production files sit around 250K chars; the
+# largest test files reach ~250K) so the bundle's full-file context
+# is available on PRs that touch them. The per-section cap
+# (`_MAX_CHANGED_FILES_CHARS`) bounds how much of this any single PR
+# can claim.
+_MAX_CHANGED_FILE_BYTES = 500_000
 
 # File suffixes the changed-files fetcher refuses to fetch even when
 # GitHub would happily return them. Inline base64 of a font, image, or

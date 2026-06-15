@@ -1972,8 +1972,8 @@ class TestFetchChangedFilesAtHead:
 
     @pytest.mark.asyncio
     async def test_too_large_file_gets_note(self):
-        # API returns size above the cap; the content is requested but
-        # we record the omission note without inlining.
+        # API reports a size well beyond the per-file cap; the
+        # content is requested but recorded as a note without inlining.
         import base64
 
         big_body = b"x" * 50
@@ -1981,7 +1981,7 @@ class TestFetchChangedFilesAtHead:
             {
                 "type": "file",
                 "encoding": "base64",
-                "size": 500_000,
+                "size": 800_000,
                 "content": base64.b64encode(big_body).decode(),
             }
         ).encode()
@@ -2000,6 +2000,34 @@ class TestFetchChangedFilesAtHead:
             files, _ = await fetch_changed_files_at_head(meta)
         assert files[0].content is None
         assert "fetch failed" in (files[0].note or "")
+
+    @pytest.mark.asyncio
+    async def test_realistic_kai_module_inlines(self):
+        # 180K chars matches the order of magnitude of `bot.py` /
+        # `webhook.py` / `config.py` in the kai repo. With the
+        # previous 200K per-file cap these files inlined sometimes
+        # and dropped to notes when the GitHub API size field crept
+        # past the threshold; the new cap admits the realistic case
+        # comfortably so the bundle's full-file context promise
+        # holds for typical PRs.
+        import base64
+
+        body = b"# kai module\n" + (b"x" * 180_000)
+        payload = json.dumps(
+            {
+                "type": "file",
+                "encoding": "base64",
+                "size": len(body),
+                "content": base64.b64encode(body).decode(),
+            }
+        ).encode()
+        meta = self._meta((("src/kai/bot.py", "modified"),))
+        proc = _mock_process(stdout=payload)
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            files, _ = await fetch_changed_files_at_head(meta)
+        assert files[0].content is not None
+        assert files[0].note is None
+        assert len(files[0].content) > 100_000
 
 
 # ── budget_review_context ──────────────────────────────────────────
