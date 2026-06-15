@@ -84,22 +84,21 @@ _MAX_PRIOR_COMMENTS_CHARS = 50_000
 #
 # Per-section caps used by the deterministic budgeter that backs
 # build_pr_review_context() / build_review_prompt_from_context(). The
-# v1 numbers (240K global / 90K changed-files / 200K per-file) were
-# tuned conservatively, and a manual acceptance pass against a real
-# kai PR (3 commits touching `bot.py` and `test_bot.py`) showed both
-# changed files dropped to notes: `test_bot.py` exceeded the 200K
-# per-file cap and `bot.py` exceeded the 90K section cap. That left
-# the bundle reviewer relying on the patch alone for the very files
-# the bundle was supposed to broaden context around. The realistic
-# kai codebase has several modules in the 150-220K-char range
-# (`bot.py`, `webhook.py`, `config.py`, `sessions.py`, `review.py`,
-# `pool.py`, the larger test files); any PR touching one of those
-# would hit the same drop. Caps are rebalanced here so realistic PRs
-# carry full file contents through to the reviewer, with the
-# cross-section drop ladder still enforcing the global ceiling.
-_MAX_REVIEW_CONTEXT_CHARS = 360_000
+# numbers target the realistic kai PR shape: a source module plus
+# its corresponding test file in the same change. Concretely, today's
+# `bot.py` is ~180K chars and `tests/test_bot.py` is ~246K chars; a
+# single-file rebalance is not enough because the budgeter measures
+# the COMBINED rendered size of the changed-files section, not each
+# file in isolation. The first production webhook review against the
+# previous cap set (250K changed-files / 360K global) saw ~426K
+# combined and dropped `test_bot.py` to a note even though both
+# files were inside the per-file cap. The current values admit the
+# two-large-file case so the bundle's full-file context survives
+# end-to-end. The cross-section drop ladder still enforces the
+# global ceiling when an unusually large PR overshoots.
+_MAX_REVIEW_CONTEXT_CHARS = 600_000
 _MAX_PATCH_CHARS = 80_000
-_MAX_CHANGED_FILES_CHARS = 250_000
+_MAX_CHANGED_FILES_CHARS = 450_000
 _MAX_RELATED_CONTEXT_CHARS = 35_000
 _MAX_LINKED_ISSUES_CHARS = 30_000
 _MAX_COMMITS_CHARS = 20_000

@@ -2369,6 +2369,56 @@ class TestRelatedContextDropsByPriority:
         assert "src/b.py" not in paths
 
 
+class TestBudgetHoldsTwoRealisticChangedFiles:
+    """
+    The realistic kai PR shape touches a source module and its test
+    file together. Both files have to survive the changed-files
+    section cap; if either gets dropped to a note, the bundle's
+    full-file context promise is broken for the very pattern users
+    rely on. The cap numbers must hold the COMBINED rendered size,
+    not just each file in isolation - the budgeter measures the
+    sum, not the max.
+    """
+
+    def test_both_realistic_files_inline_unchanged(self):
+        bot_size = 180_000
+        test_size = 246_000
+        files = (
+            ChangedFile(
+                path="src/kai/bot.py",
+                status="modified",
+                content="b" * bot_size,
+                note=None,
+            ),
+            ChangedFile(
+                path="tests/test_bot.py",
+                status="modified",
+                content="t" * test_size,
+                note=None,
+            ),
+        )
+        ctx = _ctx(
+            changed_files=files,
+            patch="diff " * 1000,
+        )
+        out = budget_review_context(ctx)
+        # No CHANGED_FILES_AT_HEAD truncation note - both files
+        # survive the per-section cap.
+        sections = {n.section for n in out.budget_notes}
+        assert "CHANGED_FILES_AT_HEAD" not in sections, (
+            f"changed-files were trimmed: {[n for n in out.budget_notes if n.section == 'CHANGED_FILES_AT_HEAD']}"
+        )
+        # Both files keep their full content.
+        kept_paths = {f.path: f.content for f in out.changed_files}
+        assert kept_paths["src/kai/bot.py"] is not None
+        assert kept_paths["tests/test_bot.py"] is not None
+        assert len(kept_paths["src/kai/bot.py"]) == bot_size
+        assert len(kept_paths["tests/test_bot.py"]) == test_size
+        # And the result stays under the global cap so the cross-section
+        # ladder does not have to fire.
+        assert _estimate_total_chars(out) <= _MAX_REVIEW_CONTEXT_CHARS
+
+
 class TestBudgetEnforcesGlobalCeiling:
     """
     After per-section caps, the final bundle must respect
