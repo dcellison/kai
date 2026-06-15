@@ -322,10 +322,6 @@ _CLOSE_PUNCT_CHARS = frozenset("\"')]`")
 # Markdown list-item line shapes.
 _LIST_LINE_WITH_CONTENT_RE = re.compile(r"^[ ]*([-*+]|\d+\.)\s+\S")
 _LIST_LINE_RE = re.compile(r"^[ ]*([-*+]|\d+\.)(\s|$)")
-_LIST_LINE_EMPTY_MARKER_RE = re.compile(r"^[ ]*([-*+]|\d+\.)\s*$")
-# Setext-style ATX headings; we care about the bare-marker case where the
-# stream paused after the hashes but before any title text arrived.
-_HEADING_EMPTY_MARKER_RE = re.compile(r"^#{1,6}\s*$")
 # Minimum length for the long-span fallback to fire. Picked to be long
 # enough that a coherent paragraph is likely visible, but short enough
 # that streamed paragraphs reach it before the user gives up watching.
@@ -485,43 +481,19 @@ def _has_dangling_final_line(candidate: str, kind: str) -> bool:
         last_real = last_real[:-1]
     ends_in_sentence = bool(last_real) and last_real[-1] in _SENTENCE_END_CHARS
 
-    if kind == "full":
-        words = final_stripped.split()
-        # Rule 1: single word without sentence punctuation.
-        if len(words) == 1 and not ends_in_sentence:
-            return True
-        # Rule 2: short line without sentence punctuation.
-        if len(final_stripped) < 24 and not ends_in_sentence:
-            return True
-        # Rule 3: bare list-item marker (no content after).
-        if _LIST_LINE_EMPTY_MARKER_RE.match(final_line):
-            return True
-        # Rule 4: bare heading marker (no content after hashes).
-        if _HEADING_EMPTY_MARKER_RE.match(final_line):
-            return True
-        # Rule 6: dangling tail after a sentence terminator on the final
-        # line. A line like `Sentence. Two` clears rule 2 by total length
-        # but the actual cut tail (`Two`) is still a fragment. Catching
-        # this lets Phase 3 fall back to the earlier sentence-boundary
-        # candidate instead of publishing the mid-sentence continuation.
-        last_term_pos = max(
-            (final_stripped.rfind(c) for c in _SENTENCE_END_CHARS),
-            default=-1,
-        )
-        if last_term_pos >= 0:
-            end = last_term_pos + 1
-            while end < len(final_stripped) and (
-                final_stripped[end] in _CLOSE_PUNCT_CHARS or final_stripped[end] in _SENTENCE_END_CHARS
-            ):
-                end += 1
-            tail = final_stripped[end:].strip()
-            if tail:
-                tail_ends_in_sentence = tail[-1] in _SENTENCE_END_CHARS
-                tail_words = tail.split()
-                if len(tail_words) == 1 and not tail_ends_in_sentence:
-                    return True
-                if len(tail) < 24 and not tail_ends_in_sentence:
-                    return True
+    # The `full` candidate sits at the very tail of the accumulated
+    # buffer; it has no preceding boundary marker to vouch for it. It
+    # is safe to publish only when the final visible line ends in
+    # sentence punctuation (with optional closing quotes/parens). Any
+    # other tail shape (bare list/heading markers, mid-sentence prose
+    # of any length, a dangling fragment after an earlier sentence on
+    # the same line) risks shipping unstable text that the next stream
+    # chunk will overwrite. Other stable boundary kinds (paragraph,
+    # sentence, closed_fence, list_item) produce their own candidates
+    # at lower or equal cut positions and win via the priority sort
+    # when they coincide.
+    if kind == "full" and not ends_in_sentence:
+        return True
 
     # Rule 5 applies to every candidate kind: an open inline span on the
     # final line is broken Markdown regardless of cut origin.
@@ -550,7 +522,19 @@ def _paragraph_cuts(working: str) -> list[int]:
 
 
 def _sentence_cuts(working: str) -> list[int]:
-    """End-of-sentence positions outside any open fenced code block."""
+    """End-of-sentence positions outside any open fenced code block.
+
+    A `.?!` run (optionally followed by closing punctuation like quotes
+    or parens) qualifies as a sentence boundary only when the run ends
+    at end-of-line or is followed by whitespace. Mid-token periods
+    (decimals like `3.13`, version strings like `v1.2.3`, file paths
+    like `src/bot.py`, domain names) are NOT sentence ends; cutting at
+    them would publish a misleading prefix that splits the token in
+    half (e.g. `Use Python 3.` while the stream still has `13` to come).
+    The next stream chunk would then overwrite the visible message with
+    the correctly-joined text, but the user has already seen the wrong
+    prefix flash by.
+    """
     cuts: list[int] = []
     in_fence = False
     pos = 0
@@ -563,15 +547,21 @@ def _sentence_cuts(working: str) -> list[int]:
             in_fence = not in_fence
         elif not in_fence:
             j = 0
-            while j < len(line):
+            line_len = len(line)
+            while j < line_len:
                 if line[j] in _SENTENCE_END_CHARS:
                     # Extend the cut through any closing-punctuation or
                     # compound sentence-end run so `Yes."` and `?!` keep
                     # the closer as part of the published prefix.
                     k = j + 1
-                    while k < len(line) and (line[k] in _CLOSE_PUNCT_CHARS or line[k] in _SENTENCE_END_CHARS):
+                    while k < line_len and (line[k] in _CLOSE_PUNCT_CHARS or line[k] in _SENTENCE_END_CHARS):
                         k += 1
-                    cuts.append(pos + k)
+                    # Sentence-boundary predicate: the run must land at
+                    # end-of-line or be followed by a whitespace
+                    # separator. Anything else means the punctuation is
+                    # internal to a token and should not become a cut.
+                    if k == line_len or line[k].isspace():
+                        cuts.append(pos + k)
                     j = k
                 else:
                     j += 1
@@ -623,20 +613,42 @@ def _list_item_cuts(working: str) -> list[int]:
 
 
 def _long_span_cut(working: str) -> int | None:
-    """Cut at the last whitespace before the final line, when ≥ threshold.
+    """Cut at a whitespace boundary in long unpunctuated prose.
 
-    Long-form responses without obvious paragraph breaks (a single long
-    monologue) still need a streaming surface so the user sees progress.
-    This fallback releases prefixes that contain at least 240 visible
-    characters and end before the final line, which preserves the
-    dangling-line guard's protection on the final visible line.
+    Long-form responses without paragraph or sentence breaks still need
+    a streaming surface so the user sees progress. Two shapes are
+    handled:
+
+      1. Multi-line: when a newline exists and the prefix before the
+         final newline already holds at least ``_LONG_SPAN_MIN_CHARS``
+         of content, cut before the final newline. This preserves the
+         dangling-line guard's protection on the final (possibly
+         in-progress) line.
+      2. Single-line: when no newline exists, cut at the rightmost
+         whitespace whose position is at or beyond the threshold.
+         Without this fallback, an inner-Claude monologue streamed as
+         one long unpunctuated paragraph would have no stable prefix
+         until a sentence terminator finally appears; the user sees a
+         stalled message for the entire run.
     """
     last_nl = working.rfind("\n")
-    if last_nl < 0:
+    if last_nl >= 0:
+        prefix = working[:last_nl].rstrip()
+        if len(prefix) >= _LONG_SPAN_MIN_CHARS:
+            return last_nl
         return None
-    prefix = working[:last_nl].rstrip()
-    if len(prefix) >= _LONG_SPAN_MIN_CHARS:
-        return last_nl
+    # Single-line fallback. Scan right-to-left for a whitespace at
+    # position ≥ threshold; the word immediately before such a
+    # whitespace is guaranteed complete (it has a separator after it),
+    # whereas the final word at the buffer tail may still be growing.
+    n = len(working)
+    if n <= _LONG_SPAN_MIN_CHARS:
+        return None
+    for i in range(n - 1, _LONG_SPAN_MIN_CHARS - 1, -1):
+        if working[i].isspace():
+            prefix = working[:i].rstrip()
+            if len(prefix) >= _LONG_SPAN_MIN_CHARS:
+                return i
     return None
 
 

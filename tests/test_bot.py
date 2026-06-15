@@ -337,6 +337,63 @@ class TestStreamPublishablePrefix:
         assert result is not None
         assert result == prose.rstrip()
 
+    def test_full_rejects_long_unfinished_final_paragraph(self):
+        """A completed paragraph followed by a long mid-sentence fragment
+        must publish only the completed paragraph. The full candidate is
+        longer than the paragraph cut, so without a tight final-line guard
+        it would win the priority sort and ship the in-progress fragment.
+        """
+        from kai.bot import _stream_publishable_prefix
+
+        text = "Complete paragraph.\n\nOne hard inconsistency is emerging"
+        assert _stream_publishable_prefix(text) == "Complete paragraph."
+
+    def test_long_span_handles_single_line_prose(self):
+        """A long unpunctuated single-line monologue must still produce a
+        streaming surface. Without the single-line fallback in
+        ``_long_span_cut`` the helper has nothing to publish (no
+        paragraph, sentence, list, or fence boundary) and the user sees
+        a stalled live message until a sentence terminator arrives.
+        """
+        from kai.bot import _stream_publishable_prefix
+
+        text = ("alpha beta " * 30).rstrip()
+        result = _stream_publishable_prefix(text)
+        assert result is not None
+        # Threshold is 240; the long-span cut must land on a whitespace
+        # at or beyond that, leaving a substantive prefix.
+        assert len(result) >= 240
+        # The cut lands at a whitespace, so the published prefix never
+        # ends with the in-progress trailing word.
+        assert not result.endswith(" ")
+
+    def test_sentence_cut_rejects_mid_token_decimal(self):
+        """A period inside a decimal is not a sentence boundary; the
+        helper must not publish ``"Use Python 3."`` while the stream is
+        still emitting ``"13"``.
+        """
+        from kai.bot import _stream_publishable_prefix
+
+        assert _stream_publishable_prefix("Use Python 3.13") is None
+
+    def test_sentence_cut_rejects_mid_token_path(self):
+        """A period inside a file path (``bot.py``) is not a sentence
+        boundary; the helper must not publish ``"Open src/kai/bot."``
+        while the stream is still emitting ``"py"``.
+        """
+        from kai.bot import _stream_publishable_prefix
+
+        assert _stream_publishable_prefix("Open src/kai/bot.py") is None
+
+    def test_terminating_period_after_internal_dots_is_sentence_end(self):
+        """A period followed by end-of-string IS a sentence boundary,
+        even when the preceding token contains internal dots. The
+        complete version-string sentence publishes as a unit.
+        """
+        from kai.bot import _stream_publishable_prefix
+
+        assert _stream_publishable_prefix("Use Python 3.13.") == "Use Python 3.13."
+
 
 # ── _save_upload ────────────────────────────────────────────────────
 
