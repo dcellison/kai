@@ -322,6 +322,18 @@ _CLOSE_PUNCT_CHARS = frozenset("\"')]`")
 # Markdown list-item line shapes.
 _LIST_LINE_WITH_CONTENT_RE = re.compile(r"^[ ]*([-*+]|\d+\.)\s+\S")
 _LIST_LINE_RE = re.compile(r"^[ ]*([-*+]|\d+\.)(\s|$)")
+# Ordered-list marker at the start of a line. Used in _sentence_cuts to
+# advance past the marker period; without this, `1. Item one` would
+# treat the `.` in `1.` as a sentence boundary and publish a bare
+# numbered marker as if it were a completed sentence.
+_ORDERED_LIST_MARKER_RE = re.compile(r"^[ ]*\d+\.(\s|$)")
+# Looser pattern that also matches a forming next-item marker. The
+# stream may have emitted just the digits of the next ordered-list
+# marker (`3`) before the period and following text arrive; treating
+# the partial marker as a list-item signal lets list_item cuts fire on
+# the previous complete items even while the next marker is still
+# mid-emission.
+_LIST_LINE_FORMING_RE = re.compile(r"^[ ]*(\d+\.?|[-*+])(\s|$)")
 # Minimum length for the long-span fallback to fire. Picked to be long
 # enough that a coherent paragraph is likely visible, but short enough
 # that streamed paragraphs reach it before the user gives up watching.
@@ -546,8 +558,15 @@ def _sentence_cuts(working: str) -> list[int]:
         if _is_fence_line(line):
             in_fence = not in_fence
         elif not in_fence:
-            j = 0
             line_len = len(line)
+            # Advance past an ordered-list marker so its period isn't
+            # treated as a sentence terminator. The marker `.` is
+            # followed by whitespace and would otherwise satisfy the
+            # sentence-end predicate, letting `1.` publish as if it
+            # were a complete sentence while the list item is still
+            # being typed.
+            list_match = _ORDERED_LIST_MARKER_RE.match(line)
+            j = list_match.end() if list_match else 0
             while j < line_len:
                 if line[j] in _SENTENCE_END_CHARS:
                     # Extend the cut through any closing-punctuation or
@@ -602,12 +621,15 @@ def _list_item_cuts(working: str) -> list[int]:
         if i + 1 >= len(lines):
             continue
         next_line = lines[i + 1]
-        # A list-item boundary fires only when the next line is either
-        # blank or itself a list-item line. That keeps prose paragraphs
-        # after a list intact (the paragraph boundary handles them) and
-        # avoids cutting a list short when the next line is still
-        # building.
-        if not next_line.strip() or _LIST_LINE_RE.match(next_line):
+        # A list-item boundary fires when the next line is either
+        # blank, a fully-formed list-item line, or a still-forming
+        # marker (bare digits like `3` before the period arrives, a
+        # lone bullet character). That keeps prose paragraphs after a
+        # list intact (the paragraph boundary handles them), avoids
+        # cutting a list short when the next line is still building,
+        # and accepts the partial next-item marker as evidence that
+        # the previous item is complete.
+        if not next_line.strip() or _LIST_LINE_FORMING_RE.match(next_line):
             cuts.append(starts[i] + len(line))
     return cuts
 

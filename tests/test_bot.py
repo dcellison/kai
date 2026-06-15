@@ -394,6 +394,30 @@ class TestStreamPublishablePrefix:
 
         assert _stream_publishable_prefix("Use Python 3.13.") == "Use Python 3.13."
 
+    def test_ordered_list_marker_is_not_sentence_boundary(self):
+        """The dot in ``1.`` is a list marker, not a sentence end. A
+        single in-progress numbered item must not publish as the bare
+        marker; with the previous sentence-cut rules it would have
+        produced ``"1."`` because the marker period is followed by
+        whitespace and therefore satisfied the new sentence predicate.
+        """
+        from kai.bot import _stream_publishable_prefix
+
+        assert _stream_publishable_prefix("1. Item one") is None
+
+    def test_forming_next_marker_releases_previous_items(self):
+        """Numbered items publish as a list once the next item's marker
+        starts emitting, even before the period and content arrive.
+        Without forming-marker awareness, an in-progress next item
+        (just the digits ``3``) would not count as a boundary and the
+        helper would publish only ``1. Item one`` instead of the full
+        ``1. Item one\\n2. Item two``.
+        """
+        from kai.bot import _stream_publishable_prefix
+
+        text = "1. Item one\n2. Item two\n3"
+        assert _stream_publishable_prefix(text) == "1. Item one\n2. Item two"
+
 
 # ── _save_upload ────────────────────────────────────────────────────
 
@@ -3638,6 +3662,44 @@ class TestHandleResponse:
         published_texts = [c.args[1] for c in mock_reply.call_args_list]
         assert "One" not in published_texts
         assert any("One final answer." in t for t in published_texts)
+
+    @pytest.mark.asyncio
+    async def test_does_not_create_live_message_for_bare_numbered_marker(self):
+        """First non-empty partial is a single in-progress numbered item;
+        the stable-prefix gate must withhold the live message. Without
+        the ordered-list-aware sentence cut, the gate would publish the
+        bare marker ``1.`` as if it were a complete sentence.
+        """
+        from kai.bot import _handle_response
+
+        update = _make_update()
+        claude = _make_mock_claude()
+        claude.send = MagicMock(
+            return_value=_fake_stream(
+                _text_event("1. Item one"),
+                _done_event("1. Item one\n2. Item two\n3. Item three"),
+            )
+        )
+        ctx = _make_context(claude=claude)
+
+        with (
+            patch.multiple("kai.bot", **self._base_patches()),
+            patch("kai.bot._reply_safe", new_callable=AsyncMock) as mock_reply,
+            patch("kai.bot._edit_message_safe", new_callable=AsyncMock) as mock_edit,
+        ):
+            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
+
+        # No live message edit ever fired; the unstable single in-progress
+        # item never produced a stable-prefix candidate, so the live
+        # message was never created mid-stream.
+        mock_edit.assert_not_called()
+        published_texts = [c.args[1] for c in mock_reply.call_args_list]
+        # The bare marker is the worst Telegram artifact this PR
+        # prevents; no published text may show it.
+        assert "1." not in published_texts
+        assert "1. Item one" not in published_texts
+        # Final delivery still carries the complete answer via _reply_safe.
+        assert any("3. Item three" in t for t in published_texts)
 
     @pytest.mark.asyncio
     async def test_publishes_completed_prefix_not_dangling_suffix(self):
