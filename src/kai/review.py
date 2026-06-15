@@ -1560,11 +1560,16 @@ def _normalize_repo_from_remote(remote_url: str) -> str:
     """
     Normalize a git remote URL to "owner/name" or "" if it cannot.
 
-    Accepts both SSH (`git@host:owner/name.git`) and HTTPS
-    (`https://host/owner/name.git`) forms, with or without a `.git`
-    suffix. Returns the empty string for shapes the bundle cannot
-    map back to a GitHub repo (a non-GitHub host, an unexpected
-    layout, etc.).
+    Accepts SSH (`git@github.com:owner/name.git`) and HTTPS
+    (`https://github.com/owner/name.git`) forms, with or without a
+    `.git` suffix. The host MUST be ``github.com``; non-GitHub
+    remotes return the empty string even when the path shape is
+    `owner/name`. This matters because the bundle uses the
+    normalized identity to decide whether the local checkout is the
+    same repository as the PR (the PR is always on GitHub); without
+    the host check, a same-named non-GitHub mirror like
+    ``git@gitlab.com:dcellison/kai.git`` would pass the safety gate
+    and feed the reviewer related excerpts from the wrong repo.
     """
     if not remote_url:
         return ""
@@ -1573,15 +1578,18 @@ def _normalize_repo_from_remote(remote_url: str) -> str:
         url = url[: -len(".git")]
     if url.startswith("git@"):
         # `git@host:owner/name`
-        _, _, tail = url.partition(":")
+        head, _, tail = url.partition(":")
+        host = head[len("git@") :]
+        if host.lower() != "github.com":
+            return ""
         if tail.count("/") == 1:
             return tail
         return ""
-    # https://host/owner/name (and https://host/owner/name/anything)
     if "://" in url:
         _, _, tail = url.partition("://")
-        # Drop host segment.
-        _, _, path = tail.partition("/")
+        host, _, path = tail.partition("/")
+        if host.lower() != "github.com":
+            return ""
         parts = path.split("/")
         if len(parts) >= 2:
             return f"{parts[0]}/{parts[1]}"

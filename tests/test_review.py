@@ -1721,6 +1721,26 @@ class TestNormalizeRepoFromRemote:
     def test_unrecognized_form_returns_empty(self):
         assert _normalize_repo_from_remote("some-random-string") == ""
 
+    def test_non_github_ssh_returns_empty(self):
+        # Same-named non-GitHub mirror MUST NOT pass the host gate.
+        # Without this, a gitlab.com checkout with the same path
+        # shape would be treated as matching a GitHub PR for
+        # `dcellison/kai` and feed unrelated excerpts to the
+        # reviewer.
+        assert _normalize_repo_from_remote("git@gitlab.com:dcellison/kai.git") == ""
+
+    def test_non_github_https_returns_empty(self):
+        assert _normalize_repo_from_remote("https://gitlab.com/dcellison/kai.git") == ""
+
+    def test_non_github_https_with_subpath_returns_empty(self):
+        # Path-shape match alone doesn't qualify; the host gate has
+        # to hold even for URLs that look like browsable GitHub
+        # links.
+        assert _normalize_repo_from_remote("https://bitbucket.org/dcellison/kai/src/main") == ""
+
+    def test_github_host_match_is_case_insensitive(self):
+        assert _normalize_repo_from_remote("git@GitHub.com:dcellison/kai.git") == "dcellison/kai"
+
 
 class TestResolveWorkspaceRemoteRepo:
     @pytest.mark.asyncio
