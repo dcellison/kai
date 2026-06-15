@@ -3388,12 +3388,11 @@ _REVIEW_TMP_DIR = Path("/tmp")
 
 async def _resolve_review_repo(
     actor_id: int,
-    chat_id: int,
-    pool: "SubprocessPool",
+    workspace: str,
     config: Config,
-) -> str:
+) -> tuple[str, str]:
     """
-    Resolve the short-form `/review <pr-number>` to an `owner/name` repo.
+    Resolve the short-form `/review <pr-number>` to ``(repo, workspace_remote)``.
 
     Walks the conservative ladder per the spec:
 
@@ -3408,27 +3407,38 @@ async def _resolve_review_repo(
     No fallback to ``Config.github_repo`` (deprecated), no
     first-of-list, and no new workspace-to-repo mapping.
 
+    The second tuple element is the normalized workspace `origin`
+    remote (or "" when the workspace is not a GitHub checkout). The
+    caller compares it to the chosen repo to decide whether the
+    workspace is safe to pass as ``local_repo_path``; passing a
+    workspace that does not match the target repo would surface the
+    wrong spec / conventions / surrounding-code excerpts into the
+    review, regardless of which ladder rung produced the repo.
+
     Args:
         actor_id: The authorized Telegram user id; drives user-scoped
             config and effective-repo lookups so a group chat does
             not read the wrong user's settings.
-        chat_id: The chat id; drives workspace resolution (workspaces
-            are chat-scoped via the pool).
+        workspace: The active workspace path (already resolved via
+            the pool); kept as a parameter so the caller can also
+            check workspace-matches in the explicit-repo branch
+            without re-fetching.
     """
     user_config = config.get_user_config(actor_id)
     yaml_repos = user_config.github_repos if user_config else []
     effective_repos = await sessions.get_effective_repos(actor_id, yaml_repos)
     effective_lower = {r.lower() for r in effective_repos}
 
-    workspace = str(await pool.get_effective_workspace(chat_id))
-    workspace_remote = await review._resolve_workspace_remote_repo(workspace)
-    if workspace_remote and workspace_remote.lower() in effective_lower:
-        return workspace_remote.lower()
+    workspace_remote_raw = await review._resolve_workspace_remote_repo(workspace)
+    workspace_remote = workspace_remote_raw.lower() if workspace_remote_raw else ""
+
+    if workspace_remote and workspace_remote in effective_lower:
+        return workspace_remote, workspace_remote
 
     if len(effective_repos) == 1:
-        return effective_repos[0].lower()
+        return effective_repos[0].lower(), workspace_remote
 
-    return ""
+    return "", workspace_remote
 
 
 @_require_auth
@@ -3476,13 +3486,18 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
     chat_id = _chat_id(update)
     config: Config = context.bot_data["config"]
     pool = _get_pool(context)
+    workspace = str(await pool.get_effective_workspace(chat_id))
 
     args = list(context.args or [])
     usage = "Usage: /review [owner/repo] <pr-number>"
 
     # Two shapes: one arg (PR number, inferred repo) or two args
     # (explicit repo + PR number). Anything else is a usage error.
+    # `workspace_remote` captures the normalized active-workspace
+    # `origin` so the post-parse step can decide whether the
+    # workspace is safe to pass as local_repo_path.
     repo: str = ""
+    workspace_remote: str = ""
     pr_number: int = 0
     if len(args) == 1:
         try:
@@ -3490,7 +3505,7 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
         except ValueError:
             await update.message.reply_text(usage)
             return
-        repo = await _resolve_review_repo(actor_id, chat_id, pool, config)
+        repo, workspace_remote = await _resolve_review_repo(actor_id, workspace, config)
         if not repo:
             await update.message.reply_text(
                 f"{usage}\n"
@@ -3509,6 +3524,8 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
         except ValueError:
             await update.message.reply_text(usage)
             return
+        workspace_remote_raw = await review._resolve_workspace_remote_repo(workspace)
+        workspace_remote = workspace_remote_raw.lower() if workspace_remote_raw else ""
     else:
         await update.message.reply_text(usage)
         return
@@ -3523,7 +3540,16 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
     claude_user = user_config.os_user if user_config and user_config.os_user else None
     agent_backend, provider = get_user_backend_and_provider(user_config, config)
     model_override = resolve_user_model(ModelRole.PR_REVIEW, user_config, config)
-    workspace = str(await pool.get_effective_workspace(chat_id))
+
+    # Only pass the workspace as `local_repo_path` when its `origin`
+    # remote actually matches the target repo. Otherwise the bundle
+    # would load spec/conventions from an unrelated checkout and
+    # the surrounding-code search would either misdirect (rare path
+    # collisions) or emit a noisy unavailable warning even though
+    # the workspace and the PR repo are intentionally unrelated.
+    # Passing None makes the bundle skip spec, conventions, and
+    # related-context cleanly.
+    local_repo_path = workspace if workspace_remote == repo else None
 
     # Start ack: always sent before the backend invocation; a single
     # review can run up to PR_REVIEW_TIMEOUT_S seconds and silent
@@ -3534,7 +3560,7 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
         result = await review.generate_pr_review(
             repo,
             pr_number,
-            local_repo_path=workspace,
+            local_repo_path=local_repo_path,
             spec_dir=config.spec_dir,
             include_prior_comments=True,
             claude_user=claude_user,

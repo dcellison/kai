@@ -6374,3 +6374,140 @@ class TestHandleReviewCommand:
         combined = "\n".join(replies)
         for w in warnings:
             assert w.source in combined
+
+    @pytest.mark.asyncio
+    async def test_explicit_form_with_mismatched_workspace_passes_none(self, tmp_path, monkeypatch):
+        # Operator is sitting in workspace whose origin points at a
+        # different repo (e.g. /Users/op/some-other-repo) and runs
+        # `/review dcellison/kai 681`. The bundle must NOT load
+        # local spec / conventions / surrounding-code from the
+        # unrelated checkout; the only safe choice is to pass
+        # local_repo_path=None so the bundle skips local lookups
+        # entirely.
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update()
+        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx.bot.send_document = AsyncMock()
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            # Active workspace's origin resolves to a different repo.
+            patch(
+                "kai.review._resolve_workspace_remote_repo",
+                new=AsyncMock(return_value="dcellison/other-repo"),
+            ),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(return_value=_review_result()),
+            ) as mock_generate,
+        ):
+            await handle_review_command(update, ctx)
+
+        assert mock_generate.call_args.kwargs["local_repo_path"] is None
+
+    @pytest.mark.asyncio
+    async def test_explicit_form_with_matching_workspace_passes_workspace(self, tmp_path, monkeypatch):
+        # Same as above but the workspace IS the target repo's
+        # checkout. The bundle gets the workspace so spec /
+        # conventions / surrounding-code search can use it.
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update()
+        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx.bot.send_document = AsyncMock()
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch(
+                "kai.review._resolve_workspace_remote_repo",
+                new=AsyncMock(return_value="dcellison/kai"),
+            ),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(return_value=_review_result()),
+            ) as mock_generate,
+        ):
+            await handle_review_command(update, ctx)
+
+        assert mock_generate.call_args.kwargs["local_repo_path"] == "/home/workspace"
+
+    @pytest.mark.asyncio
+    async def test_short_form_sole_effective_with_mismatched_workspace_passes_none(self, tmp_path, monkeypatch):
+        # Short form falls back to the sole effective repo because
+        # the workspace remote does not match it (or is empty).
+        # local_repo_path must be None in that case for the same
+        # reason as the explicit form: the workspace and the
+        # inferred repo are intentionally unrelated.
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update()
+        config = _make_config(
+            user_configs={
+                12345: UserConfig(
+                    telegram_id=12345,
+                    name="op",
+                    github_repos=["dcellison/kai"],
+                ),
+            }
+        )
+        ctx = _make_context(config=config, args=["681"])
+        ctx.bot.send_document = AsyncMock()
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            # No GitHub remote at all (e.g. a plain non-git
+            # workspace) - the sole-effective fallback fires but
+            # the workspace must not propagate.
+            patch("kai.review._resolve_workspace_remote_repo", new=AsyncMock(return_value="")),
+            patch(
+                "kai.sessions.get_effective_repos",
+                new=AsyncMock(return_value=["dcellison/kai"]),
+            ),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(return_value=_review_result()),
+            ) as mock_generate,
+        ):
+            await handle_review_command(update, ctx)
+
+        assert mock_generate.call_args.kwargs["local_repo_path"] is None
+
+    @pytest.mark.asyncio
+    async def test_short_form_workspace_match_passes_workspace(self, tmp_path, monkeypatch):
+        # Belt and braces for the happy path: short form picks up
+        # the workspace remote AND the workspace flows through as
+        # local_repo_path so the bundle's full-context path runs.
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update()
+        config = _make_config(
+            user_configs={
+                12345: UserConfig(
+                    telegram_id=12345,
+                    name="op",
+                    github_repos=["dcellison/kai", "dcellison/other"],
+                ),
+            }
+        )
+        ctx = _make_context(config=config, args=["681"])
+        ctx.bot.send_document = AsyncMock()
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch(
+                "kai.review._resolve_workspace_remote_repo",
+                new=AsyncMock(return_value="dcellison/kai"),
+            ),
+            patch(
+                "kai.sessions.get_effective_repos",
+                new=AsyncMock(return_value=["dcellison/kai", "dcellison/other"]),
+            ),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(return_value=_review_result()),
+            ) as mock_generate,
+        ):
+            await handle_review_command(update, ctx)
+
+        assert mock_generate.call_args.kwargs["local_repo_path"] == "/home/workspace"
