@@ -6268,3 +6268,109 @@ class TestHandleReviewCommand:
         assert any("Review written to" in r for r in replies)
         # ...AND the failure is visible.
         assert any("Attachment failed" in r for r in replies)
+
+    @pytest.mark.asyncio
+    async def test_canonical_write_failure_is_surfaced(self, tmp_path, monkeypatch):
+        # If the canonical /tmp/pr-N-review.md write fails (permission
+        # denied, disk full, etc.), the contract is broken: there is
+        # no artifact for the operator to read. The operator must see
+        # a clear chat error, not just the initial "Reviewing…" ack
+        # and silence.
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        # Point _REVIEW_TMP_DIR at a path that does NOT exist so the
+        # write_text call raises OSError without touching real /tmp.
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path / "does-not-exist")
+        update = _make_update()
+        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx.bot.send_document = AsyncMock()
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(return_value=_review_result()),
+            ),
+        ):
+            await handle_review_command(update, ctx)
+
+        replies = [c.args[0] for c in update.message.reply_text.call_args_list]
+        assert any("writing" in r and "failed" in r for r in replies)
+        ctx.bot.send_document.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_staging_failure_surfaces_in_status(self, tmp_path, monkeypatch):
+        # Staging is non-fatal (canonical /tmp still exists) but the
+        # operator should know the attachment will not arrive so they
+        # can fetch the file another way.
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update()
+        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx.bot.send_document = AsyncMock()
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(return_value=_review_result()),
+            ),
+            patch("kai.bot._save_upload", side_effect=OSError("read-only filesystem")),
+        ):
+            await handle_review_command(update, ctx)
+
+        replies = [c.args[0] for c in update.message.reply_text.call_args_list]
+        assert any("Staging copy failed" in r for r in replies)
+        # send_document must NOT fire when staging failed because
+        # there is no staged path to upload from.
+        ctx.bot.send_document.assert_not_awaited()
+        # Canonical path is still surfaced.
+        assert any("Review written to" in r for r in replies)
+
+    @pytest.mark.asyncio
+    async def test_many_warnings_chunked_under_telegram_limit(self, tmp_path, monkeypatch):
+        # A bundle that hits many file fetch failures can produce
+        # dozens of warnings. Concatenating them all into a single
+        # reply with the status line can blow past Telegram's 4096-
+        # char limit and cause the final reply to fail silently.
+        # Status and warnings are split across separate replies,
+        # each kept under the limit by chunk_text.
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update()
+        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx.bot.send_document = AsyncMock()
+
+        # Build warnings whose combined size exceeds 4096 chars.
+        warnings = tuple(
+            CollectionWarning(
+                source=f"changed_file:src/module_{i}.py",
+                message="content fetch failed: " + ("x" * 200),
+            )
+            for i in range(30)
+        )
+        assert sum(len(w.message) for w in warnings) > 4096
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(return_value=_review_result(warnings=warnings)),
+            ),
+        ):
+            await handle_review_command(update, ctx)
+
+        replies = [c.args[0] for c in update.message.reply_text.call_args_list]
+        # Telegram's hard limit is 4096; every reply must respect it.
+        for r in replies:
+            assert len(r) <= 4096, f"reply exceeds Telegram message limit: {len(r)} chars"
+        # Skip past the "Reviewing…" start ack to the post-backend
+        # replies; the canonical status line is the first post-
+        # backend reply and stands alone.
+        post_backend = [r for r in replies if not r.startswith("Reviewing ")]
+        assert post_backend[0].startswith("Review written to")
+        assert "Warnings:" not in post_backend[0]
+        assert any("Warnings:" in r for r in post_backend[1:])
+        # All warning sources appeared somewhere.
+        combined = "\n".join(replies)
+        for w in warnings:
+            assert w.source in combined

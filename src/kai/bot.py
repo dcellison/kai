@@ -3557,47 +3557,74 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
     body = f"# PR #{pr_number} review\n\nRepository: {repo}\nURL: {result.pr_url}\n\n{result.review_text}\n"
 
     canonical = _REVIEW_TMP_DIR / f"pr-{pr_number}-review.md"
-    canonical.write_text(body)
+    try:
+        canonical.write_text(body)
+    except OSError as exc:
+        # The canonical artifact is the contract: if we cannot write
+        # it the review effectively does not exist for the operator
+        # (no /tmp file to read, nothing to stage or upload). Surface
+        # the failure as a clear chat error so the operator does not
+        # see only the "Reviewing…" ack and silence.
+        log.exception("Failed to write canonical review artifact for %s#%d", repo, pr_number)
+        await update.message.reply_text(f"Review backend succeeded but writing {canonical} failed: {exc}")
+        return
 
     # Stage a timestamped copy under DATA_DIR/files/<chat_id>/ using
     # the existing upload-file naming convention so the staged
     # artifact composes with the per-chat file area and never
-    # overwrites a previous review's staged copy.
-    staged = _save_upload(body.encode(), f"pr-{pr_number}-review.md", user_id=chat_id)
+    # overwrites a previous review's staged copy. Staging failure
+    # is non-fatal: the canonical /tmp artifact still exists and
+    # the reply will surface the staging gap explicitly.
+    staged: Path | None = None
+    staging_failed = False
+    try:
+        staged = _save_upload(body.encode(), f"pr-{pr_number}-review.md", user_id=chat_id)
+    except OSError:
+        staging_failed = True
+        log.exception("Failed to stage review copy for %s#%d", repo, pr_number)
 
     # Upload the staged Markdown file to Telegram so phone-only use
     # can read the full review. The staged file is the upload source
     # rather than /tmp because the send-file allowlist may reject
     # /tmp and the staged path lives under the configured per-chat
-    # data area. Failure is non-fatal (the canonical /tmp artifact is
-    # already written) but it is NOT silent: a phone-only operator
-    # cannot read /tmp, so the final reply must say the attachment
-    # failed if it did.
+    # data area. Failure is non-fatal (the canonical /tmp artifact
+    # is already written) but it is NOT silent: a phone-only
+    # operator cannot read /tmp, so the final reply must say the
+    # attachment failed if it did.
     upload_failed = False
-    try:
-        with open(staged, "rb") as f:
-            await context.bot.send_document(
-                chat_id,
-                document=f,
-                caption=f"PR #{pr_number} review\n{canonical}",
-                filename=f"pr-{pr_number}-review.md",
-            )
-    except Exception:
-        upload_failed = True
-        log.exception("Failed to upload staged review document for %s#%d", repo, pr_number)
+    if staged is not None:
+        try:
+            with open(staged, "rb") as f:
+                await context.bot.send_document(
+                    chat_id,
+                    document=f,
+                    caption=f"PR #{pr_number} review\n{canonical}",
+                    filename=f"pr-{pr_number}-review.md",
+                )
+        except Exception:
+            upload_failed = True
+            log.exception("Failed to upload staged review document for %s#%d", repo, pr_number)
 
-    # Reply with the absolute path so the operator can open it in
-    # the chat-review-loop convention, plus any collection warnings
-    # so they know what context was incomplete, plus an explicit
-    # note if the document attachment failed.
-    reply_lines: list[str] = [f"Review written to {canonical}"]
-    if upload_failed:
-        reply_lines.append("Attachment failed; open the file at the path above.")
+    # Reply 1: short status line. Always sent first so the operator
+    # sees the canonical path immediately, before any potentially
+    # long warning block. Per the spec the status comes before
+    # warnings, and per Telegram's 4096-char message limit it has to
+    # stand alone so a flood of warnings does not crowd it out.
+    status_lines = [f"Review written to {canonical}"]
+    if staging_failed:
+        status_lines.append("Staging copy failed; document attachment skipped.")
+    elif upload_failed:
+        status_lines.append("Attachment failed; open the file at the path above.")
+    await update.message.reply_text("\n".join(status_lines))
+
+    # Reply 2+: collection warnings, chunked so the Telegram message
+    # limit (4096 chars) cannot truncate the final reply when a
+    # large bundle emits many file/fetch failures. chunk_text breaks
+    # at paragraph or line boundaries when possible.
     if result.collection_warnings:
-        reply_lines.append("Warnings:")
-        for w in result.collection_warnings:
-            reply_lines.append(f"  [{w.source}] {w.message}")
-    await update.message.reply_text("\n".join(reply_lines))
+        warnings_block = "Warnings:\n" + "\n".join(f"  [{w.source}] {w.message}" for w in result.collection_warnings)
+        for chunk in chunk_text(warnings_block):
+            await update.message.reply_text(chunk)
 
 
 @_require_auth
