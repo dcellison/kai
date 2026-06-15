@@ -3387,6 +3387,7 @@ _REVIEW_TMP_DIR = Path("/tmp")
 
 
 async def _resolve_review_repo(
+    actor_id: int,
     chat_id: int,
     pool: "SubprocessPool",
     config: Config,
@@ -3406,10 +3407,17 @@ async def _resolve_review_repo(
 
     No fallback to ``Config.github_repo`` (deprecated), no
     first-of-list, and no new workspace-to-repo mapping.
+
+    Args:
+        actor_id: The authorized Telegram user id; drives user-scoped
+            config and effective-repo lookups so a group chat does
+            not read the wrong user's settings.
+        chat_id: The chat id; drives workspace resolution (workspaces
+            are chat-scoped via the pool).
     """
-    user_config = config.get_user_config(chat_id)
+    user_config = config.get_user_config(actor_id)
     yaml_repos = user_config.github_repos if user_config else []
-    effective_repos = await sessions.get_effective_repos(chat_id, yaml_repos)
+    effective_repos = await sessions.get_effective_repos(actor_id, yaml_repos)
     effective_lower = {r.lower() for r in effective_repos}
 
     workspace = str(await pool.get_effective_workspace(chat_id))
@@ -3457,6 +3465,14 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
     if not await _check_totp(update, context):
         return
 
+    # `actor_id` drives every user-scoped lookup (config, effective
+    # repos, backend, provider, model override); `chat_id` drives
+    # chat-scoped state (workspace path, per-chat file staging, the
+    # reply target, document upload). In a notification group the two
+    # differ: chat_id is the group's id and would silently miss the
+    # authorized operator's user config if it were used for the
+    # user-scoped reads, dropping the review onto global defaults.
+    actor_id = _user_id(update)
     chat_id = _chat_id(update)
     config: Config = context.bot_data["config"]
     pool = _get_pool(context)
@@ -3474,7 +3490,7 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
         except ValueError:
             await update.message.reply_text(usage)
             return
-        repo = await _resolve_review_repo(chat_id, pool, config)
+        repo = await _resolve_review_repo(actor_id, chat_id, pool, config)
         if not repo:
             await update.message.reply_text(
                 f"{usage}\n"
@@ -3498,18 +3514,14 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     # Per-user backend / provider / claude-user / model-override
-    # resolution mirrors the webhook PR review path so a manual
-    # review behaves the same as the automatic one for the same user.
-    user_config = config.get_user_config(chat_id)
+    # resolution. Use the shared `get_user_backend_and_provider`
+    # helper so a manual /review picks up exactly the same effective
+    # backend the rest of the bot uses for this user; hand-rolling
+    # the fallback would drift if config.py's resolution rules ever
+    # change.
+    user_config = config.get_user_config(actor_id)
     claude_user = user_config.os_user if user_config and user_config.os_user else None
-    if user_config and user_config.agent_backend:
-        agent_backend = user_config.agent_backend
-    else:
-        agent_backend = config.agent_backend
-    if user_config and user_config.llm_provider:
-        provider = user_config.llm_provider
-    else:
-        provider = config.llm_provider
+    agent_backend, provider = get_user_backend_and_provider(user_config, config)
     model_override = resolve_user_model(ModelRole.PR_REVIEW, user_config, config)
     workspace = str(await pool.get_effective_workspace(chat_id))
 
@@ -3557,7 +3569,11 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
     # can read the full review. The staged file is the upload source
     # rather than /tmp because the send-file allowlist may reject
     # /tmp and the staged path lives under the configured per-chat
-    # data area.
+    # data area. Failure is non-fatal (the canonical /tmp artifact is
+    # already written) but it is NOT silent: a phone-only operator
+    # cannot read /tmp, so the final reply must say the attachment
+    # failed if it did.
+    upload_failed = False
     try:
         with open(staged, "rb") as f:
             await context.bot.send_document(
@@ -3567,20 +3583,21 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
                 filename=f"pr-{pr_number}-review.md",
             )
     except Exception:
-        # Document upload is best-effort; the canonical /tmp path is
-        # always available so the reviewer can read the review even
-        # if the attachment fails (Telegram size limits, network
-        # blips, etc.).
+        upload_failed = True
         log.exception("Failed to upload staged review document for %s#%d", repo, pr_number)
 
     # Reply with the absolute path so the operator can open it in
     # the chat-review-loop convention, plus any collection warnings
-    # so they know what context was incomplete.
+    # so they know what context was incomplete, plus an explicit
+    # note if the document attachment failed.
+    reply_lines: list[str] = [f"Review written to {canonical}"]
+    if upload_failed:
+        reply_lines.append("Attachment failed; open the file at the path above.")
     if result.collection_warnings:
-        warnings_text = "\n".join(f"  [{w.source}] {w.message}" for w in result.collection_warnings)
-        await update.message.reply_text(f"Review written to {canonical}\nWarnings:\n{warnings_text}")
-    else:
-        await update.message.reply_text(f"Review written to {canonical}")
+        reply_lines.append("Warnings:")
+        for w in result.collection_warnings:
+            reply_lines.append(f"  [{w.source}] {w.message}")
+    await update.message.reply_text("\n".join(reply_lines))
 
 
 @_require_auth

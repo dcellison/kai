@@ -6185,3 +6185,86 @@ class TestHandleReviewCommand:
         mock_generate.assert_not_called()
         replies = [c.args[0] for c in update.message.reply_text.call_args_list]
         assert any("Usage: /review" in r for r in replies)
+
+    @pytest.mark.asyncio
+    async def test_group_chat_uses_user_id_for_user_scoped_lookups(self, tmp_path, monkeypatch):
+        # In a notification group the message arrives on a group
+        # chat_id but the actor is the operator. User-scoped lookups
+        # (user_config, effective repos) must key on user_id, NOT
+        # chat_id, so the review picks up the operator's settings.
+        # Without this split, get_user_config(group_chat_id) returns
+        # None, github_repos is [], and the resolution silently
+        # collapses to the global defaults.
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update(chat_id=-100888, user_id=12345)
+        # User config keyed by user_id (12345), not chat_id (-100888).
+        config = _make_config(
+            user_configs={
+                12345: UserConfig(
+                    telegram_id=12345,
+                    name="op",
+                    github_repos=["dcellison/kai"],
+                    agent_backend="codex",
+                    llm_provider="openai",
+                    os_user="daniel",
+                ),
+            },
+            allowed_user_ids={12345},
+        )
+        ctx = _make_context(config=config, args=["681"])
+        ctx.bot.send_document = AsyncMock()
+
+        mock_effective = AsyncMock(return_value=["dcellison/kai"])
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch("kai.review._resolve_workspace_remote_repo", new=AsyncMock(return_value="")),
+            patch("kai.sessions.get_effective_repos", new=mock_effective),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(return_value=_review_result()),
+            ) as mock_generate,
+        ):
+            await handle_review_command(update, ctx)
+
+        # effective-repos lookup uses the actor (user) id, not the
+        # group chat id - this is the load-bearing assertion.
+        assert mock_effective.await_args.args[0] == 12345
+        # The review actually runs with the operator's resolved
+        # settings (codex / openai / daniel), not the global
+        # defaults that would apply if the lookup had used the
+        # group chat id.
+        kwargs = mock_generate.call_args.kwargs
+        assert kwargs["agent_backend"] == "codex"
+        assert kwargs["provider"] == "openai"
+        assert kwargs["claude_user"] == "daniel"
+        # And the inferred repo is the operator's (sole) effective
+        # repo, not empty.
+        assert mock_generate.call_args.args == ("dcellison/kai", 681)
+
+    @pytest.mark.asyncio
+    async def test_upload_failure_is_surfaced_in_reply(self, tmp_path, monkeypatch):
+        # Phone-only operators cannot read /tmp; if the document
+        # upload fails the final chat reply must say so rather than
+        # silently telling them to open a file they can't reach.
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update(chat_id=12345)
+        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx.bot.send_document = AsyncMock(side_effect=RuntimeError("file too large"))
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(return_value=_review_result()),
+            ),
+        ):
+            await handle_review_command(update, ctx)
+
+        replies = [c.args[0] for c in update.message.reply_text.call_args_list]
+        # The canonical path is still surfaced...
+        assert any("Review written to" in r for r in replies)
+        # ...AND the failure is visible.
+        assert any("Attachment failed" in r for r in replies)
