@@ -2243,6 +2243,18 @@ class TestBuildReviewPromptFromContext:
         prompt = build_review_prompt_from_context(_ctx())
         assert "Do not summarize the PR before listing findings" in prompt
 
+    def test_declares_bundle_is_complete_context(self):
+        # The reasoner has no shell/filesystem/tool access; without
+        # this instruction the model defaults to noting "I couldn't
+        # inspect the workspace" as residual risk on every review.
+        # The line tells the reviewer the boundary blocks are the
+        # complete context and to flag specific missing outside-of-
+        # changed-files context as concrete findings instead.
+        prompt = build_review_prompt_from_context(_ctx())
+        assert "no shell, filesystem, or tool access" in prompt
+        assert "complete context" in prompt
+        assert "Do not flag the absence of a runnable checkout" in prompt
+
     def test_budget_notes_render_inside_their_own_boundary(self):
         ctx = _ctx(budget_notes=(BudgetNote(section="RELATED_CONTEXT", message="dropped 14 hits"),))
         prompt = build_review_prompt_from_context(ctx)
