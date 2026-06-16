@@ -90,8 +90,8 @@ from kai.config import (
     get_effective_provider,
     resolve_user_model,
 )
+from kai.eval._probes import compute_rank
 from kai.eval._unscoped_recall_capture import legacy_retrieve_hits
-from kai.eval.retrieval import compute_rank
 from kai.eval.retrieval_scoped import evaluate, load_probes
 from kai.oneshot import (
     ClaudeOneShotReasoner,
@@ -131,11 +131,12 @@ _DEFAULT_SIMILARITY_THRESHOLD = 0.55
 # predictable regardless of how large the project-A row set is.
 _DEFAULT_FALLBACK_CAP = 200
 
-# Acceptance gate for the legacy verify step: a drafted exclusion
+# Acceptance gate for the unscoped verify step: a drafted exclusion
 # probe is accepted only if the excluded row appears within the
-# legacy top-K. 20 is the legacy harness's typical injected-prompt
-# depth; outside that range the exclusion is theoretical, not a
-# real retrieval the scoped pipeline must defend against.
+# unscoped top-K. 20 is the unscoped pipeline's typical
+# injected-prompt depth; outside that range the exclusion is
+# theoretical, not a real retrieval the scoped pipeline must defend
+# against.
 _DEFAULT_VERIFY_TOP_K = 20
 
 # Consecutive-failure abort guard. Matches the memory_reclassify
@@ -301,7 +302,7 @@ class VerifiedProbe:
 @dataclass
 class DroppedProbe:
     """
-    A drafted probe that the legacy verify gate rejected.
+    A drafted probe that the unscoped verify gate rejected.
 
     Tracked separately so the report can name dropped probes by
     `probe_id` and explain why each was dropped (rank None vs.
@@ -1277,15 +1278,15 @@ async def _verify_exclusion(
     verify_top_k: int,
 ) -> tuple[bool, int | None]:
     """
-    Run the legacy harness; accept if excluded_row_id is in top-K.
+    Run the unscoped recall pipeline; accept if excluded_row_id is in top-K.
 
     Returns (accepted, observed_rank). `observed_rank` is the
-    1-indexed legacy rank of the excluded row, or None when the row
-    did not appear at all. The report uses both: a None rank reads
-    as "drafted question did not retrieve the excluded row"; a rank
-    > verify_top_k reads as "retrieved but outside the gate."
+    1-indexed unscoped rank of the excluded row, or None when the
+    row did not appear at all. The report uses both: a None rank
+    reads as "drafted question did not retrieve the excluded row";
+    a rank > verify_top_k reads as "retrieved but outside the gate."
 
-    The legacy harness is run for collision probes (excluded row =
+    The unscoped pipeline runs for collision probes (excluded row =
     project-A row pinned to project-B context) and non-project
     exclusion probes (excluded row = project-bound row, workspace=
     None context). Same gate, same helper.
@@ -2645,9 +2646,9 @@ async def _run_generate(
         accepted_as_target = sum(
             1 for p in accepted if p.kind == KIND_COLLISION and p.workspace == _project_workspace_root_str(project)
         )
-        # "Verified" includes positive/legacy-default (no legacy verify
-        # by construction) plus exclusion probes that passed the gate
-        # for this project as the workspace target.
+        # "Verified" includes positive/legacy-default (no unscoped
+        # verify by construction) plus exclusion probes that passed
+        # the gate for this project as the workspace target.
         report.per_project_summary[project.project_id] = {
             "rows_considered": len(rows_by_project.get(project.project_id, [])),
             "candidates_drafted": accepted_as_target

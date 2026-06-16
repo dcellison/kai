@@ -456,7 +456,7 @@ class TestConsecutiveFailureAbort:
 
 
 class TestVerifyExclusion:
-    """The legacy harness gate used by both collision and non-project."""
+    """The unscoped recall gate used by both collision and non-project."""
 
     def test_in_top_k_accepts(self, monkeypatch):
         # legacy_retrieve_hits returns ([hits], latency). The target id

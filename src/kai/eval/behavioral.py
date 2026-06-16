@@ -3,12 +3,13 @@ Layer 2 end-to-end behavioral A/B evaluation harness.
 
 Reachable as `python -m kai.eval.behavioral`.
 
-Layer 1 (`kai.eval.retrieval`) measures whether the retrieval step
-surfaces the right facts. It does NOT answer the question that matters
-to the operator: when retrieval works, does memory injection actually
-make the model's response BETTER than a memory-off response would be?
-And when retrieval surfaces irrelevant facts (false positives, paraphrase
-clusters), does it make the response WORSE?
+The retrieval evaluator (`kai.eval.retrieval_scoped`) measures
+whether the retrieval step surfaces the right facts. It does NOT
+answer the question that matters to the operator: when retrieval
+works, does memory injection actually make the model's response
+BETTER than a memory-off response would be? And when retrieval
+surfaces irrelevant facts (false positives, paraphrase clusters),
+does it make the response WORSE?
 
 This module answers that. For each probe, it runs the question through
 the model TWICE: once with the memory block prepended (arm A or B,
@@ -53,9 +54,10 @@ Design rationale (the parts that are not obvious from the code):
 - Drift bucket. Probes whose `expected_fact_id` does not resolve via
   `memory.get_by_id` are bucketed as `drift` (fact deleted, ownership
   mismatch, source not "extracted", typo at probe authoring) and
-  excluded from win/loss/tie denominators. Same discipline as Layer 1.
-  Reusing `kai.eval.retrieval.detect_drift` keeps the two layers in
-  agreement about which probes are scorable on a given snapshot.
+  excluded from win/loss/tie denominators. Reusing the shared
+  `kai.eval._probes.detect_drift` keeps the behavioral evaluator,
+  the collision-probe generator, and any future consumer in agreement
+  about which probes are scorable on a given snapshot.
 
 - Failure buckets. `judge_error` and `generation_error` are deliberately
   separate so a noisy run is diagnosable: a 30% generation_error rate
@@ -91,12 +93,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-# Import from the Layer 1 sibling module so the two layers stay aligned
-# on probe schema, drift detection, and probe-set-hash semantics. If
-# Layer 1's drift bucketing changes, Layer 2 follows automatically.
+# Pull the probe schema, drift detection, and probe-set-hash helper
+# from the shared probe primitives so the behavioral evaluator stays
+# aligned with whatever else consumes the same shape (currently the
+# collision-probe generator). If the drift bucketing changes, every
+# consumer follows automatically.
 from kai.codex_exec import extract_codex_text
 from kai.config import ONESHOT_REASONER_BACKENDS, ModelRole, get_model_for
-from kai.eval.retrieval import (
+from kai.eval._probes import (
     Probe,
     detect_drift,
     load_probes,
@@ -341,28 +345,30 @@ class ProbeOutcome:
 def load_behavioral_probes(path: Path) -> tuple[list[Probe], dict[str, str]]:
     """Load probes plus optional per-probe ground_truth_text overrides.
 
-    Reuses Layer 1's `load_probes` for the base schema (question,
+    Reuses the shared `load_probes` for the base schema (question,
     expected_fact_id, source_turn_ts, notes) and then re-parses the
     same file to pick up the optional `ground_truth_text` field,
     returned as a dict keyed by `expected_fact_id`. Probes without
     the field will have their gold text resolved at scoring time via
     `memory.get_by_id`.
 
-    Two-pass design: Layer 1's loader is the source of truth for the
-    base probe schema (validation, comment skipping, line numbering),
-    and re-parsing here is cheap (probes files are small JSONL). The
-    alternative — extending `load_probes` with an optional return —
-    would couple Layer 1 to a Layer 2-only field. Independent layers
-    over a shared loader is the cleaner separation.
+    Two-pass design: the shared loader is the source of truth for
+    the base probe schema (validation, comment skipping, line
+    numbering), and re-parsing here is cheap (probes files are
+    small JSONL). The alternative, extending `load_probes` with an
+    optional return, would couple the shared module to a
+    behavioral-only field. Independent loaders over a shared schema
+    is the cleaner separation.
     """
     probes = load_probes(path)
     overrides: dict[str, str] = {}
     raw = path.read_text(encoding="utf-8").splitlines()
     for line in raw:
         stripped = line.lstrip()
-        # Mirror Layer 1's comment/blank skip exactly so we touch the
-        # same set of lines. A divergence here would silently mean
-        # Layer 1 sees probes Layer 2 doesn't (or vice versa).
+        # Mirror the shared loader's comment/blank skip exactly so we
+        # touch the same set of lines. A divergence here would silently
+        # mean the shared loader sees probes this loader doesn't (or
+        # vice versa).
         if not stripped or stripped.startswith("#"):
             continue
         try:
@@ -1487,7 +1493,7 @@ async def _run_all_probes(
         # the operator wrote at probe-authoring time) so the judge
         # has SOMETHING to compare against. This is best-effort; an
         # empty-notes-empty-text combination is genuinely unrecoverable
-        # and should be flagged as drift, but Layer 1's detect_drift
+        # and should be flagged as drift, but the shared detect_drift
         # only checks fact existence, not content.
         if not gt:
             gt = probe.notes
@@ -1626,7 +1632,8 @@ def _aggregate_by_tag(outcomes: list[ProbeOutcome]) -> dict[str, dict[str, int]]
     information; the operator wants to know "for probes about
     preferences, did memory help?" not "for probes about preferences,
     did the judge fail?" A multi-tag fact appears in every one of its
-    tag buckets (mirrors Layer 1's per-tag discipline).
+    tag buckets, so per-tag math is "quality for every probe whose
+    fact touches tag X" rather than partitioning probes across tags.
     """
     by_tag: dict[str, dict[str, int]] = {}
     for o in outcomes:
@@ -1865,9 +1872,8 @@ def build_output_json(
 def _render_summary(output: dict[str, Any]) -> str:
     """Human-readable summary of the run.
 
-    Plain text, no color codes — the harness output is meant to be
-    pasteable into a bug report or chat without ANSI escapes. Mirrors
-    Layer 1's `_render_single_metrics` style.
+    Plain text, no color codes; the harness output is meant to be
+    pasteable into a bug report or chat without ANSI escapes.
     """
     counts = output["outcomes"]
     # CLI version line dispatches on whichever key is present.
@@ -2089,10 +2095,10 @@ def _build_parser() -> argparse.ArgumentParser:
 def _initialize_memory() -> Path | None:
     """Load config and call init_memory(); return data_dir on success.
 
-    Mirrors Layer 1's discipline. The harness runs against the live
-    store, so the same init path keeps embedding model, Qdrant
-    directory, and history DB settings consistent with the bot
-    runtime. Errors print to stderr and the caller exits with status 1.
+    The harness runs against the live store, so the same init path
+    used by the bot runtime keeps the embedding model, Qdrant
+    directory, and history DB settings consistent. Errors print to
+    stderr and the caller exits with status 1.
 
     Returns the active `DATA_DIR` (rather than a bool) so the caller
     can populate BehavioralConfig.data_dir from the SAME process's
@@ -2137,11 +2143,12 @@ def _resolve_ground_truth(
     Drifted probes are NOT included here — the caller filters them
     upstream and they would have been excluded from `scored_probes`.
 
-    The duplicate get_by_id call (same fact already fetched once during
-    drift detection) is the documented cost of keeping Layer 2 read-only
-    against Layer 1's API. At 26 probes and Layer 1's measured p50=9ms
-    per get_by_id, the overhead is ~234ms, which is dominated by a
-    single subprocess call. Acceptable.
+    The duplicate get_by_id call (same fact already fetched once
+    during drift detection) is the documented cost of keeping this
+    evaluator read-only against the shared `detect_drift` API. At
+    26 probes and a measured p50=9ms per get_by_id, the overhead is
+    ~234ms, which is dominated by a single subprocess call.
+    Acceptable.
 
     Synchronous because get_by_id is synchronous; declaring this `async`
     would be misleading (no awaits) and would block the event loop for
@@ -2173,7 +2180,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
     Returns process exit code: 0 on success, 1 on init/IO failure,
     2 on probe-file validation failure (distinct so a calling script
-    can tell the two apart, mirroring Layer 1's exit-code convention).
+    can tell the two apart).
     """
     try:
         probes, overrides = load_behavioral_probes(args.probes)
@@ -2188,8 +2195,9 @@ async def _run_cli(args: argparse.Namespace) -> int:
     if data_dir is None:
         return 1
 
-    # Drift detection + tag mapping — reuses Layer 1's helper so the
-    # two layers agree on which probes are scorable on a given snapshot.
+    # Drift detection + tag mapping: reuses the shared helper so every
+    # eval consumer agrees on which probes are scorable on a given
+    # snapshot.
     scored_probes, drifted_probes, tags_by_id = detect_drift(probes, args.user_id)
 
     # Ground-truth text lookup for every scored probe, with overrides

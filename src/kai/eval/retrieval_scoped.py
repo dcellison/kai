@@ -3,13 +3,10 @@ Scoped retrieval evaluation harness.
 
 Reachable as `python -m kai.eval.retrieval_scoped`.
 
-Sibling to `kai.eval.retrieval` (the legacy harness). Where the
-legacy module scores `format_context`, this module scores the
-production scoped read path: `retrieve_scoped_memories` for the IR
-ranking family and `format_scoped_context_with_recall_payload` for
-prompt placement, exclusion safety, and fail-closed observation.
-Both harnesses ship in parallel until side-by-side comparisons
-settle which (if either) to retire.
+Scores the production scoped read path:
+`retrieve_scoped_memories` for the IR ranking family and
+`format_scoped_context_with_recall_payload` for prompt placement,
+exclusion safety, and fail-closed observation.
 
 Design rationale (the part that is not obvious from the code):
 
@@ -95,20 +92,16 @@ log = logging.getLogger(__name__)
 # ── Constants ───────────────────────────────────────────────────────
 
 
-# K values reported for precision / recall. Same set as the legacy
-# harness so an operator running both side by side reads the same
-# columns; 1 is the strictest top-pick metric, 3 is the typical mid-
-# budget point, 5 is the default Pareto axis used by the legacy
-# harness's sort.
+# K values reported for precision / recall. 1 is the strictest
+# top-pick metric, 3 is the typical mid-budget point, 5 is the
+# default Pareto axis the sort uses.
 _K_VALUES: tuple[int, ...] = (1, 3, 5)
 
 
 # Default sweep grid. The scoped pipeline reads the same module-level
-# knobs the legacy pipeline does at the relevant steps (raw-score
+# knobs the unscoped pipeline does at the relevant steps (raw-score
 # floor at step 7, speaker/confidence weighting at step 8, overfetch
-# inside the Mem0 fetch), so the grid is intentionally identical:
-# the two harnesses cover the same axes and operators can compare
-# corresponding grid points across the two output files. Project
+# inside the Mem0 fetch), so the grid covers the same axes. Project
 # admission knobs (`memory_enabled` per project) are policy, not
 # tuning targets; varying them would measure a configuration nobody
 # runs in production, so they are excluded.
@@ -119,9 +112,9 @@ _DEFAULT_EPISODE_SUMMARY_WEIGHT_GRID: tuple[float, ...] = (0.7, 0.85, 1.0)
 _DEFAULT_OVERFETCH_GRID: tuple[int, ...] = (10, 20, 30)
 
 
-# Production defaults for the single-config baseline shape. Match the
-# legacy module's constants because the scoped helper reads the same
-# module-level state; an operator whose .env tunes any of these will
+# Production defaults for the single-config baseline shape. The
+# scoped helper reads the same module-level state as the production
+# memory pipeline, so an operator whose .env tunes any of these will
 # see whatever they actually set in the saved baseline.
 _PRODUCTION_FLOOR = 0.30
 _PRODUCTION_USER_WEIGHT = 0.85
@@ -130,11 +123,9 @@ _PRODUCTION_EPISODE_SUMMARY_WEIGHT = 0.85
 _PRODUCTION_OVERFETCH = 20
 
 
-# Schema version written into baseline JSON output. Separate counter
-# from the legacy harness (which carries its own `_BASELINE_SCHEMA_
-# VERSION`) so operator-side comparison tools can tell legacy and
-# scoped baselines apart by version field alone; the two schemas are
-# structurally similar but the metric blocks differ.
+# Schema version written into baseline JSON output. Bump when the
+# baseline file shape changes in a way that downstream parsers would
+# misinterpret.
 _BASELINE_SCHEMA_VERSION = 1
 
 
@@ -194,12 +185,10 @@ class ScopedProbe:
 class ConfigOverride:
     """One point in the sweep grid.
 
-    Mirrors the legacy `ConfigOverride` so the two harnesses share
-    grid axes; the scoped pipeline reads the same `_SPEAKER_WEIGHTS`,
+    The scoped pipeline reads the same `_SPEAKER_WEIGHTS`,
     `_SEARCH_OVERFETCH`, and `Config.memory_search_floor` state at
-    its admission/ranking steps. Documented here as well so a reader
-    of just this file does not have to cross-reference the legacy
-    module to know what each axis controls.
+    its admission/ranking steps, so each axis here corresponds
+    directly to a production knob.
     """
 
     floor: float
@@ -318,9 +307,9 @@ class ScopedMetrics:
 def load_probes(path: Path) -> list[ScopedProbe]:
     """Load and validate probes from a JSONL file under schema v2.
 
-    File format mirrors the legacy harness: `#`-prefixed lines are
-    comments (after lstrip, so indented annotations are accepted),
-    blank lines are skipped, every other line is a JSON object.
+    File format: `#`-prefixed lines are comments (after lstrip, so
+    indented annotations are accepted), blank lines are skipped,
+    every other line is a JSON object.
 
     Required field rules:
     - `question` (string, non-empty) is required on every probe.
@@ -349,7 +338,8 @@ def load_probes(path: Path) -> list[ScopedProbe]:
         stripped = line.lstrip()
         # Comment/blank lines are skipped BEFORE JSON parse so an
         # operator can annotate a probe file in-place. Matches the
-        # legacy loader's behavior exactly.
+        # shared probe loader's behavior exactly so the two probe
+        # schemas share annotation conventions.
         if not stripped or stripped.startswith("#"):
             continue
         try:
@@ -506,10 +496,10 @@ def detect_drift(
                 positive_drift_by_line[p.line_number] = True
             else:
                 positive_drift_by_line[p.line_number] = False
-                # `tags` may be absent or None on legacy rows; the
-                # `or []` matches the defensive shape used elsewhere
-                # in memory.py. Tuple form keeps the value hashable
-                # for use as a ProbeResult field.
+                # `tags` may be absent or None on older Mem0 rows;
+                # the `or []` matches the defensive shape used
+                # elsewhere in `kai.memory`. Tuple form keeps the
+                # value hashable for use as a ScopedProbeResult field.
                 raw_tags = (fact.metadata.get("tags") if fact.metadata else None) or []
                 tags_by_id[p.expected_fact_id] = tuple(raw_tags)
         if p.expected_excluded_fact_ids:
@@ -843,8 +833,7 @@ def score_negative(
     Both metrics return 1.0 when the denominator is zero (no
     excluded ids in the probe set). 1.0 means "no failures
     observed," matching the operator's read of "all the assertions
-    we made passed." This matches the legacy harness's "zero is
-    safe" posture for empty inputs.
+    we made passed."
     """
     n_drift_negative = 0
     n_scored_negative = 0
@@ -875,10 +864,9 @@ def score_negative(
 def _percentile(values: list[float], pct: int) -> float:
     """Return the requested percentile from values (1-99 integer scale).
 
-    Same shape as the legacy harness's _percentile: linear-
-    interpolation estimate via statistics.quantiles, with 0.0 for
-    empty input and the lone value for a singleton (the library
-    rejects n=1).
+    Linear-interpolation estimate via statistics.quantiles, with
+    0.0 for empty input and the lone value for a singleton (the
+    library rejects n=1).
     """
     if not values:
         return 0.0
@@ -924,8 +912,8 @@ def aggregate_metrics(
     # Per-tag breakdown over the positive side only; the negative
     # axis has no tag concept (an excluded id is by definition the
     # one NOT supposed to surface, so its tags are not the scoring
-    # grain). Match the legacy harness's per-tag math by re-running
-    # `score_positive` over each tag's subset.
+    # grain). Per-tag metrics are computed by re-running
+    # `score_positive` over each tag's subset of probes.
     by_tag_buckets: dict[str, list[ScopedProbeResult]] = {}
     for r in positive_results:
         for tag in r.tags:
@@ -1028,9 +1016,9 @@ def _grid_iter(
     """Materialize the grid as a flat list of ConfigOverride objects.
 
     Outer-to-inner: floor, user_weight, assistant_weight,
-    episode_summary_weight, overfetch. Same axis ordering as the
-    legacy harness so two side-by-side sweeps line up row-for-row in
-    the same configuration order.
+    episode_summary_weight, overfetch. The ordering is fixed so two
+    sweep runs against the same grid emit rows in identical order
+    and a diff tool can line them up.
     """
     out: list[ConfigOverride] = []
     for f in floors:
@@ -1096,9 +1084,9 @@ async def run_sweep(
 ) -> list[tuple[ConfigOverride, list[ScopedProbeResult], ScopedMetrics]]:
     """Run `evaluate` once per grid point with module-state restoration.
 
-    Same two-snapshot pattern as the legacy harness: capture the
-    entry-time state once, then per-iteration `_apply_override` takes
-    its own throwaway inner snapshot. The outer `try/finally` restores
+    Two-snapshot pattern: capture the entry-time state once, then
+    per-iteration `_apply_override` takes its own throwaway inner
+    snapshot. The outer `try/finally` restores
     from the entry-time snapshot regardless of how the loop exits, so
     a probe raising mid-sweep or a SIGINT still leaves the module in
     its pre-sweep state.
@@ -1181,13 +1169,13 @@ def _metric_block(m: ScopedMetrics, *, include_by_tag: bool) -> dict[str, Any]:
     """Render the metric block (positive + negative + cross-cutting)
     for inclusion in either single-config or per-sweep-row output.
 
-    Mirrors the legacy harness's `_metrics_to_dict` shape on the
-    positive side so an operator-side diff tool can compare
-    corresponding fields under the same key, then adds the negative
-    block and the two scoped distributions. `include_by_tag` controls
-    whether the per-tag breakdown rides along; suppress it for sweep
-    rows where the per-tag detail would balloon the output without
-    adding signal at the table-row level.
+    Emits a positive block (precision@K, recall@K, MRR,
+    fraction_in_prompt, plus the latency percentiles), a negative
+    block (exclusion fail counts), and the two scoped distributions
+    (by_scoped_reason, by_active_project). `include_by_tag`
+    controls whether the per-tag breakdown rides along; suppress it
+    for sweep rows where the per-tag detail would balloon the
+    output without adding signal at the table-row level.
     """
     block: dict[str, Any] = {
         "n_probes": m.n_probes,
@@ -1230,11 +1218,10 @@ def _build_single_config_json(
 ) -> dict[str, Any]:
     """Build the single-config JSON envelope.
 
-    Top-level shape mirrors the legacy harness's `_build_baseline_json`
-    so operator-side tooling can navigate "config + metrics" the same
-    way. The schema_version is the scoped counter (separate from the
-    legacy counter), so a diff tool can tell baselines apart by
-    version field alone.
+    Top-level shape: schema version, generation timestamp, probe-set
+    hash, drift counts on both polarities, the override config, and
+    the metrics block. The schema_version bumps when the envelope
+    shape changes in a way downstream tooling would misinterpret.
     """
     return {
         "version": _BASELINE_SCHEMA_VERSION,
@@ -1262,14 +1249,14 @@ def _build_sweep_json(
 ) -> dict[str, Any]:
     """Build the sweep-mode JSON envelope.
 
-    Mirrors the legacy harness's sweep envelope (version, generated_at,
-    probe_set_hash, probe_count, drift counts, sweep[]) so operator-
-    side tooling can diff legacy and scoped sweep envelopes side by
-    side. The per-row block contains the override AND the metric
-    block; the `probes` array is omitted by default (a 50-probe corpus
-    across a 240-row grid is 12k probe records, bloating envelopes
-    without informing the sweep summary) and re-included under
-    `include_details` for operators chasing a specific failure mode.
+    Envelope shape: version, generated_at, probe_set_hash,
+    probe_count, drift counts, and a sweep[] array of per-row
+    blocks. Each per-row block contains the override AND the metric
+    block; the `probes` array is omitted by default (a 50-probe
+    corpus across a 240-row grid is 12k probe records, bloating
+    envelopes without informing the sweep summary) and re-included
+    under `include_details` for operators chasing a specific
+    failure mode.
     """
     # Hoist drift counts to the envelope: every per-row metric carries
     # the same n_drift_* (drift detection runs once before the grid
@@ -1555,10 +1542,10 @@ def _initialize_memory() -> bool:
                 file=sys.stderr,
             )
             return False
-        # Identify which harness is running so a side-by-side log
-        # stream (legacy + scoped) is unambiguous. The legacy module
-        # emits its own "I am legacy" warning when the scoped knob is
-        # on; this harness's line is the symmetric counterpart.
+        # Identify which evaluator the operator is running. The
+        # message names the two functions this harness exercises so
+        # an operator skimming logs knows exactly what scoring
+        # surface is in play.
         print(
             "eval: scoped harness; exercises retrieve_scoped_memories (ranking) + "
             "format_scoped_context_with_recall_payload (prompt placement).",
@@ -1572,7 +1559,7 @@ def _initialize_memory() -> bool:
             # do not describe the live production behavior here.
             print(
                 "eval: WARNING: MEMORY_SCOPED_RECALL_ENABLED is off; production "
-                "serves the LEGACY pipeline. These results describe the scoped "
+                "serves the unscoped pipeline. These results describe the scoped "
                 "pipeline only and not the live production read path on this install.",
                 file=sys.stderr,
             )

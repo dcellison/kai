@@ -30,12 +30,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from kai.config import Config
+from kai.eval._probes import compute_rank
 from kai.eval._unscoped_recall_capture import (
     _attach_capture,
     _detach_capture,
     legacy_retrieve_hits,
 )
-from kai.eval.retrieval import compute_rank
 
 # Minimal Config the recall path needs: memory enabled with a
 # production-shape budget and floor. The capture tests do not

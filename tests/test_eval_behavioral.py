@@ -55,6 +55,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kai.eval import behavioral
+from kai.eval._probes import Probe
 from kai.eval.behavioral import (
     BehavioralConfig,
     ProbeOutcome,
@@ -85,7 +86,6 @@ from kai.eval.behavioral import (
     build_arm_prompt,
     build_output_json,
 )
-from kai.eval.retrieval import Probe
 
 # ── Shared helpers ──────────────────────────────────────────────────
 

@@ -12,10 +12,10 @@ overall pass/fail verdict.
 
 The gate is distinct from `kai.eval.extraction` (prompt-revision
 comparison), `kai.eval.replay` (single-backend history replay), and
-`kai.eval.retrieval` (precomputed-fact retrieval scoring): backend
-comparison has different axes, different artifacts, and different
-thresholds, and the expected fact IDs do not exist until each
-backend arm has populated its own sandbox. Reusing one of the
+`kai.eval.retrieval_scoped` (precomputed-fact retrieval scoring):
+backend comparison has different axes, different artifacts, and
+different thresholds, and the expected fact IDs do not exist until
+each backend arm has populated its own sandbox. Reusing one of the
 existing harnesses would either carry vocabulary that does not fit
 (`v5_facts` / `v6_facts`) or expect inputs that this gate has to
 create as part of its own run.

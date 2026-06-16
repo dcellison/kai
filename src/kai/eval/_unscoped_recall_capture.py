@@ -4,20 +4,18 @@ Unscoped recall-capture helpers.
 Buffers the structured `memory.recall` log line that
 `kai.memory.format_context` emits, parses it, and exposes
 `legacy_retrieve_hits` as the public entry point for callers that
-need the unscoped recall result for a single question rather than
-the aggregate metrics the legacy eval CLI in `kai.eval.retrieval`
-produces.
+need the unscoped recall result for a single question.
 
 Why a dedicated module:
 
-`kai.eval.retrieval` is deprecated (see its docstring). The
-collision-probe generator in `kai.eval.gen_collision_probes` still
+The collision-probe generator in `kai.eval.gen_collision_probes`
 needs an unscoped verifier: when drafting a negative probe, the
 question is "does this look like a hit under the OLD unscoped
 gate?" and replacing the verifier with scoped retrieval would
-reject every good negative. The helpers live here, under a name
-that says what they are, so the eval CLI can be removed without
-taking the generator's verifier path with it.
+reject every good negative. The capture machinery lives in its
+own module because the attach / format_context / drain / detach
+invariant must live in exactly one place for the generator to
+trust the contract.
 
 The capture machinery:
 
