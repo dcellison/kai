@@ -2279,7 +2279,7 @@ def _render_scoped_sections(
 # for example) would otherwise blow up the recall line. Match the per-hit
 # snippet truncation so log volume scales consistently with the other
 # text fields.
-_SHADOW_ERROR_MESSAGE_TRUNC = 200
+_SCOPED_ERROR_MESSAGE_TRUNC = 200
 
 
 def _scoped_debug_to_payload(debug: ScopedRetrievalDebug) -> dict[str, object]:
@@ -2312,15 +2312,15 @@ def _scoped_debug_to_payload(debug: ScopedRetrievalDebug) -> dict[str, object]:
     }
 
 
-def _scoped_hit_to_shadow_payload(hit: ScopedMemoryHit) -> dict[str, object]:
+def _scoped_hit_to_payload(hit: ScopedMemoryHit) -> dict[str, object]:
     """
-    Convert a `ScopedMemoryHit` to a JSON-safe dict for the
-    `scoped_hits` array. Mirrors the per-hit shape from `memory.recall`
-    (id/source/speaker/confidence/score/adj/snippet) plus the scope
+    Convert a `ScopedMemoryHit` to a JSON-safe dict for the `hits`
+    array on the `memory.recall` payload. Carries
+    id/source/speaker/confidence/score/adj/snippet plus the scope
     discriminators (scope/project_id) so log analysts can tell at a
     glance whether each surviving hit is global or matching-project.
-    Snippet uses `_RECALL_SNIPPET_TRUNC` so the two log lines have
-    matching per-hit text shape.
+    Snippet uses `_RECALL_SNIPPET_TRUNC` so per-hit text shape stays
+    consistent with the rest of the payload.
     """
     r = hit.result
     return {
@@ -2423,7 +2423,7 @@ async def format_scoped_context_with_recall_payload(
     except Exception as exc:
         payload["reason"] = _RECALL_REASON_SCOPED_ERROR
         payload["scoped_error_type"] = type(exc).__name__
-        payload["scoped_error_message"] = _truncate(str(exc), _SHADOW_ERROR_MESSAGE_TRUNC)
+        payload["scoped_error_message"] = _truncate(str(exc), _SCOPED_ERROR_MESSAGE_TRUNC)
         payload["returned_empty"] = True
         return ScopedRecallResult(rendered_context="", recall_payload=payload)
 
@@ -2453,7 +2453,7 @@ async def format_scoped_context_with_recall_payload(
     # math depends on.
     rendered_ids = {h.result.id for h in rendered_hits}
     overflow_hits = [h for h in scoped_result.hits if h.result.id not in rendered_ids]
-    payload["hits"] = [_scoped_hit_to_shadow_payload(h) for h in rendered_hits + overflow_hits]
+    payload["hits"] = [_scoped_hit_to_payload(h) for h in rendered_hits + overflow_hits]
     payload["lines_used"] = len(rendered_hits)
     return ScopedRecallResult(rendered_context=rendered, recall_payload=payload)
 

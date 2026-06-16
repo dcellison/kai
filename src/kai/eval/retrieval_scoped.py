@@ -557,7 +557,7 @@ def _candidate_rank(hits: list, expected_fact_id: str) -> int | None:
 def _prompt_position(payload_hits: list[dict[str, Any]], expected_fact_id: str) -> int | None:
     """Return the 1-indexed position of `expected_fact_id` in the
     renderer's `payload["hits"]` list. Entries are dicts whose `id`
-    field carries the Mem0 row id (per `_scoped_hit_to_shadow_payload`
+    field carries the Mem0 row id (per `_scoped_hit_to_payload`
     in `kai.memory`). Returns None when the expected fact is not in
     the rendered list at all.
     """

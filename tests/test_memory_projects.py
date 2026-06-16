@@ -151,11 +151,11 @@ class TestDetectActiveMemoryProject:
 
     def test_detect_active_memory_project_disabled_project_detected_but_not_allowed(self, tmp_path):
         """A disabled project still returns an `ActiveMemoryProject`
-        so logs and future shadow-mode metrics can distinguish "no
-        project here" from "known project with memory disabled".
-        The `memory_enabled=False` signal is what later retrieval
-        and write paths consume; the helper does not make the
-        global-only decision itself."""
+        so logs and the `memory.recall` payload's `scoped_debug` block
+        can distinguish "no project here" from "known project with
+        memory disabled". The `memory_enabled=False` signal is what
+        retrieval and write paths consume; the helper does not make
+        the global-only decision itself."""
         root = tmp_path / "disabled_proj"
         root.mkdir()
         projects = {"disabled_proj": _project("disabled_proj", root, memory_enabled=False)}

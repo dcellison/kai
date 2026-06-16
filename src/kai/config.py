@@ -2978,6 +2978,8 @@ def load_config() -> Config:
         "PR_REVIEW_BUDGET_USD": "budgets are no longer tracked",
         "MEMORY_EXTRACTION_BUDGET_USD": "budgets are no longer tracked",
         "MEMORY_EPISODE_BUDGET_USD": "budgets are no longer tracked",
+        "MEMORY_SCOPED_RECALL_ENABLED": "scoped retrieval is the only live recall path",
+        "MEMORY_RECALL_SHADOW_ENABLED": "the scoped-vs-legacy shadow comparator is gone",
     }
     for var, reason in _retired_env_vars.items():
         if os.environ.get(var, "").strip():

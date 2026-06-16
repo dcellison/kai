@@ -1982,6 +1982,8 @@ def _cmd_config() -> None:
     env.pop("PR_REVIEW_BUDGET_USD", None)
     env.pop("MEMORY_EXTRACTION_BUDGET_USD", None)
     env.pop("MEMORY_EPISODE_BUDGET_USD", None)
+    env.pop("MEMORY_SCOPED_RECALL_ENABLED", None)
+    env.pop("MEMORY_RECALL_SHADOW_ENABLED", None)
 
     # DEFAULT_MODEL is always emitted. The model is global (per-user
     # values in users.yaml are overrides on top of it, not replacements),
@@ -4221,6 +4223,8 @@ def _cmd_apply() -> None:
         env.pop("PR_REVIEW_BUDGET_USD", None)
         env.pop("MEMORY_EXTRACTION_BUDGET_USD", None)
         env.pop("MEMORY_EPISODE_BUDGET_USD", None)
+        env.pop("MEMORY_SCOPED_RECALL_ENABLED", None)
+        env.pop("MEMORY_RECALL_SHADOW_ENABLED", None)
         _apply_secrets(env, dry_run, users_yaml_staging_path=users_yaml_staging_path)
 
         # -- Step 6: Deploy Goose config (if any goose-backed user) --

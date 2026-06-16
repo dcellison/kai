@@ -6440,6 +6440,40 @@ class TestCmdConfigGlobalDefaultsRegardlessOfUsersYaml:
         env = json.loads((tmp_path / "install.conf").read_text())["env"]
         assert "CLAUDE_MAX_CONTEXT_WINDOW" not in env
 
+    def test_retired_scoped_recall_keys_dropped_on_regenerate(self, tmp_path, monkeypatch):
+        """A regenerate over an install.conf carrying the retired
+        scoped-recall and shadow flags drops them: the runtime no
+        longer reads them, and the wizard no longer prompts for them,
+        so the regenerated env must not carry them forward."""
+        prior_conf = {
+            "install_dir": "/opt/kai",
+            "data_dir": "/var/lib/kai",
+            "service_user": "kai",
+            "platform": "darwin",
+            "env": {
+                "TELEGRAM_BOT_TOKEN": "fake-token",
+                "MEMORY_SCOPED_RECALL_ENABLED": "true",
+                "MEMORY_RECALL_SHADOW_ENABLED": "false",
+            },
+        }
+        (tmp_path / "install.conf").write_text(json.dumps(prior_conf))
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._existing_etc_users(monkeypatch)
+
+        inputs = iter(TestCmdConfigDefaultModelDispatch._inputs_for_claude_backend())
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+        monkeypatch.setattr(
+            "kai.install._prompt_default_model",
+            lambda backend, prov, default: "sonnet",
+        )
+        _cmd_config()
+
+        env = json.loads((tmp_path / "install.conf").read_text())["env"]
+        assert "MEMORY_SCOPED_RECALL_ENABLED" not in env
+        assert "MEMORY_RECALL_SHADOW_ENABLED" not in env
+
     def test_workspace_base_lands_with_users_yaml(self, tmp_path, monkeypatch):
         """WORKSPACE_BASE reaches env when users.yaml is present."""
         monkeypatch.chdir(tmp_path)

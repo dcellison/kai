@@ -158,7 +158,7 @@ def _rendered_payload(
 ) -> dict:
     """Build a renderer recall_payload matching the rendered call's
     real shape: `hits` carries per-hit dicts with an `id` field
-    (mirrors `_scoped_hit_to_shadow_payload` in kai.memory), plus
+    (mirrors `_scoped_hit_to_payload` in kai.memory), plus
     `lines_used`, `latency_ms`, top-level `reason`, and a nested
     `scoped_debug` dict.
 

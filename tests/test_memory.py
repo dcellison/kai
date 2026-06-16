@@ -4545,12 +4545,12 @@ class TestScopedMemoryAdmission:
 
     The helper is pure (no I/O, no globals), so tests exercise the
     full matrix without invoking Mem0 or the project detector. The
-    matrix matches D6 of the spec: global is always admitted;
-    project rows require a matching allowed_project_id; task and
-    unknown scopes are rejected. Exclusion-reason strings are
-    stable identifiers used by downstream `excluded_by_scope`
-    counters and shadow-mode log keys, so behavioral changes here
-    would break those consumers without a visible signal.
+    matrix: global is always admitted; project rows require a
+    matching allowed_project_id; task and unknown scopes are
+    rejected. Exclusion-reason strings are stable identifiers used by
+    downstream `excluded_by_scope` counters in the `memory.recall`
+    payload, so behavioral changes here would break those consumers
+    without a visible signal.
     """
 
     def test_scoped_admission_allows_global_without_project(self):
@@ -4856,10 +4856,10 @@ class TestRetrieveScopedMemories:
         assert [h.result.id for h in result.hits] == ["g1"]
 
     async def test_debug_metadata_includes_active_project_and_allowed_scopes(self, tmp_path):
-        """Debug payload must surface every field that shadow-mode
-        logging (#546) and operator-facing diagnostics will consume.
-        Pinned together so a future refactor cannot quietly drop a
-        field."""
+        """Debug payload must surface every field that the
+        `memory.recall` `scoped_debug` block and operator-facing
+        diagnostics consume. Pinned together so a future refactor
+        cannot quietly drop a field."""
         import kai.memory as mem_mod
         from kai.memory import retrieve_scoped_memories
 
@@ -4961,9 +4961,10 @@ class TestRetrieveScopedMemories:
 
     async def test_does_not_emit_memory_recall_log(self, tmp_path, caplog):
         """The helper MUST NOT emit a `memory.recall` log line.
-        Shadow-mode logging (#546) decides its own schema; emitting
-        a duplicate log line here would force a contract change on
-        downstream parsers."""
+        `format_scoped_context_with_recall_payload` is the only
+        emitter on the scoped path; emitting a second line here
+        would double the per-turn volume and break the eval
+        harness's grep contract."""
         import kai.memory as mem_mod
         from kai.memory import retrieve_scoped_memories
 
@@ -4988,11 +4989,12 @@ class TestFormatContextUnchangedByScopedHelper:
 
     def test_format_context_signature_and_output_unchanged(self):
         """Signature pin: `format_context(query, *, user_id,
-        token_budget=None)` is the contract `assemble_turn_context`
-        relies on. Argument addition would change the call site.
-        The prompt header string is also pinned because shadow-mode
-        and any later split-section renderer will need a clean
-        baseline to diff against."""
+        token_budget=None)` is the eval-side contract that
+        `kai.eval._unscoped_recall_capture` and
+        `kai.eval.memory_backend_gate` depend on. Argument addition
+        would change those call sites. The prompt header string is
+        also pinned because any future renderer change must keep the
+        eval harness's grep contract intact."""
         import inspect
 
         from kai.memory import format_context
@@ -5480,9 +5482,10 @@ class TestFormatScopedContext:
             assert f"global row {i}" in result
 
     def test_does_not_emit_memory_recall_log(self, caplog):
-        """Renderer is log-free per D10. Shadow-mode logging
-        (#546) owns the log schema; emitting any line here would
-        force a contract change later."""
+        """The renderer is log-free. `format_scoped_context_with_recall_payload`
+        is the only emitter of `memory.recall` on the scoped path;
+        emitting a second line here would double the per-turn log
+        volume and break the eval harness's grep contract."""
         from kai.memory import format_scoped_context
 
         with caplog.at_level("INFO", logger="kai.memory"):

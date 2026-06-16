@@ -379,13 +379,7 @@ def _browse_score(fact: MemoryResult) -> float:
 # rather than echoing raw metadata. The retrievability verdict reuses
 # `memory._scoped_memory_admission_reason` - the exact admission rule
 # scoped retrieval applies - so the detail view can never disagree
-# with what scoped retrieval would do. The verdict is also honest
-# about the cutover state: while the scoped-recall knob is off, the
-# live prompt path is legacy recall, which applies NO scope admission
-# before rendering rows into the injected memory block, so a scoped
-# yes/no would be false for the system actually serving prompts. In
-# that state the verdict renders a "scope not enforced" label instead
-# of a prediction only scoped mode would honor. Writes go through
+# with what scoped retrieval would do. Writes go through
 # `memory.build_scope_metadata` (validated shape, operator
 # provenance) merged over the row's existing metadata, because
 # `memory.update_metadata` replaces the metadata dict wholesale and
@@ -413,10 +407,8 @@ class _ScopeView:
             greps against the same vocabulary the logs use.
         retrievable_label: "yes", or "no (<admission reason>)" with
             the stable exclusion-reason key retrieval logs carry.
-            While scoped recall is disabled, a constant
-            "yes (scope not enforced: scoped recall disabled)"
-            because legacy recall serves prompts without scope
-            admission and every user-visible row stays eligible.
+            Always computed under scoped admission, matching the
+            only live recall path.
     """
 
     resolved: ResolvedMemoryScope
