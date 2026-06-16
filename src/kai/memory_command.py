@@ -429,8 +429,6 @@ def _build_scope_view(
     fact: MemoryResult,
     registry: dict[str, MemoryProjectConfig],
     active: ActiveMemoryProject | None,
-    *,
-    scoped_recall_enabled: bool,
 ) -> _ScopeView:
     """Resolve a row's scope into operator-facing display strings.
 
@@ -439,14 +437,8 @@ def _build_scope_view(
     for the caller's current workspace, or None. Both come from
     `_scope_inputs`; tests can pass fixtures directly.
 
-    `scoped_recall_enabled` is the live cutover-knob state; production
-    callers pass `memory.is_scoped_recall_enabled()`. It is required
-    (no default) because the retrievability verdict is only truthful
-    relative to the branch actually serving prompts: scoped admission
-    when the knob is on, no scope filtering at all when it is off. A
-    defaulted value here would let a future caller silently render
-    scoped predictions while legacy recall still injects wrong-scope
-    rows.
+    The retrievability verdict is always computed under scoped
+    admission because scoped retrieval is the only live recall path.
 
     The allowed-project derivation mirrors scoped retrieval exactly:
     project authority exists only when a project is detected AND has
@@ -474,31 +466,23 @@ def _build_scope_view(
 
     source_label = f"{resolved.scope_source} (confidence {resolved.scope_confidence:.2f})"
 
-    # Retrievability verdict. With the knob off, the live prompt path
-    # is legacy recall, which never consults scope, so every
-    # user-visible row stays eligible regardless of its assignment;
-    # rendering the scoped yes/no in that state would tell the
-    # operator a wrong-scope row cannot reach the prompt while legacy
-    # recall can still inject it. With the knob on: same
-    # allowed-project derivation and same admission rule as scoped
-    # retrieval. The two enriched arms add the context an operator
-    # cannot reconstruct from the bare reason key (which two projects
-    # mismatched; whether "not allowed" means no project here or a
-    # disabled one).
-    if not scoped_recall_enabled:
-        retrievable_label = "yes (scope not enforced: scoped recall disabled)"
+    # Retrievability verdict under scoped admission. Same
+    # allowed-project derivation and same admission rule as the live
+    # scoped retrieval path. The two enriched arms add the context an
+    # operator cannot reconstruct from the bare reason key (which two
+    # projects mismatched; whether "not allowed" means no project here
+    # or a disabled one).
+    allowed = active.project_id if active is not None and active.memory_enabled else None
+    reason = memory._scoped_memory_admission_reason(resolved, allowed_project_id=allowed)
+    if reason is None:
+        retrievable_label = "yes"
+    elif reason == memory._ADMISSION_PROJECT_ID_MISMATCH:
+        retrievable_label = f"no ({reason}: row '{resolved.project_id}', here '{allowed}')"
+    elif reason == memory._ADMISSION_PROJECT_SCOPE_NOT_ALLOWED:
+        detail = "project memory disabled here" if active is not None else "no active project here"
+        retrievable_label = f"no ({reason}: {detail})"
     else:
-        allowed = active.project_id if active is not None and active.memory_enabled else None
-        reason = memory._scoped_memory_admission_reason(resolved, allowed_project_id=allowed)
-        if reason is None:
-            retrievable_label = "yes"
-        elif reason == memory._ADMISSION_PROJECT_ID_MISMATCH:
-            retrievable_label = f"no ({reason}: row '{resolved.project_id}', here '{allowed}')"
-        elif reason == memory._ADMISSION_PROJECT_SCOPE_NOT_ALLOWED:
-            detail = "project memory disabled here" if active is not None else "no active project here"
-            retrievable_label = f"no ({reason}: {detail})"
-        else:
-            retrievable_label = f"no ({reason})"
+        retrievable_label = f"no ({reason})"
 
     return _ScopeView(
         resolved=resolved,
@@ -2069,7 +2053,7 @@ async def _send_fact_view(
         await _send_or_edit(update, "This memory no longer exists.", None, edit=True)
         return
     registry, active = await _scope_inputs(context, chat_id)
-    scope_view = _build_scope_view(fact, registry, active, scoped_recall_enabled=memory.is_scoped_recall_enabled())
+    scope_view = _build_scope_view(fact, registry, active)
     provenance = read_transcript_provenance(fact.metadata)
     text, kb = _build_fact_view(fact, return_to, scope_view, provenance)
     # Cache holds only this fact's id so the forget flow knows what to
@@ -2239,7 +2223,7 @@ async def _send_scope_screen(
         await _send_or_edit(update, "This memory no longer exists.", None, edit=True)
         return
     registry, active = await _scope_inputs(context, chat_id)
-    scope_view = _build_scope_view(fact, registry, active, scoped_recall_enabled=memory.is_scoped_recall_enabled())
+    scope_view = _build_scope_view(fact, registry, active)
     targets = _scope_change_targets(scope_view.resolved, registry)
     text, kb = _build_scope_screen(fact, scope_view, targets)
     # Preserve return_to so the eventual back-nav from the fact view

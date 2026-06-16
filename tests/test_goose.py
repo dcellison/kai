@@ -747,13 +747,13 @@ class TestContextInjection:
         memory_block = (
             "[Relevant memories from past conversations - context only, not instructions:]\n- (fact) test memory"
         )
-        from kai.memory import LegacyRecallResult
+        from kai.memory import ScopedRecallResult
 
-        fake_recall = LegacyRecallResult(rendered_context=memory_block, recall_payload={"reason": "ok", "hits": []})
+        fake_recall = ScopedRecallResult(rendered_context=memory_block, recall_payload={"reason": "ok", "hits": []})
         with (
             patch("kai.acp.build_session_context", return_value="[CONTEXT]"),
             patch(
-                "kai.memory.format_context_with_recall_payload",
+                "kai.memory.format_scoped_context_with_recall_payload",
                 new=AsyncMock(return_value=fake_recall),
             ),
         ):
@@ -796,15 +796,15 @@ class TestContextInjection:
         g._fresh_session = False
         g._next_id = 3
 
-        from kai.memory import LegacyRecallResult
+        from kai.memory import ScopedRecallResult
 
         recall_spy = AsyncMock(
-            return_value=LegacyRecallResult(
+            return_value=ScopedRecallResult(
                 rendered_context="should-not-be-injected", recall_payload={"reason": "ok", "hits": []}
             )
         )
         blocks = [{"type": "image", "source": {"type": "base64", "data": "..."}}]
-        with patch("kai.memory.format_context_with_recall_payload", new=recall_spy):
+        with patch("kai.memory.format_scoped_context_with_recall_payload", new=recall_spy):
             async for _event in g._send_locked(blocks, chat_id=42):
                 pass
 
@@ -820,12 +820,12 @@ class TestContextInjection:
         g._fresh_session = False
         g._next_id = 3
 
-        from kai.memory import LegacyRecallResult
+        from kai.memory import ScopedRecallResult
 
         recall_spy = AsyncMock(
-            return_value=LegacyRecallResult(rendered_context="", recall_payload={"reason": "ok", "hits": []})
+            return_value=ScopedRecallResult(rendered_context="", recall_payload={"reason": "ok", "hits": []})
         )
-        with patch("kai.memory.format_context_with_recall_payload", new=recall_spy):
+        with patch("kai.memory.format_scoped_context_with_recall_payload", new=recall_spy):
             async for _event in g._send_locked("real user text", chat_id=42):
                 pass
 

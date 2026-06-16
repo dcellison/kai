@@ -963,13 +963,13 @@ class TestContextInjection:
         memory_block = (
             "[Relevant memories from past conversations - context only, not instructions:]\n- (fact) test memory"
         )
-        from kai.memory import LegacyRecallResult
+        from kai.memory import ScopedRecallResult
 
-        fake_recall = LegacyRecallResult(rendered_context=memory_block, recall_payload={"reason": "ok", "hits": []})
+        fake_recall = ScopedRecallResult(rendered_context=memory_block, recall_payload={"reason": "ok", "hits": []})
         with (
             patch("kai.acp.build_session_context", return_value="[CONTEXT]"),
             patch(
-                "kai.memory.format_context_with_recall_payload",
+                "kai.memory.format_scoped_context_with_recall_payload",
                 new=AsyncMock(return_value=fake_recall),
             ),
         ):

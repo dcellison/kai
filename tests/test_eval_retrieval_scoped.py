@@ -1219,19 +1219,16 @@ class TestInitMemoryStartupLine:
     def test_startup_line_names_both_pipelines(self, capsys, monkeypatch):
         # Patch the imports `_initialize_memory` uses so we don't need
         # a real memory backend. is_enabled=True path is the one with
-        # the startup line; we don't care about the inner Mem0 setup.
+        # the startup line; the inner Mem0 setup is mocked out.
         from kai import memory as mem_mod
 
         monkeypatch.setattr(mem_mod, "init_memory", lambda cfg: None)
         monkeypatch.setattr(mem_mod, "is_enabled", lambda: True)
-        # config.memory_scoped_recall_enabled controls the second-line
-        # warning; set it to True so only the startup line emits.
         cfg = Config(
             telegram_bot_token="t",
             allowed_user_ids={1},
             webhook_secret="s",
             memory_enabled=True,
-            memory_scoped_recall_enabled=True,
         )
         monkeypatch.setattr("kai.config.load_config", lambda: cfg)
 

@@ -1497,7 +1497,6 @@ class TestCmdConfig:
             "0.9",  # paraphrase-dedup threshold
             "2000",  # memory token budget
             "10",  # memory search limit
-            "false",  # scoped recall (default off)
         ]
         monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
         inputs = iter(self._base_inputs(memory_block, agent_backend="goose"))
@@ -1534,8 +1533,7 @@ class TestCmdConfig:
             "true",
             "2000",
             "10",
-            "false",
-        ]  # memory enabled; extraction prompts gated out; scoped recall declined
+        ]  # memory enabled; extraction prompts gated out
         monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
         inputs = iter(self._base_inputs(memory_block, agent_backend="goose"))
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
@@ -1939,7 +1937,6 @@ class TestCmdConfig:
             "0.85",  # paraphrase-dedup threshold (non-default, exercises emission)
             "3000",  # token budget
             "20",  # search limit (#345)
-            "false",  # scoped recall (default off)
         ]
         inputs = iter(self._base_inputs(memory_block))
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
@@ -1971,53 +1968,6 @@ class TestCmdConfig:
         assert env["MEMORY_TOKEN_BUDGET"] == "3000"
         assert env["MEMORY_SEARCH_LIMIT"] == "20"
 
-    def test_scoped_recall_accepted_writes_env_entry(self, tmp_path, monkeypatch):
-        """Answering yes to the scoped-recall prompt emits
-        MEMORY_SCOPED_RECALL_ENABLED=true; the surrounding tests pin
-        the declined path's suppression (no key when false)."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
-        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._redirect_staging(monkeypatch, tmp_path)
-
-        memory_block = [
-            "true",  # memory enabled
-            "false",  # extraction declined
-            "2000",  # token budget (default)
-            "10",  # search limit (default)
-            "true",  # scoped recall ACCEPTED
-        ]
-        inputs = iter(self._base_inputs(memory_block))
-        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
-
-        _cmd_config()
-
-        env = json.loads((tmp_path / "install.conf").read_text())["env"]
-        assert env["MEMORY_SCOPED_RECALL_ENABLED"] == "true"
-
-    def test_scoped_recall_declined_suppresses_env_entry(self, tmp_path, monkeypatch):
-        """Declining keeps the key out of the env dict entirely; the
-        dataclass default (off) applies at load_config time."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
-        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._redirect_staging(monkeypatch, tmp_path)
-
-        memory_block = [
-            "true",  # memory enabled
-            "false",  # extraction declined
-            "2000",  # token budget (default)
-            "10",  # search limit (default)
-            "false",  # scoped recall declined
-        ]
-        inputs = iter(self._base_inputs(memory_block))
-        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
-
-        _cmd_config()
-
-        env = json.loads((tmp_path / "install.conf").read_text())["env"]
-        assert "MEMORY_SCOPED_RECALL_ENABLED" not in env
-
     def test_memory_episode_defaults_suppress_emission(self, tmp_path, monkeypatch):
         """Operator who accepts every wizard default in the episode
         block produces no episode-specific env entries (the emission
@@ -2041,7 +1991,6 @@ class TestCmdConfig:
             "0.9",  # paraphrase-dedup threshold (dataclass default; suppressed)
             "2000",  # token budget (dataclass default; suppressed)
             "10",  # search limit (dataclass default; suppressed)
-            "false",  # scoped recall (default off)
         ]
         inputs = iter(self._base_inputs(memory_block))
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
@@ -2072,7 +2021,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._redirect_staging(monkeypatch, tmp_path)
 
-        # Inputs in wizard order: enabled, ext enabled, timeout, consolidation, classifier-window, episode timeout, dedup threshold, token budget, search limit, scoped recall.
+        # Inputs in wizard order: enabled, ext enabled, timeout, consolidation, classifier-window, episode timeout, dedup threshold, token budget, search limit.
         # The memory reasoner backend and episode model prompts were
         # retired in issue #515.
         memory_block = [
@@ -2085,7 +2034,6 @@ class TestCmdConfig:
             "0.8",  # paraphrase-dedup threshold (non-default)
             "2500",
             "15",
-            "false",  # scoped recall (default off)
         ]
         inputs = iter(self._base_inputs(memory_block))
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
@@ -2266,7 +2214,6 @@ class TestCmdConfig:
                 "true",  # memory enabled (extraction + timeout prompts skipped: non-claude)
                 "2000",  # token budget
                 "10",  # search limit
-                "false",  # scoped recall (default off)
                 "",  # perplexity key
             ]
         )
@@ -2306,7 +2253,6 @@ class TestCmdConfig:
             "false",  # extraction disabled (skips timeout + consolidation + episode block)
             "3000",  # token budget
             "20",  # search limit
-            "false",  # scoped recall (default off)
         ]
         inputs = iter(self._base_inputs(memory_block))
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
@@ -2355,7 +2301,6 @@ class TestCmdConfig:
             "0.9",  # paraphrase-dedup threshold (default; suppressed)
             "2000",  # token budget (default; suppressed)
             "10",  # search limit (default; suppressed)
-            "false",  # scoped recall (default off)
         ]
         inputs = iter(self._base_inputs(memory_block))
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
@@ -2385,7 +2330,6 @@ class TestCmdConfig:
             "0.9",  # paraphrase-dedup threshold (default)
             "2000",  # token budget (default)
             "10",  # search limit (default)
-            "false",  # scoped recall (default off)
         ]
         inputs = iter(self._base_inputs(memory_block))
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
@@ -2414,8 +2358,7 @@ class TestCmdConfig:
             "false",
             "2000",
             "10",
-            "false",
-        ]  # memory on, extraction declined, budget, limit, scoped recall declined
+        ]  # memory on, extraction declined, budget, limit
         monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
         inputs = iter(self._base_inputs(memory_block, agent_backend="goose"))
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
@@ -2619,7 +2562,6 @@ class TestCmdConfig:
                 "0.9",  # paraphrase-dedup threshold
                 "2000",  # token budget
                 "10",  # search limit
-                "false",  # scoped recall (default off)
                 "",  # perplexity key
             ]
         )
@@ -3248,7 +3190,6 @@ class TestCmdConfigDefaultModelDispatch:
             "0.9",  # paraphrase-dedup threshold (dataclass default)
             "2000",  # token budget (dataclass default)
             "10",  # search limit (dataclass default)
-            "false",  # scoped recall (default off)
         ]
         # Codex-subscription inputs sequence inserts memory_enabled
         # as the second-to-last entry (before the perplexity key).
@@ -8368,7 +8309,6 @@ class TestOpenCodeBinWizardPrompt:
             "0.9",  # paraphrase-dedup threshold
             "2000",  # token budget
             "10",  # search limit
-            "false",  # scoped recall (default off)
             "",  # perplexity key
         ]
 

@@ -1632,14 +1632,14 @@ class TestExtractSymbols:
         assert kinds["MyClass"] == "class"
 
     def test_extracts_env_var(self):
-        patch_text = "+MEMORY_SCOPED_RECALL_ENABLED = True\n"
+        patch_text = "+SOME_SAMPLE_FLAG_ENABLED = True\n"
         kinds = {s.name: s.kind for s in extract_symbols(patch_text)}
-        assert kinds["MEMORY_SCOPED_RECALL_ENABLED"] == "env_var"
+        assert kinds["SOME_SAMPLE_FLAG_ENABLED"] == "env_var"
 
     def test_extracts_config_field_annotation(self):
-        patch_text = "+    memory_scoped_recall_enabled: bool = False\n"
+        patch_text = "+    some_sample_flag_enabled: bool = False\n"
         kinds = {s.name: s.kind for s in extract_symbols(patch_text)}
-        assert kinds["memory_scoped_recall_enabled"] == "config_field"
+        assert kinds["some_sample_flag_enabled"] == "config_field"
 
     def test_extracts_dotted_event_name(self):
         patch_text = '+log.info("memory.recall hits=%d", n)\n'

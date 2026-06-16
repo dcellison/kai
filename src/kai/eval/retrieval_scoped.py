@@ -1551,18 +1551,6 @@ def _initialize_memory() -> bool:
             "format_scoped_context_with_recall_payload (prompt placement).",
             file=sys.stderr,
         )
-        if not config.memory_scoped_recall_enabled:
-            # The scoped read path is NOT live in production for this
-            # install; the harness still runs the scoped pipeline
-            # end-to-end (which is the point of the harness's
-            # existence), but the operator should know the numbers
-            # do not describe the live production behavior here.
-            print(
-                "eval: WARNING: MEMORY_SCOPED_RECALL_ENABLED is off; production "
-                "serves the unscoped pipeline. These results describe the scoped "
-                "pipeline only and not the live production read path on this install.",
-                file=sys.stderr,
-            )
         return True
     except Exception as e:
         print(f"eval: init failed: {e}", file=sys.stderr)

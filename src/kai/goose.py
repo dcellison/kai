@@ -85,9 +85,9 @@ class GooseBackend(AcpBackend):
     tool calls, so no permission write-back is needed.
     """
 
-    # Machine identifier consumed by pool/bot dispatch and by the
-    # shadow-mode recall logger (#546) to tag `memory.recall_shadow`
-    # lines with the caller backend.
+    # Machine identifier consumed by pool/bot dispatch and tagged
+    # into the `memory.recall` line so log analysts can attribute
+    # recall behavior to the caller backend.
     backend_name = "goose"
     # Human-readable label used in error messages and log lines.
     backend_label = "Goose"

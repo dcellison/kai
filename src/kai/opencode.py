@@ -238,9 +238,9 @@ class OpenCodeBackend(AcpBackend):
     `session/request_permission` requests so tool calls do not hang.
     """
 
-    # Machine identifier consumed by pool/bot dispatch and by the
-    # shadow-mode recall logger to tag `memory.recall_shadow` lines
-    # with the caller backend.
+    # Machine identifier consumed by pool/bot dispatch and tagged
+    # into the `memory.recall` line so log analysts can attribute
+    # recall behavior to the caller backend.
     backend_name = "opencode"
     # Human-readable label used in error messages and log lines.
     backend_label = "OpenCode"

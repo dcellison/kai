@@ -66,8 +66,9 @@ class ClaudeCodeBackend(AgentBackend):
     the executor indefinitely.
     """
 
-    # Stable identifier read by the shadow-mode logger (#546) to
-    # tag `memory.recall_shadow` lines with the caller backend.
+    # Stable identifier consumed by pool/bot dispatch and tagged into
+    # the `memory.recall` line so log analysts can attribute recall
+    # behavior to the caller backend.
     backend_name = "claude_code"
 
     def __init__(
