@@ -643,10 +643,11 @@ class MemoryStats:
 #
 # The shared helper (`retrieve_scoped_memories`, defined after
 # `format_context` below) returns structured candidates plus debug
-# metadata instead of rendering prompt text. Rendering, shadow-mode
-# logging, and the live-prompt switch live in later issues; this
-# layer just owns the admission decision and per-row ranking signals
-# so every future caller can share one filter-before-rank shape.
+# metadata instead of rendering prompt text. Rendering and the
+# memory.recall payload composition live in
+# `format_scoped_context_with_recall_payload`; this layer owns the
+# admission decision and per-row ranking signals so every consumer
+# can share one filter-before-rank shape.
 #
 # The four dataclasses below split the helper's I/O into three
 # concerns: caller context in (ScopedRetrievalContext), per-row
@@ -702,12 +703,12 @@ class ScopedMemoryHit:
     A surviving memory row plus the per-row ranking signals.
 
     The helper computes speaker/confidence/weight/adjusted-score
-    once and carries them here so downstream renderers and
-    shadow-mode loggers do not have to re-parse the metadata or
-    re-multiply the demote factor. `resolved_scope` carries the
-    full read-time scope interpretation so the per-hit channel can
-    surface legacy-default and invalid-default rows without a
-    second audit field on the debug payload.
+    once and carries them here so downstream renderers and the
+    `memory.recall` payload composer do not have to re-parse the
+    metadata or re-multiply the demote factor. `resolved_scope`
+    carries the full read-time scope interpretation so the per-hit
+    channel can surface legacy-default and invalid-default rows
+    without a second audit field on the debug payload.
 
     Attributes:
         result: The raw Mem0 row.
@@ -738,10 +739,12 @@ class ScopedRetrievalDebug:
     """
     Observability payload from `retrieve_scoped_memories`.
 
-    Stable enough that shadow-mode logging (#546) can serialize it
-    directly without changing this helper. The helper itself does
-    not emit `memory.recall` or any other log line; it returns this
-    structure and lets the downstream logger decide what to record.
+    Serialized directly into the `scoped_debug` field of the
+    `memory.recall` payload by `format_scoped_context_with_recall_payload`;
+    the schema is also consumed by the eval harness for per-turn
+    audit. The retrieval helper itself does not emit `memory.recall`
+    or any other log line; it returns this structure and lets the
+    downstream renderer compose the payload.
 
     `reason` carries one of six stable strings:
         disabled               - memory subsystem is disabled or
@@ -794,8 +797,9 @@ class ScopedRetrievalResult:
 
     Bundles the per-row hit list and the debug metadata so the
     helper's two outputs travel through async boundaries as one
-    value. Callers that only need hits read `result.hits`;
-    shadow-mode callers serialize `result.debug`.
+    value. Callers that only need hits read `result.hits`; the
+    payload composer in `format_scoped_context_with_recall_payload`
+    serializes `result.debug` into the `memory.recall` line.
     """
 
     hits: list[ScopedMemoryHit]
@@ -1072,9 +1076,9 @@ def build_scope_metadata(
 
 # Stable exclusion-reason strings returned by
 # `_scoped_memory_admission_reason`. The strings appear as keys in
-# `ScopedRetrievalDebug.excluded_by_scope` and as discriminators in
-# shadow-mode logging, so they must stay stable across refactors -
-# downstream log readers will key on them.
+# `ScopedRetrievalDebug.excluded_by_scope` and feed the
+# `memory.recall` payload's `scoped_debug` block, so they must stay
+# stable across refactors; downstream log readers will key on them.
 _ADMISSION_PROJECT_SCOPE_NOT_ALLOWED = "project_scope_not_allowed"
 _ADMISSION_PROJECT_SCOPE_MISSING_PROJECT_ID = "project_scope_missing_project_id"
 _ADMISSION_PROJECT_ID_MISMATCH = "project_id_mismatch"
@@ -1832,10 +1836,10 @@ async def retrieve_scoped_memories(
 
     Returns structured candidates plus debug metadata; does NOT
     render prompt text and does NOT emit `memory.recall` (or any
-    other) log line. Live prompt injection still goes through
-    `format_context`; this helper is the shared read-path contract
-    that later prompt rendering, shadow-mode logging, and the
-    eventual read-path switch will consume.
+    other) log line. The shared read-path contract is consumed by
+    `format_scoped_context_with_recall_payload` (live prompt
+    injection) and by the eval harness; the renderer is what emits
+    the `memory.recall` line.
 
     Pipeline (filter-before-rank):
 
@@ -1861,13 +1865,12 @@ async def retrieve_scoped_memories(
 
     Args:
         context: Per-turn input. Only `chat_id`, `message`, and
-            `workspace` drive behavior in this issue. The other
-            fields ride through to debug metadata for shadow-mode
-            and future policy use.
-        token_budget: Forward-looking parameter so shadow-mode and
-            later renderers can request the same budget as live
-            `format_context`. Not consumed in this issue because
-            the helper does not render prompt lines.
+            `workspace` drive behavior here; the other fields ride
+            through to debug metadata for the `memory.recall`
+            payload and future policy use.
+        token_budget: Forwarded so the renderer can request the
+            same budget the live prompt path uses. Not consumed
+            by the helper itself; it does not render prompt lines.
         limit: Caller-supplied limit, clamped up to
             `_SEARCH_OVERFETCH` so scoped admission still has room
             to discard wrong-scope rows.
@@ -1879,9 +1882,9 @@ async def retrieve_scoped_memories(
         per-reason exclusion counts, and the caller's per-turn
         context fields.
     """
-    # Forward-looking: accepted so callers can pass it through
-    # unchanged once #545/#546 wire prompt rendering and shadow-mode
-    # logging. Reading it once silences static analysis about an
+    # Accepted so the renderer can pass it through unchanged; not
+    # consumed here because the helper does not render prompt
+    # lines. Reading it once silences static analysis about an
     # unused-but-required parameter.
     _ = token_budget
 
@@ -1990,8 +1993,8 @@ async def retrieve_scoped_memories(
     ]
 
     # Step 6: scope admission. Exclusion reasons are tallied per
-    # stable key so shadow-mode logs can compare excluded counts
-    # across the same query under legacy and scoped retrieval.
+    # stable key so the `memory.recall` payload's `scoped_debug`
+    # block can carry per-reason excluded counts for log analysis.
     admitted: list[tuple[MemoryResult, ResolvedMemoryScope]] = []
     excluded: dict[str, int] = {}
     for r, resolved in resolved_rows:
@@ -2029,8 +2032,8 @@ async def retrieve_scoped_memories(
     # via _read_time_speaker (same pattern format_context uses to
     # avoid double-parsing metadata) and compute the demote-only
     # multiplier from those two factors directly. Carrying every
-    # signal on ScopedMemoryHit means downstream renderers and
-    # shadow-mode loggers do not have to redo this work.
+    # signal on ScopedMemoryHit means the renderer and the
+    # `memory.recall` payload composer do not have to redo this work.
     hits: list[ScopedMemoryHit] = []
     for r, resolved in after_floor:
         speaker, confidence = _read_time_speaker(r.metadata)
@@ -2102,10 +2105,9 @@ def format_scoped_context(
     Render a ScopedRetrievalResult into a two-section prompt block.
 
     Pure formatting layer. Does NOT search memory, detect projects,
-    emit log lines, or call `retrieve_scoped_memories`. Live prompt
-    injection still goes through `format_context`; this renderer is
-    consumed by later issues (#546 shadow-mode logging, then the
-    read-path switch).
+    emit log lines, or call `retrieve_scoped_memories`. Consumed by
+    `format_scoped_context_with_recall_payload` for live prompt
+    injection.
 
     Section shape (D3 / D4):
 

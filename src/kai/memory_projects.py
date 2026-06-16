@@ -26,10 +26,10 @@ Detection rules (also documented inline below):
    narrower root must take precedence.
 4. Unknown paths return `None`. Detection does not guess.
 5. Disabled projects (`memory_enabled=False`) still return an
-   `ActiveMemoryProject` so logs and future shadow-mode metrics can
-   distinguish "no project here" from "known project with memory
-   disabled". Retrieval and write code must treat
-   `memory_enabled=False` as "global-only behavior".
+   `ActiveMemoryProject` so logs and the `memory.recall` payload's
+   `scoped_debug` block can distinguish "no project here" from
+   "known project with memory disabled". Retrieval and write code
+   must treat `memory_enabled=False` as "global-only behavior".
 
 The detector does NOT change retrieval, prompt rendering, or write
 routing. Wiring those paths to the detector belongs to #544 and

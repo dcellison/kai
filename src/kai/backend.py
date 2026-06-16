@@ -178,11 +178,12 @@ class AgentBackend(ABC):
     max_session_hours: float
     _session_started_at: float | None
 
-    # Stable identifier the shadow-mode logger (#546) and any future
-    # backend-aware code path can read off the instance. Concrete
-    # backends override the class-level default with their canonical
-    # name. Default `""` keeps the ABC importable for tests that
-    # construct a stub backend without thinking about logging.
+    # Stable identifier for pool/bot dispatch and `memory.recall`
+    # attribution; any future backend-aware code path can read it off
+    # the instance too. Concrete backends override the class-level
+    # default with their canonical name. Default `""` keeps the ABC
+    # importable for tests that construct a stub backend without
+    # thinking about logging.
     backend_name: str = ""
 
     @abstractmethod
