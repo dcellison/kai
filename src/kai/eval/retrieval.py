@@ -1,7 +1,28 @@
 """
-Layer 1 retrieval evaluation harness.
+Layer 1 retrieval evaluation harness (deprecated; see notice below).
 
 Reachable as `python -m kai.eval.retrieval`.
+
+Deprecation notice:
+
+The supported recall evaluator is `kai.eval.retrieval_scoped`. New
+evaluation work and CI gates should target the scoped harness.
+
+With `MEMORY_SCOPED_RECALL_ENABLED` on, every turn is served by
+`assemble_turn_context` and never touches `format_context`; this
+harness scores `format_context`, so its metrics no longer describe
+a code path that production runs. The scoped harness exercises the
+production path and is workspace-aware, so it also evaluates
+cross-project collision behavior that this harness is structurally
+blind to.
+
+This CLI remains importable because the collision-probe generator
+(`kai.eval.gen_collision_probes`) uses the unscoped recall-capture
+helpers (`legacy_retrieve_hits`, `_RecallLogCapture`) from this
+module to verify drafted negative probes against the unscoped gate;
+replacing that verifier with scoped retrieval would reject every
+good negative. The helpers will be relocated so this CLI can be
+removed.
 
 Given a probe set of `(question, expected_fact_id)` pairs, runs each
 probe through the live memory pipeline, parses the resulting
@@ -28,8 +49,8 @@ Design rationale (the part that is not obvious from the code):
   harness warns at init when that knob is enabled, and its results
   then describe a pipeline production no longer runs. The
   workspace-parameterized scoped sibling lives at
-  `kai.eval.retrieval_scoped`; both harnesses ship in parallel until
-  side-by-side comparisons settle which (if either) to retire.
+  `kai.eval.retrieval_scoped` and is the supported evaluator; see
+  the deprecation notice above.
 
 - Probes whose expected fact has been deleted from the store between
   authoring and evaluation are bucketed as "probe-set drift" rather
