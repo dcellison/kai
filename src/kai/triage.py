@@ -321,7 +321,11 @@ def build_triage_prompt(
         '  "related": [list of related issue numbers],',
         '  "project": null or "project title" if this clearly belongs on a board,',
         '  "summary": "1-2 sentence assessment of the issue",',
-        '  "priority": "low" | "medium" | "high" | "critical"',
+        '  "priority": "low" | "medium" | "high" | "critical",',
+        '  "status": "ready" | "needs_info" | "wontfix_candidate" | "blocked",',
+        '  "next_action": "single concrete recommendation for what the maintainer should do next",',
+        '  "missing_info": [list of specific questions to ask the reporter],',
+        '  "blocked_by": null or issue number (int) or short string describing the blocker',
         "}",
         "",
         "Label guidelines:",
@@ -338,6 +342,49 @@ def build_triage_prompt(
         "For project: only assign if one of the available projects clearly matches the "
         "issue's scope based on the project title/description. When in doubt, leave null. "
         "Do not force a match.",
+        "",
+        "Status guidelines:",
+        '- "ready": the issue is clear enough for a maintainer or contributor to start work. '
+        'Confirmed duplicates also use "ready"; the next_action is the close-as-duplicate step.',
+        '- "needs_info": the issue is not actionable until the reporter answers one or more '
+        "questions in missing_info. Use this when the report omits a stack trace, "
+        "reproduction steps, configuration details, or any specific information you would need "
+        "to make progress.",
+        '- "wontfix_candidate": the issue appears outside the project\'s scope or conflicts with '
+        "documented behavior. This is a SUGGESTION for human review, NOT a verdict. The "
+        "maintainer decides. Use sparingly and only when the misalignment is concrete and "
+        "named in summary / next_action.",
+        '- "blocked": the issue is valid but cannot move forward until another issue, upstream '
+        'dependency, or external decision is resolved. When you set status to "blocked", you '
+        "MUST populate blocked_by with the specific blocker.",
+        "",
+        "next_action guidelines:",
+        "- A single sentence, written for a maintainer reading the issue.",
+        '- Concrete and specific. Examples: "Ask the reporter for the exact command, expected '
+        'output, and actual output." / "Confirm whether this should be handled by the existing '
+        'project-board cleanup work." / "Start with the webhook routing tests, then update the '
+        'issue triage prompt contract." / "Track the upstream SDK release, then revisit this '
+        'issue." / "Confirm against #123 and close as duplicate." / "Confirm scope, then close '
+        'or apply the wontfix label."',
+        "- next_action describes what the MAINTAINER should do. Maintainer-driven close, "
+        "assign, label, and milestone recommendations are fine and often the right answer "
+        "(close as duplicate, close as wontfix, apply a needs-info label after asking the "
+        "reporter). Do NOT claim Kai will perform any of these automatically; Kai's mutation "
+        "surface is additive labels, optional project assignment, the triage comment, and the "
+        "Telegram notification, full stop.",
+        "",
+        "missing_info guidelines:",
+        '- Each entry is a specific question, not a vague phrase like "more details needed."',
+        '- Empty list when status is anything other than "needs_info".',
+        "- Two to four entries is typical; more than five usually means the issue is "
+        "wontfix_candidate or blocked, not needs_info.",
+        "",
+        "blocked_by guidelines:",
+        '- null for every status except "blocked".',
+        '- For "blocked", give the maintainer a handle: an issue number (preferred, when the '
+        'blocker is tracked in this repo), a short string like "upstream pytest fix" or '
+        '"operator decision on memory backend", or a URL.',
+        '- Do NOT leave blocked_by null when status is "blocked"; the maintainer would have no handle to follow up.',
     ]
 
     return "\n".join(parts)
@@ -675,6 +722,112 @@ async def apply_triage(
     # Type-guard Claude's response fields. Claude may return wrong types
     # (e.g., "labels": "bug" instead of ["bug"], or ["bug", 42, null]).
     # Filter at extraction so downstream code can assume correct types.
+    #
+    # Ordering for the actionability block (status / next_action /
+    # missing_info / blocked_by) is load-bearing: capture
+    # raw_summary_has_content from the raw model dict BEFORE the
+    # summary normalization below rewrites a missing or empty summary
+    # to "No summary provided." A status fallback that inspected the
+    # post-normalization summary would always see content and always
+    # pick "ready"; the raw signal is what makes the fallback honest.
+    # Then normalize missing_info BEFORE computing the status
+    # fallback so a scalar / dict / int / None missing_info collapses
+    # to [] and is captured in a warning log rather than influencing
+    # the status decision.
+    raw_summary_has_content = isinstance(triage_result.get("summary"), str) and triage_result["summary"].strip() != ""
+
+    missing_info_raw = triage_result.get("missing_info", [])
+    if not isinstance(missing_info_raw, list):
+        # Matches the existing list-field guard pattern for labels and
+        # related: non-list becomes []. Iterating a string would render
+        # one bullet per character; iterating a dict would render its
+        # keys; neither matches the intent.
+        log.warning(
+            "Triage: missing_info is %s (expected list); normalizing to []",
+            type(missing_info_raw).__name__,
+        )
+        missing_info: list[str] = []
+    else:
+        missing_info = [q.strip() for q in missing_info_raw if isinstance(q, str) and q.strip()]
+
+    # Status fallback uses raw_summary_has_content plus normalized
+    # missing_info per spec section 8. If the model returned a real
+    # summary AND no real questions, the issue is actionable enough to
+    # mark ready; otherwise default to needs_info so a maintainer
+    # reading the comment knows the model could not classify cleanly.
+    _ALLOWED_STATUSES = ("ready", "needs_info", "wontfix_candidate", "blocked")
+    status_raw = triage_result.get("status")
+    if status_raw in _ALLOWED_STATUSES:
+        status = status_raw
+    else:
+        if status_raw is not None:
+            log.warning(
+                "Triage: invalid status %r (expected one of %s); falling back",
+                status_raw,
+                _ALLOWED_STATUSES,
+            )
+        status = "ready" if (raw_summary_has_content and not missing_info) else "needs_info"
+
+    # blocked_by accepts int (preferred when the blocker is tracked
+    # in the repo), non-empty string (a short label or URL), or None.
+    # Any other type collapses to None.
+    blocked_by_raw = triage_result.get("blocked_by")
+    if isinstance(blocked_by_raw, int):
+        blocked_by: int | str | None = blocked_by_raw
+    elif isinstance(blocked_by_raw, str) and blocked_by_raw.strip():
+        blocked_by = blocked_by_raw.strip()
+    else:
+        blocked_by = None
+
+    # Consistency checks per spec section 8. A "blocked" label with no
+    # handle is worse than "ready" because the maintainer has nothing
+    # to follow up on; downgrade to ready and let the summary explain
+    # the situation. Conversely, rendering "Blocked by: X" alongside a
+    # non-blocked status would confuse the maintainer; drop blocked_by.
+    if status == "blocked" and blocked_by is None:
+        log.warning("Triage: status=blocked with null blocked_by; downgrading to ready")
+        status = "ready"
+    elif status != "blocked" and blocked_by is not None:
+        log.warning(
+            "Triage: blocked_by populated but status is %s; ignoring blocked_by",
+            status,
+        )
+        blocked_by = None
+
+    # next_action per-status fallback. The defaults match spec
+    # section 8 so a missing or empty next_action still renders a
+    # useful sentence in the comment instead of an empty line.
+    _NEXT_ACTION_DEFAULTS = {
+        "ready": "Review the issue and assign or start work.",
+        "needs_info": "Ask the reporter the questions in Missing information.",
+        "wontfix_candidate": ("Confirm the scope assessment and either close or apply a wontfix label."),
+        "blocked": "Track the blocking dependency and revisit this issue when it resolves.",
+    }
+    next_action_raw = triage_result.get("next_action")
+    if isinstance(next_action_raw, str) and next_action_raw.strip():
+        next_action = next_action_raw.strip()
+    else:
+        if next_action_raw is not None:
+            log.warning(
+                "Triage: next_action is %r; falling back to per-status default",
+                next_action_raw,
+            )
+        next_action = _NEXT_ACTION_DEFAULTS[status]
+
+    # Missing info edge cases: status mismatch with question count is
+    # logged but the questions render anyway when present, so the
+    # maintainer sees the model's intent even when its status decision
+    # was off. A needs_info status with no questions also logs so the
+    # operator can spot model misbehavior in the daemon log.
+    if status != "needs_info" and missing_info:
+        log.warning(
+            "Triage: status=%s but missing_info has %d question(s); rendering anyway",
+            status,
+            len(missing_info),
+        )
+    elif status == "needs_info" and not missing_info:
+        log.warning("Triage: status=needs_info but missing_info is empty; comment will lack specific questions")
+
     labels = triage_result.get("labels", [])
     if not isinstance(labels, list):
         labels = []
@@ -786,12 +939,27 @@ async def apply_triage(
 
     # Step 3: Post triage comment
     labels_str = ", ".join(new_labels) if new_labels else "(none added)"
+    # Render order per spec section 9: Triage summary, blank line,
+    # Status (always), Blocked by (only when status=blocked), Priority,
+    # Labels applied, optional duplicate / related / project, Next
+    # action (always), Missing information block (only when
+    # missing_info has at least one question). blocked_by renders as
+    # "#<n>" when an int (matches the existing "Possible duplicate of"
+    # rendering) and as the raw string otherwise.
     comment_parts = [
         f"**Triage summary:** {summary}",
         "",
-        f"**Priority:** {priority}",
-        f"**Labels applied:** {labels_str}",
+        f"**Status:** {status}",
     ]
+    if status == "blocked" and blocked_by is not None:
+        blocked_by_display = f"#{blocked_by}" if isinstance(blocked_by, int) else blocked_by
+        comment_parts.append(f"**Blocked by:** {blocked_by_display}")
+    comment_parts.extend(
+        [
+            f"**Priority:** {priority}",
+            f"**Labels applied:** {labels_str}",
+        ]
+    )
     if duplicate_of:
         comment_parts.append(f"**Possible duplicate of:** #{duplicate_of}")
     if related:
@@ -799,6 +967,11 @@ async def apply_triage(
         comment_parts.append(f"**Related issues:** {related_str}")
     if project:
         comment_parts.append(f"**Added to project:** {project}")
+    comment_parts.append(f"**Next action:** {next_action}")
+    if missing_info:
+        comment_parts.append("**Missing information:**")
+        for question in missing_info:
+            comment_parts.append(f"- {question}")
 
     comment_body = _TRIAGE_HEADER + "\n".join(comment_parts)
 
@@ -833,12 +1006,23 @@ async def apply_triage(
             log.info("Posted triage comment on %s#%d", metadata.repo, metadata.number)
 
     # Step 4: Send Telegram notification
+    # Render order per spec section 9: header, title, Status (always),
+    # Priority, Labels, Next (always, single line), optional Needs
+    # info count (questions live on the GitHub comment, not duplicated
+    # here), optional duplicate / related / project, optional Blocked
+    # by (only when status=blocked), url. blocked_by renders as
+    # "#<n>" for ints and as the raw string otherwise.
     telegram_parts = [
         f"Issue #{metadata.number} triaged in {metadata.repo}",
         metadata.title,
+        f"Status: {status}",
         f"Priority: {priority}",
         f"Labels: {', '.join(new_labels) if new_labels else '(none added)'}",
+        f"Next: {next_action}",
     ]
+    if missing_info:
+        question_word = "question" if len(missing_info) == 1 else "questions"
+        telegram_parts.append(f"Needs info: {len(missing_info)} {question_word}")
     if duplicate_of:
         telegram_parts.append(f"Possible duplicate of #{duplicate_of}")
     if related:
@@ -846,6 +1030,9 @@ async def apply_triage(
         telegram_parts.append(f"Related: {related_str}")
     if project:
         telegram_parts.append(f"Project: {project}")
+    if status == "blocked" and blocked_by is not None:
+        blocked_by_display = f"#{blocked_by}" if isinstance(blocked_by, int) else blocked_by
+        telegram_parts.append(f"Blocked by: {blocked_by_display}")
     telegram_parts.append(metadata.url)
 
     text = "\n".join(telegram_parts)

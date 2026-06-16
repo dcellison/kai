@@ -2,6 +2,7 @@
 
 import json
 import re
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1039,6 +1040,382 @@ class TestApplyTriage:
         # No --add-label calls should have been made
         add_label_calls = [cmd for cmd in commands_run if "issue" in cmd and "edit" in cmd and "--add-label" in cmd]
         assert len(add_label_calls) == 0
+
+
+# ── apply_triage actionability fields (#690) ────────────────────────
+
+
+async def _apply_triage_capture(meta: IssueMetadata, result: dict, **kwargs) -> tuple[str, str]:
+    """Run apply_triage and capture the rendered comment / Telegram bodies.
+
+    Reads the comment body from the tempfile path passed to
+    `gh issue comment --body-file`; the tempfile is still live inside
+    the mocked subprocess callback so we can read it before
+    apply_triage's `with tempfile.TemporaryDirectory(...)` block
+    cleans up. Reads the Telegram body from the mocked aiohttp post
+    call's json payload.
+    """
+    captured: dict[str, str | None] = {"comment": None, "telegram": None}
+
+    async def mock_exec(*args, **_kwargs):
+        if "issue" in args and "comment" in args and "--body-file" in args:
+            body_path = args[list(args).index("--body-file") + 1]
+            captured["comment"] = Path(body_path).read_text()
+        return _mock_subprocess(stdout="[]")
+
+    with (
+        patch("kai.triage.asyncio.create_subprocess_exec", side_effect=mock_exec),
+        patch("kai.triage.aiohttp.ClientSession") as mock_session_cls,
+    ):
+        mock_session = AsyncMock()
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_session_cls.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+        await apply_triage(meta, result, 8080, "secret", **kwargs)
+        if mock_session.post.called:
+            captured["telegram"] = mock_session.post.call_args[1]["json"]["text"]
+
+    assert captured["comment"] is not None, "apply_triage did not post a comment"
+    assert captured["telegram"] is not None, "apply_triage did not send a Telegram summary"
+    return captured["comment"], captured["telegram"]
+
+
+class TestTriageActionability:
+    """#690: status / next_action / missing_info / blocked_by output fields."""
+
+    # ── Happy path: one fixture per status value ────────────────────
+
+    @pytest.mark.asyncio
+    async def test_ready_status_renders_status_and_next_action(self):
+        meta = _make_metadata()
+        result = _triage_result(
+            status="ready",
+            next_action="Start work on the foo module.",
+            missing_info=[],
+            blocked_by=None,
+        )
+        comment, telegram = await _apply_triage_capture(meta, result)
+        assert "**Status:** ready" in comment
+        assert "**Next action:** Start work on the foo module." in comment
+        assert "**Missing information:**" not in comment
+        assert "**Blocked by:**" not in comment
+        assert "Status: ready" in telegram
+        assert "Next: Start work on the foo module." in telegram
+        assert "Needs info:" not in telegram
+        assert "Blocked by:" not in telegram
+
+    @pytest.mark.asyncio
+    async def test_needs_info_renders_missing_info_block(self):
+        meta = _make_metadata()
+        questions = [
+            "What is the exact command you ran?",
+            "What was the expected vs actual output?",
+        ]
+        result = _triage_result(
+            status="needs_info",
+            next_action="Ask the reporter for reproduction details.",
+            missing_info=questions,
+            blocked_by=None,
+        )
+        comment, telegram = await _apply_triage_capture(meta, result)
+        assert "**Status:** needs_info" in comment
+        assert "**Missing information:**" in comment
+        for question in questions:
+            assert f"- {question}" in comment
+        assert "Status: needs_info" in telegram
+        assert "Needs info: 2 questions" in telegram
+
+    @pytest.mark.asyncio
+    async def test_wontfix_candidate_renders_status(self):
+        meta = _make_metadata()
+        result = _triage_result(
+            status="wontfix_candidate",
+            next_action="Confirm scope, then close or apply the wontfix label.",
+            missing_info=[],
+            blocked_by=None,
+        )
+        commands_run = []
+
+        async def mock_exec(*args, **_kwargs):
+            commands_run.append(args)
+            if "issue" in args and "comment" in args and "--body-file" in args:
+                pass
+            return _mock_subprocess(stdout="[]")
+
+        with (
+            patch("kai.triage.asyncio.create_subprocess_exec", side_effect=mock_exec),
+            patch("kai.triage.aiohttp.ClientSession") as mock_session_cls,
+        ):
+            mock_session = AsyncMock()
+            mock_resp = AsyncMock()
+            mock_resp.status = 200
+            mock_session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+            mock_session_cls.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            await apply_triage(meta, result, 8080, "secret")
+
+        # Comment renders the status.
+        comment_calls = [cmd for cmd in commands_run if "issue" in cmd and "comment" in cmd]
+        assert len(comment_calls) == 1
+        # No automatic close: gh issue close must NEVER be invoked.
+        close_calls = [cmd for cmd in commands_run if "issue" in cmd and "close" in cmd]
+        assert close_calls == []
+
+    @pytest.mark.asyncio
+    async def test_blocked_status_renders_blocked_by_int(self):
+        meta = _make_metadata()
+        result = _triage_result(
+            status="blocked",
+            next_action="Track #42, then revisit.",
+            missing_info=[],
+            blocked_by=42,
+        )
+        comment, telegram = await _apply_triage_capture(meta, result)
+        assert "**Status:** blocked" in comment
+        assert "**Blocked by:** #42" in comment
+        assert "Status: blocked" in telegram
+        assert "Blocked by: #42" in telegram
+
+    @pytest.mark.asyncio
+    async def test_blocked_status_renders_blocked_by_string(self):
+        meta = _make_metadata()
+        result = _triage_result(
+            status="blocked",
+            next_action="Track the upstream pytest fix, then revisit.",
+            missing_info=[],
+            blocked_by="upstream pytest fix",
+        )
+        comment, telegram = await _apply_triage_capture(meta, result)
+        assert "**Status:** blocked" in comment
+        assert "**Blocked by:** upstream pytest fix" in comment
+        assert "Blocked by: upstream pytest fix" in telegram
+
+    # ── Consistency fallback tests ──────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_blocked_status_with_null_blocked_by_downgrades_to_ready(self, caplog):
+        meta = _make_metadata()
+        result = _triage_result(
+            status="blocked",
+            next_action="Track the dependency.",
+            missing_info=[],
+            blocked_by=None,
+        )
+        with caplog.at_level("WARNING", logger="kai.triage"):
+            comment, _telegram = await _apply_triage_capture(meta, result)
+        assert "**Status:** ready" in comment
+        assert "**Blocked by:**" not in comment
+        assert any("blocked with null blocked_by" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_non_blocked_status_with_blocked_by_ignores_blocked_by(self, caplog):
+        meta = _make_metadata()
+        result = _triage_result(
+            status="ready",
+            next_action="Start work.",
+            missing_info=[],
+            blocked_by=42,
+        )
+        with caplog.at_level("WARNING", logger="kai.triage"):
+            comment, telegram = await _apply_triage_capture(meta, result)
+        assert "**Status:** ready" in comment
+        assert "**Blocked by:**" not in comment
+        assert "Blocked by:" not in telegram
+        assert any("blocked_by populated but status is ready" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_invalid_status_falls_back_to_ready_with_raw_summary(self):
+        meta = _make_metadata()
+        result = _triage_result(
+            status="frobnicate",
+            summary="The login button is misaligned on Safari 17.",
+            missing_info=[],
+        )
+        comment, _telegram = await _apply_triage_capture(meta, result)
+        assert "**Status:** ready" in comment
+
+    @pytest.mark.asyncio
+    async def test_invalid_status_falls_back_to_needs_info_with_questions(self):
+        meta = _make_metadata()
+        result = _triage_result(
+            status="frobnicate",
+            summary="The login button is misaligned on Safari 17.",
+            missing_info=["What version of Safari?"],
+        )
+        comment, _telegram = await _apply_triage_capture(meta, result)
+        assert "**Status:** needs_info" in comment
+        assert "- What version of Safari?" in comment
+
+    @pytest.mark.asyncio
+    async def test_invalid_status_with_missing_summary_and_empty_missing_info_falls_back_to_needs_info(self):
+        """W-1 regression guard: status fallback uses RAW summary, not the post-normalization default.
+
+        With status="frobnicate", summary="", and missing_info=[], the
+        raw summary has no content, so the fallback selects
+        needs_info. A naive implementation that checked the
+        post-normalization summary would always see "No summary
+        provided." (non-empty) and wrongly pick "ready".
+        """
+        meta = _make_metadata()
+        result = _triage_result(
+            status="frobnicate",
+            summary="",
+            missing_info=[],
+        )
+        comment, _telegram = await _apply_triage_capture(meta, result)
+        assert "**Status:** needs_info" in comment
+
+    # ── Malformed field tests ───────────────────────────────────────
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status,expected_default",
+        [
+            ("ready", "Review the issue and assign or start work."),
+            ("needs_info", "Ask the reporter the questions in Missing information."),
+            (
+                "wontfix_candidate",
+                "Confirm the scope assessment and either close or apply a wontfix label.",
+            ),
+            ("blocked", "Track the blocking dependency and revisit this issue when it resolves."),
+        ],
+    )
+    async def test_missing_next_action_falls_back_per_status(self, status, expected_default):
+        meta = _make_metadata()
+        # blocked needs blocked_by populated, otherwise the consistency
+        # check downgrades status to "ready" and the fallback default
+        # changes underneath the test. Provide one so the status sticks.
+        result = _triage_result(
+            status=status,
+            next_action=None,
+            missing_info=["question?"] if status == "needs_info" else [],
+            blocked_by=42 if status == "blocked" else None,
+        )
+        comment, _telegram = await _apply_triage_capture(meta, result)
+        assert f"**Next action:** {expected_default}" in comment
+
+    @pytest.mark.asyncio
+    async def test_missing_info_with_non_string_entries_filters(self):
+        meta = _make_metadata()
+        result = _triage_result(
+            status="needs_info",
+            next_action="Ask the reporter.",
+            missing_info=["valid?", 42, None, "another?"],
+        )
+        comment, _telegram = await _apply_triage_capture(meta, result)
+        assert "- valid?" in comment
+        assert "- another?" in comment
+        assert "- 42" not in comment
+        assert "- None" not in comment
+
+    @pytest.mark.asyncio
+    async def test_missing_info_scalar_normalizes_to_empty_list(self, caplog):
+        """W-2 regression guard: non-list missing_info collapses to []."""
+        meta = _make_metadata()
+        result = _triage_result(
+            status="needs_info",
+            next_action="Ask the reporter.",
+            missing_info="steps?",
+        )
+        with caplog.at_level("WARNING", logger="kai.triage"):
+            comment, telegram = await _apply_triage_capture(meta, result)
+        assert "**Missing information:**" not in comment
+        assert "Needs info:" not in telegram
+        assert any("missing_info is str" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_scalar_missing_info_with_invalid_status_falls_back_to_ready(self):
+        """W-1 v3 regression guard: scalar missing_info normalizes before status fallback.
+
+        With status="frobnicate", a non-empty raw summary, and scalar
+        missing_info, the parser normalizes missing_info to [] before
+        the status fallback inspects it. Combined with the non-empty
+        raw summary, this lands as status="ready" (not "needs_info",
+        which would treat the malformed scalar as a real question
+        signal).
+        """
+        meta = _make_metadata()
+        result = _triage_result(
+            status="frobnicate",
+            summary="The login button is misaligned on Safari 17.",
+            missing_info="steps?",
+        )
+        comment, _telegram = await _apply_triage_capture(meta, result)
+        assert "**Status:** ready" in comment
+
+    @pytest.mark.asyncio
+    async def test_missing_info_when_status_is_not_needs_info_still_renders(self, caplog):
+        meta = _make_metadata()
+        result = _triage_result(
+            status="ready",
+            next_action="Start work.",
+            missing_info=["edge case to confirm?"],
+        )
+        with caplog.at_level("WARNING", logger="kai.triage"):
+            comment, telegram = await _apply_triage_capture(meta, result)
+        assert "**Status:** ready" in comment
+        assert "- edge case to confirm?" in comment
+        assert "Needs info: 1 question" in telegram
+        assert any("status=ready but missing_info has 1 question" in r.message for r in caplog.records)
+
+    # ── Prompt contract test (B-1 regression guard) ─────────────────
+
+    def test_prompt_allows_close_recommendation_in_next_action(self):
+        """B-1 regression guard: prompt permits maintainer-driven close recommendations.
+
+        The v1 spec had a prompt prohibition ("Do NOT recommend
+        closing, assigning, or setting milestones") that contradicted
+        the duplicate and wontfix_candidate fallbacks (which DO
+        recommend closing, since the maintainer is the one closing).
+        The v2 fix distinguishes maintainer-driven recommendations
+        (allowed) from claims about Kai's automatic behavior (still
+        forbidden). The prompt must contain phrasing that supports the
+        distinction; assert on the load-bearing fragments here.
+        """
+        meta = _make_metadata()
+        prompt = build_triage_prompt(meta, related_issues="[]", projects="[]")
+        assert "next_action describes what the MAINTAINER should do" in prompt
+        assert "Maintainer-driven close, assign, label, and milestone recommendations are fine" in prompt
+        assert "Do NOT claim Kai will perform any of these automatically" in prompt
+        # The wontfix_candidate framing as suggestion-not-verdict is
+        # the load-bearing phrase for false-positive risk; assert it
+        # exists too so a future prompt edit cannot silently drop it.
+        assert "SUGGESTION for human review, NOT a verdict" in prompt
+
+    # ── Existing-behavior regression ────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_existing_fields_still_render(self):
+        """Adding the new fields does not displace the existing comment lines."""
+        meta = _make_metadata(labels=[])
+        result = _triage_result(
+            labels=["bug", "enhancement"],
+            duplicate_of=99,
+            related=[100, 101],
+            project="Sprint 1",
+            summary="Login broken on Safari.",
+            priority="high",
+            status="ready",
+            next_action="Start work on the login fix.",
+            missing_info=[],
+            blocked_by=None,
+        )
+        projects_json = json.dumps({"projects": [{"title": "Sprint 1", "number": 1}]})
+        comment, telegram = await _apply_triage_capture(meta, result, projects_json=projects_json)
+        # All existing fields render.
+        assert "**Triage summary:** Login broken on Safari." in comment
+        assert "**Priority:** high" in comment
+        assert "**Labels applied:** bug, enhancement" in comment
+        assert "**Possible duplicate of:** #99" in comment
+        assert "**Related issues:** #100, #101" in comment
+        assert "**Added to project:** Sprint 1" in comment
+        # New fields render too.
+        assert "**Status:** ready" in comment
+        assert "**Next action:** Start work on the login fix." in comment
+        # Telegram surfaces the new and existing summary bits.
+        assert "Status: ready" in telegram
+        assert "Priority: high" in telegram
+        assert "Next: Start work on the login fix." in telegram
 
 
 # ── triage_issue (full pipeline) ────────────────────────────────────
