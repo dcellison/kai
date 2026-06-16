@@ -90,7 +90,8 @@ from kai.config import (
     get_effective_provider,
     resolve_user_model,
 )
-from kai.eval.retrieval import compute_rank, legacy_retrieve_hits
+from kai.eval._unscoped_recall_capture import legacy_retrieve_hits
+from kai.eval.retrieval import compute_rank
 from kai.eval.retrieval_scoped import evaluate, load_probes
 from kai.oneshot import (
     ClaudeOneShotReasoner,
