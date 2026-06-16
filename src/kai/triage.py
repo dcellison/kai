@@ -770,9 +770,13 @@ async def apply_triage(
 
     # blocked_by accepts int (preferred when the blocker is tracked
     # in the repo), non-empty string (a short label or URL), or None.
-    # Any other type collapses to None.
+    # Any other type collapses to None. The `not isinstance(..., bool)`
+    # exclusion is load-bearing: Python's bool is a subclass of int,
+    # so a model that returns "blocked_by": true would otherwise be
+    # accepted as a valid integer blocker and render as "Blocked by:
+    # #True" in the public-facing comment.
     blocked_by_raw = triage_result.get("blocked_by")
-    if isinstance(blocked_by_raw, int):
+    if isinstance(blocked_by_raw, int) and not isinstance(blocked_by_raw, bool):
         blocked_by: int | str | None = blocked_by_raw
     elif isinstance(blocked_by_raw, str) and blocked_by_raw.strip():
         blocked_by = blocked_by_raw.strip()

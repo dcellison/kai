@@ -1208,6 +1208,34 @@ class TestTriageActionability:
         assert any("blocked with null blocked_by" in r.message for r in caplog.records)
 
     @pytest.mark.asyncio
+    async def test_blocked_status_with_bool_blocked_by_rejects_and_downgrades(self, caplog):
+        """Python bool is a subclass of int; the parser must reject it explicitly.
+
+        Without the explicit bool exclusion, `"blocked_by": true` from
+        a malformed model response would be accepted as a valid
+        integer blocker (since `isinstance(True, int)` is True) and
+        render as "Blocked by: #True" in the public-facing comment.
+        The parser rejects the bool, leaving `blocked_by` None, which
+        then triggers the blocked-with-null consistency check and
+        downgrades status to ready.
+        """
+        meta = _make_metadata()
+        result = _triage_result(
+            status="blocked",
+            next_action="Track the dependency.",
+            missing_info=[],
+            blocked_by=True,
+        )
+        with caplog.at_level("WARNING", logger="kai.triage"):
+            comment, telegram = await _apply_triage_capture(meta, result)
+        assert "**Status:** ready" in comment
+        assert "**Blocked by:**" not in comment
+        assert "Blocked by:" not in telegram
+        assert "#True" not in comment
+        assert "#True" not in telegram
+        assert any("blocked with null blocked_by" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
     async def test_non_blocked_status_with_blocked_by_ignores_blocked_by(self, caplog):
         meta = _make_metadata()
         result = _triage_result(
