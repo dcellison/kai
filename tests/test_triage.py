@@ -1410,6 +1410,58 @@ class TestTriageActionability:
         # exists too so a future prompt edit cannot silently drop it.
         assert "SUGGESTION for human review, NOT a verdict" in prompt
 
+    # ── Bool-as-int guards on duplicate_of / related ────────────────
+
+    @pytest.mark.asyncio
+    async def test_bool_duplicate_of_normalizes_to_none(self):
+        """Python bool is a subclass of int; the parser must reject it on duplicate_of.
+
+        Without the explicit bool exclusion, `"duplicate_of": true`
+        from a malformed model response would be accepted as a valid
+        integer issue number (since `isinstance(True, int)` is True)
+        and render as "Possible duplicate of: #True" in the
+        public-facing comment. Same defect class the `blocked_by`
+        guard already protects against.
+        """
+        meta = _make_metadata()
+        result = _triage_result(
+            duplicate_of=True,
+            summary="Login broken on Safari.",
+            status="ready",
+            next_action="Start work.",
+            missing_info=[],
+        )
+        comment, telegram = await _apply_triage_capture(meta, result)
+        assert "**Possible duplicate of:**" not in comment
+        assert "Possible duplicate of" not in telegram
+        assert "#True" not in comment
+        assert "#True" not in telegram
+
+    @pytest.mark.asyncio
+    async def test_bool_entries_in_related_filter_out(self):
+        """Bool entries inside `related` must be filtered before rendering.
+
+        Same defect class as `duplicate_of`: True / False inside the
+        list would otherwise pass the per-entry `isinstance(n, int)`
+        filter and render as "#True" / "#False" in the public-facing
+        related-issues line.
+        """
+        meta = _make_metadata()
+        result = _triage_result(
+            related=[42, True, False, 100],
+            summary="Login broken on Safari.",
+            status="ready",
+            next_action="Start work.",
+            missing_info=[],
+        )
+        comment, telegram = await _apply_triage_capture(meta, result)
+        assert "**Related issues:** #42, #100" in comment
+        assert "Related: #42, #100" in telegram
+        assert "#True" not in comment
+        assert "#False" not in comment
+        assert "#True" not in telegram
+        assert "#False" not in telegram
+
     # ── Existing-behavior regression ────────────────────────────────
 
     @pytest.mark.asyncio

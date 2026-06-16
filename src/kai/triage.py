@@ -837,14 +837,23 @@ async def apply_triage(
         labels = []
     labels = [lbl for lbl in labels if isinstance(lbl, str) and lbl.strip()]
 
+    # The `not isinstance(..., bool)` exclusion is load-bearing:
+    # Python's bool is a subclass of int, so a model that returns
+    # "duplicate_of": true would otherwise be accepted as a valid
+    # integer issue number and render as "Possible duplicate of: #True"
+    # in the public-facing comment. Same shape as the `blocked_by`
+    # guard above.
     duplicate_of = triage_result.get("duplicate_of")
-    if not isinstance(duplicate_of, int):
+    if not isinstance(duplicate_of, int) or isinstance(duplicate_of, bool):
         duplicate_of = None
 
     related = triage_result.get("related", [])
     if not isinstance(related, list):
         related = []
-    related = [n for n in related if isinstance(n, int)]
+    # Same bool-vs-int exclusion as `duplicate_of`: True/False values
+    # inside the list would otherwise pass `isinstance(n, int)` and
+    # render as "#True" / "#False".
+    related = [n for n in related if isinstance(n, int) and not isinstance(n, bool)]
 
     project = triage_result.get("project")
     if not isinstance(project, str) or not project.strip():
