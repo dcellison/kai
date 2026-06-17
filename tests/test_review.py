@@ -2457,8 +2457,8 @@ _PINNED_LARGE_PR_FILE_SIZES: tuple[tuple[str, int], ...] = (
     ("tests/test_review.py", 104_671),
 ) + tuple(
     # Thirteen smaller files fill out the 23-file count. Collective
-    # size 666,107 bytes lands within four bytes of the measured
-    # 666,116-byte balance from the real PR.
+    # size 666,107 bytes lands within nine bytes of the measured
+    # 666,116-byte balance from the source PR.
     (f"src/kai/_padding_{i}.py", 51_239)
     for i in range(13)
 )
