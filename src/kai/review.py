@@ -2097,14 +2097,22 @@ def _cap_patch(patch: str) -> tuple[str, list[BudgetNote]]:
 
 def _cap_changed_files(
     files: tuple[ChangedFile, ...],
+    *,
+    cap: int,
 ) -> tuple[tuple[ChangedFile, ...], list[BudgetNote]]:
-    """Truncate full file contents last; never drop the file entirely."""
+    """Truncate full file contents last; never drop the file entirely.
+
+    `cap` is the dynamic changed-files section cap computed by
+    `_compute_dynamic_changed_files_cap`. It is keyword-only so the
+    caller cannot accidentally pass the wrong constant; the caller is
+    responsible for floor enforcement before invoking this function.
+    """
     notes: list[BudgetNote] = []
     if not files:
         return ((), notes)
 
     total = sum(_measure_changed_file(f) for f in files)
-    if total <= _CHANGED_FILES_SECTION_FLOOR:
+    if total <= cap:
         return (files, notes)
 
     # Drop ladder rung 6: truncate the largest file contents first
@@ -2115,7 +2123,7 @@ def _cap_changed_files(
     indexed.sort(key=lambda item: _measure_changed_file(item[1]), reverse=True)
     truncated_paths: list[str] = []
     for idx, f in indexed:
-        if sum(_measure_changed_file(g) for g in [files[i] for i in range(len(files))]) <= _CHANGED_FILES_SECTION_FLOOR:
+        if sum(_measure_changed_file(g) for g in [files[i] for i in range(len(files))]) <= cap:
             break
         if f.content is None:
             continue
@@ -2164,6 +2172,38 @@ def _estimate_total_chars(ctx: PRReviewContext) -> int:
     return total
 
 
+def _compute_dynamic_changed_files_cap(ctx: PRReviewContext) -> int:
+    """Compute the section cap for changed_files given the rest of the bundle.
+
+    Constructs a measurement context with `changed_files=()` and reuses
+    `_estimate_total_chars` so any future change to per-section
+    measurement flows through here automatically. Floors at
+    `_CHANGED_FILES_SECTION_FLOOR` so pathological non-changed sections
+    never starve changed-files below the legacy static-cap behavior.
+    Holds `_OVERHEAD_RESERVE` back for rendered overhead the estimator
+    does not capture (per-section boundary tokens, BEGIN/END markers,
+    status lines).
+    """
+    measurement_ctx = PRReviewContext(
+        repo=ctx.repo,
+        pr_number=ctx.pr_number,
+        metadata=ctx.metadata,
+        linked_issues=ctx.linked_issues,
+        commits=ctx.commits,
+        patch=ctx.patch,
+        changed_files=(),
+        related_context=ctx.related_context,
+        spec=ctx.spec,
+        conventions=ctx.conventions,
+        prior_comments=ctx.prior_comments,
+        budget_notes=ctx.budget_notes,
+        collection_warnings=ctx.collection_warnings,
+    )
+    non_changed = _estimate_total_chars(measurement_ctx)
+    headroom = _MAX_REVIEW_CONTEXT_CHARS - non_changed - _OVERHEAD_RESERVE
+    return max(_CHANGED_FILES_SECTION_FLOOR, headroom)
+
+
 def budget_review_context(ctx: PRReviewContext) -> PRReviewContext:
     """
     Apply per-section caps and the drop ladder to a freshly-collected bundle.
@@ -2187,8 +2227,10 @@ def budget_review_context(ctx: PRReviewContext) -> PRReviewContext:
     """
     notes: list[BudgetNote] = list(ctx.budget_notes)
 
-    # Per-section caps. Run in fixed order so the result is
-    # deterministic for the same input.
+    # Per-section caps for the non-changed-files sections. Run in fixed
+    # order so the result is deterministic for the same input. The
+    # changed-files section runs after these so the dynamic allocator
+    # can size it against the measured weight of everything else.
     related, n = _cap_related(ctx.related_context)
     notes.extend(n)
     commits, n = _cap_commits(ctx.commits)
@@ -2197,11 +2239,11 @@ def budget_review_context(ctx: PRReviewContext) -> PRReviewContext:
     notes.extend(n)
     patch, n = _cap_patch(ctx.patch)
     notes.extend(n)
-    changed_files, n = _cap_changed_files(ctx.changed_files)
-    notes.extend(n)
 
     # Apply prior-comments cap (mirrors the existing
     # _MAX_PRIOR_COMMENTS_CHARS behavior for the legacy diff path).
+    # Capped before the dynamic allocator runs so its measurement
+    # reflects the post-cap size, not the pre-cap raw length.
     prior_comments = ctx.prior_comments
     if prior_comments and len(prior_comments) > _MAX_PRIOR_COMMENTS_CHARS:
         prior_comments = _truncate_with_marker(
@@ -2215,6 +2257,31 @@ def budget_review_context(ctx: PRReviewContext) -> PRReviewContext:
                 message="Prior review thread truncated to stay within cap.",
             )
         )
+
+    # Build a partial context with every non-changed-files section
+    # already capped; the allocator zeros out changed_files internally
+    # before measuring so the field value we pass here does not
+    # affect the result. Reuses `_estimate_total_chars` via the
+    # helper so any future change to per-section measurement flows
+    # through here automatically.
+    partial_ctx = PRReviewContext(
+        repo=ctx.repo,
+        pr_number=ctx.pr_number,
+        metadata=ctx.metadata,
+        linked_issues=linked_issues,
+        commits=commits,
+        patch=patch,
+        changed_files=ctx.changed_files,
+        related_context=related,
+        spec=ctx.spec,
+        conventions=ctx.conventions,
+        prior_comments=prior_comments,
+        budget_notes=tuple(notes),
+        collection_warnings=ctx.collection_warnings,
+    )
+    dynamic_cap = _compute_dynamic_changed_files_cap(partial_ctx)
+    changed_files, n = _cap_changed_files(ctx.changed_files, cap=dynamic_cap)
+    notes.extend(n)
 
     capped = PRReviewContext(
         repo=ctx.repo,
