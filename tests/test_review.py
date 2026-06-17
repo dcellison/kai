@@ -7,11 +7,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kai.review import (
+    _CHANGED_FILES_SECTION_FLOOR,
+    _MAX_COMMITS_CHARS,
     _MAX_DIFF_CHARS,
+    _MAX_LINKED_ISSUES_CHARS,
     _MAX_PATCH_CHARS,
     _MAX_PRIOR_COMMENTS_CHARS,
     _MAX_RELATED_CONTEXT_CHARS,
     _MAX_REVIEW_CONTEXT_CHARS,
+    _OVERHEAD_RESERVE,
     _REVIEW_HEADER,
     BudgetNote,
     ChangedFile,
@@ -24,6 +28,7 @@ from kai.review import (
     PRReviewContext,
     PRReviewResult,
     RelatedExcerpt,
+    _compute_dynamic_changed_files_cap,
     _estimate_total_chars,
     _normalize_repo_from_remote,
     _resolve_workspace_remote_repo,
@@ -2431,6 +2436,74 @@ class TestBudgetHoldsTwoRealisticChangedFiles:
         assert _estimate_total_chars(out) <= _MAX_REVIEW_CONTEXT_CHARS
 
 
+# Pinned to the historical 23-file PR shape that motivated the ceiling
+# lift, totalling ~2.59 MB of inline content. Ten files reproduce the
+# largest paths and sizes from the source PR; thirteen padding files
+# fill out the count and bring the total within a few bytes of the
+# measured 2,591,737-byte sum. The fixture intentionally pins to
+# historical dimensions; if those files keep growing in main, the
+# fixture drifts, which is fine - this is a regression test for the
+# specific shape that motivated the lift, not for current state.
+_PINNED_LARGE_PR_FILE_SIZES: tuple[tuple[str, int], ...] = (
+    ("tests/test_install.py", 412_068),
+    ("src/kai/install.py", 276_246),
+    ("tests/test_memory.py", 240_705),
+    ("tests/test_memory_command.py", 170_555),
+    ("tests/test_config.py", 162_937),
+    ("src/kai/config.py", 150_270),
+    ("tests/test_claude.py", 149_319),
+    ("src/kai/memory.py", 145_436),
+    ("src/kai/memory_command.py", 113_414),
+    ("tests/test_review.py", 104_671),
+) + tuple(
+    # Thirteen smaller files fill out the 23-file count. Collective
+    # size 666,107 bytes lands within four bytes of the measured
+    # 666,116-byte balance from the real PR.
+    (f"src/kai/_padding_{i}.py", 51_239)
+    for i in range(13)
+)
+
+
+def _pinned_large_pr_files() -> tuple[ChangedFile, ...]:
+    """Build a changed-files tuple shaped like the lift-motivating PR.
+
+    Every file is below `_MAX_CHANGED_FILE_BYTES = 500_000`, so the
+    per-file cap never strips inline content even at the lifted
+    ceiling. Returns 23 entries totalling roughly 2.59 MB to match
+    the historical shape.
+    """
+    return tuple(
+        ChangedFile(
+            path=path,
+            status="modified",
+            content="x" * size,
+            note=None,
+        )
+        for path, size in _PINNED_LARGE_PR_FILE_SIZES
+    )
+
+
+def _changed_files_summing_to(n: int) -> tuple[ChangedFile, ...]:
+    """Return 10 ChangedFile entries whose contents sum to `n` bytes.
+
+    Distributes evenly across ten files (each well under the per-file
+    cap). The first file absorbs the remainder so the total lands
+    exactly on `n` even when `n` is not a multiple of ten.
+    """
+    file_count = 10
+    per_file = n // file_count
+    remainder = n - per_file * file_count
+    return tuple(
+        ChangedFile(
+            path=f"src/kai/sum_target_{i}.py",
+            status="modified",
+            content="x" * (per_file + (remainder if i == 0 else 0)),
+            note=None,
+        )
+        for i in range(file_count)
+    )
+
+
 class TestBudgetEnforcesGlobalCeiling:
     """
     After per-section caps, the final bundle must respect
@@ -2441,35 +2514,105 @@ class TestBudgetEnforcesGlobalCeiling:
     """
 
     def test_long_spec_and_conventions_trim_under_global_cap(self):
-        # Each section sits within its own cap but the sum overshoots.
-        long_spec = "spec line\n" * 8_000  # ~80K chars
-        long_conv = "convention line\n" * 8_000  # ~120K chars
+        # Build a bundle whose total pre-budget weight exceeds the
+        # global ceiling. The exact sizes are tuned to clear the
+        # ceiling with margin, but the pre-budget assertion below
+        # pins the fixture so a future cap change cannot silently
+        # turn this test into a non-ladder passthrough.
         long_issues = tuple(
             LinkedIssue(
                 number=n,
                 title=f"Issue {n}",
-                body="x" * 5_000,
+                body="x" * 90_000,
                 state="OPEN",
                 url="",
                 labels=(),
                 comments=(),
             )
-            for n in range(8)
+            for n in range(10)
         )
         ctx = _ctx(
-            spec=long_spec,
-            conventions=long_conv,
+            spec="A" * 1_500_000,
+            conventions="B" * 1_000_000,
+            patch="C" * 250_000,
             linked_issues=long_issues,
-            patch="diff " * 20_000,
         )
+
+        # Pre-budget assertion: the fixture's pre-budget bundle MUST
+        # exceed the global ceiling, otherwise the test does not
+        # exercise the ladder.
+        assert _estimate_total_chars(ctx) > _MAX_REVIEW_CONTEXT_CHARS
+
         out = budget_review_context(ctx)
+        # Post-budget invariant.
         assert _estimate_total_chars(out) <= _MAX_REVIEW_CONTEXT_CHARS, (
             f"global cap violated: {_estimate_total_chars(out)} > {_MAX_REVIEW_CONTEXT_CHARS}"
         )
-        # The reviewer should see what was trimmed.
-        sections = {n.section for n in out.budget_notes}
-        # At least one of SPEC, CONVENTIONS, PATCH appears in notes.
-        assert sections & {"SPEC", "CONVENTIONS", "PATCH"}
+        note_sections = {note.section for note in out.budget_notes}
+        # The 250K patch exceeds the new 200K per-section cap, so
+        # PATCH fires deterministically.
+        assert "PATCH" in note_sections
+        # The cross-section ladder trims spec / conventions because
+        # the post-cap bundle still overshoots; at least one fires.
+        assert "SPEC" in note_sections or "CONVENTIONS" in note_sections
+
+    def test_headroom_path_does_not_invoke_ladder(self):
+        # The pinned large-PR fixture (~2.59 MB of changed files) plus
+        # its 156 KB patch fit under the 3.5 MB ceiling with the
+        # typical headroom that the dynamic allocator's
+        # `_OVERHEAD_RESERVE` protects. The cross-section ladder must
+        # not fire on this path: no `CHANGED_FILES_AT_HEAD`
+        # cross-section note. The per-section `_cap_changed_files`
+        # note is allowed (separate message text).
+        ctx = _ctx(
+            changed_files=_pinned_large_pr_files(),
+            patch="P" * 156_000,
+        )
+        out = budget_review_context(ctx)
+        assert _estimate_total_chars(out) <= _MAX_REVIEW_CONTEXT_CHARS
+        cross_section_notes = [
+            n for n in out.budget_notes
+            if n.section == "CHANGED_FILES_AT_HEAD"
+            and "Cross-section ladder" in n.message
+        ]
+        assert cross_section_notes == [], (
+            "Cross-section ladder fired on a headroom-path bundle; "
+            "the dynamic allocator should have kept the bundle under "
+            "the ceiling without invoking the ladder."
+        )
+
+    def test_floor_branch_invokes_ladder(self):
+        # When non-changed weight exceeds
+        # `_MAX_REVIEW_CONTEXT_CHARS - _CHANGED_FILES_SECTION_FLOOR
+        # - _OVERHEAD_RESERVE`, the dynamic cap is forced to the
+        # floor. With the floor's section plus the non-changed
+        # weight still overshooting the global ceiling, the
+        # cross-section ladder runs as the last line of defense.
+        # The fixture's heavy spec and conventions exercise the
+        # earlier ladder rungs (spec / conventions trim) before
+        # Rung 7 would be reached, so this test only asserts that
+        # the ladder ran at all, not which specific rung fired.
+        ctx = _ctx(
+            spec="A" * 2_000_000,
+            conventions="B" * 1_200_000,
+            changed_files=_changed_files_summing_to(500_000),
+            patch="C" * 150_000,
+        )
+        # Pre-budget assertion: this fixture MUST overflow under
+        # the floor branch, otherwise the test does not exercise
+        # the ladder.
+        assert _estimate_total_chars(ctx) > _MAX_REVIEW_CONTEXT_CHARS
+
+        out = budget_review_context(ctx)
+        assert _estimate_total_chars(out) <= _MAX_REVIEW_CONTEXT_CHARS
+        cross_section_notes = [
+            n for n in out.budget_notes
+            if "Cross-section ladder" in n.message
+            or "under global ceiling" in n.message
+        ]
+        assert cross_section_notes, (
+            "Floor-branch path did not invoke the cross-section ladder."
+        )
 
     def test_pathological_bundle_emits_last_resort_note(self):
         # Forcing every section to overflow even after the ladder
@@ -2496,6 +2639,139 @@ class TestBudgetEnforcesGlobalCeiling:
         # last-resort BUDGET_NOTES entry (also acceptable).
         if _estimate_total_chars(out) > _MAX_REVIEW_CONTEXT_CHARS:
             assert "BUDGET_NOTES" in sections
+
+
+class TestDynamicChangedFilesBudget:
+    """The dynamic changed-files cap takes the global ceiling, subtracts
+    the non-changed-files weight and `_OVERHEAD_RESERVE`, and floors at
+    `_CHANGED_FILES_SECTION_FLOOR`. These tests pin the helper's
+    arithmetic against three reference shapes (quiet, busy, floor) plus
+    an end-to-end pinned-large-PR fixture.
+    """
+
+    def test_quiet_bundle_dynamic_cap_approaches_global_ceiling(self):
+        # Bare bundle with only the default metadata fields the `_ctx`
+        # helper provides. Non-changed weight collapses to the metadata
+        # estimate alone, so the dynamic cap sits within
+        # `_OVERHEAD_RESERVE + small metadata estimate` of the global
+        # ceiling.
+        ctx = _ctx()
+        cap = _compute_dynamic_changed_files_cap(ctx)
+        # Reproduce the helper's arithmetic against the same fixture
+        # so a future change to the metadata estimate flows through.
+        measurement_ctx = PRReviewContext(
+            repo=ctx.repo,
+            pr_number=ctx.pr_number,
+            metadata=ctx.metadata,
+            linked_issues=ctx.linked_issues,
+            commits=ctx.commits,
+            patch=ctx.patch,
+            changed_files=(),
+            related_context=ctx.related_context,
+            spec=ctx.spec,
+            conventions=ctx.conventions,
+            prior_comments=ctx.prior_comments,
+        )
+        non_changed = _estimate_total_chars(measurement_ctx)
+        assert cap == _MAX_REVIEW_CONTEXT_CHARS - non_changed - _OVERHEAD_RESERVE
+        # Order-of-magnitude check: the quiet cap is within 1 KB of
+        # `_MAX_REVIEW_CONTEXT_CHARS - _OVERHEAD_RESERVE`.
+        assert cap >= _MAX_REVIEW_CONTEXT_CHARS - _OVERHEAD_RESERVE - 1_000
+
+    def test_busy_bundle_dynamic_cap_shrinks_proportionally(self):
+        # Each non-changed section sits at (or near) its per-section
+        # cap; the dynamic cap shrinks by the sum of the caps plus the
+        # reserve. Sized so per-item measurement overhead stays inside
+        # the assertion tolerance.
+        related = tuple(
+            RelatedExcerpt(
+                path=f"src/{i}.py",
+                line=i,
+                symbol=f"s{i}",
+                kind="function",
+                reason="r",
+                excerpt="x" * 3_400,
+            )
+            for i in range(10)
+        )
+        commits = tuple(
+            Commit(oid=f"{i:040x}", headline="h", body="x" * 1_950)
+            for i in range(10)
+        )
+        big_issue = LinkedIssue(
+            number=1,
+            title="t",
+            body="x" * (_MAX_LINKED_ISSUES_CHARS - 100),
+            state="OPEN",
+            url="",
+            labels=(),
+            comments=(),
+        )
+        ctx = _ctx(
+            patch="P" * _MAX_PATCH_CHARS,
+            linked_issues=(big_issue,),
+            commits=commits,
+            related_context=related,
+            prior_comments="C" * _MAX_PRIOR_COMMENTS_CHARS,
+        )
+        cap = _compute_dynamic_changed_files_cap(ctx)
+        sum_of_caps = (
+            _MAX_PATCH_CHARS
+            + _MAX_RELATED_CONTEXT_CHARS
+            + _MAX_LINKED_ISSUES_CHARS
+            + _MAX_COMMITS_CHARS
+            + _MAX_PRIOR_COMMENTS_CHARS
+        )
+        expected = _MAX_REVIEW_CONTEXT_CHARS - sum_of_caps - _OVERHEAD_RESERVE
+        # Tolerate ~10K of measurement noise from per-item overheads
+        # and the metadata estimate.
+        assert abs(cap - expected) < 10_000
+
+    def test_floor_holds_when_other_sections_exceed_global_minus_floor(self):
+        # Drive non-changed weight past
+        # `_MAX_REVIEW_CONTEXT_CHARS - _CHANGED_FILES_SECTION_FLOOR
+        # - _OVERHEAD_RESERVE` so the raw computation would go below
+        # the floor; the helper must clamp to the floor.
+        ctx = _ctx(spec="A" * _MAX_REVIEW_CONTEXT_CHARS)
+        cap = _compute_dynamic_changed_files_cap(ctx)
+        assert cap == _CHANGED_FILES_SECTION_FLOOR
+
+    def test_pinned_large_pr_shape_no_changed_files_truncation(self):
+        # End-to-end: the pinned large-PR fixture goes through the
+        # full budgeter. With ~2.59 MB of changed files plus a 156 KB
+        # patch, the dynamic cap is large enough that
+        # `_cap_changed_files` keeps every file's content. No
+        # `CHANGED_FILES_AT_HEAD` budget note appears.
+        ctx = _ctx(
+            changed_files=_pinned_large_pr_files(),
+            patch="P" * 156_000,
+        )
+        out = budget_review_context(ctx)
+        changed_files_notes = [
+            n for n in out.budget_notes
+            if n.section == "CHANGED_FILES_AT_HEAD"
+        ]
+        assert changed_files_notes == [], (
+            f"Pinned large-PR fixture emitted CHANGED_FILES_AT_HEAD notes: "
+            f"{changed_files_notes}"
+        )
+        for f in out.changed_files:
+            assert f.content is not None, (
+                f"{f.path} content was dropped under the lifted ceiling"
+            )
+
+
+class TestBundleCapLifts:
+    """Pin the four bundle-budget constants that drive the current
+    budget model. A silent change to any of them re-shapes the bundle
+    in ways the rest of the test suite does not directly catch.
+    """
+
+    def test_lifted_constants_hold_expected_values(self):
+        assert _MAX_REVIEW_CONTEXT_CHARS == 3_500_000
+        assert _MAX_PATCH_CHARS == 200_000
+        assert _CHANGED_FILES_SECTION_FLOOR == 450_000
+        assert _OVERHEAD_RESERVE == 50_000
 
 
 class TestChangedFileURLEncoding:
