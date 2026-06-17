@@ -55,12 +55,45 @@ from pathlib import Path
 
 from aiohttp import web
 from telegram import Bot, Update
+from telegram.ext import Application
 
 from kai import cron, memory, review, services, sessions, triage
 from kai.config import DATA_DIR, IMAGE_EXTENSIONS, Config, ModelRole, UserConfig, resolve_user_model
 from kai.telegram_utils import chunk_text
 
 log = logging.getLogger(__name__)
+
+
+# ── Application state keys ──────────────────────────────────────────
+#
+# Typed aiohttp AppKey constants for every value this module sets or
+# reads on the running Application. aiohttp 4.x is expected to make
+# string-key access (`app["foo"]`) an error rather than the current
+# NotAppKeyWarning; AppKey is the typed handle pattern that replaces
+# string keys. These constants live at module scope so the test
+# suite imports them from `kai.webhook` and accesses the same
+# Application via the same typed keys, avoiding the same warning at
+# test time.
+#
+# Keep the constants alphabetized by name. The runtime type argument
+# is omitted for Union-typed keys (AppKey accepts `type[T] | None`,
+# which cannot express `T | None` at runtime); the variable
+# annotation carries the type narrowing the call sites rely on.
+
+ALLOWED_USER_IDS_KEY: web.AppKey[set[int]] = web.AppKey("allowed_user_ids", set)
+ALLOWED_WORKSPACES_KEY: web.AppKey[list[str]] = web.AppKey("allowed_workspaces", list)
+CHAT_ID_KEY: web.AppKey[int] = web.AppKey("chat_id", int)
+CONFIG_KEY: web.AppKey[Config] = web.AppKey("config", Config)
+POOL_KEY: web.AppKey[object] = web.AppKey("pool", object)
+PR_REVIEW_COOLDOWN_KEY: web.AppKey[int] = web.AppKey("pr_review_cooldown", int)
+PR_REVIEW_TIMEOUT_S_KEY: web.AppKey[int] = web.AppKey("pr_review_timeout_s", int)
+SPEC_DIR_KEY: web.AppKey[str] = web.AppKey("spec_dir", str)
+TELEGRAM_APP_KEY: web.AppKey[Application] = web.AppKey("telegram_app", Application)
+TELEGRAM_BOT_KEY: web.AppKey[Bot] = web.AppKey("telegram_bot", Bot)
+TELEGRAM_WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("telegram_webhook_secret", str)
+WEBHOOK_PORT_KEY: web.AppKey[int] = web.AppKey("webhook_port", int)
+WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("webhook_secret", str)
+WORKSPACE_BASE_KEY: web.AppKey[str | None] = web.AppKey("workspace_base")
 
 
 class UnauthorizedChatIdError(Exception):
@@ -226,14 +259,14 @@ async def _resolve_local_repo(repo_full_name: str, app: web.Application) -> str 
     repo_name = repo_full_name.split("/")[-1]
 
     # 1. WORKSPACE_BASE - scan immediate children for matching dir name
-    workspace_base = app.get("workspace_base")
+    workspace_base = app.get(WORKSPACE_BASE_KEY)
     if workspace_base:
         candidate = Path(workspace_base) / repo_name
         if candidate.is_dir():
             return str(candidate)
 
     # 2. ALLOWED_WORKSPACES - check each entry's directory name
-    for allowed in app.get("allowed_workspaces", []):
+    for allowed in app.get(ALLOWED_WORKSPACES_KEY, []):
         if Path(allowed).name == repo_name and Path(allowed).is_dir():
             return str(allowed)
 
@@ -275,7 +308,7 @@ def _require_secret(handler):
 
     @functools.wraps(handler)
     async def wrapper(request: web.Request) -> web.Response:
-        secret = request.app["webhook_secret"]
+        secret = request.app[WEBHOOK_SECRET_KEY]
         provided = request.headers.get("X-Webhook-Secret", "")
         if not hmac.compare_digest(provided, secret):
             log.warning("Auth failure on %s from %s", request.path, request.remote)
@@ -312,11 +345,11 @@ def _resolve_chat_id(request: web.Request, payload: dict) -> int:
         # Validate the resolved chat_id is an authorized user.
         # Without this, a prompt injection attack could make inner Claude
         # send messages to arbitrary Telegram users.
-        allowed = request.app.get("allowed_user_ids")
+        allowed = request.app.get(ALLOWED_USER_IDS_KEY)
         if allowed is not None and resolved not in allowed:
             raise UnauthorizedChatIdError(f"chat_id {resolved} is not an authorized user")
         return resolved
-    return request.app["chat_id"]
+    return request.app[CHAT_ID_KEY]
 
 
 # ── GitHub event formatters ───────────────────────────────────────────
@@ -472,7 +505,7 @@ async def _handle_telegram_update(request: web.Request) -> web.Response:
     on non-200 responses, so surfacing internal errors as HTTP errors would cause
     an infinite retry loop. Errors are logged instead.
     """
-    secret = request.app["telegram_webhook_secret"]
+    secret = request.app[TELEGRAM_WEBHOOK_SECRET_KEY]
     provided = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
     if not hmac.compare_digest(provided, secret):
         log.warning("Telegram update: invalid secret")
@@ -484,8 +517,8 @@ async def _handle_telegram_update(request: web.Request) -> web.Response:
         log.warning("Telegram update: malformed JSON")
         return web.Response(status=200)
 
-    telegram_app = request.app["telegram_app"]
-    bot = request.app["telegram_bot"]
+    telegram_app = request.app[TELEGRAM_APP_KEY]
+    bot = request.app[TELEGRAM_BOT_KEY]
 
     try:
         update = Update.de_json(data, bot)
@@ -513,7 +546,7 @@ async def _handle_github(request: web.Request) -> web.Response:
     Supported events: push, pull_request, issues, issue_comment, pull_request_review.
     Unsupported events are silently acknowledged with {"msg": "ignored"}.
     """
-    secret = request.app["webhook_secret"]
+    secret = request.app[WEBHOOK_SECRET_KEY]
 
     body = await request.read()
 
@@ -601,8 +634,8 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
     admin wildcard exists - for example, when no users.yaml is configured
     or when all admins have opted into specific repos only.
     """
-    bot = request.app["telegram_bot"]
-    config: Config = request.app["config"]
+    bot = request.app[TELEGRAM_BOT_KEY]
+    config: Config = request.app[CONFIG_KEY]
 
     # Extract the repo that triggered this event
     repo_full_name = payload.get("repository", {}).get("full_name", "")
@@ -627,7 +660,7 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
         # Fall back to the first admin in the app config so the event is
         # not silently dropped. Wrapped in try/except for consistency with
         # the fan-out path - a transient failure should return 200, not 500.
-        fallback_chat_id = request.app["chat_id"]
+        fallback_chat_id = request.app[CHAT_ID_KEY]
         try:
             await _process_github_event_for_user(
                 request,
@@ -738,7 +771,7 @@ async def _process_github_event_for_user(
             pr = payload.get("pull_request", {})
             pr_number = pr.get("number", 0)
             repo = payload.get("repository", {}).get("full_name", "")
-            cooldown = request.app.get("pr_review_cooldown", 300)
+            cooldown = request.app.get(PR_REVIEW_COOLDOWN_KEY, 300)
 
             # Cooldown is server-level, shared across all users.
             # One review per PR per cooldown window regardless of
@@ -766,15 +799,15 @@ async def _process_github_event_for_user(
             task = asyncio.create_task(
                 review.review_pr(
                     payload,
-                    webhook_port=request.app["webhook_port"],
-                    webhook_secret=request.app["webhook_secret"],
+                    webhook_port=request.app[WEBHOOK_PORT_KEY],
+                    webhook_secret=request.app[WEBHOOK_SECRET_KEY],
                     claude_user=claude_user,
                     local_repo_path=local_repo_path,
-                    spec_dir=request.app.get("spec_dir", "specs"),
+                    spec_dir=request.app.get(SPEC_DIR_KEY, "specs"),
                     notify_chat_id=target_chat_id,
                     agent_backend=agent_backend,
                     provider=provider,
-                    timeout_s=request.app["pr_review_timeout_s"],
+                    timeout_s=request.app[PR_REVIEW_TIMEOUT_S_KEY],
                     model_override=pr_review_model_override,
                 )
             )
@@ -816,8 +849,8 @@ async def _process_github_event_for_user(
             task = asyncio.create_task(
                 triage.triage_issue(
                     payload,
-                    webhook_port=request.app["webhook_port"],
-                    webhook_secret=request.app["webhook_secret"],
+                    webhook_port=request.app[WEBHOOK_PORT_KEY],
+                    webhook_secret=request.app[WEBHOOK_SECRET_KEY],
                     claude_user=claude_user,
                     notify_chat_id=target_chat_id,
                     agent_backend=agent_backend,
@@ -874,8 +907,8 @@ async def _handle_generic(request: web.Request) -> web.Response:
     payload) and forwards it to the Telegram chat. Truncates to Telegram's
     4096-char limit.
     """
-    bot = request.app["telegram_bot"]
-    chat_id = request.app["chat_id"]
+    bot = request.app[TELEGRAM_BOT_KEY]
+    chat_id = request.app[CHAT_ID_KEY]
 
     try:
         payload = await request.json()
@@ -1083,7 +1116,7 @@ async def _handle_schedule(request: web.Request) -> web.Response:
         return web.json_response({"error": "Failed to create job"}, status=500)
 
     # Register with APScheduler immediately so it starts firing
-    telegram_app = request.app["telegram_app"]
+    telegram_app = request.app[TELEGRAM_APP_KEY]
     await cron.register_job_by_id(telegram_app, job_id)
 
     log.info("Scheduled job %d '%s' via API (%s)", job_id, name, schedule_type)
@@ -1177,7 +1210,7 @@ async def _handle_delete_job(request: web.Request) -> web.Response:
     # Remove from APScheduler's in-memory queue. Daily jobs with multiple
     # times get suffixed names (e.g., cron_19_0, cron_19_1), so we match
     # both the exact name and the prefix pattern.
-    telegram_app = request.app["telegram_app"]
+    telegram_app = request.app[TELEGRAM_APP_KEY]
     jq = telegram_app.job_queue
     assert jq is not None
     prefix = f"cron_{job_id}"
@@ -1276,7 +1309,7 @@ async def _handle_update_job(request: web.Request) -> web.Response:
     schedule_changed = new_schedule_type is not None or schedule_data is not None
     if schedule_changed:
         # Remove old APScheduler entries
-        telegram_app = request.app["telegram_app"]
+        telegram_app = request.app[TELEGRAM_APP_KEY]
         jq = telegram_app.job_queue
         assert jq is not None
         prefix = f"cron_{job_id}"
@@ -1386,7 +1419,7 @@ async def _handle_send_message(request: web.Request) -> web.Response:
     if not text:
         return web.json_response({"error": "Missing required field: text"}, status=400)
 
-    bot = request.app["telegram_bot"]
+    bot = request.app[TELEGRAM_BOT_KEY]
     try:
         chat_id = _resolve_chat_id(request, payload)
     except ValueError as e:
@@ -1457,7 +1490,7 @@ async def _handle_send_file(request: web.Request) -> web.Response:
     # has their own per-user home workspace resolved from the pool (#353).
     # When the pool is unavailable (transient startup state) we refuse the
     # request rather than opening a global fallback path.
-    pool = request.app.get("pool")
+    pool = request.app.get(POOL_KEY)
     if pool is None:
         return web.json_response({"error": "No workspace configured"}, status=403)
     workspace = str(await pool.get_effective_workspace(chat_id))
@@ -1479,7 +1512,7 @@ async def _handle_send_file(request: web.Request) -> web.Response:
     if not path.is_file():
         return web.json_response({"error": f"File not found: {file_path}"}, status=404)
 
-    bot = request.app["telegram_bot"]
+    bot = request.app[TELEGRAM_BOT_KEY]
     caption = payload.get("caption", "")
 
     # Send images as photos (Telegram renders them inline) and everything
@@ -1560,7 +1593,7 @@ async def _handle_memory_add(request: web.Request) -> web.Response:
         tags: list[str], optional
         metadata: dict, optional (keys "type" and "tags" are reserved by
             add_structured; user values for those will be overwritten)
-        chat_id: int, optional, defaults to app["chat_id"]
+        chat_id: int, optional, defaults to the configured webhook chat_id
 
     Responses:
         200 {"id": "<mem0-uuid>"} on success
@@ -1688,7 +1721,7 @@ async def _handle_memory_search(request: web.Request) -> web.Response:
     Request body (JSON):
         query: str, required, non-empty after strip
         limit: int, optional (defaults to config.memory_search_limit)
-        chat_id: int, optional, defaults to app["chat_id"]
+        chat_id: int, optional, defaults to the configured webhook chat_id
 
     Responses:
         200 {"results": [<MemoryResult-dict>, ...]} on success (empty list
@@ -1774,7 +1807,7 @@ async def _handle_memory_stats(request: web.Request) -> web.Response:
     GET endpoint reads chat_id from query params, mirroring _handle_get_jobs.
 
     Query params:
-        chat_id: int, optional (defaults to app["chat_id"])
+        chat_id: int, optional (defaults to the configured webhook chat_id)
 
     Response is the MemoryStats object at the top level, NOT wrapped in
     {"results": ...} - single-object reads return the object bare per
@@ -1846,7 +1879,7 @@ async def _handle_memory_delete_all(request: web.Request) -> web.Response:
 
     Request body (JSON):
         confirm: str, required, must equal "delete-all-memories"
-        chat_id: int, optional, defaults to app["chat_id"]
+        chat_id: int, optional, defaults to the configured webhook chat_id
 
     Responses:
         200 {"status": "deleted"} on success
@@ -2048,9 +2081,9 @@ async def start(telegram_app, config) -> None:
     global _app, _runner, _webhook_registered, _health_monitor_task
 
     _app = web.Application()
-    _app["telegram_app"] = telegram_app
-    _app["telegram_bot"] = telegram_app.bot
-    _app["webhook_secret"] = config.webhook_secret
+    _app[TELEGRAM_APP_KEY] = telegram_app
+    _app[TELEGRAM_BOT_KEY] = telegram_app.bot
+    _app[WEBHOOK_SECRET_KEY] = config.webhook_secret
 
     # Set the default chat_id for API calls that don't specify a target.
     # users.yaml is mandatory so the first admin is the default; when
@@ -2058,7 +2091,7 @@ async def start(telegram_app, config) -> None:
     # (the same warning at config load time covers the no-admin case).
     admins = config.get_admins()
     if admins:
-        _app["chat_id"] = admins[0].telegram_id
+        _app[CHAT_ID_KEY] = admins[0].telegram_id
     else:
         fallback = next(iter(config.user_configs.values()))
         log.warning(
@@ -2068,46 +2101,46 @@ async def start(telegram_app, config) -> None:
             fallback.name,
             fallback.telegram_id,
         )
-        _app["chat_id"] = fallback.telegram_id
+        _app[CHAT_ID_KEY] = fallback.telegram_id
 
     # Store allowed user IDs for chat_id validation in _resolve_chat_id.
     # Prevents prompt injection from routing messages to arbitrary users.
-    _app["allowed_user_ids"] = config.allowed_user_ids
+    _app[ALLOWED_USER_IDS_KEY] = config.allowed_user_ids
 
     # Store config for GitHub actor routing in _handle_github()
-    _app["config"] = config
+    _app[CONFIG_KEY] = config
 
     # Store the subprocess pool for per-user workspace lookup in send-file.
     # Set by main.py after pool creation; may be None during init.
-    _app["pool"] = telegram_app.bot_data.get("pool")
+    _app[POOL_KEY] = telegram_app.bot_data.get("pool")
 
     # Server-level config for review/triage background tasks. Per-user
     # feature flags (pr_review, issue_triage) are resolved at event time
     # via sessions.resolve_github_settings(), not stored here.
-    _app["pr_review_cooldown"] = config.pr_review_cooldown
-    _app["pr_review_timeout_s"] = config.pr_review_timeout_s
-    _app["webhook_port"] = config.webhook_port
+    _app[PR_REVIEW_COOLDOWN_KEY] = config.pr_review_cooldown
+    _app[PR_REVIEW_TIMEOUT_S_KEY] = config.pr_review_timeout_s
+    _app[WEBHOOK_PORT_KEY] = config.webhook_port
 
     # Workspace config for review agent repo resolution. These let
     # _resolve_local_repo() match incoming PR webhook repos against
     # local checkouts without a hardcoded GITHUB_REPO setting.
-    _app["workspace_base"] = str(config.workspace_base) if config.workspace_base else None
-    _app["allowed_workspaces"] = [str(p) for p in config.allowed_workspaces]
-    _app["spec_dir"] = config.spec_dir
+    _app[WORKSPACE_BASE_KEY] = str(config.workspace_base) if config.workspace_base else None
+    _app[ALLOWED_WORKSPACES_KEY] = [str(p) for p in config.allowed_workspaces]
+    _app[SPEC_DIR_KEY] = config.spec_dir
 
     # Add per-user github_notify_chat_id values to allowed_user_ids
     # so review/triage agents can POST to /api/send-message with
     # these chat_ids. Loads from both users.yaml and DB.
     for uc in config.user_configs.values():
         if uc.github_notify_chat_id is not None:
-            _app["allowed_user_ids"].add(uc.github_notify_chat_id)
+            _app[ALLOWED_USER_IDS_KEY].add(uc.github_notify_chat_id)
     # Also add any DB-stored notify chat IDs (set via /github notify).
     # webhook.start() is already async so the await is fine.
     for uid in config.user_configs:
         val = await sessions.get_setting(f"github_notify_chat:{uid}")
         if val:
             try:
-                _app["allowed_user_ids"].add(int(val))
+                _app[ALLOWED_USER_IDS_KEY].add(int(val))
             except ValueError:
                 log.warning(
                     "Invalid github_notify_chat for user %s in DB: %s (ignoring)",
@@ -2119,7 +2152,7 @@ async def start(telegram_app, config) -> None:
     # Only register the Telegram webhook route in webhook mode. In polling mode,
     # there's no need for the endpoint and no secret to validate against.
     if config.telegram_webhook_url:
-        _app["telegram_webhook_secret"] = config.telegram_webhook_secret
+        _app[TELEGRAM_WEBHOOK_SECRET_KEY] = config.telegram_webhook_secret
         _app.router.add_post("/webhook/telegram", _handle_telegram_update)
 
     if config.webhook_secret:
@@ -2190,7 +2223,7 @@ async def start(telegram_app, config) -> None:
                 telegram_app.bot,
                 config.telegram_webhook_url,
                 config.telegram_webhook_secret,
-                _app["chat_id"],
+                _app[CHAT_ID_KEY],
             )
         )
 
@@ -2220,7 +2253,7 @@ async def stop() -> None:
 
     # Only deregister if we registered a webhook (i.e., webhook mode was active)
     if _webhook_registered and _app is not None:
-        telegram_bot = _app.get("telegram_bot")
+        telegram_bot = _app.get(TELEGRAM_BOT_KEY)
         if telegram_bot is not None:
             try:
                 await telegram_bot.delete_webhook()
@@ -2249,7 +2282,7 @@ def add_allowed_chat_id(chat_id: int) -> None:
     _resolve_chat_id() until the next restart.
     """
     if _app is not None:
-        allowed = _app.get("allowed_user_ids")
+        allowed = _app.get(ALLOWED_USER_IDS_KEY)
         if allowed is not None:
             allowed.add(chat_id)
 
@@ -2262,7 +2295,7 @@ def remove_allowed_chat_id(chat_id: int) -> None:
     Called by bot.py when /github notify reset clears a notification
     destination. A user's own telegram_id must never be removed.
 
-    Important: config.allowed_user_ids and _app["allowed_user_ids"]
+    Important: config.allowed_user_ids and _app[ALLOWED_USER_IDS_KEY]
     are the SAME set object (assigned by reference at start()). We
     cannot use config.allowed_user_ids as the guard because any
     chat_id we previously added via add_allowed_chat_id() would also
@@ -2270,12 +2303,12 @@ def remove_allowed_chat_id(chat_id: int) -> None:
     by telegram_id, populated at load time, never mutated at runtime).
     """
     if _app is not None:
-        allowed = _app.get("allowed_user_ids")
+        allowed = _app.get(ALLOWED_USER_IDS_KEY)
         if allowed is None:
             return
         # Never remove a chat_id that belongs to an actual user.
         # user_configs keys are telegram_ids of real users.
-        config = _app.get("config")
+        config = _app.get(CONFIG_KEY)
         if config and chat_id in config.user_configs:
             return
         allowed.discard(chat_id)

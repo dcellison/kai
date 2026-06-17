@@ -13,6 +13,17 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from kai.config import UserConfig
 from kai.webhook import (
+    ALLOWED_USER_IDS_KEY,
+    ALLOWED_WORKSPACES_KEY,
+    CHAT_ID_KEY,
+    CONFIG_KEY,
+    PR_REVIEW_COOLDOWN_KEY,
+    PR_REVIEW_TIMEOUT_S_KEY,
+    SPEC_DIR_KEY,
+    TELEGRAM_BOT_KEY,
+    WEBHOOK_PORT_KEY,
+    WEBHOOK_SECRET_KEY,
+    WORKSPACE_BASE_KEY,
     _fmt_issue_comment,
     _fmt_issues,
     _fmt_pull_request,
@@ -404,24 +415,23 @@ def _build_test_app(
     Tests should mock sessions.resolve_github_settings to control these.
     """
     app = web.Application()
-    app["webhook_secret"] = _TEST_SECRET
-    app["pr_review_cooldown"] = cooldown
+    app[WEBHOOK_SECRET_KEY] = _TEST_SECRET
+    app[PR_REVIEW_COOLDOWN_KEY] = cooldown
     # Review subprocess resource limits (defaults match config.py).
-    app["pr_review_timeout_s"] = 900
+    app[PR_REVIEW_TIMEOUT_S_KEY] = 900
     # Config needed by review background tasks
-    app["webhook_port"] = 8080
-    app["claude_user"] = None
+    app[WEBHOOK_PORT_KEY] = 8080
     # Workspace config for review agent repo resolution. Tests that need
     # _resolve_local_repo() to return a specific path populate workspace_base
     # or allowed_workspaces; the default is empty so _mock_resolve_repo is
     # used for routing tests that don't care about the resolution result.
-    app["workspace_base"] = None
-    app["allowed_workspaces"] = []
-    app["spec_dir"] = "specs"
+    app[WORKSPACE_BASE_KEY] = None
+    app[ALLOWED_WORKSPACES_KEY] = []
+    app[SPEC_DIR_KEY] = "specs"
     # Mock bot that records sent messages
     mock_bot = AsyncMock()
-    app["telegram_bot"] = mock_bot
-    app["chat_id"] = 12345
+    app[TELEGRAM_BOT_KEY] = mock_bot
+    app[CHAT_ID_KEY] = 12345
     # Config for per-user routing. Default mock has no user_configs,
     # so all events fall through to admin chat_id.
     if config is None:
@@ -430,9 +440,9 @@ def _build_test_app(
         # get_user_config is synchronous in real Config; must not
         # return a coroutine. With no users configured, always None.
         mock_config.get_user_config = lambda uid: None
-        app["config"] = mock_config
+        app[CONFIG_KEY] = mock_config
     else:
-        app["config"] = config
+        app[CONFIG_KEY] = config
     app.router.add_post("/webhook/github", _handle_github)
     return app
 
@@ -510,7 +520,7 @@ class TestPRReviewRouting:
                 assert resp.status == 200
                 assert data["status"] == "ok"
                 # Should NOT have sent a Telegram notification (review task fires instead)
-                app["telegram_bot"].send_message.assert_not_called()
+                app[TELEGRAM_BOT_KEY].send_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_falls_through_when_disabled(self, _clear_cooldowns):
@@ -534,7 +544,7 @@ class TestPRReviewRouting:
                 assert resp.status == 200
                 # Falls through to _fmt_pull_request, which formats a notification
                 assert data.get("status") == "ok"
-                app["telegram_bot"].send_message.assert_called_once()
+                app[TELEGRAM_BOT_KEY].send_message.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_cooldown_skips_recent(self, _clear_cooldowns, _mock_resolve_repo):
@@ -629,7 +639,7 @@ class TestPRReviewRouting:
                 assert resp.status == 200
                 # Should fall through to _fmt_pull_request for the "closed" notification
                 assert data.get("status") == "ok"
-                app["telegram_bot"].send_message.assert_called_once()
+                app[TELEGRAM_BOT_KEY].send_message.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_synchronize_routed(self, _clear_cooldowns, _mock_resolve_repo):
@@ -703,8 +713,8 @@ class TestResolveLocalRepo:
         anvil_dir.mkdir()
 
         app = web.Application()
-        app["workspace_base"] = str(tmp_path)
-        app["allowed_workspaces"] = []
+        app[WORKSPACE_BASE_KEY] = str(tmp_path)
+        app[ALLOWED_WORKSPACES_KEY] = []
 
         result = await _resolve_local_repo("dcellison/anvil", app)
         assert result == str(anvil_dir)
@@ -716,8 +726,8 @@ class TestResolveLocalRepo:
         myrepo.mkdir()
 
         app = web.Application()
-        app["workspace_base"] = None
-        app["allowed_workspaces"] = [str(myrepo)]
+        app[WORKSPACE_BASE_KEY] = None
+        app[ALLOWED_WORKSPACES_KEY] = [str(myrepo)]
 
         result = await _resolve_local_repo("owner/myrepo", app)
         assert result == str(myrepo)
@@ -729,8 +739,8 @@ class TestResolveLocalRepo:
         history_repo.mkdir()
 
         app = web.Application()
-        app["workspace_base"] = None
-        app["allowed_workspaces"] = []
+        app[WORKSPACE_BASE_KEY] = None
+        app[ALLOWED_WORKSPACES_KEY] = []
 
         with patch(
             "kai.webhook.sessions.get_all_workspace_paths",
@@ -744,8 +754,8 @@ class TestResolveLocalRepo:
     async def test_no_match(self, tmp_path):
         """Returns None when no workspace matches the repo."""
         app = web.Application()
-        app["workspace_base"] = str(tmp_path)
-        app["allowed_workspaces"] = []
+        app[WORKSPACE_BASE_KEY] = str(tmp_path)
+        app[ALLOWED_WORKSPACES_KEY] = []
 
         with patch(
             "kai.webhook.sessions.get_all_workspace_paths",
@@ -759,8 +769,8 @@ class TestResolveLocalRepo:
     async def test_nonexistent_dir_skipped(self, tmp_path):
         """History entries pointing to deleted directories are skipped."""
         app = web.Application()
-        app["workspace_base"] = None
-        app["allowed_workspaces"] = []
+        app[WORKSPACE_BASE_KEY] = None
+        app[ALLOWED_WORKSPACES_KEY] = []
 
         with patch(
             "kai.webhook.sessions.get_all_workspace_paths",
@@ -777,8 +787,8 @@ class TestResolveLocalRepo:
         other_user_repo.mkdir()
 
         app = web.Application()
-        app["workspace_base"] = None
-        app["allowed_workspaces"] = []
+        app[WORKSPACE_BASE_KEY] = None
+        app[ALLOWED_WORKSPACES_KEY] = []
 
         with patch(
             "kai.webhook.sessions.get_all_workspace_paths",
@@ -872,7 +882,7 @@ class TestIssueTriageRouting:
                 assert resp.status == 200
                 assert data["status"] == "ok"
                 # Should NOT have sent a standard Telegram notification
-                app["telegram_bot"].send_message.assert_not_called()
+                app[TELEGRAM_BOT_KEY].send_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_falls_through_when_disabled(self, _clear_cooldowns):
@@ -895,7 +905,7 @@ class TestIssueTriageRouting:
                 await resp.json()
                 assert resp.status == 200
                 # Falls through to standard formatter, which sends a Telegram message
-                app["telegram_bot"].send_message.assert_called_once()
+                app[TELEGRAM_BOT_KEY].send_message.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_cooldown(self, _clear_cooldowns):
@@ -953,7 +963,7 @@ class TestIssueTriageRouting:
                 await resp.json()
                 assert resp.status == 200
                 # Closed events fall through to standard formatter
-                app["telegram_bot"].send_message.assert_called_once()
+                app[TELEGRAM_BOT_KEY].send_message.assert_called_once()
 
 
 # ── _handle_github exception handling ──────────────────────────────
@@ -967,7 +977,7 @@ class TestGitHubExceptionHandler:
         """An unhandled exception in event processing returns 500."""
         app = _build_test_app()
         # Remove telegram_bot to trigger KeyError in _process_github_event
-        del app["telegram_bot"]
+        del app[TELEGRAM_BOT_KEY]
         payload = {"action": "opened", "repository": {"full_name": "owner/repo"}}
         body = json.dumps(payload).encode()
         sig = _sign_payload(payload)
@@ -1176,7 +1186,7 @@ class TestGitHubNotifyGroup:
                 assert resp.status == 200
 
         # Notification should go to the group chat_id, not the default DM
-        call_args = app["telegram_bot"].send_message.call_args
+        call_args = app[TELEGRAM_BOT_KEY].send_message.call_args
         assert call_args[0][0] == -100999
 
     @pytest.mark.asyncio
@@ -1206,7 +1216,7 @@ class TestGitHubNotifyGroup:
                 assert resp.status == 200
 
         # Notification should go to the default admin DM (12345)
-        call_args = app["telegram_bot"].send_message.call_args
+        call_args = app[TELEGRAM_BOT_KEY].send_message.call_args
         assert call_args[0][0] == 12345
 
 
@@ -1467,7 +1477,7 @@ class TestPerUserRouting:
                 assert resp.status == 200
 
         # Notification should go to user 111, not the admin (12345)
-        call_args = app["telegram_bot"].send_message.call_args
+        call_args = app[TELEGRAM_BOT_KEY].send_message.call_args
         assert call_args[0][0] == 111
 
     @pytest.mark.asyncio
@@ -1517,8 +1527,8 @@ class TestPerUserRouting:
         # Resolver called once per subscribed user
         assert call_count == 2
         # Both users should receive notifications
-        assert app["telegram_bot"].send_message.call_count == 2
-        sent_to = {c[0][0] for c in app["telegram_bot"].send_message.call_args_list}
+        assert app[TELEGRAM_BOT_KEY].send_message.call_count == 2
+        sent_to = {c[0][0] for c in app[TELEGRAM_BOT_KEY].send_message.call_args_list}
         assert sent_to == {111, 222}
 
     @pytest.mark.asyncio
@@ -1551,7 +1561,7 @@ class TestPerUserRouting:
                 assert resp.status == 200
 
         # Should go to admin chat_id (12345), not user 111
-        call_args = app["telegram_bot"].send_message.call_args
+        call_args = app[TELEGRAM_BOT_KEY].send_message.call_args
         assert call_args[0][0] == 12345
 
     @pytest.mark.asyncio
@@ -1700,7 +1710,7 @@ class TestPerUserRouting:
                 assert resp.status == 200
 
         # Notification should go to the user's notify_chat_id, not their DM
-        call_args = app["telegram_bot"].send_message.call_args
+        call_args = app[TELEGRAM_BOT_KEY].send_message.call_args
         assert call_args[0][0] == -100999
 
     @pytest.mark.asyncio
@@ -1752,7 +1762,7 @@ class TestPerUserRouting:
         # Both users were attempted (resolve called twice)
         assert call_count == 2
         # User 2 still got their notification despite user 1's failure
-        call_args = app["telegram_bot"].send_message.call_args
+        call_args = app[TELEGRAM_BOT_KEY].send_message.call_args
         assert call_args[0][0] == 222
 
     # ── Per-user os_user resolution ─────────────────────────────
@@ -1875,7 +1885,7 @@ class TestPerUserRouting:
 
         # Return different notify_chat_id per caller so we can distinguish
         # wildcard routing (chat_id=111) from fallback routing (chat_id=12345).
-        # The fallback calls resolve_github_settings with app["chat_id"]=12345,
+        # The fallback calls resolve_github_settings with app[CHAT_ID_KEY]=12345,
         # the wildcard path calls with the admin's telegram_id=111.
         async def _per_caller_settings(chat_id, config):
             return {
@@ -1898,7 +1908,7 @@ class TestPerUserRouting:
                 assert resp.status == 200
 
         # Admin received the event via wildcard (111), not fallback (12345)
-        call_args = app["telegram_bot"].send_message.call_args
+        call_args = app[TELEGRAM_BOT_KEY].send_message.call_args
         assert call_args[0][0] == 111
 
     @pytest.mark.asyncio
@@ -1959,7 +1969,7 @@ class TestPerUserRouting:
                 assert resp.status == 200
 
         # Event goes to fallback admin (12345), not user 111
-        call_args = app["telegram_bot"].send_message.call_args
+        call_args = app[TELEGRAM_BOT_KEY].send_message.call_args
         assert call_args[0][0] == 12345
 
     @pytest.mark.asyncio
@@ -2081,12 +2091,12 @@ class TestAllowedChatIdMutations:
         import kai.webhook as wh
 
         app = web.Application()
-        app["allowed_user_ids"] = {100}
+        app[ALLOWED_USER_IDS_KEY] = {100}
         old_app = wh._app
         wh._app = app
         try:
             add_allowed_chat_id(999)
-            assert 999 in app["allowed_user_ids"]
+            assert 999 in app[ALLOWED_USER_IDS_KEY]
         finally:
             wh._app = old_app
 
@@ -2095,15 +2105,15 @@ class TestAllowedChatIdMutations:
         import kai.webhook as wh
 
         app = web.Application()
-        app["allowed_user_ids"] = {100}
+        app[ALLOWED_USER_IDS_KEY] = {100}
         old_app = wh._app
         wh._app = app
         try:
             add_allowed_chat_id(999)
             add_allowed_chat_id(999)
             # Sets don't have duplicates; just verify it's present
-            assert 999 in app["allowed_user_ids"]
-            assert len(app["allowed_user_ids"]) == 2  # {100, 999}
+            assert 999 in app[ALLOWED_USER_IDS_KEY]
+            assert len(app[ALLOWED_USER_IDS_KEY]) == 2  # {100, 999}
         finally:
             wh._app = old_app
 
@@ -2124,17 +2134,17 @@ class TestAllowedChatIdMutations:
         import kai.webhook as wh
 
         app = web.Application()
-        app["allowed_user_ids"] = {100, -100123}
+        app[ALLOWED_USER_IDS_KEY] = {100, -100123}
         # No config needed for this case - group IDs are never in user_configs
         mock_config = AsyncMock()
         mock_config.user_configs = {}
-        app["config"] = mock_config
+        app[CONFIG_KEY] = mock_config
         old_app = wh._app
         wh._app = app
         try:
             remove_allowed_chat_id(-100123)
-            assert -100123 not in app["allowed_user_ids"]
-            assert 100 in app["allowed_user_ids"]
+            assert -100123 not in app[ALLOWED_USER_IDS_KEY]
+            assert 100 in app[ALLOWED_USER_IDS_KEY]
         finally:
             wh._app = old_app
 
@@ -2147,14 +2157,14 @@ class TestAllowedChatIdMutations:
         mock_config.user_configs = {12345: user}
 
         app = web.Application()
-        app["allowed_user_ids"] = {12345, -100999}
-        app["config"] = mock_config
+        app[ALLOWED_USER_IDS_KEY] = {12345, -100999}
+        app[CONFIG_KEY] = mock_config
         old_app = wh._app
         wh._app = app
         try:
             remove_allowed_chat_id(12345)
             # 12345 is a real user - must NOT be removed
-            assert 12345 in app["allowed_user_ids"]
+            assert 12345 in app[ALLOWED_USER_IDS_KEY]
         finally:
             wh._app = old_app
 
