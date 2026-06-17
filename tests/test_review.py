@@ -2571,9 +2571,7 @@ class TestBudgetEnforcesGlobalCeiling:
         out = budget_review_context(ctx)
         assert _estimate_total_chars(out) <= _MAX_REVIEW_CONTEXT_CHARS
         cross_section_notes = [
-            n for n in out.budget_notes
-            if n.section == "CHANGED_FILES_AT_HEAD"
-            and "Cross-section ladder" in n.message
+            n for n in out.budget_notes if n.section == "CHANGED_FILES_AT_HEAD" and "Cross-section ladder" in n.message
         ]
         assert cross_section_notes == [], (
             "Cross-section ladder fired on a headroom-path bundle; "
@@ -2606,13 +2604,9 @@ class TestBudgetEnforcesGlobalCeiling:
         out = budget_review_context(ctx)
         assert _estimate_total_chars(out) <= _MAX_REVIEW_CONTEXT_CHARS
         cross_section_notes = [
-            n for n in out.budget_notes
-            if "Cross-section ladder" in n.message
-            or "under global ceiling" in n.message
+            n for n in out.budget_notes if "Cross-section ladder" in n.message or "under global ceiling" in n.message
         ]
-        assert cross_section_notes, (
-            "Floor-branch path did not invoke the cross-section ladder."
-        )
+        assert cross_section_notes, "Floor-branch path did not invoke the cross-section ladder."
 
     def test_pathological_bundle_emits_last_resort_note(self):
         # Forcing every section to overflow even after the ladder
@@ -2694,10 +2688,7 @@ class TestDynamicChangedFilesBudget:
             )
             for i in range(10)
         )
-        commits = tuple(
-            Commit(oid=f"{i:040x}", headline="h", body="x" * 1_950)
-            for i in range(10)
-        )
+        commits = tuple(Commit(oid=f"{i:040x}", headline="h", body="x" * 1_950) for i in range(10))
         big_issue = LinkedIssue(
             number=1,
             title="t",
@@ -2747,18 +2738,12 @@ class TestDynamicChangedFilesBudget:
             patch="P" * 156_000,
         )
         out = budget_review_context(ctx)
-        changed_files_notes = [
-            n for n in out.budget_notes
-            if n.section == "CHANGED_FILES_AT_HEAD"
-        ]
+        changed_files_notes = [n for n in out.budget_notes if n.section == "CHANGED_FILES_AT_HEAD"]
         assert changed_files_notes == [], (
-            f"Pinned large-PR fixture emitted CHANGED_FILES_AT_HEAD notes: "
-            f"{changed_files_notes}"
+            f"Pinned large-PR fixture emitted CHANGED_FILES_AT_HEAD notes: {changed_files_notes}"
         )
         for f in out.changed_files:
-            assert f.content is not None, (
-                f"{f.path} content was dropped under the lifted ceiling"
-            )
+            assert f.content is not None, f"{f.path} content was dropped under the lifted ceiling"
 
 
 class TestBundleCapLifts:
