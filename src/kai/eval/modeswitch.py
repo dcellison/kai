@@ -848,7 +848,7 @@ def _run_check() -> int:
     # Stats probe: 200 = enabled, 503 = disabled, anything else =
     # unexpected. Issue the request with NO `chat_id` query
     # parameter so the server falls back to its app-default
-    # (`request.app["chat_id"]` at webhook.py's _resolve_chat_id).
+    # (`request.app[CHAT_ID_KEY]` at webhook.py's _resolve_chat_id).
     # Earlier versions of this harness passed `chat_id=1` as a
     # placeholder, which fails: _resolve_chat_id runs after secret
     # auth but before the memory.is_enabled() branch, and rejects
