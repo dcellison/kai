@@ -33,7 +33,7 @@ tts = [
     "piper-tts>=1.4.0",
 ]
 totp = [
-    "pyotp>=2.9",
+    "pyotp>=2.10.0",
     "qrcode>=7.4",
 ]
 
