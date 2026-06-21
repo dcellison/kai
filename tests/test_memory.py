@@ -168,6 +168,20 @@ def real_memory_instance(tmp_path_factory):
 # ── Unit tests (mocked Mem0, fast) ─────────────────────────────────
 
 
+# Third-party warnings scoped to this class: qdrant-client's local
+# mode opens a transient `:memory:` sqlite inside a `with` block
+# during collection creation; mem0's init then deepcopies the
+# surrounding state and duplicates the sqlite handle, which goes out
+# of scope unclosed. mem0's huggingface embedder calls
+# sentence-transformers' deprecated `get_sentence_embedding_dimension`.
+# Both come from third-party code; the suppression is scoped to this
+# class so a future leak from in-tree sqlite or in-tree FutureWarning
+# still surfaces in the rest of the suite.
+@pytest.mark.filterwarnings(
+    "ignore:unclosed database in <sqlite3.Connection object:ResourceWarning",
+    "ignore:unclosed event loop:ResourceWarning",
+    "ignore:The `get_sentence_embedding_dimension` method has been renamed to `get_embedding_dimension`:FutureWarning",
+)
 class TestInitMemory:
     """Tests for init_memory() startup behavior."""
 
@@ -3546,6 +3560,14 @@ class TestGetAllFacts:
 
 
 @integration
+# Scoped to this class for the same reasons documented on
+# `TestInitMemory`: third-party warnings from mem0's huggingface
+# embedder and qdrant-client's transient sqlite handle.
+@pytest.mark.filterwarnings(
+    "ignore:unclosed database in <sqlite3.Connection object:ResourceWarning",
+    "ignore:unclosed event loop:ResourceWarning",
+    "ignore:The `get_sentence_embedding_dimension` method has been renamed to `get_embedding_dimension`:FutureWarning",
+)
 class TestMemoryIntegration:
     """End-to-end tests with a real Mem0 instance and Qdrant storage."""
 
