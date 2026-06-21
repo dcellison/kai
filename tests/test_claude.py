@@ -123,7 +123,8 @@ class TestCommandConstruction:
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
             mock_proc = MagicMock()
             mock_proc.returncode = None
-            mock_proc.stderr = AsyncMock()
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
             mock_exec.return_value = mock_proc
 
             await claude._ensure_started()
@@ -143,7 +144,8 @@ class TestCommandConstruction:
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
             mock_proc = MagicMock()
             mock_proc.returncode = None
-            mock_proc.stderr = AsyncMock()
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
             mock_exec.return_value = mock_proc
 
             await claude._ensure_started()
@@ -169,7 +171,8 @@ class TestCommandConstruction:
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
             mock_proc = MagicMock()
             mock_proc.returncode = None
-            mock_proc.stderr = AsyncMock()
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
             mock_exec.return_value = mock_proc
 
             await claude._ensure_started()
@@ -189,7 +192,8 @@ class TestCommandConstruction:
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
             mock_proc = MagicMock()
             mock_proc.returncode = None
-            mock_proc.stderr = AsyncMock()
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
             mock_exec.return_value = mock_proc
 
             with caplog.at_level("WARNING", logger="kai.config"):
@@ -221,7 +225,8 @@ class TestCommandConstruction:
         ):
             mock_proc = MagicMock()
             mock_proc.returncode = None
-            mock_proc.stderr = AsyncMock()
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
             mock_exec.return_value = mock_proc
 
             await claude._ensure_started()
@@ -252,7 +257,8 @@ class TestCommandConstruction:
         ):
             mock_proc = MagicMock()
             mock_proc.returncode = None
-            mock_proc.stderr = AsyncMock()
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
             mock_exec.return_value = mock_proc
 
             await claude._ensure_started()
@@ -277,7 +283,8 @@ class TestCommandConstruction:
         ):
             mock_proc = MagicMock()
             mock_proc.returncode = None
-            mock_proc.stderr = AsyncMock()
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
             mock_exec.return_value = mock_proc
 
             await claude._ensure_started()
@@ -299,7 +306,8 @@ class TestCommandConstruction:
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
             mock_proc = MagicMock()
             mock_proc.returncode = None
-            mock_proc.stderr = AsyncMock()
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
             mock_exec.return_value = mock_proc
 
             await claude._ensure_started()
@@ -327,7 +335,8 @@ class TestCommandConstruction:
         ):
             mock_proc = MagicMock()
             mock_proc.returncode = None
-            mock_proc.stderr = AsyncMock()
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
             mock_exec.return_value = mock_proc
 
             await claude._ensure_started()
@@ -357,7 +366,8 @@ class TestCommandConstruction:
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
             mock_proc = MagicMock()
             mock_proc.returncode = None
-            mock_proc.stderr = AsyncMock()
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
             mock_exec.return_value = mock_proc
 
             await claude._ensure_started()
@@ -377,7 +387,8 @@ class TestCommandConstruction:
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
             mock_proc = MagicMock()
             mock_proc.returncode = None
-            mock_proc.stderr = AsyncMock()
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
             mock_exec.return_value = mock_proc
 
             await claude._ensure_started()
@@ -395,7 +406,8 @@ class TestCommandConstruction:
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
             mock_proc = MagicMock()
             mock_proc.returncode = None
-            mock_proc.stderr = AsyncMock()
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
             mock_exec.return_value = mock_proc
 
             await claude._ensure_started()
@@ -413,7 +425,8 @@ class TestCommandConstruction:
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
             mock_proc = MagicMock()
             mock_proc.returncode = None
-            mock_proc.stderr = AsyncMock()
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
             mock_exec.return_value = mock_proc
 
             await claude._ensure_started()
@@ -434,7 +447,8 @@ class TestCommandConstruction:
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
             mock_proc = MagicMock()
             mock_proc.returncode = None
-            mock_proc.stderr = AsyncMock()
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
             mock_exec.return_value = mock_proc
 
             await claude._ensure_started()
@@ -458,7 +472,8 @@ class TestCommandConstruction:
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
             mock_proc = MagicMock()
             mock_proc.returncode = None
-            mock_proc.stderr = AsyncMock()
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
             mock_exec.return_value = mock_proc
 
             await claude._ensure_started()
@@ -485,7 +500,8 @@ class TestCommandConstruction:
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
             mock_proc = MagicMock()
             mock_proc.returncode = None
-            mock_proc.stderr = AsyncMock()
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
             mock_exec.return_value = mock_proc
 
             await claude._ensure_started()
@@ -504,7 +520,8 @@ class TestCommandConstruction:
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
             mock_proc = MagicMock()
             mock_proc.returncode = None
-            mock_proc.stderr = AsyncMock()
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
             mock_exec.return_value = mock_proc
 
             await claude._ensure_started()
@@ -529,7 +546,8 @@ class TestCommandConstruction:
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
             mock_proc = MagicMock()
             mock_proc.returncode = None
-            mock_proc.stderr = AsyncMock()
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
             mock_exec.return_value = mock_proc
 
             await claude._ensure_started()
@@ -945,7 +963,8 @@ class TestEnsureStarted:
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
             mock_proc = MagicMock()
             mock_proc.returncode = None
-            mock_proc.stderr = AsyncMock()
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
             mock_exec.return_value = mock_proc
 
             await claude._ensure_started()
@@ -969,7 +988,8 @@ class TestEnsureStarted:
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
             mock_proc = MagicMock()
             mock_proc.returncode = None
-            mock_proc.stderr = AsyncMock()
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
             mock_exec.return_value = mock_proc
 
             await claude._ensure_started()
@@ -986,7 +1006,8 @@ class TestEnsureStarted:
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
             mock_proc = MagicMock()
             mock_proc.returncode = None
-            mock_proc.stderr = AsyncMock()
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
             mock_exec.return_value = mock_proc
 
             await claude._ensure_started()
@@ -1002,7 +1023,8 @@ class TestEnsureStarted:
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
             mock_proc = MagicMock()
             mock_proc.returncode = None
-            mock_proc.stderr = AsyncMock()
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
             mock_exec.return_value = mock_proc
 
             before = time.monotonic()
@@ -1330,8 +1352,18 @@ class TestSendLockedErrors:
         claude._proc = proc
         claude._fresh_session = False
 
-        # Patch wait_for to propagate the TimeoutError
-        with patch("asyncio.wait_for", side_effect=TimeoutError):
+        # Production calls asyncio.wait_for(readline(), timeout=timeout);
+        # readline() has already constructed a coroutine by the time the
+        # patched wait_for runs. A bare `side_effect=TimeoutError` would
+        # raise without awaiting or closing that coroutine, leaking a
+        # never-awaited-coroutine warning. Close the supplied coroutine
+        # first, then raise. The *args/**kwargs shape tolerates
+        # production's keyword `timeout=` argument.
+        async def _timeout_after_closing(coro, *args, **kwargs):
+            coro.close()
+            raise TimeoutError
+
+        with patch("asyncio.wait_for", side_effect=_timeout_after_closing):
             events = await _collect_events(claude)
 
         assert events[-1].done is True
