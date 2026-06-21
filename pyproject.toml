@@ -84,4 +84,12 @@ filterwarnings = [
     # code path is entirely third-party. Filter only this exact
     # message rather than the whole ResourceWarning category.
     "ignore:unclosed database in <sqlite3.Connection object:ResourceWarning",
+    # mem0's huggingface embedder calls
+    # sentence-transformers' `get_sentence_embedding_dimension`,
+    # which the library renamed to `get_embedding_dimension` in a
+    # recent release. mem0 has not migrated. The warning is upstream
+    # noise; suppressing it does not hide any project-side issue.
+    # Filter narrowly by the exact message tail so a different rename
+    # (or a different deprecation entirely) still surfaces.
+    "ignore:The `get_sentence_embedding_dimension` method has been renamed to `get_embedding_dimension`:FutureWarning",
 ]
