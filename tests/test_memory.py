@@ -465,7 +465,14 @@ class TestInitMemory:
             init_memory(config)
             assert is_enabled()
 
-        # Reset and test with a mocked dimension mismatch
+        # Reset and test with a mocked dimension mismatch. Close
+        # before resetting so Mem0's history db and the Qdrant
+        # clients release cleanly; if we only dropped the singleton
+        # via _reset_memory_module(), the live Memory instance from
+        # the first init would no longer be reachable when the
+        # autouse _close_init_memory_after_test fixture runs, and the
+        # cleanup would fall back to GC finalization.
+        _close_init_memory()
         _reset_memory_module()
 
         mock_memory = MagicMock()
