@@ -439,8 +439,19 @@ def _build_test_app(
         # every chained attribute call (e.g. config.default_models.get(...))
         # return a coroutine, which then leaks as the
         # AsyncMockMixin._execute_mock_call never-awaited warning.
+        #
+        # The dataclass-shaped attribute defaults below let
+        # resolve_user_model() return a real string (the registry
+        # default for the selected backend) rather than a chained
+        # MagicMock. Without them, model_override would silently flow
+        # through to review_pr / triage_issue as a MagicMock instance,
+        # which the mocked downstream callers accept but real code
+        # would not.
         mock_config = MagicMock()
         mock_config.user_configs = {}
+        mock_config.default_models = {}
+        mock_config.agent_backend = "claude"
+        mock_config.llm_provider = ""
         # get_user_config is synchronous in real Config; must not
         # return a coroutine. With no users configured, always None.
         mock_config.get_user_config = lambda uid: None
@@ -698,6 +709,13 @@ class TestPRReviewRouting:
             assert call_kwargs[0][0] == payload
             assert call_kwargs[1]["webhook_port"] == 8080
             assert call_kwargs[1]["webhook_secret"] == _TEST_SECRET
+            # model_override must be a real string, not a mock. The
+            # dataclass-shaped defaults on the fixture config let
+            # resolve_user_model return the registry default for the
+            # claude backend (`sonnet`); a bare MagicMock config would
+            # silently pass a MagicMock instance here, vacuously
+            # satisfying mocked review_pr but failing under real code.
+            assert isinstance(call_kwargs[1]["model_override"], str)
             # _resolve_local_repo is mocked to return None here;
             # dedicated tests for resolution logic are in TestResolveLocalRepo.
             assert call_kwargs[1]["local_repo_path"] is None
@@ -1253,9 +1271,17 @@ class TestGetSubscribedUsers:
 
         Config is a sync dataclass; AsyncMock would make chained
         attribute calls return coroutines that never get awaited.
+
+        The dataclass-shaped attribute defaults make
+        `resolve_user_model()` return a real registry string rather
+        than a chained MagicMock; without them, model_override would
+        flow through routing tests as an opaque mock.
         """
         config = MagicMock()
         config.user_configs = user_configs if user_configs is not None else {}
+        config.default_models = {}
+        config.agent_backend = "claude"
+        config.llm_provider = ""
         return config
 
     def _make_user(
@@ -1454,9 +1480,19 @@ class TestPerUserRouting:
         attribute calls like `config.default_models.get(...)` return a
         coroutine instead of a value, which then surfaces as the
         AsyncMockMixin._execute_mock_call never-awaited warning.
+
+        The dataclass-shaped attribute defaults make
+        `resolve_user_model()` return a real registry string rather
+        than a chained MagicMock; without them, the routing tests
+        would pass model_override as an opaque mock into review_pr /
+        triage_issue, hiding any future regression that depended on
+        the override being a real string.
         """
         config = MagicMock()
         config.user_configs = {u.telegram_id: u for u in users}
+        config.default_models = {}
+        config.agent_backend = "claude"
+        config.llm_provider = ""
         # get_user_config returns the UserConfig for a given ID
         config.get_user_config = lambda uid: config.user_configs.get(uid)
         return config
