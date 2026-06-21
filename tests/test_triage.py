@@ -861,7 +861,7 @@ class TestApplyTriage:
             patch("kai.triage.asyncio.create_subprocess_exec", side_effect=mock_exec),
             patch("kai.triage.aiohttp.ClientSession") as mock_session_cls,
         ):
-            mock_session, mock_resp = _mock_aiohttp_session_post(status=200)
+            mock_session, _ = _mock_aiohttp_session_post(status=200)
             _attach_session_to_class(mock_session, mock_session_cls)
             await apply_triage(meta, result, 8080, "secret")
 
@@ -892,7 +892,7 @@ class TestApplyTriage:
             patch("kai.triage.asyncio.create_subprocess_exec", side_effect=mock_exec),
             patch("kai.triage.aiohttp.ClientSession") as mock_session_cls,
         ):
-            mock_session, mock_resp = _mock_aiohttp_session_post(status=200)
+            mock_session, _ = _mock_aiohttp_session_post(status=200)
             _attach_session_to_class(mock_session, mock_session_cls)
             await apply_triage(meta, result, 8080, "secret")
 
@@ -921,7 +921,7 @@ class TestApplyTriage:
             patch("kai.triage.asyncio.create_subprocess_exec", side_effect=mock_exec),
             patch("kai.triage.aiohttp.ClientSession") as mock_session_cls,
         ):
-            mock_session, mock_resp = _mock_aiohttp_session_post(status=200)
+            mock_session, _ = _mock_aiohttp_session_post(status=200)
             _attach_session_to_class(mock_session, mock_session_cls)
             await apply_triage(meta, result, 8080, "secret", projects_json=projects_json)
 
@@ -946,7 +946,7 @@ class TestApplyTriage:
             patch("kai.triage.asyncio.create_subprocess_exec", side_effect=mock_exec),
             patch("kai.triage.aiohttp.ClientSession") as mock_session_cls,
         ):
-            mock_session, mock_resp = _mock_aiohttp_session_post(status=200)
+            mock_session, _ = _mock_aiohttp_session_post(status=200)
             _attach_session_to_class(mock_session, mock_session_cls)
             await apply_triage(meta, result, 8080, "secret")
 
@@ -971,7 +971,7 @@ class TestApplyTriage:
             patch("kai.triage.asyncio.create_subprocess_exec", side_effect=mock_exec),
             patch("kai.triage.aiohttp.ClientSession") as mock_session_cls,
         ):
-            mock_session, mock_resp = _mock_aiohttp_session_post(status=200)
+            mock_session, _ = _mock_aiohttp_session_post(status=200)
             _attach_session_to_class(mock_session, mock_session_cls)
             await apply_triage(meta, result, 8080, "secret")
 
@@ -993,7 +993,7 @@ class TestApplyTriage:
             patch("kai.triage.asyncio.create_subprocess_exec", side_effect=mock_exec),
             patch("kai.triage.aiohttp.ClientSession") as mock_session_cls,
         ):
-            mock_session, mock_resp = _mock_aiohttp_session_post(status=200)
+            mock_session, _ = _mock_aiohttp_session_post(status=200)
             _attach_session_to_class(mock_session, mock_session_cls)
             await apply_triage(meta, result, 8080, "secret")
 
@@ -1024,7 +1024,7 @@ class TestApplyTriage:
             patch("kai.triage.asyncio.create_subprocess_exec", side_effect=mock_exec),
             patch("kai.triage.aiohttp.ClientSession") as mock_session_cls,
         ):
-            mock_session, mock_resp = _mock_aiohttp_session_post(status=200)
+            mock_session, _ = _mock_aiohttp_session_post(status=200)
             _attach_session_to_class(mock_session, mock_session_cls)
             await apply_triage(meta, result, 8080, "secret")
 
@@ -1049,7 +1049,7 @@ class TestApplyTriage:
             patch("kai.triage.asyncio.create_subprocess_exec", side_effect=mock_exec),
             patch("kai.triage.aiohttp.ClientSession") as mock_session_cls,
         ):
-            mock_session, mock_resp = _mock_aiohttp_session_post(status=200)
+            mock_session, _ = _mock_aiohttp_session_post(status=200)
             _attach_session_to_class(mock_session, mock_session_cls)
             await apply_triage(meta, result, 8080, "secret")
 
@@ -1084,7 +1084,7 @@ async def _apply_triage_capture(meta: IssueMetadata, result: dict, **kwargs) -> 
         patch("kai.triage.asyncio.create_subprocess_exec", side_effect=mock_exec),
         patch("kai.triage.aiohttp.ClientSession") as mock_session_cls,
     ):
-        mock_session, mock_resp = _mock_aiohttp_session_post(status=200)
+        mock_session, _ = _mock_aiohttp_session_post(status=200)
         _attach_session_to_class(mock_session, mock_session_cls)
         await apply_triage(meta, result, 8080, "secret", **kwargs)
         if mock_session.post.called:
@@ -1161,7 +1161,7 @@ class TestTriageActionability:
             patch("kai.triage.asyncio.create_subprocess_exec", side_effect=mock_exec),
             patch("kai.triage.aiohttp.ClientSession") as mock_session_cls,
         ):
-            mock_session, mock_resp = _mock_aiohttp_session_post(status=200)
+            mock_session, _ = _mock_aiohttp_session_post(status=200)
             _attach_session_to_class(mock_session, mock_session_cls)
             await apply_triage(meta, result, 8080, "secret")
 
@@ -1551,7 +1551,7 @@ class TestTriageIssue:
             patch("kai.triage.asyncio.create_subprocess_exec", side_effect=mock_exec),
             patch("kai.triage.aiohttp.ClientSession") as mock_session_cls,
         ):
-            mock_session, mock_resp = _mock_aiohttp_session_post(status=200)
+            mock_session, _ = _mock_aiohttp_session_post(status=200)
             _attach_session_to_class(mock_session, mock_session_cls)
             await triage_issue(payload, 8080, "secret")
 
@@ -1575,7 +1575,7 @@ class TestTriageIssue:
             patch("kai.triage.asyncio.create_subprocess_exec", side_effect=mock_exec),
             patch("kai.triage.aiohttp.ClientSession") as mock_session_cls,
         ):
-            mock_session, mock_resp = _mock_aiohttp_session_post(status=200)
+            mock_session, _ = _mock_aiohttp_session_post(status=200)
             _attach_session_to_class(mock_session, mock_session_cls)
             # Should not raise
             await triage_issue(payload, 8080, "secret")
@@ -1599,7 +1599,7 @@ class TestTriageIssue:
             patch("kai.triage.asyncio.create_subprocess_exec", side_effect=mock_exec),
             patch("kai.triage.aiohttp.ClientSession") as mock_session_cls,
         ):
-            mock_session, mock_resp = _mock_aiohttp_session_post(status=200)
+            mock_session, _ = _mock_aiohttp_session_post(status=200)
             _attach_session_to_class(mock_session, mock_session_cls)
             await triage_issue(payload, 8080, "secret")
 

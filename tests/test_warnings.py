@@ -39,8 +39,7 @@ def test_async_mock_warning_bucket_stays_empty():
     # would report zero leaks and the regression guard would pass for
     # the wrong reason.
     assert proc.returncode == 0, (
-        f"Subprocess pytest exited {proc.returncode}; warning count "
-        f"cannot be trusted. Captured output:\n{combined}"
+        f"Subprocess pytest exited {proc.returncode}; warning count cannot be trusted. Captured output:\n{combined}"
     )
     leaks = combined.count("AsyncMockMixin._execute_mock_call")
     assert leaks == 0, (
