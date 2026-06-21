@@ -1628,14 +1628,22 @@ class TestSendErrorNotification:
             labels=[],
         )
 
-        mock_session = AsyncMock()
-        mock_session.post = AsyncMock(side_effect=ConnectionError("refused"))
+        # session.post() is a sync call in production; the side effect
+        # must fire when the call itself runs, not when an awaited
+        # coroutine resumes. AsyncMock would queue the exception on
+        # the unawaited coroutine and never raise, letting the test
+        # pass for the wrong reason (and leaking a never-awaited
+        # coroutine warning). MagicMock raises synchronously.
+        mock_session = MagicMock()
+        mock_session.post = MagicMock(side_effect=ConnectionError("refused"))
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
         mock_session.__aexit__ = AsyncMock(return_value=False)
 
         with patch("kai.triage.aiohttp.ClientSession", return_value=mock_session):
             # Should not raise
             await _send_error_notification(metadata, "test error", 8080, "secret")
+
+        mock_session.post.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_does_not_raise_on_timeout(self):
@@ -1651,13 +1659,15 @@ class TestSendErrorNotification:
             labels=[],
         )
 
-        mock_session = AsyncMock()
-        mock_session.post = AsyncMock(side_effect=TimeoutError())
+        mock_session = MagicMock()
+        mock_session.post = MagicMock(side_effect=TimeoutError())
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
         mock_session.__aexit__ = AsyncMock(return_value=False)
 
         with patch("kai.triage.aiohttp.ClientSession", return_value=mock_session):
             await _send_error_notification(metadata, "test error", 8080, "secret")
+
+        mock_session.post.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_logs_warning_on_failure(self, caplog):
@@ -1672,8 +1682,8 @@ class TestSendErrorNotification:
             labels=[],
         )
 
-        mock_session = AsyncMock()
-        mock_session.post = AsyncMock(side_effect=RuntimeError("boom"))
+        mock_session = MagicMock()
+        mock_session.post = MagicMock(side_effect=RuntimeError("boom"))
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
         mock_session.__aexit__ = AsyncMock(return_value=False)
 
@@ -1683,6 +1693,7 @@ class TestSendErrorNotification:
         ):
             await _send_error_notification(metadata, "test error", 8080, "secret")
 
+        mock_session.post.assert_called_once()
         assert "Failed to send triage error notification" in caplog.text
 
     @pytest.mark.asyncio
