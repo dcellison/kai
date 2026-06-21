@@ -1,18 +1,28 @@
-"""Regression guard for the async-mock warning bucket from issue 532.
+"""Regression guard for the async-mock warning bucket from issues 532 and 712.
 
 When this test fails, a new test has reintroduced the
-`AsyncMockMixin._execute_mock_call was never awaited` pattern in the
-two files this guard covers. Either fix the mock setup at the site
+`AsyncMockMixin._execute_mock_call was never awaited` pattern in one
+of the files this guard covers. Either fix the mock setup at the site
 that emits the warning, or remove this test if the maintenance burden
 is no longer worthwhile.
 
-The guard is scoped to `tests/test_triage.py` and
-`tests/test_claude.py`, which is where issue 532 surfaced the
-async-mock bucket and where this guard's accompanying migrations
-landed. Other files (notably `tests/test_webhook.py`) have a
-separate, aiohttp-fixture-teardown root cause and are tracked
-independently; do not extend this guard to cover them without first
-investigating that distinct shape.
+The guard is scoped to the test files where the bucket was identified
+and cleared (PR #711 for issue 532; the PR closing issue 712 for the
+remaining files). New files added to the suite that misuse AsyncMock
+will not be caught here automatically; extend the file list below
+when adding the same shape of fix elsewhere.
+
+The two recurring root shapes the guard catches:
+
+1. AsyncMock-where-MagicMock-was-needed: a sync interface (e.g. a
+   Config dataclass, an aiohttp.ClientSession's `.post(...)` call)
+   mocked with AsyncMock, so calling it returns an unawaited
+   coroutine that production then misuses (assigns to a value,
+   passes to `async with`, etc.).
+2. wait_for-leaks-coroutine: a patched `asyncio.wait_for` with a
+   bare `side_effect=TimeoutError` that raises without closing the
+   already-constructed coroutine production passed to it. The fix is
+   a coroutine-closing helper.
 
 The guard runs a focused pytest subprocess so the warning capture
 stays independent of the parent pytest's warning filters, which is
@@ -23,8 +33,20 @@ mask the inner warnings.
 import subprocess
 import sys
 
+# Files covered by the regression guard. Add a file here when a new
+# test in it gets fixed for the same async-mock leak pattern, so future
+# regressions surface immediately.
+_GUARDED_FILES = (
+    "tests/test_triage.py",
+    "tests/test_claude.py",
+    "tests/test_webhook.py",
+    "tests/test_review.py",
+    "tests/test_tts.py",
+    "tests/test_transcribe.py",
+)
 
-def test_async_mock_warning_bucket_empty_in_triage_and_claude_tests():
+
+def test_async_mock_warning_bucket_empty_across_guarded_files():
     proc = subprocess.run(
         [
             sys.executable,
@@ -33,8 +55,7 @@ def test_async_mock_warning_bucket_empty_in_triage_and_claude_tests():
             "-W",
             "default",
             "--quiet",
-            "tests/test_triage.py",
-            "tests/test_claude.py",
+            *_GUARDED_FILES,
         ],
         capture_output=True,
         text=True,

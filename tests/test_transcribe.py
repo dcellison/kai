@@ -64,9 +64,18 @@ class TestRun:
     async def test_timeout(self):
         """Timeout kills process and raises TranscriptionError."""
         proc = _make_proc()
+
+        async def _timeout_after_closing(coro, *args, **kwargs):
+            # Close the coroutine production created via proc.communicate()
+            # before raising; a bare side_effect=TimeoutError would leak
+            # the unawaited coroutine and surface as the
+            # AsyncMockMixin._execute_mock_call warning.
+            coro.close()
+            raise TimeoutError
+
         with (
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=proc),
-            patch("asyncio.wait_for", side_effect=TimeoutError),
+            patch("asyncio.wait_for", side_effect=_timeout_after_closing),
             pytest.raises(TranscriptionError, match="timed out"),
         ):
             await _run("ffmpeg", label="ffmpeg")

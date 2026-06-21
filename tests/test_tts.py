@@ -96,9 +96,18 @@ class TestSynthesizePiper:
     async def test_piper_timeout(self, tmp_path, tts_tmpdir):
         model_dir = _model_path(tmp_path)
         proc = _make_proc()
+
+        async def _timeout_after_closing(coro, *args, **kwargs):
+            # Close the coroutine production created via proc.communicate(...)
+            # before raising; a bare side_effect=TimeoutError would leak
+            # the unawaited coroutine and surface as the
+            # AsyncMockMixin._execute_mock_call warning.
+            coro.close()
+            raise TimeoutError
+
         with (
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=proc),
-            patch("asyncio.wait_for", side_effect=TimeoutError),
+            patch("asyncio.wait_for", side_effect=_timeout_after_closing),
             pytest.raises(TTSError, match="timed out"),
         ):
             await synthesize_speech("hello", model_dir)
@@ -174,7 +183,10 @@ class TestSynthesizeFfmpeg:
             if wait_for_count == 1:
                 # Piper's communicate - let it through
                 return await original_wait_for(coro, timeout=timeout)
-            # ffmpeg's communicate - timeout
+            # ffmpeg's communicate - timeout. Close the supplied
+            # coroutine before raising so the patched wait_for does
+            # not leak an unawaited AsyncMock coroutine.
+            coro.close()
             raise TimeoutError
 
         with (

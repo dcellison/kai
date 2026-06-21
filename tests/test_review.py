@@ -1024,9 +1024,9 @@ class TestSendReviewSummary:
         """Success summary includes PR link and title."""
         meta = _metadata(repo="owner/repo", number=42, title="Add feature X")
 
-        mock_resp = AsyncMock()
+        mock_resp = MagicMock()
         mock_resp.status = 200
-        mock_session = AsyncMock()
+        mock_session = MagicMock()
         mock_session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
         mock_session.post.return_value.__aexit__ = AsyncMock(return_value=False)
 
@@ -1036,6 +1036,7 @@ class TestSendReviewSummary:
             await send_review_summary(meta, True, 8080, "secret")
 
         # Verify the POST was made with correct URL and content
+        assert mock_session.post.called
         call_args = mock_session.post.call_args
         assert "localhost:8080/api/send-message" in call_args[0][0]
         body = call_args[1]["json"]
@@ -1048,9 +1049,9 @@ class TestSendReviewSummary:
         """Failure summary says 'Failed to review'."""
         meta = _metadata()
 
-        mock_resp = AsyncMock()
+        mock_resp = MagicMock()
         mock_resp.status = 200
-        mock_session = AsyncMock()
+        mock_session = MagicMock()
         mock_session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
         mock_session.post.return_value.__aexit__ = AsyncMock(return_value=False)
 
@@ -1059,6 +1060,7 @@ class TestSendReviewSummary:
             mock_cs.return_value.__aexit__ = AsyncMock(return_value=False)
             await send_review_summary(meta, False, 8080, "secret")
 
+        assert mock_session.post.called
         body = mock_session.post.call_args[1]["json"]
         assert "Failed to review" in body["text"]
 
@@ -1076,9 +1078,14 @@ class TestSendReviewSummary:
         """When notify_chat_id is set, chat_id is included in the POST body."""
         meta = _metadata()
 
-        mock_resp = AsyncMock()
+        # session.post() is a sync call returning an async context
+        # manager. MagicMock keeps the call return synchronous; an
+        # AsyncMock session would make .post() return a coroutine
+        # that production then tries to use as `async with`, leaking
+        # the AsyncMockMixin._execute_mock_call warning.
+        mock_resp = MagicMock()
         mock_resp.status = 200
-        mock_session = AsyncMock()
+        mock_session = MagicMock()
         mock_session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
         mock_session.post.return_value.__aexit__ = AsyncMock(return_value=False)
 
@@ -1087,6 +1094,7 @@ class TestSendReviewSummary:
             mock_cs.return_value.__aexit__ = AsyncMock(return_value=False)
             await send_review_summary(meta, True, 8080, "secret", notify_chat_id=-100123)
 
+        assert mock_session.post.called
         body = mock_session.post.call_args[1]["json"]
         assert body["chat_id"] == -100123
 
@@ -1095,9 +1103,9 @@ class TestSendReviewSummary:
         """When notify_chat_id is None, chat_id is NOT in the POST body."""
         meta = _metadata()
 
-        mock_resp = AsyncMock()
+        mock_resp = MagicMock()
         mock_resp.status = 200
-        mock_session = AsyncMock()
+        mock_session = MagicMock()
         mock_session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
         mock_session.post.return_value.__aexit__ = AsyncMock(return_value=False)
 
@@ -1106,6 +1114,7 @@ class TestSendReviewSummary:
             mock_cs.return_value.__aexit__ = AsyncMock(return_value=False)
             await send_review_summary(meta, True, 8080, "secret", notify_chat_id=None)
 
+        assert mock_session.post.called
         body = mock_session.post.call_args[1]["json"]
         assert "chat_id" not in body
 

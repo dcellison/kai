@@ -5,7 +5,7 @@ import dataclasses
 import hashlib
 import hmac
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -435,7 +435,11 @@ def _build_test_app(
     # Config for per-user routing. Default mock has no user_configs,
     # so all events fall through to admin chat_id.
     if config is None:
-        mock_config = AsyncMock()
+        # Config is a sync dataclass. Using AsyncMock here would make
+        # every chained attribute call (e.g. config.default_models.get(...))
+        # return a coroutine, which then leaks as the
+        # AsyncMockMixin._execute_mock_call never-awaited warning.
+        mock_config = MagicMock()
         mock_config.user_configs = {}
         # get_user_config is synchronous in real Config; must not
         # return a coroutine. With no users configured, always None.
@@ -1240,14 +1244,17 @@ class TestGetSubscribedUsers:
         with patch("kai.webhook.sessions.get_effective_repos", side_effect=_passthrough):
             yield
 
-    def _make_config(self, user_configs: dict | None = None) -> AsyncMock:
+    def _make_config(self, user_configs: dict | None = None) -> MagicMock:
         """Build a mock Config with the given user_configs dict.
 
         Post-#565 tranche A `Config.user_configs` is a non-optional
         dict; a None argument here is coerced to `{}` to preserve the
         empty-dict test ergonomics callers expect.
+
+        Config is a sync dataclass; AsyncMock would make chained
+        attribute calls return coroutines that never get awaited.
         """
-        config = AsyncMock()
+        config = MagicMock()
         config.user_configs = user_configs if user_configs is not None else {}
         return config
 
@@ -1440,9 +1447,15 @@ class TestPerUserRouting:
             role=role,
         )
 
-    def _make_config_with_users(self, users: list) -> AsyncMock:
-        """Build a mock Config with user_configs populated."""
-        config = AsyncMock()
+    def _make_config_with_users(self, users: list) -> MagicMock:
+        """Build a mock Config with user_configs populated.
+
+        Config is a sync dataclass; using AsyncMock would make chained
+        attribute calls like `config.default_models.get(...)` return a
+        coroutine instead of a value, which then surfaces as the
+        AsyncMockMixin._execute_mock_call never-awaited warning.
+        """
+        config = MagicMock()
         config.user_configs = {u.telegram_id: u for u in users}
         # get_user_config returns the UserConfig for a given ID
         config.get_user_config = lambda uid: config.user_configs.get(uid)
@@ -2136,7 +2149,7 @@ class TestAllowedChatIdMutations:
         app = web.Application()
         app[ALLOWED_USER_IDS_KEY] = {100, -100123}
         # No config needed for this case - group IDs are never in user_configs
-        mock_config = AsyncMock()
+        mock_config = MagicMock()
         mock_config.user_configs = {}
         app[CONFIG_KEY] = mock_config
         old_app = wh._app
@@ -2153,7 +2166,7 @@ class TestAllowedChatIdMutations:
         import kai.webhook as wh
 
         user = UserConfig(telegram_id=12345, name="alice")
-        mock_config = AsyncMock()
+        mock_config = MagicMock()
         mock_config.user_configs = {12345: user}
 
         app = web.Application()
