@@ -73,3 +73,15 @@ markers = [
     "integration: marks tests requiring optional dependencies (deselect with -m 'not integration')",
     "routing_test: codex routing-policy tests that opt out of the test-level same-user bypass",
 ]
+filterwarnings = [
+    # qdrant-client local mode opens a transient `:memory:` sqlite
+    # inside a `with` block during collection creation
+    # (qdrant_client/local/persistence.py). mem0's init machinery then
+    # deepcopies the surrounding state, which duplicates the sqlite
+    # handle without sharing the lifecycle; the duplicate goes out of
+    # scope unclosed and surfaces this warning. The original handle
+    # is closed by the `with` block, no real resource leaks, and the
+    # code path is entirely third-party. Filter only this exact
+    # message rather than the whole ResourceWarning category.
+    "ignore:unclosed database in <sqlite3.Connection object:ResourceWarning",
+]
