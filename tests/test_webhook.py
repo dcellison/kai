@@ -504,6 +504,27 @@ def _mock_settings(
     )
 
 
+@pytest.fixture
+def _mock_review_and_triage():
+    """Mock review.review_pr and triage.triage_issue at module scope.
+
+    The webhook routing tests trigger background-task creation
+    (`asyncio.create_task(review.review_pr(...))`). Without the mock,
+    the real review_pr spawns a `gh pr diff` subprocess via
+    `fetch_pr_diff`. The test exits before that background task
+    completes, the event loop closes, the subprocess transport never
+    sees a clean close, and the OS-level pipes leak as
+    ResourceWarning chatter (`unclosed transport`, `unclosed file`).
+    Mocking both functions keeps the routing path fully simulated and
+    avoids any real subprocess spawn.
+    """
+    with (
+        patch("kai.webhook.review.review_pr", new_callable=AsyncMock) as mock_review,
+        patch("kai.webhook.triage.triage_issue", new_callable=AsyncMock) as mock_triage,
+    ):
+        yield mock_review, mock_triage
+
+
 class TestPRReviewRouting:
     """Integration tests for PR review routing in _handle_github.
 
@@ -512,6 +533,11 @@ class TestPRReviewRouting:
     user_configs, so all events hit the fallback path (admin chat_id)
     and the mocked settings control whether review/triage triggers.
     """
+
+    @pytest.fixture(autouse=True)
+    def _stub_review_and_triage(self, _mock_review_and_triage):
+        """Default routing tests do not need real review_pr / triage_issue."""
+        yield
 
     @pytest.mark.asyncio
     async def test_routes_opened_when_enabled(self, _clear_cooldowns, _mock_resolve_repo):
