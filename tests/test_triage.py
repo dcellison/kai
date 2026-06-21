@@ -85,6 +85,40 @@ def _mock_subprocess(stdout: str = "", returncode: int = 0, stderr: str = ""):
     return mock_proc
 
 
+def _mock_aiohttp_session_post(status: int = 200) -> tuple[MagicMock, MagicMock]:
+    """Build a mocked aiohttp ClientSession for the
+    `async with session, session.post(...)` pattern.
+
+    Returns (session, response). The session is a MagicMock so its
+    `.post(...)` call returns an object that supports the async
+    context manager protocol directly; the response is a MagicMock
+    with `.status` defaulted to the supplied value. Pair with a
+    `patch("kai.triage.aiohttp.ClientSession")` context manager and
+    wire the patched class via `_attach_session_to_class()`.
+
+    The bare `AsyncMock()` predecessor of this helper made
+    `session.post` itself an AsyncMock, so the production
+    `async with session.post(...) as resp:` evaluated `__aenter__`
+    on an unawaited coroutine and silently failed inside the
+    surrounding `try / except Exception:`. The helper uses a
+    MagicMock session so `.post(...)` returns a normal object whose
+    `__aenter__` resolves to the configured response.
+    """
+    session = MagicMock()
+    response = MagicMock()
+    response.status = status
+    session.post.return_value.__aenter__ = AsyncMock(return_value=response)
+    session.post.return_value.__aexit__ = AsyncMock(return_value=None)
+    return session, response
+
+
+def _attach_session_to_class(session: MagicMock, mock_cls: MagicMock) -> None:
+    """Wire a patched `aiohttp.ClientSession` mock class to yield
+    `session` from `async with aiohttp.ClientSession() as session:`."""
+    mock_cls.return_value.__aenter__ = AsyncMock(return_value=session)
+    mock_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+
+
 # ── extract_issue_metadata ──────────────────────────────────────────
 
 
