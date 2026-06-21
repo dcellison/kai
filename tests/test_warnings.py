@@ -1,22 +1,30 @@
 """Regression guard for the async-mock warning bucket from issue 532.
 
 When this test fails, a new test has reintroduced the
-`AsyncMockMixin._execute_mock_call was never awaited` pattern. Either
-fix the mock setup at the site that emits the warning, or remove this
-test if the maintenance burden is no longer worthwhile.
+`AsyncMockMixin._execute_mock_call was never awaited` pattern in the
+two files this guard covers. Either fix the mock setup at the site
+that emits the warning, or remove this test if the maintenance burden
+is no longer worthwhile.
 
-The guard runs a focused pytest subprocess against the two files that
-historically carried the warning bucket. The subprocess form keeps the
-warning capture independent of the parent pytest's warning filters,
-which is necessary because pytest's `-W` flag at the outer level can
-otherwise mask the inner warnings.
+The guard is scoped to `tests/test_triage.py` and
+`tests/test_claude.py`, which is where issue 532 surfaced the
+async-mock bucket and where this guard's accompanying migrations
+landed. Other files (notably `tests/test_webhook.py`) have a
+separate, aiohttp-fixture-teardown root cause and are tracked
+independently; do not extend this guard to cover them without first
+investigating that distinct shape.
+
+The guard runs a focused pytest subprocess so the warning capture
+stays independent of the parent pytest's warning filters, which is
+necessary because pytest's `-W` flag at the outer level can otherwise
+mask the inner warnings.
 """
 
 import subprocess
 import sys
 
 
-def test_async_mock_warning_bucket_stays_empty():
+def test_async_mock_warning_bucket_empty_in_triage_and_claude_tests():
     proc = subprocess.run(
         [
             sys.executable,
