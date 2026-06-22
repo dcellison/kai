@@ -1831,8 +1831,11 @@ class TestCmdConfig:
         # With a canonical users.yaml already present the wizard skips the
         # user-creation prompts entirely and never stages a new file, so
         # no admin prompt is shown and no top-level staging key is written.
+        # The user-setup section also stays silent (no bare header) because
+        # there is nothing to do and no stray leftover to warn about.
         output = capsys.readouterr().out
         assert "Admin Telegram ID" not in output
+        assert "-- User setup --" not in output
         assert "users_yaml_staging_path" not in conf
 
     def test_validates_required_fields(self):

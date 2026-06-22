@@ -898,15 +898,25 @@ def _cmd_config() -> None:
     # `PROJECT_ROOT/users.yaml` from a previous install cycle is
     # ignored; a one-line deprecation warning tells the operator to
     # remove it or move it to the canonical location.
-    print("-- User setup --")
     stray_project_users_yaml = PROJECT_ROOT / "users.yaml"
     if deployment_mode == "protected":
         users_yaml_path = USERS_YAML
     else:
         users_yaml_path = _xdg_users_yaml_path()
-    if stray_project_users_yaml.exists():
-        print(f"  Note: {stray_project_users_yaml} is no longer used. Move it to {users_yaml_path} or remove it.")
     users_yaml_exists = users_yaml_path.exists()
+    stray_note = (
+        f"  Note: {stray_project_users_yaml} is no longer used. Move it to {users_yaml_path} or remove it."
+        if stray_project_users_yaml.exists()
+        else None
+    )
+    # The user-setup section emits output only when there is something to
+    # do: a first-time install (the admin prompts below run) or a stray
+    # leftover to warn about. When the canonical users.yaml already
+    # exists the wizard leaves it untouched, so it prints no bare header.
+    if not users_yaml_exists or stray_note:
+        print("-- User setup --")
+    if stray_note:
+        print(stray_note)
 
     # Admin os_user captured by the advanced-mode prompt block below.
     # Carried in scope here so the codex-memory branch can reuse it
@@ -932,9 +942,8 @@ def _cmd_config() -> None:
     # the canonical file from a no-longer-current staging artifact.
     users_yaml_staging_path: str | None = None
 
-    # When the canonical users.yaml already exists the wizard leaves it
-    # untouched (edit it directly or use the Telegram commands), so the
-    # admin-identity prompts below run only on a first-time install.
+    # First-time install only: collect the admin identity and stage a
+    # users.yaml. An existing canonical file is left untouched.
     if not users_yaml_exists:
         while True:
             admin_telegram_id = _prompt(
