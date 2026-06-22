@@ -197,6 +197,82 @@ def _prompt_choice(label: str, choices: list[str], default: str = "") -> str:
         print(f"  Please choose one of: {choices_str}")
 
 
+def _prompt_optional_choice(
+    label: str,
+    choices: list[str],
+    default: str = "",
+    empty_hint: str = "empty = default",
+) -> str:
+    """
+    Prompt the user to pick from a list of valid choices, with empty
+    input promoted to a first-class valid answer.
+
+    Use for set-or-absent settings where absence has its own meaning:
+    omitting the variable from install.conf is the signal to let the
+    downstream consumer use its own default. The Codex effort prompt
+    is the seed call site; absence means CodexBackend skips the
+    `-c model_reasoning_effort` override and codex falls back to the
+    per-OS-user `~/.codex/config.toml` or the model default.
+
+    The prefill is normalized via `.strip().lower()` before the `in
+    choices` check, mirroring the runtime config parser's tolerance
+    for copy-paste-shaped values. A prefill that lands in `choices`
+    after normalization round-trips on Enter and is displayed in its
+    canonical lowercased form. A prefill that does not match after
+    normalization is treated as no prefill: the inline hint advertises
+    the empty-default path, and Enter returns "".
+
+    Display:
+        - With a usable prefill:    `label (a/b/c) [b]: `
+        - Without a usable prefill: `label (a/b/c, empty = default): `
+
+    Args:
+        label: The prompt text shown to the user.
+        choices: List of valid string values. Membership is checked
+            case-sensitively after the caller's input is lowercased,
+            so `choices` should contain canonical lowercase entries.
+        default: Prefill candidate. Normalized via `.strip().lower()`
+            before the membership check. An out-of-list value after
+            normalization is treated as no default.
+        empty_hint: Phrase shown inline next to the choices in the
+            no-prefill display path, and repeated in the re-prompt on
+            invalid input. Default "empty = default" is generic;
+            callers should pass a site-specific phrase like
+            "empty = codex default" so the operator sees the semantics
+            in their own terms.
+
+    Returns:
+        The chosen value (guaranteed to be in `choices`), or "" when
+        the operator explicitly leaves the answer empty AND there is
+        no usable prefill.
+    """
+    choices_str = "/".join(choices)
+    # Match the runtime config parser's tolerance for copy-paste-shaped
+    # values (pinned by test_uppercase_and_whitespace_normalized in the
+    # codex-effort config tests) so a re-run of `make config` with a
+    # value like "  HIGH " sitting in /etc/kai/env keeps the existing
+    # setting instead of silently treating it as out-of-list and
+    # dropping it.
+    effective_default = default.strip().lower()
+    if effective_default in choices:
+        prompt_text = f"{label} ({choices_str}) [{effective_default}]: "
+    else:
+        # No usable prefill: advertise the empty-default path inline
+        # so a first-time operator does not have to guess that empty
+        # is a valid answer. The empty hint never appears alongside
+        # `[prefill]` so the prompt does not give two different
+        # "what happens on Enter" answers at once.
+        prompt_text = f"{label} ({choices_str}, {empty_hint}): "
+        effective_default = ""
+    while True:
+        value = input(prompt_text).strip().lower()
+        if not value:
+            return effective_default
+        if value in choices:
+            return value
+        print(f"  Must be one of {choices_str}, or {empty_hint}.")
+
+
 def _prompt_bool(label: str, default: bool = False) -> bool:
     """
     Prompt the user for a yes/no answer.
@@ -1448,31 +1524,24 @@ def _cmd_config() -> None:
         print()
 
     # CODEX_EFFORT_LEVEL mirrors the claude effort prompt for the
-    # codex backend with one contract difference: the default is empty
-    # (set-or-absent). Empty means CodexBackend passes no
+    # codex backend with one contract difference: empty is a valid
+    # answer (set-or-absent). Empty means CodexBackend passes no
     # `-c model_reasoning_effort` override and codex falls back to the
     # per-OS-user ~/.codex/config.toml or the model default, which is
     # the right posture because codex config is per-OS-user and
     # operator-owned, and xhigh availability is model-dependent.
-    # _prompt_choice cannot express "empty means skip", so this is a
-    # validated free-text prompt: empty accepted, anything else must
-    # be in CODEX_EFFORT_LEVELS (the same allow-list config.py
-    # enforces at load, so install.conf cannot carry a value that
-    # fails at service startup).
+    # _prompt_optional_choice exists to express that contract: it
+    # validates non-empty input against the same allow-list config.py
+    # enforces at load so install.conf cannot carry a value that fails
+    # at service startup, while accepting "" as the no-override signal.
     codex_effort_level = ""
     if agent_backend == "codex":
-        while True:
-            codex_effort_level = (
-                _prompt(
-                    "Codex reasoning effort (empty = codex default)",
-                    existing_env.get("CODEX_EFFORT_LEVEL", ""),
-                )
-                .strip()
-                .lower()
-            )
-            if not codex_effort_level or codex_effort_level in CODEX_EFFORT_LEVELS:
-                break
-            print(f"  Must be one of {', '.join(CODEX_EFFORT_LEVELS)}, or empty for the codex default.")
+        codex_effort_level = _prompt_optional_choice(
+            "Codex reasoning effort",
+            list(CODEX_EFFORT_LEVELS),
+            existing_env.get("CODEX_EFFORT_LEVEL", ""),
+            empty_hint="empty = codex default",
+        )
         print()
 
     # -- Webhook server --

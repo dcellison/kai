@@ -46,6 +46,7 @@ from kai.install import (
     _generate_users_yaml,
     _migrate_identity_to_claude_md,
     _prompt_choice,
+    _prompt_optional_choice,
     _read_users_yaml_text,
     _retire_install_home_claude,
     _retire_install_home_dir,
@@ -1059,6 +1060,161 @@ class TestPromptChoice:
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
         result = _prompt_choice("Pick", ["a", "b"], default="A")
         assert result == "a"
+
+
+class TestPromptOptionalChoice:
+    """
+    `_prompt_optional_choice` covers the set-or-absent prompt shape:
+    empty input is a first-class valid answer, the prefill is normalized
+    via `.strip().lower()` before the `in choices` check, and the inline
+    empty-default hint is shown only when there is no usable prefill.
+
+    The Codex effort prompt is the seed call site; these tests pin the
+    helper's contract independently of any specific caller.
+    """
+
+    @staticmethod
+    def _record(monkeypatch, inputs: list[str]) -> list[str]:
+        """
+        Install an `input` stub that records every prompt string and
+        returns the next scripted answer. Returned list is the live
+        prompts buffer; assertions read it after the helper returns.
+        """
+        recorded_prompts: list[str] = []
+        it = iter(inputs)
+
+        def mock_input(prompt: str) -> str:
+            recorded_prompts.append(prompt)
+            return next(it)
+
+        monkeypatch.setattr("builtins.input", mock_input)
+        return recorded_prompts
+
+    def test_empty_input_returns_empty_when_default_empty(self, monkeypatch):
+        """
+        With no prefill, pressing Enter is the operator's "use the
+        downstream default" signal and the helper returns "". The
+        inline hint advertising the empty-default path is also shown
+        in the prompt so a first-time operator sees it.
+        """
+        prompts = self._record(monkeypatch, [""])
+        result = _prompt_optional_choice("Pick", ["a", "b", "c"], default="", empty_hint="empty = pick default")
+        assert result == ""
+        assert "a/b/c" in prompts[0]
+        assert "empty = pick default" in prompts[0]
+
+    def test_empty_input_returns_default_when_default_in_choices(self, monkeypatch):
+        """
+        A valid prefill round-trips on Enter. The empty-default hint is
+        suppressed in the prompt so the operator does not see two
+        different "what happens on Enter" answers at once.
+        """
+        prompts = self._record(monkeypatch, [""])
+        result = _prompt_optional_choice("Pick", ["a", "b", "c"], default="b", empty_hint="empty = pick default")
+        assert result == "b"
+        assert "[b]" in prompts[0]
+        assert "empty = pick default" not in prompts[0]
+
+    def test_empty_input_returns_normalized_default_when_default_case_or_whitespace_differs(self, monkeypatch):
+        """
+        A copy-pasted prefill like "  HIGH " in /etc/kai/env round-trips
+        to its canonical "high" form on Enter, matching the runtime
+        config parser's tolerance for case and whitespace. The displayed
+        suffix shows the normalized value, never the raw input.
+
+        Regression guard: a raw `in choices` check would treat
+        "  HIGH " as out-of-list and erase the env var during
+        reconfiguration. The normalization happens inside the helper
+        so the operator's existing setting is preserved.
+        """
+        prompts = self._record(monkeypatch, [""])
+        result = _prompt_optional_choice("Pick", ["low", "medium", "high"], default="  HIGH ")
+        assert result == "high"
+        assert "[high]" in prompts[0]
+        assert "[  HIGH ]" not in prompts[0]
+
+    def test_empty_input_returns_empty_when_default_not_in_choices(self, monkeypatch):
+        """
+        A prefill that does not match any choice after normalization is
+        treated as no prefill: the suffix reverts to the inline empty-
+        default hint and Enter returns "". `"max"` is deliberately
+        chosen as a value that does not normalize into any allowed
+        entry so this test exercises only the out-of-list branch, not
+        the case-and-whitespace normalization branch.
+        """
+        prompts = self._record(monkeypatch, [""])
+        result = _prompt_optional_choice(
+            "Pick",
+            ["low", "medium", "high"],
+            default="max",
+            empty_hint="empty = pick default",
+        )
+        assert result == ""
+        assert "empty = pick default" in prompts[0]
+        assert "[max]" not in prompts[0]
+
+    def test_in_list_input_returned_lowercased(self, monkeypatch):
+        """
+        Typed input is normalized via `.strip().lower()` before the
+        membership check, so the operator can type "HIGH" or " high "
+        and the function returns the canonical "high". Mirrors the
+        same normalization `_prompt_choice` applies to its input.
+        """
+        self._record(monkeypatch, ["HIGH"])
+        result = _prompt_optional_choice("Pick", ["low", "medium", "high"], default="")
+        assert result == "high"
+
+    def test_invalid_input_reprompts_with_choices_and_empty_hint(self, monkeypatch, capsys):
+        """
+        On an out-of-list typed answer the helper re-prompts and the
+        notice on stdout includes both the allowed choices and the
+        empty-default hint, so the operator can recover by retyping
+        OR by pressing Enter.
+        """
+        self._record(monkeypatch, ["bogus", "low"])
+        result = _prompt_optional_choice(
+            "Pick",
+            ["low", "medium", "high"],
+            default="",
+            empty_hint="empty = pick default",
+        )
+        assert result == "low"
+        captured = capsys.readouterr().out
+        assert "low/medium/high" in captured
+        assert "empty = pick default" in captured
+
+    def test_whitespace_only_input_treated_as_empty(self, monkeypatch):
+        """
+        `.strip()` on typed input collapses a whitespace-only answer to
+        "", which then takes the empty-input branch. With no prefill
+        the helper returns "". Pins parity with how the runtime config
+        parser treats `CODEX_EFFORT_LEVEL="   "` as effectively unset.
+        """
+        self._record(monkeypatch, ["   "])
+        result = _prompt_optional_choice("Pick", ["a", "b", "c"], default="")
+        assert result == ""
+
+    def test_custom_empty_hint_appears_in_prompt(self, monkeypatch):
+        """
+        The Codex call site passes `empty_hint="empty = codex default"`
+        so the operator sees the semantics in their own terms. This
+        test pins that the custom hint reaches the prompt verbatim in
+        the no-prefill display path.
+
+        Uses CODEX_EFFORT_LEVELS rather than a hand-written copy of the
+        tuple so the canonical effort vocabulary stays single-sourced
+        in `kai.config`.
+        """
+        from kai.config import CODEX_EFFORT_LEVELS
+
+        prompts = self._record(monkeypatch, [""])
+        _prompt_optional_choice(
+            "Codex reasoning effort",
+            list(CODEX_EFFORT_LEVELS),
+            default="",
+            empty_hint="empty = codex default",
+        )
+        assert "empty = codex default" in prompts[0]
 
 
 # ── Config subcommand ────────────────────────────────────────────────
@@ -3051,6 +3207,48 @@ class TestCmdConfigDefaultModelDispatch:
         base[idx - 1] = "HIGH"
         _, env = self._run(monkeypatch, tmp_path, base, helper_return="gpt-5.5")
         assert env.get("CODEX_EFFORT_LEVEL") == "high"
+
+    def test_codex_effort_prompt_displays_choices(self, tmp_path, monkeypatch):
+        """
+        The Codex effort prompt advertises the allowed values and the
+        empty-default semantics BEFORE accepting input, so the operator
+        does not have to guess the vocabulary.
+
+        Replaces the default `lambda prompt: next(inputs_iter)` stub
+        with a recording variant so the test can inspect every prompt
+        string the wizard issues, then asserts that the prompt issued
+        for the codex effort slot contains every value in
+        CODEX_EFFORT_LEVELS plus the `empty = codex default` hint.
+        """
+        from unittest.mock import MagicMock
+
+        from kai.config import CODEX_EFFORT_LEVELS
+
+        self._setup(monkeypatch, tmp_path)
+        helper_mock = MagicMock(return_value="gpt-5.5")
+        monkeypatch.setattr("kai.install._prompt_default_model", helper_mock)
+        monkeypatch.setattr("kai.install._validate_codex_bin", lambda p: bool(p))
+
+        recorded_prompts: list[str] = []
+        inputs_iter = iter(self._inputs_for_codex_subscription())
+
+        def mock_input(prompt: str) -> str:
+            recorded_prompts.append(prompt)
+            return next(inputs_iter)
+
+        monkeypatch.setattr("builtins.input", mock_input)
+        _cmd_config()
+
+        # Find the prompt issued for the Codex effort slot. The label
+        # "Codex reasoning effort" is unique in the wizard chain so a
+        # substring match identifies the right prompt without coupling
+        # to its position in the input list.
+        codex_prompts = [p for p in recorded_prompts if "Codex reasoning effort" in p]
+        assert len(codex_prompts) == 1, f"expected exactly one Codex effort prompt, got {codex_prompts!r}"
+        prompt = codex_prompts[0]
+        for level in CODEX_EFFORT_LEVELS:
+            assert level in prompt, f"codex effort prompt missing level {level!r}; prompt={prompt!r}"
+        assert "empty = codex default" in prompt
 
     def test_reprompts_on_provider_flip_with_users_yaml(self, tmp_path, monkeypatch):
         """
