@@ -19,9 +19,17 @@ import subprocess
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import yaml
 from dotenv import load_dotenv
+
+if TYPE_CHECKING:
+    # Static-analysis-only import. `kai.discovery` imports `DATA_DIR`
+    # from this module; a runtime `from kai.discovery import ...` here
+    # would create a cycle. `model_source_for_backend` does the
+    # runtime import inside its body where the cycle is harmless.
+    from kai.discovery import ProviderModelSource
 
 log = logging.getLogger(__name__)
 
@@ -707,6 +715,91 @@ def models_for_backend(agent_backend: str, eff_provider: str) -> dict[str, str] 
     if eff_provider in OPEN_ENDED_PROVIDERS:
         return None
     return PROVIDER_MODELS.get(eff_provider)
+
+
+def model_source_for_backend(
+    agent_backend: str,
+    eff_provider: str,
+    *,
+    schedule_refresh: bool = True,
+) -> "ProviderModelSource":
+    """Runtime model surface for the given (backend, provider) pair.
+
+    Bot/UI-only sibling to `models_for_backend`. Consults the model
+    discovery cache for discoverable providers (currently openrouter)
+    and may schedule a background refresh on an absent or stale read.
+    Synchronous; never blocks on HTTP.
+
+    Returns a `ProviderModelSource` whose `.kind` tells the caller how
+    to render: "discovered" / "discovered_stale" come with a cached
+    model dict and a `cache_gen` suitable for binding callback_data;
+    "curated" wraps the same dicts `models_for_backend` returns for
+    static providers; "open_ended" is the free-text fallback.
+
+    Do NOT call from install.py. The installer uses
+    `models_for_backend` so it stays free of event-loop / cache
+    assumptions.
+
+    Args:
+        agent_backend: Active backend (claude / codex / goose / opencode).
+        eff_provider: Effective provider for non-codex backends.
+        schedule_refresh: When False, never schedule a background
+            refresh even on an absent or stale cache. Used by the
+            admin refresh CLI, which drives the refresh itself and
+            does not want a duplicate task on the bot's loop.
+
+    Returns:
+        ProviderModelSource describing the current surface.
+    """
+    # Local imports so the module-level `from kai.config import DATA_DIR`
+    # in kai.discovery does not become a cycle. config.py is loaded
+    # first (its DATA_DIR is referenced by discovery's top-level
+    # import); discovery is imported lazily here when the function
+    # actually runs.
+    from kai.discovery import ProviderModelSource, get_provider_model_source
+
+    if agent_backend == "codex":
+        return ProviderModelSource(
+            kind="curated",
+            models=CODEX_MODELS,
+            refreshed_at=None,
+            cache_gen=None,
+        )
+    if agent_backend == "opencode":
+        return ProviderModelSource(
+            kind="open_ended",
+            models={},
+            refreshed_at=None,
+            cache_gen=None,
+        )
+    if eff_provider == "openrouter":
+        return get_provider_model_source("openrouter", schedule_refresh=schedule_refresh)
+    if eff_provider in OPEN_ENDED_PROVIDERS:
+        # ollama in P1; Phase 2a brings it into discovery.
+        return ProviderModelSource(
+            kind="open_ended",
+            models={},
+            refreshed_at=None,
+            cache_gen=None,
+        )
+    curated = PROVIDER_MODELS.get(eff_provider)
+    if curated is None:
+        # Unknown provider with no curated list. Mirrors the
+        # `models_for_backend` "None" branch so the keyboard handler
+        # falls through to the text-input UI rather than rendering an
+        # empty keyboard.
+        return ProviderModelSource(
+            kind="open_ended",
+            models={},
+            refreshed_at=None,
+            cache_gen=None,
+        )
+    return ProviderModelSource(
+        kind="curated",
+        models=curated,
+        refreshed_at=None,
+        cache_gen=None,
+    )
 
 
 def get_user_backend_and_provider(user_config: "UserConfig | None", config: "Config") -> tuple[str, str]:

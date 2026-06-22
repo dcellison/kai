@@ -131,6 +131,8 @@ Responses stream into Telegram in real time, updating the message every 2 second
 
 Switch models via `/models` (interactive picker) or `/model <name>` (direct). Available models depend on the configured backend: Claude Code offers Opus, Sonnet, and Haiku; Goose offers whatever the user's configured provider supports; Codex offers the Codex CLI's curated model list; OpenCode accepts free-text `provider/model` IDs (for example `anthropic/claude-sonnet-4-6`) that OpenCode resolves at runtime against the credentials in `~/.local/share/opencode/auth.json`. Changing models restarts the session.
 
+Models flow through three layers: providers are **registered** in code (auth, env vars, validation), the per-(backend, provider) model list is **discovered** dynamically where the upstream catalogue is reliable (currently OpenRouter via background refresh of an on-disk cache; other providers stay curated until later phases bring them in), and **defaults** are curated separately and never changed automatically by discovery. The admin command `python -m kai.refresh_models` audits curated providers' `/v1/models` endpoints and forces a one-shot refresh of the discovery cache; the runtime freshness mechanism is `/models`'s own background refresh.
+
 ### Voice input
 
 Voice notes are transcribed locally using [whisper.cpp](https://github.com/ggerganov/whisper.cpp) and forwarded to the agent. Requires `ffmpeg` and `whisper-cpp`. Disabled by default - set `VOICE_ENABLED=true` after installing dependencies. See the [Voice Setup](https://github.com/dcellison/kai/wiki/Voice-Setup) wiki page.
