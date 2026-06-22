@@ -302,6 +302,29 @@ async def test_refresh_with_empty_result_and_nonempty_prior_raises_refresh_error
     assert path.read_bytes() == prior_bytes
 
 
+async def test_refresh_with_empty_result_and_no_prior_raises_refresh_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a first-run install, an empty fetch must also raise rather
+    than write an empty cache. Otherwise the next read would lock in
+    `kind="discovered"` against an empty map for one TTL, rendering
+    an empty keyboard instead of the open-ended fallback that lets
+    the operator type a model id while OpenRouter recovers.
+    """
+    path = _cache_path("openrouter")
+    assert not path.exists()
+
+    _register_fetcher(monkeypatch, returns={})
+    with pytest.raises(RefreshError):
+        await refresh_provider_models("openrouter")
+    assert not path.exists()
+
+    # Next read still takes the open-ended fallback (which the bot
+    # surfaces as a text prompt), not an empty discovered keyboard.
+    source = get_provider_model_source("openrouter", schedule_refresh=False)
+    assert source.kind == "open_ended"
+
+
 async def test_refresh_failure_raises_RefreshError_and_preserves_prior_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
