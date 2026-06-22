@@ -1022,7 +1022,13 @@ def _cmd_config() -> None:
             users_yaml_path.write_text(users_yaml_content)
             os.chmod(users_yaml_path, 0o600)
         print(f"  Generated {users_yaml_path}")
-    print()
+    # Blank separator only when the user-setup section above actually
+    # printed something (first-time prompts or a stray-leftover note),
+    # gated on the same condition as its header. On a re-run with an
+    # existing users.yaml the section is silent, so this would otherwise
+    # be an orphaned blank line before the transport prompt.
+    if not users_yaml_exists or stray_note:
+        print()
 
     transport = _prompt_choice(
         "Telegram transport",

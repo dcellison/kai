@@ -1831,8 +1831,10 @@ class TestCmdConfig:
         # With a canonical users.yaml already present the wizard skips the
         # user-creation prompts entirely and never stages a new file, so
         # no admin prompt is shown and no top-level staging key is written.
-        # The user-setup section also stays silent (no bare header) because
-        # there is nothing to do and no stray leftover to warn about.
+        # The user-setup section also stays fully silent: no bare header
+        # and no trailing blank separator (both gated on the same
+        # "something to show" condition), so it adds nothing between the
+        # bot-token and transport prompts.
         output = capsys.readouterr().out
         assert "Admin Telegram ID" not in output
         assert "-- User setup --" not in output
