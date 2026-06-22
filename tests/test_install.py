@@ -3708,6 +3708,35 @@ class TestCmdApplyDefaultModelGate:
         _cmd_apply()
         stop_service.assert_called_once()
 
+    def test_apply_normalizes_mixed_case_global_backend(self, tmp_path, monkeypatch):
+        """A hand-edited install.conf with `DEFAULT_BACKEND: "Goose"`
+        normalizes to lowercase in the written env so the downstream
+        goose-config / sudoers gates (which read the raw value) and
+        /etc/kai/env all see the canonical form. Without the write-back,
+        validation lowercases for the gate but `_apply_goose_config`
+        would see "Goose" and skip the deploy."""
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+        conf_path = self._write_install_conf(
+            tmp_path,
+            {"DEFAULT_MODEL": "gpt-5.5", "DEFAULT_BACKEND": "Goose", "LLM_PROVIDER": "openai"},
+        )
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        self._patch_side_effects(monkeypatch)
+        secrets_mock = MagicMock()
+        monkeypatch.setattr("kai.install._apply_secrets", secrets_mock)
+        goose_mock = MagicMock()
+        monkeypatch.setattr("kai.install._apply_goose_config", goose_mock)
+        monkeypatch.setenv("DRY_RUN", "1")
+
+        _cmd_apply()
+
+        written_env = secrets_mock.call_args.args[0]
+        assert written_env.get("DEFAULT_BACKEND") == "goose"
+        # The goose-config deploy gate receives the normalized value.
+        assert goose_mock.call_args.kwargs.get("agent_backend") == "goose"
+
 
 # ── Directory creation ───────────────────────────────────────────────
 
@@ -7742,6 +7771,23 @@ class TestEntryBackendLegacyKey:
 
         path = tmp_path / "users.yaml"
         path.write_text(f"users:\n  - telegram_id: 1\n    {key}: goose\n    os_user: alice\n")
+        assert _collect_goose_os_users_from_yaml(path, "claude") == ["alice"]
+
+    def test_collect_backends_normalizes_mixed_case(self, tmp_path):
+        """A mixed-case per-user value is valid at runtime (the loader
+        lowercases); the scanner must normalize too so the goose-config
+        membership check `"goose" in <set>` matches."""
+        path = tmp_path / "users.yaml"
+        path.write_text("users:\n  - telegram_id: 1\n    default_backend: Goose\n")
+        assert _collect_backends_from_yaml(path) == {"goose"}
+
+    def test_goose_os_users_normalizes_mixed_case(self, tmp_path):
+        """A mixed-case `default_backend: Goose` user's os_user must
+        still be collected for the per-user goose config deploy."""
+        from kai.install import _collect_goose_os_users_from_yaml
+
+        path = tmp_path / "users.yaml"
+        path.write_text("users:\n  - telegram_id: 1\n    default_backend: Goose\n    os_user: alice\n")
         assert _collect_goose_os_users_from_yaml(path, "claude") == ["alice"]
 
 

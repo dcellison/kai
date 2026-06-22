@@ -2649,7 +2649,13 @@ def _collect_backends_from_yaml(users_yaml_path: str | Path) -> set[str]:
         # values can name a backend.
         if not isinstance(backend, str):
             continue
-        normalized = backend.strip()
+        # Normalize with .strip().lower() to match the runtime loader
+        # (`_load_user_configs` lowercases before validating). A mixed-
+        # case `default_backend: Goose` routes the user to goose at
+        # runtime; without lowering here, `_apply_goose_config`'s
+        # `"goose" in <set>` membership check would miss it and skip
+        # the per-user goose config deployment.
+        normalized = backend.strip().lower()
         if normalized:
             backends.add(normalized)
     return backends
@@ -2701,8 +2707,15 @@ def _collect_goose_os_users_from_yaml(
         backend = _entry_backend(entry)
         # Non-string / empty per-user values mean "inherit the global
         # backend" (PyYAML may parse unquoted scalars as non-strings;
-        # the runtime loader rejects those separately).
-        effective = backend.strip() if isinstance(backend, str) and backend.strip() else agent_backend
+        # the runtime loader rejects those separately). Lowercase the
+        # per-user value to match the runtime loader so a mixed-case
+        # `default_backend: Goose` entry's os_user still receives the
+        # goose config deploy. The global `agent_backend` arg is
+        # already normalized by the caller (_cmd_apply).
+        if isinstance(backend, str) and backend.strip():
+            effective = backend.strip().lower()
+        else:
+            effective = agent_backend
         if effective != "goose":
             continue
         os_user = entry.get("os_user")
@@ -4189,6 +4202,15 @@ def _cmd_apply() -> None:
     # the missing-key case that is precisely what this gate exists for.
     default_model_raw = env.get("DEFAULT_MODEL", "")
     agent_backend_raw = env.get("DEFAULT_BACKEND", "claude").strip().lower()
+    # Write the normalized value back so the downstream goose-config and
+    # sudoers gates (which read env.get("DEFAULT_BACKEND") raw) and the
+    # written /etc/kai/env all see the canonical lowercase form. Only
+    # when the key is present, to preserve the "claude omits the key"
+    # contract. Without this, a hand-edited install.conf with
+    # DEFAULT_BACKEND="Goose" passes validation here but skips goose
+    # config deployment below.
+    if "DEFAULT_BACKEND" in env:
+        env["DEFAULT_BACKEND"] = agent_backend_raw
     llm_provider_raw = env.get("LLM_PROVIDER", "").strip().lower()
     eff_provider_for_check = "anthropic" if agent_backend_raw == "claude" else llm_provider_raw
     resolved_model = default_model_raw or "sonnet"
