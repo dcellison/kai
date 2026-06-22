@@ -59,18 +59,17 @@ from kai.backend import resolve_home_workspace
 from kai.config import (
     DATA_DIR,
     ONESHOT_REASONER_BACKENDS,
+    OPEN_ENDED_PROVIDERS,
     PROVIDER_DEFAULTS,
     Config,
     ModelRole,
     WorkspaceConfig,
     get_effective_provider,
     get_user_backend_and_provider,
-    model_source_for_backend,
     models_for_backend,
     resolve_user_model,
     validate_model_for_backend,
 )
-from kai.discovery import ProviderModelSource
 from kai.history import LogEntry, log_message
 from kai.locks import get_lock, get_stop_event
 from kai.pool import SubprocessPool
@@ -869,134 +868,39 @@ def _get_user_provider(pool: SubprocessPool, chat_id: int, config: Config) -> st
     return provider
 
 
-# Keyboard pagination cutoff for the /models inline keyboard. Doubles
-# as the cutoff above which `/model`, `/settings model`, and
-# `/workspace config model` no-args usage strings collapse to a short
-# generic sentence instead of enumerating every id. Sharing the
-# constant guarantees the operator never sees a flat keyboard but a
-# long usage string, or vice versa.
-_MODELS_PAGE_SIZE = 20
+def _get_user_models(pool: SubprocessPool, chat_id: int, config: Config) -> dict[str, str] | None:
+    """Get the curated model dict for a user's backend/provider, or None if open-ended.
 
-
-def _get_user_model_source(
-    pool: SubprocessPool,
-    chat_id: int,
-    config: Config,
-    *,
-    schedule_refresh: bool = True,
-) -> ProviderModelSource:
-    """Resolve the user's runtime model surface.
-
-    Wraps `model_source_for_backend` with the per-user (backend,
-    provider) cascade. Returns a `ProviderModelSource` whose `.kind`
-    tells callers how to render: discovered/discovered_stale come with
-    a `cache_gen` for callback binding; curated wraps the static
-    dicts; open_ended drives the text-prompt fallback.
+    Codex installs see CODEX_MODELS; other backends see PROVIDER_MODELS
+    for their effective provider. None means open-ended (no keyboard).
+    The codex-side surface is fully separate from PROVIDER_MODELS["openai"]
+    so a codex install never offers a goose-only model.
     """
     backend, provider = _get_user_backend_provider(pool, chat_id, config)
-    return model_source_for_backend(backend, provider, schedule_refresh=schedule_refresh)
+    models = models_for_backend(backend, provider)
+    if models is None and backend != "codex" and backend != "opencode" and provider not in OPEN_ENDED_PROVIDERS:
+        # Provider is not open-ended but has no curated list. This means
+        # PROVIDER_MODELS is missing an entry for a valid provider -
+        # programming oversight, not user error. OpenCode is excluded
+        # alongside codex because its None return is intentional (full
+        # provider/model IDs are open-ended, not a missing registry
+        # entry), and the global llm_provider for opencode is usually
+        # empty so the OPEN_ENDED_PROVIDERS check above would not catch
+        # it.
+        log.warning(
+            "Provider '%s' has no curated model list; falling back to text input",
+            provider,
+        )
+    return models
 
 
-def _get_user_models(pool: SubprocessPool, chat_id: int, config: Config) -> dict[str, str] | None:
-    """Get the curated/discovered model dict, or None if open-ended.
-
-    Thin wrapper around `_get_user_model_source` retained for callers
-    that only need the id->display map (display lookup after a model
-    switch, usage strings for curated-and-small sources).
-    """
-    source = _get_user_model_source(pool, chat_id, config)
-    if source.kind == "open_ended":
-        return None
-    return dict(source.models)
-
-
-def _short_usage(cmd: str) -> str:
-    """Short generic usage sentence for `/model`, `/settings model`,
-    and `/workspace config model` when the model source is discovered
-    or too large to enumerate inline. Telegram's per-message limit is
-    4096 chars; a 340-model OpenRouter catalog joined with ` | ` is
-    ~9 KB."""
-    return f"Usage: {cmd} <model_id>. Use /models to browse available models."
-
-
-def _should_short_usage(source: ProviderModelSource) -> bool:
-    """Collapse usage to the short generic form when the source is
-    discovered (regardless of size; the operator should be steered to
-    /models for the live catalog) or has more entries than fit in a
-    single keyboard page."""
-    if source.kind in ("discovered", "discovered_stale"):
-        return True
-    return len(source.models) > _MODELS_PAGE_SIZE
-
-
-def _render_models_keyboard(
-    current: str,
-    source: ProviderModelSource,
-    *,
-    page: int = 0,
-) -> InlineKeyboardMarkup:
-    """Build the inline keyboard for /models.
-
-    Curated sources at or below page size render flat with direct
-    `model:<id>` callbacks (the historical UX). Discovered sources
-    render alphabetically-sorted in pages of `_MODELS_PAGE_SIZE`,
-    using indirect `model_pick:<cache_gen>:<index>` callback_data so
-    OpenRouter IDs that exceed Telegram's 64-byte callback limit stay
-    selectable. A `cache_gen` mismatch at click time means a
-    background refresh landed between render and click; the click
-    handler rejects with a `catalogue changed` message instead of
-    selecting the wrong model.
-    """
-    if source.kind == "curated":
-        buttons = []
-        for key, name in source.models.items():
-            label = f"{name} \U0001f7e2" if key == current else name
-            buttons.append([InlineKeyboardButton(label, callback_data=f"model:{key}")])
-        return InlineKeyboardMarkup(buttons)
-
-    # Discovered / discovered_stale. cache_gen is set for both kinds.
-    assert source.cache_gen is not None, "discovered source must carry cache_gen"
-    ids = sorted(source.models.keys())
-    start = page * _MODELS_PAGE_SIZE
-    end = start + _MODELS_PAGE_SIZE
-    page_ids = ids[start:end]
-    buttons: list[list[InlineKeyboardButton]] = []
-    for offset, model_id in enumerate(page_ids):
-        absolute_index = start + offset
-        # 3-digit zero-padded index; OpenRouter is at 340 today, well
-        # under 1000. P2 raises the width if a provider exceeds.
-        callback = f"model_pick:{source.cache_gen}:{absolute_index:03d}"
-        display = source.models.get(model_id, model_id)
-        label = f"{display} \U0001f7e2" if model_id == current else display
-        buttons.append([InlineKeyboardButton(label, callback_data=callback)])
-    if len(ids) > _MODELS_PAGE_SIZE:
-        nav: list[InlineKeyboardButton] = []
-        if page > 0:
-            nav.append(
-                InlineKeyboardButton(
-                    "« prev",
-                    callback_data=f"models_page:{source.cache_gen}:{page - 1}",
-                )
-            )
-        if end < len(ids):
-            nav.append(
-                InlineKeyboardButton(
-                    "next »",
-                    callback_data=f"models_page:{source.cache_gen}:{page + 1}",
-                )
-            )
-        if nav:
-            buttons.append(nav)
+def _models_keyboard(current: str, models: dict[str, str]) -> InlineKeyboardMarkup:
+    """Build an inline keyboard with model choices, highlighting the current model."""
+    buttons = []
+    for key, name in models.items():
+        label = f"{name} \U0001f7e2" if key == current else name
+        buttons.append([InlineKeyboardButton(label, callback_data=f"model:{key}")])
     return InlineKeyboardMarkup(buttons)
-
-
-def _models_title(source: ProviderModelSource) -> str:
-    """Title text above the keyboard. Stale sources tell the operator a
-    background refresh is in flight so they understand why the
-    catalog might change between visits."""
-    if source.kind == "discovered_stale":
-        return "Choose a model (catalogue updating in background):"
-    return "Choose a model:"
 
 
 @_require_auth
@@ -1006,22 +910,22 @@ async def handle_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     pool = _get_pool(context)
     chat_id = _chat_id(update)
     config: Config = context.bot_data["config"]
-    source = _get_user_model_source(pool, chat_id, config)
+    models = _get_user_models(pool, chat_id, config)
 
-    # get_effective_model() reflects persisted settings even before
-    # the first message (when no subprocess instance exists yet after
-    # a service restart).
-    current = await pool.get_effective_model(chat_id)
-
-    if source.kind == "open_ended":
+    if models is None:
+        # Open-ended provider - no keyboard, show current model.
+        # Use get_effective_model() so the displayed model reflects
+        # persisted settings even before the first message (when no
+        # subprocess instance exists yet after a service restart).
+        current = await pool.get_effective_model(chat_id)
         await update.message.reply_text(
             f"Current model: {current}\nUse /model <id> to switch to any model your provider supports."
         )
         return
 
     await update.message.reply_text(
-        _models_title(source),
-        reply_markup=_render_models_keyboard(current, source, page=0),
+        "Choose a model:",
+        reply_markup=_models_keyboard(await pool.get_effective_model(chat_id), models),
     )
 
 
@@ -1098,134 +1002,6 @@ async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
-_CATALOGUE_CHANGED_MSG = "Catalogue changed; please re-open /models."
-
-
-async def handle_model_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handle inline keyboard model selection for discovered sources.
-
-    Callback shape: `model_pick:<cache_gen>:<index>` where
-    `<cache_gen>` is the 8-hex-char snapshot hash from the rendered
-    keyboard and `<index>` is the 3-digit alphabetical index into the
-    cached model list. The handler re-reads the discovery cache and
-    rejects the click if the catalog has changed or the cache is
-    missing/malformed/truncated, so a background refresh that lands
-    between render and click cannot route the click to the wrong
-    model.
-    """
-    assert update.callback_query is not None
-    query = update.callback_query
-    config: Config = context.bot_data["config"]
-    if not _is_authorized(config, _user_id(update)):
-        await query.answer("Not authorized.")
-        return
-    assert query.data is not None
-    parts = query.data.split(":", 2)
-    if len(parts) != 3:
-        await query.answer(_CATALOGUE_CHANGED_MSG)
-        return
-    _, click_gen, index_str = parts
-    try:
-        index = int(index_str)
-    except ValueError:
-        await query.answer(_CATALOGUE_CHANGED_MSG)
-        return
-
-    pool = _get_pool(context)
-    chat_id = _chat_id(update)
-    # schedule_refresh=False on the click path: we want to resolve
-    # against the current cache and either succeed or reject. If the
-    # cache is stale, a separate background refresh from the initial
-    # /models render is already in flight (or will be scheduled by the
-    # next /models). Avoids piling refresh tasks per click.
-    source = _get_user_model_source(pool, chat_id, config, schedule_refresh=False)
-    if source.kind not in ("discovered", "discovered_stale"):
-        await query.answer()
-        await query.edit_message_text(_CATALOGUE_CHANGED_MSG, reply_markup=InlineKeyboardMarkup([]))
-        return
-    if source.cache_gen != click_gen:
-        await query.answer()
-        await query.edit_message_text(_CATALOGUE_CHANGED_MSG, reply_markup=InlineKeyboardMarkup([]))
-        return
-    ids = sorted(source.models.keys())
-    if index < 0 or index >= len(ids):
-        await query.answer()
-        await query.edit_message_text(_CATALOGUE_CHANGED_MSG, reply_markup=InlineKeyboardMarkup([]))
-        return
-    model = ids[index]
-
-    backend, provider = _get_user_backend_provider(pool, chat_id, config)
-    if not validate_model_for_backend(model, backend, provider):
-        await query.answer("Invalid model.")
-        return
-
-    if model == await pool.get_effective_model(chat_id):
-        await query.answer()
-        await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
-        return
-
-    await query.answer()
-    await _switch_model(context, chat_id, model)
-    display = source.models.get(model, model)
-    await query.edit_message_text(
-        f"Switched to {display}. Session restarted.",
-        reply_markup=InlineKeyboardMarkup([]),
-    )
-
-
-async def handle_models_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handle pagination navigation on the /models keyboard.
-
-    Callback shape: `models_page:<cache_gen>:<page>`. Same cache-gen
-    binding as `handle_model_pick_callback`; a refresh that changes
-    the catalog between render and click rejects the page-flip and
-    asks the operator to re-open /models.
-    """
-    assert update.callback_query is not None
-    query = update.callback_query
-    config: Config = context.bot_data["config"]
-    if not _is_authorized(config, _user_id(update)):
-        await query.answer("Not authorized.")
-        return
-    assert query.data is not None
-    parts = query.data.split(":", 2)
-    if len(parts) != 3:
-        await query.answer(_CATALOGUE_CHANGED_MSG)
-        return
-    _, click_gen, page_str = parts
-    try:
-        page = int(page_str)
-    except ValueError:
-        await query.answer(_CATALOGUE_CHANGED_MSG)
-        return
-
-    pool = _get_pool(context)
-    chat_id = _chat_id(update)
-    source = _get_user_model_source(pool, chat_id, config, schedule_refresh=False)
-    if source.kind not in ("discovered", "discovered_stale") or source.cache_gen != click_gen:
-        await query.answer()
-        await query.edit_message_text(_CATALOGUE_CHANGED_MSG, reply_markup=InlineKeyboardMarkup([]))
-        return
-    # Bound the page against the current catalog size with the same
-    # defensive shape `handle_model_pick_callback` uses for indices.
-    # Without this guard, a stale or tampered `models_page:<gen>:999`
-    # whose cache_gen still matches would slice to an empty page and
-    # blank the keyboard without any explanation to the operator.
-    max_page = max(0, (len(source.models) - 1) // _MODELS_PAGE_SIZE)
-    if page < 0 or page > max_page:
-        await query.answer()
-        await query.edit_message_text(_CATALOGUE_CHANGED_MSG, reply_markup=InlineKeyboardMarkup([]))
-        return
-
-    current = await pool.get_effective_model(chat_id)
-    await query.answer()
-    await query.edit_message_reply_markup(
-        reply_markup=_render_models_keyboard(current, source, page=page),
-    )
-
-
 @_require_auth
 async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /model <name> - switch model directly via text command."""
@@ -1235,17 +1011,12 @@ async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     config: Config = context.bot_data["config"]
 
     if not context.args:
-        # schedule_refresh=False on a usage-only path: the operator
-        # asked for help, not to browse. /models is where refresh
-        # scheduling belongs.
-        source = _get_user_model_source(pool, chat_id, config, schedule_refresh=False)
-        if source.kind == "open_ended":
-            await update.message.reply_text("Usage: /model <model_id>")
-        elif _should_short_usage(source):
-            await update.message.reply_text(_short_usage("/model"))
-        else:
-            opts = " | ".join(sorted(source.models.keys()))
+        models = _get_user_models(pool, chat_id, config)
+        if models:
+            opts = " | ".join(sorted(models.keys()))
             await update.message.reply_text(f"Usage: /model <{opts}>")
+        else:
+            await update.message.reply_text("Usage: /model <model_id>")
         return
 
     model = context.args[0].lower()
@@ -1299,14 +1070,12 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if field == "model":
         pool = _get_pool(context)
         if not value:
-            source = _get_user_model_source(pool, chat_id, config, schedule_refresh=False)
-            if source.kind == "open_ended":
-                await update.message.reply_text("Usage: /settings model <model_id>")
-            elif _should_short_usage(source):
-                await update.message.reply_text(_short_usage("/settings model"))
-            else:
-                opts = " | ".join(sorted(source.models.keys()))
+            user_models = _get_user_models(pool, chat_id, config)
+            if user_models:
+                opts = " | ".join(sorted(user_models.keys()))
                 await update.message.reply_text(f"Usage: /settings model <{opts}>")
+            else:
+                await update.message.reply_text("Usage: /settings model <model_id>")
             return
 
         model_key = value.lower()
@@ -2024,14 +1793,12 @@ async def _handle_workspace_config(
     if field == "model":
         pool = _get_pool(context)
         if not value:
-            source = _get_user_model_source(pool, chat_id, config, schedule_refresh=False)
-            if source.kind == "open_ended":
-                await update.message.reply_text("Usage: /workspace config model <model_id>")
-            elif _should_short_usage(source):
-                await update.message.reply_text(_short_usage("/workspace config model"))
-            else:
-                opts = " | ".join(sorted(source.models.keys()))
+            user_models = _get_user_models(pool, chat_id, config)
+            if user_models:
+                opts = " | ".join(sorted(user_models.keys()))
                 await update.message.reply_text(f"Usage: /workspace config model <{opts}>")
+            else:
+                await update.message.reply_text("Usage: /workspace config model <model_id>")
             return
         # Backend-aware validation
         backend, provider = _get_user_backend_provider(pool, chat_id, config)
@@ -4882,8 +4649,6 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
 
     # Callback query handlers for inline keyboards (pattern-matched)
     app.add_handler(CallbackQueryHandler(handle_model_callback, pattern=r"^model:"))
-    app.add_handler(CallbackQueryHandler(handle_model_pick_callback, pattern=r"^model_pick:"))
-    app.add_handler(CallbackQueryHandler(handle_models_page_callback, pattern=r"^models_page:"))
     app.add_handler(CallbackQueryHandler(handle_voice_callback, pattern=r"^voice:"))
     app.add_handler(CallbackQueryHandler(handle_workspace_callback, pattern=r"^ws:"))
     app.add_handler(CallbackQueryHandler(memory_command.handle_memory_callback, pattern=r"^mem:"))

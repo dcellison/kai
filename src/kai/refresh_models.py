@@ -1,34 +1,26 @@
-"""Admin audit and one-shot cache refresh for provider model lists.
+"""Opt-in refresh helper for `PROVIDER_MODELS`.
 
-`/models`'s background refresh is the runtime freshness mechanism;
-this command is the operator-facing audit and on-demand refresh tool.
-
-Curated providers (anthropic, openai, google): the command queries
-each provider's `/v1/models` endpoint and prints a unified diff
-against the in-tree `PROVIDER_MODELS[provider]` keys. The command
-never writes source files; operator review of the diff is the trust
-boundary. Pass `--write-snippet` to emit a paste-able Python fragment
-that the operator copies into `src/kai/config.py` by hand.
-
-Discovered providers (openrouter): the command calls the discovery
-layer's refresh directly and prints a diff against the prior on-disk
-cache. The discovery cache is written atomically on success;
-unchanged on failure.
+Operator runs `python -m kai.refresh_models` (or `make refresh-models`)
+to query each curated provider's `/v1/models` endpoint and print a
+unified diff against the in-tree `PROVIDER_MODELS[provider]` keys.
+The command never writes source files; operator review of the diff
+is the trust boundary. Pass `--write-snippet` to emit a paste-able
+Python fragment to stdout that the operator copies into
+`src/kai/config.py` by hand.
 
 Exit codes:
-- 0: every queried provider responded; no diff against the prior
+- 0: every queried provider responded; no diff against the in-tree
      list (or every queried provider was skipped for missing auth).
 - 1: every queried provider responded; at least one provider has a
      diff (new and / or retired models).
 - 2: at least one provider failed to respond (network error, 5xx,
      unexpected response shape). Other providers' diffs still print.
 
-Per-provider auth for curated providers comes from
-`PROVIDER_KEY_VARS`. A provider whose API key is unset in env skips
-with a `"skipped: no API key"` notice; this is not counted as a
-failure (exit 2 reserves for actual remote faults). Ollama is
-absent from both `PROVIDER_MODELS` and Phase 1's discovery layer and
-skips with a one-line notice; Phase 2a brings it into discovery.
+Per-provider auth comes from `PROVIDER_KEY_VARS`. A provider whose
+API key is unset in env skips with a `"skipped: no API key"` notice;
+this is not counted as a failure (exit 2 reserves for actual remote
+faults). OpenRouter and Ollama are absent from `PROVIDER_MODELS`
+today (open-ended providers) and skip with a one-line notice.
 """
 
 from __future__ import annotations
@@ -166,48 +158,6 @@ def _render_snippet(provider: str, remote_models: list[str]) -> str:
     return "\n".join(lines)
 
 
-async def _refresh_openrouter() -> tuple[int, list[str]]:
-    """Refresh the OpenRouter discovery cache and print a diff.
-
-    Calls the discovery layer's `refresh_provider_models` directly so
-    the bot's runtime refresh scheduler does not race against this
-    one-shot path. On a RefreshError (network failure, parse error,
-    timeout), the prior cache stays on disk and the function returns
-    status 2 with the error appended to the output lines.
-    """
-    import time
-
-    from kai.discovery import RefreshError, get_provider_model_source, refresh_provider_models
-
-    lines: list[str] = []
-    prior = get_provider_model_source("openrouter", schedule_refresh=False)
-    if prior.kind == "open_ended" or prior.refreshed_at is None:
-        lines.append("openrouter: cache empty (first refresh)")
-    else:
-        age_hours = (time.time() - prior.refreshed_at) / 3600
-        lines.append(f"openrouter: cache age {age_hours:.1f}h, {len(prior.models)} models")
-
-    try:
-        result = await refresh_provider_models("openrouter")
-    except RefreshError as exc:
-        lines.append(f"openrouter: ERROR ({exc})")
-        return 2, lines
-
-    summary_bits = [f"{result.total} models"]
-    if result.models_added:
-        summary_bits.append(f"{len(result.models_added)} new")
-    if result.models_removed:
-        summary_bits.append(f"{len(result.models_removed)} retired")
-    lines.append("openrouter: " + ", ".join(summary_bits))
-    for m in result.models_added:
-        lines.append(f"  +  {m}")
-    for m in result.models_removed:
-        lines.append(f"  -  {m}")
-
-    status = 1 if (result.models_added or result.models_removed) else 0
-    return status, lines
-
-
 async def _refresh_one(provider: str, *, write_snippet: bool) -> tuple[int, list[str]]:
     """Refresh one provider's model list.
 
@@ -216,8 +166,6 @@ async def _refresh_one(provider: str, *, write_snippet: bool) -> tuple[int, list
         1 = diff present
         2 = fetch failed
     """
-    if provider == "openrouter":
-        return await _refresh_openrouter()
     if provider not in _provider_fetchers:
         return 0, [f"{provider}: skipped (open-ended provider; no curated list to diff)"]
     key_var = PROVIDER_KEY_VARS.get(provider, "")
@@ -246,13 +194,9 @@ async def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m kai.refresh_models",
         description=(
-            "Admin audit and one-shot cache refresh for provider model "
-            "lists. Curated providers print a diff against the in-tree "
-            "PROVIDER_MODELS (never writes source files; the operator "
-            "hand-edits src/kai/config.py after reviewing the diff). "
-            "Discovered providers refresh the on-disk discovery cache "
-            "directly. The runtime freshness mechanism is /models's "
-            "background refresh; this command is operator-facing."
+            "Query each curated provider's /v1/models endpoint and print a "
+            "diff against PROVIDER_MODELS in src/kai/config.py. Never writes "
+            "source files; operator hand-edits config.py after reviewing the diff."
         ),
     )
     parser.add_argument(

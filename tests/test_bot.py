@@ -31,9 +31,9 @@ from kai.bot import (
     _handle_workspace_deny,
     _is_authorized,
     _is_notify_chat_used,
+    _models_keyboard,
     _notify_if_queued,
     _prepend_queue_marker,
-    _render_models_keyboard,
     _reply_safe,
     _require_auth,
     _resolve_workspace_path,
@@ -56,9 +56,7 @@ from kai.bot import (
     handle_message,
     handle_model,
     handle_model_callback,
-    handle_model_pick_callback,
     handle_models,
-    handle_models_page_callback,
     handle_new,
     handle_photo,
     handle_review_command,
@@ -77,7 +75,6 @@ from kai.bot import (
     handle_workspaces,
 )
 from kai.config import PROVIDER_MODELS, Config, UserConfig
-from kai.discovery import ProviderModelSource
 from kai.review import CollectionWarning, PRReviewResult
 from kai.tts import DEFAULT_VOICE, VOICES
 from kai.workspace_utils import is_workspace_allowed
@@ -947,34 +944,27 @@ class TestEditMessageSafe:
         assert len(sent) <= 4096
 
 
-# ── _render_models_keyboard ──────────────────────────────────────────
+# ── _models_keyboard ─────────────────────────────────────────────────
 
 
 class TestModelsKeyboard:
-    """Curated-source rendering (the historical UX). Discovered-source
-    rendering is covered by `TestDiscoveredKeyboard` below."""
-
-    _curated_source = ProviderModelSource(
-        kind="curated",
-        models=PROVIDER_MODELS["anthropic"],
-        refreshed_at=None,
-        cache_gen=None,
-    )
+    # Use Anthropic's curated models for keyboard tests
+    _anthropic_models = PROVIDER_MODELS["anthropic"]
 
     def test_current_model_gets_green_dot(self):
-        kb = _render_models_keyboard("sonnet", self._curated_source)
+        kb = _models_keyboard("sonnet", self._anthropic_models)
         labels = _button_labels(kb)
         assert any("\U0001f7e2" in lbl and "Sonnet" in lbl for lbl in labels)
 
     def test_all_models_present(self):
-        kb = _render_models_keyboard("sonnet", self._curated_source)
+        kb = _models_keyboard("sonnet", self._anthropic_models)
         callbacks = _button_callbacks(kb)
         assert "model:opus" in callbacks
         assert "model:sonnet" in callbacks
         assert "model:haiku" in callbacks
 
     def test_callback_data_format(self):
-        kb = _render_models_keyboard("opus", self._curated_source)
+        kb = _models_keyboard("opus", self._anthropic_models)
         callbacks = _button_callbacks(kb)
         assert all(c.startswith("model:") for c in callbacks)
 
@@ -6521,362 +6511,3 @@ class TestHandleReviewCommand:
             await handle_review_command(update, ctx)
 
         assert mock_generate.call_args.kwargs["local_repo_path"] == "/home/workspace"
-
-
-# ── Model discovery: keyboard, callbacks, usage paths ────────────────
-
-
-def _seed_openrouter_cache(
-    monkeypatch,
-    tmp_path: Path,
-    models: dict[str, str],
-    *,
-    stale: bool = False,
-) -> str:
-    """Write a discovery cache to a tmp DATA_DIR and return the
-    cache_gen the layer would compute for it.
-
-    Tests use the returned `cache_gen` to build callback strings that
-    match what `_render_models_keyboard` would emit, so an "ok" path
-    and a "stale gen" path can both be exercised against the same
-    cache shape.
-    """
-    import json
-    import time as _time
-
-    from kai import discovery as _disc
-    from kai.discovery import (
-        _DISCOVERY_TTL_SECONDS,
-        _SCHEMA_VERSION,
-        _cache_path,
-        _compute_cache_gen,
-    )
-
-    monkeypatch.setattr(_disc, "DATA_DIR", tmp_path)
-    _disc._refresh_tasks.clear()
-    path = _cache_path("openrouter")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    refreshed_at = (_time.time() - _DISCOVERY_TTL_SECONDS - 60) if stale else _time.time()
-    payload = {
-        "schema_version": _SCHEMA_VERSION,
-        "provider": "openrouter",
-        "refreshed_at": refreshed_at,
-        "models": models,
-    }
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    return _compute_cache_gen(models)
-
-
-def _redirect_discovery_data_dir(monkeypatch, tmp_path: Path) -> None:
-    """Point discovery at a tmp directory without seeding a cache; the
-    absent-cache path is what tests exercise."""
-    from kai import discovery as _disc
-
-    monkeypatch.setattr(_disc, "DATA_DIR", tmp_path)
-    _disc._refresh_tasks.clear()
-
-
-def _discovered_source(models: dict[str, str], cache_gen: str = "abcd1234") -> ProviderModelSource:
-    return ProviderModelSource(kind="discovered", models=models, refreshed_at=1.0, cache_gen=cache_gen)
-
-
-class TestDiscoveredKeyboard:
-    """Discovered-source rendering: indirect callback data,
-    pagination, byte-length safety for oversized IDs."""
-
-    _SMALL = {f"prov{i}/m{i}": f"M{i}" for i in range(5)}
-    _AT_THRESHOLD = {f"prov/m{i:03d}": f"M{i}" for i in range(20)}
-    _OVER_THRESHOLD = {f"prov/m{i:03d}": f"M{i}" for i in range(25)}
-
-    def test_keyboard_uses_model_pick_prefix(self):
-        kb = _render_models_keyboard("", _discovered_source(self._SMALL))
-        callbacks = _button_callbacks(kb)
-        assert all(c.startswith("model_pick:") for c in callbacks)
-
-    def test_keyboard_does_not_paginate_at_threshold(self):
-        """20 models render flat with no nav row, matching the curated
-        UX cutoff so the operator does not see a navigation bar for a
-        small catalog."""
-        kb = _render_models_keyboard("", _discovered_source(self._AT_THRESHOLD))
-        callbacks = _button_callbacks(kb)
-        assert all(c.startswith("model_pick:") for c in callbacks)
-        assert len(callbacks) == 20
-
-    def test_keyboard_paginates_over_threshold(self):
-        """25 models on page 0 show 20 model rows plus a `next »`
-        button keyed against the same cache_gen."""
-        kb = _render_models_keyboard("", _discovered_source(self._OVER_THRESHOLD, cache_gen="cafef00d"))
-        callbacks = _button_callbacks(kb)
-        model_picks = [c for c in callbacks if c.startswith("model_pick:")]
-        page_buttons = [c for c in callbacks if c.startswith("models_page:")]
-        assert len(model_picks) == 20
-        assert page_buttons == ["models_page:cafef00d:1"]
-
-    def test_callback_data_within_64_bytes_for_oversized_openrouter_id(self):
-        """The live OpenRouter catalog has an ID that overflows the
-        64-byte callback_data limit when used with a direct
-        `model:<id>` prefix. The indirect `model_pick:<gen>:<index>`
-        scheme bounds every button at ~23 bytes regardless of the
-        underlying ID length."""
-        oversized = "cognitivecomputations/dolphin-mistral-24b-venice-edition:free"
-        models = {oversized: "Dolphin Mistral 24B Venice :free"}
-        kb = _render_models_keyboard("", _discovered_source(models, cache_gen="aaaaaaaa"))
-        for row in kb.inline_keyboard:
-            for button in row:
-                assert len(button.callback_data.encode("utf-8")) <= 64
-
-    def test_keyboard_marks_current_model_with_green_dot(self):
-        kb = _render_models_keyboard("prov/m003", _discovered_source(self._OVER_THRESHOLD))
-        labels = _button_labels(kb)
-        assert any("\U0001f7e2" in lbl for lbl in labels)
-
-
-class TestHandleModelsDiscovery:
-    @pytest.mark.asyncio
-    async def test_discovered_keyboard_uses_cached_models(self, tmp_path, monkeypatch):
-        _seed_openrouter_cache(
-            monkeypatch,
-            tmp_path,
-            {f"prov/m{i:03d}": f"M{i}" for i in range(5)},
-        )
-        pool = _make_mock_claude(model="prov/m000", provider="openrouter")
-        update = _make_update()
-        ctx = _make_context(claude=pool)
-        await handle_models(update, ctx)
-        call = update.message.reply_text.call_args
-        assert "Choose a model" in call[0][0]
-        assert "catalogue updating" not in call[0][0]
-        callbacks = _button_callbacks(call[1]["reply_markup"])
-        assert all(c.startswith("model_pick:") for c in callbacks)
-
-    @pytest.mark.asyncio
-    async def test_discovered_stale_titles_message(self, tmp_path, monkeypatch):
-        _seed_openrouter_cache(
-            monkeypatch,
-            tmp_path,
-            {f"prov/m{i:03d}": f"M{i}" for i in range(5)},
-            stale=True,
-        )
-        pool = _make_mock_claude(model="prov/m000", provider="openrouter")
-        update = _make_update()
-        ctx = _make_context(claude=pool)
-        await handle_models(update, ctx)
-        title = update.message.reply_text.call_args[0][0]
-        assert "catalogue updating in background" in title
-
-    @pytest.mark.asyncio
-    async def test_open_ended_when_cache_absent_for_openrouter(self, tmp_path, monkeypatch):
-        _redirect_discovery_data_dir(monkeypatch, tmp_path)
-        pool = _make_mock_claude(model="anthropic/claude-sonnet-4.5", provider="openrouter")
-        update = _make_update()
-        ctx = _make_context(claude=pool)
-        await handle_models(update, ctx)
-        call = update.message.reply_text.call_args
-        reply = call[0][0]
-        assert "Current model" in reply
-        assert "/model" in reply
-        assert call[1].get("reply_markup") is None or "reply_markup" not in call[1]
-
-
-class TestHandleModelPickCallback:
-    @pytest.mark.asyncio
-    async def test_selects_correct_model_for_oversized_id(self, tmp_path, monkeypatch):
-        """An ID too large for direct callback_data still routes
-        correctly because the click carries an index instead of the
-        id itself."""
-        oversized = "cognitivecomputations/dolphin-mistral-24b-venice-edition:free"
-        models = {oversized: "Dolphin", "z/last": "Z"}
-        cache_gen = _seed_openrouter_cache(monkeypatch, tmp_path, models)
-        ids = sorted(models.keys())
-        index = ids.index(oversized)
-        pool = _make_mock_claude(model="z/last", provider="openrouter")
-        update = _make_callback_update(data=f"model_pick:{cache_gen}:{index:03d}")
-        ctx = _make_context(claude=pool)
-        with (
-            patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
-            patch("kai.bot.sessions.set_user_setting", new_callable=AsyncMock),
-            patch("kai.bot.sessions.delete_workspace_config_setting", new_callable=AsyncMock),
-        ):
-            await handle_model_pick_callback(update, ctx)
-        pool.set_model.assert_called_once_with(ANY, oversized)
-
-    @pytest.mark.asyncio
-    async def test_stale_cache_gen_rejects_gracefully(self, tmp_path, monkeypatch):
-        """A click whose cache_gen no longer matches the on-disk
-        catalog edits the message with the catalogue-changed notice
-        and does NOT route the click."""
-        _seed_openrouter_cache(monkeypatch, tmp_path, {"a/one": "One", "b/two": "Two"})
-        pool = _make_mock_claude(model="a/one", provider="openrouter")
-        update = _make_callback_update(data="model_pick:deadbeef:000")
-        ctx = _make_context(claude=pool)
-        await handle_model_pick_callback(update, ctx)
-        edit_text = update.callback_query.edit_message_text.call_args[0][0]
-        assert "Catalogue changed" in edit_text
-        pool.set_model.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_missing_cache_rejects_gracefully(self, tmp_path, monkeypatch):
-        """A click that arrives after the cache file is deleted gets
-        the catalogue-changed notice; the handler does not raise."""
-        _redirect_discovery_data_dir(monkeypatch, tmp_path)
-        pool = _make_mock_claude(model="a/one", provider="openrouter")
-        update = _make_callback_update(data="model_pick:deadbeef:000")
-        ctx = _make_context(claude=pool)
-        await handle_model_pick_callback(update, ctx)
-        edit_text = update.callback_query.edit_message_text.call_args[0][0]
-        assert "Catalogue changed" in edit_text
-
-    @pytest.mark.asyncio
-    async def test_malformed_cache_rejects_gracefully(self, tmp_path, monkeypatch):
-        """A corrupt cache file at click time gets the
-        catalogue-changed notice. JSONDecodeError does not propagate."""
-        from kai import discovery as _disc
-        from kai.discovery import _cache_path
-
-        monkeypatch.setattr(_disc, "DATA_DIR", tmp_path)
-        _disc._refresh_tasks.clear()
-        path = _cache_path("openrouter")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{this is not json", encoding="utf-8")
-        pool = _make_mock_claude(model="a/one", provider="openrouter")
-        update = _make_callback_update(data="model_pick:deadbeef:000")
-        ctx = _make_context(claude=pool)
-        await handle_model_pick_callback(update, ctx)
-        edit_text = update.callback_query.edit_message_text.call_args[0][0]
-        assert "Catalogue changed" in edit_text
-
-    @pytest.mark.asyncio
-    async def test_out_of_range_index_rejects_gracefully(self, tmp_path, monkeypatch):
-        """A click whose index is beyond the cached list (e.g. a
-        truncated or tampered callback) gets the catalogue-changed
-        notice. No IndexError propagates."""
-        cache_gen = _seed_openrouter_cache(monkeypatch, tmp_path, {"a/one": "One"})
-        pool = _make_mock_claude(model="a/one", provider="openrouter")
-        update = _make_callback_update(data=f"model_pick:{cache_gen}:999")
-        ctx = _make_context(claude=pool)
-        await handle_model_pick_callback(update, ctx)
-        edit_text = update.callback_query.edit_message_text.call_args[0][0]
-        assert "Catalogue changed" in edit_text
-
-
-class TestHandleModelsPageCallback:
-    @pytest.mark.asyncio
-    async def test_unauthorized_user_rejected(self, tmp_path, monkeypatch):
-        """The page callback shares the authorization gate that
-        model_pick uses; unauthorized users get the not-authorized
-        answer rather than a new keyboard."""
-        _seed_openrouter_cache(monkeypatch, tmp_path, {"a/one": "One"})
-        update = _make_callback_update(data="models_page:deadbeef:1", user_id=99)
-        ctx = _make_context(config=_make_config(allowed_user_ids={1}))
-        await handle_models_page_callback(update, ctx)
-        update.callback_query.answer.assert_called_once_with("Not authorized.")
-
-    @pytest.mark.asyncio
-    async def test_legitimate_next_page_returns_remaining_models(self, tmp_path, monkeypatch):
-        """The happy path: 25-model catalog, page 1 renders the
-        remaining 5 model_pick buttons (and only a `« prev` nav button,
-        because we are at the last page)."""
-        models = {f"prov/m{i:03d}": f"M{i}" for i in range(25)}
-        cache_gen = _seed_openrouter_cache(monkeypatch, tmp_path, models)
-        pool = _make_mock_claude(model="prov/m000", provider="openrouter")
-        update = _make_callback_update(data=f"models_page:{cache_gen}:1")
-        ctx = _make_context(claude=pool)
-        await handle_models_page_callback(update, ctx)
-        update.callback_query.edit_message_reply_markup.assert_called_once()
-        kb = update.callback_query.edit_message_reply_markup.call_args.kwargs["reply_markup"]
-        callbacks = _button_callbacks(kb)
-        model_picks = [c for c in callbacks if c.startswith("model_pick:")]
-        page_buttons = [c for c in callbacks if c.startswith("models_page:")]
-        assert len(model_picks) == 5
-        assert page_buttons == [f"models_page:{cache_gen}:0"]
-
-    @pytest.mark.asyncio
-    async def test_out_of_range_page_rejects_gracefully(self, tmp_path, monkeypatch):
-        """A page index beyond the cache size (stale or tampered
-        callback) gets the catalogue-changed notice instead of an
-        empty keyboard. Mirrors the defensive shape the model_pick
-        path uses for out-of-range indices."""
-        models = {f"prov/m{i:03d}": f"M{i}" for i in range(25)}
-        cache_gen = _seed_openrouter_cache(monkeypatch, tmp_path, models)
-        pool = _make_mock_claude(model="prov/m000", provider="openrouter")
-        update = _make_callback_update(data=f"models_page:{cache_gen}:999")
-        ctx = _make_context(claude=pool)
-        await handle_models_page_callback(update, ctx)
-        edit_text = update.callback_query.edit_message_text.call_args[0][0]
-        assert "Catalogue changed" in edit_text
-        update.callback_query.edit_message_reply_markup.assert_not_called()
-
-
-class TestUsageStringsForDiscoveredSource:
-    """The /model, /settings model, and /workspace config model
-    no-args usage paths collapse to a short generic sentence for any
-    discovered or large source. A 340-model OpenRouter catalog joined
-    with ` | ` is ~9 KB; the short form keeps every command's no-args
-    reply well under Telegram's 4096-char limit."""
-
-    _LARGE = {f"prov/m{i:03d}": f"M{i}" for i in range(25)}
-
-    @pytest.mark.asyncio
-    async def test_model_command_usage_short_for_discovered_source(self, tmp_path, monkeypatch):
-        _seed_openrouter_cache(monkeypatch, tmp_path, self._LARGE)
-        pool = _make_mock_claude(model="prov/m000", provider="openrouter")
-        update = _make_update()
-        ctx = _make_context(claude=pool, args=[])
-        await handle_model(update, ctx)
-        reply = update.message.reply_text.call_args[0][0]
-        assert reply == "Usage: /model <model_id>. Use /models to browse available models."
-        assert " | " not in reply
-
-    @pytest.mark.asyncio
-    async def test_settings_model_usage_short_for_discovered_source(self, tmp_path, monkeypatch):
-        from contextlib import ExitStack
-
-        _seed_openrouter_cache(monkeypatch, tmp_path, self._LARGE)
-        pool = _make_mock_claude(model="prov/m000", provider="openrouter")
-        update = _make_update(text="/settings model")
-        ctx = _make_context(claude=pool, args=["model"])
-        mock_sessions = AsyncMock()
-        mock_sessions.get_user_settings = AsyncMock(return_value={})
-        with ExitStack() as stack:
-            stack.enter_context(patch("kai.bot.sessions", mock_sessions))
-            await handle_settings(update, ctx)
-        reply = update.message.reply_text.call_args[0][0]
-        assert reply == "Usage: /settings model <model_id>. Use /models to browse available models."
-        assert " | " not in reply
-
-    @pytest.mark.asyncio
-    async def test_workspace_config_model_usage_short_for_discovered_source(self, tmp_path, monkeypatch):
-        from contextlib import ExitStack
-
-        _seed_openrouter_cache(monkeypatch, tmp_path, self._LARGE)
-        pool = _make_mock_claude(model="prov/m000", provider="openrouter")
-        update = _make_update(text="/workspace config model")
-        ctx = _make_context(claude=pool)
-        mock_sessions = AsyncMock()
-        mock_sessions.get_workspace_config_settings = AsyncMock(return_value={})
-        with ExitStack() as stack:
-            stack.enter_context(patch("kai.bot.sessions", mock_sessions))
-            await _handle_workspace_config(update, ctx, "config model")
-        reply = update.message.reply_text.call_args[0][0]
-        assert reply == ("Usage: /workspace config model <model_id>. Use /models to browse available models.")
-        assert " | " not in reply
-
-    @pytest.mark.asyncio
-    async def test_model_command_validates_independent_of_discovery_cache(self, tmp_path, monkeypatch):
-        """A `/model <id>` on openrouter still passes validation when
-        the discovery cache is empty; openrouter is open-ended in
-        `validate_model_for_backend`, so a model the cache has not
-        yet learned about is still selectable via text command.
-        Otherwise an operator who knows a freshly-released ID could
-        not use it until the next background refresh landed."""
-        _redirect_discovery_data_dir(monkeypatch, tmp_path)
-        pool = _make_mock_claude(model="anthropic/claude-sonnet-4.5", provider="openrouter")
-        update = _make_update()
-        ctx = _make_context(claude=pool, args=["anthropic/claude-sonnet-4.5"])
-        with (
-            patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
-            patch("kai.bot.sessions.set_user_setting", new_callable=AsyncMock),
-            patch("kai.bot.sessions.delete_workspace_config_setting", new_callable=AsyncMock),
-        ):
-            await handle_model(update, ctx)
-        pool.set_model.assert_called_once_with(ANY, "anthropic/claude-sonnet-4.5")
