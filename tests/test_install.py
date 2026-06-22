@@ -1183,6 +1183,32 @@ class TestPromptOptionalChoice:
         assert "low/medium/high" in captured
         assert "empty = pick default" in captured
 
+    def test_invalid_input_reprompt_does_not_advertise_empty_default_when_prefill_present(self, monkeypatch, capsys):
+        """
+        With a usable prefill, Enter returns the prefill, not "". The
+        recovery message must match that: advertise that empty keeps
+        the prefill, NOT that empty means the downstream default. The
+        latter would mislead the operator into thinking they can clear
+        the override by pressing Enter at the re-prompt.
+
+        Inputs are `["bogus", ""]`: the first answer triggers the
+        recovery message, the second answer (empty) takes the prefill-
+        round-trip branch. Asserts the recovery text omits the
+        `empty_hint` and the final return is the prefill.
+        """
+        self._record(monkeypatch, ["bogus", ""])
+        result = _prompt_optional_choice(
+            "Pick",
+            ["low", "medium", "high"],
+            default="high",
+            empty_hint="empty = pick default",
+        )
+        assert result == "high"
+        captured = capsys.readouterr().out
+        assert "low/medium/high" in captured
+        assert "high" in captured
+        assert "empty = pick default" not in captured
+
     def test_whitespace_only_input_treated_as_empty(self, monkeypatch):
         """
         `.strip()` on typed input collapses a whitespace-only answer to

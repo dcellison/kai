@@ -270,7 +270,16 @@ def _prompt_optional_choice(
             return effective_default
         if value in choices:
             return value
-        print(f"  Must be one of {choices_str}, or {empty_hint}.")
+        # The recovery message has to match what Enter actually does
+        # at this point in the loop. With a usable prefill, Enter
+        # round-trips that prefill (NOT the downstream default), so
+        # advertising the empty-default hint here would be a lie and
+        # would mislead the operator into thinking they can clear the
+        # override by pressing Enter on the re-prompt.
+        if effective_default:
+            print(f"  Must be one of {choices_str}, or empty to keep {effective_default}.")
+        else:
+            print(f"  Must be one of {choices_str}, or {empty_hint}.")
 
 
 def _prompt_bool(label: str, default: bool = False) -> bool:
