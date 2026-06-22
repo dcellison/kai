@@ -282,6 +282,26 @@ async def test_refresh_writes_cache_atomically(monkeypatch: pytest.MonkeyPatch) 
     assert not list(path.parent.glob("*.tmp"))
 
 
+async def test_refresh_with_empty_result_and_nonempty_prior_raises_refresh_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An upstream incident that returns a shape-valid but semantically
+    empty catalog (e.g. `{"data": []}`) must NOT overwrite a working
+    prior cache with `{}`. Without this guard, the next /models read
+    would see `kind="discovered"` against an empty map and render a
+    keyboard with zero buttons, taking the operator from "stale but
+    usable" to "no usable surface" on a transient upstream fault.
+    """
+    _write_cache("openrouter", {"a/b": "Ay Bee", "c/d": "See Dee"}, time.time() - 60)
+    path = _cache_path("openrouter")
+    prior_bytes = path.read_bytes()
+
+    _register_fetcher(monkeypatch, returns={})
+    with pytest.raises(RefreshError):
+        await refresh_provider_models("openrouter")
+    assert path.read_bytes() == prior_bytes
+
+
 async def test_refresh_failure_raises_RefreshError_and_preserves_prior_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

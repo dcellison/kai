@@ -1208,8 +1208,15 @@ async def handle_models_page_callback(update: Update, context: ContextTypes.DEFA
         await query.answer()
         await query.edit_message_text(_CATALOGUE_CHANGED_MSG, reply_markup=InlineKeyboardMarkup([]))
         return
-    if page < 0:
-        await query.answer(_CATALOGUE_CHANGED_MSG)
+    # Bound the page against the current catalog size with the same
+    # defensive shape `handle_model_pick_callback` uses for indices.
+    # Without this guard, a stale or tampered `models_page:<gen>:999`
+    # whose cache_gen still matches would slice to an empty page and
+    # blank the keyboard without any explanation to the operator.
+    max_page = max(0, (len(source.models) - 1) // _MODELS_PAGE_SIZE)
+    if page < 0 or page > max_page:
+        await query.answer()
+        await query.edit_message_text(_CATALOGUE_CHANGED_MSG, reply_markup=InlineKeyboardMarkup([]))
         return
 
     current = await pool.get_effective_model(chat_id)

@@ -6771,6 +6771,41 @@ class TestHandleModelsPageCallback:
         await handle_models_page_callback(update, ctx)
         update.callback_query.answer.assert_called_once_with("Not authorized.")
 
+    @pytest.mark.asyncio
+    async def test_legitimate_next_page_returns_remaining_models(self, tmp_path, monkeypatch):
+        """The happy path: 25-model catalog, page 1 renders the
+        remaining 5 model_pick buttons (and only a `« prev` nav button,
+        because we are at the last page)."""
+        models = {f"prov/m{i:03d}": f"M{i}" for i in range(25)}
+        cache_gen = _seed_openrouter_cache(monkeypatch, tmp_path, models)
+        pool = _make_mock_claude(model="prov/m000", provider="openrouter")
+        update = _make_callback_update(data=f"models_page:{cache_gen}:1")
+        ctx = _make_context(claude=pool)
+        await handle_models_page_callback(update, ctx)
+        update.callback_query.edit_message_reply_markup.assert_called_once()
+        kb = update.callback_query.edit_message_reply_markup.call_args.kwargs["reply_markup"]
+        callbacks = _button_callbacks(kb)
+        model_picks = [c for c in callbacks if c.startswith("model_pick:")]
+        page_buttons = [c for c in callbacks if c.startswith("models_page:")]
+        assert len(model_picks) == 5
+        assert page_buttons == [f"models_page:{cache_gen}:0"]
+
+    @pytest.mark.asyncio
+    async def test_out_of_range_page_rejects_gracefully(self, tmp_path, monkeypatch):
+        """A page index beyond the cache size (stale or tampered
+        callback) gets the catalogue-changed notice instead of an
+        empty keyboard. Mirrors the defensive shape the model_pick
+        path uses for out-of-range indices."""
+        models = {f"prov/m{i:03d}": f"M{i}" for i in range(25)}
+        cache_gen = _seed_openrouter_cache(monkeypatch, tmp_path, models)
+        pool = _make_mock_claude(model="prov/m000", provider="openrouter")
+        update = _make_callback_update(data=f"models_page:{cache_gen}:999")
+        ctx = _make_context(claude=pool)
+        await handle_models_page_callback(update, ctx)
+        edit_text = update.callback_query.edit_message_text.call_args[0][0]
+        assert "Catalogue changed" in edit_text
+        update.callback_query.edit_message_reply_markup.assert_not_called()
+
 
 class TestUsageStringsForDiscoveredSource:
     """The /model, /settings model, and /workspace config model

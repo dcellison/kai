@@ -455,6 +455,22 @@ async def refresh_provider_models(
 
     prior = _read_cache(provider)
     prior_models = prior[0] if prior is not None else {}
+
+    # An empty fetch result against a non-empty prior cache is almost
+    # always an upstream incident (the catalog endpoint returned an
+    # empty `data` array, or a row-shape change dropped every entry
+    # past the per-row id filter). Preserving the prior snapshot here
+    # is the same "operator-visible model list survives a transient
+    # outage" contract the network-failure path enforces. Without this
+    # guard the runtime path would commit the empty result, /models
+    # would render an empty keyboard, and the operator would lose
+    # access to the stale catalog they could have kept selecting from.
+    if not new_models and prior_models:
+        raise RefreshError(
+            f"{provider}: fetch returned an empty catalog while a prior cache "
+            f"with {len(prior_models)} models exists; refusing to overwrite"
+        )
+
     added = sorted(set(new_models) - set(prior_models))
     removed = sorted(set(prior_models) - set(new_models))
 
