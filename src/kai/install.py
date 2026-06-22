@@ -932,29 +932,10 @@ def _cmd_config() -> None:
     # the canonical file from a no-longer-current staging artifact.
     users_yaml_staging_path: str | None = None
 
-    if users_yaml_exists:
-        # Summarize the existing config without modifying it. Reads
-        # go through `_read_users_yaml_text` so the protected
-        # `/etc/kai/users.yaml` path works via sudo cat. Empty
-        # summary on unreadable / malformed - the summary is
-        # cosmetic, the downstream codex predicate is what matters.
-        summary = ""
-        raw_yaml = _read_users_yaml_text(users_yaml_path)
-        if raw_yaml is not None:
-            try:
-                data = yaml.safe_load(raw_yaml)
-            except yaml.YAMLError:
-                data = None
-            if isinstance(data, dict) and isinstance(data.get("users"), list):
-                entries = data["users"]
-                n_users = len(entries)
-                n_admins = sum(1 for e in entries if isinstance(e, dict) and str(e.get("role", "")).lower() == "admin")
-                summary = (
-                    f" ({n_users} user{'s' if n_users != 1 else ''}, {n_admins} admin{'s' if n_admins != 1 else ''})"
-                )
-        print(f"  users.yaml already configured{summary}.")
-        print("  To modify users, edit users.yaml directly or use Telegram commands.")
-    else:
+    # When the canonical users.yaml already exists the wizard leaves it
+    # untouched (edit it directly or use the Telegram commands), so the
+    # admin-identity prompts below run only on a first-time install.
+    if not users_yaml_exists:
         while True:
             admin_telegram_id = _prompt(
                 "Admin Telegram ID",
@@ -1662,8 +1643,6 @@ def _cmd_config() -> None:
     # timeout. Both fire on every wizard run. The per-user
     # `pr_review` toggle lives in users.yaml (or /github reviews).
     print("-- PR review agent --")
-    print("  Per-user PR review toggle lives in users.yaml ('pr_review')")
-    print("  or via /github reviews on|off.")
 
     # Global cooldown always prompts: any opted-in user can drive
     # reviews, so the cooldown must be configurable for any install
