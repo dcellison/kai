@@ -1265,15 +1265,17 @@ class TestCmdConfig:
     def _simulate_existing_etc_users_yaml(monkeypatch, content):
         """Simulate the canonical users.yaml already existing with the given content.
 
-        Used by tests that want to exercise the wizard's "skip user
-        prompts; summarize existing config" branch without touching the
-        real `/etc/kai/`. Patches the path's existence check AND the
-        sudo-cat reader that the wizard goes through (`Path.exists` for
-        the existence gate; `_read_users_yaml_text` for the body the
-        wizard prints a summary of). The existence patch compares
-        against the live `kai.install.USERS_YAML` attribute rather than
-        a hardcoded path, so it stacks on top of the autouse
-        `_isolate_users_yaml` redirect from conftest.
+        Used by tests that want the wizard to take the existing-canonical
+        path (skip the user-creation prompts, leave the file untouched)
+        without touching the real `/etc/kai/`. Patches the path's
+        existence check AND the sudo-cat reader the wizard goes through
+        (`Path.exists` for the existence gate; `_read_users_yaml_text`
+        for the body the wizard's later per-user scans parse, e.g.
+        `_users_yaml_goose_providers` / `_users_yaml_agent_backends`).
+        The existence patch compares against the live
+        `kai.install.USERS_YAML` attribute rather than a hardcoded path,
+        so it stacks on top of the autouse `_isolate_users_yaml` redirect
+        from conftest.
         """
         _real_exists = Path.exists
 
