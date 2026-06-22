@@ -100,7 +100,7 @@ def _config(tmp_path: Path) -> MagicMock:
     cfg.memory_projects = {}
     cfg.user_configs = {}
     cfg.default_backend = "claude"
-    cfg.llm_provider = ""
+    cfg.default_provider = ""
     cfg.memory_extraction_timeout_s = 60
     cfg.session_db_path = tmp_path / "kai.db"
     return cfg
@@ -468,8 +468,8 @@ class TestResolveClassificationSettings:
     def test_user_overrides_win_over_global(self, tmp_path):
         cfg = _config(tmp_path)
         user = MagicMock()
-        user.default_backend = "codex"
-        user.llm_provider = "deepseek"
+        user.backend = "codex"
+        user.provider = "deepseek"
         user.os_user = "alice"
         cfg.user_configs = {100: user}
         settings = memory_reclassify.resolve_classification_settings(
@@ -489,8 +489,8 @@ class TestResolveClassificationSettings:
     def test_explicit_flags_override_resolution(self, tmp_path):
         cfg = _config(tmp_path)
         user = MagicMock()
-        user.default_backend = "codex"
-        user.llm_provider = "deepseek"
+        user.backend = "codex"
+        user.provider = "deepseek"
         user.os_user = "alice"
         cfg.user_configs = {100: user}
         settings = memory_reclassify.resolve_classification_settings(

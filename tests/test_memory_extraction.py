@@ -3970,7 +3970,7 @@ class TestExtractAndStorePerUserDispatch:
                     telegram_id=2,
                     name="bob",
                     os_user="bob_os",
-                    default_backend="codex",
+                    backend="codex",
                 ),
             },
         )
@@ -4021,7 +4021,7 @@ class TestExtractAndStorePerUserDispatch:
                     telegram_id=2,
                     name="bob",
                     os_user="bob_os",
-                    default_backend="codex",
+                    backend="codex",
                 ),
             },
         )
@@ -4036,7 +4036,7 @@ class TestExtractAndStorePerUserDispatch:
     @pytest.mark.asyncio
     async def test_per_user_override_wins_over_global(self, monkeypatch):
         """Global `DEFAULT_BACKEND=claude` with a per-user
-        `default_backend: codex` override resolves to codex for the
+        `backend: codex` override resolves to codex for the
         override user. Pin the cascade direction (per-user beats
         global) at the dispatch site."""
         from kai import memory as memory_module
@@ -4074,7 +4074,7 @@ class TestExtractAndStorePerUserDispatch:
                     telegram_id=1,
                     name="alice",
                     os_user="alice_os",
-                    default_backend="codex",
+                    backend="codex",
                 )
             },
         )
@@ -4084,7 +4084,7 @@ class TestExtractAndStorePerUserDispatch:
     @pytest.mark.asyncio
     async def test_inherits_global_when_no_per_user_override(self, monkeypatch):
         """Global `DEFAULT_BACKEND=codex` with a users.yaml entry that
-        does not pin `default_backend` resolves to codex for that
+        does not pin `backend` resolves to codex for that
         user. Pins the cascade fallback when no override exists."""
         from kai import memory as memory_module
         from kai.config import UserConfig
@@ -4154,7 +4154,7 @@ class TestExtractAndStorePerUserDispatch:
                     telegram_id=1,
                     name="alice",
                     os_user="alice_os",
-                    default_backend="codex",
+                    backend="codex",
                 )
             },
         )

@@ -2412,7 +2412,7 @@ class TestDashboardBackendNote:
         the note; the fall-through matches the extraction gate's
         backend resolution."""
         user_cfg = MagicMock()
-        user_cfg.default_backend = "goose"
+        user_cfg.backend = "goose"
         auth_config.get_user_config.return_value = user_cfg
         monkeypatch.setattr(memory_command, "ONESHOT_REASONER_BACKENDS", frozenset({"claude", "codex"}))
         monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)

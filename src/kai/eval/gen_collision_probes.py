@@ -43,11 +43,11 @@ Architecture notes:
   and so the structured-log `purpose` tag (`"collision_probe_drafting"`)
   distinguishes drafting calls from PR reviews.
 - Provider normalization: `resolve_classification_settings` returns
-  the raw `llm_provider` cascade. For single-provider backends
+  the raw `provider` cascade. For single-provider backends
   (claude->anthropic, codex->openai), we normalize via
   `get_effective_provider` before passing into `resolve_user_model`.
   Without that step, a codex user with inherited
-  `config.llm_provider="anthropic"` would look up a non-existent
+  `config.default_provider="anthropic"` would look up a non-existent
   `(codex, anthropic, pr_review)` registry entry.
 - Embedding source: `kai.memory.embed_texts` is the public boundary.
   Every Mem0 internal-attribute hop lives in
@@ -701,11 +701,11 @@ def _resolve_run_config(
 
     Provider normalization is the key step `resolve_classification_settings`
     does NOT do (its `_resolve_effective_provider` returns the raw
-    `llm_provider` cascade). For single-provider backends, the raw
+    `provider` cascade). For single-provider backends, the raw
     value can be the wrong provider for the registry lookup. The
     explicit `get_effective_provider(backend, raw)` call here is the
     correct fix; without it, a codex user with inherited
-    `config.llm_provider="anthropic"` fails to resolve any model.
+    `config.default_provider="anthropic"` fails to resolve any model.
     """
     from kai.memory_reclassify import (
         _resolve_user_config,
@@ -725,9 +725,9 @@ def _resolve_run_config(
 
     # Normalize for single-provider backends before passing into
     # resolve_user_model. The raw cascade value can be the wrong
-    # provider when the user inherits a global llm_provider set for
+    # provider when the user inherits a global provider set for
     # a different backend (e.g. a codex user inheriting
-    # llm_provider="anthropic" would otherwise miss the
+    # provider="anthropic" would otherwise miss the
     # (codex, openai, pr_review) registry entry).
     effective_provider = get_effective_provider(effective_backend, raw_provider)
 

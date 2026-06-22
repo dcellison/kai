@@ -13,7 +13,7 @@ install's memory state.
 
 Invocation: `python -m kai.smoke.memory [--user-id <chat_id>] [--os-user <name>]`.
 
-The `--user-id` flag selects which user's effective `default_backend`
+The `--user-id` flag selects which user's effective backend
 the smoke runs under (the same per-user dispatch production uses).
 When omitted, the smoke falls back to the global `config.default_backend`.
 The `--os-user` flag is required when the resolved effective backend
@@ -101,7 +101,7 @@ async def _run(user_id: str | None, os_user: str | None) -> int:
 
     # Resolve the effective backend the smoke runs under. With per-user
     # dispatch (issue #515), production extraction uses each user's
-    # effective `default_backend`; the smoke mirrors that by accepting a
+    # effective backend; the smoke mirrors that by accepting a
     # `--user-id` that the helper looks up in users.yaml. Without
     # `--user-id`, fall back to the global `default_backend` (the legacy
     # single-backend smoke path). The string the helper takes is the
@@ -213,7 +213,7 @@ def main() -> int:
         dest="user_id",
         default=None,
         help=(
-            "Telegram chat_id whose effective default_backend selects the reasoner. "
+            "Telegram chat_id whose effective backend selects the reasoner. "
             "Defaults to the global default_backend when omitted."
         ),
     )

@@ -884,7 +884,7 @@ def _get_user_models(pool: SubprocessPool, chat_id: int, config: Config) -> dict
         # programming oversight, not user error. OpenCode is excluded
         # alongside codex because its None return is intentional (full
         # provider/model IDs are open-ended, not a missing registry
-        # entry), and the global llm_provider for opencode is usually
+        # entry), and the global provider for opencode is usually
         # empty so the OPEN_ENDED_PROVIDERS check above would not catch
         # it.
         log.warning(
@@ -1152,7 +1152,7 @@ async def _show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
 
     # Timeout
     yaml_timeout = user_config.timeout if user_config else None
-    timeout, timeout_src = _resolve("timeout", yaml_timeout, config.agent_timeout_seconds, lambda v: f"{int(v)}s")
+    timeout, timeout_src = _resolve("timeout", yaml_timeout, config.default_timeout, lambda v: f"{int(v)}s")
 
     # Provider info - always show so users know their configuration.
     # Uses the shared helper that checks the running instance first,
@@ -1188,7 +1188,7 @@ def _revert_instance_field(pool: SubprocessPool, chat_id: int, field: str, confi
             # If the user's provider differs from the global provider, the
             # global default_model may be invalid for their provider.
             provider = instance.provider
-            effective_global = get_effective_provider(config.default_backend, config.llm_provider)
+            effective_global = get_effective_provider(config.default_backend, config.default_provider)
             if provider == effective_global:
                 instance.model = config.default_model
             else:
@@ -1204,7 +1204,7 @@ def _revert_instance_field(pool: SubprocessPool, chat_id: int, field: str, confi
                     fallback = config.default_model
                 instance.model = fallback
     elif field == "timeout":
-        instance.timeout_seconds = user.timeout if user and user.timeout is not None else config.agent_timeout_seconds
+        instance.timeout_seconds = user.timeout if user and user.timeout is not None else config.default_timeout
 
 
 async def _handle_settings_reset(
@@ -1891,7 +1891,7 @@ async def _show_workspace_config(
         elif user_config and user_config.timeout is not None:
             timeout, timeout_src = user_config.timeout, "users.yaml"
         else:
-            timeout, timeout_src = config.agent_timeout_seconds, "global default"
+            timeout, timeout_src = config.default_timeout, "global default"
         lines.append(f"  Timeout: {timeout}s ({timeout_src})")
     except (ValueError, TypeError):
         lines.append("  Timeout: (corrupted - reset with /workspace config reset timeout)")
@@ -4499,9 +4499,7 @@ async def _handle_response(
                 # is mandatory here.
                 user_config = config.get_user_config(chat_id)
                 effective_backend = (
-                    user_config.default_backend
-                    if user_config and user_config.default_backend
-                    else config.default_backend
+                    user_config.backend if user_config and user_config.backend else config.default_backend
                 )
                 if config.memory_extraction_enabled and effective_backend in ONESHOT_REASONER_BACKENDS:
                     # Windowed PRIOR CONTEXT for the episode classifier

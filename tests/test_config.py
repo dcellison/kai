@@ -32,7 +32,7 @@ _CONFIG_ENV_VARS = [
     "ALLOWED_USER_IDS",
     "DEFAULT_MODEL",
     "CLAUDE_MODEL",
-    "CLAUDE_TIMEOUT_SECONDS",
+    "CLAUDE_TIMEOUT_SECONDS",  # removed; cleared so a host value cannot leak into tests
     "BUDGET_CEILING",  # retired (budgets are no longer tracked)
     "CLAUDE_MAX_BUDGET_USD",  # retired (budgets are no longer tracked)
     "AGENT_MAX_SESSION_HOURS",
@@ -64,7 +64,10 @@ _CONFIG_ENV_VARS = [
     "TOTP_LOCKOUT_ATTEMPTS",
     "TOTP_LOCKOUT_MINUTES",
     "DEFAULT_BACKEND",
-    "LLM_PROVIDER",
+    "DEFAULT_PROVIDER",
+    "LLM_PROVIDER",  # backward compat (renamed to DEFAULT_PROVIDER)
+    "DEFAULT_TIMEOUT",
+    "AGENT_TIMEOUT_SECONDS",  # backward compat (renamed to DEFAULT_TIMEOUT)
     "MEMORY_ENABLED",
     "MEMORY_SEARCH_LIMIT",
     "MEMORY_TOKEN_BUDGET",
@@ -186,7 +189,7 @@ class TestLoadConfigDefaults:
         _set_required(monkeypatch)
         config = load_config()
         assert config.default_model == "sonnet"
-        assert config.agent_timeout_seconds == 120
+        assert config.default_timeout == 120
         assert config.agent_max_session_hours == 0
         assert config.webhook_port == 8080
         # Without TELEGRAM_WEBHOOK_URL, defaults to polling mode
@@ -295,50 +298,50 @@ class TestLoadConfigErrors:
         with pytest.raises(SystemExit, match="DEFAULT_BACKEND"):
             load_config()
 
-    def test_invalid_llm_provider(self, monkeypatch):
-        """LLM_PROVIDER with an unrecognized value raises SystemExit."""
+    def test_invalid_provider(self, monkeypatch):
+        """DEFAULT_PROVIDER with an unrecognized value raises SystemExit."""
         _set_required(monkeypatch)
         monkeypatch.setenv("DEFAULT_BACKEND", "goose")
-        monkeypatch.setenv("LLM_PROVIDER", "invalid")
-        with pytest.raises(SystemExit, match="LLM_PROVIDER"):
+        monkeypatch.setenv("DEFAULT_PROVIDER", "invalid")
+        with pytest.raises(SystemExit, match="DEFAULT_PROVIDER"):
             load_config()
 
-    def test_missing_llm_provider(self, monkeypatch):
-        """LLM_PROVIDER missing when backend=goose raises SystemExit."""
+    def test_missing_provider(self, monkeypatch):
+        """DEFAULT_PROVIDER missing when backend=goose raises SystemExit."""
         _set_required(monkeypatch)
         monkeypatch.setenv("DEFAULT_BACKEND", "goose")
-        with pytest.raises(SystemExit, match="LLM_PROVIDER"):
+        with pytest.raises(SystemExit, match="DEFAULT_PROVIDER"):
             load_config()
 
-    def test_llm_provider_ignored_for_claude(self, monkeypatch):
-        """LLM_PROVIDER is not validated when backend=claude."""
+    def test_provider_ignored_for_claude(self, monkeypatch):
+        """DEFAULT_PROVIDER is not validated when backend=claude."""
         _set_required(monkeypatch)
         cfg = load_config()
-        assert cfg.llm_provider == ""
+        assert cfg.default_provider == ""
 
-    def test_invalid_llm_provider_ignored_for_claude(self, monkeypatch):
-        """Even an invalid LLM_PROVIDER is ignored when backend=claude."""
+    def test_invalid_provider_ignored_for_claude(self, monkeypatch):
+        """Even an invalid DEFAULT_PROVIDER is ignored when backend=claude."""
         _set_required(monkeypatch)
-        monkeypatch.setenv("LLM_PROVIDER", "completelywrong")
+        monkeypatch.setenv("DEFAULT_PROVIDER", "completelywrong")
         cfg = load_config()
-        assert cfg.llm_provider == ""
+        assert cfg.default_provider == ""
 
-    def test_valid_llm_provider(self, monkeypatch):
-        """Valid LLM_PROVIDER is accepted and stored."""
+    def test_valid_provider(self, monkeypatch):
+        """Valid DEFAULT_PROVIDER is accepted and stored."""
         _set_required(monkeypatch)
         monkeypatch.setenv("DEFAULT_BACKEND", "goose")
-        monkeypatch.setenv("LLM_PROVIDER", "openai")
+        monkeypatch.setenv("DEFAULT_PROVIDER", "openai")
         # DEFAULT_MODEL must be valid for the openai provider
         monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.4")
         cfg = load_config()
-        assert cfg.llm_provider == "openai"
+        assert cfg.default_provider == "openai"
 
     def test_goose_without_provider_exits(self, monkeypatch):
-        """DEFAULT_BACKEND=goose without LLM_PROVIDER fails at startup."""
+        """DEFAULT_BACKEND=goose without a provider fails at startup."""
         _set_required(monkeypatch)
         monkeypatch.setenv("DEFAULT_BACKEND", "goose")
-        # LLM_PROVIDER not set - empty string is not in VALID_PROVIDERS["goose"]
-        with pytest.raises(SystemExit, match=r"LLM_PROVIDER.*not valid"):
+        # DEFAULT_PROVIDER not set - empty string is not in VALID_PROVIDERS["goose"]
+        with pytest.raises(SystemExit, match=r"DEFAULT_PROVIDER.*not valid"):
             load_config()
 
 
@@ -807,7 +810,8 @@ def _mock_user_configs(monkeypatch):
 # GITHUB_NOTIFY_CHAT_ID) are no longer read at runtime and have no
 # deprecation handling here — the loader silently ignores them.
 _RENAMED_VARS_WITH_VALUES = {
-    "CLAUDE_TIMEOUT_SECONDS": "120",
+    "CLAUDE_MAX_SESSION_HOURS": "4",
+    "CLAUDE_IDLE_TIMEOUT": "900",
 }
 
 
@@ -826,11 +830,11 @@ class TestRenamedEnvWarnings:
     def test_empty_var_does_not_warn(self, monkeypatch, caplog):
         """Empty string env vars are not treated as 'set'."""
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
-        monkeypatch.setenv("CLAUDE_TIMEOUT_SECONDS", "")
+        monkeypatch.setenv("CLAUDE_IDLE_TIMEOUT", "")
         _mock_user_configs(monkeypatch)
         with caplog.at_level(logging.WARNING, logger="kai.config"):
             load_config()
-        assert "CLAUDE_TIMEOUT_SECONDS in env is deprecated" not in caplog.text
+        assert "CLAUDE_IDLE_TIMEOUT in env is deprecated" not in caplog.text
 
 
 # Retired env vars: the setting no longer exists, so the loader warns
@@ -979,7 +983,7 @@ class TestMinimalEnvWithUsersYaml:
         config = load_config()
         # Uses dataclass defaults when no env var is set
         assert config.default_model == "sonnet"
-        assert config.agent_timeout_seconds == 120
+        assert config.default_timeout == 120
         assert config.workspace_base is None
         assert config.allowed_workspaces == []
         # users.yaml IDs are the authorization surface
@@ -1776,13 +1780,13 @@ class TestExtractionEligibleBackendsHelper:
 
         configs = {
             1: UserConfig(telegram_id=1, name="alice", os_user="a"),
-            2: UserConfig(telegram_id=2, name="bob", os_user="b", default_backend="codex"),
+            2: UserConfig(telegram_id=2, name="bob", os_user="b", backend="codex"),
         }
         eligible = _compute_extraction_eligible_backends("claude", configs, True)
         assert eligible == {"claude", "codex"}
 
     def test_goose_users_contribute_to_eligible_set(self):
-        """A users.yaml entry with `default_backend: goose` contributes
+        """A users.yaml entry with `backend: goose` contributes
         to the eligible set now that goose ships a OneShotReasoner;
         the config-load precondition / binary checks must fire for a
         goose user the same way they do for the other backends."""
@@ -1790,7 +1794,7 @@ class TestExtractionEligibleBackendsHelper:
 
         configs = {
             1: UserConfig(telegram_id=1, name="alice", os_user="a"),
-            2: UserConfig(telegram_id=2, name="bob", os_user="b", default_backend="goose", llm_provider="openai"),
+            2: UserConfig(telegram_id=2, name="bob", os_user="b", backend="goose", provider="openai"),
         }
         eligible = _compute_extraction_eligible_backends("claude", configs, True)
         assert eligible == {"claude", "goose"}
@@ -1806,7 +1810,7 @@ class TestExtractionEligibleBackendsHelper:
         monkeypatch.setattr(config_module, "ONESHOT_REASONER_BACKENDS", frozenset({"claude", "codex"}))
         configs = {
             1: UserConfig(telegram_id=1, name="alice", os_user="a"),
-            2: UserConfig(telegram_id=2, name="bob", os_user="b", default_backend="goose", llm_provider="openai"),
+            2: UserConfig(telegram_id=2, name="bob", os_user="b", backend="goose", provider="openai"),
         }
         eligible = _compute_extraction_eligible_backends("claude", configs, True)
         assert eligible == {"claude"}
@@ -1822,7 +1826,7 @@ class TestExtractionEligibleBackendsHelper:
 
         configs = {
             1: UserConfig(telegram_id=1, name="alice", os_user="a"),
-            2: UserConfig(telegram_id=2, name="bob", os_user="b", default_backend="opencode"),
+            2: UserConfig(telegram_id=2, name="bob", os_user="b", backend="opencode"),
         }
         eligible = _compute_extraction_eligible_backends("claude", configs, True)
         assert eligible == {"claude", "opencode"}
@@ -2672,7 +2676,7 @@ class TestDefaultBackendEnvResolution:
         monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.5")
         # Clear the one-shot warned-context set so the assertion below
         # observes this process's actual warn behavior.
-        config_module._default_backend_deprecation_warned.clear()
+        config_module._renamed_key_deprecation_warned.clear()
         cfg = load_config()
         assert cfg.default_backend == "codex"
 
@@ -2687,7 +2691,7 @@ class TestDefaultBackendEnvResolution:
         monkeypatch.delenv("DEFAULT_BACKEND", raising=False)
         monkeypatch.setenv("AGENT_BACKEND", "codex")
         monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.5")
-        config_module._default_backend_deprecation_warned.clear()
+        config_module._renamed_key_deprecation_warned.clear()
         with caplog.at_level(logging.WARNING):
             cfg = load_config()
         assert cfg.default_backend == "codex"
@@ -2706,26 +2710,100 @@ class TestDefaultBackendEnvResolution:
         monkeypatch.setenv("OPENAI_API_KEY", "k")
         monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.5")
         monkeypatch.setenv("AGENT_BACKEND", "codex")
-        config_module._default_backend_deprecation_warned.clear()
+        config_module._renamed_key_deprecation_warned.clear()
         with caplog.at_level(logging.WARNING):
             cfg = load_config()
         assert cfg.default_backend == "goose"
         assert not any("AGENT_BACKEND is deprecated" in r.message for r in caplog.records)
 
 
+class TestDefaultProviderEnvResolution:
+    """Back-compat for the LLM_PROVIDER -> DEFAULT_PROVIDER env rename.
+
+    The provider is read only for multi-provider backends (goose,
+    opencode), so these tests drive goose so load_config consults the
+    key. The reader prefers DEFAULT_PROVIDER and falls back to the
+    deprecated LLM_PROVIDER for one release with a one-shot warning.
+    """
+
+    def test_legacy_LLM_PROVIDER_env_resolved_with_warning(self, monkeypatch, caplog):
+        import kai.config as config_module
+
+        _set_required(monkeypatch)
+        monkeypatch.setenv("DEFAULT_BACKEND", "goose")
+        monkeypatch.delenv("DEFAULT_PROVIDER", raising=False)
+        monkeypatch.setenv("LLM_PROVIDER", "openai")
+        monkeypatch.setenv("OPENAI_API_KEY", "k")
+        monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.5")
+        config_module._renamed_key_deprecation_warned.clear()
+        with caplog.at_level(logging.WARNING):
+            cfg = load_config()
+        assert cfg.default_provider == "openai"
+        assert any("LLM_PROVIDER" in r.message and "DEFAULT_PROVIDER" in r.message for r in caplog.records)
+
+    def test_DEFAULT_PROVIDER_env_wins_when_both_set(self, monkeypatch, caplog):
+        import kai.config as config_module
+
+        _set_required(monkeypatch)
+        monkeypatch.setenv("DEFAULT_BACKEND", "goose")
+        monkeypatch.setenv("DEFAULT_PROVIDER", "openai")
+        monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+        monkeypatch.setenv("OPENAI_API_KEY", "k")
+        monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.5")
+        config_module._renamed_key_deprecation_warned.clear()
+        with caplog.at_level(logging.WARNING):
+            cfg = load_config()
+        assert cfg.default_provider == "openai"
+        assert not any("LLM_PROVIDER is deprecated" in r.message for r in caplog.records)
+
+
+class TestResolveEvalProvider:
+    """The shared eval-time provider resolver used by the behavioral
+    eval and the memory backend gate. Reads DEFAULT_PROVIDER with a
+    one-release fallback to the deprecated LLM_PROVIDER name."""
+
+    def test_reads_DEFAULT_PROVIDER(self, monkeypatch, caplog):
+        import kai.config as config_module
+
+        monkeypatch.delenv("LLM_PROVIDER", raising=False)
+        monkeypatch.setenv("DEFAULT_PROVIDER", "OpenAI")
+        config_module._renamed_key_deprecation_warned.clear()
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            # Normalizes via strip().lower().
+            assert config_module._resolve_eval_provider("eval ctx") == "openai"
+        assert not any("deprecated" in r.message for r in caplog.records)
+
+    def test_legacy_LLM_PROVIDER_resolved_with_warning(self, monkeypatch, caplog):
+        import kai.config as config_module
+
+        monkeypatch.delenv("DEFAULT_PROVIDER", raising=False)
+        monkeypatch.setenv("LLM_PROVIDER", "openai")
+        config_module._renamed_key_deprecation_warned.clear()
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            assert config_module._resolve_eval_provider("eval ctx") == "openai"
+        assert any("LLM_PROVIDER" in r.message and "DEFAULT_PROVIDER" in r.message for r in caplog.records)
+
+    def test_neither_set_returns_empty(self, monkeypatch):
+        import kai.config as config_module
+
+        monkeypatch.delenv("DEFAULT_PROVIDER", raising=False)
+        monkeypatch.delenv("LLM_PROVIDER", raising=False)
+        assert config_module._resolve_eval_provider("eval ctx") == ""
+
+
 class TestGetUserBackendAndProvider:
     """Per-user cascade resolver."""
 
-    def _config(self, default_backend="claude", llm_provider=""):
+    def _config(self, default_backend="claude", default_provider=""):
         cfg = MagicMock()
         cfg.default_backend = default_backend
-        cfg.llm_provider = llm_provider
+        cfg.default_provider = default_provider
         return cfg
 
-    def _user_config(self, default_backend=None, llm_provider=None):
+    def _user_config(self, backend=None, provider=None):
         uc = MagicMock()
-        uc.default_backend = default_backend
-        uc.llm_provider = llm_provider
+        uc.backend = backend
+        uc.provider = provider
         return uc
 
     def test_no_user_config_returns_global(self):
@@ -2740,7 +2818,7 @@ class TestGetUserBackendAndProvider:
         from kai.config import get_user_backend_and_provider
 
         cfg = self._config(default_backend="claude")
-        uc = self._user_config(default_backend="codex")
+        uc = self._user_config(backend="codex")
         backend, provider = get_user_backend_and_provider(uc, cfg)
         assert backend == "codex"
         assert provider == "openai"
@@ -2749,7 +2827,7 @@ class TestGetUserBackendAndProvider:
         from kai.config import get_user_backend_and_provider
 
         cfg = self._config(default_backend="codex")
-        uc = self._user_config(default_backend="goose", llm_provider="openai")
+        uc = self._user_config(backend="goose", provider="openai")
         backend, provider = get_user_backend_and_provider(uc, cfg)
         assert backend == "goose"
         assert provider == "openai"
@@ -2758,18 +2836,24 @@ class TestGetUserBackendAndProvider:
         from kai.config import get_user_backend_and_provider
 
         cfg = self._config(default_backend="codex")
-        uc = self._user_config(default_backend="codex", llm_provider="anthropic")
+        uc = self._user_config(backend="codex", provider="anthropic")
         backend, provider = get_user_backend_and_provider(uc, cfg)
         assert backend == "codex"
         assert provider == "openai"
 
 
-class TestAgentTimeoutSecondsRename:
-    """CLAUDE_TIMEOUT_SECONDS -> AGENT_TIMEOUT_SECONDS rename with legacy alias."""
+class TestDefaultTimeoutRename:
+    """AGENT_TIMEOUT_SECONDS -> DEFAULT_TIMEOUT rename with a one-release
+    legacy alias. The older CLAUDE_TIMEOUT_SECONDS step is gone entirely."""
 
     def _required_env(self, monkeypatch, **overrides):
         for var in _CONFIG_ENV_VARS:
             monkeypatch.delenv(var, raising=False)
+        # Clear the one-shot warned set so per-test warn assertions
+        # observe this process's actual warn behavior.
+        import kai.config as config_module
+
+        config_module._renamed_key_deprecation_warned.clear()
         base = {
             "TELEGRAM_BOT_TOKEN": "test-token",
             "ALLOWED_USER_IDS": "12345",
@@ -2787,26 +2871,36 @@ class TestAgentTimeoutSecondsRename:
             "users:\n  - telegram_id: 12345\n    name: test\n    role: admin\n",
         )
 
-    def test_agent_timeout_seconds_preferred(self, monkeypatch):
+    def test_DEFAULT_TIMEOUT_env_wins_when_both_set(self, monkeypatch, caplog):
         self._required_env(
             monkeypatch,
-            AGENT_TIMEOUT_SECONDS="180",
-            CLAUDE_TIMEOUT_SECONDS="60",
+            DEFAULT_TIMEOUT="180",
+            AGENT_TIMEOUT_SECONDS="60",
         )
-        cfg = load_config()
-        assert cfg.agent_timeout_seconds == 180
-
-    def test_legacy_only_falls_back_with_warning(self, monkeypatch, caplog):
-        self._required_env(monkeypatch, CLAUDE_TIMEOUT_SECONDS="240")
         with caplog.at_level(logging.WARNING, logger="kai.config"):
             cfg = load_config()
-        assert cfg.agent_timeout_seconds == 240
-        assert any("CLAUDE_TIMEOUT_SECONDS is deprecated" in r.message for r in caplog.records)
+        assert cfg.default_timeout == 180
+        # The legacy key is never consulted, so no deprecation warning.
+        assert not any("AGENT_TIMEOUT_SECONDS is deprecated" in r.message for r in caplog.records)
+
+    def test_legacy_AGENT_TIMEOUT_SECONDS_env_resolved_with_warning(self, monkeypatch, caplog):
+        self._required_env(monkeypatch, AGENT_TIMEOUT_SECONDS="240")
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            cfg = load_config()
+        assert cfg.default_timeout == 240
+        assert any("AGENT_TIMEOUT_SECONDS" in r.message and "DEFAULT_TIMEOUT" in r.message for r in caplog.records)
+
+    def test_CLAUDE_TIMEOUT_SECONDS_no_longer_honored(self, monkeypatch):
+        """The older CLAUDE_TIMEOUT_SECONDS back-compat step was removed;
+        setting only it leaves the timeout at the 120 default."""
+        self._required_env(monkeypatch, CLAUDE_TIMEOUT_SECONDS="240")
+        cfg = load_config()
+        assert cfg.default_timeout == 120
 
     def test_neither_set_defaults_to_120(self, monkeypatch):
         self._required_env(monkeypatch)
         cfg = load_config()
-        assert cfg.agent_timeout_seconds == 120
+        assert cfg.default_timeout == 120
 
 
 class TestAgentSessionLifecycleRename:
@@ -3650,7 +3744,7 @@ class TestResolveUserModel:
     def _config(self, default_models=None):
         cfg = MagicMock()
         cfg.default_backend = "claude"
-        cfg.llm_provider = ""
+        cfg.default_provider = ""
         cfg.default_models = default_models or {}
         return cfg
 
@@ -3712,7 +3806,7 @@ class TestLegacyEnvOverrideSeeding:
         from kai.config import UserConfig, _apply_legacy_model_env_overrides
 
         monkeypatch.setenv("PR_REVIEW_MODEL_CLAUDE", "opus")
-        uc = UserConfig(telegram_id=1, name="test", default_backend="codex")
+        uc = UserConfig(telegram_id=1, name="test", backend="codex")
         out = _apply_legacy_model_env_overrides({1: uc}, "claude")
         assert out[1].models is None
 

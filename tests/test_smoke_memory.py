@@ -267,7 +267,7 @@ class TestSmokeMemoryUserIdDispatch:
                     telegram_id=1,
                     name="codex_user",
                     os_user="codex_os",
-                    default_backend="codex",
+                    backend="codex",
                 )
             }
         )
@@ -314,7 +314,7 @@ class TestSmokeMemoryUserIdDispatch:
                     telegram_id=1,
                     name="claude_user",
                     os_user="claude_os",
-                    default_backend="claude",
+                    backend="claude",
                 )
             },
         )

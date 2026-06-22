@@ -548,7 +548,7 @@ class TestConstructor:
 
 class TestStartupFailureSurface:
     """
-    Spec #556 acceptance criterion: a per-user `default_backend: opencode`
+    Spec #556 acceptance criterion: a per-user `backend: opencode`
     entry on a non-opencode install must produce a chat-visible
     startup-failure StreamEvent (not silent failure, not fall-through
     to claude) when `opencode` is missing from PATH.

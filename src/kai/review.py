@@ -3055,7 +3055,7 @@ async def run_review(
     if agent_backend == "goose":
         if not provider:
             raise ValueError(
-                "agent_backend is 'goose' but provider is empty. Set LLM_PROVIDER in .env or per-user config."
+                "agent_backend is 'goose' but provider is empty. Set DEFAULT_PROVIDER in .env or per-user config."
             )
         # Dispatch to the goose one-shot reasoner, which owns the
         # `goose run -i - ... --max-turns 1` argv, GOOSE_BIN

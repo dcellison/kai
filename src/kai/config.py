@@ -79,7 +79,7 @@ ONESHOT_REASONER_BACKENDS: frozenset[str] = frozenset({"claude", "codex", "goose
 # that needs to know "what providers can this backend talk to" reads
 # from this map. Claude and codex are 1:1 with one provider each;
 # opencode and goose are 1:N. load_config validates that every user's
-# (default_backend, llm_provider) pair is a member. Adding a new
+# (backend, provider) pair is a member. Adding a new
 # backend is one row here; adding a new provider to an existing
 # backend is one tuple element. Tuple values (not frozensets) so the
 # wizard offers providers in a stable, documented order; sorted
@@ -104,8 +104,8 @@ BACKEND_PROVIDERS: dict[str, tuple[str, ...]] = {
 #
 # Kept distinct from BACKEND_PROVIDERS so claude / codex stay out of
 # the "requires provider" gates that drive the wizard provider-prompt,
-# the per-user `llm_provider` validation in _load_user_configs, and
-# the global LLM_PROVIDER env-var validation in load_config. Membership
+# the per-user `provider` validation in _load_user_configs, and
+# the global DEFAULT_PROVIDER env-var validation in load_config. Membership
 # in BACKEND_PROVIDERS describes what is allowed; membership here
 # describes what is required.
 BACKENDS_NEEDING_PROVIDER_PROMPT: frozenset[str] = frozenset(b for b, ps in BACKEND_PROVIDERS.items() if len(ps) > 1)
@@ -686,28 +686,35 @@ def validate_model_for_backend(model: str, backend: str, eff_provider: str) -> b
     return validate_model_for_provider(model, eff_provider)
 
 
-# Contexts that have already emitted the AGENT_BACKEND deprecation
-# warning. Keyed by the `context` string each reader passes so a given
+# (context, matched legacy key) pairs that have already emitted a
+# renamed-key deprecation warning. Keyed by both halves so a given
 # source (the env file, a specific user's yaml entry, install.conf)
-# warns at most once per process instead of once per lookup.
-_default_backend_deprecation_warned: set[str] = set()
+# warns at most once per legacy key per process instead of once per
+# lookup, and a multi-key fallback chain warns distinctly for each
+# legacy name it encounters.
+_renamed_key_deprecation_warned: set[tuple[str, str]] = set()
 
 
-def _resolve_default_backend(
+def _resolve_renamed_key(
     get: Callable[[str], str | None],
-    new_key: str,
-    old_key: str,
     *,
+    new_key: str,
+    legacy_keys: list[str],
     context: str,
     default: str | None,
 ) -> str | None:
-    """Read the default-backend setting, preferring the new key name.
+    """Read a config value, preferring the new key over legacy names.
 
-    Centralizes the one-release back-compat window for the
-    `AGENT_BACKEND` -> `DEFAULT_BACKEND` rename. Every reader (env,
-    install.conf dict, per-user yaml entry) passes its own lookup
-    callable plus the key casing for its source so a single
-    implementation serves all of them.
+    Centralizes the one-release back-compat window for a key rename.
+    Every reader (env, install.conf dict, per-user yaml entry) passes
+    its own lookup callable plus the key casing for its source so a
+    single implementation serves all of them.
+
+    `legacy_keys` is ordered most-recent-first: the first legacy key
+    that is present wins. A key that has had more than one rename (the
+    per-user backend went `agent_backend` -> `default_backend` ->
+    `backend`) lists every prior name so an install carrying any of
+    them still resolves.
 
     Absence semantics differ by caller and are made explicit through
     `default`: global readers pass `default="claude"` (the
@@ -720,33 +727,64 @@ def _resolve_default_backend(
     Args:
         get: Lookup callable taking a key and returning value-or-None
             (os.environ.get, env_dict.get, entry.get).
-        new_key: The current key name (DEFAULT_BACKEND / default_backend).
-        old_key: The deprecated key name (AGENT_BACKEND / agent_backend).
+        new_key: The current key name (DEFAULT_BACKEND / backend).
+        legacy_keys: Deprecated key names, most-recent first
+            (e.g. ["default_backend", "agent_backend"]).
         context: Human-readable source name for the one-shot
             deprecation log line (e.g. "/etc/kai/env", "install.conf",
             "users.yaml entry for <user>").
-        default: Value to return when neither key is set.
+        default: Value to return when no key is set.
 
     Returns:
-        The resolved backend string, or `default` when neither key is
-        present. Does not validate against VALID_BACKENDS; callers keep
-        their existing validation.
+        The resolved string, or `default` when no key is present. Does
+        not validate the value; callers keep their existing validation.
     """
     new_value = get(new_key)
     if new_value is not None:
         return new_value
-    old_value = get(old_key)
-    if old_value is not None:
-        if context not in _default_backend_deprecation_warned:
-            _default_backend_deprecation_warned.add(context)
-            log.warning(
-                "%s is deprecated; rename to %s (found in %s)",
-                old_key,
-                new_key,
-                context,
-            )
-        return old_value
+    for old_key in legacy_keys:
+        old_value = get(old_key)
+        if old_value is not None:
+            warned = (context, old_key)
+            if warned not in _renamed_key_deprecation_warned:
+                _renamed_key_deprecation_warned.add(warned)
+                log.warning(
+                    "%s is deprecated; rename to %s (found in %s)",
+                    old_key,
+                    new_key,
+                    context,
+                )
+            return old_value
     return default
+
+
+def _resolve_eval_provider(context: str) -> str:
+    """Eval-time provider, read from the process env.
+
+    The developer eval tools (behavioral eval, memory backend gate) run
+    against the operator's configured provider rather than a sandboxed
+    user, so they read the same global env `load_config` does: the
+    canonical DEFAULT_PROVIDER with a one-release fallback to the
+    deprecated LLM_PROVIDER name. Single-provider backends (claude,
+    codex) ignore the result because their provider is implicit. Shared
+    so both eval entry points resolve the provider identically and
+    neither bypasses the rename window. `context` names the caller for
+    the one-shot deprecation log line.
+    """
+    return (
+        (
+            _resolve_renamed_key(
+                os.environ.get,
+                new_key="DEFAULT_PROVIDER",
+                legacy_keys=["LLM_PROVIDER"],
+                context=context,
+                default="",
+            )
+            or ""
+        )
+        .strip()
+        .lower()
+    )
 
 
 def models_for_backend(agent_backend: str, eff_provider: str) -> dict[str, str] | None:
@@ -776,22 +814,22 @@ def models_for_backend(agent_backend: str, eff_provider: str) -> dict[str, str] 
 def get_user_backend_and_provider(user_config: "UserConfig | None", config: "Config") -> tuple[str, str]:
     """Resolve (backend, provider) for a chat_id with the per-user cascade.
 
-    Pool.py and bot.py already implement this cascade (user.default_backend
-    > config.default_backend, similar for llm_provider); this function
+    Pool.py and bot.py already implement this cascade (user.backend
+    > config.default_backend, similar for provider); this function
     consolidates it in one place so every runtime model-validation site
     sees the same effective backend for a given user. Backend determines
     provider 1:1 for codex (openai) and claude (anthropic); goose and
-    opencode both consult the raw llm_provider cascade (opencode's
+    opencode both consult the raw provider cascade (opencode's
     value is informational - the real provider/model resolution lives
     inside OpenCode's full `provider/model` string at runtime).
     """
-    backend = user_config.default_backend if user_config and user_config.default_backend else config.default_backend
+    backend = user_config.backend if user_config and user_config.backend else config.default_backend
     if backend == "claude":
         provider = "anthropic"
     elif backend == "codex":
         provider = "openai"
     else:
-        provider = user_config.llm_provider if user_config and user_config.llm_provider else config.llm_provider
+        provider = user_config.provider if user_config and user_config.provider else config.default_provider
     return backend, provider
 
 
@@ -1002,8 +1040,8 @@ class UserConfig:
     allowed_workspaces: list[Path] = field(default_factory=list)
     # Per-user backend/provider override. Admin-controlled via users.yaml,
     # not user-configurable via /settings. None = use global config.
-    default_backend: str | None = None
-    llm_provider: str | None = None
+    backend: str | None = None
+    provider: str | None = None
     # GitHub notification routing fields. github_repos controls which
     # repos route webhook events to this user. pr_review and issue_triage
     # are tri-state: None = use global default, True/False = admin override.
@@ -1048,7 +1086,7 @@ class Config:
             Only required in webhook mode. Defaults to WEBHOOK_SECRET if not explicitly set.
         allowed_user_ids: Set of Telegram user IDs permitted to interact with the bot (required)
         default_model: Default model name, provider-dependent (e.g. sonnet, gpt-5.5-pro, gemini-2.5-pro)
-        agent_timeout_seconds: Seconds before an agent response is considered timed
+        default_timeout: Seconds before an agent response is considered timed
             out, on every backend
         agent_max_session_hours: Hours before an agent subprocess is recycled, on every
             backend. Prevents unbounded memory growth in long-lived agent processes (the
@@ -1086,7 +1124,7 @@ class Config:
     # MODEL_REGISTRY[(backend, provider, role)] (lowest) in the
     # resolution chain that `resolve_user_model` implements.
     default_models: dict[str, str] = field(default_factory=dict)
-    agent_timeout_seconds: int = 120
+    default_timeout: int = 120
     # Backend-generic pool lifecycle tunables, matching the AGENT_-
     # prefixed env vars they load from: every backend's subprocess is
     # recycled by age and evicted when idle.
@@ -1220,7 +1258,7 @@ class Config:
     # which API key env var the backend expects and whether Kai's
     # logical model names ("sonnet", "opus") are translated to Anthropic IDs.
     # Ignored when default_backend="claude".
-    llm_provider: str = ""
+    default_provider: str = ""
 
     # Semantic memory system (Mem0 + Qdrant + local embeddings).
     # When enabled, every conversation is embedded and searchable.
@@ -1944,7 +1982,7 @@ def _compute_extraction_eligible_backends(
         return set()
     eligible: set[str] = set()
     for uc in user_configs.values():
-        effective = uc.default_backend or agent_backend
+        effective = uc.backend or agent_backend
         if effective in ONESHOT_REASONER_BACKENDS:
             eligible.add(effective)
     return eligible
@@ -1959,7 +1997,7 @@ def _apply_legacy_model_env_overrides(
     Reads PR_REVIEW_MODEL_<EFFECTIVE_BACKEND> and
     ISSUE_TRIAGE_MODEL_<EFFECTIVE_BACKEND> from the process env for
     each user. EFFECTIVE_BACKEND is the user's per-user override
-    (`uc.default_backend`) or `default_backend` when the user has no
+    (`uc.backend`) or `default_backend` when the user has no
     override. The resolution is inlined as a single fallback
     expression rather than calling `get_user_backend_and_provider`,
     because the full Config object is not yet built at this point in
@@ -1983,7 +2021,7 @@ def _apply_legacy_model_env_overrides(
     warned = False
     out: dict[int, UserConfig] = {}
     for uid, uc in user_configs.items():
-        backend = uc.default_backend or default_backend
+        backend = uc.backend or default_backend
         existing_models = dict(uc.models or {})
         for role_str, env_prefix in [
             ("pr_review", "PR_REVIEW_MODEL"),
@@ -2030,10 +2068,10 @@ def _compute_extraction_eligible_backend_provider_pairs(
         return set()
     eligible: set[tuple[str, str]] = set()
     for uc in user_configs.values():
-        eff_backend = uc.default_backend or agent_backend
+        eff_backend = uc.backend or agent_backend
         if eff_backend not in ONESHOT_REASONER_BACKENDS:
             continue
-        eff_provider = uc.llm_provider or agent_provider
+        eff_provider = uc.provider or agent_provider
         if eff_backend == "claude":
             eff_provider = "anthropic"
         elif eff_backend == "codex":
@@ -2078,7 +2116,7 @@ def _load_user_configs(
 
     Args:
         global_backend: The global default_backend from env config.
-        global_llm_provider: The global llm_provider from env config.
+        global_llm_provider: The global default_provider from env config.
             Both are needed to cascade per-user model validation:
             a user's effective provider determines which models are valid.
         users_yaml_path: Resolved users.yaml path for this deployment.
@@ -2215,17 +2253,18 @@ def _load_user_configs(
         if entry.get("max_budget") is not None:
             log.warning("users.yaml: 'max_budget' for %s is no longer supported; ignoring", name)
 
-        # Validate optional per-user default_backend (must be valid if
-        # set). Reads default_backend, falling back to the deprecated
-        # agent_backend key for one release. default=None so a user
-        # with neither key inherits the global backend below via
-        # `user_backend or global_backend`, rather than being pinned to
-        # claude.
+        # Validate optional per-user backend (must be valid if set).
+        # Reads `backend`, falling back to the deprecated `default_backend`
+        # and then `agent_backend` keys for one release (the per-user key
+        # was renamed twice: agent_backend -> default_backend -> backend).
+        # default=None so a user with neither key inherits the global
+        # backend below via `user_backend or global_backend`, rather than
+        # being pinned to claude.
         user_backend: str | None = None
-        raw_backend = _resolve_default_backend(
+        raw_backend = _resolve_renamed_key(
             entry.get,
-            "default_backend",
-            "agent_backend",
+            new_key="backend",
+            legacy_keys=["default_backend", "agent_backend"],
             context=f"users.yaml entry for {name}",
             default=None,
         )
@@ -2233,14 +2272,22 @@ def _load_user_configs(
             backend_str = str(raw_backend).strip().lower()
             if backend_str not in VALID_BACKENDS:
                 raise SystemExit(
-                    f"users.yaml: user '{name}' has invalid default_backend '{backend_str}' "
+                    f"users.yaml: user '{name}' has invalid backend '{backend_str}' "
                     f"(must be one of: {', '.join(sorted(VALID_BACKENDS))})"
                 )
             user_backend = backend_str
 
-        # Validate optional llm_provider (must be valid for the user's backend)
+        # Validate optional per-user provider (must be valid for the
+        # user's backend). Reads `provider`, falling back to the
+        # deprecated `llm_provider` key for one release.
         user_provider: str | None = None
-        raw_provider = entry.get("llm_provider")
+        raw_provider = _resolve_renamed_key(
+            entry.get,
+            new_key="provider",
+            legacy_keys=["llm_provider"],
+            context=f"users.yaml entry for {name}",
+            default=None,
+        )
         if raw_provider is not None:
             provider_str = str(raw_provider).strip().lower()
             # Validate against the user's effective backend. If the user
@@ -2249,7 +2296,7 @@ def _load_user_configs(
             # Validate against BACKEND_PROVIDERS only when the backend
             # requires a provider prompt. Single-provider backends
             # (claude, codex) are absent from BACKENDS_NEEDING_PROVIDER_PROMPT,
-            # so a per-user llm_provider override on those backends is
+            # so a per-user provider override on those backends is
             # accepted without a curated-list check (the provider is
             # implicit at runtime regardless of what users.yaml says).
             valid: tuple[str, ...] | None = (
@@ -2259,7 +2306,7 @@ def _load_user_configs(
             )
             if valid is not None and provider_str not in valid:
                 raise SystemExit(
-                    f"users.yaml: user '{name}' has invalid llm_provider "
+                    f"users.yaml: user '{name}' has invalid provider "
                     f"'{provider_str}' for backend '{eff_backend_for_val}' "
                     f"(must be one of: {', '.join(sorted(valid))})"
                 )
@@ -2275,9 +2322,9 @@ def _load_user_configs(
         # resolved (neither user-level nor global), that's a fatal config error.
         if eff_backend in BACKENDS_NEEDING_PROVIDER_PROMPT and not eff_provider_str:
             raise SystemExit(
-                f"users.yaml: user '{name}' has default_backend='{eff_backend}' but no "
-                f"llm_provider is configured (set it in users.yaml or as "
-                f"LLM_PROVIDER env var)"
+                f"users.yaml: user '{name}' has backend='{eff_backend}' but no "
+                f"provider is configured (set it in users.yaml or as "
+                f"DEFAULT_PROVIDER env var)"
             )
 
         # Warn if user is on an open-ended provider with no model set.
@@ -2521,8 +2568,8 @@ def _load_user_configs(
             timeout=user_timeout,
             workspace_base=user_workspace_base,
             allowed_workspaces=user_allowed_workspaces,
-            default_backend=user_backend,
-            llm_provider=user_provider,
+            backend=user_backend,
+            provider=user_provider,
             github_repos=github_repos,
             github_notify_chat_id=github_notify_chat_id,
             pr_review=pr_review,
@@ -2639,26 +2686,27 @@ def load_config() -> Config:
 
     # Validate numeric config - fail fast with clear messages rather than
     # cryptic ValueError tracebacks from int()/float() on bad input.
-    # AGENT_TIMEOUT_SECONDS is the canonical key; CLAUDE_TIMEOUT_SECONDS
-    # is a legacy alias kept for installs upgrading without re-running
-    # the wizard. Apply-time migration in install.py rewrites
-    # /etc/kai/env to the new key, so the legacy fallback only fires
-    # on the first start after the upgrade.
-    raw_timeout = os.environ.get("AGENT_TIMEOUT_SECONDS", "").strip()
-    if not raw_timeout:
-        legacy_timeout = os.environ.get("CLAUDE_TIMEOUT_SECONDS", "").strip()
-        if legacy_timeout:
-            log.warning(
-                "CLAUDE_TIMEOUT_SECONDS is deprecated; use AGENT_TIMEOUT_SECONDS. "
-                "Re-run 'make install' to migrate /etc/kai/env automatically."
-            )
-            raw_timeout = legacy_timeout
-        else:
-            raw_timeout = "120"
+    # DEFAULT_TIMEOUT is the canonical key; AGENT_TIMEOUT_SECONDS is a
+    # legacy alias kept for installs upgrading without re-running the
+    # wizard. Apply-time migration in install.py rewrites /etc/kai/env
+    # to the new key, so the legacy fallback only fires on the first
+    # start after the upgrade. The lookup treats an empty value as
+    # absent so an unset/blank new key still falls through to the
+    # legacy name and then the 120 default.
+    raw_timeout = (
+        _resolve_renamed_key(
+            lambda k: (os.environ.get(k) or "").strip() or None,
+            new_key="DEFAULT_TIMEOUT",
+            legacy_keys=["AGENT_TIMEOUT_SECONDS"],
+            context="/etc/kai/env",
+            default=None,
+        )
+        or "120"
+    )
     try:
-        agent_timeout_seconds = int(raw_timeout)
+        default_timeout = int(raw_timeout)
     except ValueError:
-        raise SystemExit("AGENT_TIMEOUT_SECONDS must be an integer") from None
+        raise SystemExit("DEFAULT_TIMEOUT must be an integer") from None
     # AGENT_MAX_SESSION_HOURS / AGENT_IDLE_TIMEOUT are the canonical
     # keys; the CLAUDE_-prefixed forms are legacy aliases kept for
     # installs upgrading without re-running the wizard. Apply-time
@@ -2769,10 +2817,10 @@ def load_config() -> Config:
     # AGENT_BACKEND name; absence means the installation default "claude".
     default_backend = (
         (
-            _resolve_default_backend(
+            _resolve_renamed_key(
                 os.environ.get,
-                "DEFAULT_BACKEND",
-                "AGENT_BACKEND",
+                new_key="DEFAULT_BACKEND",
+                legacy_keys=["AGENT_BACKEND"],
                 context="/etc/kai/env",
                 default="claude",
             )
@@ -2797,16 +2845,30 @@ def load_config() -> Config:
     # Single-provider backends (claude, codex) skip the prompt because
     # their provider is implicit; multi-provider backends (opencode,
     # goose) must name one so the (backend, provider, role) registry
-    # lookup can find a row.
-    llm_provider = ""
+    # lookup can find a row. DEFAULT_PROVIDER with a one-release
+    # fallback to the deprecated LLM_PROVIDER name.
+    default_provider = ""
     valid_providers: tuple[str, ...] | None = (
         BACKEND_PROVIDERS.get(default_backend) if default_backend in BACKENDS_NEEDING_PROVIDER_PROMPT else None
     )
     if valid_providers is not None:
-        llm_provider = os.environ.get("LLM_PROVIDER", "").strip().lower()
-        if llm_provider not in valid_providers:
+        default_provider = (
+            (
+                _resolve_renamed_key(
+                    os.environ.get,
+                    new_key="DEFAULT_PROVIDER",
+                    legacy_keys=["LLM_PROVIDER"],
+                    context="/etc/kai/env",
+                    default="",
+                )
+                or ""
+            )
+            .strip()
+            .lower()
+        )
+        if default_provider not in valid_providers:
             raise SystemExit(
-                f"LLM_PROVIDER '{llm_provider}' is not valid for backend "
+                f"DEFAULT_PROVIDER '{default_provider}' is not valid for backend "
                 f"'{default_backend}' (must be one of: "
                 f"{', '.join(sorted(valid_providers))})"
             )
@@ -2985,7 +3047,7 @@ def load_config() -> Config:
     # explicit override for tests and ad-hoc development; the operator
     # path is always one of the two resolved defaults.
     users_yaml_path = _resolve_users_yaml_path(bool(protected_env))
-    user_configs = _load_user_configs(default_backend, llm_provider, users_yaml_path)
+    user_configs = _load_user_configs(default_backend, default_provider, users_yaml_path)
     # Seed UserConfig.models from the deprecated per-role env vars
     # (PR_REVIEW_MODEL_<BACKEND> / ISSUE_TRIAGE_MODEL_<BACKEND>). The
     # values reach dispatch through UserConfig.models rather than via
@@ -3044,7 +3106,6 @@ def load_config() -> Config:
     # not legacy renames; the runtime no longer reads them at all and
     # the corresponding wizard prompts have been retired.
     _renamed_env_vars = {
-        "CLAUDE_TIMEOUT_SECONDS": "AGENT_TIMEOUT_SECONDS.",
         "CLAUDE_MAX_SESSION_HOURS": "AGENT_MAX_SESSION_HOURS.",
         "CLAUDE_IDLE_TIMEOUT": "AGENT_IDLE_TIMEOUT.",
     }
@@ -3145,7 +3206,7 @@ def load_config() -> Config:
     # to PROVIDER_MODELS["openai"]. Other backends still use the
     # provider-only validator. Catches typos at startup instead of
     # letting them propagate to a confusing runtime failure.
-    global_provider = get_effective_provider(default_backend, llm_provider)
+    global_provider = get_effective_provider(default_backend, default_provider)
     if not validate_model_for_backend(default_model, default_backend, global_provider):
         if default_backend == "codex":
             valid = sorted(CODEX_MODELS.keys())
@@ -3165,7 +3226,7 @@ def load_config() -> Config:
         allowed_user_ids=allowed_ids,
         default_model=default_model,
         default_models=default_models,
-        agent_timeout_seconds=agent_timeout_seconds,
+        default_timeout=default_timeout,
         agent_max_session_hours=agent_max_session_hours,
         agent_idle_timeout=agent_idle_timeout,
         claude_autocompact_pct=claude_autocompact_pct,
@@ -3191,7 +3252,7 @@ def load_config() -> Config:
         totp_lockout_attempts=totp_lockout_attempts,
         totp_lockout_minutes=totp_lockout_minutes,
         default_backend=default_backend,
-        llm_provider=llm_provider,
+        default_provider=default_provider,
         memory_enabled=memory_enabled,
         memory_search_limit=memory_search_limit,
         memory_token_budget=memory_token_budget,

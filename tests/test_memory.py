@@ -348,7 +348,7 @@ class TestInitMemory:
             default_backend="claude",
             user_configs={
                 1: UserConfig(telegram_id=1, name="alice", os_user="a"),
-                2: UserConfig(telegram_id=2, name="bob", os_user="b", default_backend="codex"),
+                2: UserConfig(telegram_id=2, name="bob", os_user="b", backend="codex"),
             },
         )
         with (

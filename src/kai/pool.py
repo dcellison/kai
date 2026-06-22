@@ -109,13 +109,13 @@ class SubprocessPool:
         """
         Create an AgentBackend for a specific user.
 
-        Backend selection: per-user default_backend (from users.yaml)
+        Backend selection: per-user backend (from users.yaml)
         overrides the global config.default_backend. Both share the same
         ABC interface; pool.py is backend-agnostic after this point.
 
         Resolution order for each setting:
         1. UserConfig from users.yaml (os_user, home_workspace, model,
-           timeout, default_backend, llm_provider)
+           timeout, backend, provider)
         2. Global config defaults (from .env)
 
         Per-user DB overrides (set via /settings or /model) are applied
@@ -134,9 +134,9 @@ class SubprocessPool:
         # Per-user backend and provider, falling back to global config.
         # Routed through the canonical get_user_backend_and_provider
         # resolver so codex always reports provider="openai" even when
-        # llm_provider is unset, matching the same cascade bot.py and
+        # the provider is unset, matching the same cascade bot.py and
         # the install-time validator use. Without this, a user with
-        # `default_backend: codex` on a globally-claude install ended up
+        # `backend: codex` on a globally-claude install ended up
         # with effective_provider="" and the fallback below dispatched
         # the global default_model ("sonnet"), which codex CLI rejects.
         backend, effective_provider = get_user_backend_and_provider(user, self._config)
@@ -144,7 +144,7 @@ class SubprocessPool:
         # claude (anthropic) and codex (openai) so global_provider lines
         # up with effective_provider whenever the user has not overridden
         # the backend; no codex-specific patch needed here.
-        global_provider = get_effective_provider(self._config.default_backend, self._config.llm_provider)
+        global_provider = get_effective_provider(self._config.default_backend, self._config.default_provider)
 
         # Per-user model. When the user's effective backend differs
         # from the global one, the global default_model may not be
@@ -201,7 +201,7 @@ class SubprocessPool:
                 )
                 model = self._config.default_model
 
-        timeout = user.timeout if user and user.timeout is not None else self._config.agent_timeout_seconds
+        timeout = user.timeout if user and user.timeout is not None else self._config.default_timeout
         # home_ws is what the backend treats as "home" for the foreign-
         # workspace reminder. Same resolution as the workspace above so
         # the two cannot drift; pre-#353 this took a different path that

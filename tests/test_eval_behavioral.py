@@ -961,13 +961,13 @@ class TestBackendAwareModelResolution:
         """
         Goose is a registry-resolved backend: an unset flag resolves
         through the (goose, provider, role) rows the same way claude
-        does. LLM_PROVIDER is required env on goose installs, so the
+        does. DEFAULT_PROVIDER is required env on goose installs, so the
         eval reads it the same way the runtime does.
         """
         from kai.config import ModelRole, get_model_for
 
         monkeypatch.setenv("DEFAULT_BACKEND", "goose")
-        monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+        monkeypatch.setenv("DEFAULT_PROVIDER", "anthropic")
         args = self._make_args(tmp_path)  # judge_model=None, gen_model=None
         config = self._run_with_captured_config(args)
         assert config.judge_model == get_model_for(ModelRole.BEHAVIORAL_JUDGE, "goose", "anthropic")
@@ -1026,7 +1026,7 @@ class TestBackendAwareModelResolution:
 
         monkeypatch.delenv("AGENT_BACKEND", raising=False)
         monkeypatch.setenv("DEFAULT_BACKEND", "goose")
-        monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+        monkeypatch.setenv("DEFAULT_PROVIDER", "anthropic")
         args = self._make_args(tmp_path)
         config = self._run_with_captured_config(args)
         assert config.judge_model == get_model_for(ModelRole.BEHAVIORAL_JUDGE, "goose", "anthropic")

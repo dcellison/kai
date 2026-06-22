@@ -162,19 +162,19 @@ class TestGetUserModelsWarningSuppression:
     """
 
     def test_opencode_does_not_log_missing_registry_warning(self, caplog):
-        """Global opencode install with empty llm_provider should NOT log the warning."""
+        """Global opencode install with empty provider should NOT log the warning."""
         import logging
 
         from kai.bot import _get_user_models
         from kai.pool import SubprocessPool
 
-        # Empty llm_provider is the realistic global-opencode case
+        # Empty provider is the realistic global-opencode case
         # (VALID_PROVIDERS["opencode"] does not exist; the wizard never
-        # prompts for an llm_provider). The pre-fix code path warns
+        # prompts for a provider). The pre-fix code path warns
         # because "" is not in OPEN_ENDED_PROVIDERS.
         config = MagicMock()
         config.default_backend = "opencode"
-        config.llm_provider = ""
+        config.default_provider = ""
         config.get_user_config = MagicMock(return_value=None)
         pool = MagicMock(spec=SubprocessPool)
         pool.get_if_exists = MagicMock(return_value=None)
@@ -195,7 +195,7 @@ class TestGetUserModelsWarningSuppression:
 
         config = MagicMock()
         config.default_backend = "codex"
-        config.llm_provider = ""
+        config.default_provider = ""
         config.get_user_config = MagicMock(return_value=None)
         pool = MagicMock(spec=SubprocessPool)
         pool.get_if_exists = MagicMock(return_value=None)
@@ -3497,7 +3497,7 @@ class TestHandleResponse:
                 12345: UserConfig(
                     telegram_id=12345,
                     name="opencode-user",
-                    default_backend="opencode",
+                    backend="opencode",
                 ),
             },
         )
@@ -3539,8 +3539,8 @@ class TestHandleResponse:
                 12345: UserConfig(
                     telegram_id=12345,
                     name="goose-user",
-                    default_backend="goose",
-                    llm_provider="openai",
+                    backend="goose",
+                    provider="openai",
                 ),
             },
         )
@@ -4702,7 +4702,7 @@ class TestHandleSettings:
     async def test_reset_reverts_codex_install_to_default(self):
         """
         /settings reset model on a wizard-generated codex install with
-        LLM_PROVIDER unset must revert to the wizard's DEFAULT_MODEL
+        DEFAULT_PROVIDER unset must revert to the wizard's DEFAULT_MODEL
         (e.g. gpt-5.5), not PROVIDER_DEFAULTS["openai"] (gpt-5.4).
         Regression for PR #489 re-review: get_effective_provider had
         to be taught the codex->openai rule so _revert_instance_field
@@ -4712,7 +4712,7 @@ class TestHandleSettings:
         update = _make_update(text="/settings reset model")
         config = _make_config(
             default_backend="codex",
-            llm_provider="",
+            default_provider="",
             default_model="gpt-5.5",
         )
         pool = _make_mock_claude(provider="openai")
@@ -4750,7 +4750,7 @@ class TestHandleSettings:
             await handle_settings(update, ctx)
 
         assert instance.model == config.default_model
-        assert instance.timeout_seconds == config.agent_timeout_seconds
+        assert instance.timeout_seconds == config.default_timeout
 
 
 # ── /github command ─────────────────────────────────────────────────
@@ -6205,8 +6205,8 @@ class TestHandleReviewCommand:
                     telegram_id=12345,
                     name="op",
                     github_repos=["dcellison/kai"],
-                    default_backend="codex",
-                    llm_provider="openai",
+                    backend="codex",
+                    provider="openai",
                     os_user="daniel",
                 ),
             },

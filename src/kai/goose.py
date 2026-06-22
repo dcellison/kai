@@ -125,7 +125,7 @@ class GooseBackend(AcpBackend):
         talk to (openai, anthropic, google, etc.). Without it,
         session/new fails with "Internal error" against a binary that
         has no default provider configured. Kai's wizard writes
-        LLM_PROVIDER to /etc/kai/env for its own bookkeeping, but the
+        DEFAULT_PROVIDER to /etc/kai/env for its own bookkeeping, but the
         goose binary reads the GOOSE_-prefixed name; the translation
         happens here so the two layers stay decoupled. The value runs
         through `goose_provider_id` because goose's wire-level provider

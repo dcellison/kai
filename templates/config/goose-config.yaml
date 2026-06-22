@@ -6,7 +6,7 @@
 #
 # GOOSE_MODEL and GOOSE_PROVIDER are intentionally omitted here;
 # both are set at runtime by GooseBackend when launching `goose acp`,
-# translated from the effective per-user model and llm_provider.
+# translated from the effective per-user model and provider.
 # Workspace config (workspaces.yaml env / env_file) can override
 # either one for per-workspace provider or model pinning.
 

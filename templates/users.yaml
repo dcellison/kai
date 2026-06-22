@@ -30,17 +30,17 @@ users:
 
     # Optional per-user defaults. Users can override these at runtime
     # via /settings. Omitted fields inherit installation defaults
-    # (DEFAULT_MODEL, AGENT_TIMEOUT_SECONDS).
+    # (DEFAULT_MODEL, DEFAULT_TIMEOUT).
     # model: opus             # haiku/sonnet/opus for claude; provider/model for opencode
     # timeout: 300            # response timeout in seconds (max 600)
 
     # Default backend. Overrides the global DEFAULT_BACKEND from .env for
     # this user only. Default is "claude" (Claude Code CLI). Other
-    # options: "goose" (Goose ACP, requires llm_provider + API key),
+    # options: "goose" (Goose ACP, requires provider + API key),
     # "codex" (OpenAI Codex CLI), "opencode" (OpenCode ACP; model is
     # a full "provider/model" ID, auth managed by `opencode auth login`).
-    # default_backend: goose
-    # llm_provider: openai    # required for goose; ignored for opencode
+    # backend: goose
+    # provider: openai    # required for goose; ignored for opencode
     # model: anthropic/claude-sonnet-4-6   # opencode example (full provider/model ID)
 
     # GitHub notification settings. github_repos controls which repos

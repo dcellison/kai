@@ -621,7 +621,7 @@ class TestResolveUserDefaults:
             "telegram_bot_token": "test",
             "allowed_user_ids": {111},
             "default_model": "sonnet",
-            "agent_timeout_seconds": 120,
+            "default_timeout": 120,
         }
         defaults.update(kwargs)
         if user_configs is not None:

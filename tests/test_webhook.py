@@ -451,7 +451,7 @@ def _build_test_app(
         mock_config.user_configs = {}
         mock_config.default_models = {}
         mock_config.default_backend = "claude"
-        mock_config.llm_provider = ""
+        mock_config.default_provider = ""
         # get_user_config is synchronous in real Config; must not
         # return a coroutine. With no users configured, always None.
         mock_config.get_user_config = lambda uid: None
@@ -1307,7 +1307,7 @@ class TestGetSubscribedUsers:
         config.user_configs = user_configs if user_configs is not None else {}
         config.default_models = {}
         config.default_backend = "claude"
-        config.llm_provider = ""
+        config.default_provider = ""
         return config
 
     def _make_user(
@@ -1518,7 +1518,7 @@ class TestPerUserRouting:
         config.user_configs = {u.telegram_id: u for u in users}
         config.default_models = {}
         config.default_backend = "claude"
-        config.llm_provider = ""
+        config.default_provider = ""
         # get_user_config returns the UserConfig for a given ID
         config.get_user_config = lambda uid: config.user_configs.get(uid)
         return config
@@ -2049,14 +2049,14 @@ class TestPerUserRouting:
 
     @pytest.mark.asyncio
     async def test_review_receives_user_backend(self, _clear_cooldowns, _mock_resolve_repo):
-        """Per-user default_backend/llm_provider are passed to review_pr."""
+        """Per-user backend/provider are passed to review_pr."""
         base = self._make_user_config(111, repos=["owner/repo"])
         # Frozen dataclass - use replace to set per-user backend override
-        user = dataclasses.replace(base, default_backend="goose", llm_provider="openai")
+        user = dataclasses.replace(base, backend="goose", provider="openai")
         config = self._make_config_with_users([user])
         # Global defaults (should be overridden by per-user values)
         config.default_backend = "claude"
-        config.llm_provider = ""
+        config.default_provider = ""
         app = _build_test_app(config=config)
         payload = _make_pr_payload("opened")
         body = json.dumps(payload).encode()
@@ -2084,12 +2084,12 @@ class TestPerUserRouting:
 
     @pytest.mark.asyncio
     async def test_triage_receives_user_backend(self, _clear_cooldowns):
-        """Per-user default_backend/llm_provider are passed to triage_issue."""
+        """Per-user backend/provider are passed to triage_issue."""
         base = self._make_user_config(111, repos=["owner/repo"])
-        user = dataclasses.replace(base, default_backend="goose", llm_provider="anthropic")
+        user = dataclasses.replace(base, backend="goose", provider="anthropic")
         config = self._make_config_with_users([user])
         config.default_backend = "claude"
-        config.llm_provider = ""
+        config.default_provider = ""
         app = _build_test_app(config=config)
         payload = _make_issue_payload("opened")
         body = json.dumps(payload).encode()
@@ -2119,10 +2119,10 @@ class TestPerUserRouting:
     async def test_review_uses_global_backend_when_no_user_override(self, _clear_cooldowns, _mock_resolve_repo):
         """Without per-user override, review_pr gets the global backend."""
         user = self._make_user_config(111, repos=["owner/repo"])
-        # No default_backend/llm_provider set on user - defaults are None
+        # No backend/provider set on user - defaults are None
         config = self._make_config_with_users([user])
         config.default_backend = "goose"
-        config.llm_provider = "google"
+        config.default_provider = "google"
         app = _build_test_app(config=config)
         payload = _make_pr_payload("opened")
         body = json.dumps(payload).encode()

@@ -1939,9 +1939,9 @@ def _resolve_os_user(user_id: str, config: Config) -> str | None:
 
 def _resolve_effective_backend(user_id: str, config: Config) -> str:
     """
-    Resolve the user being extracted to its effective `default_backend`.
+    Resolve the user being extracted to its effective backend.
 
-    Cascade: per-user `default_backend` from users.yaml wins; otherwise
+    Cascade: per-user `backend` from users.yaml wins; otherwise
     the global `config.default_backend` applies. The same shape
     `_ingest_memory` in bot.py uses to gate extraction eligibility,
     kept in lockstep so the per-user dispatch site here cannot drift
@@ -1966,7 +1966,7 @@ def _resolve_effective_backend(user_id: str, config: Config) -> str:
     user_cfg = config.user_configs.get(tid)
     if user_cfg is None:
         return config.default_backend
-    return user_cfg.default_backend or config.default_backend
+    return user_cfg.backend or config.default_backend
 
 
 def _resolve_user_config(user_id: str, config: Config):
@@ -1986,7 +1986,7 @@ def _resolve_user_config(user_id: str, config: Config):
 
 def _resolve_effective_provider(user_id: str, config: Config) -> str:
     """
-    Resolve the user being extracted to its effective `llm_provider`.
+    Resolve the user being extracted to its effective provider.
 
     Mirrors `_resolve_effective_backend`'s cascade for the provider
     axis. Required by the (backend, provider, role) MODEL_REGISTRY
@@ -2002,11 +2002,11 @@ def _resolve_effective_provider(user_id: str, config: Config) -> str:
     try:
         tid = int(user_id)
     except ValueError:
-        return config.llm_provider
+        return config.default_provider
     user_cfg = config.user_configs.get(tid)
     if user_cfg is None:
-        return config.llm_provider
-    return user_cfg.llm_provider or config.llm_provider
+        return config.default_provider
+    return user_cfg.provider or config.default_provider
 
 
 def _build_memory_reasoner(

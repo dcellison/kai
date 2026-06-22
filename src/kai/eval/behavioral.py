@@ -102,7 +102,8 @@ from kai.codex_exec import extract_codex_text
 from kai.config import (
     ONESHOT_REASONER_BACKENDS,
     ModelRole,
-    _resolve_default_backend,
+    _resolve_eval_provider,
+    _resolve_renamed_key,
     get_model_for,
 )
 from kai.eval._probes import (
@@ -2235,10 +2236,10 @@ async def _run_cli(args: argparse.Namespace) -> int:
     # not a per-user override).
     eval_backend = (
         (
-            _resolve_default_backend(
+            _resolve_renamed_key(
                 os.environ.get,
-                "DEFAULT_BACKEND",
-                "AGENT_BACKEND",
+                new_key="DEFAULT_BACKEND",
+                legacy_keys=["AGENT_BACKEND"],
                 context="behavioral eval env",
                 default="claude",
             )
@@ -2247,12 +2248,11 @@ async def _run_cli(args: argparse.Namespace) -> int:
         .strip()
         .lower()
     )
-    # Provider is read from the eval-time LLM_PROVIDER env (the eval
-    # gate runs as a developer tool against the operator's configured
-    # backend / provider, not against a sandboxed user). Single-provider
-    # backends (claude, codex) ignore this value because their provider
-    # is implicit at runtime.
-    eval_provider = os.environ.get("LLM_PROVIDER", "").strip().lower()
+    # Provider is read from the eval-time env (DEFAULT_PROVIDER, with a
+    # one-release fallback to the deprecated LLM_PROVIDER name) via the
+    # shared resolver. Single-provider backends (claude, codex) ignore
+    # this value because their provider is implicit at runtime.
+    eval_provider = _resolve_eval_provider("behavioral eval env")
     if eval_backend in ONESHOT_REASONER_BACKENDS:
         resolved_judge_model = get_model_for(
             ModelRole.BEHAVIORAL_JUDGE,

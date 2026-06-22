@@ -36,7 +36,6 @@ import dataclasses
 import hashlib
 import json
 import logging
-import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -46,7 +45,7 @@ from pathlib import Path
 from typing import Any
 
 from kai import memory, memory_extraction
-from kai.config import ONESHOT_REASONER_BACKENDS, Config, ModelRole, get_model_for, load_config
+from kai.config import ONESHOT_REASONER_BACKENDS, Config, ModelRole, _resolve_eval_provider, get_model_for, load_config
 from kai.eval.extraction import _window_to_extractor_args
 from kai.eval.replay import _SANDBOX_USER_ID_PREFIX
 
@@ -734,10 +733,11 @@ async def run_backend(
     # registry, matching what `get_model_for(role, backend, provider)`
     # produces in production per-extraction. Pinned here so the
     # BackendRun summary reports the same SKUs the reasoner actually
-    # spawned. Eval-time provider comes from the LLM_PROVIDER env var
-    # (the gate runs as a developer tool against the operator's
-    # configured backend / provider, not against a sandboxed user).
-    eval_provider = os.environ.get("LLM_PROVIDER", "").strip().lower()
+    # spawned. Eval-time provider comes from the shared resolver
+    # (DEFAULT_PROVIDER, with a one-release fallback to the deprecated
+    # LLM_PROVIDER name); the gate runs as a developer tool against the
+    # operator's configured backend / provider, not a sandboxed user.
+    eval_provider = _resolve_eval_provider("memory backend gate env")
     run = BackendRun(
         backend=backend,
         sandbox_user_id=sandbox_user_id,

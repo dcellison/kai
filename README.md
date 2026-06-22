@@ -89,7 +89,7 @@ Workspaces can also define a system prompt via `workspaces.yaml` for workspace-s
 
 #### Memory backend selection
 
-Semantic memory extraction (the subprocess that proactively writes facts and episode summaries) routes per-user: each user's effective `default_backend` selects the reasoner, and the model comes from the project's `MODEL_REGISTRY` for that `(role, backend)` pair. Claude-effective users get the claude reasoner with the claude-registry model; codex-effective users get the codex reasoner with the codex-registry model; opencode-effective users get the opencode reasoner with the opencode-registry model (a `provider/model` string resolved at runtime by `opencode` against the operator's `opencode auth login` state). There is no per-deployment override for the memory reasoner or model; an operator who wants a different model edits the registry in `config.py`.
+Semantic memory extraction (the subprocess that proactively writes facts and episode summaries) routes per-user: each user's effective backend selects the reasoner, and the model comes from the project's `MODEL_REGISTRY` for that `(role, backend)` pair. Claude-effective users get the claude reasoner with the claude-registry model; codex-effective users get the codex reasoner with the codex-registry model; opencode-effective users get the opencode reasoner with the opencode-registry model (a `provider/model` string resolved at runtime by `opencode` against the operator's `opencode auth login` state). There is no per-deployment override for the memory reasoner or model; an operator who wants a different model edits the registry in `config.py`.
 
 OpenCode users get the same one-shot parity as claude and codex users: PR review, issue triage, memory extraction, episode generation, and behavioral eval all dispatch through `OpenCodeOneShotReasoner`, which spawns a fresh `opencode acp` JSON-RPC subprocess per call and denies any tool-permission request mid-stream. No fall-through to `claude --print` or `codex exec` for opencode users on any one-shot site.
 
@@ -216,9 +216,9 @@ Authorization, per-user model selection, per-user OS isolation, per-user GitHub 
 |---|---|---|---|
 | `TELEGRAM_BOT_TOKEN` | Yes | | Bot token from BotFather |
 | `DEFAULT_BACKEND` | No | `claude` | Global default backend: `claude`, `goose`, `codex`, or `opencode`. Per-user override goes in `users.yaml`. (The former `AGENT_BACKEND` name is still read for one release with a deprecation warning.) |
-| `LLM_PROVIDER` | Non-claude | | Global provider for non-claude backends. Per-user override in `users.yaml`. |
+| `DEFAULT_PROVIDER` | Non-claude | | Global provider for non-claude backends. Per-user override in `users.yaml`. (The former `LLM_PROVIDER` name is still read for one release with a deprecation warning.) |
 | `DEFAULT_MODEL` | No | `sonnet` | Installation-wide default model. Per-user override in `users.yaml` `model`, or `/settings model`. |
-| `AGENT_TIMEOUT_SECONDS` | No | `120` | Installation-wide default per-message timeout. Per-user override in `users.yaml` `timeout`, or `/settings timeout`. |
+| `DEFAULT_TIMEOUT` | No | `120` | Installation-wide default per-message timeout. Per-user override in `users.yaml` `timeout`, or `/settings timeout`. (The former `AGENT_TIMEOUT_SECONDS` name is still read for one release with a deprecation warning.) |
 | `CLAUDE_AUTOCOMPACT_PCT` | No | `80` | Context compression threshold %, Claude Code only. When usage hits this, Claude compresses history. Can only lower the default (~83%), not raise it. |
 | `AGENT_MAX_SESSION_HOURS` | No | `0` | Maximum session age in hours before recycling the subprocess (0 = no limit). Applies to every backend. Recommended: 4-8 on memory-constrained machines. |
 | `WORKSPACE_BASE` | No | | Installation-wide default workspace base directory. Per-user override in `users.yaml` `workspace_base`. |
@@ -240,7 +240,7 @@ Authorization, per-user model selection, per-user OS isolation, per-user GitHub 
 | `TOTP_LOCKOUT_MINUTES` | No | `15` | TOTP lockout duration in minutes |
 | `FILE_RETENTION_DAYS` | No | `0` | Days to keep uploaded files before cleanup (0 to disable) |
 
-There is no spending cap: every supported backend runs on subscription auth where per-token cost numbers are not real billing. Runaway prevention comes from the per-message timeout (`AGENT_TIMEOUT_SECONDS`) and session lifecycle limits (`AGENT_MAX_SESSION_HOURS`, `AGENT_IDLE_TIMEOUT`).
+There is no spending cap: every supported backend runs on subscription auth where per-token cost numbers are not real billing. Runaway prevention comes from the per-message timeout (`DEFAULT_TIMEOUT`) and session lifecycle limits (`AGENT_MAX_SESSION_HOURS`, `AGENT_IDLE_TIMEOUT`).
 
 ## Running
 
