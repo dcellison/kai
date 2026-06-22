@@ -34,12 +34,12 @@ users:
     # model: opus             # haiku/sonnet/opus for claude; provider/model for opencode
     # timeout: 300            # response timeout in seconds (max 600)
 
-    # Agent backend. Overrides the global AGENT_BACKEND from .env for
+    # Default backend. Overrides the global DEFAULT_BACKEND from .env for
     # this user only. Default is "claude" (Claude Code CLI). Other
     # options: "goose" (Goose ACP, requires llm_provider + API key),
     # "codex" (OpenAI Codex CLI), "opencode" (OpenCode ACP; model is
     # a full "provider/model" ID, auth managed by `opencode auth login`).
-    # agent_backend: goose
+    # default_backend: goose
     # llm_provider: openai    # required for goose; ignored for opencode
     # model: anthropic/claude-sonnet-4-6   # opencode example (full provider/model ID)
 

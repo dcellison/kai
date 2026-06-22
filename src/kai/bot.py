@@ -1188,7 +1188,7 @@ def _revert_instance_field(pool: SubprocessPool, chat_id: int, field: str, confi
             # If the user's provider differs from the global provider, the
             # global default_model may be invalid for their provider.
             provider = instance.provider
-            effective_global = get_effective_provider(config.agent_backend, config.llm_provider)
+            effective_global = get_effective_provider(config.default_backend, config.llm_provider)
             if provider == effective_global:
                 instance.model = config.default_model
             else:
@@ -4499,7 +4499,9 @@ async def _handle_response(
                 # is mandatory here.
                 user_config = config.get_user_config(chat_id)
                 effective_backend = (
-                    user_config.agent_backend if user_config and user_config.agent_backend else config.agent_backend
+                    user_config.default_backend
+                    if user_config and user_config.default_backend
+                    else config.default_backend
                 )
                 if config.memory_extraction_enabled and effective_backend in ONESHOT_REASONER_BACKENDS:
                     # Windowed PRIOR CONTEXT for the episode classifier

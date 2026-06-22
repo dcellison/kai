@@ -109,13 +109,13 @@ class SubprocessPool:
         """
         Create an AgentBackend for a specific user.
 
-        Backend selection: per-user agent_backend (from users.yaml)
-        overrides the global config.agent_backend. Both share the same
+        Backend selection: per-user default_backend (from users.yaml)
+        overrides the global config.default_backend. Both share the same
         ABC interface; pool.py is backend-agnostic after this point.
 
         Resolution order for each setting:
         1. UserConfig from users.yaml (os_user, home_workspace, model,
-           timeout, agent_backend, llm_provider)
+           timeout, default_backend, llm_provider)
         2. Global config defaults (from .env)
 
         Per-user DB overrides (set via /settings or /model) are applied
@@ -136,7 +136,7 @@ class SubprocessPool:
         # resolver so codex always reports provider="openai" even when
         # llm_provider is unset, matching the same cascade bot.py and
         # the install-time validator use. Without this, a user with
-        # `agent_backend: codex` on a globally-claude install ended up
+        # `default_backend: codex` on a globally-claude install ended up
         # with effective_provider="" and the fallback below dispatched
         # the global default_model ("sonnet"), which codex CLI rejects.
         backend, effective_provider = get_user_backend_and_provider(user, self._config)
@@ -144,14 +144,14 @@ class SubprocessPool:
         # claude (anthropic) and codex (openai) so global_provider lines
         # up with effective_provider whenever the user has not overridden
         # the backend; no codex-specific patch needed here.
-        global_provider = get_effective_provider(self._config.agent_backend, self._config.llm_provider)
+        global_provider = get_effective_provider(self._config.default_backend, self._config.llm_provider)
 
         # Per-user model. When the user's effective backend differs
         # from the global one, the global default_model may not be
         # valid; fall back to the per-backend default instead.
         if user and user.model:
             model = user.model
-        elif backend == self._config.agent_backend and effective_provider == global_provider:
+        elif backend == self._config.default_backend and effective_provider == global_provider:
             model = self._config.default_model
             # Catch the case where the global backend itself is an open-ended
             # provider and DEFAULT_MODEL is something generic like "sonnet".

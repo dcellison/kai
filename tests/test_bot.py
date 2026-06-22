@@ -173,7 +173,7 @@ class TestGetUserModelsWarningSuppression:
         # prompts for an llm_provider). The pre-fix code path warns
         # because "" is not in OPEN_ENDED_PROVIDERS.
         config = MagicMock()
-        config.agent_backend = "opencode"
+        config.default_backend = "opencode"
         config.llm_provider = ""
         config.get_user_config = MagicMock(return_value=None)
         pool = MagicMock(spec=SubprocessPool)
@@ -194,7 +194,7 @@ class TestGetUserModelsWarningSuppression:
         from kai.pool import SubprocessPool
 
         config = MagicMock()
-        config.agent_backend = "codex"
+        config.default_backend = "codex"
         config.llm_provider = ""
         config.get_user_config = MagicMock(return_value=None)
         pool = MagicMock(spec=SubprocessPool)
@@ -3431,7 +3431,7 @@ class TestHandleResponse:
         # contract under test is the outer gate plus the inner config
         # branch, neither of which depends on prior_pairs being
         # non-empty. memory_extraction_enabled=True so the inner gate
-        # passes; agent_backend defaults to "claude" so the backend
+        # passes; default_backend defaults to "claude" so the backend
         # check passes too.
         config = _make_config(
             memory_extraction_enabled=True,
@@ -3497,7 +3497,7 @@ class TestHandleResponse:
                 12345: UserConfig(
                     telegram_id=12345,
                     name="opencode-user",
-                    agent_backend="opencode",
+                    default_backend="opencode",
                 ),
             },
         )
@@ -3539,7 +3539,7 @@ class TestHandleResponse:
                 12345: UserConfig(
                     telegram_id=12345,
                     name="goose-user",
-                    agent_backend="goose",
+                    default_backend="goose",
                     llm_provider="openai",
                 ),
             },
@@ -4711,7 +4711,7 @@ class TestHandleSettings:
         """
         update = _make_update(text="/settings reset model")
         config = _make_config(
-            agent_backend="codex",
+            default_backend="codex",
             llm_provider="",
             default_model="gpt-5.5",
         )
@@ -6205,7 +6205,7 @@ class TestHandleReviewCommand:
                     telegram_id=12345,
                     name="op",
                     github_repos=["dcellison/kai"],
-                    agent_backend="codex",
+                    default_backend="codex",
                     llm_provider="openai",
                     os_user="daniel",
                 ),

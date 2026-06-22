@@ -99,7 +99,7 @@ def _config(tmp_path: Path) -> MagicMock:
     cfg = MagicMock()
     cfg.memory_projects = {}
     cfg.user_configs = {}
-    cfg.agent_backend = "claude"
+    cfg.default_backend = "claude"
     cfg.llm_provider = ""
     cfg.memory_extraction_timeout_s = 60
     cfg.session_db_path = tmp_path / "kai.db"
@@ -468,7 +468,7 @@ class TestResolveClassificationSettings:
     def test_user_overrides_win_over_global(self, tmp_path):
         cfg = _config(tmp_path)
         user = MagicMock()
-        user.agent_backend = "codex"
+        user.default_backend = "codex"
         user.llm_provider = "deepseek"
         user.os_user = "alice"
         cfg.user_configs = {100: user}
@@ -479,7 +479,7 @@ class TestResolveClassificationSettings:
 
     def test_unsupported_effective_backend_errors(self, tmp_path):
         cfg = _config(tmp_path)
-        cfg.agent_backend = "not-a-reasoner-backend"
+        cfg.default_backend = "not-a-reasoner-backend"
         settings = memory_reclassify.resolve_classification_settings(
             cfg, "100", backend=None, os_user=None, provider=None
         )
@@ -489,7 +489,7 @@ class TestResolveClassificationSettings:
     def test_explicit_flags_override_resolution(self, tmp_path):
         cfg = _config(tmp_path)
         user = MagicMock()
-        user.agent_backend = "codex"
+        user.default_backend = "codex"
         user.llm_provider = "deepseek"
         user.os_user = "alice"
         cfg.user_configs = {100: user}
@@ -564,7 +564,7 @@ class TestDryRun:
     @pytest.mark.asyncio
     async def test_unsupported_backend_exits_2(self, dry_run_env):
         env = dry_run_env
-        env["config"].agent_backend = "not-a-reasoner-backend"
+        env["config"].default_backend = "not-a-reasoner-backend"
         code = await env["run"](backend=None)
         assert code == 2
 

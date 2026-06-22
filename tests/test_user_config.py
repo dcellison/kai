@@ -45,7 +45,7 @@ class TestUserConfig:
         assert uc.github_notify_chat_id is None
         assert uc.pr_review is None
         assert uc.issue_triage is None
-        assert uc.agent_backend is None
+        assert uc.default_backend is None
         assert uc.llm_provider is None
 
     def test_all_fields(self):
@@ -64,7 +64,7 @@ class TestUserConfig:
             github_notify_chat_id=-100123456789,
             pr_review=True,
             issue_triage=False,
-            agent_backend="goose",
+            default_backend="goose",
             llm_provider="openai",
         )
         assert uc.role == "admin"
@@ -77,7 +77,7 @@ class TestUserConfig:
         assert uc.github_notify_chat_id == -100123456789
         assert uc.pr_review is True
         assert uc.issue_triage is False
-        assert uc.agent_backend == "goose"
+        assert uc.default_backend == "goose"
         assert uc.llm_provider == "openai"
 
     def test_frozen(self):
@@ -827,13 +827,13 @@ class TestLoadUserConfigs:
     # ── Per-user backend/provider ─────────────────────────────────
 
     def test_valid_agent_backend(self, tmp_path):
-        """Valid agent_backend is parsed and stored."""
+        """Valid default_backend is parsed and stored."""
         data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
                 name: alice
-                agent_backend: goose
+                default_backend: goose
                 llm_provider: openai
                 model: gpt-5.4
             """,
@@ -843,23 +843,23 @@ class TestLoadUserConfigs:
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
-        assert configs[111].agent_backend == "goose"
+        assert configs[111].default_backend == "goose"
         assert configs[111].llm_provider == "openai"
         assert configs[111].model == "gpt-5.4"
 
     def test_invalid_agent_backend_exits(self, tmp_path):
-        """Invalid agent_backend causes SystemExit."""
+        """Invalid default_backend causes SystemExit."""
         data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
                 name: alice
-                agent_backend: invalid
+                default_backend: invalid
             """,
         )
         with (
             patch("kai.config._read_protected_yaml", return_value=data),
-            pytest.raises(SystemExit, match="invalid agent_backend"),
+            pytest.raises(SystemExit, match="invalid default_backend"),
         ):
             _load_user_configs("claude", "")
 
@@ -870,7 +870,7 @@ class TestLoadUserConfigs:
             users:
               - telegram_id: 111
                 name: alice
-                agent_backend: goose
+                default_backend: goose
                 llm_provider: badprovider
             """,
         )
@@ -887,7 +887,7 @@ class TestLoadUserConfigs:
             users:
               - telegram_id: 111
                 name: alice
-                agent_backend: goose
+                default_backend: goose
             """,
         )
         with (
@@ -897,6 +897,63 @@ class TestLoadUserConfigs:
         ):
             _load_user_configs("claude", "")
 
+    def test_legacy_agent_backend_in_users_yaml_still_resolved_with_warning(self, tmp_path, caplog):
+        """A users.yaml entry using the deprecated `agent_backend:` key
+        still resolves to default_backend for one release, with a
+        one-shot deprecation warning naming the user."""
+        import logging
+
+        import kai.config as config_module
+
+        data = self._yaml_dict(
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                agent_backend: codex
+            """,
+        )
+        config_module._default_backend_deprecation_warned.clear()
+        with (
+            patch("kai.config._read_protected_yaml", return_value=data),
+            caplog.at_level(logging.WARNING),
+        ):
+            configs = _load_user_configs("claude", "")
+        assert configs[111].default_backend == "codex"
+        assert any("agent_backend" in r.message and "default_backend" in r.message for r in caplog.records)
+
+    def test_user_without_backend_inherits_nonclaude_global(self, tmp_path):
+        """A users.yaml entry that omits the backend key must NOT be
+        pinned to claude: its stored override stays None so the
+        runtime cascade (user override OR global) inherits the global
+        backend. Regression guard for the resolver-default split: the
+        per-user reader passes default=None, not default="claude".
+        """
+        data = self._yaml_dict(
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+            """,
+        )
+        with patch("kai.config._read_protected_yaml", return_value=data):
+            # Global backend is goose; the user has no per-user backend.
+            configs = _load_user_configs("goose", "openai")
+        # None on the stored override is what makes the runtime cascade
+        # inherit the global backend rather than forcing claude.
+        assert configs[111].default_backend is None
+        # And the canonical cascade resolves the user to the global goose.
+        from kai.config import Config, get_user_backend_and_provider
+
+        global_cfg = Config(
+            telegram_bot_token="test",
+            allowed_user_ids={1},
+            default_backend="goose",
+            llm_provider="openai",
+        )
+        backend, _provider = get_user_backend_and_provider(configs[111], global_cfg)
+        assert backend == "goose"
+
     def test_goose_backend_inherits_global_provider(self, tmp_path):
         """User with goose backend inherits global llm_provider."""
         data = self._yaml_dict(
@@ -904,7 +961,7 @@ class TestLoadUserConfigs:
             users:
               - telegram_id: 111
                 name: alice
-                agent_backend: goose
+                default_backend: goose
                 model: gpt-5.4
             """,
         )
@@ -915,7 +972,7 @@ class TestLoadUserConfigs:
             configs = _load_user_configs("goose", "openai")
         assert configs is not None
         # User inherits global provider, no per-user override stored
-        assert configs[111].agent_backend == "goose"
+        assert configs[111].default_backend == "goose"
         assert configs[111].llm_provider is None
 
     def test_model_validated_against_user_provider(self, tmp_path):
@@ -925,7 +982,7 @@ class TestLoadUserConfigs:
             users:
               - telegram_id: 111
                 name: alice
-                agent_backend: goose
+                default_backend: goose
                 llm_provider: openai
                 model: opus
             """,
@@ -945,7 +1002,7 @@ class TestLoadUserConfigs:
             users:
               - telegram_id: 111
                 name: alice
-                agent_backend: goose
+                default_backend: goose
                 llm_provider: ollama
             """,
         )

@@ -13,9 +13,9 @@ install's memory state.
 
 Invocation: `python -m kai.smoke.memory [--user-id <chat_id>] [--os-user <name>]`.
 
-The `--user-id` flag selects which user's effective `agent_backend`
+The `--user-id` flag selects which user's effective `default_backend`
 the smoke runs under (the same per-user dispatch production uses).
-When omitted, the smoke falls back to the global `config.agent_backend`.
+When omitted, the smoke falls back to the global `config.default_backend`.
 The `--os-user` flag is required when the resolved effective backend
 is codex; the codex reasoner refuses to spawn without an os_user (it
 exists to prevent the bot user from running codex). Pass the per-user
@@ -101,9 +101,9 @@ async def _run(user_id: str | None, os_user: str | None) -> int:
 
     # Resolve the effective backend the smoke runs under. With per-user
     # dispatch (issue #515), production extraction uses each user's
-    # effective `agent_backend`; the smoke mirrors that by accepting a
+    # effective `default_backend`; the smoke mirrors that by accepting a
     # `--user-id` that the helper looks up in users.yaml. Without
-    # `--user-id`, fall back to the global `agent_backend` (the legacy
+    # `--user-id`, fall back to the global `default_backend` (the legacy
     # single-backend smoke path). The string the helper takes is the
     # raw user_id (production threads it through `extract_and_store`
     # the same way), so reuse it directly.
@@ -115,7 +115,7 @@ async def _run(user_id: str | None, os_user: str | None) -> int:
         sys.stderr.write(
             f"smoke: effective backend {effective_backend!r} has no memory reasoner. "
             f"Pass --user-id matching an entry in users.yaml whose effective backend "
-            f"is one of: {eligible}, or run with a matching global AGENT_BACKEND.\n"
+            f"is one of: {eligible}, or run with a matching global DEFAULT_BACKEND.\n"
         )
         return 1
 
@@ -125,7 +125,7 @@ async def _run(user_id: str | None, os_user: str | None) -> int:
     print(f"provider: {effective_provider}")
     print(f"extraction model: {extraction_model}")
     print(f"episode model: {episode_model}")
-    print(f"user_id: {user_id or '(none; using global agent_backend)'}")
+    print(f"user_id: {user_id or '(none; using global default_backend)'}")
     print(f"os_user: {os_user or '(none; direct spawn)'}")
 
     reasoner = _build_memory_reasoner(effective_backend, os_user=os_user)
@@ -213,8 +213,8 @@ def main() -> int:
         dest="user_id",
         default=None,
         help=(
-            "Telegram chat_id whose effective agent_backend selects the reasoner. "
-            "Defaults to the global agent_backend when omitted."
+            "Telegram chat_id whose effective default_backend selects the reasoner. "
+            "Defaults to the global default_backend when omitted."
         ),
     )
     parser.add_argument(

@@ -144,11 +144,11 @@ class TestInstanceCreation:
 
 class TestPerUserBackendRouting:
     def test_user_gets_goose_when_global_is_claude(self):
-        """User with agent_backend=goose gets GooseBackend even when global is claude."""
+        """User with default_backend=goose gets GooseBackend even when global is claude."""
         user = UserConfig(
             telegram_id=111,
             name="alice",
-            agent_backend="goose",
+            default_backend="goose",
             llm_provider="openai",
             model="gpt-5.4",
         )
@@ -160,7 +160,7 @@ class TestPerUserBackendRouting:
         assert instance.model == "gpt-5.4"
 
     def test_user_without_backend_gets_global(self):
-        """User with no agent_backend gets the global backend (claude)."""
+        """User with no default_backend gets the global backend (claude)."""
         user = UserConfig(telegram_id=111, name="alice")
         config = _make_config(user_configs={111: user})
         pool = SubprocessPool(config=config, services_info=[])
@@ -174,12 +174,12 @@ class TestPerUserBackendRouting:
         user = UserConfig(
             telegram_id=111,
             name="alice",
-            agent_backend="goose",
+            default_backend="goose",
             llm_provider="google",
             model="gemini-3-flash",
         )
         config = _make_config(
-            agent_backend="goose",
+            default_backend="goose",
             llm_provider="openai",
             default_model="gpt-5.4",
             user_configs={111: user},
@@ -196,7 +196,7 @@ class TestPerUserBackendRouting:
         user = UserConfig(
             telegram_id=111,
             name="alice",
-            agent_backend="goose",
+            default_backend="goose",
             llm_provider="openai",
             # No model set - should get openai default, not global "sonnet"
         )
@@ -213,7 +213,7 @@ class TestPerUserBackendRouting:
         user = UserConfig(
             telegram_id=111,
             name="alice",
-            agent_backend="goose",
+            default_backend="goose",
             llm_provider="openai",
             model="gpt-5.4",
         )
@@ -235,7 +235,7 @@ class TestPerUserBackendRouting:
 
     def test_opencode_user_on_claude_global_install(self):
         """
-        Per-user `agent_backend: opencode` on a globally-claude install
+        Per-user `default_backend: opencode` on a globally-claude install
         with a free-text model gets an OpenCodeBackend with the supplied
         model intact. OpenCode model strings are full provider/model
         IDs; no per-provider default substitution applies.
@@ -245,11 +245,11 @@ class TestPerUserBackendRouting:
         user = UserConfig(
             telegram_id=111,
             name="alice",
-            agent_backend="opencode",
+            default_backend="opencode",
             model="anthropic/claude-sonnet-4-6",
         )
         config = _make_config(
-            agent_backend="claude",
+            default_backend="claude",
             llm_provider="anthropic",
             default_model="sonnet",
             user_configs={111: user},
@@ -261,7 +261,7 @@ class TestPerUserBackendRouting:
 
     def test_opencode_user_without_model_falls_back_to_empty(self, caplog):
         """
-        Per-user `agent_backend: opencode` with no model and global
+        Per-user `default_backend: opencode` with no model and global
         backend != opencode: OpenCodeBackend gets model="" so OPENCODE_
         CONFIG_CONTENT is omitted and OpenCode uses its own config
         files. A warning is logged so the operator notices the gap.
@@ -273,11 +273,11 @@ class TestPerUserBackendRouting:
         user = UserConfig(
             telegram_id=111,
             name="alice",
-            agent_backend="opencode",
+            default_backend="opencode",
             # NO model: tests the bare opencode-override case.
         )
         config = _make_config(
-            agent_backend="claude",
+            default_backend="claude",
             llm_provider="anthropic",
             default_model="sonnet",
             user_configs={111: user},
@@ -291,7 +291,7 @@ class TestPerUserBackendRouting:
 
     def test_codex_user_on_claude_global_install_gets_codex_default(self):
         """
-        Per-user `agent_backend: codex` on a globally-claude install
+        Per-user `default_backend: codex` on a globally-claude install
         must NOT fall through to the global default_model ("sonnet"),
         which codex CLI rejects. Without the
         get_user_backend_and_provider routing in _create_instance,
@@ -304,12 +304,12 @@ class TestPerUserBackendRouting:
         user = UserConfig(
             telegram_id=111,
             name="alice",
-            agent_backend="codex",
+            default_backend="codex",
             # NO llm_provider, NO model - tests the bare codex-override case.
         )
         # Globally-claude install (the failure surface from PR #489 review).
         config = _make_config(
-            agent_backend="claude",
+            default_backend="claude",
             llm_provider="anthropic",
             default_model="sonnet",
             user_configs={111: user},
@@ -329,7 +329,7 @@ class TestPerUserBackendRouting:
         user = UserConfig(
             telegram_id=111,
             name="alice",
-            agent_backend="goose",
+            default_backend="goose",
             llm_provider="anthropic",
             model="sonnet",
             os_user="alice-os",
@@ -350,11 +350,13 @@ class TestPerUserBackendRouting:
 
         users = {
             111: UserConfig(
-                telegram_id=111, name="a", agent_backend="claude", llm_provider="anthropic", model="sonnet"
+                telegram_id=111, name="a", default_backend="claude", llm_provider="anthropic", model="sonnet"
             ),
-            222: UserConfig(telegram_id=222, name="b", agent_backend="codex"),
-            333: UserConfig(telegram_id=333, name="c", agent_backend="goose", llm_provider="anthropic", model="sonnet"),
-            444: UserConfig(telegram_id=444, name="d", agent_backend="opencode", model="anthropic/claude-sonnet-4-6"),
+            222: UserConfig(telegram_id=222, name="b", default_backend="codex"),
+            333: UserConfig(
+                telegram_id=333, name="c", default_backend="goose", llm_provider="anthropic", model="sonnet"
+            ),
+            444: UserConfig(telegram_id=444, name="d", default_backend="opencode", model="anthropic/claude-sonnet-4-6"),
         }
         config = _make_config(agent_max_session_hours=6.5, user_configs=users)
         pool = SubprocessPool(config=config, services_info=[])
@@ -380,7 +382,7 @@ class TestPerUserBackendRouting:
         user = UserConfig(
             telegram_id=111,
             name="alice",
-            agent_backend="opencode",
+            default_backend="opencode",
             model="anthropic/claude-sonnet-4-6",
             os_user="alice-os",
         )
@@ -726,11 +728,11 @@ class TestWorkspaceRestoration:
         user = UserConfig(
             telegram_id=111,
             name="alice",
-            agent_backend="codex",
+            default_backend="codex",
             home_workspace=ws,
         )
         config = _make_config(
-            agent_backend="codex",
+            default_backend="codex",
             llm_provider="openai",
             default_model="gpt-5.5",
             user_configs={111: user},

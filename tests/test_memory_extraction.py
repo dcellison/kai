@@ -3722,7 +3722,7 @@ class TestRunExtractorWithCodexEnvelope:
                     duration_ms=42,
                 )
 
-        config = _cfg(agent_backend="codex")
+        config = _cfg(default_backend="codex")
         with patch("kai.memory_extraction._build_memory_reasoner", return_value=_FakeCodexReasoner()):
             result = await memory_extraction._run_extractor(
                 payload_text="payload",
@@ -3752,7 +3752,7 @@ class TestRunExtractorWithCodexEnvelope:
             async def run(self, **kwargs):
                 raise OneShotOutputError("codex final JSON missing required fields: ['facts', 'has_episode']")
 
-        config = _cfg(agent_backend="codex")
+        config = _cfg(default_backend="codex")
         with patch("kai.memory_extraction._build_memory_reasoner", return_value=_OutputErrorReasoner()):
             result = await memory_extraction._run_extractor(
                 payload_text="payload",
@@ -3963,14 +3963,14 @@ class TestExtractAndStorePerUserDispatch:
 
         config = replace(
             _cfg(),
-            agent_backend="claude",
+            default_backend="claude",
             user_configs={
                 1: UserConfig(telegram_id=1, name="alice", os_user="alice_os"),
                 2: UserConfig(
                     telegram_id=2,
                     name="bob",
                     os_user="bob_os",
-                    agent_backend="codex",
+                    default_backend="codex",
                 ),
             },
         )
@@ -4014,14 +4014,14 @@ class TestExtractAndStorePerUserDispatch:
 
         config = replace(
             _cfg(),
-            agent_backend="claude",
+            default_backend="claude",
             user_configs={
                 1: UserConfig(telegram_id=1, name="alice", os_user="alice_os"),
                 2: UserConfig(
                     telegram_id=2,
                     name="bob",
                     os_user="bob_os",
-                    agent_backend="codex",
+                    default_backend="codex",
                 ),
             },
         )
@@ -4035,8 +4035,8 @@ class TestExtractAndStorePerUserDispatch:
 
     @pytest.mark.asyncio
     async def test_per_user_override_wins_over_global(self, monkeypatch):
-        """Global `AGENT_BACKEND=claude` with a per-user
-        `agent_backend: codex` override resolves to codex for the
+        """Global `DEFAULT_BACKEND=claude` with a per-user
+        `default_backend: codex` override resolves to codex for the
         override user. Pin the cascade direction (per-user beats
         global) at the dispatch site."""
         from kai import memory as memory_module
@@ -4068,13 +4068,13 @@ class TestExtractAndStorePerUserDispatch:
 
         config = replace(
             _cfg(),
-            agent_backend="claude",
+            default_backend="claude",
             user_configs={
                 1: UserConfig(
                     telegram_id=1,
                     name="alice",
                     os_user="alice_os",
-                    agent_backend="codex",
+                    default_backend="codex",
                 )
             },
         )
@@ -4083,8 +4083,8 @@ class TestExtractAndStorePerUserDispatch:
 
     @pytest.mark.asyncio
     async def test_inherits_global_when_no_per_user_override(self, monkeypatch):
-        """Global `AGENT_BACKEND=codex` with a users.yaml entry that
-        does not pin `agent_backend` resolves to codex for that
+        """Global `DEFAULT_BACKEND=codex` with a users.yaml entry that
+        does not pin `default_backend` resolves to codex for that
         user. Pins the cascade fallback when no override exists."""
         from kai import memory as memory_module
         from kai.config import UserConfig
@@ -4115,7 +4115,7 @@ class TestExtractAndStorePerUserDispatch:
 
         config = replace(
             _cfg(),
-            agent_backend="codex",
+            default_backend="codex",
             user_configs={
                 1: UserConfig(telegram_id=1, name="alice", os_user="alice_os"),
             },
@@ -4148,13 +4148,13 @@ class TestExtractAndStorePerUserDispatch:
 
         config = replace(
             _cfg(),
-            agent_backend="claude",
+            default_backend="claude",
             user_configs={
                 1: UserConfig(
                     telegram_id=1,
                     name="alice",
                     os_user="alice_os",
-                    agent_backend="codex",
+                    default_backend="codex",
                 )
             },
         )

@@ -2108,7 +2108,7 @@ def auth_config():
     cfg = MagicMock()
     cfg.allowed_user_ids = {999}
     cfg.memory_search_floor = 0.3
-    cfg.agent_backend = "claude"
+    cfg.default_backend = "claude"
     cfg.get_user_config.return_value = None
     return cfg
 
@@ -2355,7 +2355,7 @@ class TestDashboardBackendNote:
     async def test_note_appended_for_non_reasoner_backend(
         self, monkeypatch, update_factory, context_factory, auth_config
     ):
-        auth_config.agent_backend = "goose"
+        auth_config.default_backend = "goose"
         monkeypatch.setattr(memory_command, "ONESHOT_REASONER_BACKENDS", frozenset({"claude", "codex"}))
         monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
         monkeypatch.setattr(
@@ -2375,7 +2375,7 @@ class TestDashboardBackendNote:
         """The empty state is where "why is this empty?" is sharpest;
         the note must appear there too, not only on populated
         dashboards."""
-        auth_config.agent_backend = "goose"
+        auth_config.default_backend = "goose"
         monkeypatch.setattr(memory_command, "ONESHOT_REASONER_BACKENDS", frozenset({"claude", "codex"}))
         monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
         monkeypatch.setattr(
@@ -2412,7 +2412,7 @@ class TestDashboardBackendNote:
         the note; the fall-through matches the extraction gate's
         backend resolution."""
         user_cfg = MagicMock()
-        user_cfg.agent_backend = "goose"
+        user_cfg.default_backend = "goose"
         auth_config.get_user_config.return_value = user_cfg
         monkeypatch.setattr(memory_command, "ONESHOT_REASONER_BACKENDS", frozenset({"claude", "codex"}))
         monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)

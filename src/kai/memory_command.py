@@ -1902,7 +1902,9 @@ async def _send_dashboard(
     # gate's backend resolution in bot.py.
     config: Config = context.bot_data["config"]
     user_config = config.get_user_config(chat_id)
-    effective_backend = user_config.agent_backend if user_config and user_config.agent_backend else config.agent_backend
+    effective_backend = (
+        user_config.default_backend if user_config and user_config.default_backend else config.default_backend
+    )
     if effective_backend not in ONESHOT_REASONER_BACKENDS:
         text += (
             f"\n\nNote: memory extraction is not available on the {effective_backend} "

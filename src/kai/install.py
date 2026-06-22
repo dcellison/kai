@@ -55,6 +55,7 @@ from kai.config import (
     VALID_BACKENDS,
     ModelRole,
     _read_protected_file,
+    _resolve_default_backend,
     models_for_backend,
     validate_model_for_backend,
 )
@@ -644,13 +645,31 @@ def _users_yaml_entries(users_yaml_path: Path) -> list[dict]:
     return [entry for entry in users if isinstance(entry, dict)]
 
 
+def _entry_backend(entry: dict) -> object:
+    """
+    Read a users.yaml entry's backend, preferring the new
+    `default_backend` key and falling back to the deprecated
+    `agent_backend` key for one release.
+
+    Returns the raw value (or None) so callers apply their own
+    normalization/validation, matching how they read the key today.
+    No deprecation warning here: the daemon-side `_load_user_configs`
+    emits the per-user warning; these installer scanners only need
+    set membership.
+    """
+    value = entry.get("default_backend")
+    if value is not None:
+        return value
+    return entry.get("agent_backend")
+
+
 def _users_yaml_goose_providers(users_yaml_path: Path, global_provider: str) -> list[str]:
     """
     Collect the distinct providers per-user goose entries need API
     keys for.
 
     Returns the sorted set of `llm_provider` values across entries
-    whose `agent_backend` is "goose", falling back to
+    whose `default_backend` is "goose", falling back to
     `global_provider` for entries that omit the field - the same
     cascade the runtime applies. Goose is the only backend whose
     per-user auth rides the daemon environment: claude, codex, and
@@ -665,7 +684,7 @@ def _users_yaml_goose_providers(users_yaml_path: Path, global_provider: str) -> 
         # (str.strip().lower()): mixed-case `Goose` / `DeepSeek`
         # values are valid at runtime, so the scan must not let a
         # casing difference skip a key the daemon will demand.
-        backend = entry.get("agent_backend")
+        backend = _entry_backend(entry)
         if not isinstance(backend, str) or backend.strip().lower() != "goose":
             continue
         provider = entry.get("llm_provider") or global_provider
@@ -676,7 +695,7 @@ def _users_yaml_goose_providers(users_yaml_path: Path, global_provider: str) -> 
 
 def _users_yaml_agent_backends(users_yaml_path: Path) -> set[str]:
     """
-    Collect the distinct per-user `agent_backend` values for
+    Collect the distinct per-user `default_backend` values for
     wizard-side binary collection.
 
     A users.yaml entry on a non-global backend makes that backend's
@@ -690,7 +709,7 @@ def _users_yaml_agent_backends(users_yaml_path: Path) -> set[str]:
     """
     backends: set[str] = set()
     for entry in _users_yaml_entries(users_yaml_path):
-        backend = entry.get("agent_backend")
+        backend = _entry_backend(entry)
         # Normalize the same way the runtime loader does
         # (str.strip().lower()): mixed-case values like `Codex` are
         # valid at runtime and route the user, so the scan must
@@ -1015,12 +1034,22 @@ def _cmd_config() -> None:
         )
     print()
 
-    # -- Agent backend --
-    print("-- Agent backend --")
+    # -- Default backend --
+    print("-- Default backend --")
+    # Prefill reads DEFAULT_BACKEND, falling back to the deprecated
+    # AGENT_BACKEND key so a re-run against a legacy install.conf keeps
+    # the operator's prior choice; the wizard writes DEFAULT_BACKEND only.
     agent_backend = _prompt_choice(
-        "Agent backend",
+        "Default backend",
         sorted(VALID_BACKENDS),
-        existing_env.get("AGENT_BACKEND", "claude"),
+        _resolve_default_backend(
+            existing_env.get,
+            "DEFAULT_BACKEND",
+            "AGENT_BACKEND",
+            context="install.conf",
+            default="claude",
+        )
+        or "claude",
     )
 
     # Codex auth handling runs BEFORE the legacy provider/key block so
@@ -1030,8 +1059,8 @@ def _cmd_config() -> None:
     # block below skips codex entirely; codex follows the same path
     # claude does for the provider prompt.
     #
-    # Gate on the global `agent_backend` selection only. Per-user
-    # `agent_backend: codex` overrides in users.yaml do NOT trigger
+    # Gate on the global backend selection only. Per-user
+    # `default_backend: codex` overrides in users.yaml do NOT trigger
     # the auth-mode setup here; codex AUTH for those users stays
     # out-of-band (per-OS-user `codex login`). Their BINARY path is
     # collected by the per-user backend scan after the provider
@@ -1109,7 +1138,7 @@ def _cmd_config() -> None:
             print("  After install, log in to codex as the target os_user:")
             print("    <os_user> ~$ codex login")
             print("  Run as the os_user themselves, not via sudo from another account.")
-            print("  If users.yaml has per-user `agent_backend: codex` entries with")
+            print("  If users.yaml has per-user `default_backend: codex` entries with")
             print("  different os_users, log in as each of those too.")
 
     # OpenCode setup: binary-path wizard prompt + post-install auth
@@ -1122,8 +1151,8 @@ def _cmd_config() -> None:
     # models_for_backend("opencode", _) returns None, the operator gets
     # a free-text prompt for a full `provider/model` ID.
     #
-    # Gate on the global `agent_backend` selection only. Per-user
-    # `agent_backend: opencode` overrides in users.yaml do NOT
+    # Gate on the global backend selection only. Per-user
+    # `default_backend: opencode` overrides in users.yaml do NOT
     # trigger the setup here; opencode AUTH for those users stays
     # out-of-band (`opencode auth login` per OS user). Their BINARY
     # path is collected by the per-user backend scan after the
@@ -1321,7 +1350,7 @@ def _cmd_config() -> None:
     # users_yaml_exists gate skipped them entirely on the
     # re-run-with-users.yaml path, which let a stale global model
     # survive a backend switch (the operator-visible bug: switching
-    # AGENT_BACKEND from one model surface to another left the prior
+    # DEFAULT_BACKEND from one model surface to another left the prior
     # value unchanged because the re-validation path never ran).
     #
     # Determine the effective provider for model choices. Claude
@@ -1954,12 +1983,13 @@ def _cmd_config() -> None:
         "TTS_ENABLED": str(tts_enabled).lower(),
     }
 
-    # AGENT_BACKEND is the global default backend; users.yaml entries
+    # DEFAULT_BACKEND is the global default backend; users.yaml entries
     # can override it per user. Only write non-default values to keep
     # the env file clean (the runtime defaults to claude when the key
-    # is absent).
+    # is absent). The wizard writes the new name only; the runtime keeps
+    # a one-release read fallback for a legacy AGENT_BACKEND key.
     if agent_backend != "claude":
-        env["AGENT_BACKEND"] = agent_backend
+        env["DEFAULT_BACKEND"] = agent_backend
 
     # LLM provider and API key. Written alongside the backend choice
     # so they survive into /etc/kai/env and are not wiped on reinstall.
@@ -2582,7 +2612,7 @@ def _collect_os_users_from_yaml(users_yaml_path: str | Path) -> list[str]:
 
 def _collect_backends_from_yaml(users_yaml_path: str | Path) -> set[str]:
     """
-    Read users.yaml and return the distinct per-user agent_backend values.
+    Read users.yaml and return the distinct per-user default_backend values.
 
     Sibling of `_collect_os_users_from_yaml` with the same lightweight
     posture: the installer only needs the backend names to scope the
@@ -2614,7 +2644,7 @@ def _collect_backends_from_yaml(users_yaml_path: str | Path) -> set[str]:
     for entry in users:
         if not isinstance(entry, dict):
             continue
-        backend = entry.get("agent_backend")
+        backend = _entry_backend(entry)
         # PyYAML may parse unquoted scalars as non-strings; only string
         # values can name a backend.
         if not isinstance(backend, str):
@@ -2633,7 +2663,7 @@ def _collect_goose_os_users_from_yaml(
     Read users.yaml and return distinct, validated os_user values of
     goose-backed users.
 
-    A user is goose-backed when their entry's `agent_backend` is
+    A user is goose-backed when their entry's `default_backend` is
     "goose", or when the entry carries no per-user backend and the
     install's global backend (`agent_backend`) is goose - the same
     inheritance contract the runtime applies. `_apply_goose_config`
@@ -2668,7 +2698,7 @@ def _collect_goose_os_users_from_yaml(
     for entry in users:
         if not isinstance(entry, dict):
             continue
-        backend = entry.get("agent_backend")
+        backend = _entry_backend(entry)
         # Non-string / empty per-user values mean "inherit the global
         # backend" (PyYAML may parse unquoted scalars as non-strings;
         # the runtime loader rejects those separately).
@@ -2716,7 +2746,11 @@ def _build_codex_login_reminder(
     for backwards compatibility with the existing caller / tests, but
     are no longer read.
     """
-    if env.get("AGENT_BACKEND", "claude") != "codex":
+    default_backend = (
+        _resolve_default_backend(env.get, "DEFAULT_BACKEND", "AGENT_BACKEND", context="install.conf", default="claude")
+        or "claude"
+    )
+    if default_backend != "codex":
         return None
     if env.get("CODEX_AUTH_MODE", "subscription") != "subscription":
         return None
@@ -2725,7 +2759,7 @@ def _build_codex_login_reminder(
         "  Log in to codex as the target os_user before the first message:\n"
         "    <os_user> ~$ codex login\n"
         "  Run as the os_user themselves, not via sudo from another account.\n"
-        "  If users.yaml has per-user `agent_backend: codex` entries with\n"
+        "  If users.yaml has per-user `default_backend: codex` entries with\n"
         "  different os_users, log in as each of those too."
     )
 
@@ -4093,6 +4127,21 @@ def _cmd_apply() -> None:
     service_user = conf.get("service_user")
     platform = conf.get("platform")
     env = conf.get("env", {})
+    # Migrate a legacy AGENT_BACKEND key in the install.conf env dict to
+    # DEFAULT_BACKEND once, here, before any gate reads it or
+    # _apply_secrets writes /etc/kai/env. Apply consumes the env dict
+    # directly (it never goes through load_config), so without this an
+    # apply driven by a legacy install.conf would either skip
+    # backend-specific setup or, for codex/goose, validate the default
+    # model against the wrong (claude/anthropic) surface and fail. After
+    # this block every downstream `env.get("DEFAULT_BACKEND")` sees the
+    # resolved value and /etc/kai/env is written with the new name only.
+    if "AGENT_BACKEND" in env and "DEFAULT_BACKEND" not in env:
+        env["DEFAULT_BACKEND"] = env.pop("AGENT_BACKEND")
+    elif "AGENT_BACKEND" in env:
+        # Both present: the new key wins; drop the legacy one so it does
+        # not linger in the written env file.
+        del env["AGENT_BACKEND"]
     # Top-level installer metadata: present only when the wizard
     # staged a first-time users.yaml that has not yet been applied.
     # The empty-string -> None coercion treats a hand-edited conf
@@ -4129,23 +4178,24 @@ def _cmd_apply() -> None:
     #
     # Normalize the same way load_config does (config.py reads both env
     # vars through .strip().lower() before validating). A hand-edited
-    # install.conf with "AGENT_BACKEND": "Claude" or trailing whitespace
+    # install.conf with "DEFAULT_BACKEND": "Claude" or trailing whitespace
     # would otherwise compute the wrong effective provider here, pass
-    # the apply gate, and then fail at startup.
+    # the apply gate, and then fail at startup. The legacy AGENT_BACKEND
+    # key was already migrated to DEFAULT_BACKEND at the top of apply.
     #
     # Resolve the same fallback load_config uses ("" -> "sonnet"). An
     # empty or missing DEFAULT_MODEL is silently promoted at runtime;
     # if we do not mirror that promotion here, the apply gate misses
     # the missing-key case that is precisely what this gate exists for.
     default_model_raw = env.get("DEFAULT_MODEL", "")
-    agent_backend_raw = env.get("AGENT_BACKEND", "claude").strip().lower()
+    agent_backend_raw = env.get("DEFAULT_BACKEND", "claude").strip().lower()
     llm_provider_raw = env.get("LLM_PROVIDER", "").strip().lower()
     eff_provider_for_check = "anthropic" if agent_backend_raw == "claude" else llm_provider_raw
     resolved_model = default_model_raw or "sonnet"
     # Backend-aware validation: codex installs validate against
     # CODEX_MODELS only - no fallback to PROVIDER_MODELS["openai"].
     # That closes the regression where install.conf with
-    # AGENT_BACKEND=codex and DEFAULT_MODEL=opus survived apply
+    # DEFAULT_BACKEND=codex and DEFAULT_MODEL=opus survived apply
     # because validate_model_for_provider accepted unknown effective-
     # provider "" unchecked, or where DEFAULT_MODEL=gpt-5.4-nano
     # (goose-valid) survived because the wizard mapped codex onto
@@ -4242,7 +4292,7 @@ def _cmd_apply() -> None:
         # wins over any value already in install.conf.
         #
         # Gate the apply-time shell env pass-through on the global
-        # AGENT_BACKEND only: it is an ad-hoc escape hatch for global
+        # DEFAULT_BACKEND only: it is an ad-hoc escape hatch for global
         # backend installs (`sudo CODEX_BIN=... kai install apply`).
         # Per-user backend entries do NOT need it; their binary paths
         # are collected by the `make config` per-user backend scan
@@ -4250,7 +4300,7 @@ def _cmd_apply() -> None:
         # consumes below. Codex AUTH for per-user entries stays
         # out-of-band (per-OS-user `codex login`).
         env_codex_bin = os.environ.get("CODEX_BIN")
-        if env_codex_bin and env.get("AGENT_BACKEND") == "codex":
+        if env_codex_bin and env.get("DEFAULT_BACKEND") == "codex":
             env["CODEX_BIN"] = env_codex_bin
         # Mirror the same env pass-through for OPENCODE_BIN so an
         # `sudo OPENCODE_BIN=... kai install apply` invocation pins
@@ -4260,20 +4310,20 @@ def _cmd_apply() -> None:
         # entries get their path from the wizard scan via
         # install.conf, with auth out-of-band (`opencode auth login`).
         env_opencode_bin = os.environ.get("OPENCODE_BIN")
-        if env_opencode_bin and env.get("AGENT_BACKEND") == "opencode":
+        if env_opencode_bin and env.get("DEFAULT_BACKEND") == "opencode":
             env["OPENCODE_BIN"] = env_opencode_bin
         # And for GOOSE_BIN, completing the per-backend trio. Same
         # split as the two above: shell env override for global goose
         # installs, install.conf from the wizard scan for per-user
         # entries.
         env_goose_bin = os.environ.get("GOOSE_BIN")
-        if env_goose_bin and env.get("AGENT_BACKEND") == "goose":
+        if env_goose_bin and env.get("DEFAULT_BACKEND") == "goose":
             env["GOOSE_BIN"] = env_goose_bin
         # And for CLAUDE_BIN, completing the per-backend set. The
-        # AGENT_BACKEND gate compares against the runtime default
+        # DEFAULT_BACKEND gate compares against the runtime default
         # because the wizard omits the key on claude installs.
         env_claude_bin = os.environ.get("CLAUDE_BIN")
-        if env_claude_bin and env.get("AGENT_BACKEND", "claude") == "claude":
+        if env_claude_bin and env.get("DEFAULT_BACKEND", "claude") == "claude":
             env["CLAUDE_BIN"] = env_claude_bin
         # AGENT_TIMEOUT_SECONDS migration. Operators upgrading without
         # re-running the wizard carry the legacy CLAUDE_TIMEOUT_SECONDS
@@ -4306,10 +4356,10 @@ def _cmd_apply() -> None:
         _apply_secrets(env, dry_run, users_yaml_staging_path=users_yaml_staging_path)
 
         # -- Step 6: Deploy Goose config (if any goose-backed user) --
-        # The function gates itself: global AGENT_BACKEND=goose or a
-        # per-user agent_backend override in users.yaml both mean some
+        # The function gates itself: global DEFAULT_BACKEND=goose or a
+        # per-user default_backend override in users.yaml both mean some
         # session spawns `goose acp`; otherwise it no-ops.
-        agent_backend = env.get("AGENT_BACKEND", "claude")
+        agent_backend = env.get("DEFAULT_BACKEND", "claude")
         _apply_goose_config(
             service_user,
             install_path,
@@ -5523,9 +5573,9 @@ def _apply_sudoers(
     fire only on installs where the wizard has not collected a value.
 
     `agent_backend` is the install's global backend (the env dict's
-    AGENT_BACKEND, defaulting to claude when the key is absent, which
+    DEFAULT_BACKEND, defaulting to claude when the key is absent, which
     matches the runtime default). Together with the per-user
-    agent_backend overrides in users.yaml it scopes the missing-binary
+    default_backend overrides in users.yaml it scopes the missing-binary
     backstop below to backends the install actually uses.
     """
     # None resolves to the module-level USERS_YAML at call time rather
@@ -5558,7 +5608,7 @@ def _apply_sudoers(
     # reinstall, or wizard re-run that makes the paths agree.
     #
     # The check is scoped to backends the install actually uses (the
-    # global agent_backend plus any per-user agent_backend overrides
+    # global backend plus any per-user default_backend overrides
     # in users.yaml): telling an opencode-only operator to install
     # claude would manufacture a requirement that does not exist and
     # train operators to ignore the warning. The rules themselves are

@@ -297,7 +297,7 @@ class TestInitMemory:
             lambda backend: f"/fake/{backend}-binary",
         )
         # Per-user dispatch: the eligible set is computed from
-        # `agent_backend` (legacy ALLOWED_USER_IDS auth has no
+        # `default_backend` (legacy ALLOWED_USER_IDS auth has no
         # users.yaml, so every user inherits the global). A
         # single-backend install logs the uniform-mode flat keys plus
         # the per-backend maps. users.yaml is mandatory post-#565
@@ -305,7 +305,7 @@ class TestInitMemory:
         # backend matches the global.
         config = _make_config(
             memory_extraction_enabled=True,
-            agent_backend="codex",
+            default_backend="codex",
             user_configs={1: UserConfig(telegram_id=1, name="alice", os_user="a")},
         )
         with (
@@ -345,10 +345,10 @@ class TestInitMemory:
         )
         config = _make_config(
             memory_extraction_enabled=True,
-            agent_backend="claude",
+            default_backend="claude",
             user_configs={
                 1: UserConfig(telegram_id=1, name="alice", os_user="a"),
-                2: UserConfig(telegram_id=2, name="bob", os_user="b", agent_backend="codex"),
+                2: UserConfig(telegram_id=2, name="bob", os_user="b", default_backend="codex"),
             },
         )
         with (

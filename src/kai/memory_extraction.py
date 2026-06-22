@@ -1939,10 +1939,10 @@ def _resolve_os_user(user_id: str, config: Config) -> str | None:
 
 def _resolve_effective_backend(user_id: str, config: Config) -> str:
     """
-    Resolve the user being extracted to its effective `agent_backend`.
+    Resolve the user being extracted to its effective `default_backend`.
 
-    Cascade: per-user `agent_backend` from users.yaml wins; otherwise
-    the global `config.agent_backend` applies. The same shape
+    Cascade: per-user `default_backend` from users.yaml wins; otherwise
+    the global `config.default_backend` applies. The same shape
     `_ingest_memory` in bot.py uses to gate extraction eligibility,
     kept in lockstep so the per-user dispatch site here cannot drift
     from the eligibility check there.
@@ -1962,11 +1962,11 @@ def _resolve_effective_backend(user_id: str, config: Config) -> str:
     try:
         tid = int(user_id)
     except ValueError:
-        return config.agent_backend
+        return config.default_backend
     user_cfg = config.user_configs.get(tid)
     if user_cfg is None:
-        return config.agent_backend
-    return user_cfg.agent_backend or config.agent_backend
+        return config.default_backend
+    return user_cfg.default_backend or config.default_backend
 
 
 def _resolve_user_config(user_id: str, config: Config):

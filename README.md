@@ -89,13 +89,13 @@ Workspaces can also define a system prompt via `workspaces.yaml` for workspace-s
 
 #### Memory backend selection
 
-Semantic memory extraction (the subprocess that proactively writes facts and episode summaries) routes per-user: each user's effective `agent_backend` selects the reasoner, and the model comes from the project's `MODEL_REGISTRY` for that `(role, backend)` pair. Claude-effective users get the claude reasoner with the claude-registry model; codex-effective users get the codex reasoner with the codex-registry model; opencode-effective users get the opencode reasoner with the opencode-registry model (a `provider/model` string resolved at runtime by `opencode` against the operator's `opencode auth login` state). There is no per-deployment override for the memory reasoner or model; an operator who wants a different model edits the registry in `config.py`.
+Semantic memory extraction (the subprocess that proactively writes facts and episode summaries) routes per-user: each user's effective `default_backend` selects the reasoner, and the model comes from the project's `MODEL_REGISTRY` for that `(role, backend)` pair. Claude-effective users get the claude reasoner with the claude-registry model; codex-effective users get the codex reasoner with the codex-registry model; opencode-effective users get the opencode reasoner with the opencode-registry model (a `provider/model` string resolved at runtime by `opencode` against the operator's `opencode auth login` state). There is no per-deployment override for the memory reasoner or model; an operator who wants a different model edits the registry in `config.py`.
 
 OpenCode users get the same one-shot parity as claude and codex users: PR review, issue triage, memory extraction, episode generation, and behavioral eval all dispatch through `OpenCodeOneShotReasoner`, which spawns a fresh `opencode acp` JSON-RPC subprocess per call and denies any tool-permission request mid-stream. No fall-through to `claude --print` or `codex exec` for opencode users on any one-shot site.
 
 Each backend that runs extraction on this install must have its binary reachable at startup; the bot exits at config-load otherwise with a message naming the offending backend and resolution sequence. Retrieval-only memory (`MEMORY_ENABLED=true` with extraction disabled) requires no extraction binary.
 
-To verify a memory configuration end-to-end without writing to the store, run `python -m kai.smoke.memory` from the install directory. Pass `--user-id <chat_id>` to drive the smoke under that user's effective backend (otherwise the global `AGENT_BACKEND` is used). Pass `--os-user <name>` when the effective backend resolves to codex or opencode and the target user is not the bot process user; both reasoners refuse to spawn under sudo without one. The smoke prints the resolved binary, the argv that ran, and any extracted facts.
+To verify a memory configuration end-to-end without writing to the store, run `python -m kai.smoke.memory` from the install directory. Pass `--user-id <chat_id>` to drive the smoke under that user's effective backend (otherwise the global `DEFAULT_BACKEND` is used). Pass `--os-user <name>` when the effective backend resolves to codex or opencode and the target user is not the bot process user; both reasoners refuse to spawn under sudo without one. The smoke prints the resolved binary, the argv that ran, and any extracted facts.
 
 ### Scheduled jobs
 
@@ -215,7 +215,7 @@ Authorization, per-user model selection, per-user OS isolation, per-user GitHub 
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `TELEGRAM_BOT_TOKEN` | Yes | | Bot token from BotFather |
-| `AGENT_BACKEND` | No | `claude` | Global agent backend: `claude`, `goose`, `codex`, or `opencode`. Per-user override goes in `users.yaml`. |
+| `DEFAULT_BACKEND` | No | `claude` | Global default backend: `claude`, `goose`, `codex`, or `opencode`. Per-user override goes in `users.yaml`. (The former `AGENT_BACKEND` name is still read for one release with a deprecation warning.) |
 | `LLM_PROVIDER` | Non-claude | | Global provider for non-claude backends. Per-user override in `users.yaml`. |
 | `DEFAULT_MODEL` | No | `sonnet` | Installation-wide default model. Per-user override in `users.yaml` `model`, or `/settings model`. |
 | `AGENT_TIMEOUT_SECONDS` | No | `120` | Installation-wide default per-message timeout. Per-user override in `users.yaml` `timeout`, or `/settings timeout`. |

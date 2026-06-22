@@ -1347,7 +1347,7 @@ class TestCmdConfig:
         # ALLOWED_USER_IDS should not be in the env dict
         assert "ALLOWED_USER_IDS" not in conf["env"]
         # Default backend should not appear in env (only non-default values)
-        assert "AGENT_BACKEND" not in conf["env"]
+        assert "DEFAULT_BACKEND" not in conf["env"]
         # users.yaml should have been generated
         yaml_path = tmp_path / "users.yaml"
         assert yaml_path.exists()
@@ -1592,7 +1592,7 @@ class TestCmdConfig:
         )
 
     def test_goose_backend_writes_env(self, tmp_path, monkeypatch, capsys):
-        """Selecting goose backend writes AGENT_BACKEND to env."""
+        """Selecting goose backend writes DEFAULT_BACKEND to env."""
         monkeypatch.chdir(tmp_path)
         conf_path = tmp_path / "install.conf"
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
@@ -1601,7 +1601,7 @@ class TestCmdConfig:
 
         # Pre-seed existing config with goose backend so the prompt
         # appears (it is gated behind an existing non-claude value).
-        existing = {"version": 1, "env": {"AGENT_BACKEND": "goose"}}
+        existing = {"version": 1, "env": {"DEFAULT_BACKEND": "goose"}}
         conf_path.write_text(json.dumps(existing))
 
         monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
@@ -1646,7 +1646,7 @@ class TestCmdConfig:
         _cmd_config()
 
         conf = json.loads((tmp_path / "install.conf").read_text())
-        assert conf["env"]["AGENT_BACKEND"] == "goose"
+        assert conf["env"]["DEFAULT_BACKEND"] == "goose"
         assert conf["env"]["LLM_PROVIDER"] == "anthropic"
         assert conf["env"]["ANTHROPIC_API_KEY"] == "sk-ant-test-key"
         assert conf["env"]["GOOSE_BIN"] == "/opt/homebrew/bin/goose"
@@ -1666,7 +1666,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._redirect_staging(monkeypatch, tmp_path)
 
-        existing = {"version": 1, "env": {"AGENT_BACKEND": "goose"}}
+        existing = {"version": 1, "env": {"DEFAULT_BACKEND": "goose"}}
         conf_path.write_text(json.dumps(existing))
 
         memory_block = [
@@ -1708,7 +1708,7 @@ class TestCmdConfig:
         monkeypatch.setattr(install_module, "ONESHOT_REASONER_BACKENDS", frozenset({"claude", "codex"}))
         self._redirect_staging(monkeypatch, tmp_path)
 
-        existing = {"version": 1, "env": {"AGENT_BACKEND": "goose"}}
+        existing = {"version": 1, "env": {"DEFAULT_BACKEND": "goose"}}
         conf_path.write_text(json.dumps(existing))
 
         memory_block = [
@@ -1736,7 +1736,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._redirect_staging(monkeypatch, tmp_path)
 
-        existing = {"version": 1, "env": {"AGENT_BACKEND": "goose"}}
+        existing = {"version": 1, "env": {"DEFAULT_BACKEND": "goose"}}
         conf_path.write_text(json.dumps(existing))
 
         # No API key input after "ollama" - the prompt is skipped.
@@ -2049,8 +2049,8 @@ class TestCmdConfig:
         assert "CLAUDE_EFFORT_LEVEL" not in env
         assert "CLAUDE_USER" not in env
 
-        # Sanity: AGENT_BACKEND was emitted (it always is for non-claude).
-        assert env.get("AGENT_BACKEND") == "goose"
+        # Sanity: DEFAULT_BACKEND was emitted (it always is for non-claude).
+        assert env.get("DEFAULT_BACKEND") == "goose"
 
     def test_goose_backend_prunes_existing_claude_only_keys(self, tmp_path, monkeypatch):
         """When the operator switches an existing claude install to
@@ -2075,7 +2075,7 @@ class TestCmdConfig:
         pre_existing = {
             "version": 1,
             "env": {
-                "AGENT_BACKEND": "claude",
+                "DEFAULT_BACKEND": "claude",
                 "CLAUDE_AUTOCOMPACT_PCT": "50",
                 "CLAUDE_EFFORT_LEVEL": "xhigh",
                 "CLAUDE_USER": "kai",
@@ -2093,11 +2093,11 @@ class TestCmdConfig:
         conf = json.loads(conf_path.read_text())
         env = conf["env"]
         # All three previously-set Claude-only keys must be absent.
-        # AGENT_BACKEND must reflect the new selection.
+        # DEFAULT_BACKEND must reflect the new selection.
         assert "CLAUDE_AUTOCOMPACT_PCT" not in env
         assert "CLAUDE_EFFORT_LEVEL" not in env
         assert "CLAUDE_USER" not in env
-        assert env.get("AGENT_BACKEND") == "goose"
+        assert env.get("DEFAULT_BACKEND") == "goose"
 
     def test_memory_enabled_writes_tunables(self, tmp_path, monkeypatch):
         """MEMORY_ENABLED=true with extraction writes the chosen tunables."""
@@ -2259,7 +2259,7 @@ class TestCmdConfig:
             "users:\n  - telegram_id: 999\n    name: existing\n    role: admin\n",
         )
 
-        # AGENT_BACKEND seeded explicitly so the extraction-keys cleanup (non-claude pops them) doesn't depend on the wizard's implicit default.
+        # DEFAULT_BACKEND seeded explicitly so the extraction-keys cleanup (non-claude pops them) doesn't depend on the wizard's implicit default.
         existing = {
             "version": 1,
             "install_dir": "/opt/kai",
@@ -2269,7 +2269,7 @@ class TestCmdConfig:
             "env": {
                 "TELEGRAM_BOT_TOKEN": "existing-token",
                 "WEBHOOK_SECRET": "existing-secret",
-                "AGENT_BACKEND": "claude",
+                "DEFAULT_BACKEND": "claude",
                 "MEMORY_ENABLED": "true",
                 "MEMORY_EXTRACTION_ENABLED": "true",
                 "MEMORY_EXTRACTION_BUDGET_USD": "0.08",
@@ -2354,7 +2354,7 @@ class TestCmdConfig:
         existing = {
             "version": 1,
             "env": {
-                "AGENT_BACKEND": "goose",
+                "DEFAULT_BACKEND": "goose",
                 "MEMORY_ENABLED": "true",
                 "MEMORY_EXTRACTION_ENABLED": "true",
                 "MEMORY_EXTRACTION_BUDGET_USD": "0.05",
@@ -2640,7 +2640,7 @@ class TestCmdConfig:
         # else falls back to dataclass defaults via load_config.
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
         monkeypatch.setenv("ALLOWED_USER_IDS", "1")
-        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("DEFAULT_BACKEND", "codex")
         # DEFAULT_MODEL validates against the agent backend's model
         # set; codex requires a CODEX_MODELS entry. The wizard would
         # have prompted for this; here we set it explicitly to focus
@@ -2649,7 +2649,7 @@ class TestCmdConfig:
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
         # MEMORY_REASONER_BACKEND retired (issue #515); memory reasoner
-        # derives from AGENT_BACKEND per-user. The wizard no longer
+        # derives from DEFAULT_BACKEND per-user. The wizard no longer
         # emits the key.
         # MEMORY_EPISODE_MODEL is intentionally NOT set; the codex
         # branch defaults the wizard prompt to blank, which means
@@ -2660,7 +2660,7 @@ class TestCmdConfig:
         config = load_config()
         assert config.memory_enabled is True
         assert config.memory_extraction_enabled is True
-        assert config.agent_backend == "codex"
+        assert config.default_backend == "codex"
         # Per-user dispatch (issue #515) resolves the memory model
         # from the registry at extraction time; verify both stage roles
         # have a codex-valid row.
@@ -2795,7 +2795,7 @@ class TestCmdConfig:
         config = load_config()
         assert config.memory_enabled is True
         assert config.memory_extraction_enabled is True
-        assert config.agent_backend == "codex"
+        assert config.default_backend == "codex"
         assert config.user_configs is not None
         assert 12345 in config.user_configs
         # No os_user → in-process spawn at runtime via the
@@ -3234,6 +3234,22 @@ class TestCmdConfigDefaultModelDispatch:
         _, env = self._run(monkeypatch, tmp_path, base, helper_return="gpt-5.5")
         assert env.get("CODEX_EFFORT_LEVEL") == "high"
 
+    def test_install_conf_legacy_AGENT_BACKEND_migrates_on_resave(self, tmp_path, monkeypatch):
+        """Re-running the wizard against a prior install.conf that
+        carries the deprecated AGENT_BACKEND key writes DEFAULT_BACKEND
+        only: the wizard never re-emits the legacy key, so the resaved
+        install.conf is clean. The legacy value is still honored as the
+        prefill (read through the resolver)."""
+        self._setup(monkeypatch, tmp_path, existing_env={"AGENT_BACKEND": "codex"})
+        _, env = self._run(
+            monkeypatch,
+            tmp_path,
+            self._inputs_for_codex_subscription(),
+            helper_return="gpt-5.5",
+        )
+        assert env.get("DEFAULT_BACKEND") == "codex"
+        assert "AGENT_BACKEND" not in env
+
     def test_codex_effort_prompt_displays_choices(self, tmp_path, monkeypatch):
         """
         The Codex effort prompt advertises the allowed values and the
@@ -3429,10 +3445,10 @@ class TestCmdConfigDefaultModelDispatch:
         inputs = base_inputs[: idx + 1] + memory_inputs[1:] + base_inputs[idx + 1 :]
         _, env = self._run(monkeypatch, tmp_path, inputs, helper_return="gpt-5.4")
         # Codex install persists memory extraction config; the global
-        # AGENT_BACKEND=codex is what makes codex extraction-eligible.
+        # DEFAULT_BACKEND=codex is what makes codex extraction-eligible.
         assert env.get("MEMORY_ENABLED") == "true"
         assert env.get("MEMORY_EXTRACTION_ENABLED") == "true"
-        assert env.get("AGENT_BACKEND") == "codex"
+        assert env.get("DEFAULT_BACKEND") == "codex"
         # MEMORY_REASONER_BACKEND retired; the wizard must not emit it.
         assert "MEMORY_REASONER_BACKEND" not in env
 
@@ -3501,7 +3517,7 @@ class TestCmdApplyDefaultModelGate:
         monkeypatch.setattr("os.geteuid", lambda: 0)
         conf_path = self._write_install_conf(
             tmp_path,
-            {"DEFAULT_MODEL": "sonnet", "AGENT_BACKEND": "goose", "LLM_PROVIDER": "openai"},
+            {"DEFAULT_MODEL": "sonnet", "DEFAULT_BACKEND": "goose", "LLM_PROVIDER": "openai"},
         )
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         stop_service = self._patch_side_effects(monkeypatch)
@@ -3523,7 +3539,7 @@ class TestCmdApplyDefaultModelGate:
         monkeypatch.setattr("os.geteuid", lambda: 0)
         conf_path = self._write_install_conf(
             tmp_path,
-            {"AGENT_BACKEND": "goose", "LLM_PROVIDER": "openai"},
+            {"DEFAULT_BACKEND": "goose", "LLM_PROVIDER": "openai"},
         )
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         stop_service = self._patch_side_effects(monkeypatch)
@@ -3545,7 +3561,7 @@ class TestCmdApplyDefaultModelGate:
         monkeypatch.setattr("os.geteuid", lambda: 0)
         conf_path = self._write_install_conf(
             tmp_path,
-            {"AGENT_BACKEND": "claude"},
+            {"DEFAULT_BACKEND": "claude"},
         )
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         stop_service = self._patch_side_effects(monkeypatch)
@@ -3568,7 +3584,7 @@ class TestCmdApplyDefaultModelGate:
             tmp_path,
             {
                 "DEFAULT_MODEL": "anthropic/claude-sonnet-4-6",
-                "AGENT_BACKEND": "goose",
+                "DEFAULT_BACKEND": "goose",
                 "LLM_PROVIDER": "openrouter",
             },
         )
@@ -3589,7 +3605,7 @@ class TestCmdApplyDefaultModelGate:
         monkeypatch.setenv("DRY_RUN", "1")
         conf_path = self._write_install_conf(
             tmp_path,
-            {"DEFAULT_MODEL": "sonnet", "AGENT_BACKEND": "goose", "LLM_PROVIDER": "openai"},
+            {"DEFAULT_MODEL": "sonnet", "DEFAULT_BACKEND": "goose", "LLM_PROVIDER": "openai"},
         )
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         stop_service = self._patch_side_effects(monkeypatch)
@@ -3604,12 +3620,12 @@ class TestCmdApplyDefaultModelGate:
     def test_normalizes_llm_provider_case_and_whitespace(self, tmp_path, monkeypatch):
         """
         Mirrors load_config's .strip().lower() normalization on
-        AGENT_BACKEND and LLM_PROVIDER. The test relies on a code path
+        DEFAULT_BACKEND and LLM_PROVIDER. The test relies on a code path
         where normalized and un-normalized lookups produce DIFFERENT
         gate outcomes, so that the test fails if either transformation
         is dropped from the gate.
 
-        Setup: AGENT_BACKEND="goose", LLM_PROVIDER=" OpenAI ", DEFAULT_MODEL="sonnet".
+        Setup: DEFAULT_BACKEND="goose", LLM_PROVIDER=" OpenAI ", DEFAULT_MODEL="sonnet".
         - With .strip().lower() applied: eff_provider="openai",
           validate("sonnet", "openai") returns False (sonnet is not in
           PROVIDER_MODELS["openai"]) -> SystemExit.
@@ -3628,7 +3644,7 @@ class TestCmdApplyDefaultModelGate:
             tmp_path,
             {
                 "DEFAULT_MODEL": "sonnet",
-                "AGENT_BACKEND": "goose",
+                "DEFAULT_BACKEND": "goose",
                 "LLM_PROVIDER": " OpenAI ",
             },
         )
@@ -3642,6 +3658,55 @@ class TestCmdApplyDefaultModelGate:
         # load_config error wording.
         assert "openai" in str(excinfo.value).lower()
         stop_service.assert_not_called()
+
+    def test_apply_resolves_legacy_AGENT_BACKEND(self, tmp_path, monkeypatch):
+        """A legacy install.conf carrying AGENT_BACKEND=codex must
+        validate the default model against the CODEX surface (not
+        anthropic) and migrate the env dict so /etc/kai/env is written
+        with DEFAULT_BACKEND and no AGENT_BACKEND.
+
+        Apply consumes the install.conf env dict directly, never through
+        load_config, so the migration has to happen inside _cmd_apply.
+        gpt-5.5 is codex-valid but NOT anthropic-valid: if the apply
+        path defaulted the backend to claude, this would SystemExit.
+        """
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+        conf_path = self._write_install_conf(
+            tmp_path,
+            {"DEFAULT_MODEL": "gpt-5.5", "AGENT_BACKEND": "codex"},
+        )
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        self._patch_side_effects(monkeypatch)
+        # Capture the env dict handed to _apply_secrets to confirm the
+        # in-memory migration ran before the write.
+        secrets_mock = MagicMock()
+        monkeypatch.setattr("kai.install._apply_secrets", secrets_mock)
+        monkeypatch.setenv("DRY_RUN", "1")
+
+        _cmd_apply()
+
+        secrets_mock.assert_called_once()
+        written_env = secrets_mock.call_args.args[0]
+        assert written_env.get("DEFAULT_BACKEND") == "codex"
+        assert "AGENT_BACKEND" not in written_env
+
+    def test_apply_resolves_new_DEFAULT_BACKEND(self, tmp_path, monkeypatch):
+        """A new-name install.conf passes through cleanly: goose-path
+        setup is reached (the gate accepts a goose-valid model and apply
+        proceeds past _stop_service)."""
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+        conf_path = self._write_install_conf(
+            tmp_path,
+            {"DEFAULT_MODEL": "gpt-5.5", "DEFAULT_BACKEND": "goose", "LLM_PROVIDER": "openai"},
+        )
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        stop_service = self._patch_side_effects(monkeypatch)
+        monkeypatch.setenv("DRY_RUN", "1")
+
+        _cmd_apply()
+        stop_service.assert_called_once()
 
 
 # ── Directory creation ───────────────────────────────────────────────
@@ -6941,7 +7006,7 @@ class TestCmdApplyStagingHandoff:
                 "TELEGRAM_BOT_TOKEN": "tok",
                 "WEBHOOK_SECRET": "secret",
                 "DEFAULT_MODEL": "sonnet",
-                "AGENT_BACKEND": "claude",
+                "DEFAULT_BACKEND": "claude",
             },
         }
         if staging_path is not None:
@@ -7368,7 +7433,7 @@ class TestCmdApplySingleUserRefuses:
                 "TELEGRAM_BOT_TOKEN": "tok",
                 "WEBHOOK_SECRET": "secret",
                 "DEFAULT_MODEL": "sonnet",
-                "AGENT_BACKEND": "claude",
+                "DEFAULT_BACKEND": "claude",
             },
         }
         conf_path = tmp_path / "install.conf"
@@ -7542,7 +7607,7 @@ class TestApplySudoersDryRun:
             "    os_user: alice\n"
             "  - telegram_id: 2\n"
             "    os_user: bob\n"
-            "    agent_backend: claude\n"
+            "    default_backend: claude\n"
         )
 
         _apply_sudoers(
@@ -7617,7 +7682,7 @@ class TestApplySudoersDryRun:
 
 
 class TestCollectBackendsFromYaml:
-    """The lightweight per-user agent_backend reader that scopes the
+    """The lightweight per-user default_backend reader that scopes the
     sudoers missing-binary backstop."""
 
     def test_missing_file_returns_empty_set(self, tmp_path):
@@ -7628,11 +7693,11 @@ class TestCollectBackendsFromYaml:
         path.write_text(
             "users:\n"
             "  - telegram_id: 1\n"
-            "    agent_backend: codex\n"
+            "    default_backend: codex\n"
             "  - telegram_id: 2\n"
-            "    agent_backend: opencode\n"
+            "    default_backend: opencode\n"
             "  - telegram_id: 3\n"
-            "    agent_backend: codex\n"
+            "    default_backend: codex\n"
             "  - telegram_id: 4\n"
         )
         assert _collect_backends_from_yaml(path) == {"codex", "opencode"}
@@ -7640,9 +7705,44 @@ class TestCollectBackendsFromYaml:
     def test_non_string_and_blank_values_skipped(self, tmp_path):
         path = tmp_path / "users.yaml"
         path.write_text(
-            "users:\n  - telegram_id: 1\n    agent_backend: 42\n  - telegram_id: 2\n    agent_backend: '  '\n"
+            "users:\n  - telegram_id: 1\n    default_backend: 42\n  - telegram_id: 2\n    default_backend: '  '\n"
         )
         assert _collect_backends_from_yaml(path) == set()
+
+
+class TestEntryBackendLegacyKey:
+    """Every installer-side users.yaml scanner reads a per-user entry's
+    backend through `_entry_backend`, which prefers `default_backend`
+    and falls back to the deprecated `agent_backend` key for one
+    release. Without this, a per-user `default_backend: goose` entry
+    would be invisible to wizard/apply setup (provider keys, binary
+    collection, goose config deployment, sudoers scoping)."""
+
+    @pytest.mark.parametrize("key", ["default_backend", "agent_backend"])
+    def test_collect_backends_reads_both_keys(self, tmp_path, key):
+        path = tmp_path / "users.yaml"
+        path.write_text(f"users:\n  - telegram_id: 1\n    {key}: goose\n")
+        assert _collect_backends_from_yaml(path) == {"goose"}
+
+    @pytest.mark.parametrize("key", ["default_backend", "agent_backend"])
+    def test_users_yaml_agent_backends_reads_both_keys(self, tmp_path, key):
+        path = tmp_path / "users.yaml"
+        path.write_text(f"users:\n  - telegram_id: 1\n    {key}: codex\n")
+        assert _users_yaml_agent_backends(path) == {"codex"}
+
+    @pytest.mark.parametrize("key", ["default_backend", "agent_backend"])
+    def test_goose_providers_reads_both_keys(self, tmp_path, key):
+        path = tmp_path / "users.yaml"
+        path.write_text(f"users:\n  - telegram_id: 1\n    {key}: goose\n    llm_provider: openai\n")
+        assert _users_yaml_goose_providers(path, "anthropic") == ["openai"]
+
+    @pytest.mark.parametrize("key", ["default_backend", "agent_backend"])
+    def test_goose_os_users_reads_both_keys(self, tmp_path, key):
+        from kai.install import _collect_goose_os_users_from_yaml
+
+        path = tmp_path / "users.yaml"
+        path.write_text(f"users:\n  - telegram_id: 1\n    {key}: goose\n    os_user: alice\n")
+        assert _collect_goose_os_users_from_yaml(path, "claude") == ["alice"]
 
 
 # ── _apply_service dry run ───────────────────────────────────────────
@@ -7776,17 +7876,17 @@ class TestApplyGooseConfig:
             "users:\n"
             "  - telegram_id: 1\n"
             "    name: alice\n"
-            "    agent_backend: goose\n"
+            "    default_backend: goose\n"
             "    os_user: alice\n"
             # Duplicate os_user entry: the deploy must dedupe.
             "  - telegram_id: 2\n"
             "    name: alice2\n"
-            "    agent_backend: goose\n"
+            "    default_backend: goose\n"
             "    os_user: alice\n"
             # Non-goose user with an os_user: not a deploy target.
             "  - telegram_id: 3\n"
             "    name: bob\n"
-            "    agent_backend: codex\n"
+            "    default_backend: codex\n"
             "    os_user: bob\n"
         )
 
@@ -7831,7 +7931,7 @@ class TestApplyGooseConfig:
 
     def test_global_goose_install_deploys_to_os_users_without_override(self, tmp_path, monkeypatch):
         """On a global goose install, users.yaml entries with no
-        per-user agent_backend inherit goose and their os_user homes
+        per-user default_backend inherit goose and their os_user homes
         are deploy targets."""
         import types
 
@@ -7882,7 +7982,7 @@ class TestApplyGooseConfig:
 
         users_yaml = tmp_path / "users.yaml"
         users_yaml.write_text(
-            "users:\n  - telegram_id: 1\n    name: alice\n    agent_backend: goose\n    os_user: alice\n"
+            "users:\n  - telegram_id: 1\n    name: alice\n    default_backend: goose\n    os_user: alice\n"
         )
         monkeypatch.setattr(
             "kai.install.pwd",
@@ -7916,7 +8016,7 @@ class TestApplyGooseConfig:
         # return before the template existence check.
         install_path = tmp_path / "opt" / "kai"
         users_yaml = tmp_path / "users.yaml"
-        users_yaml.write_text("users:\n  - {telegram_id: 1, name: a, agent_backend: codex, os_user: bob}\n")
+        users_yaml.write_text("users:\n  - {telegram_id: 1, name: a, default_backend: codex, os_user: bob}\n")
 
         _apply_goose_config(
             "kai",
@@ -7943,7 +8043,7 @@ class TestApplyGooseConfig:
 
         users_yaml = tmp_path / "users.yaml"
         users_yaml.write_text(
-            "users:\n  - telegram_id: 1\n    name: ghost\n    agent_backend: goose\n    os_user: ghost\n"
+            "users:\n  - telegram_id: 1\n    name: ghost\n    default_backend: goose\n    os_user: ghost\n"
         )
 
         def _raise_keyerror(name):
@@ -7982,8 +8082,8 @@ class TestCollectGooseOsUsersFromYaml:
         path = tmp_path / "users.yaml"
         path.write_text(
             "users:\n"
-            "  - {telegram_id: 1, name: a, agent_backend: goose, os_user: alice}\n"
-            "  - {telegram_id: 2, name: b, agent_backend: codex, os_user: bob}\n"
+            "  - {telegram_id: 1, name: a, default_backend: goose, os_user: alice}\n"
+            "  - {telegram_id: 2, name: b, default_backend: codex, os_user: bob}\n"
             "  - {telegram_id: 3, name: c, os_user: carol}\n"
         )
         assert _collect_goose_os_users_from_yaml(path, "claude") == ["alice"]
@@ -7995,7 +8095,7 @@ class TestCollectGooseOsUsersFromYaml:
         path.write_text(
             "users:\n"
             "  - {telegram_id: 1, name: a, os_user: alice}\n"
-            "  - {telegram_id: 2, name: b, agent_backend: claude, os_user: bob}\n"
+            "  - {telegram_id: 2, name: b, default_backend: claude, os_user: bob}\n"
         )
         assert _collect_goose_os_users_from_yaml(path, "goose") == ["alice"]
 
@@ -8003,7 +8103,7 @@ class TestCollectGooseOsUsersFromYaml:
         from kai.install import _collect_goose_os_users_from_yaml
 
         path = tmp_path / "users.yaml"
-        path.write_text("users:\n  - {telegram_id: 1, name: a, agent_backend: goose}\n")
+        path.write_text("users:\n  - {telegram_id: 1, name: a, default_backend: goose}\n")
         assert _collect_goose_os_users_from_yaml(path, "claude") == []
 
     def test_duplicates_deduped_preserving_order(self, tmp_path):
@@ -8012,9 +8112,9 @@ class TestCollectGooseOsUsersFromYaml:
         path = tmp_path / "users.yaml"
         path.write_text(
             "users:\n"
-            "  - {telegram_id: 1, name: a, agent_backend: goose, os_user: alice}\n"
-            "  - {telegram_id: 2, name: b, agent_backend: goose, os_user: dana}\n"
-            "  - {telegram_id: 3, name: c, agent_backend: goose, os_user: alice}\n"
+            "  - {telegram_id: 1, name: a, default_backend: goose, os_user: alice}\n"
+            "  - {telegram_id: 2, name: b, default_backend: goose, os_user: dana}\n"
+            "  - {telegram_id: 3, name: c, default_backend: goose, os_user: alice}\n"
         )
         assert _collect_goose_os_users_from_yaml(path, "claude") == ["alice", "dana"]
 
@@ -8022,7 +8122,7 @@ class TestCollectGooseOsUsersFromYaml:
         from kai.install import _collect_goose_os_users_from_yaml
 
         path = tmp_path / "users.yaml"
-        path.write_text('users:\n  - {telegram_id: 1, name: a, agent_backend: goose, os_user: "bad)user"}\n')
+        path.write_text('users:\n  - {telegram_id: 1, name: a, default_backend: goose, os_user: "bad)user"}\n')
         with pytest.raises(ValueError, match="Invalid os_user"):
             _collect_goose_os_users_from_yaml(path, "claude")
 
@@ -8597,7 +8697,7 @@ class TestOpenCodeBinWizardPrompt:
 
         env = json.loads((tmp_path / "install.conf").read_text())["env"]
         assert env["OPENCODE_BIN"] == str(opencode_path)
-        assert env["AGENT_BACKEND"] == "opencode"
+        assert env["DEFAULT_BACKEND"] == "opencode"
 
     def test_wizard_loops_on_invalid_opencode_bin(self, tmp_path, monkeypatch):
         """An invalid path (does not exist, or not executable) must
@@ -8898,9 +8998,9 @@ class TestOpenCodeBinWizardPrompt:
         _cmd_config()
 
         env = json.loads((tmp_path / "install.conf").read_text())["env"]
-        # AGENT_BACKEND pins which gate branch fired; opencode here
+        # DEFAULT_BACKEND pins which gate branch fired; opencode here
         # exercises the previously-broken cleanup path.
-        assert env["AGENT_BACKEND"] == "opencode"
+        assert env["DEFAULT_BACKEND"] == "opencode"
         # MEMORY_EXTRACTION_ENABLED was always emitted by the wizard,
         # then silently stripped by the cleanup gate before the gate
         # read from ONESHOT_REASONER_BACKENDS. Load-bearing assertion
@@ -8958,7 +9058,7 @@ class TestApplyBackendAwareModelValidation:
     def _conf(self, tmp_path, **env_overrides):
         env = {
             "TELEGRAM_BOT_TOKEN": "tok",
-            "AGENT_BACKEND": "codex",
+            "DEFAULT_BACKEND": "codex",
             "DEFAULT_MODEL": "gpt-5.5",
         }
         env.update(env_overrides)
@@ -9101,8 +9201,8 @@ class TestApplyAgentTimeoutMigration:
 class TestBuildCodexLoginReminder:
     """Post-install codex subscription-auth reminder policy.
 
-    The reminder is global-only: it fires when AGENT_BACKEND=codex AND
-    auth mode is subscription. Per-user `agent_backend: codex` entries
+    The reminder is global-only: it fires when DEFAULT_BACKEND=codex AND
+    auth mode is subscription. Per-user `default_backend: codex` entries
     in users.yaml DO NOT trigger the reminder; mixed-backend installs
     are operator-managed and the reminder would be wizard noise for
     operators who chose a non-codex global backend.
@@ -9126,7 +9226,7 @@ class TestBuildCodexLoginReminder:
             tmp_path,
             [{"telegram_id": 1, "name": "alice", "role": "admin", "os_user": "alice"}],
         )
-        env = {"AGENT_BACKEND": "codex", "CODEX_AUTH_MODE": "subscription"}
+        env = {"DEFAULT_BACKEND": "codex", "CODEX_AUTH_MODE": "subscription"}
         text = _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml)
         assert text is not None
         assert "Codex subscription auth required:" in text
@@ -9137,7 +9237,7 @@ class TestBuildCodexLoginReminder:
         from kai.install import _build_codex_login_reminder
 
         users_yaml = self._write_users_yaml(tmp_path, [])
-        env = {"AGENT_BACKEND": "codex"}
+        env = {"DEFAULT_BACKEND": "codex"}
         text = _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml)
         assert text is not None
 
@@ -9158,7 +9258,7 @@ class TestBuildCodexLoginReminder:
                 {"telegram_id": 2, "name": "bob", "role": "user", "os_user": "bob"},
             ],
         )
-        env = {"AGENT_BACKEND": "codex"}
+        env = {"DEFAULT_BACKEND": "codex"}
         text = _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml)
         assert text is not None
         # No per-user enumeration. Specific os_user lines must NOT appear.
@@ -9184,12 +9284,12 @@ class TestBuildCodexLoginReminder:
                     "telegram_id": 1,
                     "name": "alice",
                     "role": "admin",
-                    "agent_backend": "codex",
+                    "default_backend": "codex",
                     "os_user": "alice",
                 }
             ],
         )
-        env = {"AGENT_BACKEND": "claude"}
+        env = {"DEFAULT_BACKEND": "claude"}
         assert _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml) is None
 
     def test_pure_claude_returns_none(self, tmp_path):
@@ -9200,7 +9300,7 @@ class TestBuildCodexLoginReminder:
             tmp_path,
             [{"telegram_id": 1, "name": "alice", "role": "admin", "os_user": "alice"}],
         )
-        env = {"AGENT_BACKEND": "claude"}
+        env = {"DEFAULT_BACKEND": "claude"}
         assert _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml) is None
 
     def test_codex_api_key_mode_returns_none(self, tmp_path):
@@ -9211,11 +9311,11 @@ class TestBuildCodexLoginReminder:
             tmp_path,
             [{"telegram_id": 1, "name": "alice", "role": "admin", "os_user": "alice"}],
         )
-        env = {"AGENT_BACKEND": "codex", "CODEX_AUTH_MODE": "api_key"}
+        env = {"DEFAULT_BACKEND": "codex", "CODEX_AUTH_MODE": "api_key"}
         assert _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml) is None
 
     def test_missing_agent_backend_returns_none(self, tmp_path):
-        """No AGENT_BACKEND key in env defaults to claude; reminder skipped."""
+        """No DEFAULT_BACKEND key in env defaults to claude; reminder skipped."""
         from kai.install import _build_codex_login_reminder
 
         users_yaml = self._write_users_yaml(tmp_path, [])
@@ -9242,7 +9342,7 @@ class TestUsersYamlGooseProviders:
     def test_goose_entry_with_explicit_provider(self, tmp_path):
         p = self._write(
             tmp_path,
-            "users:\n  - telegram_id: 1\n    name: a\n    agent_backend: goose\n    llm_provider: deepseek\n",
+            "users:\n  - telegram_id: 1\n    name: a\n    default_backend: goose\n    llm_provider: deepseek\n",
         )
         assert _users_yaml_goose_providers(p, "") == ["deepseek"]
 
@@ -9253,29 +9353,29 @@ class TestUsersYamlGooseProviders:
         canonical provider form PROVIDER_KEY_VARS is keyed on."""
         p = self._write(
             tmp_path,
-            "users:\n  - telegram_id: 1\n    name: a\n    agent_backend: Goose\n    llm_provider: DeepSeek\n",
+            "users:\n  - telegram_id: 1\n    name: a\n    default_backend: Goose\n    llm_provider: DeepSeek\n",
         )
         assert _users_yaml_goose_providers(p, "") == ["deepseek"]
 
     def test_falls_back_to_global_provider(self, tmp_path):
         """An entry that omits llm_provider inherits the global
         provider, mirroring the runtime cascade."""
-        p = self._write(tmp_path, "users:\n  - telegram_id: 1\n    name: a\n    agent_backend: goose\n")
+        p = self._write(tmp_path, "users:\n  - telegram_id: 1\n    name: a\n    default_backend: goose\n")
         assert _users_yaml_goose_providers(p, "deepseek") == ["deepseek"]
 
     def test_no_global_fallback_yields_nothing(self, tmp_path):
         """No llm_provider anywhere: the scan returns nothing and the
         runtime's users.yaml validation owns the error."""
-        p = self._write(tmp_path, "users:\n  - telegram_id: 1\n    name: a\n    agent_backend: goose\n")
+        p = self._write(tmp_path, "users:\n  - telegram_id: 1\n    name: a\n    default_backend: goose\n")
         assert _users_yaml_goose_providers(p, "") == []
 
     def test_distinct_providers_deduplicated_and_sorted(self, tmp_path):
         p = self._write(
             tmp_path,
             "users:\n"
-            "  - telegram_id: 1\n    name: a\n    agent_backend: goose\n    llm_provider: openai\n"
-            "  - telegram_id: 2\n    name: b\n    agent_backend: goose\n    llm_provider: deepseek\n"
-            "  - telegram_id: 3\n    name: c\n    agent_backend: goose\n    llm_provider: deepseek\n",
+            "  - telegram_id: 1\n    name: a\n    default_backend: goose\n    llm_provider: openai\n"
+            "  - telegram_id: 2\n    name: b\n    default_backend: goose\n    llm_provider: deepseek\n"
+            "  - telegram_id: 3\n    name: c\n    default_backend: goose\n    llm_provider: deepseek\n",
         )
         assert _users_yaml_goose_providers(p, "") == ["deepseek", "openai"]
 
@@ -9285,8 +9385,8 @@ class TestUsersYamlGooseProviders:
         p = self._write(
             tmp_path,
             "users:\n"
-            "  - telegram_id: 1\n    name: a\n    agent_backend: opencode\n    llm_provider: deepseek\n"
-            "  - telegram_id: 2\n    name: b\n    agent_backend: codex\n"
+            "  - telegram_id: 1\n    name: a\n    default_backend: opencode\n    llm_provider: deepseek\n"
+            "  - telegram_id: 2\n    name: b\n    default_backend: codex\n"
             "  - telegram_id: 3\n    name: c\n",
         )
         assert _users_yaml_goose_providers(p, "deepseek") == []
@@ -9316,7 +9416,7 @@ class TestWizardPerUserGooseProviderKeys:
         "    role: admin\n"
         "  - telegram_id: 2\n"
         "    name: bob\n"
-        "    agent_backend: goose\n"
+        "    default_backend: goose\n"
         "    llm_provider: deepseek\n"
     )
 
@@ -9460,9 +9560,9 @@ class TestUsersYamlAgentBackends:
         p = self._write(
             tmp_path,
             "users:\n"
-            "  - telegram_id: 1\n    name: a\n    agent_backend: goose\n"
-            "  - telegram_id: 2\n    name: b\n    agent_backend: codex\n"
-            "  - telegram_id: 3\n    name: c\n    agent_backend: codex\n"
+            "  - telegram_id: 1\n    name: a\n    default_backend: goose\n"
+            "  - telegram_id: 2\n    name: b\n    default_backend: codex\n"
+            "  - telegram_id: 3\n    name: c\n    default_backend: codex\n"
             "  - telegram_id: 4\n    name: d\n",
         )
         assert _users_yaml_agent_backends(p) == {"goose", "codex"}
@@ -9470,18 +9570,18 @@ class TestUsersYamlAgentBackends:
     def test_strips_whitespace_skips_non_strings(self, tmp_path):
         p = self._write(
             tmp_path,
-            "users:\n  - telegram_id: 1\n    name: a\n    agent_backend: ' codex '\n  - telegram_id: 2\n    name: b\n    agent_backend: 7\n",
+            "users:\n  - telegram_id: 1\n    name: a\n    default_backend: ' codex '\n  - telegram_id: 2\n    name: b\n    default_backend: 7\n",
         )
         assert _users_yaml_agent_backends(p) == {"codex"}
 
     def test_mixed_case_normalized_like_runtime(self, tmp_path):
-        """The runtime loader accepts `agent_backend` case-insensitively
+        """The runtime loader accepts `default_backend` case-insensitively
         (str.strip().lower() before validation), so mixed-case entries
         route users at runtime; the scan must produce the canonical
         lower-case form or the prompt gates silently miss them."""
         p = self._write(
             tmp_path,
-            "users:\n  - telegram_id: 1\n    name: a\n    agent_backend: Codex\n  - telegram_id: 2\n    name: b\n    agent_backend: ' GOOSE '\n",
+            "users:\n  - telegram_id: 1\n    name: a\n    default_backend: Codex\n  - telegram_id: 2\n    name: b\n    default_backend: ' GOOSE '\n",
         )
         assert _users_yaml_agent_backends(p) == {"codex", "goose"}
 
@@ -9507,7 +9607,7 @@ class TestWizardPerUserBackendBinaries:
         "    role: admin\n"
         "  - telegram_id: 2\n"
         "    name: bob\n"
-        "    agent_backend: codex\n"
+        "    default_backend: codex\n"
     )
     CLAUDE_USERS_YAML = (
         "users:\n"
@@ -9516,7 +9616,7 @@ class TestWizardPerUserBackendBinaries:
         "    role: admin\n"
         "  - telegram_id: 2\n"
         "    name: bob\n"
-        "    agent_backend: claude\n"
+        "    default_backend: claude\n"
     )
     PLAIN_USERS_YAML = "users:\n  - telegram_id: 1\n    name: alice\n    role: admin\n"
 
@@ -9619,7 +9719,7 @@ class TestWizardPerUserBackendBinaries:
         assert env["CODEX_BIN"] == "/stored/bin/codex"
 
     def test_mixed_case_codex_entry_still_prompts(self, tmp_path, monkeypatch):
-        """`agent_backend: Codex` is valid at runtime (the loader
+        """`default_backend: Codex` is valid at runtime (the loader
         lowercases before validation) and routes the user, so the
         scan must normalize the same way; a casing difference must
         not skip the binary prompt and reintroduce the startup-gate
@@ -9631,7 +9731,7 @@ class TestWizardPerUserBackendBinaries:
             "    role: admin\n"
             "  - telegram_id: 2\n"
             "    name: bob\n"
-            "    agent_backend: Codex\n"
+            "    default_backend: Codex\n"
         )
         self._setup(monkeypatch, tmp_path, mixed_yaml)
         monkeypatch.setattr("kai.install._validate_codex_bin", lambda p: bool(p))
@@ -9655,7 +9755,7 @@ class TestWizardPerUserBackendBinaries:
             "    role: admin\n"
             "  - telegram_id: 2\n"
             "    name: bob\n"
-            "    agent_backend: opencode\n"
+            "    default_backend: opencode\n"
         )
         self._setup(monkeypatch, tmp_path, opencode_yaml)
         monkeypatch.setattr("kai.install._validate_opencode_bin", lambda p: bool(p))

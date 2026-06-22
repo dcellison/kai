@@ -63,7 +63,7 @@ _CONFIG_ENV_VARS = [
     "TOTP_CHALLENGE_SECONDS",
     "TOTP_LOCKOUT_ATTEMPTS",
     "TOTP_LOCKOUT_MINUTES",
-    "AGENT_BACKEND",
+    "DEFAULT_BACKEND",
     "LLM_PROVIDER",
     "MEMORY_ENABLED",
     "MEMORY_SEARCH_LIMIT",
@@ -198,7 +198,7 @@ class TestLoadConfigDefaults:
         # Autocompact tuning defaults to 0 (use Claude Code default)
         assert config.claude_autocompact_pct == 0
         # Agent backend default
-        assert config.agent_backend == "claude"
+        assert config.default_backend == "claude"
 
     def test_autocompact_from_env(self, monkeypatch):
         _set_required(monkeypatch)
@@ -289,16 +289,16 @@ class TestLoadConfigErrors:
             load_config()
 
     def test_invalid_agent_backend(self, monkeypatch):
-        """AGENT_BACKEND with an unrecognized value raises SystemExit."""
+        """DEFAULT_BACKEND with an unrecognized value raises SystemExit."""
         _set_required(monkeypatch)
-        monkeypatch.setenv("AGENT_BACKEND", "invalid")
-        with pytest.raises(SystemExit, match="AGENT_BACKEND"):
+        monkeypatch.setenv("DEFAULT_BACKEND", "invalid")
+        with pytest.raises(SystemExit, match="DEFAULT_BACKEND"):
             load_config()
 
     def test_invalid_llm_provider(self, monkeypatch):
         """LLM_PROVIDER with an unrecognized value raises SystemExit."""
         _set_required(monkeypatch)
-        monkeypatch.setenv("AGENT_BACKEND", "goose")
+        monkeypatch.setenv("DEFAULT_BACKEND", "goose")
         monkeypatch.setenv("LLM_PROVIDER", "invalid")
         with pytest.raises(SystemExit, match="LLM_PROVIDER"):
             load_config()
@@ -306,7 +306,7 @@ class TestLoadConfigErrors:
     def test_missing_llm_provider(self, monkeypatch):
         """LLM_PROVIDER missing when backend=goose raises SystemExit."""
         _set_required(monkeypatch)
-        monkeypatch.setenv("AGENT_BACKEND", "goose")
+        monkeypatch.setenv("DEFAULT_BACKEND", "goose")
         with pytest.raises(SystemExit, match="LLM_PROVIDER"):
             load_config()
 
@@ -326,7 +326,7 @@ class TestLoadConfigErrors:
     def test_valid_llm_provider(self, monkeypatch):
         """Valid LLM_PROVIDER is accepted and stored."""
         _set_required(monkeypatch)
-        monkeypatch.setenv("AGENT_BACKEND", "goose")
+        monkeypatch.setenv("DEFAULT_BACKEND", "goose")
         monkeypatch.setenv("LLM_PROVIDER", "openai")
         # DEFAULT_MODEL must be valid for the openai provider
         monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.4")
@@ -334,9 +334,9 @@ class TestLoadConfigErrors:
         assert cfg.llm_provider == "openai"
 
     def test_goose_without_provider_exits(self, monkeypatch):
-        """AGENT_BACKEND=goose without LLM_PROVIDER fails at startup."""
+        """DEFAULT_BACKEND=goose without LLM_PROVIDER fails at startup."""
         _set_required(monkeypatch)
-        monkeypatch.setenv("AGENT_BACKEND", "goose")
+        monkeypatch.setenv("DEFAULT_BACKEND", "goose")
         # LLM_PROVIDER not set - empty string is not in VALID_PROVIDERS["goose"]
         with pytest.raises(SystemExit, match=r"LLM_PROVIDER.*not valid"):
             load_config()
@@ -1546,7 +1546,7 @@ class TestMemoryReasonerBinaryValidation:
         _set_required(monkeypatch)
         _patch_protected_users_yaml(
             monkeypatch,
-            "users:\n  - telegram_id: 12345\n    name: alice\n    role: admin\n    agent_backend: codex\n    os_user: alice_os\n",
+            "users:\n  - telegram_id: 12345\n    name: alice\n    role: admin\n    default_backend: codex\n    os_user: alice_os\n",
         )
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
@@ -1613,24 +1613,24 @@ class TestCodexMemorySameUserSymmetry:
     """Codex memory follows claude's `resolve_claude_user` symmetry
     (issue #522): `os_user` is optional and same-user spawn is a
     supported deployment shape. config-load does NOT refuse any of:
-    AGENT_BACKEND=codex without users.yaml, codex-effective user
+    DEFAULT_BACKEND=codex without users.yaml, codex-effective user
     without os_user, or codex-effective user with os_user matching
     the bot user. Pinning these as starts-cleanly cases guards
     against a future change that re-introduces the pre-#522
     deployment-shape assumption."""
 
     def test_codex_no_users_yaml_starts_cleanly(self, monkeypatch):
-        """AGENT_BACKEND=codex with extraction enabled and no
+        """DEFAULT_BACKEND=codex with extraction enabled and no
         users.yaml loads successfully. Per-user dispatch falls back
         to the global agent_backend; the spawn target is the bot
         user via the self-sudo-skip path."""
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
-        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("DEFAULT_BACKEND", "codex")
         monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.4-mini")
         config = load_config()
-        assert config.agent_backend == "codex"
+        assert config.default_backend == "codex"
         assert config.memory_extraction_enabled is True
 
     def test_codex_users_yaml_missing_os_user_starts_cleanly(self, monkeypatch):
@@ -1645,7 +1645,7 @@ class TestCodexMemorySameUserSymmetry:
         )
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
-        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("DEFAULT_BACKEND", "codex")
         monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.4-mini")
         config = load_config()
         assert config.user_configs is not None
@@ -1665,7 +1665,7 @@ class TestCodexMemorySameUserSymmetry:
         )
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
-        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("DEFAULT_BACKEND", "codex")
         monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.4-mini")
         config = load_config()
         assert config.user_configs[12345].os_user == bot_user
@@ -1682,7 +1682,7 @@ class TestCodexMemorySameUserSymmetry:
         )
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
-        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("DEFAULT_BACKEND", "codex")
         monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.4-mini")
         config = load_config()
         assert config.user_configs[12345].os_user == "alice_os"
@@ -1712,7 +1712,7 @@ class TestMemoryReasonerModelResolution:
     def test_codex_default_resolves_to_codex_model(self, monkeypatch):
         """Codex install: registry resolves to a codex-CLI-valid SKU.
         Test path is the per-user dispatch surface that production
-        will follow: AGENT_BACKEND=codex + users.yaml with os_user."""
+        will follow: DEFAULT_BACKEND=codex + users.yaml with os_user."""
         _set_required(monkeypatch)
         _patch_protected_users_yaml(
             monkeypatch,
@@ -1720,7 +1720,7 @@ class TestMemoryReasonerModelResolution:
         )
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
-        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("DEFAULT_BACKEND", "codex")
         monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.4-mini")
         load_config()
         assert get_model_for(ModelRole.MEMORY_EXTRACTION, "codex", "openai") == "gpt-5.4-mini"
@@ -1776,13 +1776,13 @@ class TestExtractionEligibleBackendsHelper:
 
         configs = {
             1: UserConfig(telegram_id=1, name="alice", os_user="a"),
-            2: UserConfig(telegram_id=2, name="bob", os_user="b", agent_backend="codex"),
+            2: UserConfig(telegram_id=2, name="bob", os_user="b", default_backend="codex"),
         }
         eligible = _compute_extraction_eligible_backends("claude", configs, True)
         assert eligible == {"claude", "codex"}
 
     def test_goose_users_contribute_to_eligible_set(self):
-        """A users.yaml entry with `agent_backend: goose` contributes
+        """A users.yaml entry with `default_backend: goose` contributes
         to the eligible set now that goose ships a OneShotReasoner;
         the config-load precondition / binary checks must fire for a
         goose user the same way they do for the other backends."""
@@ -1790,7 +1790,7 @@ class TestExtractionEligibleBackendsHelper:
 
         configs = {
             1: UserConfig(telegram_id=1, name="alice", os_user="a"),
-            2: UserConfig(telegram_id=2, name="bob", os_user="b", agent_backend="goose", llm_provider="openai"),
+            2: UserConfig(telegram_id=2, name="bob", os_user="b", default_backend="goose", llm_provider="openai"),
         }
         eligible = _compute_extraction_eligible_backends("claude", configs, True)
         assert eligible == {"claude", "goose"}
@@ -1806,7 +1806,7 @@ class TestExtractionEligibleBackendsHelper:
         monkeypatch.setattr(config_module, "ONESHOT_REASONER_BACKENDS", frozenset({"claude", "codex"}))
         configs = {
             1: UserConfig(telegram_id=1, name="alice", os_user="a"),
-            2: UserConfig(telegram_id=2, name="bob", os_user="b", agent_backend="goose", llm_provider="openai"),
+            2: UserConfig(telegram_id=2, name="bob", os_user="b", default_backend="goose", llm_provider="openai"),
         }
         eligible = _compute_extraction_eligible_backends("claude", configs, True)
         assert eligible == {"claude"}
@@ -1822,13 +1822,13 @@ class TestExtractionEligibleBackendsHelper:
 
         configs = {
             1: UserConfig(telegram_id=1, name="alice", os_user="a"),
-            2: UserConfig(telegram_id=2, name="bob", os_user="b", agent_backend="opencode"),
+            2: UserConfig(telegram_id=2, name="bob", os_user="b", default_backend="opencode"),
         }
         eligible = _compute_extraction_eligible_backends("claude", configs, True)
         assert eligible == {"claude", "opencode"}
 
     def test_global_opencode_with_no_users_yields_opencode_only(self):
-        """Single-user opencode install (global AGENT_BACKEND=opencode,
+        """Single-user opencode install (global DEFAULT_BACKEND=opencode,
         empty users dict) still produces an empty eligible set because
         the cascade only counts users present in the dict. This is the
         same shape the claude / codex paths produce for an empty
@@ -1865,8 +1865,8 @@ class TestRegistryValidationPerEligibleBackend:
     runtime without its codex memory-role rows being validated."""
 
     def test_missing_codex_memory_extraction_row_systemexits(self, monkeypatch):
-        """Mixed install: AGENT_BACKEND=claude with one users.yaml
-        entry pinned to `agent_backend: codex`. Patch the registry
+        """Mixed install: DEFAULT_BACKEND=claude with one users.yaml
+        entry pinned to `default_backend: codex`. Patch the registry
         so the codex MEMORY_EXTRACTION row is missing; load_config
         SystemExits at startup."""
         import kai.config as config_mod
@@ -1877,7 +1877,7 @@ class TestRegistryValidationPerEligibleBackend:
             monkeypatch,
             "users:\n"
             "  - telegram_id: 1\n    name: alice\n    role: admin\n"
-            "    agent_backend: codex\n    os_user: alice_os\n",
+            "    default_backend: codex\n    os_user: alice_os\n",
         )
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
@@ -2653,25 +2653,85 @@ class TestValidBackends:
         assert "codex" not in BACKENDS_NEEDING_PROVIDER_PROMPT
 
 
+class TestDefaultBackendEnvResolution:
+    """Back-compat for the AGENT_BACKEND -> DEFAULT_BACKEND env rename.
+
+    The global env reader prefers DEFAULT_BACKEND and falls back to the
+    deprecated AGENT_BACKEND for one release with a one-shot warning.
+    Absence means the installation default "claude".
+    """
+
+    def test_default_backend_env_resolved(self, monkeypatch):
+        """The new key sets the global backend with no deprecation noise."""
+        import kai.config as config_module
+
+        _set_required(monkeypatch)
+        monkeypatch.delenv("AGENT_BACKEND", raising=False)
+        monkeypatch.setenv("DEFAULT_BACKEND", "codex")
+        # codex validates DEFAULT_MODEL against CODEX_MODELS at load.
+        monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.5")
+        # Clear the one-shot warned-context set so the assertion below
+        # observes this process's actual warn behavior.
+        config_module._default_backend_deprecation_warned.clear()
+        cfg = load_config()
+        assert cfg.default_backend == "codex"
+
+    def test_legacy_AGENT_BACKEND_env_still_resolved_with_warning(self, monkeypatch, caplog):
+        """Only the deprecated key set: it still resolves, and a WARNING
+        names the rename so the operator can migrate /etc/kai/env."""
+        import logging
+
+        import kai.config as config_module
+
+        _set_required(monkeypatch)
+        monkeypatch.delenv("DEFAULT_BACKEND", raising=False)
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.5")
+        config_module._default_backend_deprecation_warned.clear()
+        with caplog.at_level(logging.WARNING):
+            cfg = load_config()
+        assert cfg.default_backend == "codex"
+        assert any("AGENT_BACKEND" in r.message and "DEFAULT_BACKEND" in r.message for r in caplog.records)
+
+    def test_default_backend_env_wins_when_both_set(self, monkeypatch, caplog):
+        """The new key wins over the deprecated one, and no deprecation
+        warning fires because the legacy key is never consulted."""
+        import logging
+
+        import kai.config as config_module
+
+        _set_required(monkeypatch)
+        monkeypatch.setenv("DEFAULT_BACKEND", "goose")
+        monkeypatch.setenv("LLM_PROVIDER", "openai")
+        monkeypatch.setenv("OPENAI_API_KEY", "k")
+        monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.5")
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        config_module._default_backend_deprecation_warned.clear()
+        with caplog.at_level(logging.WARNING):
+            cfg = load_config()
+        assert cfg.default_backend == "goose"
+        assert not any("AGENT_BACKEND is deprecated" in r.message for r in caplog.records)
+
+
 class TestGetUserBackendAndProvider:
     """Per-user cascade resolver."""
 
-    def _config(self, agent_backend="claude", llm_provider=""):
+    def _config(self, default_backend="claude", llm_provider=""):
         cfg = MagicMock()
-        cfg.agent_backend = agent_backend
+        cfg.default_backend = default_backend
         cfg.llm_provider = llm_provider
         return cfg
 
-    def _user_config(self, agent_backend=None, llm_provider=None):
+    def _user_config(self, default_backend=None, llm_provider=None):
         uc = MagicMock()
-        uc.agent_backend = agent_backend
+        uc.default_backend = default_backend
         uc.llm_provider = llm_provider
         return uc
 
     def test_no_user_config_returns_global(self):
         from kai.config import get_user_backend_and_provider
 
-        cfg = self._config(agent_backend="claude")
+        cfg = self._config(default_backend="claude")
         backend, provider = get_user_backend_and_provider(None, cfg)
         assert backend == "claude"
         assert provider == "anthropic"
@@ -2679,8 +2739,8 @@ class TestGetUserBackendAndProvider:
     def test_user_backend_overrides_global(self):
         from kai.config import get_user_backend_and_provider
 
-        cfg = self._config(agent_backend="claude")
-        uc = self._user_config(agent_backend="codex")
+        cfg = self._config(default_backend="claude")
+        uc = self._user_config(default_backend="codex")
         backend, provider = get_user_backend_and_provider(uc, cfg)
         assert backend == "codex"
         assert provider == "openai"
@@ -2688,8 +2748,8 @@ class TestGetUserBackendAndProvider:
     def test_global_codex_user_goose_returns_goose(self):
         from kai.config import get_user_backend_and_provider
 
-        cfg = self._config(agent_backend="codex")
-        uc = self._user_config(agent_backend="goose", llm_provider="openai")
+        cfg = self._config(default_backend="codex")
+        uc = self._user_config(default_backend="goose", llm_provider="openai")
         backend, provider = get_user_backend_and_provider(uc, cfg)
         assert backend == "goose"
         assert provider == "openai"
@@ -2697,8 +2757,8 @@ class TestGetUserBackendAndProvider:
     def test_codex_provider_is_openai_regardless_of_llm_provider(self):
         from kai.config import get_user_backend_and_provider
 
-        cfg = self._config(agent_backend="codex")
-        uc = self._user_config(agent_backend="codex", llm_provider="anthropic")
+        cfg = self._config(default_backend="codex")
+        uc = self._user_config(default_backend="codex", llm_provider="anthropic")
         backend, provider = get_user_backend_and_provider(uc, cfg)
         assert backend == "codex"
         assert provider == "openai"
@@ -2836,17 +2896,17 @@ class TestLoadConfigBackendAwareModelValidation:
         )
 
     def test_codex_rejects_goose_only_model(self, monkeypatch):
-        self._env(monkeypatch, AGENT_BACKEND="codex", DEFAULT_MODEL="gpt-5.4-nano")
+        self._env(monkeypatch, DEFAULT_BACKEND="codex", DEFAULT_MODEL="gpt-5.4-nano")
         with pytest.raises(SystemExit, match="not valid for codex"):
             load_config()
 
     def test_codex_rejects_claude_model(self, monkeypatch):
-        self._env(monkeypatch, AGENT_BACKEND="codex", DEFAULT_MODEL="opus")
+        self._env(monkeypatch, DEFAULT_BACKEND="codex", DEFAULT_MODEL="opus")
         with pytest.raises(SystemExit, match="not valid for codex"):
             load_config()
 
     def test_codex_accepts_gpt55(self, monkeypatch):
-        self._env(monkeypatch, AGENT_BACKEND="codex", DEFAULT_MODEL="gpt-5.5")
+        self._env(monkeypatch, DEFAULT_BACKEND="codex", DEFAULT_MODEL="gpt-5.5")
         cfg = load_config()
         assert cfg.default_model == "gpt-5.5"
 
@@ -3589,7 +3649,7 @@ class TestResolveUserModel:
 
     def _config(self, default_models=None):
         cfg = MagicMock()
-        cfg.agent_backend = "claude"
+        cfg.default_backend = "claude"
         cfg.llm_provider = ""
         cfg.default_models = default_models or {}
         return cfg
@@ -3652,7 +3712,7 @@ class TestLegacyEnvOverrideSeeding:
         from kai.config import UserConfig, _apply_legacy_model_env_overrides
 
         monkeypatch.setenv("PR_REVIEW_MODEL_CLAUDE", "opus")
-        uc = UserConfig(telegram_id=1, name="test", agent_backend="codex")
+        uc = UserConfig(telegram_id=1, name="test", default_backend="codex")
         out = _apply_legacy_model_env_overrides({1: uc}, "claude")
         assert out[1].models is None
 

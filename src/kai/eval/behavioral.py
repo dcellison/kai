@@ -99,7 +99,12 @@ from typing import Any
 # collision-probe generator). If the drift bucketing changes, every
 # consumer follows automatically.
 from kai.codex_exec import extract_codex_text
-from kai.config import ONESHOT_REASONER_BACKENDS, ModelRole, get_model_for
+from kai.config import (
+    ONESHOT_REASONER_BACKENDS,
+    ModelRole,
+    _resolve_default_backend,
+    get_model_for,
+)
 from kai.eval._probes import (
     Probe,
     detect_drift,
@@ -304,7 +309,7 @@ class BehavioralConfig:
     # get a sensible path.
     data_dir: Path = Path(".")
     # Active agent backend for this run ("claude" or "codex"). Resolved
-    # once at _run_cli from AGENT_BACKEND and threaded through every
+    # once at _run_cli from DEFAULT_BACKEND and threaded through every
     # subprocess builder + stdout parser + version capture so the
     # codex and claude verticals can stay byte-isolated. Default
     # "claude" matches the pre-codex behavior so test fixtures that
@@ -2220,12 +2225,28 @@ async def _run_cli(args: argparse.Namespace) -> int:
     #
     # MODEL_REGISTRY covers every backend in ONESHOT_REASONER_BACKENDS,
     # which is every real backend today. The else arm below survives as
-    # the defensive path for an AGENT_BACKEND env value the registry
+    # the defensive path for a DEFAULT_BACKEND env value the registry
     # does not know (a typo, or a future backend mid-introduction):
     # explicit --judge-model / --gen-model wins, otherwise the legacy
     # _DEFAULT_JUDGE_MODEL / _DEFAULT_GEN_MODEL constants are used
     # rather than crashing with a LookupError on an unset flag.
-    eval_backend = os.environ.get("AGENT_BACKEND", "claude").strip().lower()
+    # Reads DEFAULT_BACKEND with the one-release AGENT_BACKEND fallback;
+    # global default is "claude" (this is the installation-wide setting,
+    # not a per-user override).
+    eval_backend = (
+        (
+            _resolve_default_backend(
+                os.environ.get,
+                "DEFAULT_BACKEND",
+                "AGENT_BACKEND",
+                context="behavioral eval env",
+                default="claude",
+            )
+            or "claude"
+        )
+        .strip()
+        .lower()
+    )
     # Provider is read from the eval-time LLM_PROVIDER env (the eval
     # gate runs as a developer tool against the operator's configured
     # backend / provider, not against a sandboxed user). Single-provider
@@ -2246,7 +2267,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
             override=args.gen_model or "",
         )
     else:
-        # Unrecognized AGENT_BACKEND env value: explicit flag wins,
+        # Unrecognized DEFAULT_BACKEND env value: explicit flag wins,
         # otherwise the legacy _DEFAULT_* constant is used.
         resolved_judge_model = args.judge_model or _DEFAULT_JUDGE_MODEL
         resolved_gen_model = args.gen_model or _DEFAULT_GEN_MODEL

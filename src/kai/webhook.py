@@ -738,10 +738,10 @@ async def _process_github_event_for_user(
     # Resolve per-user backend/provider for the review/triage agents.
     # Same resolution logic as pool.py _create_instance: per-user
     # config overrides global config.
-    if user_config and user_config.agent_backend:
-        agent_backend = user_config.agent_backend
+    if user_config and user_config.default_backend:
+        agent_backend = user_config.default_backend
     else:
-        agent_backend = config.agent_backend
+        agent_backend = config.default_backend
 
     if user_config and user_config.llm_provider:
         provider = user_config.llm_provider

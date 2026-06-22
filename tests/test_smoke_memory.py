@@ -37,7 +37,7 @@ def _config(**overrides) -> Config:
     defaults = {
         "memory_enabled": True,
         "memory_extraction_enabled": True,
-        "agent_backend": "claude",
+        "default_backend": "claude",
         "memory_extraction_timeout_s": 30,
     }
     defaults.update(overrides)
@@ -193,12 +193,12 @@ class TestSmokeMemoryRoutingPrecondition:
     @pytest.mark.asyncio
     async def test_codex_without_os_user_proceeds(self, monkeypatch, capsys):
         """Issue #522: codex same-user spawn is supported. Smoke
-        without --os-user against AGENT_BACKEND=codex no longer
+        without --os-user against DEFAULT_BACKEND=codex no longer
         exits 1 on the precondition; it proceeds to the reasoner
         call. Pins the symmetry with claude same-user."""
         from kai.smoke import memory as smoke_module
 
-        monkeypatch.setattr(smoke_module, "load_config", lambda: _config(agent_backend="codex"))
+        monkeypatch.setattr(smoke_module, "load_config", lambda: _config(default_backend="codex"))
         fake_run = AsyncMock(
             return_value=OneShotResult(
                 text=_success_envelope(),
@@ -250,7 +250,7 @@ class TestSmokeMemoryUserIdDispatch:
     """The `--user-id` flag drives the smoke's effective backend
     resolution (issue #515). With per-user dispatch, the smoke must
     reach the same reasoner production would for that user; without
-    `--user-id`, it falls back to the global `agent_backend`."""
+    `--user-id`, it falls back to the global `default_backend`."""
 
     @pytest.mark.asyncio
     async def test_user_id_resolves_codex_user(self, monkeypatch, capsys):
@@ -267,7 +267,7 @@ class TestSmokeMemoryUserIdDispatch:
                     telegram_id=1,
                     name="codex_user",
                     os_user="codex_os",
-                    agent_backend="codex",
+                    default_backend="codex",
                 )
             }
         )
@@ -303,18 +303,18 @@ class TestSmokeMemoryUserIdDispatch:
     @pytest.mark.asyncio
     async def test_user_id_resolves_claude_user(self, monkeypatch, capsys):
         """A `--user-id` matching a claude-effective users.yaml entry
-        resolves to claude even when global AGENT_BACKEND=codex."""
+        resolves to claude even when global DEFAULT_BACKEND=codex."""
         from kai.config import UserConfig
         from kai.smoke import memory as smoke_module
 
         config = _config(
-            agent_backend="codex",
+            default_backend="codex",
             user_configs={
                 1: UserConfig(
                     telegram_id=1,
                     name="claude_user",
                     os_user="claude_os",
-                    agent_backend="claude",
+                    default_backend="claude",
                 )
             },
         )
@@ -350,12 +350,12 @@ class TestSmokeMemoryUserIdDispatch:
     @pytest.mark.asyncio
     async def test_no_user_id_uses_global_agent_backend(self, monkeypatch, capsys):
         """Smoke without `--user-id` falls back to the global
-        `agent_backend`. Pins the legacy single-backend smoke path
+        `default_backend`. Pins the legacy single-backend smoke path
         so the per-user dispatch change does not silently break
         operator habits ('run smoke without flags' still works)."""
         from kai.smoke import memory as smoke_module
 
-        config = _config(agent_backend="claude")
+        config = _config(default_backend="claude")
         monkeypatch.setattr(smoke_module, "load_config", lambda: config)
         captured_backend: list[str] = []
 

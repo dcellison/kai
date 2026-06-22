@@ -621,7 +621,7 @@ def make_backend_config(base_config: Config, backend: str) -> Config:
     Forces memory_enabled=True and memory_extraction_enabled=True so
     the harness can run against an install whose env file disables
     memory in production. Drives the per-user dispatch (issue #515)
-    by setting `agent_backend` to the backend under test; with no
+    by setting `default_backend` to the backend under test; with no
     `user_configs` override, `_resolve_effective_backend` in
     `memory_extraction.py` returns the global value for every
     extraction call, so the harness deterministically exercises one
@@ -634,7 +634,7 @@ def make_backend_config(base_config: Config, backend: str) -> Config:
         base_config,
         memory_enabled=True,
         memory_extraction_enabled=True,
-        agent_backend=backend,
+        default_backend=backend,
     )
 
 

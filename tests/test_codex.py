@@ -2222,7 +2222,7 @@ class TestCodexGrandchildEscalation:
 
 class TestStartupFailureSurface:
     """
-    Spec #556 acceptance criterion: a per-user `agent_backend: codex`
+    Spec #556 acceptance criterion: a per-user `default_backend: codex`
     entry on a non-codex install must produce a chat-visible
     startup-failure StreamEvent (not silent failure, not fall-through
     to claude) when codex tooling is missing.

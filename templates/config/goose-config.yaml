@@ -1,7 +1,7 @@
 # Goose extension configuration for Kai.
 #
 # Deployed to ~/.config/goose/config.yaml by `make install` when
-# AGENT_BACKEND=goose. Controls which Goose extensions are loaded
+# DEFAULT_BACKEND=goose. Controls which Goose extensions are loaded
 # in ACP mode (`goose acp`).
 #
 # GOOSE_MODEL and GOOSE_PROVIDER are intentionally omitted here;

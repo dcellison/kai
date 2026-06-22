@@ -248,15 +248,15 @@ class TestValidateUserPrefix:
 class TestMakeBackendConfig:
     def test_claude_resolves_claude_models(self):
         """Issue #515 retired the memory reasoner + model env vars;
-        `make_backend_config` now stamps `agent_backend` and the eval
+        `make_backend_config` now stamps `default_backend` and the eval
         harness reads models inline via `get_model_for(role, backend)`
-        at each call site. Pin both the agent_backend selection and
+        at each call site. Pin both the default_backend selection and
         the registry-resolved model strings so a future registry
         change surfaces here."""
         from kai.config import ModelRole, get_model_for
 
         config = g.make_backend_config(_BASE_CONFIG, "claude")
-        assert config.agent_backend == "claude"
+        assert config.default_backend == "claude"
         assert config.memory_enabled is True
         assert config.memory_extraction_enabled is True
         # Registry resolution still produces the expected literals.
@@ -267,7 +267,7 @@ class TestMakeBackendConfig:
         from kai.config import ModelRole, get_model_for
 
         config = g.make_backend_config(_BASE_CONFIG, "codex")
-        assert config.agent_backend == "codex"
+        assert config.default_backend == "codex"
         assert get_model_for(ModelRole.MEMORY_EXTRACTION, "codex", "openai") == "gpt-5.4-mini"
         assert get_model_for(ModelRole.MEMORY_EPISODE, "codex", "openai") == "gpt-5.4-mini"
 

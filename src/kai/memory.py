@@ -1321,7 +1321,7 @@ def init_memory(config: Config) -> None:
     )
 
     eligible_pairs: set[tuple[str, str]] = _compute_extraction_eligible_backend_provider_pairs(
-        config.agent_backend,
+        config.default_backend,
         config.llm_provider,
         config.user_configs,
         config.memory_extraction_enabled,

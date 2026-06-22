@@ -630,10 +630,10 @@ async def _run_one_probe(
         # Per-user dispatch (issue #515): `_run_extractor` now requires
         # an explicit `effective_backend`. The eval harness runs in
         # single-backend mode (one prompt-pair comparison per run, no
-        # mixed-backend cascade), so the global `agent_backend` is the
+        # mixed-backend cascade), so the global `default_backend` is the
         # correct backend for both arms; threading it explicitly avoids
         # relying on a default we no longer have.
-        effective_backend = config.agent_backend
+        effective_backend = config.default_backend
         pre_v5 = sum(memory_extraction._RULE_6_REJECTIONS.snapshot().values())
         v5_result = await memory_extraction._run_extractor(
             payload,

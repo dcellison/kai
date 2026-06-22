@@ -933,7 +933,7 @@ class TestBackendAwareModelResolution:
         Invoke _run_cli with heavyweight machinery mocked, capturing
         the BehavioralConfig that gets handed to _run_all_probes.
 
-        Callers apply monkeypatch.setenv("AGENT_BACKEND", ...) before
+        Callers apply monkeypatch.setenv("DEFAULT_BACKEND", ...) before
         calling this helper; the env is already set by the time
         _run_cli reads it.
         """
@@ -966,7 +966,7 @@ class TestBackendAwareModelResolution:
         """
         from kai.config import ModelRole, get_model_for
 
-        monkeypatch.setenv("AGENT_BACKEND", "goose")
+        monkeypatch.setenv("DEFAULT_BACKEND", "goose")
         monkeypatch.setenv("LLM_PROVIDER", "anthropic")
         args = self._make_args(tmp_path)  # judge_model=None, gen_model=None
         config = self._run_with_captured_config(args)
@@ -975,11 +975,11 @@ class TestBackendAwareModelResolution:
 
     def test_unrecognized_backend_falls_back_to_legacy_constant(self, tmp_path, monkeypatch):
         """
-        An AGENT_BACKEND env value the registry does not know must NOT
+        A DEFAULT_BACKEND env value the registry does not know must NOT
         trigger get_model_for (no registry row, would raise
         LookupError). The fallback path uses _DEFAULT_JUDGE_MODEL.
         """
-        monkeypatch.setenv("AGENT_BACKEND", "nonexistent")
+        monkeypatch.setenv("DEFAULT_BACKEND", "nonexistent")
         args = self._make_args(tmp_path)  # judge_model=None, gen_model=None
         config = self._run_with_captured_config(args)
         assert config.judge_model == behavioral._DEFAULT_JUDGE_MODEL
@@ -990,7 +990,7 @@ class TestBackendAwareModelResolution:
         Explicit --judge-model still wins on goose. The fallback only
         kicks in for an unset (None) flag value.
         """
-        monkeypatch.setenv("AGENT_BACKEND", "goose")
+        monkeypatch.setenv("DEFAULT_BACKEND", "goose")
         args = self._make_args(tmp_path, judge_model="opus", gen_model="haiku")
         config = self._run_with_captured_config(args)
         assert config.judge_model == "opus"
@@ -1004,7 +1004,7 @@ class TestBackendAwareModelResolution:
         Phase 1's no-behavior-change invariant, so the resolved values
         must equal the pre-Phase-1 defaults.
         """
-        monkeypatch.setenv("AGENT_BACKEND", "claude")
+        monkeypatch.setenv("DEFAULT_BACKEND", "claude")
         args = self._make_args(tmp_path)
         config = self._run_with_captured_config(args)
         assert config.judge_model == behavioral._DEFAULT_JUDGE_MODEL
@@ -1012,11 +1012,36 @@ class TestBackendAwareModelResolution:
 
     def test_claude_explicit_flag_wins(self, tmp_path, monkeypatch):
         """Explicit flag wins on claude too, exercising the override path."""
-        monkeypatch.setenv("AGENT_BACKEND", "claude")
+        monkeypatch.setenv("DEFAULT_BACKEND", "claude")
         args = self._make_args(tmp_path, judge_model="opus", gen_model="sonnet")
         config = self._run_with_captured_config(args)
         assert config.judge_model == "opus"
         assert config.gen_model == "sonnet"
+
+    def test_behavioral_eval_resolves_new_DEFAULT_BACKEND(self, tmp_path, monkeypatch):
+        """The eval reads DEFAULT_BACKEND. With only the new key set
+        (no AGENT_BACKEND), it stamps the resolved backend and resolves
+        the goose registry rows."""
+        from kai.config import ModelRole, get_model_for
+
+        monkeypatch.delenv("AGENT_BACKEND", raising=False)
+        monkeypatch.setenv("DEFAULT_BACKEND", "goose")
+        monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+        args = self._make_args(tmp_path)
+        config = self._run_with_captured_config(args)
+        assert config.judge_model == get_model_for(ModelRole.BEHAVIORAL_JUDGE, "goose", "anthropic")
+
+    def test_behavioral_eval_resolves_legacy_AGENT_BACKEND(self, tmp_path, monkeypatch):
+        """One-release back-compat: a legacy AGENT_BACKEND env value
+        (no DEFAULT_BACKEND) still resolves the eval backend."""
+        from kai.config import ModelRole, get_model_for
+
+        monkeypatch.delenv("DEFAULT_BACKEND", raising=False)
+        monkeypatch.setenv("AGENT_BACKEND", "goose")
+        monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+        args = self._make_args(tmp_path)
+        config = self._run_with_captured_config(args)
+        assert config.judge_model == get_model_for(ModelRole.BEHAVIORAL_JUDGE, "goose", "anthropic")
 
 
 class TestProbeIdMatchesSourcePosition:
