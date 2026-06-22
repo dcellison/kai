@@ -40,7 +40,7 @@ users:
     # "codex" (OpenAI Codex CLI), "opencode" (OpenCode ACP; model is
     # a full "provider/model" ID, auth managed by `opencode auth login`).
     # backend: goose
-    # provider: openai    # required for goose; ignored for opencode
+    # provider: openai    # required for goose and opencode (selects the model registry)
     # model: anthropic/claude-sonnet-4-6   # opencode example (full provider/model ID)
 
     # GitHub notification settings. github_repos controls which repos

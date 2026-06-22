@@ -216,7 +216,7 @@ Authorization, per-user model selection, per-user OS isolation, per-user GitHub 
 |---|---|---|---|
 | `TELEGRAM_BOT_TOKEN` | Yes | | Bot token from BotFather |
 | `DEFAULT_BACKEND` | No | `claude` | Global default backend: `claude`, `goose`, `codex`, or `opencode`. Per-user override goes in `users.yaml`. (The former `AGENT_BACKEND` name is still read for one release with a deprecation warning.) |
-| `DEFAULT_PROVIDER` | Non-claude | | Global provider for non-claude backends. Per-user override in `users.yaml`. (The former `LLM_PROVIDER` name is still read for one release with a deprecation warning.) |
+| `DEFAULT_PROVIDER` | goose/opencode | | Global provider for the multi-provider backends (`goose`, `opencode`); `claude` and `codex` are single-provider and ignore it. Per-user override in `users.yaml`. (The former `LLM_PROVIDER` name is still read for one release with a deprecation warning.) |
 | `DEFAULT_MODEL` | No | `sonnet` | Installation-wide default model. Per-user override in `users.yaml` `model`, or `/settings model`. |
 | `DEFAULT_TIMEOUT` | No | `120` | Installation-wide default per-message timeout. Per-user override in `users.yaml` `timeout`, or `/settings timeout`. (The former `AGENT_TIMEOUT_SECONDS` name is still read for one release with a deprecation warning.) |
 | `CLAUDE_AUTOCOMPACT_PCT` | No | `80` | Context compression threshold %, Claude Code only. When usage hits this, Claude compresses history. Can only lower the default (~83%), not raise it. |

@@ -298,6 +298,23 @@ class TestMakeBackendConfig:
         assert get_model_for(ModelRole.MEMORY_EXTRACTION, "codex", "openai") == "gpt-5.4-mini"
         assert get_model_for(ModelRole.MEMORY_EPISODE, "codex", "openai") == "gpt-5.4-mini"
 
+    def test_stamps_eval_provider_for_extraction(self):
+        """The eval provider is stamped into `default_provider` so the
+        extraction path (which resolves provider from the config, not the
+        run summary) sees the same value the report does. Without this a
+        goose arm run from a claude/codex install would extract with an
+        empty provider."""
+        config = g.make_backend_config(_BASE_CONFIG, "goose", "openai")
+        assert config.default_backend == "goose"
+        assert config.default_provider == "openai"
+
+    def test_default_provider_empty_when_omitted(self):
+        """Single-provider arms (claude/codex) pass no provider; the
+        implicit provider is used regardless, so default_provider stays
+        empty."""
+        config = g.make_backend_config(_BASE_CONFIG, "claude")
+        assert config.default_provider == ""
+
 
 # ── Anchor matching ─────────────────────────────────────────────────
 

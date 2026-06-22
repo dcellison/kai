@@ -614,7 +614,7 @@ def validate_user_prefix(prefix: str) -> None:
         )
 
 
-def make_backend_config(base_config: Config, backend: str) -> Config:
+def make_backend_config(base_config: Config, backend: str, provider: str = "") -> Config:
     """Build a per-backend copy of the production Config.
 
     Forces memory_enabled=True and memory_extraction_enabled=True so
@@ -628,12 +628,21 @@ def make_backend_config(base_config: Config, backend: str) -> Config:
     via `get_model_for(role, effective_backend)`; no Config fields
     carry per-backend models any more. Uses `dataclasses.replace`
     because `Config` is frozen.
+
+    `provider` is the eval-time provider stamped into `default_provider`
+    so the extraction path resolves the same (backend, provider) pair
+    the run summary reports. Without it, an install whose global backend
+    is single-provider (claude/codex) leaves `default_provider=""`, so a
+    goose/opencode arm would extract with an empty provider while the
+    report shows the resolved one. Single-provider arms ignore the value
+    (their provider is implicit).
     """
     return dataclasses.replace(
         base_config,
         memory_enabled=True,
         memory_extraction_enabled=True,
         default_backend=backend,
+        default_provider=provider,
     )
 
 
@@ -723,7 +732,14 @@ async def run_backend(
     FileHandler is removed in the finally so a crash mid-run does
     not leak a handler into the next arm.
     """
-    config = make_backend_config(base_config, backend)
+    # Eval-time provider comes from the shared resolver (DEFAULT_PROVIDER,
+    # with a one-release fallback to the deprecated LLM_PROVIDER name);
+    # the gate runs as a developer tool against the operator's configured
+    # backend / provider, not a sandboxed user. Stamped into the config
+    # below so the extraction path resolves the same (backend, provider)
+    # pair the run summary reports.
+    eval_provider = _resolve_eval_provider("memory backend gate env")
+    config = make_backend_config(base_config, backend, eval_provider)
     if reset:
         memory.delete_all(user_id=sandbox_user_id)
     elif memory.get_all(user_id=sandbox_user_id, limit=1):
@@ -733,11 +749,7 @@ async def run_backend(
     # registry, matching what `get_model_for(role, backend, provider)`
     # produces in production per-extraction. Pinned here so the
     # BackendRun summary reports the same SKUs the reasoner actually
-    # spawned. Eval-time provider comes from the shared resolver
-    # (DEFAULT_PROVIDER, with a one-release fallback to the deprecated
-    # LLM_PROVIDER name); the gate runs as a developer tool against the
-    # operator's configured backend / provider, not a sandboxed user.
-    eval_provider = _resolve_eval_provider("memory backend gate env")
+    # spawned.
     run = BackendRun(
         backend=backend,
         sandbox_user_id=sandbox_user_id,
