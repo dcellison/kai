@@ -51,6 +51,8 @@ This is not an API relay bot. The inner backend is a full coding-agent runtime w
 
 ## Backend Options
 
+In Kai, a backend is more than a model provider. Each backend is a full coding harness with its own protocol, tool behavior, authentication path, context handling, model surface, and failure modes. Kai normalizes lifecycle and routing around those harnesses while preserving the differences that matter.
+
 | Backend | Runtime | Model Selection Shape | Notes |
 |---|---|---|---|
 | Claude Code | `claude` CLI | Claude aliases and full model IDs | Default backend. |
