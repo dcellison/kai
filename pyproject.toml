@@ -26,7 +26,7 @@ dev = [
     "pytest-asyncio>=0.24.0",
 ]
 memory = [
-    "mem0ai>=2.0.0",
+    "mem0ai>=2.0.13",
     "sentence-transformers>=3.0.0",
 ]
 tts = [
