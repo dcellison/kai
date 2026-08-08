@@ -40,6 +40,7 @@ from pathlib import Path
 import yaml
 
 from kai.config import (
+    _VALID_ROLES,
     BACKEND_PROVIDERS,
     BACKENDS_NEEDING_PROVIDER_PROMPT,
     CODEX_DEFAULT_MODEL,
@@ -60,6 +61,7 @@ from kai.config import (
     models_for_backend,
     validate_model_for_backend,
 )
+from kai.user_isolation import validate_protected_user_isolation
 
 # Config file written by `config`, read by `apply`.
 # Anchored to PROJECT_ROOT so it resolves correctly regardless of CWD.
@@ -661,6 +663,75 @@ def _users_yaml_entries(users_yaml_path: Path) -> list[dict]:
     return [entry for entry in users if isinstance(entry, dict)]
 
 
+def _protected_user_assignments(users_yaml_path: Path) -> list[tuple[int, str, str | None]]:
+    """Load the interactive principals relevant to protected OS isolation.
+
+    This is an installer-side projection of config._load_user_configs: invalid
+    entries are ignored, duplicate Telegram IDs use the first valid entry, and
+    all valid entries retain only the identity fields needed by the isolation
+    validator.  Unlike the wizard's informational scanners, this reader fails
+    loudly on an unreadable or malformed file because apply must validate the
+    effective users.yaml before stopping a working service.
+    """
+    raw = _read_users_yaml_text(users_yaml_path)
+    if raw is None:
+        raise ValueError(f"Protected users.yaml is missing or unreadable: {users_yaml_path}")
+    try:
+        data = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Protected users.yaml is malformed: {users_yaml_path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"Protected users.yaml must contain a YAML mapping: {users_yaml_path}")
+    entries = data.get("users")
+    if not isinstance(entries, list):
+        raise ValueError(f"Protected users.yaml must contain a 'users' list: {users_yaml_path}")
+
+    assignments: list[tuple[int, str, str | None]] = []
+    seen_ids: set[int] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        raw_id = entry.get("telegram_id")
+        try:
+            if isinstance(raw_id, bool):
+                raise ValueError
+            telegram_id = int(raw_id)
+            if telegram_id <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            continue
+        name = str(entry.get("name") or "").strip()
+        role = str(entry.get("role", "user")).strip().lower()
+        if not name or role not in _VALID_ROLES or telegram_id in seen_ids:
+            continue
+        seen_ids.add(telegram_id)
+
+        raw_os_user = entry.get("os_user")
+        os_user = str(raw_os_user).strip() if raw_os_user is not None else ""
+        os_user = os_user or None
+        if os_user is not None and not _validate_os_user(os_user):
+            raise ValueError(f"Invalid os_user {os_user!r} in {users_yaml_path}: must match {_OS_USER_RE.pattern}")
+        assignments.append((telegram_id, name, os_user))
+    return assignments
+
+
+def _validate_protected_users_yaml(
+    users_yaml_path: Path,
+    service_user: str,
+    *,
+    require_existing_accounts: bool,
+    service_uid: int | None = None,
+) -> tuple[str, ...]:
+    """Validate protected user isolation, optionally including passwd lookup."""
+    assignments = _protected_user_assignments(users_yaml_path)
+    return validate_protected_user_isolation(
+        assignments,
+        service_user,
+        account_uid=(lambda name: pwd.getpwnam(name).pw_uid) if require_existing_accounts else None,
+        service_uid=service_uid,
+    )
+
+
 def _entry_backend(entry: dict) -> object:
     """
     Read a users.yaml entry's backend, preferring the new `backend`
@@ -980,34 +1051,42 @@ def _cmd_config() -> None:
                 break
             print("  Name may only contain letters, numbers, spaces, hyphens, and underscores.")
 
-        # Advanced options: os_user and home_workspace.
-        advanced = _prompt_bool("Configure advanced user options", False)
-
-        if advanced:
-            # `os_user` is optional on both backends and follows the
-            # same semantics: an empty value (or a value matching the
-            # bot process user) spawns the agent in-process via the
-            # self-sudo-skip path detected by `resolve_claude_user`;
-            # a different OS account wraps the agent argv in `sudo -H
-            # -u <user>` for cross-user isolation. Operators who run
-            # kai under their own account leave this empty; operators
-            # with a dedicated kai service user and separate per-user
-            # OS accounts set it to those accounts.
-            default_os_user = os.environ.get("USER", "")
+        if deployment_mode == "protected":
+            # The service account can sudo-cat exact protected Kai files.
+            # A persistent agent running as that identity would inherit
+            # those capabilities, so protected mode has no same-user path.
+            print("  Protected mode requires a distinct OS account for each interactive user.")
             while True:
-                admin_os_user = _prompt("OS user for subprocess isolation", default_os_user).strip() or None
-                if admin_os_user is None or _validate_os_user(admin_os_user):
-                    break
-                print("  Username may only contain letters, numbers, dots, hyphens, and underscores.")
+                admin_os_user = _prompt(
+                    "OS user for subprocess isolation",
+                    "",
+                    required=True,
+                ).strip()
+                if not _validate_os_user(admin_os_user):
+                    print("  Username may only contain letters, numbers, dots, hyphens, and underscores.")
+                    continue
+                if admin_os_user == service_user:
+                    print(f"  Must differ from the Kai service account {service_user!r}.")
+                    continue
+                break
+        else:
+            # Single-user mode intentionally keeps the historic optional
+            # same-user spawn shape. There is no protected service account
+            # or cross-principal boundary in this deployment mode.
+            advanced = _prompt_bool("Configure advanced user options", False)
+            if advanced:
+                default_os_user = os.environ.get("USER", "")
+                while True:
+                    admin_os_user = _prompt("OS user for subprocess isolation", default_os_user).strip() or None
+                    if admin_os_user is None or _validate_os_user(admin_os_user):
+                        break
+                    print("  Username may only contain letters, numbers, dots, hyphens, and underscores.")
 
+        if admin_os_user is not None:
             # No wizard prompt for home_workspace post-#353. The admin lands
             # in DATA_DIR/home/<chat_id>/ like any other user; the per-user
             # default is private to them. An admin who wants a path outside
-            # DATA_DIR (a clone of the dev tree, a synced volume, etc.) can
-            # add `home_workspace: /absolute/path` to their users.yaml entry
-            # by hand after install. Removing the prompt prevents the wizard
-            # from defaulting back to the shared PROJECT_ROOT directory the
-            # spec exists to eliminate.
+            # DATA_DIR can add `home_workspace` to users.yaml by hand.
             admin_home_workspace = None
 
         # First-time write target depends on deployment mode:
@@ -1040,6 +1119,16 @@ def _cmd_config() -> None:
             users_yaml_path.write_text(users_yaml_content)
             os.chmod(users_yaml_path, 0o600)
         print(f"  Generated {users_yaml_path}")
+
+    if deployment_mode == "protected":
+        try:
+            _validate_protected_users_yaml(
+                users_yaml_path,
+                service_user,
+                require_existing_accounts=False,
+            )
+        except ValueError as exc:
+            raise SystemExit(f"Protected user isolation validation failed before writing install.conf:\n{exc}") from exc
     # Blank separator only when the user-setup section above actually
     # printed something (first-time prompts or a stray-leftover note),
     # gated on the same condition as its header. On a re-run with an
@@ -4293,6 +4382,26 @@ def _cmd_apply() -> None:
         svc_gid = user_info.pw_gid
     except KeyError:
         raise SystemExit(f"Service user '{service_user}' does not exist on this system.") from None
+
+    # Resolve and validate the users.yaml that this apply would leave active
+    # before stopping the running service or touching disk. A readable staging
+    # file wins on first install; otherwise the canonical protected copy stays
+    # authoritative, matching _apply_secrets' copy/skip behavior.
+    staged_users_yaml = Path(users_yaml_staging_path) if users_yaml_staging_path else None
+    effective_users_yaml = (
+        staged_users_yaml if staged_users_yaml is not None and staged_users_yaml.is_file() else USERS_YAML
+    )
+    try:
+        _validate_protected_users_yaml(
+            effective_users_yaml,
+            service_user,
+            require_existing_accounts=True,
+            service_uid=svc_uid,
+        )
+    except ValueError as exc:
+        raise SystemExit(
+            f"Protected user isolation preflight failed; no installation changes were made:\n{exc}"
+        ) from exc
 
     # Defensive validation: refuse to apply an install.conf whose
     # (DEFAULT_MODEL, effective_provider) pair would fail load_config's

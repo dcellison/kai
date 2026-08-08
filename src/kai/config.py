@@ -25,6 +25,8 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
+from kai.user_isolation import validate_protected_user_isolation
+
 log = logging.getLogger(__name__)
 
 
@@ -3133,6 +3135,27 @@ def load_config() -> Config:
     # path is always one of the two resolved defaults.
     users_yaml_path = _resolve_users_yaml_path(bool(protected_env))
     user_configs = _load_user_configs(default_backend, default_provider, users_yaml_path)
+    if protected_env:
+        # A protected install gives the outer service account narrowly
+        # scoped sudo access to root-owned Kai configuration.  A persistent
+        # conversational agent running as that same account would inherit
+        # those capabilities even though its environment is sanitized.
+        # Fail at startup if a hand-edited users.yaml weakens the boundary.
+        try:
+            service_user = pwd.getpwuid(os.geteuid()).pw_name
+        except KeyError:
+            raise SystemExit(
+                f"Protected installation could not resolve the Kai service account for effective uid {os.geteuid()}."
+            ) from None
+        try:
+            validate_protected_user_isolation(
+                ((uc.telegram_id, uc.name, uc.os_user) for uc in user_configs.values()),
+                service_user,
+                account_uid=lambda name: pwd.getpwnam(name).pw_uid,
+                service_uid=os.geteuid(),
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
     # Seed UserConfig.models from the deprecated per-role env vars
     # (PR_REVIEW_MODEL_<BACKEND> / ISSUE_TRIAGE_MODEL_<BACKEND>). The
     # values reach dispatch through UserConfig.models rather than via

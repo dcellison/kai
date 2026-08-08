@@ -1287,6 +1287,12 @@ class TestCmdConfig:
             return _real_exists(self)
 
         monkeypatch.setattr(Path, "exists", _exists_with_canonical)
+        parsed = yaml.safe_load(content)
+        if isinstance(parsed, dict) and isinstance(parsed.get("users"), list):
+            for index, entry in enumerate(parsed["users"]):
+                if isinstance(entry, dict) and not entry.get("os_user"):
+                    entry["os_user"] = f"test-os-user-{index}"
+            content = yaml.safe_dump(parsed, sort_keys=False)
         monkeypatch.setattr("kai.install._read_users_yaml_text", lambda path: content)
 
     def test_writes_install_conf(self, tmp_path, monkeypatch):
@@ -1307,7 +1313,7 @@ class TestCmdConfig:
                 "fake-token",  # bot token
                 "12345",  # admin telegram ID
                 "admin",  # admin display name
-                "false",  # advanced user options
+                "testuser",  # required protected os_user
                 "polling",  # transport
                 "claude",  # agent backend
                 "/usr/bin/true",  # claude binary path
@@ -1406,7 +1412,6 @@ class TestCmdConfig:
                 "fake-token",  # bot token
                 "12345",  # admin telegram ID
                 "admin",  # admin display name
-                "true",  # advanced user options
                 "testuser",  # os_user
                 # no home_workspace prompt post-#353
                 "polling",  # transport
@@ -1490,7 +1495,7 @@ class TestCmdConfig:
                 "fake-token",  # bot token
                 "12345",  # admin telegram ID
                 "admin",  # admin display name
-                "false",  # advanced user options -> no os_user, no home prompt
+                "testuser",  # required protected os_user
                 "polling",  # transport
                 "claude",  # agent backend
                 "/usr/bin/true",  # claude binary path
@@ -1559,7 +1564,6 @@ class TestCmdConfig:
                 "fake-token",
                 "12345",
                 "admin",
-                "true",  # advanced -> os_user prompt
                 "testuser",  # os_user (no home_workspace prompt should follow)
                 "polling",
                 "claude",
@@ -1622,7 +1626,7 @@ class TestCmdConfig:
                 "fake-token",  # bot token
                 "12345",  # admin telegram ID
                 "admin",  # admin display name
-                "false",  # advanced user options
+                "testuser",  # required protected os_user
                 "polling",  # transport
                 "goose",  # agent backend (prompt shown because existing config has goose)
                 "/opt/homebrew/bin/goose",  # goose binary path (validator stubbed)
@@ -1758,7 +1762,7 @@ class TestCmdConfig:
                 "fake-token",  # bot token
                 "12345",  # admin telegram ID
                 "admin",  # admin display name
-                "false",  # advanced user options
+                "testuser",  # required protected os_user
                 "polling",  # transport
                 "goose",  # agent backend
                 "/opt/homebrew/bin/goose",  # goose binary path (validator stubbed)
@@ -2000,7 +2004,7 @@ class TestCmdConfig:
             "fake-token",  # bot token
             "12345",  # admin telegram ID
             "admin",  # admin display name
-            "false",  # advanced user options
+            "testuser",  # required protected os_user
             "polling",  # transport
             agent_backend,  # agent backend
             *backend_block,  # llm_provider + api_key (non-claude only)
@@ -2441,7 +2445,7 @@ class TestCmdConfig:
                 "fake-token",  # bot token
                 "12345",  # admin telegram ID
                 "admin",  # admin display name
-                "false",  # advanced user options
+                "testuser",  # required protected os_user
                 "polling",  # transport
                 "goose",  # agent backend (was claude)
                 "/opt/homebrew/bin/goose",  # goose binary path (validator stubbed)
@@ -2703,6 +2707,10 @@ class TestCmdConfig:
             return None
 
         monkeypatch.setattr("kai.config._read_protected_file", _fake_read)
+        monkeypatch.setattr(
+            "kai.config.pwd.getpwnam",
+            lambda name: MagicMock(pw_uid=os.geteuid() + 100_000),
+        )
         # Seed only the env keys the wizard would emit. Everything
         # else falls back to dataclass defaults via load_config.
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
@@ -2737,20 +2745,12 @@ class TestCmdConfig:
         assert get_model_for(ModelRole.MEMORY_EPISODE, "codex", "openai") in CODEX_MODELS
 
     def test_codex_fresh_install_with_memory_extraction_yields_valid_users_yaml(self, tmp_path, monkeypatch):
-        """Fresh-install integration contract for codex memory.
+        """Fresh protected Codex+memory config carries OS isolation.
 
-        When the wizard drives the path 'no users.yaml -> codex backend
-        -> enable memory -> enable extraction' AND the operator accepts
-        the default 'Configure advanced user options = false', the
-        wizard writes users.yaml with NO `os_user`. Issue #522 makes
-        that valid: codex memory follows claude's `resolve_claude_user`
-        symmetry and spawns in-process when os_user is unset. The
-        produced env + users.yaml must pass load_config() without any
-        codex-memory-specific precondition firing.
-
-        Pre-#522 this same input shape required a separate reprompt
-        for a non-bot os_user; that reprompt is now gone along with
-        the load_config precondition that motivated it.
+        Issue #522's same-user Codex symmetry remains supported in
+        single-user mode. Protected mode now requires an explicit target
+        account, and the generated env + users.yaml must still pass the
+        complete load_config integration path.
         """
         from unittest.mock import MagicMock
 
@@ -2781,7 +2781,7 @@ class TestCmdConfig:
                 "fake-token",  # bot token
                 "12345",  # admin telegram ID
                 "admin",  # admin display name
-                "false",  # advanced user options (no os_user)
+                "testuser",  # required protected os_user
                 "polling",  # transport
                 "codex",  # agent backend
                 "subscription",  # codex auth mode
@@ -2818,15 +2818,13 @@ class TestCmdConfig:
 
         _cmd_config()
 
-        # users.yaml is written without os_user; same-user spawn is
-        # the supported deployment shape for an operator who accepts
-        # the default "Configure advanced user options = false".
+        # Protected users.yaml carries the explicit non-service target.
         users_yaml_path = tmp_path / "users.yaml"
         assert users_yaml_path.exists()
         data = yaml.safe_load(users_yaml_path.read_text())
         entry = data["users"][0]
         assert entry["telegram_id"] == 12345
-        assert entry.get("os_user") is None
+        assert entry.get("os_user") == "testuser"
 
         # Integration pin: feed the produced env + users.yaml into
         # load_config and assert it accepts the shape. The wizard
@@ -2853,6 +2851,10 @@ class TestCmdConfig:
 
         monkeypatch.setattr("kai.config._read_protected_file", _fake_read)
         monkeypatch.setattr(
+            "kai.config.pwd.getpwnam",
+            lambda name: MagicMock(pw_uid=os.geteuid() + 100_000),
+        )
+        monkeypatch.setattr(
             "kai.oneshot_binary.resolve_oneshot_binary",
             lambda backend: f"/fake/{backend}",
         )
@@ -2865,9 +2867,7 @@ class TestCmdConfig:
         assert config.default_backend == "codex"
         assert config.user_configs is not None
         assert 12345 in config.user_configs
-        # No os_user → in-process spawn at runtime via the
-        # self-sudo-skip path.
-        assert config.user_configs[12345].os_user is None
+        assert config.user_configs[12345].os_user == "testuser"
 
 
 # ── Apply subcommand ─────────────────────────────────────────────────
@@ -2911,6 +2911,9 @@ class TestCmdApply:
         """DRY_RUN=1 prints actions without executing them."""
         monkeypatch.setattr("os.geteuid", lambda: 0)
         monkeypatch.setenv("DRY_RUN", "1")
+        kai.install.USERS_YAML.write_text(
+            "users:\n  - telegram_id: 1\n    name: test\n    role: admin\n    os_user: root\n"
+        )
 
         conf_path = tmp_path / "install.conf"
         conf_path.write_text(
@@ -2945,6 +2948,9 @@ class TestCmdApply:
         """
         monkeypatch.setattr("os.geteuid", lambda: 0)
         monkeypatch.setenv("DRY_RUN", "1")
+        kai.install.USERS_YAML.write_text(
+            "users:\n  - telegram_id: 1\n    name: test\n    role: admin\n    os_user: root\n"
+        )
         conf_path = tmp_path / "install.conf"
         conf_path.write_text(
             json.dumps(
@@ -3017,6 +3023,9 @@ class TestCmdApply:
         reach its try/finally block; the rest of the apply path is
         either short-circuited by dry-run or monkey-patched per test.
         Returns the conf path."""
+        kai.install.USERS_YAML.write_text(
+            "users:\n  - telegram_id: 1\n    name: test\n    role: admin\n    os_user: root\n"
+        )
         conf_path = tmp_path / "install.conf"
         conf_path.write_text(
             json.dumps(
@@ -3133,6 +3142,100 @@ class TestCmdApply:
         assert "Manual recovery" in out
 
 
+class TestProtectedUserIsolationPreflight:
+    @staticmethod
+    def _write_conf(tmp_path: Path, *, staging: Path | None = None) -> Path:
+        conf = {
+            "version": 1,
+            "deployment_mode": "protected",
+            "install_dir": str(tmp_path / "opt-kai"),
+            "data_dir": str(tmp_path / "data"),
+            "service_user": "kai-service",
+            "platform": "darwin",
+            "env": {"TELEGRAM_BOT_TOKEN": "tok", "DEFAULT_MODEL": "sonnet"},
+        }
+        if staging is not None:
+            conf["users_yaml_staging_path"] = str(staging)
+        path = tmp_path / "install.conf"
+        path.write_text(json.dumps(conf))
+        return path
+
+    @staticmethod
+    def _fake_accounts(monkeypatch, *, missing: str | None = None) -> None:
+        class _FakePwd:
+            pw_gid = 4242
+
+            def __init__(self, uid):
+                self.pw_uid = uid
+
+        def _lookup(name):
+            if name == missing:
+                raise KeyError(name)
+            return _FakePwd(4242 if name == "kai-service" else 5252)
+
+        monkeypatch.setattr("kai.install.pwd.getpwnam", _lookup)
+
+    def test_missing_os_user_aborts_before_service_stop(self, tmp_path, monkeypatch):
+        kai.install.USERS_YAML.write_text("users:\n  - telegram_id: 1\n    name: alice\n    role: admin\n")
+        monkeypatch.setattr("kai.install.INSTALL_CONF", self._write_conf(tmp_path))
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+        self._fake_accounts(monkeypatch)
+        stop = MagicMock()
+        monkeypatch.setattr("kai.install._stop_service", stop)
+
+        with pytest.raises(SystemExit, match="missing required os_user"):
+            _cmd_apply()
+        stop.assert_not_called()
+        assert not (tmp_path / "opt-kai").exists()
+
+    def test_service_account_mapping_aborts_before_service_stop(self, tmp_path, monkeypatch):
+        kai.install.USERS_YAML.write_text(
+            "users:\n  - telegram_id: 1\n    name: alice\n    role: admin\n    os_user: kai-service\n"
+        )
+        monkeypatch.setattr("kai.install.INSTALL_CONF", self._write_conf(tmp_path))
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+        self._fake_accounts(monkeypatch)
+        stop = MagicMock()
+        monkeypatch.setattr("kai.install._stop_service", stop)
+
+        with pytest.raises(SystemExit, match="maps to service account"):
+            _cmd_apply()
+        stop.assert_not_called()
+
+    def test_nonexistent_target_aborts_before_service_stop(self, tmp_path, monkeypatch):
+        kai.install.USERS_YAML.write_text(
+            "users:\n  - telegram_id: 1\n    name: alice\n    role: admin\n    os_user: absent-user\n"
+        )
+        monkeypatch.setattr("kai.install.INSTALL_CONF", self._write_conf(tmp_path))
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+        self._fake_accounts(monkeypatch, missing="absent-user")
+        stop = MagicMock()
+        monkeypatch.setattr("kai.install._stop_service", stop)
+
+        with pytest.raises(SystemExit, match="nonexistent OS account"):
+            _cmd_apply()
+        stop.assert_not_called()
+
+    def test_staged_users_yaml_is_the_preflight_authority(self, tmp_path, monkeypatch):
+        kai.install.USERS_YAML.write_text(
+            "users:\n  - telegram_id: 1\n    name: safe\n    role: admin\n    os_user: safe-user\n"
+        )
+        staging = tmp_path / "staged-users.yaml"
+        staging.write_text("users:\n  - telegram_id: 2\n    name: unsafe\n    role: admin\n")
+        monkeypatch.setattr(
+            "kai.install.INSTALL_CONF",
+            self._write_conf(tmp_path, staging=staging),
+        )
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+        self._fake_accounts(monkeypatch)
+        stop = MagicMock()
+        monkeypatch.setattr("kai.install._stop_service", stop)
+
+        with pytest.raises(SystemExit, match="missing required os_user"):
+            _cmd_apply()
+        stop.assert_not_called()
+
+
 class TestCmdConfigDefaultModelDispatch:
     """
     Wizard dispatch for DEFAULT_MODEL when users.yaml exists.
@@ -3169,9 +3272,10 @@ class TestCmdConfigDefaultModelDispatch:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        # Pretend the canonical users.yaml exists with empty user list;
-        # only the presence flag matters for this dispatch test, not the
-        # content. Compares against the live USERS_YAML attribute so it
+        # Pretend the canonical users.yaml exists with one isolated user;
+        # only the presence flag matters for this dispatch test. Protected
+        # mode now validates the OS-user boundary before later prompts.
+        # Compares against the live USERS_YAML attribute so it
         # stacks on the autouse `_isolate_users_yaml` redirect.
         _real_exists = Path.exists
 
@@ -3181,7 +3285,10 @@ class TestCmdConfigDefaultModelDispatch:
             return _real_exists(self)
 
         monkeypatch.setattr(Path, "exists", _exists_with_canonical)
-        monkeypatch.setattr("kai.install._read_users_yaml_text", lambda path: "users: []\n")
+        monkeypatch.setattr(
+            "kai.install._read_users_yaml_text",
+            lambda path: "users:\n  - telegram_id: 1\n    name: test\n    role: admin\n    os_user: test-os-user\n",
+        )
 
         if existing_env is not None:
             (tmp_path / "install.conf").write_text(json.dumps({"env": existing_env, "version": 1}))
@@ -3586,6 +3693,9 @@ class TestCmdApplyDefaultModelGate:
     @staticmethod
     def _write_install_conf(tmp_path, env: dict[str, str]) -> Path:
         """Write a minimal install.conf with the given env dict."""
+        kai.install.USERS_YAML.write_text(
+            "users:\n  - telegram_id: 1\n    name: test\n    role: admin\n    os_user: root\n"
+        )
         conf_path = tmp_path / "install.conf"
         conf_path.write_text(
             json.dumps(
@@ -7270,7 +7380,7 @@ class TestCmdConfigCanonicalUsersYaml:
             "fake-token",
             "12345",  # admin telegram id
             "admin",  # admin name
-            "false",  # advanced
+            "testuser",  # required protected os_user
             "polling",
             "claude",
             "/usr/bin/true",  # claude binary path
@@ -7427,10 +7537,15 @@ class TestCmdApplyStagingHandoff:
         monkeypatch.setattr("os.geteuid", lambda: 0)
 
         class _FakePwd:
-            pw_uid = 4242
             pw_gid = 4242
 
-        monkeypatch.setattr("pwd.getpwnam", lambda name: _FakePwd)
+            def __init__(self, uid):
+                self.pw_uid = uid
+
+        monkeypatch.setattr("pwd.getpwnam", lambda name: _FakePwd(4242 if name == "kai" else 5252))
+        kai.install.USERS_YAML.write_text(
+            "users:\n  - telegram_id: 1\n    name: test\n    role: admin\n    os_user: testuser\n"
+        )
 
         def _fake_apply_secrets(env, dry_run, users_yaml_staging_path=None):
             captured["users_yaml_staging_path"] = users_yaml_staging_path
@@ -7452,7 +7567,7 @@ class TestCmdApplyStagingHandoff:
         top-level conf key, preserving env and other top-level keys.
         """
         staging = tmp_path / "users.yaml"
-        staging.write_text("users: []\n")
+        staging.write_text("users:\n  - telegram_id: 1\n    name: test\n    role: admin\n    os_user: testuser\n")
         conf_path = self._minimal_conf(tmp_path, str(staging))
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         monkeypatch.delenv("DRY_RUN", raising=False)
@@ -7478,7 +7593,7 @@ class TestCmdApplyStagingHandoff:
         handoff exactly as if the dry run had never happened.
         """
         staging = tmp_path / "users.yaml"
-        staging.write_text("users: []\n")
+        staging.write_text("users:\n  - telegram_id: 1\n    name: test\n    role: admin\n    os_user: testuser\n")
         conf_path = self._minimal_conf(tmp_path, str(staging))
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         monkeypatch.setenv("DRY_RUN", "1")
@@ -7521,7 +7636,7 @@ class TestCmdApplyStagingHandoff:
         operator_cache = tmp_path / "operator-cache"
         operator_cache.mkdir()
         staging = operator_cache / "users.yaml"
-        staging.write_text("users: []\n")
+        staging.write_text("users:\n  - telegram_id: 1\n    name: test\n    role: admin\n    os_user: testuser\n")
         conf_path = self._minimal_conf(tmp_path, str(staging))
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         monkeypatch.delenv("DRY_RUN", raising=False)
@@ -7847,10 +7962,15 @@ class TestCmdApplySingleUserRefuses:
         # fire when deployment_mode is missing from the conf.
 
         class _FakePwd:
-            pw_uid = 4242
             pw_gid = 4242
 
-        monkeypatch.setattr("pwd.getpwnam", lambda name: _FakePwd)
+            def __init__(self, uid):
+                self.pw_uid = uid
+
+        monkeypatch.setattr("pwd.getpwnam", lambda name: _FakePwd(4242 if name == "kai" else 5252))
+        kai.install.USERS_YAML.write_text(
+            "users:\n  - telegram_id: 1\n    name: test\n    role: admin\n    os_user: testuser\n"
+        )
         monkeypatch.setattr("kai.install._stop_service", lambda *a, **kw: None)
         monkeypatch.setattr("kai.install._apply_directories", lambda *a, **kw: None)
         monkeypatch.setattr("kai.install._apply_source", lambda *a, **kw: None)
@@ -9088,7 +9208,7 @@ class TestOpenCodeBinWizardPrompt:
             "fake-token",  # bot token
             "12345",  # admin telegram ID
             "admin",  # admin display name
-            "false",  # advanced user options (no per-user os_user)
+            "testuser",  # required protected os_user
             "polling",  # transport
             "opencode",  # agent backend
             opencode_bin_path,  # OPENCODE_BIN
@@ -9505,6 +9625,9 @@ class TestApplyBackendAwareModelValidation:
     """_cmd_apply rejects codex installs with goose-only or claude models."""
 
     def _conf(self, tmp_path, **env_overrides):
+        kai.install.USERS_YAML.write_text(
+            "users:\n  - telegram_id: 1\n    name: test\n    role: admin\n    os_user: root\n"
+        )
         env = {
             "TELEGRAM_BOT_TOKEN": "tok",
             "DEFAULT_BACKEND": "codex",

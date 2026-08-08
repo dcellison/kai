@@ -97,6 +97,13 @@ def _clean_env(monkeypatch):
     monkeypatch.setattr("kai.config.load_dotenv", lambda *a, **kw: None)
     # Prevent real sudo calls during tests - default to None (dev mode fallback)
     monkeypatch.setattr("kai.config._read_protected_file", lambda path: None)
+    # Protected-isolation tests use synthetic OS account names. Give each
+    # name a stable, non-service UID by default; focused passwd/alias tests
+    # override this lookup explicitly.
+    monkeypatch.setattr(
+        "kai.config.pwd.getpwnam",
+        lambda name: MagicMock(pw_uid=10000 + sum(ord(char) for char in name)),
+    )
     for var in _CONFIG_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
 
@@ -141,7 +148,10 @@ def _set_required(monkeypatch, token="fake-token", user_ids="123"):
     # mandatory-users contract is met. Names are auto-generated;
     # role=admin so the no-admin-warning does not fire.
     user_entries = "\n".join(
-        f"  - telegram_id: {uid.strip()}\n    name: test-user-{uid.strip()}\n    role: admin"
+        f"  - telegram_id: {uid.strip()}\n"
+        f"    name: test-user-{uid.strip()}\n"
+        f"    role: admin\n"
+        f"    os_user: test-os-user-{uid.strip()}"
         for uid in user_ids.split(",")
         if uid.strip()
     )
@@ -175,6 +185,14 @@ def _patch_protected_users_yaml(monkeypatch, content: str) -> None:
         return None
 
     monkeypatch.setattr("kai.config._read_protected_file", _fake_read)
+
+
+def _patch_single_user_users_yaml(monkeypatch, tmp_path: Path, content: str) -> None:
+    """Simulate a single-user deployment with an explicit users.yaml."""
+    users_yaml = tmp_path / "users.yaml"
+    users_yaml.write_text(content)
+    monkeypatch.setenv("KAI_USERS_YAML", str(users_yaml))
+    monkeypatch.setattr("kai.config._read_protected_file", lambda path: None)
 
 
 # ── Happy path ───────────────────────────────────────────────────────
@@ -668,7 +686,7 @@ class TestDualModeLoading:
         the auth contract; otherwise load_config raises before
         reaching the env-file assertions these tests exist for.
         """
-        users_yaml = "users:\n  - telegram_id: 999\n    name: test\n    role: admin\n"
+        users_yaml = "users:\n  - telegram_id: 999\n    name: test\n    role: admin\n    os_user: protected-test-user\n"
 
         def _read(path):
             if path == "/etc/kai/env":
@@ -740,6 +758,60 @@ class TestDualModeLoading:
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "from-env")
         config = load_config()
         assert config.telegram_bot_token == "from-env"
+
+
+class TestProtectedUserIsolation:
+    def test_protected_install_requires_os_user(self, monkeypatch):
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake-token")
+        _patch_protected_users_yaml(
+            monkeypatch,
+            "users:\n  - telegram_id: 1\n    name: alice\n    role: admin\n",
+        )
+        with pytest.raises(SystemExit, match="missing required os_user"):
+            load_config()
+
+    def test_protected_install_rejects_service_account(self, monkeypatch):
+        service_user = pwd.getpwuid(os.geteuid()).pw_name
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake-token")
+        _patch_protected_users_yaml(
+            monkeypatch,
+            f"users:\n  - telegram_id: 1\n    name: alice\n    role: admin\n    os_user: {service_user}\n",
+        )
+        with pytest.raises(SystemExit, match="maps to service account"):
+            load_config()
+
+    def test_protected_install_rejects_shared_os_account(self, monkeypatch):
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake-token")
+        _patch_protected_users_yaml(
+            monkeypatch,
+            "users:\n"
+            "  - telegram_id: 1\n    name: alice\n    role: admin\n    os_user: shared\n"
+            "  - telegram_id: 2\n    name: bob\n    role: user\n    os_user: shared\n",
+        )
+        with pytest.raises(SystemExit, match="shared by multiple Telegram principals"):
+            load_config()
+
+    def test_protected_install_rejects_service_uid_alias(self, monkeypatch):
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake-token")
+        monkeypatch.setattr(
+            "kai.config.pwd.getpwnam",
+            lambda name: MagicMock(pw_uid=os.geteuid()),
+        )
+        _patch_protected_users_yaml(
+            monkeypatch,
+            "users:\n  - telegram_id: 1\n    name: alice\n    role: admin\n    os_user: kai-alias\n",
+        )
+        with pytest.raises(SystemExit, match="resolves to service uid"):
+            load_config()
+
+    def test_single_user_install_still_allows_missing_os_user(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake-token")
+        _patch_single_user_users_yaml(
+            monkeypatch,
+            tmp_path,
+            "users:\n  - telegram_id: 1\n    name: alice\n    role: admin\n",
+        )
+        assert load_config().user_configs[1].os_user is None
 
 
 # ── PR review config ─────────────────────────────────────────────
@@ -1665,14 +1737,13 @@ class TestMemoryReasonerBinaryValidation:
 
 
 class TestCodexMemorySameUserSymmetry:
-    """Codex memory follows claude's `resolve_claude_user` symmetry
-    (issue #522): `os_user` is optional and same-user spawn is a
-    supported deployment shape. config-load does NOT refuse any of:
-    DEFAULT_BACKEND=codex without users.yaml, codex-effective user
-    without os_user, or codex-effective user with os_user matching
-    the bot user. Pinning these as starts-cleanly cases guards
-    against a future change that re-introduces the pre-#522
-    deployment-shape assumption."""
+    """Same-user Codex remains supported for single-user deployments.
+
+    Protected installs now enforce a different trust boundary: every
+    conversational principal must run as a distinct non-service OS account.
+    These issue-#522 compatibility cases therefore use the XDG/single-user
+    config path rather than simulating root-owned protected configuration.
+    """
 
     def test_codex_no_users_yaml_starts_cleanly(self, monkeypatch):
         """DEFAULT_BACKEND=codex with extraction enabled and no
@@ -1688,14 +1759,15 @@ class TestCodexMemorySameUserSymmetry:
         assert config.default_backend == "codex"
         assert config.memory_extraction_enabled is True
 
-    def test_codex_users_yaml_missing_os_user_starts_cleanly(self, monkeypatch):
+    def test_codex_users_yaml_missing_os_user_starts_cleanly(self, monkeypatch, tmp_path):
         """A codex-effective users.yaml entry without `os_user`
         loads successfully. The runtime treats missing os_user as
         in-process spawn (claude's existing pattern), so config-load
         does not refuse the shape."""
         _set_required(monkeypatch)
-        _patch_protected_users_yaml(
+        _patch_single_user_users_yaml(
             monkeypatch,
+            tmp_path,
             "users:\n  - telegram_id: 67890\n    name: bob\n    role: user\n",
         )
         monkeypatch.setenv("MEMORY_ENABLED", "true")
@@ -1706,7 +1778,7 @@ class TestCodexMemorySameUserSymmetry:
         assert config.user_configs is not None
         assert config.user_configs[67890].os_user is None
 
-    def test_codex_users_yaml_same_user_as_bot_starts_cleanly(self, monkeypatch):
+    def test_codex_users_yaml_same_user_as_bot_starts_cleanly(self, monkeypatch, tmp_path):
         """A codex-effective users.yaml entry with `os_user`
         matching the bot user loads successfully. The runtime
         detects same-user via `resolve_claude_user` and spawns
@@ -1714,8 +1786,9 @@ class TestCodexMemorySameUserSymmetry:
         for same-user."""
         bot_user = pwd.getpwuid(os.getuid()).pw_name
         _set_required(monkeypatch)
-        _patch_protected_users_yaml(
+        _patch_single_user_users_yaml(
             monkeypatch,
+            tmp_path,
             f"users:\n  - telegram_id: 12345\n    name: alice\n    role: admin\n    os_user: {bot_user}\n",
         )
         monkeypatch.setenv("MEMORY_ENABLED", "true")
@@ -2947,7 +3020,7 @@ class TestDefaultTimeoutRename:
         # admin entry so load_config completes for these env-driven tests.
         _patch_protected_users_yaml(
             monkeypatch,
-            "users:\n  - telegram_id: 12345\n    name: test\n    role: admin\n",
+            "users:\n  - telegram_id: 12345\n    name: test\n    role: admin\n    os_user: test-os-user\n",
         )
 
     def test_DEFAULT_TIMEOUT_env_wins_when_both_set(self, monkeypatch, caplog):
@@ -3003,7 +3076,7 @@ class TestAgentSessionLifecycleRename:
             monkeypatch.setenv(k, v)
         _patch_protected_users_yaml(
             monkeypatch,
-            "users:\n  - telegram_id: 12345\n    name: test\n    role: admin\n",
+            "users:\n  - telegram_id: 12345\n    name: test\n    role: admin\n    os_user: test-os-user\n",
         )
 
     def test_agent_keys_preferred_over_legacy(self, monkeypatch):
@@ -3065,7 +3138,7 @@ class TestLoadConfigBackendAwareModelValidation:
         # admin entry so the validation tests reach the model check.
         _patch_protected_users_yaml(
             monkeypatch,
-            "users:\n  - telegram_id: 12345\n    name: test\n    role: admin\n",
+            "users:\n  - telegram_id: 12345\n    name: test\n    role: admin\n    os_user: test-os-user\n",
         )
 
     def test_codex_rejects_goose_only_model(self, monkeypatch):
@@ -3463,7 +3536,7 @@ class TestLoadMemoryProjects:
         monkeypatch.setenv("GENERIC_WEBHOOK_SECRET", "test-secret")
         _patch_protected_users_yaml(
             monkeypatch,
-            "users:\n  - telegram_id: 12345\n    name: test\n    role: admin\n",
+            "users:\n  - telegram_id: 12345\n    name: test\n    role: admin\n    os_user: test-os-user\n",
         )
 
         registry_root = tmp_path / "registry_root"
