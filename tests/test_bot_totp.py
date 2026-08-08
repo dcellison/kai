@@ -18,7 +18,13 @@ import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from kai.bot import handle_document, handle_message, handle_photo, handle_voice
+from kai.bot import (
+    _require_sensitive_authentication,
+    handle_document,
+    handle_message,
+    handle_photo,
+    handle_voice,
+)
 from kai.totp import TotpStateError
 
 # ── Test helpers ──────────────────────────────────────────────────────────
@@ -38,6 +44,7 @@ def _make_update(text: str = "hello") -> MagicMock:
     update.effective_chat.id = 12345
     update.effective_chat.send_message = AsyncMock()
     update.effective_user.id = 67890
+    update.callback_query = None
     return update
 
 
@@ -82,6 +89,65 @@ def _downstream_patches() -> dict:
         "_clear_responding": MagicMock(),
         "get_lock": MagicMock(return_value=_fake_lock()),
     }
+
+
+# ── Common sensitive-handler middleware ─────────────────────────────
+
+
+async def test_sensitive_middleware_requires_authorization_before_totp():
+    """Unknown users are silently dropped without receiving a TOTP challenge."""
+    update = _make_update("/job info 1")
+    ctx = _make_context()
+    handler = AsyncMock()
+    wrapped = _require_sensitive_authentication(handler)
+
+    with (
+        patch("kai.bot._is_authorized", return_value=False),
+        patch("kai.bot._check_totp", new_callable=AsyncMock) as check_totp,
+    ):
+        await wrapped(update, ctx)
+
+    check_totp.assert_not_awaited()
+    handler.assert_not_awaited()
+
+
+async def test_sensitive_middleware_dispatches_only_after_totp():
+    """An authorized, authenticated update reaches its sensitive handler."""
+    update = _make_update("/job info 1")
+    ctx = _make_context()
+    handler = AsyncMock()
+    wrapped = _require_sensitive_authentication(handler)
+
+    with (
+        patch("kai.bot._is_authorized", return_value=True),
+        patch("kai.bot._check_totp", new_callable=AsyncMock, return_value=True) as check_totp,
+    ):
+        await wrapped(update, ctx)
+
+    check_totp.assert_awaited_once_with(update, ctx)
+    handler.assert_awaited_once_with(update, ctx)
+
+
+async def test_sensitive_callback_challenges_without_dispatching():
+    """Expired inline callbacks prompt for a text code and never mutate state."""
+    update = _make_update()
+    update.message = None
+    update.effective_message.reply_text = AsyncMock()
+    update.callback_query = MagicMock()
+    update.callback_query.answer = AsyncMock()
+    ctx = _make_context()
+    handler = AsyncMock()
+    wrapped = _require_sensitive_authentication(handler)
+
+    with (
+        patch("kai.bot._is_authorized", return_value=True),
+        patch("kai.bot.is_totp_configured", return_value=True),
+    ):
+        await wrapped(update, ctx)
+
+    update.effective_message.reply_text.assert_awaited_once_with("Session expired. Enter code from authenticator.")
+    update.callback_query.answer.assert_awaited_once_with("Authentication required.")
+    handler.assert_not_awaited()
 
 
 # ── Gate-blocking tests ───────────────────────────────────────────────────
@@ -273,6 +339,7 @@ async def test_invalid_code_shows_remaining_attempts():
 def _make_photo_update() -> MagicMock:
     """Create a mock Update with a photo attachment."""
     update = MagicMock()
+    update.callback_query = None
     update.message.photo = [MagicMock()]  # non-empty = has photo
     update.message.caption = "What is this?"
     update.message.reply_text = AsyncMock()
@@ -285,6 +352,7 @@ def _make_photo_update() -> MagicMock:
 def _make_document_update() -> MagicMock:
     """Create a mock Update with a document attachment."""
     update = MagicMock()
+    update.callback_query = None
     update.message.document = MagicMock()
     update.message.document.file_name = "test.txt"
     update.message.document.file_size = 100
@@ -299,6 +367,7 @@ def _make_document_update() -> MagicMock:
 def _make_voice_update() -> MagicMock:
     """Create a mock Update with a voice message."""
     update = MagicMock()
+    update.callback_query = None
     update.message.voice = MagicMock()
     update.message.reply_text = AsyncMock()
     update.message.delete = AsyncMock()

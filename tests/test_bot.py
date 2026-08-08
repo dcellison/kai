@@ -5364,6 +5364,40 @@ class TestCommandMenu:
         missing = EXPECTED_MENU_COMMANDS - registered
         assert not missing, f"Menu commands without handlers: {missing}"
 
+    def test_all_stateful_commands_use_common_totp_middleware(self):
+        """Every command except the narrow recovery set defaults to TOTP."""
+        from telegram.ext import CommandHandler as CH
+
+        app = create_bot(_make_config())
+        callbacks: dict[str, object] = {}
+        for group_handlers in app.handlers.values():
+            for handler in group_handlers:
+                if isinstance(handler, CH):
+                    for command in handler.commands:
+                        callbacks[command] = handler.callback
+
+        assert {
+            name for name, callback in callbacks.items() if not getattr(callback, "_kai_totp_sensitive", False)
+        } == {
+            "start",
+            "help",
+        }
+
+    def test_all_inline_callbacks_use_common_totp_middleware(self):
+        """Model, voice, workspace, and memory buttons cannot bypass TOTP."""
+        from telegram.ext import CallbackQueryHandler as CQH
+
+        app = create_bot(_make_config())
+        callbacks = [
+            handler.callback
+            for group_handlers in app.handlers.values()
+            for handler in group_handlers
+            if isinstance(handler, CQH)
+        ]
+
+        assert len(callbacks) == 4
+        assert all(getattr(callback, "_kai_totp_sensitive", False) for callback in callbacks)
+
     def test_menu_matches_expected_set(self):
         """The set_my_commands list in main.py matches EXPECTED_MENU_COMMANDS.
 

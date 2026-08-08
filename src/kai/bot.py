@@ -306,6 +306,32 @@ def _require_auth(func):
     return wrapper
 
 
+def _require_sensitive_authentication(func):
+    """Wrap a registered handler with authorization and TOTP middleware.
+
+    The wrapper lives at the Telegram registration boundary so it can protect
+    handlers defined in other modules (notably memory_command) without a
+    circular import.  Authorization runs first to avoid disclosing the bot or
+    issuing TOTP challenges to unknown Telegram users.
+    """
+
+    @functools.wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        config: Config = context.bot_data["config"]
+        if not _is_authorized(config, _user_id(update)):
+            if update.callback_query is not None:
+                await update.callback_query.answer("Not authorized.")
+            return
+        if not await _check_totp(update, context):
+            return
+        return await func(update, context)
+
+    # Tests and registration audits use this explicit marker instead of
+    # inferring security from wrapper names or decorator order.
+    wrapper._kai_totp_sensitive = True  # type: ignore[attr-defined]
+    return wrapper
+
+
 # ── Telegram message utilities ───────────────────────────────────────
 
 
@@ -3469,8 +3495,8 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
                                          sole configured repo.
         /review <owner/repo> <pr-number> explicit repository.
 
-    Auth + TOTP gate mirrors content-invoking commands. The review
-    runs inside the update handler (per the spec: not a detached
+    Runtime registration places this handler behind the common authorization
+    and TOTP middleware. The review runs inside the update handler (not a detached
     background task). On success the review text lands at
     ``/tmp/pr-<N>-review.md`` as the canonical artifact, a
     timestamped copy is staged under the chat's file area via
@@ -3480,13 +3506,6 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
     untouched.
     """
     assert update.message is not None
-
-    # TOTP gate: same precedent as content-invoking commands that run
-    # a user-scoped backend subprocess (handle_photo, handle_document,
-    # handle_voice). The review backend consumes the user's
-    # OAuth-authed subprocess, so the gate applies here too.
-    if not await _check_totp(update, context):
-        return
 
     # `actor_id` drives every user-scoped lookup (config, effective
     # repos, backend, provider, model override); `chat_id` drives
@@ -4141,6 +4160,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def _deny_totp_state_error(update: Update, exc: TotpStateError) -> None:
     """Deny an update when protected TOTP state cannot be trusted."""
     log.error("TOTP state unavailable; denying Telegram update: %s", exc)
+    if update.callback_query is not None:
+        await update.callback_query.answer("Authentication unavailable.", show_alert=True)
     message = update.message or update.effective_message
     if message is not None:
         await message.reply_text("Authentication service unavailable. Access denied; contact the Kai administrator.")
@@ -4151,13 +4172,10 @@ async def _check_totp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
     Check TOTP authentication if configured. Returns True if the request
     should proceed, False if a challenge was sent or access denied.
 
-    Must be called at the top of any handler that sends user content to
-    Claude. For non-text handlers (photo, document, voice), this sends
-    the challenge prompt and returns False - the user must then type
-    their code as a text message, which handle_message processes.
-
-    Informational commands (/stats, /help, /job, etc.) do NOT need
-    this gate since they don't invoke Claude with user content.
+    Used directly by content handlers and by the common sensitive-handler
+    middleware. For non-text updates, this sends the challenge prompt and
+    returns False; the user then types their code as a text message, which
+    handle_message processes.
     """
     try:
         if not await asyncio.to_thread(is_totp_configured):
@@ -4168,7 +4186,10 @@ async def _check_totp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
 
     assert context.user_data is not None
     assert update.effective_chat is not None
-    assert update.message is not None
+    message = update.message or update.effective_message
+    if message is None:
+        log.error("TOTP challenge denied: Telegram update has no effective message")
+        return False
 
     totp_cfg: Config = context.bot_data["config"]
     session_min = totp_cfg.totp_session_minutes
@@ -4189,7 +4210,9 @@ async def _check_totp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
         context.user_data["totp_pending"] = {
             "expires_at": time.time() + challenge_sec,
         }
-        await update.message.reply_text("Session expired. Enter code from authenticator.")
+        await message.reply_text("Session expired. Enter code from authenticator.")
+    if update.callback_query is not None:
+        await update.callback_query.answer("Authentication required.")
     return False
 
 
@@ -4665,33 +4688,51 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
         services_info=services.get_available_services(),
     )
 
-    # Command handlers (alphabetical registration, but order doesn't matter for commands)
-    app.add_handler(CommandHandler("start", handle_start))
-    app.add_handler(CommandHandler("new", handle_new))
-    app.add_handler(CommandHandler("models", handle_models))
-    app.add_handler(CommandHandler("model", handle_model))
-    app.add_handler(CommandHandler("stats", handle_stats))
-    app.add_handler(CommandHandler("help", handle_help))
-    app.add_handler(CommandHandler("job", handle_job))
-    app.add_handler(CommandHandler("jobs", handle_jobs))
-    app.add_handler(CommandHandler("settings", handle_settings))
-    app.add_handler(CommandHandler("project", handle_project))
-    app.add_handler(CommandHandler("workspace", handle_workspace))
-    app.add_handler(CommandHandler("ws", handle_workspace))
-    app.add_handler(CommandHandler("workspaces", handle_workspaces))
-    app.add_handler(CommandHandler("voice", handle_voice_command))
-    app.add_handler(CommandHandler("voices", handle_voices))
-    app.add_handler(CommandHandler("webhooks", handle_webhooks))
-    app.add_handler(CommandHandler("github", handle_github))
-    app.add_handler(CommandHandler("review", handle_review_command))
-    app.add_handler(CommandHandler("memory", memory_command.handle_memory_command))
-    app.add_handler(CommandHandler("stop", handle_stop))
+    # Default every recognized command to sensitive. `/start` and `/help`
+    # disclose no user state and remain available so an authorized operator can
+    # get recovery guidance before authenticating. Adding a future command to
+    # this table automatically puts it behind TOTP unless it is deliberately
+    # added to the narrow exemption set.
+    command_handlers = [
+        ("start", handle_start),
+        ("new", handle_new),
+        ("models", handle_models),
+        ("model", handle_model),
+        ("stats", handle_stats),
+        ("help", handle_help),
+        ("job", handle_job),
+        ("jobs", handle_jobs),
+        ("settings", handle_settings),
+        ("project", handle_project),
+        ("workspace", handle_workspace),
+        ("ws", handle_workspace),
+        ("workspaces", handle_workspaces),
+        ("voice", handle_voice_command),
+        ("voices", handle_voices),
+        ("webhooks", handle_webhooks),
+        ("github", handle_github),
+        ("review", handle_review_command),
+        ("memory", memory_command.handle_memory_command),
+        ("stop", handle_stop),
+    ]
+    totp_exempt_commands = {"start", "help"}
+    for command, callback in command_handlers:
+        registered_callback = (
+            callback if command in totp_exempt_commands else _require_sensitive_authentication(callback)
+        )
+        app.add_handler(CommandHandler(command, registered_callback))
 
-    # Callback query handlers for inline keyboards (pattern-matched)
-    app.add_handler(CallbackQueryHandler(handle_model_callback, pattern=r"^model:"))
-    app.add_handler(CallbackQueryHandler(handle_voice_callback, pattern=r"^voice:"))
-    app.add_handler(CallbackQueryHandler(handle_workspace_callback, pattern=r"^ws:"))
-    app.add_handler(CallbackQueryHandler(memory_command.handle_memory_callback, pattern=r"^mem:"))
+    # Every callback either discloses user state or mutates it, so all callback
+    # families share the same authorization/TOTP middleware.
+    app.add_handler(CallbackQueryHandler(_require_sensitive_authentication(handle_model_callback), pattern=r"^model:"))
+    app.add_handler(CallbackQueryHandler(_require_sensitive_authentication(handle_voice_callback), pattern=r"^voice:"))
+    app.add_handler(CallbackQueryHandler(_require_sensitive_authentication(handle_workspace_callback), pattern=r"^ws:"))
+    app.add_handler(
+        CallbackQueryHandler(
+            _require_sensitive_authentication(memory_command.handle_memory_callback),
+            pattern=r"^mem:",
+        )
+    )
 
     # Media handlers (must be before the catch-all text handler)
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
