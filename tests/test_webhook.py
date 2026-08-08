@@ -407,10 +407,11 @@ def _build_test_app(
 ) -> web.Application:
     """Build a minimal aiohttp app with _handle_github wired up.
 
-    The config parameter controls per-user routing. When None, a mock
-    Config with user_configs={} is used, which causes _get_subscribed_users
-    to return empty and the fallback path (admin chat_id) to fire. To test
-    per-user routing, pass a mock with user_configs populated.
+    The config parameter controls per-user routing. When None, the legacy
+    fallback-admin fixture is retained, but its synchronous user lookup
+    returns an explicit ``owner/repo`` authorization so review/triage tests
+    exercise the permitted path. To test other routing, pass a mock with
+    custom user_configs.
 
     Feature flags (pr_review, issue_triage, notify_chat_id) are now resolved
     per-user via resolve_github_settings() instead of app dict globals.
@@ -435,8 +436,10 @@ def _build_test_app(
     mock_bot = AsyncMock()
     app[TELEGRAM_BOT_KEY] = mock_bot
     app[CHAT_ID_KEY] = 12345
-    # Config for per-user routing. Default mock has no user_configs,
-    # so all events fall through to admin chat_id.
+    # Config for per-user routing. The default deliberately keeps an empty
+    # routing map so these older tests exercise the fallback path without a DB,
+    # while get_user_config returns the fallback admin's explicit operations
+    # authorization.
     if config is None:
         # Config is a sync dataclass. Using AsyncMock here would make
         # every chained attribute call (e.g. config.default_models.get(...))
@@ -451,13 +454,19 @@ def _build_test_app(
         # which the mocked downstream callers accept but real code
         # would not.
         mock_config = MagicMock()
+        default_user = UserConfig(
+            telegram_id=12345,
+            name="test-admin",
+            role="admin",
+            github_repos=["owner/repo"],
+        )
         mock_config.user_configs = {}
         mock_config.default_models = {}
         mock_config.default_backend = "claude"
         mock_config.default_provider = ""
-        # get_user_config is synchronous in real Config; must not
-        # return a coroutine. With no users configured, always None.
-        mock_config.get_user_config = lambda uid: None
+        # get_user_config is synchronous in real Config; it must not return a
+        # coroutine or authorization could be tested against a mock object.
+        mock_config.get_user_config = lambda uid: default_user if uid == 12345 else None
         app[CONFIG_KEY] = mock_config
     else:
         app[CONFIG_KEY] = config
@@ -1996,8 +2005,8 @@ class TestPerUserRouting:
         assert call_args[0][0] == 111
 
     @pytest.mark.asyncio
-    async def test_admin_wildcard_triggers_pr_review(self, _clear_cooldowns, _mock_resolve_repo):
-        """Admin wildcard with pr_review=True triggers the review agent."""
+    async def test_admin_wildcard_cannot_trigger_pr_review(self, _clear_cooldowns, _mock_resolve_repo, caplog):
+        """Subscription wildcard never grants shared-identity review authority."""
         admin = self._make_user_config(111, role="admin")
         config = self._make_config_with_users([admin])
         app = _build_test_app(config=config)
@@ -2022,7 +2031,82 @@ class TestPerUserRouting:
 
             # Allow background task to complete
             await asyncio.sleep(0.01)
-            mock_review.assert_called_once()
+            mock_review.assert_not_called()
+            app[TELEGRAM_BOT_KEY].send_message.assert_called_once()
+            assert "not admin-authorized" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_db_added_subscription_cannot_trigger_pr_review(
+        self,
+        _clear_cooldowns,
+        _mock_resolve_repo,
+        caplog,
+    ):
+        """An effective notification subscription does not grant review."""
+        user = self._make_user_config(111, repos=[])
+        config = self._make_config_with_users([user])
+        app = _build_test_app(config=config)
+        payload = _make_pr_payload("opened")
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        with (
+            patch(
+                "kai.webhook.sessions.get_effective_repos",
+                new=AsyncMock(return_value=["owner/repo"]),
+            ),
+            _mock_settings(pr_review=True, notify_chat_id=111),
+            patch("kai.webhook.review.review_pr", new_callable=AsyncMock) as mock_review,
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "pull_request",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert resp.status == 200
+
+            await asyncio.sleep(0.01)
+            mock_review.assert_not_called()
+            app[TELEGRAM_BOT_KEY].send_message.assert_called_once()
+            assert "not admin-authorized" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_db_added_subscription_cannot_trigger_issue_triage(self, _clear_cooldowns, caplog):
+        """Mutable notification state cannot grant GitHub mutations."""
+        user = self._make_user_config(111, repos=[])
+        config = self._make_config_with_users([user])
+        app = _build_test_app(config=config)
+        payload = _make_issue_payload("opened")
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        with (
+            patch(
+                "kai.webhook.sessions.get_effective_repos",
+                new=AsyncMock(return_value=["owner/repo"]),
+            ),
+            _mock_settings(issue_triage=True, notify_chat_id=111),
+            patch("kai.webhook.triage.triage_issue", new_callable=AsyncMock) as mock_triage,
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "issues",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert resp.status == 200
+
+            await asyncio.sleep(0.01)
+            mock_triage.assert_not_called()
+            app[TELEGRAM_BOT_KEY].send_message.assert_called_once()
+            assert "not admin-authorized" in caplog.text
 
     @pytest.mark.asyncio
     async def test_regular_user_no_repos_receives_nothing(self, _clear_cooldowns):

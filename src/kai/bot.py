@@ -3395,9 +3395,9 @@ async def _resolve_review_repo(
     Walks the conservative ladder per the spec:
 
     1. If the active workspace is a git checkout whose `origin` remote
-       normalizes to exactly one repo in the user's effective GitHub
-       repo list, return that repo.
-    2. Otherwise, if the user's effective GitHub repo list contains
+       normalizes to exactly one repo in the user's admin-configured
+       GitHub repo list, return that repo.
+    2. Otherwise, if the user's configured GitHub repo list contains
        exactly one repo, return that repo.
     3. Otherwise, return the empty string so the caller can prompt
        for the explicit `owner/repo` form.
@@ -3423,18 +3423,16 @@ async def _resolve_review_repo(
             without re-fetching.
     """
     user_config = config.get_user_config(actor_id)
-    yaml_repos = user_config.github_repos if user_config else []
-    effective_repos = await sessions.get_effective_repos(actor_id, yaml_repos)
-    effective_lower = {r.lower() for r in effective_repos}
+    authorized_repos = sorted({repo.strip().lower() for repo in (user_config.github_repos if user_config else [])})
 
     workspace_remote_raw = await review._resolve_workspace_remote_repo(workspace)
     workspace_remote = workspace_remote_raw.lower() if workspace_remote_raw else ""
 
-    if workspace_remote and workspace_remote in effective_lower:
+    if workspace_remote and workspace_remote in authorized_repos:
         return workspace_remote, workspace_remote
 
-    if len(effective_repos) == 1:
-        return effective_repos[0].lower(), workspace_remote
+    if len(authorized_repos) == 1:
+        return authorized_repos[0].lower(), workspace_remote
 
     return "", workspace_remote
 
@@ -3449,9 +3447,9 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
         /review <pr-number>              repository is inferred from
                                          the active workspace's git
                                          remote (when it matches one
-                                         of the user's effective
+                                         of the user's configured
                                          GitHub repos) or from the
-                                         sole effective repo.
+                                         sole configured repo.
         /review <owner/repo> <pr-number> explicit repository.
 
     Auth + TOTP gate mirrors content-invoking commands. The review
@@ -3508,7 +3506,7 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_text(
                 f"{usage}\n"
                 "Could not infer the repository from your active workspace or your "
-                "effective GitHub repo list."
+                "admin-configured GitHub repo list."
             )
             return
     elif len(args) == 2:
@@ -3528,13 +3526,30 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(usage)
         return
 
+    # Review collection shells out to `gh` in the outer Kai process. The
+    # target must therefore come from the user's admin-controlled users.yaml
+    # grant, never merely from a self-service notification subscription. This
+    # check covers both the inferred and explicit command forms and defaults
+    # to no authority for missing users and admins with an empty list.
+    user_config = config.get_user_config(actor_id)
+    if user_config is None or not user_config.authorizes_github_repo(repo):
+        log.warning(
+            "Denied manual GitHub review for user %d: repository %s is not admin-authorized",
+            actor_id,
+            repo,
+        )
+        await update.message.reply_text(
+            f"Repository `{repo}` is not authorized for GitHub review. "
+            "Ask the Kai administrator to add its exact name to your github_repos entry in users.yaml."
+        )
+        return
+
     # Per-user backend / provider / claude-user / model-override
     # resolution. Use the shared `get_user_backend_and_provider`
     # helper so a manual /review picks up exactly the same effective
     # backend the rest of the bot uses for this user; hand-rolling
     # the fallback would drift if config.py's resolution rules ever
     # change.
-    user_config = config.get_user_config(actor_id)
     claude_user = user_config.os_user if user_config and user_config.os_user else None
     agent_backend, provider = get_user_backend_and_provider(user_config, config)
     model_override = resolve_user_model(ModelRole.PR_REVIEW, user_config, config)

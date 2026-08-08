@@ -778,6 +778,8 @@ async def _process_github_event_for_user(
     # back to "run as the bot's own OS user" inside the agent backend.
     user_config = config.get_user_config(chat_id)
     claude_user = user_config.os_user if user_config and user_config.os_user else None
+    repo_full_name = payload.get("repository", {}).get("full_name", "")
+    github_operations_authorized = bool(user_config and user_config.authorizes_github_repo(repo_full_name))
 
     # Resolve per-user backend/provider for the review/triage agents.
     # Same resolution logic as pool.py _create_instance: per-user
@@ -811,10 +813,10 @@ async def _process_github_event_for_user(
     # (closed, merged) still get the standard Telegram notification.
     if settings["pr_review"] and event_type == "pull_request":
         action = payload.get("action", "")
-        if action in ("opened", "reopened", "synchronize"):
+        if action in ("opened", "reopened", "synchronize") and github_operations_authorized:
             pr = payload.get("pull_request", {})
             pr_number = pr.get("number", 0)
-            repo = payload.get("repository", {}).get("full_name", "")
+            repo = repo_full_name
             cooldown = request.app.get(PR_REVIEW_COOLDOWN_KEY, 300)
 
             # Cooldown is server-level, shared across all users.
@@ -866,6 +868,12 @@ async def _process_github_event_for_user(
                 chat_id,
             )
             return
+        if action in ("opened", "reopened", "synchronize"):
+            log.warning(
+                "Denied automated GitHub review for user %d: repository %s is not admin-authorized",
+                chat_id,
+                repo_full_name,
+            )
 
     # ── Issue triage routing ────────────────────────────────────
     # When issue triage is enabled for this user, opened issues are
@@ -875,10 +883,10 @@ async def _process_github_event_for_user(
     # the standard formatter.
     if settings["issue_triage"] and event_type == "issues":
         action = payload.get("action", "")
-        if action == "opened":
+        if action == "opened" and github_operations_authorized:
             issue = payload.get("issue", {})
             issue_number = issue.get("number", 0)
-            repo = payload.get("repository", {}).get("full_name", "")
+            repo = repo_full_name
 
             if _should_skip_triage(repo, issue_number):
                 log.info(
@@ -912,6 +920,12 @@ async def _process_github_event_for_user(
                 chat_id,
             )
             return
+        if action == "opened":
+            log.warning(
+                "Denied automated GitHub issue triage for user %d: repository %s is not admin-authorized",
+                chat_id,
+                repo_full_name,
+            )
 
     # ── Standard notification path ───────────────────────────────
     # Look up the formatter for this event type

@@ -1044,6 +1044,9 @@ class UserConfig:
         timeout: Default timeout in seconds for Claude responses.
         workspace_base: Base directory for /workspace new and name resolution.
             Falls back to global WORKSPACE_BASE env var if not set.
+        github_repos: Admin-controlled repositories this user may access
+            through Kai's shared GitHub review and triage authority. The
+            mutable notification subscription list cannot expand this set.
         allowed_services: External proxy service names this user's persistent
             agent may call. Empty by default, including for admins.
     """
@@ -1072,8 +1075,11 @@ class UserConfig:
     backend: str | None = None
     provider: str | None = None
     # GitHub notification routing fields. github_repos controls which
-    # repos route webhook events to this user. pr_review and issue_triage
-    # are tri-state: None = use global default, True/False = admin override.
+    # repos initially route webhook events to this user and is also the
+    # admin-controlled authorization boundary for review/triage operations.
+    # Self-service notification subscriptions never expand that authority.
+    # pr_review and issue_triage are tri-state: None = use global default,
+    # True/False = admin override.
     github_repos: list[str] = field(default_factory=list)
     github_notify_chat_id: int | None = None
     pr_review: bool | None = None
@@ -1095,6 +1101,17 @@ class UserConfig:
     # gets `models["agent"] = model_value` synthesized at load time
     # so existing users.yaml files keep working unchanged.
     models: dict[str, str] | None = None
+
+    def authorizes_github_repo(self, repo: str) -> bool:
+        """Return whether shared-identity GitHub operations may target ``repo``.
+
+        Only the loaded, admin-controlled ``users.yaml`` baseline grants
+        this authority. Database additions made through ``/github add`` are
+        notification subscriptions and are deliberately not consulted here.
+        GitHub owner/repository names are case-insensitive.
+        """
+        normalized = repo.strip().lower()
+        return bool(normalized) and any(configured.strip().lower() == normalized for configured in self.github_repos)
 
 
 # ── Config dataclass ─────────────────────────────────────────────────

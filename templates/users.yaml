@@ -49,11 +49,13 @@ users:
     # provider: openai    # required for goose and opencode (selects the model registry)
     # model: anthropic/claude-sonnet-4-6   # opencode example (full provider/model ID)
 
-    # GitHub notification settings. github_repos controls which repos
-    # route events to this user. pr_review and issue_triage toggle
-    # automated processing. github_notify_chat_id sends notifications
+    # GitHub settings. github_repos is the admin-controlled authorization
+    # boundary for GitHub review and triage operations, as well as the
+    # initial notification list. Omission grants no review/triage authority,
+    # even to admins. `/github add` can add notification subscriptions but
+    # never expands this operations allowlist. pr_review and issue_triage
+    # toggle automated processing. github_notify_chat_id sends notifications
     # to a separate chat (e.g., a Telegram group) instead of the DM.
-    # All are optional and overridable via /github commands.
     # github_repos:
     #   - alice/my-project
     #   - alice/other-repo

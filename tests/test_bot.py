@@ -5825,6 +5825,21 @@ def _review_result(text: str = "review output", warnings=()) -> PRReviewResult:
     )
 
 
+def _review_command_config(*repos: str, user_id: int = 1) -> Config:
+    """Build a production-shaped config for an authorized review actor."""
+    configured = list(repos or ("dcellison/kai",))
+    return _make_config(
+        allowed_user_ids={user_id},
+        user_configs={
+            user_id: UserConfig(
+                telegram_id=user_id,
+                name="reviewer",
+                github_repos=configured,
+            )
+        },
+    )
+
+
 class TestHandleReviewCommand:
     """
     Manual /review command. The handler shares the bundle path with
@@ -5841,8 +5856,8 @@ class TestHandleReviewCommand:
         update = _make_update()
         config = _make_config(
             user_configs={
-                12345: UserConfig(
-                    telegram_id=12345,
+                1: UserConfig(
+                    telegram_id=1,
                     name="op",
                     github_repos=["dcellison/kai", "dcellison/other"],
                 ),
@@ -5871,16 +5886,16 @@ class TestHandleReviewCommand:
         assert mock_generate.call_args.args == ("dcellison/kai", 681)
 
     @pytest.mark.asyncio
-    async def test_short_form_falls_back_to_sole_effective_repo(self, tmp_path, monkeypatch):
+    async def test_short_form_falls_back_to_sole_configured_repo(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
         monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         update = _make_update()
-        # Workspace remote doesn't match the single effective repo;
-        # the sole-effective fallback kicks in.
+        # Workspace remote doesn't match the single configured repo;
+        # the sole-configured fallback kicks in.
         config = _make_config(
             user_configs={
-                12345: UserConfig(
-                    telegram_id=12345,
+                1: UserConfig(
+                    telegram_id=1,
                     name="op",
                     github_repos=["dcellison/kai"],
                 ),
@@ -5906,6 +5921,28 @@ class TestHandleReviewCommand:
         assert mock_generate.call_args.args == ("dcellison/kai", 681)
 
     @pytest.mark.asyncio
+    async def test_short_form_deduplicates_case_varied_configured_repo(self, tmp_path, monkeypatch):
+        """Duplicate config spellings remain one usable authorization."""
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update()
+        config = _review_command_config("DCellison/Kai", "dcellison/kai")
+        ctx = _make_context(config=config, args=["681"])
+        ctx.bot.send_document = AsyncMock()
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch("kai.review._resolve_workspace_remote_repo", new=AsyncMock(return_value="")),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(return_value=_review_result()),
+            ) as mock_generate,
+        ):
+            await handle_review_command(update, ctx)
+
+        assert mock_generate.call_args.args == ("dcellison/kai", 681)
+
+    @pytest.mark.asyncio
     async def test_short_form_usage_error_when_unresolved(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
         monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
@@ -5913,8 +5950,8 @@ class TestHandleReviewCommand:
         # Multi-repo + no workspace match → usage error.
         config = _make_config(
             user_configs={
-                12345: UserConfig(
-                    telegram_id=12345,
+                1: UserConfig(
+                    telegram_id=1,
                     name="op",
                     github_repos=["dcellison/kai", "dcellison/other"],
                 ),
@@ -5946,7 +5983,7 @@ class TestHandleReviewCommand:
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
         monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         update = _make_update()
-        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx = _make_context(config=_review_command_config(), args=["dcellison/kai", "681"])
         ctx.bot.send_document = AsyncMock()
 
         with (
@@ -5959,6 +5996,51 @@ class TestHandleReviewCommand:
             await handle_review_command(update, ctx)
 
         assert mock_generate.call_args.args == ("dcellison/kai", 681)
+
+    @pytest.mark.asyncio
+    async def test_explicit_repo_denied_when_only_another_user_is_authorized(self, tmp_path, monkeypatch):
+        """One user cannot spend Kai's GitHub authority granted to another."""
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update(user_id=1)
+        config = _make_config(
+            allowed_user_ids={1, 2},
+            user_configs={
+                1: UserConfig(telegram_id=1, name="alice", github_repos=["alice/repo"]),
+                2: UserConfig(telegram_id=2, name="bob", github_repos=["private/target"]),
+            },
+        )
+        ctx = _make_context(config=config, args=["private/target", "681"])
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch("kai.bot.review.generate_pr_review", new=AsyncMock()) as mock_generate,
+        ):
+            await handle_review_command(update, ctx)
+
+        mock_generate.assert_not_awaited()
+        replies = [call.args[0] for call in update.message.reply_text.call_args_list]
+        assert any("not authorized for GitHub review" in reply for reply in replies)
+
+    @pytest.mark.asyncio
+    async def test_db_added_subscription_does_not_authorize_explicit_review(self, tmp_path, monkeypatch):
+        """Mutable notification subscriptions never grant shared-gh access."""
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update(user_id=1)
+        config = _review_command_config("configured/repo")
+        ctx = _make_context(config=config, args=["db-added/repo", "681"])
+        mock_effective = AsyncMock(return_value=["configured/repo", "db-added/repo"])
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch("kai.bot.sessions.get_effective_repos", new=mock_effective),
+            patch("kai.bot.review.generate_pr_review", new=AsyncMock()) as mock_generate,
+        ):
+            await handle_review_command(update, ctx)
+
+        mock_effective.assert_not_awaited()
+        mock_generate.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_invalid_repo_format_returns_error(self, tmp_path, monkeypatch):
@@ -6007,7 +6089,7 @@ class TestHandleReviewCommand:
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
         monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         update = _make_update()
-        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx = _make_context(config=_review_command_config(), args=["dcellison/kai", "681"])
         ctx.bot.send_document = AsyncMock()
 
         ack_at_call: list[int] = []
@@ -6030,7 +6112,7 @@ class TestHandleReviewCommand:
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
         monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         update = _make_update()
-        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx = _make_context(config=_review_command_config(), args=["dcellison/kai", "681"])
         ctx.bot.send_document = AsyncMock()
 
         with (
@@ -6053,7 +6135,7 @@ class TestHandleReviewCommand:
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
         monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         update = _make_update(chat_id=12345)
-        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx = _make_context(config=_review_command_config(), args=["dcellison/kai", "681"])
         ctx.bot.send_document = AsyncMock()
 
         with (
@@ -6075,7 +6157,7 @@ class TestHandleReviewCommand:
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
         monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         update = _make_update(chat_id=12345)
-        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx = _make_context(config=_review_command_config(), args=["dcellison/kai", "681"])
         ctx.bot.send_document = AsyncMock()
 
         with (
@@ -6101,7 +6183,7 @@ class TestHandleReviewCommand:
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
         monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         update = _make_update()
-        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx = _make_context(config=_review_command_config(), args=["dcellison/kai", "681"])
         ctx.bot.send_document = AsyncMock()
 
         with (
@@ -6125,7 +6207,7 @@ class TestHandleReviewCommand:
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
         monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         update = _make_update()
-        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx = _make_context(config=_review_command_config(), args=["dcellison/kai", "681"])
         ctx.bot.send_document = AsyncMock()
 
         from kai.webhook import _review_cooldowns
@@ -6147,7 +6229,7 @@ class TestHandleReviewCommand:
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
         monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         update = _make_update()
-        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx = _make_context(config=_review_command_config(), args=["dcellison/kai", "681"])
         ctx.bot.send_document = AsyncMock()
 
         warnings = (CollectionWarning(source="related_search", message="search unavailable for repo"),)
@@ -6169,7 +6251,7 @@ class TestHandleReviewCommand:
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
         monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         update = _make_update()
-        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx = _make_context(config=_review_command_config(), args=["dcellison/kai", "681"])
         ctx.bot.send_document = AsyncMock()
 
         with (
@@ -6209,7 +6291,7 @@ class TestHandleReviewCommand:
     async def test_group_chat_uses_user_id_for_user_scoped_lookups(self, tmp_path, monkeypatch):
         # In a notification group the message arrives on a group
         # chat_id but the actor is the operator. User-scoped lookups
-        # (user_config, effective repos) must key on user_id, NOT
+        # (user_config, configured repos) must key on user_id, NOT
         # chat_id, so the review picks up the operator's settings.
         # Without this split, get_user_config(group_chat_id) returns
         # None, github_repos is [], and the resolution silently
@@ -6234,12 +6316,9 @@ class TestHandleReviewCommand:
         ctx = _make_context(config=config, args=["681"])
         ctx.bot.send_document = AsyncMock()
 
-        mock_effective = AsyncMock(return_value=["dcellison/kai"])
-
         with (
             patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
             patch("kai.review._resolve_workspace_remote_repo", new=AsyncMock(return_value="")),
-            patch("kai.sessions.get_effective_repos", new=mock_effective),
             patch(
                 "kai.bot.review.generate_pr_review",
                 new=AsyncMock(return_value=_review_result()),
@@ -6247,9 +6326,6 @@ class TestHandleReviewCommand:
         ):
             await handle_review_command(update, ctx)
 
-        # effective-repos lookup uses the actor (user) id, not the
-        # group chat id - this is the load-bearing assertion.
-        assert mock_effective.await_args.args[0] == 12345
         # The review actually runs with the operator's resolved
         # settings (codex / openai / daniel), not the global
         # defaults that would apply if the lookup had used the
@@ -6258,7 +6334,7 @@ class TestHandleReviewCommand:
         assert kwargs["agent_backend"] == "codex"
         assert kwargs["provider"] == "openai"
         assert kwargs["claude_user"] == "daniel"
-        # And the inferred repo is the operator's (sole) effective
+        # And the inferred repo is the operator's sole configured
         # repo, not empty.
         assert mock_generate.call_args.args == ("dcellison/kai", 681)
 
@@ -6270,7 +6346,7 @@ class TestHandleReviewCommand:
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
         monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         update = _make_update(chat_id=12345)
-        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx = _make_context(config=_review_command_config(), args=["dcellison/kai", "681"])
         ctx.bot.send_document = AsyncMock(side_effect=RuntimeError("file too large"))
 
         with (
@@ -6300,7 +6376,7 @@ class TestHandleReviewCommand:
         # write_text call raises OSError without touching real /tmp.
         monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path / "does-not-exist")
         update = _make_update()
-        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx = _make_context(config=_review_command_config(), args=["dcellison/kai", "681"])
         ctx.bot.send_document = AsyncMock()
 
         with (
@@ -6324,7 +6400,7 @@ class TestHandleReviewCommand:
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
         monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         update = _make_update()
-        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx = _make_context(config=_review_command_config(), args=["dcellison/kai", "681"])
         ctx.bot.send_document = AsyncMock()
 
         with (
@@ -6356,7 +6432,7 @@ class TestHandleReviewCommand:
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
         monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         update = _make_update()
-        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx = _make_context(config=_review_command_config(), args=["dcellison/kai", "681"])
         ctx.bot.send_document = AsyncMock()
 
         # Build warnings whose combined size exceeds 4096 chars.
@@ -6406,7 +6482,7 @@ class TestHandleReviewCommand:
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
         monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         update = _make_update()
-        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx = _make_context(config=_review_command_config(), args=["dcellison/kai", "681"])
         ctx.bot.send_document = AsyncMock()
 
         with (
@@ -6433,7 +6509,7 @@ class TestHandleReviewCommand:
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
         monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         update = _make_update()
-        ctx = _make_context(args=["dcellison/kai", "681"])
+        ctx = _make_context(config=_review_command_config(), args=["dcellison/kai", "681"])
         ctx.bot.send_document = AsyncMock()
 
         with (
@@ -6452,8 +6528,8 @@ class TestHandleReviewCommand:
         assert mock_generate.call_args.kwargs["local_repo_path"] == "/home/workspace"
 
     @pytest.mark.asyncio
-    async def test_short_form_sole_effective_with_mismatched_workspace_passes_none(self, tmp_path, monkeypatch):
-        # Short form falls back to the sole effective repo because
+    async def test_short_form_sole_configured_with_mismatched_workspace_passes_none(self, tmp_path, monkeypatch):
+        # Short form falls back to the sole configured repo because
         # the workspace remote does not match it (or is empty).
         # local_repo_path must be None in that case for the same
         # reason as the explicit form: the workspace and the
@@ -6463,8 +6539,8 @@ class TestHandleReviewCommand:
         update = _make_update()
         config = _make_config(
             user_configs={
-                12345: UserConfig(
-                    telegram_id=12345,
+                1: UserConfig(
+                    telegram_id=1,
                     name="op",
                     github_repos=["dcellison/kai"],
                 ),
@@ -6476,13 +6552,9 @@ class TestHandleReviewCommand:
         with (
             patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
             # No GitHub remote at all (e.g. a plain non-git
-            # workspace) - the sole-effective fallback fires but
+            # workspace) - the sole-configured fallback fires but
             # the workspace must not propagate.
             patch("kai.review._resolve_workspace_remote_repo", new=AsyncMock(return_value="")),
-            patch(
-                "kai.sessions.get_effective_repos",
-                new=AsyncMock(return_value=["dcellison/kai"]),
-            ),
             patch(
                 "kai.bot.review.generate_pr_review",
                 new=AsyncMock(return_value=_review_result()),
@@ -6502,8 +6574,8 @@ class TestHandleReviewCommand:
         update = _make_update()
         config = _make_config(
             user_configs={
-                12345: UserConfig(
-                    telegram_id=12345,
+                1: UserConfig(
+                    telegram_id=1,
                     name="op",
                     github_repos=["dcellison/kai", "dcellison/other"],
                 ),
@@ -6517,10 +6589,6 @@ class TestHandleReviewCommand:
             patch(
                 "kai.review._resolve_workspace_remote_repo",
                 new=AsyncMock(return_value="dcellison/kai"),
-            ),
-            patch(
-                "kai.sessions.get_effective_repos",
-                new=AsyncMock(return_value=["dcellison/kai", "dcellison/other"]),
             ),
             patch(
                 "kai.bot.review.generate_pr_review",

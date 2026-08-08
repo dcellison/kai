@@ -96,6 +96,7 @@ Kai has real local authority, so the security model is part of the product rathe
 - **Local execution:** Kai runs on your machine. Conversations do not pass through a Kai-hosted relay.
 - **Path confinement:** File exchange is constrained to allowed workspace and file-storage paths.
 - **Service proxy:** Third-party API keys live in server-side config and are injected only for services explicitly allowed to that user in `users.yaml`; keys are never placed in conversation context.
+- **GitHub operation boundary:** Shared-identity PR review and issue triage run only for repositories explicitly authorized to that user in admin-controlled `users.yaml`; notification subscriptions cannot grant operation access.
 - **Per-user isolation:** Users have separate history, files, workspaces, jobs, settings, and agent subprocesses.
 - **Principal-bound internal API:** Agent API credentials resolve to a fixed user and explicit scopes in the outer service; request data cannot select another principal.
 - **Separated webhook credentials:** GitHub, generic, and Telegram ingress use distinct secrets that are not exposed to persistent agent subprocesses.

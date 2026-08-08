@@ -734,6 +734,26 @@ class TestLoadUserConfigs:
         assert configs is not None
         assert configs[111].github_repos == []
 
+    def test_github_operations_require_exact_admin_configured_repo(self):
+        """Repository authority is exact, case-insensitive, and fail-closed."""
+        user = UserConfig(
+            telegram_id=111,
+            name="alice",
+            role="admin",
+            github_repos=["Owner/Allowed"],
+        )
+
+        assert user.authorizes_github_repo("owner/allowed")
+        assert user.authorizes_github_repo("OWNER/ALLOWED")
+        assert not user.authorizes_github_repo("owner/other")
+        assert not user.authorizes_github_repo("")
+
+    def test_admin_without_github_repos_has_no_operation_authority(self):
+        """Admin role never implies wildcard GitHub review/triage access."""
+        admin = UserConfig(telegram_id=111, name="alice", role="admin")
+
+        assert not admin.authorizes_github_repo("owner/repo")
+
     # ── github_notify_chat_id field ──
 
     def test_github_notify_chat_id_parsed(self, tmp_path):
