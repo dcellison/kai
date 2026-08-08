@@ -102,6 +102,13 @@ Kai has real local authority, so the security model is part of the product rathe
 - **Separated webhook credentials:** GitHub, generic, and Telegram ingress use distinct secrets that are not exposed to persistent agent subprocesses.
 - **Optional OS isolation:** A user's backend subprocess can run under a dedicated OS account through generated sudoers rules.
 
+Upgraded installations may temporarily retain the former shared
+`WEBHOOK_SECRET`. After all GitHub and generic webhook callers have been moved
+to their named secrets, run `make config` and answer `false` to **Retain
+deprecated WEBHOOK_SECRET fallback**. Pressing Enter keeps compatibility. The
+generated `install.conf` can then be reviewed with `make DRY_RUN=1 install`
+before `make install` deploys it.
+
 See [TOTP Authentication](https://github.com/dcellison/kai/wiki/TOTP-Authentication), [GitHub Notification Routing](https://github.com/dcellison/kai/wiki/GitHub-Notification-Routing), and [Exposing Kai to the Internet](https://github.com/dcellison/kai/wiki/Exposing-Kai-to-the-Internet) for the detailed operational docs.
 
 ## Common Workflows

@@ -766,8 +766,8 @@ def _cmd_config() -> None:
 
     If install.conf already exists, its values are used as defaults so re-running
     only asks about changes. Auto-detects platform, generates distinct named
-    webhook secrets, and preserves an existing legacy secret for the temporary
-    compatibility window. Validates all inputs before writing.
+    webhook secrets, and offers an explicit safe-default choice to preserve or
+    retire an existing legacy secret. Validates all inputs before writing.
 
     No sudo required - this runs as the current user.
     """
@@ -1669,6 +1669,23 @@ def _cmd_config() -> None:
     reserved_webhook_secrets = {github_webhook_secret, legacy_webhook_secret, tg_webhook_secret}
     while not generic_webhook_secret or generic_webhook_secret in reserved_webhook_secrets:
         generic_webhook_secret = secrets.token_hex(32)
+
+    # install.conf is generated output from this wizard. An upgraded install
+    # must therefore retire the legacy fallback here rather than by editing or
+    # post-processing that artifact. Preserve compatibility on Enter: callers
+    # have to be migrated and tested before the operator explicitly chooses
+    # false. Fresh installations never carry WEBHOOK_SECRET and skip the prompt.
+    if legacy_webhook_secret:
+        print()
+        print("A deprecated WEBHOOK_SECRET compatibility fallback is present.")
+        print("Retire it only after GitHub and generic webhook callers use their named secrets.")
+        retain_legacy_webhook_secret = _prompt_bool(
+            "Retain deprecated WEBHOOK_SECRET fallback",
+            True,
+        )
+        if not retain_legacy_webhook_secret:
+            legacy_webhook_secret = ""
+            print("  WEBHOOK_SECRET will be omitted from the generated configuration.")
     print()
 
     # -- Workspaces --

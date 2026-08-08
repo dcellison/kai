@@ -1850,7 +1850,54 @@ class TestCmdConfig:
         output = capsys.readouterr().out
         assert "Admin Telegram ID" not in output
         assert "-- User setup --" not in output
+        assert "A deprecated WEBHOOK_SECRET compatibility fallback is present" in output
         assert "users_yaml_staging_path" not in conf
+
+    def test_regeneration_can_retire_legacy_webhook_fallback(self, tmp_path, monkeypatch, capsys):
+        """The operator retires compatibility through make config; the
+        generated artifact omits only the legacy key and keeps named secrets.
+        """
+        monkeypatch.chdir(tmp_path)
+        conf_path = tmp_path / "install.conf"
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._simulate_existing_etc_users_yaml(
+            monkeypatch,
+            "users:\n  - telegram_id: 999\n    name: existing\n    role: admin\n",
+        )
+        existing = {
+            "version": 1,
+            "install_dir": "/opt/kai",
+            "data_dir": "/var/lib/kai",
+            "service_user": "kai",
+            "platform": "darwin",
+            "env": {
+                "TELEGRAM_BOT_TOKEN": "existing-token",
+                "WEBHOOK_SECRET": "legacy-secret",
+                "GITHUB_WEBHOOK_SECRET": "github-secret",
+                "GENERIC_WEBHOOK_SECRET": "generic-secret",
+            },
+        }
+        conf_path.write_text(json.dumps(existing))
+
+        def answer(prompt: str) -> str:
+            if "Claude binary path" in prompt:
+                return "/usr/bin/true"
+            if "Retain deprecated WEBHOOK_SECRET fallback" in prompt:
+                return "false"
+            return ""
+
+        monkeypatch.setattr("builtins.input", answer)
+
+        _cmd_config()
+
+        generated = json.loads(conf_path.read_text())
+        assert "WEBHOOK_SECRET" not in generated["env"]
+        assert generated["env"]["GITHUB_WEBHOOK_SECRET"] == "github-secret"
+        assert generated["env"]["GENERIC_WEBHOOK_SECRET"] == "generic-secret"
+        assert generated["env"]["TELEGRAM_BOT_TOKEN"] == "existing-token"
+        output = capsys.readouterr().out
+        assert "WEBHOOK_SECRET will be omitted from the generated configuration" in output
 
     def test_validates_required_fields(self):
         """Required-field validation rejects empty input."""
