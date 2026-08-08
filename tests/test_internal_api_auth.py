@@ -22,6 +22,26 @@ def test_agent_credentials_are_unique_and_resolve_server_side() -> None:
     assert auth.authenticate("not-a-token") is None
 
 
+def test_persistent_agent_profile_is_explicit_and_excludes_delete_all() -> None:
+    """Persistent agents retain normal APIs but cannot wipe all memory."""
+    auth = InternalAPIAuth.for_users({123})
+    principal = auth.authenticate(auth.agent_credential_for(123))
+
+    assert principal is not None
+    assert principal.scopes == frozenset(
+        {
+            InternalAPIScope.JOBS_READ,
+            InternalAPIScope.JOBS_WRITE,
+            InternalAPIScope.SERVICES_CALL,
+            InternalAPIScope.MESSAGES_SEND,
+            InternalAPIScope.FILES_SEND,
+            InternalAPIScope.MEMORY_READ,
+            InternalAPIScope.MEMORY_ADD,
+        }
+    )
+    assert not principal.allows(InternalAPIScope.MEMORY_DELETE_ALL)
+
+
 def test_notification_credential_has_only_message_scope() -> None:
     """One-shot notification agents cannot access jobs, files, services, or memory."""
     auth = InternalAPIAuth()
@@ -35,7 +55,8 @@ def test_notification_credential_has_only_message_scope() -> None:
     assert not principal.allows(InternalAPIScope.SERVICES_CALL)
     assert not principal.allows(InternalAPIScope.FILES_SEND)
     assert not principal.allows(InternalAPIScope.MEMORY_READ)
-    assert not principal.allows(InternalAPIScope.MEMORY_WRITE)
+    assert not principal.allows(InternalAPIScope.MEMORY_ADD)
+    assert not principal.allows(InternalAPIScope.MEMORY_DELETE_ALL)
 
 
 def test_fixed_test_credentials_must_be_unique() -> None:

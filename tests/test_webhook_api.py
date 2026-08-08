@@ -10,7 +10,7 @@ import pytest
 from aiohttp import web
 
 from kai import sessions
-from kai.internal_api_auth import InternalAPIAuth, InternalAPIPrincipal
+from kai.internal_api_auth import InternalAPIAuth, InternalAPIPrincipal, InternalAPIScope
 from kai.services import ServiceResponse
 from kai.webhook import (
     ALLOWED_USER_IDS_KEY,
@@ -48,6 +48,15 @@ from kai.webhook import (
 def _make_internal_api_auth() -> InternalAPIAuth:
     """Create deterministic credentials for the two API test principals."""
     return InternalAPIAuth({123: "test-secret", 456: "other-secret"})
+
+
+async def _call_memory_delete_all_as_authorized(request, *, chat_id: int = 123):
+    """Exercise delete-all handler behavior with an explicitly privileged principal."""
+    principal = InternalAPIPrincipal(
+        chat_id=chat_id,
+        scopes=frozenset({InternalAPIScope.MEMORY_DELETE_ALL}),
+    )
+    return await _handle_memory_delete_all.__wrapped__(request, principal)
 
 
 @pytest.fixture
@@ -2783,7 +2792,7 @@ class TestMemoryDeleteAll:
         mock_request.json = AsyncMock(return_value={"confirm": self._CONFIRM})
 
         with patch("kai.memory.is_enabled", return_value=True), patch("kai.memory.delete_all"):
-            resp = await _handle_memory_delete_all(mock_request)
+            resp = await _call_memory_delete_all_as_authorized(mock_request)
 
         assert resp.status == 200
         body = json.loads(resp.body.decode())
@@ -2795,7 +2804,7 @@ class TestMemoryDeleteAll:
         mock_request.json = AsyncMock(return_value={})
 
         with patch("kai.memory.delete_all") as mock_del:
-            resp = await _handle_memory_delete_all(mock_request)
+            resp = await _call_memory_delete_all_as_authorized(mock_request)
 
         assert resp.status == 400
         body = json.loads(resp.body.decode())
@@ -2810,7 +2819,7 @@ class TestMemoryDeleteAll:
         mock_request.json = AsyncMock(return_value={"confirm": "yes-please"})
 
         with patch("kai.memory.delete_all") as mock_del:
-            resp = await _handle_memory_delete_all(mock_request)
+            resp = await _call_memory_delete_all_as_authorized(mock_request)
 
         assert resp.status == 400
         mock_del.assert_not_called()
@@ -2821,7 +2830,7 @@ class TestMemoryDeleteAll:
         mock_request.json = AsyncMock(return_value={"confirm": self._CONFIRM})
 
         with patch("kai.memory.is_enabled", return_value=False), patch("kai.memory.delete_all") as mock_del:
-            resp = await _handle_memory_delete_all(mock_request)
+            resp = await _call_memory_delete_all_as_authorized(mock_request)
 
         assert resp.status == 503
         # The user explicitly asked for a delete; if memory is off, we
@@ -2835,7 +2844,7 @@ class TestMemoryDeleteAll:
         mock_request.json = AsyncMock(return_value={"confirm": self._CONFIRM, "chat_id": 456})
 
         with patch("kai.memory.is_enabled", return_value=True), patch("kai.memory.delete_all") as mock_del:
-            await _handle_memory_delete_all(mock_request)
+            await _call_memory_delete_all_as_authorized(mock_request, chat_id=456)
 
         assert mock_del.call_args.kwargs["user_id"] == "456"
         assert isinstance(mock_del.call_args.kwargs["user_id"], str)
@@ -2863,7 +2872,7 @@ class TestMemoryDeleteAll:
             patch("kai.memory.is_enabled", return_value=True),
             patch("kai.memory.delete_all", side_effect=RuntimeError("boom")),
         ):
-            resp = await _handle_memory_delete_all(mock_request)
+            resp = await _call_memory_delete_all_as_authorized(mock_request)
 
         assert resp.status == 500
         body = json.loads(resp.body.decode())
@@ -2883,9 +2892,21 @@ class TestMemoryDeleteAll:
             patch("kai.memory.is_enabled", return_value=True),
             patch("kai.memory.delete_all") as mock_del,
         ):
+            resp = await _call_memory_delete_all_as_authorized(mock_request)
+
+        assert resp.status == 403
+        mock_del.assert_not_called()
+
+    async def test_persistent_agent_scope_cannot_delete_all(self, mock_request):
+        """A normal persistent-agent credential is denied before deletion."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"confirm": self._CONFIRM})
+
+        with patch("kai.memory.delete_all") as mock_del:
             resp = await _handle_memory_delete_all(mock_request)
 
         assert resp.status == 403
+        assert resp.text == "Credential is not authorized for this operation"
         mock_del.assert_not_called()
 
 
@@ -2932,7 +2953,7 @@ _NON_OBJECT_HANDLERS = [
     pytest.param(_handle_send_file, lambda r: None, id="send_file"),
     pytest.param(_handle_memory_add, lambda r: None, id="memory_add"),
     pytest.param(_handle_memory_search, lambda r: None, id="memory_search"),
-    pytest.param(_handle_memory_delete_all, lambda r: None, id="memory_delete_all"),
+    pytest.param(_call_memory_delete_all_as_authorized, lambda r: None, id="memory_delete_all"),
 ]
 
 # Non-object JSON shapes the handlers must reject. `True` is included

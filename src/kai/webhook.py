@@ -1618,7 +1618,7 @@ def _memory_disabled_response() -> web.Response:
     return web.json_response({"error": "Memory system disabled"}, status=503)
 
 
-@_require_internal_api(InternalAPIScope.MEMORY_WRITE)
+@_require_internal_api(InternalAPIScope.MEMORY_ADD)
 async def _handle_memory_add(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     Store a structured memory via memory.add_structured().
@@ -1904,7 +1904,7 @@ async def _handle_memory_stats(request: web.Request, principal: InternalAPIPrinc
         return web.json_response({"error": "Memory stats failed"}, status=500)
 
 
-@_require_internal_api(InternalAPIScope.MEMORY_WRITE)
+@_require_internal_api(InternalAPIScope.MEMORY_DELETE_ALL)
 async def _handle_memory_delete_all(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     Delete all memories for a user via memory.delete_all().

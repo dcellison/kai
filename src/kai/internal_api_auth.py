@@ -24,10 +24,23 @@ class InternalAPIScope(StrEnum):
     MESSAGES_SEND = "messages:send"
     FILES_SEND = "files:send"
     MEMORY_READ = "memory:read"
-    MEMORY_WRITE = "memory:write"
+    MEMORY_ADD = "memory:add"
+    MEMORY_DELETE_ALL = "memory:delete-all"
 
 
-_AGENT_SCOPES = frozenset(InternalAPIScope)
+# Keep the persistent-agent profile explicit. Constructing it from the enum
+# would silently grant every future capability to every long-lived agent.
+_PERSISTENT_AGENT_SCOPES = frozenset(
+    {
+        InternalAPIScope.JOBS_READ,
+        InternalAPIScope.JOBS_WRITE,
+        InternalAPIScope.SERVICES_CALL,
+        InternalAPIScope.MESSAGES_SEND,
+        InternalAPIScope.FILES_SEND,
+        InternalAPIScope.MEMORY_READ,
+        InternalAPIScope.MEMORY_ADD,
+    }
+)
 _NOTIFICATION_SCOPES = frozenset({InternalAPIScope.MESSAGES_SEND})
 
 
@@ -63,20 +76,20 @@ class InternalAPIAuth:
         for chat_id, credential in (agent_credentials or {}).items():
             self._register(
                 credential,
-                InternalAPIPrincipal(chat_id=chat_id, scopes=_AGENT_SCOPES),
+                InternalAPIPrincipal(chat_id=chat_id, scopes=_PERSISTENT_AGENT_SCOPES),
             )
 
     @classmethod
     def for_users(cls, user_ids: Iterable[int]) -> InternalAPIAuth:
-        """Create an auth store with a full agent credential for each user."""
+        """Create an auth store with a persistent-agent credential for each user."""
         auth = cls()
         for chat_id in sorted(set(user_ids)):
             auth.agent_credential_for(chat_id)
         return auth
 
     def agent_credential_for(self, chat_id: int) -> str:
-        """Return the full internal API credential for a persistent user agent."""
-        return self._credential_for(InternalAPIPrincipal(chat_id=chat_id, scopes=_AGENT_SCOPES))
+        """Return the scoped internal API credential for a persistent user agent."""
+        return self._credential_for(InternalAPIPrincipal(chat_id=chat_id, scopes=_PERSISTENT_AGENT_SCOPES))
 
     def notification_credential_for(self, chat_id: int) -> str:
         """Return a send-message-only credential for a notification agent."""
