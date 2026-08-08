@@ -51,6 +51,7 @@ from kai.install import (
     _resolve_codex_bin_prompt_default,
     _retire_install_home_claude,
     _retire_install_home_dir,
+    _secure_codex_turn_image_staging,
     _set_ownership,
     _src_checksum,
     _start_service,
@@ -4612,6 +4613,56 @@ class TestSrcChecksum:
 
 
 # ── Migration ────────────────────────────────────────────────────────
+
+
+class TestSecureCodexTurnImageStaging:
+    def test_removes_only_legacy_files_and_makes_root_non_listable(self, tmp_path, capsys):
+        staging_root = tmp_path / "data" / "files" / "codex_turn_images"
+        staging_root.mkdir(parents=True, mode=0o755)
+        staging_root.chmod(0o755)
+        legacy = staging_root / "turn-image-old.jpeg"
+        legacy.write_bytes(b"private image")
+        legacy.chmod(0o644)
+        unrelated = staging_root / "operator-note.txt"
+        unrelated.write_text("keep")
+        principal_dir = staging_root / "12345"
+        principal_dir.mkdir()
+
+        _secure_codex_turn_image_staging(tmp_path / "data", dry_run=False)
+
+        assert not legacy.exists()
+        assert unrelated.read_text() == "keep"
+        assert principal_dir.is_dir()
+        assert staging_root.stat().st_mode & 0o777 == 0o711
+        output = capsys.readouterr().out
+        assert "Removed 1 legacy Codex turn image file" in output
+        assert "mode 0711" in output
+
+    def test_dry_run_reports_without_mutating(self, tmp_path, capsys):
+        staging_root = tmp_path / "data" / "files" / "codex_turn_images"
+        staging_root.mkdir(parents=True, mode=0o755)
+        staging_root.chmod(0o755)
+        legacy = staging_root / "turn-image-crash.png"
+        legacy.write_bytes(b"private image")
+
+        _secure_codex_turn_image_staging(tmp_path / "data", dry_run=True)
+
+        assert legacy.exists()
+        assert staging_root.stat().st_mode & 0o777 == 0o755
+        output = capsys.readouterr().out
+        assert "[DRY RUN] Would remove 1 legacy Codex turn image file" in output
+        assert "[DRY RUN] Would set mode 0711" in output
+
+    def test_refuses_symlink_staging_root(self, tmp_path):
+        data_path = tmp_path / "data"
+        files_dir = data_path / "files"
+        files_dir.mkdir(parents=True)
+        target = tmp_path / "attacker-controlled"
+        target.mkdir()
+        (files_dir / "codex_turn_images").symlink_to(target, target_is_directory=True)
+
+        with pytest.raises(RuntimeError, match="Refusing unsafe Codex image staging path"):
+            _secure_codex_turn_image_staging(data_path, dry_run=False)
 
 
 class TestApplyMigrate:

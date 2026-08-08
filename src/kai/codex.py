@@ -42,8 +42,10 @@ import base64
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import AsyncIterator
@@ -79,19 +81,55 @@ log = logging.getLogger(__name__)
 # here and apply it before setting CODEX_MODEL on the subprocess env.
 
 
-# Where per-turn image files for codex live. The app-server's
-# LocalImageUserInput takes a file path, not an inline payload, so the
-# base64 image data the bot layer sends in content blocks must be
-# materialized on disk for the duration of the turn. The directory
-# sits under DATA_DIR/files because that tree is the established
-# agent-readable upload area (the bot already tells agents to read
-# saved uploads there by absolute path); the workspace would also be
-# readable but project workspaces can be git repositories, and a
-# transient binary appearing inside one invites accidental commits.
+# Where per-turn image files for codex live. Each authenticated principal gets
+# a non-listable child directory. The app-server's LocalImageUserInput takes a
+# file path, not an inline payload, so the base64 image data the bot layer sends
+# in content blocks must be materialized on disk for the duration of the turn.
+# The directory sits under DATA_DIR/files because that tree is the established
+# upload area; the workspace would also be readable but can be a git repository,
+# where a transient binary invites accidental commits.
 _TURN_IMAGE_DIR = DATA_DIR / "files" / "codex_turn_images"
 
 
-def write_turn_image_file(block: dict) -> Path | None:
+def _grant_turn_image_read_access(path: Path, reader_user: str) -> None:
+    """Grant exactly one cross-OS-user reader access to a private image.
+
+    Kai owns the freshly created file and keeps its POSIX mode at ``0600``.
+    A named ACL gives the isolated Codex OS user read-only access without
+    making the image readable to every local account or granting Kai a broader
+    sudo file-copy capability.
+
+    macOS ships ACL support in ``/bin/chmod``. Linux uses ``setfacl``; if it is
+    unavailable, the caller fails closed and drops the image with the existing
+    user-visible notice instead of weakening permissions.
+    """
+    if sys.platform == "darwin":
+        command = [
+            "/bin/chmod",
+            "+a",
+            f"user:{reader_user} allow read,readattr,readextattr,readsecurity",
+            str(path),
+        ]
+    elif sys.platform.startswith("linux"):
+        setfacl = shutil.which("setfacl")
+        if setfacl is None:
+            raise OSError("setfacl is required for isolated Codex image input on Linux")
+        command = [setfacl, "-m", f"u:{reader_user}:r--", str(path)]
+    else:
+        raise OSError(f"isolated Codex image input is unsupported on {sys.platform}")
+
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit status {result.returncode}"
+        raise OSError(f"could not grant Codex image access to {reader_user}: {detail}")
+
+
+def write_turn_image_file(
+    block: dict,
+    *,
+    chat_id: int | None,
+    reader_user: str | None,
+) -> Path | None:
     """
     Materialize an Anthropic-style base64 image block as a file for
     codex's `localImage` input item.
@@ -102,13 +140,14 @@ def write_turn_image_file(block: dict) -> Path | None:
     blocks verbatim. The codex app-server has no inline-payload image
     input; its `LocalImageUserInput` is `{"type": "localImage",
     "path": ...}`, so the payload is written to a temp file and the
-    path rides the turn. The caller owns the file's lifetime and
-    unlinks it when the turn ends.
+    path rides the turn. The caller owns the file's lifetime and unlinks it
+    when the turn ends.
 
-    The file is chmod 0o644 after writing (NamedTemporaryFile
-    defaults to 0o600, which the target-user subprocess cannot open
-    on the sudo-wrapped path) and the directory 0o755, the same
-    posture as the codex one-shot's `--output-schema` temp file.
+    Files remain mode ``0600``. In cross-user mode, ``reader_user`` receives a
+    read-only named ACL. The root and per-principal directories are mode
+    ``0711``: the isolated process can traverse a path it was explicitly given,
+    while other local users cannot list staged filenames. File permissions
+    remain the confidentiality boundary even if a random filename is learned.
 
     Returns None when the block is not the expected Anthropic base64
     shape, the payload is not valid base64, or the write fails; the
@@ -133,20 +172,32 @@ def write_turn_image_file(block: dict) -> Path | None:
     # the filename.
     subtype = media_type.split("/", 1)[-1]
     suffix = f".{subtype}" if subtype.isalnum() else ".img"
+    principal = "unscoped" if chat_id is None else str(chat_id)
+    principal_dir = _TURN_IMAGE_DIR / principal
+    path: Path | None = None
     try:
         _TURN_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
-        _TURN_IMAGE_DIR.chmod(0o755)
+        _TURN_IMAGE_DIR.chmod(0o711)
+        principal_dir.mkdir(parents=True, exist_ok=True)
+        principal_dir.chmod(0o711)
         with tempfile.NamedTemporaryFile(
             mode="wb",
             suffix=suffix,
             prefix="turn-image-",
-            dir=str(_TURN_IMAGE_DIR),
+            dir=str(principal_dir),
             delete=False,
         ) as fh:
-            fh.write(raw)
             path = Path(fh.name)
-        path.chmod(0o644)
+            fh.write(raw)
+        path.chmod(0o600)
+        if reader_user is not None:
+            _grant_turn_image_read_access(path, reader_user)
     except OSError as e:
+        if path is not None:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
         log.warning("CodexBackend: could not write turn image file: %s", e)
         return None
     return path
@@ -779,7 +830,11 @@ class CodexBackend(AgentBackend):
                     input_blocks.append({"type": "text", "text": block["text"]})
                     continue
                 if block_type == "image":
-                    image_path = write_turn_image_file(block)
+                    image_path = write_turn_image_file(
+                        block,
+                        chat_id=chat_id,
+                        reader_user=self._effective_codex_user,
+                    )
                     if image_path is not None:
                         turn_image_paths.append(image_path)
                         input_blocks.append({"type": "localImage", "path": str(image_path)})

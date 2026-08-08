@@ -85,6 +85,8 @@ make run
 
 `make config` writes the runtime env file and mandatory `users.yaml` for the deployment mode you select. Pick `single_user` for a local repo checkout under your own account. Pick `protected` when you want source, data, and secrets split across protected system directories. Protected mode requires every Telegram user to have a unique `os_user` that differs from the Kai service account; this keeps persistent agents from inheriting the daemon's protected-config capabilities. Single-user mode continues to support running the agent as the operator account.
 
+Protected Linux installations that use Codex image input also require `setfacl` (normally provided by the distribution's `acl` package). Kai uses a read-only named ACL so an image can remain private to the service and its intended `os_user`; if ACL support is unavailable, that image is dropped with a user-visible notice instead of being made world-readable.
+
 For full installation details, see [Getting Started](https://github.com/dcellison/kai/wiki/Getting-Started), [Multi-User Setup](https://github.com/dcellison/kai/wiki/Multi-User-Setup), and [System Architecture](https://github.com/dcellison/kai/wiki/System-Architecture).
 
 ## Security Model

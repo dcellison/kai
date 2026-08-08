@@ -3645,6 +3645,50 @@ def _start_service(platform: str, dry_run: bool, **_kwargs: object) -> None:
     raise ServiceStartError(detail)
 
 
+def _secure_codex_turn_image_staging(data_path: Path, dry_run: bool) -> None:
+    """Retire world-readable Codex turn images from the legacy layout.
+
+    Older releases wrote ``turn-image-*`` files directly under the shared
+    ``codex_turn_images`` directory with mode ``0644``. The service is stopped
+    while install migration runs, so no legitimate turn can still be using
+    those transient files. Remove only the exact legacy filename class, leave
+    unrelated entries and new per-principal subdirectories untouched, and make
+    the staging root traversable but non-listable for isolated OS users.
+    """
+    staging_root = data_path / "files" / "codex_turn_images"
+    if staging_root.is_symlink():
+        raise RuntimeError(f"Refusing unsafe Codex image staging path: {staging_root}")
+    if not staging_root.exists():
+        return
+    if not staging_root.is_dir():
+        raise RuntimeError(f"Refusing unsafe Codex image staging path: {staging_root}")
+
+    legacy_files = sorted(
+        (
+            entry
+            for entry in staging_root.iterdir()
+            if entry.name.startswith("turn-image-") and (entry.is_file() or entry.is_symlink())
+        ),
+        key=lambda entry: entry.name,
+    )
+    current_mode = staging_root.stat().st_mode & 0o777
+
+    if dry_run:
+        if legacy_files:
+            print(f"[DRY RUN] Would remove {len(legacy_files)} legacy Codex turn image file(s) from {staging_root}")
+        if current_mode != 0o711:
+            print(f"[DRY RUN] Would set mode 0711 on Codex image staging root: {staging_root}")
+        return
+
+    for path in legacy_files:
+        path.unlink(missing_ok=True)
+    os.chmod(staging_root, 0o711)
+    if legacy_files:
+        print(f"  Removed {len(legacy_files)} legacy Codex turn image file(s) from {staging_root}")
+    if current_mode != 0o711:
+        print(f"  Secured Codex image staging root {staging_root} (mode 0711)")
+
+
 def _apply_migrate(
     data_path: Path,
     install_path: Path,
@@ -3677,6 +3721,11 @@ def _apply_migrate(
     # uses to keep the host's real config out of test outcomes.
     if users_yaml_path is None:
         users_yaml_path = USERS_YAML
+
+    # Retire the old shared/listable Codex image layout before migrating or
+    # reconciling other runtime data. The protected service is stopped for the
+    # whole apply transaction, so every root-level turn image is stale.
+    _secure_codex_turn_image_staging(data_path, dry_run)
 
     # -- Database migration --
     db_src = PROJECT_ROOT / "kai.db"

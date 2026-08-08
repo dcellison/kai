@@ -215,10 +215,14 @@ def _anthropic_image_block(media_type: str = "image/jpeg") -> dict:
     }
 
 
-async def _collect_events(c: CodexBackend, prompt: str | list = "test") -> list[StreamEvent]:
+async def _collect_events(
+    c: CodexBackend,
+    prompt: str | list = "test",
+    chat_id: int | None = None,
+) -> list[StreamEvent]:
     """Send a prompt and collect all yielded StreamEvents."""
     events = []
-    async for event in c._send_locked(prompt):
+    async for event in c._send_locked(prompt, chat_id=chat_id):
         events.append(event)
     return events
 
@@ -1174,47 +1178,141 @@ class TestPromptCoercion:
 
 class TestWriteTurnImageFile:
     """`write_turn_image_file` materializes the Anthropic base64 image
-    shape as a world-readable file for codex's localImage input, and
-    returns None on any other shape so the caller drops the block."""
+    shape as a private, principal-scoped file for codex's localImage
+    input, and returns None on any other shape so the caller drops the
+    block."""
 
     def test_writes_decoded_bytes_with_subtype_suffix(self):
-        path = write_turn_image_file(_anthropic_image_block())
+        path = write_turn_image_file(
+            _anthropic_image_block(),
+            chat_id=12345,
+            reader_user=None,
+        )
         assert path is not None
         try:
             assert path.read_bytes() == _IMAGE_BYTES
             assert path.name.startswith("turn-image-")
             assert path.suffix == ".jpeg"
-            assert path.parent.name == "codex_turn_images"
-            # World-readable so a sudo-routed codex user can open it.
-            assert path.stat().st_mode & 0o777 == 0o644
+            assert path.parent.name == "12345"
+            assert path.parent.parent.name == "codex_turn_images"
+            assert path.parent.stat().st_mode & 0o777 == 0o711
+            assert path.parent.parent.stat().st_mode & 0o777 == 0o711
+            assert path.stat().st_mode & 0o777 == 0o600
         finally:
             path.unlink()
 
     def test_non_alnum_subtype_falls_back_to_neutral_suffix(self):
-        path = write_turn_image_file(_anthropic_image_block(media_type="image/svg+xml"))
+        path = write_turn_image_file(
+            _anthropic_image_block(media_type="image/svg+xml"),
+            chat_id=12345,
+            reader_user=None,
+        )
         assert path is not None
         try:
             assert path.suffix == ".img"
         finally:
             path.unlink()
 
+    def test_distinct_principals_use_distinct_non_listable_directories(self):
+        first = write_turn_image_file(_anthropic_image_block(), chat_id=111, reader_user=None)
+        second = write_turn_image_file(_anthropic_image_block(), chat_id=222, reader_user=None)
+        assert first is not None and second is not None
+        try:
+            assert first.parent.name == "111"
+            assert second.parent.name == "222"
+            assert first.parent != second.parent
+            assert first.stat().st_mode & 0o777 == 0o600
+            assert second.stat().st_mode & 0o777 == 0o600
+        finally:
+            first.unlink()
+            second.unlink()
+
+    def test_macos_cross_user_file_gets_named_read_acl(self):
+        completed = MagicMock(returncode=0, stderr="")
+        with (
+            patch("kai.codex.sys.platform", "darwin"),
+            patch("kai.codex.subprocess.run", return_value=completed) as run,
+        ):
+            path = write_turn_image_file(
+                _anthropic_image_block(),
+                chat_id=12345,
+                reader_user="alice",
+            )
+
+        assert path is not None
+        try:
+            assert path.stat().st_mode & 0o777 == 0o600
+            command = run.call_args.args[0]
+            assert command[:2] == ["/bin/chmod", "+a"]
+            assert command[2] == "user:alice allow read,readattr,readextattr,readsecurity"
+            assert command[3] == str(path)
+        finally:
+            path.unlink()
+
+    def test_linux_without_setfacl_fails_closed_and_removes_file(self):
+        with (
+            patch("kai.codex.sys.platform", "linux"),
+            patch("kai.codex.shutil.which", return_value=None),
+        ):
+            path = write_turn_image_file(
+                _anthropic_image_block(),
+                chat_id=98765,
+                reader_user="alice",
+            )
+
+        assert path is None
+        principal_dir = DATA_DIR / "files" / "codex_turn_images" / "98765"
+        assert not list(principal_dir.glob("turn-image-*"))
+
+    def test_linux_cross_user_file_gets_named_read_acl(self):
+        completed = MagicMock(returncode=0, stderr="")
+        with (
+            patch("kai.codex.sys.platform", "linux"),
+            patch("kai.codex.shutil.which", return_value="/usr/bin/setfacl"),
+            patch("kai.codex.subprocess.run", return_value=completed) as run,
+        ):
+            path = write_turn_image_file(
+                _anthropic_image_block(),
+                chat_id=12345,
+                reader_user="alice",
+            )
+
+        assert path is not None
+        try:
+            assert path.stat().st_mode & 0o777 == 0o600
+            assert run.call_args.args[0] == [
+                "/usr/bin/setfacl",
+                "-m",
+                "u:alice:r--",
+                str(path),
+            ]
+        finally:
+            path.unlink()
+
     def test_non_dict_source_returns_none(self):
-        assert write_turn_image_file({"type": "image", "source": "fake"}) is None
+        assert (
+            write_turn_image_file(
+                {"type": "image", "source": "fake"},
+                chat_id=12345,
+                reader_user=None,
+            )
+            is None
+        )
 
     def test_non_base64_source_type_returns_none(self):
         block = {"type": "image", "source": {"type": "url", "url": "https://x.test/i.png"}}
-        assert write_turn_image_file(block) is None
+        assert write_turn_image_file(block, chat_id=12345, reader_user=None) is None
 
     def test_missing_fields_return_none(self):
         block = {"type": "image", "source": {"type": "base64", "media_type": "image/png"}}
-        assert write_turn_image_file(block) is None
+        assert write_turn_image_file(block, chat_id=12345, reader_user=None) is None
 
     def test_invalid_base64_returns_none(self):
         block = {
             "type": "image",
             "source": {"type": "base64", "media_type": "image/png", "data": "not!valid!b64"},
         }
-        assert write_turn_image_file(block) is None
+        assert write_turn_image_file(block, chat_id=12345, reader_user=None) is None
 
 
 class TestImageForwarding:
@@ -1247,6 +1345,24 @@ class TestImageForwarding:
         final = events[-1].response
         assert final is not None and final.success
         assert "[Note:" not in final.text
+
+    @pytest.mark.asyncio
+    async def test_image_writer_receives_principal_and_effective_os_user(self):
+        c = _make_codex()
+        c._proc = _make_mock_proc([_agent_message_delta("ok"), _turn_completed("completed")])
+        c._session_id = "test-session"
+        c._fresh_session = False
+        c._next_id = 3
+        c._effective_codex_user = "alice"
+
+        with patch("kai.codex.write_turn_image_file", return_value=None) as writer:
+            await _collect_events(c, prompt=[_anthropic_image_block()], chat_id=24680)
+
+        writer.assert_called_once_with(
+            _anthropic_image_block(),
+            chat_id=24680,
+            reader_user="alice",
+        )
 
     @pytest.mark.asyncio
     async def test_dropped_image_seeds_user_notice(self):
