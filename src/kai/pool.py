@@ -71,9 +71,7 @@ class SubprocessPool:
     ):
         self._config = config
         available_service_names = {
-            service["name"]
-            for service in services_info
-            if isinstance(service.get("name"), str) and service["name"]
+            service["name"] for service in services_info if isinstance(service.get("name"), str) and service["name"]
         }
         allowed_services_by_user: dict[int, frozenset[str]] = {}
         self._services_info_by_user: dict[int, list[dict]] = {}
