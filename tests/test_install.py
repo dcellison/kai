@@ -254,6 +254,7 @@ class TestGenerateUsersYaml:
         assert entry["telegram_id"] == 123456789  # int, not string
         assert entry["name"] == "alice"
         assert entry["role"] == "admin"
+        assert entry["allowed_services"] == []
         assert "os_user" not in entry
         assert "home_workspace" not in entry
 

@@ -28,13 +28,14 @@ class InternalAPIScope(StrEnum):
     MEMORY_DELETE_ALL = "memory:delete-all"
 
 
-# Keep the persistent-agent profile explicit. Constructing it from the enum
-# would silently grant every future capability to every long-lived agent.
-_PERSISTENT_AGENT_SCOPES = frozenset(
+# Keep the persistent-agent base profile explicit. Constructing it from the
+# enum would silently grant every future capability to every long-lived agent.
+# SERVICES_CALL is added only when that principal has at least one explicitly
+# allowed service name.
+_PERSISTENT_AGENT_BASE_SCOPES = frozenset(
     {
         InternalAPIScope.JOBS_READ,
         InternalAPIScope.JOBS_WRITE,
-        InternalAPIScope.SERVICES_CALL,
         InternalAPIScope.MESSAGES_SEND,
         InternalAPIScope.FILES_SEND,
         InternalAPIScope.MEMORY_READ,
@@ -50,10 +51,15 @@ class InternalAPIPrincipal:
 
     chat_id: int
     scopes: frozenset[InternalAPIScope]
+    allowed_services: frozenset[str] = frozenset()
 
     def allows(self, scope: InternalAPIScope) -> bool:
         """Return whether this principal has the requested API scope."""
         return scope in self.scopes
+
+    def allows_service(self, service_name: str) -> bool:
+        """Return whether this principal may call one named service."""
+        return self.allows(InternalAPIScope.SERVICES_CALL) and service_name in self.allowed_services
 
 
 class InternalAPIAuth:
@@ -67,29 +73,45 @@ class InternalAPIAuth:
         agent_credentials: Optional fixed per-user credentials. Production code
             leaves this unset and receives cryptographically random tokens; the
             explicit form keeps direct handler tests deterministic.
+        allowed_services_by_user: Explicit service names each persistent user
+            agent may call. Omitted users receive no service-call scope.
     """
 
-    def __init__(self, agent_credentials: Mapping[int, str] | None = None) -> None:
+    def __init__(
+        self,
+        agent_credentials: Mapping[int, str] | None = None,
+        *,
+        allowed_services_by_user: Mapping[int, Iterable[str]] | None = None,
+    ) -> None:
         self._principals_by_credential: dict[str, InternalAPIPrincipal] = {}
         self._credentials_by_principal: dict[InternalAPIPrincipal, str] = {}
+        self._allowed_services_by_user = {
+            chat_id: frozenset(name for name in names if name)
+            for chat_id, names in (allowed_services_by_user or {}).items()
+        }
 
         for chat_id, credential in (agent_credentials or {}).items():
             self._register(
                 credential,
-                InternalAPIPrincipal(chat_id=chat_id, scopes=_PERSISTENT_AGENT_SCOPES),
+                self._agent_principal(chat_id),
             )
 
     @classmethod
-    def for_users(cls, user_ids: Iterable[int]) -> InternalAPIAuth:
+    def for_users(
+        cls,
+        user_ids: Iterable[int],
+        *,
+        allowed_services_by_user: Mapping[int, Iterable[str]] | None = None,
+    ) -> InternalAPIAuth:
         """Create an auth store with a persistent-agent credential for each user."""
-        auth = cls()
+        auth = cls(allowed_services_by_user=allowed_services_by_user)
         for chat_id in sorted(set(user_ids)):
             auth.agent_credential_for(chat_id)
         return auth
 
     def agent_credential_for(self, chat_id: int) -> str:
         """Return the scoped internal API credential for a persistent user agent."""
-        return self._credential_for(InternalAPIPrincipal(chat_id=chat_id, scopes=_PERSISTENT_AGENT_SCOPES))
+        return self._credential_for(self._agent_principal(chat_id))
 
     def notification_credential_for(self, chat_id: int) -> str:
         """Return a send-message-only credential for a notification agent."""
@@ -111,6 +133,18 @@ class InternalAPIAuth:
             if hmac.compare_digest(credential, expected):
                 matched = principal
         return matched
+
+    def _agent_principal(self, chat_id: int) -> InternalAPIPrincipal:
+        """Build the configured persistent-agent principal for one user."""
+        allowed_services = self._allowed_services_by_user.get(chat_id, frozenset())
+        scopes = set(_PERSISTENT_AGENT_BASE_SCOPES)
+        if allowed_services:
+            scopes.add(InternalAPIScope.SERVICES_CALL)
+        return InternalAPIPrincipal(
+            chat_id=chat_id,
+            scopes=frozenset(scopes),
+            allowed_services=allowed_services,
+        )
 
     def _credential_for(self, principal: InternalAPIPrincipal) -> str:
         """Return an existing credential for a principal or issue a new one."""

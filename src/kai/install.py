@@ -2600,6 +2600,7 @@ def _generate_users_yaml(
         # round-trip as non-string types through yaml.safe_load.
         f"    name: {_yaml_scalar(name)}",
         "    role: admin",
+        "    allowed_services: []",
     ]
     if os_user:
         lines.append(f"    os_user: {_yaml_scalar(os_user)}")

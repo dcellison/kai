@@ -95,7 +95,7 @@ Kai has real local authority, so the security model is part of the product rathe
 - **Optional TOTP gate:** Time-based one-time passwords can protect the chat surface after idle timeout.
 - **Local execution:** Kai runs on your machine. Conversations do not pass through a Kai-hosted relay.
 - **Path confinement:** File exchange is constrained to allowed workspace and file-storage paths.
-- **Service proxy:** Third-party API keys live in server-side config and are injected at request time, not placed in conversation context.
+- **Service proxy:** Third-party API keys live in server-side config and are injected only for services explicitly allowed to that user in `users.yaml`; keys are never placed in conversation context.
 - **Per-user isolation:** Users have separate history, files, workspaces, jobs, settings, and agent subprocesses.
 - **Principal-bound internal API:** Agent API credentials resolve to a fixed user and explicit scopes in the outer service; request data cannot select another principal.
 - **Separated webhook credentials:** GitHub, generic, and Telegram ingress use distinct secrets that are not exposed to persistent agent subprocesses.

@@ -70,11 +70,40 @@ class SubprocessPool:
         services_info: list[dict],
     ):
         self._config = config
-        self._services_info = services_info
+        available_service_names = {
+            service["name"]
+            for service in services_info
+            if isinstance(service.get("name"), str) and service["name"]
+        }
+        allowed_services_by_user: dict[int, frozenset[str]] = {}
+        self._services_info_by_user: dict[int, list[dict]] = {}
+        for chat_id in config.allowed_user_ids:
+            user = config.get_user_config(chat_id)
+            requested = frozenset(user.allowed_services if user else [])
+            unavailable = requested - available_service_names
+            if unavailable:
+                log.warning(
+                    "users.yaml: user %d has unavailable allowed_services: %s; denying them",
+                    chat_id,
+                    ", ".join(sorted(unavailable)),
+                )
+            allowed = requested & available_service_names
+            allowed_services_by_user[chat_id] = allowed
+            self._services_info_by_user[chat_id] = [
+                service for service in services_info if service.get("name") in allowed
+            ]
+        if available_service_names and not any(allowed_services_by_user.values()):
+            log.warning(
+                "External services are loaded but no user has an allowed_services grant; "
+                "the agent service proxy is disabled for every user"
+            )
         # Tokens are random and process-local. The pool owns the store because
         # it creates every persistent backend; webhook.start() receives this
         # same object through bot_data so credential resolution cannot drift.
-        self._internal_api_auth = InternalAPIAuth.for_users(config.allowed_user_ids)
+        self._internal_api_auth = InternalAPIAuth.for_users(
+            config.allowed_user_ids,
+            allowed_services_by_user=allowed_services_by_user,
+        )
         self._pool: dict[int, AgentBackend] = {}
         self._last_activity: dict[int, float] = {}
         # Pending one-time setup for a freshly-created backend instance.
@@ -257,6 +286,7 @@ class SubprocessPool:
         # Agents receive only their random principal credential, never an
         # external webhook signing secret.
         internal_api_credential = self._internal_api_auth.agent_credential_for(chat_id)
+        services_info = self._services_info_by_user.get(chat_id, [])
 
         if backend == "goose":
             return GooseBackend(
@@ -266,7 +296,7 @@ class SubprocessPool:
                 webhook_port=self._config.webhook_port,
                 webhook_secret=internal_api_credential,
                 timeout_seconds=timeout,
-                services_info=self._services_info,
+                services_info=services_info,
                 workspace_config=ws_config,
                 provider=effective_provider,
                 memory_enabled=self._config.memory_enabled,
@@ -287,7 +317,7 @@ class SubprocessPool:
                 webhook_port=self._config.webhook_port,
                 webhook_secret=internal_api_credential,
                 timeout_seconds=timeout,
-                services_info=self._services_info,
+                services_info=services_info,
                 workspace_config=ws_config,
                 provider=effective_provider,
                 memory_enabled=self._config.memory_enabled,
@@ -309,7 +339,7 @@ class SubprocessPool:
                 webhook_port=self._config.webhook_port,
                 webhook_secret=internal_api_credential,
                 timeout_seconds=timeout,
-                services_info=self._services_info,
+                services_info=services_info,
                 workspace_config=ws_config,
                 provider="openai",
                 codex_user=os_user,
@@ -325,7 +355,7 @@ class SubprocessPool:
             webhook_port=self._config.webhook_port,
             webhook_secret=internal_api_credential,
             timeout_seconds=timeout,
-            services_info=self._services_info,
+            services_info=services_info,
             claude_user=os_user,
             max_session_hours=self._config.agent_max_session_hours,
             workspace_config=ws_config,

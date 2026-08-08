@@ -23,6 +23,12 @@ users:
     # os_user: alice          # OS user for subprocess isolation
     # home_workspace: ~/projects/main  # per-user home workspace
 
+    # External services this user's persistent agent may call through
+    # Kai's credential-injecting proxy. Omission means no services, even
+    # for admins. Names must match enabled entries in services.yaml.
+    allowed_services:
+      - perplexity
+
     # workspace_base: directory for /workspace new and name resolution.
     # /workspace <name> looks for subdirectories under this path.
     # Inherits the global WORKSPACE_BASE installation default if unset.

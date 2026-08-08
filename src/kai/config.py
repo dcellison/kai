@@ -1044,6 +1044,8 @@ class UserConfig:
         timeout: Default timeout in seconds for Claude responses.
         workspace_base: Base directory for /workspace new and name resolution.
             Falls back to global WORKSPACE_BASE env var if not set.
+        allowed_services: External proxy service names this user's persistent
+            agent may call. Empty by default, including for admins.
     """
 
     telegram_id: int
@@ -1076,6 +1078,10 @@ class UserConfig:
     github_notify_chat_id: int | None = None
     pr_review: bool | None = None
     issue_triage: bool | None = None
+    # External services the persistent agent may call through Kai's
+    # credential-injecting proxy. Admin-controlled via users.yaml and
+    # fail-closed: omission means no services, including for admins.
+    allowed_services: list[str] = field(default_factory=list)
     # Per-role per-user model overrides loaded from users.yaml `models:`.
     # Keys are role identifiers: "agent" for the conversational role
     # plus every ModelRole.value ("pr_review", "issue_triage",
@@ -2507,6 +2513,36 @@ def _load_user_configs(
                 name,
             )
 
+        # Parse the explicit per-user external-service allowlist. Service
+        # existence is checked later by SubprocessPool, after services.yaml
+        # has been loaded and missing-key services have been filtered out.
+        raw_allowed_services = entry.get("allowed_services", [])
+        allowed_services: list[str] = []
+        if isinstance(raw_allowed_services, list):
+            for raw_service in raw_allowed_services:
+                if not isinstance(raw_service, str):
+                    log.warning(
+                        "users.yaml: invalid allowed_services entry for %s: %r (expected a service name)",
+                        name,
+                        raw_service,
+                    )
+                    continue
+                service_name = raw_service.strip()
+                if not service_name or service_name == "*" or "/" in service_name:
+                    log.warning(
+                        "users.yaml: invalid allowed_services entry for %s: %r (wildcards and paths are not allowed)",
+                        name,
+                        raw_service,
+                    )
+                    continue
+                if service_name not in allowed_services:
+                    allowed_services.append(service_name)
+        else:
+            log.warning(
+                "users.yaml: allowed_services for %s must be a list (ignoring)",
+                name,
+            )
+
         # Parse optional github_notify_chat_id (integer, can be negative
         # for group chats). Follows the same pattern as telegram_id validation.
         github_notify_chat_id: int | None = None
@@ -2611,6 +2647,7 @@ def _load_user_configs(
             github_notify_chat_id=github_notify_chat_id,
             pr_review=pr_review,
             issue_triage=issue_triage,
+            allowed_services=allowed_services,
             models=user_models,
         )
 

@@ -6,8 +6,10 @@
 # Setup:
 #   1. Copy this file to the repo root: cp templates/services.yaml services.yaml
 #   2. Uncomment the services you want to use
-#   3. Set the corresponding API key(s) in .env
-#   4. Restart Kai
+#   3. Add each service name to the intended users' `allowed_services`
+#      lists in users.yaml
+#   4. Set the corresponding API key(s) in .env
+#   5. Restart Kai
 #
 # Kai injects authentication from .env at call time — API keys never
 # enter Claude's context. See <DATA_DIR>/home/<chat_id>/.claude/CLAUDE.md for usage docs.

@@ -20,6 +20,7 @@ import pytest
 
 from kai.config import Config, UserConfig, WorkspaceConfig
 from kai.goose import GooseBackend
+from kai.internal_api_auth import InternalAPIScope
 from kai.pool import SubprocessPool
 
 
@@ -92,6 +93,60 @@ class TestInstanceCreation:
         principal = pool.internal_api_auth.authenticate(credential)
         assert principal is not None
         assert principal.chat_id == 111
+
+    def test_services_are_filtered_per_user_and_bound_to_principal(self):
+        """Only explicitly allowed, available services reach each agent."""
+        services_info = [
+            {"name": "perplexity", "method": "POST", "description": "search"},
+            {"name": "weather", "method": "GET", "description": "weather"},
+        ]
+        config = _make_config(
+            user_configs={
+                111: UserConfig(telegram_id=111, name="alice", allowed_services=["perplexity"]),
+                222: UserConfig(telegram_id=222, name="bob"),
+            }
+        )
+        pool = SubprocessPool(config=config, services_info=services_info)
+
+        alice = pool.get(111)
+        bob = pool.get(222)
+        alice_principal = pool.internal_api_auth.authenticate(alice._api_context.webhook_secret)
+        bob_principal = pool.internal_api_auth.authenticate(bob._api_context.webhook_secret)
+
+        assert alice._api_context.services_info == [services_info[0]]
+        assert bob._api_context.services_info == []
+        assert alice_principal is not None
+        assert alice_principal.allows(InternalAPIScope.SERVICES_CALL)
+        assert alice_principal.allows_service("perplexity")
+        assert not alice_principal.allows_service("weather")
+        assert bob_principal is not None
+        assert not bob_principal.allows(InternalAPIScope.SERVICES_CALL)
+
+    def test_unavailable_allowed_service_is_denied_with_warning(self, caplog):
+        """Typos and unloaded services never become credential authority."""
+        config = _make_config(
+            user_configs={
+                111: UserConfig(telegram_id=111, name="alice", allowed_services=["missing"]),
+                222: UserConfig(telegram_id=222, name="bob"),
+            }
+        )
+
+        pool = SubprocessPool(config=config, services_info=[])
+        instance = pool.get(111)
+        principal = pool.internal_api_auth.authenticate(instance._api_context.webhook_secret)
+
+        assert principal is not None
+        assert principal.allowed_services == frozenset()
+        assert instance._api_context.services_info == []
+        assert "unavailable allowed_services: missing; denying them" in caplog.text
+
+    def test_loaded_services_without_any_grants_warn(self, caplog):
+        """Secure upgrade default is visible rather than silently surprising."""
+        services_info = [{"name": "perplexity", "method": "POST", "description": "search"}]
+
+        SubprocessPool(config=_make_config(), services_info=services_info)
+
+        assert "service proxy is disabled for every user" in caplog.text
 
     def test_get_uses_user_config(self, tmp_path):
         """User with os_user and home_workspace gets correct instance."""

@@ -47,7 +47,10 @@ from kai.webhook import (
 
 def _make_internal_api_auth() -> InternalAPIAuth:
     """Create deterministic credentials for the two API test principals."""
-    return InternalAPIAuth({123: "test-secret", 456: "other-secret"})
+    return InternalAPIAuth(
+        {123: "test-secret", 456: "other-secret"},
+        allowed_services_by_user={123: {"perplexity"}},
+    )
 
 
 async def _call_memory_delete_all_as_authorized(request, *, chat_id: int = 123):
@@ -1471,6 +1474,30 @@ class TestServiceCall:
         resp = await _handle_service_call(service_request)
 
         assert resp.status == 401
+
+    async def test_unlisted_service_returns_403_before_proxy_call(self, service_request):
+        """A service-scoped principal cannot select a different service name."""
+        service_request.match_info = {"name": "billing"}
+        service_request.json = AsyncMock(return_value={"body": {}})
+
+        with patch("kai.services.call_service", new_callable=AsyncMock) as mock_call:
+            resp = await _handle_service_call(service_request)
+
+        assert resp.status == 403
+        assert json.loads(resp.body.decode()) == {"error": "Service is not authorized for this principal"}
+        mock_call.assert_not_called()
+
+    async def test_user_without_service_grants_lacks_scope(self, service_request):
+        """An empty allowlist omits the broad service-call scope entirely."""
+        service_request.headers = {"X-Webhook-Secret": "other-secret"}
+        service_request.json = AsyncMock(return_value={"body": {}})
+
+        with patch("kai.services.call_service", new_callable=AsyncMock) as mock_call:
+            resp = await _handle_service_call(service_request)
+
+        assert resp.status == 403
+        assert resp.text == "Credential is not authorized for this operation"
+        mock_call.assert_not_called()
 
 
 # ── _resolve_chat_id ────────────────────────────────────────────────

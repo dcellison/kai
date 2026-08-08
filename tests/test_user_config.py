@@ -45,6 +45,7 @@ class TestUserConfig:
         assert uc.github_notify_chat_id is None
         assert uc.pr_review is None
         assert uc.issue_triage is None
+        assert uc.allowed_services == []
         assert uc.backend is None
         assert uc.provider is None
 
@@ -64,6 +65,7 @@ class TestUserConfig:
             github_notify_chat_id=-100123456789,
             pr_review=True,
             issue_triage=False,
+            allowed_services=["perplexity"],
             backend="goose",
             provider="openai",
         )
@@ -77,6 +79,7 @@ class TestUserConfig:
         assert uc.github_notify_chat_id == -100123456789
         assert uc.pr_review is True
         assert uc.issue_triage is False
+        assert uc.allowed_services == ["perplexity"]
         assert uc.backend == "goose"
         assert uc.provider == "openai"
 
@@ -539,6 +542,7 @@ class TestLoadUserConfigs:
         assert configs[111].github_notify_chat_id is None
         assert configs[111].pr_review is None
         assert configs[111].issue_triage is None
+        assert configs[111].allowed_services == []
 
     # ── workspace_base field ──
 
@@ -596,6 +600,59 @@ class TestLoadUserConfigs:
             configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].workspace_base is None
+
+    # ── allowed_services field ──
+
+    def test_allowed_services_parsed_deduplicated_and_ordered(self, tmp_path):
+        data = self._yaml_dict(
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                allowed_services:
+                  - perplexity
+                  - weather
+                  - perplexity
+            """,
+        )
+        with patch("kai.config._read_protected_yaml", return_value=data):
+            configs = _load_user_configs("claude", "")
+
+        assert configs[111].allowed_services == ["perplexity", "weather"]
+
+    def test_allowed_services_invalid_entries_fail_closed(self, tmp_path, caplog):
+        data = self._yaml_dict(
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                allowed_services:
+                  - perplexity
+                  - '*'
+                  - nested/service
+                  - 42
+            """,
+        )
+        with patch("kai.config._read_protected_yaml", return_value=data):
+            configs = _load_user_configs("claude", "")
+
+        assert configs[111].allowed_services == ["perplexity"]
+        assert "invalid allowed_services entry" in caplog.text
+
+    def test_allowed_services_not_list_is_ignored(self, tmp_path, caplog):
+        data = self._yaml_dict(
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                allowed_services: perplexity
+            """,
+        )
+        with patch("kai.config._read_protected_yaml", return_value=data):
+            configs = _load_user_configs("claude", "")
+
+        assert configs[111].allowed_services == []
+        assert "allowed_services for alice must be a list" in caplog.text
 
     # ── github_repos field ──
 

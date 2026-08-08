@@ -1369,7 +1369,7 @@ async def _handle_update_job(request: web.Request, principal: InternalAPIPrincip
 
 
 @_require_internal_api(InternalAPIScope.SERVICES_CALL)
-async def _handle_service_call(request: web.Request, _principal: InternalAPIPrincipal) -> web.Response:
+async def _handle_service_call(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     Proxy an authenticated request to an external service.
 
@@ -1391,6 +1391,13 @@ async def _handle_service_call(request: web.Request, _principal: InternalAPIPrin
 
     # Extract service name from URL path
     service_name = request.match_info["name"]
+    if not principal.allows_service(service_name):
+        log.warning(
+            "Internal API service denial for principal %d: %s",
+            principal.chat_id,
+            service_name,
+        )
+        return web.json_response({"error": "Service is not authorized for this principal"}, status=403)
 
     # Parse optional JSON body with request parameters. The body is
     # genuinely optional here (services with no JSON-body config still

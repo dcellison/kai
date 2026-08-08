@@ -32,14 +32,35 @@ def test_persistent_agent_profile_is_explicit_and_excludes_delete_all() -> None:
         {
             InternalAPIScope.JOBS_READ,
             InternalAPIScope.JOBS_WRITE,
-            InternalAPIScope.SERVICES_CALL,
             InternalAPIScope.MESSAGES_SEND,
             InternalAPIScope.FILES_SEND,
             InternalAPIScope.MEMORY_READ,
             InternalAPIScope.MEMORY_ADD,
         }
     )
+    assert principal.allowed_services == frozenset()
+    assert not principal.allows(InternalAPIScope.SERVICES_CALL)
     assert not principal.allows(InternalAPIScope.MEMORY_DELETE_ALL)
+
+
+def test_persistent_agent_service_scope_requires_explicit_names() -> None:
+    """Service scope and resources are issued only from the per-user allowlist."""
+    auth = InternalAPIAuth.for_users(
+        {123, 456},
+        allowed_services_by_user={123: {"perplexity", "weather"}},
+    )
+
+    principal_123 = auth.authenticate(auth.agent_credential_for(123))
+    principal_456 = auth.authenticate(auth.agent_credential_for(456))
+
+    assert principal_123 is not None
+    assert principal_123.allows(InternalAPIScope.SERVICES_CALL)
+    assert principal_123.allows_service("perplexity")
+    assert principal_123.allows_service("weather")
+    assert not principal_123.allows_service("billing")
+    assert principal_456 is not None
+    assert not principal_456.allows(InternalAPIScope.SERVICES_CALL)
+    assert not principal_456.allows_service("perplexity")
 
 
 def test_notification_credential_has_only_message_scope() -> None:
@@ -49,6 +70,7 @@ def test_notification_credential_has_only_message_scope() -> None:
 
     assert principal is not None
     assert principal.chat_id == -100123
+    assert principal.allowed_services == frozenset()
     assert principal.allows(InternalAPIScope.MESSAGES_SEND)
     assert not principal.allows(InternalAPIScope.JOBS_READ)
     assert not principal.allows(InternalAPIScope.JOBS_WRITE)
