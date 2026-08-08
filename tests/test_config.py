@@ -817,6 +817,24 @@ class TestProtectedUserIsolation:
 # ── PR review config ─────────────────────────────────────────────
 
 
+class TestTotpConfig:
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "TOTP_SESSION_MINUTES",
+            "TOTP_CHALLENGE_SECONDS",
+            "TOTP_LOCKOUT_ATTEMPTS",
+            "TOTP_LOCKOUT_MINUTES",
+        ],
+    )
+    def test_security_timing_values_must_be_positive(self, monkeypatch, name):
+        """Zero cannot disable a TOTP session or lockout control."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv(name, "0")
+        with pytest.raises(SystemExit, match=f"{name} must be a positive integer"):
+            load_config()
+
+
 class TestPRReviewConfig:
     def test_defaults(self, monkeypatch):
         """PR review resource controls take dataclass defaults when env is empty."""

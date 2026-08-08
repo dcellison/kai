@@ -8,6 +8,8 @@ within the totp module for each test.
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from unittest.mock import MagicMock, patch
 
 import pyotp
@@ -15,6 +17,7 @@ import pytest
 
 import kai.totp
 from kai.totp import (
+    TotpStateError,
     get_failure_count,
     get_lockout_remaining,
     is_totp_configured,
@@ -47,11 +50,21 @@ def _secret_proc(secret: str = _TEST_SECRET) -> MagicMock:
     return m
 
 
-def _attempts_proc(failures: int = 0, lockout_until: float = 0) -> MagicMock:
+def _attempts_proc(failures: int = 0, lockout_until: float = 0, principal_id: int = 12345) -> MagicMock:
     """Return a mock subprocess result that looks like a successful sudo cat of the attempts file."""
     m = MagicMock()
     m.returncode = 0
-    m.stdout = json.dumps({"failures": failures, "lockout_until": lockout_until})
+    m.stdout = json.dumps(
+        {
+            "version": 2,
+            "principals": {
+                str(principal_id): {
+                    "failures": failures,
+                    "lockout_until": lockout_until,
+                }
+            },
+        }
+    )
     return m
 
 
@@ -77,10 +90,10 @@ def _tee_proc() -> MagicMock:
 def test_verify_code_rejects_malformed_input():
     """verify_code returns False immediately for non-6-digit input, with no subprocess calls."""
     with patch("kai.totp.subprocess.run") as mock_run:
-        assert verify_code("12345") is False  # too short
-        assert verify_code("1234567") is False  # too long
-        assert verify_code("12345a") is False  # non-digit
-        assert verify_code("") is False  # empty
+        assert verify_code("12345", 12345) is False  # too short
+        assert verify_code("1234567", 12345) is False  # too long
+        assert verify_code("12345a", 12345) is False  # non-digit
+        assert verify_code("", 12345) is False  # empty
         mock_run.assert_not_called()
 
 
@@ -95,7 +108,7 @@ def test_verify_code_valid():
             _secret_proc(),  # _read_secret
             _tee_proc(),  # _write_attempts (reset counter on success)
         ]
-        result = verify_code(valid_code)
+        result = verify_code(valid_code, 12345)
 
     assert result is True
 
@@ -108,7 +121,7 @@ def test_verify_code_invalid():
             _secret_proc(),  # _read_secret
             _tee_proc(),  # _write_attempts (increment failures)
         ]
-        result = verify_code("000000")
+        result = verify_code("000000", 12345)
 
     assert result is False
 
@@ -124,14 +137,14 @@ def test_failure_counter_increments():
             _secret_proc(),  # _read_secret
             _tee_proc(),  # _write_attempts
         ]
-        verify_code("000000")
+        verify_code("000000", 12345)
 
         # Inspect what was written - it's the third call, with input= containing the state.
         write_call = mock_run.call_args_list[2]
         written = json.loads(write_call.kwargs["input"])
 
-    assert written["failures"] == 1
-    assert written["lockout_until"] == 0
+    assert written["principals"]["12345"]["failures"] == 1
+    assert written["principals"]["12345"]["lockout_until"] == 0
 
 
 def test_lockout_triggers_after_n_failures():
@@ -143,15 +156,16 @@ def test_lockout_triggers_after_n_failures():
             _secret_proc(),  # _read_secret
             _tee_proc(),  # _write_attempts - should trigger lockout
         ]
-        verify_code("000000")
+        verify_code("000000", 12345)
 
         write_call = mock_run.call_args_list[2]
         written = json.loads(write_call.kwargs["input"])
 
-    assert written["failures"] == 3
+    record = written["principals"]["12345"]
+    assert record["failures"] == 3
     # lockout_until should be roughly now + 15 minutes
-    assert written["lockout_until"] > time.time()
-    assert written["lockout_until"] < time.time() + 15 * 60 + 5  # +5s tolerance
+    assert record["lockout_until"] > time.time()
+    assert record["lockout_until"] < time.time() + 15 * 60 + 5  # +5s tolerance
 
 
 def test_verify_returns_false_during_lockout_even_with_valid_code():
@@ -163,7 +177,7 @@ def test_verify_returns_false_during_lockout_even_with_valid_code():
         mock_run.side_effect = [
             _attempts_proc(failures=3, lockout_until=future_lockout),  # _read_attempts
         ]
-        result = verify_code(valid_code)
+        result = verify_code(valid_code, 12345)
 
     assert result is False
     # Only one subprocess call should have been made (reading attempts).
@@ -181,29 +195,56 @@ def test_successful_code_resets_failure_counter():
             _secret_proc(),  # _read_secret
             _tee_proc(),  # _write_attempts
         ]
-        result = verify_code(valid_code)
+        result = verify_code(valid_code, 12345)
 
         write_call = mock_run.call_args_list[2]
         written = json.loads(write_call.kwargs["input"])
 
     assert result is True
-    assert written["failures"] == 0
-    assert written["lockout_until"] == 0
+    assert written["principals"]["12345"]["failures"] == 0
+    assert written["principals"]["12345"]["lockout_until"] == 0
 
 
 # ── is_totp_configured ───────────────────────────────────────────────
 
 
 def test_is_totp_configured_true_when_readable():
-    """is_totp_configured returns True when the secret file is readable."""
-    with patch("kai.totp.subprocess.run", return_value=_secret_proc()):
+    """Configured means both protected files exist, are readable, and validate."""
+    with (
+        patch("kai.totp._totp_files_present", return_value=(True, True)),
+        patch("kai.totp.subprocess.run", side_effect=[_secret_proc(), _attempts_proc()]),
+    ):
         assert is_totp_configured() is True
 
 
-def test_is_totp_configured_false_when_file_missing():
-    """is_totp_configured returns False when sudo cat exits non-zero (file missing, no sudoers rule, etc.)."""
-    with patch("kai.totp.subprocess.run", return_value=_failed_proc()):
+def test_is_totp_configured_false_only_when_both_files_absent():
+    """A cleanly absent secret and attempts file is the sole disabled state."""
+    with (
+        patch("kai.totp._totp_files_present", return_value=(False, False)),
+        patch("kai.totp.subprocess.run") as mock_run,
+    ):
         assert is_totp_configured() is False
+    mock_run.assert_not_called()
+
+
+@pytest.mark.parametrize("presence", [(True, False), (False, True)])
+def test_is_totp_configured_fails_closed_on_partial_state(presence):
+    """Losing either protected file cannot silently disable configured TOTP."""
+    with (
+        patch("kai.totp._totp_files_present", return_value=presence),
+        pytest.raises(TotpStateError, match="incomplete"),
+    ):
+        is_totp_configured()
+
+
+def test_is_totp_configured_fails_closed_on_secret_read_error():
+    """A sudo/permission failure is unavailable, not 'not configured'."""
+    with (
+        patch("kai.totp._totp_files_present", return_value=(True, True)),
+        patch("kai.totp.subprocess.run", return_value=_failed_proc()),
+        pytest.raises(TotpStateError, match="secret read failed"),
+    ):
+        is_totp_configured()
 
 
 # ── get_lockout_remaining ────────────────────────────────────────────
@@ -212,14 +253,14 @@ def test_is_totp_configured_false_when_file_missing():
 def test_get_lockout_remaining_zero_when_not_locked():
     """get_lockout_remaining returns 0 when lockout_until is 0 (no active lockout)."""
     with patch("kai.totp.subprocess.run", return_value=_attempts_proc(lockout_until=0)):
-        assert get_lockout_remaining() == 0
+        assert get_lockout_remaining(12345) == 0
 
 
 def test_get_lockout_remaining_positive_when_locked():
     """get_lockout_remaining returns a positive number of seconds when locked out."""
     future = time.time() + 300  # 5 minutes from now
     with patch("kai.totp.subprocess.run", return_value=_attempts_proc(lockout_until=future)):
-        remaining = get_lockout_remaining()
+        remaining = get_lockout_remaining(12345)
 
     # Should be close to 300, allow a few seconds of test execution slack.
     assert 295 <= remaining <= 300
@@ -231,7 +272,7 @@ def test_get_lockout_remaining_positive_when_locked():
 def test_get_failure_count_returns_failures_from_disk():
     """get_failure_count returns the current consecutive failure count from the attempts file."""
     with patch("kai.totp.subprocess.run", return_value=_attempts_proc(failures=2)):
-        count = get_failure_count()
+        count = get_failure_count(12345)
 
     assert count == 2
 
@@ -239,7 +280,7 @@ def test_get_failure_count_returns_failures_from_disk():
 def test_get_failure_count_returns_zero_on_clean_state():
     """get_failure_count returns 0 when there are no recorded failures."""
     with patch("kai.totp.subprocess.run", return_value=_attempts_proc(failures=0)):
-        count = get_failure_count()
+        count = get_failure_count(12345)
 
     assert count == 0
 
@@ -247,8 +288,8 @@ def test_get_failure_count_returns_zero_on_clean_state():
 # ── _read_attempts validation ────────────────────────────────────────
 
 
-def test_corrupt_lockout_until_falls_back_to_defaults():
-    """A non-numeric lockout_until in the attempts file triggers the fallback.
+def test_corrupt_lockout_until_fails_closed():
+    """A non-numeric lockout timestamp is rejected rather than reset.
 
     Fixes #36: the validation checked failures but not lockout_until,
     so a corrupted value like "abc" would pass validation and later
@@ -257,19 +298,102 @@ def test_corrupt_lockout_until_falls_back_to_defaults():
     corrupt = MagicMock()
     corrupt.returncode = 0
     corrupt.stdout = json.dumps({"failures": 0, "lockout_until": "abc"})
-    with patch("kai.totp.subprocess.run", return_value=corrupt):
-        remaining = get_lockout_remaining()
+    with (
+        patch("kai.totp.subprocess.run", return_value=corrupt),
+        pytest.raises(TotpStateError, match="lockout timestamp"),
+    ):
+        get_lockout_remaining(12345)
 
-    # Default state has lockout_until=0, so remaining should be 0
-    assert remaining == 0
 
-
-def test_corrupt_failures_falls_back_to_defaults():
-    """A non-numeric failures field triggers the fallback to defaults."""
+def test_corrupt_failures_fails_closed():
+    """A non-numeric failure count is rejected rather than reset."""
     corrupt = MagicMock()
     corrupt.returncode = 0
     corrupt.stdout = json.dumps({"failures": "xyz", "lockout_until": 0})
-    with patch("kai.totp.subprocess.run", return_value=corrupt):
-        count = get_failure_count()
+    with (
+        patch("kai.totp.subprocess.run", return_value=corrupt),
+        pytest.raises(TotpStateError, match="failure count"),
+    ):
+        get_failure_count(12345)
 
-    assert count == 0
+
+def test_legacy_global_state_is_preserved_during_migration():
+    """The old global counter becomes a wildcard fallback, not a reset."""
+    legacy = MagicMock(returncode=0, stdout=json.dumps({"failures": 2, "lockout_until": 0}))
+    with patch("kai.totp.subprocess.run", return_value=legacy):
+        assert get_failure_count(67890) == 2
+
+
+def test_attempt_state_is_isolated_per_principal():
+    """One Telegram user's failures do not consume another user's attempts."""
+    document = {
+        "version": 2,
+        "principals": {
+            "111": {"failures": 2, "lockout_until": 0},
+            "222": {"failures": 0, "lockout_until": 0},
+        },
+    }
+    proc = MagicMock(returncode=0, stdout=json.dumps(document))
+    with patch("kai.totp.subprocess.run", return_value=proc):
+        assert get_failure_count(111) == 2
+        assert get_failure_count(222) == 0
+
+
+def test_verification_updates_only_requesting_principal():
+    """Writing one failure preserves every other principal's record."""
+    document = {
+        "version": 2,
+        "principals": {
+            "111": {"failures": 1, "lockout_until": 0},
+            "222": {"failures": 2, "lockout_until": 0},
+        },
+    }
+    attempts = MagicMock(returncode=0, stdout=json.dumps(document))
+    with (
+        patch("kai.totp.subprocess.run", side_effect=[attempts, _secret_proc(), _tee_proc()]) as run,
+        patch("kai.totp.pyotp.TOTP.verify", return_value=False),
+    ):
+        assert verify_code("000000", 111) is False
+
+    written = json.loads(run.call_args_list[2].kwargs["input"])
+    assert written["principals"]["111"]["failures"] == 2
+    assert written["principals"]["222"]["failures"] == 2
+
+
+def test_failed_attempt_write_is_not_silently_ignored():
+    """A tee failure raises, so a valid code cannot bypass durable state."""
+    valid_code = pyotp.TOTP(_TEST_SECRET).now()
+    with (
+        patch(
+            "kai.totp.subprocess.run",
+            side_effect=[_attempts_proc(), _secret_proc(), _failed_proc()],
+        ),
+        pytest.raises(TotpStateError, match="write failed"),
+    ):
+        verify_code(valid_code, 12345)
+
+
+def test_concurrent_failures_are_serialized():
+    """Concurrent read-modify-write transactions cannot lose an increment."""
+    stored = {"version": 2, "principals": {}}
+
+    def read_attempts():
+        return deepcopy(stored)
+
+    def write_attempts(value):
+        nonlocal stored
+        # Widen the race window. The module lock must still preserve both writes.
+        time.sleep(0.01)
+        stored = deepcopy(value)
+
+    with (
+        patch("kai.totp._read_attempts", side_effect=read_attempts),
+        patch("kai.totp._read_secret", return_value=_TEST_SECRET),
+        patch("kai.totp._write_attempts", side_effect=write_attempts),
+        patch("kai.totp.pyotp.TOTP.verify", return_value=False),
+        ThreadPoolExecutor(max_workers=2) as executor,
+    ):
+        results = list(executor.map(lambda _: verify_code("000000", 12345), range(2)))
+
+    assert results == [False, False]
+    assert stored["principals"]["12345"]["failures"] == 2

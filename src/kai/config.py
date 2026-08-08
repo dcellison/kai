@@ -2884,18 +2884,26 @@ def load_config() -> Config:
 
     try:
         totp_session_minutes = int(os.environ.get("TOTP_SESSION_MINUTES", "30"))
+        if totp_session_minutes <= 0:
+            raise SystemExit("TOTP_SESSION_MINUTES must be a positive integer")
     except ValueError:
         raise SystemExit("TOTP_SESSION_MINUTES must be an integer") from None
     try:
         totp_challenge_seconds = int(os.environ.get("TOTP_CHALLENGE_SECONDS", "120"))
+        if totp_challenge_seconds <= 0:
+            raise SystemExit("TOTP_CHALLENGE_SECONDS must be a positive integer")
     except ValueError:
         raise SystemExit("TOTP_CHALLENGE_SECONDS must be an integer") from None
     try:
         totp_lockout_attempts = int(os.environ.get("TOTP_LOCKOUT_ATTEMPTS", "3"))
+        if totp_lockout_attempts <= 0:
+            raise SystemExit("TOTP_LOCKOUT_ATTEMPTS must be a positive integer")
     except ValueError:
         raise SystemExit("TOTP_LOCKOUT_ATTEMPTS must be an integer") from None
     try:
         totp_lockout_minutes = int(os.environ.get("TOTP_LOCKOUT_MINUTES", "15"))
+        if totp_lockout_minutes <= 0:
+            raise SystemExit("TOTP_LOCKOUT_MINUTES must be a positive integer")
     except ValueError:
         raise SystemExit("TOTP_LOCKOUT_MINUTES must be an integer") from None
 

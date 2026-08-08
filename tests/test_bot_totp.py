@@ -19,6 +19,7 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from kai.bot import handle_document, handle_message, handle_photo, handle_voice
+from kai.totp import TotpStateError
 
 # ── Test helpers ──────────────────────────────────────────────────────────
 
@@ -36,6 +37,7 @@ def _make_update(text: str = "hello") -> MagicMock:
     update.message.delete = AsyncMock()
     update.effective_chat.id = 12345
     update.effective_chat.send_message = AsyncMock()
+    update.effective_user.id = 67890
     return update
 
 
@@ -125,6 +127,24 @@ async def test_gate_skipped_when_totp_not_configured():
     update.message.reply_text.assert_not_called()
 
 
+async def test_gate_fails_closed_when_totp_state_is_unavailable():
+    """A protected-state read error denies the message instead of disabling TOTP."""
+    update = _make_update("hello")
+    ctx = _make_context()
+
+    with (
+        patch("kai.bot._is_authorized", return_value=True),
+        patch("kai.bot.is_totp_configured", side_effect=TotpStateError("sudo failed")),
+        patch("kai.bot._handle_response", new_callable=AsyncMock) as handle_response,
+    ):
+        await handle_message(update, ctx)
+
+    update.message.reply_text.assert_called_once_with(
+        "Authentication service unavailable. Access denied; contact the Kai administrator."
+    )
+    handle_response.assert_not_awaited()
+
+
 async def test_code_message_deleted_after_verification():
     """The code message is deleted from chat regardless of whether verification succeeds or fails."""
     pending = {"expires_at": time.time() + 120}
@@ -172,7 +192,7 @@ async def test_successful_auth_sets_timestamp():
         patch("kai.bot._is_authorized", return_value=True),
         patch("kai.bot.is_totp_configured", return_value=True),
         patch("kai.bot.get_lockout_remaining", return_value=0),
-        patch("kai.bot.verify_code", return_value=True),
+        patch("kai.bot.verify_code", return_value=True) as verify,
     ):
         await handle_message(update, ctx)
     after = time.time()
@@ -181,6 +201,27 @@ async def test_successful_auth_sets_timestamp():
     assert before <= ctx.user_data["totp_authenticated_at"] <= after
     # Pending state must be cleared after successful auth.
     assert "totp_pending" not in ctx.user_data
+    verify.assert_called_once_with("123456", 67890, 3, 15)
+
+
+async def test_gate_denies_when_attempt_state_write_fails():
+    """A valid code is not accepted unless its counter reset persists."""
+    pending = {"expires_at": time.time() + 120}
+    update = _make_update("123456")
+    ctx = _make_context({"totp_pending": pending})
+
+    with (
+        patch("kai.bot._is_authorized", return_value=True),
+        patch("kai.bot.is_totp_configured", return_value=True),
+        patch("kai.bot.get_lockout_remaining", return_value=0),
+        patch("kai.bot.verify_code", side_effect=TotpStateError("tee failed")),
+    ):
+        await handle_message(update, ctx)
+
+    assert "totp_authenticated_at" not in ctx.user_data
+    update.message.reply_text.assert_called_once_with(
+        "Authentication service unavailable. Access denied; contact the Kai administrator."
+    )
 
 
 async def test_lockout_message_shown_when_rate_limited():

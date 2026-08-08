@@ -35,6 +35,7 @@ import functools
 import json
 import logging
 import math
+import os
 import re
 import shutil
 import time
@@ -78,25 +79,41 @@ from kai.transcribe import TranscriptionError, transcribe_voice
 from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
 from kai.workspace_utils import is_workspace_allowed
 
-# TOTP is optional (requires pip install -e '.[totp]'). When the extra is not
-# installed, is_totp_configured() returns False and the gate is fully disabled.
-# All four stubs are defined in the except block so Pyright doesn't flag them
-# as possibly-unbound at their call sites inside the gate.
+# TOTP is optional for single-user development (requires pip install
+# -e '.[totp]'). A missing extra may disable the gate only when neither
+# protected TOTP file exists. If protected state exists, fail closed.
 try:
-    from kai.totp import get_failure_count, get_lockout_remaining, is_totp_configured, verify_code
-except ImportError:
+    from kai.totp import TotpStateError, get_failure_count, get_lockout_remaining, is_totp_configured, verify_code
+except ImportError as exc:
+    _TOTP_IMPORT_FAILURE = exc
+
+    class TotpStateError(RuntimeError):  # type: ignore[no-redef]
+        """TOTP protected state exists but the optional implementation is unavailable."""
 
     def is_totp_configured() -> bool:  # type: ignore[misc]
+        try:
+            state_exists = any(os.path.exists(path) for path in ("/etc/kai/totp.secret", "/etc/kai/totp.attempts"))
+        except OSError as exc:
+            raise TotpStateError("Could not determine whether protected TOTP state exists") from exc
+        if state_exists:
+            raise TotpStateError("Protected TOTP state exists but TOTP support could not be imported") from (
+                _TOTP_IMPORT_FAILURE
+            )
         return False
 
-    def get_lockout_remaining() -> int:  # type: ignore[misc]
-        return 0
+    def get_lockout_remaining(principal_id: int) -> int:  # type: ignore[misc]
+        raise TotpStateError("TOTP support is unavailable")
 
-    def verify_code(code: str, lockout_attempts: int = 3, lockout_minutes: int = 15) -> bool:  # type: ignore[misc]
-        return False
+    def verify_code(  # type: ignore[misc]
+        code: str,
+        principal_id: int,
+        lockout_attempts: int = 3,
+        lockout_minutes: int = 15,
+    ) -> bool:
+        raise TotpStateError("TOTP support is unavailable")
 
-    def get_failure_count() -> int:  # type: ignore[misc]
-        return 0
+    def get_failure_count(principal_id: int) -> int:  # type: ignore[misc]
+        raise TotpStateError("TOTP support is unavailable")
 
 
 log = logging.getLogger(__name__)
@@ -4121,6 +4138,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ── Main message handler ─────────────────────────────────────────────
 
 
+async def _deny_totp_state_error(update: Update, exc: TotpStateError) -> None:
+    """Deny an update when protected TOTP state cannot be trusted."""
+    log.error("TOTP state unavailable; denying Telegram update: %s", exc)
+    message = update.message or update.effective_message
+    if message is not None:
+        await message.reply_text("Authentication service unavailable. Access denied; contact the Kai administrator.")
+
+
 async def _check_totp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     Check TOTP authentication if configured. Returns True if the request
@@ -4134,8 +4159,12 @@ async def _check_totp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
     Informational commands (/stats, /help, /job, etc.) do NOT need
     this gate since they don't invoke Claude with user content.
     """
-    if not await asyncio.to_thread(is_totp_configured):
-        return True
+    try:
+        if not await asyncio.to_thread(is_totp_configured):
+            return True
+    except TotpStateError as exc:
+        await _deny_totp_state_error(update, exc)
+        return False
 
     assert context.user_data is not None
     assert update.effective_chat is not None
@@ -4164,6 +4193,83 @@ async def _check_totp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
     return False
 
 
+async def _check_totp_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Run the complete text-message TOTP challenge and verification flow."""
+    try:
+        if not await asyncio.to_thread(is_totp_configured):
+            return True
+
+        assert context.user_data is not None
+        assert update.effective_chat is not None
+        assert update.message is not None
+
+        principal_id = _user_id(update)
+        totp_cfg: Config = context.bot_data["config"]
+        auth_time = context.user_data.get("totp_authenticated_at", 0)
+        totp_expired = time.time() - auth_time > totp_cfg.totp_session_minutes * 60
+
+        if not totp_expired:
+            # Auth is still valid - refresh the timestamp so the session
+            # timeout measures inactivity, not time since login.
+            context.user_data["totp_authenticated_at"] = time.time()
+            return True
+
+        pending = context.user_data.get("totp_pending")
+        if not pending:
+            # First message after expiry - send challenge via the shared helper.
+            await _check_totp(update, context)
+            return False
+
+        if time.time() > pending["expires_at"]:
+            del context.user_data["totp_pending"]
+            await update.message.reply_text("TOTP challenge expired. Send another message to try again.")
+            return False
+
+        code = update.message.text.strip() if update.message.text else ""
+
+        # Only treat 6-digit ASCII strings as code attempts. Other messages
+        # are kept out of the verifier and are not deleted from Telegram.
+        if not (code.isascii() and code.isdigit() and len(code) == 6):
+            await update.effective_chat.send_message("Authentication required. Enter your 6-digit code.")
+            return False
+
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+        lockout_remaining = await asyncio.to_thread(get_lockout_remaining, principal_id)
+        if lockout_remaining > 0:
+            minutes = math.ceil(lockout_remaining / 60)
+            await update.effective_chat.send_message(
+                f"Too many failed attempts. Locked out for {minutes} more minute{'s' if minutes != 1 else ''}."
+            )
+            return False
+
+        lockout_attempts = totp_cfg.totp_lockout_attempts
+        lockout_minutes = totp_cfg.totp_lockout_minutes
+        if await asyncio.to_thread(verify_code, code, principal_id, lockout_attempts, lockout_minutes):
+            del context.user_data["totp_pending"]
+            context.user_data["totp_authenticated_at"] = time.time()
+            await update.effective_chat.send_message("Authenticated.")
+            return False
+
+        lockout_remaining = await asyncio.to_thread(get_lockout_remaining, principal_id)
+        if lockout_remaining > 0:
+            del context.user_data["totp_pending"]
+            await update.effective_chat.send_message(
+                f"Too many failed attempts. Locked out for {lockout_minutes} minutes."
+            )
+        else:
+            failures = await asyncio.to_thread(get_failure_count, principal_id)
+            remaining = max(0, lockout_attempts - failures)
+            await update.effective_chat.send_message(f"Invalid code. {remaining} attempt(s) remaining.")
+        return False
+    except TotpStateError as exc:
+        await _deny_totp_state_error(update, exc)
+        return False
+
+
 @_require_auth
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -4176,87 +4282,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not update.message or not update.message.text:
         return
 
-    # ── TOTP gate ────────────────────────────────────────────────────────
-    # handle_message needs the full TOTP flow: check session, send
-    # challenge, AND verify codes. Media handlers use _check_totp()
-    # which only handles the first two steps. We keep the expiry check
-    # inline here because _check_totp sets totp_pending as a side effect,
-    # and we need to read the pending state before that happens.
-    if await asyncio.to_thread(is_totp_configured):
-        assert context.user_data is not None
-        assert update.effective_chat is not None
-
-        totp_cfg: Config = context.bot_data["config"]
-        auth_time = context.user_data.get("totp_authenticated_at", 0)
-        totp_expired = time.time() - auth_time > totp_cfg.totp_session_minutes * 60
-
-        if totp_expired:
-            pending = context.user_data.get("totp_pending")
-
-            if not pending:
-                # First message after expiry - send challenge via helper
-                await _check_totp(update, context)
-                return
-
-            # A challenge is in flight. This text is the TOTP code.
-            if time.time() > pending["expires_at"]:
-                del context.user_data["totp_pending"]
-                await update.message.reply_text("TOTP challenge expired. Send another message to try again.")
-                return
-
-            code = update.message.text.strip() if update.message.text else ""
-
-            # Only treat 6-digit ASCII strings as code attempts. Other
-            # messages (e.g., normal chat that arrived concurrently with the
-            # challenge) are dropped with a brief reminder instead of being
-            # fed to verify_code(). This prevents message deletion, spurious
-            # "Invalid code" responses, and unnecessary sudo calls.
-            # Note: isascii() guard is needed because isdigit() accepts
-            # non-ASCII digit characters (superscripts, Arabic-Indic, etc.).
-            if not (code.isascii() and code.isdigit() and len(code) == 6):
-                await update.effective_chat.send_message("Authentication required. Enter your 6-digit code.")
-                return
-
-            # Delete the code message so it doesn't linger in chat
-            try:
-                await update.message.delete()
-            except Exception:
-                pass
-
-            # Check global lockout before calling verify_code()
-            lockout_remaining = await asyncio.to_thread(get_lockout_remaining)
-            if lockout_remaining > 0:
-                minutes = math.ceil(lockout_remaining / 60)
-                await update.effective_chat.send_message(
-                    f"Too many failed attempts. Locked out for {minutes} more minute{'s' if minutes != 1 else ''}."
-                )
-                return
-
-            lockout_attempts = totp_cfg.totp_lockout_attempts
-            lockout_minutes = totp_cfg.totp_lockout_minutes
-
-            if await asyncio.to_thread(verify_code, code, lockout_attempts, lockout_minutes):
-                del context.user_data["totp_pending"]
-                context.user_data["totp_authenticated_at"] = time.time()
-                await update.effective_chat.send_message("Authenticated.")
-                return
-
-            # Verification failed
-            lockout_remaining = await asyncio.to_thread(get_lockout_remaining)
-            if lockout_remaining > 0:
-                del context.user_data["totp_pending"]
-                await update.effective_chat.send_message(
-                    f"Too many failed attempts. Locked out for {lockout_minutes} minutes."
-                )
-            else:
-                remaining = lockout_attempts - await asyncio.to_thread(get_failure_count)
-                await update.effective_chat.send_message(f"Invalid code. {remaining} attempt(s) remaining.")
-            return
-
-        # Auth is still valid - refresh the timestamp so the session
-        # timeout measures inactivity, not time since login.
-        context.user_data["totp_authenticated_at"] = time.time()
-    # ── End TOTP gate ─────────────────────────────────────────────────────
+    if not await _check_totp_text(update, context):
+        return
 
     chat_id = _chat_id(update)
     prompt = update.message.text
