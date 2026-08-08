@@ -956,8 +956,14 @@ class TestEnsureStarted:
         mock_exec.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_passes_webhook_secret_in_env(self):
-        """Webhook secret is passed via KAI_WEBHOOK_SECRET env var."""
+    async def test_passes_only_principal_credential_in_env(self, monkeypatch):
+        """The agent gets its API credential but no outer control-plane secrets."""
+        monkeypatch.setenv("WEBHOOK_SECRET", "legacy-generic-secret")
+        monkeypatch.setenv("GENERIC_WEBHOOK_SECRET", "generic-signing-secret")
+        monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "github-signing-secret")
+        monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "telegram-signing-secret")
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bot-token")
+        monkeypatch.setenv("GH_TOKEN", "outer-github-token")
         claude = _make_claude(webhook_secret="my-secret")
 
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
@@ -971,6 +977,12 @@ class TestEnsureStarted:
 
             call_kwargs = mock_exec.call_args[1]
             assert call_kwargs["env"]["KAI_WEBHOOK_SECRET"] == "my-secret"
+            assert "WEBHOOK_SECRET" not in call_kwargs["env"]
+            assert "GENERIC_WEBHOOK_SECRET" not in call_kwargs["env"]
+            assert "GITHUB_WEBHOOK_SECRET" not in call_kwargs["env"]
+            assert "TELEGRAM_WEBHOOK_SECRET" not in call_kwargs["env"]
+            assert "TELEGRAM_BOT_TOKEN" not in call_kwargs["env"]
+            assert "GH_TOKEN" not in call_kwargs["env"]
 
     @pytest.mark.asyncio
     async def test_subprocess_limit_is_at_least_16mb(self):

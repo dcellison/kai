@@ -29,6 +29,38 @@ from kai.history import get_recent_history
 log = logging.getLogger(__name__)
 
 
+# Outer-daemon control-plane credentials must never enter a persistent agent
+# environment. Provider API keys are intentionally not listed: some supported
+# backends use them for model authentication, whereas these values authorize
+# Telegram, external webhooks, or the service account's GitHub identity.
+_CONTROL_PLANE_ENV_VARS = frozenset(
+    {
+        "GH_TOKEN",
+        "GENERIC_WEBHOOK_SECRET",
+        "GITHUB_TOKEN",
+        "GITHUB_WEBHOOK_SECRET",
+        "KAI_WEBHOOK_SECRET",
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_WEBHOOK_SECRET",
+        "WEBHOOK_SECRET",
+    }
+)
+
+
+def sanitize_agent_environment(environment: dict[str, str]) -> dict[str, str]:
+    """Return an agent environment without outer control-plane credentials.
+
+    Callers apply workspace environment configuration first, sanitize second,
+    and finally add the principal-bound ``KAI_WEBHOOK_SECRET`` credential. This
+    ordering prevents both inherited daemon state and a workspace env file from
+    restoring an external signing or bot credential.
+    """
+    sanitized = environment.copy()
+    for name in _CONTROL_PLANE_ENV_VARS:
+        sanitized.pop(name, None)
+    return sanitized
+
+
 def apply_workspace_model(
     workspace_config: WorkspaceConfig | None,
     backend: str,
@@ -121,7 +153,7 @@ class ApiContext:
 
     Attributes:
         webhook_port: Local port the webhook server listens on.
-        webhook_secret: Shared secret for authenticating API requests.
+        webhook_secret: Principal-bound credential for internal API requests.
         services_info: List of dicts describing available external services.
     """
 
@@ -389,8 +421,9 @@ def build_session_context(
         )
 
     # Inject scheduling API info (always, so cron works from any workspace).
-    # The secret is passed via $KAI_WEBHOOK_SECRET env var (not embedded
-    # in prompt text) to prevent leakage through session logs.
+    # The principal credential is passed via $KAI_WEBHOOK_SECRET (legacy
+    # variable name) rather than embedded in prompt text, preventing session-log
+    # leakage while preserving existing agent instructions.
     if api.webhook_secret:
         api_note = (
             f"[Scheduling API: To create jobs, use curl (NEVER WebFetch) to POST JSON to "
@@ -755,9 +788,8 @@ def _is_notification_only_chat_id(chat_id: int | None, config: Config) -> bool:
     True iff this chat_id has no interactive user entry in users.yaml.
 
     A chat_id is "notification-only" when it appears in the running
-    system (a github_notify_chat_id field on another user's config, or
-    an /api/send-message target, or any chat that received a
-    notification and is therefore in allowed_user_ids) but is NOT the
+    system (a github_notify_chat_id field on another user's config, an
+    /api/send-message target, or any other outbound destination) but is NOT the
     primary telegram_id key of any user entry. Examples: a GitHub
     notification group chat, a deploy-status broadcast channel, a
     review-summary destination room.
@@ -769,9 +801,8 @@ def _is_notification_only_chat_id(chat_id: int | None, config: Config) -> bool:
     Returns True (skip auto-provisioning) when the chat_id is not a
     key in user_configs. The contract on True: the caller must NOT
     create a per-user directory for this chat_id. The chat_id
-    remains valid for outbound notification sending (it lives in
-    allowed_user_ids); only the home-workspace provisioning is
-    suppressed.
+    remains valid for outbound notification sending; only the home-workspace
+    provisioning is suppressed.
     """
     if chat_id is None:
         return False
@@ -832,8 +863,7 @@ def resolve_home_workspace(
 
     # Notification-only chat_ids must not auto-provision a home
     # directory. The chat_id is real enough to receive outbound
-    # notifications (it was added to allowed_user_ids at config-load
-    # time), but it has no interactive user entry in users.yaml. The
+    # notifications, but it has no interactive user entry in users.yaml. The
     # previous unconditional ensure_user_home call mkdir'd an empty
     # `home/<chat_id>/` on first contact - either a stray inbound
     # message from the notification chat (a human in the GitHub

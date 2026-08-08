@@ -598,6 +598,8 @@ def _make_config(**overrides) -> Config:
         "allowed_user_ids": {1},
         "workspace_base": None,
         "allowed_workspaces": [],
+        "github_webhook_secret": "github-test-secret",
+        "generic_webhook_secret": "generic-test-secret",
         "webhook_secret": "test-secret",
         "webhook_port": 8080,
         "tts_enabled": False,
@@ -962,6 +964,13 @@ class TestModelsKeyboard:
         assert "model:opus" in callbacks
         assert "model:sonnet" in callbacks
         assert "model:haiku" in callbacks
+
+    def test_codex_keyboard_offers_gpt56(self):
+        """The documented GPT-5.6 alias is selectable on the Codex surface."""
+        from kai.config import CODEX_MODELS
+
+        kb = _models_keyboard("gpt-5.5", CODEX_MODELS)
+        assert "model:gpt-5.6" in _button_callbacks(kb)
 
     def test_callback_data_format(self):
         kb = _models_keyboard("opus", self._anthropic_models)
@@ -1693,7 +1702,7 @@ class TestHandleWebhooks:
     @pytest.mark.asyncio
     async def test_running_with_secret(self):
         update = _make_update()
-        ctx = _make_context(config=_make_config(webhook_secret="s3cret"))
+        ctx = _make_context(config=_make_config(github_webhook_secret="s3cret"))
         with patch("kai.bot.webhook.is_running", return_value=True):
             await handle_webhooks(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
@@ -1703,20 +1712,26 @@ class TestHandleWebhooks:
     @pytest.mark.asyncio
     async def test_not_running(self):
         update = _make_update()
-        ctx = _make_context(config=_make_config(webhook_secret="s3cret"))
+        ctx = _make_context(config=_make_config(github_webhook_secret="s3cret"))
         with patch("kai.bot.webhook.is_running", return_value=False):
             await handle_webhooks(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "not running" in reply
 
     @pytest.mark.asyncio
-    async def test_no_secret(self):
+    async def test_no_external_secrets(self):
         update = _make_update()
-        ctx = _make_context(config=_make_config(webhook_secret=""))
+        ctx = _make_context(
+            config=_make_config(
+                github_webhook_secret="",
+                generic_webhook_secret="",
+            )
+        )
         with patch("kai.bot.webhook.is_running", return_value=True):
             await handle_webhooks(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
-        assert "WEBHOOK_SECRET not set" in reply
+        assert "No external webhook secrets" in reply
+        assert "/api/schedule" in reply
 
 
 # ── handle_workspace ─────────────────────────────────────────────────

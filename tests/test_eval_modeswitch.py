@@ -520,71 +520,15 @@ class TestExtractionCallSiteGating:
 
 
 class TestCheckSubcommand:
-    """check subcommand's tri-state exit code contract: 0 on a clean
-    read, 2 on missing WEBHOOK_SECRET, 1 on health-down or unexpected
-    stats status. Tests monkeypatch the `_http_get` helper to drive
-    each branch without standing up an HTTP server."""
-
-    def test_check_missing_secret_exits_2(self, monkeypatch, capsys) -> None:
-        """WEBHOOK_SECRET not exported at all: print the
-        not-set hint and exit 2 BEFORE making any HTTP call."""
-        monkeypatch.delenv("WEBHOOK_SECRET", raising=False)
-
-        # _http_get must NOT be called on this path. If it is,
-        # the HTTP shim would try to reach localhost:8080, which
-        # might pick up the running production service and skew
-        # the test. Explicit raise on call surfaces the regression.
-        def _no_http(*args, **kwargs):
-            raise AssertionError("_http_get must not be called when secret is missing")
-
-        monkeypatch.setattr(modeswitch, "_http_get", _no_http)
-        rc = modeswitch._run_check()
-        assert rc == 2
-        out = capsys.readouterr().out
-        # Pin all three lines the production code emits on the
-        # missing-secret path. The example-command line is part of
-        # the diagnostic shape; dropping it would leave the operator
-        # without the actionable next step.
-        assert "secret_found: no" in out
-        assert "WEBHOOK_SECRET not set" in out
-        assert "sudo bash -c 'source /etc/kai/env" in out
-
-    def test_check_empty_secret_exits_2_with_distinct_diagnostic(self, monkeypatch, capsys) -> None:
-        """WEBHOOK_SECRET exported but set to the empty string:
-        report `secret_found: empty` (not `no`) and exit 2 with a
-        diagnostic that points the operator at the env-file typo,
-        not at sourcing the env file. The two cases are
-        operationally distinct: one is "you didn't source", the
-        other is "you sourced but the value is wrong"."""
-        monkeypatch.setenv("WEBHOOK_SECRET", "")
-
-        def _no_http(*args, **kwargs):
-            raise AssertionError("_http_get must not be called when secret is empty")
-
-        monkeypatch.setattr(modeswitch, "_http_get", _no_http)
-        rc = modeswitch._run_check()
-        assert rc == 2
-        out = capsys.readouterr().out
-        # Pin all three lines the production code emits on the
-        # empty-secret path. The "a line like" parenthetical is the
-        # actionable hint pointing at the env-file typo shape; the
-        # operator needs it to know what to look for.
-        assert "secret_found: empty" in out
-        assert "exported but empty" in out
-        assert "a line like" in out
-        # The distinct diagnostic must NOT collapse back to the
-        # not-set messaging that the operator already ruled out by
-        # sourcing the env file.
-        assert "WEBHOOK_SECRET not set" not in out
+    """The runtime check reads the non-sensitive mode from /health."""
 
     def test_check_health_down_exits_1(self, monkeypatch, capsys) -> None:
         """Health probe returns non-200: report `health: down`, skip
         the stats probe, and exit 1. Prompt-version probe still runs
         because operators want the deploy version visible even when
         the service is down."""
-        monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
 
-        def _http_health_down(url, secret=None, timeout=5.0):
+        def _http_health_down(url, timeout=5.0):
             if "/health" in url:
                 return 500, b""
             raise AssertionError(f"unexpected url: {url}")
@@ -594,132 +538,53 @@ class TestCheckSubcommand:
         rc = modeswitch._run_check()
         assert rc == 1
         out = capsys.readouterr().out
-        # Pin every line the production code emits on the health-
-        # down path: secret_found, health, mode, and BOTH prompt
-        # versions. A regression that drops any of these lines
-        # silently (e.g., an early-return that skips the prompt-
-        # version probe) would go undetected without all four
-        # assertions; pinning the full output shape closes that
-        # gap.
-        assert "secret_found: yes" in out
         assert "health: down" in out
         assert "mode: unknown(service-down)" in out
         assert "extraction_prompt_version: 7" in out
         assert "episode_prompt_version: 1" in out
 
-    def test_check_stats_503_reports_disabled(self, monkeypatch, capsys) -> None:
-        """Stats probe returns 503 (memory disabled): report
-        `mode: disabled` and exit 0. The 503 is the documented
-        memory-disabled response from the @_require_secret-protected
-        endpoint."""
-        monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
-
-        def _http_disabled(url, secret=None, timeout=5.0):
-            if "/health" in url:
-                return 200, b'{"status": "ok"}'
-            if "/api/memory/stats" in url:
-                # Auth header MUST be present. The test asserts the
-                # secret was threaded through; without this, a
-                # regression that dropped the X-Webhook-Secret header
-                # would let the test pass against a 401 (which the
-                # caller would then mis-classify).
-                assert secret == "test-secret", f"expected secret to be threaded; got {secret!r}"
-                # URL must NOT carry an explicit chat_id. The
-                # webhook handler resolves chat_id BEFORE the
-                # is_enabled() branch and rejects any explicit
-                # value not in allowed_user_ids with a 403; an
-                # earlier version of this harness passed chat_id=1
-                # and silently 403'd against production. Pinning
-                # the absence here closes the regression.
-                assert "chat_id" not in url, f"stats URL must not carry a chat_id parameter; got {url!r}"
-                return 503, b'{"error": "memory disabled"}'
-            raise AssertionError(f"unexpected url: {url}")
+    def test_check_health_reports_disabled(self, monkeypatch, capsys) -> None:
+        def _http_disabled(url, timeout=5.0):
+            assert url.endswith("/health")
+            return 200, b'{"status": "ok", "memory_enabled": false}'
 
         monkeypatch.setattr(modeswitch, "_http_get", _http_disabled)
         monkeypatch.setattr(modeswitch, "_read_prompt_versions", lambda: ("7", "1"))
         rc = modeswitch._run_check()
         assert rc == 0
         out = capsys.readouterr().out
-        # Pin every line the production code emits on the disabled
-        # mode path. Same shape as test_check_health_down_exits_1.
-        assert "secret_found: yes" in out
         assert "health: ok" in out
         assert "mode: disabled" in out
         assert "extraction_prompt_version: 7" in out
         assert "episode_prompt_version: 1" in out
 
-    def test_check_stats_200_reports_enabled(self, monkeypatch, capsys) -> None:
-        """Stats probe returns 200 with a stats payload (memory
-        enabled): report `mode: enabled` and exit 0."""
-        monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
-
-        def _http_enabled(url, secret=None, timeout=5.0):
-            if "/health" in url:
-                return 200, b'{"status": "ok"}'
-            if "/api/memory/stats" in url:
-                # Same auth-header threading guard as the disabled
-                # test: a regression that drops `secret=secret` at
-                # the stats call site would let the test pass against
-                # an unauthed 200 (which the production code would
-                # never see in real life, but the test should not
-                # silently accept), masking the regression. Pinned
-                # symmetrically across all stats-touching mocks.
-                assert secret == "test-secret", f"expected secret to be threaded; got {secret!r}"
-                # URL must NOT carry an explicit chat_id (see the
-                # disabled-test comment for the 403-against-prod
-                # rationale).
-                assert "chat_id" not in url, f"stats URL must not carry a chat_id parameter; got {url!r}"
-                return 200, b'{"total_count": 42}'
-            raise AssertionError(f"unexpected url: {url}")
+    def test_check_health_reports_enabled(self, monkeypatch, capsys) -> None:
+        def _http_enabled(url, timeout=5.0):
+            assert url.endswith("/health")
+            return 200, b'{"status": "ok", "memory_enabled": true}'
 
         monkeypatch.setattr(modeswitch, "_http_get", _http_enabled)
         monkeypatch.setattr(modeswitch, "_read_prompt_versions", lambda: ("7", "1"))
         rc = modeswitch._run_check()
         assert rc == 0
         out = capsys.readouterr().out
-        # Pin every line the production code emits on the enabled
-        # mode path. Same shape as the disabled, health-down, and
-        # unexpected-status test cases.
-        assert "secret_found: yes" in out
         assert "health: ok" in out
         assert "mode: enabled" in out
         assert "extraction_prompt_version: 7" in out
         assert "episode_prompt_version: 1" in out
 
-    def test_check_stats_unexpected_status_exits_1(self, monkeypatch, capsys) -> None:
-        """Stats probe returns a status that's neither 200 nor 503
-        (e.g. 401 from a wrong secret, or a 500 server error): report
-        the status and exit 1. This is the shape that the spec's
-        anti-false-negative argument hinges on; a silent fall-through
-        to 'disabled' here would defeat the entire harness."""
-        monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
-
-        def _http_unexpected(url, secret=None, timeout=5.0):
-            if "/health" in url:
-                return 200, b'{"status": "ok"}'
-            if "/api/memory/stats" in url:
-                # Same auth-header threading guard as the disabled
-                # and enabled tests; pinned symmetrically across
-                # all stats-touching mocks.
-                assert secret == "test-secret", f"expected secret to be threaded; got {secret!r}"
-                # URL must NOT carry an explicit chat_id (see the
-                # disabled-test comment for the 403-against-prod
-                # rationale).
-                assert "chat_id" not in url, f"stats URL must not carry a chat_id parameter; got {url!r}"
-                return 401, b'{"error": "unauthorized"}'
-            raise AssertionError(f"unexpected url: {url}")
+    def test_check_invalid_health_payload_exits_1(self, monkeypatch, capsys) -> None:
+        def _http_unexpected(url, timeout=5.0):
+            assert url.endswith("/health")
+            return 200, b'{"status": "ok"}'
 
         monkeypatch.setattr(modeswitch, "_http_get", _http_unexpected)
         monkeypatch.setattr(modeswitch, "_read_prompt_versions", lambda: ("7", "1"))
         rc = modeswitch._run_check()
         assert rc == 1
         out = capsys.readouterr().out
-        # Pin every line the production code emits on the
-        # unexpected-status path. Same shape as the disabled and
-        # health-down test cases.
-        assert "secret_found: yes" in out
         assert "health: ok" in out
-        assert "mode: unknown(401)" in out
+        assert "mode: unknown(health-payload)" in out
         assert "extraction_prompt_version: 7" in out
         assert "episode_prompt_version: 1" in out
 
@@ -729,26 +594,14 @@ class TestCheckSubcommand:
         is what unblocks the rest of the report; without it, the
         harness would crash with ValueError on a config typo.
 
-        Mock follows the same auth-secret + chat_id-absence pattern as
-        the three other stats-touching mocks; full output shape pinned
-        per the same pattern as the four mode-reporting tests."""
-        monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
+        The health probe remains the only request."""
         monkeypatch.setenv("WEBHOOK_PORT", "not-an-integer")
 
         captured_urls: list[str] = []
 
-        def _http_with_capture(url, secret=None, timeout=5.0):
+        def _http_with_capture(url, timeout=5.0):
             captured_urls.append(url)
-            if "/health" in url:
-                return 200, b'{"status": "ok"}'
-            if "/api/memory/stats" in url:
-                # Auth-secret + chat_id-absence guards parallel to
-                # _http_disabled / _http_enabled / _http_unexpected;
-                # see the disabled-test comment for the rationale.
-                assert secret == "test-secret", f"expected secret to be threaded; got {secret!r}"
-                assert "chat_id" not in url, f"stats URL must not carry a chat_id parameter; got {url!r}"
-                return 200, b'{"total_count": 0}'
-            raise AssertionError(f"unexpected url: {url}")
+            return 200, b'{"status": "ok", "memory_enabled": true}'
 
         monkeypatch.setattr(modeswitch, "_http_get", _http_with_capture)
         monkeypatch.setattr(modeswitch, "_read_prompt_versions", lambda: ("7", "1"))
@@ -760,9 +613,6 @@ class TestCheckSubcommand:
         # Every captured URL must point at port 8080, the documented
         # fallback. Pinning the URL is what proves the fallback ran.
         assert all("localhost:8080" in u for u in captured_urls), captured_urls
-        # Pin the full five-line report shape, parallel to the
-        # other mode-reporting tests in this class.
-        assert "secret_found: yes" in out
         assert "health: ok" in out
         assert "mode: enabled" in out
         assert "extraction_prompt_version: 7" in out
@@ -776,23 +626,14 @@ class TestCheckSubcommand:
         accept and report `health: down (status=0)`, which is the
         confusing diagnostic the range guard exists to prevent.
 
-        Mock follows the same auth-secret + chat_id-absence pattern as
-        the three other stats-touching mocks; full output shape pinned
-        per the same pattern as the four mode-reporting tests."""
-        monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
+        The health probe remains the only request."""
         monkeypatch.setenv("WEBHOOK_PORT", "99999")
 
         captured_urls: list[str] = []
 
-        def _http_with_capture(url, secret=None, timeout=5.0):
+        def _http_with_capture(url, timeout=5.0):
             captured_urls.append(url)
-            if "/health" in url:
-                return 200, b'{"status": "ok"}'
-            if "/api/memory/stats" in url:
-                assert secret == "test-secret", f"expected secret to be threaded; got {secret!r}"
-                assert "chat_id" not in url, f"stats URL must not carry a chat_id parameter; got {url!r}"
-                return 200, b'{"total_count": 0}'
-            raise AssertionError(f"unexpected url: {url}")
+            return 200, b'{"status": "ok", "memory_enabled": true}'
 
         monkeypatch.setattr(modeswitch, "_http_get", _http_with_capture)
         monkeypatch.setattr(modeswitch, "_read_prompt_versions", lambda: ("7", "1"))
@@ -805,9 +646,6 @@ class TestCheckSubcommand:
         # reading the source.
         assert "out of range" in out
         assert all("localhost:8080" in u for u in captured_urls), captured_urls
-        # Pin the full five-line report shape, parallel to the
-        # other mode-reporting tests in this class.
-        assert "secret_found: yes" in out
         assert "health: ok" in out
         assert "mode: enabled" in out
         assert "extraction_prompt_version: 7" in out

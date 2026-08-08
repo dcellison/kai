@@ -57,6 +57,7 @@ from kai.backend import (
     build_session_context,
     ensure_user_memory,
     ensure_user_preferences,
+    sanitize_agent_environment,
 )
 from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude_user
 
@@ -755,10 +756,9 @@ class AcpBackend(AgentBackend):
 
         Goose adds GOOSE_MODEL (and conditionally GOOSE_PROVIDER).
         OpenCode may add OPENCODE_CONFIG_CONTENT or OPENCODE_CONFIG.
-        The shared layer applies workspace env_file / inline env and
-        the webhook secret AFTER this hook so workspace overrides can
-        still shadow backend-specific defaults; the webhook secret is
-        applied last so workspace env cannot override it.
+        The shared layer applies workspace env_file / inline env after this
+        hook, strips outer control-plane credentials, and applies the
+        principal-bound API credential last.
 
         Hook receives a mutable dict copy of the inherited environment;
         it may mutate in place or return a different dict.
@@ -931,7 +931,7 @@ class AcpBackend(AgentBackend):
         Start the ACP subprocess if not already running.
 
         Spawns the subprocess via build_argv() with the env produced by
-        build_env() (plus workspace overrides and the webhook secret),
+        build_env() (plus workspace overrides and the principal credential),
         then runs the two-step handshake:
         1. initialize - establishes protocol version and capabilities
         2. session/new - creates a session with backend-specific params
@@ -960,8 +960,9 @@ class AcpBackend(AgentBackend):
         # 2. Backend-specific keys (via self.build_env)
         # 3. Per-workspace env_file values
         # 4. Per-workspace inline env values (override env_file)
-        # 5. Webhook secret (workspace env can't override it)
-        # 6. Per-os-user TMPDIR anchor (cross-user mode only; LAST so
+        # 5. Remove outer control-plane credentials
+        # 6. Principal API credential (workspace env can't override it)
+        # 7. Per-os-user TMPDIR anchor (cross-user mode only; LAST so
         #    workspace env cannot point one user's temp writes at
         #    another's). The per-user dirs under <DATA_DIR>/tmp/ are
         #    created and chowned by install.py; TMPDIR survives
@@ -972,6 +973,7 @@ class AcpBackend(AgentBackend):
                 env.update(parse_env_file(self.workspace_config.env_file))
             if self.workspace_config.env:
                 env.update(self.workspace_config.env)
+        env = sanitize_agent_environment(env)
         if self._api_context.webhook_secret:
             env["KAI_WEBHOOK_SECRET"] = self._api_context.webhook_secret
         if effective_os_user:

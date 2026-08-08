@@ -10,17 +10,22 @@ import pytest
 from aiohttp import web
 
 from kai import sessions
+from kai.internal_api_auth import InternalAPIAuth, InternalAPIPrincipal
 from kai.services import ServiceResponse
 from kai.webhook import (
     ALLOWED_USER_IDS_KEY,
     CHAT_ID_KEY,
     CONFIG_KEY,
+    GENERIC_WEBHOOK_SECRET_KEY,
+    GITHUB_WEBHOOK_SECRET_KEY,
+    INTERNAL_API_AUTH_KEY,
+    LEGACY_WEBHOOK_SECRET_KEY,
     POOL_KEY,
     PR_REVIEW_COOLDOWN_KEY,
     TELEGRAM_APP_KEY,
     TELEGRAM_BOT_KEY,
     TELEGRAM_WEBHOOK_SECRET_KEY,
-    WEBHOOK_SECRET_KEY,
+    UnauthorizedChatIdError,
     _handle_delete_job,
     _handle_generic,
     _handle_get_job,
@@ -40,6 +45,11 @@ from kai.webhook import (
 )
 
 
+def _make_internal_api_auth() -> InternalAPIAuth:
+    """Create deterministic credentials for the two API test principals."""
+    return InternalAPIAuth({123: "test-secret", 456: "other-secret"})
+
+
 @pytest.fixture
 async def db(tmp_path):
     """Initialize a fresh database for each test."""
@@ -53,7 +63,8 @@ def mock_request():
     """Create a minimal mock request with app dict and helpers."""
     request = MagicMock(spec=web.Request)
     request.app = {
-        WEBHOOK_SECRET_KEY: "test-secret",
+        INTERNAL_API_AUTH_KEY: _make_internal_api_auth(),
+        GENERIC_WEBHOOK_SECRET_KEY: "signing-secret",
         TELEGRAM_APP_KEY: MagicMock(),
         TELEGRAM_BOT_KEY: AsyncMock(),
         CHAT_ID_KEY: 123,
@@ -342,7 +353,8 @@ def send_file_request(tmp_path):
     mock_pool.get_effective_workspace = AsyncMock(return_value=tmp_path)
     request = MagicMock(spec=web.Request)
     request.app = {
-        WEBHOOK_SECRET_KEY: "test-secret",
+        INTERNAL_API_AUTH_KEY: _make_internal_api_auth(),
+        GENERIC_WEBHOOK_SECRET_KEY: "signing-secret",
         TELEGRAM_BOT_KEY: AsyncMock(),
         CHAT_ID_KEY: 123,
         POOL_KEY: mock_pool,
@@ -431,7 +443,8 @@ def send_message_request():
     """Create a mock request for the send-message endpoint."""
     request = MagicMock(spec=web.Request)
     request.app = {
-        WEBHOOK_SECRET_KEY: "test-secret",
+        INTERNAL_API_AUTH_KEY: _make_internal_api_auth(),
+        GENERIC_WEBHOOK_SECRET_KEY: "signing-secret",
         TELEGRAM_BOT_KEY: AsyncMock(),
         CHAT_ID_KEY: 123,
     }
@@ -536,6 +549,16 @@ class TestTelegramUpdate:
         assert resp.status == 401
         telegram_request.app[TELEGRAM_APP_KEY].process_update.assert_not_called()
 
+    async def test_legacy_webhook_secret_is_not_accepted(self, telegram_request):
+        """The external transition credential never crosses into Telegram auth."""
+        telegram_request.app[LEGACY_WEBHOOK_SECRET_KEY] = "legacy-secret"
+        telegram_request.headers = {"X-Telegram-Bot-Api-Secret-Token": "legacy-secret"}
+
+        resp = await _handle_telegram_update(telegram_request)
+
+        assert resp.status == 401
+        telegram_request.app[TELEGRAM_APP_KEY].process_update.assert_not_called()
+
     async def test_missing_secret_returns_401(self, telegram_request):
         """Missing secret header returns 401."""
         telegram_request.headers = {}
@@ -585,7 +608,8 @@ def github_request():
     mock_config.user_configs = {}
     request = MagicMock(spec=web.Request)
     request.app = {
-        WEBHOOK_SECRET_KEY: "test-secret",
+        INTERNAL_API_AUTH_KEY: _make_internal_api_auth(),
+        GITHUB_WEBHOOK_SECRET_KEY: "test-secret",
         TELEGRAM_BOT_KEY: AsyncMock(),
         CHAT_ID_KEY: 12345,
         CONFIG_KEY: mock_config,
@@ -703,6 +727,39 @@ class TestGitHubWebhook:
         assert resp.status == 401
         github_request.app[TELEGRAM_BOT_KEY].send_message.assert_not_called()
 
+    async def test_legacy_signature_is_accepted_and_logged(self, github_request, caplog):
+        """An existing GitHub registration stays live and produces migration telemetry."""
+        body = b'{"zen": "migration"}'
+        github_request.app[LEGACY_WEBHOOK_SECRET_KEY] = "legacy-secret"
+        github_request.read = AsyncMock(return_value=body)
+        github_request.headers = {
+            "X-Hub-Signature-256": _sign_body("legacy-secret", body),
+            "X-GitHub-Event": "ping",
+        }
+
+        with caplog.at_level("WARNING", logger="kai.webhook"):
+            resp = await _handle_github(github_request)
+
+        assert resp.status == 200
+        assert "Legacy WEBHOOK_SECRET authenticated /webhook/github" in caplog.text
+        assert "GITHUB_WEBHOOK_SECRET" in caplog.text
+
+    async def test_named_signature_does_not_log_legacy_use(self, github_request, caplog):
+        """The primary named credential wins even while compatibility is configured."""
+        body = b'{"zen": "named"}'
+        github_request.app[LEGACY_WEBHOOK_SECRET_KEY] = "legacy-secret"
+        github_request.read = AsyncMock(return_value=body)
+        github_request.headers = {
+            "X-Hub-Signature-256": _sign_body("test-secret", body),
+            "X-GitHub-Event": "ping",
+        }
+
+        with caplog.at_level("WARNING", logger="kai.webhook"):
+            resp = await _handle_github(github_request)
+
+        assert resp.status == 200
+        assert "Legacy WEBHOOK_SECRET authenticated" not in caplog.text
+
     async def test_ping_event_returns_pong(self, github_request):
         """GitHub ping events are acknowledged without sending to Telegram."""
         body = b'{"zen": "testing"}'
@@ -778,7 +835,8 @@ def generic_request():
     """Create a mock request for the generic webhook endpoint."""
     request = MagicMock(spec=web.Request)
     request.app = {
-        WEBHOOK_SECRET_KEY: "test-secret",
+        INTERNAL_API_AUTH_KEY: _make_internal_api_auth(),
+        GENERIC_WEBHOOK_SECRET_KEY: "test-secret",
         TELEGRAM_BOT_KEY: AsyncMock(),
         CHAT_ID_KEY: 12345,
     }
@@ -858,6 +916,30 @@ class TestGenericWebhook:
         resp = await _handle_generic(generic_request)
 
         assert resp.status == 401
+
+    async def test_legacy_secret_is_accepted_and_logged(self, generic_request, caplog):
+        """An unknown external caller gets a compatibility window with telemetry."""
+        generic_request.app[LEGACY_WEBHOOK_SECRET_KEY] = "legacy-secret"
+        generic_request.headers = {"X-Webhook-Secret": "legacy-secret"}
+        generic_request.json = AsyncMock(return_value={"message": "legacy caller"})
+
+        with caplog.at_level("WARNING", logger="kai.webhook"):
+            resp = await _handle_generic(generic_request)
+
+        assert resp.status == 200
+        assert "Legacy WEBHOOK_SECRET authenticated /webhook" in caplog.text
+        assert "GENERIC_WEBHOOK_SECRET" in caplog.text
+
+    async def test_named_secret_does_not_log_legacy_use(self, generic_request, caplog):
+        """The generic route checks its named credential before the fallback."""
+        generic_request.app[LEGACY_WEBHOOK_SECRET_KEY] = "legacy-secret"
+        generic_request.json = AsyncMock(return_value={"message": "named caller"})
+
+        with caplog.at_level("WARNING", logger="kai.webhook"):
+            resp = await _handle_generic(generic_request)
+
+        assert resp.status == 200
+        assert "Legacy WEBHOOK_SECRET authenticated" not in caplog.text
 
 
 # ── GET /api/jobs ──────────────────────────────────────────────────
@@ -1297,7 +1379,8 @@ def service_request():
     """Create a mock request for the service proxy endpoint."""
     request = MagicMock(spec=web.Request)
     request.app = {
-        WEBHOOK_SECRET_KEY: "test-secret",
+        INTERNAL_API_AUTH_KEY: _make_internal_api_auth(),
+        GENERIC_WEBHOOK_SECRET_KEY: "signing-secret",
     }
     request.headers = {"X-Webhook-Secret": "test-secret"}
     request.match_info = {"name": "perplexity"}
@@ -1385,56 +1468,59 @@ class TestServiceCall:
 
 
 class TestResolveChatId:
-    def _make_request(self, app_chat_id=12345):
-        """Create a minimal mock request with an app-level chat_id."""
-        request = MagicMock()
-        request.app = {CHAT_ID_KEY: app_chat_id}
-        return request
+    def _principal(self, chat_id: int = 123) -> InternalAPIPrincipal:
+        """Resolve a deterministic test principal from its credential."""
+        auth = _make_internal_api_auth()
+        credential = "test-secret" if chat_id == 123 else "other-secret"
+        principal = auth.authenticate(credential)
+        assert principal is not None
+        return principal
 
-    def test_explicit_chat_id(self):
-        """Uses chat_id from payload when present."""
-        request = self._make_request(app_chat_id=99999)
-        assert _resolve_chat_id(request, {"chat_id": 42}) == 42
+    def test_mismatched_explicit_chat_id_rejected(self):
+        """Rejects a request-supplied identity that differs from the principal."""
+        principal = self._principal()
+        with pytest.raises(UnauthorizedChatIdError, match="does not match authenticated principal"):
+            _resolve_chat_id(principal, {"chat_id": 42})
 
-    def test_fallback_to_app_default(self):
-        """Falls back to app-level chat_id when payload has no chat_id."""
-        request = self._make_request(app_chat_id=12345)
-        assert _resolve_chat_id(request, {}) == 12345
+    def test_omitted_chat_id_uses_principal(self):
+        """Omitted chat_id resolves to the authenticated principal."""
+        principal = self._principal()
+        assert _resolve_chat_id(principal, {}) == 123
 
     def test_invalid_non_numeric(self):
         """Raises ValueError for non-numeric chat_id."""
-        request = self._make_request()
+        principal = self._principal()
         with pytest.raises(ValueError, match="must be an integer"):
-            _resolve_chat_id(request, {"chat_id": "abc"})
+            _resolve_chat_id(principal, {"chat_id": "abc"})
 
     def test_invalid_float(self):
         """Raises ValueError for non-integer float chat_id."""
-        request = self._make_request()
+        principal = self._principal()
         with pytest.raises(ValueError, match="must be an integer"):
-            _resolve_chat_id(request, {"chat_id": 12345.6})
+            _resolve_chat_id(principal, {"chat_id": 12345.6})
 
     def test_invalid_bool(self):
         """Raises ValueError for boolean chat_id."""
-        request = self._make_request()
+        principal = self._principal()
         with pytest.raises(ValueError, match="must be an integer"):
-            _resolve_chat_id(request, {"chat_id": True})
+            _resolve_chat_id(principal, {"chat_id": True})
 
     def test_integer_like_float_accepted(self):
         """Integer-like float (e.g. 42.0) is accepted."""
-        request = self._make_request()
-        assert _resolve_chat_id(request, {"chat_id": 42.0}) == 42
+        principal = self._principal(chat_id=456)
+        assert _resolve_chat_id(principal, {"chat_id": 456.0}) == 456
 
     def test_string_integer_accepted(self):
         """String-encoded integer (e.g. from JSON) is accepted."""
-        request = self._make_request()
-        assert _resolve_chat_id(request, {"chat_id": "42"}) == 42
+        principal = self._principal(chat_id=456)
+        assert _resolve_chat_id(principal, {"chat_id": "456"}) == 456
 
 
 class TestGetJobsChatIdRouting:
     @pytest.mark.asyncio
     async def test_query_param_routes_to_user(self, db, mock_request):
         """GET /api/jobs?chat_id=456 returns jobs for that user."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.headers = {"X-Webhook-Secret": "other-secret"}
         mock_request.app[CHAT_ID_KEY] = 123
         mock_request.query = {"chat_id": "456"}
 
@@ -1468,7 +1554,7 @@ class TestScheduleChatIdRouting:
     @pytest.mark.asyncio
     async def test_explicit_chat_id_in_body(self, db, mock_request):
         """POST /api/schedule with chat_id routes job to that user."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.headers = {"X-Webhook-Secret": "other-secret"}
         mock_request.app[CHAT_ID_KEY] = 123
         mock_request.app[TELEGRAM_APP_KEY].job_queue = MagicMock()
         mock_request.app[TELEGRAM_APP_KEY].job_queue.jobs.return_value = []
@@ -1501,8 +1587,45 @@ class TestScheduleChatIdRouting:
 
 class TestChatIdAuthorization:
     @pytest.mark.asyncio
+    async def test_external_signing_secret_is_not_an_api_credential(self, mock_request):
+        """Possession of the GitHub/generic signing secret does not authorize API calls."""
+        mock_request.headers = {"X-Webhook-Secret": "signing-secret"}
+        mock_request.json = AsyncMock(return_value={"text": "hello"})
+
+        resp = await _handle_send_message(mock_request)
+
+        assert resp.status == 401
+        mock_request.app[TELEGRAM_BOT_KEY].send_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_legacy_webhook_secret_is_not_an_api_credential(self, mock_request):
+        """The transition fallback remains external-only."""
+        mock_request.app[LEGACY_WEBHOOK_SECRET_KEY] = "legacy-secret"
+        mock_request.headers = {"X-Webhook-Secret": "legacy-secret"}
+        mock_request.json = AsyncMock(return_value={"text": "hello"})
+
+        resp = await _handle_send_message(mock_request)
+
+        assert resp.status == 401
+        mock_request.app[TELEGRAM_BOT_KEY].send_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_notification_credential_cannot_manage_jobs(self, mock_request):
+        """A review/triage notification credential is limited to sending messages."""
+        auth = mock_request.app[INTERNAL_API_AUTH_KEY]
+        credential = auth.notification_credential_for(123)
+        mock_request.headers = {"X-Webhook-Secret": credential}
+
+        mock_request.json = AsyncMock(return_value={"text": "review complete"})
+        send_resp = await _handle_send_message(mock_request)
+        assert send_resp.status == 200
+
+        schedule_resp = await _handle_schedule(mock_request)
+        assert schedule_resp.status == 403
+
+    @pytest.mark.asyncio
     async def test_unauthorized_chat_id_returns_403(self, db, mock_request):
-        """POST /api/schedule with chat_id not in allowed_user_ids returns 403."""
+        """POST /api/schedule with chat_id differing from the principal returns 403."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.app[TELEGRAM_APP_KEY].job_queue = MagicMock()
         mock_request.app[TELEGRAM_APP_KEY].job_queue.jobs.return_value = []
@@ -1513,7 +1636,7 @@ class TestChatIdAuthorization:
                 "prompt": "test",
                 "schedule_type": "daily",
                 "schedule_data": {"times": ["09:00"]},
-                "chat_id": 999999,  # not in allowed_user_ids
+                "chat_id": 999999,  # differs from authenticated principal 123
             }
         )
 
@@ -1521,24 +1644,25 @@ class TestChatIdAuthorization:
         assert resp.status == 403
 
     @pytest.mark.asyncio
-    async def test_authorized_chat_id_accepted(self, db, mock_request):
-        """POST /api/schedule with chat_id in allowed_user_ids succeeds."""
+    async def test_other_authorized_chat_id_rejected(self, db, mock_request):
+        """A credential for user 123 cannot schedule work as user 456."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.app[TELEGRAM_APP_KEY].job_queue = MagicMock()
         mock_request.app[TELEGRAM_APP_KEY].job_queue.jobs.return_value = []
 
         mock_request.json = AsyncMock(
             return_value={
-                "name": "Good Job",
+                "name": "Cross-user Job",
                 "prompt": "test",
                 "schedule_type": "daily",
                 "schedule_data": {"times": ["09:00"]},
-                "chat_id": 456,  # in allowed_user_ids
+                "chat_id": 456,  # authorized user, but not this caller's principal
             }
         )
 
         resp = await _handle_schedule(mock_request)
-        assert resp.status == 200
+        assert resp.status == 403
+        assert await sessions.get_jobs(456) == []
 
     @pytest.mark.asyncio
     async def test_send_message_unauthorized_returns_403(self, db, mock_request):
@@ -1559,23 +1683,18 @@ class TestChatIdAuthorization:
         assert resp.status == 403
 
     def test_resolve_chat_id_unauthorized(self):
-        """_resolve_chat_id raises UnauthorizedChatIdError for unknown users."""
-        from kai.webhook import UnauthorizedChatIdError
-
-        request = MagicMock()
-        request.app = {CHAT_ID_KEY: 123, ALLOWED_USER_IDS_KEY: {123, 456}}
+        """_resolve_chat_id rejects any identity other than the principal."""
+        principal = _make_internal_api_auth().authenticate("test-secret")
+        assert principal is not None
 
         with pytest.raises(UnauthorizedChatIdError):
-            _resolve_chat_id(request, {"chat_id": 999999})
+            _resolve_chat_id(principal, {"chat_id": 999999})
 
-    def test_resolve_chat_id_no_allowed_list(self):
-        """_resolve_chat_id skips validation when allowed_user_ids is not set."""
-        request = MagicMock()
-        request.app = {CHAT_ID_KEY: 123}
-
-        # Should not raise even though 999 isn't in any allowed list
-        result = _resolve_chat_id(request, {"chat_id": 999})
-        assert result == 999
+    def test_resolve_chat_id_accepts_matching_principal(self):
+        """_resolve_chat_id accepts an explicit repetition of the principal."""
+        principal = _make_internal_api_auth().authenticate("test-secret")
+        assert principal is not None
+        assert _resolve_chat_id(principal, {"chat_id": 123}) == 123
 
 
 # ── Job ownership ──────────────────────────────────────────────────
@@ -1673,13 +1792,14 @@ class TestGetJobsAuth:
     """Authorization tests for GET /api/jobs."""
 
     @pytest.mark.asyncio
-    async def test_omitted_chat_id_defaults_to_admin(self, db, mock_request):
-        """GET /api/jobs without chat_id falls back to admin, preserving backward compat."""
+    async def test_omitted_chat_id_uses_authenticated_principal(self, db, mock_request):
+        """Omitted identity resolves to the credential owner, never the app default."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
-        # No query param set; should fall back to app[CHAT_ID_KEY] = 123
+        # A deliberately different app default proves it is not an auth fallback.
+        mock_request.app[CHAT_ID_KEY] = 456
         await sessions.create_job(
             chat_id=123,
-            name="Admin Job",
+            name="Principal Job",
             job_type="reminder",
             prompt="test",
             schedule_type="daily",
@@ -1690,7 +1810,7 @@ class TestGetJobsAuth:
         assert resp.status == 200
         body = json.loads(resp.body.decode())
         assert len(body) == 1
-        assert body[0]["name"] == "Admin Job"
+        assert body[0]["name"] == "Principal Job"
 
     @pytest.mark.asyncio
     async def test_unauthorized_chat_id_returns_403(self, db, mock_request):
@@ -1704,7 +1824,7 @@ class TestGetJobsAuth:
     @pytest.mark.asyncio
     async def test_authorized_chat_id_returns_only_their_jobs(self, db, mock_request):
         """GET /api/jobs?chat_id=456 returns only user 456's jobs."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.headers = {"X-Webhook-Secret": "other-secret"}
         mock_request.query = {"chat_id": "456"}
 
         await sessions.create_job(
@@ -1734,10 +1854,10 @@ class TestGetJobAuth:
     """Authorization and ownership tests for GET /api/jobs/{id}."""
 
     @pytest.mark.asyncio
-    async def test_omitted_chat_id_defaults_to_admin(self, db, mock_request):
-        """GET /api/jobs/{id} without chat_id falls back to admin, preserving backward compat."""
+    async def test_omitted_chat_id_uses_principal(self, db, mock_request):
+        """GET /api/jobs/{id} without chat_id uses the credential owner."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
-        # No query param set; should fall back to app[CHAT_ID_KEY] = 123
+        mock_request.app[CHAT_ID_KEY] = 456
         job_id = await sessions.create_job(
             chat_id=123,
             name="Admin Job",
@@ -1756,7 +1876,7 @@ class TestGetJobAuth:
     @pytest.mark.asyncio
     async def test_wrong_owner_returns_404(self, db, mock_request):
         """GET /api/jobs/{id} returns 404 when job belongs to another user."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.headers = {"X-Webhook-Secret": "other-secret"}
         # Caller is user 456, job belongs to user 123
         mock_request.query = {"chat_id": "456"}
         job_id = await sessions.create_job(
@@ -1775,7 +1895,7 @@ class TestGetJobAuth:
     @pytest.mark.asyncio
     async def test_owner_can_view_own_job(self, db, mock_request):
         """GET /api/jobs/{id}?chat_id=456 returns the job when owned by 456."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.headers = {"X-Webhook-Secret": "other-secret"}
         mock_request.query = {"chat_id": "456"}
         job_id = await sessions.create_job(
             chat_id=456,
@@ -1807,10 +1927,10 @@ class TestDeleteJobAuth:
     """Authorization tests for DELETE /api/jobs/{id}."""
 
     @pytest.mark.asyncio
-    async def test_omitted_chat_id_defaults_to_admin(self, db, mock_request):
-        """DELETE without chat_id falls back to admin, preserving backward compat."""
+    async def test_omitted_chat_id_uses_principal(self, db, mock_request):
+        """DELETE without chat_id uses the credential owner."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
-        # No query param set; should fall back to app[CHAT_ID_KEY] = 123
+        mock_request.app[CHAT_ID_KEY] = 456
         job_id = await sessions.create_job(
             chat_id=123,
             name="Admin Job",
@@ -1828,7 +1948,7 @@ class TestDeleteJobAuth:
     @pytest.mark.asyncio
     async def test_user_can_delete_own_job(self, db, mock_request):
         """DELETE /api/jobs/{id}?chat_id=456 deletes user 456's job."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.headers = {"X-Webhook-Secret": "other-secret"}
         mock_request.query = {"chat_id": "456"}
         job_id = await sessions.create_job(
             chat_id=456,
@@ -1847,7 +1967,7 @@ class TestDeleteJobAuth:
     @pytest.mark.asyncio
     async def test_cannot_delete_other_users_job(self, db, mock_request):
         """DELETE /api/jobs/{id}?chat_id=456 returns 404 for admin's job."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.headers = {"X-Webhook-Secret": "other-secret"}
         mock_request.query = {"chat_id": "456"}
         job_id = await sessions.create_job(
             chat_id=123,
@@ -1879,9 +1999,10 @@ class TestUpdateJobAuth:
     """Authorization tests for PATCH /api/jobs/{id}."""
 
     @pytest.mark.asyncio
-    async def test_omitted_chat_id_defaults_to_admin(self, db, mock_request):
-        """PATCH without chat_id in body falls back to admin, preserving backward compat."""
+    async def test_omitted_chat_id_uses_principal(self, db, mock_request):
+        """PATCH without chat_id in the body uses the credential owner."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app[CHAT_ID_KEY] = 456
         job_id = await sessions.create_job(
             chat_id=123,
             name="Original",
@@ -1891,7 +2012,7 @@ class TestUpdateJobAuth:
             schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
         )
         mock_request.match_info = {"id": str(job_id)}
-        # No chat_id in body; falls back to app[CHAT_ID_KEY] = 123
+        # No chat_id in body; the token still resolves to user 123.
         mock_request.json = AsyncMock(return_value={"name": "Updated"})
 
         resp = await _handle_update_job(mock_request)
@@ -1903,7 +2024,7 @@ class TestUpdateJobAuth:
     @pytest.mark.asyncio
     async def test_user_can_update_own_job(self, db, mock_request):
         """PATCH with chat_id in body updates the user's own job."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.headers = {"X-Webhook-Secret": "other-secret"}
         job_id = await sessions.create_job(
             chat_id=456,
             name="Original",
@@ -1924,7 +2045,7 @@ class TestUpdateJobAuth:
     @pytest.mark.asyncio
     async def test_cannot_update_other_users_job(self, db, mock_request):
         """PATCH with chat_id=456 returns 404 for admin's job."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.headers = {"X-Webhook-Secret": "other-secret"}
         job_id = await sessions.create_job(
             chat_id=123,
             name="Admin Job",
@@ -2144,7 +2265,7 @@ class TestMemoryAdd:
         existing facts under the same chat_id (silently, since both writes
         succeed).
         """
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.headers = {"X-Webhook-Secret": "other-secret"}
         mock_request.json = AsyncMock(return_value={"content": "x", "chat_id": 456})
 
         with (
@@ -2158,9 +2279,9 @@ class TestMemoryAdd:
         assert isinstance(kwargs["user_id"], str)
 
     async def test_returns_403_on_unauthorized_chat_id(self, mock_request):
-        """chat_id not in allowed_user_ids -> 403, primitive not called."""
+        """chat_id differing from the principal -> 403, primitive not called."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
-        # 999 is not in the fixture's allowed_user_ids = {123, 456}
+        # The credential resolves to principal 123, not the requested 999.
         mock_request.json = AsyncMock(return_value={"content": "x", "chat_id": 999})
 
         with patch("kai.memory.is_enabled", return_value=True), patch("kai.memory.add_structured") as mock_add:
@@ -2490,7 +2611,7 @@ class TestMemorySearch:
         assert body == {"error": "Memory search failed"}
 
     async def test_returns_403_on_unauthorized_chat_id(self, mock_request):
-        """chat_id not in allowed_user_ids -> 403, primitive not called."""
+        """chat_id differing from the principal -> 403, primitive not called."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.json = AsyncMock(return_value={"query": "x", "chat_id": 999})
 
@@ -2575,8 +2696,8 @@ class TestMemoryStats:
         """GET endpoint: chat_id comes from query params, mirroring _handle_get_jobs."""
         from kai.memory import MemoryStats
 
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
-        # 456 is in allowed_user_ids; query params come in as strings.
+        mock_request.headers = {"X-Webhook-Secret": "other-secret"}
+        # The user-456 credential matches the string query parameter.
         mock_request.query = {"chat_id": "456"}
 
         with (
@@ -2598,7 +2719,7 @@ class TestMemoryStats:
         assert resp.status == 401
 
     async def test_returns_403_on_unauthorized_chat_id(self, mock_request):
-        """Query-string chat_id outside allowed_user_ids -> 403."""
+        """Query-string chat_id differing from the principal -> 403."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.query = {"chat_id": "999"}
 
@@ -2710,7 +2831,7 @@ class TestMemoryDeleteAll:
 
     async def test_calls_delete_all_with_stringified_user_id(self, mock_request):
         """int -> str cast at the memory boundary, same as add."""
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.headers = {"X-Webhook-Secret": "other-secret"}
         mock_request.json = AsyncMock(return_value={"confirm": self._CONFIRM, "chat_id": 456})
 
         with patch("kai.memory.is_enabled", return_value=True), patch("kai.memory.delete_all") as mock_del:
@@ -2749,7 +2870,7 @@ class TestMemoryDeleteAll:
         assert body == {"error": "Memory delete failed"}
 
     async def test_returns_403_on_unauthorized_chat_id(self, mock_request):
-        """chat_id not in allowed_user_ids -> 403, primitive not called.
+        """chat_id differing from the principal -> 403, primitive not called.
 
         Verifies the 403 path runs even when the confirm token is
         correct: an unauthorized caller with the right token should
@@ -2791,7 +2912,11 @@ class TestMemoryDeleteAll:
 # minimal - the goal is to reach the isinstance check, not to exercise
 # the rest of the handler.
 _NON_OBJECT_HANDLERS = [
-    pytest.param(_handle_generic, lambda r: None, id="generic"),
+    pytest.param(
+        _handle_generic,
+        lambda r: setattr(r, "headers", {"X-Webhook-Secret": "signing-secret"}),
+        id="generic",
+    ),
     pytest.param(_handle_schedule, lambda r: None, id="schedule"),
     pytest.param(
         _handle_update_job,

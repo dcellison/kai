@@ -475,6 +475,21 @@ def _validate_codex_bin(value: str) -> bool:
     return p.is_absolute() and p.is_file() and os.access(p, os.X_OK)
 
 
+def _resolve_codex_bin_prompt_default(existing_env: dict[str, str]) -> str:
+    """Return a usable default for every Codex binary-path prompt.
+
+    Preserve a saved CODEX_BIN while it is executable. If an upgrade moved
+    the binary, discard the stale value and prefer the executable currently
+    discoverable on the operator's PATH. The Homebrew path remains only a
+    suggestion when Codex cannot be discovered; prompt validation still
+    prevents the wizard from accepting a missing executable.
+    """
+    saved = existing_env.get("CODEX_BIN", "")
+    if _validate_codex_bin(saved):
+        return saved
+    return shutil.which("codex") or "/opt/homebrew/bin/codex"
+
+
 def _validate_opencode_bin(value: str) -> bool:
     """Return True when the path is absolute, exists, and is executable.
 
@@ -749,8 +764,9 @@ def _cmd_config() -> None:
     Interactive Q&A that collects configuration values and writes install.conf.
 
     If install.conf already exists, its values are used as defaults so re-running
-    only asks about changes. Auto-detects platform and generates a webhook secret
-    if one isn't already set. Validates all inputs before writing.
+    only asks about changes. Auto-detects platform, generates distinct named
+    webhook secrets, and preserves an existing legacy secret for the temporary
+    compatibility window. Validates all inputs before writing.
 
     No sudo required - this runs as the current user.
     """
@@ -768,6 +784,7 @@ def _cmd_config() -> None:
             print(f"Warning: could not read existing {INSTALL_CONF}: {e}\n")
 
     existing_env: dict = existing.get("env", {})
+    legacy_webhook_secret = existing_env.get("WEBHOOK_SECRET", "")
 
     # Auto-detect platform
     if sys.platform == "darwin":
@@ -1138,13 +1155,14 @@ def _cmd_config() -> None:
         # Codex binary path: wizard-prompted and persisted in install.conf
         # so `make install` writes both /etc/kai/env's CODEX_BIN and the
         # sudoers SETENV rule from the same source of truth. Default
-        # suggestion uses `which codex` from the operator's PATH; falls
-        # back to Homebrew only when which finds nothing.
+        # suggestion keeps a valid saved path, otherwise uses `which codex`
+        # from the operator's PATH. This recovers automatically when an
+        # upgrade moves the binary. Falls back to Homebrew only when which
+        # finds nothing; validation still prevents accepting a missing path.
         while True:
-            which_codex = shutil.which("codex") or "/opt/homebrew/bin/codex"
             codex_bin = _prompt(
                 "Codex binary path",
-                existing_env.get("CODEX_BIN", which_codex),
+                _resolve_codex_bin_prompt_default(existing_env),
                 required=True,
             )
             if _validate_codex_bin(codex_bin):
@@ -1336,10 +1354,9 @@ def _cmd_config() -> None:
     if "codex" in peruser_backends and not codex_bin:
         print("  users.yaml has a codex entry; the daemon needs a resolvable codex binary.")
         while True:
-            which_codex = shutil.which("codex") or "/opt/homebrew/bin/codex"
             codex_bin = _prompt(
                 "Codex binary path",
-                existing_env.get("CODEX_BIN", which_codex),
+                _resolve_codex_bin_prompt_default(existing_env),
                 required=True,
             )
             if _validate_codex_bin(codex_bin):
@@ -1622,11 +1639,32 @@ def _cmd_config() -> None:
             break
         print("  Must be a valid port number (1-65535).")
 
-    # Auto-generate webhook secret if not already set
-    default_secret = existing_env.get("WEBHOOK_SECRET", "")
-    if not default_secret:
-        default_secret = secrets.token_hex(32)
-    webhook_secret = _prompt("Webhook secret", default_secret, required=True)
+    # Named credentials are the long-term configuration. Keep them distinct
+    # from an existing legacy credential so the runtime can identify and log
+    # callers that still depend on compatibility authentication.
+    default_github_secret = existing_env.get("GITHUB_WEBHOOK_SECRET", "")
+    reserved_webhook_secrets = {legacy_webhook_secret, tg_webhook_secret}
+    while not default_github_secret or default_github_secret in reserved_webhook_secrets:
+        default_github_secret = secrets.token_hex(32)
+    while True:
+        github_webhook_secret = _prompt(
+            "GitHub webhook secret",
+            default_github_secret,
+            required=True,
+        )
+        if github_webhook_secret not in reserved_webhook_secrets:
+            break
+        print("  GitHub, Telegram, and legacy webhook secrets must use different values.")
+        default_github_secret = secrets.token_hex(32)
+
+    if tg_webhook_secret and tg_webhook_secret == legacy_webhook_secret:
+        print("  Telegram and legacy webhook secrets must be different; Telegram will use a generated token.")
+        tg_webhook_secret = ""
+
+    generic_webhook_secret = existing_env.get("GENERIC_WEBHOOK_SECRET", "")
+    reserved_webhook_secrets = {github_webhook_secret, legacy_webhook_secret, tg_webhook_secret}
+    while not generic_webhook_secret or generic_webhook_secret in reserved_webhook_secrets:
+        generic_webhook_secret = secrets.token_hex(32)
     print()
 
     # -- Workspaces --
@@ -1782,10 +1820,9 @@ def _cmd_config() -> None:
                 # block already ran.
                 if agent_backend == "codex" and not codex_bin:
                     while True:
-                        which_codex = shutil.which("codex") or "/opt/homebrew/bin/codex"
                         codex_bin = _prompt(
                             "Codex binary path (required by codex memory reasoner)",
-                            existing_env.get("CODEX_BIN", which_codex),
+                            _resolve_codex_bin_prompt_default(existing_env),
                             required=True,
                         )
                         if _validate_codex_bin(codex_bin):
@@ -2005,10 +2042,13 @@ def _cmd_config() -> None:
     env: dict[str, str] = {
         "TELEGRAM_BOT_TOKEN": bot_token,
         "WEBHOOK_PORT": port,
-        "WEBHOOK_SECRET": webhook_secret,
+        "GITHUB_WEBHOOK_SECRET": github_webhook_secret,
+        "GENERIC_WEBHOOK_SECRET": generic_webhook_secret,
         "VOICE_ENABLED": str(voice_enabled).lower(),
         "TTS_ENABLED": str(tts_enabled).lower(),
     }
+    if legacy_webhook_secret:
+        env["WEBHOOK_SECRET"] = legacy_webhook_secret
 
     # DEFAULT_BACKEND is the global default backend; users.yaml entries
     # can override it per user. Only write non-default values to keep
@@ -2421,15 +2461,22 @@ def _set_ownership(path: Path, uid: int, gid: int, recursive: bool = False) -> N
                 os.chown(child, uid, gid)
 
 
-def _copy_tree(src: Path, dst: Path, excludes: set[str] | None = None) -> None:
+def _copy_tree(
+    src: Path,
+    dst: Path,
+    excludes: set[str] | None = None,
+    *,
+    replace: bool = False,
+) -> None:
     """
     Copy a directory tree, excluding patterns like __pycache__.
 
-    Uses a merge-based approach: walks the source tree and copies each file
-    individually, creating destination directories as needed. Files at the
-    destination that don't exist in the source are left untouched. This is
-    critical for workspace/.claude/ where runtime-created content (skills,
-    Claude Code state files) must survive installs.
+    By default, uses a merge-based approach: walks the source tree and copies
+    each file individually, creating destination directories as needed. Files
+    at the destination that don't exist in the source are left untouched.
+    Callers for generated trees such as the installed Python source can pass
+    ``replace=True`` so deleted source files do not survive an upgrade and get
+    packaged into the venv as obsolete modules.
 
     The previous implementation used shutil.rmtree(dst) before copytree(),
     which destroyed ALL destination contents including runtime data that the
@@ -2451,7 +2498,14 @@ def _copy_tree(src: Path, dst: Path, excludes: set[str] | None = None) -> None:
         src: Source directory.
         dst: Destination directory (created if it doesn't exist).
         excludes: Set of glob patterns to exclude (e.g., {"__pycache__", "*.pyc"}).
+        replace: Remove the destination tree before copying.
     """
+    if replace:
+        if dst.is_symlink():
+            dst.unlink()
+        elif dst.exists():
+            shutil.rmtree(dst)
+
     ignore_fn = shutil.ignore_patterns(*(excludes or set()))
 
     for src_dir, dirs, files in os.walk(src):
@@ -5239,7 +5293,10 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
         _retire_install_home_dir(install_path, dry_run=dry_run)
         return
 
-    _copy_tree(src_src, src_dst, _SOURCE_EXCLUDES)
+    # The install source is generated, root-owned state with no runtime data.
+    # Replace it exactly so removed modules cannot remain importable or be
+    # included by the subsequent non-editable pip install.
+    _copy_tree(src_src, src_dst, _SOURCE_EXCLUDES, replace=True)
     _set_ownership(src_dst, 0, 0, recursive=True)
     print(f"  Copied source to {src_dst}")
 
@@ -5270,6 +5327,33 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
     _retire_install_home_dir(install_path, dry_run=dry_run)
 
 
+def _resolve_venv_base_python() -> str:
+    """Resolve and validate the Python interpreter used to create/repair a venv."""
+    python = shutil.which("python3.13")
+    if python is None and sys.version_info >= (3, 13):
+        # `sudo` may reset PATH and hide Homebrew even though the installer is
+        # already running under a valid project-venv interpreter. Python's venv
+        # module resolves that interpreter's base executable when creating or
+        # upgrading the target environment.
+        python = sys.executable
+    python = python or shutil.which("python3") or "python3"
+    result = subprocess.run(
+        [python, "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        parts = result.stdout.strip().split(".")
+        major, minor = parts[0], parts[1]
+        if (int(major), int(minor)) < (3, 13):
+            raise SystemExit(
+                f"Python >= 3.13 required, but {python} is {result.stdout.strip()}. "
+                f"Install Python 3.13+ and ensure it is on PATH."
+            )
+    return python
+
+
 def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
     """
     Create or update the virtual environment in the install location.
@@ -5288,10 +5372,19 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
         dry_run: If True, print what would be done without doing it.
     """
     venv_path = install_path / "venv"
+    venv_python = venv_path / "bin" / "python"
     pyproject_dst = install_path / "pyproject.toml"
     src_dst = install_path / "src"
+    build_path = install_path / "build"
 
     if is_update and venv_path.exists():
+        # Homebrew removes the old Cellar path when Python is upgraded. A venv
+        # created with symlinks can therefore remain on disk while its Python
+        # interpreter becomes a dangling symlink. Detect that before the
+        # checksum fast-path or a no-source-change update would leave a service
+        # that cannot restart.
+        venv_needs_repair = not (venv_python.is_file() and os.access(venv_python, os.X_OK))
+
         # Check if pyproject.toml or source files changed. Both are needed
         # because the install is non-editable: pip copies code into the venv's
         # site-packages, so updating src/ at the install path alone does
@@ -5301,15 +5394,22 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
         old_pyproject = ""
         if pyproject_checksum_file.exists():
             old_pyproject = pyproject_checksum_file.read_text().strip()
-        new_pyproject = _file_checksum(pyproject_dst)
+        # During a real apply, _apply_source has already copied the incoming
+        # files to the install tree. During a dry run that copy is deliberately
+        # skipped, so compare the repository inputs directly or the preview
+        # will incorrectly report an unchanged venv for every source-only
+        # update.
+        incoming_pyproject = PROJECT_ROOT / "pyproject.toml" if dry_run else pyproject_dst
+        new_pyproject = _file_checksum(incoming_pyproject)
 
         src_checksum_file = install_path / ".src.sha256"
         old_src = ""
         if src_checksum_file.exists():
             old_src = src_checksum_file.read_text().strip()
-        new_src = _src_checksum(src_dst)
+        incoming_src = PROJECT_ROOT / "src" if dry_run else src_dst
+        new_src = _src_checksum(incoming_src)
 
-        if old_pyproject == new_pyproject and old_src == new_src:
+        if old_pyproject == new_pyproject and old_src == new_src and not venv_needs_repair:
             print("  Venv unchanged (pyproject.toml and source checksums match)")
             return
 
@@ -5321,51 +5421,67 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
             changed.append("source")
 
         if dry_run:
-            print(f"[DRY RUN] Would update venv ({' and '.join(changed)} changed)")
+            if venv_needs_repair:
+                print("[DRY RUN] Would repair venv (Python interpreter missing or unusable)")
+            if changed:
+                print(f"[DRY RUN] Would update venv ({' and '.join(changed)} changed)")
+            if build_path.exists():
+                print(f"[DRY RUN] Would remove stale package build artifacts: {build_path}")
             return
 
-        print(f"  Updating venv ({' and '.join(changed)} changed)...")
+        if venv_needs_repair:
+            python = _resolve_venv_base_python()
+            print(f"  Repairing venv with {python}...")
+            # `venv --upgrade` does not overwrite dangling interpreter
+            # symlinks. Remove only those generated links first; installed
+            # packages and every usable executable remain untouched.
+            removed_links = 0
+            for candidate in sorted((venv_path / "bin").glob("python*")):
+                if candidate.is_symlink() and not candidate.exists():
+                    candidate.unlink()
+                    removed_links += 1
+            if removed_links:
+                print(f"  Removed {removed_links} dangling venv interpreter symlink(s)")
+            subprocess.run(
+                [python, "-m", "venv", "--upgrade", str(venv_path)],
+                check=True,
+            )
+            if not (venv_python.is_file() and os.access(venv_python, os.X_OK)):
+                raise RuntimeError(f"Venv repair did not create a usable interpreter: {venv_python}")
+            print("  Repaired venv interpreter")
+
+        if changed:
+            print(f"  Updating venv ({' and '.join(changed)} changed)...")
     else:
         if dry_run:
             print(f"[DRY RUN] Would create venv: {venv_path}")
+            if build_path.exists():
+                print(f"[DRY RUN] Would remove stale package build artifacts: {build_path}")
             print("[DRY RUN] Would install package into venv")
             return
 
         print(f"  Creating venv at {venv_path}...")
-        # Find Python 3.13+
-        python = shutil.which("python3.13") or shutil.which("python3") or "python3"
-
-        # Verify the resolved Python meets the minimum version before creating
-        # the venv. Without this, a 3.12 venv gets built successfully but pip
-        # install fails later with a confusing requires-python error.
-        result = subprocess.run(
-            [python, "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode == 0:
-            parts = result.stdout.strip().split(".")
-            major, minor = parts[0], parts[1]
-            if (int(major), int(minor)) < (3, 13):
-                raise SystemExit(
-                    f"Python >= 3.13 required, but {python} is {result.stdout.strip()}. "
-                    f"Install Python 3.13+ and ensure it is on PATH."
-                )
+        python = _resolve_venv_base_python()
 
         subprocess.run(
             [python, "-m", "venv", str(venv_path)],
             check=True,
         )
 
+    # setuptools can reuse build/lib from an earlier wheel build and include
+    # Python modules that were subsequently deleted from src/. Always remove
+    # this generated tree before pip builds the non-editable package.
+    if build_path.exists():
+        shutil.rmtree(build_path)
+        print(f"  Removed stale package build artifacts: {build_path}")
+
     # Install the package with optional dependencies.
     # Uses a non-editable install (not -e) so the venv is self-contained
     # and doesn't depend on the source directory being writable.
-    pip = str(venv_path / "bin" / "pip")
     extras = "memory,totp,tts"
     install_spec = f"{install_path}[{extras}]"
     subprocess.run(
-        [pip, "install", install_spec],
+        [str(venv_python), "-m", "pip", "install", install_spec],
         check=True,
     )
     print("  Installed package into venv")

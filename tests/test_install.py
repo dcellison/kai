@@ -48,6 +48,7 @@ from kai.install import (
     _prompt_choice,
     _prompt_optional_choice,
     _read_users_yaml_text,
+    _resolve_codex_bin_prompt_default,
     _retire_install_home_claude,
     _retire_install_home_dir,
     _set_ownership,
@@ -1342,6 +1343,9 @@ class TestCmdConfig:
         assert conf["version"] == 1
         assert conf["install_dir"] == "/opt/kai"
         assert conf["env"]["TELEGRAM_BOT_TOKEN"] == "fake-token"
+        assert conf["env"]["GITHUB_WEBHOOK_SECRET"] == "test-secret"
+        assert conf["env"]["GENERIC_WEBHOOK_SECRET"] != "test-secret"
+        assert "WEBHOOK_SECRET" not in conf["env"]
         # The context window setting was removed; the wizard never
         # emits the retired key.
         assert "CLAUDE_MAX_CONTEXT_WINDOW" not in conf["env"]
@@ -1828,6 +1832,13 @@ class TestCmdConfig:
         # Should preserve existing values when user accepts defaults
         assert conf["install_dir"] == "/custom/path"
         assert conf["env"]["TELEGRAM_BOT_TOKEN"] == "existing-token"
+        # The legacy value remains available to both external routes during
+        # observation. New named credentials are distinct so fallback use can
+        # be identified and logged endpoint by endpoint.
+        assert conf["env"]["GITHUB_WEBHOOK_SECRET"] != "existing-secret"
+        assert conf["env"]["GENERIC_WEBHOOK_SECRET"] != "existing-secret"
+        assert conf["env"]["GITHUB_WEBHOOK_SECRET"] != conf["env"]["GENERIC_WEBHOOK_SECRET"]
+        assert conf["env"]["WEBHOOK_SECRET"] == "existing-secret"
         # With a canonical users.yaml already present the wizard skips the
         # user-creation prompts entirely and never stages a new file, so
         # no admin prompt is shown and no top-level staging key is written.
@@ -2875,6 +2886,59 @@ class TestCmdApply:
         assert not (tmp_path / "opt" / "kai").exists()
         # Secrets reminder should NOT appear during dry run
         assert "contains secrets" not in output
+
+    def test_dry_run_flag_reaches_every_apply_helper(self, tmp_path, monkeypatch):
+        """The apply orchestrator passes True to every mutation boundary.
+
+        This protects the end-to-end contract independently of each helper's
+        own no-mutation tests. A future positional-argument regression at any
+        call site fails here before a privileged dry run can reach that helper
+        with dry_run=False.
+        """
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+        monkeypatch.setenv("DRY_RUN", "1")
+        conf_path = tmp_path / "install.conf"
+        conf_path.write_text(
+            json.dumps(
+                {
+                    "install_dir": str(tmp_path / "opt" / "kai"),
+                    "data_dir": str(tmp_path / "var" / "lib" / "kai"),
+                    "service_user": "nobody",
+                    "platform": "darwin",
+                    "env": {"TELEGRAM_BOT_TOKEN": "tok"},
+                }
+            )
+        )
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+
+        dry_run_positions = {
+            "_stop_service": 1,
+            "_apply_directories": 4,
+            "_apply_source": 3,
+            "_apply_venv": 2,
+            "_apply_models": 1,
+            "_apply_secrets": 1,
+            "_apply_goose_config": 4,
+            "_apply_sudoers": 1,
+            "_apply_migrate": 4,
+            "_apply_service": 4,
+            "_start_service": 1,
+        }
+        observed: dict[str, bool] = {}
+
+        def recorder(name: str, position: int):
+            def record(*args, **kwargs):
+                value = kwargs.get("dry_run", args[position] if len(args) > position else None)
+                observed[name] = value
+
+            return record
+
+        for name, position in dry_run_positions.items():
+            monkeypatch.setattr(f"kai.install.{name}", recorder(name, position))
+
+        _cmd_apply()
+
+        assert observed == {name: True for name in dry_run_positions}
 
     def test_generates_env_file_content(self):
         """The generated env file contains all provided values."""
@@ -4015,6 +4079,20 @@ class TestCmdStatus:
 class TestApplyVenv:
     """Tests for _apply_venv(), which creates the virtual environment."""
 
+    def test_base_python_falls_back_to_running_interpreter(self, monkeypatch):
+        """A sudo-reset PATH still uses the installer's valid Python 3.13."""
+        monkeypatch.setattr(shutil, "which", lambda name: None)
+        commands = []
+
+        def fake_run(cmd, **kwargs):
+            commands.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="3.13\n", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        assert kai.install._resolve_venv_base_python() == kai.install.sys.executable
+        assert commands[0][0] == kai.install.sys.executable
+
     def test_rejects_old_python(self, tmp_path, monkeypatch):
         """Exits with a clear error if the resolved Python is below 3.13."""
         install = tmp_path / "opt" / "kai"
@@ -4043,7 +4121,8 @@ class TestApplyVenv:
         """Skips reinstall when both pyproject.toml and source checksums match."""
         install = tmp_path / "opt" / "kai"
         install.mkdir(parents=True)
-        (install / "venv").mkdir()
+        (install / "venv" / "bin").mkdir(parents=True)
+        (install / "venv" / "bin" / "python").touch(mode=0o755)
 
         # Write pyproject.toml and source files
         (install / "pyproject.toml").write_text("[project]\nname = 'kai'\n")
@@ -4067,6 +4146,10 @@ class TestApplyVenv:
         install = tmp_path / "opt" / "kai"
         install.mkdir(parents=True)
         (install / "venv" / "bin").mkdir(parents=True)
+        (install / "venv" / "bin" / "python").touch(mode=0o755)
+        stale_build = install / "build" / "lib" / "kai"
+        stale_build.mkdir(parents=True)
+        (stale_build / "obsolete.py").write_text("# removed source module")
 
         # Write pyproject.toml and initial source
         (install / "pyproject.toml").write_text("[project]\nname = 'kai'\n")
@@ -4094,35 +4177,52 @@ class TestApplyVenv:
 
         output = capsys.readouterr().out
         assert "source changed" in output
+        assert "Removed stale package build artifacts" in output
+        assert not (install / "build").exists()
         assert "Installed package into venv" in output
 
-    def test_reinstalls_on_source_change_dry_run(self, tmp_path, capsys):
-        """Dry run reports source change without actually reinstalling."""
+    def test_reinstalls_on_source_change_dry_run(self, tmp_path, monkeypatch, capsys):
+        """Dry run compares incoming source even though the copy is skipped."""
         install = tmp_path / "opt" / "kai"
         install.mkdir(parents=True)
-        (install / "venv").mkdir()
+        (install / "venv" / "bin").mkdir(parents=True)
+        (install / "venv" / "bin" / "python").touch(mode=0o755)
+        stale_build = install / "build" / "lib" / "kai"
+        stale_build.mkdir(parents=True)
+        (stale_build / "obsolete.py").write_text("# removed source module")
 
         (install / "pyproject.toml").write_text("[project]\nname = 'kai'\n")
         src = install / "src" / "kai"
         src.mkdir(parents=True)
         (src / "bot.py").write_text("# bot v1")
 
-        # Save checksums, then modify source
+        # Save checksums for the currently installed source.
         (install / ".pyproject.sha256").write_text(_file_checksum(install / "pyproject.toml") + "\n")
         (install / ".src.sha256").write_text(_src_checksum(install / "src") + "\n")
-        (src / "bot.py").write_text("# bot v2 - new feature")
+
+        # The incoming repository has changed, but dry-run must not copy it to
+        # the install tree merely to compute the preview.
+        project = tmp_path / "project"
+        (project / "src" / "kai").mkdir(parents=True)
+        (project / "pyproject.toml").write_text("[project]\nname = 'kai'\n")
+        (project / "src" / "kai" / "bot.py").write_text("# bot v2 - new feature")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", project)
 
         _apply_venv(install, is_update=True, dry_run=True)
 
         output = capsys.readouterr().out
         assert "DRY RUN" in output
         assert "source changed" in output
+        assert "Would remove stale package build artifacts" in output
+        assert (install / "build" / "lib" / "kai" / "obsolete.py").exists()
+        assert (install / "src" / "kai" / "bot.py").read_text() == "# bot v1"
 
     def test_saves_both_checksums_after_install(self, tmp_path, monkeypatch):
         """Both .pyproject.sha256 and .src.sha256 are written after a successful install."""
         install = tmp_path / "opt" / "kai"
         install.mkdir(parents=True)
         (install / "venv" / "bin").mkdir(parents=True)
+        (install / "venv" / "bin" / "python").touch(mode=0o755)
 
         (install / "pyproject.toml").write_text("[project]\nname = 'kai'\n")
         src = install / "src" / "kai"
@@ -4152,6 +4252,7 @@ class TestApplyVenv:
         install = tmp_path / "opt" / "kai"
         install.mkdir(parents=True)
         (install / "venv" / "bin").mkdir(parents=True)
+        (install / "venv" / "bin" / "python").touch(mode=0o755)
 
         (install / "pyproject.toml").write_text("[project]\nname = 'kai'\n")
         src = install / "src" / "kai"
@@ -4174,6 +4275,71 @@ class TestApplyVenv:
         # Should reinstall because .src.sha256 is missing (old_src == "" != new_src)
         assert "source changed" in output
         assert "Installed package into venv" in output
+
+    def test_repairs_dangling_venv_python_before_install(self, tmp_path, monkeypatch, capsys):
+        """A Homebrew upgrade leaving a dangling venv symlink is repaired in place."""
+        install = tmp_path / "opt" / "kai"
+        venv_bin = install / "venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        venv_python = venv_bin / "python"
+        venv_python.symlink_to("python3.13")
+        (venv_bin / "python3").symlink_to("python3.13")
+        (venv_bin / "python3.13").symlink_to("/removed/homebrew/python3.13")
+
+        (install / "pyproject.toml").write_text("[project]\nname = 'kai'\n")
+        src = install / "src" / "kai"
+        src.mkdir(parents=True)
+        (src / "__init__.py").write_text("# init")
+        (install / ".pyproject.sha256").write_text(_file_checksum(install / "pyproject.toml") + "\n")
+        (install / ".src.sha256").write_text(_src_checksum(install / "src") + "\n")
+
+        base_python = "/opt/homebrew/bin/python3.13"
+        monkeypatch.setattr(shutil, "which", lambda name: base_python)
+        commands = []
+
+        def fake_run(cmd, **kwargs):
+            commands.append(cmd)
+            if "-c" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="3.13\n", stderr="")
+            if cmd[:4] == [base_python, "-m", "venv", "--upgrade"]:
+                venv_python.touch(mode=0o755)
+            return subprocess.CompletedProcess(cmd, 0)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr("kai.install._set_ownership", lambda *a, **kw: None)
+
+        _apply_venv(install, is_update=True, dry_run=False)
+
+        output = capsys.readouterr().out
+        assert "Repairing venv" in output
+        assert "Removed 3 dangling venv interpreter symlink" in output
+        assert "Repaired venv interpreter" in output
+        assert [base_python, "-m", "venv", "--upgrade", str(install / "venv")] in commands
+        assert [str(venv_python), "-m", "pip", "install", f"{install}[memory,totp,tts]"] in commands
+
+    def test_dry_run_reports_dangling_venv_python_without_repair(self, tmp_path, monkeypatch, capsys):
+        """Dry-run detects a broken venv but never invokes a repair command."""
+        install = tmp_path / "opt" / "kai"
+        venv_bin = install / "venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        (venv_bin / "python").symlink_to("/removed/homebrew/python3.13")
+
+        (install / "pyproject.toml").write_text("[project]\nname = 'kai'\n")
+        src = install / "src" / "kai"
+        src.mkdir(parents=True)
+        (src / "__init__.py").write_text("# init")
+        (install / ".pyproject.sha256").write_text(_file_checksum(install / "pyproject.toml") + "\n")
+        (install / ".src.sha256").write_text(_src_checksum(install / "src") + "\n")
+
+        def fail_run(*args, **kwargs):
+            raise AssertionError("dry-run must not invoke subprocess.run")
+
+        monkeypatch.setattr(subprocess, "run", fail_run)
+
+        _apply_venv(install, is_update=True, dry_run=True)
+
+        output = capsys.readouterr().out
+        assert "[DRY RUN] Would repair venv" in output
 
 
 class TestSrcChecksum:
@@ -5487,6 +5653,42 @@ class TestCli:
         assert captured_env.get("DRY_RUN") == "1"
 
 
+class TestMakeInstallDryRun:
+    """The Make layer must carry dry-run intent across sudo explicitly."""
+
+    @staticmethod
+    def _clean_env() -> dict[str, str]:
+        env = os.environ.copy()
+        env.pop("DRY_RUN", None)
+        return env
+
+    @pytest.mark.skipif(shutil.which("make") is None, reason="make is not installed")
+    def test_nonempty_dry_run_adds_explicit_cli_flag(self):
+        result = subprocess.run(
+            ["make", "-n", "DRY_RUN=1", "install"],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=self._clean_env(),
+        )
+
+        assert "install apply --dry-run" in result.stdout
+
+    @pytest.mark.skipif(shutil.which("make") is None, reason="make is not installed")
+    def test_normal_install_does_not_add_dry_run_flag(self):
+        result = subprocess.run(
+            ["make", "-n", "install"],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=self._clean_env(),
+        )
+
+        assert "install apply --dry-run" not in result.stdout
+
+
 # ── _set_ownership ───────────────────────────────────────────────────
 
 
@@ -5584,6 +5786,21 @@ class TestCopyTree:
 
         assert (dst / "new.py").read_text() == "new"
         assert (dst / "runtime_data.txt").read_text() == "must survive"
+
+    def test_replace_removes_destination_only_files(self, tmp_path: Path) -> None:
+        """Generated trees can opt into exact replacement to remove stale files."""
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "current.py").write_text("current")
+
+        dst = tmp_path / "dst"
+        dst.mkdir()
+        (dst / "obsolete.py").write_text("obsolete")
+
+        _copy_tree(src, dst, replace=True)
+
+        assert (dst / "current.py").read_text() == "current"
+        assert not (dst / "obsolete.py").exists()
 
     def test_overwrites_matching_files(self, tmp_path: Path) -> None:
         """Source files overwrite same-named destination files."""
@@ -5842,6 +6059,14 @@ class TestApplySource:
         config_dst = install / "config"
         config_calls = [c for c in mock_copy.call_args_list if c[0][0] == config_dir and c[0][1] == config_dst]
         assert len(config_calls) == 1
+
+        # Installed Python source is generated state and must be replaced
+        # exactly so repository deletions remove obsolete installed modules.
+        source_dir = src / "src"
+        source_dst = install / "src"
+        source_calls = [c for c in mock_copy.call_args_list if c[0][0] == source_dir and c[0][1] == source_dst]
+        assert len(source_calls) == 1
+        assert source_calls[0].kwargs["replace"] is True
 
         # <install>/config/ should be root-owned (static template, not runtime data)
         own_calls = [c for c in mock_own.call_args_list if c[0] == (config_dst, 0, 0) and c[1].get("recursive") is True]
@@ -8620,6 +8845,34 @@ class TestValidateCodexBin:
         f.write_text("#!/bin/sh\necho hi\n")
         f.chmod(0o755)
         assert _validate_codex_bin(str(f)) is True
+
+
+class TestResolveCodexBinPromptDefault:
+    """Upgrade-safe default selection for the Codex wizard prompt."""
+
+    def test_valid_saved_path_remains_authoritative(self, tmp_path, monkeypatch):
+        saved = tmp_path / "saved-codex"
+        saved.write_text("#!/bin/sh\n")
+        saved.chmod(0o755)
+        detected = tmp_path / "detected-codex"
+        detected.write_text("#!/bin/sh\n")
+        detected.chmod(0o755)
+        monkeypatch.setattr("kai.install.shutil.which", lambda command: str(detected))
+
+        result = _resolve_codex_bin_prompt_default({"CODEX_BIN": str(saved)})
+
+        assert result == str(saved)
+
+    def test_stale_saved_path_recovers_to_detected_executable(self, tmp_path, monkeypatch):
+        stale = tmp_path / "moved-codex"
+        detected = tmp_path / "detected-codex"
+        detected.write_text("#!/bin/sh\n")
+        detected.chmod(0o755)
+        monkeypatch.setattr("kai.install.shutil.which", lambda command: str(detected))
+
+        result = _resolve_codex_bin_prompt_default({"CODEX_BIN": str(stale)})
+
+        assert result == str(detected)
 
 
 class TestValidateOpenCodeBin:

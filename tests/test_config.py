@@ -29,6 +29,8 @@ _CONFIG_ENV_VARS = [
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_WEBHOOK_URL",
     "TELEGRAM_WEBHOOK_SECRET",
+    "GITHUB_WEBHOOK_SECRET",
+    "GENERIC_WEBHOOK_SECRET",
     "ALLOWED_USER_IDS",
     "DEFAULT_MODEL",
     "CLAUDE_MODEL",
@@ -376,10 +378,56 @@ class TestLoadConfigOptional:
         config = load_config()
         assert config.workspace_base == tmp_path
 
-    def test_webhook_secret(self, monkeypatch):
+    def test_explicit_webhook_secrets_are_separate(self, monkeypatch):
         _set_required(monkeypatch)
-        monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
-        assert load_config().webhook_secret == "s3cret"
+        monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "github-secret")
+        monkeypatch.setenv("GENERIC_WEBHOOK_SECRET", "generic-secret")
+        config = load_config()
+        assert config.github_webhook_secret == "github-secret"
+        assert config.generic_webhook_secret == "generic-secret"
+
+    def test_legacy_webhook_secret_stays_separate_for_external_fallback(self, monkeypatch, caplog):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("WEBHOOK_SECRET", "legacy-secret")
+
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            config = load_config()
+
+        assert config.github_webhook_secret == ""
+        assert config.generic_webhook_secret == ""
+        assert config.webhook_secret == "legacy-secret"
+        assert "deprecated" in caplog.text
+        assert "/webhook/github and /webhook only" in caplog.text
+
+    def test_explicit_generic_secret_wins_over_legacy(self, monkeypatch, caplog):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("GENERIC_WEBHOOK_SECRET", "generic-secret")
+        monkeypatch.setenv("WEBHOOK_SECRET", "legacy-secret")
+
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            config = load_config()
+
+        assert config.generic_webhook_secret == "generic-secret"
+        assert config.github_webhook_secret == ""
+        assert config.webhook_secret == "legacy-secret"
+        assert "temporary compatibility authentication" in caplog.text
+
+    @pytest.mark.parametrize(
+        ("left_name", "right_name"),
+        [
+            ("GITHUB_WEBHOOK_SECRET", "GENERIC_WEBHOOK_SECRET"),
+            ("TELEGRAM_WEBHOOK_SECRET", "GITHUB_WEBHOOK_SECRET"),
+            ("TELEGRAM_WEBHOOK_SECRET", "GENERIC_WEBHOOK_SECRET"),
+        ],
+    )
+    def test_ingress_secrets_must_be_distinct(self, monkeypatch, left_name, right_name):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("TELEGRAM_WEBHOOK_URL", "https://example.com/webhook/telegram")
+        monkeypatch.setenv(left_name, "reused-secret")
+        monkeypatch.setenv(right_name, "reused-secret")
+
+        with pytest.raises(SystemExit, match="must use different values"):
+            load_config()
 
     def test_allowed_workspaces_default_empty(self, monkeypatch):
         _set_required(monkeypatch)
@@ -452,35 +500,38 @@ class TestTelegramWebhookConfig:
         """With TELEGRAM_WEBHOOK_URL set, config selects webhook mode."""
         _set_required(monkeypatch)
         monkeypatch.setenv("TELEGRAM_WEBHOOK_URL", "https://example.com/webhook/telegram")
-        monkeypatch.setenv("WEBHOOK_SECRET", "shared-secret")
+        monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "telegram-secret")
         config = load_config()
         assert config.telegram_webhook_url == "https://example.com/webhook/telegram"
 
-    def test_secret_defaults_to_webhook_secret(self, monkeypatch):
-        """TELEGRAM_WEBHOOK_SECRET falls back to WEBHOOK_SECRET when unset."""
+    def test_secret_is_generated_when_unset(self, monkeypatch):
+        """Webhook mode gets a process credential without reusing another domain's secret."""
         _set_required(monkeypatch)
         monkeypatch.setenv("TELEGRAM_WEBHOOK_URL", "https://example.com/webhook/telegram")
-        monkeypatch.setenv("WEBHOOK_SECRET", "shared-secret")
-        # TELEGRAM_WEBHOOK_SECRET deliberately not set
-        config = load_config()
-        assert config.telegram_webhook_secret == "shared-secret"
+        monkeypatch.setenv("WEBHOOK_SECRET", "legacy-secret")
+        monkeypatch.setattr("kai.config.secrets.token_urlsafe", lambda _n: "generated-telegram-secret")
 
-    def test_explicit_secret_overrides_fallback(self, monkeypatch):
+        config = load_config()
+        assert config.telegram_webhook_secret == "generated-telegram-secret"
+
+    def test_explicit_secret_is_used(self, monkeypatch):
         """TELEGRAM_WEBHOOK_SECRET uses its own value when explicitly set."""
         _set_required(monkeypatch)
         monkeypatch.setenv("TELEGRAM_WEBHOOK_URL", "https://example.com/webhook/telegram")
-        monkeypatch.setenv("WEBHOOK_SECRET", "shared-secret")
+        monkeypatch.setenv("WEBHOOK_SECRET", "legacy-secret")
         monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "tg-only-secret")
         config = load_config()
         assert config.telegram_webhook_secret == "tg-only-secret"
 
-    def test_webhook_url_without_secret_raises(self, monkeypatch):
-        """Webhook mode with no secret is rejected to prevent open endpoint."""
+    def test_generated_secret_does_not_require_external_secret(self, monkeypatch):
+        """Webhook mode stays authenticated even when no external webhook is enabled."""
         _set_required(monkeypatch)
         monkeypatch.setenv("TELEGRAM_WEBHOOK_URL", "https://example.com/webhook/telegram")
-        # Neither TELEGRAM_WEBHOOK_SECRET nor WEBHOOK_SECRET set
-        with pytest.raises(SystemExit, match="TELEGRAM_WEBHOOK_SECRET"):
-            load_config()
+        monkeypatch.setattr("kai.config.secrets.token_urlsafe", lambda _n: "generated-telegram-secret")
+
+        config = load_config()
+
+        assert config.telegram_webhook_secret == "generated-telegram-secret"
 
     def test_polling_mode_ignores_missing_secret(self, monkeypatch):
         """In polling mode, missing secrets are fine (no webhook to protect)."""
@@ -964,7 +1015,7 @@ class TestGitHubReposWarning:
 _MINIMAL_GLOBAL_ENV = {
     "TELEGRAM_BOT_TOKEN": "fake-token",
     "WEBHOOK_PORT": "8080",
-    "WEBHOOK_SECRET": "test-secret",
+    "GENERIC_WEBHOOK_SECRET": "test-secret",
 }
 
 
@@ -2447,9 +2498,10 @@ class TestCodexModelsSurface:
     constants with no overlap requirement and no fallback path.
     """
 
-    def test_codex_models_includes_gpt55_and_codex_variants(self):
+    def test_codex_models_includes_current_alias_and_codex_variants(self):
         from kai.config import CODEX_MODELS
 
+        assert "gpt-5.6" in CODEX_MODELS
         assert "gpt-5.5" in CODEX_MODELS
         assert "gpt-5.3-codex" in CODEX_MODELS
         assert "gpt-5.3-codex-spark" in CODEX_MODELS
@@ -2485,6 +2537,7 @@ class TestValidateModelForBackend:
     def test_codex_accepts_codex_models(self):
         from kai.config import validate_model_for_backend
 
+        assert validate_model_for_backend("gpt-5.6", "codex", "openai") is True
         assert validate_model_for_backend("gpt-5.5", "codex", "openai") is True
         assert validate_model_for_backend("gpt-5.4-mini", "codex", "openai") is True
 
@@ -2859,7 +2912,7 @@ class TestDefaultTimeoutRename:
             "ALLOWED_USER_IDS": "12345",
             "DEFAULT_MODEL": "sonnet",
             "WEBHOOK_PORT": "8080",
-            "WEBHOOK_SECRET": "test-secret",
+            "GENERIC_WEBHOOK_SECRET": "test-secret",
         }
         base.update(overrides)
         for k, v in base.items():
@@ -2917,7 +2970,7 @@ class TestAgentSessionLifecycleRename:
             "ALLOWED_USER_IDS": "12345",
             "DEFAULT_MODEL": "sonnet",
             "WEBHOOK_PORT": "8080",
-            "WEBHOOK_SECRET": "test-secret",
+            "GENERIC_WEBHOOK_SECRET": "test-secret",
         }
         base.update(overrides)
         for k, v in base.items():
@@ -2977,7 +3030,7 @@ class TestLoadConfigBackendAwareModelValidation:
             "TELEGRAM_BOT_TOKEN": "test-token",
             "ALLOWED_USER_IDS": "12345",
             "WEBHOOK_PORT": "8080",
-            "WEBHOOK_SECRET": "test-secret",
+            "GENERIC_WEBHOOK_SECRET": "test-secret",
         }
         base.update(overrides)
         for k, v in base.items():
@@ -3381,7 +3434,7 @@ class TestLoadMemoryProjects:
             monkeypatch.delenv(v, raising=False)
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
         monkeypatch.setenv("ALLOWED_USER_IDS", "12345")
-        monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
+        monkeypatch.setenv("GENERIC_WEBHOOK_SECRET", "test-secret")
         _patch_protected_users_yaml(
             monkeypatch,
             "users:\n  - telegram_id: 12345\n    name: test\n    role: admin\n",

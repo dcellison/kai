@@ -1552,8 +1552,14 @@ class TestSubprocessConstruction:
         assert call_kwargs["stderr"] == asyncio.subprocess.PIPE
 
     @pytest.mark.asyncio
-    async def test_webhook_secret_injected(self):
-        """KAI_WEBHOOK_SECRET is set in the subprocess env when configured."""
+    async def test_only_principal_credential_is_injected(self, monkeypatch):
+        """Codex receives its API credential but no outer control-plane secrets."""
+        monkeypatch.setenv("WEBHOOK_SECRET", "legacy-generic-secret")
+        monkeypatch.setenv("GENERIC_WEBHOOK_SECRET", "generic-signing-secret")
+        monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "github-signing-secret")
+        monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "telegram-signing-secret")
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bot-token")
+        monkeypatch.setenv("GITHUB_TOKEN", "outer-github-token")
         c = _make_codex(webhook_secret="s3cr3t")
         proc = _make_mock_proc(_handshake_lines())
 
@@ -1562,6 +1568,12 @@ class TestSubprocessConstruction:
 
         call_kwargs = mock_exec.call_args[1]
         assert call_kwargs["env"]["KAI_WEBHOOK_SECRET"] == "s3cr3t"
+        assert "WEBHOOK_SECRET" not in call_kwargs["env"]
+        assert "GENERIC_WEBHOOK_SECRET" not in call_kwargs["env"]
+        assert "GITHUB_WEBHOOK_SECRET" not in call_kwargs["env"]
+        assert "TELEGRAM_WEBHOOK_SECRET" not in call_kwargs["env"]
+        assert "TELEGRAM_BOT_TOKEN" not in call_kwargs["env"]
+        assert "GITHUB_TOKEN" not in call_kwargs["env"]
 
 
 # ── Per-user OAuth isolation (codex_user / sudo wrap) ─────────────

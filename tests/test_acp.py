@@ -1474,9 +1474,18 @@ class TestEnvLayering:
 
     @pytest.mark.asyncio
     async def test_webhook_secret_applied_last(self, tmp_path):
-        """KAI_WEBHOOK_SECRET cannot be overridden by workspace env."""
+        """Only the principal credential survives workspace env layering."""
         env_file = tmp_path / "ws.env"
-        env_file.write_text("KAI_WEBHOOK_SECRET=workspace-secret\nFOO=bar\n")
+        env_file.write_text(
+            "KAI_WEBHOOK_SECRET=workspace-secret\n"
+            "WEBHOOK_SECRET=legacy-generic-secret\n"
+            "GENERIC_WEBHOOK_SECRET=generic-signing-secret\n"
+            "GITHUB_WEBHOOK_SECRET=github-signing-secret\n"
+            "TELEGRAM_WEBHOOK_SECRET=telegram-signing-secret\n"
+            "TELEGRAM_BOT_TOKEN=bot-token\n"
+            "GH_TOKEN=outer-github-token\n"
+            "FOO=bar\n"
+        )
         ws = WorkspaceConfig(path=Path("/tmp/ws"), env_file=env_file)
         b = _make_fake(workspace_config=ws, webhook_secret="real-secret")
 
@@ -1498,6 +1507,12 @@ class TestEnvLayering:
         assert env["FOO"] == "bar"
         # Webhook secret wins over workspace env_file's attempt to override.
         assert env["KAI_WEBHOOK_SECRET"] == "real-secret"
+        assert "WEBHOOK_SECRET" not in env
+        assert "GENERIC_WEBHOOK_SECRET" not in env
+        assert "GITHUB_WEBHOOK_SECRET" not in env
+        assert "TELEGRAM_WEBHOOK_SECRET" not in env
+        assert "TELEGRAM_BOT_TOKEN" not in env
+        assert "GH_TOKEN" not in env
 
     @pytest.mark.asyncio
     async def test_workspace_inline_env_overrides_file(self, tmp_path):

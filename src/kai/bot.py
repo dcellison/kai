@@ -2772,6 +2772,8 @@ async def _github_api_ensure_webhook(
     """
     if config.telegram_webhook_url is None:
         raise github_api.GitHubAPIError(0, "No webhook URL configured (polling mode)")
+    if not config.github_webhook_secret:
+        raise github_api.GitHubAPIError(0, "GITHUB_WEBHOOK_SECRET is not configured")
     owner, name = repo.split("/", 1)
     webhook_url = _derive_webhook_url(config.telegram_webhook_url)
 
@@ -2790,7 +2792,7 @@ async def _github_api_ensure_webhook(
         name,
         token,
         webhook_url,
-        config.webhook_secret,
+        config.github_webhook_secret,
     )
     await sessions.set_setting(f"github_hook_id:{repo}", str(hook_id))
 
@@ -3208,7 +3210,7 @@ async def _handle_github_notify(
 
     if value == "reset":
         # Read the current notify chat_id before deleting it, so we can
-        # remove it from the live allowed_user_ids set.
+        # remove it from the live notification-destination registry.
         old_val = await sessions.get_setting(f"github_notify_chat:{chat_id}")
         await sessions.delete_setting(f"github_notify_chat:{chat_id}")
         if old_val:
@@ -3216,12 +3218,9 @@ async def _handle_github_notify(
                 old_chat_id = int(old_val)
             except ValueError:
                 old_chat_id = None
-            # Never remove the user's own chat_id from the allowed
-            # set. This is the primary guard for legacy mode (no
-            # users.yaml) where remove_allowed_chat_id's user_configs
-            # check cannot fire. Also correct in multi-user mode -
-            # a user's own ID was in allowed_user_ids before any
-            # notify additions and must stay.
+            # Never remove the user's own chat_id from the legacy registry.
+            # The registry is no longer an authorization source, but keeping
+            # this guard preserves its outbound-destination semantics.
             if old_chat_id is not None and old_chat_id != chat_id:
                 still_used = await _is_notify_chat_used(
                     old_chat_id,
@@ -3241,9 +3240,8 @@ async def _handle_github_notify(
         return
 
     # If there is an existing notify destination that differs from the
-    # new one, clean it up from allowed_user_ids before overwriting.
-    # Without this, the old chat_id would linger in the set until
-    # restart - a minor auth leak for abandoned group chats.
+    # new one, clean it up from the live registry before overwriting.
+    # Without this, the old chat_id would linger until restart.
     old_val = await sessions.get_setting(f"github_notify_chat:{chat_id}")
     if old_val:
         try:
@@ -3261,8 +3259,8 @@ async def _handle_github_notify(
 
     await sessions.set_setting(f"github_notify_chat:{chat_id}", str(notify_id))
 
-    # Update the live allowed_user_ids set so /api/send-message accepts
-    # this chat_id immediately, without requiring a restart.
+    # Keep the legacy live destination registry synchronized. Internal API
+    # access is credential-bound and does not consult this collection.
     webhook.add_allowed_chat_id(notify_id)
 
     await update.message.reply_text(f"GitHub notifications will go to chat {notify_id}.")
@@ -3344,34 +3342,34 @@ async def handle_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     config: Config = context.bot_data["config"]
     running = webhook.is_running()
     status = "running" if running else "not running"
-    has_secret = bool(config.webhook_secret)
+    has_github_secret = bool(config.github_webhook_secret)
+    has_generic_secret = bool(config.generic_webhook_secret)
     lines = [
         f"Webhook server: {status}",
         f"Port: {config.webhook_port}",
         "",
         "Endpoints:",
         "  GET  /health          (health check)",
+        "  POST /api/schedule    (principal-bound scheduling API)",
+        "  POST /api/services/*  (principal-bound service proxy)",
     ]
-    if has_secret:
-        lines += [
-            "  POST /webhook/github  (GitHub events)",
-            "  POST /webhook         (generic)",
-            "  POST /api/schedule    (scheduling API)",
-            "  POST /api/services/*  (external service proxy)",
-        ]
-    else:
+    if has_github_secret:
+        lines.append("  POST /webhook/github  (GitHub events)")
+    if has_generic_secret:
+        lines.append("  POST /webhook         (generic)")
+    if not has_github_secret and not has_generic_secret:
         lines += [
             "",
-            "WEBHOOK_SECRET not set — only /health is active.",
-            "Set WEBHOOK_SECRET in .env to enable webhooks and scheduling.",
+            "No external webhook secrets are configured.",
+            "Internal APIs remain active with per-user process credentials.",
         ]
-    if running and has_secret:
+    if running and has_github_secret:
         lines += [
             "",
             "GitHub setup:",
             "1. Set Payload URL to https://your-host/webhook/github",
             "2. Content type: application/json",
-            "3. Set the secret to match WEBHOOK_SECRET",
+            "3. Set the secret to match GITHUB_WEBHOOK_SECRET",
             "4. Choose events: Pushes, Pull requests, Issues, Comments",
         ]
     await update.message.reply_text("\n".join(lines))

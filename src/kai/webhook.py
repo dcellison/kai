@@ -31,10 +31,12 @@ Routes are organized into these groups:
     - /api/memory/stats     - Memory statistics for a user (GET)
     - /api/memory/all       - Delete all memories for a user (DELETE, requires confirm token)
 
-The Telegram webhook route uses its own secret (TELEGRAM_WEBHOOK_SECRET) and is
-only registered in webhook mode. All other webhook/API endpoints require
-WEBHOOK_SECRET. When WEBHOOK_SECRET is unset, only /health is active (plus
-/webhook/telegram if in webhook mode).
+Every ingress domain has an independent credential. Telegram uses its configured
+or process-generated secret token, GitHub uses GITHUB_WEBHOOK_SECRET, and the
+generic endpoint uses GENERIC_WEBHOOK_SECRET. During migration only, the
+deprecated WEBHOOK_SECRET is an external-only fallback for the GitHub and generic
+routes; successful fallback use is logged. Internal API routes always use random,
+principal-bound process credentials and do not depend on external webhook secrets.
 
 GitHub events are formatted into human-readable Markdown messages and sent
 to the configured Telegram chat. The formatter pattern (dispatch dict mapping
@@ -59,6 +61,7 @@ from telegram.ext import Application
 
 from kai import cron, memory, review, services, sessions, triage
 from kai.config import DATA_DIR, IMAGE_EXTENSIONS, Config, ModelRole, UserConfig, resolve_user_model
+from kai.internal_api_auth import InternalAPIAuth, InternalAPIPrincipal, InternalAPIScope
 from kai.telegram_utils import chunk_text
 
 log = logging.getLogger(__name__)
@@ -84,6 +87,10 @@ ALLOWED_USER_IDS_KEY: web.AppKey[set[int]] = web.AppKey("allowed_user_ids", set)
 ALLOWED_WORKSPACES_KEY: web.AppKey[list[str]] = web.AppKey("allowed_workspaces", list)
 CHAT_ID_KEY: web.AppKey[int] = web.AppKey("chat_id", int)
 CONFIG_KEY: web.AppKey[Config] = web.AppKey("config", Config)
+GENERIC_WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("generic_webhook_secret", str)
+GITHUB_WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("github_webhook_secret", str)
+INTERNAL_API_AUTH_KEY: web.AppKey[InternalAPIAuth] = web.AppKey("internal_api_auth", InternalAPIAuth)
+LEGACY_WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("legacy_webhook_secret", str)
 POOL_KEY: web.AppKey[object] = web.AppKey("pool", object)
 PR_REVIEW_COOLDOWN_KEY: web.AppKey[int] = web.AppKey("pr_review_cooldown", int)
 PR_REVIEW_TIMEOUT_S_KEY: web.AppKey[int] = web.AppKey("pr_review_timeout_s", int)
@@ -92,12 +99,11 @@ TELEGRAM_APP_KEY: web.AppKey[Application] = web.AppKey("telegram_app", Applicati
 TELEGRAM_BOT_KEY: web.AppKey[Bot] = web.AppKey("telegram_bot", Bot)
 TELEGRAM_WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("telegram_webhook_secret", str)
 WEBHOOK_PORT_KEY: web.AppKey[int] = web.AppKey("webhook_port", int)
-WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("webhook_secret", str)
 WORKSPACE_BASE_KEY: web.AppKey[str | None] = web.AppKey("workspace_base")
 
 
 class UnauthorizedChatIdError(Exception):
-    """Raised when a request specifies a chat_id not in allowed_user_ids."""
+    """Raised when a request targets a chat_id other than its principal."""
 
 
 # Module-level server state, managed by start() and stop()
@@ -302,34 +308,65 @@ def _strip_markdown(text: str) -> str:
     return text
 
 
-def _require_secret(handler):
-    """Decorator that validates the X-Webhook-Secret header before
-    calling the route handler. Returns 401 on mismatch."""
+def _require_generic_webhook_secret(handler):
+    """Validate the generic credential, with observable legacy fallback."""
 
     @functools.wraps(handler)
     async def wrapper(request: web.Request) -> web.Response:
-        secret = request.app[WEBHOOK_SECRET_KEY]
+        secret = request.app[GENERIC_WEBHOOK_SECRET_KEY]
+        legacy_secret = request.app.get(LEGACY_WEBHOOK_SECRET_KEY, "")
         provided = request.headers.get("X-Webhook-Secret", "")
-        if not hmac.compare_digest(provided, secret):
+        if secret and hmac.compare_digest(provided, secret):
+            return await handler(request)
+        if legacy_secret and hmac.compare_digest(provided, legacy_secret):
+            log.warning(
+                "Legacy WEBHOOK_SECRET authenticated /webhook from %s; migrate this caller to GENERIC_WEBHOOK_SECRET",
+                request.remote,
+            )
+            return await handler(request)
+        else:
             log.warning("Auth failure on %s from %s", request.path, request.remote)
             return web.Response(status=401, text="Invalid secret")
-        return await handler(request)
 
     return wrapper
 
 
-def _resolve_chat_id(request: web.Request, payload: dict) -> int:
-    """
-    Extract chat_id from the request payload if present, otherwise
-    fall back to the app-level default.
+def _require_internal_api(scope: InternalAPIScope):
+    """Require a principal-bound internal API credential with one scope."""
 
-    This allows the inner Claude process to specify which user a
-    message/file/job belongs to, while remaining backward-compatible
-    with callers that don't pass chat_id.
+    def decorator(handler):
+        @functools.wraps(handler)
+        async def wrapper(request: web.Request) -> web.Response:
+            credential = request.headers.get("X-Webhook-Secret", "")
+            principal = request.app[INTERNAL_API_AUTH_KEY].authenticate(credential)
+            if principal is None:
+                log.warning("Internal API auth failure on %s from %s", request.path, request.remote)
+                return web.Response(status=401, text="Invalid credential")
+            if not principal.allows(scope):
+                log.warning(
+                    "Internal API scope denial on %s for principal %d",
+                    request.path,
+                    principal.chat_id,
+                )
+                return web.Response(status=403, text="Credential is not authorized for this operation")
+            return await handler(request, principal)
+
+        return wrapper
+
+    return decorator
+
+
+def _resolve_chat_id(principal: InternalAPIPrincipal, payload: dict) -> int:
+    """
+    Resolve identity from the authenticated principal, not request data.
+
+    A caller may include chat_id for clarity and compatibility, but it must
+    match the server-resolved credential owner. Omitting chat_id uses that
+    owner directly; there is no admin or application-default fallback.
 
     Raises:
         ValueError: If chat_id is present but not a valid integer.
-        UnauthorizedChatIdError: If chat_id is not in allowed_user_ids.
+        UnauthorizedChatIdError: If chat_id differs from the principal.
     """
     explicit = payload.get("chat_id")
     if explicit is not None:
@@ -342,14 +379,12 @@ def _resolve_chat_id(request: web.Request, payload: dict) -> int:
             resolved = int(explicit)
         except (TypeError, ValueError):
             raise ValueError(f"chat_id must be an integer, got {explicit!r}") from None
-        # Validate the resolved chat_id is an authorized user.
-        # Without this, a prompt injection attack could make inner Claude
-        # send messages to arbitrary Telegram users.
-        allowed = request.app.get(ALLOWED_USER_IDS_KEY)
-        if allowed is not None and resolved not in allowed:
-            raise UnauthorizedChatIdError(f"chat_id {resolved} is not an authorized user")
+        if resolved != principal.chat_id:
+            raise UnauthorizedChatIdError(
+                f"chat_id {resolved} does not match authenticated principal {principal.chat_id}"
+            )
         return resolved
-    return request.app[CHAT_ID_KEY]
+    return principal.chat_id
 
 
 # ── GitHub event formatters ───────────────────────────────────────────
@@ -464,7 +499,7 @@ def _verify_github_signature(secret: str, body: bytes, signature: str) -> bool:
     comparison to prevent timing attacks.
 
     Args:
-        secret: The shared webhook secret configured in GitHub and .env.
+        secret: The dedicated GITHUB_WEBHOOK_SECRET configured in GitHub and Kai.
         body: The raw request body bytes.
         signature: The X-Hub-Signature-256 header value (e.g., "sha256=abc123...").
 
@@ -481,8 +516,8 @@ def _verify_github_signature(secret: str, body: bytes, signature: str) -> bool:
 
 
 async def _handle_health(request: web.Request) -> web.Response:
-    """Health check endpoint. Returns {"status": "ok"} for uptime monitoring."""
-    return web.json_response({"status": "ok"})
+    """Return liveness plus the non-sensitive memory feature mode."""
+    return web.json_response({"status": "ok", "memory_enabled": memory.is_enabled()})
 
 
 async def _handle_telegram_update(request: web.Request) -> web.Response:
@@ -546,13 +581,22 @@ async def _handle_github(request: web.Request) -> web.Response:
     Supported events: push, pull_request, issues, issue_comment, pull_request_review.
     Unsupported events are silently acknowledged with {"msg": "ignored"}.
     """
-    secret = request.app[WEBHOOK_SECRET_KEY]
+    secret = request.app[GITHUB_WEBHOOK_SECRET_KEY]
+    legacy_secret = request.app.get(LEGACY_WEBHOOK_SECRET_KEY, "")
 
     body = await request.read()
 
     # Validate HMAC-SHA256 signature from GitHub
     signature = request.headers.get("X-Hub-Signature-256", "")
-    if not _verify_github_signature(secret, body, signature):
+    if secret and _verify_github_signature(secret, body, signature):
+        pass
+    elif legacy_secret and _verify_github_signature(legacy_secret, body, signature):
+        log.warning(
+            "Legacy WEBHOOK_SECRET authenticated /webhook/github from %s; "
+            "migrate the GitHub webhook to GITHUB_WEBHOOK_SECRET",
+            request.remote,
+        )
+    else:
         log.warning("GitHub webhook: invalid signature")
         return web.Response(status=401, text="Invalid signature")
 
@@ -800,7 +844,7 @@ async def _process_github_event_for_user(
                 review.review_pr(
                     payload,
                     webhook_port=request.app[WEBHOOK_PORT_KEY],
-                    webhook_secret=request.app[WEBHOOK_SECRET_KEY],
+                    webhook_secret=request.app[INTERNAL_API_AUTH_KEY].notification_credential_for(target_chat_id),
                     claude_user=claude_user,
                     local_repo_path=local_repo_path,
                     spec_dir=request.app.get(SPEC_DIR_KEY, "specs"),
@@ -850,7 +894,7 @@ async def _process_github_event_for_user(
                 triage.triage_issue(
                     payload,
                     webhook_port=request.app[WEBHOOK_PORT_KEY],
-                    webhook_secret=request.app[WEBHOOK_SECRET_KEY],
+                    webhook_secret=request.app[INTERNAL_API_AUTH_KEY].notification_credential_for(target_chat_id),
                     claude_user=claude_user,
                     notify_chat_id=target_chat_id,
                     agent_backend=agent_backend,
@@ -898,7 +942,7 @@ async def _process_github_event_for_user(
     )
 
 
-@_require_secret
+@_require_generic_webhook_secret
 async def _handle_generic(request: web.Request) -> web.Response:
     """
     Handle generic webhook notifications from any source.
@@ -1024,8 +1068,8 @@ def _validate_schedule_data(
     return json.dumps(parsed), None
 
 
-@_require_secret
-async def _handle_schedule(request: web.Request) -> web.Response:
+@_require_internal_api(InternalAPIScope.JOBS_WRITE)
+async def _handle_schedule(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     Create a new scheduled job via the HTTP API.
 
@@ -1085,7 +1129,7 @@ async def _handle_schedule(request: web.Request) -> web.Response:
     auto_remove = payload.get("auto_remove", False)
     notify_on_check = payload.get("notify_on_check", False)
     try:
-        chat_id = _resolve_chat_id(request, payload)
+        chat_id = _resolve_chat_id(principal, payload)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
     except UnauthorizedChatIdError as e:
@@ -1126,8 +1170,8 @@ async def _handle_schedule(request: web.Request) -> web.Response:
 # ── Jobs API ─────────────────────────────────────────────────────────
 
 
-@_require_secret
-async def _handle_get_jobs(request: web.Request) -> web.Response:
+@_require_internal_api(InternalAPIScope.JOBS_READ)
+async def _handle_get_jobs(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     List all active jobs for the configured chat.
 
@@ -1139,7 +1183,7 @@ async def _handle_get_jobs(request: web.Request) -> web.Response:
     # dict so _resolve_chat_id can extract and validate chat_id the same
     # way it does for POST endpoints with JSON bodies.
     try:
-        chat_id = _resolve_chat_id(request, dict(request.query))
+        chat_id = _resolve_chat_id(principal, dict(request.query))
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
     except UnauthorizedChatIdError as e:
@@ -1148,8 +1192,8 @@ async def _handle_get_jobs(request: web.Request) -> web.Response:
     return web.json_response(jobs)
 
 
-@_require_secret
-async def _handle_get_job(request: web.Request) -> web.Response:
+@_require_internal_api(InternalAPIScope.JOBS_READ)
+async def _handle_get_job(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     Get a single job by its database ID.
 
@@ -1163,7 +1207,7 @@ async def _handle_get_job(request: web.Request) -> web.Response:
 
     # Resolve caller identity for ownership check
     try:
-        chat_id = _resolve_chat_id(request, dict(request.query))
+        chat_id = _resolve_chat_id(principal, dict(request.query))
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
     except UnauthorizedChatIdError as e:
@@ -1178,8 +1222,8 @@ async def _handle_get_job(request: web.Request) -> web.Response:
     return web.json_response(job)
 
 
-@_require_secret
-async def _handle_delete_job(request: web.Request) -> web.Response:
+@_require_internal_api(InternalAPIScope.JOBS_WRITE)
+async def _handle_delete_job(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     Delete a scheduled job by ID via the HTTP API.
 
@@ -1193,12 +1237,10 @@ async def _handle_delete_job(request: web.Request) -> web.Response:
     except ValueError:
         return web.json_response({"error": "Invalid job ID"}, status=400)
 
-    # Resolve caller identity from query params (e.g., ?chat_id=456).
-    # Falls back to admin chat_id when omitted, preserving backward
-    # compatibility. _resolve_chat_id validates against allowed_user_ids
-    # to prevent cross-user job manipulation via prompt injection.
+    # Resolve caller identity from its server-owned principal. A query-string
+    # chat_id is accepted only when it repeats that identity.
     try:
-        chat_id = _resolve_chat_id(request, dict(request.query))
+        chat_id = _resolve_chat_id(principal, dict(request.query))
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
     except UnauthorizedChatIdError as e:
@@ -1222,8 +1264,8 @@ async def _handle_delete_job(request: web.Request) -> web.Response:
     return web.json_response({"deleted": job_id})
 
 
-@_require_secret
-async def _handle_update_job(request: web.Request) -> web.Response:
+@_require_internal_api(InternalAPIScope.JOBS_WRITE)
+async def _handle_update_job(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     Update a scheduled job's mutable fields via the HTTP API.
 
@@ -1285,7 +1327,7 @@ async def _handle_update_job(request: web.Request) -> web.Response:
     # an updatable column - update_job only writes explicitly named fields
     # (name, prompt, schedule_type, etc.) to the SET clause.
     try:
-        chat_id = _resolve_chat_id(request, payload)
+        chat_id = _resolve_chat_id(principal, payload)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
     except UnauthorizedChatIdError as e:
@@ -1326,8 +1368,8 @@ async def _handle_update_job(request: web.Request) -> web.Response:
 # ── Service proxy ────────────────────────────────────────────────────
 
 
-@_require_secret
-async def _handle_service_call(request: web.Request) -> web.Response:
+@_require_internal_api(InternalAPIScope.SERVICES_CALL)
+async def _handle_service_call(request: web.Request, _principal: InternalAPIPrincipal) -> web.Response:
     """
     Proxy an authenticated request to an external service.
 
@@ -1387,8 +1429,8 @@ async def _handle_service_call(request: web.Request) -> web.Response:
 # ── Messaging ────────────────────────────────────────────────────────
 
 
-@_require_secret
-async def _handle_send_message(request: web.Request) -> web.Response:
+@_require_internal_api(InternalAPIScope.MESSAGES_SEND)
+async def _handle_send_message(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     Send a text message to the Telegram chat.
 
@@ -1421,7 +1463,7 @@ async def _handle_send_message(request: web.Request) -> web.Response:
 
     bot = request.app[TELEGRAM_BOT_KEY]
     try:
-        chat_id = _resolve_chat_id(request, payload)
+        chat_id = _resolve_chat_id(principal, payload)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
     except UnauthorizedChatIdError as e:
@@ -1441,8 +1483,8 @@ async def _handle_send_message(request: web.Request) -> web.Response:
 # ── File exchange ────────────────────────────────────────────────────
 
 
-@_require_secret
-async def _handle_send_file(request: web.Request) -> web.Response:
+@_require_internal_api(InternalAPIScope.FILES_SEND)
+async def _handle_send_file(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     Send a file from the filesystem to the Telegram chat.
 
@@ -1477,7 +1519,7 @@ async def _handle_send_file(request: web.Request) -> web.Response:
 
     # Resolve chat_id first - needed for per-user workspace confinement
     try:
-        chat_id = _resolve_chat_id(request, payload)
+        chat_id = _resolve_chat_id(principal, payload)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
     except UnauthorizedChatIdError as e:
@@ -1576,8 +1618,8 @@ def _memory_disabled_response() -> web.Response:
     return web.json_response({"error": "Memory system disabled"}, status=503)
 
 
-@_require_secret
-async def _handle_memory_add(request: web.Request) -> web.Response:
+@_require_internal_api(InternalAPIScope.MEMORY_WRITE)
+async def _handle_memory_add(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     Store a structured memory via memory.add_structured().
 
@@ -1593,13 +1635,13 @@ async def _handle_memory_add(request: web.Request) -> web.Response:
         tags: list[str], optional
         metadata: dict, optional (keys "type" and "tags" are reserved by
             add_structured; user values for those will be overwritten)
-        chat_id: int, optional, defaults to the configured webhook chat_id
+        chat_id: int, optional, defaults to the authenticated principal
 
     Responses:
         200 {"id": "<mem0-uuid>"} on success
         400 on bad input (invalid JSON, missing/empty content, bad chat_id)
-        401 on bad/missing X-Webhook-Secret (handled by the decorator)
-        403 on unauthorized chat_id
+        401 on bad/missing internal API credential (handled by the decorator)
+        403 on a chat_id that differs from the authenticated principal
         503 when memory is disabled (precheck; do not retry, escalate)
         500 when add_structured() returns None despite memory being enabled
             (the underlying store call failed; may be transient)
@@ -1657,7 +1699,7 @@ async def _handle_memory_add(request: web.Request) -> web.Response:
         return web.json_response({"error": "metadata must be a JSON object"}, status=400)
 
     try:
-        chat_id = _resolve_chat_id(request, payload)
+        chat_id = _resolve_chat_id(principal, payload)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
     except UnauthorizedChatIdError as e:
@@ -1708,8 +1750,8 @@ async def _handle_memory_add(request: web.Request) -> web.Response:
     return web.json_response({"id": memory_id})
 
 
-@_require_secret
-async def _handle_memory_search(request: web.Request) -> web.Response:
+@_require_internal_api(InternalAPIScope.MEMORY_READ)
+async def _handle_memory_search(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     Search memories via memory.search().
 
@@ -1721,7 +1763,7 @@ async def _handle_memory_search(request: web.Request) -> web.Response:
     Request body (JSON):
         query: str, required, non-empty after strip
         limit: int, optional (defaults to config.memory_search_limit)
-        chat_id: int, optional, defaults to the configured webhook chat_id
+        chat_id: int, optional, defaults to the authenticated principal
 
     Responses:
         200 {"results": [<MemoryResult-dict>, ...]} on success (empty list
@@ -1762,7 +1804,7 @@ async def _handle_memory_search(request: web.Request) -> web.Response:
         return web.json_response({"error": "limit must be a positive integer"}, status=400)
 
     try:
-        chat_id = _resolve_chat_id(request, payload)
+        chat_id = _resolve_chat_id(principal, payload)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
     except UnauthorizedChatIdError as e:
@@ -1799,15 +1841,15 @@ async def _handle_memory_search(request: web.Request) -> web.Response:
         return web.json_response({"error": "Memory search failed"}, status=500)
 
 
-@_require_secret
-async def _handle_memory_stats(request: web.Request) -> web.Response:
+@_require_internal_api(InternalAPIScope.MEMORY_READ)
+async def _handle_memory_stats(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     Return memory statistics via memory.get_stats().
 
     GET endpoint reads chat_id from query params, mirroring _handle_get_jobs.
 
     Query params:
-        chat_id: int, optional (defaults to the configured webhook chat_id)
+        chat_id: int, optional (defaults to the authenticated principal)
 
     Response is the MemoryStats object at the top level, NOT wrapped in
     {"results": ...} - single-object reads return the object bare per
@@ -1829,7 +1871,7 @@ async def _handle_memory_stats(request: web.Request) -> web.Response:
     # GET handlers feed query params to _resolve_chat_id; established
     # pattern at _handle_get_jobs.
     try:
-        chat_id = _resolve_chat_id(request, dict(request.query))
+        chat_id = _resolve_chat_id(principal, dict(request.query))
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
     except UnauthorizedChatIdError as e:
@@ -1862,8 +1904,8 @@ async def _handle_memory_stats(request: web.Request) -> web.Response:
         return web.json_response({"error": "Memory stats failed"}, status=500)
 
 
-@_require_secret
-async def _handle_memory_delete_all(request: web.Request) -> web.Response:
+@_require_internal_api(InternalAPIScope.MEMORY_WRITE)
+async def _handle_memory_delete_all(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     Delete all memories for a user via memory.delete_all().
 
@@ -1879,7 +1921,7 @@ async def _handle_memory_delete_all(request: web.Request) -> web.Response:
 
     Request body (JSON):
         confirm: str, required, must equal "delete-all-memories"
-        chat_id: int, optional, defaults to the configured webhook chat_id
+        chat_id: int, optional, defaults to the authenticated principal
 
     Responses:
         200 {"status": "deleted"} on success
@@ -1917,7 +1959,7 @@ async def _handle_memory_delete_all(request: web.Request) -> web.Response:
         )
 
     try:
-        chat_id = _resolve_chat_id(request, payload)
+        chat_id = _resolve_chat_id(principal, payload)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
     except UnauthorizedChatIdError as e:
@@ -2062,6 +2104,47 @@ async def _webhook_health_loop(bot, webhook_url: str, webhook_secret: str, chat_
 # ── Lifecycle ────────────────────────────────────────────────────────
 
 
+def _register_routes(app: web.Application, config: Config) -> None:
+    """Register independently gated external routes and always-on internal APIs."""
+    app.router.add_get("/health", _handle_health)
+
+    if config.webhook_secret:
+        app[LEGACY_WEBHOOK_SECRET_KEY] = config.webhook_secret
+
+    if config.telegram_webhook_url:
+        if not config.telegram_webhook_secret:
+            raise RuntimeError("Telegram webhook mode requires a non-empty secret")
+        app[TELEGRAM_WEBHOOK_SECRET_KEY] = config.telegram_webhook_secret
+        app.router.add_post("/webhook/telegram", _handle_telegram_update)
+
+    if config.github_webhook_secret or config.webhook_secret:
+        app[GITHUB_WEBHOOK_SECRET_KEY] = config.github_webhook_secret
+        app.router.add_post("/webhook/github", _handle_github)
+    else:
+        log.warning("GITHUB_WEBHOOK_SECRET not set - GitHub webhook endpoint disabled")
+
+    if config.generic_webhook_secret or config.webhook_secret:
+        app[GENERIC_WEBHOOK_SECRET_KEY] = config.generic_webhook_secret
+        app.router.add_post("/webhook", _handle_generic)
+    else:
+        log.info("GENERIC_WEBHOOK_SECRET not set - generic webhook endpoint disabled")
+
+    # These routes authenticate through INTERNAL_API_AUTH_KEY. Their
+    # availability must not be coupled to any public ingress configuration.
+    app.router.add_post("/api/schedule", _handle_schedule)
+    app.router.add_get("/api/jobs", _handle_get_jobs)
+    app.router.add_get("/api/jobs/{id}", _handle_get_job)
+    app.router.add_delete("/api/jobs/{id}", _handle_delete_job)
+    app.router.add_patch("/api/jobs/{id}", _handle_update_job)
+    app.router.add_post("/api/services/{name}", _handle_service_call)
+    app.router.add_post("/api/send-message", _handle_send_message)
+    app.router.add_post("/api/send-file", _handle_send_file)
+    app.router.add_post("/api/memory/add", _handle_memory_add)
+    app.router.add_post("/api/memory/search", _handle_memory_search)
+    app.router.add_get("/api/memory/stats", _handle_memory_stats)
+    app.router.add_delete("/api/memory/all", _handle_memory_delete_all)
+
+
 async def start(telegram_app, config) -> None:
     """
     Start the HTTP server and optionally register the Telegram webhook.
@@ -2083,12 +2166,16 @@ async def start(telegram_app, config) -> None:
     _app = web.Application()
     _app[TELEGRAM_APP_KEY] = telegram_app
     _app[TELEGRAM_BOT_KEY] = telegram_app.bot
-    _app[WEBHOOK_SECRET_KEY] = config.webhook_secret
 
-    # Set the default chat_id for API calls that don't specify a target.
-    # users.yaml is mandatory so the first admin is the default; when
-    # no admin is defined, fall back to the first user with a warning
-    # (the same warning at config load time covers the no-admin case).
+    pool = telegram_app.bot_data.get("pool")
+    internal_api_auth = getattr(pool, "internal_api_auth", None)
+    if not isinstance(internal_api_auth, InternalAPIAuth):
+        raise RuntimeError("Subprocess pool did not provide an internal API credential store")
+    _app[INTERNAL_API_AUTH_KEY] = internal_api_auth
+
+    # Set the fallback destination for unattributed external webhook events.
+    # Internal API calls never use this value for identity; their credential
+    # resolves a principal before the handler runs.
     admins = config.get_admins()
     if admins:
         _app[CHAT_ID_KEY] = admins[0].telegram_id
@@ -2103,16 +2190,18 @@ async def start(telegram_app, config) -> None:
         )
         _app[CHAT_ID_KEY] = fallback.telegram_id
 
-    # Store allowed user IDs for chat_id validation in _resolve_chat_id.
-    # Prevents prompt injection from routing messages to arbitrary users.
-    _app[ALLOWED_USER_IDS_KEY] = config.allowed_user_ids
+    # Keep notification destinations separate from Config.allowed_user_ids,
+    # which is the immutable-at-runtime source for Telegram inbound auth. The
+    # API no longer consults this set for identity; credentials resolve their
+    # principal server-side.
+    _app[ALLOWED_USER_IDS_KEY] = set(config.allowed_user_ids)
 
     # Store config for GitHub actor routing in _handle_github()
     _app[CONFIG_KEY] = config
 
     # Store the subprocess pool for per-user workspace lookup in send-file.
     # Set by main.py after pool creation; may be None during init.
-    _app[POOL_KEY] = telegram_app.bot_data.get("pool")
+    _app[POOL_KEY] = pool
 
     # Server-level config for review/triage background tasks. Per-user
     # feature flags (pr_review, issue_triage) are resolved at event time
@@ -2128,9 +2217,9 @@ async def start(telegram_app, config) -> None:
     _app[ALLOWED_WORKSPACES_KEY] = [str(p) for p in config.allowed_workspaces]
     _app[SPEC_DIR_KEY] = config.spec_dir
 
-    # Add per-user github_notify_chat_id values to allowed_user_ids
-    # so review/triage agents can POST to /api/send-message with
-    # these chat_ids. Loads from both users.yaml and DB.
+    # Maintain the legacy live notification-destination registry from both
+    # users.yaml and DB. This set is intentionally detached from Config's
+    # inbound Telegram principals and is not consulted by internal API auth.
     for uc in config.user_configs.values():
         if uc.github_notify_chat_id is not None:
             _app[ALLOWED_USER_IDS_KEY].add(uc.github_notify_chat_id)
@@ -2147,31 +2236,7 @@ async def start(telegram_app, config) -> None:
                     uid,
                     val,
                 )
-    _app.router.add_get("/health", _handle_health)
-
-    # Only register the Telegram webhook route in webhook mode. In polling mode,
-    # there's no need for the endpoint and no secret to validate against.
-    if config.telegram_webhook_url:
-        _app[TELEGRAM_WEBHOOK_SECRET_KEY] = config.telegram_webhook_secret
-        _app.router.add_post("/webhook/telegram", _handle_telegram_update)
-
-    if config.webhook_secret:
-        _app.router.add_post("/webhook/github", _handle_github)
-        _app.router.add_post("/webhook", _handle_generic)
-        _app.router.add_post("/api/schedule", _handle_schedule)
-        _app.router.add_get("/api/jobs", _handle_get_jobs)
-        _app.router.add_get("/api/jobs/{id}", _handle_get_job)
-        _app.router.add_delete("/api/jobs/{id}", _handle_delete_job)
-        _app.router.add_patch("/api/jobs/{id}", _handle_update_job)
-        _app.router.add_post("/api/services/{name}", _handle_service_call)
-        _app.router.add_post("/api/send-message", _handle_send_message)
-        _app.router.add_post("/api/send-file", _handle_send_file)
-        _app.router.add_post("/api/memory/add", _handle_memory_add)
-        _app.router.add_post("/api/memory/search", _handle_memory_search)
-        _app.router.add_get("/api/memory/stats", _handle_memory_stats)
-        _app.router.add_delete("/api/memory/all", _handle_memory_delete_all)
-    else:
-        log.warning("WEBHOOK_SECRET not set - webhook and scheduling endpoints disabled")
+    _register_routes(_app, config)
 
     _runner = web.AppRunner(_app, access_log=None)
     await _runner.setup()
@@ -2275,11 +2340,11 @@ def is_running() -> bool:
 
 def add_allowed_chat_id(chat_id: int) -> None:
     """
-    Add a chat_id to the live allowed_user_ids set.
+    Add a chat_id to the legacy live notification-destination registry.
 
     Called by bot.py when /github notify sets a new notification
-    destination. Without this, the new chat_id is rejected by
-    _resolve_chat_id() until the next restart.
+    destination. This registry no longer grants Telegram or internal API
+    authority; those identities come from users.yaml and API credentials.
     """
     if _app is not None:
         allowed = _app.get(ALLOWED_USER_IDS_KEY)
@@ -2289,18 +2354,15 @@ def add_allowed_chat_id(chat_id: int) -> None:
 
 def remove_allowed_chat_id(chat_id: int) -> None:
     """
-    Remove a chat_id from the live allowed_user_ids set, but only
+    Remove a chat_id from the live notification registry, but only
     if it does not belong to an actual authorized user.
 
     Called by bot.py when /github notify reset clears a notification
     destination. A user's own telegram_id must never be removed.
 
-    Important: config.allowed_user_ids and _app[ALLOWED_USER_IDS_KEY]
-    are the SAME set object (assigned by reference at start()). We
-    cannot use config.allowed_user_ids as the guard because any
-    chat_id we previously added via add_allowed_chat_id() would also
-    appear there. Instead, check config.user_configs (a dict keyed
-    by telegram_id, populated at load time, never mutated at runtime).
+    Config.allowed_user_ids is deliberately a different set object so
+    notification changes cannot mutate inbound Telegram authorization.
+    user_configs remains the immutable source for the preservation guard.
     """
     if _app is not None:
         allowed = _app.get(ALLOWED_USER_IDS_KEY)

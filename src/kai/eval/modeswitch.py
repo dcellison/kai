@@ -19,15 +19,12 @@ Two subcommands:
 
     python -m kai.eval.modeswitch check
         Runtime sanity check against the running service. Reports the
-        live effective mode plus the deployed prompt versions. Reads
-        WEBHOOK_SECRET from the process environment; source
-        /etc/kai/env first under sudo:
+        live effective mode plus the deployed prompt versions. The
+        localhost health response carries the non-sensitive mode bit,
+        so this diagnostic does not need an internal API credential.
 
-            sudo bash -c 'source /etc/kai/env && env | grep WEBHOOK_SECRET'
-
-        Exit codes: 0 on a clean read; 2 if WEBHOOK_SECRET is not in
-        the environment; 1 if /health is down or /api/memory/stats
-        returns an unexpected status.
+        Exit codes: 0 on a clean read; 1 if /health is down or its
+        response does not contain a valid mode.
 
 The verify subcommand is the merge gate. The check subcommand is
 informational and can be re-run as production state changes.
@@ -39,8 +36,7 @@ Operator round-trip (manual; sudo-gated; not automated by this script):
        macOS: sudo launchctl bootout system/com.syrinx.kai
               sudo launchctl bootstrap system /Library/LaunchDaemons/com.syrinx.kai.plist
        Linux: sudo systemctl stop kai && sudo systemctl start kai
-    3. source /etc/kai/env  # pull WEBHOOK_SECRET into the shell env
-       python -m kai.eval.modeswitch check    # confirms disabled
+    3. python -m kai.eval.modeswitch check    # confirms disabled
     4. python -m kai.eval.modeswitch verify   # logic invariants under both flags
     5. operator: sudo edit /etc/kai/env, set MEMORY_ENABLED=true
     6. operator restarts the service (same commands as step 2)
@@ -753,7 +749,7 @@ def _read_prompt_versions() -> tuple[str, str]:
     return "unknown", "unknown"
 
 
-def _http_get(url: str, secret: str | None = None, timeout: float = 5.0) -> tuple[int, bytes]:
+def _http_get(url: str, timeout: float = 5.0) -> tuple[int, bytes]:
     """Issue a GET against the local kai service and return
     (status_code, body_bytes). On network error or timeout, returns
     (0, b"") so the caller can branch on a non-200/non-503 status.
@@ -764,8 +760,6 @@ def _http_get(url: str, secret: str | None = None, timeout: float = 5.0) -> tupl
     responding.
     """
     req = urllib.request.Request(url)
-    if secret is not None:
-        req.add_header("X-Webhook-Secret", secret)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, resp.read()
@@ -782,36 +776,7 @@ def _http_get(url: str, secret: str | None = None, timeout: float = 5.0) -> tupl
 
 
 def _run_check() -> int:
-    """Probe the running service and print a five-line report.
-
-    Tri-state exit code:
-      0: clean read (health=ok and stats returned a definite mode)
-      1: health=down or stats returned an unexpected status
-      2: WEBHOOK_SECRET not in process environment
-    """
-    # Distinguish "not exported" (None) from "exported but empty"
-    # (the empty string). Both fail the same way for /api/memory/stats
-    # auth (the request would carry no usable secret), but the
-    # diagnostic differs: a missing-from-env case wants "source
-    # /etc/kai/env first"; an empty-but-set case wants the operator
-    # to fix the env-file value. `check` is the tool operators run
-    # when debugging a config issue; a misleading diagnostic at that
-    # moment is worse than verbose accuracy.
-    secret = os.environ.get("WEBHOOK_SECRET")
-
-    if secret is None:
-        print("secret_found: no")
-        print("  WEBHOOK_SECRET not set; source /etc/kai/env first")
-        print("  e.g. sudo bash -c 'source /etc/kai/env && env | grep WEBHOOK_SECRET'")
-        return 2
-    if secret == "":
-        print("secret_found: empty")
-        print("  WEBHOOK_SECRET is exported but empty; check /etc/kai/env for a typo")
-        print("  (a line like `WEBHOOK_SECRET=` with no value)")
-        return 2
-
-    print("secret_found: yes")
-
+    """Probe the running service and print its live memory mode."""
     # Resolve the webhook port from the environment so the harness
     # tracks a non-default deploy (dev instance on a different port,
     # port-conflict resolution). Mirrors the `WEBHOOK_PORT` env var
@@ -834,7 +799,7 @@ def _run_check() -> int:
 
     # Health probe first; if the service is down, the stats probe
     # cannot succeed and we report up-front.
-    health_status, _ = _http_get(f"{base_url}/health")
+    health_status, health_body = _http_get(f"{base_url}/health")
     if health_status != 200:
         print(f"health: down (status={health_status})")
         ext_v, ep_v = _read_prompt_versions()
@@ -845,31 +810,21 @@ def _run_check() -> int:
 
     print("health: ok")
 
-    # Stats probe: 200 = enabled, 503 = disabled, anything else =
-    # unexpected. Issue the request with NO `chat_id` query
-    # parameter so the server falls back to its app-default
-    # (`request.app[CHAT_ID_KEY]` at webhook.py's _resolve_chat_id).
-    # Earlier versions of this harness passed `chat_id=1` as a
-    # placeholder, which fails: _resolve_chat_id runs after secret
-    # auth but before the memory.is_enabled() branch, and rejects
-    # any explicit chat_id not in `allowed_user_ids` with a 403.
-    # The mode probe needs the enabled/disabled signal, not any
-    # particular user's stats, so omitting the parameter routes
-    # cleanly through the app-default and reports the system-wide
-    # memory state.
-    stats_url = f"{base_url}/api/memory/stats"
-    stats_status, _ = _http_get(stats_url, secret=secret)
-
     ext_v, ep_v = _read_prompt_versions()
 
-    if stats_status == 200:
+    try:
+        health_payload = json.loads(health_body)
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+        health_payload = {}
+    memory_enabled = health_payload.get("memory_enabled") if isinstance(health_payload, dict) else None
+    if memory_enabled is True:
         print("mode: enabled")
         rc = 0
-    elif stats_status == 503:
+    elif memory_enabled is False:
         print("mode: disabled")
         rc = 0
     else:
-        print(f"mode: unknown({stats_status})")
+        print("mode: unknown(health-payload)")
         rc = 1
 
     print(f"extraction_prompt_version: {ext_v}")

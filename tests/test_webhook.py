@@ -12,17 +12,19 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from kai.config import UserConfig
+from kai.internal_api_auth import InternalAPIAuth, InternalAPIScope
 from kai.webhook import (
     ALLOWED_USER_IDS_KEY,
     ALLOWED_WORKSPACES_KEY,
     CHAT_ID_KEY,
     CONFIG_KEY,
+    GITHUB_WEBHOOK_SECRET_KEY,
+    INTERNAL_API_AUTH_KEY,
     PR_REVIEW_COOLDOWN_KEY,
     PR_REVIEW_TIMEOUT_S_KEY,
     SPEC_DIR_KEY,
     TELEGRAM_BOT_KEY,
     WEBHOOK_PORT_KEY,
-    WEBHOOK_SECRET_KEY,
     WORKSPACE_BASE_KEY,
     _fmt_issue_comment,
     _fmt_issues,
@@ -415,7 +417,8 @@ def _build_test_app(
     Tests should mock sessions.resolve_github_settings to control these.
     """
     app = web.Application()
-    app[WEBHOOK_SECRET_KEY] = _TEST_SECRET
+    app[GITHUB_WEBHOOK_SECRET_KEY] = _TEST_SECRET
+    app[INTERNAL_API_AUTH_KEY] = InternalAPIAuth()
     app[PR_REVIEW_COOLDOWN_KEY] = cooldown
     # Review subprocess resource limits (defaults match config.py).
     app[PR_REVIEW_TIMEOUT_S_KEY] = 900
@@ -734,7 +737,13 @@ class TestPRReviewRouting:
             # Verify the payload and config were passed correctly
             assert call_kwargs[0][0] == payload
             assert call_kwargs[1]["webhook_port"] == 8080
-            assert call_kwargs[1]["webhook_secret"] == _TEST_SECRET
+            credential = call_kwargs[1]["webhook_secret"]
+            assert credential != _TEST_SECRET
+            principal = app[INTERNAL_API_AUTH_KEY].authenticate(credential)
+            assert principal is not None
+            assert principal.chat_id == 12345
+            assert principal.allows(InternalAPIScope.MESSAGES_SEND)
+            assert not principal.allows(InternalAPIScope.JOBS_WRITE)
             # model_override must be a real string, not a mock. The
             # dataclass-shaped defaults on the fixture config let
             # resolve_user_model return the registry default for the
@@ -2154,11 +2163,11 @@ class TestPerUserRouting:
 
 
 class TestAllowedChatIdMutations:
-    """Tests for the live allowed_user_ids set mutation functions.
+    """Tests for the legacy live notification-destination registry.
 
     These functions are called by bot.py when /github notify modifies
-    a notification destination, keeping the in-memory set in sync with
-    the database without requiring a restart.
+    a notification destination. The registry must remain detached from
+    Config.allowed_user_ids so outbound changes cannot authorize senders.
     """
 
     def test_add_allowed_chat_id(self):
@@ -2189,6 +2198,22 @@ class TestAllowedChatIdMutations:
             # Sets don't have duplicates; just verify it's present
             assert 999 in app[ALLOWED_USER_IDS_KEY]
             assert len(app[ALLOWED_USER_IDS_KEY]) == 2  # {100, 999}
+        finally:
+            wh._app = old_app
+
+    def test_add_does_not_mutate_inbound_principals(self):
+        """Adding an outbound destination cannot authorize a Telegram user."""
+        import kai.webhook as wh
+
+        inbound_principals = {100}
+        app = web.Application()
+        app[ALLOWED_USER_IDS_KEY] = set(inbound_principals)
+        old_app = wh._app
+        wh._app = app
+        try:
+            add_allowed_chat_id(999)
+            assert app[ALLOWED_USER_IDS_KEY] == {100, 999}
+            assert inbound_principals == {100}
         finally:
             wh._app = old_app
 

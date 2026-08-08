@@ -15,6 +15,7 @@ derived from this file's location in the source tree: src/kai/config.py -> proje
 import logging
 import os
 import pwd
+import secrets
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -208,8 +209,11 @@ PROVIDER_DEFAULTS: dict[str, str] = {
 # codex CLI exposes a different set than the OpenAI HTTP API surface
 # goose drives, and treating them as one list lets a goose-only
 # model (e.g. gpt-5.4-nano) leak onto a codex install where the CLI
-# rejects it. Refresh when the codex CLI bumps; no auto-discovery.
+# rejects it. GPT-5.6 uses the stable alias that OpenAI documents as
+# routing to GPT-5.6 Sol (verified 2026-08-07). Refresh when the codex
+# CLI bumps; no auto-discovery.
 CODEX_MODELS: dict[str, str] = {
+    "gpt-5.6": "\U0001f7e2 GPT-5.6",
     "gpt-5.5": "\U0001f7e2 GPT-5.5",
     "gpt-5.4": "\U0001f7e1 GPT-5.4",
     "gpt-5.4-mini": "\U0001f535 GPT-5.4 Mini",
@@ -1083,7 +1087,7 @@ class Config:
             When None, Kai falls back to long-polling (Kai pulls updates from Telegram).
         telegram_webhook_secret: Secret token for validating incoming Telegram updates.
             Sent by Telegram as X-Telegram-Bot-Api-Secret-Token header on each update.
-            Only required in webhook mode. Defaults to WEBHOOK_SECRET if not explicitly set.
+            Only used in webhook mode. Generated for the process when not explicitly set.
         allowed_user_ids: Set of Telegram user IDs permitted to interact with the bot (required)
         default_model: Default model name, provider-dependent (e.g. sonnet, gpt-5.5-pro, gemini-2.5-pro)
         default_timeout: Seconds before an agent response is considered timed
@@ -1094,7 +1098,11 @@ class Config:
             panics). 0 = no limit.
         session_db_path: Path to the SQLite database for sessions, jobs, and settings
         webhook_port: Port for the local aiohttp server (webhooks + scheduling API)
-        webhook_secret: HMAC secret for verifying incoming webhook payloads
+        github_webhook_secret: HMAC secret for verifying GitHub webhook payloads.
+        generic_webhook_secret: Header secret for the generic webhook endpoint.
+        webhook_secret: Deprecated WEBHOOK_SECRET compatibility credential. During
+            the migration window it is accepted only by the GitHub and generic
+            external webhook routes, never by Telegram or internal APIs.
         voice_enabled: Whether to transcribe Telegram voice notes via whisper-cpp
         whisper_model_path: Path to the whisper-cpp GGML model file
         tts_enabled: Whether to enable Piper text-to-speech for voice responses
@@ -1174,6 +1182,10 @@ class Config:
 
     # Webhook server
     webhook_port: int = 8080
+    github_webhook_secret: str = ""
+    generic_webhook_secret: str = ""
+    # Deprecated: temporary external-only fallback for existing GitHub and
+    # generic webhook callers. Never use this for Telegram or internal APIs.
     webhook_secret: str = ""
 
     # Voice input (speech-to-text via whisper-cpp)
@@ -2641,19 +2653,13 @@ def load_config() -> Config:
     if raw_webhook_url:
         telegram_webhook_url = raw_webhook_url
 
-        # Webhook secret: validates incoming updates from Telegram. Falls back to
-        # WEBHOOK_SECRET so existing installs work without a config change. Must be
-        # non-empty in webhook mode; an empty secret would let anyone POST fake
-        # updates to /webhook/telegram.
+        # Webhook secret: validates incoming updates from Telegram. A fresh
+        # process-lifetime value is safe here because start() registers that same
+        # value with Telegram before accepting traffic. Never reuse an external
+        # webhook signing secret across protocol boundaries.
         telegram_webhook_secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
         if not telegram_webhook_secret:
-            telegram_webhook_secret = os.environ.get("WEBHOOK_SECRET", "").strip()
-        if not telegram_webhook_secret:
-            raise SystemExit(
-                "TELEGRAM_WEBHOOK_SECRET (or WEBHOOK_SECRET as fallback) is required in .env "
-                "when TELEGRAM_WEBHOOK_URL is set. Without it, anyone could POST fake updates "
-                "to the Telegram webhook endpoint."
-            )
+            telegram_webhook_secret = secrets.token_urlsafe(32)
         log.info("Telegram transport: webhook (%s)", telegram_webhook_url)
     else:
         log.info("Telegram transport: polling (TELEGRAM_WEBHOOK_URL not set)")
@@ -3219,6 +3225,28 @@ def load_config() -> Config:
             f"'{global_provider}' (must be one of: {', '.join(valid)})"
         )
 
+    github_webhook_secret = os.environ.get("GITHUB_WEBHOOK_SECRET", "").strip()
+    generic_webhook_secret = os.environ.get("GENERIC_WEBHOOK_SECRET", "").strip()
+    legacy_webhook_secret = os.environ.get("WEBHOOK_SECRET", "").strip()
+    if legacy_webhook_secret:
+        log.warning(
+            "WEBHOOK_SECRET is deprecated; temporary compatibility authentication "
+            "is enabled for /webhook/github and /webhook only. It never "
+            "authenticates Telegram or /api/* routes."
+        )
+
+    configured_ingress_secrets = [
+        ("TELEGRAM_WEBHOOK_SECRET", telegram_webhook_secret),
+        ("GITHUB_WEBHOOK_SECRET", github_webhook_secret),
+        ("GENERIC_WEBHOOK_SECRET", generic_webhook_secret),
+    ]
+    for index, (left_name, left_value) in enumerate(configured_ingress_secrets):
+        if not left_value:
+            continue
+        for right_name, right_value in configured_ingress_secrets[index + 1 :]:
+            if right_value and left_value == right_value:
+                raise SystemExit(f"{left_name} and {right_name} must use different values")
+
     return Config(
         telegram_bot_token=token,
         telegram_webhook_url=telegram_webhook_url,
@@ -3234,7 +3262,9 @@ def load_config() -> Config:
         codex_auth_mode=codex_auth_mode,
         codex_effort_level=codex_effort_level,
         webhook_port=webhook_port,
-        webhook_secret=os.environ.get("WEBHOOK_SECRET", ""),
+        github_webhook_secret=github_webhook_secret,
+        generic_webhook_secret=generic_webhook_secret,
+        webhook_secret=legacy_webhook_secret,
         voice_enabled=os.environ.get("VOICE_ENABLED", "").lower() in ("1", "true", "yes"),
         tts_enabled=os.environ.get("TTS_ENABLED", "").lower() in ("1", "true", "yes"),
         workspace_base=workspace_base,

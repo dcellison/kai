@@ -97,6 +97,8 @@ Kai has real local authority, so the security model is part of the product rathe
 - **Path confinement:** File exchange is constrained to allowed workspace and file-storage paths.
 - **Service proxy:** Third-party API keys live in server-side config and are injected at request time, not placed in conversation context.
 - **Per-user isolation:** Users have separate history, files, workspaces, jobs, settings, and agent subprocesses.
+- **Principal-bound internal API:** Agent API credentials resolve to a fixed user and explicit scopes in the outer service; request data cannot select another principal.
+- **Separated webhook credentials:** GitHub, generic, and Telegram ingress use distinct secrets that are not exposed to persistent agent subprocesses.
 - **Optional OS isolation:** A user's backend subprocess can run under a dedicated OS account through generated sudoers rules.
 
 See [TOTP Authentication](https://github.com/dcellison/kai/wiki/TOTP-Authentication), [GitHub Notification Routing](https://github.com/dcellison/kai/wiki/GitHub-Notification-Routing), and [Exposing Kai to the Internet](https://github.com/dcellison/kai/wiki/Exposing-Kai-to-the-Internet) for the detailed operational docs.

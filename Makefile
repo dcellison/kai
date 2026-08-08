@@ -27,8 +27,10 @@ setup:
 config:
 	$(BIN)python -m kai install config
 
+# Any non-empty DRY_RUN becomes an explicit CLI flag inside the root
+# process. Do not rely on sudo environment propagation for this safety gate.
 install:
-	sudo DRY_RUN="$(DRY_RUN)" $(BIN)python -m kai install apply
+	sudo $(BIN)python -m kai install apply $(if $(strip $(DRY_RUN)),--dry-run,)
 
 install-status:
 	$(BIN)python -m kai install status

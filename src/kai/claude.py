@@ -39,6 +39,7 @@ from kai.backend import (
     build_session_context,
     ensure_user_memory,
     ensure_user_preferences,
+    sanitize_agent_environment,
 )
 from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude_user
 
@@ -273,14 +274,16 @@ class ClaudeCodeBackend(AgentBackend):
         # 1. Base environment (inherited from parent process)
         # 2. Per-workspace env_file values (shared .env file)
         # 3. Per-workspace inline env values (override env_file)
-        # 4. Webhook secret (LAST - workspace env can't override it)
+        # 4. Remove outer control-plane credentials
+        # 5. Principal API credential (LAST - workspace env can't override it)
         env = os.environ.copy()
         if self.workspace_config:
             if self.workspace_config.env_file:
                 env.update(parse_env_file(self.workspace_config.env_file))
             if self.workspace_config.env:
                 env.update(self.workspace_config.env)
-        # Webhook secret last - ensures workspace env can't override it.
+        env = sanitize_agent_environment(env)
+        # Principal credential last - ensures workspace env can't override it.
         if self._api_context.webhook_secret:
             env["KAI_WEBHOOK_SECRET"] = self._api_context.webhook_secret
 

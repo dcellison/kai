@@ -33,6 +33,7 @@ from kai.config import (
     validate_model_for_backend,
 )
 from kai.goose import GooseBackend
+from kai.internal_api_auth import InternalAPIAuth
 from kai.workspace_utils import is_workspace_allowed
 
 log = logging.getLogger(__name__)
@@ -69,6 +70,10 @@ class SubprocessPool:
     ):
         self._config = config
         self._services_info = services_info
+        # Tokens are random and process-local. The pool owns the store because
+        # it creates every persistent backend; webhook.start() receives this
+        # same object through bot_data so credential resolution cannot drift.
+        self._internal_api_auth = InternalAPIAuth.for_users(config.allowed_user_ids)
         self._pool: dict[int, AgentBackend] = {}
         self._last_activity: dict[int, float] = {}
         # Pending one-time setup for a freshly-created backend instance.
@@ -82,6 +87,11 @@ class SubprocessPool:
         self._pending_settings_restore: set[int] = set()
         self._in_flight: set[int] = set()  # chat_ids with active send()
         self._eviction_task: asyncio.Task | None = None
+
+    @property
+    def internal_api_auth(self) -> InternalAPIAuth:
+        """Return the credential store shared with the loopback HTTP server."""
+        return self._internal_api_auth
 
     # ── Instance management ─────────────────────────────────────────
 
@@ -235,13 +245,18 @@ class SubprocessPool:
         # OpenCode ACP, "codex" uses OpenAI Codex CLI's app-server
         # JSON-RPC protocol, anything else (including the default
         # "claude") uses Claude Code CLI.
+        # Internal API availability is independent of public webhook ingress.
+        # Agents receive only their random principal credential, never an
+        # external webhook signing secret.
+        internal_api_credential = self._internal_api_auth.agent_credential_for(chat_id)
+
         if backend == "goose":
             return GooseBackend(
                 model=model,
                 workspace=workspace,
                 home_workspace=home_ws,
                 webhook_port=self._config.webhook_port,
-                webhook_secret=self._config.webhook_secret,
+                webhook_secret=internal_api_credential,
                 timeout_seconds=timeout,
                 services_info=self._services_info,
                 workspace_config=ws_config,
@@ -262,7 +277,7 @@ class SubprocessPool:
                 workspace=workspace,
                 home_workspace=home_ws,
                 webhook_port=self._config.webhook_port,
-                webhook_secret=self._config.webhook_secret,
+                webhook_secret=internal_api_credential,
                 timeout_seconds=timeout,
                 services_info=self._services_info,
                 workspace_config=ws_config,
@@ -284,7 +299,7 @@ class SubprocessPool:
                 workspace=workspace,
                 home_workspace=home_ws,
                 webhook_port=self._config.webhook_port,
-                webhook_secret=self._config.webhook_secret,
+                webhook_secret=internal_api_credential,
                 timeout_seconds=timeout,
                 services_info=self._services_info,
                 workspace_config=ws_config,
@@ -300,7 +315,7 @@ class SubprocessPool:
             workspace=workspace,
             home_workspace=home_ws,
             webhook_port=self._config.webhook_port,
-            webhook_secret=self._config.webhook_secret,
+            webhook_secret=internal_api_credential,
             timeout_seconds=timeout,
             services_info=self._services_info,
             claude_user=os_user,

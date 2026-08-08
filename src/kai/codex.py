@@ -62,6 +62,7 @@ from kai.backend import (
     build_session_context,
     ensure_user_memory,
     ensure_user_preferences,
+    sanitize_agent_environment,
 )
 from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude_user
 
@@ -335,8 +336,9 @@ class CodexBackend(AgentBackend):
         # 3. CODEX_PROVIDER (forward-compat placeholder; "openai" today)
         # 4. Per-workspace env_file values
         # 5. Per-workspace inline env values (override env_file)
-        # 6. Webhook secret (workspace env can't override it)
-        # 7. Per-os-user TMPDIR anchor (cross-user mode only; set
+        # 6. Remove outer control-plane credentials
+        # 7. Principal API credential (workspace env can't override it)
+        # 8. Per-os-user TMPDIR anchor (cross-user mode only; set
         #    below once the effective user is resolved, LAST so
         #    workspace env cannot point one user's temp writes at
         #    another's)
@@ -350,6 +352,7 @@ class CodexBackend(AgentBackend):
                 env.update(parse_env_file(self.workspace_config.env_file))
             if self.workspace_config.env:
                 env.update(self.workspace_config.env)
+        env = sanitize_agent_environment(env)
         if self._api_context.webhook_secret:
             env["KAI_WEBHOOK_SECRET"] = self._api_context.webhook_secret
 

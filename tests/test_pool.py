@@ -70,6 +70,28 @@ class TestInstanceCreation:
         a = pool.get(111)
         b = pool.get(222)
         assert a is not b
+        assert a._api_context.webhook_secret != b._api_context.webhook_secret
+        assert a._api_context.webhook_secret != "secret"
+        assert b._api_context.webhook_secret != "secret"
+
+    def test_internal_api_credential_exists_without_external_webhooks(self):
+        """Disabling public ingress must not remove the agent's scoped API."""
+        pool = SubprocessPool(
+            config=_make_config(
+                webhook_secret="",
+                github_webhook_secret="",
+                generic_webhook_secret="",
+            ),
+            services_info=[],
+        )
+
+        instance = pool.get(111)
+
+        credential = instance._api_context.webhook_secret
+        assert credential
+        principal = pool.internal_api_auth.authenticate(credential)
+        assert principal is not None
+        assert principal.chat_id == 111
 
     def test_get_uses_user_config(self, tmp_path):
         """User with os_user and home_workspace gets correct instance."""

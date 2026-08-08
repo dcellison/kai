@@ -36,7 +36,7 @@ def _make_config(**overrides) -> Config:
         "telegram_bot_token": "test-token",
         "allowed_user_ids": {1},
         "telegram_webhook_url": "https://api.example.com/webhook/telegram",
-        "webhook_secret": "test-secret",
+        "github_webhook_secret": "test-secret",
         "webhook_port": 8080,
     }
     defaults.update(overrides)
@@ -593,6 +593,18 @@ class TestEnsureWebhook:
         """Raises GitHubAPIError(0) when telegram_webhook_url is None."""
         config = _make_config(telegram_webhook_url=None)
         with pytest.raises(GitHubAPIError, match="polling mode"):
+            await _github_api_ensure_webhook("alice/repo", "ghp_test", config)
+
+    @pytest.mark.asyncio
+    async def test_missing_github_secret_raises(self):
+        """GitHub registration cannot borrow a generic or legacy secret."""
+        config = _make_config(
+            github_webhook_secret="",
+            generic_webhook_secret="generic-secret",
+            webhook_secret="legacy-secret",
+        )
+
+        with pytest.raises(GitHubAPIError, match="GITHUB_WEBHOOK_SECRET"):
             await _github_api_ensure_webhook("alice/repo", "ghp_test", config)
 
     @pytest.mark.asyncio
