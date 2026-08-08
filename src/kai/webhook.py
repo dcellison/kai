@@ -1514,8 +1514,10 @@ async def _handle_send_file(request: web.Request, principal: InternalAPIPrincipa
     an optional "caption". Images are sent as photos (rendered inline),
     everything else as document attachments.
 
-    Path confinement: the resolved path must be inside the current workspace
-    directory. This prevents path traversal attacks via symlinks or "../".
+    Path confinement: the resolved path must be inside the authenticated
+    principal's current workspace or its scoped upload directory. This
+    prevents path traversal attacks via symlinks or "../" and prevents one
+    principal from sending files from another principal's upload directory.
 
     Returns:
         JSON {"status": "sent", "file": "<filename>"} on success, or an
@@ -1557,18 +1559,19 @@ async def _handle_send_file(request: web.Request, principal: InternalAPIPrincipa
     if pool is None:
         return web.json_response({"error": "No workspace configured"}, status=403)
     workspace = str(await pool.get_effective_workspace(chat_id))
-    # Allow files from either the workspace or DATA_DIR/files/.
-    # DATA_DIR/files/ is where uploaded files now live (PR #145).
-    # Confinement to DATA_DIR/"files" (not all of DATA_DIR) is deliberate;
-    # inner Claude should not be able to send the database, logs, or
-    # history files via this endpoint.
+    # Allow files from either the workspace or this authenticated principal's
+    # upload directory. Telegram uploads are stored under
+    # DATA_DIR/files/<chat_id>/; the legacy shared DATA_DIR/files/ root and
+    # sibling principals' directories are deliberately excluded. The scope is
+    # derived from the authenticated principal, never from a caller-selected
+    # request field.
     workspace_resolved = Path(workspace).resolve()
-    files_resolved = (DATA_DIR / "files").resolve()
+    principal_files_resolved = (DATA_DIR / "files" / str(principal.chat_id)).resolve()
     try:
         path.relative_to(workspace_resolved)
     except ValueError:
         try:
-            path.relative_to(files_resolved)
+            path.relative_to(principal_files_resolved)
         except ValueError:
             return web.json_response({"error": "Path outside allowed directories"}, status=403)
 

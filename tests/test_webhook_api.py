@@ -375,6 +375,17 @@ def send_file_request(tmp_path):
     return request
 
 
+@pytest.fixture
+def isolated_send_file_roots(tmp_path, send_file_request, monkeypatch):
+    """Give send-file distinct workspace and per-principal upload roots."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr("kai.webhook.DATA_DIR", data_dir)
+    send_file_request.app[POOL_KEY].get_effective_workspace.return_value = workspace
+    return send_file_request, workspace, data_dir
+
+
 class TestSendFile:
     async def test_send_image_as_photo(self, tmp_path, send_file_request):
         """Image files are sent via send_photo (rendered inline in Telegram)."""
@@ -432,6 +443,76 @@ class TestSendFile:
         send_file_request.json = AsyncMock(return_value={"path": "/etc/passwd"})
         resp = await _handle_send_file(send_file_request)
         assert resp.status == 403
+
+    async def test_authenticated_principal_can_send_own_uploaded_file(self, isolated_send_file_roots):
+        """The principal's DATA_DIR/files/<chat_id> directory is allowed."""
+        request, _workspace, data_dir = isolated_send_file_roots
+        uploaded = data_dir / "files" / "123" / "report.txt"
+        uploaded.parent.mkdir(parents=True)
+        uploaded.write_text("principal-owned")
+        request.json = AsyncMock(return_value={"path": str(uploaded)})
+
+        resp = await _handle_send_file(request)
+
+        assert resp.status == 200
+        request.app[TELEGRAM_BOT_KEY].send_document.assert_awaited_once()
+
+    async def test_file_scope_follows_authenticated_credential(self, isolated_send_file_roots):
+        """A second credential receives its own scope, independent of app defaults."""
+        request, _workspace, data_dir = isolated_send_file_roots
+        uploaded = data_dir / "files" / "456" / "report.txt"
+        uploaded.parent.mkdir(parents=True)
+        uploaded.write_text("second principal")
+        request.headers = {"X-Webhook-Secret": "other-secret"}
+        request.json = AsyncMock(return_value={"path": str(uploaded)})
+
+        resp = await _handle_send_file(request)
+
+        assert resp.status == 200
+        request.app[TELEGRAM_BOT_KEY].send_document.assert_awaited_once()
+        assert request.app[TELEGRAM_BOT_KEY].send_document.await_args.args[0] == 456
+
+    async def test_authenticated_principal_cannot_send_sibling_uploaded_file(self, isolated_send_file_roots):
+        """A FILES_SEND credential cannot select another principal's upload."""
+        request, _workspace, data_dir = isolated_send_file_roots
+        sibling_file = data_dir / "files" / "456" / "secret.txt"
+        sibling_file.parent.mkdir(parents=True)
+        sibling_file.write_text("other principal")
+        request.json = AsyncMock(return_value={"path": str(sibling_file)})
+
+        resp = await _handle_send_file(request)
+
+        assert resp.status == 403
+        request.app[TELEGRAM_BOT_KEY].send_document.assert_not_awaited()
+
+    async def test_authenticated_principal_cannot_send_legacy_shared_file(self, isolated_send_file_roots):
+        """Ambiguous files in the legacy shared root are not exposed by the API."""
+        request, _workspace, data_dir = isolated_send_file_roots
+        shared_file = data_dir / "files" / "legacy.txt"
+        shared_file.parent.mkdir(parents=True)
+        shared_file.write_text("unattributed")
+        request.json = AsyncMock(return_value={"path": str(shared_file)})
+
+        resp = await _handle_send_file(request)
+
+        assert resp.status == 403
+        request.app[TELEGRAM_BOT_KEY].send_document.assert_not_awaited()
+
+    async def test_symlink_cannot_escape_principal_upload_directory(self, isolated_send_file_roots):
+        """Resolving a symlink into a sibling principal's directory is denied."""
+        request, _workspace, data_dir = isolated_send_file_roots
+        sibling_file = data_dir / "files" / "456" / "secret.txt"
+        sibling_file.parent.mkdir(parents=True)
+        sibling_file.write_text("other principal")
+        link = data_dir / "files" / "123" / "link.txt"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(sibling_file)
+        request.json = AsyncMock(return_value={"path": str(link)})
+
+        resp = await _handle_send_file(request)
+
+        assert resp.status == 403
+        request.app[TELEGRAM_BOT_KEY].send_document.assert_not_awaited()
 
     async def test_invalid_json_returns_400(self, send_file_request):
         """Returns 400 for malformed JSON body."""

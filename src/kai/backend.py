@@ -466,7 +466,8 @@ def build_session_context(
             f"[File API: To send a file to the user, use curl (NEVER WebFetch) to POST JSON to "
             f"http://localhost:{api.webhook_port}/api/send-file "
             f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
-            f'Required: "path" (absolute file path within the current workspace {workspace}). '
+            f'Required: "path" (absolute file path within the current workspace {workspace} '
+            f"or your principal-scoped incoming-file directory {files_path}). "
             f'Optional: "caption". Images are sent as photos, '
             f"everything else as documents.\n"
             f"Incoming files from the user are auto-saved to "

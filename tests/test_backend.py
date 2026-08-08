@@ -352,6 +352,26 @@ class TestBuildSessionContext:
         assert "Messaging API" in result
         assert "File API" in result
 
+    def test_file_api_docs_name_principal_upload_directory(self, tmp_path):
+        """File API guidance exposes only the current principal's upload path."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        data_dir = tmp_path / "data"
+        (data_dir / "memory").mkdir(parents=True)
+
+        with patch("kai.backend.get_recent_history", return_value=""):
+            result = build_session_context(
+                workspace=workspace,
+                home_workspace=workspace,
+                api=self._api(),
+                workspace_config=None,
+                chat_id=123,
+                data_dir=data_dir,
+            )
+
+        assert result is not None
+        assert f"principal-scoped incoming-file directory {data_dir}/files/123/" in result
+
     def test_services_included(self, tmp_path):
         """External services block is injected when services are configured."""
         workspace = tmp_path / "ws"
