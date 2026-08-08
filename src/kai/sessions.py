@@ -722,6 +722,14 @@ async def resolve_user_defaults(
     db_settings = await get_user_settings(chat_id)
     user_config = config.get_user_config(chat_id)
 
+    # Model aliases are backend-specific. Resolve the user's backend
+    # before returning a persisted preference so command handlers that
+    # inspect settings prior to subprocess creation display the same
+    # canonical ID the backend will receive.
+    from kai.config import canonicalize_model_for_backend, get_user_backend_and_provider
+
+    backend, _provider = get_user_backend_and_provider(user_config, config)
+
     # Model: DB > users.yaml > env > "sonnet".
     # Strip whitespace so "" and " " don't pass through as valid model
     # names. The UI validates before storing, but direct DB manipulation
@@ -733,6 +741,7 @@ async def resolve_user_defaults(
     raw_yaml_model = user_config.model if user_config else None
     yaml_model = raw_yaml_model.strip() if raw_yaml_model is not None else None
     model = db_model if db_model else yaml_model if yaml_model else config.default_model
+    model = canonicalize_model_for_backend(model, backend)
 
     # Timeout: DB > users.yaml > env > 120
     yaml_timeout = user_config.timeout if user_config and user_config.timeout is not None else None

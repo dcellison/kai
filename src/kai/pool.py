@@ -28,6 +28,7 @@ from kai.config import (
     PROVIDER_DEFAULTS,
     Config,
     WorkspaceConfig,
+    canonicalize_model_for_backend,
     get_effective_provider,
     get_user_backend_and_provider,
     validate_model_for_backend,
@@ -210,6 +211,13 @@ class SubprocessPool:
                     self._config.default_model,
                 )
                 model = self._config.default_model
+
+        # Canonicalize retired backend-specific spellings after the
+        # complete precedence cascade and before constructing a backend.
+        # This keeps direct Config objects and persisted users.yaml values
+        # from reaching the Codex app-server with the rejected gpt-5.6
+        # family shorthand.
+        model = canonicalize_model_for_backend(model, backend)
 
         timeout = user.timeout if user and user.timeout is not None else self._config.default_timeout
         # home_ws is what the backend treats as "home" for the foreign-
@@ -468,14 +476,23 @@ class SubprocessPool:
         # precedence guard matches what was actually applied to
         # instance.model.
         ws_model_raw = instance.workspace_config.model if instance.workspace_config else None
-        ws_model_applied = bool(
-            ws_model_raw and validate_model_for_backend(ws_model_raw, instance_backend, instance.provider)
-        )
-        if not ws_model_applied and "model" in db_settings and db_settings["model"] != instance.model:
-            stored_model = db_settings["model"]
+        ws_model = canonicalize_model_for_backend(ws_model_raw, instance_backend) if ws_model_raw is not None else None
+        ws_model_applied = bool(ws_model and validate_model_for_backend(ws_model, instance_backend, instance.provider))
+        if not ws_model_applied and "model" in db_settings:
+            stored_model_raw = db_settings["model"]
+            stored_model = canonicalize_model_for_backend(stored_model_raw, instance_backend)
             if validate_model_for_backend(stored_model, instance_backend, instance.provider):
-                instance.model = stored_model
-                needs_restart = True
+                if stored_model != stored_model_raw:
+                    await sessions.set_user_setting(chat_id, "model", stored_model)
+                    log.info(
+                        "Migrated stored model for user %d from '%s' to '%s'",
+                        chat_id,
+                        stored_model_raw,
+                        stored_model,
+                    )
+                if stored_model != instance.model:
+                    instance.model = stored_model
+                    needs_restart = True
             else:
                 log.warning(
                     "Ignoring stored model '%s' for user %d (invalid for backend '%s'/provider '%s')",
@@ -599,7 +616,7 @@ class SubprocessPool:
     def set_model(self, chat_id: int, model: str) -> None:
         """Set the model for a user's subprocess."""
         instance = self.get(chat_id)
-        instance.model = model
+        instance.model = canonicalize_model_for_backend(model, instance.backend_name)
 
     async def get_effective_workspace(self, chat_id: int) -> Path:
         """

@@ -644,6 +644,19 @@ class TestResolveUserDefaults:
         # Unset fields still come from globals
         assert result["timeout"] == 120
 
+    async def test_codex_legacy_gpt56_setting_resolves_to_sol(self, db):
+        """Settings displays use the same exact Codex ID as runtime dispatch."""
+        config = self._make_config(
+            default_backend="codex",
+            default_provider="openai",
+            default_model="gpt-5.5",
+        )
+        await sessions.set_user_setting(111, "model", "gpt-5.6")
+
+        result = await sessions.resolve_user_defaults(111, config)
+
+        assert result["model"] == "gpt-5.6-sol"
+
     async def test_yaml_overrides_globals(self, db):
         """users.yaml settings override global defaults."""
         from kai.config import UserConfig

@@ -2498,10 +2498,13 @@ class TestCodexModelsSurface:
     constants with no overlap requirement and no fallback path.
     """
 
-    def test_codex_models_includes_current_alias_and_codex_variants(self):
+    def test_codex_models_includes_gpt56_family_and_codex_variants(self):
         from kai.config import CODEX_MODELS
 
-        assert "gpt-5.6" in CODEX_MODELS
+        assert "gpt-5.6-sol" in CODEX_MODELS
+        assert "gpt-5.6-terra" in CODEX_MODELS
+        assert "gpt-5.6-luna" in CODEX_MODELS
+        assert "gpt-5.6" not in CODEX_MODELS
         assert "gpt-5.5" in CODEX_MODELS
         assert "gpt-5.3-codex" in CODEX_MODELS
         assert "gpt-5.3-codex-spark" in CODEX_MODELS
@@ -2537,9 +2540,22 @@ class TestValidateModelForBackend:
     def test_codex_accepts_codex_models(self):
         from kai.config import validate_model_for_backend
 
-        assert validate_model_for_backend("gpt-5.6", "codex", "openai") is True
+        assert validate_model_for_backend("gpt-5.6-sol", "codex", "openai") is True
+        assert validate_model_for_backend("gpt-5.6-terra", "codex", "openai") is True
+        assert validate_model_for_backend("gpt-5.6-luna", "codex", "openai") is True
         assert validate_model_for_backend("gpt-5.5", "codex", "openai") is True
         assert validate_model_for_backend("gpt-5.4-mini", "codex", "openai") is True
+
+    def test_codex_rejects_gpt56_family_shorthand(self):
+        from kai.config import validate_model_for_backend
+
+        assert validate_model_for_backend("gpt-5.6", "codex", "openai") is False
+
+    def test_codex_canonicalizes_retired_gpt56_shorthand(self):
+        from kai.config import canonicalize_model_for_backend
+
+        assert canonicalize_model_for_backend("gpt-5.6", "codex") == "gpt-5.6-sol"
+        assert canonicalize_model_for_backend("gpt-5.6", "goose") == "gpt-5.6"
 
     def test_codex_rejects_nano_even_though_in_openai_provider_list(self):
         from kai.config import PROVIDER_MODELS, validate_model_for_backend
@@ -2732,6 +2748,16 @@ class TestDefaultBackendEnvResolution:
         config_module._renamed_key_deprecation_warned.clear()
         cfg = load_config()
         assert cfg.default_backend == "codex"
+
+    def test_codex_legacy_gpt56_default_is_canonicalized(self, monkeypatch):
+        """An installed shorthand survives upgrade as the exact Sol model ID."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("DEFAULT_BACKEND", "codex")
+        monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.6")
+
+        cfg = load_config()
+
+        assert cfg.default_model == "gpt-5.6-sol"
 
     def test_legacy_AGENT_BACKEND_env_still_resolved_with_warning(self, monkeypatch, caplog):
         """Only the deprecated key set: it still resolves, and a WARNING

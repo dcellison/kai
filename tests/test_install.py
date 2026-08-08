@@ -3764,6 +3764,26 @@ class TestCmdApplyDefaultModelGate:
         assert written_env.get("DEFAULT_BACKEND") == "codex"
         assert "AGENT_BACKEND" not in written_env
 
+    def test_apply_canonicalizes_legacy_codex_gpt56_model(self, tmp_path, monkeypatch):
+        """Apply rewrites the rejected family shorthand before writing /etc/kai/env."""
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+        conf_path = self._write_install_conf(
+            tmp_path,
+            {"DEFAULT_MODEL": "gpt-5.6", "DEFAULT_BACKEND": "codex"},
+        )
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        self._patch_side_effects(monkeypatch)
+        secrets_mock = MagicMock()
+        monkeypatch.setattr("kai.install._apply_secrets", secrets_mock)
+        monkeypatch.setenv("DRY_RUN", "1")
+
+        _cmd_apply()
+
+        written_env = secrets_mock.call_args.args[0]
+        assert written_env["DEFAULT_MODEL"] == "gpt-5.6-sol"
+
     def test_apply_resolves_new_DEFAULT_BACKEND(self, tmp_path, monkeypatch):
         """A new-name install.conf passes through cleanly: goose-path
         setup is reached (the gate accepts a goose-valid model and apply

@@ -965,12 +965,16 @@ class TestModelsKeyboard:
         assert "model:sonnet" in callbacks
         assert "model:haiku" in callbacks
 
-    def test_codex_keyboard_offers_gpt56(self):
-        """The documented GPT-5.6 alias is selectable on the Codex surface."""
+    def test_codex_keyboard_offers_exact_gpt56_models(self):
+        """The ChatGPT-account GPT-5.6 IDs are selectable, not the rejected shorthand."""
         from kai.config import CODEX_MODELS
 
         kb = _models_keyboard("gpt-5.5", CODEX_MODELS)
-        assert "model:gpt-5.6" in _button_callbacks(kb)
+        callbacks = _button_callbacks(kb)
+        assert "model:gpt-5.6-sol" in callbacks
+        assert "model:gpt-5.6-terra" in callbacks
+        assert "model:gpt-5.6-luna" in callbacks
+        assert "model:gpt-5.6" not in callbacks
 
     def test_callback_data_format(self):
         kb = _models_keyboard("opus", self._anthropic_models)

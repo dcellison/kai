@@ -1452,6 +1452,12 @@ class TestApplyWorkspaceModel:
         wc = WorkspaceConfig(path=Path("/tmp/ws"), model="gpt-5.5", timeout=None)
         assert apply_workspace_model(wc, "codex", "openai", "gpt-5.4") == "gpt-5.5"
 
+    def test_codex_canonicalizes_legacy_gpt56_workspace_override(self):
+        from kai.backend import apply_workspace_model
+
+        wc = WorkspaceConfig(path=Path("/tmp/ws"), model="gpt-5.6", timeout=None)
+        assert apply_workspace_model(wc, "codex", "openai", "gpt-5.5") == "gpt-5.6-sol"
+
     def test_codex_rejects_goose_only_override(self, caplog):
         from kai.backend import apply_workspace_model
 

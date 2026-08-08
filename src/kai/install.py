@@ -56,6 +56,7 @@ from kai.config import (
     ModelRole,
     _read_protected_file,
     _resolve_renamed_key,
+    canonicalize_model_for_backend,
     models_for_backend,
     validate_model_for_backend,
 )
@@ -1437,6 +1438,7 @@ def _cmd_config() -> None:
     # choices list. Prefilling the bad value would let the operator
     # accept the just-rejected value with Enter.
     raw_existing_model = existing_env.get("DEFAULT_MODEL", existing_env.get("CLAUDE_MODEL", ""))
+    raw_existing_model = canonicalize_model_for_backend(raw_existing_model, agent_backend)
     if raw_existing_model and validate_model_for_backend(raw_existing_model, agent_backend, eff_provider):
         default_model_prefill_value = raw_existing_model
     else:
@@ -1466,7 +1468,9 @@ def _cmd_config() -> None:
         try:
             parsed_existing = json.loads(existing_default_models_raw)
             if isinstance(parsed_existing, dict):
-                existing_default_models = {str(k): str(v) for k, v in parsed_existing.items()}
+                existing_default_models = {
+                    str(k): canonicalize_model_for_backend(str(v), agent_backend) for k, v in parsed_existing.items()
+                }
         except ValueError:
             # Invalid JSON in env: ignore; the wizard re-captures.
             pass
@@ -4305,7 +4309,9 @@ def _cmd_apply() -> None:
     # already migrated to it at the top of apply.
     provider_raw = env.get("DEFAULT_PROVIDER", "").strip().lower()
     eff_provider_for_check = "anthropic" if agent_backend_raw == "claude" else provider_raw
-    resolved_model = default_model_raw or "sonnet"
+    resolved_model = canonicalize_model_for_backend(default_model_raw or "sonnet", agent_backend_raw)
+    if default_model_raw and resolved_model != default_model_raw:
+        env["DEFAULT_MODEL"] = resolved_model
     # Backend-aware validation: codex installs validate against
     # CODEX_MODELS only - no fallback to PROVIDER_MODELS["openai"].
     # That closes the regression where install.conf with

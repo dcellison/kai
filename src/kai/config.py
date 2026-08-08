@@ -209,11 +209,15 @@ PROVIDER_DEFAULTS: dict[str, str] = {
 # codex CLI exposes a different set than the OpenAI HTTP API surface
 # goose drives, and treating them as one list lets a goose-only
 # model (e.g. gpt-5.4-nano) leak onto a codex install where the CLI
-# rejects it. GPT-5.6 uses the stable alias that OpenAI documents as
-# routing to GPT-5.6 Sol (verified 2026-08-07). Refresh when the codex
-# CLI bumps; no auto-discovery.
+# rejects it. GPT-5.6 has three subscription-Codex model IDs; the
+# family shorthand is not accepted by the ChatGPT-account service
+# even though some Codex documentation and CLI examples use it.
+# Verified against Codex app-server model/list on 2026-08-07. Refresh
+# when the codex CLI bumps; no auto-discovery.
 CODEX_MODELS: dict[str, str] = {
-    "gpt-5.6": "\U0001f7e2 GPT-5.6",
+    "gpt-5.6-sol": "\U0001f7e2 GPT-5.6 Sol",
+    "gpt-5.6-terra": "\U0001f7e1 GPT-5.6 Terra",
+    "gpt-5.6-luna": "\U0001f535 GPT-5.6 Luna",
     "gpt-5.5": "\U0001f7e2 GPT-5.5",
     "gpt-5.4": "\U0001f7e1 GPT-5.4",
     "gpt-5.4-mini": "\U0001f535 GPT-5.4 Mini",
@@ -221,6 +225,22 @@ CODEX_MODELS: dict[str, str] = {
     "gpt-5.3-codex-spark": "⚡ GPT-5.3 Codex Spark",
     "gpt-5.2": "\U0001f7e4 GPT-5.2",
 }
+
+# One-release compatibility for the invalid GPT-5.6 family shorthand
+# Kai briefly offered. Keep aliases out of CODEX_MODELS so new model
+# pickers and validators expose only IDs accepted by Codex. Callers
+# that ingest persisted operator state canonicalize before validating.
+_LEGACY_CODEX_MODEL_ALIASES: dict[str, str] = {
+    "gpt-5.6": "gpt-5.6-sol",
+}
+
+
+def canonicalize_model_for_backend(model: str, backend: str) -> str:
+    """Map a retired model spelling to the exact ID its backend accepts."""
+    if backend == "codex":
+        return _LEGACY_CODEX_MODEL_ALIASES.get(model, model)
+    return model
+
 
 # Codex's default model when DEFAULT_MODEL is unset on a codex install.
 # Independent of PROVIDER_DEFAULTS["openai"] (goose-on-openai still
@@ -236,9 +256,12 @@ OPEN_ENDED_PROVIDERS: frozenset[str] = frozenset({"openrouter", "ollama"})
 # (workspaces can be used by users on different backends/providers).
 # Includes CODEX_MODELS so codex-only IDs like gpt-5.5 are accepted
 # in workspaces.yaml; each backend's change_workspace decides whether
-# to actually USE the override for its surface.
+# to actually USE the override for its surface. Legacy Codex aliases
+# remain loadable for one release and are canonicalized at apply time.
 _ALL_CURATED_MODELS: frozenset[str] = frozenset(
-    list(model for models in PROVIDER_MODELS.values() for model in models) + list(CODEX_MODELS.keys())
+    list(model for models in PROVIDER_MODELS.values() for model in models)
+    + list(CODEX_MODELS.keys())
+    + list(_LEGACY_CODEX_MODEL_ALIASES.keys())
 )
 
 
@@ -2346,6 +2369,7 @@ def _load_user_configs(
         model = entry.get("model")
         if model is not None:
             model = str(model).strip().lower()
+            model = canonicalize_model_for_backend(model, eff_backend)
         if model is None and eff_provider in OPEN_ENDED_PROVIDERS:
             log.warning(
                 "users.yaml: user '%s' is on open-ended provider '%s' with no "
@@ -2553,6 +2577,7 @@ def _load_user_configs(
                         f"users.yaml: user '{name}' has models.{role_key} with an empty value; "
                         f"remove the key or set a non-empty model string."
                     )
+                value_str = canonicalize_model_for_backend(value_str, eff_backend)
                 if not validate_model_for_backend(value_str, eff_backend, eff_provider):
                     raise SystemExit(
                         f"users.yaml: user '{name}' has models.{role_key}={value_str!r} which is "
@@ -3172,7 +3197,10 @@ def load_config() -> Config:
                 ", ".join(features),
             )
 
-    default_model = os.environ.get("DEFAULT_MODEL", "sonnet")
+    default_model = canonicalize_model_for_backend(
+        os.environ.get("DEFAULT_MODEL", "sonnet"),
+        default_backend,
+    )
 
     # Parse DEFAULT_MODELS_JSON: global per-role defaults captured by
     # the wizard's per-role customization step. Empty / unset / invalid
@@ -3205,6 +3233,7 @@ def load_config() -> Config:
             value_str = str(raw_value).strip()
             if not value_str:
                 raise SystemExit(f"DEFAULT_MODELS_JSON: empty value for role '{role_key}'.")
+            value_str = canonicalize_model_for_backend(value_str, default_backend)
             default_models[role_key] = value_str
 
     # Validate DEFAULT_MODEL against the effective global backend.

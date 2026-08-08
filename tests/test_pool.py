@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kai.config import Config, UserConfig
+from kai.config import Config, UserConfig, WorkspaceConfig
 from kai.goose import GooseBackend
 from kai.pool import SubprocessPool
 
@@ -644,6 +644,67 @@ class TestWorkspaceRestoration:
             # Model is a CLI flag, so changing it triggers restart
             assert instance.model == "opus"
             mock_restart.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_restore_migrates_legacy_codex_gpt56_setting(self, tmp_path):
+        """The briefly offered family shorthand is persisted as the exact Sol ID."""
+        config = _make_config(
+            default_backend="codex",
+            default_provider="openai",
+            default_model="gpt-5.5",
+        )
+        pool = SubprocessPool(config=config, services_info=[])
+        instance = pool.get(111)
+
+        with (
+            patch(
+                "kai.pool.sessions.get_user_settings",
+                new_callable=AsyncMock,
+                return_value={"model": "gpt-5.6"},
+            ),
+            patch("kai.pool.sessions.set_user_setting", new_callable=AsyncMock) as mock_store,
+            patch.object(instance, "restart", new_callable=AsyncMock) as mock_restart,
+        ):
+            await pool._apply_user_db_settings(111, instance)
+
+        assert instance.model == "gpt-5.6-sol"
+        mock_store.assert_awaited_once_with(111, "model", "gpt-5.6-sol")
+        mock_restart.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_legacy_codex_workspace_alias_keeps_precedence_over_db_model(self, tmp_path):
+        """Canonicalization must not make an applied workspace override look invalid."""
+        ws = (tmp_path / "ws").resolve()
+        ws.mkdir()
+        user = UserConfig(
+            telegram_id=111,
+            name="alice",
+            backend="codex",
+            home_workspace=ws,
+        )
+        config = _make_config(
+            default_backend="codex",
+            default_provider="openai",
+            default_model="gpt-5.5",
+            user_configs={111: user},
+        )
+        config.workspace_configs[ws] = WorkspaceConfig(path=ws, model="gpt-5.6")
+        pool = SubprocessPool(config=config, services_info=[])
+        instance = pool.get(111)
+        assert instance.model == "gpt-5.6-sol"
+
+        with (
+            patch(
+                "kai.pool.sessions.get_user_settings",
+                new_callable=AsyncMock,
+                return_value={"model": "gpt-5.5"},
+            ),
+            patch.object(instance, "restart", new_callable=AsyncMock) as mock_restart,
+        ):
+            await pool._apply_user_db_settings(111, instance)
+
+        assert instance.model == "gpt-5.6-sol"
+        mock_restart.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_restore_no_db_settings_no_restart(self, tmp_path):
