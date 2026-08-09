@@ -32,6 +32,8 @@ import os
 import shutil
 from pathlib import Path
 
+from kai.backend_registry import BackendRegistryError, backend_registry_is_authoritative, resolve_backend_command
+
 
 class BinaryResolutionError(Exception):
     """
@@ -92,6 +94,12 @@ def resolve_oneshot_binary(backend: str) -> str:
     caller's config validation upstream of this function has a
     bug, not the operator's PATH.
     """
+    if backend_registry_is_authoritative():
+        try:
+            return resolve_backend_command(backend)
+        except BackendRegistryError as e:
+            raise BinaryResolutionError(f"could not resolve {backend} binary from backend registry: {e}") from e
+
     if backend == "claude":
         # Structural mirror of the codex / opencode / goose arms.
         # CLAUDE_BIN, when set, is validated as a configuration error

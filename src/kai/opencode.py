@@ -43,6 +43,7 @@ import os
 from typing import Literal
 
 from kai.acp import AcpBackend
+from kai.backend_registry import BackendRegistryError, backend_registry_is_authoritative, resolve_backend_command
 
 log = logging.getLogger(__name__)
 
@@ -265,7 +266,13 @@ class OpenCodeBackend(AcpBackend):
         installs with opencode on PATH keep working without the
         override.
         """
-        opencode_bin = os.environ.get("OPENCODE_BIN") or "opencode"
+        if backend_registry_is_authoritative():
+            try:
+                opencode_bin = resolve_backend_command("opencode", allow_bare_fallback=True)
+            except BackendRegistryError as e:
+                raise RuntimeError(f"OpenCode startup failed: {e}") from e
+        else:
+            opencode_bin = os.environ.get("OPENCODE_BIN") or "opencode"
         return [opencode_bin, "acp"]
 
     def build_env(self, base_env: dict[str, str]) -> dict[str, str]:

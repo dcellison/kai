@@ -18,6 +18,7 @@ import kai.install
 from kai.install import (
     _LAUNCHD_LABEL,
     ServiceStartError,
+    _apply_backend_registry,
     _apply_directories,
     _apply_goose_config,
     _apply_migrate,
@@ -331,6 +332,7 @@ class TestGenerateSudoers:
         assert f"{cat_path} /etc/kai/users.yaml" in result
         assert f"{cat_path} /etc/kai/workspaces.yaml" in result
         assert f"{cat_path} /etc/kai/memory-projects.yaml" in result
+        assert f"{cat_path} /etc/kai/backends.yaml" in result
         assert f"{cat_path} /etc/kai/totp.secret" in result
         assert f"{cat_path} /etc/kai/totp.attempts" in result
 
@@ -2988,6 +2990,7 @@ class TestCmdApply:
             "_apply_venv": 2,
             "_apply_models": 1,
             "_apply_secrets": 1,
+            "_apply_backend_registry": 2,
             "_apply_goose_config": 4,
             "_apply_sudoers": 1,
             "_apply_migrate": 4,
@@ -3745,6 +3748,7 @@ class TestCmdApplyDefaultModelGate:
             "_apply_venv",
             "_apply_models",
             "_apply_secrets",
+            "_apply_backend_registry",
             "_apply_goose_config",
             "_apply_sudoers",
             "_apply_migrate",
@@ -7070,6 +7074,35 @@ class TestApplySecretsDryRun:
         assert "/etc/kai/users.yaml" in output
 
 
+class TestApplyBackendRegistry:
+    def test_build_registry_uses_env_paths(self, monkeypatch):
+        monkeypatch.setattr("kai.install._resolve_default_claude_bin", lambda service_user: "/fallback/claude")
+        monkeypatch.setattr("kai.install._resolve_default_codex_bin", lambda: "/fallback/codex")
+
+        rendered = kai.install._build_backend_registry(
+            "kai",
+            {
+                "CLAUDE_BIN": "/custom/claude",
+                "CODEX_BIN": "/custom/codex",
+                "OPENCODE_BIN": "/custom/opencode",
+                "GOOSE_BIN": "/custom/goose",
+            },
+        )
+        data = yaml.safe_load(rendered)
+
+        assert data["backends"]["claude"]["command"] == "/custom/claude"
+        assert data["backends"]["codex"]["command"] == "/custom/codex"
+        assert data["backends"]["opencode"]["command"] == "/custom/opencode"
+        assert data["backends"]["goose"]["command"] == "/custom/goose"
+        assert "gpt-5.6-sol" in data["backends"]["codex"]["allowed_models"]
+
+    def test_dry_run_prints_registry_write(self, capsys):
+        _apply_backend_registry("kai", {}, dry_run=True)
+        output = capsys.readouterr().out
+        assert "/etc/kai/backends.yaml" in output
+        assert "0644" in output
+
+
 # ── _apply_secrets staging copy precedence ───────────────────────────
 
 
@@ -7622,6 +7655,7 @@ class TestCmdApplyStagingHandoff:
         monkeypatch.setattr("kai.install._apply_venv", lambda *a, **kw: None)
         monkeypatch.setattr("kai.install._apply_models", lambda *a, **kw: None)
         monkeypatch.setattr("kai.install._apply_secrets", _fake_apply_secrets)
+        monkeypatch.setattr("kai.install._apply_backend_registry", lambda *a, **kw: None)
         monkeypatch.setattr("kai.install._apply_sudoers", lambda *a, **kw: None)
         monkeypatch.setattr("kai.install._apply_migrate", lambda *a, **kw: None)
         monkeypatch.setattr("kai.install._apply_service", lambda *a, **kw: None)
@@ -8043,6 +8077,7 @@ class TestCmdApplySingleUserRefuses:
         monkeypatch.setattr("kai.install._apply_venv", lambda *a, **kw: None)
         monkeypatch.setattr("kai.install._apply_models", lambda *a, **kw: None)
         monkeypatch.setattr("kai.install._apply_secrets", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.install._apply_backend_registry", lambda *a, **kw: None)
         monkeypatch.setattr("kai.install._apply_sudoers", lambda *a, **kw: None)
         monkeypatch.setattr("kai.install._apply_migrate", lambda *a, **kw: None)
         monkeypatch.setattr("kai.install._apply_service", lambda *a, **kw: None)

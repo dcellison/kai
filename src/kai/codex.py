@@ -66,6 +66,7 @@ from kai.backend import (
     ensure_user_preferences,
     sanitize_agent_environment,
 )
+from kai.backend_registry import BackendRegistryError, backend_registry_is_authoritative, resolve_backend_command
 from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude_user
 
 log = logging.getLogger(__name__)
@@ -443,15 +444,16 @@ class CodexBackend(AgentBackend):
         if effective_codex_user:
             env["TMPDIR"] = str(DATA_DIR / "tmp" / effective_codex_user)
 
-        # Resolve the codex binary path. When `codex` is not on the
-        # service user's PATH (multi-user installs where codex lives
-        # in a per-os_user home, e.g. /Users/daniel/.npm-global/bin),
-        # sudo cannot find the bare name and the spawn dies with
-        # "a password is required". The CODEX_BIN env var lets the
-        # install (or operator) pin an absolute path that the sudoers
-        # rule also names exactly. Without CODEX_BIN, use the same
-        # common absolute fallback the installer writes to sudoers.
-        codex_bin = os.environ.get("CODEX_BIN") or _resolve_default_codex_bin()
+        # Resolve from the installed backend registry when present.
+        # Without a registry, keep the legacy common-path fallback so
+        # development and older installs behave unchanged.
+        if backend_registry_is_authoritative():
+            try:
+                codex_bin = resolve_backend_command("codex", allow_bare_fallback=True)
+            except BackendRegistryError as e:
+                raise RuntimeError(f"Codex startup failed: {e}") from e
+        else:
+            codex_bin = os.environ.get("CODEX_BIN") or _resolve_default_codex_bin()
         codex_argv = [codex_bin]
         # The reasoning-effort override rides BEFORE the subcommand
         # token: `-c key=value` is defined at the codex CLI root

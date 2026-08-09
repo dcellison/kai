@@ -3211,9 +3211,9 @@ def load_config() -> Config:
                 raise SystemExit(
                     f"Memory extraction requires the {_backend!r} binary to be reachable "
                     f"at startup (at least one extraction-eligible user routes to it), but "
-                    f"{e}. Set {_backend.upper()}_BIN to the binary's absolute path or "
-                    f"fix PATH; rerun the wizard if you no longer want memory extraction "
-                    f"enabled."
+                    f"{e}. Update the installed backend registry with `make install`, "
+                    f"set {_backend.upper()}_BIN as an admin-owned compatibility override, "
+                    f"or fix PATH; rerun the wizard if you no longer want memory extraction enabled."
                 ) from None
 
     # Renamed env vars: warn when the legacy name is present so the

@@ -39,6 +39,7 @@ from pathlib import Path
 
 import yaml
 
+from kai.backend_registry import render_backend_registry
 from kai.config import (
     _VALID_ROLES,
     BACKEND_PROVIDERS,
@@ -74,6 +75,7 @@ INSTALL_CONF = PROJECT_ROOT / "install.conf"
 # test suite can patch one attribute and stay isolated from the host's
 # real runtime config.
 USERS_YAML = Path("/etc/kai/users.yaml")
+BACKENDS_YAML = Path("/etc/kai/backends.yaml")
 
 # Default installation paths
 _DEFAULT_INSTALL_DIR = "/opt/kai"
@@ -3195,6 +3197,7 @@ def _generate_sudoers(
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/users.yaml
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/workspaces.yaml
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/memory-projects.yaml
+        {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/backends.yaml
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/totp.secret
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/totp.attempts
         {service_user} ALL=(root) NOPASSWD: {tee_path} /etc/kai/totp.attempts
@@ -4685,7 +4688,10 @@ def _cmd_apply() -> None:
         env.pop("MEMORY_RECALL_SHADOW_ENABLED", None)
         _apply_secrets(env, dry_run, users_yaml_staging_path=users_yaml_staging_path)
 
-        # -- Step 6: Deploy Goose config (if any goose-backed user) --
+        # -- Step 6: Deploy installed backend registry --
+        _apply_backend_registry(service_user, env, dry_run)
+
+        # -- Step 7: Deploy Goose config (if any goose-backed user) --
         # The function gates itself: global DEFAULT_BACKEND=goose or a
         # per-user backend override in users.yaml both mean some
         # session spawns `goose acp`; otherwise it no-ops.
@@ -4699,7 +4705,7 @@ def _cmd_apply() -> None:
             agent_backend=agent_backend,
         )
 
-        # -- Step 7: Configure sudoers --
+        # -- Step 8: Configure sudoers --
         _apply_sudoers(
             service_user,
             dry_run,
@@ -4710,10 +4716,10 @@ def _cmd_apply() -> None:
             agent_backend=agent_backend,
         )
 
-        # -- Step 8: Migrate runtime data --
+        # -- Step 9: Migrate runtime data --
         _apply_migrate(data_path, install_path, svc_uid, svc_gid, dry_run)
 
-        # -- Step 9: Generate service definition --
+        # -- Step 10: Generate service definition --
         webhook_port = int(env.get("WEBHOOK_PORT", "8080"))
         _apply_service(install_dir, data_dir, service_user, platform, dry_run, webhook_port)
         # Apply path completed without exception. Flipping the flag
@@ -5812,6 +5818,48 @@ def _apply_secrets(
             print(f"  Copied {yaml_dst}")
 
 
+def _build_backend_registry(service_user: str, env: dict[str, str]) -> str:
+    """Build the installed backend registry from admin-owned install state."""
+    svc_home = _user_home(service_user)
+    entries = {
+        "claude": {
+            "driver": "claude",
+            "runtime": "local_process",
+            "command": env.get("CLAUDE_BIN") or _resolve_default_claude_bin(service_user),
+            "allowed_models": sorted(PROVIDER_MODELS["anthropic"].keys()),
+        },
+        "codex": {
+            "driver": "codex",
+            "runtime": "local_process",
+            "command": env.get("CODEX_BIN") or _resolve_default_codex_bin(),
+            "allowed_models": sorted(CODEX_MODELS.keys()),
+        },
+        "goose": {
+            "driver": "goose",
+            "runtime": "local_process",
+            "command": env.get("GOOSE_BIN") or "/opt/homebrew/bin/goose",
+        },
+        "opencode": {
+            "driver": "opencode",
+            "runtime": "local_process",
+            "command": env.get("OPENCODE_BIN") or f"{svc_home}/.local/bin/opencode",
+        },
+    }
+    return render_backend_registry(entries)
+
+
+def _apply_backend_registry(service_user: str, env: dict[str, str], dry_run: bool) -> None:
+    """Write the non-secret installed backend registry."""
+    content = _build_backend_registry(service_user, env)
+    if dry_run:
+        print(f"[DRY RUN] Would write: {BACKENDS_YAML} (mode 0644)")
+        return
+    BACKENDS_YAML.write_text(content)
+    os.chmod(BACKENDS_YAML, 0o644)
+    os.chown(BACKENDS_YAML, 0, 0)
+    print(f"  Wrote {BACKENDS_YAML}")
+
+
 def _apply_goose_config(
     service_user: str,
     install_path: Path,
@@ -6017,23 +6065,23 @@ def _apply_sudoers(
         expected_bins: dict[str, tuple[Path, str]] = {
             "claude": (
                 Path(claude_bin or _resolve_default_claude_bin(service_user)),
-                "Re-run 'make config' and point CLAUDE_BIN at the actual claude "
-                "install location to keep the rule and runtime in sync.",
+                "Run 'make install' after installing claude globally, or re-run "
+                "'make config' and point CLAUDE_BIN at the actual install location.",
             ),
             "codex": (
                 Path(codex_bin or _resolve_default_codex_bin()),
-                "Re-run 'make config' and point CODEX_BIN at the actual codex "
-                "install location to keep the rule and runtime in sync.",
+                "Run 'make install' after installing codex globally, or re-run "
+                "'make config' and point CODEX_BIN at the actual install location.",
             ),
             "opencode": (
                 Path(opencode_bin or f"{svc_home}/.local/bin/opencode"),
-                "Re-run 'make config' and point OPENCODE_BIN at the actual "
-                "opencode install location to keep the rule and runtime in sync.",
+                "Run 'make install' after installing opencode globally, or re-run "
+                "'make config' and point OPENCODE_BIN at the actual install location.",
             ),
             "goose": (
                 Path(goose_bin or "/opt/homebrew/bin/goose"),
-                "Re-run 'make config' and point GOOSE_BIN at the actual goose "
-                "install location to keep the rule and runtime in sync.",
+                "Run 'make install' after installing goose globally, or re-run "
+                "'make config' and point GOOSE_BIN at the actual install location.",
             ),
         }
         for backend in sorted(backends_in_use & expected_bins.keys()):

@@ -20,6 +20,7 @@ import logging
 import os
 
 from kai.acp import AcpBackend
+from kai.backend_registry import BackendRegistryError, backend_registry_is_authoritative, resolve_backend_command
 
 log = logging.getLogger(__name__)
 
@@ -109,7 +110,13 @@ class GooseBackend(AcpBackend):
         back to bare "goose" so installs with goose on PATH keep
         working without the override.
         """
-        goose_bin = os.environ.get("GOOSE_BIN") or "goose"
+        if backend_registry_is_authoritative():
+            try:
+                goose_bin = resolve_backend_command("goose", allow_bare_fallback=True)
+            except BackendRegistryError as e:
+                raise RuntimeError(f"Goose startup failed: {e}") from e
+        else:
+            goose_bin = os.environ.get("GOOSE_BIN") or "goose"
         return [goose_bin, "acp", "--with-builtin", "developer"]
 
     def build_env(self, base_env: dict[str, str]) -> dict[str, str]:

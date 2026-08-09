@@ -41,6 +41,7 @@ from kai.backend import (
     ensure_user_preferences,
     sanitize_agent_environment,
 )
+from kai.backend_registry import BackendRegistryError, backend_registry_is_authoritative, resolve_backend_command
 from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude_user
 
 log = logging.getLogger(__name__)
@@ -207,15 +208,16 @@ class ClaudeCodeBackend(AgentBackend):
         if self.is_alive:
             return
 
-        # Resolve the claude binary path. The CLAUDE_BIN env var lets
-        # the install (or operator) pin an absolute path; the sudoers
-        # rule for cross-user spawns names the same file, and sudo's
-        # PATH resolution of a bare name must land on exactly that
-        # file for the rule to match. The fallback order mirrors
-        # install.py's sudoers generator: service-user native install,
-        # Homebrew install, then bare "claude" for single-user PATH
-        # installs. Mirrors the CODEX_BIN handling in codex.py.
-        claude_bin = os.environ.get("CLAUDE_BIN") or _resolve_default_claude_bin()
+        # Resolve from the installed backend registry when present.
+        # Without a registry, keep the legacy backend-specific fallback
+        # order so development and older installs behave unchanged.
+        if backend_registry_is_authoritative():
+            try:
+                claude_bin = resolve_backend_command("claude", allow_bare_fallback=True)
+            except BackendRegistryError as e:
+                raise RuntimeError(f"Claude startup failed: {e}") from e
+        else:
+            claude_bin = os.environ.get("CLAUDE_BIN") or _resolve_default_claude_bin()
 
         # Build the Claude command arguments.
         claude_cmd = [
