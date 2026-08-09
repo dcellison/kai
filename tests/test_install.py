@@ -9122,6 +9122,7 @@ class TestResolveCodexBinPromptDefault:
         detected = tmp_path / "detected-codex"
         detected.write_text("#!/bin/sh\n")
         detected.chmod(0o755)
+        monkeypatch.setattr("kai.install._validate_codex_bin", lambda p: p == str(detected))
         monkeypatch.setattr("kai.install.shutil.which", lambda command: str(detected))
 
         result = _resolve_codex_bin_prompt_default({"CODEX_BIN": str(stale)})
@@ -9662,15 +9663,17 @@ class TestGenerateSudoersCodexBinArg:
         assert "kai ALL=(daniel) SETENV: NOPASSWD: /Users/daniel/.npm-global/bin/codex" in out
         assert "/opt/homebrew/bin/codex" not in out
 
-    def test_codex_bin_arg_none_falls_back_to_homebrew(self):
+    def test_codex_bin_arg_none_prefers_common_absolute_path(self, monkeypatch):
         from kai.install import _generate_sudoers
 
+        monkeypatch.setattr("kai.install._validate_codex_bin", lambda p: p == "/usr/local/bin/codex")
         out = _generate_sudoers(
             service_user="kai",
             os_users=["daniel"],
             codex_bin=None,
         )
-        assert "/opt/homebrew/bin/codex" in out
+        assert "kai ALL=(daniel) SETENV: NOPASSWD: /usr/local/bin/codex" in out
+        assert "/opt/homebrew/bin/codex" not in out
 
     def test_codex_bin_does_not_read_os_environ(self, monkeypatch):
         """Setting CODEX_BIN in os.environ should have NO effect; only

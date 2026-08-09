@@ -501,15 +501,30 @@ def _resolve_codex_bin_prompt_default(existing_env: dict[str, str]) -> str:
     """Return a usable default for every Codex binary-path prompt.
 
     Preserve a saved CODEX_BIN while it is executable. If an upgrade moved
-    the binary, discard the stale value and prefer the executable currently
-    discoverable on the operator's PATH. The Homebrew path remains only a
-    suggestion when Codex cannot be discovered; prompt validation still
-    prevents the wizard from accepting a missing executable.
+    the binary, discard the stale value and use the same common-path
+    resolver that sudoers generation uses.
     """
     saved = existing_env.get("CODEX_BIN", "")
     if _validate_codex_bin(saved):
         return saved
-    return shutil.which("codex") or "/opt/homebrew/bin/codex"
+    return _resolve_default_codex_bin()
+
+
+def _resolve_default_codex_bin() -> str:
+    """Return the default Codex binary path used by sudoers.
+
+    Prefer stable absolute install locations over the installer caller's
+    PATH. The runtime uses the same precedence when CODEX_BIN is unset,
+    so a users.yaml-only backend switch can be made effective with
+    `make install` rather than an interactive `make config` pass.
+    """
+    for candidate in ("/usr/local/bin/codex", "/opt/homebrew/bin/codex"):
+        if _validate_codex_bin(candidate):
+            return candidate
+    discovered = shutil.which("codex")
+    if discovered and _validate_codex_bin(discovered):
+        return discovered
+    return "/usr/local/bin/codex"
 
 
 def _validate_opencode_bin(value: str) -> bool:
@@ -3150,8 +3165,9 @@ def _generate_sudoers(
     service user's `~/.local/bin/claude` (the native installer
     location); operators with a custom install location (e.g. the
     Homebrew cask) override via CLAUDE_BIN. The codex binary path
-    defaults to /opt/homebrew/bin/codex; Linux installs override with
-    the CODEX_BIN env var at install time. The opencode rule uses the
+    defaults to the first executable common install location; unusual
+    installs override with the CODEX_BIN env var at install time. The
+    opencode rule uses the
     service user's `~/.local/bin/opencode` path (where the upstream
     installer drops the binary by default); operators with a custom
     install location can override via OPENCODE_BIN. The goose rule
@@ -3222,14 +3238,12 @@ def _generate_sudoers(
         claude_bin_resolved = claude_bin or _resolve_default_claude_bin(service_user)
         # Codex binary path is now threaded as an argument. The wizard
         # prompts for and persists the value in install.conf; _cmd_apply
-        # passes it to _apply_sudoers which passes it here. We
-        # deliberately do NOT call shutil.which or os.environ inside
-        # this function: resolving against root's install-time PATH
-        # would silently pick the wrong binary on multi-user installs
-        # (the same failure mode PR #455 removed for claude_bin). The
-        # Homebrew fallback only fires on a first-time install where
-        # the wizard has not run yet.
-        codex_bin_resolved = codex_bin or "/opt/homebrew/bin/codex"
+        # passes it to _apply_sudoers which passes it here. When a user
+        # later switches users.yaml to codex without re-running the
+        # wizard, resolve a common absolute Codex install path that the
+        # runtime uses too. That keeps sudoers and runtime in sync while
+        # still letting CODEX_BIN override unusual installs explicitly.
+        codex_bin_resolved = codex_bin or _resolve_default_codex_bin()
         # OpenCode binary path. Upstream's install script drops the
         # binary under the SERVICE user's ~/.local/bin/opencode by
         # default, so the same `svc_home` anchoring applies as the
@@ -5945,7 +5959,8 @@ def _apply_sudoers(
     SETENV rules pin the same absolute paths the running bot will
     invoke. `claude_bin` falls back to the service user's
     `~/.local/bin/claude` (the native installer location);
-    `codex_bin` falls back to /opt/homebrew/bin/codex; `opencode_bin`
+    `codex_bin` falls back to a common absolute codex install path;
+    `opencode_bin`
     falls back to the service user's `~/.local/bin/opencode`;
     `goose_bin` falls back to /opt/homebrew/bin/goose. The fallbacks
     fire only on installs where the wizard has not collected a value.
@@ -6006,7 +6021,7 @@ def _apply_sudoers(
                 "install location to keep the rule and runtime in sync.",
             ),
             "codex": (
-                Path(codex_bin or "/opt/homebrew/bin/codex"),
+                Path(codex_bin or _resolve_default_codex_bin()),
                 "Re-run 'make config' and point CODEX_BIN at the actual codex "
                 "install location to keep the rule and runtime in sync.",
             ),

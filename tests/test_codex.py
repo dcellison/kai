@@ -397,6 +397,8 @@ class TestHandshake:
 
         with (
             patch.dict(os.environ, {}, clear=False),
+            patch.object(Path, "is_file", lambda _p: False),
+            patch("kai.codex.shutil.which", lambda _name: None),
             patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec,
         ):
             os.environ.pop("CODEX_BIN", None)
@@ -404,6 +406,32 @@ class TestHandshake:
 
         argv = mock_exec.call_args[0]
         assert argv[0] == "codex"
+        assert argv[1] == "app-server"
+
+    @pytest.mark.asyncio
+    async def test_argv_uses_common_absolute_codex_fallback(self):
+        """
+        When CODEX_BIN is unset but Codex exists at a common absolute
+        install path, runtime uses that path so sudoers command matching
+        can succeed after a users.yaml-only switch to the codex backend.
+        """
+        c = _make_codex()
+        proc = _make_mock_proc(_handshake_lines())
+
+        def fake_is_file(path: Path) -> bool:
+            return str(path) == "/usr/local/bin/codex"
+
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            patch.object(Path, "is_file", fake_is_file),
+            patch("os.access", lambda p, mode: str(p) == "/usr/local/bin/codex"),
+            patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec,
+        ):
+            os.environ.pop("CODEX_BIN", None)
+            await c._ensure_started()
+
+        argv = mock_exec.call_args[0]
+        assert argv[0] == "/usr/local/bin/codex"
         assert argv[1] == "app-server"
 
     @pytest.mark.asyncio
@@ -1741,14 +1769,14 @@ class TestCodexUserSudoWrap:
 
     @pytest.mark.asyncio
     async def test_no_sudo_when_codex_user_unset(self):
-        """Default (codex_user=None): argv starts with "codex", no sudo."""
+        """Default (codex_user=None): argv is not sudo-wrapped."""
         c = _make_codex()
         proc = _make_mock_proc(_handshake_lines())
         with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
             await c._ensure_started()
         argv = mock_exec.call_args[0]
-        assert argv[0] == "codex"
         assert "sudo" not in argv
+        assert argv[1] == "app-server"
 
     @pytest.mark.asyncio
     async def test_sudo_wraps_argv_when_codex_user_set(self):
@@ -1774,8 +1802,9 @@ class TestCodexUserSudoWrap:
         # chat leg as on extraction / review / triage.
         assert "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR,CODEX_HOME,OPENAI_API_KEY,OPENAI_BASE_URL" in argv
         # Codex binary follows the sudo prologue.
-        codex_i = argv.index("codex")
-        assert argv[codex_i + 1] == "app-server"
+        separator_i = argv.index("--")
+        assert argv[separator_i + 1].endswith("/codex") or argv[separator_i + 1] == "codex"
+        assert argv[separator_i + 2] == "app-server"
 
     @pytest.mark.asyncio
     async def test_tmpdir_anchored_per_os_user_in_cross_user_mode(self):

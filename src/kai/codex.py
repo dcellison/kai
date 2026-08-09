@@ -91,6 +91,22 @@ log = logging.getLogger(__name__)
 _TURN_IMAGE_DIR = DATA_DIR / "files" / "codex_turn_images"
 
 
+def _resolve_default_codex_bin() -> str:
+    """Resolve Codex to a stable absolute path when CODEX_BIN is unset.
+
+    Cross-user launches go through sudoers, whose command matching is
+    path-exact. Prefer common absolute install paths so runtime and the
+    installer's sudoers fallback stay aligned after a users.yaml-only
+    switch to the codex backend.
+    """
+    for candidate in ("/usr/local/bin/codex", "/opt/homebrew/bin/codex"):
+        path = Path(candidate)
+        if path.is_file() and os.access(path, os.X_OK):
+            return candidate
+    discovered = shutil.which("codex")
+    return discovered or "codex"
+
+
 def _grant_turn_image_read_access(path: Path, reader_user: str) -> None:
     """Grant exactly one cross-OS-user reader access to a private image.
 
@@ -433,9 +449,9 @@ class CodexBackend(AgentBackend):
         # sudo cannot find the bare name and the spawn dies with
         # "a password is required". The CODEX_BIN env var lets the
         # install (or operator) pin an absolute path that the sudoers
-        # rule also names exactly. Falls back to bare "codex" so
-        # single-user installs with codex on PATH still work.
-        codex_bin = os.environ.get("CODEX_BIN") or "codex"
+        # rule also names exactly. Without CODEX_BIN, use the same
+        # common absolute fallback the installer writes to sudoers.
+        codex_bin = os.environ.get("CODEX_BIN") or _resolve_default_codex_bin()
         codex_argv = [codex_bin]
         # The reasoning-effort override rides BEFORE the subcommand
         # token: `-c key=value` is defined at the codex CLI root
