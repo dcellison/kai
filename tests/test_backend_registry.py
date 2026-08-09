@@ -7,6 +7,7 @@ import yaml
 
 from kai.backend_registry import (
     BackendRegistryError,
+    backend_registry_is_authoritative,
     render_backend_registry,
     resolve_backend_command,
 )
@@ -74,11 +75,23 @@ def test_registry_command_must_be_absolute(tmp_path, monkeypatch):
 
 def test_default_missing_registry_uses_legacy_path_resolution(monkeypatch):
     monkeypatch.delenv("KAI_BACKENDS_YAML", raising=False)
+    monkeypatch.delenv("KAI_INSTALL_DIR", raising=False)
     monkeypatch.delenv("CLAUDE_BIN", raising=False)
     monkeypatch.setattr("kai.backend_registry.DEFAULT_BACKENDS_YAML", Path("/does/not/exist"))
     monkeypatch.setattr("kai.backend_registry.shutil.which", lambda name: f"/fake/{name}")
 
     assert resolve_backend_command("claude") == "/fake/claude"
+
+
+def test_installed_mode_missing_registry_fails(monkeypatch):
+    monkeypatch.delenv("KAI_BACKENDS_YAML", raising=False)
+    monkeypatch.setenv("KAI_INSTALL_DIR", "/opt/kai")
+    monkeypatch.setenv("CLAUDE_BIN", "/tmp/legacy-claude")
+    monkeypatch.setattr("kai.backend_registry.DEFAULT_BACKENDS_YAML", Path("/does/not/exist"))
+
+    assert backend_registry_is_authoritative()
+    with pytest.raises(BackendRegistryError, match="does not exist"):
+        resolve_backend_command("claude")
 
 
 def test_explicit_missing_registry_fails(monkeypatch):

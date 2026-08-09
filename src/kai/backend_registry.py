@@ -3,9 +3,9 @@ Installed backend registry.
 
 This module is the machine-capability boundary for local agent
 backends. User-facing configuration names backend IDs ("codex",
-"claude", etc.); executable paths are resolved from an admin-owned
-registry when present, with the legacy admin-owned ``*_BIN``
-environment variables retained as a compatibility fallback.
+"claude", etc.); protected installs resolve executable paths from
+an admin-owned registry. Single-user/dev runs keep the legacy
+``*_BIN`` / PATH fallback unless an explicit registry override is set.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import yaml
 
 DEFAULT_BACKENDS_YAML = Path("/etc/kai/backends.yaml")
 BACKENDS_YAML_ENV = "KAI_BACKENDS_YAML"
+INSTALL_DIR_ENV = "KAI_INSTALL_DIR"
 
 _BACKEND_ENV_VARS: dict[str, str] = {
     "claude": "CLAUDE_BIN",
@@ -58,26 +59,31 @@ def backend_registry_exists(path: Path | None = None) -> bool:
         return path.is_file()
     if os.environ.get(BACKENDS_YAML_ENV, "").strip():
         return backend_registry_path().is_file()
-    if not os.environ.get("KAI_INSTALL_DIR", "").strip():
+    if not os.environ.get(INSTALL_DIR_ENV, "").strip():
         return False
     return backend_registry_path().is_file()
 
 
+def backend_registry_required() -> bool:
+    """Return whether this process must use the backend registry."""
+    return bool(os.environ.get(BACKENDS_YAML_ENV, "").strip() or os.environ.get(INSTALL_DIR_ENV, "").strip())
+
+
 def backend_registry_is_authoritative() -> bool:
     """Return whether backend command resolution must use the registry."""
-    return bool(os.environ.get(BACKENDS_YAML_ENV, "").strip()) or backend_registry_exists()
+    return backend_registry_required() or backend_registry_exists()
 
 
 def load_backend_registry(path: Path | None = None) -> dict[str, BackendRegistryEntry]:
     """
     Load the admin-owned backend registry.
 
-    Returns an empty dict when no registry exists. A present but
-    malformed registry is a configuration error because runtime and
-    sudoers path decisions must not silently fall back to unrelated
-    binaries.
+    Returns an empty dict only for single-user/dev mode when no registry
+    exists. A missing required registry, or a present but malformed
+    registry, is a configuration error because runtime and sudoers path
+    decisions must not silently fall back to unrelated binaries.
     """
-    explicit_path = path is not None or bool(os.environ.get(BACKENDS_YAML_ENV, "").strip())
+    explicit_path = path is not None or backend_registry_required()
     registry_path = path or backend_registry_path()
     if not registry_path.is_file():
         if explicit_path:
@@ -157,9 +163,10 @@ def resolve_backend_command(backend: str, *, allow_bare_fallback: bool = False) 
     Resolve the command for an installed backend.
 
     Precedence:
-      1. admin-owned backend registry, if present;
-      2. legacy admin-owned ``*_BIN`` environment variable;
-      3. PATH lookup;
+      1. admin-owned backend registry for protected installs or explicit
+         registry overrides;
+      2. legacy ``*_BIN`` environment variable for single-user/dev mode;
+      3. PATH lookup for single-user/dev mode;
       4. optional bare command fallback for persistent/dev spawns.
     """
     backend = backend.strip().lower()
