@@ -46,6 +46,27 @@ from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude
 log = logging.getLogger(__name__)
 
 
+def _resolve_default_claude_bin() -> str:
+    """Return the default Claude binary path for persistent chat."""
+    native = Path.home() / ".local" / "bin" / "claude"
+    if native.is_file() and os.access(native, os.X_OK):
+        return str(native)
+    homebrew = Path("/opt/homebrew/bin/claude")
+    if str(Path.home()).startswith("/Users/") and homebrew.is_file() and os.access(homebrew, os.X_OK):
+        return str(homebrew)
+    return "claude"
+
+
+_CLAUDE_STDERR_WARNING_MARKERS = (
+    "a password is required",
+    "permission denied",
+    "not found",
+    "no such file or directory",
+    "authentication",
+    "auth failed",
+)
+
+
 # ── Claude Code backend ─────────────────────────────────────────────
 
 
@@ -190,11 +211,11 @@ class ClaudeCodeBackend(AgentBackend):
         # the install (or operator) pin an absolute path; the sudoers
         # rule for cross-user spawns names the same file, and sudo's
         # PATH resolution of a bare name must land on exactly that
-        # file for the rule to match. Falls back to bare "claude" so
-        # installs with claude on the service user's PATH and no
-        # override keep working. Mirrors the CODEX_BIN handling in
-        # codex.py.
-        claude_bin = os.environ.get("CLAUDE_BIN") or "claude"
+        # file for the rule to match. The fallback order mirrors
+        # install.py's sudoers generator: service-user native install,
+        # Homebrew install, then bare "claude" for single-user PATH
+        # installs. Mirrors the CODEX_BIN handling in codex.py.
+        claude_bin = os.environ.get("CLAUDE_BIN") or _resolve_default_claude_bin()
 
         # Build the Claude command arguments.
         claude_cmd = [
@@ -383,7 +404,11 @@ class ClaudeCodeBackend(AgentBackend):
                     break
                 text = line.decode().strip()
                 if text:
-                    log.debug("Claude stderr: %s", text[:200])
+                    snippet = text[:200]
+                    if any(marker in text.lower() for marker in _CLAUDE_STDERR_WARNING_MARKERS):
+                        log.warning("Claude stderr: %s", snippet)
+                    else:
+                        log.debug("Claude stderr: %s", snippet)
             except Exception:
                 log.warning("Unexpected error in stderr drain", exc_info=True)
                 break

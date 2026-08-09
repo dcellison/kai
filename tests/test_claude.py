@@ -115,6 +115,12 @@ def _result_event(
 class TestCommandConstruction:
     """Verify _ensure_started() builds the right command depending on claude_user."""
 
+    @pytest.fixture(autouse=True)
+    def _legacy_default_claude_bin(self, monkeypatch):
+        """Most command-construction tests assert sudo wrapping, not
+        host-specific binary discovery."""
+        monkeypatch.setattr("kai.claude._resolve_default_claude_bin", lambda: "claude")
+
     @pytest.mark.asyncio
     async def test_cmd_without_claude_user(self):
         """Without claude_user, command starts with 'claude' directly."""
@@ -382,6 +388,27 @@ class TestCommandConstruction:
         (mirrors codex's CODEX_BIN and opencode's OPENCODE_BIN
         contract)."""
         monkeypatch.setenv("CLAUDE_BIN", "/opt/homebrew/bin/claude")
+        claude = _make_claude()
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
+            mock_exec.return_value = mock_proc
+
+            await claude._ensure_started()
+
+            cmd = mock_exec.call_args[0]
+            assert cmd[0] == "/opt/homebrew/bin/claude"
+
+    @pytest.mark.asyncio
+    async def test_default_claude_bin_uses_resolver(self, monkeypatch):
+        """When CLAUDE_BIN is unset, the argv head comes from the
+        native/Homebrew resolver rather than always being bare
+        `claude`."""
+        monkeypatch.delenv("CLAUDE_BIN", raising=False)
+        monkeypatch.setattr("kai.claude._resolve_default_claude_bin", lambda: "/opt/homebrew/bin/claude")
         claude = _make_claude()
 
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
@@ -1080,6 +1107,20 @@ class TestDrainStderr:
         await claude._drain_stderr()
 
         assert "some warning" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_permission_stderr_logs_warning(self, caplog):
+        """Startup-shaped stderr is visible at INFO-level deployments."""
+        caplog.set_level("WARNING", logger="kai.claude")
+        claude = _make_claude()
+        mock_proc = MagicMock()
+        mock_proc.stderr = MagicMock()
+        mock_proc.stderr.readline = AsyncMock(side_effect=[b"sudo: a password is required\n", b""])
+        claude._proc = mock_proc
+
+        await claude._drain_stderr()
+
+        assert "sudo: a password is required" in caplog.text
 
     @pytest.mark.asyncio
     async def test_truncates_long_lines(self, caplog):

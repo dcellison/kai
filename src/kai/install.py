@@ -478,6 +478,25 @@ def _validate_codex_bin(value: str) -> bool:
     return p.is_absolute() and p.is_file() and os.access(p, os.X_OK)
 
 
+def _resolve_default_claude_bin(service_user: str) -> str:
+    """Return the default Claude binary path used by sudoers.
+
+    Native Claude installs land under the service user's home. The
+    Homebrew cask installs under /opt/homebrew/bin/claude. Prefer the
+    native service-user path when it exists, but recover the common
+    macOS Homebrew install instead of pinning sudoers to a missing
+    ~/.local/bin/claude.
+    """
+    svc_home = _user_home(service_user)
+    native = Path(svc_home) / ".local" / "bin" / "claude"
+    if _validate_claude_bin(str(native)):
+        return str(native)
+    homebrew = Path("/opt/homebrew/bin/claude")
+    if svc_home.startswith("/Users/") and _validate_claude_bin(str(homebrew)):
+        return str(homebrew)
+    return str(native)
+
+
 def _resolve_codex_bin_prompt_default(existing_env: dict[str, str]) -> str:
     """Return a usable default for every Codex binary-path prompt.
 
@@ -3188,18 +3207,19 @@ def _generate_sudoers(
 
     if target_users:
         # Anchor the rule path to the wizard-collected CLAUDE_BIN when
-        # present, else the SERVICE user's native-installer location.
+        # present, else the default resolver's service-user native
+        # install / Homebrew fallback.
         # The runtime spawn uses the same precedence (claude.py reads
-        # CLAUDE_BIN, else spawns bare `claude` which sudo resolves
-        # against the caller's PATH, the service user's), so the rule
-        # references the same binary the bot invokes. We deliberately
-        # do NOT call shutil.which here: resolving against whatever
+        # CLAUDE_BIN, else tries the same native/Homebrew fallbacks
+        # before spawning bare `claude`), so the rule references the
+        # same binary the bot invokes. We deliberately do NOT call
+        # shutil.which here: resolving against whatever
         # PATH root has when `sudo make install` runs can pick up any
         # user's `~/.local/bin/claude` that happens to be on PATH at
         # install time, baking the wrong path into the rule and
         # breaking the bot's sudo dispatch.
         svc_home = _user_home(service_user)
-        claude_bin_resolved = claude_bin or f"{svc_home}/.local/bin/claude"
+        claude_bin_resolved = claude_bin or _resolve_default_claude_bin(service_user)
         # Codex binary path is now threaded as an argument. The wizard
         # prompts for and persists the value in install.conf; _cmd_apply
         # passes it to _apply_sudoers which passes it here. We
@@ -5981,7 +6001,7 @@ def _apply_sudoers(
         # backend with a sudoers rule needs an entry in both places.
         expected_bins: dict[str, tuple[Path, str]] = {
             "claude": (
-                Path(claude_bin or f"{svc_home}/.local/bin/claude"),
+                Path(claude_bin or _resolve_default_claude_bin(service_user)),
                 "Re-run 'make config' and point CLAUDE_BIN at the actual claude "
                 "install location to keep the rule and runtime in sync.",
             ),

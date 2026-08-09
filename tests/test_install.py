@@ -387,6 +387,21 @@ class TestGenerateSudoers:
         assert "/home/kai/.local/bin/claude" in result
         assert "/some/other/users/local/bin/claude" not in result
 
+    def test_claude_bin_homebrew_fallback_when_service_native_missing(self, monkeypatch):
+        """On macOS, a missing service-user native Claude install falls
+        back to the Homebrew cask path so runtime backend switches can
+        use Claude without a hand-authored CLAUDE_BIN."""
+        monkeypatch.setattr("kai.install._user_home", lambda u: "/Users/kai")
+        monkeypatch.setattr(
+            "kai.install._validate_claude_bin",
+            lambda p: p == "/opt/homebrew/bin/claude",
+        )
+
+        result = _generate_sudoers("kai", os_users=["alice"])
+
+        assert "kai ALL=(alice) SETENV: NOPASSWD: /opt/homebrew/bin/claude" in result
+        assert "/Users/kai/.local/bin/claude" not in result
+
     def test_claude_bin_arg_overrides_default(self, monkeypatch):
         """An explicit claude_bin (the wizard-collected CLAUDE_BIN)
         replaces the service-home fallback in the per-user rule, so
