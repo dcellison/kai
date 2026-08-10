@@ -7245,6 +7245,29 @@ class TestApplyBackendRegistry:
         assert data["backends"]["goose"]["command"] == "/custom/goose"
         assert "gpt-5.6-sol" in data["backends"]["codex"]["allowed_models"]
 
+    def test_registry_and_sudoers_use_same_explicit_backend_paths(self):
+        env = {
+            "CLAUDE_BIN": "/registry/claude",
+            "CODEX_BIN": "/registry/codex",
+            "OPENCODE_BIN": "/registry/opencode",
+            "GOOSE_BIN": "/registry/goose",
+        }
+
+        registry = yaml.safe_load(kai.install._build_backend_registry("kai", env))
+        sudoers = _generate_sudoers(
+            "kai",
+            os_users=["alice"],
+            claude_bin=env["CLAUDE_BIN"],
+            codex_bin=env["CODEX_BIN"],
+            opencode_bin=env["OPENCODE_BIN"],
+            goose_bin=env["GOOSE_BIN"],
+        )
+
+        for backend in ("claude", "codex", "opencode", "goose"):
+            command = registry["backends"][backend]["command"]
+            assert command == env[f"{backend.upper()}_BIN"]
+            assert f"kai ALL=(alice) SETENV: NOPASSWD: {command}" in sudoers
+
     def test_dry_run_prints_registry_write(self, capsys):
         _apply_backend_registry("kai", {}, dry_run=True)
         output = capsys.readouterr().out
@@ -9872,6 +9895,49 @@ class TestGenerateSudoersCodexBinArg:
         )
         assert "/correct/path/codex" in out
         assert "/should/not/be/used" not in out
+
+
+class TestGenerateSudoersBackendPathArgs:
+    """Backend sudoers paths come from explicit install state, not process env."""
+
+    def test_all_backend_path_args_pin_sudoers_paths(self):
+        out = _generate_sudoers(
+            service_user="kai",
+            os_users=["daniel"],
+            claude_bin="/pins/claude",
+            codex_bin="/pins/codex",
+            opencode_bin="/pins/opencode",
+            goose_bin="/pins/goose",
+        )
+
+        assert "kai ALL=(daniel) SETENV: NOPASSWD: /pins/claude" in out
+        assert "kai ALL=(daniel) SETENV: NOPASSWD: /pins/codex" in out
+        assert "kai ALL=(daniel) SETENV: NOPASSWD: /pins/opencode" in out
+        assert "kai ALL=(daniel) SETENV: NOPASSWD: /pins/goose" in out
+
+    def test_backend_path_args_do_not_read_os_environ(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_BIN", "/env/claude")
+        monkeypatch.setenv("CODEX_BIN", "/env/codex")
+        monkeypatch.setenv("OPENCODE_BIN", "/env/opencode")
+        monkeypatch.setenv("GOOSE_BIN", "/env/goose")
+
+        out = _generate_sudoers(
+            service_user="kai",
+            os_users=["daniel"],
+            claude_bin="/arg/claude",
+            codex_bin="/arg/codex",
+            opencode_bin="/arg/opencode",
+            goose_bin="/arg/goose",
+        )
+
+        assert "/arg/claude" in out
+        assert "/arg/codex" in out
+        assert "/arg/opencode" in out
+        assert "/arg/goose" in out
+        assert "/env/claude" not in out
+        assert "/env/codex" not in out
+        assert "/env/opencode" not in out
+        assert "/env/goose" not in out
 
 
 class TestApplyBackendAwareModelValidation:
