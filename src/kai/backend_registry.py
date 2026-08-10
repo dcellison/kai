@@ -31,6 +31,7 @@ _BACKEND_ENV_VARS: dict[str, str] = {
     "opencode": "OPENCODE_BIN",
     "goose": "GOOSE_BIN",
 }
+_SUPPORTED_RUNTIME = "local_process"
 
 
 class BackendRegistryError(Exception):
@@ -117,24 +118,48 @@ def load_backend_registry(path: Path | None = None) -> dict[str, BackendRegistry
         backend = str(backend_id).strip().lower()
         if not backend:
             raise BackendRegistryError(f"backend registry {registry_path}: empty backend id")
+        if backend not in _BACKEND_ENV_VARS:
+            valid = ", ".join(sorted(_BACKEND_ENV_VARS))
+            raise BackendRegistryError(
+                f"backend registry {registry_path}: unsupported backend {backend!r}; valid backends: {valid}"
+            )
         if not isinstance(value, dict):
             raise BackendRegistryError(f"backend registry {registry_path}: backend {backend!r} must be a mapping")
         command = str(value.get("command") or "").strip()
         if not command:
             raise BackendRegistryError(f"backend registry {registry_path}: backend {backend!r} missing command")
+        driver = str(value.get("driver") or backend).strip().lower() or backend
+        if driver != backend:
+            raise BackendRegistryError(
+                f"backend registry {registry_path}: backend {backend!r} driver {driver!r} must match backend id"
+            )
+        runtime = str(value.get("runtime") or _SUPPORTED_RUNTIME).strip().lower() or _SUPPORTED_RUNTIME
+        if runtime != _SUPPORTED_RUNTIME:
+            raise BackendRegistryError(
+                f"backend registry {registry_path}: backend {backend!r} runtime {runtime!r} is not supported"
+            )
         models = value.get("allowed_models", [])
         if models is None:
             model_tuple: tuple[str, ...] = ()
         elif isinstance(models, list):
-            model_tuple = tuple(str(item).strip() for item in models if str(item).strip())
+            checked_models: list[str] = []
+            for item in models:
+                if not isinstance(item, str):
+                    raise BackendRegistryError(
+                        f"backend registry {registry_path}: backend {backend!r} allowed_models entries must be strings"
+                    )
+                model = item.strip()
+                if model:
+                    checked_models.append(model)
+            model_tuple = tuple(checked_models)
         else:
             raise BackendRegistryError(
                 f"backend registry {registry_path}: backend {backend!r} allowed_models must be a list"
             )
         entries[backend] = BackendRegistryEntry(
             id=backend,
-            driver=str(value.get("driver") or backend).strip() or backend,
-            runtime=str(value.get("runtime") or "local_process").strip() or "local_process",
+            driver=driver,
+            runtime=runtime,
             command=command,
             allowed_models=model_tuple,
         )

@@ -53,6 +53,29 @@ def test_present_registry_rejects_unknown_backend(tmp_path, monkeypatch):
         resolve_backend_command("codex")
 
 
+def test_registry_rejects_unsupported_backend_id(tmp_path, monkeypatch):
+    custom = _exe(tmp_path / "custom")
+    registry = tmp_path / "backends.yaml"
+    registry.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "backends": {
+                    "custom": {
+                        "driver": "custom",
+                        "runtime": "local_process",
+                        "command": str(custom),
+                    }
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("KAI_BACKENDS_YAML", str(registry))
+
+    with pytest.raises(BackendRegistryError, match="unsupported backend 'custom'"):
+        load_backend_registry()
+
+
 def test_registry_command_must_be_absolute(tmp_path, monkeypatch):
     registry = tmp_path / "backends.yaml"
     registry.write_text(
@@ -73,6 +96,98 @@ def test_registry_command_must_be_absolute(tmp_path, monkeypatch):
 
     with pytest.raises(BackendRegistryError, match="not absolute"):
         resolve_backend_command("claude")
+
+
+def test_registry_driver_must_match_backend_id(tmp_path, monkeypatch):
+    codex = _exe(tmp_path / "codex")
+    registry = tmp_path / "backends.yaml"
+    registry.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "backends": {
+                    "codex": {
+                        "driver": "claude",
+                        "runtime": "local_process",
+                        "command": str(codex),
+                    }
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("KAI_BACKENDS_YAML", str(registry))
+
+    with pytest.raises(BackendRegistryError, match="driver 'claude' must match backend id"):
+        load_backend_registry()
+
+
+def test_registry_runtime_must_be_local_process(tmp_path, monkeypatch):
+    codex = _exe(tmp_path / "codex")
+    registry = tmp_path / "backends.yaml"
+    registry.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "backends": {
+                    "codex": {
+                        "driver": "codex",
+                        "runtime": "container",
+                        "command": str(codex),
+                    }
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("KAI_BACKENDS_YAML", str(registry))
+
+    with pytest.raises(BackendRegistryError, match="runtime 'container' is not supported"):
+        load_backend_registry()
+
+
+def test_registry_defaults_driver_and_runtime_to_backend_local_process(tmp_path, monkeypatch):
+    codex = _exe(tmp_path / "codex")
+    registry = tmp_path / "backends.yaml"
+    registry.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "backends": {
+                    "codex": {
+                        "command": str(codex),
+                    }
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("KAI_BACKENDS_YAML", str(registry))
+
+    entry = load_backend_registry()["codex"]
+    assert entry.driver == "codex"
+    assert entry.runtime == "local_process"
+
+
+def test_registry_allowed_models_entries_must_be_strings(tmp_path, monkeypatch):
+    codex = _exe(tmp_path / "codex")
+    registry = tmp_path / "backends.yaml"
+    registry.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "backends": {
+                    "codex": {
+                        "driver": "codex",
+                        "runtime": "local_process",
+                        "command": str(codex),
+                        "allowed_models": ["gpt-5.6-sol", 56],
+                    }
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("KAI_BACKENDS_YAML", str(registry))
+
+    with pytest.raises(BackendRegistryError, match="allowed_models entries must be strings"):
+        load_backend_registry()
 
 
 @pytest.mark.parametrize("mode", [0o664, 0o646])
