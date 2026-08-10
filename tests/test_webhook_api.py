@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiohttp import web
 
+import kai.webhook as webhook_mod
 from kai import sessions
 from kai.internal_api_auth import InternalAPIAuth, InternalAPIPrincipal, InternalAPIScope
 from kai.services import ServiceResponse
@@ -42,6 +43,7 @@ from kai.webhook import (
     _handle_telegram_update,
     _handle_update_job,
     _resolve_chat_id,
+    stop,
 )
 
 
@@ -678,6 +680,65 @@ class TestTelegramUpdate:
 
         assert resp.status == 200
         telegram_request.app[TELEGRAM_APP_KEY].process_update.assert_not_called()
+
+
+# ── webhook shutdown background task drain ─────────────────────────
+
+
+class TestWebhookStopBackgroundTasks:
+    async def test_stop_waits_for_background_tasks_before_runner_cleanup(self, monkeypatch):
+        """Clean shutdown drains in-flight webhook work before tearing down aiohttp."""
+        events: list[str] = []
+
+        async def background_work():
+            await asyncio.sleep(0)
+            events.append("task")
+
+        async def cleanup():
+            events.append("cleanup")
+
+        task = asyncio.create_task(background_work())
+        webhook_mod._background_tasks.add(task)
+        task.add_done_callback(webhook_mod._background_tasks.discard)
+
+        runner = MagicMock()
+        runner.cleanup = AsyncMock(side_effect=cleanup)
+        monkeypatch.setattr(webhook_mod, "_runner", runner)
+        monkeypatch.setattr(webhook_mod, "_app", None)
+        monkeypatch.setattr(webhook_mod, "_webhook_registered", False)
+        monkeypatch.setattr(webhook_mod, "_health_monitor_task", None)
+
+        await stop()
+
+        assert events == ["task", "cleanup"]
+        assert webhook_mod._background_tasks == set()
+
+    async def test_stop_cancels_background_tasks_after_timeout(self, monkeypatch):
+        """Shutdown remains bounded if webhook background work does not finish."""
+        started = asyncio.Event()
+
+        async def background_work():
+            started.set()
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(background_work())
+        await started.wait()
+        webhook_mod._background_tasks.add(task)
+        task.add_done_callback(webhook_mod._background_tasks.discard)
+
+        runner = MagicMock()
+        runner.cleanup = AsyncMock()
+        monkeypatch.setattr(webhook_mod, "_runner", runner)
+        monkeypatch.setattr(webhook_mod, "_app", None)
+        monkeypatch.setattr(webhook_mod, "_webhook_registered", False)
+        monkeypatch.setattr(webhook_mod, "_health_monitor_task", None)
+        monkeypatch.setattr(webhook_mod, "_BACKGROUND_TASK_DRAIN_TIMEOUT", 0.001)
+
+        await stop()
+
+        assert task.cancelled()
+        assert webhook_mod._background_tasks == set()
+        runner.cleanup.assert_awaited_once()
 
 
 # ── GitHub webhook helpers ─────────────────────────────────────────

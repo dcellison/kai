@@ -118,6 +118,7 @@ _webhook_registered: bool = False
 # tasks, so an unreferenced task can be silently collected mid-execution).
 # Each task removes itself from the set via a done callback.
 _background_tasks: set[asyncio.Task] = set()
+_BACKGROUND_TASK_DRAIN_TIMEOUT = 30.0
 
 # Webhook health monitor task, started in start() and cancelled in stop().
 # Periodically checks Telegram's getWebhookInfo for delivery errors and
@@ -127,6 +128,48 @@ _health_monitor_task: asyncio.Task | None = None
 # How often to check webhook health (seconds). Frequent enough to catch
 # problems quickly, infrequent enough to avoid API rate limits.
 _HEALTH_CHECK_INTERVAL = 300  # 5 minutes
+
+
+async def _drain_background_tasks(timeout: float = _BACKGROUND_TASK_DRAIN_TIMEOUT) -> None:
+    """
+    Wait briefly for fire-and-forget webhook work during shutdown.
+
+    Telegram update processing, PR review, and issue triage are launched as
+    background tasks so inbound webhooks can be acknowledged promptly. During a
+    controlled shutdown, let those tasks finish before tearing down the server.
+    If they overrun the bounded timeout, cancel them rather than hanging
+    shutdown indefinitely.
+    """
+    pending = {task for task in _background_tasks if not task.done()}
+    if not pending:
+        return
+
+    log.info("Waiting for %d webhook background task(s) to finish", len(pending))
+    done, still_pending = await asyncio.wait(pending, timeout=timeout)
+    for task in done:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("Webhook background task failed during shutdown")
+        finally:
+            _background_tasks.discard(task)
+
+    if not still_pending:
+        return
+
+    log.warning(
+        "Cancelling %d webhook background task(s) after %.1fs shutdown timeout",
+        len(still_pending),
+        timeout,
+    )
+    for task in still_pending:
+        task.cancel()
+    await asyncio.gather(*still_pending, return_exceptions=True)
+    for task in still_pending:
+        _background_tasks.discard(task)
+
 
 # If Telegram reports an error within this window, re-register the webhook.
 # Slightly longer than the check interval so a single transient error
@@ -2360,6 +2403,7 @@ async def stop() -> None:
             except Exception:
                 log.warning("Failed to deregister Telegram webhook (will re-register on next start)")
         _webhook_registered = False
+    await _drain_background_tasks(_BACKGROUND_TASK_DRAIN_TIMEOUT)
     if _runner:
         await _runner.cleanup()
         log.info("Webhook server stopped")
