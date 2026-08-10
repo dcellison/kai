@@ -3596,6 +3596,7 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
     claude_user = user_config.os_user if user_config and user_config.os_user else None
     agent_backend, provider = get_user_backend_and_provider(user_config, config)
     model_override = resolve_user_model(ModelRole.PR_REVIEW, user_config, config)
+    github_token = await sessions.get_setting(f"github_token:{actor_id}")
 
     # Only pass the workspace as `local_repo_path` when its `origin`
     # remote actually matches the target repo. Otherwise the bundle
@@ -3624,6 +3625,7 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
             provider=provider,
             timeout_s=config.pr_review_timeout_s,
             model_override=model_override,
+            github_token=github_token,
         )
     except Exception as exc:
         log.exception("Manual review failed for %s#%d", repo, pr_number)

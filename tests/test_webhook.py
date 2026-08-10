@@ -402,6 +402,13 @@ def _make_pr_payload(action: str, pr_number: int = 42, merged: bool = False) -> 
     }
 
 
+@pytest.fixture(autouse=True)
+def _default_github_token_lookup():
+    """Webhook tests default to no stored per-user GitHub token."""
+    with patch("kai.webhook.sessions.get_setting", new_callable=AsyncMock, return_value=None):
+        yield
+
+
 def _build_test_app(
     cooldown: int = 300,
     config: object | None = None,
@@ -551,6 +558,12 @@ class TestPRReviewRouting:
     def _stub_review_and_triage(self, _mock_review_and_triage):
         """Default routing tests do not need real review_pr / triage_issue."""
         yield
+
+    @pytest.fixture(autouse=True)
+    def _mock_github_token_setting(self):
+        """Default routing tests run without a stored per-user GitHub token."""
+        with patch("kai.webhook.sessions.get_setting", new_callable=AsyncMock, return_value=None):
+            yield
 
     @pytest.mark.asyncio
     async def test_routes_opened_when_enabled(self, _clear_cooldowns, _mock_resolve_repo):
@@ -726,6 +739,7 @@ class TestPRReviewRouting:
 
         with (
             _mock_settings(pr_review=True),
+            patch("kai.webhook.sessions.get_setting", new_callable=AsyncMock, return_value="ghp_user"),
             patch("kai.webhook.review.review_pr", new_callable=AsyncMock) as mock_review,
         ):
             async with TestClient(TestServer(app)) as client:
@@ -761,6 +775,7 @@ class TestPRReviewRouting:
             # silently pass a MagicMock instance here, vacuously
             # satisfying mocked review_pr but failing under real code.
             assert isinstance(call_kwargs[1]["model_override"], str)
+            assert call_kwargs[1]["github_token"] == "ghp_user"
             # _resolve_local_repo is mocked to return None here;
             # dedicated tests for resolution logic are in TestResolveLocalRepo.
             assert call_kwargs[1]["local_repo_path"] is None

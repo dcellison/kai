@@ -5919,6 +5919,12 @@ class TestHandleReviewCommand:
     warning surfacing).
     """
 
+    @pytest.fixture(autouse=True)
+    def _mock_github_token_setting(self):
+        """Default manual review tests run without a stored per-user GitHub token."""
+        with patch("kai.bot.sessions.get_setting", new_callable=AsyncMock, return_value=None):
+            yield
+
     @pytest.mark.asyncio
     async def test_short_form_uses_workspace_git_remote_match(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
@@ -5946,6 +5952,7 @@ class TestHandleReviewCommand:
                 "kai.sessions.get_effective_repos",
                 new=AsyncMock(return_value=["dcellison/kai", "dcellison/other"]),
             ),
+            patch("kai.bot.sessions.get_setting", new=AsyncMock(return_value="ghp_user")),
             patch(
                 "kai.bot.review.generate_pr_review",
                 new=AsyncMock(return_value=_review_result()),
@@ -5954,6 +5961,7 @@ class TestHandleReviewCommand:
             await handle_review_command(update, ctx)
 
         assert mock_generate.call_args.args == ("dcellison/kai", 681)
+        assert mock_generate.call_args.kwargs["github_token"] == "ghp_user"
 
     @pytest.mark.asyncio
     async def test_short_form_falls_back_to_sole_configured_repo(self, tmp_path, monkeypatch):

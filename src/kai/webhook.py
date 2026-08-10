@@ -891,6 +891,7 @@ async def _process_github_event_for_user(
     # Resolve this user's effective GitHub settings
     settings = await sessions.resolve_github_settings(chat_id, config)
     target_chat_id = settings["notify_chat_id"]
+    github_token = await sessions.get_setting(f"github_token:{chat_id}")
 
     # Resolve per-user os_user for subprocess isolation. None falls
     # back to "run as the bot's own OS user" inside the agent backend.
@@ -973,6 +974,7 @@ async def _process_github_event_for_user(
                     provider=provider,
                     timeout_s=request.app[PR_REVIEW_TIMEOUT_S_KEY],
                     model_override=pr_review_model_override,
+                    github_token=github_token,
                 )
             )
             _background_tasks.add(task)

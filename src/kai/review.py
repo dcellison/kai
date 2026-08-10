@@ -33,6 +33,7 @@ import binascii
 import glob as glob_mod
 import json
 import logging
+import os
 import re
 import urllib.parse
 from dataclasses import dataclass, field
@@ -73,6 +74,20 @@ _REVIEW_TIMEOUT = 900
 # Header prepended to every review comment on GitHub. Distinguishes
 # automated reviews from human comments. Per design decision #11.
 _REVIEW_HEADER = "## Review by Kai\n\n"
+
+
+def _github_cli_env(github_token: str | None) -> dict[str, str] | None:
+    """Return a gh subprocess environment pinned to a user token, if present."""
+    token = github_token.strip() if github_token else ""
+    if not token:
+        return None
+    env = dict(os.environ)
+    # gh recognizes GH_TOKEN first; GITHUB_TOKEN is also supported for
+    # GitHub.com. Set both so a daemon-level token cannot leak through.
+    env["GH_TOKEN"] = token
+    env["GITHUB_TOKEN"] = token
+    return env
+
 
 # Maximum total characters of prior review comments to include in the
 # prompt. Oldest reviews are truncated first if the cap is exceeded,
@@ -680,7 +695,7 @@ async def load_conventions(
 # ── Prior comment awareness ────────────────────────────────────────
 
 
-async def fetch_prior_comments(repo: str, pr_number: int) -> str | None:
+async def fetch_prior_comments(repo: str, pr_number: int, github_token: str | None = None) -> str | None:
     """
     Fetch prior review comments from the PR's comment thread.
 
@@ -714,6 +729,7 @@ async def fetch_prior_comments(repo: str, pr_number: int) -> str | None:
             ".[]",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=_github_cli_env(github_token),
         )
         stdout, stderr = await proc.communicate()
 
@@ -950,7 +966,7 @@ def build_review_prompt(
     return "\n".join(parts)
 
 
-async def fetch_pr_diff(repo: str, pr_number: int) -> str:
+async def fetch_pr_diff(repo: str, pr_number: int, github_token: str | None = None) -> str:
     """
     Fetch the diff for a PR using the GitHub CLI.
 
@@ -976,6 +992,7 @@ async def fetch_pr_diff(repo: str, pr_number: int) -> str:
         repo,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_github_cli_env(github_token),
     )
     stdout, stderr = await proc.communicate()
 
@@ -1000,7 +1017,11 @@ _PR_VIEW_FIELDS = (
 )
 
 
-async def fetch_extended_pr_metadata(repo: str, pr_number: int) -> ExtendedPRMetadata:
+async def fetch_extended_pr_metadata(
+    repo: str,
+    pr_number: int,
+    github_token: str | None = None,
+) -> ExtendedPRMetadata:
     """
     Fetch the bundle's view of PR metadata via `gh pr view --json`.
 
@@ -1037,6 +1058,7 @@ async def fetch_extended_pr_metadata(repo: str, pr_number: int) -> ExtendedPRMet
         _PR_VIEW_FIELDS,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_github_cli_env(github_token),
     )
     stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
@@ -1087,7 +1109,7 @@ async def fetch_extended_pr_metadata(repo: str, pr_number: int) -> ExtendedPRMet
 _ISSUE_VIEW_FIELDS = "number,title,body,state,url,labels,comments"
 
 
-async def fetch_linked_issue(repo: str, issue_number: int) -> LinkedIssue:
+async def fetch_linked_issue(repo: str, issue_number: int, github_token: str | None = None) -> LinkedIssue:
     """
     Fetch a single linked issue via `gh issue view --json`.
 
@@ -1117,6 +1139,7 @@ async def fetch_linked_issue(repo: str, issue_number: int) -> LinkedIssue:
         _ISSUE_VIEW_FIELDS,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_github_cli_env(github_token),
     )
     stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
@@ -1152,6 +1175,7 @@ async def fetch_linked_issue(repo: str, issue_number: int) -> LinkedIssue:
 async def fetch_linked_issues(
     repo: str,
     issue_numbers: tuple[int, ...],
+    github_token: str | None = None,
 ) -> tuple[tuple[LinkedIssue, ...], tuple[CollectionWarning, ...]]:
     """
     Fetch every linked issue in parallel; per-issue failures are warnings.
@@ -1178,7 +1202,7 @@ async def fetch_linked_issues(
     # network call. return_exceptions=True keeps a single failure from
     # poisoning the gather; we classify per-task below.
     results = await asyncio.gather(
-        *(fetch_linked_issue(repo, n) for n in issue_numbers),
+        *(fetch_linked_issue(repo, n, github_token=github_token) for n in issue_numbers),
         return_exceptions=True,
     )
     issues: list[LinkedIssue] = []
@@ -1253,6 +1277,7 @@ async def _fetch_file_at_head(
     repo: str,
     head_oid: str,
     path: str,
+    github_token: str | None = None,
 ) -> tuple[str | None, str | None]:
     """
     Fetch a single file's contents at `head_oid` via the GitHub contents API.
@@ -1282,6 +1307,7 @@ async def _fetch_file_at_head(
         f"repos/{repo}/contents/{encoded_path}?ref={head_oid}",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_github_cli_env(github_token),
     )
     stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
@@ -1336,6 +1362,7 @@ async def _fetch_file_at_head(
 
 async def fetch_changed_files_at_head(
     metadata: ExtendedPRMetadata,
+    github_token: str | None = None,
 ) -> tuple[tuple[ChangedFile, ...], tuple[CollectionWarning, ...]]:
     """
     Fetch full file contents at the PR head for every changed file.
@@ -1398,7 +1425,10 @@ async def fetch_changed_files_at_head(
 
     if fetchable:
         results = await asyncio.gather(
-            *(_fetch_file_at_head(metadata.repo, metadata.head_oid, p) for _, p, _ in fetchable),
+            *(
+                _fetch_file_at_head(metadata.repo, metadata.head_oid, p, github_token=github_token)
+                for _, p, _ in fetchable
+            ),
             return_exceptions=True,
         )
         for (idx, path, status), result in zip(fetchable, results, strict=True):
@@ -2575,6 +2605,7 @@ async def build_pr_review_context(
     local_repo_path: str | None = None,
     spec_dir: str = "specs",
     include_prior_comments: bool = True,
+    github_token: str | None = None,
 ) -> PRReviewContext:
     """
     Collect the full review-context bundle for a PR.
@@ -2612,14 +2643,14 @@ async def build_pr_review_context(
     """
     warnings: list[CollectionWarning] = []
 
-    metadata = await fetch_extended_pr_metadata(repo, pr_number)
-    patch = await fetch_pr_diff(repo, pr_number)
+    metadata = await fetch_extended_pr_metadata(repo, pr_number, github_token=github_token)
+    patch = await fetch_pr_diff(repo, pr_number, github_token=github_token)
 
     # Collection of independent fetchers in parallel. Each returns
     # (data, warnings) so a single failing fetcher cannot poison the
     # whole bundle.
-    linked_task = fetch_linked_issues(repo, metadata.closing_issue_numbers)
-    files_task = fetch_changed_files_at_head(metadata)
+    linked_task = fetch_linked_issues(repo, metadata.closing_issue_numbers, github_token=github_token)
+    files_task = fetch_changed_files_at_head(metadata, github_token=github_token)
 
     (linked_issues, linked_warnings), (changed_files, files_warnings) = await asyncio.gather(linked_task, files_task)
     warnings.extend(linked_warnings)
@@ -2630,7 +2661,7 @@ async def build_pr_review_context(
     # and bodies in the `commits` payload. Re-pull that payload here
     # so the bundle carries the bodies even though
     # `ExtendedPRMetadata` only holds OIDs.
-    commits = await _fetch_pr_commits(repo, pr_number)
+    commits = await _fetch_pr_commits(repo, pr_number, github_token=github_token)
 
     # Symbol extraction is pure; surrounding-code search is async
     # because rg invocations run concurrently.
@@ -2659,7 +2690,7 @@ async def build_pr_review_context(
     prior_comments = None
     if include_prior_comments:
         try:
-            prior_comments = await fetch_prior_comments(repo, pr_number)
+            prior_comments = await fetch_prior_comments(repo, pr_number, github_token=github_token)
         except Exception:
             log.warning("Failed to fetch prior comments for %s#%d", repo, pr_number, exc_info=True)
             warnings.append(
@@ -2686,7 +2717,7 @@ async def build_pr_review_context(
     return budget_review_context(raw)
 
 
-async def _fetch_pr_commits(repo: str, pr_number: int) -> tuple[Commit, ...]:
+async def _fetch_pr_commits(repo: str, pr_number: int, github_token: str | None = None) -> tuple[Commit, ...]:
     """
     Fetch per-commit headline + body via `gh pr view --json commits`.
 
@@ -2709,6 +2740,7 @@ async def _fetch_pr_commits(repo: str, pr_number: int) -> tuple[Commit, ...]:
         "commits",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_github_cli_env(github_token),
     )
     stdout, _ = await proc.communicate()
     if proc.returncode != 0:
@@ -3121,7 +3153,7 @@ async def run_review(
         return result.text
 
 
-async def post_review_comment(repo: str, pr_number: int, review: str) -> bool:
+async def post_review_comment(repo: str, pr_number: int, review: str, github_token: str | None = None) -> bool:
     """
     Post the review as a single GitHub PR comment via the gh CLI.
 
@@ -3154,6 +3186,7 @@ async def post_review_comment(repo: str, pr_number: int, review: str) -> bool:
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_github_cli_env(github_token),
     )
     _, stderr = await proc.communicate(input=comment_body.encode())
 
@@ -3226,6 +3259,7 @@ async def generate_pr_review(
     provider: str = "",
     timeout_s: int = _REVIEW_TIMEOUT,
     model_override: str = "",
+    github_token: str | None = None,
 ) -> PRReviewResult:
     """
     Build the review bundle, render the prompt, and run the review backend.
@@ -3267,6 +3301,7 @@ async def generate_pr_review(
         local_repo_path=local_repo_path,
         spec_dir=spec_dir,
         include_prior_comments=include_prior_comments,
+        github_token=github_token,
     )
     prompt = build_review_prompt_from_context(context)
     review_text = await run_review(
@@ -3299,6 +3334,7 @@ async def review_pr(
     provider: str = "",
     timeout_s: int = _REVIEW_TIMEOUT,
     model_override: str = "",
+    github_token: str | None = None,
 ) -> None:
     """
     Full review pipeline: build the bundle, run the review, post results.
@@ -3334,7 +3370,7 @@ async def review_pr(
         # that produced no reviewable change. Skipping early avoids
         # pulling the rest of the bundle (linked issues, file
         # contents, related search) for a no-op review.
-        early_patch = await fetch_pr_diff(metadata.repo, metadata.number)
+        early_patch = await fetch_pr_diff(metadata.repo, metadata.number, github_token=github_token)
         if not early_patch.strip():
             log.info("Empty diff for %s#%d, skipping review", metadata.repo, metadata.number)
             return
@@ -3350,6 +3386,7 @@ async def review_pr(
             provider=provider,
             timeout_s=timeout_s,
             model_override=model_override,
+            github_token=github_token,
         )
 
         if not result.review_text.strip():
@@ -3357,7 +3394,9 @@ async def review_pr(
             await send_review_summary(metadata, False, webhook_port, webhook_secret, notify_chat_id)
             return
 
-        posted = await post_review_comment(metadata.repo, metadata.number, result.review_text)
+        posted = await post_review_comment(
+            metadata.repo, metadata.number, result.review_text, github_token=github_token
+        )
         await send_review_summary(metadata, posted, webhook_port, webhook_secret, notify_chat_id)
 
     except Exception:

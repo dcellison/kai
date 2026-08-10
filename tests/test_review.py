@@ -508,6 +508,18 @@ class TestFetchPRDiff:
         assert "+added" in result
 
     @pytest.mark.asyncio
+    async def test_user_token_sets_gh_environment(self):
+        """A supplied user PAT overrides inherited gh authentication."""
+        mock_proc = _mock_process(stdout=b"diff --git a/foo.py b/foo.py\n+added\n")
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await fetch_pr_diff("owner/repo", 42, github_token="ghp_user")
+
+        env = mock_exec.call_args.kwargs["env"]
+        assert env["GH_TOKEN"] == "ghp_user"
+        assert env["GITHUB_TOKEN"] == "ghp_user"
+
+    @pytest.mark.asyncio
     async def test_failure_raises(self):
         """Non-zero exit from gh pr diff raises RuntimeError with the error message."""
         mock_proc = _mock_process(stderr=b"not found", returncode=1)
@@ -1005,6 +1017,19 @@ class TestPostReviewComment:
         assert "Looks good." in stdin_text
 
     @pytest.mark.asyncio
+    async def test_user_token_sets_gh_environment(self):
+        """Comment posting uses the supplied user's GitHub token."""
+        mock_proc = _mock_process(returncode=0)
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            result = await post_review_comment("owner/repo", 42, "Looks good.", github_token="ghp_user")
+
+        assert result is True
+        env = mock_exec.call_args.kwargs["env"]
+        assert env["GH_TOKEN"] == "ghp_user"
+        assert env["GITHUB_TOKEN"] == "ghp_user"
+
+    @pytest.mark.asyncio
     async def test_failure_returns_false(self):
         """Failed gh pr comment returns False."""
         mock_proc = _mock_process(stderr=b"not found", returncode=1)
@@ -1158,11 +1183,11 @@ class TestReviewPR:
         ):
             await review_pr(payload, 8080, "secret", claude_user="kai")
 
-        mock_diff.assert_called_once_with("owner/repo", 42)
+        mock_diff.assert_called_once_with("owner/repo", 42, github_token=None)
         mock_generate.assert_called_once()
         assert mock_generate.call_args.args == ("owner/repo", 42)
         assert mock_generate.call_args.kwargs["claude_user"] == "kai"
-        mock_post.assert_called_once_with("owner/repo", 42, "review output")
+        mock_post.assert_called_once_with("owner/repo", 42, "review output", github_token=None)
 
         expected_meta = PRMetadata(
             repo="owner/repo",
@@ -1293,6 +1318,26 @@ class TestReviewPR:
         assert kwargs["provider"] == "openai"
         assert kwargs["timeout_s"] == 42
         assert kwargs["model_override"] == "gpt-foo"
+
+    @pytest.mark.asyncio
+    async def test_forwards_github_token_to_fetch_generate_and_post(self):
+        """Webhook reviews use one per-user token for every gh subprocess stage."""
+        payload = _webhook_payload()
+
+        with (
+            patch("kai.review.fetch_pr_diff", return_value="diff content") as mock_diff,
+            patch(
+                "kai.review.generate_pr_review",
+                return_value=_result(),
+            ) as mock_generate,
+            patch("kai.review.post_review_comment", return_value=True) as mock_post,
+            patch("kai.review.send_review_summary"),
+        ):
+            await review_pr(payload, 8080, "secret", github_token="ghp_user")
+
+        mock_diff.assert_called_once_with("owner/repo", 42, github_token="ghp_user")
+        assert mock_generate.call_args.kwargs["github_token"] == "ghp_user"
+        mock_post.assert_called_once_with("owner/repo", 42, "review output", github_token="ghp_user")
 
 
 # ── resolve_spec_from_body ─────────────────────────────────────────

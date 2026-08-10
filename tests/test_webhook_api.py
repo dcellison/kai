@@ -72,6 +72,13 @@ async def db(tmp_path):
     await sessions.close_db()
 
 
+@pytest.fixture(autouse=True)
+def _default_github_token_lookup():
+    """Webhook API tests default to no stored per-user GitHub token."""
+    with patch("kai.webhook.sessions.get_setting", new_callable=AsyncMock, return_value=None):
+        yield
+
+
 @pytest.fixture
 def mock_request():
     """Create a minimal mock request with app dict and helpers."""
