@@ -5675,13 +5675,14 @@ def _configured_install_backends(env: dict[str, str], users_yaml_path: str | Pat
     return configured & VALID_BACKENDS
 
 
-def _backend_registry_entries(service_user: str, env: dict[str, str], users_yaml_path: str | Path | None = None) -> dict[str, dict[str, object]]:
+def _backend_registry_entries(
+    service_user: str, env: dict[str, str], users_yaml_path: str | Path | None = None
+) -> dict[str, dict[str, object]]:
     """Build backend registry entries from discovered global installs."""
     discovered = _discover_backend_commands(service_user)
     if not discovered:
         raise SystemExit(
-            "No supported backend command was found. Install at least one of: "
-            "claude, codex, goose, opencode."
+            "No supported backend command was found. Install at least one of: claude, codex, goose, opencode."
         )
 
     missing = sorted(_configured_install_backends(env, users_yaml_path) - discovered.keys())
