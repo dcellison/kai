@@ -4148,6 +4148,7 @@ class TestApplyDirectories:
         _apply_directories(install, data, 503, 20, dry_run=False, workspace_base=None)
 
         mode_by_path = dict(chmods)
+        assert mode_by_path[str(data / "files")] == 0o711
         assert mode_by_path[str(data / "memory")] == 0o711
         assert mode_by_path[str(data / "preferences")] == 0o711
         assert mode_by_path[str(data / "home")] == 0o711

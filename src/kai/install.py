@@ -4857,7 +4857,7 @@ def _apply_directories(
         (home_path, svc_uid, svc_gid, 0o755),  # user-writable home workspace
         (data_path, svc_uid, svc_gid, 0o755),  # user-owned data dir
         (data_path / "logs", svc_uid, svc_gid, 0o755),
-        (data_path / "files", svc_uid, svc_gid, 0o755),
+        (data_path / "files", svc_uid, svc_gid, _PRIVATE_USER_ROOT_MODE),
         (data_path / "history", svc_uid, svc_gid, 0o755),
         (data_path / "memory", svc_uid, svc_gid, _PRIVATE_USER_ROOT_MODE),
         # Per-user preferences root (#400). Top-level dir is service-

@@ -10,6 +10,7 @@ handler using mock Telegram Update/Context objects.
 import asyncio
 import json
 import logging
+import stat
 from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
@@ -431,6 +432,7 @@ class TestSaveUpload:
         monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         _save_upload(b"hello", "test.txt")
         assert (tmp_path / "files").is_dir()
+        assert stat.S_IMODE((tmp_path / "files").stat().st_mode) == 0o711
 
     def test_saves_content_correctly(self, tmp_path, monkeypatch):
         """Written bytes match the input exactly."""
@@ -439,6 +441,44 @@ class TestSaveUpload:
         data = b"binary content here"
         result = _save_upload(data, "doc.pdf")
         assert result.read_bytes() == data
+        assert stat.S_IMODE(result.stat().st_mode) == 0o600
+
+    def test_per_user_directory_is_traversal_only(self, tmp_path, monkeypatch):
+        """Per-user upload dirs are not listable by sibling local users."""
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        result = _save_upload(b"x", "report.pdf", user_id=123)
+        assert result.parent == tmp_path / "files" / "123"
+        assert stat.S_IMODE((tmp_path / "files").stat().st_mode) == 0o711
+        assert stat.S_IMODE(result.parent.stat().st_mode) == 0o711
+        assert stat.S_IMODE(result.stat().st_mode) == 0o600
+
+    def test_macos_reader_user_gets_named_read_acl(self, tmp_path, monkeypatch):
+        """Cross-user protected installs grant the target os_user exact-file read access."""
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        completed = MagicMock(returncode=0, stderr="")
+        with (
+            patch("kai.bot.sys.platform", "darwin"),
+            patch("kai.bot.subprocess.run", return_value=completed) as run,
+        ):
+            result = _save_upload(b"x", "report.pdf", user_id=123, reader_user="alice")
+
+        command = run.call_args.args[0]
+        assert command[:2] == ["/bin/chmod", "+a"]
+        assert command[2] == "user:alice allow read,readattr,readextattr,readsecurity"
+        assert command[3] == str(result)
+        assert stat.S_IMODE(result.stat().st_mode) == 0o600
+
+    def test_linux_missing_setfacl_fails_closed(self, tmp_path, monkeypatch):
+        """If a protected handoff cannot grant read access, no unreadable path is left behind."""
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        with (
+            patch("kai.bot.sys.platform", "linux"),
+            patch("kai.bot.shutil.which", return_value=None),
+            pytest.raises(OSError, match="setfacl is required"),
+        ):
+            _save_upload(b"x", "report.pdf", user_id=123, reader_user="alice")
+
+        assert list((tmp_path / "files" / "123").glob("*")) == []
 
     def test_filename_contains_original_name(self, tmp_path, monkeypatch):
         """Saved filename preserves the original name after the timestamp."""

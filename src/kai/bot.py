@@ -38,6 +38,8 @@ import math
 import os
 import re
 import shutil
+import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -78,6 +80,9 @@ from kai.telegram_utils import chunk_text
 from kai.transcribe import TranscriptionError, transcribe_voice
 from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
 from kai.workspace_utils import is_workspace_allowed
+
+_UPLOAD_ROOT_MODE = 0o711
+_UPLOAD_FILE_MODE = 0o600
 
 # TOTP is optional for single-user development (requires pip install
 # -e '.[totp]'). A missing extra may disable the gate only when neither
@@ -3668,7 +3673,12 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
     staged: Path | None = None
     staging_failed = False
     try:
-        staged = _save_upload(body.encode(), f"pr-{pr_number}-review.md", user_id=chat_id)
+        staged = _save_upload(
+            body.encode(),
+            f"pr-{pr_number}-review.md",
+            user_id=chat_id,
+            reader_user=claude_user,
+        )
     except OSError:
         staging_failed = True
         log.exception("Failed to stage review copy for %s#%d", repo, pr_number)
@@ -3793,7 +3803,43 @@ async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_T
 # ── Media message handlers ──────────────────────────────────────────
 
 
-def _save_upload(data: bytes, filename: str, user_id: int | None = None) -> Path:
+def _grant_upload_read_access(path: Path, reader_user: str) -> None:
+    """Grant one target OS user read access to a private upload file."""
+    if sys.platform == "darwin":
+        command = [
+            "/bin/chmod",
+            "+a",
+            f"user:{reader_user} allow read,readattr,readextattr,readsecurity",
+            str(path),
+        ]
+    elif sys.platform.startswith("linux"):
+        setfacl = shutil.which("setfacl")
+        if setfacl is None:
+            raise OSError("setfacl is required for isolated uploaded-file handoff on Linux")
+        command = [setfacl, "-m", f"u:{reader_user}:r--", str(path)]
+    else:
+        raise OSError(f"isolated uploaded-file handoff is unsupported on {sys.platform}")
+
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit status {result.returncode}"
+        raise OSError(f"could not grant upload access to {reader_user}: {detail}")
+
+
+def _upload_reader_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str | None:
+    """Return the configured target OS user that must read uploaded files."""
+    config: Config = context.bot_data["config"]
+    user_config = config.get_user_config(chat_id)
+    return user_config.os_user if user_config and user_config.os_user else None
+
+
+def _save_upload(
+    data: bytes,
+    filename: str,
+    user_id: int | None = None,
+    *,
+    reader_user: str | None = None,
+) -> Path:
     """
     Save file bytes to DATA_DIR/files/ with a timestamped name.
 
@@ -3807,10 +3853,16 @@ def _save_upload(data: bytes, filename: str, user_id: int | None = None) -> Path
     When None, uses the shared DATA_DIR/files/ directory (backward-
     compatible for single-user deployments).
 
+    Upload directories are traversal-only and files are private. In protected
+    installs where the agent runs as a different os_user, reader_user gets a
+    named read ACL so the exact file path can be consumed without making the
+    upload listable or world-readable.
+
     Args:
         data: Raw file bytes to write.
         filename: Original filename from Telegram (sanitized before use).
         user_id: Optional Telegram user ID for per-user file isolation.
+        reader_user: Optional OS user that should receive read access.
 
     Returns:
         Absolute path to the saved file.
@@ -3820,6 +3872,9 @@ def _save_upload(data: bytes, filename: str, user_id: int | None = None) -> Path
     else:
         files_dir = DATA_DIR / "files"
     files_dir.mkdir(parents=True, exist_ok=True)
+    (DATA_DIR / "files").chmod(_UPLOAD_ROOT_MODE)
+    if user_id is not None:
+        files_dir.chmod(_UPLOAD_ROOT_MODE)
 
     # Timestamp prefix ensures unique names even if the same file is sent twice
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -3829,7 +3884,17 @@ def _save_upload(data: bytes, filename: str, user_id: int | None = None) -> Path
     if not safe_name:
         safe_name = "unnamed_file"
     dest = files_dir / f"{ts}_{safe_name}"
-    dest.write_bytes(data)
+    try:
+        dest.write_bytes(data)
+        dest.chmod(_UPLOAD_FILE_MODE)
+        if reader_user is not None:
+            _grant_upload_read_access(dest, reader_user)
+    except OSError:
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     return dest
 
 
@@ -3852,6 +3917,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     chat_id = _chat_id(update)
     pool = _get_pool(context)
     model = pool.get_model(chat_id)
+    reader_user = _upload_reader_user(context, chat_id)
 
     # Download the largest available resolution (last in the list)
     photo = update.message.photo[-1]
@@ -3861,7 +3927,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     b64 = base64.b64encode(raw).decode()
 
     # Save to DATA_DIR/files/ so Claude can access the file via shell tools
-    saved = _save_upload(raw, f"photo_{photo.file_unique_id}.jpg", user_id=chat_id)
+    try:
+        saved = _save_upload(raw, f"photo_{photo.file_unique_id}.jpg", user_id=chat_id, reader_user=reader_user)
+    except OSError as exc:
+        log.exception("Failed to save uploaded photo for chat %d", chat_id)
+        await update.message.reply_text(f"Couldn't save the upload for agent access: {exc}")
+        return
 
     caption = update.message.caption or "What's in this image?"
     caption += f"\n[File saved to: {saved}]"
@@ -3982,6 +4053,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     chat_id = _chat_id(update)
     pool = _get_pool(context)
     model = pool.get_model(chat_id)
+    reader_user = _upload_reader_user(context, chat_id)
 
     if suffix in _IMAGE_MEDIA_TYPES:
         # Handle images sent as documents (uncompressed upload)
@@ -3992,7 +4064,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         media_type = _IMAGE_MEDIA_TYPES[suffix]
 
         # Save to DATA_DIR/files/ so Claude can access the file via shell tools
-        saved = _save_upload(raw, file_name, user_id=chat_id)
+        try:
+            saved = _save_upload(raw, file_name, user_id=chat_id, reader_user=reader_user)
+        except OSError as exc:
+            log.exception("Failed to save uploaded image document for chat %d", chat_id)
+            await update.message.reply_text(f"Couldn't save the upload for agent access: {exc}")
+            return
         img_caption = caption or f"What's in this image ({file_name})?"
         img_caption += f"\n[File saved to: {saved}]"
 
@@ -4018,7 +4095,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         # Save to DATA_DIR/files/ so Claude can access the file via shell tools
-        saved = _save_upload(raw, file_name, user_id=chat_id)
+        try:
+            saved = _save_upload(raw, file_name, user_id=chat_id, reader_user=reader_user)
+        except OSError as exc:
+            log.exception("Failed to save uploaded text document for chat %d", chat_id)
+            await update.message.reply_text(f"Couldn't save the upload for agent access: {exc}")
+            return
         header = f"File: {file_name}\n```\n{text_content}\n```\n[File saved to: {saved}]"
 
         user_log = log_message(
@@ -4036,7 +4118,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # can work with the file via shell tools (e.g., unzip, pdftotext, etc.)
         file = await context.bot.get_file(doc.file_id)
         data = await file.download_as_bytearray()
-        saved = _save_upload(bytes(data), file_name, user_id=chat_id)
+        try:
+            saved = _save_upload(bytes(data), file_name, user_id=chat_id, reader_user=reader_user)
+        except OSError as exc:
+            log.exception("Failed to save uploaded document for chat %d", chat_id)
+            await update.message.reply_text(f"Couldn't save the upload for agent access: {exc}")
+            return
 
         user_log = log_message(
             direction="user",
