@@ -97,6 +97,22 @@ class TestTelegramUpdateQueue:
         assert second_claim["attempt_count"] == 2
         assert second_claim["last_error"] == "temporary failure"
 
+    async def test_discard_marks_processing_update_done_with_error(self, db):
+        row_id, _ = await sessions.enqueue_telegram_update(1005, '{"update_id":1005}')
+        claimed = await sessions.claim_next_telegram_update()
+        assert claimed is not None
+
+        assert await sessions.discard_telegram_update(row_id, "poison update") is True
+
+        async with sessions._get_db().execute(
+            "SELECT status, last_error FROM telegram_update_queue WHERE id = ?",
+            (row_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row["status"] == "done"
+        assert row["last_error"] == "poison update"
+        assert await sessions.claim_next_telegram_update() is None
+
     async def test_requeue_processing_updates_for_startup_recovery(self, db):
         row_id, _ = await sessions.enqueue_telegram_update(1004, '{"update_id":1004}')
         first_claim = await sessions.claim_next_telegram_update()

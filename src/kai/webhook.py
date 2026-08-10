@@ -119,6 +119,8 @@ _webhook_registered: bool = False
 # Each task removes itself from the set via a done callback.
 _background_tasks: set[asyncio.Task] = set()
 _BACKGROUND_TASK_DRAIN_TIMEOUT = 30.0
+_telegram_queue_worker_task: asyncio.Task | None = None
+_TELEGRAM_UPDATE_MAX_ATTEMPTS = 5
 
 # Webhook health monitor task, started in start() and cancelled in stop().
 # Periodically checks Telegram's getWebhookInfo for delivery errors and
@@ -169,6 +171,74 @@ async def _drain_background_tasks(timeout: float = _BACKGROUND_TASK_DRAIN_TIMEOU
     await asyncio.gather(*still_pending, return_exceptions=True)
     for task in still_pending:
         _background_tasks.discard(task)
+
+
+async def _process_queued_telegram_update(
+    row: sessions.TelegramUpdateQueueRow,
+    telegram_app: Application,
+    bot: Bot,
+) -> None:
+    row_id = row["id"]
+    try:
+        data = json.loads(row["payload"])
+        update = Update.de_json(data, bot)
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        log.exception("Discarding malformed queued Telegram update %s", row_id)
+        await sessions.discard_telegram_update(row_id, error)
+        return
+
+    if update is None:
+        await sessions.complete_telegram_update(row_id)
+        return
+
+    try:
+        await telegram_app.process_update(update)
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        if row["attempt_count"] >= _TELEGRAM_UPDATE_MAX_ATTEMPTS:
+            log.exception(
+                "Discarding Telegram update queue row %s after %d failed attempt(s)",
+                row_id,
+                row["attempt_count"],
+            )
+            await sessions.discard_telegram_update(row_id, error)
+            return
+        log.exception("Telegram update queue row %s failed; retrying later", row_id)
+        await sessions.retry_telegram_update(row_id, error)
+        return
+
+    await sessions.complete_telegram_update(row_id)
+
+
+async def _telegram_update_queue_worker(telegram_app: Application, bot: Bot) -> None:
+    try:
+        while True:
+            row = await sessions.claim_next_telegram_update()
+            if row is None:
+                return
+            await _process_queued_telegram_update(row, telegram_app, bot)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Telegram update queue worker crashed")
+
+
+def _telegram_worker_done(task: asyncio.Task) -> None:
+    global _telegram_queue_worker_task
+    if _telegram_queue_worker_task is task:
+        _telegram_queue_worker_task = None
+    _background_tasks.discard(task)
+
+
+def _ensure_telegram_update_queue_worker(telegram_app: Application, bot: Bot) -> None:
+    global _telegram_queue_worker_task
+    if _telegram_queue_worker_task is not None and not _telegram_queue_worker_task.done():
+        return
+    task = asyncio.create_task(_telegram_update_queue_worker(telegram_app, bot))
+    _telegram_queue_worker_task = task
+    _background_tasks.add(task)
+    task.add_done_callback(_telegram_worker_done)
 
 
 # If Telegram reports an error within this window, re-register the webhook.
@@ -568,20 +638,21 @@ async def _handle_telegram_update(request: web.Request) -> web.Response:
     Receive a Telegram update pushed via webhook.
 
     Validates the X-Telegram-Bot-Api-Secret-Token header against the configured
-    secret, deserializes the JSON body into a python-telegram-bot Update object,
-    and dispatches it to the existing handler system via process_update().
+    secret, persists the raw update to the durable inbound queue, and starts a
+    background worker that dispatches queued updates to process_update().
 
-    IMPORTANT: process_update() is launched as a background task, not awaited.
+    IMPORTANT: queued updates are processed by a background task, not awaited.
     Claude responses can take 30+ seconds, and Telegram's webhook client times
     out after ~30-35s. If we awaited process_update(), Telegram would assume
     delivery failed and retry the same message, causing duplicate responses.
-    By returning 200 immediately and processing in the background, we acknowledge
-    receipt before Telegram's timeout. The per-chat lock in bot.py serializes
-    concurrent messages, so ordering is preserved.
+    By returning 200 after durable enqueue and processing in the background, we
+    acknowledge receipt before Telegram's timeout while allowing restart replay.
+    The per-chat lock in bot.py serializes concurrent messages, so ordering is
+    preserved per chat.
 
-    Returns 200 after the update is queued. Payload errors still return 200 to
-    avoid permanent Telegram retries, but a local enqueue failure returns 500
-    because no work was accepted and a retry may succeed.
+    Returns 200 after the update is durably queued. Payloads without a usable
+    update_id still return 200 to avoid permanent Telegram retries, but a local
+    persistence failure returns 500 because no work was accepted.
     """
     secret = request.app[TELEGRAM_WEBHOOK_SECRET_KEY]
     provided = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
@@ -597,31 +668,21 @@ async def _handle_telegram_update(request: web.Request) -> web.Response:
 
     telegram_app = request.app[TELEGRAM_APP_KEY]
     bot = request.app[TELEGRAM_BOT_KEY]
-
-    try:
-        update = Update.de_json(data, bot)
-    except Exception:
-        log.exception("Error deserializing Telegram update")
-        return web.Response(status=200)
-    if not update:
+    update_id = data.get("update_id") if isinstance(data, dict) else None
+    if isinstance(update_id, bool) or not isinstance(update_id, int):
+        log.warning("Telegram update: missing or invalid update_id")
         return web.Response(status=200)
 
-    # Fire-and-forget: return 200 to Telegram immediately while processing
-    # continues in the background. Without this, Claude's response time would
-    # exceed Telegram's webhook timeout.
-    process_update = None
     try:
-        process_update = telegram_app.process_update(update)
-        task = asyncio.create_task(process_update)
+        await sessions.enqueue_telegram_update(update_id, json.dumps(data))
     except Exception:
-        if process_update is not None:
-            close = getattr(process_update, "close", None)
-            if close is not None:
-                close()
-        log.exception("Failed to enqueue Telegram update")
+        log.exception("Failed to persist Telegram update %s", update_id)
         return web.Response(status=500, text="Failed to enqueue update")
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+
+    try:
+        _ensure_telegram_update_queue_worker(telegram_app, bot)
+    except Exception:
+        log.exception("Failed to start Telegram update queue worker")
 
     return web.Response(status=200)
 
@@ -2346,6 +2407,11 @@ async def start(telegram_app, config) -> None:
     # Without retries, a single timeout kills the whole startup and launchd
     # eventually gives up restarting.
     if config.telegram_webhook_url:
+        requeued = await sessions.requeue_processing_telegram_updates()
+        if requeued:
+            log.info("Requeued %d unfinished Telegram update(s) from previous run", requeued)
+        _ensure_telegram_update_queue_worker(telegram_app, telegram_app.bot)
+
         max_attempts = 5
         for attempt in range(1, max_attempts + 1):
             try:

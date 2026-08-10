@@ -459,6 +459,23 @@ async def retry_telegram_update(row_id: int, error: str) -> bool:
     return cursor.rowcount > 0
 
 
+async def discard_telegram_update(row_id: int, error: str) -> bool:
+    """Mark a claimed Telegram update done after a permanent processing failure."""
+    cursor = await _get_db().execute(
+        """
+        UPDATE telegram_update_queue
+        SET status = 'done',
+            last_error = ?,
+            processed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = 'processing'
+        """,
+        (error, row_id),
+    )
+    await _get_db().commit()
+    return cursor.rowcount > 0
+
+
 async def requeue_processing_telegram_updates() -> int:
     """
     Requeue updates left in processing by a previous process crash.

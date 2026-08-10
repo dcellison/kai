@@ -620,7 +620,7 @@ def telegram_request():
 
 
 class TestTelegramUpdate:
-    async def test_valid_secret_dispatches_update(self, telegram_request, monkeypatch):
+    async def test_valid_secret_dispatches_update(self, db, telegram_request, monkeypatch):
         """Valid secret and JSON body dispatches to process_update."""
         fake_update = MagicMock()
         monkeypatch.setattr("kai.webhook.Update.de_json", MagicMock(return_value=fake_update))
@@ -629,10 +629,10 @@ class TestTelegramUpdate:
         resp = await _handle_telegram_update(telegram_request)
 
         assert resp.status == 200
-        # process_update runs as a background task (fire-and-forget to avoid
-        # Telegram's webhook timeout). Yield to the event loop so the task
-        # actually executes before we assert.
-        await asyncio.sleep(0)
+        # process_update runs from the durable queue worker. Wait for that
+        # worker before the DB fixture closes.
+        assert webhook_mod._telegram_queue_worker_task is not None
+        await webhook_mod._telegram_queue_worker_task
         telegram_request.app[TELEGRAM_APP_KEY].process_update.assert_called_once_with(fake_update)
 
     async def test_wrong_secret_returns_401(self, telegram_request):
@@ -671,29 +671,79 @@ class TestTelegramUpdate:
         assert resp.status == 200
         telegram_request.app[TELEGRAM_APP_KEY].process_update.assert_not_called()
 
-    async def test_null_update_skips_dispatch(self, telegram_request, monkeypatch):
-        """If Update.de_json returns None, process_update is not called."""
-        monkeypatch.setattr("kai.webhook.Update.de_json", MagicMock(return_value=None))
-        telegram_request.json = AsyncMock(return_value={"update_id": 999})
+    async def test_missing_update_id_skips_dispatch(self, telegram_request):
+        """Updates without a durable dedupe key are swallowed to avoid permanent retries."""
+        telegram_request.json = AsyncMock(return_value={"message": {"text": "missing id"}})
 
         resp = await _handle_telegram_update(telegram_request)
 
         assert resp.status == 200
         telegram_request.app[TELEGRAM_APP_KEY].process_update.assert_not_called()
 
-    async def test_enqueue_failure_returns_500(self, telegram_request, monkeypatch):
-        """If no background task is queued, do not acknowledge the update as accepted."""
-        fake_update = MagicMock()
-        monkeypatch.setattr("kai.webhook.Update.de_json", MagicMock(return_value=fake_update))
-        monkeypatch.setattr("kai.webhook.asyncio.create_task", MagicMock(side_effect=RuntimeError("loop closing")))
+    async def test_persistence_failure_returns_500(self, telegram_request, monkeypatch):
+        """If the durable queue write fails, do not acknowledge the update as accepted."""
+        monkeypatch.setattr(
+            "kai.webhook.sessions.enqueue_telegram_update",
+            AsyncMock(side_effect=RuntimeError("database locked")),
+        )
         telegram_request.json = AsyncMock(return_value={"update_id": 123})
         webhook_mod._background_tasks.clear()
 
         resp = await _handle_telegram_update(telegram_request)
 
         assert resp.status == 500
-        telegram_request.app[TELEGRAM_APP_KEY].process_update.assert_called_once_with(fake_update)
+        telegram_request.app[TELEGRAM_APP_KEY].process_update.assert_not_called()
         assert webhook_mod._background_tasks == set()
+
+    async def test_worker_retries_then_completes_transient_failure(self, db, telegram_request, monkeypatch):
+        """A process_update exception requeues the durable row for another attempt."""
+        fake_update = MagicMock()
+        monkeypatch.setattr("kai.webhook.Update.de_json", MagicMock(return_value=fake_update))
+        telegram_request.app[TELEGRAM_APP_KEY].process_update = AsyncMock(side_effect=[RuntimeError("boom"), None])
+
+        row_id, _ = await sessions.enqueue_telegram_update(124, '{"update_id":124}')
+        webhook_mod._ensure_telegram_update_queue_worker(
+            telegram_request.app[TELEGRAM_APP_KEY],
+            telegram_request.app[TELEGRAM_BOT_KEY],
+        )
+        assert webhook_mod._telegram_queue_worker_task is not None
+        await webhook_mod._telegram_queue_worker_task
+
+        telegram_request.app[TELEGRAM_APP_KEY].process_update.assert_awaited_with(fake_update)
+        assert telegram_request.app[TELEGRAM_APP_KEY].process_update.await_count == 2
+        async with sessions._get_db().execute(
+            "SELECT status, attempt_count, last_error FROM telegram_update_queue WHERE id = ?",
+            (row_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row["status"] == "done"
+        assert row["attempt_count"] == 2
+        assert "RuntimeError: boom" in row["last_error"]
+
+    async def test_worker_discards_poison_update_after_max_attempts(self, db, telegram_request, monkeypatch):
+        """A permanently failing queued update is discarded after bounded retries."""
+        fake_update = MagicMock()
+        monkeypatch.setattr("kai.webhook.Update.de_json", MagicMock(return_value=fake_update))
+        monkeypatch.setattr(webhook_mod, "_TELEGRAM_UPDATE_MAX_ATTEMPTS", 2)
+        telegram_request.app[TELEGRAM_APP_KEY].process_update = AsyncMock(side_effect=RuntimeError("always bad"))
+
+        row_id, _ = await sessions.enqueue_telegram_update(125, '{"update_id":125}')
+        webhook_mod._ensure_telegram_update_queue_worker(
+            telegram_request.app[TELEGRAM_APP_KEY],
+            telegram_request.app[TELEGRAM_BOT_KEY],
+        )
+        assert webhook_mod._telegram_queue_worker_task is not None
+        await webhook_mod._telegram_queue_worker_task
+
+        assert telegram_request.app[TELEGRAM_APP_KEY].process_update.await_count == 2
+        async with sessions._get_db().execute(
+            "SELECT status, attempt_count, last_error FROM telegram_update_queue WHERE id = ?",
+            (row_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row["status"] == "done"
+        assert row["attempt_count"] == 2
+        assert "RuntimeError: always bad" in row["last_error"]
 
 
 # ── webhook shutdown background task drain ─────────────────────────
