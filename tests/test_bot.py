@@ -644,6 +644,7 @@ def _make_config(**overrides) -> Config:
         "webhook_port": 8080,
         "tts_enabled": False,
         "voice_enabled": False,
+        "default_backend": "claude",
         "default_model": get_default_model_for_backend("claude", "anthropic"),
     }
     defaults.update(overrides)
@@ -3491,8 +3492,8 @@ class TestHandleResponse:
         # contract under test is the outer gate plus the inner config
         # branch, neither of which depends on prior_pairs being
         # non-empty. memory_extraction_enabled=True so the inner gate
-        # passes; default_backend defaults to "claude" so the backend
-        # check passes too.
+        # passes; _make_config explicitly selects the Claude backend
+        # used by this test's mocked pool.
         config = _make_config(
             memory_extraction_enabled=True,
             episode_classifier_context_turns=0,
