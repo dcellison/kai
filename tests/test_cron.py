@@ -323,6 +323,21 @@ class TestRegisterNewJobs:
             count = await _register_new_jobs(mock_app)
         assert count == 2
 
+    @pytest.mark.asyncio()
+    async def test_malformed_job_does_not_abort_startup_registration(self, mock_app, caplog):
+        """One malformed active DB row is logged and skipped; later jobs still register."""
+        caplog.set_level("ERROR", logger="kai.cron")
+        jobs = [
+            _make_job(job_id=1, schedule_data="{not-json"),
+            _make_job(job_id=2, schedule_type="interval", schedule_data=json.dumps({"seconds": 60})),
+        ]
+        with patch("kai.cron.sessions.get_all_active_jobs", new_callable=AsyncMock, return_value=jobs):
+            count = await _register_new_jobs(mock_app)
+
+        assert count == 1
+        mock_app.job_queue.run_repeating.assert_called_once()
+        assert "Failed to register active job 1 during startup" in caplog.text
+
 
 # ── init_jobs ────────────────────────────────────────────────────────
 

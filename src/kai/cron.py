@@ -117,20 +117,24 @@ async def _register_new_jobs(app: Application) -> int:
     now = datetime.now(UTC)
     count = 0
     for job in jobs:
-        job_name = f"cron_{job['id']}"
-        # Daily jobs with multiple times get suffixed names (cron_13_0, cron_13_1)
-        if any(name == job_name or name.startswith(f"{job_name}_") for name in registered):
-            continue
-        schedule = json.loads(job["schedule_data"])
-        # Skip expired one-shot jobs rather than registering them
-        if job["schedule_type"] == "once":
-            run_at = _ensure_utc(datetime.fromisoformat(schedule["run_at"]))
-            if run_at <= now:
-                await sessions.deactivate_job(job["id"])
-                log.info("Skipped expired one-shot job %d: %s", job["id"], job["name"])
+        try:
+            job_name = f"cron_{job['id']}"
+            # Daily jobs with multiple times get suffixed names (cron_13_0, cron_13_1)
+            if any(name == job_name or name.startswith(f"{job_name}_") for name in registered):
                 continue
-        _register_job(app, job)
-        count += 1
+            schedule = json.loads(job["schedule_data"])
+            # Skip expired one-shot jobs rather than registering them
+            if job["schedule_type"] == "once":
+                run_at = _ensure_utc(datetime.fromisoformat(schedule["run_at"]))
+                if run_at <= now:
+                    await sessions.deactivate_job(job["id"])
+                    log.info("Skipped expired one-shot job %d: %s", job["id"], job["name"])
+                    continue
+            _register_job(app, job)
+            count += 1
+        except Exception:
+            job_id = job.get("id", "<unknown>") if isinstance(job, dict) else "<unknown>"
+            log.exception("Failed to register active job %s during startup; skipping", job_id)
     return count
 
 
