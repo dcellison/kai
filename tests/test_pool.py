@@ -43,6 +43,7 @@ def _make_config(**overrides) -> Config:
     defaults: dict = {
         "telegram_bot_token": "test",
         "allowed_user_ids": {111, 222},
+        "default_backend": "claude",
         "default_model": "sonnet",
         "default_timeout": 30,
         "agent_max_session_hours": 0,
@@ -242,9 +243,17 @@ class TestPerUserBackendRouting:
         config = _make_config(user_configs={111: user})
         pool = SubprocessPool(config=config, services_info=[])
         instance = pool.get(111)
-        # Default global backend is claude -> ClaudeCodeBackend
+        # This fixture explicitly selects Claude globally.
         assert not isinstance(instance, GooseBackend)
         assert instance.provider == "anthropic"
+
+    def test_unknown_global_backend_is_rejected(self):
+        """An unknown backend cannot fall through to a concrete driver."""
+        config = _make_config(default_backend="unknown")
+        pool = SubprocessPool(config=config, services_info=[])
+
+        with pytest.raises(RuntimeError, match="unsupported backend 'unknown'"):
+            pool.get(111)
 
     def test_user_provider_overrides_global(self):
         """User with provider gets GooseBackend with that provider."""
@@ -951,9 +960,9 @@ class TestRestoreBackendNameDispatch:
     """
     _apply_user_db_settings reads the backend identifier off
     `instance.backend_name` instead of inspecting the concrete class
-    name. Pin each real backend's value plus the falsy fallback so an
-    OpenCode (or any future) backend cannot regress the dispatch by
-    setting backend_name incorrectly.
+    name. Pin the declared identity and fail-closed behavior so a
+    current or future backend cannot regress dispatch by omitting or
+    misdeclaring backend_name.
     """
 
     @pytest.mark.asyncio
@@ -984,30 +993,18 @@ class TestRestoreBackendNameDispatch:
             mock_validate.assert_called_once_with("gpt-5.4-mini", "goose", "openai")
 
     @pytest.mark.asyncio
-    async def test_empty_backend_name_falls_back_to_claude_with_warning(self, tmp_path, caplog):
-        """A test double or legacy stub with empty backend_name routes to "claude" with a warning."""
-        import logging
-
+    async def test_empty_backend_name_is_rejected(self, tmp_path):
+        """An empty backend identity cannot inherit another backend's policy."""
         pool = SubprocessPool(config=_make_config(), services_info=[])
         instance = pool.get(111)
-        # Simulate a stub backend that never overrode the ABC default.
         instance.backend_name = ""
         instance.provider = "anthropic"
-        # Instance default model is "sonnet"; DB model must differ to
-        # actually reach the validate_model_for_backend call in the
-        # restore path (the guard short-circuits when they match).
         db_settings = {"model": "opus"}
         with (
-            caplog.at_level(logging.WARNING, logger="kai.pool"),
             patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value=db_settings),
-            patch("kai.pool.validate_model_for_backend", return_value=True) as mock_validate,
-            patch.object(instance, "restart", new_callable=AsyncMock),
+            pytest.raises(RuntimeError, match="invalid backend_name"),
         ):
             await pool._apply_user_db_settings(111, instance)
-            # Fallback string is "claude".
-            mock_validate.assert_called_once_with("opus", "claude", "anthropic")
-        # Warning was logged about the empty backend_name.
-        assert any("empty backend_name" in rec.message for rec in caplog.records)
 
 
 # ── get_if_exists ───────────────────────────────────────────────────
@@ -1364,6 +1361,7 @@ class TestGetEffectiveWorkspace:
             patch.object(SubprocessPool, "_create_instance") as mock_create,
         ):
             stub = MagicMock()
+            stub.backend_name = "claude"
             stub.change_workspace = AsyncMock()
             mock_create.return_value = stub
             result = await pool.get_effective_workspace(999)
@@ -1642,6 +1640,7 @@ class TestSendAppliesSettingsAfterResolverCall:
         pool = SubprocessPool(config=_make_config(), services_info=[])
         with patch("kai.pool.SubprocessPool._create_instance") as mock_create:
             stub = MagicMock()
+            stub.backend_name = "claude"
             stub.change_workspace = AsyncMock()
             mock_create.return_value = stub
             await pool.change_workspace(111, ws)

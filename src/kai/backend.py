@@ -26,6 +26,7 @@ from pathlib import Path
 from kai.config import (
     DATA_DIR,
     PROJECT_ROOT,
+    VALID_BACKENDS,
     Config,
     WorkspaceConfig,
     canonicalize_model_for_backend,
@@ -103,6 +104,24 @@ def sanitize_agent_environment(environment: dict[str, str]) -> dict[str, str]:
     for name in _CONTROL_PLANE_ENV_VARS:
         sanitized.pop(name, None)
     return sanitized
+
+
+def require_backend_name(instance: object) -> str:
+    """Return an instance's canonical backend identity or fail closed.
+
+    Every concrete backend must declare ``backend_name`` as one of the
+    configured backend identifiers. Missing, empty, non-string, and unknown
+    values indicate a programming or integration error; callers must never
+    substitute another backend because that would apply the wrong model,
+    provider, and execution policy.
+    """
+    name = getattr(instance, "backend_name", None)
+    if not isinstance(name, str) or name not in VALID_BACKENDS:
+        expected = ", ".join(sorted(VALID_BACKENDS))
+        raise RuntimeError(
+            f"Backend instance {type(instance).__name__} has invalid backend_name {name!r}; expected one of: {expected}"
+        )
+    return name
 
 
 def apply_workspace_model(
@@ -258,9 +277,8 @@ class AgentBackend(ABC):
     # Stable identifier for pool/bot dispatch and `memory.recall`
     # attribution; any future backend-aware code path can read it off
     # the instance too. Concrete backends override the class-level
-    # default with their canonical name. Default `""` keeps the ABC
-    # importable for tests that construct a stub backend without
-    # thinking about logging.
+    # sentinel with their canonical name. Consumers validate it through
+    # require_backend_name() before making backend-specific decisions.
     backend_name: str = ""
 
     @abstractmethod

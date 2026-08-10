@@ -90,9 +90,8 @@ class TestBackendNameForInstance:
 
     Real backends each set the attribute to their canonical identifier
     (claude.py: "claude"; goose.py: "goose"; codex.py: "codex").
-    A test double or legacy stub that never overrode the ABC default
-    falls back to "claude" with a warning so model validation still
-    routes through the provider-only path.
+    Missing or invalid identities are rejected so model validation
+    cannot silently use another backend's policy.
     """
 
     def test_claude_backend_returns_class_attribute(self):
@@ -119,33 +118,38 @@ class TestBackendNameForInstance:
         instance.backend_name = CodexBackend.backend_name
         assert _backend_name_for_instance(instance) == "codex"
 
-    def test_falsy_backend_name_falls_back_to_claude_with_warning(self, caplog):
-        """A stub with empty backend_name returns "claude" and logs a warning."""
-        import logging
+    def test_opencode_backend_returns_opencode(self):
+        """OpenCodeBackend.backend_name is "opencode"."""
+        from kai.opencode import OpenCodeBackend
 
-        # Plain object with empty backend_name to simulate a test double or
-        # legacy stub that never overrode the ABC default of "".
+        instance = MagicMock(spec=OpenCodeBackend)
+        instance.backend_name = OpenCodeBackend.backend_name
+        assert _backend_name_for_instance(instance) == "opencode"
+
+    def test_falsy_backend_name_is_rejected(self):
+        """A stub with an empty backend identity fails closed."""
         stub = MagicMock()
         stub.backend_name = ""
 
-        with caplog.at_level(logging.WARNING, logger="kai.bot"):
-            result = _backend_name_for_instance(stub)
-        assert result == "claude"
-        assert any("empty backend_name" in rec.message for rec in caplog.records)
+        with pytest.raises(RuntimeError, match="invalid backend_name"):
+            _backend_name_for_instance(stub)
 
-    def test_missing_backend_name_attribute_falls_back_to_claude(self, caplog):
-        """A stub without the attribute at all routes through the same fallback."""
-        import logging
+    def test_missing_backend_name_attribute_is_rejected(self):
+        """A stub without a backend identity fails closed."""
 
-        # Use a bare object so MagicMock's auto-attributes don't synthesize
-        # a non-empty backend_name on access. getattr returns the default.
         class _Stub:
             pass
 
-        with caplog.at_level(logging.WARNING, logger="kai.bot"):
-            result = _backend_name_for_instance(_Stub())
-        assert result == "claude"
-        assert any("empty backend_name" in rec.message for rec in caplog.records)
+        with pytest.raises(RuntimeError, match="invalid backend_name"):
+            _backend_name_for_instance(_Stub())
+
+    def test_unknown_backend_name_is_rejected(self):
+        """A non-canonical backend identity cannot reach model routing."""
+        stub = MagicMock()
+        stub.backend_name = "unknown"
+
+        with pytest.raises(RuntimeError, match="invalid backend_name"):
+            _backend_name_for_instance(stub)
 
 
 # ── _get_user_models warning suppression ─────────────────────────────
@@ -780,6 +784,7 @@ def _make_mock_claude(model="sonnet", workspace=None, is_alive=True, provider="a
     # Mock instance returned by pool.get() and pool.get_if_exists()
     # with the provider attribute for provider-aware model selection.
     instance = MagicMock()
+    instance.backend_name = "claude"
     instance.model = model
     instance.provider = provider
     instance.workspace = ws

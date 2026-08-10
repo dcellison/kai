@@ -58,7 +58,7 @@ from telegram.ext import (
 )
 
 from kai import github_api, memory_command, review, services, sessions, webhook
-from kai.backend import resolve_home_workspace
+from kai.backend import require_backend_name, resolve_home_workspace
 from kai.config import (
     DATA_DIR,
     ONESHOT_REASONER_BACKENDS,
@@ -870,23 +870,8 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 def _backend_name_for_instance(instance: object) -> str:
-    """Map a backend instance to its config-key backend name.
-
-    Reads the `backend_name` class attribute every concrete backend sets
-    (claude / goose / codex / opencode). A falsy value indicates a
-    test double or legacy stub that never overrode the ABC default of
-    `""`; for those, log a warning and fall back to "claude" so the
-    historical default for unknown shapes is preserved.
-    """
-    name = getattr(instance, "backend_name", "")
-    if not name:
-        log.warning(
-            "Instance %s has empty backend_name; falling back to 'claude'. "
-            "Concrete backends must set the backend_name class attribute.",
-            type(instance).__name__,
-        )
-        return "claude"
-    return name
+    """Return a live instance's validated config-key backend name."""
+    return require_backend_name(instance)
 
 
 def _get_user_backend_provider(pool: SubprocessPool, chat_id: int, config: Config) -> tuple[str, str]:

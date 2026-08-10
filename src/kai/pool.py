@@ -20,10 +20,11 @@ from collections.abc import AsyncGenerator
 from pathlib import Path
 
 from kai import sessions
-from kai.backend import AgentBackend, StreamEvent, resolve_home_workspace
+from kai.backend import AgentBackend, StreamEvent, require_backend_name, resolve_home_workspace
 from kai.claude import ClaudeCodeBackend
 from kai.config import (
     OPEN_ENDED_PROVIDERS,
+    VALID_BACKENDS,
     Config,
     WorkspaceConfig,
     canonicalize_model_for_backend,
@@ -132,6 +133,7 @@ class SubprocessPool:
         """
         if chat_id not in self._pool:
             instance = self._create_instance(chat_id)
+            require_backend_name(instance)
             self._pool[chat_id] = instance
             # Mark both one-time setup steps as pending. The split
             # matters at command-path callers that finish the workspace
@@ -170,13 +172,14 @@ class SubprocessPool:
 
         # Per-user backend and provider, falling back to global config.
         # Routed through the canonical get_user_backend_and_provider
-        # resolver so codex always reports provider="openai" even when
-        # the provider is unset, matching the same cascade bot.py and
-        # the install-time validator use. Without this, a user with
-        # `backend: codex` on a globally-claude install ended up
-        # with effective_provider="" and the fallback below dispatched
-        # the global default_model ("sonnet"), which codex CLI rejects.
+        # resolver so single-provider backends report their canonical
+        # provider even when the provider is unset, matching the same
+        # cascade bot.py and the install-time validator use. Without
+        # this, a per-user backend differing from the global backend can
+        # inherit an incompatible global model.
         backend, effective_provider = get_user_backend_and_provider(user, self._config)
+        if backend not in VALID_BACKENDS:
+            raise RuntimeError(f"Cannot create backend instance for unsupported backend {backend!r}")
         # get_effective_provider hardcodes the backend->provider rule for
         # claude (anthropic) and codex (openai) so global_provider lines
         # up with effective_provider whenever the user has not overridden
@@ -243,10 +246,8 @@ class SubprocessPool:
         # points the subprocess at the right home.
         os_user = user.os_user if user else None
 
-        # Backend selection: "goose" uses Goose ACP, "opencode" uses
-        # OpenCode ACP, "codex" uses OpenAI Codex CLI's app-server
-        # JSON-RPC protocol, anything else (including the default
-        # "claude") uses Claude Code CLI.
+        # Backend selection is explicit. No branch may substitute a
+        # different backend for a missing or unknown identifier.
         # Internal API availability is independent of public webhook ingress.
         # Agents receive only their random principal credential, never an
         # external webhook signing secret.
@@ -316,22 +317,25 @@ class SubprocessPool:
                 defer_user_file_reads=getattr(self._config, "protected_install", False) is True,
             )
 
-        return ClaudeCodeBackend(
-            model=model,
-            workspace=workspace,
-            home_workspace=home_ws,
-            webhook_port=self._config.webhook_port,
-            webhook_secret=internal_api_credential,
-            timeout_seconds=timeout,
-            services_info=services_info,
-            claude_user=os_user,
-            max_session_hours=self._config.agent_max_session_hours,
-            workspace_config=ws_config,
-            autocompact_pct=self._config.claude_autocompact_pct,
-            claude_effort_level=self._config.claude_effort_level,
-            memory_enabled=self._config.memory_enabled,
-            defer_user_file_reads=getattr(self._config, "protected_install", False) is True,
-        )
+        if backend == "claude":
+            return ClaudeCodeBackend(
+                model=model,
+                workspace=workspace,
+                home_workspace=home_ws,
+                webhook_port=self._config.webhook_port,
+                webhook_secret=internal_api_credential,
+                timeout_seconds=timeout,
+                services_info=services_info,
+                claude_user=os_user,
+                max_session_hours=self._config.agent_max_session_hours,
+                workspace_config=ws_config,
+                autocompact_pct=self._config.claude_autocompact_pct,
+                claude_effort_level=self._config.claude_effort_level,
+                memory_enabled=self._config.memory_enabled,
+                defer_user_file_reads=getattr(self._config, "protected_install", False) is True,
+            )
+
+        raise RuntimeError(f"Cannot create backend instance for unsupported backend {backend!r}")
 
     # ── Prompt routing ──────────────────────────────────────────────
 
@@ -442,24 +446,10 @@ class SubprocessPool:
         # because the value is baked into the CLI command at startup)
         needs_restart = False
 
-        # Read the backend identifier off the instance. Every concrete
-        # backend sets `backend_name` as a class attribute (claude
-        # / goose / codex / opencode). The ABC default is the empty
-        # string, so a test double or legacy stub that never overrides
-        # falls through to "claude" with a warning; this preserves the
-        # historical default for unknown shapes while keeping real
-        # backends out of the class-name if-chain that previously had
-        # to be extended for every new backend. Hoisted out of the
-        # DB-model branch because the ws_model guard below also needs
-        # it.
-        instance_backend = instance.backend_name
-        if not instance_backend:
-            log.warning(
-                "Instance %s has empty backend_name; falling back to 'claude'. "
-                "Concrete backends must set the backend_name class attribute.",
-                type(instance).__name__,
-            )
-            instance_backend = "claude"
+        # Validate the instance identity before applying backend-specific
+        # model policy. Missing or unknown identities are invariant
+        # violations and must not inherit another backend's rules.
+        instance_backend = require_backend_name(instance)
 
         # Model: only apply if workspace config has a VALID model for
         # this backend. A workspaces.yaml entry like
@@ -615,7 +605,7 @@ class SubprocessPool:
     def set_model(self, chat_id: int, model: str) -> None:
         """Set the model for a user's subprocess."""
         instance = self.get(chat_id)
-        instance.model = canonicalize_model_for_backend(model, instance.backend_name)
+        instance.model = canonicalize_model_for_backend(model, require_backend_name(instance))
 
     async def get_effective_workspace(self, chat_id: int) -> Path:
         """
