@@ -3117,7 +3117,7 @@ class TestCmdApply:
         monkeypatch.setattr("os.geteuid", lambda: 0)
         monkeypatch.setenv("DRY_RUN", "1")
 
-        def fake_apply_secrets(env, dry_run, users_yaml_staging_path=None):
+        def fake_apply_secrets(env, dry_run, users_yaml_staging_path=None, protected_yaml_staging_paths=None):
             raise SystemExit("simulated apply SystemExit (e.g. venv version gate)")
 
         def fake_start(platform, dry_run, **kw):
@@ -3149,7 +3149,7 @@ class TestCmdApply:
         class ApplyBlewUp(RuntimeError):
             pass
 
-        def fake_apply_secrets(env, dry_run, users_yaml_staging_path=None):
+        def fake_apply_secrets(env, dry_run, users_yaml_staging_path=None, protected_yaml_staging_paths=None):
             raise ApplyBlewUp("simulated apply step failure")
 
         def fake_start(platform, dry_run, **kw):
@@ -7313,6 +7313,27 @@ class TestApplySecretsDryRun:
         assert "/etc/kai/workspaces.yaml" in output
         assert "/etc/kai/memory-projects.yaml" in output
 
+    def test_dry_run_prefers_staged_optional_protected_yaml_configs(self, tmp_path, monkeypatch, capsys):
+        """Dry run shows staged optional YAML sources when install.conf recorded them."""
+        project = tmp_path / "project"
+        stage = tmp_path / "stage"
+        project.mkdir()
+        stage.mkdir()
+        (project / "services.yaml").write_text("project: true\n")
+        staged_services = stage / "services.yaml"
+        staged_services.write_text("staged: true\n")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", project)
+
+        _apply_secrets(
+            {"TELEGRAM_BOT_TOKEN": "test"},
+            dry_run=True,
+            protected_yaml_staging_paths={"services.yaml": str(staged_services)},
+        )
+
+        output = capsys.readouterr().out
+        assert f"{staged_services} -> /etc/kai/services.yaml" in output
+        assert f"{project / 'services.yaml'} -> /etc/kai/services.yaml" not in output
+
 
 class TestApplyBackendRegistry:
     def test_build_registry_uses_env_paths(self, monkeypatch):
@@ -7445,6 +7466,29 @@ class TestApplySecretsUsersYamlStaging:
             assert (str(tmp_path / name), dst) in copied
             assert (dst, 0o600) in chmodded
             assert (dst, 0, 0) in chowned
+
+    def test_staged_optional_protected_yaml_configs_win_over_project_tree(self, tmp_path, monkeypatch):
+        """Recorded staging paths are the privileged-apply source of truth."""
+        project = tmp_path / "project"
+        stage = tmp_path / "stage"
+        project.mkdir()
+        stage.mkdir()
+        (project / "services.yaml").write_text("project: true\n")
+        staged_services = stage / "services.yaml"
+        staged_services.write_text("staged: true\n")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", project)
+        copied, chmodded, chowned = self._intercept_filesystem(monkeypatch)
+
+        _apply_secrets(
+            {"TELEGRAM_BOT_TOKEN": "test"},
+            dry_run=False,
+            protected_yaml_staging_paths={"services.yaml": str(staged_services)},
+        )
+
+        assert (str(staged_services), "/etc/kai/services.yaml") in copied
+        assert (str(project / "services.yaml"), "/etc/kai/services.yaml") not in copied
+        assert ("/etc/kai/services.yaml", 0o600) in chmodded
+        assert ("/etc/kai/services.yaml", 0, 0) in chowned
 
     def test_skips_when_path_is_none(self, tmp_path, monkeypatch):
         """No staging path -> no users.yaml copy."""
@@ -7844,6 +7888,35 @@ class TestCmdConfigCanonicalUsersYaml:
         assert "users_yaml_staging_path" not in conf["env"]
         assert "USERS_YAML_STAGING_PATH" not in conf["env"]
 
+    def test_protected_install_records_optional_yaml_staging_paths(self, tmp_path, monkeypatch):
+        """Project-root optional YAML configs are staged as installer metadata."""
+        monkeypatch.chdir(tmp_path)
+        conf_path = tmp_path / "install.conf"
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        staging_dir = tmp_path / "stage"
+        staging_dir.mkdir()
+        monkeypatch.setattr(
+            "kai.install._install_staging_path",
+            lambda filename: staging_dir / filename,
+        )
+        (tmp_path / "services.yaml").write_text("services: {}\n")
+        (tmp_path / "workspaces.yaml").write_text("workspaces: []\n")
+
+        inputs = iter(self._base_inputs())
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+        _cmd_config()
+
+        conf = json.loads(conf_path.read_text())
+        staged = conf["protected_yaml_staging_paths"]
+        assert staged == {
+            "services.yaml": str(staging_dir / "services.yaml"),
+            "workspaces.yaml": str(staging_dir / "workspaces.yaml"),
+        }
+        assert "protected_yaml_staging_paths" not in conf["env"]
+        assert (staging_dir / "services.yaml").read_text() == "services: {}\n"
+        assert stat.S_IMODE((staging_dir / "services.yaml").stat().st_mode) == 0o600
+
     def test_env_file_does_not_carry_staging_path(self, tmp_path, monkeypatch):
         """Regression guard: `_generate_env_file(env)` never emits a
         `USERS_YAML_STAGING_PATH` line. Pins the schema discipline that
@@ -7875,7 +7948,11 @@ class TestCmdApplyStagingHandoff:
     """
 
     @staticmethod
-    def _minimal_conf(tmp_path, staging_path: str | None) -> Path:
+    def _minimal_conf(
+        tmp_path,
+        staging_path: str | None,
+        protected_yaml_staging_paths: dict[str, object] | None = None,
+    ) -> Path:
         """Write a minimal install.conf the apply path can validate.
 
         Mirrors what `_cmd_config` would have produced for a claude
@@ -7897,6 +7974,8 @@ class TestCmdApplyStagingHandoff:
         }
         if staging_path is not None:
             conf["users_yaml_staging_path"] = staging_path
+        if protected_yaml_staging_paths is not None:
+            conf["protected_yaml_staging_paths"] = protected_yaml_staging_paths
         path = tmp_path / "install.conf"
         path.write_text(json.dumps(conf, indent=2) + "\n")
         os.chmod(path, 0o600)
@@ -7924,8 +8003,9 @@ class TestCmdApplyStagingHandoff:
             "users:\n  - telegram_id: 1\n    name: test\n    role: admin\n    os_user: testuser\n"
         )
 
-        def _fake_apply_secrets(env, dry_run, users_yaml_staging_path=None):
+        def _fake_apply_secrets(env, dry_run, users_yaml_staging_path=None, protected_yaml_staging_paths=None):
             captured["users_yaml_staging_path"] = users_yaml_staging_path
+            captured["protected_yaml_staging_paths"] = protected_yaml_staging_paths
 
         monkeypatch.setattr("kai.install._stop_service", lambda *a, **kw: None)
         monkeypatch.setattr("kai.install._apply_directories", lambda *a, **kw: None)
@@ -7960,6 +8040,7 @@ class TestCmdApplyStagingHandoff:
         assert not staging.exists()
         rewritten = json.loads(conf_path.read_text())
         assert "users_yaml_staging_path" not in rewritten
+        assert "protected_yaml_staging_paths" not in rewritten
         assert rewritten["env"]["TELEGRAM_BOT_TOKEN"] == "tok"
         assert rewritten["install_dir"] == str(tmp_path / "opt-kai")
         # Mode preservation: install.conf still carries secrets.
@@ -8003,6 +8084,77 @@ class TestCmdApplyStagingHandoff:
         assert captured["users_yaml_staging_path"] is None
         rewritten = json.loads(conf_path.read_text())
         assert "users_yaml_staging_path" not in rewritten
+
+    def test_real_apply_unlinks_and_strips_optional_yaml_staging(self, tmp_path, monkeypatch):
+        """Successful real apply cleans optional protected-YAML staging metadata."""
+        staging = tmp_path / "services.yaml"
+        staging.write_text("services: {}\n")
+        conf_path = self._minimal_conf(
+            tmp_path,
+            staging_path=None,
+            protected_yaml_staging_paths={"services.yaml": str(staging)},
+        )
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.delenv("DRY_RUN", raising=False)
+        captured: dict = {}
+        self._stub_apply_internals(monkeypatch, captured)
+
+        _cmd_apply()
+
+        assert captured["protected_yaml_staging_paths"] == {"services.yaml": str(staging)}
+        assert not staging.exists()
+        rewritten = json.loads(conf_path.read_text())
+        assert "protected_yaml_staging_paths" not in rewritten
+
+    def test_dry_run_preserves_optional_yaml_staging(self, tmp_path, monkeypatch, capsys):
+        """Dry run does not consume optional protected-YAML staging files."""
+        staging = tmp_path / "services.yaml"
+        staging.write_text("services: {}\n")
+        conf_path = self._minimal_conf(
+            tmp_path,
+            staging_path=None,
+            protected_yaml_staging_paths={"services.yaml": str(staging)},
+        )
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setenv("DRY_RUN", "1")
+        captured: dict = {}
+        self._stub_apply_internals(monkeypatch, captured)
+
+        _cmd_apply()
+
+        assert staging.exists()
+        rewritten = json.loads(conf_path.read_text())
+        assert rewritten.get("protected_yaml_staging_paths") == {"services.yaml": str(staging)}
+        out = capsys.readouterr().out
+        assert "[DRY RUN] Would unlink staging file" in out
+        assert "[DRY RUN] Would strip protected_yaml_staging_paths" in out
+
+    def test_optional_yaml_staging_path_must_be_string(self, tmp_path, monkeypatch):
+        """Hand-edited staging maps fail closed before install mutations."""
+        hand_edited_map = {"services.yaml": 123}
+        conf_path = self._minimal_conf(
+            tmp_path,
+            staging_path=None,
+            protected_yaml_staging_paths=hand_edited_map,
+        )
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+
+        with pytest.raises(SystemExit, match="must be an absolute path string"):
+            _cmd_apply()
+
+    def test_optional_yaml_staging_path_must_be_absolute(self, tmp_path, monkeypatch):
+        """Relative staging paths are refused before root copies config."""
+        conf_path = self._minimal_conf(
+            tmp_path,
+            staging_path=None,
+            protected_yaml_staging_paths={"services.yaml": "relative/services.yaml"},
+        )
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+
+        with pytest.raises(SystemExit, match="must be an absolute path"):
+            _cmd_apply()
 
     def test_home_mismatch_resolved_via_conf_key(self, tmp_path, monkeypatch):
         """Apply locates the staging file from install.conf even when

@@ -105,6 +105,11 @@ _SERVICE_START_RETRY_SECONDS = 2
 _PRIVATE_USER_ROOT_MODE = 0o711
 _PRIVATE_USER_DIR_MODE = 0o700
 _PRIVATE_USER_FILE_MODE = 0o600
+_OPTIONAL_PROTECTED_YAML_CONFIGS: tuple[str, ...] = (
+    "services.yaml",
+    "workspaces.yaml",
+    "memory-projects.yaml",
+)
 
 
 class ServiceStartError(Exception):
@@ -593,14 +598,42 @@ def _install_staging_path(filename: str) -> Path:
     return cache_dir / filename
 
 
+def _stage_optional_protected_yaml_configs(deployment_mode: str) -> dict[str, str]:
+    """Stage optional protected YAML configs for a later privileged apply.
+
+    Protected installs copy these files into `/etc/kai/`, but the
+    wizard runs as the unprivileged operator while apply runs as root.
+    Staging mirrors the users.yaml handoff: the project tree is read
+    while the operator is explicitly running `make config`, then apply
+    consumes a concrete operator-private path from install.conf.
+
+    Existing installs remain compatible because apply still falls back
+    to PROJECT_ROOT when no staging metadata is present.
+    """
+    if deployment_mode != "protected":
+        return {}
+
+    staged: dict[str, str] = {}
+    for yaml_name in _OPTIONAL_PROTECTED_YAML_CONFIGS:
+        src = PROJECT_ROOT / yaml_name
+        if not src.is_file():
+            continue
+        dst = _install_staging_path(yaml_name)
+        shutil.copy2(src, dst)
+        os.chmod(dst, 0o600)
+        staged[yaml_name] = str(dst)
+    return staged
+
+
 def _strip_install_conf_keys(*keys: str) -> None:
     """Remove the named top-level keys from `install.conf` and rewrite.
 
     Used by `_cmd_apply` after `apply_succeeded = True` to drop one-
-    shot installer-metadata keys (currently just `users_yaml_staging_
-    path`) so a subsequent re-run does not redo a handoff that already
-    completed. Top-level only: keys inside the `env` dict belong to
-    `/etc/kai/env` and are not touched by this helper.
+    shot installer-metadata keys (for example `users_yaml_staging_path`
+    and `protected_yaml_staging_paths`) so a subsequent re-run does not
+    redo a handoff that already completed. Top-level only: keys inside
+    the `env` dict belong to `/etc/kai/env` and are not touched by this
+    helper.
 
     Preserves the 0600 mode because `install.conf` still carries
     secrets (bot token, webhook secret) until the operator explicitly
@@ -1074,6 +1107,7 @@ def _cmd_config() -> None:
     # value from `existing`: a stale key would cause apply to overwrite
     # the canonical file from a no-longer-current staging artifact.
     users_yaml_staging_path: str | None = None
+    protected_yaml_staging_paths: dict[str, str] = {}
 
     # First-time install only: collect the admin identity and stage a
     # users.yaml. An existing canonical file is left untouched.
@@ -1179,6 +1213,12 @@ def _cmd_config() -> None:
     # existing users.yaml the section is silent, so this would otherwise
     # be an orphaned blank line before the transport prompt.
     if not users_yaml_exists or stray_note:
+        print()
+
+    protected_yaml_staging_paths = _stage_optional_protected_yaml_configs(deployment_mode)
+    if protected_yaml_staging_paths:
+        staged_names = ", ".join(sorted(protected_yaml_staging_paths))
+        print(f"Staged protected YAML config for install: {staged_names}")
         print()
 
     transport = _prompt_choice(
@@ -2479,6 +2519,8 @@ def _cmd_config() -> None:
     # before honoring any recorded staging path.
     if users_yaml_staging_path:
         conf["users_yaml_staging_path"] = users_yaml_staging_path
+    if protected_yaml_staging_paths:
+        conf["protected_yaml_staging_paths"] = protected_yaml_staging_paths
 
     INSTALL_CONF.write_text(json.dumps(conf, indent=2) + "\n")
     # Restrict permissions since the file contains secrets (bot token, webhook secret)
@@ -4454,6 +4496,29 @@ def _cmd_apply() -> None:
     # touching; the protected-mode gate ensures we never reach here
     # with that combination.
     users_yaml_staging_path = conf.get("users_yaml_staging_path", "") or None
+    raw_protected_yaml_staging_paths = conf.get("protected_yaml_staging_paths", {})
+    if raw_protected_yaml_staging_paths is None:
+        protected_yaml_staging_paths: dict[str, str] = {}
+    elif not isinstance(raw_protected_yaml_staging_paths, dict):
+        raise SystemExit("install.conf protected_yaml_staging_paths must be a mapping of filename -> path.")
+    else:
+        protected_yaml_staging_paths = {}
+        for raw_name, raw_path in raw_protected_yaml_staging_paths.items():
+            name = str(raw_name).strip()
+            if name not in _OPTIONAL_PROTECTED_YAML_CONFIGS:
+                raise SystemExit(
+                    f"install.conf protected_yaml_staging_paths has unsupported file {name!r}; "
+                    f"valid files: {', '.join(_OPTIONAL_PROTECTED_YAML_CONFIGS)}."
+                )
+            if not isinstance(raw_path, str):
+                raise SystemExit(
+                    f"install.conf protected_yaml_staging_paths[{name!r}] must be an absolute path string."
+                )
+            path = raw_path.strip()
+            if path:
+                if not Path(path).is_absolute():
+                    raise SystemExit(f"install.conf protected_yaml_staging_paths[{name!r}] must be an absolute path.")
+                protected_yaml_staging_paths[name] = path
 
     if not all([install_dir, data_dir, service_user, platform]):
         raise SystemExit("install.conf is missing required fields.")
@@ -4686,7 +4751,12 @@ def _cmd_apply() -> None:
         env.pop("MEMORY_EPISODE_BUDGET_USD", None)
         env.pop("MEMORY_SCOPED_RECALL_ENABLED", None)
         env.pop("MEMORY_RECALL_SHADOW_ENABLED", None)
-        _apply_secrets(env, dry_run, users_yaml_staging_path=users_yaml_staging_path)
+        _apply_secrets(
+            env,
+            dry_run,
+            users_yaml_staging_path=users_yaml_staging_path,
+            protected_yaml_staging_paths=protected_yaml_staging_paths,
+        )
 
         # -- Step 6: Deploy installed backend registry --
         _apply_backend_registry(service_user, env, dry_run)
@@ -4747,6 +4817,15 @@ def _cmd_apply() -> None:
             else:
                 Path(users_yaml_staging_path).unlink(missing_ok=True)
                 _strip_install_conf_keys("users_yaml_staging_path")
+        if protected_yaml_staging_paths:
+            if dry_run:
+                for path in protected_yaml_staging_paths.values():
+                    print(f"[DRY RUN] Would unlink staging file: {path}")
+                print("[DRY RUN] Would strip protected_yaml_staging_paths from install.conf")
+            else:
+                for path in protected_yaml_staging_paths.values():
+                    Path(path).unlink(missing_ok=True)
+                _strip_install_conf_keys("protected_yaml_staging_paths")
     except Exception:
         print("\nInstallation failed. See error above.")
         print("The installation may be in a partial state.")
@@ -5776,6 +5855,7 @@ def _apply_secrets(
     env: dict[str, str],
     dry_run: bool,
     users_yaml_staging_path: str | None = None,
+    protected_yaml_staging_paths: dict[str, str] | None = None,
 ) -> None:
     """Write the /etc/kai/env file from install.conf environment values.
 
@@ -5805,18 +5885,24 @@ def _apply_secrets(
         if candidate.is_file():
             users_yaml_src = candidate
 
+    optional_yaml_sources: dict[str, Path] = {}
+    for yaml_name in _OPTIONAL_PROTECTED_YAML_CONFIGS:
+        staged = (protected_yaml_staging_paths or {}).get(yaml_name)
+        if staged:
+            staged_path = Path(staged)
+            if staged_path.is_file():
+                optional_yaml_sources[yaml_name] = staged_path
+                continue
+        project_path = PROJECT_ROOT / yaml_name
+        if project_path.is_file():
+            optional_yaml_sources[yaml_name] = project_path
+
     if dry_run:
         print(f"[DRY RUN] Would write: {env_path} (mode 0600)")
         if users_yaml_src is not None:
             print(f"[DRY RUN] Would copy: {users_yaml_src} -> {etc_kai / 'users.yaml'} (mode 0600)")
-        # TODO: services.yaml, workspaces.yaml, and memory-projects.yaml still copy from
-        # PROJECT_ROOT pending follow-up issues that mirror the
-        # users.yaml staging flow for those files. The asymmetry is
-        # intentional and tracked; users.yaml moves first because it
-        # is auth-bearing.
-        for yaml_name in ("services.yaml", "workspaces.yaml", "memory-projects.yaml"):
-            if (PROJECT_ROOT / yaml_name).exists():
-                print(f"[DRY RUN] Would copy: {etc_kai / yaml_name} (mode 0600)")
+        for yaml_name, yaml_src in optional_yaml_sources.items():
+            print(f"[DRY RUN] Would copy: {yaml_src} -> {etc_kai / yaml_name} (mode 0600)")
         return
 
     env_path.write_text(env_content)
@@ -5838,21 +5924,17 @@ def _apply_secrets(
         os.chown(users_yaml_dst, 0, 0)
         print(f"  Copied {users_yaml_dst}")
 
-    # Copy optional YAML config files to /etc/kai/ if they exist in the
-    # source directory. All get root-only permissions (mode 0600) since
-    # they may contain sensitive configuration (API keys in services.yaml).
-    # TODO: services.yaml, workspaces.yaml, and memory-projects.yaml still read from
-    # PROJECT_ROOT pending follow-up issues that mirror the users.yaml
-    # staging flow. The asymmetry is documented in-code so it is
-    # visible to anyone touching this function.
-    for yaml_name in ("services.yaml", "workspaces.yaml", "memory-projects.yaml"):
-        yaml_src = PROJECT_ROOT / yaml_name
+    # Copy optional YAML config files to /etc/kai/. Staged files
+    # recorded by `make config` win; the project-tree fallback remains
+    # for upgraded install.conf files that predate the staging map.
+    # All get root-only permissions (mode 0600) since they may contain
+    # sensitive configuration (API keys in services.yaml).
+    for yaml_name, yaml_src in optional_yaml_sources.items():
         yaml_dst = etc_kai / yaml_name
-        if yaml_src.exists():
-            shutil.copy2(yaml_src, yaml_dst)
-            os.chmod(yaml_dst, 0o600)
-            os.chown(yaml_dst, 0, 0)
-            print(f"  Copied {yaml_dst}")
+        shutil.copy2(yaml_src, yaml_dst)
+        os.chmod(yaml_dst, 0o600)
+        os.chown(yaml_dst, 0, 0)
+        print(f"  Copied {yaml_dst}")
 
 
 def _build_backend_registry(service_user: str, env: dict[str, str]) -> str:
