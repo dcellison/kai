@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=68.0,<84"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,11 +9,11 @@ description = "Telegram gateway to Claude Code CLI"
 license = "Apache-2.0"
 requires-python = ">=3.13"
 dependencies = [
-    "python-telegram-bot[ext]>=20.0",
-    "aiosqlite>=0.19.0",
-    "python-dotenv>=1.0.0",
-    "aiohttp>=3.9.0",
-    "pyyaml>=6.0",
+    "python-telegram-bot[ext]>=20.0,<23",
+    "aiosqlite>=0.19.0,<1",
+    "python-dotenv>=1.0.0,<2",
+    "aiohttp>=3.9.0,<4",
+    "pyyaml>=6.0,<7",
 ]
 
 [project.scripts]
@@ -21,22 +21,22 @@ kai = "kai.main:main"
 
 [project.optional-dependencies]
 dev = [
-    "ruff>=0.9.0",
-    "pyright>=1.1.390",
-    "pip-audit>=2.10.0",
-    "pytest>=8.0",
-    "pytest-asyncio>=0.24.0",
+    "ruff>=0.9.0,<1",
+    "pyright>=1.1.390,<2",
+    "pip-audit>=2.10.0,<3",
+    "pytest>=8.0,<10",
+    "pytest-asyncio>=0.24.0,<2",
 ]
 memory = [
-    "mem0ai>=2.0.0",
-    "sentence-transformers>=3.0.0",
+    "mem0ai>=2.0.0,<3",
+    "sentence-transformers>=3.0.0,<6",
 ]
 tts = [
-    "piper-tts>=1.4.0",
+    "piper-tts>=1.4.0,<2",
 ]
 totp = [
-    "pyotp>=2.9",
-    "qrcode>=7.4",
+    "pyotp>=2.9,<3",
+    "qrcode>=7.4,<9",
 ]
 
 [tool.setuptools.packages.find]

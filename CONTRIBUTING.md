@@ -162,6 +162,10 @@ CI includes a scheduled, non-blocking dependency audit workflow. Run
 The audit is advisory until the existing dependency-vulnerability backlog
 is cleared or an explicit ignore policy is documented.
 
+Direct dependencies should use both a lower bound and a conservative upper
+bound, normally the next major version. This keeps routine installs from
+silently crossing major-version compatibility boundaries.
+
 ### Tests
 
 - Tests live in `tests/` and use **pytest** with **pytest-asyncio**.
