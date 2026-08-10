@@ -1,0 +1,22 @@
+# Reviewed install constraints for Kai's protected install.
+#
+# The protected installer copies this file into /opt/kai and passes it to
+# `pip install --constraint` when installing `.[memory,totp,tts]`.
+#
+# Scope: direct runtime and optional-install dependencies only. Do not add
+# incidental transitive packages here unless a vulnerability, compatibility
+# issue, or reproducibility incident requires it.
+
+python-telegram-bot==22.6
+aiosqlite==0.22.1
+python-dotenv==1.2.2
+aiohttp==3.14.3
+pyyaml==6.0.3
+
+mem0ai==2.0.0
+sentence-transformers==5.4.1
+
+piper-tts==1.4.1
+
+pyotp==2.9.0
+qrcode==8.2

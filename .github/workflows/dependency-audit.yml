@@ -24,7 +24,7 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -e '.[dev,memory,totp,tts]'
+        run: pip install --constraint requirements/constraints.txt -e '.[dev,memory,totp,tts]'
 
       - name: Run dependency audit
         run: |
