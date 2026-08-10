@@ -44,14 +44,12 @@ from kai.config import (
     _VALID_ROLES,
     BACKEND_PROVIDERS,
     BACKENDS_NEEDING_PROVIDER_PROMPT,
-    CODEX_DEFAULT_MODEL,
     CODEX_EFFORT_LEVELS,
     CODEX_MODELS,
     EFFORT_LEVELS,
     MODEL_REGISTRY,
     ONESHOT_REASONER_BACKENDS,
     PROJECT_ROOT,
-    PROVIDER_DEFAULTS,
     PROVIDER_KEY_VARS,
     PROVIDER_MODELS,
     VALID_BACKENDS,
@@ -59,6 +57,7 @@ from kai.config import (
     _read_protected_file,
     _resolve_renamed_key,
     canonicalize_model_for_backend,
+    get_default_model_for_backend,
     models_for_backend,
     validate_model_for_backend,
 )
@@ -306,7 +305,13 @@ def _prompt_bool(label: str, default: bool = False) -> bool:
 
 def _prompt_default_model(agent_backend: str, eff_provider: str, default_val: str) -> str:
     """
-    Prompt for DEFAULT_MODEL, dispatching on the active backend.
+    Deprecated compatibility helper for the retired DEFAULT_MODEL prompt.
+
+    The install wizard no longer calls this. The conversational default
+    is MODEL_REGISTRY's ModelRole.AGENT row for the active
+    backend/provider. Keep this helper temporarily so older tests and
+    out-of-tree tooling that monkeypatch it fail softly rather than
+    raising AttributeError.
 
     Three shapes of model surface need different prompts:
     - Codex backend ships its own curated CLI model list (CODEX_MODELS)
@@ -321,11 +326,9 @@ def _prompt_default_model(agent_backend: str, eff_provider: str, default_val: st
       without a PROVIDER_MODELS entry) accept arbitrary model
       identifiers; the operator types one via _prompt(required=True).
 
-    The required=True on the open-ended branch forces the operator to
-    commit to a concrete model string. load_config falls back to "sonnet"
-    when DEFAULT_MODEL is empty or missing, and "sonnet" is anthropic-only;
-    letting the operator leave the field blank on an open-ended provider
-    would set them up for a startup-time validation failure.
+    The required=True on the open-ended branch forced the operator to
+    commit to a concrete model string. Current installs should use the
+    agent row in MODEL_REGISTRY instead.
 
     Args:
         agent_backend: The active backend ("claude", "codex", "goose").
@@ -1514,70 +1517,24 @@ def _cmd_config() -> None:
             print(f"  Path '{goose_bin}' is not an absolute path to an existing executable.")
 
     # -- Agent --
-    # DEFAULT_MODEL and DEFAULT_TIMEOUT are
-    # inheritable installation defaults:
-    # users.yaml entries that omit a per-user override fall back to
-    # these values at runtime. The prompts therefore fire on every
-    # wizard run regardless of users.yaml presence. The previous
-    # users_yaml_exists gate skipped them entirely on the
-    # re-run-with-users.yaml path, which let a stale global model
-    # survive a backend switch (the operator-visible bug: switching
-    # DEFAULT_BACKEND from one model surface to another left the prior
-    # value unchanged because the re-validation path never ran).
-    #
     # Determine the effective provider for model choices. Claude
-    # backend always uses Anthropic; Goose uses the selected provider.
+    # backend always uses Anthropic; Codex always uses OpenAI; multi-
+    # provider backends use the selected provider. The conversational
+    # default model is no longer prompted here; it is the
+    # MODEL_REGISTRY[ModelRole.AGENT] row for this backend/provider.
+    # Existing DEFAULT_MODEL / CLAUDE_MODEL keys are intentionally not
+    # re-emitted so re-running the wizard migrates installs back to the
+    # registry default. Per-user `models.agent` remains the override
+    # surface for individual users.
     eff_provider = "anthropic" if agent_backend == "claude" else llm_provider
 
-    def _default_model_prefill() -> str:
-        """Backend-aware prefill for the re-prompt-after-reject path.
-
-        Codex installs use CODEX_DEFAULT_MODEL (independent from
-        PROVIDER_DEFAULTS["openai"] which goose-on-openai still
-        consults). Other backends use PROVIDER_DEFAULTS[eff_provider].
-        """
-        if agent_backend == "codex":
-            return CODEX_DEFAULT_MODEL
-        return PROVIDER_DEFAULTS.get(eff_provider, "")
-
     print("-- Agent --")
-    # DEFAULT_MODEL is an inheritable installation default; the prompt
-    # fires on every wizard run with the existing env value prefilled
-    # when it validates for the (possibly newly chosen) backend.
-    # Always routing through _prompt_default_model is load-bearing for
-    # the operator who wants to change the global model without
-    # changing backends: the previous "keep silently on valid match"
-    # shortcut left them with no path to update it via the wizard.
-    #
-    # Re-validation is backend-aware, not provider-only: codex rejects
-    # gpt-5.4-nano even though it's valid for goose-on-openai, so a
-    # backend switch with a model that lives only on the prior surface
-    # falls through to the curated default. Empty raw_existing_model
-    # also fails validation; the _prompt(required=True) branch in
-    # _prompt_default_model handles the open-ended case.
-    #
-    # When the existing value fails validation, the rejection reason
-    # is printed and the prefill becomes the backend-aware default
-    # rather than the rejected value, because _prompt_default_model
-    # returns its default parameter without re-validating against the
-    # choices list. Prefilling the bad value would let the operator
-    # accept the just-rejected value with Enter.
-    raw_existing_model = existing_env.get("DEFAULT_MODEL", existing_env.get("CLAUDE_MODEL", ""))
-    raw_existing_model = canonicalize_model_for_backend(raw_existing_model, agent_backend)
-    if raw_existing_model and validate_model_for_backend(raw_existing_model, agent_backend, eff_provider):
-        default_model_prefill_value = raw_existing_model
-    else:
-        if raw_existing_model:
-            surface = "codex" if agent_backend == "codex" else f"provider '{eff_provider}'"
-            print(f"  DEFAULT_MODEL '{raw_existing_model}' is not valid for {surface}. Please choose a new default.")
-        default_model_prefill_value = _default_model_prefill()
-    model = _prompt_default_model(agent_backend, eff_provider, default_model_prefill_value)
 
     # Per-role model customization. The conversational role (`agent`)
-    # was just captured via `_prompt_default_model` above; this block
-    # offers the six non-conversational roles (PR review, issue triage,
-    # memory extraction, memory episode, behavioral judge, behavioral
-    # gen) as an optional follow-up. Default-accept is one keystroke
+    # is not prompted; its default is marked in MODEL_REGISTRY. This
+    # block offers the non-conversational roles (PR review, issue
+    # triage, memory extraction, memory episode, behavioral judge,
+    # behavioral gen) as an optional follow-up. Default-accept is one keystroke
     # ("no, use registry defaults"); operators who want per-role
     # control answer yes and walk the role list.
     #
@@ -1619,6 +1576,8 @@ def _cmd_config() -> None:
         # Walk every ModelRole regardless so the wizard surfaces the
         # full set; operators accept defaults to skip individual roles.
         for role in ModelRole:
+            if role is ModelRole.AGENT:
+                continue
             role_key = role.value
             try:
                 role_default = MODEL_REGISTRY[(agent_backend, eff_provider, role)]
@@ -2305,16 +2264,12 @@ def _cmd_config() -> None:
     env.pop("MEMORY_EPISODE_BUDGET_USD", None)
     env.pop("MEMORY_SCOPED_RECALL_ENABLED", None)
     env.pop("MEMORY_RECALL_SHADOW_ENABLED", None)
-
-    # DEFAULT_MODEL is always emitted. The model is global (per-user
-    # values in users.yaml are overrides on top of it, not replacements),
-    # and load_config validates DEFAULT_MODEL against the effective
-    # provider at startup. The load_config fallback ("sonnet") is
-    # anthropic-only, so omitting the key on non-anthropic backends
-    # produces a startup-time SystemExit; emitting it unconditionally
-    # makes the env file self-describing and forces the wizard layer
-    # to own the validation responsibility.
-    env["DEFAULT_MODEL"] = model
+    # DEFAULT_MODEL / CLAUDE_MODEL are retired from the wizard output.
+    # The conversational default now comes from MODEL_REGISTRY's
+    # ModelRole.AGENT row for the active backend/provider. Existing
+    # hand-edited DEFAULT_MODEL remains loadable, but re-running
+    # `make config` migrates back to the registry default.
+    env.pop("DEFAULT_MODEL", None)
 
     # DEFAULT_MODELS_JSON carries the per-role customization overrides
     # captured above (delta-from-defaults: only roles the operator
@@ -4490,11 +4445,10 @@ def _cmd_apply() -> None:
         ) from exc
 
     # Defensive validation: refuse to apply an install.conf whose
-    # (DEFAULT_MODEL, effective_provider) pair would fail load_config's
-    # startup check. Without this gate, apply would stop the service,
-    # rewrite /etc/kai/env, then the next service start would crash with
-    # an inscrutable message; the operator would see a partial-state
-    # installation and a dead bot.
+    # explicit DEFAULT_MODEL would fail load_config's startup check.
+    # DEFAULT_MODEL itself is no longer required; when absent,
+    # load_config uses MODEL_REGISTRY's ModelRole.AGENT row for the
+    # active backend/provider.
     #
     # Normalize the same way load_config does (config.py reads both env
     # vars through .strip().lower() before validating). A hand-edited
@@ -4503,10 +4457,6 @@ def _cmd_apply() -> None:
     # the apply gate, and then fail at startup. The legacy AGENT_BACKEND
     # key was already migrated to DEFAULT_BACKEND at the top of apply.
     #
-    # Resolve the same fallback load_config uses ("" -> "sonnet"). An
-    # empty or missing DEFAULT_MODEL is silently promoted at runtime;
-    # if we do not mirror that promotion here, the apply gate misses
-    # the missing-key case that is precisely what this gate exists for.
     default_model_raw = env.get("DEFAULT_MODEL", "")
     agent_backend_raw = env.get("DEFAULT_BACKEND", "claude").strip().lower()
     # Write the normalized value back so the downstream goose-config and
@@ -4522,7 +4472,15 @@ def _cmd_apply() -> None:
     # already migrated to it at the top of apply.
     provider_raw = env.get("DEFAULT_PROVIDER", "").strip().lower()
     eff_provider_for_check = "anthropic" if agent_backend_raw == "claude" else provider_raw
-    resolved_model = canonicalize_model_for_backend(default_model_raw or "sonnet", agent_backend_raw)
+    try:
+        registry_default_model = get_default_model_for_backend(agent_backend_raw, eff_provider_for_check)
+    except LookupError as exc:
+        raise SystemExit(
+            f"MODEL_REGISTRY has no agent default for backend '{agent_backend_raw}' "
+            f"and provider '{eff_provider_for_check}'. No usable default model is installed; "
+            "fix src/kai/config.py or set an explicit compatible DEFAULT_MODEL before applying."
+        ) from exc
+    resolved_model = canonicalize_model_for_backend(default_model_raw or registry_default_model, agent_backend_raw)
     if default_model_raw and resolved_model != default_model_raw:
         env["DEFAULT_MODEL"] = resolved_model
     # Backend-aware validation: codex installs validate against
@@ -4542,15 +4500,15 @@ def _cmd_apply() -> None:
             surface_label = f"provider '{eff_provider_for_check}'"
         if default_model_raw:
             msg = f"install.conf has DEFAULT_MODEL='{default_model_raw}' which is not valid for {surface_label}."
+            remedy = "Remove DEFAULT_MODEL to use the registry default, or set a compatible model."
         else:
             msg = (
-                f"install.conf has no DEFAULT_MODEL; the load_config fallback "
-                f"'sonnet' is not valid for {surface_label}."
+                f"MODEL_REGISTRY agent default '{registry_default_model}' is not valid for {surface_label}; "
+                "no usable default model is installed."
             )
+            remedy = "Fix MODEL_REGISTRY's agent row or set an explicit compatible DEFAULT_MODEL."
         valid_list = ", ".join(valid_models) or "(no curated list)"
-        raise SystemExit(
-            f"{msg} Re-run 'python -m kai install config' to pick a compatible model. Valid models: {valid_list}"
-        )
+        raise SystemExit(f"{msg} {remedy} Valid models: {valid_list}")
 
     dry_run = os.environ.get("DRY_RUN", "").strip() in ("1", "true", "yes")
     if dry_run:

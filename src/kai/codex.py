@@ -72,12 +72,12 @@ from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude
 log = logging.getLogger(__name__)
 
 
-# Codex is openai-only in v1. Pool.py resolves self.model via
-# PROVIDER_DEFAULTS["openai"] (currently "gpt-5.4") for codex-backed
-# users, so the value is already in OpenAI's native form ("gpt-5.4",
-# "gpt-5.4-mini", "gpt-5.4-nano"). No logical-name remapping is
-# needed at this layer, unlike goose.py which translates "sonnet" /
-# "opus" / "haiku" to claude-sonnet-4-6 etc for the Anthropic case.
+# Codex is openai-only in v1. Pool.py resolves self.model through the
+# backend/provider model registry for codex-backed users, so the value
+# is already in Codex's native model form ("gpt-5.6-sol", "gpt-5.5",
+# "gpt-5.4-mini", etc.). No logical-name remapping is needed at this
+# layer, unlike goose.py which translates "sonnet" / "opus" / "haiku"
+# to claude-sonnet-4-6 etc for the Anthropic case.
 # If a future codex version accepts a Kai-internal alias, add a map
 # here and apply it before setting CODEX_MODEL on the subprocess env.
 

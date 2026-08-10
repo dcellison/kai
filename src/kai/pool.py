@@ -23,12 +23,11 @@ from kai import sessions
 from kai.backend import AgentBackend, StreamEvent, resolve_home_workspace
 from kai.claude import ClaudeCodeBackend
 from kai.config import (
-    CODEX_DEFAULT_MODEL,
     OPEN_ENDED_PROVIDERS,
-    PROVIDER_DEFAULTS,
     Config,
     WorkspaceConfig,
     canonicalize_model_for_backend,
+    get_default_model_for_backend,
     get_effective_provider,
     get_user_backend_and_provider,
     validate_model_for_backend,
@@ -192,7 +191,8 @@ class SubprocessPool:
         elif backend == self._config.default_backend and effective_provider == global_provider:
             model = self._config.default_model
             # Catch the case where the global backend itself is an open-ended
-            # provider and DEFAULT_MODEL is something generic like "sonnet".
+            # provider and DEFAULT_MODEL is a backend-specific value
+            # that may be invalid for the open-ended provider.
             # Startup validation passes because open-ended providers accept
             # any model string, but the provider API will reject it.
             if effective_provider in OPEN_ENDED_PROVIDERS:
@@ -203,41 +203,8 @@ class SubprocessPool:
                     chat_id,
                     model,
                 )
-        elif backend == "codex":
-            # Per-user codex override on a non-codex global install.
-            # Use codex's own default (gpt-5.5) - not PROVIDER_DEFAULTS["openai"]
-            # which goose-on-openai still consults and which would
-            # bypass the codex/goose surface separation.
-            model = CODEX_DEFAULT_MODEL
-        elif backend == "opencode":
-            # Per-user opencode override on a non-opencode global install
-            # with no user.model. There is no safe per-provider default
-            # we can guess (opencode model strings are full provider/model
-            # IDs and we do not know which providers the operator has
-            # authenticated). Pass empty so OpenCodeBackend.build_env
-            # skips OPENCODE_CONFIG_CONTENT and OpenCode falls back to
-            # its own config files. Warn so the operator notices.
-            log.warning(
-                "No model configured for opencode user %d; OpenCode will use "
-                "its own config defaults (set DEFAULT_MODEL globally or per-user "
-                "in users.yaml to override)",
-                chat_id,
-            )
-            model = ""
         else:
-            model = PROVIDER_DEFAULTS.get(effective_provider, "")
-            if not model:
-                # Open-ended provider (openrouter, ollama) with no model configured.
-                # Use the global default as a last resort but warn - it's almost
-                # certainly wrong (e.g., "sonnet" sent to ollama).
-                log.warning(
-                    "No model configured for provider '%s' (chat %d); "
-                    "falling back to global default '%s' which may not be valid",
-                    effective_provider,
-                    chat_id,
-                    self._config.default_model,
-                )
-                model = self._config.default_model
+            model = get_default_model_for_backend(backend, effective_provider)
 
         # Canonicalize retired backend-specific spellings after the
         # complete precedence cascade and before constructing a backend.

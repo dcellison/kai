@@ -74,7 +74,7 @@ from kai.bot import (
     handle_workspace_callback,
     handle_workspaces,
 )
-from kai.config import PROVIDER_MODELS, Config, UserConfig
+from kai.config import PROVIDER_MODELS, Config, UserConfig, get_default_model_for_backend
 from kai.review import CollectionWarning, PRReviewResult
 from kai.tts import DEFAULT_VOICE, VOICES
 from kai.workspace_utils import is_workspace_allowed
@@ -604,6 +604,7 @@ def _make_config(**overrides) -> Config:
         "webhook_port": 8080,
         "tts_enabled": False,
         "voice_enabled": False,
+        "default_model": get_default_model_for_backend("claude", "anthropic"),
     }
     defaults.update(overrides)
     return Config(**defaults)

@@ -187,14 +187,11 @@ PROVIDER_MODELS: dict[str, dict[str, str]] = {
     },
 }
 
-# Default model for each provider, used as the wizard prompt
-# suggestion for the conversational role (DEFAULT_MODEL / per-user
-# `models.agent`). The conversational role does the most work and
-# the heaviest work in the Kai system; defaulting to a balanced or
-# speed-tier model on this surface underspends on the highest-value
-# path. Each entry below is the strongest curated model the provider
-# offers. Open-ended providers (openrouter, ollama) have no entry;
-# users on those providers MUST set a model explicitly.
+# Strongest curated model for provider-only callers such as the model
+# reset UI. Install-wide conversational defaults are backend-aware and
+# live in MODEL_REGISTRY[ModelRole.AGENT]; do not use this table as an
+# install/runtime fallback for an arbitrary backend/provider pair. Each
+# entry below is the strongest curated model the provider offers.
 #
 # Non-agent roles (PR review, issue triage, memory extraction,
 # memory episode, behavioral judge, behavioral gen) use the tier
@@ -269,18 +266,11 @@ _ALL_CURATED_MODELS: frozenset[str] = frozenset(
 
 # ── Per-role model registry ──────────────────────────────────────────
 #
-# Maps (backend, role) -> the model identifier each backend's CLI
-# accepts as --model for that role. Centralizes per-function defaults
-# so codex and any future backend can declare its mapping in one place
-# instead of scattered _TRIAGE_MODEL / _REVIEW_MODEL / _DEFAULT_*
+# Maps (backend, provider, role) -> the model identifier each backend's
+# CLI accepts as --model for that role. Centralizes defaults so codex
+# and any future backend can declare their model surface in one place
+# instead of scattered _TRIAGE_MODEL / _REVIEW_MODEL / DEFAULT_MODEL
 # constants across modules.
-#
-# Scope: only the four one-shot agent roles whose model strings move
-# between backends in the codex epic. CONVERSATION is excluded
-# deliberately: conversational model selection is owned by pool.py +
-# DEFAULT_MODEL + PROVIDER_DEFAULTS, and routing it through the
-# registry would collide with the per-user override layer that
-# users.yaml / /settings already provide.
 
 
 class ModelRole(StrEnum):
@@ -294,6 +284,7 @@ class ModelRole(StrEnum):
     that backend's CLI as --model.
     """
 
+    AGENT = "agent"
     PR_REVIEW = "pr_review"
     ISSUE_TRIAGE = "issue_triage"
     BEHAVIORAL_JUDGE = "behavioral_judge"
@@ -317,6 +308,7 @@ class ModelRole(StrEnum):
 # reasoning) means one line here plus a per-(backend, provider)
 # tier-map entry in lockstep.
 _TIER_BY_ROLE: dict[ModelRole, str] = {
+    ModelRole.AGENT: "agent",
     ModelRole.PR_REVIEW: "balanced",
     ModelRole.ISSUE_TRIAGE: "balanced",
     ModelRole.MEMORY_EXTRACTION: "cheap",
@@ -347,19 +339,23 @@ _BACKEND_PROVIDER_TIER_MODELS: dict[tuple[str, str], dict[str, str]] = {
     # cheap-tier roles where a fully-pinned model version is
     # preferable so an automated stage-2 episode generation stays
     # reproducible across CLI version bumps.
-    ("claude", "anthropic"): {"balanced": "sonnet", "cheap": "claude-haiku-4-5-20251001"},
+    ("claude", "anthropic"): {"agent": "sonnet", "balanced": "sonnet", "cheap": "claude-haiku-4-5-20251001"},
     # Codex CLI accepts the OpenAI model surface. gpt-5.5 is the
     # current frontier reasoning model; gpt-5.4-mini stays as the
     # cheap tier for high-volume roles (memory extraction, episode
     # generation, behavioral judge).
-    ("codex", "openai"): {"balanced": "gpt-5.5", "cheap": "gpt-5.4-mini"},
+    ("codex", "openai"): {"agent": CODEX_DEFAULT_MODEL, "balanced": "gpt-5.5", "cheap": "gpt-5.4-mini"},
     # OpenCode/Anthropic surface uses the `anthropic/<model>`
     # provider-prefixed shape; the model halves match the current
     # Claude SKUs (Sonnet 4.6 and Haiku 4.5 as of 2026-06-09).
-    ("opencode", "anthropic"): {"balanced": "anthropic/claude-sonnet-4-6", "cheap": "anthropic/claude-haiku-4-5"},
+    ("opencode", "anthropic"): {
+        "agent": "anthropic/claude-sonnet-4-6",
+        "balanced": "anthropic/claude-sonnet-4-6",
+        "cheap": "anthropic/claude-haiku-4-5",
+    },
     # OpenCode/OpenAI: same tier split as codex/openai but in the
     # opencode provider-prefixed shape.
-    ("opencode", "openai"): {"balanced": "openai/gpt-5.5", "cheap": "openai/gpt-5.4-mini"},
+    ("opencode", "openai"): {"agent": "openai/gpt-5.5", "balanced": "openai/gpt-5.5", "cheap": "openai/gpt-5.4-mini"},
     # DeepSeek V4 first-class OpenCode surface (V4 Pro and V4 Flash).
     # The legacy `deepseek-chat` / `deepseek-reasoner` aliases (mode
     # flags on V4 Flash) retire 2026-07-24, so do not use them in
@@ -368,33 +364,55 @@ _BACKEND_PROVIDER_TIER_MODELS: dict[tuple[str, str], dict[str, str]] = {
     # for high-volume / latency-sensitive roles (the cheap tier
     # covers memory extraction / memory episode / behavioral_judge).
     # Same 1M context on both; the split is capability-vs-cost.
-    ("opencode", "deepseek"): {"balanced": "deepseek/deepseek-v4-pro", "cheap": "deepseek/deepseek-v4-flash"},
+    ("opencode", "deepseek"): {
+        "agent": "deepseek/deepseek-v4-pro",
+        "balanced": "deepseek/deepseek-v4-pro",
+        "cheap": "deepseek/deepseek-v4-flash",
+    },
     # Google's most advanced for complex tasks per the Gemini API
     # docs (2026-06-09) is gemini-2.5-pro; gemini-2.5-flash is the
     # speed/cost tier. The 3.x family is mostly Preview / specialized.
-    ("opencode", "google"): {"balanced": "google/gemini-2.5-pro", "cheap": "google/gemini-2.5-flash"},
+    ("opencode", "google"): {
+        "agent": "google/gemini-2.5-pro",
+        "balanced": "google/gemini-2.5-pro",
+        "cheap": "google/gemini-2.5-flash",
+    },
     # OpenRouter's "provider/model" shape nests under opencode's own
     # "provider/model" prefix; the structural check accepts this
     # because the outer slash is what matters to opencode.
     ("opencode", "openrouter"): {
+        "agent": "openrouter/anthropic/claude-sonnet-4-6",
         "balanced": "openrouter/anthropic/claude-sonnet-4-6",
         "cheap": "openrouter/anthropic/claude-haiku-4-5",
     },
-    ("opencode", "ollama"): {"balanced": "ollama/llama4:70b", "cheap": "ollama/llama4:8b"},
-    ("goose", "anthropic"): {"balanced": "claude-sonnet-4-6", "cheap": "claude-haiku-4-5"},
-    ("goose", "openai"): {"balanced": "gpt-5.5", "cheap": "gpt-5.4-mini"},
+    ("opencode", "ollama"): {
+        "agent": "ollama/llama4:70b",
+        "balanced": "ollama/llama4:70b",
+        "cheap": "ollama/llama4:8b",
+    },
+    ("goose", "anthropic"): {
+        "agent": "claude-sonnet-4-6",
+        "balanced": "claude-sonnet-4-6",
+        "cheap": "claude-haiku-4-5",
+    },
+    ("goose", "openai"): {"agent": "gpt-5.5-pro", "balanced": "gpt-5.5", "cheap": "gpt-5.4-mini"},
     # goose-on-deepseek: bare model names; goose passes them through
     # to the provider API directly (no opencode-style "provider/"
     # prefix). Same Pro / Flash split as opencode-on-deepseek above;
     # same 2026-07-24 deprecation reason for skipping the legacy
     # `deepseek-chat` alias.
-    ("goose", "deepseek"): {"balanced": "deepseek-v4-pro", "cheap": "deepseek-v4-flash"},
-    ("goose", "google"): {"balanced": "gemini-2.5-pro", "cheap": "gemini-2.5-flash"},
+    ("goose", "deepseek"): {
+        "agent": "deepseek-v4-pro",
+        "balanced": "deepseek-v4-pro",
+        "cheap": "deepseek-v4-flash",
+    },
+    ("goose", "google"): {"agent": "gemini-2.5-pro", "balanced": "gemini-2.5-pro", "cheap": "gemini-2.5-flash"},
     ("goose", "openrouter"): {
+        "agent": "openrouter/anthropic/claude-sonnet-4-6",
         "balanced": "openrouter/anthropic/claude-sonnet-4-6",
         "cheap": "openrouter/anthropic/claude-haiku-4-5",
     },
-    ("goose", "ollama"): {"balanced": "llama4:70b", "cheap": "llama4:8b"},
+    ("goose", "ollama"): {"agent": "llama4:70b", "balanced": "llama4:70b", "cheap": "llama4:8b"},
 }
 
 
@@ -472,6 +490,11 @@ def get_model_for(role: ModelRole, backend: str, provider: str, override: str = 
         raise LookupError(
             f"No registry entry for (backend={backend}, provider={effective_provider}, role={role.value})"
         ) from None
+
+
+def get_default_model_for_backend(backend: str, provider: str) -> str:
+    """Resolve the registry default for the conversational agent role."""
+    return get_model_for(ModelRole.AGENT, backend, provider)
 
 
 def _check_model_registry_complete() -> None:
@@ -1172,7 +1195,10 @@ class Config:
     telegram_webhook_secret: str | None = None
 
     # Claude Code process configuration
-    default_model: str = "sonnet"
+    # Real runtime config is populated by load_config() from
+    # MODEL_REGISTRY[ModelRole.AGENT]. Empty here prevents direct
+    # Config() construction from silently assuming a Claude model.
+    default_model: str = ""
     # Global per-role model defaults. Parsed from DEFAULT_MODELS_JSON
     # env var at load time as a JSON object: keys are role identifiers
     # ("agent" plus every ModelRole.value), values are model strings.
@@ -2388,9 +2414,10 @@ def _load_user_configs(
             )
 
         # Warn if user is on an open-ended provider with no model set.
-        # PROVIDER_DEFAULTS has no entry for openrouter/ollama, so the
-        # pool would fall back to the global default_model (e.g., "sonnet")
-        # which is almost certainly wrong for that provider.
+        # The registry has an agent default for each shipped
+        # backend/provider pair, but openrouter/ollama installations are
+        # operator-specific enough that a per-user explicit model is
+        # still preferable.
         model = entry.get("model")
         if model is not None:
             model = str(model).strip().lower()
@@ -3282,8 +3309,10 @@ def load_config() -> Config:
                 ", ".join(features),
             )
 
+    global_provider = get_effective_provider(default_backend, default_provider)
+    configured_default_model = os.environ.get("DEFAULT_MODEL", "").strip()
     default_model = canonicalize_model_for_backend(
-        os.environ.get("DEFAULT_MODEL", "sonnet"),
+        configured_default_model or get_default_model_for_backend(default_backend, global_provider),
         default_backend,
     )
 
@@ -3321,21 +3350,22 @@ def load_config() -> Config:
             value_str = canonicalize_model_for_backend(value_str, default_backend)
             default_models[role_key] = value_str
 
-    # Validate DEFAULT_MODEL against the effective global backend.
+    # Validate DEFAULT_MODEL / registry agent default against the
+    # effective global backend.
     # Codex installs validate against CODEX_MODELS only - no fallback
     # to PROVIDER_MODELS["openai"]. Other backends still use the
     # provider-only validator. Catches typos at startup instead of
     # letting them propagate to a confusing runtime failure.
-    global_provider = get_effective_provider(default_backend, default_provider)
     if not validate_model_for_backend(default_model, default_backend, global_provider):
+        source_label = "DEFAULT_MODEL" if configured_default_model else "MODEL_REGISTRY agent default"
         if default_backend == "codex":
             valid = sorted(CODEX_MODELS.keys())
             raise SystemExit(
-                f"DEFAULT_MODEL '{default_model}' is not valid for codex (must be one of: {', '.join(valid)})"
+                f"{source_label} '{default_model}' is not valid for codex (must be one of: {', '.join(valid)})"
             )
         valid = sorted(PROVIDER_MODELS.get(global_provider, {}).keys())
         raise SystemExit(
-            f"DEFAULT_MODEL '{default_model}' is not valid for provider "
+            f"{source_label} '{default_model}' is not valid for provider "
             f"'{global_provider}' (must be one of: {', '.join(valid)})"
         )
 

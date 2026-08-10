@@ -336,12 +336,11 @@ class TestPerUserBackendRouting:
         assert isinstance(instance, OpenCodeBackend)
         assert instance.model == "anthropic/claude-sonnet-4-6"
 
-    def test_opencode_user_without_model_falls_back_to_empty(self, caplog):
+    def test_opencode_user_without_model_uses_registry_agent_default(self, caplog):
         """
         Per-user `backend: opencode` with no model and global
-        backend != opencode: OpenCodeBackend gets model="" so OPENCODE_
-        CONFIG_CONTENT is omitted and OpenCode uses its own config
-        files. A warning is logged so the operator notices the gap.
+        backend != opencode: OpenCodeBackend gets the registry's
+        opencode/anthropic agent default.
         """
         import logging
 
@@ -363,8 +362,8 @@ class TestPerUserBackendRouting:
         with caplog.at_level(logging.WARNING, logger="kai.pool"):
             instance = pool.get(111)
         assert isinstance(instance, OpenCodeBackend)
-        assert instance.model == ""
-        assert any("No model configured for opencode" in rec.message for rec in caplog.records)
+        assert instance.model == "anthropic/claude-sonnet-4-6"
+        assert not any("No model configured for opencode" in rec.message for rec in caplog.records)
 
     def test_codex_user_on_claude_global_install_gets_codex_default(self):
         """

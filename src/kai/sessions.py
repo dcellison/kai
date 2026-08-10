@@ -730,7 +730,7 @@ async def resolve_user_defaults(
 
     backend, _provider = get_user_backend_and_provider(user_config, config)
 
-    # Model: DB > users.yaml > env > "sonnet".
+    # Model: DB > users.yaml > registry/env default.
     # Strip whitespace so "" and " " don't pass through as valid model
     # names. The UI validates before storing, but direct DB manipulation
     # could insert empty strings that cause confusing runtime errors.

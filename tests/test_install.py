@@ -3257,20 +3257,12 @@ class TestProtectedUserIsolationPreflight:
 
 class TestCmdConfigDefaultModelDispatch:
     """
-    Wizard dispatch for DEFAULT_MODEL when users.yaml exists.
+    Wizard handling for retired DEFAULT_MODEL prompting.
 
-    Dispatch shape:
-    - _prompt_default_model fires on every wizard run, regardless of
-      whether the existing value validates;
-    - the prefill is the existing value when it validates against the
-      effective backend, otherwise the backend-aware curated default
-      (never the just-rejected value).
-
-    Always routing through the prompt is load-bearing: it lets an
-    operator with users.yaml present change the inherited global
-    model via `make config` instead of needing to hand-edit
-    /etc/kai/env. The previous "keep silently on valid match"
-    shortcut closed that path.
+    The conversational default now comes from MODEL_REGISTRY's
+    ModelRole.AGENT row for the effective backend/provider. Re-running
+    the wizard does not call _prompt_default_model and does not emit
+    DEFAULT_MODEL, even when an older install.conf still carries one.
 
     The wizard has many prompts that fire before and after the model
     dispatch. The helper below mocks _prompt_default_model to capture
@@ -3332,7 +3324,7 @@ class TestCmdConfigDefaultModelDispatch:
             "polling",  # transport
             "claude",  # agent backend
             "/usr/bin/true",  # claude binary path
-            # model prompt is handled by the _prompt_default_model mock
+            # no DEFAULT_MODEL prompt; agent default comes from MODEL_REGISTRY
             "false",  # customize per-role models (decline; use registry defaults)
             "120",  # agent timeout (global default)
             "0",  # max session age hours (0 = no limit)
@@ -3374,7 +3366,7 @@ class TestCmdConfigDefaultModelDispatch:
             # No OPENAI_API_KEY prompt in subscription mode
             "/usr/local/bin/codex",  # codex binary path
             # No provider prompt (codex is single-provider; absent from BACKENDS_NEEDING_PROVIDER_PROMPT)
-            # Model prompt handled by the _prompt_default_model mock
+            # no DEFAULT_MODEL prompt; agent default comes from MODEL_REGISTRY
             "false",  # customize per-role models (decline; use registry defaults)
             "120",  # agent timeout (global default)
             "0",  # max session age hours (0 = no limit)
@@ -3408,7 +3400,7 @@ class TestCmdConfigDefaultModelDispatch:
             "/opt/homebrew/bin/goose",  # goose binary path (validator stubbed)
             "openai",  # llm provider
             "openai-key",  # OPENAI_API_KEY
-            # model prompt is handled by the _prompt_default_model mock
+            # no DEFAULT_MODEL prompt; agent default comes from MODEL_REGISTRY
             "false",  # customize per-role models (decline; use registry defaults)
             "120",  # agent timeout (global default)
             "0",  # max session age hours (0 = no limit)
@@ -3432,9 +3424,9 @@ class TestCmdConfigDefaultModelDispatch:
         """
         Run _cmd_config with _prompt_default_model mocked.
 
-        Returns (mock_object, written_env) where mock_object exposes
-        call_args / called for assertion, and written_env is the env
-        dict that the wizard wrote to install.conf.
+        Returns (mock_object, written_env). The mock should remain
+        uncalled; it is installed to catch accidental reintroduction of
+        the retired DEFAULT_MODEL prompt.
         """
         from unittest.mock import MagicMock
 
@@ -3538,11 +3530,12 @@ class TestCmdConfigDefaultModelDispatch:
             assert level in prompt, f"codex effort prompt missing level {level!r}; prompt={prompt!r}"
         assert "empty = codex default" in prompt
 
-    def test_reprompts_on_provider_flip_with_users_yaml(self, tmp_path, monkeypatch):
+    def test_provider_flip_drops_existing_default_model(self, tmp_path, monkeypatch):
         """
         With users.yaml present and DEFAULT_MODEL=sonnet, flipping to
-        goose+openai prompts for a new model and the chosen value lands
-        in install.conf.
+        goose+openai does not prompt for a replacement. The regenerated
+        install.conf drops DEFAULT_MODEL so runtime uses the registry
+        agent default for goose/openai.
         """
         self._setup(monkeypatch, tmp_path, existing_env={"DEFAULT_MODEL": "sonnet"})
         monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
@@ -3552,20 +3545,16 @@ class TestCmdConfigDefaultModelDispatch:
             self._inputs_for_goose_openai(),
             helper_return="gpt-5.4-mini",
         )
-        helper.assert_called_once()
-        # New signature: (agent_backend, eff_provider, default_val)
-        assert helper.call_args.args[0] == "goose"
-        assert helper.call_args.args[1] == "openai"
-        assert env["DEFAULT_MODEL"] == "gpt-5.4-mini"
+        helper.assert_not_called()
+        assert env["DEFAULT_BACKEND"] == "goose"
+        assert env["DEFAULT_PROVIDER"] == "openai"
+        assert "DEFAULT_MODEL" not in env
 
-    def test_prompt_fires_with_valid_existing_as_prefill(self, tmp_path, monkeypatch):
+    def test_valid_existing_default_model_is_not_reemitted(self, tmp_path, monkeypatch):
         """
         With users.yaml present, DEFAULT_MODEL=sonnet, and the wizard
-        kept on claude, the model prompt STILL fires and the existing
-        value is passed as the prefill. The operator's choice (from
-        the helper return) lands in install.conf. Pins the contract
-        that the operator can always edit the global model via
-        `make config`, not just when it is invalid for the backend.
+        kept on claude, the model prompt does not fire and the
+        regenerated install.conf omits DEFAULT_MODEL.
         """
         self._setup(monkeypatch, tmp_path, existing_env={"DEFAULT_MODEL": "sonnet"})
         helper, env = self._run(
@@ -3574,19 +3563,14 @@ class TestCmdConfigDefaultModelDispatch:
             self._inputs_for_claude_backend(),
             helper_return="haiku",
         )
-        helper.assert_called_once()
-        # Prefill is the existing value because it validates for claude.
-        assert helper.call_args.args[0] == "claude"
-        assert helper.call_args.args[1] == "anthropic"
-        assert helper.call_args.args[2] == "sonnet"
-        assert env["DEFAULT_MODEL"] == "haiku"
+        helper.assert_not_called()
+        assert "DEFAULT_MODEL" not in env
 
-    def test_reprompts_on_empty_existing_model_claude(self, tmp_path, monkeypatch):
+    def test_empty_existing_model_uses_registry_default_claude(self, tmp_path, monkeypatch):
         """
-        users.yaml present, no DEFAULT_MODEL in existing env, backend stays
-        claude. Empty existing model fails validate_model_for_provider
-        (empty is not in PROVIDER_MODELS["anthropic"]), so the dispatch
-        re-prompts.
+        users.yaml present, no DEFAULT_MODEL in existing env, backend
+        stays claude. The wizard does not prompt; runtime falls through
+        to MODEL_REGISTRY's claude/anthropic agent default.
         """
         self._setup(monkeypatch, tmp_path, existing_env={})
         helper, env = self._run(
@@ -3595,17 +3579,15 @@ class TestCmdConfigDefaultModelDispatch:
             self._inputs_for_claude_backend(),
             helper_return="sonnet",
         )
-        helper.assert_called_once()
-        # New signature: (agent_backend, eff_provider, default_val)
-        assert helper.call_args.args[0] == "claude"
-        assert helper.call_args.args[1] == "anthropic"
-        assert env["DEFAULT_MODEL"] == "sonnet"
+        helper.assert_not_called()
+        assert "DEFAULT_MODEL" not in env
 
-    def test_reprompts_on_empty_existing_model_openai(self, tmp_path, monkeypatch):
+    def test_empty_existing_model_uses_registry_default_openai(self, tmp_path, monkeypatch):
         """
         Empty-existing-model path on a non-anthropic provider: flip to
-        goose+openai with no DEFAULT_MODEL in existing env, dispatch
-        re-prompts, helper fires with eff_provider equal to "openai".
+        goose+openai with no DEFAULT_MODEL in existing env. The wizard
+        does not prompt; runtime falls through to MODEL_REGISTRY's
+        goose/openai agent default.
         """
         self._setup(monkeypatch, tmp_path, existing_env={})
         monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
@@ -3615,21 +3597,17 @@ class TestCmdConfigDefaultModelDispatch:
             self._inputs_for_goose_openai(),
             helper_return="gpt-5.4",
         )
-        helper.assert_called_once()
-        # New signature: (agent_backend, eff_provider, default_val)
-        assert helper.call_args.args[0] == "goose"
-        assert helper.call_args.args[1] == "openai"
-        assert env["DEFAULT_MODEL"] == "gpt-5.4"
+        helper.assert_not_called()
+        assert env["DEFAULT_BACKEND"] == "goose"
+        assert env["DEFAULT_PROVIDER"] == "openai"
+        assert "DEFAULT_MODEL" not in env
 
-    def test_reprompt_prefill_is_provider_default_not_invalid_existing(self, tmp_path, monkeypatch):
+    def test_invalid_existing_default_model_is_dropped(self, tmp_path, monkeypatch):
         """
-        When re-prompting because the existing model is invalid for the
-        new provider, the prefill is PROVIDER_DEFAULTS for the new
-        provider, NOT the just-rejected value. Guards against
-        _prompt_choice's default-passthrough behavior (it returns its
-        `default` parameter on empty input without validating it against
-        the `choices` list); if the dispatch passed the invalid model as
-        the prefill, the operator pressing Enter would re-accept it.
+        When an older install.conf carries a DEFAULT_MODEL that is
+        invalid for the newly selected backend/provider, the wizard
+        drops it instead of prompting for a replacement. Runtime then
+        uses MODEL_REGISTRY's agent default.
         """
         self._setup(monkeypatch, tmp_path, existing_env={"DEFAULT_MODEL": "opus"})
         monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
@@ -3639,14 +3617,10 @@ class TestCmdConfigDefaultModelDispatch:
             self._inputs_for_goose_openai(),
             helper_return="gpt-5.4-mini",
         )
-        helper.assert_called_once()
-        # New signature: (agent_backend, eff_provider, default_val).
-        # Third positional arg is the prefill. Must be
-        # PROVIDER_DEFAULTS["openai"] = "gpt-5.5-pro" (the strongest
-        # OpenAI text model), NOT the rejected "opus".
-        assert helper.call_args.args[2] == "gpt-5.5-pro"
-        assert helper.call_args.args[2] != "opus"
-        assert env["DEFAULT_MODEL"] == "gpt-5.4-mini"
+        helper.assert_not_called()
+        assert env["DEFAULT_BACKEND"] == "goose"
+        assert env["DEFAULT_PROVIDER"] == "openai"
+        assert "DEFAULT_MODEL" not in env
 
     def test_codex_install_enables_memory_with_codex_reasoner(self, tmp_path, monkeypatch):
         """
@@ -3777,14 +3751,14 @@ class TestCmdApplyDefaultModelGate:
         msg = str(excinfo.value)
         assert "sonnet" in msg
         assert "openai" in msg
-        assert "install config" in msg
+        assert "registry default" in msg
         stop_service.assert_not_called()
 
-    def test_rejects_missing_default_model_on_non_anthropic(self, tmp_path, monkeypatch):
+    def test_accepts_missing_default_model_on_non_anthropic(self, tmp_path, monkeypatch):
         """
-        Missing DEFAULT_MODEL on a non-anthropic provider raises
-        SystemExit naming the load_config 'sonnet' fallback so the
-        operator understands why an unset key is a problem.
+        Missing DEFAULT_MODEL on a non-anthropic provider is valid now:
+        load_config uses MODEL_REGISTRY's agent default for the active
+        backend/provider.
         """
         monkeypatch.setattr("os.geteuid", lambda: 0)
         conf_path = self._write_install_conf(
@@ -3794,19 +3768,37 @@ class TestCmdApplyDefaultModelGate:
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         stop_service = self._patch_side_effects(monkeypatch)
 
+        _cmd_apply()
+        stop_service.assert_called_once()
+
+    def test_rejects_invalid_registry_agent_default(self, tmp_path, monkeypatch):
+        """
+        Missing DEFAULT_MODEL does not mean "install anything": apply
+        validates MODEL_REGISTRY's agent default for the selected
+        backend/provider before any service side effects.
+        """
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+        conf_path = self._write_install_conf(
+            tmp_path,
+            {"DEFAULT_BACKEND": "goose", "DEFAULT_PROVIDER": "openai"},
+        )
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setattr("kai.install.get_default_model_for_backend", lambda *_args: "sonnet")
+        stop_service = self._patch_side_effects(monkeypatch)
+
         with pytest.raises(SystemExit) as excinfo:
             _cmd_apply()
         msg = str(excinfo.value)
-        assert "no DEFAULT_MODEL" in msg
-        assert "sonnet" in msg
+        assert "MODEL_REGISTRY agent default" in msg
+        assert "no usable default model is installed" in msg
         assert "openai" in msg
         stop_service.assert_not_called()
 
     def test_accepts_missing_default_model_on_anthropic(self, tmp_path, monkeypatch):
         """
-        Missing DEFAULT_MODEL on anthropic: resolves to 'sonnet' via the
-        load_config fallback; sonnet is valid for anthropic so the gate
-        passes and apply proceeds past _stop_service.
+        Missing DEFAULT_MODEL on anthropic resolves through
+        MODEL_REGISTRY's agent default, so the gate passes and apply
+        proceeds past _stop_service.
         """
         monkeypatch.setattr("os.geteuid", lambda: 0)
         conf_path = self._write_install_conf(
