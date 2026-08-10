@@ -442,6 +442,30 @@ class TestPerUserBackendRouting:
             assert isinstance(instance, expected_type)
             assert instance.max_session_hours == 6.5
 
+    def test_protected_install_defers_user_file_reads_for_all_backends(self):
+        """Protected installs stop backend context from reading user files in the daemon."""
+        from kai.claude import ClaudeCodeBackend
+        from kai.codex import CodexBackend
+        from kai.opencode import OpenCodeBackend
+
+        users = {
+            111: UserConfig(telegram_id=111, name="a", backend="claude", provider="anthropic", model="sonnet"),
+            222: UserConfig(telegram_id=222, name="b", backend="codex"),
+            333: UserConfig(telegram_id=333, name="c", backend="goose", provider="anthropic", model="sonnet"),
+            444: UserConfig(telegram_id=444, name="d", backend="opencode", model="anthropic/claude-sonnet-4-6"),
+        }
+        config = _make_config(protected_install=True, user_configs=users)
+        pool = SubprocessPool(config=config, services_info=[])
+        for chat_id, expected_type in [
+            (111, ClaudeCodeBackend),
+            (222, CodexBackend),
+            (333, GooseBackend),
+            (444, OpenCodeBackend),
+        ]:
+            instance = pool.get(chat_id)
+            assert isinstance(instance, expected_type)
+            assert instance.defer_user_file_reads is True
+
     def test_opencode_user_receives_os_user(self):
         """An opencode user's os_user reaches OpenCodeBackend, which
         wires the per-user sudo isolation in the shared ACP layer

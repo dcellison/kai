@@ -121,6 +121,11 @@ class ClaudeCodeBackend(AgentBackend):
         # the kwarg; production callers (pool.py) always pass an
         # explicit value.
         memory_enabled: bool = False,
+        # Protected installs keep per-user files unreadable to other
+        # users. When true, first-turn context injects paths instead
+        # of daemon-read file contents; the user-isolated subprocess
+        # can read its own files directly.
+        defer_user_file_reads: bool = False,
     ):
         # ABC-required attributes (pool.py reads/writes these)
         self.model = model
@@ -141,6 +146,7 @@ class ClaudeCodeBackend(AgentBackend):
         # Session-age recycling limit (ABC surface; checked by the
         # inherited _should_recycle at the top of _send_locked).
         self.max_session_hours = max_session_hours
+        self.defer_user_file_reads = defer_user_file_reads
 
         # Claude-Code-specific attributes (not on the ABC)
         self.claude_user = claude_user
@@ -764,6 +770,7 @@ class ClaudeCodeBackend(AgentBackend):
                 chat_id=chat_id,
                 data_dir=DATA_DIR,
                 memory_enabled=self.memory_enabled,
+                defer_user_file_reads=self.defer_user_file_reads,
             )
 
         # Foreign-workspace reminder is built fresh per turn (its

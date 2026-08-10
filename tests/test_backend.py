@@ -89,6 +89,41 @@ class TestBuildSessionContext:
         assert "[Your core identity and instructions:]" in result
         assert "Be helpful." in result
 
+    def test_defer_user_file_reads_injects_paths_not_contents(self, tmp_path):
+        """Protected mode avoids daemon-side reads of user-owned files."""
+        home = tmp_path / "home" / "12345"
+        home.mkdir(parents=True)
+        (home / ".claude").mkdir()
+        (home / ".claude" / "CLAUDE.md").write_text("PRIVATE IDENTITY")
+
+        foreign = tmp_path / "foreign"
+        foreign.mkdir()
+        data_dir = tmp_path / "data"
+        pref_dir = data_dir / "preferences" / "12345"
+        pref_dir.mkdir(parents=True)
+        (pref_dir / "PREFERENCES.md").write_text("PRIVATE PREFS")
+        memory_dir = data_dir / "memory" / "12345"
+        memory_dir.mkdir(parents=True)
+        (memory_dir / "MEMORY.md").write_text("PRIVATE MEMORY")
+
+        with patch("kai.backend.get_recent_history", return_value=""):
+            result = build_session_context(
+                workspace=foreign,
+                home_workspace=home,
+                api=self._api(),
+                workspace_config=None,
+                chat_id=12345,
+                data_dir=data_dir,
+                defer_user_file_reads=True,
+            )
+
+        assert "PRIVATE IDENTITY" not in result
+        assert "PRIVATE PREFS" not in result
+        assert "PRIVATE MEMORY" not in result
+        assert str(home / ".claude" / "CLAUDE.md") in result
+        assert str(pref_dir / "PREFERENCES.md") in result
+        assert str(memory_dir / "MEMORY.md") in result
+
     def test_memory_exists(self, tmp_path):
         """Memory content included when file exists and is non-empty."""
         workspace = tmp_path / "ws"

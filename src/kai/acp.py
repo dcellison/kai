@@ -666,6 +666,11 @@ class AcpBackend(AgentBackend):
         # unbounded memory growth in a long-lived agent subprocess.
         # The pool passes Config.agent_max_session_hours.
         max_session_hours: float = 0,
+        # Protected installs keep per-user files unreadable to other
+        # users. When true, first-turn context injects paths instead
+        # of daemon-read file contents; the user-isolated subprocess
+        # can read its own files directly.
+        defer_user_file_reads: bool = False,
     ):
         # ABC-required attributes (pool.py reads/writes these)
         self.model = model
@@ -676,6 +681,7 @@ class AcpBackend(AgentBackend):
         self.provider = provider
         self.memory_enabled = memory_enabled
         self.os_user = os_user
+        self.defer_user_file_reads = defer_user_file_reads
         # Session-age recycling limit (ABC surface; checked by the
         # inherited _should_recycle at the top of _send_locked).
         self.max_session_hours = max_session_hours
@@ -1222,6 +1228,7 @@ class AcpBackend(AgentBackend):
                 chat_id=chat_id,
                 data_dir=DATA_DIR,
                 memory_enabled=self.memory_enabled,
+                defer_user_file_reads=self.defer_user_file_reads,
             )
 
         reminder = build_foreign_workspace_reminder(self.workspace, self.home_workspace) or ""

@@ -294,6 +294,7 @@ def build_session_context(
     chat_id: int | None,
     data_dir: Path,
     memory_enabled: bool = False,
+    defer_user_file_reads: bool = False,
 ) -> str:
     """
     Build the context prefix for the first message of a new session.
@@ -318,6 +319,11 @@ def build_session_context(
             as a bool rather than the full Config to match the existing
             convention of backends taking individual config fields at
             construction.
+        defer_user_file_reads: When True, do not read per-user files
+            from the daemon process. Instead inject the paths the
+            user-isolated backend subprocess should read. This is the
+            protected-install path that allows per-user directories to
+            be tightened without granting daemon-readable contents.
     """
     parts: list[str] = []
 
@@ -327,12 +333,18 @@ def build_session_context(
     # in get_workspace_system_prompt().
     if workspace != home_workspace:
         identity_path = home_workspace / ".claude" / "CLAUDE.md"
-        try:
-            identity = identity_path.read_text().strip()
-            if identity:
-                parts.append(f"[Your core identity and instructions:]\n{identity}")
-        except OSError:
-            pass
+        if defer_user_file_reads:
+            parts.append(
+                "[Your core identity and instructions are stored at "
+                f"{identity_path}. Read this file before applying identity-specific instructions.]"
+            )
+        else:
+            try:
+                identity = identity_path.read_text().strip()
+                if identity:
+                    parts.append(f"[Your core identity and instructions:]\n{identity}")
+            except OSError:
+                pass
 
     # Memory subsystem state marker. Tells the inner agent where to
     # route new fact saves: enabled = POST /api/memory/add (Qdrant),
@@ -358,18 +370,24 @@ def build_session_context(
     # is no global-fallback PREFERENCES.md.
     if chat_id is not None:
         pref_path = data_dir / "preferences" / str(chat_id) / "PREFERENCES.md"
-        try:
-            pref_text = pref_path.read_text().strip()
-            if pref_text:
-                parts.append(f"[Your personal preferences (file: {pref_path}):]\n{pref_text}")
-            else:
-                parts.append(f"[Your personal preferences (file: {pref_path}):]\n(currently empty)")
-        except OSError:
-            # OSError fires only on missing or unreadable files; the
-            # empty case is handled by the else branch above with a
-            # distinct "(currently empty)" placeholder. Match the
-            # MEMORY.md branch's wording for symmetry.
-            parts.append(f"[Your personal preferences (file: {pref_path}):]\n(not yet created)")
+        if defer_user_file_reads:
+            parts.append(
+                f"[Your personal preferences are stored at {pref_path}. "
+                "Read this file before applying personal preference instructions.]"
+            )
+        else:
+            try:
+                pref_text = pref_path.read_text().strip()
+                if pref_text:
+                    parts.append(f"[Your personal preferences (file: {pref_path}):]\n{pref_text}")
+                else:
+                    parts.append(f"[Your personal preferences (file: {pref_path}):]\n(currently empty)")
+            except OSError:
+                # OSError fires only on missing or unreadable files; the
+                # empty case is handled by the else branch above with a
+                # distinct "(currently empty)" placeholder. Match the
+                # MEMORY.md branch's wording for symmetry.
+                parts.append(f"[Your personal preferences (file: {pref_path}):]\n(not yet created)")
 
     # Inject Kai's personal memory from DATA_DIR ONLY in disabled mode.
     # In enabled mode, Qdrant is the active fact surface (retrieved via
@@ -397,14 +415,20 @@ def build_session_context(
             memory_path = data_dir / "memory" / str(chat_id) / "MEMORY.md"
         else:
             memory_path = data_dir / "memory" / "MEMORY.md"
-        try:
-            memory = memory_path.read_text().strip()
-            if memory:
-                parts.append(f"[Your persistent memory (file: {memory_path}):]\n{memory}")
-            else:
-                parts.append(f"[Your persistent memory (file: {memory_path}):]\n(currently empty)")
-        except OSError:
-            parts.append(f"[Your persistent memory (file: {memory_path}):]\n(not yet created)")
+        if defer_user_file_reads and chat_id is not None:
+            parts.append(
+                f"[Your persistent memory is stored at {memory_path}. "
+                "Read this file when persistent memory is relevant; update it for durable memory writes.]"
+            )
+        else:
+            try:
+                memory = memory_path.read_text().strip()
+                if memory:
+                    parts.append(f"[Your persistent memory (file: {memory_path}):]\n{memory}")
+                else:
+                    parts.append(f"[Your persistent memory (file: {memory_path}):]\n(currently empty)")
+            except OSError:
+                parts.append(f"[Your persistent memory (file: {memory_path}):]\n(not yet created)")
 
     # Per-workspace system prompt from workspaces.yaml. Injected
     # between the identity/memory block and conversation history,

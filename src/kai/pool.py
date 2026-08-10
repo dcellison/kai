@@ -267,6 +267,7 @@ class SubprocessPool:
                 memory_enabled=self._config.memory_enabled,
                 os_user=os_user,
                 max_session_hours=self._config.agent_max_session_hours,
+                defer_user_file_reads=getattr(self._config, "protected_install", False) is True,
             )
 
         if backend == "opencode":
@@ -288,6 +289,7 @@ class SubprocessPool:
                 memory_enabled=self._config.memory_enabled,
                 os_user=os_user,
                 max_session_hours=self._config.agent_max_session_hours,
+                defer_user_file_reads=getattr(self._config, "protected_install", False) is True,
             )
 
         if backend == "codex":
@@ -311,6 +313,7 @@ class SubprocessPool:
                 memory_enabled=self._config.memory_enabled,
                 max_session_hours=self._config.agent_max_session_hours,
                 codex_effort_level=self._config.codex_effort_level,
+                defer_user_file_reads=getattr(self._config, "protected_install", False) is True,
             )
 
         return ClaudeCodeBackend(
@@ -327,6 +330,7 @@ class SubprocessPool:
             autocompact_pct=self._config.claude_autocompact_pct,
             claude_effort_level=self._config.claude_effort_level,
             memory_enabled=self._config.memory_enabled,
+            defer_user_file_reads=getattr(self._config, "protected_install", False) is True,
         )
 
     # ── Prompt routing ──────────────────────────────────────────────
