@@ -2308,7 +2308,7 @@ class TestBuildReviewPromptFromContext:
         # complete context and to flag specific missing outside-of-
         # changed-files context as concrete findings instead.
         prompt = build_review_prompt_from_context(_ctx())
-        assert "no shell, filesystem, or tool access" in prompt
+        assert "no shell, project-filesystem, network, or external tool access" in prompt
         assert "complete context" in prompt
         assert "Do not flag the absence of a runnable checkout" in prompt
 

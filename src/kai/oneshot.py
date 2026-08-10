@@ -86,6 +86,42 @@ _SUBPROCESS_ENV_ALLOWLIST = (
 )
 
 
+# Codex one-shot calls are classifiers/renderers, not interactive agents.  Keep
+# their execution boundary independent of the operator's Codex configuration
+# and give the model access only to the neutral working root that Kai creates
+# for the call.  The permission-profile value is one TOML inline table because
+# `codex -c` dotted-path parsing cannot represent the special `:minimal` and
+# `:workspace_roots` keys reliably one segment at a time.
+_CODEX_ONESHOT_PERMISSION_PROFILE = (
+    'permissions.kai-oneshot={description="Kai bounded one-shot", '
+    'filesystem={":minimal"="read", ":workspace_roots"={"."="read"}}, '
+    "network={enabled=false}}"
+)
+
+
+# Defense in depth around the permission profile.  `shell_tool=false` is the
+# load-bearing tool suppression; the remaining entries remove other built-in
+# or account-backed tool surfaces that a Codex release may otherwise advertise
+# to the model.  `--strict-config` on the invocation makes a renamed/removed
+# control fail the one-shot call closed instead of silently weakening it.
+_CODEX_ONESHOT_DISABLED_FEATURES = (
+    "shell_tool",
+    "unified_exec",
+    "apps",
+    "plugins",
+    "remote_plugin",
+    "browser_use",
+    "browser_use_external",
+    "computer_use",
+    "image_generation",
+    "multi_agent",
+    "hooks",
+    "skill_search",
+    "skill_mcp_dependency_install",
+    "view_image",
+)
+
+
 def _ensure_extractor_cwd() -> None:
     """
     Create the neutral subprocess cwd on first use and chmod it 0o755
@@ -1004,11 +1040,25 @@ class CodexOneShotReasoner:
       codex one-shot lineage is to pass this on every exec invocation.
     - `--ephemeral` mirrors Claude's `--no-session-persistence`: no
       session files written under ~/.codex per call.
-    - `--ignore-rules` keeps user or project execpolicy `.rules`
-      files from influencing memory extraction. The neutral cwd
-      already avoids project rules, but the explicit flag protects
-      the one-shot path from user-level rule drift on the service
-      user's `~/.codex/`.
+    - `--ignore-user-config` and `--ignore-rules` keep user config,
+      MCP servers, hooks, skills, and user/project execpolicy rules
+      from influencing a bounded call. Authentication still comes
+      from the target user's CODEX_HOME, as Codex documents for
+      `--ignore-user-config`.
+    - `--strict-config` makes an unsupported security control fail
+      the call instead of being ignored after a Codex CLI change.
+    - `approval_policy="never"` prevents an untrusted prompt from
+      turning a tool attempt into an operator approval request.
+    - The `kai-oneshot` permission profile grants read access only to
+      Codex's minimal runtime files and this call's neutral workspace,
+      with network disabled. The profile is deliberately used instead
+      of `--sandbox`: Codex permission profiles do not compose with the
+      legacy sandbox flag, and passing both would make `--sandbox` win.
+    - Shell, apps/plugins, browser/computer/image tools, multi-agent,
+      hooks, skills, and image viewing are explicitly disabled. Web
+      search is disabled separately and MCP configuration is replaced
+      with an empty table. The filesystem profile remains a second
+      line of defense if a future CLI accidentally exposes a tool.
     - `--cd <cwd>` tells codex its working root explicitly; the
       subprocess `cwd` argument keeps the process environment aligned
       with that root so a future codex release that reads cwd from
@@ -1026,10 +1076,9 @@ class CodexOneShotReasoner:
       asks for structured output only and does not need tools, shell
       commands, or filesystem writes. Granting the bypass would widen
       blast radius if a future codex release tried to invoke tools.
-    - `--sandbox danger-full-access`: same reasoning. If codex
-      attempts tool calls during exec, the call should fail or
-      produce no valid final JSON; the reasoner then raises
-      `OneShotOutputError` and the caller stores nothing.
+    - Any `--sandbox` value: the narrower named permission profile is
+      the active sandbox contract, and Codex documents that the legacy
+      `--sandbox` flag overrides rather than composes with profiles.
 
     The schema temp file lives under `DATA_DIR/memory/extractor_cwd/`
     on production and the test-supplied cwd otherwise. Storing it
@@ -1114,10 +1163,24 @@ class CodexOneShotReasoner:
             "--json",
             "--skip-git-repo-check",
             "--ephemeral",
+            "--ignore-user-config",
             "--ignore-rules",
+            "--strict-config",
+            "--config",
+            'approval_policy="never"',
+            "--config",
+            'default_permissions="kai-oneshot"',
+            "--config",
+            _CODEX_ONESHOT_PERMISSION_PROFILE,
+            "--config",
+            'web_search="disabled"',
+            "--config",
+            "mcp_servers={}",
             "--cd",
             str(self._cwd),
         ]
+        for feature in _CODEX_ONESHOT_DISABLED_FEATURES:
+            cmd.extend(["--disable", feature])
         if model is not None:
             cmd.extend(["--model", model])
 

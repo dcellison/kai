@@ -508,9 +508,10 @@ def _codex_envelope_ndjson(payload: dict) -> bytes:
 
 class TestCodexOneShotReasonerArgv:
     """The codex argv must reflect the spec's flag set: exec mode,
-    JSON event output, trusted-dir skip, ephemeral session, ignore
-    user/project rules, neutral cwd, model when provided, and
-    --output-schema with a real path only when a schema is supplied."""
+    JSON event output, trusted-dir skip, ephemeral session, isolated
+    config/rules, a fail-closed read-only permission profile, disabled
+    tool surfaces, neutral cwd, model when provided, and --output-schema
+    with a real path only when a schema is supplied."""
 
     @pytest.mark.asyncio
     async def test_argv_includes_required_flags(self, tmp_path, monkeypatch):
@@ -534,7 +535,40 @@ class TestCodexOneShotReasonerArgv:
         assert "--json" in cmd
         assert "--skip-git-repo-check" in cmd
         assert "--ephemeral" in cmd
+        assert "--ignore-user-config" in cmd
         assert "--ignore-rules" in cmd
+        assert "--strict-config" in cmd
+        config_values = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--config"]
+        assert 'approval_policy="never"' in config_values
+        assert 'default_permissions="kai-oneshot"' in config_values
+        permission_config = next(value for value in config_values if value.startswith("permissions.kai-oneshot="))
+        assert '":minimal"="read"' in permission_config
+        assert '":workspace_roots"={"."="read"}' in permission_config
+        assert "network={enabled=false}" in permission_config
+        assert 'web_search="disabled"' in config_values
+        assert "mcp_servers={}" in config_values
+
+        disabled = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--disable"]
+        assert {
+            "shell_tool",
+            "unified_exec",
+            "apps",
+            "plugins",
+            "remote_plugin",
+            "browser_use",
+            "browser_use_external",
+            "computer_use",
+            "image_generation",
+            "multi_agent",
+            "hooks",
+            "skill_search",
+            "skill_mcp_dependency_install",
+            "view_image",
+        } <= set(disabled)
+        # Permission profiles and the legacy --sandbox flag do not
+        # compose: adding --sandbox would silently override this
+        # narrower profile.
+        assert "--sandbox" not in cmd
         i = cmd.index("--cd")
         assert cmd[i + 1] == str(tmp_path)
         i = cmd.index("--model")
