@@ -3278,7 +3278,7 @@ async def _handle_github_notify(
                     config=config,
                 )
                 if not still_used:
-                    webhook.remove_allowed_chat_id(old_chat_id)
+                    webhook.remove_notification_chat_id(old_chat_id)
         await update.message.reply_text("Notification destination reset to this chat.")
         return
 
@@ -3305,13 +3305,13 @@ async def _handle_github_notify(
                 config=config,
             )
             if not still_used:
-                webhook.remove_allowed_chat_id(old_notify)
+                webhook.remove_notification_chat_id(old_notify)
 
     await sessions.set_setting(f"github_notify_chat:{chat_id}", str(notify_id))
 
-    # Keep the legacy live destination registry synchronized. Internal API
-    # access is credential-bound and does not consult this collection.
-    webhook.add_allowed_chat_id(notify_id)
+    # Keep the live outbound-destination registry synchronized. This does not
+    # expand Telegram inbound authorization.
+    webhook.add_notification_chat_id(notify_id)
 
     await update.message.reply_text(f"GitHub notifications will go to chat {notify_id}.")
 

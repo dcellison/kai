@@ -4925,7 +4925,7 @@ class TestHandleGitHub:
 
         with (
             patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.webhook.add_allowed_chat_id") as mock_add,
+            patch("kai.bot.webhook.add_notification_chat_id") as mock_add,
         ):
             await handle_github(update, ctx)
 
@@ -5059,11 +5059,11 @@ class TestHandleGitHub:
         reply = update.message.reply_text.call_args[0][0]
         assert "unknown subcommand" in reply.lower()
 
-    # ── 11. /github notify - live allowed_user_ids updates ────────
+    # ── 11. /github notify - live notification destination updates ────────
 
     @pytest.mark.asyncio
-    async def test_notify_set_updates_allowed_ids(self):
-        """/github notify -100999 adds the group to allowed_user_ids immediately."""
+    async def test_notify_set_updates_notification_destinations(self):
+        """/github notify -100999 adds the group to notification destinations immediately."""
         update = _make_update(text="/github notify -100999")
         config = _make_config()
         ctx = _make_context(config=config, args=["notify", "-100999"])
@@ -5074,7 +5074,7 @@ class TestHandleGitHub:
 
         with (
             patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.webhook.add_allowed_chat_id") as mock_add,
+            patch("kai.bot.webhook.add_notification_chat_id") as mock_add,
         ):
             await handle_github(update, ctx)
 
@@ -5085,10 +5085,10 @@ class TestHandleGitHub:
 
     @pytest.mark.asyncio
     async def test_notify_set_overwrite_cleans_up_old(self):
-        """Overwriting a notify destination removes the old chat_id from allowed set.
+        """Overwriting a notify destination removes the old outbound destination.
 
-        Without this cleanup, the old chat_id would linger in allowed_user_ids
-        until restart - an auth leak for abandoned group chats.
+        Without this cleanup, the old chat_id would linger in the live
+        outbound notification registry until restart.
         """
         update = _make_update(text="/github notify -100888")
         config = _make_config()
@@ -5100,8 +5100,8 @@ class TestHandleGitHub:
 
         with (
             patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.webhook.add_allowed_chat_id") as mock_add,
-            patch("kai.bot.webhook.remove_allowed_chat_id") as mock_remove,
+            patch("kai.bot.webhook.add_notification_chat_id") as mock_add,
+            patch("kai.bot.webhook.remove_notification_chat_id") as mock_remove,
             patch("kai.bot._is_notify_chat_used", new_callable=AsyncMock, return_value=False),
         ):
             await handle_github(update, ctx)
@@ -5122,8 +5122,8 @@ class TestHandleGitHub:
 
         with (
             patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.webhook.add_allowed_chat_id") as mock_add,
-            patch("kai.bot.webhook.remove_allowed_chat_id") as mock_remove,
+            patch("kai.bot.webhook.add_notification_chat_id") as mock_add,
+            patch("kai.bot.webhook.remove_notification_chat_id") as mock_remove,
             # Another user still uses the old chat_id
             patch("kai.bot._is_notify_chat_used", new_callable=AsyncMock, return_value=True),
         ):
@@ -5146,8 +5146,8 @@ class TestHandleGitHub:
 
         with (
             patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.webhook.add_allowed_chat_id") as mock_add,
-            patch("kai.bot.webhook.remove_allowed_chat_id") as mock_remove,
+            patch("kai.bot.webhook.add_notification_chat_id") as mock_add,
+            patch("kai.bot.webhook.remove_notification_chat_id") as mock_remove,
         ):
             await handle_github(update, ctx)
 
@@ -5156,8 +5156,8 @@ class TestHandleGitHub:
         mock_add.assert_called_once_with(-100999)
 
     @pytest.mark.asyncio
-    async def test_notify_reset_removes_from_allowed_ids(self):
-        """/github notify reset removes the old chat_id from allowed_user_ids."""
+    async def test_notify_reset_removes_from_notification_destinations(self):
+        """/github notify reset removes the old outbound notification destination."""
         update = _make_update(text="/github notify reset")
         config = _make_config()
         ctx = _make_context(config=config, args=["notify", "reset"])
@@ -5168,7 +5168,7 @@ class TestHandleGitHub:
 
         with (
             patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.webhook.remove_allowed_chat_id") as mock_remove,
+            patch("kai.bot.webhook.remove_notification_chat_id") as mock_remove,
             patch("kai.bot._is_notify_chat_used", new_callable=AsyncMock, return_value=False),
         ):
             await handle_github(update, ctx)
@@ -5188,7 +5188,7 @@ class TestHandleGitHub:
 
         with (
             patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.webhook.remove_allowed_chat_id") as mock_remove,
+            patch("kai.bot.webhook.remove_notification_chat_id") as mock_remove,
             # Another user still uses this chat_id
             patch("kai.bot._is_notify_chat_used", new_callable=AsyncMock, return_value=True),
         ):
@@ -5201,8 +5201,8 @@ class TestHandleGitHub:
     async def test_notify_reset_self_id_skips_removal(self):
         """/github notify reset does NOT remove the user's own chat_id.
 
-        This is the primary guard for legacy mode (no users.yaml) where
-        remove_allowed_chat_id's user_configs check cannot fire.
+        This guard keeps the user's own authorized chat out of outbound
+        notification cleanup.
         """
         update = _make_update(text="/github notify reset")
         config = _make_config()
@@ -5214,7 +5214,7 @@ class TestHandleGitHub:
 
         with (
             patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.webhook.remove_allowed_chat_id") as mock_remove,
+            patch("kai.bot.webhook.remove_notification_chat_id") as mock_remove,
         ):
             await handle_github(update, ctx)
 

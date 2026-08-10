@@ -20,6 +20,7 @@ from kai.webhook import (
     CONFIG_KEY,
     GITHUB_WEBHOOK_SECRET_KEY,
     INTERNAL_API_AUTH_KEY,
+    NOTIFICATION_CHAT_IDS_KEY,
     PR_REVIEW_COOLDOWN_KEY,
     PR_REVIEW_TIMEOUT_S_KEY,
     SPEC_DIR_KEY,
@@ -42,8 +43,8 @@ from kai.webhook import (
     _triage_cooldowns,
     _verify_github_signature,
     _webhook_health_loop,
-    add_allowed_chat_id,
-    remove_allowed_chat_id,
+    add_notification_chat_id,
+    remove_notification_chat_id,
 )
 
 # ── _verify_github_signature ─────────────────────────────────────────
@@ -2249,45 +2250,100 @@ class TestPerUserRouting:
             assert mock_review.call_args[1]["provider"] == "google"
 
 
-# ── add_allowed_chat_id / remove_allowed_chat_id ────────────────────
+# ── add_notification_chat_id / remove_notification_chat_id ───────────
 
 
-class TestAllowedChatIdMutations:
-    """Tests for the legacy live notification-destination registry.
+class TestNotificationChatIdMutations:
+    """Tests for the live notification-destination registry.
 
     These functions are called by bot.py when /github notify modifies
     a notification destination. The registry must remain detached from
     Config.allowed_user_ids so outbound changes cannot authorize senders.
     """
 
-    def test_add_allowed_chat_id(self):
-        """add_allowed_chat_id adds a chat_id to the live set."""
+    @pytest.mark.asyncio
+    async def test_start_keeps_notification_destinations_out_of_inbound_principals(self):
+        """Configured and DB notification destinations do not become authorized users."""
+        import kai.webhook as wh
+
+        admin = UserConfig(
+            telegram_id=111,
+            name="alice",
+            role="admin",
+            github_notify_chat_id=-100111,
+        )
+        config = MagicMock()
+        config.user_configs = {111: admin}
+        config.allowed_user_ids = {111}
+        config.get_admins.return_value = [admin]
+        config.webhook_secret = None
+        config.telegram_webhook_url = None
+        config.telegram_webhook_secret = None
+        config.github_webhook_secret = None
+        config.generic_webhook_secret = None
+        config.pr_review_cooldown = 0
+        config.pr_review_timeout_s = 0
+        config.webhook_port = 0
+        config.workspace_base = None
+        config.allowed_workspaces = []
+        config.spec_dir = "specs"
+
+        telegram_app = MagicMock()
+        telegram_app.bot = AsyncMock()
+        telegram_app.bot_data = {"pool": MagicMock(internal_api_auth=InternalAPIAuth({111: "secret"}))}
+
+        fake_runner = MagicMock()
+        fake_runner.setup = AsyncMock()
+        fake_site = MagicMock()
+        fake_site.start = AsyncMock()
+
+        old_app = wh._app
+        old_runner = wh._runner
+        try:
+            with (
+                patch("kai.webhook.sessions.get_setting", new_callable=AsyncMock, return_value="-100222"),
+                patch("kai.webhook.web.AppRunner", return_value=fake_runner),
+                patch("kai.webhook.web.TCPSite", return_value=fake_site),
+            ):
+                await wh.start(telegram_app, config)
+
+            assert wh._app[ALLOWED_USER_IDS_KEY] == {111}
+            assert wh._app[NOTIFICATION_CHAT_IDS_KEY] == {-100111, -100222}
+        finally:
+            wh._app = old_app
+            wh._runner = old_runner
+
+    def test_add_notification_chat_id(self):
+        """add_notification_chat_id adds a chat_id to the outbound registry."""
         import kai.webhook as wh
 
         app = web.Application()
         app[ALLOWED_USER_IDS_KEY] = {100}
+        app[NOTIFICATION_CHAT_IDS_KEY] = set()
         old_app = wh._app
         wh._app = app
         try:
-            add_allowed_chat_id(999)
-            assert 999 in app[ALLOWED_USER_IDS_KEY]
+            add_notification_chat_id(999)
+            assert app[NOTIFICATION_CHAT_IDS_KEY] == {999}
+            assert app[ALLOWED_USER_IDS_KEY] == {100}
         finally:
             wh._app = old_app
 
-    def test_add_allowed_chat_id_idempotent(self):
+    def test_add_notification_chat_id_idempotent(self):
         """Adding the same chat_id twice does not duplicate it."""
         import kai.webhook as wh
 
         app = web.Application()
         app[ALLOWED_USER_IDS_KEY] = {100}
+        app[NOTIFICATION_CHAT_IDS_KEY] = set()
         old_app = wh._app
         wh._app = app
         try:
-            add_allowed_chat_id(999)
-            add_allowed_chat_id(999)
+            add_notification_chat_id(999)
+            add_notification_chat_id(999)
             # Sets don't have duplicates; just verify it's present
-            assert 999 in app[ALLOWED_USER_IDS_KEY]
-            assert len(app[ALLOWED_USER_IDS_KEY]) == 2  # {100, 999}
+            assert app[NOTIFICATION_CHAT_IDS_KEY] == {999}
+            assert app[ALLOWED_USER_IDS_KEY] == {100}
         finally:
             wh._app = old_app
 
@@ -2298,33 +2354,36 @@ class TestAllowedChatIdMutations:
         inbound_principals = {100}
         app = web.Application()
         app[ALLOWED_USER_IDS_KEY] = set(inbound_principals)
+        app[NOTIFICATION_CHAT_IDS_KEY] = set()
         old_app = wh._app
         wh._app = app
         try:
-            add_allowed_chat_id(999)
-            assert app[ALLOWED_USER_IDS_KEY] == {100, 999}
+            add_notification_chat_id(999)
+            assert app[ALLOWED_USER_IDS_KEY] == {100}
+            assert app[NOTIFICATION_CHAT_IDS_KEY] == {999}
             assert inbound_principals == {100}
         finally:
             wh._app = old_app
 
-    def test_add_allowed_chat_id_no_app(self):
-        """add_allowed_chat_id is a no-op when _app is None (polling mode)."""
+    def test_add_notification_chat_id_no_app(self):
+        """add_notification_chat_id is a no-op when _app is None (polling mode)."""
         import kai.webhook as wh
 
         old_app = wh._app
         wh._app = None
         try:
             # Should not raise
-            add_allowed_chat_id(999)
+            add_notification_chat_id(999)
         finally:
             wh._app = old_app
 
-    def test_remove_allowed_chat_id_group(self):
-        """remove_allowed_chat_id removes a group chat_id from the set."""
+    def test_remove_notification_chat_id_group(self):
+        """remove_notification_chat_id removes a group chat_id from the outbound registry."""
         import kai.webhook as wh
 
         app = web.Application()
-        app[ALLOWED_USER_IDS_KEY] = {100, -100123}
+        app[ALLOWED_USER_IDS_KEY] = {100}
+        app[NOTIFICATION_CHAT_IDS_KEY] = {-100123}
         # No config needed for this case - group IDs are never in user_configs
         mock_config = MagicMock()
         mock_config.user_configs = {}
@@ -2332,14 +2391,14 @@ class TestAllowedChatIdMutations:
         old_app = wh._app
         wh._app = app
         try:
-            remove_allowed_chat_id(-100123)
-            assert -100123 not in app[ALLOWED_USER_IDS_KEY]
-            assert 100 in app[ALLOWED_USER_IDS_KEY]
+            remove_notification_chat_id(-100123)
+            assert -100123 not in app[NOTIFICATION_CHAT_IDS_KEY]
+            assert app[ALLOWED_USER_IDS_KEY] == {100}
         finally:
             wh._app = old_app
 
-    def test_remove_allowed_chat_id_preserves_users(self):
-        """remove_allowed_chat_id does NOT remove a real user's telegram_id."""
+    def test_remove_notification_chat_id_preserves_users(self):
+        """remove_notification_chat_id does NOT remove a real user's telegram_id."""
         import kai.webhook as wh
 
         user = UserConfig(telegram_id=12345, name="alice")
@@ -2347,25 +2406,27 @@ class TestAllowedChatIdMutations:
         mock_config.user_configs = {12345: user}
 
         app = web.Application()
-        app[ALLOWED_USER_IDS_KEY] = {12345, -100999}
+        app[ALLOWED_USER_IDS_KEY] = {12345}
+        app[NOTIFICATION_CHAT_IDS_KEY] = {12345, -100999}
         app[CONFIG_KEY] = mock_config
         old_app = wh._app
         wh._app = app
         try:
-            remove_allowed_chat_id(12345)
+            remove_notification_chat_id(12345)
             # 12345 is a real user - must NOT be removed
             assert 12345 in app[ALLOWED_USER_IDS_KEY]
+            assert 12345 in app[NOTIFICATION_CHAT_IDS_KEY]
         finally:
             wh._app = old_app
 
-    def test_remove_allowed_chat_id_no_app(self):
-        """remove_allowed_chat_id is a no-op when _app is None (polling mode)."""
+    def test_remove_notification_chat_id_no_app(self):
+        """remove_notification_chat_id is a no-op when _app is None (polling mode)."""
         import kai.webhook as wh
 
         old_app = wh._app
         wh._app = None
         try:
             # Should not raise
-            remove_allowed_chat_id(-100123)
+            remove_notification_chat_id(-100123)
         finally:
             wh._app = old_app
