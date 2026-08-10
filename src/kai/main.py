@@ -214,9 +214,10 @@ def _start() -> None:
 
     Loads configuration, then delegates to an async initialization
     function that manages the full application lifecycle. Catches
-    KeyboardInterrupt for clean Ctrl+C shutdown and logs any
-    unexpected crashes. SystemExit propagates to `main`'s choke
-    point, which mirrors gate messages into the main log.
+    KeyboardInterrupt for clean Ctrl+C shutdown and converts unexpected
+    crashes into a non-zero process exit after logging them. SystemExit
+    propagates to `main`'s choke point, which mirrors gate messages
+    into the main log.
     """
     config = load_config()
     logging.info("Kai starting (model=%s, users=%s)", config.default_model, config.allowed_user_ids)
@@ -440,8 +441,9 @@ def _start() -> None:
         asyncio.run(_init_and_run())
     except KeyboardInterrupt:
         logging.info("Kai stopped.")
-    except Exception:
+    except Exception as exc:
         logging.exception("Kai crashed")
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":

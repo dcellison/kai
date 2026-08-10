@@ -14,6 +14,7 @@ import logging
 from datetime import UTC, datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -380,3 +381,34 @@ class TestMainStartupErrorLogging:
             main()
 
         assert not [r for r in caplog.records if r.levelno == logging.CRITICAL]
+
+
+class TestStartCrashExit:
+    """Unexpected runtime crashes must not look like clean process exits."""
+
+    def test_unexpected_asyncio_crash_exits_nonzero(self, caplog, monkeypatch):
+        from kai.main import _start
+
+        monkeypatch.setattr(
+            "kai.main.load_config",
+            lambda: SimpleNamespace(
+                default_model="gpt-test",
+                allowed_user_ids={123},
+                telegram_webhook_url=None,
+                session_db_path=":memory:",
+            ),
+        )
+        monkeypatch.setattr("kai.main._read_protected_file", lambda _path: "")
+        monkeypatch.setattr("kai.main.services.load_services", lambda _path: {})
+
+        def fail_run(coro):
+            coro.close()
+            raise RuntimeError("event loop died")
+
+        monkeypatch.setattr("kai.main.asyncio.run", fail_run)
+
+        with caplog.at_level(logging.ERROR), pytest.raises(SystemExit) as excinfo:
+            _start()
+
+        assert excinfo.value.code == 1
+        assert any(r.levelno == logging.ERROR and "Kai crashed" in r.getMessage() for r in caplog.records)
