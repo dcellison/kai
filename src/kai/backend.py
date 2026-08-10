@@ -517,7 +517,7 @@ def build_session_context(
             f"http://localhost:{api.webhook_port}/api/schedule "
             f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
             f"Required fields: name, prompt, schedule_type, schedule_data. "
-            f"Optional: job_type (reminder|claude), auto_remove (bool). "
+            f"Optional: job_type (reminder|agent), auto_remove (bool). "
             f"To list jobs: GET /api/jobs. To update: PATCH /api/jobs/{{id}}. "
             f"To delete: DELETE /api/jobs/{{id}}.]"
         )

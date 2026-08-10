@@ -7,7 +7,7 @@ Covers:
 3. register_job_by_id() - DB lookup + registration
 4. _register_new_jobs() - startup bulk registration
 5. init_jobs() - entry point delegation
-6. _job_callback() - reminder and Claude job execution branches
+6. _job_callback() - reminder and agent job execution branches
 """
 
 import json
@@ -31,7 +31,7 @@ from kai.cron import (
 
 @pytest.fixture(autouse=True)
 def mock_lock(monkeypatch):
-    """Stub out the async lock so Claude job tests don't need real asyncio locks."""
+    """Stub out the async lock so agent job tests don't need real asyncio locks."""
     lock = AsyncMock()
     lock.__aenter__ = AsyncMock()
     lock.__aexit__ = AsyncMock(return_value=False)
@@ -94,19 +94,19 @@ def mock_context():
         "schedule_type": "daily",
     }
     ctx.job.schedule_removal = MagicMock()
-    # Default: no Claude process (reminder tests don't need it)
+    # Default: no agent process (reminder tests don't need it)
     ctx.bot_data = {}
     return ctx
 
 
-def _make_claude_mock(text="The response", success=True, error=None):
+def _make_agent_mock(text="The response", success=True, error=None):
     """
-    Build a mock Claude process whose send() yields a single done event.
+    Build a mock agent pool whose send() yields a single done event.
 
     The async generator protocol matches what _job_callback expects:
     iterate events until event.done is True, then read event.response.
     """
-    mock_claude = MagicMock()
+    mock_agent = MagicMock()
 
     async def fake_send(prompt, chat_id=None):
         event = MagicMock()
@@ -117,8 +117,8 @@ def _make_claude_mock(text="The response", success=True, error=None):
         event.response.error = error
         yield event
 
-    mock_claude.send = fake_send
-    return mock_claude
+    mock_agent.send = fake_send
+    return mock_agent
 
 
 # ── _ensure_utc ──────────────────────────────────────────────────────
@@ -150,6 +150,19 @@ class TestEnsureUtc:
 
 
 class TestRegisterJob:
+    def test_legacy_agent_type_is_normalized_in_callback_data(self, mock_app):
+        job = _make_job(job_type="claude")
+        _register_job(mock_app, job)
+        assert mock_app.job_queue.run_daily.call_args.kwargs["data"]["job_type"] == "agent"
+
+    def test_unknown_job_type_is_rejected_before_registration(self, mock_app):
+        job = _make_job(job_type="unknown")
+        with pytest.raises(ValueError, match="job_type must be one of: reminder, agent"):
+            _register_job(mock_app, job)
+        mock_app.job_queue.run_once.assert_not_called()
+        mock_app.job_queue.run_daily.assert_not_called()
+        mock_app.job_queue.run_repeating.assert_not_called()
+
     def test_once_schedule(self, mock_app):
         """run_once is called with the parsed run_at datetime."""
         job = _make_job(
@@ -417,51 +430,74 @@ class TestJobCallbackReminder:
         mock_context.job.schedule_removal.assert_not_called()
 
 
-# ── _job_callback: Claude jobs (no auto-remove) ─────────────────────
+# ── _job_callback: agent jobs (no auto-remove) ──────────────────────
 
 
-class TestJobCallbackClaude:
+class TestJobCallbackAgent:
     @pytest.fixture(autouse=True)
-    def _setup_claude_context(self, mock_context):
-        """Configure mock_context for Claude job tests."""
-        mock_context.job.data["job_type"] = "claude"
+    def _setup_agent_context(self, mock_context):
+        """Configure mock_context for agent job tests."""
+        mock_context.job.data["job_type"] = "agent"
         self.ctx = mock_context
 
     @pytest.mark.asyncio()
-    async def test_sends_claude_response_to_telegram(self):
-        """Claude response is delivered with a [Job: name] prefix."""
-        self.ctx.bot_data = {"pool": _make_claude_mock("Hello world")}
+    async def test_sends_agent_response_to_telegram(self):
+        """The selected backend's response is delivered with a [Job: name] prefix."""
+        self.ctx.bot_data = {"pool": _make_agent_mock("Hello world")}
         with patch("kai.cron.log_message"):
             await _job_callback(self.ctx)
         self.ctx.bot.send_message.assert_called_once_with(chat_id=12345, text="[Job: Test Job]\nHello world")
 
     @pytest.mark.asyncio()
+    async def test_legacy_job_type_routes_through_selected_agent(self):
+        self.ctx.job.data["job_type"] = "claude"
+        self.ctx.bot_data = {"pool": _make_agent_mock("Legacy job preserved")}
+        with patch("kai.cron.log_message"):
+            await _job_callback(self.ctx)
+        self.ctx.bot.send_message.assert_called_once_with(
+            chat_id=12345,
+            text="[Job: Test Job]\nLegacy job preserved",
+        )
+
+    @pytest.mark.asyncio()
+    async def test_unknown_job_type_never_reaches_agent_pool(self, caplog):
+        self.ctx.job.data["job_type"] = "unknown"
+        pool = MagicMock()
+        self.ctx.bot_data = {"pool": pool}
+
+        await _job_callback(self.ctx)
+
+        assert "unsupported job_type 'unknown'; skipping" in caplog.text
+        pool.send.assert_not_called()
+        self.ctx.bot.send_message.assert_not_called()
+
+    @pytest.mark.asyncio()
     async def test_shows_typing_indicator(self):
-        """A typing indicator is sent before the Claude request."""
-        self.ctx.bot_data = {"pool": _make_claude_mock()}
+        """A typing indicator is sent before the agent request."""
+        self.ctx.bot_data = {"pool": _make_agent_mock()}
         with patch("kai.cron.log_message"):
             await _job_callback(self.ctx)
         self.ctx.bot.send_chat_action.assert_called_once()
 
     @pytest.mark.asyncio()
-    async def test_no_claude_process_returns_early(self, caplog):
-        """When claude isn't in bot_data, logs error and returns without crashing."""
+    async def test_no_agent_pool_returns_early(self, caplog):
+        """When the agent pool isn't in bot_data, log and return without crashing."""
         self.ctx.bot_data = {}
         await _job_callback(self.ctx)
         assert "No subprocess pool" in caplog.text
         self.ctx.bot.send_message.assert_not_called()
 
     @pytest.mark.asyncio()
-    async def test_claude_stream_exception_returns_early(self, caplog):
+    async def test_agent_stream_exception_returns_early(self, caplog):
         """Exceptions during agent interaction are caught and logged."""
-        mock_claude = MagicMock()
+        mock_agent = MagicMock()
 
         async def exploding_send(prompt):
             raise RuntimeError("process died")
             yield
 
-        mock_claude.send = exploding_send
-        self.ctx.bot_data = {"pool": mock_claude}
+        mock_agent.send = exploding_send
+        self.ctx.bot_data = {"pool": mock_agent}
         await _job_callback(self.ctx)
         assert "crashed" in caplog.text
         self.ctx.bot.send_message.assert_not_called()
@@ -469,7 +505,7 @@ class TestJobCallbackClaude:
     @pytest.mark.asyncio()
     async def test_no_done_event_returns_early(self, caplog):
         """When the stream ends without a done event, logs warning and returns."""
-        mock_claude = MagicMock()
+        mock_agent = MagicMock()
 
         async def empty_send(prompt, chat_id=None):
             # Yield a non-done event, then end
@@ -477,16 +513,16 @@ class TestJobCallbackClaude:
             event.done = False
             yield event
 
-        mock_claude.send = empty_send
-        self.ctx.bot_data = {"pool": mock_claude}
+        mock_agent.send = empty_send
+        self.ctx.bot_data = {"pool": mock_agent}
         await _job_callback(self.ctx)
         assert "without a done event" in caplog.text
         self.ctx.bot.send_message.assert_not_called()
 
     @pytest.mark.asyncio()
-    async def test_claude_error_response_returns_early(self, caplog):
-        """When Claude returns success=False, logs the error and returns."""
-        self.ctx.bot_data = {"pool": _make_claude_mock(success=False, error="rate limited")}
+    async def test_agent_error_response_returns_early(self, caplog):
+        """When the backend returns success=False, log the error and return."""
+        self.ctx.bot_data = {"pool": _make_agent_mock(success=False, error="rate limited")}
         await _job_callback(self.ctx)
         assert "rate limited" in caplog.text
         self.ctx.bot.send_message.assert_not_called()
@@ -494,7 +530,7 @@ class TestJobCallbackClaude:
     @pytest.mark.asyncio()
     async def test_forbidden_on_send_deactivates(self):
         """Forbidden when sending the result deactivates and removes the job."""
-        self.ctx.bot_data = {"pool": _make_claude_mock()}
+        self.ctx.bot_data = {"pool": _make_agent_mock()}
         self.ctx.bot.send_message.side_effect = Forbidden("blocked")
         with (
             patch("kai.cron.log_message"),
@@ -507,7 +543,7 @@ class TestJobCallbackClaude:
     @pytest.mark.asyncio()
     async def test_other_send_exception_does_not_deactivate(self):
         """Non-Forbidden send exceptions log the error but keep the job active."""
-        self.ctx.bot_data = {"pool": _make_claude_mock()}
+        self.ctx.bot_data = {"pool": _make_agent_mock()}
         self.ctx.bot.send_message.side_effect = RuntimeError("timeout")
         with (
             patch("kai.cron.log_message"),
@@ -517,10 +553,10 @@ class TestJobCallbackClaude:
         mock_deactivate.assert_not_called()
 
     @pytest.mark.asyncio()
-    async def test_one_shot_claude_deactivates_after_sending(self):
-        """One-shot Claude jobs (schedule_type=once) deactivate after delivery."""
+    async def test_one_shot_agent_deactivates_after_sending(self):
+        """One-shot agent jobs (schedule_type=once) deactivate after delivery."""
         self.ctx.job.data["schedule_type"] = "once"
-        self.ctx.bot_data = {"pool": _make_claude_mock("The answer is 42")}
+        self.ctx.bot_data = {"pool": _make_agent_mock("The answer is 42")}
         with (
             patch("kai.cron.log_message"),
             patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate,
@@ -533,10 +569,10 @@ class TestJobCallbackClaude:
         self.ctx.job.schedule_removal.assert_not_called()
 
     @pytest.mark.asyncio()
-    async def test_recurring_claude_does_not_deactivate(self):
-        """Recurring Claude jobs (daily/interval) are not deactivated after delivery."""
+    async def test_recurring_agent_does_not_deactivate(self):
+        """Recurring agent jobs (daily/interval) are not deactivated after delivery."""
         self.ctx.job.data["schedule_type"] = "daily"
-        self.ctx.bot_data = {"pool": _make_claude_mock("Daily report")}
+        self.ctx.bot_data = {"pool": _make_agent_mock("Daily report")}
         with (
             patch("kai.cron.log_message"),
             patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate,
@@ -551,15 +587,15 @@ class TestJobCallbackClaude:
 class TestJobCallbackConditionMet:
     @pytest.fixture(autouse=True)
     def _setup_auto_remove_context(self, mock_context):
-        """Configure mock_context for auto-remove Claude job tests."""
-        mock_context.job.data["job_type"] = "claude"
+        """Configure mock_context for auto-remove agent job tests."""
+        mock_context.job.data["job_type"] = "agent"
         mock_context.job.data["auto_remove"] = True
         self.ctx = mock_context
 
     @pytest.mark.asyncio()
     async def test_detects_condition_met_prefix(self):
         """Case-insensitive CONDITION_MET: prefix triggers the met branch."""
-        self.ctx.bot_data = {"pool": _make_claude_mock("condition_met: Package arrived!")}
+        self.ctx.bot_data = {"pool": _make_agent_mock("condition_met: Package arrived!")}
         with (
             patch("kai.cron.log_message"),
             patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate,
@@ -572,7 +608,7 @@ class TestJobCallbackConditionMet:
     @pytest.mark.asyncio()
     async def test_extracts_message_after_marker(self):
         """The message text after CONDITION_MET: is delivered to the user."""
-        self.ctx.bot_data = {"pool": _make_claude_mock("CONDITION_MET: Package arrived!")}
+        self.ctx.bot_data = {"pool": _make_agent_mock("CONDITION_MET: Package arrived!")}
         with (
             patch("kai.cron.log_message"),
             patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock),
@@ -584,7 +620,7 @@ class TestJobCallbackConditionMet:
     @pytest.mark.asyncio()
     async def test_multi_line_response(self):
         """Text on lines after the marker line is included in the message."""
-        self.ctx.bot_data = {"pool": _make_claude_mock("CONDITION_MET: Done\nHere are details.")}
+        self.ctx.bot_data = {"pool": _make_agent_mock("CONDITION_MET: Done\nHere are details.")}
         with (
             patch("kai.cron.log_message"),
             patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock),
@@ -597,7 +633,7 @@ class TestJobCallbackConditionMet:
     @pytest.mark.asyncio()
     async def test_no_message_after_marker(self):
         """When nothing follows CONDITION_MET:, a default message is sent."""
-        self.ctx.bot_data = {"pool": _make_claude_mock("CONDITION_MET:")}
+        self.ctx.bot_data = {"pool": _make_agent_mock("CONDITION_MET:")}
         with (
             patch("kai.cron.log_message"),
             patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock),
@@ -609,7 +645,7 @@ class TestJobCallbackConditionMet:
     @pytest.mark.asyncio()
     async def test_forbidden_still_deactivates(self):
         """Even if the chat is gone (Forbidden), the job is still deactivated."""
-        self.ctx.bot_data = {"pool": _make_claude_mock("CONDITION_MET: done")}
+        self.ctx.bot_data = {"pool": _make_agent_mock("CONDITION_MET: done")}
         self.ctx.bot.send_message.side_effect = Forbidden("blocked")
         with (
             patch("kai.cron.log_message"),
@@ -626,8 +662,8 @@ class TestJobCallbackConditionMet:
 class TestJobCallbackConditionNotMet:
     @pytest.fixture(autouse=True)
     def _setup_auto_remove_context(self, mock_context):
-        """Configure mock_context for auto-remove Claude job tests."""
-        mock_context.job.data["job_type"] = "claude"
+        """Configure mock_context for auto-remove agent job tests."""
+        mock_context.job.data["job_type"] = "agent"
         mock_context.job.data["auto_remove"] = True
         mock_context.job.data["notify_on_check"] = False
         self.ctx = mock_context
@@ -635,7 +671,7 @@ class TestJobCallbackConditionNotMet:
     @pytest.mark.asyncio()
     async def test_detects_condition_not_met(self):
         """CONDITION_NOT_MET is recognized (case-insensitive, no colon required)."""
-        self.ctx.bot_data = {"pool": _make_claude_mock("CONDITION_NOT_MET")}
+        self.ctx.bot_data = {"pool": _make_agent_mock("CONDITION_NOT_MET")}
         with patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate:
             await _job_callback(self.ctx)
         # Job stays active - not deactivated
@@ -645,7 +681,7 @@ class TestJobCallbackConditionNotMet:
     @pytest.mark.asyncio()
     async def test_silent_when_notify_disabled(self):
         """With notify_on_check=False, no message is sent to the user."""
-        self.ctx.bot_data = {"pool": _make_claude_mock("CONDITION_NOT_MET: still waiting")}
+        self.ctx.bot_data = {"pool": _make_agent_mock("CONDITION_NOT_MET: still waiting")}
         await _job_callback(self.ctx)
         self.ctx.bot.send_message.assert_not_called()
 
@@ -653,7 +689,7 @@ class TestJobCallbackConditionNotMet:
     async def test_sends_message_when_notify_enabled(self):
         """With notify_on_check=True, the status message is sent to the user."""
         self.ctx.job.data["notify_on_check"] = True
-        self.ctx.bot_data = {"pool": _make_claude_mock("CONDITION_NOT_MET: Package in transit")}
+        self.ctx.bot_data = {"pool": _make_agent_mock("CONDITION_NOT_MET: Package in transit")}
         with patch("kai.cron.log_message"):
             await _job_callback(self.ctx)
         sent_text = self.ctx.bot.send_message.call_args.kwargs["text"]
@@ -664,7 +700,7 @@ class TestJobCallbackConditionNotMet:
         """Both 'CONDITION_NOT_MET: msg' and 'CONDITION_NOT_MET msg' work."""
         self.ctx.job.data["notify_on_check"] = True
         # Without colon
-        self.ctx.bot_data = {"pool": _make_claude_mock("CONDITION_NOT_MET Still checking")}
+        self.ctx.bot_data = {"pool": _make_agent_mock("CONDITION_NOT_MET Still checking")}
         with patch("kai.cron.log_message"):
             await _job_callback(self.ctx)
         # The lstrip(":") handles the optional colon; without it, the space
@@ -676,7 +712,7 @@ class TestJobCallbackConditionNotMet:
     async def test_no_message_after_marker_with_notify(self):
         """When nothing follows CONDITION_NOT_MET with notify=True, sends default text."""
         self.ctx.job.data["notify_on_check"] = True
-        self.ctx.bot_data = {"pool": _make_claude_mock("CONDITION_NOT_MET")}
+        self.ctx.bot_data = {"pool": _make_agent_mock("CONDITION_NOT_MET")}
         with patch("kai.cron.log_message"):
             await _job_callback(self.ctx)
         sent_text = self.ctx.bot.send_message.call_args.kwargs["text"]
@@ -686,7 +722,7 @@ class TestJobCallbackConditionNotMet:
     async def test_forbidden_with_notify_deactivates(self):
         """Forbidden when sending a notify update deactivates and removes the job."""
         self.ctx.job.data["notify_on_check"] = True
-        self.ctx.bot_data = {"pool": _make_claude_mock("CONDITION_NOT_MET: status")}
+        self.ctx.bot_data = {"pool": _make_agent_mock("CONDITION_NOT_MET: status")}
         self.ctx.bot.send_message.side_effect = Forbidden("blocked")
         with (
             patch("kai.cron.log_message"),
@@ -700,7 +736,7 @@ class TestJobCallbackConditionNotMet:
     async def test_one_shot_condition_not_met_deactivates(self):
         """One-shot auto-remove jobs deactivate even when condition is not met."""
         self.ctx.job.data["schedule_type"] = "once"
-        self.ctx.bot_data = {"pool": _make_claude_mock("CONDITION_NOT_MET")}
+        self.ctx.bot_data = {"pool": _make_agent_mock("CONDITION_NOT_MET")}
         with patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate:
             await _job_callback(self.ctx)
         mock_deactivate.assert_called_once_with(1)

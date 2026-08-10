@@ -7,7 +7,7 @@ into four tables:
 1. **sessions** - Agent session tracking (session ID, model).
    One row per chat_id, upserted on each response.
 
-2. **jobs** - Scheduled tasks (reminders, agent jobs with job_type "claude", conditional monitors).
+2. **jobs** - Scheduled tasks (reminders, agent jobs, conditional monitors).
    Created via the scheduling API (POST /api/schedule) or the inner agent's curl.
    Jobs have a schedule_type (once/daily/interval) and can be deactivated
    without deletion to preserve history.
@@ -40,6 +40,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
 
 import aiosqlite
+
+from kai.job_types import JOB_TYPE_AGENT, LEGACY_JOB_TYPE_AGENT, normalize_job_type
 
 if TYPE_CHECKING:
     from kai.config import Config, WorkspaceConfig
@@ -167,6 +169,15 @@ async def init_db(db_path: Path) -> None:
         if "notify_on_check" not in columns:
             log.debug("Adding notify_on_check column to jobs table")
             await _get_db().execute("ALTER TABLE jobs ADD COLUMN notify_on_check INTEGER DEFAULT 0")
+
+        # Durable compatibility migration: the old value named one
+        # implementation even though scheduled work always routes through the
+        # owning user's selected backend. Preserve every job while replacing
+        # only that identifier with the backend-neutral canonical value.
+        await _get_db().execute(
+            "UPDATE jobs SET job_type = ? WHERE job_type = ?",
+            (JOB_TYPE_AGENT, LEGACY_JOB_TYPE_AGENT),
+        )
 
         log.debug("Creating settings table")
         await _get_db().execute("""
@@ -514,7 +525,8 @@ async def create_job(
     Args:
         chat_id: Telegram chat ID that owns this job.
         name: Human-readable job name (shown in /jobs).
-        job_type: "reminder" (sends prompt as-is) or "claude" (processed by the agent backend).
+        job_type: "reminder" (sends prompt as-is) or "agent" (processed by the selected backend).
+            The legacy value "claude" is accepted and stored as "agent".
         prompt: Message text for reminders, or the agent prompt for agent-type jobs.
         schedule_type: "once", "daily", or "interval".
         schedule_data: JSON string with schedule details.
@@ -528,10 +540,20 @@ async def create_job(
     Returns:
         The auto-generated integer job ID.
     """
+    canonical_job_type = normalize_job_type(job_type)
     cursor = await _get_db().execute(
         """INSERT INTO jobs (chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, notify_on_check)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (chat_id, name, job_type, prompt, schedule_type, schedule_data, int(auto_remove), int(notify_on_check)),
+        (
+            chat_id,
+            name,
+            canonical_job_type,
+            prompt,
+            schedule_type,
+            schedule_data,
+            int(auto_remove),
+            int(notify_on_check),
+        ),
     )
     await _get_db().commit()
     # RuntimeError instead of assert so this guard survives python -O.
@@ -637,7 +659,7 @@ async def update_job(
     is inactive.
 
     Note: job_type and chat_id are intentionally not updatable. Changing
-    a job from reminder to claude (or vice versa) is a fundamentally
+    a job from reminder to agent processing (or vice versa) is a fundamentally
     different job — delete and recreate for that.
 
     Args:

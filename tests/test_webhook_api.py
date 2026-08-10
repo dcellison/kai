@@ -127,8 +127,8 @@ class TestScheduleJobType:
         assert "error" in body
         assert "job_type" in body["error"]
 
-    async def test_valid_job_type_accepted(self, db, mock_request):
-        """Schedule endpoint accepts valid job_type values without error."""
+    async def test_agent_job_type_accepted(self, db, mock_request):
+        """Schedule endpoint accepts the canonical agent job type."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.app[CHAT_ID_KEY] = 123
         mock_request.app[TELEGRAM_APP_KEY].job_queue = MagicMock()
@@ -140,7 +140,31 @@ class TestScheduleJobType:
 
         mock_request.json = AsyncMock(
             return_value={
-                "name": "test claude job",
+                "name": "test agent job",
+                "prompt": "test",
+                "schedule_type": "once",
+                "schedule_data": {"run_at": "2026-02-20T10:00:00+00:00"},
+                "job_type": "agent",
+            }
+        )
+
+        resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 200
+        body = json.loads(resp.body.decode())
+        assert "job_id" in body
+
+    async def test_legacy_agent_job_type_is_stored_canonically(self, db, mock_request):
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app[CHAT_ID_KEY] = 123
+        mock_request.app[TELEGRAM_APP_KEY].job_queue = MagicMock()
+
+        import kai.cron as cron_mod
+
+        cron_mod.register_job_by_id = AsyncMock(return_value=True)
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "legacy agent job",
                 "prompt": "test",
                 "schedule_type": "once",
                 "schedule_data": {"run_at": "2026-02-20T10:00:00+00:00"},
@@ -151,8 +175,9 @@ class TestScheduleJobType:
         resp = await _handle_schedule(mock_request)
 
         assert resp.status == 200
-        body = json.loads(resp.body.decode())
-        assert "job_id" in body
+        job = await sessions.get_job_by_id(json.loads(resp.body.decode())["job_id"])
+        assert job is not None
+        assert job["job_type"] == "agent"
 
 
 # ── DELETE /api/jobs/{id} ────────────────────────────────────────────
@@ -256,7 +281,7 @@ class TestUpdateJob:
         job_id = await sessions.create_job(
             chat_id=123,
             name="old name",
-            job_type="claude",
+            job_type="agent",
             prompt="old prompt",
             schedule_type="interval",
             schedule_data='{"seconds": 3600}',
@@ -1269,7 +1294,7 @@ class TestGetJobs:
         await sessions.create_job(
             chat_id=123,
             name="Job B",
-            job_type="claude",
+            job_type="agent",
             prompt="check",
             schedule_type="interval",
             schedule_data='{"seconds": 3600}',

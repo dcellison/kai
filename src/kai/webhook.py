@@ -20,7 +20,7 @@ Routes are organized into these groups:
     - /webhook/telegram     - Telegram updates (webhook mode only, secret_token auth)
     - /webhook/github       - GitHub events with HMAC-SHA256 signature validation
     - /webhook              - Generic webhooks with shared-secret auth
-    - /api/schedule         - Job creation API (used by inner Claude via curl)
+    - /api/schedule         - Job creation API (used by persistent agents via curl)
     - /api/jobs             - Job listing and detail API
     - /api/jobs/{id}        - Job detail (GET), deletion (DELETE), and update (PATCH)
     - /api/services/{name}  - External service proxy (injects auth from .env)
@@ -62,6 +62,7 @@ from telegram.ext import Application
 from kai import cron, memory, review, services, sessions, triage
 from kai.config import DATA_DIR, IMAGE_EXTENSIONS, Config, ModelRole, UserConfig, resolve_user_model
 from kai.internal_api_auth import InternalAPIAuth, InternalAPIPrincipal, InternalAPIScope
+from kai.job_types import CANONICAL_JOB_TYPES, normalize_job_type
 from kai.telegram_utils import chunk_text
 
 log = logging.getLogger(__name__)
@@ -1150,9 +1151,6 @@ async def _handle_generic(request: web.Request) -> web.Response:
 # Valid schedule types accepted by the scheduling API
 _VALID_SCHEDULE_TYPES = ("once", "daily", "interval")
 
-# Valid job types accepted by the scheduling API
-_VALID_JOB_TYPES = ("reminder", "claude")
-
 
 def _validate_schedule_data(
     schedule_data: dict | str,
@@ -1236,8 +1234,8 @@ async def _handle_schedule(request: web.Request, principal: InternalAPIPrincipal
     """
     Create a new scheduled job via the HTTP API.
 
-    This is the primary interface for the inner Claude Code process to create
-    scheduled tasks. Claude uses curl to POST here from within the workspace.
+    This is the primary interface for persistent agent backends to create
+    scheduled tasks from within the workspace.
 
     Required JSON fields: name, prompt, schedule_type, schedule_data.
     Optional fields: job_type (default "reminder"), auto_remove (default false),
@@ -1282,11 +1280,14 @@ async def _handle_schedule(request: web.Request, principal: InternalAPIPrincipal
             status=400,
         )
 
-    # Optional fields with defaults — validate job_type the same way as schedule_type
-    job_type = payload.get("job_type", "reminder")
-    if job_type not in _VALID_JOB_TYPES:
+    # Normalize the compatibility alias at ingress so all new rows use the
+    # backend-neutral identifier. sessions.create_job repeats this validation
+    # as the persistence boundary for non-HTTP callers.
+    try:
+        job_type = normalize_job_type(payload.get("job_type", "reminder"))
+    except ValueError:
         return web.json_response(
-            {"error": f"job_type must be one of: {', '.join(_VALID_JOB_TYPES)}"},
+            {"error": f"job_type must be one of: {', '.join(CANONICAL_JOB_TYPES)}"},
             status=400,
         )
     auto_remove = payload.get("auto_remove", False)
@@ -1347,7 +1348,7 @@ async def _handle_get_jobs(request: web.Request, principal: InternalAPIPrincipal
     """
     List all active jobs for the configured chat.
 
-    Used by the inner Claude to check what jobs are currently scheduled
+    Used by persistent agents to check what jobs are currently scheduled
     without needing to parse Telegram bot command output.
     """
 

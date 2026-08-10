@@ -4,14 +4,14 @@ Scheduled job execution engine using APScheduler.
 Provides functionality to:
 1. Load active jobs from the database and register them with APScheduler at startup
 2. Register new jobs on-the-fly when created via the scheduling API
-3. Execute jobs when their triggers fire (reminders and Claude-processed tasks)
+3. Execute jobs when their triggers fire (reminders and agent-processed tasks)
 4. Handle conditional auto-remove jobs with CONDITION_MET/CONDITION_NOT_MET markers
 
 Job types:
     - **reminder** — Sends the prompt text directly to Telegram as a message.
-    - **claude** — Sends the prompt through the persistent Claude process and
-      delivers Claude's response to Telegram. Supports auto-remove mode where
-      the job deactivates itself when Claude indicates a condition is met.
+    - **agent** — Sends the prompt through the user's selected backend and
+      delivers its response to Telegram. Supports auto-remove mode where the
+      job deactivates itself when the backend indicates a condition is met.
 
 Schedule types:
     - **once** — Fires at a specific ISO datetime, then deactivates.
@@ -33,13 +33,14 @@ from telegram.ext import Application, ContextTypes, ExtBot
 
 from kai import sessions
 from kai.history import log_message
+from kai.job_types import JOB_TYPE_AGENT, JOB_TYPE_REMINDER, normalize_job_type
 from kai.locks import get_lock
 from kai.telegram_utils import chunk_text
 
 log = logging.getLogger(__name__)
 
 # Protocol markers for conditional auto-remove jobs.
-# Claude is instructed to begin its response with one of these markers.
+# The selected agent backend is instructed to begin its response with one of these markers.
 # Matching is case-insensitive and checks the start of the first non-empty line.
 _CONDITION_MET_PREFIX = "CONDITION_MET:"
 _CONDITION_NOT_MET_PREFIX = (
@@ -175,13 +176,14 @@ def _register_job(app: Application, job: dict) -> None:
     jq = app.job_queue
     assert jq is not None
     schedule = json.loads(job["schedule_data"])
+    job_type = normalize_job_type(job["job_type"])
     job_name = f"cron_{job['id']}"
 
     # Data passed to the callback when the job fires
     callback_data = {
         "job_id": job["id"],
         "chat_id": job["chat_id"],
-        "job_type": job["job_type"],
+        "job_type": job_type,
         "prompt": job["prompt"],
         "auto_remove": job["auto_remove"],
         "notify_on_check": job.get("notify_on_check", False),
@@ -231,10 +233,10 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     Routes to the appropriate handler based on job_type:
     - "reminder" jobs send the prompt text directly to Telegram.
-    - "claude" jobs send the prompt through the persistent Claude process,
+    - "agent" jobs send the prompt through the user's selected backend,
       then handle the response (including conditional auto-remove logic).
 
-    For Claude jobs with auto_remove=True, the response is inspected for
+    For agent jobs with auto_remove=True, the response is inspected for
     protocol markers:
     - CONDITION_MET: <message> — delivers the message and deactivates the job.
     - CONDITION_NOT_MET: <message> — silently continues (default), or delivers
@@ -249,7 +251,11 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
     assert isinstance(job.data, dict)
     data: dict = job.data
     chat_id = data["chat_id"]
-    job_type = data["job_type"]
+    try:
+        job_type = normalize_job_type(data["job_type"])
+    except ValueError:
+        log.error("Job %s has unsupported job_type %r; skipping", data.get("job_id", "<unknown>"), data.get("job_type"))
+        return
     prompt = data["prompt"]
     auto_remove = data["auto_remove"]
     job_id = data["job_id"]
@@ -257,7 +263,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("Job %d '%s' fired (type=%s)", job_id, data["name"], job_type)
 
     # ── Reminder jobs: send prompt text directly ──
-    if job_type == "reminder":
+    if job_type == JOB_TYPE_REMINDER:
         # Strip stray backslash escapes (e.g. \! from bash double-quoting in curl)
         prompt = prompt.replace("\\!", "!").replace("\\.", ".").replace("\\?", "?")
         try:
@@ -278,14 +284,18 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
             await sessions.deactivate_job(job_id)
         return
 
-    # ── Claude jobs: send prompt through the subprocess pool ──
+    if job_type != JOB_TYPE_AGENT:  # pragma: no cover - normalize_job_type guards this
+        log.error("Job %d has unsupported normalized job_type %r; skipping", job_id, job_type)
+        return
+
+    # ── Agent jobs: send prompt through the subprocess pool ──
     pool = context.bot_data.get("pool")
     if not pool:
         log.error("No subprocess pool available for job %d", job_id)
         return
 
     async with get_lock(chat_id):
-        # Show typing indicator while Claude processes the prompt
+        # Show typing indicator while the selected backend processes the prompt
         try:
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
         except Exception:

@@ -247,7 +247,7 @@ class TestJobs:
         job_id = await sessions.create_job(
             chat_id=1,
             name="j1",
-            job_type="claude",
+            job_type="agent",
             prompt="analyze",
             schedule_type="daily",
             schedule_data='{"times": ["09:00"]}',
@@ -255,7 +255,33 @@ class TestJobs:
         job = await sessions.get_job_by_id(job_id)
         assert job is not None
         assert job["name"] == "j1"
-        assert job["job_type"] == "claude"
+        assert job["job_type"] == "agent"
+
+    async def test_legacy_agent_type_is_stored_canonically(self, db):
+        job_id = await sessions.create_job(
+            chat_id=1,
+            name="legacy",
+            job_type="claude",
+            prompt="analyze",
+            schedule_type="daily",
+            schedule_data='{"times": ["09:00"]}',
+        )
+        job = await sessions.get_job_by_id(job_id)
+        assert job is not None
+        assert job["job_type"] == "agent"
+
+    async def test_create_job_rejects_unknown_type(self, db):
+        with pytest.raises(ValueError, match="job_type must be one of: reminder, agent"):
+            await sessions.create_job(
+                chat_id=1,
+                name="invalid",
+                job_type="unknown",
+                prompt="do something",
+                schedule_type="once",
+                schedule_data="{}",
+            )
+
+        assert await sessions.get_jobs(1) == []
 
     async def test_get_job_by_id_unknown(self, db):
         assert await sessions.get_job_by_id(999) is None
@@ -328,7 +354,7 @@ class TestJobs:
         job_id = await sessions.create_job(
             chat_id=1,
             name="j1",
-            job_type="claude",
+            job_type="agent",
             prompt="old prompt",
             schedule_type="interval",
             schedule_data='{"seconds": 3600}',
@@ -380,7 +406,7 @@ class TestJobs:
         job_id = await sessions.create_job(
             chat_id=1,
             name="j1",
-            job_type="claude",
+            job_type="agent",
             prompt="check",
             schedule_type="interval",
             schedule_data='{"seconds": 3600}',
@@ -1448,6 +1474,45 @@ class TestResolveGitHubSettings:
         await sessions.set_setting("issue_triage:111", "FALSE")
         result = await sessions.resolve_github_settings(111, config)
         assert result["issue_triage"] is False
+
+
+# ── Scheduled job type migration ────────────────────────────────────
+
+
+class TestJobTypeMigration:
+    async def test_legacy_agent_jobs_are_migrated_without_data_loss(self, tmp_path):
+        db_path = tmp_path / "legacy_jobs.db"
+        async with aiosqlite.connect(str(db_path)) as conn:
+            await conn.execute("""
+                CREATE TABLE jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    job_type TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    schedule_type TEXT NOT NULL,
+                    schedule_data TEXT NOT NULL,
+                    active INTEGER DEFAULT 1,
+                    auto_remove INTEGER DEFAULT 0,
+                    notify_on_check INTEGER DEFAULT 0
+                )
+            """)
+            await conn.execute(
+                "INSERT INTO jobs (chat_id, name, job_type, prompt, schedule_type, schedule_data) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (1, "legacy", "claude", "check status", "interval", '{"seconds": 60}'),
+            )
+            await conn.commit()
+
+        try:
+            await sessions.init_db(db_path)
+            job = await sessions.get_job_by_id(1)
+            assert job is not None
+            assert job["job_type"] == "agent"
+            assert job["name"] == "legacy"
+            assert job["prompt"] == "check status"
+        finally:
+            await sessions.close_db()
 
 
 # ── Workspace history migration ─────────────────────────────────────
