@@ -152,6 +152,14 @@ def _validate_absolute_executable(backend: str, command: str, source: str) -> st
         raise BackendRegistryError(f"{source} for backend {backend!r} is not a file: {command!r}")
     if not os.access(str(path), os.X_OK):
         raise BackendRegistryError(f"{source} for backend {backend!r} is not executable: {command!r}")
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError as e:
+        raise BackendRegistryError(f"could not stat {source} for backend {backend!r}: {e}") from e
+    if mode & 0o022:
+        raise BackendRegistryError(
+            f"{source} for backend {backend!r} has unsafe permissions {mode:#04o}; remove group/other write access"
+        )
     return str(path)
 
 

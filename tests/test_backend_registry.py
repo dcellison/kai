@@ -103,6 +103,34 @@ def test_registry_file_must_not_be_group_or_world_writable(tmp_path, monkeypatch
         resolve_backend_command("claude")
 
 
+@pytest.mark.parametrize("mode", [0o775, 0o757])
+def test_registry_command_must_not_be_group_or_world_writable(tmp_path, monkeypatch, mode):
+    """The registry file is not sufficient if the registered executable
+    can be replaced in place by a non-admin account.
+    """
+    codex = _exe(tmp_path / "codex")
+    codex.chmod(mode)
+    registry = tmp_path / "backends.yaml"
+    registry.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "backends": {
+                    "codex": {
+                        "driver": "codex",
+                        "runtime": "local_process",
+                        "command": str(codex),
+                    }
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("KAI_BACKENDS_YAML", str(registry))
+
+    with pytest.raises(BackendRegistryError, match="unsafe permissions"):
+        resolve_backend_command("codex")
+
+
 def test_default_missing_registry_uses_legacy_path_resolution(monkeypatch):
     monkeypatch.delenv("KAI_BACKENDS_YAML", raising=False)
     monkeypatch.delenv("KAI_INSTALL_DIR", raising=False)
