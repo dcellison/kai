@@ -20,15 +20,18 @@ import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 import yaml
 from dotenv import load_dotenv
 
+from kai.backend_registry import BackendRegistryError, backend_registry_is_authoritative, load_backend_registry
 from kai.protected_config import ProtectedConfigError, validate_protected_file_metadata
 from kai.user_isolation import validate_protected_user_isolation
 
 log = logging.getLogger(__name__)
+_legacy_registry_model_warning_emitted: set[tuple[str, str]] = set()
 
 
 # ── Module-level paths and constants ─────────────────────────────────
@@ -697,6 +700,59 @@ def is_opencode_model_shape(model: str) -> bool:
     return all(parts)
 
 
+def _backend_registry_allowed_models(backend: str) -> tuple[str, ...] | None:
+    """Return the authoritative registry allowlist for a backend, if any.
+
+    Empty/missing `allowed_models` means "no registry-level model
+    ceiling"; the backend's built-in validator remains authoritative.
+    A malformed or missing required registry fails closed by returning
+    an empty tuple, which makes every model invalid for that backend.
+    """
+    if not backend_registry_is_authoritative():
+        return None
+    try:
+        entry = load_backend_registry().get(backend)
+    except BackendRegistryError as exc:
+        log.error("Could not load backend registry while validating model for %s: %s", backend, exc)
+        return ()
+    if entry is None:
+        log.error("Backend registry has no entry for backend %s while validating models", backend)
+        return ()
+    return entry.allowed_models or None
+
+
+def _model_allowed_by_registry(model: str, backend: str, allowed_models: tuple[str, ...]) -> bool:
+    """Return whether a backend-registry allowlist permits a model.
+
+    `allowed_models` entries support exact strings and shell-style
+    wildcards. The generated Claude registry uses this to preserve the
+    existing `claude-*` full-model-ID behavior while still making the
+    protected registry an enforceable ceiling.
+    """
+    if any(fnmatchcase(model, pattern) for pattern in allowed_models):
+        return True
+
+    # Compatibility for upgraded installs whose existing generated
+    # registry predates the `claude-*` wildcard. The old generator
+    # wrote exactly the short Anthropic aliases. Preserve the runtime's
+    # intentional full-ID behavior until the next `make install`
+    # rewrites /etc/kai/backends.yaml with the explicit wildcard.
+    if backend == "claude" and model.startswith("claude-"):
+        old_generated_claude_aliases = frozenset(PROVIDER_MODELS["anthropic"].keys())
+        if frozenset(allowed_models) == old_generated_claude_aliases:
+            warned = (backend, model)
+            if warned not in _legacy_registry_model_warning_emitted:
+                _legacy_registry_model_warning_emitted.add(warned)
+                log.warning(
+                    "Backend registry allowed_models for claude uses the legacy alias-only form; "
+                    "allowing full Claude model id %r for compatibility. Re-run make install to "
+                    "write the explicit claude-* allowlist.",
+                    model,
+                )
+            return True
+    return False
+
+
 def validate_model_for_backend(model: str, backend: str, eff_provider: str) -> bool:
     """Check if a model is valid for the active backend.
 
@@ -729,14 +785,21 @@ def validate_model_for_backend(model: str, backend: str, eff_provider: str) -> b
     share no fallback path.
     """
     if backend == "codex":
-        return model in CODEX_MODELS
-    if backend == "opencode":
-        return is_opencode_model_shape(model)
-    if backend == "claude" and model.startswith("claude-"):
+        base_allowed = model in CODEX_MODELS
+    elif backend == "opencode":
+        base_allowed = is_opencode_model_shape(model)
+    elif (backend == "claude" or (backend == "goose" and eff_provider == "anthropic")) and model.startswith("claude-"):
+        base_allowed = True
+    else:
+        base_allowed = validate_model_for_provider(model, eff_provider)
+
+    if not base_allowed:
+        return False
+
+    registry_allowed = _backend_registry_allowed_models(backend)
+    if registry_allowed is None:
         return True
-    if backend == "goose" and eff_provider == "anthropic" and model.startswith("claude-"):
-        return True
-    return validate_model_for_provider(model, eff_provider)
+    return _model_allowed_by_registry(model, backend, registry_allowed)
 
 
 # (context, matched legacy key) pairs that have already emitted a

@@ -5945,7 +5945,7 @@ def _build_backend_registry(service_user: str, env: dict[str, str]) -> str:
             "driver": "claude",
             "runtime": "local_process",
             "command": env.get("CLAUDE_BIN") or _resolve_default_claude_bin(service_user),
-            "allowed_models": sorted(PROVIDER_MODELS["anthropic"].keys()),
+            "allowed_models": sorted((*PROVIDER_MODELS["anthropic"].keys(), "claude-*")),
         },
         "codex": {
             "driver": "codex",

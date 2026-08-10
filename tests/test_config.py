@@ -2683,6 +2683,13 @@ class TestCodexModelsSurface:
 class TestValidateModelForBackend:
     """Backend-aware validator."""
 
+    @staticmethod
+    def _write_backend_registry(tmp_path, monkeypatch, body: str) -> None:
+        registry = tmp_path / "backends.yaml"
+        registry.write_text(textwrap.dedent(body).lstrip())
+        registry.chmod(0o644)
+        monkeypatch.setenv("KAI_BACKENDS_YAML", str(registry))
+
     def test_codex_accepts_codex_models(self):
         from kai.config import validate_model_for_backend
 
@@ -2711,6 +2718,47 @@ class TestValidateModelForBackend:
 
     def test_codex_rejects_claude_models(self):
         from kai.config import validate_model_for_backend
+
+        assert validate_model_for_backend("opus", "codex", "openai") is False
+
+    def test_registry_allowed_models_narrows_codex_surface(self, tmp_path, monkeypatch):
+        from kai.config import validate_model_for_backend
+
+        self._write_backend_registry(
+            tmp_path,
+            monkeypatch,
+            """
+            version: 1
+            backends:
+              codex:
+                driver: codex
+                runtime: local_process
+                command: /usr/local/bin/codex
+                allowed_models:
+                  - gpt-5.5
+            """,
+        )
+
+        assert validate_model_for_backend("gpt-5.5", "codex", "openai") is True
+        assert validate_model_for_backend("gpt-5.6-sol", "codex", "openai") is False
+
+    def test_registry_allowed_models_cannot_widen_codex_surface(self, tmp_path, monkeypatch):
+        from kai.config import validate_model_for_backend
+
+        self._write_backend_registry(
+            tmp_path,
+            monkeypatch,
+            """
+            version: 1
+            backends:
+              codex:
+                driver: codex
+                runtime: local_process
+                command: /usr/local/bin/codex
+                allowed_models:
+                  - opus
+            """,
+        )
 
         assert validate_model_for_backend("opus", "codex", "openai") is False
 
@@ -2757,6 +2805,55 @@ class TestValidateModelForBackend:
         assert validate_model_for_backend("claude-haiku-4-5-20251001", "claude", "anthropic") is True
         # The curated alias trio keeps working alongside the passthrough.
         assert validate_model_for_backend("sonnet", "claude", "anthropic") is True
+
+    def test_registry_allowed_models_supports_claude_wildcard(self, tmp_path, monkeypatch):
+        from kai.config import validate_model_for_backend
+
+        self._write_backend_registry(
+            tmp_path,
+            monkeypatch,
+            """
+            version: 1
+            backends:
+              claude:
+                driver: claude
+                runtime: local_process
+                command: /opt/homebrew/bin/claude
+                allowed_models:
+                  - haiku
+                  - opus
+                  - sonnet
+                  - claude-*
+            """,
+        )
+
+        assert validate_model_for_backend("sonnet", "claude", "anthropic") is True
+        assert validate_model_for_backend("claude-opus-4-8", "claude", "anthropic") is True
+        assert validate_model_for_backend("gpt-5.5", "claude", "anthropic") is False
+
+    def test_legacy_alias_only_claude_registry_preserves_full_ids(self, tmp_path, monkeypatch, caplog):
+        from kai.config import validate_model_for_backend
+
+        self._write_backend_registry(
+            tmp_path,
+            monkeypatch,
+            """
+            version: 1
+            backends:
+              claude:
+                driver: claude
+                runtime: local_process
+                command: /opt/homebrew/bin/claude
+                allowed_models:
+                  - haiku
+                  - opus
+                  - sonnet
+            """,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            assert validate_model_for_backend("claude-opus-4-8", "claude", "anthropic") is True
+        assert "legacy alias-only form" in caplog.text
 
     def test_claude_rejects_non_claude_garbage(self):
         """The structural passthrough is claude-* scoped; other strings
