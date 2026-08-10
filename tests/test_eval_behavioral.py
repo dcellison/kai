@@ -104,6 +104,7 @@ def _make_config(**overrides) -> BehavioralConfig:
         "gen_timeout_s": 120,
         "seed": "0123456789abcdef",
         "max_concurrency": 4,
+        "backend": "claude",
     }
     base.update(overrides)
     return BehavioralConfig(**base)
@@ -895,15 +896,8 @@ class TestBackendAwareModelResolution:
     """
     Verify the backend-aware dispatch in _run_cli for judge/gen models.
 
-    The resolution shape:
-    - On claude / codex, get_model_for(role, backend, override=args.x or "")
-      handles the lookup. Unset flag yields the registry default;
-      explicit flag wins via override.
-    - On goose (and any future non-registry backend), the legacy
-      _DEFAULT_JUDGE_MODEL / _DEFAULT_GEN_MODEL constants are used
-      when the flag is unset, mirroring pre-Phase-1 behavior. Without
-      this fallback, get_model_for would raise LookupError on the
-      missing (goose, BEHAVIORAL_*) row and crash the eval CLI.
+    Only backends with behavioral-evaluator protocol implementations
+    may reach model resolution or subprocess dispatch.
     """
 
     @staticmethod
@@ -957,44 +951,37 @@ class TestBackendAwareModelResolution:
             asyncio.run(behavioral._run_cli(args))
         return captured["config"]
 
-    def test_goose_unset_flag_uses_registry(self, tmp_path, monkeypatch):
-        """
-        Goose is a registry-resolved backend: an unset flag resolves
-        through the (goose, provider, role) rows the same way claude
-        does. DEFAULT_PROVIDER is required env on goose installs, so the
-        eval reads it the same way the runtime does.
-        """
-        from kai.config import ModelRole, get_model_for
+    @staticmethod
+    def _run_for_exit_code(args):
+        with (
+            patch.object(behavioral, "_initialize_memory", return_value=Path("/tmp")),
+            patch.object(behavioral, "_run_all_probes", new=AsyncMock()) as run_probes,
+        ):
+            exit_code = asyncio.run(behavioral._run_cli(args))
+        return exit_code, run_probes
 
-        monkeypatch.setenv("DEFAULT_BACKEND", "goose")
-        monkeypatch.setenv("DEFAULT_PROVIDER", "anthropic")
-        args = self._make_args(tmp_path)  # judge_model=None, gen_model=None
-        config = self._run_with_captured_config(args)
-        assert config.judge_model == get_model_for(ModelRole.BEHAVIORAL_JUDGE, "goose", "anthropic")
-        assert config.gen_model == get_model_for(ModelRole.BEHAVIORAL_GEN, "goose", "anthropic")
+    @pytest.mark.parametrize("backend", ["goose", "opencode"])
+    def test_backend_without_behavioral_protocol_fails_closed(self, backend, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("DEFAULT_BACKEND", backend)
+        args = self._make_args(tmp_path, judge_model="explicit-judge", gen_model="explicit-gen")
 
-    def test_unrecognized_backend_falls_back_to_legacy_constant(self, tmp_path, monkeypatch):
-        """
-        A DEFAULT_BACKEND env value the registry does not know must NOT
-        trigger get_model_for (no registry row, would raise
-        LookupError). The fallback path uses _DEFAULT_JUDGE_MODEL.
-        """
+        exit_code, run_probes = self._run_for_exit_code(args)
+
+        assert exit_code == 1
+        run_probes.assert_not_awaited()
+        assert (
+            f"backend {backend!r} is installed but behavioral evaluation does not implement" in capsys.readouterr().err
+        )
+
+    def test_unrecognized_backend_fails_closed(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setenv("DEFAULT_BACKEND", "nonexistent")
-        args = self._make_args(tmp_path)  # judge_model=None, gen_model=None
-        config = self._run_with_captured_config(args)
-        assert config.judge_model == behavioral._DEFAULT_JUDGE_MODEL
-        assert config.gen_model == behavioral._DEFAULT_GEN_MODEL
+        args = self._make_args(tmp_path)
 
-    def test_goose_explicit_flag_wins(self, tmp_path, monkeypatch):
-        """
-        Explicit --judge-model still wins on goose. The fallback only
-        kicks in for an unset (None) flag value.
-        """
-        monkeypatch.setenv("DEFAULT_BACKEND", "goose")
-        args = self._make_args(tmp_path, judge_model="opus", gen_model="haiku")
-        config = self._run_with_captured_config(args)
-        assert config.judge_model == "opus"
-        assert config.gen_model == "haiku"
+        exit_code, run_probes = self._run_for_exit_code(args)
+
+        assert exit_code == 1
+        run_probes.assert_not_awaited()
+        assert "configured default backend 'nonexistent' is not valid" in capsys.readouterr().err
 
     def test_claude_unset_flag_uses_registry(self, tmp_path, monkeypatch):
         """
@@ -1020,28 +1007,22 @@ class TestBackendAwareModelResolution:
 
     def test_behavioral_eval_resolves_new_DEFAULT_BACKEND(self, tmp_path, monkeypatch):
         """The eval reads DEFAULT_BACKEND. With only the new key set
-        (no AGENT_BACKEND), it stamps the resolved backend and resolves
-        the goose registry rows."""
-        from kai.config import ModelRole, get_model_for
+        (no AGENT_BACKEND), it stamps the resolved backend."""
 
         monkeypatch.delenv("AGENT_BACKEND", raising=False)
-        monkeypatch.setenv("DEFAULT_BACKEND", "goose")
-        monkeypatch.setenv("DEFAULT_PROVIDER", "anthropic")
+        monkeypatch.setenv("DEFAULT_BACKEND", "codex")
         args = self._make_args(tmp_path)
         config = self._run_with_captured_config(args)
-        assert config.judge_model == get_model_for(ModelRole.BEHAVIORAL_JUDGE, "goose", "anthropic")
+        assert config.backend == "codex"
 
     def test_behavioral_eval_resolves_legacy_AGENT_BACKEND(self, tmp_path, monkeypatch):
         """One-release back-compat: a legacy AGENT_BACKEND env value
         (no DEFAULT_BACKEND) still resolves the eval backend."""
-        from kai.config import ModelRole, get_model_for
-
         monkeypatch.delenv("DEFAULT_BACKEND", raising=False)
-        monkeypatch.setenv("AGENT_BACKEND", "goose")
-        monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
         args = self._make_args(tmp_path)
         config = self._run_with_captured_config(args)
-        assert config.judge_model == get_model_for(ModelRole.BEHAVIORAL_JUDGE, "goose", "anthropic")
+        assert config.backend == "codex"
 
 
 class TestProbeIdMatchesSourcePosition:
@@ -1750,16 +1731,9 @@ class TestCaptureAgentCliVersionCodex:
         assert field == "codex_cli_version"
         assert mock_run.call_args[0][0] == ["/tmp/fake-codex", "--version"]
 
-    def test_unknown_backend_falls_back_to_claude(self, monkeypatch):
-        monkeypatch.delenv("CODEX_BIN", raising=False)
-        monkeypatch.delenv("CLAUDE_BIN", raising=False)
-        fake_result = MagicMock()
-        fake_result.returncode = 0
-        fake_result.stdout = "claude 2.1.118\n"
-        with patch("kai.eval.behavioral.subprocess.run", return_value=fake_result) as mock_run:
-            field, _value = _capture_agent_cli_version("goose")
-        assert field == "claude_cli_version"
-        assert mock_run.call_args[0][0] == ["claude", "--version"]
+    def test_unknown_backend_fails_closed(self):
+        with pytest.raises(ValueError, match="unsupported behavioral-eval backend: 'goose'"):
+            _capture_agent_cli_version("goose")
 
     def test_subprocess_failure_returns_unknown(self):
         fake_result = MagicMock()

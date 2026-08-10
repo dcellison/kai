@@ -98,9 +98,13 @@ from typing import Any
 # aligned with whatever else consumes the same shape (currently the
 # collision-probe generator). If the drift bucketing changes, every
 # consumer follows automatically.
+from kai.backend_registry import (
+    BackendRegistryError,
+    resolve_backend_command,
+    resolve_default_backend,
+)
 from kai.codex_exec import extract_codex_text
 from kai.config import (
-    ONESHOT_REASONER_BACKENDS,
     ModelRole,
     _resolve_eval_provider,
     _resolve_renamed_key,
@@ -113,6 +117,8 @@ from kai.eval._probes import (
     probe_set_hash,
 )
 from kai.prompt_utils import make_boundary
+
+_SUPPORTED_BEHAVIORAL_BACKENDS = frozenset({"claude", "codex"})
 
 log = logging.getLogger(__name__)
 
@@ -289,6 +295,10 @@ class BehavioralConfig:
     gen_timeout_s: int
     seed: str
     max_concurrency: int
+    # The evaluator currently has protocol-specific implementations for
+    # exactly these two backends. Callers must select one explicitly;
+    # unsupported identities are rejected before any subprocess starts.
+    backend: str
     # Eval-only synthetic-pollution count. Defaults to 0 so existing
     # tests and existing CLI invocations stay byte-for-byte identical
     # to today's behavior; a non-zero value opts the run into the
@@ -309,14 +319,6 @@ class BehavioralConfig:
     # test fixtures that build a config without invoking the CLI still
     # get a sensible path.
     data_dir: Path = Path(".")
-    # Active agent backend for this run ("claude" or "codex"). Resolved
-    # once at _run_cli from DEFAULT_BACKEND and threaded through every
-    # subprocess builder + stdout parser + version capture so the
-    # codex and claude verticals can stay byte-isolated. Default
-    # "claude" matches the pre-codex behavior so test fixtures that
-    # build a config without setting this field still produce the
-    # historical command shape.
-    backend: str = "claude"
 
 
 @dataclass
@@ -422,10 +424,7 @@ def _build_judge_cmd(config: BehavioralConfig) -> list[str]:
     probe as judge_error with no diagnostic. Re-run the verification
     if upgrading the CLI past 2.x.
     """
-    # CLAUDE_BIN env override is honored same as triage/review and the
-    # one-shot resolver, so the eval spawns the same binary the rest
-    # of the system pins.
-    claude_bin = os.environ.get("CLAUDE_BIN") or "claude"
+    claude_bin = resolve_backend_command("claude", allow_bare_fallback=True)
     return [
         claude_bin,
         "--print",
@@ -466,8 +465,7 @@ def _build_gen_cmd(config: BehavioralConfig) -> list[str]:
       `claude_cli_version` field in the output JSON lets cross-run
       comparisons detect drift in that residual.
     """
-    # Same CLAUDE_BIN precedence as the judge builder above.
-    claude_bin = os.environ.get("CLAUDE_BIN") or "claude"
+    claude_bin = resolve_backend_command("claude", allow_bare_fallback=True)
     return [
         claude_bin,
         "--print",
@@ -498,12 +496,11 @@ def _build_judge_cmd_codex(config: BehavioralConfig) -> list[str]:
     (see `_validate_judge_envelope`) and injects the system prompt as
     a boundary-delimited prefix to stdin (see `_render_codex_stdin`).
 
-    `CODEX_BIN` env override is honored same as triage/review and the
-    persistent backend: installs where codex lives in a per-os_user
-    home and not on the service user's PATH still resolve the absolute
-    binary. Falls back to bare "codex" when unset.
+    The binary is resolved through the same protected backend registry
+    used by the persistent runtime. Development installs retain the
+    legacy environment/PATH resolution behavior.
     """
-    codex_bin = os.environ.get("CODEX_BIN") or "codex"
+    codex_bin = resolve_backend_command("codex", allow_bare_fallback=True)
     return [
         codex_bin,
         "exec",
@@ -533,7 +530,7 @@ def _build_gen_cmd_codex(config: BehavioralConfig) -> list[str]:
     joins all completed items with a blank-line separator so multi-item
     turns are not truncated (the PR #490 / PR #491 lesson).
     """
-    codex_bin = os.environ.get("CODEX_BIN") or "codex"
+    codex_bin = resolve_backend_command("codex", allow_bare_fallback=True)
     return [
         codex_bin,
         "exec",
@@ -1194,9 +1191,11 @@ async def _run_one_arm(
     if config.backend == "codex":
         cmd = _build_gen_cmd_codex(config)
         stdin_payload = _render_codex_stdin("", arm_prompt)
-    else:
+    elif config.backend == "claude":
         cmd = _build_gen_cmd(config)
         stdin_payload = arm_prompt
+    else:
+        raise ValueError(f"unsupported behavioral-eval backend: {config.backend!r}")
     rc, stdout, _stderr, elapsed_ms = await _run_subprocess(
         cmd=cmd,
         stdin_payload=stdin_payload,
@@ -1208,8 +1207,10 @@ async def _run_one_arm(
         return None, elapsed_ms
     if config.backend == "codex":
         text = _parse_codex_gen_stdout(stdout).strip()
-    else:
+    elif config.backend == "claude":
         text = stdout.decode("utf-8", errors="replace").strip()
+    else:  # pragma: no cover - guarded before subprocess dispatch above
+        raise ValueError(f"unsupported behavioral-eval backend: {config.backend!r}")
     if not text:
         # Successful exit with no output is still a broken response -
         # the judge cannot score nothing against the gold fact. Bucket
@@ -1248,9 +1249,11 @@ async def _run_one_judge(
         # no boundary block, but the judge always uses a non-empty
         # system prompt, so the SYSTEM section is present.
         stdin_payload = _render_codex_stdin(_JUDGE_SYSTEM_PROMPT, payload)
-    else:
+    elif config.backend == "claude":
         cmd = _build_judge_cmd(config)
         stdin_payload = payload
+    else:
+        raise ValueError(f"unsupported behavioral-eval backend: {config.backend!r}")
     rc, stdout, _stderr, elapsed_ms = await _run_subprocess(
         cmd=cmd,
         stdin_payload=stdin_payload,
@@ -1266,7 +1269,9 @@ async def _run_one_judge(
         # against _JUDGE_SCHEMA via _validate_judge_envelope.
         parsed = _parse_codex_judge_stdout(stdout)
         return parsed, elapsed_ms
-    return _parse_judge_stdout(stdout), elapsed_ms
+    if config.backend == "claude":
+        return _parse_judge_stdout(stdout), elapsed_ms
+    raise ValueError(f"unsupported behavioral-eval backend: {config.backend!r}")  # pragma: no cover
 
 
 async def _run_one_probe(
@@ -1728,8 +1733,8 @@ def _capture_agent_cli_version(backend: str) -> tuple[str, str]:
     JSON key the caller should write under: `"claude_cli_version"` on
     a claude run, `"codex_cli_version"` on a codex run. The harness
     writes exactly one of those keys and leaves the other absent.
-    Unknown backends fall back to the claude tuple so non-registry
-    paths (e.g. goose) preserve the pre-codex behavior.
+    Unsupported backends are rejected rather than being routed through
+    a different backend's CLI protocol.
 
     Used to detect cross-run drift in the residual default context the
     CLI injects. A CLI upgrade between runs that changes that default
@@ -1751,14 +1756,14 @@ def _capture_agent_cli_version(backend: str) -> tuple[str, str]:
     """
     if backend == "codex":
         field_name = "codex_cli_version"
-        codex_bin = os.environ.get("CODEX_BIN") or "codex"
+        codex_bin = resolve_backend_command("codex", allow_bare_fallback=True)
         argv = [codex_bin, "--version"]
-    else:
-        # claude (and any unknown backend, by design) - same binary
-        # precedence as the judge / generator builders.
+    elif backend == "claude":
         field_name = "claude_cli_version"
-        claude_bin = os.environ.get("CLAUDE_BIN") or "claude"
+        claude_bin = resolve_backend_command("claude", allow_bare_fallback=True)
         argv = [claude_bin, "--version"]
+    else:
+        raise ValueError(f"unsupported behavioral-eval backend: {backend!r}")
     try:
         result = subprocess.run(
             argv,
@@ -2201,6 +2206,31 @@ async def _run_cli(args: argparse.Namespace) -> int:
     if data_dir is None:
         return 1
 
+    # Resolve the explicit installation choice through the same
+    # protected registry contract used by the service. The evaluator
+    # implements backend-specific wire protocols, so it must reject an
+    # installed backend whose evaluator vertical has not been written.
+    configured_backend = _resolve_renamed_key(
+        os.environ.get,
+        new_key="DEFAULT_BACKEND",
+        legacy_keys=["AGENT_BACKEND"],
+        context="behavioral eval env",
+        default="",
+    )
+    try:
+        eval_backend = resolve_default_backend(configured_backend or "")
+    except BackendRegistryError as exc:
+        print(f"eval: {exc}", file=sys.stderr)
+        return 1
+    if eval_backend not in _SUPPORTED_BEHAVIORAL_BACKENDS:
+        supported = ", ".join(sorted(_SUPPORTED_BEHAVIORAL_BACKENDS))
+        print(
+            f"eval: backend {eval_backend!r} is installed but behavioral evaluation "
+            f"does not implement its CLI protocol; supported backends: {supported}",
+            file=sys.stderr,
+        )
+        return 1
+
     # Drift detection + tag mapping: reuses the shared helper so every
     # eval consumer agrees on which probes are scorable on a given
     # snapshot.
@@ -2224,53 +2254,23 @@ async def _run_cli(args: argparse.Namespace) -> int:
     # _build_parser) means an unset flag yields override="" so the
     # branch below picks the right backend-appropriate default.
     #
-    # MODEL_REGISTRY covers every backend in ONESHOT_REASONER_BACKENDS,
-    # which is every real backend today. The else arm below survives as
-    # the defensive path for a DEFAULT_BACKEND env value the registry
-    # does not know (a typo, or a future backend mid-introduction):
-    # explicit --judge-model / --gen-model wins, otherwise the legacy
-    # _DEFAULT_JUDGE_MODEL / _DEFAULT_GEN_MODEL constants are used
-    # rather than crashing with a LookupError on an unset flag.
-    # Reads DEFAULT_BACKEND with the one-release AGENT_BACKEND fallback;
-    # global default is "claude" (this is the installation-wide setting,
-    # not a per-user override).
-    eval_backend = (
-        (
-            _resolve_renamed_key(
-                os.environ.get,
-                new_key="DEFAULT_BACKEND",
-                legacy_keys=["AGENT_BACKEND"],
-                context="behavioral eval env",
-                default="claude",
-            )
-            or "claude"
-        )
-        .strip()
-        .lower()
-    )
     # Provider is read from the eval-time env (DEFAULT_PROVIDER, with a
     # one-release fallback to the deprecated LLM_PROVIDER name) via the
     # shared resolver. Single-provider backends (claude, codex) ignore
     # this value because their provider is implicit at runtime.
     eval_provider = _resolve_eval_provider("behavioral eval env")
-    if eval_backend in ONESHOT_REASONER_BACKENDS:
-        resolved_judge_model = get_model_for(
-            ModelRole.BEHAVIORAL_JUDGE,
-            eval_backend,
-            eval_provider,
-            override=args.judge_model or "",
-        )
-        resolved_gen_model = get_model_for(
-            ModelRole.BEHAVIORAL_GEN,
-            eval_backend,
-            eval_provider,
-            override=args.gen_model or "",
-        )
-    else:
-        # Unrecognized DEFAULT_BACKEND env value: explicit flag wins,
-        # otherwise the legacy _DEFAULT_* constant is used.
-        resolved_judge_model = args.judge_model or _DEFAULT_JUDGE_MODEL
-        resolved_gen_model = args.gen_model or _DEFAULT_GEN_MODEL
+    resolved_judge_model = get_model_for(
+        ModelRole.BEHAVIORAL_JUDGE,
+        eval_backend,
+        eval_provider,
+        override=args.judge_model or "",
+    )
+    resolved_gen_model = get_model_for(
+        ModelRole.BEHAVIORAL_GEN,
+        eval_backend,
+        eval_provider,
+        override=args.gen_model or "",
+    )
     config = BehavioralConfig(
         judge_model=resolved_judge_model,
         judge_timeout_s=args.judge_timeout_s,
