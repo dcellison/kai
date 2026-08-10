@@ -19,7 +19,10 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -e '.[dev,totp]'
+        run: pip install --constraint requirements/constraints.txt -e '.[dev,totp]'
+
+      - name: Validate install constraints
+        run: make BIN= check-install-constraints
 
       - name: Lint and format check
         run: make BIN= check
