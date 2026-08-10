@@ -2883,9 +2883,10 @@ async def _handle_github_token(
     """
     Handle /github token <ghp_...> and /github token clear.
 
-    Stores or clears the user's GitHub PAT. The token is stored as
-    plaintext in SQLite - acceptable for a local deployment where
-    DB file access implies host access. Never logged, never echoed.
+    Stores or clears the user's GitHub PAT. The token is stored in
+    owner-only SQLite state, never logged, never echoed, and the
+    source Telegram command is deleted after a successful store when
+    Telegram permits deletion.
     """
     assert update.message is not None
 
@@ -2898,9 +2899,15 @@ async def _handle_github_token(
         await update.message.reply_text("GitHub token removed.")
         return
 
-    # Store the token. Plaintext in SQLite is acceptable for local
-    # deployment where DB file access implies host access.
+    # Store the token in owner-only SQLite state, then delete the
+    # token-bearing Telegram command where Telegram permits it.
     await sessions.set_setting(f"github_token:{chat_id}", args[0])
+    try:
+        await update.message.delete()
+    except BadRequest as exc:
+        log.warning("Could not delete GitHub token command message: %s", exc)
+    except Exception:
+        log.exception("Could not delete GitHub token command message")
     await update.message.reply_text("GitHub token stored.")
 
 

@@ -3744,9 +3744,15 @@ def _apply_migrate(
             else:
                 print("  Database integrity check passed")
 
+            os.chmod(db_dst, 0o600)
             os.chown(db_dst, svc_uid, svc_gid)
     elif db_dst.exists():
         print("  Database already exists at destination, skipping migration")
+        if dry_run:
+            print(f"[DRY RUN] Would secure database: {db_dst} (mode 0600, {svc_uid}:{svc_gid})")
+        else:
+            os.chmod(db_dst, 0o600)
+            os.chown(db_dst, svc_uid, svc_gid)
     elif not db_src.exists():
         print("  No source database found, skipping migration")
 

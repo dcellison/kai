@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
 
@@ -53,6 +54,26 @@ def _get_db() -> aiosqlite.Connection:
     return _db
 
 
+def _restrict_sqlite_file(path: Path) -> None:
+    """Create/chmod a SQLite file so persisted secrets are owner-only."""
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+    path.chmod(0o600)
+
+
+def _restrict_sqlite_files(db_path: Path) -> None:
+    """Restrict the main DB and any SQLite WAL/SHM companion files."""
+    for path in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+        if path.exists():
+            path.chmod(0o600)
+
+
 # ── Initialization ───────────────────────────────────────────────────
 
 
@@ -72,6 +93,7 @@ async def init_db(db_path: Path) -> None:
         db_path: Path to the SQLite database file (created if missing).
     """
     global _db
+    _restrict_sqlite_file(db_path)
     _db = await aiosqlite.connect(str(db_path))
     _get_db().row_factory = aiosqlite.Row
     # PRAGMAs are database configuration, not schema. They must execute
@@ -85,6 +107,7 @@ async def init_db(db_path: Path) -> None:
         if row and row[0] != "wal":
             log.warning("Failed to enable WAL mode; journal_mode is %s", row[0])
     await _get_db().execute("PRAGMA busy_timeout=5000")
+    _restrict_sqlite_files(db_path)
 
     try:
         # BEGIN IMMEDIATE acquires the write lock up front rather than on
@@ -198,6 +221,7 @@ async def init_db(db_path: Path) -> None:
             await _get_db().execute("ALTER TABLE workspace_history_new RENAME TO workspace_history")
 
         await _get_db().commit()
+        _restrict_sqlite_files(db_path)
     except Exception:
         # Roll back the entire init sequence. The database is left in its
         # pre-init state (no partial tables, no half-migrated schema).

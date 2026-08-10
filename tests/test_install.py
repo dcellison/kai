@@ -4699,6 +4699,7 @@ class TestApplyMigrate:
 
         assert (data_path / "kai.db").exists()
         assert (data_path / "kai.db").read_text() == "fake-db-content"
+        assert stat.S_IMODE((data_path / "kai.db").stat().st_mode) == 0o600
 
     def test_verifies_integrity(self, tmp_path, monkeypatch):
         """Runs PRAGMA integrity_check on the copied database."""
@@ -4738,11 +4739,16 @@ class TestApplyMigrate:
         data_path.mkdir()
         (data_path / "logs").mkdir()
         (data_path / "kai.db").write_text("existing-content")
+        (data_path / "kai.db").chmod(0o644)
+        chowned: list[tuple[str, int, int]] = []
+        monkeypatch.setattr("kai.install.os.chown", lambda path, uid, gid: chowned.append((str(path), uid, gid)))
 
         _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         # Destination should be unchanged
         assert (data_path / "kai.db").read_text() == "existing-content"
+        assert stat.S_IMODE((data_path / "kai.db").stat().st_mode) == 0o600
+        assert (str(data_path / "kai.db"), 501, 20) in chowned
         assert "already exists" in capsys.readouterr().out
 
     def test_copies_logs(self, tmp_path, monkeypatch):

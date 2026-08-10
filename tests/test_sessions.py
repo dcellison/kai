@@ -1,6 +1,7 @@
 """Tests for sessions.py async database CRUD."""
 
 import sqlite3
+import stat
 from pathlib import Path
 
 import aiosqlite
@@ -1454,6 +1455,32 @@ class TestWorkspaceHistoryMigration:
 
 class TestInitDbTransaction:
     """Verify init_db wraps all DDL in a single atomic transaction."""
+
+    @pytest.mark.asyncio
+    async def test_fresh_db_file_is_owner_only(self, tmp_path):
+        """SQLite files can hold GitHub PATs, so the DB must be 0600."""
+        db_path = tmp_path / "fresh.db"
+        await sessions.init_db(db_path)
+        try:
+            assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
+            for companion in (Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+                if companion.exists():
+                    assert stat.S_IMODE(companion.stat().st_mode) == 0o600
+        finally:
+            await sessions.close_db()
+
+    @pytest.mark.asyncio
+    async def test_existing_db_file_mode_is_repaired(self, tmp_path):
+        """Startup repairs an older permissive kai.db mode."""
+        db_path = tmp_path / "existing.db"
+        db_path.write_bytes(b"")
+        db_path.chmod(0o644)
+
+        await sessions.init_db(db_path)
+        try:
+            assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
+        finally:
+            await sessions.close_db()
 
     @pytest.mark.asyncio
     async def test_fresh_db_creates_all_tables(self, tmp_path):

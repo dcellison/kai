@@ -4875,6 +4875,41 @@ class TestHandleGitHub:
     # ── 3. /github notify <chat_id> ───────────────────────────────
 
     @pytest.mark.asyncio
+    async def test_token_store_deletes_source_message(self):
+        """/github token stores the PAT and deletes the Telegram command."""
+        update = _make_update(text="/github token ghp_secret")
+        config = _make_config()
+        ctx = _make_context(config=config, args=["token", "ghp_secret"])
+        mock_sessions = AsyncMock()
+        mock_sessions.set_setting = AsyncMock()
+
+        with patch("kai.bot.sessions", mock_sessions):
+            await handle_github(update, ctx)
+
+        mock_sessions.set_setting.assert_called_once_with("github_token:12345", "ghp_secret")
+        update.message.delete.assert_awaited_once()
+        reply = update.message.reply_text.call_args[0][0]
+        assert "stored" in reply.lower()
+
+    @pytest.mark.asyncio
+    async def test_token_store_continues_if_source_delete_fails(self):
+        """A Telegram delete failure is logged but does not drop the PAT update."""
+        update = _make_update(text="/github token ghp_secret")
+        update.message.delete.side_effect = BadRequest("message can't be deleted")
+        config = _make_config()
+        ctx = _make_context(config=config, args=["token", "ghp_secret"])
+        mock_sessions = AsyncMock()
+        mock_sessions.set_setting = AsyncMock()
+
+        with patch("kai.bot.sessions", mock_sessions):
+            await handle_github(update, ctx)
+
+        mock_sessions.set_setting.assert_called_once_with("github_token:12345", "ghp_secret")
+        update.message.delete.assert_awaited_once()
+        reply = update.message.reply_text.call_args[0][0]
+        assert "stored" in reply.lower()
+
+    @pytest.mark.asyncio
     async def test_notify_set(self):
         """/github notify 123456 sets notification chat and updates live set."""
         update = _make_update(text="/github notify 123456")
