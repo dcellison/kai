@@ -10,7 +10,9 @@ from kai.backend_registry import (
     BackendRegistryError,
     backend_registry_is_authoritative,
     load_backend_registry,
+    load_backend_registry_default_backend,
     render_backend_registry,
+    resolve_default_backend,
     resolve_backend_command,
 )
 
@@ -318,3 +320,89 @@ def test_render_backend_registry_is_stable():
 
     assert list(data["backends"]) == ["claude", "codex"]
     assert data["version"] == 1
+
+
+def test_render_backend_registry_includes_valid_default_backend():
+    rendered = render_backend_registry(
+        {
+            "codex": {"driver": "codex", "runtime": "local_process", "command": "/usr/local/bin/codex"},
+            "goose": {"driver": "goose", "runtime": "local_process", "command": "/opt/homebrew/bin/goose"},
+        },
+        default_backend="codex",
+    )
+    data = yaml.safe_load(rendered)
+
+    assert data["default_backend"] == "codex"
+    assert list(data["backends"]) == ["codex", "goose"]
+
+
+def test_render_backend_registry_rejects_unknown_default_backend():
+    with pytest.raises(BackendRegistryError, match="default_backend 'opencode' has no backend entry"):
+        render_backend_registry(
+            {"codex": {"driver": "codex", "runtime": "local_process", "command": "/usr/local/bin/codex"}},
+            default_backend="opencode",
+        )
+
+
+def test_resolve_default_backend_uses_registry_default(tmp_path, monkeypatch):
+    codex = _exe(tmp_path / "codex")
+    goose = _exe(tmp_path / "goose")
+    registry = tmp_path / "backends.yaml"
+    registry.write_text(
+        render_backend_registry(
+            {
+                "codex": {"driver": "codex", "runtime": "local_process", "command": str(codex)},
+                "goose": {"driver": "goose", "runtime": "local_process", "command": str(goose)},
+            },
+            default_backend="goose",
+        )
+    )
+    monkeypatch.setenv("KAI_BACKENDS_YAML", str(registry))
+
+    assert load_backend_registry_default_backend() == "goose"
+    assert resolve_default_backend("") == "goose"
+
+
+def test_resolve_default_backend_uses_sole_registry_backend(tmp_path, monkeypatch):
+    codex = _exe(tmp_path / "codex")
+    registry = tmp_path / "backends.yaml"
+    registry.write_text(
+        render_backend_registry(
+            {"codex": {"driver": "codex", "runtime": "local_process", "command": str(codex)}}
+        )
+    )
+    monkeypatch.setenv("KAI_BACKENDS_YAML", str(registry))
+
+    assert resolve_default_backend("") == "codex"
+
+
+def test_resolve_default_backend_requires_selection_for_ambiguous_registry(tmp_path, monkeypatch):
+    codex = _exe(tmp_path / "codex")
+    goose = _exe(tmp_path / "goose")
+    registry = tmp_path / "backends.yaml"
+    registry.write_text(
+        render_backend_registry(
+            {
+                "codex": {"driver": "codex", "runtime": "local_process", "command": str(codex)},
+                "goose": {"driver": "goose", "runtime": "local_process", "command": str(goose)},
+            }
+        )
+    )
+    monkeypatch.setenv("KAI_BACKENDS_YAML", str(registry))
+
+    with pytest.raises(BackendRegistryError, match="does not define default_backend"):
+        resolve_default_backend("")
+
+
+def test_resolve_default_backend_rejects_configured_backend_missing_from_registry(tmp_path, monkeypatch):
+    codex = _exe(tmp_path / "codex")
+    registry = tmp_path / "backends.yaml"
+    registry.write_text(
+        render_backend_registry(
+            {"codex": {"driver": "codex", "runtime": "local_process", "command": str(codex)}}
+        )
+    )
+    monkeypatch.setenv("KAI_BACKENDS_YAML", str(registry))
+
+    with pytest.raises(BackendRegistryError, match="not installed"):
+        resolve_default_backend("goose")

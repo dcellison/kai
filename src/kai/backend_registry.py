@@ -166,6 +166,68 @@ def load_backend_registry(path: Path | None = None) -> dict[str, BackendRegistry
     return entries
 
 
+def load_backend_registry_default_backend(path: Path | None = None) -> str:
+    """Return the registry's configured default backend, if present."""
+    entries = load_backend_registry(path)
+    registry_path = path or backend_registry_path()
+    try:
+        raw = yaml.safe_load(registry_path.read_text()) or {}
+    except OSError as e:
+        raise BackendRegistryError(f"could not read backend registry {registry_path}: {e}") from e
+    except yaml.YAMLError as e:
+        raise BackendRegistryError(f"backend registry {registry_path} is not valid YAML: {e}") from e
+    if not isinstance(raw, dict):
+        raise BackendRegistryError(f"backend registry {registry_path}: expected a YAML mapping")
+    default_backend = str(raw.get("default_backend") or "").strip().lower()
+    if not default_backend:
+        return ""
+    if default_backend not in entries:
+        raise BackendRegistryError(
+            f"backend registry {registry_path}: default_backend {default_backend!r} has no backend entry"
+        )
+    return default_backend
+
+
+def resolve_default_backend(configured_backend: str = "") -> str:
+    """
+    Resolve the effective default backend without provider-specific fallback.
+
+    A configured backend wins, but installed/explicit-registry mode also
+    requires it to exist in the backend registry. If no backend is
+    configured, an authoritative registry may select one via
+    `default_backend`, or by containing exactly one backend entry.
+    """
+    configured = configured_backend.strip().lower()
+    registry: dict[str, BackendRegistryEntry] | None = None
+    if backend_registry_is_authoritative():
+        registry = load_backend_registry()
+
+    if configured:
+        if configured not in _BACKEND_ENV_VARS:
+            valid = ", ".join(sorted(_BACKEND_ENV_VARS))
+            raise BackendRegistryError(f"configured default backend {configured!r} is not valid; valid backends: {valid}")
+        if registry is not None and configured not in registry:
+            installed = ", ".join(sorted(registry)) or "<none>"
+            raise BackendRegistryError(
+                f"configured default backend {configured!r} is not installed; installed backends: {installed}"
+            )
+        return configured
+
+    if registry is not None:
+        registry_default = load_backend_registry_default_backend()
+        if registry_default:
+            return registry_default
+        if len(registry) == 1:
+            return next(iter(registry))
+        installed = ", ".join(sorted(registry)) or "<none>"
+        raise BackendRegistryError(
+            "DEFAULT_BACKEND is not set and backend registry does not define default_backend; "
+            f"installed backends: {installed}"
+        )
+
+    raise BackendRegistryError("DEFAULT_BACKEND is not set and no backend registry is available")
+
+
 def _validate_absolute_executable(backend: str, command: str, source: str) -> str:
     path = Path(command)
     if not path.is_absolute():
@@ -223,7 +285,16 @@ def resolve_backend_command(backend: str, *, allow_bare_fallback: bool = False) 
     return _legacy_env_or_path_command(backend, allow_bare_fallback=allow_bare_fallback)
 
 
-def render_backend_registry(entries: dict[str, dict[str, Any]]) -> str:
+def render_backend_registry(entries: dict[str, dict[str, Any]], *, default_backend: str = "") -> str:
     """Render backend registry YAML with stable ordering."""
-    ordered = {"version": 1, "backends": {key: entries[key] for key in sorted(entries)}}
+    ordered: dict[str, Any] = {"version": 1}
+    normalized_default = default_backend.strip().lower()
+    if normalized_default:
+        if normalized_default not in entries:
+            raise BackendRegistryError(
+                f"default_backend {normalized_default!r} has no backend entry; "
+                f"available backends: {', '.join(sorted(entries))}"
+            )
+        ordered["default_backend"] = normalized_default
+    ordered["backends"] = {key: entries[key] for key in sorted(entries)}
     return yaml.safe_dump(ordered, sort_keys=False)

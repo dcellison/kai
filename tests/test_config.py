@@ -88,6 +88,7 @@ _CONFIG_ENV_VARS = [
     "MEMORY_DUPLICATE_THRESHOLD",
     "KAI_DATA_DIR",
     "KAI_INSTALL_DIR",
+    "KAI_BACKENDS_YAML",
 ]
 
 
@@ -107,6 +108,7 @@ def _clean_env(monkeypatch):
     )
     for var in _CONFIG_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("DEFAULT_BACKEND", "claude")
 
 
 @pytest.fixture(autouse=True)
@@ -145,6 +147,7 @@ def _set_required(monkeypatch, token="fake-token", user_ids="123"):
     """
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", token)
     monkeypatch.setenv("ALLOWED_USER_IDS", user_ids)
+    monkeypatch.setenv("DEFAULT_BACKEND", "claude")
     # Build a minimal valid users.yaml from `user_ids` so the
     # mandatory-users contract is met. Names are auto-generated;
     # role=admin so the no-admin-warning does not fire.
@@ -228,7 +231,7 @@ class TestLoadConfigDefaults:
         assert config.workspace_base is None
         # Autocompact tuning defaults to 0 (use Claude Code default)
         assert config.claude_autocompact_pct == 0
-        # Agent backend default
+        # Agent backend from explicit test config
         assert config.default_backend == "claude"
 
     def test_autocompact_from_env(self, monkeypatch):
@@ -323,7 +326,7 @@ class TestLoadConfigErrors:
         """DEFAULT_BACKEND with an unrecognized value raises SystemExit."""
         _set_required(monkeypatch)
         monkeypatch.setenv("DEFAULT_BACKEND", "invalid")
-        with pytest.raises(SystemExit, match="DEFAULT_BACKEND"):
+        with pytest.raises(SystemExit, match="default backend"):
             load_config()
 
     def test_invalid_provider(self, monkeypatch):
@@ -3036,8 +3039,55 @@ class TestDefaultBackendEnvResolution:
 
     The global env reader prefers DEFAULT_BACKEND and falls back to the
     deprecated AGENT_BACKEND for one release with a one-shot warning.
-    Absence means the installation default "claude".
+    Absence is resolved from the installed backend registry.
     """
+
+    def test_default_backend_can_come_from_sole_registry_backend(self, monkeypatch, tmp_path):
+        """An installed registry with one backend is sufficient when
+        DEFAULT_BACKEND is unset."""
+        from kai.backend_registry import render_backend_registry
+
+        _set_required(monkeypatch)
+        monkeypatch.delenv("DEFAULT_BACKEND", raising=False)
+        codex = tmp_path / "codex"
+        codex.write_text("#!/bin/sh\nexit 0\n")
+        codex.chmod(0o755)
+        registry = tmp_path / "backends.yaml"
+        registry.write_text(
+            render_backend_registry(
+                {"codex": {"driver": "codex", "runtime": "local_process", "command": str(codex)}}
+            )
+        )
+        monkeypatch.setenv("KAI_BACKENDS_YAML", str(registry))
+
+        cfg = load_config()
+
+        assert cfg.default_backend == "codex"
+
+    def test_default_backend_requires_selection_with_multiple_registry_backends(self, monkeypatch, tmp_path):
+        """Multiple installed backends require an explicit default."""
+        from kai.backend_registry import render_backend_registry
+
+        _set_required(monkeypatch)
+        monkeypatch.delenv("DEFAULT_BACKEND", raising=False)
+        codex = tmp_path / "codex"
+        goose = tmp_path / "goose"
+        for exe in (codex, goose):
+            exe.write_text("#!/bin/sh\nexit 0\n")
+            exe.chmod(0o755)
+        registry = tmp_path / "backends.yaml"
+        registry.write_text(
+            render_backend_registry(
+                {
+                    "codex": {"driver": "codex", "runtime": "local_process", "command": str(codex)},
+                    "goose": {"driver": "goose", "runtime": "local_process", "command": str(goose)},
+                }
+            )
+        )
+        monkeypatch.setenv("KAI_BACKENDS_YAML", str(registry))
+
+        with pytest.raises(SystemExit, match="does not define default_backend"):
+            load_config()
 
     def test_default_backend_env_resolved(self, monkeypatch):
         """The new key sets the global backend with no deprecation noise."""
@@ -3241,6 +3291,7 @@ class TestDefaultTimeoutRename:
         base = {
             "TELEGRAM_BOT_TOKEN": "test-token",
             "ALLOWED_USER_IDS": "12345",
+            "DEFAULT_BACKEND": "claude",
             "DEFAULT_MODEL": "sonnet",
             "WEBHOOK_PORT": "8080",
             "GENERIC_WEBHOOK_SECRET": "test-secret",
@@ -3299,6 +3350,7 @@ class TestAgentSessionLifecycleRename:
         base = {
             "TELEGRAM_BOT_TOKEN": "test-token",
             "ALLOWED_USER_IDS": "12345",
+            "DEFAULT_BACKEND": "claude",
             "DEFAULT_MODEL": "sonnet",
             "WEBHOOK_PORT": "8080",
             "GENERIC_WEBHOOK_SECRET": "test-secret",
@@ -3765,6 +3817,7 @@ class TestLoadMemoryProjects:
             monkeypatch.delenv(v, raising=False)
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
         monkeypatch.setenv("ALLOWED_USER_IDS", "12345")
+        monkeypatch.setenv("DEFAULT_BACKEND", "claude")
         monkeypatch.setenv("GENERIC_WEBHOOK_SECRET", "test-secret")
         _patch_protected_users_yaml(
             monkeypatch,

@@ -1455,8 +1455,8 @@ class TestCmdConfig:
         assert conf["env"]["CLAUDE_AUTOCOMPACT_PCT"] == "80"
         # ALLOWED_USER_IDS should not be in the env dict
         assert "ALLOWED_USER_IDS" not in conf["env"]
-        # Default backend should not appear in env (only non-default values)
-        assert "DEFAULT_BACKEND" not in conf["env"]
+        # Default backend is emitted explicitly.
+        assert conf["env"]["DEFAULT_BACKEND"] == "claude"
         # users.yaml should have been generated
         yaml_path = tmp_path / "users.yaml"
         assert yaml_path.exists()
@@ -1902,6 +1902,7 @@ class TestCmdConfig:
             "env": {
                 "TELEGRAM_BOT_TOKEN": "existing-token",
                 "WEBHOOK_SECRET": "existing-secret",
+                "DEFAULT_BACKEND": "claude",
             },
         }
         conf_path.write_text(json.dumps(existing))
@@ -1962,6 +1963,7 @@ class TestCmdConfig:
                 "WEBHOOK_SECRET": "legacy-secret",
                 "GITHUB_WEBHOOK_SECRET": "github-secret",
                 "GENERIC_WEBHOOK_SECRET": "generic-secret",
+                "DEFAULT_BACKEND": "claude",
             },
         }
         conf_path.write_text(json.dumps(existing))
@@ -2189,7 +2191,7 @@ class TestCmdConfig:
         assert "CLAUDE_EFFORT_LEVEL" not in env
         assert "CLAUDE_USER" not in env
 
-        # Sanity: DEFAULT_BACKEND was emitted (it always is for non-claude).
+        # Sanity: DEFAULT_BACKEND is emitted explicitly.
         assert env.get("DEFAULT_BACKEND") == "goose"
 
     def test_goose_backend_prunes_existing_claude_only_keys(self, tmp_path, monkeypatch):
@@ -2399,7 +2401,8 @@ class TestCmdConfig:
             "users:\n  - telegram_id: 999\n    name: existing\n    role: admin\n",
         )
 
-        # DEFAULT_BACKEND seeded explicitly so the extraction-keys cleanup (non-claude pops them) doesn't depend on the wizard's implicit default.
+        # DEFAULT_BACKEND seeded explicitly so the extraction-keys cleanup
+        # has a concrete backend selection.
         existing = {
             "version": 1,
             "install_dir": "/opt/kai",
@@ -2993,7 +2996,7 @@ class TestCmdApply:
                     "data_dir": str(tmp_path / "var" / "lib" / "kai"),
                     "service_user": "nobody",
                     "platform": "darwin",
-                    "env": {"TELEGRAM_BOT_TOKEN": "tok"},
+                    "env": {"TELEGRAM_BOT_TOKEN": "tok", "DEFAULT_BACKEND": "claude"},
                 }
             )
         )
@@ -3029,7 +3032,7 @@ class TestCmdApply:
                     "data_dir": str(tmp_path / "var" / "lib" / "kai"),
                     "service_user": "nobody",
                     "platform": "darwin",
-                    "env": {"TELEGRAM_BOT_TOKEN": "tok"},
+                    "env": {"TELEGRAM_BOT_TOKEN": "tok", "DEFAULT_BACKEND": "claude"},
                 }
             )
         )
@@ -3105,7 +3108,7 @@ class TestCmdApply:
                     "data_dir": str(tmp_path / "var" / "lib" / "kai"),
                     "service_user": "nobody",
                     "platform": "darwin",
-                    "env": {"TELEGRAM_BOT_TOKEN": "tok"},
+                    "env": {"TELEGRAM_BOT_TOKEN": "tok", "DEFAULT_BACKEND": "claude"},
                 }
             )
         )
@@ -3223,7 +3226,7 @@ class TestProtectedUserIsolationPreflight:
             "data_dir": str(tmp_path / "data"),
             "service_user": "kai-service",
             "platform": "darwin",
-            "env": {"TELEGRAM_BOT_TOKEN": "tok", "DEFAULT_MODEL": "sonnet"},
+            "env": {"TELEGRAM_BOT_TOKEN": "tok", "DEFAULT_BACKEND": "claude", "DEFAULT_MODEL": "sonnet"},
         }
         if staging is not None:
             conf["users_yaml_staging_path"] = str(staging)
@@ -3735,6 +3738,8 @@ class TestCmdApplyDefaultModelGate:
     @staticmethod
     def _write_install_conf(tmp_path, env: dict[str, str]) -> Path:
         """Write a minimal install.conf with the given env dict."""
+        if "DEFAULT_BACKEND" not in env and "AGENT_BACKEND" not in env:
+            env = {"DEFAULT_BACKEND": "claude", **env}
         kai.install.USERS_YAML.write_text(
             "users:\n  - telegram_id: 1\n    name: test\n    role: admin\n    os_user: root\n"
         )
@@ -7388,6 +7393,7 @@ class TestApplyBackendRegistry:
         rendered = kai.install._build_backend_registry(
             "kai",
             {
+                "DEFAULT_BACKEND": "codex",
                 "CLAUDE_BIN": "/custom/claude",
                 "CODEX_BIN": "/custom/codex",
                 "OPENCODE_BIN": "/custom/opencode",
@@ -7400,6 +7406,7 @@ class TestApplyBackendRegistry:
         assert data["backends"]["codex"]["command"] == "/global/codex"
         assert data["backends"]["opencode"]["command"] == "/global/opencode"
         assert data["backends"]["goose"]["command"] == "/global/goose"
+        assert data["default_backend"] == "codex"
         assert "gpt-5.6-sol" in data["backends"]["codex"]["allowed_models"]
         assert "fable" in data["backends"]["claude"]["allowed_models"]
         assert "claude-*" in data["backends"]["claude"]["allowed_models"]
@@ -7415,6 +7422,7 @@ class TestApplyBackendRegistry:
             },
         )
         env = {
+            "DEFAULT_BACKEND": "codex",
             "CLAUDE_BIN": "/ignored/claude",
             "CODEX_BIN": "/ignored/codex",
             "OPENCODE_BIN": "/ignored/opencode",
@@ -7611,7 +7619,7 @@ class TestStripInstallConfKeys:
             "version": 1,
             "install_dir": "/opt/kai",
             "users_yaml_staging_path": "/tmp/staged",
-            "env": {"TELEGRAM_BOT_TOKEN": "tok"},
+            "env": {"TELEGRAM_BOT_TOKEN": "tok", "DEFAULT_BACKEND": "claude"},
         }
         conf_path.write_text(json.dumps(original, indent=2) + "\n")
         os.chmod(conf_path, 0o600)
@@ -7623,7 +7631,7 @@ class TestStripInstallConfKeys:
         assert "users_yaml_staging_path" not in rewritten
         assert rewritten["version"] == 1
         assert rewritten["install_dir"] == "/opt/kai"
-        assert rewritten["env"] == {"TELEGRAM_BOT_TOKEN": "tok"}
+        assert rewritten["env"] == original["env"]
         assert stat.S_IMODE(conf_path.stat().st_mode) == 0o600
 
     def test_idempotent_when_key_absent(self, tmp_path, monkeypatch):
@@ -8508,7 +8516,7 @@ class TestCmdApplySingleUserRefuses:
             "data_dir": str(tmp_path),
             "service_user": "kai",
             "platform": "darwin",
-            "env": {"TELEGRAM_BOT_TOKEN": "tok"},
+            "env": {"TELEGRAM_BOT_TOKEN": "tok", "DEFAULT_BACKEND": "claude"},
         }
         path = tmp_path / "install.conf"
         path.write_text(json.dumps(conf, indent=2) + "\n")
@@ -8589,7 +8597,7 @@ class TestCmdApplySingleUserRefuses:
 class TestApplySudoersDryRun:
     def test_dry_run(self, capsys):
         """Dry run: prints expected messages."""
-        _apply_sudoers("kai", dry_run=True)
+        _apply_sudoers("kai", dry_run=True, agent_backend="claude")
         output = capsys.readouterr().out
         assert "DRY RUN" in output
         assert "sudoers" in output.lower() or "visudo" in output.lower()
@@ -8607,7 +8615,7 @@ class TestApplySudoersDryRun:
         users_yaml = tmp_path / "users.yaml"
         users_yaml.write_text("users:\n  - telegram_id: 1\n    os_user: alice\n")
 
-        _apply_sudoers("kai", dry_run=True, users_yaml_path=users_yaml)
+        _apply_sudoers("kai", dry_run=True, users_yaml_path=users_yaml, agent_backend="claude")
 
         captured = capsys.readouterr()
         assert "Warning" in captured.err
@@ -8625,7 +8633,7 @@ class TestApplySudoersDryRun:
         users_yaml = tmp_path / "users.yaml"
         users_yaml.write_text("users: []\n")
 
-        _apply_sudoers("kai", dry_run=True, users_yaml_path=users_yaml)
+        _apply_sudoers("kai", dry_run=True, users_yaml_path=users_yaml, agent_backend="claude")
 
         captured = capsys.readouterr()
         assert "Warning" not in captured.err
@@ -8644,7 +8652,7 @@ class TestApplySudoersDryRun:
         users_yaml = tmp_path / "users.yaml"
         users_yaml.write_text("users:\n  - telegram_id: 1\n    os_user: alice\n")
 
-        _apply_sudoers("kai", dry_run=True, users_yaml_path=users_yaml)
+        _apply_sudoers("kai", dry_run=True, users_yaml_path=users_yaml, agent_backend="claude")
 
         captured = capsys.readouterr()
         assert "Warning" not in captured.err
@@ -10266,7 +10274,7 @@ class TestBuildCodexLoginReminder:
         assert _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml) is None
 
     def test_missing_agent_backend_returns_none(self, tmp_path):
-        """No DEFAULT_BACKEND key in env defaults to claude; reminder skipped."""
+        """No explicit codex default, no reminder."""
         from kai.install import _build_codex_login_reminder
 
         users_yaml = self._write_users_yaml(tmp_path, [])

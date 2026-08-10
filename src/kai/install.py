@@ -39,7 +39,7 @@ from pathlib import Path
 
 import yaml
 
-from kai.backend_registry import render_backend_registry
+from kai.backend_registry import BackendRegistryError, render_backend_registry
 from kai.config import (
     _VALID_ROLES,
     BACKEND_PROVIDERS,
@@ -1324,19 +1324,30 @@ def _cmd_config() -> None:
         )
     # Prefill reads DEFAULT_BACKEND, falling back to the deprecated
     # AGENT_BACKEND key so a re-run against a legacy install.conf keeps
-    # the operator's prior choice; the wizard writes DEFAULT_BACKEND only.
-    agent_backend = _prompt_choice(
-        "Default backend",
-        backend_choices,
+    # the operator's prior choice. Without an existing value, a
+    # single-backend install can accept Enter; multi-backend installs
+    # must choose explicitly.
+    existing_backend = (
         _resolve_renamed_key(
             existing_env.get,
             new_key="DEFAULT_BACKEND",
             legacy_keys=["AGENT_BACKEND"],
             context="install.conf",
-            default="claude",
+            default="",
         )
-        or "claude",
+        or ""
     )
+    backend_prefill = existing_backend or (backend_choices[0] if len(backend_choices) == 1 else "")
+    while True:
+        agent_backend = _prompt_optional_choice(
+            "Default backend",
+            backend_choices,
+            backend_prefill,
+            empty_hint="choose one",
+        )
+        if agent_backend:
+            break
+        print("  Default backend is required.")
 
     # Codex auth handling runs BEFORE the legacy provider/key block so
     # subscription mode is not gated on an OPENAI_API_KEY the operator
@@ -2039,12 +2050,9 @@ def _cmd_config() -> None:
         env["WEBHOOK_SECRET"] = legacy_webhook_secret
 
     # DEFAULT_BACKEND is the global default backend; users.yaml entries
-    # can override it per user. Only write non-default values to keep
-    # the env file clean (the runtime defaults to claude when the key
-    # is absent). The wizard writes the new name only; the runtime keeps
-    # a one-release read fallback for a legacy AGENT_BACKEND key.
-    if agent_backend != "claude":
-        env["DEFAULT_BACKEND"] = agent_backend
+    # can override it per user. The wizard writes the selected backend
+    # explicitly; absence is not a backend-selection signal.
+    env["DEFAULT_BACKEND"] = agent_backend
 
     # LLM provider and API key. Written alongside the backend choice
     # so they survive into /etc/kai/env and are not wiped on reinstall.
@@ -2820,10 +2828,14 @@ def _build_codex_login_reminder(
     """
     default_backend = (
         _resolve_renamed_key(
-            env.get, new_key="DEFAULT_BACKEND", legacy_keys=["AGENT_BACKEND"], context="install.conf", default="claude"
+            env.get,
+            new_key="DEFAULT_BACKEND",
+            legacy_keys=["AGENT_BACKEND"],
+            context="install.conf",
+            default="",
         )
-        or "claude"
-    )
+        or ""
+    ).strip().lower()
     if default_backend != "codex":
         return None
     if env.get("CODEX_AUTH_MODE", "subscription") != "subscription":
@@ -4333,16 +4345,10 @@ def _cmd_apply() -> None:
     # key was already migrated to DEFAULT_BACKEND at the top of apply.
     #
     default_model_raw = env.get("DEFAULT_MODEL", "")
-    agent_backend_raw = env.get("DEFAULT_BACKEND", "claude").strip().lower()
-    # Write the normalized value back so the downstream goose-config and
-    # sudoers gates (which read env.get("DEFAULT_BACKEND") raw) and the
-    # written /etc/kai/env all see the canonical lowercase form. Only
-    # when the key is present, to preserve the "claude omits the key"
-    # contract. Without this, a hand-edited install.conf with
-    # DEFAULT_BACKEND="Goose" passes validation here but skips goose
-    # config deployment below.
-    if "DEFAULT_BACKEND" in env:
-        env["DEFAULT_BACKEND"] = agent_backend_raw
+    agent_backend_raw = _resolve_install_default_backend(env, _discover_backend_commands(service_user))
+    # Write the normalized value back so downstream gates and the
+    # written /etc/kai/env all see the canonical lowercase form.
+    env["DEFAULT_BACKEND"] = agent_backend_raw
     # Reads the canonical DEFAULT_PROVIDER; a legacy LLM_PROVIDER key was
     # already migrated to it at the top of apply.
     provider_raw = env.get("DEFAULT_PROVIDER", "").strip().lower()
@@ -4500,7 +4506,7 @@ def _cmd_apply() -> None:
         # The function gates itself: global DEFAULT_BACKEND=goose or a
         # per-user backend override in users.yaml both mean some
         # session spawns `goose acp`; otherwise it no-ops.
-        agent_backend = env.get("DEFAULT_BACKEND", "claude")
+        agent_backend = _resolve_install_default_backend(env)
         _apply_goose_config(
             service_user,
             install_path,
@@ -5668,11 +5674,45 @@ def _apply_secrets(
         print(f"  Copied {yaml_dst}")
 
 
-def _configured_install_backends(env: dict[str, str], users_yaml_path: str | Path | None = None) -> set[str]:
+def _configured_install_backends(
+    env: dict[str, str],
+    users_yaml_path: str | Path | None = None,
+    *,
+    default_backend: str | None = None,
+) -> set[str]:
     """Return backend IDs used by global config or users.yaml overrides."""
-    configured = {env.get("DEFAULT_BACKEND", "claude").strip().lower() or "claude"}
+    configured = {default_backend or _resolve_install_default_backend(env)}
     configured |= _collect_backends_from_yaml(users_yaml_path or USERS_YAML)
     return configured & VALID_BACKENDS
+
+
+def _resolve_install_default_backend(env: dict[str, str], discovered: dict[str, str] | None = None) -> str:
+    """Resolve install-time default backend without provider-specific fallback."""
+    configured = (
+        _resolve_renamed_key(
+            env.get,
+            new_key="DEFAULT_BACKEND",
+            legacy_keys=["AGENT_BACKEND"],
+            context="install.conf",
+            default="",
+        )
+        or ""
+    ).strip().lower()
+    if configured:
+        if configured not in VALID_BACKENDS:
+            raise SystemExit(
+                f"DEFAULT_BACKEND '{configured}' is not valid (must be one of: {', '.join(sorted(VALID_BACKENDS))})"
+            )
+        return configured
+
+    installed = discovered if discovered is not None else _discover_backend_commands("kai")
+    if len(installed) == 1:
+        return next(iter(installed))
+    installed_label = ", ".join(sorted(installed)) or "<none>"
+    raise SystemExit(
+        "DEFAULT_BACKEND is not set. Re-run `make config` and choose one of the installed backends: "
+        f"{installed_label}."
+    )
 
 
 def _backend_registry_entries(
@@ -5685,7 +5725,8 @@ def _backend_registry_entries(
             "No supported backend command was found. Install at least one of: claude, codex, goose, opencode."
         )
 
-    missing = sorted(_configured_install_backends(env, users_yaml_path) - discovered.keys())
+    default_backend = _resolve_install_default_backend(env, discovered)
+    missing = sorted(_configured_install_backends(env, users_yaml_path, default_backend=default_backend) - discovered.keys())
     if missing:
         raise SystemExit(
             "Configured backend(s) are not installed globally: "
@@ -5725,7 +5766,12 @@ def _backend_registry_entries(
 
 def _build_backend_registry(service_user: str, env: dict[str, str], users_yaml_path: str | Path | None = None) -> str:
     """Build the installed backend registry from discovered global commands."""
-    return render_backend_registry(_backend_registry_entries(service_user, env, users_yaml_path))
+    entries = _backend_registry_entries(service_user, env, users_yaml_path)
+    default_backend = _resolve_install_default_backend(env, {backend: "" for backend in entries})
+    try:
+        return render_backend_registry(entries, default_backend=default_backend)
+    except BackendRegistryError as exc:
+        raise SystemExit(str(exc)) from None
 
 
 def _apply_backend_registry(service_user: str, env: dict[str, str], dry_run: bool) -> None:
@@ -5747,7 +5793,7 @@ def _apply_goose_config(
     svc_gid: int,
     dry_run: bool,
     users_yaml_path: str | Path | None = None,
-    agent_backend: str = "claude",
+    agent_backend: str = "",
 ) -> None:
     """
     Deploy the Goose extension config to every home goose runs from.
@@ -5767,7 +5813,8 @@ def _apply_goose_config(
     `_apply_sudoers`). No-ops when nothing in the install is
     goose-backed - neither the global backend nor any users.yaml
     override - so the apply pipeline can call it unconditionally and
-    a claude-only install is never blocked on the goose template.
+    an install without Goose users is never blocked on the goose
+    template.
     """
     # None resolves to the module-level USERS_YAML at call time rather
     # than in the signature: a def-time default would bake the
@@ -5870,7 +5917,7 @@ def _apply_sudoers(
     codex_bin: str | None = None,
     opencode_bin: str | None = None,
     goose_bin: str | None = None,
-    agent_backend: str = "claude",
+    agent_backend: str = "",
 ) -> None:
     """
     Write sudoers rules for the service user to read protected config.
@@ -5888,11 +5935,9 @@ def _apply_sudoers(
     for direct/dev formatter compatibility; `_cmd_apply` does not feed
     them from install.conf or process environment.
 
-    `agent_backend` is the install's global backend (the env dict's
-    DEFAULT_BACKEND, defaulting to claude when the key is absent, which
-    matches the runtime default). Together with the per-user
-    backend overrides in users.yaml it scopes the missing-binary
-    backstop below to backends the install actually uses.
+    `agent_backend` is the install's resolved global backend. Together
+    with the per-user backend overrides in users.yaml it scopes the
+    missing-binary backstop below to backends the install actually uses.
     """
     # None resolves to the module-level USERS_YAML at call time rather
     # than in the signature: a def-time default would bake the

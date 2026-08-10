@@ -26,7 +26,12 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
-from kai.backend_registry import BackendRegistryError, backend_registry_is_authoritative, load_backend_registry
+from kai.backend_registry import (
+    BackendRegistryError,
+    backend_registry_is_authoritative,
+    load_backend_registry,
+    resolve_default_backend,
+)
 from kai.protected_config import ProtectedConfigError, validate_protected_file_metadata
 from kai.user_isolation import validate_protected_user_isolation
 
@@ -832,12 +837,13 @@ def _resolve_renamed_key(
     them still resolves.
 
     Absence semantics differ by caller and are made explicit through
-    `default`: global readers pass `default="claude"` (the
-    installation default); the per-user yaml reader passes
-    `default=None` so a backend-less user still inherits the global
-    backend via the caller's `user_backend or global_backend` cascade.
-    Returning "claude" for an absent per-user key would wrongly pin
-    that user to claude on a non-claude install.
+    `default`: global backend readers pass an empty default and then
+    resolve through the installed backend registry; the per-user yaml
+    reader passes `default=None` so a backend-less user still inherits
+    the global backend via the caller's `user_backend or global_backend`
+    cascade. Returning a concrete backend for an absent per-user key
+    would wrongly pin that user to a backend instead of preserving
+    inheritance.
 
     Args:
         get: Lookup callable taking a key and returning value-or-None
@@ -1430,9 +1436,10 @@ class Config:
     totp_lockout_attempts: int = 3
     totp_lockout_minutes: int = 15
 
-    # Default backend selection: "claude" (default) uses Claude Code CLI,
-    # "goose" uses Goose ACP (Agent Client Protocol) as the agent harness.
-    default_backend: str = "claude"
+    # Default backend selection. Production config is resolved by
+    # load_config(); direct test/helper construction should set this
+    # explicitly when backend-specific behavior is under test.
+    default_backend: str = ""
 
     # LLM provider for non-Claude backends (e.g. Goose). Determines
     # which API key env var the backend expects and whether Kai's
@@ -3070,23 +3077,19 @@ def load_config() -> Config:
     except ValueError:
         raise SystemExit("TOTP_LOCKOUT_MINUTES must be an integer") from None
 
-    # Default backend selection - "claude" (default) or "goose".
-    # DEFAULT_BACKEND with a one-release fallback to the deprecated
-    # AGENT_BACKEND name; absence means the installation default "claude".
-    default_backend = (
-        (
-            _resolve_renamed_key(
-                os.environ.get,
-                new_key="DEFAULT_BACKEND",
-                legacy_keys=["AGENT_BACKEND"],
-                context="/etc/kai/env",
-                default="claude",
-            )
-            or "claude"
-        )
-        .strip()
-        .lower()
+    # Default backend selection. The value must be explicitly
+    # configured or derived from the installed backend registry.
+    default_backend_raw = _resolve_renamed_key(
+        os.environ.get,
+        new_key="DEFAULT_BACKEND",
+        legacy_keys=["AGENT_BACKEND"],
+        context="/etc/kai/env",
+        default="",
     )
+    try:
+        default_backend = resolve_default_backend(default_backend_raw or "")
+    except BackendRegistryError as exc:
+        raise SystemExit(str(exc)) from None
     if default_backend not in VALID_BACKENDS:
         raise SystemExit(
             f"DEFAULT_BACKEND '{default_backend}' is not valid (must be one of: {', '.join(sorted(VALID_BACKENDS))})"
