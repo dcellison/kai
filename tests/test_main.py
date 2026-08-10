@@ -386,9 +386,8 @@ class TestMainStartupErrorLogging:
 class TestStartCrashExit:
     """Unexpected runtime crashes must not look like clean process exits."""
 
-    def test_unexpected_asyncio_crash_exits_nonzero(self, caplog, monkeypatch):
-        from kai.main import _start
-
+    @staticmethod
+    def _patch_minimal_config(monkeypatch):
         monkeypatch.setattr(
             "kai.main.load_config",
             lambda: SimpleNamespace(
@@ -398,17 +397,75 @@ class TestStartCrashExit:
                 session_db_path=":memory:",
             ),
         )
-        monkeypatch.setattr("kai.main._read_protected_file", lambda _path: "")
-        monkeypatch.setattr("kai.main.services.load_services", lambda _path: {})
 
+    @staticmethod
+    def _patch_asyncio_crash(monkeypatch):
         def fail_run(coro):
             coro.close()
             raise RuntimeError("event loop died")
 
         monkeypatch.setattr("kai.main.asyncio.run", fail_run)
 
+    def test_unexpected_asyncio_crash_exits_nonzero(self, caplog, monkeypatch):
+        from kai.main import _start
+
+        self._patch_minimal_config(monkeypatch)
+        monkeypatch.setattr("kai.main._read_protected_file", lambda _path: "")
+        monkeypatch.setattr("kai.main.services.load_services", lambda _path: {})
+        self._patch_asyncio_crash(monkeypatch)
+
         with caplog.at_level(logging.ERROR), pytest.raises(SystemExit) as excinfo:
             _start()
 
         assert excinfo.value.code == 1
         assert any(r.levelno == logging.ERROR and "Kai crashed" in r.getMessage() for r in caplog.records)
+
+    def test_empty_protected_services_yaml_disables_services_without_local_fallback(self, monkeypatch):
+        """An empty readable /etc/kai/services.yaml is authoritative.
+
+        Protected installs must not fall back to PROJECT_ROOT/services.yaml
+        merely because the protected file is empty.
+        """
+        from kai.main import _start
+
+        calls: list[tuple[str, str]] = []
+        self._patch_minimal_config(monkeypatch)
+        monkeypatch.setattr("kai.main._read_protected_file", lambda _path: "")
+        monkeypatch.setattr(
+            "kai.main.services.load_services_from_string",
+            lambda text: calls.append(("protected", text)) or {},
+        )
+        monkeypatch.setattr(
+            "kai.main.services.load_services",
+            lambda path: calls.append(("local", str(path))) or {},
+        )
+        self._patch_asyncio_crash(monkeypatch)
+
+        with pytest.raises(SystemExit):
+            _start()
+
+        assert calls == [("protected", "")]
+
+    def test_unreadable_protected_services_yaml_uses_local_fallback(self, monkeypatch):
+        """None from the protected reader means absent/unreadable, so dev
+        fallback to PROJECT_ROOT/services.yaml is still preserved.
+        """
+        from kai.main import _start
+
+        calls: list[tuple[str, str]] = []
+        self._patch_minimal_config(monkeypatch)
+        monkeypatch.setattr("kai.main._read_protected_file", lambda _path: None)
+        monkeypatch.setattr(
+            "kai.main.services.load_services_from_string",
+            lambda text: calls.append(("protected", text)) or {},
+        )
+        monkeypatch.setattr(
+            "kai.main.services.load_services",
+            lambda path: calls.append(("local", str(path))) or {},
+        )
+        self._patch_asyncio_crash(monkeypatch)
+
+        with pytest.raises(SystemExit):
+            _start()
+
+        assert calls == [("local", str(Path(__file__).resolve().parents[1] / "services.yaml"))]

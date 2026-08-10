@@ -4,14 +4,16 @@
 # external API that inner Claude can call via the local proxy endpoint.
 #
 # Setup:
-#   1. Copy this file to the repo root: cp templates/services.yaml services.yaml
-#   2. Uncomment the services you want to use
+#   1. Copy this file to services.yaml for single-user installs, or to
+#      /etc/kai/services.yaml for protected installs.
+#   2. Uncomment the services you want to use.
 #   3. Add each service name to the intended users' `allowed_services`
-#      lists in users.yaml
-#   4. Set the corresponding API key(s) in .env
-#   5. Restart Kai
+#      lists in users.yaml.
+#   4. Set the corresponding API key(s) in .env for single-user installs,
+#      or /etc/kai/env for protected installs.
+#   5. Restart Kai.
 #
-# Kai injects authentication from .env at call time — API keys never
+# Kai injects authentication from the server-side env at call time — API keys never
 # enter Claude's context. See <DATA_DIR>/home/<chat_id>/.claude/CLAUDE.md for usage docs.
 #
 # Auth types:

@@ -225,7 +225,7 @@ def _start() -> None:
     # Load external service definitions. In a protected installation, services.yaml
     # lives in /etc/kai/ (root-owned). Falls back to PROJECT_ROOT for development.
     protected_yaml = _read_protected_file("/etc/kai/services.yaml")
-    if protected_yaml:
+    if protected_yaml is not None:
         loaded = services.load_services_from_string(protected_yaml)
     else:
         loaded = services.load_services(PROJECT_ROOT / "services.yaml")
