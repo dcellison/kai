@@ -183,21 +183,44 @@ class TestStripQuotes:
 class TestReadProtectedYaml:
     def test_returns_parsed_yaml(self):
         """Returns parsed dict when sudo cat succeeds."""
-        with patch("kai.config._read_protected_file", return_value="workspaces:\n  - path: /tmp\n"):
+        with (
+            patch("kai.config.validate_protected_file_metadata", return_value=True),
+            patch("kai.config._read_protected_file", return_value="workspaces:\n  - path: /tmp\n"),
+        ):
             result = _read_protected_yaml("workspaces.yaml")
         assert result == {"workspaces": [{"path": "/tmp"}]}
 
-    def test_returns_none_on_missing_file(self):
+    def test_returns_none_on_missing_metadata_without_sudo(self):
         """Returns None when the protected file doesn't exist."""
-        with patch("kai.config._read_protected_file", return_value=None):
+        with (
+            patch("kai.config.validate_protected_file_metadata", return_value=False),
+            patch("kai.config._read_protected_file") as read_file,
+        ):
             result = _read_protected_yaml("workspaces.yaml")
         assert result is None
+        read_file.assert_not_called()
+
+    def test_returns_malformed_on_present_but_unreadable(self, caplog):
+        """A protected read failure must not fall back to local config."""
+        from kai.config import _YAML_MALFORMED
+
+        with (
+            patch("kai.config.validate_protected_file_metadata", return_value=True),
+            patch("kai.config._read_protected_file", return_value=None),
+        ):
+            result = _read_protected_yaml("workspaces.yaml")
+
+        assert result is _YAML_MALFORMED
+        assert "refusing local fallback" in caplog.text
 
     def test_returns_malformed_on_non_dict(self):
         """Returns _YAML_MALFORMED when YAML parses to a non-dict."""
         from kai.config import _YAML_MALFORMED
 
-        with patch("kai.config._read_protected_file", return_value="- item1\n- item2\n"):
+        with (
+            patch("kai.config.validate_protected_file_metadata", return_value=True),
+            patch("kai.config._read_protected_file", return_value="- item1\n- item2\n"),
+        ):
             result = _read_protected_yaml("workspaces.yaml")
         assert result is _YAML_MALFORMED
 
@@ -205,7 +228,10 @@ class TestReadProtectedYaml:
         """Returns _YAML_MALFORMED (not None) when YAML is invalid."""
         from kai.config import _YAML_MALFORMED
 
-        with patch("kai.config._read_protected_file", return_value="{{bad["):
+        with (
+            patch("kai.config.validate_protected_file_metadata", return_value=True),
+            patch("kai.config._read_protected_file", return_value="{{bad["),
+        ):
             result = _read_protected_yaml("workspaces.yaml")
         assert result is _YAML_MALFORMED
 

@@ -2728,6 +2728,10 @@ class TestCmdConfig:
 
         monkeypatch.setattr("kai.config._read_protected_file", _fake_read)
         monkeypatch.setattr(
+            "kai.config.validate_protected_file_metadata",
+            lambda path, **kw: path == "/etc/kai/users.yaml",
+        )
+        monkeypatch.setattr(
             "kai.config.pwd.getpwnam",
             lambda name: MagicMock(pw_uid=os.geteuid() + 100_000),
         )
@@ -2870,6 +2874,10 @@ class TestCmdConfig:
             return None
 
         monkeypatch.setattr("kai.config._read_protected_file", _fake_read)
+        monkeypatch.setattr(
+            "kai.config.validate_protected_file_metadata",
+            lambda path, **kw: path == "/etc/kai/users.yaml",
+        )
         monkeypatch.setattr(
             "kai.config.pwd.getpwnam",
             lambda name: MagicMock(pw_uid=os.geteuid() + 100_000),

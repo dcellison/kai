@@ -1534,9 +1534,18 @@ def _read_protected_yaml(filename: str) -> dict | object | None:
         be read, or the _YAML_MALFORMED sentinel if the file exists but
         is invalid. Callers must check ``is _YAML_MALFORMED`` before use.
     """
-    content = _read_protected_file(f"/etc/kai/{filename}")
-    if content is None:
+    path = f"/etc/kai/{filename}"
+    try:
+        present = validate_protected_file_metadata(path, missing_ok=True)
+    except ProtectedConfigError as e:
+        raise SystemExit(str(e)) from e
+    if not present:
         return None
+
+    content = _read_protected_file(path)
+    if content is None:
+        log.error("Protected config /etc/kai/%s exists but could not be read; refusing local fallback", filename)
+        return _YAML_MALFORMED
     try:
         result = yaml.safe_load(content)
         if isinstance(result, dict):

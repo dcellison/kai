@@ -97,6 +97,7 @@ def _clean_env(monkeypatch):
     monkeypatch.setattr("kai.config.load_dotenv", lambda *a, **kw: None)
     # Prevent real sudo calls during tests - default to None (dev mode fallback)
     monkeypatch.setattr("kai.config._read_protected_file", lambda path: None)
+    monkeypatch.setattr("kai.config.validate_protected_file_metadata", lambda path, **kw: False)
     # Protected-isolation tests use synthetic OS account names. Give each
     # name a stable, non-service UID by default; focused passwd/alias tests
     # override this lookup explicitly.
@@ -168,6 +169,9 @@ def _patch_protected_users_yaml(monkeypatch, content: str) -> None:
       - `/etc/kai/users.yaml` returns `content`, which the protected-
         path branch of `_read_users_yaml` consumes via the existing
         `_read_protected_yaml` sudo-cat shim.
+      - protected-file metadata validation sees `/etc/kai/users.yaml`
+        as present and every other protected YAML file as absent, so
+        tests do not stat the host's real `/etc/kai`.
 
     Any other protected-file lookup returns None (the default shape
     on dev hosts). Tests that specifically need the XDG / single-user
@@ -185,6 +189,10 @@ def _patch_protected_users_yaml(monkeypatch, content: str) -> None:
         return None
 
     monkeypatch.setattr("kai.config._read_protected_file", _fake_read)
+    monkeypatch.setattr(
+        "kai.config.validate_protected_file_metadata",
+        lambda path, **kw: path == "/etc/kai/users.yaml",
+    )
 
 
 def _patch_single_user_users_yaml(monkeypatch, tmp_path: Path, content: str) -> None:
@@ -715,6 +723,10 @@ class TestReadProtectedFile:
 
 class TestDualModeLoading:
     @staticmethod
+    def _protected_metadata(path: str, **_kwargs) -> bool:
+        return path in {"/etc/kai/env", "/etc/kai/users.yaml"}
+
+    @staticmethod
     def _protected_reader(env_content: str):
         """Lambda that responds to both /etc/kai/env and /etc/kai/users.yaml.
 
@@ -736,6 +748,7 @@ class TestDualModeLoading:
 
     def test_loads_from_protected_env(self, monkeypatch):
         """When /etc/kai/env is readable, values are used as config."""
+        monkeypatch.setattr("kai.config.validate_protected_file_metadata", self._protected_metadata)
         monkeypatch.setattr(
             "kai.config._read_protected_file",
             self._protected_reader("TELEGRAM_BOT_TOKEN=protected-token\nALLOWED_USER_IDS=999\n"),
@@ -747,6 +760,7 @@ class TestDualModeLoading:
 
     def test_protected_env_strips_quotes(self, monkeypatch):
         """Quote marks around values in /etc/kai/env are stripped."""
+        monkeypatch.setattr("kai.config.validate_protected_file_metadata", self._protected_metadata)
         monkeypatch.setattr(
             "kai.config._read_protected_file",
             self._protected_reader("TELEGRAM_BOT_TOKEN=\"quoted-token\"\nALLOWED_USER_IDS='999'\n"),
@@ -757,6 +771,7 @@ class TestDualModeLoading:
 
     def test_protected_env_skips_comments_and_blanks(self, monkeypatch):
         """Comments and blank lines in /etc/kai/env are ignored."""
+        monkeypatch.setattr("kai.config.validate_protected_file_metadata", self._protected_metadata)
         monkeypatch.setattr(
             "kai.config._read_protected_file",
             self._protected_reader("# comment\n\nTELEGRAM_BOT_TOKEN=tok\n\nALLOWED_USER_IDS=999\n"),
@@ -789,6 +804,7 @@ class TestDualModeLoading:
 
     def test_env_vars_take_precedence_over_protected(self, monkeypatch):
         """Explicitly set env vars override values from /etc/kai/env."""
+        monkeypatch.setattr("kai.config.validate_protected_file_metadata", self._protected_metadata)
         monkeypatch.setattr(
             "kai.config._read_protected_file",
             self._protected_reader("TELEGRAM_BOT_TOKEN=from-file\nALLOWED_USER_IDS=999\n"),
