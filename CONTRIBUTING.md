@@ -157,6 +157,11 @@ networking, file I/O, or process execution follow these rules:
 - **No new attack surface without discussion.** New endpoints, file
   operations, or shell commands get discussed in an issue first.
 
+CI includes a scheduled, non-blocking dependency audit workflow. Run
+`make audit-deps` locally to inspect the current installed environment.
+The audit is advisory until the existing dependency-vulnerability backlog
+is cleared or an explicit ignore policy is documented.
+
 ### Tests
 
 - Tests live in `tests/` and use **pytest** with **pytest-asyncio**.

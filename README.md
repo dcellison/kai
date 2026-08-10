@@ -149,6 +149,7 @@ make lint       # Run ruff
 make format     # Format with ruff
 make check      # Lint and format check
 make typecheck  # Run Pyright on the maintained typed baseline
+make audit-deps # Report known vulnerabilities in installed dependencies
 make test       # Run pytest
 make run        # Start Kai locally
 ```

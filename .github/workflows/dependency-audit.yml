@@ -1,0 +1,45 @@
+# Report known Python dependency vulnerabilities.
+#
+# This workflow is intentionally non-blocking while Kai still has an
+# existing vulnerability backlog. It runs on a schedule and on manual
+# dispatch so maintainers can see the current dependency risk without
+# breaking unrelated PRs. Convert it to blocking once the backlog is
+# cleared or an explicit ignore policy is in place.
+name: Dependency audit
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 11 * * 1"
+
+jobs:
+  pip-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e '.[dev,memory,totp,tts]'
+
+      - name: Run dependency audit
+        run: |
+          set +e
+          make BIN= audit-deps > pip-audit.txt
+          status=$?
+          pip-audit --local --skip-editable --format json --output pip-audit.json
+          echo "pip-audit exited with status ${status}" >> pip-audit.txt
+          cat pip-audit.txt
+          exit 0
+
+      - name: Upload audit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit-report
+          path: |
+            pip-audit.txt
+            pip-audit.json
