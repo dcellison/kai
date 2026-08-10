@@ -7,7 +7,7 @@ Provides functionality to:
 3. List available GitHub Projects for board assignment
 4. Construct boundary-delimited triage prompts (prompt injection prevention)
 5. Spawn a one-shot LLM subprocess for analysis
-6. Parse structured JSON responses from Claude (with markdown fence stripping)
+6. Parse structured JSON responses from the selected model (with markdown fence stripping)
 7. Apply triage results: labels, project assignment, comments, notifications
 8. Orchestrate the full pipeline from webhook event to posted triage
 
@@ -440,8 +440,9 @@ def build_triage_prompt(
 
 async def run_triage(
     prompt: str,
+    *,
+    agent_backend: str,
     claude_user: str | None = None,
-    agent_backend: str = "claude",
     provider: str = "",
     # Per-role model override. Caller in webhook.py resolves
     # `user_config.models.get("issue_triage", "")` and passes it;
@@ -581,9 +582,9 @@ async def run_triage(
         except OneShotError as exc:
             raise RuntimeError(f"Goose triage failed: {exc}") from exc
         return result.text
-    else:
-        # Claude (the default backend). Dispatch to the claude
-        # one-shot reasoner in free-form mode (json_schema=None):
+    if agent_backend == "claude":
+        # Dispatch to the Claude one-shot reasoner in free-form mode
+        # (json_schema=None):
         # plain `claude --print` text output with no tools, no
         # session persistence, a neutral cwd, the allow-listed
         # subprocess env, and binary resolution shared with config
@@ -615,6 +616,8 @@ async def run_triage(
         except OneShotError as exc:
             raise RuntimeError(f"Claude triage failed: {exc}") from exc
         return result.text
+
+    raise ValueError(f"Unsupported triage backend: {agent_backend!r}")
 
 
 def _parse_triage_json(raw: str) -> dict:
@@ -1150,9 +1153,10 @@ async def triage_issue(
     payload: dict,
     webhook_port: int,
     webhook_secret: str,
+    *,
+    agent_backend: str,
     claude_user: str | None = None,
     notify_chat_id: int | None = None,
-    agent_backend: str = "claude",
     provider: str = "",
     model_override: str = "",
     allowed_triage_projects: list[str] | None = None,
@@ -1173,7 +1177,8 @@ async def triage_issue(
         payload: The full GitHub webhook payload dict.
         webhook_port: Local webhook server port.
         webhook_secret: Webhook secret for API auth.
-        claude_user: Optional OS user for the Claude subprocess.
+        agent_backend: Explicit backend selected for this triage run.
+        claude_user: Optional OS user for the backend subprocess.
     """
     # Metadata extraction is inside try/except so a malformed payload
     # doesn't produce an unhandled exception in the background task.

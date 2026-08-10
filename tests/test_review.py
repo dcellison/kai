@@ -536,7 +536,7 @@ class TestFetchPRDiff:
 
 class TestRunReviewClaudeDispatch:
     """
-    `run_review` with the default claude backend dispatches to
+    `run_review` with the explicitly selected Claude backend dispatches to
     `ClaudeOneShotReasoner` (NOT an inline `claude --print` spawn).
     The reasoner owns binary resolution, the free-form plain-text
     argv, per-user os_user routing, and the allow-listed subprocess
@@ -565,7 +565,7 @@ class TestRunReviewClaudeDispatch:
             patch("kai.review.ClaudeOneShotReasoner", return_value=fake) as ctor,
             patch("kai.review.asyncio.create_subprocess_exec") as mock_exec,
         ):
-            result = await run_review("review prompt", claude_user="someone")
+            result = await run_review("review prompt", agent_backend="claude", claude_user="someone")
 
         assert result == "review body from claude"
         ctor.assert_called_once()
@@ -593,7 +593,7 @@ class TestRunReviewClaudeDispatch:
         fake = self._fake_reasoner()
 
         with patch("kai.review.ClaudeOneShotReasoner", return_value=fake):
-            await run_review("prompt", model_override="opus")
+            await run_review("prompt", agent_backend="claude", model_override="opus")
 
         assert fake.run.call_args.kwargs["model"] == "opus"
 
@@ -605,7 +605,7 @@ class TestRunReviewClaudeDispatch:
         fake = self._fake_reasoner()
 
         with patch("kai.review.ClaudeOneShotReasoner", return_value=fake):
-            await run_review("prompt", timeout_s=777)
+            await run_review("prompt", agent_backend="claude", timeout_s=777)
 
         assert fake.run.call_args.kwargs["timeout"] == 777
 
@@ -620,7 +620,7 @@ class TestRunReviewClaudeDispatch:
             patch("kai.review.ClaudeOneShotReasoner", return_value=fake),
             pytest.raises(RuntimeError, match=r"Review subprocess timed out"),
         ):
-            await run_review("prompt")
+            await run_review("prompt", agent_backend="claude")
 
     @pytest.mark.asyncio
     async def test_run_review_collapses_oneshot_error_to_runtime_error(self):
@@ -635,7 +635,7 @@ class TestRunReviewClaudeDispatch:
             # detail; this is what reaches the Telegram failure notice.
             pytest.raises(RuntimeError, match=r"Claude review failed: exit 1: model not found"),
         ):
-            await run_review("prompt")
+            await run_review("prompt", agent_backend="claude")
 
 
 # ── run_review (Codex backend) ─────────────────────────────────────
@@ -875,19 +875,16 @@ class TestRunReviewGooseDispatch:
             await run_review("prompt", agent_backend="goose", provider="anthropic")
 
     @pytest.mark.asyncio
-    async def test_default_backend_is_claude(self):
-        """Calling run_review with no backend args still uses Claude
-        (dispatching to ClaudeOneShotReasoner, not goose)."""
-        from kai.oneshot import OneShotResult
+    async def test_backend_is_required(self):
+        """Review dispatch cannot select a backend implicitly."""
+        with pytest.raises(TypeError, match="agent_backend"):
+            await run_review("prompt")  # type: ignore[call-arg]
 
-        fake = MagicMock()
-        fake.run = AsyncMock(return_value=OneShotResult(text="ok", backend="claude", model="sonnet"))
-
-        with patch("kai.review.ClaudeOneShotReasoner", return_value=fake) as ctor:
-            await run_review("prompt")
-
-        ctor.assert_called_once()
-        fake.run.assert_awaited_once()
+    @pytest.mark.asyncio
+    async def test_unknown_backend_is_rejected(self):
+        """An unknown backend cannot fall through to another driver."""
+        with pytest.raises(ValueError, match="Unsupported review backend"):
+            await run_review("prompt", agent_backend="unknown")
 
     @pytest.mark.asyncio
     async def test_empty_provider_raises(self):
@@ -1181,7 +1178,7 @@ class TestReviewPR:
             patch("kai.review.post_review_comment", return_value=True) as mock_post,
             patch("kai.review.send_review_summary") as mock_summary,
         ):
-            await review_pr(payload, 8080, "secret", claude_user="kai")
+            await review_pr(payload, 8080, "secret", agent_backend="claude", claude_user="kai")
 
         mock_diff.assert_called_once_with("owner/repo", 42, github_token=None)
         mock_generate.assert_called_once()
@@ -1209,7 +1206,7 @@ class TestReviewPR:
             patch("kai.review.generate_pr_review") as mock_generate,
             patch("kai.review.send_review_summary") as mock_summary,
         ):
-            await review_pr(payload, 8080, "secret")
+            await review_pr(payload, 8080, "secret", agent_backend="claude")
 
         mock_generate.assert_not_called()
         mock_summary.assert_not_called()
@@ -1223,7 +1220,7 @@ class TestReviewPR:
             patch("kai.review.fetch_pr_diff", side_effect=RuntimeError("gh failed")),
             patch("kai.review.send_review_summary") as mock_summary,
         ):
-            await review_pr(payload, 8080, "secret")
+            await review_pr(payload, 8080, "secret", agent_backend="claude")
 
         mock_summary.assert_called_once()
         assert mock_summary.call_args[0][1] is False
@@ -1241,7 +1238,7 @@ class TestReviewPR:
             ),
             patch("kai.review.send_review_summary") as mock_summary,
         ):
-            await review_pr(payload, 8080, "secret")
+            await review_pr(payload, 8080, "secret", agent_backend="claude")
 
         mock_summary.assert_called_once()
         assert mock_summary.call_args[0][1] is False
@@ -1257,7 +1254,7 @@ class TestReviewPR:
             patch("kai.review.post_review_comment") as mock_post,
             patch("kai.review.send_review_summary") as mock_summary,
         ):
-            await review_pr(payload, 8080, "secret")
+            await review_pr(payload, 8080, "secret", agent_backend="claude")
 
         mock_post.assert_not_called()
         mock_summary.assert_called_once()
@@ -1281,6 +1278,7 @@ class TestReviewPR:
                 payload,
                 8080,
                 "secret",
+                agent_backend="claude",
                 local_repo_path="/repo",
                 spec_dir="my/specs",
             )
@@ -1333,7 +1331,7 @@ class TestReviewPR:
             patch("kai.review.post_review_comment", return_value=True) as mock_post,
             patch("kai.review.send_review_summary"),
         ):
-            await review_pr(payload, 8080, "secret", github_token="ghp_user")
+            await review_pr(payload, 8080, "secret", agent_backend="claude", github_token="ghp_user")
 
         mock_diff.assert_called_once_with("owner/repo", 42, github_token="ghp_user")
         assert mock_generate.call_args.kwargs["github_token"] == "ghp_user"

@@ -2962,8 +2962,9 @@ def build_review_prompt_from_context(context: PRReviewContext) -> str:
 
 async def run_review(
     prompt: str,
+    *,
+    agent_backend: str,
     claude_user: str | None = None,
-    agent_backend: str = "claude",
     provider: str = "",
     timeout_s: int = _REVIEW_TIMEOUT,
     # Per-role model override. Caller in webhook.py resolves
@@ -3118,9 +3119,9 @@ async def run_review(
         except OneShotError as exc:
             raise RuntimeError(f"Goose review failed: {exc}") from exc
         return result.text
-    else:
-        # Claude (the default backend). Dispatch to the claude
-        # one-shot reasoner in free-form mode (json_schema=None):
+    if agent_backend == "claude":
+        # Dispatch to the Claude one-shot reasoner in free-form mode
+        # (json_schema=None):
         # plain `claude --print` text output with no tools, no
         # session persistence, a neutral cwd, the allow-listed
         # subprocess env, and binary resolution shared with config
@@ -3152,6 +3153,8 @@ async def run_review(
             raise RuntimeError(f"Claude review failed: {exc}") from exc
         return result.text
 
+    raise ValueError(f"Unsupported review backend: {agent_backend!r}")
+
 
 async def post_review_comment(repo: str, pr_number: int, review: str, github_token: str | None = None) -> bool:
     """
@@ -3164,7 +3167,7 @@ async def post_review_comment(repo: str, pr_number: int, review: str, github_tok
     Args:
         repo: Full repository name (e.g., "dcellison/kai").
         pr_number: The PR number.
-        review: The review text from Claude.
+        review: The review text returned by the selected backend.
 
     Returns:
         True if the comment was posted successfully, False otherwise.
@@ -3251,11 +3254,11 @@ async def generate_pr_review(
     repo: str,
     pr_number: int,
     *,
+    agent_backend: str,
     local_repo_path: str | None = None,
     spec_dir: str = "specs",
     include_prior_comments: bool = True,
     claude_user: str | None = None,
-    agent_backend: str = "claude",
     provider: str = "",
     timeout_s: int = _REVIEW_TIMEOUT,
     model_override: str = "",
@@ -3326,11 +3329,12 @@ async def review_pr(
     payload: dict,
     webhook_port: int,
     webhook_secret: str,
+    *,
+    agent_backend: str,
     claude_user: str | None = None,
     local_repo_path: str | None = None,
     spec_dir: str = "specs",
     notify_chat_id: int | None = None,
-    agent_backend: str = "claude",
     provider: str = "",
     timeout_s: int = _REVIEW_TIMEOUT,
     model_override: str = "",
@@ -3358,6 +3362,7 @@ async def review_pr(
         payload: The full GitHub webhook payload dict.
         webhook_port: Local webhook server port.
         webhook_secret: Webhook secret for API auth.
+        agent_backend: Explicit backend selected for this review.
         claude_user: Optional OS user for the review subprocess.
         local_repo_path: Optional path to local repo checkout for
             spec resolution, conventions, and related-context search.

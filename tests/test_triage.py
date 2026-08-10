@@ -336,7 +336,7 @@ class TestListProjects:
 
 class TestRunTriageClaudeDispatch:
     """
-    `run_triage` with the default claude backend dispatches to
+    `run_triage` with the explicitly selected Claude backend dispatches to
     `ClaudeOneShotReasoner` (NOT an inline `claude --print` spawn).
     The reasoner owns binary resolution, the free-form plain-text
     argv, per-user os_user routing, and the allow-listed subprocess
@@ -364,7 +364,7 @@ class TestRunTriageClaudeDispatch:
             patch("kai.triage.ClaudeOneShotReasoner", return_value=fake) as ctor,
             patch("kai.triage.asyncio.create_subprocess_exec") as mock_exec,
         ):
-            result = await run_triage("triage prompt", claude_user="someone")
+            result = await run_triage("triage prompt", agent_backend="claude", claude_user="someone")
 
         assert result == '{"labels": ["bug"], "summary": "A bug."}'
         ctor.assert_called_once()
@@ -392,7 +392,7 @@ class TestRunTriageClaudeDispatch:
         fake = self._fake_reasoner()
 
         with patch("kai.triage.ClaudeOneShotReasoner", return_value=fake):
-            await run_triage("prompt", model_override="opus")
+            await run_triage("prompt", agent_backend="claude", model_override="opus")
 
         assert fake.run.call_args.kwargs["model"] == "opus"
 
@@ -407,7 +407,7 @@ class TestRunTriageClaudeDispatch:
             patch("kai.triage.ClaudeOneShotReasoner", return_value=fake),
             pytest.raises(RuntimeError, match=r"Triage subprocess timed out"),
         ):
-            await run_triage("prompt")
+            await run_triage("prompt", agent_backend="claude")
 
     @pytest.mark.asyncio
     async def test_run_triage_collapses_oneshot_error_to_runtime_error(self):
@@ -420,7 +420,7 @@ class TestRunTriageClaudeDispatch:
             patch("kai.triage.ClaudeOneShotReasoner", return_value=fake),
             pytest.raises(RuntimeError, match=r"Claude triage failed"),
         ):
-            await run_triage("prompt")
+            await run_triage("prompt", agent_backend="claude")
 
 
 # ── run_triage (Goose backend) ─────────────────────────────────────
@@ -532,19 +532,16 @@ class TestRunTriageGooseDispatch:
             await run_triage("prompt", agent_backend="goose", provider="anthropic")
 
     @pytest.mark.asyncio
-    async def test_default_backend_is_claude(self):
-        """Calling run_triage with no backend args still uses Claude
-        (dispatching to ClaudeOneShotReasoner, not goose)."""
-        from kai.oneshot import OneShotResult
+    async def test_backend_is_required(self):
+        """Triage dispatch cannot select a backend implicitly."""
+        with pytest.raises(TypeError, match="agent_backend"):
+            await run_triage("prompt")  # type: ignore[call-arg]
 
-        fake = MagicMock()
-        fake.run = AsyncMock(return_value=OneShotResult(text='{"labels": []}', backend="claude", model="sonnet"))
-
-        with patch("kai.triage.ClaudeOneShotReasoner", return_value=fake) as ctor:
-            await run_triage("prompt")
-
-        ctor.assert_called_once()
-        fake.run.assert_awaited_once()
+    @pytest.mark.asyncio
+    async def test_unknown_backend_is_rejected(self):
+        """An unknown backend cannot fall through to another driver."""
+        with pytest.raises(ValueError, match="Unsupported triage backend"):
+            await run_triage("prompt", agent_backend="unknown")
 
     @pytest.mark.asyncio
     async def test_empty_provider_raises(self):
@@ -1609,7 +1606,7 @@ class TestTriageIssue:
         ):
             mock_session, _ = _mock_aiohttp_session_post(status=200)
             _attach_session_to_class(mock_session, mock_session_cls)
-            await triage_issue(payload, 8080, "secret")
+            await triage_issue(payload, 8080, "secret", agent_backend="claude")
 
         assert mock_session.post.called
         # Pipeline ran (multiple subprocess calls)
@@ -1652,7 +1649,13 @@ class TestTriageIssue:
             patch("kai.triage.run_triage", side_effect=mock_run_triage),
             patch("kai.triage.apply_triage", new_callable=AsyncMock) as mock_apply,
         ):
-            await triage_issue(payload, 8080, "secret", allowed_triage_projects=["Sprint 1"])
+            await triage_issue(
+                payload,
+                8080,
+                "secret",
+                agent_backend="claude",
+                allowed_triage_projects=["Sprint 1"],
+            )
 
         assert "Sprint 1" in captured_prompt["prompt"]
         assert "Secret Board" not in captured_prompt["prompt"]
@@ -1697,7 +1700,7 @@ class TestTriageIssue:
         ):
             mock_session, _ = _mock_aiohttp_session_post(status=200)
             _attach_session_to_class(mock_session, mock_session_cls)
-            await triage_issue(payload, 8080, "secret", github_token="ghp_user")
+            await triage_issue(payload, 8080, "secret", agent_backend="claude", github_token="ghp_user")
 
         assert gh_envs
         assert all(env is not None for env in gh_envs)
@@ -1721,7 +1724,7 @@ class TestTriageIssue:
             mock_session, _ = _mock_aiohttp_session_post(status=200)
             _attach_session_to_class(mock_session, mock_session_cls)
             # Should not raise
-            await triage_issue(payload, 8080, "secret")
+            await triage_issue(payload, 8080, "secret", agent_backend="claude")
 
         # Error notification was sent
         mock_session.post.assert_called_once()
@@ -1744,7 +1747,7 @@ class TestTriageIssue:
         ):
             mock_session, _ = _mock_aiohttp_session_post(status=200)
             _attach_session_to_class(mock_session, mock_session_cls)
-            await triage_issue(payload, 8080, "secret")
+            await triage_issue(payload, 8080, "secret", agent_backend="claude")
 
         # Error notification was sent
         mock_session.post.assert_called_once()
@@ -1958,6 +1961,7 @@ class TestTriageErrorContent:
                 {"issue": {}, "repository": {}},
                 webhook_port=8080,
                 webhook_secret="secret",
+                agent_backend="claude",
             )
 
         # The error_detail argument should be just the type name
