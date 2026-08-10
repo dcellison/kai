@@ -4137,6 +4137,21 @@ class TestApplyDirectories:
 
         assert ws_base.exists()
 
+    def test_user_data_roots_are_traversal_only(self, tmp_path, monkeypatch):
+        """Per-user data roots are not listable by sibling OS users."""
+        chmods: list[tuple[str, int]] = []
+        monkeypatch.setattr("os.chmod", lambda path, mode: chmods.append((str(path), mode)))
+
+        install = tmp_path / "opt" / "kai"
+        data = tmp_path / "var" / "lib" / "kai"
+
+        _apply_directories(install, data, 503, 20, dry_run=False, workspace_base=None)
+
+        mode_by_path = dict(chmods)
+        assert mode_by_path[str(data / "memory")] == 0o711
+        assert mode_by_path[str(data / "preferences")] == 0o711
+        assert mode_by_path[str(data / "home")] == 0o711
+
 
 # ── Status subcommand ────────────────────────────────────────────────
 
@@ -5050,6 +5065,8 @@ class TestApplyMigratePerUserMemory:
         primary_dst = memory_dir / "8888" / "MEMORY.md"
         assert primary_dst.exists()
         assert primary_dst.read_text() == "operator notes from before #347"
+        assert stat.S_IMODE((memory_dir / "8888").stat().st_mode) == 0o700
+        assert stat.S_IMODE(primary_dst.stat().st_mode) == 0o600
         # Critical: legacy global MUST be gone (move, not copy) so a
         # later read at memory/MEMORY.md cannot leak this content.
         assert not legacy_global.exists()
@@ -5365,13 +5382,12 @@ class TestApplyMigratePerUserHome:
         Pre-fix: the block was guarded by `if home_root.is_dir():`
         which silently skipped everything when the parent was absent.
 
-        Round 2 review fix: home_root must end up at exactly 0o755,
-        not whatever the umask leaves behind. mkdir(mode=0o755) is
+        Current security contract: home_root must end up at exactly
+        0o711, not whatever the umask leaves behind. mkdir(mode=0o711) is
         masked by the process umask; under the production service
-        umask of 0o027 this would leave home_root at 0o750, blocking
-        group traversal for distinct-os_user subprocesses. We set a
-        hostile umask inside the test to prove the explicit chmod
-        survives it.
+        umask of 0o027 this would leave home_root at 0o710. We set a
+        hostile umask inside the test to prove the explicit chmod both
+        preserves traversal and prevents directory listing by siblings.
         """
         import os as _os
         import stat
@@ -5389,7 +5405,7 @@ class TestApplyMigratePerUserHome:
 
         # Hostile umask matches the production service launchd config.
         # Without the explicit os.chmod after mkdir, home_root would
-        # come out as 0o750 here.
+        # come out as 0o710 here.
         prev_umask = _os.umask(0o027)
         try:
             _apply_migrate(
@@ -5407,12 +5423,12 @@ class TestApplyMigratePerUserHome:
         home_root = data_path / "home"
         assert home_root.is_dir()
         assert (home_root / "8888").is_dir()
-        # Both at exactly 0o755 (group/other read+traverse, no write).
-        assert stat.S_IMODE(home_root.stat().st_mode) == 0o755, (
+        # Root is traversal-only for siblings; the per-user slot is private.
+        assert stat.S_IMODE(home_root.stat().st_mode) == 0o711, (
             f"home_root mode {oct(stat.S_IMODE(home_root.stat().st_mode))} - "
             "umask masked the mkdir mode and explicit chmod did not run"
         )
-        assert stat.S_IMODE((home_root / "8888").stat().st_mode) == 0o755
+        assert stat.S_IMODE((home_root / "8888").stat().st_mode) == 0o700
 
     def test_override_resolves_through_data_path_symlink(self, tmp_path, monkeypatch):
         """
@@ -5524,6 +5540,8 @@ class TestApplyMigratePerUserPreferences:
         target = data_path / "preferences" / "7777" / "PREFERENCES.md"
         assert target.is_file()
         assert "Style" in target.read_text()
+        assert target.stat().st_mode & 0o777 == 0o600
+        assert (data_path / "preferences" / "7777").stat().st_mode & 0o777 == 0o700
 
     def test_seeds_each_user_in_multi_user_yaml(self, tmp_path, monkeypatch):
         """Every users.yaml entry gets its own PREFERENCES.md seeded from the template."""

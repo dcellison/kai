@@ -35,6 +35,43 @@ from kai.history import get_recent_history
 
 log = logging.getLogger(__name__)
 
+_PRIVATE_USER_ROOT_MODE = 0o711
+_PRIVATE_USER_DIR_MODE = 0o700
+_PRIVATE_USER_FILE_MODE = 0o600
+
+
+def _chmod_private_user_root(path: Path) -> None:
+    """Best-effort chmod for shared per-user data roots."""
+    if path.is_symlink():
+        return
+    try:
+        os.chmod(path, _PRIVATE_USER_ROOT_MODE)
+    except PermissionError:
+        pass
+
+
+def _chmod_private_user_dir(path: Path) -> None:
+    """Best-effort chmod for lazily-created user-owned directories."""
+    if path.is_symlink():
+        return
+    try:
+        os.chmod(path, _PRIVATE_USER_DIR_MODE)
+    except PermissionError:
+        # In protected installs, install.py may have already chowned this path
+        # to the target os_user. The service user can traverse/read only via
+        # configured handoff paths and must not crash if chmod returns EPERM.
+        pass
+
+
+def _chmod_private_user_file(path: Path) -> None:
+    """Best-effort chmod for lazily-created user-owned files."""
+    if path.is_symlink():
+        return
+    try:
+        os.chmod(path, _PRIVATE_USER_FILE_MODE)
+    except PermissionError:
+        pass
+
 
 # Outer-daemon control-plane credentials must never enter a persistent agent
 # environment. Provider API keys are intentionally not listed: some supported
@@ -593,19 +630,22 @@ def ensure_user_memory(chat_id: int | None, data_dir: Path) -> None:
     # still has a writable memory_root for the inner agent to update.
     # Without this branch a write attempt from the subprocess would
     # FileNotFoundError on the missing parent directory.
+    memory_root = data_dir / "memory"
     if chat_id is None:
-        user_memory_dir = data_dir / "memory"
+        user_memory_dir = memory_root
         user_memory_file = user_memory_dir / "MEMORY.md"
     else:
-        user_memory_dir = data_dir / "memory" / str(chat_id)
+        user_memory_dir = memory_root / str(chat_id)
         user_memory_file = user_memory_dir / "MEMORY.md"
 
     try:
-        user_memory_dir.mkdir(parents=True, exist_ok=True)
+        memory_root.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_ROOT_MODE)
+        _chmod_private_user_root(memory_root)
+        user_memory_dir.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_DIR_MODE)
+        if chat_id is not None:
+            _chmod_private_user_dir(user_memory_dir)
         if not user_memory_file.exists():
             # Seed from the template if one ships with the source tree.
-            # Copy2 preserves mode bits so a deliberately permissive
-            # template stays that way.
             template = PROJECT_ROOT / "templates" / ".claude" / "MEMORY.md"
             if template.is_file():
                 shutil.copy2(template, user_memory_file)
@@ -614,6 +654,7 @@ def ensure_user_memory(chat_id: int | None, data_dir: Path) -> None:
                 # install tree is incomplete). Create a minimal placeholder
                 # so the subprocess has a writable file to edit.
                 user_memory_file.write_text("# Memory\n")
+        _chmod_private_user_file(user_memory_file)
     except OSError:
         log.warning(
             "ensure_user_memory: could not bootstrap %s",
@@ -651,16 +692,17 @@ def ensure_user_preferences(chat_id: int | None, data_dir: Path) -> None:
     if chat_id is None:
         return
 
-    user_pref_dir = data_dir / "preferences" / str(chat_id)
+    preferences_root = data_dir / "preferences"
+    user_pref_dir = preferences_root / str(chat_id)
     user_pref_file = user_pref_dir / "PREFERENCES.md"
 
     try:
-        user_pref_dir.mkdir(parents=True, exist_ok=True)
+        preferences_root.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_ROOT_MODE)
+        _chmod_private_user_root(preferences_root)
+        user_pref_dir.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_DIR_MODE)
+        _chmod_private_user_dir(user_pref_dir)
         if not user_pref_file.exists():
             # Seed from the template if one ships with the source tree.
-            # Copy2 preserves mode bits so a deliberately permissive
-            # template stays that way. Mirrors ensure_user_memory's seed
-            # step.
             template = PROJECT_ROOT / "templates" / ".claude" / "PREFERENCES.md"
             if template.is_file():
                 shutil.copy2(template, user_pref_file)
@@ -671,6 +713,7 @@ def ensure_user_preferences(chat_id: int | None, data_dir: Path) -> None:
                 # to edit. Matches ensure_user_memory's `# Memory\n`
                 # precedent for symmetry.
                 user_pref_file.write_text("# Preferences\n")
+        _chmod_private_user_file(user_pref_file)
     except OSError:
         log.warning(
             "ensure_user_preferences: could not bootstrap %s",
@@ -716,10 +759,11 @@ def ensure_user_home(chat_id: int | None, data_dir: Path) -> Path:
     real user; it is not shared between actual Telegram users because
     any real message carries a chat_id.
 
-    Mode 0755 with per-user chown at install time is what isolates
-    users from each other. Matches memory/ exactly (install.py
-    `_apply_migrate` uses the same ownership rules). Isolation comes
-    from ownership, not mode bits.
+    Managed per-user home directories are private (0700) with per-user
+    chown at install time. The lazy fallback uses the same private mode
+    under the caller's ownership for dev / single-user paths. Distinct
+    os_user entries added after install still require a reinstall so
+    install.py can apply the correct ownership.
 
     Like ensure_user_memory and ensure_user_preferences, this seeds
     `<home>/.claude/CLAUDE.md` from `templates/.claude/CLAUDE.md` when
@@ -738,21 +782,23 @@ def ensure_user_home(chat_id: int | None, data_dir: Path) -> Path:
     # fixed "anon" subdir so the resolver always returns a concrete
     # path rather than None; avoids defensive None-checks at every call
     # site.
+    home_root = data_dir / "home"
     if chat_id is None:
-        path = data_dir / "home" / "anon"
+        path = home_root / "anon"
     else:
-        path = data_dir / "home" / str(chat_id)
+        path = home_root / str(chat_id)
 
     # mkdir parents=True is load-bearing: on a brand-new install the
     # data_dir/home/ root may not exist yet (the installer creates it,
     # but dev paths and the tests go straight through lazy bootstrap).
     # exist_ok=True means this is safe to call on every session init.
-    path.mkdir(parents=True, exist_ok=True, mode=0o755)
+    home_root.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_ROOT_MODE)
+    _chmod_private_user_root(home_root)
+    path.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_DIR_MODE)
     # mkdir's mode= argument is masked by the process umask, so on a
-    # service configured with umask 0o027 the directory can end up 0o750
-    # instead of 0o755. That blocks group traversal and can break the
-    # inner subprocess when sudo -u targets a different identity. Force
-    # the intended bits explicitly - this is the same pattern install.py
+    # service configured with a restrictive umask the directory can end
+    # up narrower than 0o700. Force the intended bits explicitly - this
+    # is the same pattern install.py
     # `_apply_migrate` uses after its mkdir calls.
     #
     # Swallow PermissionError because in a multi-user install the
@@ -765,7 +811,7 @@ def ensure_user_home(chat_id: int | None, data_dir: Path) -> Path:
     # Narrow to PermissionError rather than bare OSError so unrelated
     # failure modes (ENOENT, ENOTDIR, EIO) still propagate.
     try:
-        os.chmod(path, 0o755)
+        os.chmod(path, _PRIVATE_USER_DIR_MODE)
     except PermissionError:
         pass
 
@@ -781,22 +827,8 @@ def ensure_user_home(chat_id: int | None, data_dir: Path) -> Path:
         claude_dir = path / ".claude"
         claude_dst = claude_dir / "CLAUDE.md"
         if not claude_dst.exists():
-            claude_dir.mkdir(parents=True, exist_ok=True)
-            # mkdir's mode= is masked by umask; force the bits to 0o755
-            # explicitly the same way the parent `path` does above.
-            # Without this, a service running under umask 0o027 lands
-            # the .claude/ subdir at 0o750, which blocks group-traverse
-            # for distinct-os_user subprocesses (sudo -H -u <os_user>)
-            # and silently breaks identity reads. ensure_user_memory
-            # and ensure_user_preferences create their per-user parent
-            # dirs without an explicit chmod and so have the same
-            # pre-existing umask gap on `data_dir/memory/<chat_id>/`
-            # and `data_dir/preferences/<chat_id>/`. ensure_user_home
-            # already chmods its own per-user parent at line 617; the
-            # call here closes the matching gap on the .claude/ subdir
-            # it creates. Closing the sibling-function gaps is out of
-            # scope for this PR but worth a follow-up.
-            os.chmod(claude_dir, 0o755)
+            claude_dir.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_DIR_MODE)
+            _chmod_private_user_dir(claude_dir)
             template = PROJECT_ROOT / "templates" / ".claude" / "CLAUDE.md"
             if template.is_file():
                 shutil.copy2(template, claude_dst)
@@ -806,6 +838,8 @@ def ensure_user_home(chat_id: int | None, data_dir: Path) -> Path:
                 # ensure_user_preferences' `# Preferences\n` last-resort
                 # placeholder so the inner agent has a writable file.
                 claude_dst.write_text("# Identity\n")
+        _chmod_private_user_dir(claude_dir)
+        _chmod_private_user_file(claude_dst)
     except OSError:
         log.warning(
             "ensure_user_home: could not seed CLAUDE.md at %s",

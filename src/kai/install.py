@@ -102,6 +102,10 @@ _SERVICE_START_MAX_ATTEMPTS = 3
 _SERVICE_START_SETTLE_SECONDS = 1
 _SERVICE_START_RETRY_SECONDS = 2
 
+_PRIVATE_USER_ROOT_MODE = 0o711
+_PRIVATE_USER_DIR_MODE = 0o700
+_PRIVATE_USER_FILE_MODE = 0o600
+
 
 class ServiceStartError(Exception):
     """Raised by `_start_service` when the post-condition verify
@@ -2555,12 +2559,40 @@ def _set_ownership(path: Path, uid: int, gid: int, recursive: bool = False) -> N
         os.lchown(path, uid, gid)
     else:
         os.chown(path, uid, gid)
-    if recursive and path.is_dir():
+    if recursive and path.is_dir() and not path.is_symlink():
         for child in path.rglob("*"):
             if child.is_symlink():
                 os.lchown(child, uid, gid)
             else:
                 os.chown(child, uid, gid)
+
+
+def _set_private_user_tree_modes(path: Path) -> None:
+    """
+    Make a user-owned Kai data subtree private without following symlinks.
+
+    Directories become 0700; regular files become 0600. Symlinks are skipped:
+    chmod(2) would affect the target on most platforms, which is not safe for
+    a tree that may contain stale or operator-created entries.
+    """
+    if path.is_symlink():
+        return
+    if path.is_dir():
+        os.chmod(path, _PRIVATE_USER_DIR_MODE)
+        for root, dirs, files in os.walk(path, followlinks=False):
+            root_path = Path(root)
+            if not root_path.is_symlink():
+                os.chmod(root_path, _PRIVATE_USER_DIR_MODE)
+            for dirname in dirs:
+                child = root_path / dirname
+                if not child.is_symlink():
+                    os.chmod(child, _PRIVATE_USER_DIR_MODE)
+            for filename in files:
+                child = root_path / filename
+                if not child.is_symlink():
+                    os.chmod(child, _PRIVATE_USER_FILE_MODE)
+    elif path.exists():
+        os.chmod(path, _PRIVATE_USER_FILE_MODE)
 
 
 def _copy_tree(
@@ -3823,6 +3855,7 @@ def _apply_migrate(
                 f"users.yaml entry, then re-run sudo make install."
             ) from exc
         per_user_ids[str(chat_id)] = (pwd_entry.pw_uid, pwd_entry.pw_gid)
+    known_user_dir_names = {str(chat_id) for chat_id, _os_user in memory_owners if chat_id is not None}
 
     # Resolve the primary operator's chat_id (first yaml entry). When
     # users.yaml is absent or empty (first-ever install, single-user
@@ -3955,17 +3988,19 @@ def _apply_migrate(
         # ValueError; we cannot reach this block in that state.
 
         if dry_run:
-            print(f"[DRY RUN] Would set ownership on {memory_tree} (service + per-user)")
+            print(f"[DRY RUN] Would set ownership/modes on {memory_tree} (service + per-user)")
             for name, (uid, gid) in per_user_ids.items():
-                print(f"[DRY RUN]   {memory_tree / name} -> ({uid}:{gid})")
+                print(f"[DRY RUN]   {memory_tree / name} -> ({uid}:{gid}, mode 0700)")
         else:
             # Top-level directory: service-owned so the service user
             # can create new per-user subdirs on add-user flows.
             _set_ownership(memory_tree, svc_uid, svc_gid, recursive=False)
+            os.chmod(memory_tree, _PRIVATE_USER_ROOT_MODE)
             for entry in memory_tree.iterdir():
-                if entry.is_dir() and entry.name in per_user_ids:
-                    uid, gid = per_user_ids[entry.name]
+                if entry.is_dir() and entry.name in known_user_dir_names:
+                    uid, gid = per_user_ids.get(entry.name, (svc_uid, svc_gid))
                     _set_ownership(entry, uid, gid, recursive=True)
+                    _set_private_user_tree_modes(entry)
                 else:
                     # qdrant/, mem0_history.db, extractor_cwd/, and any
                     # memory/<chat_id>/ whose user has no os_user set.
@@ -4025,15 +4060,17 @@ def _apply_migrate(
     # ownership on first-run only and stale files would persist.
     if preferences_tree.is_dir():
         if dry_run:
-            print(f"[DRY RUN] Would set ownership on {preferences_tree} (service + per-user)")
+            print(f"[DRY RUN] Would set ownership/modes on {preferences_tree} (service + per-user)")
             for name, (uid, gid) in per_user_ids.items():
-                print(f"[DRY RUN]   {preferences_tree / name} -> ({uid}:{gid})")
+                print(f"[DRY RUN]   {preferences_tree / name} -> ({uid}:{gid}, mode 0700)")
         else:
             _set_ownership(preferences_tree, svc_uid, svc_gid, recursive=False)
+            os.chmod(preferences_tree, _PRIVATE_USER_ROOT_MODE)
             for entry in preferences_tree.iterdir():
-                if entry.is_dir() and entry.name in per_user_ids:
-                    uid, gid = per_user_ids[entry.name]
+                if entry.is_dir() and entry.name in known_user_dir_names:
+                    uid, gid = per_user_ids.get(entry.name, (svc_uid, svc_gid))
                     _set_ownership(entry, uid, gid, recursive=True)
+                    _set_private_user_tree_modes(entry)
                 else:
                     # Subdirs whose chat_id has no os_user, or any
                     # stray top-level entry, fall through to service
@@ -4071,15 +4108,13 @@ def _apply_migrate(
     # ownership is already correct, and if it did not run a defensive
     # chown here would mask the real bug rather than fix it.
     if not dry_run:
-        home_root.mkdir(parents=True, exist_ok=True, mode=0o755)
+        home_root.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_ROOT_MODE)
         # mkdir's mode= is masked by umask. Under the production
-        # service umask of 0o027 the directory ends up 0o750, which
-        # blocks group traversal: a distinct-os_user subprocess that
-        # is not in the service group cannot enter home_root to reach
-        # its own per-user slot, even though that slot has correct
-        # 0o755 mode. Force the bits explicitly - same pattern as
-        # ensure_user_home and the user_dir.chmod two lines below.
-        os.chmod(home_root, 0o755)
+        # service umask of 0o027 the directory would otherwise end up
+        # 0o710. Force traversal-only public bits so distinct os_user
+        # subprocesses can reach their own private slots without
+        # listing sibling chat IDs.
+        os.chmod(home_root, _PRIVATE_USER_ROOT_MODE)
     # Resolve data_path once for the symlink-safe containment check
     # below. _collect_user_home_overrides canonicalizes each override
     # via Path.resolve(); comparing against an unresolved data_path
@@ -4100,26 +4135,28 @@ def _apply_migrate(
         # resolve_home_workspace returns it verbatim at runtime. Case
         # 1: no override - provision the per-user default slot.
         user_dir = override if override is not None else home_root / str(chat_id)
-        if user_dir.exists():
-            continue  # idempotent across reinstalls
+        user_dir_exists = user_dir.exists()
         if dry_run:
             if str(chat_id) in per_user_ids:
                 uid, gid = per_user_ids[str(chat_id)]
-                print(f"[DRY RUN] Would create {user_dir} ({uid}:{gid})")
+                action = "set private mode on" if user_dir_exists else "create"
+                print(f"[DRY RUN] Would {action} {user_dir} ({uid}:{gid}, mode 0700)")
             else:
-                print(f"[DRY RUN] Would create {user_dir} ({svc_uid}:{svc_gid})")
+                action = "set private mode on" if user_dir_exists else "create"
+                print(f"[DRY RUN] Would {action} {user_dir} ({svc_uid}:{svc_gid}, mode 0700)")
             continue
-        user_dir.mkdir(parents=True, exist_ok=True, mode=0o755)
+        user_dir.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_DIR_MODE)
         # mkdir does not always honor mode (it is masked by umask).
         # Force the intended bits explicitly so the per-user dir
-        # ends up 0755 regardless of the install-time umask.
-        os.chmod(user_dir, 0o755)
+        # ends up private regardless of the install-time umask.
+        os.chmod(user_dir, _PRIVATE_USER_DIR_MODE)
         if str(chat_id) in per_user_ids:
             uid, gid = per_user_ids[str(chat_id)]
             _set_ownership(user_dir, uid, gid, recursive=False)
         else:
             _set_ownership(user_dir, svc_uid, svc_gid, recursive=False)
-        print(f"  Created {user_dir}")
+        if not user_dir_exists:
+            print(f"  Created {user_dir}")
 
     # -- CLAUDE.md per-user pre-creation --
     # Mirror the MEMORY.md / PREFERENCES.md per-user pattern above. For
@@ -4207,13 +4244,10 @@ def _apply_migrate(
         # `not exists()` is the same guard ensure_user_memory and
         # ensure_user_preferences use; matches the seed-step contract.
         claude_dir.mkdir(parents=True, exist_ok=True)
-        # mkdir's mode= is masked by umask; force 0o755 explicitly so a
-        # service running under umask 0o027 does not land the subdir at
-        # 0o750 (which would block group-traverse for distinct-os_user
-        # subprocesses). Mirrors the chmod in
-        # `backend.ensure_user_home`'s lazy seed branch and the
-        # parent-dir chmod in the home-creation loop above.
-        os.chmod(claude_dir, 0o755)
+        # mkdir's mode= is masked by umask; force the private mode
+        # explicitly. The user-owned home slot is now 0700, so no
+        # sibling user needs traversal through this subdir.
+        os.chmod(claude_dir, _PRIVATE_USER_DIR_MODE)
         if not claude_dst.exists():
             # Wrap the actual file write in try/except so an OSError
             # (broken symlink at claude_dst, mounted FS, permissions)
@@ -4276,6 +4310,7 @@ def _apply_migrate(
             _set_ownership(claude_dir, uid, gid, recursive=True)
         else:
             _set_ownership(claude_dir, svc_uid, svc_gid, recursive=True)
+        _set_private_user_tree_modes(claude_dir)
 
     # -- Per-os-user temp directories (#454) --
     # The inner Claude binary writes a content-hashed settings cache
@@ -4824,18 +4859,18 @@ def _apply_directories(
         (data_path / "logs", svc_uid, svc_gid, 0o755),
         (data_path / "files", svc_uid, svc_gid, 0o755),
         (data_path / "history", svc_uid, svc_gid, 0o755),
-        (data_path / "memory", svc_uid, svc_gid, 0o755),
+        (data_path / "memory", svc_uid, svc_gid, _PRIVATE_USER_ROOT_MODE),
         # Per-user preferences root (#400). Top-level dir is service-
         # owned so the bot can lazily create new preferences/<chat_id>/
         # subdirs at first message; per-user subdirs are pre-created
         # and chowned in _apply_migrate when the user has a distinct
         # os_user.
-        (data_path / "preferences", svc_uid, svc_gid, 0o755),
+        (data_path / "preferences", svc_uid, svc_gid, _PRIVATE_USER_ROOT_MODE),
         # Per-user home root (#353). Top-level dir is service-owned so
         # the bot can lazily create new home/<chat_id>/ subdirs at first
         # message; per-user subdirs are pre-created and chowned in
         # _apply_migrate when the user has a distinct os_user.
-        (data_path / "home", svc_uid, svc_gid, 0o755),
+        (data_path / "home", svc_uid, svc_gid, _PRIVATE_USER_ROOT_MODE),
         (Path("/etc/kai"), 0, 0, 0o755),
     ]
 

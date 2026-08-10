@@ -9,6 +9,7 @@ and the ApiContext/AgentResponse/StreamEvent data types. These functions are pur
 
 import logging
 import os
+import stat
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -769,33 +770,30 @@ class TestEnsureUserHome:
         assert result == tmp_path / "home" / "anon"
         assert result.is_dir()
 
-    def test_directory_mode_is_exactly_0755(self, tmp_path):
+    def test_directory_mode_is_exactly_0700(self, tmp_path):
         """
-        Mode must be EXACTLY 0o755 after ensure_user_home, regardless
-        of the process umask. The umask on a hardened service is
-        commonly 0o027, which would mask mkdir(mode=0o755) down to
-        0o750 - blocking group traversal and breaking the inner
-        subprocess when sudo -u targets a different identity. The
-        helper must chmod explicitly after mkdir to force the intended
-        bits; this test fails loudly if that chmod is ever removed.
+        Mode must be EXACTLY 0o700 after ensure_user_home. Per-user
+        home workspaces contain identity files and agent state, so they
+        should not be listable/readable by sibling OS users.
 
-        A weaker assertion (mode & 0o022 == 0) would accept 0o750 and
-        silently mask a regression of exactly this kind.
+        A weaker assertion (mode & 0o077 == 0) would accept 0o600 and
+        silently mask a regression that makes the directory unusable.
         """
-        # Set a hostile umask to simulate the production service config
-        # (umask 0o027 on the launchd plist). Without the explicit chmod
-        # in ensure_user_home, mkdir(mode=0o755) would return 0o750 here.
+        # Set a hostile umask. Without the explicit chmod in
+        # ensure_user_home, mkdir(mode=0o700) can be masked down.
         import os as _os
         import stat
 
-        prev_umask = _os.umask(0o027)
+        (tmp_path / "home").mkdir()
+        prev_umask = _os.umask(0o777)
         try:
             result = ensure_user_home(99, tmp_path)
         finally:
             _os.umask(prev_umask)
 
         mode = stat.S_IMODE(result.stat().st_mode)
-        assert mode == 0o755, f"expected 0o755, got {oct(mode)}"
+        assert mode == 0o700, f"expected 0o700, got {oct(mode)}"
+        assert stat.S_IMODE((tmp_path / "home").stat().st_mode) == 0o711
 
     def test_seeds_claude_md_from_template(self, tmp_path):
         """
@@ -823,6 +821,8 @@ class TestEnsureUserHome:
         claude_dst = home / ".claude" / "CLAUDE.md"
         assert claude_dst.is_file(), f"Expected lazy seed at {claude_dst}"
         assert claude_dst.read_text() == "# Kai template\n"
+        assert stat.S_IMODE((home / ".claude").stat().st_mode) == 0o700
+        assert stat.S_IMODE(claude_dst.stat().st_mode) == 0o600
 
     def test_seed_is_idempotent(self, tmp_path):
         """An existing per-user CLAUDE.md is never overwritten on later calls."""
@@ -1237,6 +1237,9 @@ class TestEnsureUserMemory:
         target = data_dir / "memory" / "42" / "MEMORY.md"
         assert target.is_file()
         assert "About the User" in target.read_text()
+        assert stat.S_IMODE((data_dir / "memory").stat().st_mode) == 0o711
+        assert stat.S_IMODE(target.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
 
     def test_no_template_creates_placeholder(self, tmp_path, monkeypatch):
         """Falls back to minimal '# Memory\\n' when no example template exists."""
@@ -1295,6 +1298,8 @@ class TestEnsureUserMemory:
         legacy = data_dir / "memory" / "MEMORY.md"
         assert legacy.is_file()
         assert "Dev" in legacy.read_text()
+        assert stat.S_IMODE((data_dir / "memory").stat().st_mode) == 0o711
+        assert stat.S_IMODE(legacy.stat().st_mode) == 0o600
         # No per-user subdir was created (chat_id=None must not
         # leak into a numeric subdirectory name).
         assert list((data_dir / "memory").iterdir()) == [legacy]
@@ -1356,6 +1361,9 @@ class TestEnsureUserPreferences:
         target = data_dir / "preferences" / "42" / "PREFERENCES.md"
         assert target.is_file()
         assert "Style" in target.read_text()
+        assert stat.S_IMODE((data_dir / "preferences").stat().st_mode) == 0o711
+        assert stat.S_IMODE(target.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
 
     def test_no_template_creates_placeholder(self, tmp_path, monkeypatch):
         """Falls back to '# Preferences\\n' placeholder when no example template exists."""
