@@ -1307,6 +1307,50 @@ class TestScheduleValidation:
         body = json.loads(resp.body.decode())
         mock_register.assert_called_once_with(mock_request.app[TELEGRAM_APP_KEY], body["job_id"])
 
+    async def test_scheduler_false_deactivates_created_job(self, db, mock_request):
+        """A registration miss returns 500 and does not leave an active duplicateable job."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app[CHAT_ID_KEY] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "scheduler false",
+                "prompt": "test",
+                "schedule_type": "interval",
+                "schedule_data": {"seconds": 300},
+            }
+        )
+        with patch("kai.cron.register_job_by_id", new_callable=AsyncMock, return_value=False):
+            resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 500
+        body = json.loads(resp.body.decode())
+        assert body["error"] == "Failed to register job"
+        assert await sessions.get_jobs(123) == []
+
+    async def test_scheduler_exception_deactivates_created_job(self, db, mock_request):
+        """A registration exception returns 500 and compensates the committed row."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app[CHAT_ID_KEY] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "scheduler raise",
+                "prompt": "test",
+                "schedule_type": "interval",
+                "schedule_data": {"seconds": 300},
+            }
+        )
+        with patch(
+            "kai.cron.register_job_by_id",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("scheduler unavailable"),
+        ):
+            resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 500
+        body = json.loads(resp.body.decode())
+        assert body["error"] == "Failed to register job"
+        assert await sessions.get_jobs(123) == []
+
     async def test_invalid_json_returns_400(self, db, mock_request):
         """Malformed JSON body returns 400."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}

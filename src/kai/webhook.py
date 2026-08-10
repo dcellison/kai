@@ -1176,7 +1176,16 @@ async def _handle_schedule(request: web.Request, principal: InternalAPIPrincipal
 
     # Register with APScheduler immediately so it starts firing
     telegram_app = request.app[TELEGRAM_APP_KEY]
-    await cron.register_job_by_id(telegram_app, job_id)
+    try:
+        registered = await cron.register_job_by_id(telegram_app, job_id)
+    except Exception:
+        log.exception("Failed to register job %d with scheduler", job_id)
+        await sessions.deactivate_job(job_id, chat_id=chat_id)
+        return web.json_response({"error": "Failed to register job"}, status=500)
+    if not registered:
+        log.error("Failed to register job %d with scheduler", job_id)
+        await sessions.deactivate_job(job_id, chat_id=chat_id)
+        return web.json_response({"error": "Failed to register job"}, status=500)
 
     log.info("Scheduled job %d '%s' via API (%s)", job_id, name, schedule_type)
     return web.json_response({"job_id": job_id, "name": name})
