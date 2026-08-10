@@ -5611,6 +5611,7 @@ def _apply_secrets(
     """
     etc_kai = Path("/etc/kai")
     env_path = etc_kai / "env"
+    users_yaml_dst = USERS_YAML
     env_content = _generate_env_file(env)
 
     # Resolve users.yaml staging once so the dry-run preview and the
@@ -5641,7 +5642,9 @@ def _apply_secrets(
     if dry_run:
         print(f"[DRY RUN] Would write: {env_path} (mode 0600)")
         if users_yaml_src is not None:
-            print(f"[DRY RUN] Would copy: {users_yaml_src} -> {etc_kai / 'users.yaml'} (mode 0600)")
+            print(f"[DRY RUN] Would copy: {users_yaml_src} -> {users_yaml_dst} (mode 0600)")
+        elif users_yaml_dst.is_file():
+            print(f"[DRY RUN] Would secure existing: {users_yaml_dst} (mode 0600, root-owned)")
         for yaml_name, yaml_src in optional_yaml_sources.items():
             print(f"[DRY RUN] Would copy: {yaml_src} -> {etc_kai / yaml_name} (mode 0600)")
         return
@@ -5659,11 +5662,21 @@ def _apply_secrets(
     # happens in `_cmd_apply` after `apply_succeeded = True` so a
     # failed apply preserves both for a clean retry.
     if users_yaml_src is not None:
-        users_yaml_dst = etc_kai / "users.yaml"
         shutil.copy2(users_yaml_src, users_yaml_dst)
-        os.chmod(users_yaml_dst, 0o600)
-        os.chown(users_yaml_dst, 0, 0)
         print(f"  Copied {users_yaml_dst}")
+
+    # Enforce the runtime metadata contract on every protected apply,
+    # including updates that retain the canonical users.yaml instead of
+    # copying a newly staged file.  The runtime refuses a root-owned 0644
+    # users.yaml, so skipping this repair can leave launchd/systemd repeatedly
+    # starting a launcher whose Python child exits before binding /health.
+    # A missing destination with no staged source is left alone here; the
+    # apply preflight rejects that state before the working service is stopped.
+    if users_yaml_src is not None or users_yaml_dst.is_file():
+        os.chmod(users_yaml_dst, _PRIVATE_USER_FILE_MODE)
+        os.chown(users_yaml_dst, 0, 0)
+        if users_yaml_src is None:
+            print(f"  Secured existing {users_yaml_dst} (mode 0600, root-owned)")
 
     # Copy optional YAML config files to /etc/kai/. Staged files
     # recorded by `make config` win; the project-tree fallback remains

@@ -7342,7 +7342,19 @@ class TestApplySecretsDryRun:
         )
         output = capsys.readouterr().out
         assert str(staging) in output
-        assert "/etc/kai/users.yaml" in output
+        assert str(kai.install.USERS_YAML) in output
+
+    def test_dry_run_previews_retained_users_yaml_metadata_repair(self, tmp_path, monkeypatch, capsys):
+        """An update without staging still previews the mandatory mode/owner repair."""
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users: []\n")
+        monkeypatch.setattr("kai.install.USERS_YAML", users_yaml)
+
+        _apply_secrets({"TELEGRAM_BOT_TOKEN": "test"}, dry_run=True)
+
+        output = capsys.readouterr().out
+        assert f"Would secure existing: {users_yaml}" in output
+        assert "mode 0600, root-owned" in output
 
     def test_dry_run_previews_optional_protected_yaml_configs(self, tmp_path, monkeypatch, capsys):
         """Dry run previews every optional YAML file runtime can load from /etc/kai."""
@@ -7519,12 +7531,28 @@ class TestApplySecretsUsersYamlStaging:
             users_yaml_staging_path=str(staging),
         )
 
-        users_copies = [(src, dst) for src, dst in copied if dst == "/etc/kai/users.yaml"]
-        assert users_copies == [(str(staging), "/etc/kai/users.yaml")]
-        users_modes = [m for p, m in chmodded if p == "/etc/kai/users.yaml"]
+        users_yaml_dst = str(kai.install.USERS_YAML)
+        users_copies = [(src, dst) for src, dst in copied if dst == users_yaml_dst]
+        assert users_copies == [(str(staging), users_yaml_dst)]
+        users_modes = [m for p, m in chmodded if p == users_yaml_dst]
         assert 0o600 in users_modes
-        users_owners = [(uid, gid) for p, uid, gid in chowned if p == "/etc/kai/users.yaml"]
+        users_owners = [(uid, gid) for p, uid, gid in chowned if p == users_yaml_dst]
         assert (0, 0) in users_owners
+
+    def test_retained_users_yaml_is_secured_without_copy(self, tmp_path, monkeypatch, capsys):
+        """An existing canonical file is root-owned 0600 even without staging."""
+        self._no_other_yamls(monkeypatch, tmp_path)
+        users_yaml = tmp_path / "installed-users.yaml"
+        users_yaml.write_text("users: []\n")
+        monkeypatch.setattr("kai.install.USERS_YAML", users_yaml)
+        copied, chmodded, chowned = self._intercept_filesystem(monkeypatch)
+
+        _apply_secrets({"TELEGRAM_BOT_TOKEN": "test"}, dry_run=False, users_yaml_staging_path=None)
+
+        assert not any(dst == str(users_yaml) for _src, dst in copied)
+        assert (str(users_yaml), 0o600) in chmodded
+        assert (str(users_yaml), 0, 0) in chowned
+        assert f"Secured existing {users_yaml}" in capsys.readouterr().out
 
     def test_copies_optional_protected_yaml_configs(self, tmp_path, monkeypatch):
         """services/workspaces/memory-projects are installed as root-owned 0600 config."""
