@@ -2771,6 +2771,7 @@ class TestValidateModelForBackend:
         from kai.config import validate_model_for_backend
 
         assert validate_model_for_backend("opus", "claude", "anthropic") is True
+        assert validate_model_for_backend("fable", "claude", "anthropic") is True
 
     def test_goose_anthropic_accepts_full_claude_ids(self):
         """Goose hands GOOSE_MODEL verbatim to the Anthropic API, so any
@@ -2830,6 +2831,67 @@ class TestValidateModelForBackend:
         assert validate_model_for_backend("sonnet", "claude", "anthropic") is True
         assert validate_model_for_backend("claude-opus-4-8", "claude", "anthropic") is True
         assert validate_model_for_backend("gpt-5.5", "claude", "anthropic") is False
+
+    def test_registry_allowed_models_narrows_codex_model_list(self, tmp_path, monkeypatch):
+        from kai.config import models_for_backend
+
+        self._write_backend_registry(
+            tmp_path,
+            monkeypatch,
+            """
+            version: 1
+            backends:
+              codex:
+                driver: codex
+                runtime: local_process
+                command: /usr/local/bin/codex
+                allowed_models:
+                  - gpt-5.5
+            """,
+        )
+
+        assert models_for_backend("codex", "openai") == {"gpt-5.5": "\U0001f7e2 GPT-5.5"}
+
+    def test_registry_allowed_models_narrows_claude_model_list(self, tmp_path, monkeypatch):
+        from kai.config import models_for_backend
+
+        self._write_backend_registry(
+            tmp_path,
+            monkeypatch,
+            """
+            version: 1
+            backends:
+              claude:
+                driver: claude
+                runtime: local_process
+                command: /opt/homebrew/bin/claude
+                allowed_models:
+                  - sonnet
+                  - claude-*
+            """,
+        )
+
+        assert models_for_backend("claude", "anthropic") == {"sonnet": "\u26a1 Sonnet"}
+
+    def test_claude_wildcard_uses_free_text_instead_of_literal_choice(self, tmp_path, monkeypatch):
+        from kai.config import models_for_backend
+
+        self._write_backend_registry(
+            tmp_path,
+            monkeypatch,
+            """
+            version: 1
+            backends:
+              claude:
+                driver: claude
+                runtime: local_process
+                command: /opt/homebrew/bin/claude
+                allowed_models:
+                  - claude-*
+            """,
+        )
+
+        assert models_for_backend("claude", "anthropic") is None
 
     def test_legacy_alias_only_claude_registry_preserves_full_ids(self, tmp_path, monkeypatch, caplog):
         from kai.config import validate_model_for_backend

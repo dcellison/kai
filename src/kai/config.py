@@ -141,14 +141,13 @@ PROVIDER_KEY_VARS: dict[str, str] = {
 # Goose passes model IDs through verbatim to the provider API - no
 # aliasing layer - so these must be the exact strings the APIs accept.
 PROVIDER_MODELS: dict[str, dict[str, str]] = {
-    # Claude CLI accepts short aliases that auto-resolve to the
-    # current SKU (`opus` -> claude-opus-4-8 as of 2026-06-09).
-    # Listing the aliases here keeps the registry stable across
-    # Anthropic version bumps; the CLI handles the resolution.
-    # Claude Fable 5 is Anthropic's strongest widely-released model
-    # today but is not yet wired as a Claude CLI short alias, so
-    # the keyboard surface stays at opus/sonnet/haiku.
+    # Claude Code accepts short aliases that auto-resolve to the
+    # current SKU. Listing the aliases here keeps the registry stable
+    # across Anthropic version bumps; the CLI handles the resolution.
+    # Verified 2026-08-10 against Claude Code CLI docs and local
+    # `claude --help`.
     "anthropic": {
+        "fable": "\U0001f52e Fable",
         "opus": "\U0001f9e0 Opus",
         "sonnet": "\u26a1 Sonnet",
         "haiku": "\U0001fab6 Haiku",
@@ -738,7 +737,7 @@ def _model_allowed_by_registry(model: str, backend: str, allowed_models: tuple[s
     # intentional full-ID behavior until the next `make install`
     # rewrites /etc/kai/backends.yaml with the explicit wildcard.
     if backend == "claude" and model.startswith("claude-"):
-        old_generated_claude_aliases = frozenset(PROVIDER_MODELS["anthropic"].keys())
+        old_generated_claude_aliases = frozenset({"haiku", "opus", "sonnet"})
         if frozenset(allowed_models) == old_generated_claude_aliases:
             warned = (backend, model)
             if warned not in _legacy_registry_model_warning_emitted:
@@ -917,14 +916,33 @@ def models_for_backend(agent_backend: str, eff_provider: str) -> dict[str, str] 
     providers the operator authenticated via `opencode auth login`.
     A curated keyboard would mislead users into picking IDs their
     OpenCode install cannot resolve.
+
+    When the protected backend registry has an `allowed_models`
+    ceiling, the returned curated list is filtered through that ceiling
+    so user-facing choices never advertise a model that the canonical
+    validator will reject. Wildcard registry entries such as
+    `claude-*` allow typed full IDs, but they are not rendered as
+    literal keyboard choices.
     """
     if agent_backend == "codex":
-        return CODEX_MODELS
-    if agent_backend == "opencode":
+        models = CODEX_MODELS
+    elif agent_backend == "opencode" or eff_provider in OPEN_ENDED_PROVIDERS:
         return None
-    if eff_provider in OPEN_ENDED_PROVIDERS:
+    else:
+        models = PROVIDER_MODELS.get(eff_provider)
+
+    if models is None:
         return None
-    return PROVIDER_MODELS.get(eff_provider)
+
+    registry_allowed = _backend_registry_allowed_models(agent_backend)
+    if registry_allowed is None:
+        return models
+    filtered = {
+        model: label
+        for model, label in models.items()
+        if _model_allowed_by_registry(model, agent_backend, registry_allowed)
+    }
+    return filtered or None
 
 
 def get_user_backend_and_provider(user_config: "UserConfig | None", config: "Config") -> tuple[str, str]:

@@ -7356,6 +7356,7 @@ class TestApplyBackendRegistry:
         assert data["backends"]["opencode"]["command"] == "/custom/opencode"
         assert data["backends"]["goose"]["command"] == "/custom/goose"
         assert "gpt-5.6-sol" in data["backends"]["codex"]["allowed_models"]
+        assert "fable" in data["backends"]["claude"]["allowed_models"]
         assert "claude-*" in data["backends"]["claude"]["allowed_models"]
 
     def test_registry_and_sudoers_use_same_explicit_backend_paths(self):
