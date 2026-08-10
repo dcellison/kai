@@ -151,6 +151,7 @@ make check      # Lint and format check
 make typecheck  # Run Pyright on the maintained typed baseline
 make audit-deps # Report known vulnerabilities in installed dependencies
 make check-install-constraints # Dry-run install dependency resolution with constraints
+make module-sizes # Report large Python modules for decomposition planning
 make test       # Run pytest
 make run        # Start Kai locally
 ```

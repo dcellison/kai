@@ -2,7 +2,7 @@
 # where tools are installed globally (no .venv).
 BIN = .venv/bin/
 
-.PHONY: run lint format check typecheck audit-deps check-install-constraints test setup config install install-status tts-model refresh-models
+.PHONY: run lint format check typecheck audit-deps check-install-constraints module-sizes test setup config install install-status tts-model refresh-models
 
 run:
 	$(BIN)python -m kai
@@ -24,6 +24,9 @@ audit-deps:
 
 check-install-constraints:
 	$(BIN)python -m pip install --dry-run --constraint requirements/constraints.txt -e '.[memory,totp,tts]'
+
+module-sizes:
+	$(BIN)python scripts/module-sizes.py
 
 test:
 	$(BIN)python -m pytest tests/ -v

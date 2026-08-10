@@ -171,6 +171,10 @@ into `/opt/kai` and passes it to `pip install --constraint`. Treat changes to
 that file as install-affecting supply-chain changes and review them with the
 same care as `pyproject.toml`.
 
+Use `make module-sizes` when planning trust-boundary refactors. The report is
+advisory; it exists to make oversized modules visible before incremental
+decomposition work.
+
 ### Tests
 
 - Tests live in `tests/` and use **pytest** with **pytest-asyncio**.
