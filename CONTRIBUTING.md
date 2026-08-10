@@ -166,6 +166,11 @@ Direct dependencies should use both a lower bound and a conservative upper
 bound, normally the next major version. This keeps routine installs from
 silently crossing major-version compatibility boundaries.
 
+If `requirements/constraints.txt` exists, the protected installer copies it
+into `/opt/kai` and passes it to `pip install --constraint`. Treat changes to
+that file as install-affecting supply-chain changes and review them with the
+same care as `pyproject.toml`.
+
 ### Tests
 
 - Tests live in `tests/` and use **pytest** with **pytest-asyncio**.

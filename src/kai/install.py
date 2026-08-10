@@ -125,6 +125,7 @@ class ServiceStartError(Exception):
 # Files and directories to copy from source to the install location.
 # Excludes __pycache__, .pyc, and other build artifacts.
 _SOURCE_EXCLUDES = {"__pycache__", "*.pyc", "*.egg-info", ".git", ".venv", ".env"}
+_INSTALL_CONSTRAINTS_REL = Path("requirements") / "constraints.txt"
 
 # ── Input helpers ────────────────────────────────────────────────────
 
@@ -5430,11 +5431,13 @@ def _retire_install_home_dir(install_path: Path, dry_run: bool) -> None:
 
 
 def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -> None:
-    """Copy source tree and home config from PROJECT_ROOT to the install location."""
+    """Copy source tree, package metadata, optional constraints, and home config into the install tree."""
     src_src = PROJECT_ROOT / "src"
     src_dst = install_path / "src"
     pyproject_src = PROJECT_ROOT / "pyproject.toml"
     pyproject_dst = install_path / "pyproject.toml"
+    constraints_src = PROJECT_ROOT / _INSTALL_CONSTRAINTS_REL
+    constraints_dst = install_path / _INSTALL_CONSTRAINTS_REL
     # Config templates (e.g. goose-config.yaml) referenced by later
     # install steps like _apply_goose_config(). Root-owned since
     # these are static templates, not runtime data. Per-user runtime
@@ -5470,6 +5473,10 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
     if dry_run:
         print(f"[DRY RUN] Would copy: {src_src} -> {src_dst}")
         print(f"[DRY RUN] Would copy: {pyproject_src} -> {pyproject_dst}")
+        if constraints_src.is_file():
+            print(f"[DRY RUN] Would copy: {constraints_src} -> {constraints_dst}")
+        elif constraints_dst.exists():
+            print(f"[DRY RUN] Would remove stale install constraints: {constraints_dst}")
         if config_src.is_dir():
             print(f"[DRY RUN] Would copy: {config_src} -> {config_dst}")
         # Dry-run preview for the empty-home cleanup. Matches the
@@ -5489,6 +5496,15 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
     shutil.copy2(pyproject_src, pyproject_dst)
     os.chown(pyproject_dst, 0, 0)
     print(f"  Copied {pyproject_dst}")
+
+    if constraints_src.is_file():
+        constraints_dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(constraints_src, constraints_dst)
+        os.chown(constraints_dst, 0, 0)
+        print(f"  Copied {constraints_dst}")
+    elif constraints_dst.exists():
+        constraints_dst.unlink()
+        print(f"  Removed stale install constraints {constraints_dst}")
 
     # Copy templates/config/ -> install/config/ (config templates like
     # goose-config.yaml). These are static templates referenced by
@@ -5540,6 +5556,11 @@ def _resolve_venv_base_python() -> str:
     return python
 
 
+def _optional_file_checksum(path: Path) -> str:
+    """Return a file checksum, or an empty string when the optional file is absent."""
+    return _file_checksum(path) if path.is_file() else ""
+
+
 def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
     """
     Create or update the virtual environment in the install location.
@@ -5560,6 +5581,7 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
     venv_path = install_path / "venv"
     venv_python = venv_path / "bin" / "python"
     pyproject_dst = install_path / "pyproject.toml"
+    constraints_dst = install_path / _INSTALL_CONSTRAINTS_REL
     src_dst = install_path / "src"
     build_path = install_path / "build"
 
@@ -5588,6 +5610,13 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
         incoming_pyproject = PROJECT_ROOT / "pyproject.toml" if dry_run else pyproject_dst
         new_pyproject = _file_checksum(incoming_pyproject)
 
+        constraints_checksum_file = install_path / ".constraints.sha256"
+        old_constraints = ""
+        if constraints_checksum_file.exists():
+            old_constraints = constraints_checksum_file.read_text().strip()
+        incoming_constraints = PROJECT_ROOT / _INSTALL_CONSTRAINTS_REL if dry_run else constraints_dst
+        new_constraints = _optional_file_checksum(incoming_constraints)
+
         src_checksum_file = install_path / ".src.sha256"
         old_src = ""
         if src_checksum_file.exists():
@@ -5595,14 +5624,21 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
         incoming_src = PROJECT_ROOT / "src" if dry_run else src_dst
         new_src = _src_checksum(incoming_src)
 
-        if old_pyproject == new_pyproject and old_src == new_src and not venv_needs_repair:
-            print("  Venv unchanged (pyproject.toml and source checksums match)")
+        if (
+            old_pyproject == new_pyproject
+            and old_constraints == new_constraints
+            and old_src == new_src
+            and not venv_needs_repair
+        ):
+            print("  Venv unchanged (pyproject.toml, constraints, and source checksums match)")
             return
 
         # Report what changed for operator visibility
         changed: list[str] = []
         if old_pyproject != new_pyproject:
             changed.append("pyproject.toml")
+        if old_constraints != new_constraints:
+            changed.append("constraints")
         if old_src != new_src:
             changed.append("source")
 
@@ -5666,16 +5702,18 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
     # and doesn't depend on the source directory being writable.
     extras = "memory,totp,tts"
     install_spec = f"{install_path}[{extras}]"
-    subprocess.run(
-        [str(venv_python), "-m", "pip", "install", install_spec],
-        check=True,
-    )
+    pip_install_cmd = [str(venv_python), "-m", "pip", "install"]
+    if constraints_dst.is_file():
+        pip_install_cmd.extend(["--constraint", str(constraints_dst)])
+    pip_install_cmd.append(install_spec)
+    subprocess.run(pip_install_cmd, check=True)
     print("  Installed package into venv")
 
     # Save checksums for future update detection. Both are written after a
     # successful install so that a partial failure (e.g., pip crash mid-install)
     # leaves stale checksums and triggers a retry on the next run.
     (install_path / ".pyproject.sha256").write_text(_file_checksum(pyproject_dst) + "\n")
+    (install_path / ".constraints.sha256").write_text(_optional_file_checksum(constraints_dst) + "\n")
     (install_path / ".src.sha256").write_text(_src_checksum(src_dst) + "\n")
 
     # Set venv ownership to root (read-only for service user)

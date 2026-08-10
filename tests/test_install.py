@@ -46,6 +46,7 @@ from kai.install import (
     _generate_systemd_unit,
     _generate_users_yaml,
     _migrate_identity_to_claude_md,
+    _optional_file_checksum,
     _prompt_choice,
     _prompt_optional_choice,
     _read_users_yaml_text,
@@ -4431,11 +4432,89 @@ class TestApplyVenv:
 
         # Both checksum files should exist now
         assert (install / ".pyproject.sha256").exists()
+        assert (install / ".constraints.sha256").exists()
         assert (install / ".src.sha256").exists()
 
         # And they should contain the correct checksums
         assert (install / ".pyproject.sha256").read_text().strip() == _file_checksum(install / "pyproject.toml")
+        assert (install / ".constraints.sha256").read_text().strip() == ""
         assert (install / ".src.sha256").read_text().strip() == _src_checksum(install / "src")
+
+    def test_reinstalls_on_constraints_change(self, tmp_path, monkeypatch, capsys):
+        """Constraint file changes trigger a venv reinstall even when source is unchanged."""
+        install = tmp_path / "opt" / "kai"
+        install.mkdir(parents=True)
+        (install / "venv" / "bin").mkdir(parents=True)
+        (install / "venv" / "bin" / "python").touch(mode=0o755)
+
+        (install / "pyproject.toml").write_text("[project]\nname = 'kai'\n")
+        constraints = install / "requirements" / "constraints.txt"
+        constraints.parent.mkdir(parents=True)
+        constraints.write_text("aiohttp==3.13.4\n")
+        src = install / "src" / "kai"
+        src.mkdir(parents=True)
+        (src / "__init__.py").write_text("# init")
+
+        (install / ".pyproject.sha256").write_text(_file_checksum(install / "pyproject.toml") + "\n")
+        (install / ".constraints.sha256").write_text(_file_checksum(constraints) + "\n")
+        (install / ".src.sha256").write_text(_src_checksum(install / "src") + "\n")
+
+        constraints.write_text("aiohttp==3.14.0\n")
+
+        commands = []
+
+        def fake_run(cmd, **kwargs):
+            commands.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr("kai.install._set_ownership", lambda *a, **kw: None)
+
+        _apply_venv(install, is_update=True, dry_run=False)
+
+        output = capsys.readouterr().out
+        assert "constraints changed" in output
+        assert [
+            str(install / "venv" / "bin" / "python"),
+            "-m",
+            "pip",
+            "install",
+            "--constraint",
+            str(constraints),
+            f"{install}[memory,totp,tts]",
+        ] in commands
+        assert (install / ".constraints.sha256").read_text().strip() == _file_checksum(constraints)
+
+    def test_dry_run_reports_constraints_change(self, tmp_path, monkeypatch, capsys):
+        """Dry-run compares incoming constraints without copying them."""
+        install = tmp_path / "opt" / "kai"
+        install.mkdir(parents=True)
+        (install / "venv" / "bin").mkdir(parents=True)
+        (install / "venv" / "bin" / "python").touch(mode=0o755)
+
+        (install / "pyproject.toml").write_text("[project]\nname = 'kai'\n")
+        src = install / "src" / "kai"
+        src.mkdir(parents=True)
+        (src / "__init__.py").write_text("# init")
+
+        (install / ".pyproject.sha256").write_text(_file_checksum(install / "pyproject.toml") + "\n")
+        (install / ".src.sha256").write_text(_src_checksum(install / "src") + "\n")
+
+        project = tmp_path / "project"
+        (project / "src" / "kai").mkdir(parents=True)
+        (project / "pyproject.toml").write_text("[project]\nname = 'kai'\n")
+        (project / "src" / "kai" / "__init__.py").write_text("# init")
+        incoming_constraints = project / "requirements" / "constraints.txt"
+        incoming_constraints.parent.mkdir(parents=True)
+        incoming_constraints.write_text("aiohttp==3.13.4\n")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", project)
+
+        _apply_venv(install, is_update=True, dry_run=True)
+
+        output = capsys.readouterr().out
+        assert "DRY RUN" in output
+        assert "constraints changed" in output
+        assert not (install / "requirements" / "constraints.txt").exists()
 
     def test_first_update_without_src_checksum(self, tmp_path, monkeypatch, capsys):
         """First update after this fix triggers reinstall (no .src.sha256 from old install)."""
@@ -6215,17 +6294,17 @@ class TestGenerateLauncherScript:
 
 class TestApplySource:
     """
-    _apply_source copies src/, pyproject.toml, and templates/config/
-    into the install tree, and retires the dead <install>/home/.claude/
-    subtree (and any legacy IDENTITY.md) via _retire_install_home_claude.
-    Post-#447 the install tree carries no CLAUDE.md; the per-user
-    runtime <DATA_DIR>/home/<chat_id>/.claude/CLAUDE.md is seeded by
+    _apply_source copies src/, pyproject.toml, optional install
+    constraints, and templates/config/ into the install tree, and
+    retires the dead <install>/home/.claude/ subtree (and any legacy
+    IDENTITY.md) via _retire_install_home_claude. Post-#447 the install
+    tree carries no CLAUDE.md; the per-user runtime
+    <DATA_DIR>/home/<chat_id>/.claude/CLAUDE.md is seeded by
     _apply_migrate (eager, install-time) and backend.ensure_user_home
     (lazy, first-message fallback). The retirement helper has its own
-    pinned contracts in TestRetireInstallHomeClaude below; the
-    migration helper that ran before #447 is no longer called from
-    _apply_source but is unit-tested directly in
-    TestMigrateIdentityToClaudeMd.
+    pinned contracts in TestRetireInstallHomeClaude below; the migration
+    helper that ran before #447 is no longer called from _apply_source
+    but is unit-tested directly in TestMigrateIdentityToClaudeMd.
     """
 
     def test_dry_run_does_not_mention_retired_template_paths(self, tmp_path, capsys):
@@ -6331,6 +6410,59 @@ class TestApplySource:
         # Should not create the destination during dry run.
         assert not (tmp_path / "install" / "config").exists()
         assert not (tmp_path / "install" / "home" / "config").exists()
+
+    def test_copies_install_constraints(self, tmp_path):
+        """requirements/constraints.txt is copied to the install tree when present."""
+        src = tmp_path / "source"
+        (src / "src").mkdir(parents=True)
+        (src / "src" / "module.py").write_text("code")
+        (src / "pyproject.toml").write_text("[project]")
+        constraints_src = src / "requirements" / "constraints.txt"
+        constraints_src.parent.mkdir(parents=True)
+        constraints_src.write_text("aiohttp==3.13.4\n")
+        install = tmp_path / "install"
+        install.mkdir()
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install._set_ownership"),
+            patch("os.chown"),
+        ):
+            _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
+
+        constraints_dst = install / "requirements" / "constraints.txt"
+        assert constraints_dst.read_text() == "aiohttp==3.13.4\n"
+
+    def test_removes_stale_install_constraints(self, tmp_path):
+        """A removed source constraints file removes the stale install copy."""
+        src = tmp_path / "source"
+        (src / "src").mkdir(parents=True)
+        (src / "src" / "module.py").write_text("code")
+        (src / "pyproject.toml").write_text("[project]")
+        install = tmp_path / "install"
+        install.mkdir()
+        constraints_dst = install / "requirements" / "constraints.txt"
+        constraints_dst.parent.mkdir(parents=True)
+        constraints_dst.write_text("aiohttp==3.13.4\n")
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install._set_ownership"),
+            patch("os.chown"),
+        ):
+            _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
+
+        assert not constraints_dst.exists()
+
+
+class TestOptionalFileChecksum:
+    def test_missing_file_returns_empty_string(self, tmp_path):
+        assert _optional_file_checksum(tmp_path / "missing.txt") == ""
+
+    def test_existing_file_returns_file_checksum(self, tmp_path):
+        path = tmp_path / "constraints.txt"
+        path.write_text("aiohttp==3.13.4\n")
+        assert _optional_file_checksum(path) == _file_checksum(path)
 
 
 # ── _retire_install_home_claude ──────────────────────────────────────
