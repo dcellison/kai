@@ -111,6 +111,9 @@ deprecated WEBHOOK_SECRET fallback**. Pressing Enter keeps compatibility. The
 generated `install.conf` can then be reviewed with `make DRY_RUN=1 install`
 before `make install` deploys it.
 
+The current remediation status and compatibility exceptions are tracked in
+[Security Remediation Status](SECURITY_REMEDIATION_STATUS.md).
+
 See [TOTP Authentication](https://github.com/dcellison/kai/wiki/TOTP-Authentication), [GitHub Notification Routing](https://github.com/dcellison/kai/wiki/GitHub-Notification-Routing), and [Exposing Kai to the Internet](https://github.com/dcellison/kai/wiki/Exposing-Kai-to-the-Internet) for the detailed operational docs.
 
 ## Common Workflows
