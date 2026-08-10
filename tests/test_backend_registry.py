@@ -73,6 +73,36 @@ def test_registry_command_must_be_absolute(tmp_path, monkeypatch):
         resolve_backend_command("claude")
 
 
+@pytest.mark.parametrize("mode", [0o664, 0o646])
+def test_registry_file_must_not_be_group_or_world_writable(tmp_path, monkeypatch, mode):
+    """The installed backend registry is a machine-capability boundary.
+
+    If the file is writable by group/other users, a non-admin account
+    could swap backend commands and bypass the curated registry.
+    """
+    claude = _exe(tmp_path / "claude")
+    registry = tmp_path / "backends.yaml"
+    registry.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "backends": {
+                    "claude": {
+                        "driver": "claude",
+                        "runtime": "local_process",
+                        "command": str(claude),
+                    }
+                },
+            }
+        )
+    )
+    registry.chmod(mode)
+    monkeypatch.setenv("KAI_BACKENDS_YAML", str(registry))
+
+    with pytest.raises(BackendRegistryError, match="unsafe permissions"):
+        resolve_backend_command("claude")
+
+
 def test_default_missing_registry_uses_legacy_path_resolution(monkeypatch):
     monkeypatch.delenv("KAI_BACKENDS_YAML", raising=False)
     monkeypatch.delenv("KAI_INSTALL_DIR", raising=False)

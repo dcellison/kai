@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -89,6 +90,7 @@ def load_backend_registry(path: Path | None = None) -> dict[str, BackendRegistry
         if explicit_path:
             raise BackendRegistryError(f"backend registry {registry_path} does not exist")
         return {}
+    _validate_registry_file_permissions(registry_path)
     try:
         raw = yaml.safe_load(registry_path.read_text()) or {}
     except OSError as e:
@@ -128,6 +130,18 @@ def load_backend_registry(path: Path | None = None) -> dict[str, BackendRegistry
             allowed_models=model_tuple,
         )
     return entries
+
+
+def _validate_registry_file_permissions(path: Path) -> None:
+    """Reject registry files writable by group or other users."""
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError as e:
+        raise BackendRegistryError(f"could not stat backend registry {path}: {e}") from e
+    if mode & 0o022:
+        raise BackendRegistryError(
+            f"backend registry {path} has unsafe permissions {mode:#04o}; remove group/other write access"
+        )
 
 
 def _validate_absolute_executable(backend: str, command: str, source: str) -> str:
