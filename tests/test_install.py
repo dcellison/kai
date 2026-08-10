@@ -394,7 +394,7 @@ class TestGenerateSudoers:
     def test_claude_bin_homebrew_fallback_when_service_native_missing(self, monkeypatch):
         """On macOS, a missing service-user native Claude install falls
         back to the Homebrew cask path so runtime backend switches can
-        use Claude without a hand-authored CLAUDE_BIN."""
+        use Claude when the direct formatter fallback is exercised."""
         monkeypatch.setattr("kai.install._user_home", lambda u: "/Users/kai")
         monkeypatch.setattr(
             "kai.install._validate_claude_bin",
@@ -407,9 +407,9 @@ class TestGenerateSudoers:
         assert "/Users/kai/.local/bin/claude" not in result
 
     def test_claude_bin_arg_overrides_default(self, monkeypatch):
-        """An explicit claude_bin (the wizard-collected CLAUDE_BIN)
-        replaces the service-home fallback in the per-user rule, so
-        the rule names the same binary the runtime spawn pins."""
+        """An explicit claude_bin replaces the service-home fallback
+        in the per-user rule. Protected install callers pass this from
+        the backend registry."""
         monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
         result = _generate_sudoers("kai", os_users=["alice"], claude_bin="/opt/homebrew/bin/claude")
         assert "kai ALL=(alice) SETENV: NOPASSWD: /opt/homebrew/bin/claude" in result
@@ -1282,6 +1282,10 @@ class TestCmdConfig:
             "kai.install._install_staging_path",
             lambda filename: tmp_path / filename,
         )
+        monkeypatch.setattr(
+            "kai.install._backend_choices_for_config",
+            lambda service_user: ["claude", "codex", "goose", "opencode"],
+        )
 
     @staticmethod
     def _simulate_existing_etc_users_yaml(monkeypatch, content):
@@ -1315,6 +1319,56 @@ class TestCmdConfig:
             content = yaml.safe_dump(parsed, sort_keys=False)
         monkeypatch.setattr("kai.install._read_users_yaml_text", lambda path: content)
 
+    def test_backend_choices_read_existing_registry(self, tmp_path, monkeypatch):
+        registry = tmp_path / "backends.yaml"
+        registry.write_text(
+            "version: 1\n"
+            "backends:\n"
+            "  codex:\n"
+            "    command: /usr/local/bin/codex\n"
+            "  goose:\n"
+            "    command: /opt/homebrew/bin/goose\n"
+            "  unknown:\n"
+            "    command: /tmp/unknown\n"
+        )
+        monkeypatch.setattr("kai.install.BACKENDS_YAML", registry)
+
+        assert kai.install._backend_choices_from_existing_registry() == ["codex", "goose"]
+
+    def test_backend_choices_fallback_to_global_discovery(self, monkeypatch):
+        monkeypatch.setattr("kai.install._backend_choices_from_existing_registry", lambda: [])
+        monkeypatch.setattr(
+            "kai.install._discover_backend_commands",
+            lambda service_user: {"opencode": "/usr/local/bin/opencode", "codex": "/usr/local/bin/codex"},
+        )
+
+        assert kai.install._backend_choices_for_config("kai") == ["codex", "opencode"]
+
+    def test_config_fails_when_no_backend_is_installed(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr("kai.install._install_staging_path", lambda filename: tmp_path / filename)
+        monkeypatch.setattr("kai.install._backend_choices_for_config", lambda service_user: [])
+        inputs = iter(
+            [
+                "protected",
+                "/opt/kai",
+                "/var/lib/kai",
+                "kai",
+                "darwin",
+                "fake-token",
+                "12345",
+                "admin",
+                "testuser",
+                "polling",
+            ]
+        )
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        with pytest.raises(SystemExit, match="No installed Kai backends were found"):
+            _cmd_config()
+
     def test_writes_install_conf(self, tmp_path, monkeypatch):
         """Config subcommand writes valid JSON to install.conf."""
         monkeypatch.chdir(tmp_path)
@@ -1336,7 +1390,6 @@ class TestCmdConfig:
                 "testuser",  # required protected os_user
                 "polling",  # transport
                 "claude",  # agent backend
-                "/usr/bin/true",  # claude binary path
                 "sonnet",  # model
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # timeout
@@ -1388,12 +1441,9 @@ class TestCmdConfig:
         assert data["users"][0]["telegram_id"] == 12345
         assert data["users"][0]["role"] == "admin"
 
-    def test_claude_install_emits_claude_bin(self, tmp_path, monkeypatch):
-        """The wizard-collected claude binary path lands in
-        install.conf's env as CLAUDE_BIN, so `make install` writes
-        /etc/kai/env's CLAUDE_BIN and the sudoers SETENV rule from the
-        same source of truth (the same contract CODEX_BIN /
-        OPENCODE_BIN / GOOSE_BIN follow)."""
+    def test_config_does_not_emit_backend_binary_paths(self, tmp_path, monkeypatch):
+        """Backend command paths are install registry facts, not
+        install.conf values collected from the operator."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
@@ -1405,7 +1455,8 @@ class TestCmdConfig:
         _cmd_config()
 
         conf = json.loads((tmp_path / "install.conf").read_text())
-        assert conf["env"]["CLAUDE_BIN"] == "/usr/bin/true"
+        for key in ("CLAUDE_BIN", "CODEX_BIN", "GOOSE_BIN", "OPENCODE_BIN"):
+            assert key not in conf["env"]
 
     def test_advanced_user_options(self, tmp_path, monkeypatch):
         """
@@ -1436,7 +1487,6 @@ class TestCmdConfig:
                 # no home_workspace prompt post-#353
                 "polling",  # transport
                 "claude",  # agent backend
-                "/usr/bin/true",  # claude binary path
                 "sonnet",  # model
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # timeout
@@ -1518,7 +1568,6 @@ class TestCmdConfig:
                 "testuser",  # required protected os_user
                 "polling",  # transport
                 "claude",  # agent backend
-                "/usr/bin/true",  # claude binary path
                 "sonnet",  # model
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # timeout
@@ -1587,7 +1636,6 @@ class TestCmdConfig:
                 "testuser",  # os_user (no home_workspace prompt should follow)
                 "polling",
                 "claude",
-                "/usr/bin/true",  # claude binary path
                 "sonnet",
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",
@@ -1649,7 +1697,6 @@ class TestCmdConfig:
                 "testuser",  # required protected os_user
                 "polling",  # transport
                 "goose",  # agent backend (prompt shown because existing config has goose)
-                "/opt/homebrew/bin/goose",  # goose binary path (validator stubbed)
                 "anthropic",  # goose provider
                 "sk-ant-test-key",  # ANTHROPIC_API_KEY
                 "sonnet",  # model
@@ -1680,7 +1727,6 @@ class TestCmdConfig:
         assert conf["env"]["DEFAULT_BACKEND"] == "goose"
         assert conf["env"]["DEFAULT_PROVIDER"] == "anthropic"
         assert conf["env"]["ANTHROPIC_API_KEY"] == "sk-ant-test-key"
-        assert conf["env"]["GOOSE_BIN"] == "/opt/homebrew/bin/goose"
         # Memory was declined, so the retrieval-only note must not
         # print; it belongs only to the memory-enabled flow.
         out = capsys.readouterr().out
@@ -1785,7 +1831,6 @@ class TestCmdConfig:
                 "testuser",  # required protected os_user
                 "polling",  # transport
                 "goose",  # agent backend
-                "/opt/homebrew/bin/goose",  # goose binary path (validator stubbed)
                 "ollama",  # goose provider (no key needed)
                 "sonnet",  # model
                 "false",  # customize per-role models (decline; use registry defaults)
@@ -1843,13 +1888,7 @@ class TestCmdConfig:
         existing_users_yaml = "users:\n  - telegram_id: 999\n    name: existing\n    role: admin\n"
         self._simulate_existing_etc_users_yaml(monkeypatch, existing_users_yaml)
 
-        # Press Enter for everything except the claude binary prompt,
-        # whose default depends on the runner's PATH (`which claude`);
-        # an explicit answer keeps the test host-independent.
-        monkeypatch.setattr(
-            "builtins.input",
-            lambda prompt: "/usr/bin/true" if "Claude binary path" in prompt else "",
-        )
+        monkeypatch.setattr("builtins.input", lambda prompt: "")
 
         _cmd_config()
 
@@ -1905,8 +1944,6 @@ class TestCmdConfig:
         conf_path.write_text(json.dumps(existing))
 
         def answer(prompt: str) -> str:
-            if "Claude binary path" in prompt:
-                return "/usr/bin/true"
             if "Retain deprecated WEBHOOK_SECRET fallback" in prompt:
                 return "false"
             return ""
@@ -1985,21 +2022,10 @@ class TestCmdConfig:
             )
         # Wizard prompts for provider + API key only for non-claude
         # backends. The API key prompt itself is skipped when provider
-        # is "ollama" (local model, no auth). The goose backend block
-        # additionally prompts for the binary path before the provider
-        # prompt; goose callers stub `_validate_goose_bin` (the codex
-        # wizard-test precedent), so the literal path here never
-        # touches the host filesystem.
+        # is "ollama" (local model, no auth). Backend command paths
+        # now come from the installed backend registry/discovery, not
+        # from config wizard answers.
         backend_block: list[str] = []
-        if agent_backend == "claude":
-            # The global-claude block prompts for the binary path
-            # right after backend selection. /usr/bin/true exists and
-            # is executable on macOS and Linux CI runners alike, so
-            # the real _validate_claude_bin passes without a claude
-            # install on the host and without a validator stub.
-            backend_block.append("/usr/bin/true")
-        if agent_backend == "goose":
-            backend_block.append("/opt/homebrew/bin/goose")
         if agent_backend != "claude":
             backend_block.append(llm_provider)
             if llm_provider != "ollama":
@@ -2372,13 +2398,8 @@ class TestCmdConfig:
         conf_path.write_text(json.dumps(existing))
         # users.yaml is simulated above via _simulate_existing_etc_users_yaml,
         # which keeps the wizard on the existing-config branch and skips
-        # the per-user prompts that lack defaults. The claude binary
-        # prompt gets an explicit answer because its default depends
-        # on the runner's PATH (`which claude`).
-        monkeypatch.setattr(
-            "builtins.input",
-            lambda prompt: "/usr/bin/true" if "Claude binary path" in prompt else "",
-        )
+        # the per-user prompts that lack defaults.
+        monkeypatch.setattr("builtins.input", lambda prompt: "")
 
         _cmd_config()
 
@@ -2468,7 +2489,6 @@ class TestCmdConfig:
                 "testuser",  # required protected os_user
                 "polling",  # transport
                 "goose",  # agent backend (was claude)
-                "/opt/homebrew/bin/goose",  # goose binary path (validator stubbed)
                 "anthropic",  # goose provider
                 "sk-ant-test-key",  # API key
                 "sonnet",  # model
@@ -2809,7 +2829,6 @@ class TestCmdConfig:
                 "polling",  # transport
                 "codex",  # agent backend
                 "subscription",  # codex auth mode
-                "/usr/local/bin/codex",  # codex binary path
                 # model: handled by _prompt_default_model mock
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # agent timeout
@@ -3333,7 +3352,6 @@ class TestCmdConfigDefaultModelDispatch:
             "fake-token",  # bot token
             "polling",  # transport
             "claude",  # agent backend
-            "/usr/bin/true",  # claude binary path
             # no DEFAULT_MODEL prompt; agent default comes from MODEL_REGISTRY
             "false",  # customize per-role models (decline; use registry defaults)
             "120",  # agent timeout (global default)
@@ -3374,7 +3392,6 @@ class TestCmdConfigDefaultModelDispatch:
             "codex",  # agent backend
             "subscription",  # codex auth mode
             # No OPENAI_API_KEY prompt in subscription mode
-            "/usr/local/bin/codex",  # codex binary path
             # No provider prompt (codex is single-provider; absent from BACKENDS_NEEDING_PROVIDER_PROMPT)
             # no DEFAULT_MODEL prompt; agent default comes from MODEL_REGISTRY
             "false",  # customize per-role models (decline; use registry defaults)
@@ -3407,7 +3424,6 @@ class TestCmdConfigDefaultModelDispatch:
             "fake-token",  # bot token
             "polling",  # transport
             "goose",  # agent backend
-            "/opt/homebrew/bin/goose",  # goose binary path (validator stubbed)
             "openai",  # llm provider
             "openai-key",  # OPENAI_API_KEY
             # no DEFAULT_MODEL prompt; agent default comes from MODEL_REGISTRY
@@ -7336,10 +7352,16 @@ class TestApplySecretsDryRun:
 
 
 class TestApplyBackendRegistry:
-    def test_build_registry_uses_env_paths(self, monkeypatch):
-        monkeypatch.setattr("kai.install._resolve_default_claude_bin", lambda service_user: "/fallback/claude")
-        monkeypatch.setattr("kai.install._resolve_default_codex_bin", lambda: "/fallback/codex")
-
+    def test_build_registry_uses_discovered_global_commands(self, monkeypatch):
+        monkeypatch.setattr(
+            "kai.install._discover_backend_commands",
+            lambda service_user: {
+                "claude": "/global/claude",
+                "codex": "/global/codex",
+                "opencode": "/global/opencode",
+                "goose": "/global/goose",
+            },
+        )
         rendered = kai.install._build_backend_registry(
             "kai",
             {
@@ -7351,42 +7373,61 @@ class TestApplyBackendRegistry:
         )
         data = yaml.safe_load(rendered)
 
-        assert data["backends"]["claude"]["command"] == "/custom/claude"
-        assert data["backends"]["codex"]["command"] == "/custom/codex"
-        assert data["backends"]["opencode"]["command"] == "/custom/opencode"
-        assert data["backends"]["goose"]["command"] == "/custom/goose"
+        assert data["backends"]["claude"]["command"] == "/global/claude"
+        assert data["backends"]["codex"]["command"] == "/global/codex"
+        assert data["backends"]["opencode"]["command"] == "/global/opencode"
+        assert data["backends"]["goose"]["command"] == "/global/goose"
         assert "gpt-5.6-sol" in data["backends"]["codex"]["allowed_models"]
         assert "fable" in data["backends"]["claude"]["allowed_models"]
         assert "claude-*" in data["backends"]["claude"]["allowed_models"]
 
-    def test_registry_and_sudoers_use_same_explicit_backend_paths(self):
+    def test_registry_and_sudoers_use_same_discovered_backend_paths(self, monkeypatch):
+        monkeypatch.setattr(
+            "kai.install._discover_backend_commands",
+            lambda service_user: {
+                "claude": "/registry/claude",
+                "codex": "/registry/codex",
+                "opencode": "/registry/opencode",
+                "goose": "/registry/goose",
+            },
+        )
         env = {
-            "CLAUDE_BIN": "/registry/claude",
-            "CODEX_BIN": "/registry/codex",
-            "OPENCODE_BIN": "/registry/opencode",
-            "GOOSE_BIN": "/registry/goose",
+            "CLAUDE_BIN": "/ignored/claude",
+            "CODEX_BIN": "/ignored/codex",
+            "OPENCODE_BIN": "/ignored/opencode",
+            "GOOSE_BIN": "/ignored/goose",
         }
 
         registry = yaml.safe_load(kai.install._build_backend_registry("kai", env))
+        commands = {backend: entry["command"] for backend, entry in registry["backends"].items()}
         sudoers = _generate_sudoers(
             "kai",
             os_users=["alice"],
-            claude_bin=env["CLAUDE_BIN"],
-            codex_bin=env["CODEX_BIN"],
-            opencode_bin=env["OPENCODE_BIN"],
-            goose_bin=env["GOOSE_BIN"],
+            claude_bin=commands["claude"],
+            codex_bin=commands["codex"],
+            opencode_bin=commands["opencode"],
+            goose_bin=commands["goose"],
         )
 
         for backend in ("claude", "codex", "opencode", "goose"):
             command = registry["backends"][backend]["command"]
-            assert command == env[f"{backend.upper()}_BIN"]
             assert f"kai ALL=(alice) SETENV: NOPASSWD: {command}" in sudoers
 
-    def test_dry_run_prints_registry_write(self, capsys):
+    def test_dry_run_prints_registry_write(self, capsys, monkeypatch):
+        monkeypatch.setattr(
+            "kai.install._discover_backend_commands",
+            lambda service_user: {"claude": "/global/claude"},
+        )
         _apply_backend_registry("kai", {}, dry_run=True)
         output = capsys.readouterr().out
         assert "/etc/kai/backends.yaml" in output
         assert "0644" in output
+
+    def test_configured_backend_must_be_discovered(self, monkeypatch):
+        monkeypatch.setattr("kai.install._discover_backend_commands", lambda service_user: {"codex": "/global/codex"})
+
+        with pytest.raises(SystemExit, match="Configured backend\\(s\\) are not installed globally: claude"):
+            kai.install._build_backend_registry("kai", {"DEFAULT_BACKEND": "claude"})
 
 
 # ── _apply_secrets staging copy precedence ───────────────────────────
@@ -7806,7 +7847,6 @@ class TestCmdConfigCanonicalUsersYaml:
             "testuser",  # required protected os_user
             "polling",
             "claude",
-            "/usr/bin/true",  # claude binary path
             "sonnet",
             "false",  # customize per-role models (decline)
             "120",
@@ -8270,7 +8310,6 @@ class TestCmdConfigSingleUserMode:
             "false",  # advanced
             "polling",  # transport
             "claude",  # backend
-            "/usr/bin/true",  # claude binary path
             "sonnet",  # model
             "false",  # customize per-role models (decline; use registry defaults)
             "120",  # timeout
@@ -8538,6 +8577,10 @@ class TestApplySudoersDryRun:
         svc_home.mkdir(parents=True)
         # Intentionally do NOT create svc_home/.local/bin/claude.
         monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+        monkeypatch.setattr(
+            "kai.install._discover_backend_commands",
+            lambda service_user: {"claude": str(svc_home / ".local" / "bin" / "claude")},
+        )
         users_yaml = tmp_path / "users.yaml"
         users_yaml.write_text("users:\n  - telegram_id: 1\n    os_user: alice\n")
 
@@ -8552,6 +8595,10 @@ class TestApplySudoersDryRun:
         svc_home = tmp_path / "home" / "kai"
         svc_home.mkdir(parents=True)
         monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+        monkeypatch.setattr(
+            "kai.install._discover_backend_commands",
+            lambda service_user: {"claude": str(svc_home / ".local" / "bin" / "claude")},
+        )
         users_yaml = tmp_path / "users.yaml"
         users_yaml.write_text("users: []\n")
 
@@ -8567,6 +8614,10 @@ class TestApplySudoersDryRun:
         bin_dir.mkdir(parents=True)
         (bin_dir / "claude").write_text("#!/bin/sh\n")
         monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+        monkeypatch.setattr(
+            "kai.install._discover_backend_commands",
+            lambda service_user: {"claude": str(bin_dir / "claude")},
+        )
         users_yaml = tmp_path / "users.yaml"
         users_yaml.write_text("users:\n  - telegram_id: 1\n    os_user: alice\n")
 
@@ -8582,6 +8633,10 @@ class TestApplySudoersDryRun:
         svc_home.mkdir(parents=True)
         # Neither the claude binary nor the opencode binary exists.
         monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+        monkeypatch.setattr(
+            "kai.install._discover_backend_commands",
+            lambda service_user: {"opencode": str(tmp_path / "nope" / "opencode")},
+        )
         users_yaml = tmp_path / "users.yaml"
         users_yaml.write_text("users:\n  - telegram_id: 1\n    os_user: alice\n")
 
@@ -8589,14 +8644,13 @@ class TestApplySudoersDryRun:
             "kai",
             dry_run=True,
             users_yaml_path=users_yaml,
-            opencode_bin=str(tmp_path / "nope" / "opencode"),
             agent_backend="opencode",
         )
 
         captured = capsys.readouterr()
         assert "claude" not in captured.err
         assert "opencode sudoers" in captured.err
-        assert "OPENCODE_BIN" in captured.err
+        assert "/etc/kai/backends.yaml" in captured.err
 
     def test_opencode_only_install_silent_when_binary_exists(self, tmp_path, capsys, monkeypatch):
         """An opencode-only install with its binary in place warns about
@@ -8606,6 +8660,10 @@ class TestApplySudoersDryRun:
         opencode = tmp_path / "opencode"
         opencode.write_text("#!/bin/sh\n")
         monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+        monkeypatch.setattr(
+            "kai.install._discover_backend_commands",
+            lambda service_user: {"opencode": str(opencode)},
+        )
         users_yaml = tmp_path / "users.yaml"
         users_yaml.write_text("users:\n  - telegram_id: 1\n    os_user: alice\n")
 
@@ -8613,19 +8671,22 @@ class TestApplySudoersDryRun:
             "kai",
             dry_run=True,
             users_yaml_path=users_yaml,
-            opencode_bin=str(opencode),
             agent_backend="opencode",
         )
 
         captured = capsys.readouterr()
         assert "Warning" not in captured.err
 
-    def test_codex_backend_missing_binary_names_codex_bin(self, tmp_path, capsys, monkeypatch):
+    def test_codex_backend_missing_binary_names_registry(self, tmp_path, capsys, monkeypatch):
         """A codex install with a missing binary gets the codex warning
-        pointing at the CODEX_BIN wizard setting."""
+        pointing at backend registry regeneration."""
         svc_home = tmp_path / "home" / "kai"
         svc_home.mkdir(parents=True)
         monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+        monkeypatch.setattr(
+            "kai.install._discover_backend_commands",
+            lambda service_user: {"codex": str(tmp_path / "nope" / "codex")},
+        )
         users_yaml = tmp_path / "users.yaml"
         users_yaml.write_text("users:\n  - telegram_id: 1\n    os_user: alice\n")
 
@@ -8633,13 +8694,12 @@ class TestApplySudoersDryRun:
             "kai",
             dry_run=True,
             users_yaml_path=users_yaml,
-            codex_bin=str(tmp_path / "nope" / "codex"),
             agent_backend="codex",
         )
 
         captured = capsys.readouterr()
         assert "codex sudoers" in captured.err
-        assert "CODEX_BIN" in captured.err
+        assert "/etc/kai/backends.yaml" in captured.err
         assert "claude" not in captured.err
 
     def test_per_user_backend_override_widens_the_check(self, tmp_path, capsys, monkeypatch):
@@ -8652,6 +8712,13 @@ class TestApplySudoersDryRun:
         opencode = tmp_path / "opencode"
         opencode.write_text("#!/bin/sh\n")
         monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+        monkeypatch.setattr(
+            "kai.install._discover_backend_commands",
+            lambda service_user: {
+                "claude": str(svc_home / ".local" / "bin" / "claude"),
+                "opencode": str(opencode),
+            },
+        )
         users_yaml = tmp_path / "users.yaml"
         users_yaml.write_text(
             "users:\n"
@@ -8666,7 +8733,6 @@ class TestApplySudoersDryRun:
             "kai",
             dry_run=True,
             users_yaml_path=users_yaml,
-            opencode_bin=str(opencode),
             agent_backend="opencode",
         )
 
@@ -8677,9 +8743,9 @@ class TestApplySudoersDryRun:
         assert "the claude sudoers rule" in captured.err
         assert "the opencode sudoers rule" not in captured.err
 
-    def test_goose_only_install_missing_binary_names_goose_bin(self, tmp_path, capsys, monkeypatch):
+    def test_goose_only_install_missing_binary_names_registry(self, tmp_path, capsys, monkeypatch):
         """A goose-only install with os_users warns when the goose
-        binary path does not exist, and the remedy names GOOSE_BIN:
+        binary path does not exist, and the remedy names the registry:
         goose now has a per-user sudoers rule with a pinned path, so
         the backstop covers it the same way it covers the other
         backends. The path is passed explicitly (never the host
@@ -8688,6 +8754,10 @@ class TestApplySudoersDryRun:
         svc_home = tmp_path / "home" / "kai"
         svc_home.mkdir(parents=True)
         monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+        monkeypatch.setattr(
+            "kai.install._discover_backend_commands",
+            lambda service_user: {"goose": str(tmp_path / "nope" / "goose")},
+        )
         users_yaml = tmp_path / "users.yaml"
         users_yaml.write_text("users:\n  - telegram_id: 1\n    os_user: alice\n")
 
@@ -8695,13 +8765,12 @@ class TestApplySudoersDryRun:
             "kai",
             dry_run=True,
             users_yaml_path=users_yaml,
-            goose_bin=str(tmp_path / "nope" / "goose"),
             agent_backend="goose",
         )
 
         captured = capsys.readouterr()
         assert "the goose sudoers rule" in captured.err
-        assert "GOOSE_BIN" in captured.err
+        assert "/etc/kai/backends.yaml" in captured.err
         # Scoping: a goose-only install must not be told about the
         # other backends' binaries.
         assert "the claude sudoers rule" not in captured.err
@@ -8715,6 +8784,10 @@ class TestApplySudoersDryRun:
         svc_home = tmp_path / "home" / "kai"
         svc_home.mkdir(parents=True)
         monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+        monkeypatch.setattr(
+            "kai.install._discover_backend_commands",
+            lambda service_user: {"goose": str(goose)},
+        )
         users_yaml = tmp_path / "users.yaml"
         users_yaml.write_text("users:\n  - telegram_id: 1\n    os_user: alice\n")
         goose = tmp_path / "goose"
@@ -8725,7 +8798,6 @@ class TestApplySudoersDryRun:
             "kai",
             dry_run=True,
             users_yaml_path=users_yaml,
-            goose_bin=str(goose),
             agent_backend="goose",
         )
 
@@ -9701,20 +9773,8 @@ class TestValidateGooseBin:
         assert _validate_goose_bin(str(f)) is True
 
 
-class TestOpenCodeBinWizardPrompt:
-    """Wizard collects OPENCODE_BIN when the operator picks opencode
-    as the global backend. Mirrors the codex wizard's collection
-    pattern: prompt with `shutil.which("opencode")` as the default
-    suggestion, validate the chosen path, persist to install.conf
-    so `make install` reads from the same source of truth as the
-    sudoers SETENV rule emitter (PR #577). The escape hatch
-    `sudo OPENCODE_BIN=... make install` is preserved by the
-    `_cmd_apply` env passthrough also added in PR #577.
-
-    These tests focus on the wizard surface; the sudoers-rule
-    threading is already covered under TestGenerateSudoersCodexBinArg
-    and the matching opencode regression tests in test_install.py.
-    """
+class TestOpenCodeConfigWizard:
+    """OpenCode config writes backend/provider settings, not binary paths."""
 
     def _redirect_staging(self, monkeypatch, tmp_path):
         """Redirect the staging-path helper so the wizard writes under tmp_path."""
@@ -9723,15 +9783,12 @@ class TestOpenCodeBinWizardPrompt:
             lambda filename: tmp_path / filename,
         )
 
-    def _opencode_inputs(self, opencode_bin_path: str) -> list[str]:
+    def _opencode_inputs(self) -> list[str]:
         """Build the input sequence for an opencode-backend wizard run.
 
-        Mirrors the codex-install test's input sequence at line ~2440
-        of test_install.py except for the agent backend and the
-        binary-path prompt: codex has `codex_auth_mode` plus the
-        codex binary path; opencode has only the opencode binary
-        path (no auth mode prompt because opencode auth lives outside
-        the wizard surface, in `~/.local/share/opencode/auth.json`).
+        OpenCode auth and command installation live outside
+        `make config`; the installed backend registry records command
+        paths during `make install`.
         """
         return [
             "protected",  # deployment mode
@@ -9745,7 +9802,6 @@ class TestOpenCodeBinWizardPrompt:
             "testuser",  # required protected os_user
             "polling",  # transport
             "opencode",  # agent backend
-            opencode_bin_path,  # OPENCODE_BIN
             "anthropic",  # provider (opencode joined BACKENDS_NEEDING_PROVIDER_PROMPT)
             # API key prompt skipped for opencode (auth managed by `opencode auth login`).
             # model: handled by _prompt_default_model mock
@@ -9773,19 +9829,15 @@ class TestOpenCodeBinWizardPrompt:
             "",  # perplexity key
         ]
 
-    def test_wizard_persists_opencode_bin_to_install_conf(self, tmp_path, monkeypatch):
-        """The wizard's opencode block collects OPENCODE_BIN and
-        persists it under `env` in install.conf. The persisted value
-        is then threaded into /etc/kai/env and the sudoers rule by
-        `_cmd_apply` and `_generate_sudoers` (covered separately)."""
-        opencode_path = tmp_path / "fake_opencode"
-        opencode_path.write_text("#!/bin/sh\necho hi\n")
-        opencode_path.chmod(0o755)
-
+    def test_wizard_persists_opencode_backend_without_bin(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._redirect_staging(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            "kai.install._backend_choices_for_config",
+            lambda service_user: ["opencode"],
+        )
         # Mock the model prompt so the test doesn't drive the
         # provider/model free-text branch directly.
         monkeypatch.setattr(
@@ -9793,261 +9845,14 @@ class TestOpenCodeBinWizardPrompt:
             MagicMock(return_value="anthropic/claude-sonnet-4-5"),
         )
 
-        inputs = iter(self._opencode_inputs(str(opencode_path)))
+        inputs = iter(self._opencode_inputs())
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
 
         _cmd_config()
 
         env = json.loads((tmp_path / "install.conf").read_text())["env"]
-        assert env["OPENCODE_BIN"] == str(opencode_path)
         assert env["DEFAULT_BACKEND"] == "opencode"
-
-    def test_wizard_loops_on_invalid_opencode_bin(self, tmp_path, monkeypatch):
-        """An invalid path (does not exist, or not executable) must
-        re-prompt until the operator types a valid one. Symmetric
-        with the codex validator loop at install.py:810-819."""
-        valid_path = tmp_path / "fake_opencode"
-        valid_path.write_text("#!/bin/sh\necho hi\n")
-        valid_path.chmod(0o755)
-        invalid_path = tmp_path / "does_not_exist"
-
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
-        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._redirect_staging(monkeypatch, tmp_path)
-        monkeypatch.setattr(
-            "kai.install._prompt_default_model",
-            MagicMock(return_value="anthropic/claude-sonnet-4-5"),
-        )
-
-        # Build inputs: first opencode_bin is invalid; loop pulls the
-        # next input from the iterator, which is the valid path. The
-        # rest of the wizard inputs follow.
-        inputs_list = self._opencode_inputs(str(valid_path))
-        # Find the position of opencode_bin in the input list and
-        # inject the invalid path before it.
-        opencode_idx = inputs_list.index(str(valid_path))
-        inputs_list.insert(opencode_idx, str(invalid_path))
-        inputs = iter(inputs_list)
-        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
-
-        _cmd_config()
-
-        env = json.loads((tmp_path / "install.conf").read_text())["env"]
-        # The persisted value is the valid path, NOT the invalid one
-        # the operator typed first. Confirms the validator loop did
-        # not accept the bad input.
-        assert env["OPENCODE_BIN"] == str(valid_path)
-
-    def test_wizard_uses_shutil_which_as_default_suggestion(self, tmp_path, monkeypatch):
-        """When no existing OPENCODE_BIN is in install.conf, the
-        wizard's prompt uses `shutil.which("opencode")` as the
-        default suggestion. Pinned via a capture-and-assert on the
-        `_prompt` call's `default` argument."""
-        opencode_path = tmp_path / "fake_opencode"
-        opencode_path.write_text("#!/bin/sh\necho hi\n")
-        opencode_path.chmod(0o755)
-        # Sentinel which `shutil.which` returns; the wizard should
-        # pass this value as the prompt default.
-        sentinel_which_value = "/sentinel/which/opencode"
-        # Make `shutil.which("opencode")` return the sentinel; leave
-        # other lookups untouched so the wizard's other PATH-based
-        # checks still work.
-        original_which = shutil.which
-
-        def _which(name):
-            if name == "opencode":
-                return sentinel_which_value
-            return original_which(name)
-
-        monkeypatch.setattr("kai.install.shutil.which", _which)
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
-        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._redirect_staging(monkeypatch, tmp_path)
-        monkeypatch.setattr(
-            "kai.install._prompt_default_model",
-            MagicMock(return_value="anthropic/claude-sonnet-4-5"),
-        )
-
-        # Capture every `_prompt` call so the test can verify the
-        # OpenCode binary prompt was offered the sentinel value as
-        # the default. The captured tuples are (label, default, ...).
-        captured: list[tuple] = []
-        from kai.install import _prompt as _real_prompt
-
-        def _capturing_prompt(label, default="", required=False, **kwargs):
-            captured.append((label, default, required))
-            # Return the typed value via the input iterator path so
-            # the rest of the wizard flow proceeds normally. Re-route
-            # by calling the real prompt, which uses input().
-            return _real_prompt(label, default=default, required=required, **kwargs)
-
-        monkeypatch.setattr("kai.install._prompt", _capturing_prompt)
-
-        inputs = iter(self._opencode_inputs(str(opencode_path)))
-        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
-
-        _cmd_config()
-
-        # Find the OpenCode binary path prompt in the captured list
-        # and assert its default value was the sentinel from
-        # `shutil.which("opencode")`. The exact label text matches
-        # what the spec specifies.
-        opencode_prompts = [c for c in captured if c[0] == "OpenCode binary path"]
-        assert opencode_prompts, "wizard did not prompt for OpenCode binary path"
-        _label, default, required = opencode_prompts[0]
-        assert default == sentinel_which_value
-        assert required is True
-
-    def test_memory_extraction_defense_in_depth_block_collects_opencode_bin(self, tmp_path, monkeypatch):
-        """Defense-in-depth: when `agent_backend == "opencode"` and the
-        memory-extraction block is reached without `opencode_bin`
-        having been collected (e.g., a future refactor moved the
-        memory-extraction prompt before the global-backend block),
-        the wizard re-prompts with a memory-reasoner-flavored label
-        rather than silently leaving install.conf without
-        `OPENCODE_BIN`.
-
-        The current wizard ordering makes this combination
-        unreachable in practice; the test simulates it by forcing
-        the global-opencode block's validator to accept an empty
-        string (which the operator types when the first prompt
-        appears), so the wizard exits that block with
-        `opencode_bin == ""`. The memory-extraction block's
-        `if agent_backend == "opencode" and not opencode_bin:` gate
-        fires, re-prompts, and the second value is what persists.
-        Pinned so a future refactor that exposes this code path is
-        covered by an existing test rather than discovered at
-        runtime.
-        """
-        valid_path = tmp_path / "fake_opencode"
-        valid_path.write_text("#!/bin/sh\necho hi\n")
-        valid_path.chmod(0o755)
-
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
-        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._redirect_staging(monkeypatch, tmp_path)
-        monkeypatch.setattr(
-            "kai.install._prompt_default_model",
-            MagicMock(return_value="anthropic/claude-sonnet-4-5"),
-        )
-
-        # Force the validator to accept the empty string the
-        # global-opencode block sees so the loop exits with
-        # opencode_bin == "" and the memory-extraction defense-in-
-        # depth gate fires. The real validator still rejects empty
-        # in production; this monkeypatch is what simulates the
-        # future-refactor failure mode the defense-in-depth block
-        # guards against.
-        monkeypatch.setattr("kai.install._validate_opencode_bin", lambda p: True)
-
-        # Stub `_prompt` so the global-opencode label returns empty
-        # (bypassing `_prompt`'s required-field re-prompt loop) and
-        # the defense-in-depth label returns the valid path. Every
-        # other prompt label passes through to the real `_prompt`
-        # so the rest of the wizard flow consumes the input
-        # iterator normally. This is the precision the test needs:
-        # forcing opencode_bin to "" after the global block without
-        # changing the wizard's other prompts.
-        captured: list[tuple] = []
-        from kai.install import _prompt as _real_prompt
-
-        def _stub_prompt(label, default="", required=False, **kwargs):
-            captured.append((label, default, required))
-            if label == "OpenCode binary path":
-                return ""
-            if label == "OpenCode binary path (required by opencode memory reasoner)":
-                return str(valid_path)
-            return _real_prompt(label, default=default, required=required, **kwargs)
-
-        monkeypatch.setattr("kai.install._prompt", _stub_prompt)
-
-        # The stubbed _prompt for "OpenCode binary path" does not
-        # call input(), so the slot in _opencode_inputs for that
-        # prompt is unused. Drop it so the subsequent timeout
-        # prompt does not consume the placeholder path as its
-        # integer input.
-        inputs_list = self._opencode_inputs(str(valid_path))
-        inputs_list.remove(str(valid_path))
-        inputs = iter(inputs_list)
-        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
-
-        _cmd_config()
-
-        # Both labels appear in the captured prompts: the global-
-        # opencode one (no memory-reasoner suffix) and the defense-
-        # in-depth one (with the suffix).
-        labels = [c[0] for c in captured]
-        assert "OpenCode binary path" in labels
-        assert "OpenCode binary path (required by opencode memory reasoner)" in labels
-
-        # install.conf carries the value from the second prompt
-        # (the defense-in-depth block's collection), which is the
-        # valid path. The empty value from the first prompt is
-        # overwritten when the defense-in-depth block re-assigns
-        # opencode_bin.
-        env = json.loads((tmp_path / "install.conf").read_text())["env"]
-        assert env["OPENCODE_BIN"] == str(valid_path)
-
-    def test_wizard_re_run_preserves_existing_opencode_bin(self, tmp_path, monkeypatch):
-        """A re-run of `make config` with an existing OPENCODE_BIN
-        in install.conf uses the existing value as the default
-        suggestion, NOT the PATH-derived value. Mirrors the codex
-        re-run preservation pattern: `existing_env.get("OPENCODE_BIN",
-        which_opencode)` reads from the already-persisted value
-        first."""
-        opencode_path = tmp_path / "fake_opencode"
-        opencode_path.write_text("#!/bin/sh\necho hi\n")
-        opencode_path.chmod(0o755)
-        prior_path = tmp_path / "prior_opencode"
-        prior_path.write_text("#!/bin/sh\necho prior\n")
-        prior_path.chmod(0o755)
-
-        # Pre-populate install.conf with an existing OPENCODE_BIN
-        # value so the wizard's re-run branch fires.
-        prior_conf = {
-            "install_dir": "/opt/kai",
-            "data_dir": "/var/lib/kai",
-            "service_user": "kai",
-            "platform": "darwin",
-            "env": {
-                "OPENCODE_BIN": str(prior_path),
-                "TELEGRAM_BOT_TOKEN": "fake-token",
-            },
-        }
-        (tmp_path / "install.conf").write_text(json.dumps(prior_conf))
-
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
-        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._redirect_staging(monkeypatch, tmp_path)
-        monkeypatch.setattr(
-            "kai.install._prompt_default_model",
-            MagicMock(return_value="anthropic/claude-sonnet-4-5"),
-        )
-
-        captured: list[tuple] = []
-        from kai.install import _prompt as _real_prompt
-
-        def _capturing_prompt(label, default="", required=False, **kwargs):
-            captured.append((label, default, required))
-            return _real_prompt(label, default=default, required=required, **kwargs)
-
-        monkeypatch.setattr("kai.install._prompt", _capturing_prompt)
-
-        inputs = iter(self._opencode_inputs(str(opencode_path)))
-        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
-
-        _cmd_config()
-
-        # The OpenCode binary prompt's default came from the
-        # pre-populated env, not from shutil.which.
-        opencode_prompts = [c for c in captured if c[0] == "OpenCode binary path"]
-        assert opencode_prompts, "wizard did not prompt for OpenCode binary path"
-        _, default, _ = opencode_prompts[0]
-        assert default == str(prior_path)
+        assert "OPENCODE_BIN" not in env
 
     def test_memory_extraction_enabled_persists_for_opencode_install(self, tmp_path, monkeypatch):
         """An opencode operator who answers `true` to the memory
@@ -10072,14 +9877,14 @@ class TestOpenCodeBinWizardPrompt:
         into install.conf, giving the cleanup gate's matching `.pop`
         sites real keys to (not) strip.
         """
-        opencode_path = tmp_path / "fake_opencode"
-        opencode_path.write_text("#!/bin/sh\necho hi\n")
-        opencode_path.chmod(0o755)
-
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._redirect_staging(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            "kai.install._backend_choices_for_config",
+            lambda service_user: ["opencode"],
+        )
         monkeypatch.setattr(
             "kai.install._prompt_default_model",
             MagicMock(return_value="anthropic/claude-sonnet-4-5"),
@@ -10091,7 +9896,7 @@ class TestOpenCodeBinWizardPrompt:
         # cleanup gate has matching keys to (not) strip. The "120"
         # value appears twice (agent timeout, then episode timeout);
         # take the second occurrence for the episode-timeout slot.
-        inputs_list = self._opencode_inputs(str(opencode_path))
+        inputs_list = self._opencode_inputs()
         inputs_list[inputs_list.index("10")] = "20"  # MEMORY_EXTRACTION_TIMEOUT_S
         first_120 = inputs_list.index("120")
         inputs_list[inputs_list.index("120", first_120 + 1)] = "180"  # MEMORY_EPISODE_TIMEOUT_S
@@ -10114,6 +9919,7 @@ class TestOpenCodeBinWizardPrompt:
         # operator chose values different from the dataclass defaults.
         assert env["MEMORY_EXTRACTION_TIMEOUT_S"] == "20"
         assert env["MEMORY_EPISODE_TIMEOUT_S"] == "180"
+        assert "OPENCODE_BIN" not in env
 
 
 class TestGenerateSudoersCodexBinArg:
@@ -10549,6 +10355,10 @@ class TestWizardPerUserGooseProviderKeys:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(
+            "kai.install._backend_choices_for_config",
+            lambda service_user: ["claude", "codex", "goose", "opencode"],
+        )
         TestCmdConfig._simulate_existing_etc_users_yaml(monkeypatch, users_yaml)
         monkeypatch.setattr(
             "kai.install._prompt_default_model",
@@ -10574,19 +10384,16 @@ class TestWizardPerUserGooseProviderKeys:
 
     def test_peruser_goose_entry_prompts_for_key(self, tmp_path, monkeypatch, capsys):
         """Global claude install with a per-user goose+deepseek entry:
-        the wizard prompts for DEEPSEEK_API_KEY and then the goose
-        binary path (both inserted right after the global claude-
-        binary slot in the input chain) and emits both to env."""
+        the wizard prompts for DEEPSEEK_API_KEY but does not collect a
+        goose binary path; backend commands come from the registry."""
         self._setup(monkeypatch, tmp_path, self.GOOSE_DEEPSEEK_USERS_YAML)
-        monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
         inputs = TestCmdConfigDefaultModelDispatch._inputs_for_claude_backend()
-        i = inputs.index("/usr/bin/true")
-        inputs = inputs[: i + 1] + ["sk-ds-peruser", "/opt/homebrew/bin/goose"] + inputs[i + 1 :]
+        inputs.insert(inputs.index("claude") + 1, "sk-ds-peruser")
 
         env = self._run(monkeypatch, tmp_path, inputs)
 
         assert env["DEEPSEEK_API_KEY"] == "sk-ds-peruser"
-        assert env["GOOSE_BIN"] == "/opt/homebrew/bin/goose"
+        assert "GOOSE_BIN" not in env
         out = capsys.readouterr().out
         assert "goose entry on deepseek" in out
         assert "DEEPSEEK_API_KEY" in out
@@ -10715,12 +10522,8 @@ class TestUsersYamlAgentBackends:
         assert _users_yaml_agent_backends(p) == set()
 
 
-class TestWizardPerUserBackendBinaries:
-    """Wizard collection of agent binary paths when per-user entries
-    use a backend other than the global one. Mirrors the provider-key
-    collection: scan users.yaml, prompt only for binaries the global
-    blocks did not already collect, flow into the existing
-    persistence variables."""
+class TestWizardPerUserBackendsUseRegistry:
+    """Per-user backend entries do not authorize config-time binary paths."""
 
     CODEX_USERS_YAML = (
         "users:\n"
@@ -10731,15 +10534,6 @@ class TestWizardPerUserBackendBinaries:
         "    name: bob\n"
         "    backend: codex\n"
     )
-    CLAUDE_USERS_YAML = (
-        "users:\n"
-        "  - telegram_id: 1\n"
-        "    name: alice\n"
-        "    role: admin\n"
-        "  - telegram_id: 2\n"
-        "    name: bob\n"
-        "    backend: claude\n"
-    )
     PLAIN_USERS_YAML = "users:\n  - telegram_id: 1\n    name: alice\n    role: admin\n"
 
     @staticmethod
@@ -10747,6 +10541,10 @@ class TestWizardPerUserBackendBinaries:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(
+            "kai.install._backend_choices_for_config",
+            lambda service_user: ["claude", "codex", "goose", "opencode"],
+        )
         TestCmdConfig._simulate_existing_etc_users_yaml(monkeypatch, users_yaml)
         monkeypatch.setattr(
             "kai.install._prompt_default_model",
@@ -10762,52 +10560,21 @@ class TestWizardPerUserBackendBinaries:
         _cmd_config()
         return json.loads((tmp_path / "install.conf").read_text())["env"]
 
-    def test_peruser_codex_entry_prompts_for_binary(self, tmp_path, monkeypatch, capsys):
-        """Global claude install with a per-user codex entry: the
-        wizard prompts for the codex binary path and CODEX_BIN lands
-        in env, so the fail-closed extraction gate can resolve codex
-        at startup. This is the incident shape: per-user codex on a
-        non-codex global install previously had no collection path
-        and the daemon exited at boot."""
+    def test_peruser_codex_entry_does_not_prompt_for_binary(self, tmp_path, monkeypatch):
         self._setup(monkeypatch, tmp_path, self.CODEX_USERS_YAML)
-        monkeypatch.setattr("kai.install._validate_codex_bin", lambda p: bool(p))
         inputs = TestCmdConfigDefaultModelDispatch._inputs_for_claude_backend()
-        i = inputs.index("/usr/bin/true")
-        inputs = inputs[: i + 1] + ["/per-user/npm/bin/codex"] + inputs[i + 1 :]
 
         env = self._run(monkeypatch, tmp_path, inputs)
 
-        assert env["CODEX_BIN"] == "/per-user/npm/bin/codex"
-        assert "codex entry" in capsys.readouterr().out
-
-    def test_peruser_claude_entry_prompts_for_binary(self, tmp_path, monkeypatch, capsys):
-        """Global goose install with a per-user claude entry: the
-        wizard prompts for the claude binary path and CLAUDE_BIN
-        lands in env, the same collection contract the other three
-        backends follow. The answer is a real executable so the
-        unstubbed _validate_claude_bin passes on any runner."""
-        self._setup(monkeypatch, tmp_path, self.CLAUDE_USERS_YAML)
-        monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
-        inputs = list(TestCmdConfigDefaultModelDispatch._inputs_for_goose_openai())
-        i = inputs.index("openai-key")
-        inputs = inputs[: i + 1] + ["/usr/bin/true"] + inputs[i + 1 :]
-
-        env = self._run(monkeypatch, tmp_path, inputs)
-
-        assert env["CLAUDE_BIN"] == "/usr/bin/true"
-        assert "claude entry" in capsys.readouterr().out
+        assert "CODEX_BIN" not in env
 
     def test_global_codex_does_not_reprompt(self, tmp_path, monkeypatch):
-        """Global codex install with a per-user codex entry: the
-        global block already collected codex_bin, so the per-user
-        block must not prompt again (the unmodified codex chain is
-        consumed exactly)."""
         self._setup(monkeypatch, tmp_path, self.CODEX_USERS_YAML)
-        monkeypatch.setattr("kai.install._validate_codex_bin", lambda p: bool(p))
 
         env = self._run(monkeypatch, tmp_path, TestCmdConfigDefaultModelDispatch._inputs_for_codex_subscription())
 
-        assert env["CODEX_BIN"] == "/usr/local/bin/codex"
+        assert env["DEFAULT_BACKEND"] == "codex"
+        assert "CODEX_BIN" not in env
 
     def test_plain_users_yaml_no_binary_prompt(self, tmp_path, monkeypatch):
         """No per-user backend entries: the unmodified claude chain is
@@ -10821,26 +10588,20 @@ class TestWizardPerUserBackendBinaries:
         assert "OPENCODE_BIN" not in env
 
     def test_stored_binary_offered_as_default(self, tmp_path, monkeypatch):
-        """Re-run with a stored CODEX_BIN: the prompt fires again for
-        the still-present codex entry and pressing Enter keeps the
-        stored path."""
+        """Re-run with a stored CODEX_BIN strips it on resave."""
         self._setup(
             monkeypatch,
             tmp_path,
             self.CODEX_USERS_YAML,
             existing_env={"TELEGRAM_BOT_TOKEN": "fake-token", "CODEX_BIN": "/stored/bin/codex"},
         )
-        monkeypatch.setattr("kai.install._validate_codex_bin", lambda p: bool(p))
         inputs = TestCmdConfigDefaultModelDispatch._inputs_for_claude_backend()
-        i = inputs.index("/usr/bin/true")
-        # Empty answer accepts the prompt default (the stored path).
-        inputs = inputs[: i + 1] + [""] + inputs[i + 1 :]
 
         env = self._run(monkeypatch, tmp_path, inputs)
 
-        assert env["CODEX_BIN"] == "/stored/bin/codex"
+        assert "CODEX_BIN" not in env
 
-    def test_mixed_case_codex_entry_still_prompts(self, tmp_path, monkeypatch):
+    def test_mixed_case_codex_entry_still_does_not_prompt(self, tmp_path, monkeypatch):
         """`backend: Codex` is valid at runtime (the loader
         lowercases before validation) and routes the user, so the
         scan must normalize the same way; a casing difference must
@@ -10856,20 +10617,13 @@ class TestWizardPerUserBackendBinaries:
             "    backend: Codex\n"
         )
         self._setup(monkeypatch, tmp_path, mixed_yaml)
-        monkeypatch.setattr("kai.install._validate_codex_bin", lambda p: bool(p))
         inputs = TestCmdConfigDefaultModelDispatch._inputs_for_claude_backend()
-        i = inputs.index("/usr/bin/true")
-        inputs = inputs[: i + 1] + ["/per-user/npm/bin/codex"] + inputs[i + 1 :]
 
         env = self._run(monkeypatch, tmp_path, inputs)
 
-        assert env["CODEX_BIN"] == "/per-user/npm/bin/codex"
+        assert "CODEX_BIN" not in env
 
-    def test_peruser_opencode_entry_prompts_for_binary(self, tmp_path, monkeypatch, capsys):
-        """Global claude install with a per-user opencode entry: the
-        wizard prompts for the opencode binary path and OPENCODE_BIN
-        lands in env, completing the acceptance triple (codex, goose,
-        opencode) on the per-user scan."""
+    def test_peruser_opencode_entry_does_not_prompt_for_binary(self, tmp_path, monkeypatch):
         opencode_yaml = (
             "users:\n"
             "  - telegram_id: 1\n"
@@ -10880,12 +10634,8 @@ class TestWizardPerUserBackendBinaries:
             "    backend: opencode\n"
         )
         self._setup(monkeypatch, tmp_path, opencode_yaml)
-        monkeypatch.setattr("kai.install._validate_opencode_bin", lambda p: bool(p))
         inputs = TestCmdConfigDefaultModelDispatch._inputs_for_claude_backend()
-        i = inputs.index("/usr/bin/true")
-        inputs = inputs[: i + 1] + ["/custom/bin/opencode"] + inputs[i + 1 :]
 
         env = self._run(monkeypatch, tmp_path, inputs)
 
-        assert env["OPENCODE_BIN"] == "/custom/bin/opencode"
-        assert "opencode entry" in capsys.readouterr().out
+        assert "OPENCODE_BIN" not in env

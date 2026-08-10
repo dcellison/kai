@@ -460,10 +460,10 @@ def _validate_chat_id(value: str) -> bool:
 def _validate_claude_bin(value: str) -> bool:
     """Return True when the path is absolute, exists, and is executable.
 
-    Required by the claude wizard prompt; the path is baked into both
-    the runtime CLAUDE_BIN env var and the sudoers rule that allows
-    cross-os_user claude spawns, so a non-existent path here would
-    surface as a confusing 'a password is required' at first message.
+    Used by installer discovery/fallback paths before a command is
+    written into the admin-owned backend registry or sudoers rules, so
+    a non-existent path here would surface as a confusing 'a password
+    is required' at first message.
     The path must also be absolute: a relative path resolves against
     the wizard's working directory at validation time but against the
     daemon's working directory at spawn time, and sudoers command
@@ -479,10 +479,10 @@ def _validate_claude_bin(value: str) -> bool:
 def _validate_codex_bin(value: str) -> bool:
     """Return True when the path is absolute, exists, and is executable.
 
-    Required by the codex wizard prompt; the path is baked into both
-    the runtime CODEX_BIN env var and the sudoers rule that allows
-    cross-os_user codex spawns, so a non-existent path here would
-    surface as a confusing 'a password is required' at first message.
+    Used by installer discovery/fallback paths before a command is
+    written into the admin-owned backend registry or sudoers rules, so
+    a non-existent path here would surface as a confusing 'a password
+    is required' at first message.
     The absoluteness requirement mirrors `_validate_claude_bin` above:
     relative paths resolve differently for the wizard and the daemon,
     and sudoers command matching expects absolute paths.
@@ -513,7 +513,7 @@ def _resolve_default_claude_bin(service_user: str) -> str:
 
 
 def _resolve_codex_bin_prompt_default(existing_env: dict[str, str]) -> str:
-    """Return a usable default for every Codex binary-path prompt.
+    """Return a usable default for legacy Codex binary-path callers.
 
     Preserve a saved CODEX_BIN while it is executable. If an upgrade moved
     the binary, discard the stale value and use the same common-path
@@ -545,11 +545,10 @@ def _resolve_default_codex_bin() -> str:
 def _validate_opencode_bin(value: str) -> bool:
     """Return True when the path is absolute, exists, and is executable.
 
-    Required by the opencode wizard prompt; the path is baked into
-    both the runtime OPENCODE_BIN env var and the sudoers rule that
-    allows cross-os_user opencode spawns, so a non-existent path
-    here would surface as a confusing 'a password is required' or
-    'command not found' at the first one-shot call. Paired with
+    Used by installer discovery/fallback paths before a command is
+    written into the admin-owned backend registry or sudoers rules, so
+    a non-existent path here would surface as a confusing 'a password
+    is required' or 'command not found' at the first one-shot call. Paired with
     `_validate_codex_bin` above so the two binary validators stay
     together; the body shape matches codex byte-for-byte (absolute
     plus is-file plus executable) because the underlying requirement
@@ -564,16 +563,94 @@ def _validate_opencode_bin(value: str) -> bool:
 def _validate_goose_bin(value: str) -> bool:
     """Return True when the path is absolute, exists, and is executable.
 
-    Required by the goose wizard prompt; same dual consumer as the
-    codex and opencode validators above (runtime GOOSE_BIN env var
-    plus the per-user sudoers rule), and the same absolute plus
-    is-file plus executable body because the underlying requirement
-    is the same.
+    Used by installer discovery/fallback paths before a command is
+    written into the admin-owned backend registry or sudoers rules.
+    Same absolute plus is-file plus executable body as the other
+    backend validators because the underlying requirement is the same.
     """
     if not value:
         return False
     p = Path(value)
     return p.is_absolute() and p.is_file() and os.access(p, os.X_OK)
+
+
+def _first_executable_path(candidates: Iterable[str]) -> str:
+    """Return the first absolute executable file in candidates, else empty."""
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = Path(candidate)
+        if path.is_absolute() and path.is_file() and os.access(str(path), os.X_OK):
+            return str(path)
+    return ""
+
+
+def _discover_backend_commands(service_user: str) -> dict[str, str]:
+    """
+    Discover globally installed backend commands without reading user-
+    supplied path config.
+
+    The result feeds /etc/kai/backends.yaml. Operators choose backend
+    IDs; command paths are install facts discovered by the installer
+    and written as admin-owned state.
+    """
+    svc_home = _user_home(service_user)
+    candidates: dict[str, tuple[str, ...]] = {
+        "claude": (
+            str(Path(svc_home) / ".local" / "bin" / "claude"),
+            "/opt/homebrew/bin/claude",
+            shutil.which("claude") or "",
+        ),
+        "codex": (
+            "/usr/local/bin/codex",
+            "/opt/homebrew/bin/codex",
+            shutil.which("codex") or "",
+        ),
+        "goose": (
+            "/opt/homebrew/bin/goose",
+            shutil.which("goose") or "",
+        ),
+        "opencode": (
+            str(Path(svc_home) / ".local" / "bin" / "opencode"),
+            shutil.which("opencode") or "",
+        ),
+    }
+    discovered: dict[str, str] = {}
+    for backend, backend_candidates in candidates.items():
+        command = _first_executable_path(backend_candidates)
+        if command:
+            discovered[backend] = command
+    return discovered
+
+
+def _backend_choices_from_existing_registry() -> list[str]:
+    """Return backend IDs from the installed registry, if it is readable."""
+    content = ""
+    if BACKENDS_YAML.is_file():
+        try:
+            content = BACKENDS_YAML.read_text()
+        except OSError:
+            content = ""
+    if not content:
+        content = _read_protected_file(str(BACKENDS_YAML)) or ""
+    if not content:
+        return []
+    try:
+        raw = yaml.safe_load(content) or {}
+    except yaml.YAMLError:
+        return []
+    if not isinstance(raw, dict) or not isinstance(raw.get("backends"), dict):
+        return []
+    choices = [str(backend).strip().lower() for backend in raw["backends"]]
+    return sorted(backend for backend in choices if backend in VALID_BACKENDS)
+
+
+def _backend_choices_for_config(service_user: str) -> list[str]:
+    """Return backend choices for the wizard from registry/discovery."""
+    registry_choices = _backend_choices_from_existing_registry()
+    if registry_choices:
+        return registry_choices
+    return sorted(_discover_backend_commands(service_user))
 
 
 def _install_staging_path(filename: str) -> Path:
@@ -879,16 +956,12 @@ def _users_yaml_goose_providers(users_yaml_path: Path, global_provider: str) -> 
 
 def _users_yaml_agent_backends(users_yaml_path: Path) -> set[str]:
     """
-    Collect the distinct per-user `backend` values for
-    wizard-side binary collection.
+    Collect the distinct per-user `backend` values for installer checks.
 
-    A users.yaml entry on a non-global backend makes that backend's
-    binary load-bearing at runtime (the chat spawn and the per-user
-    memory-extraction dispatch both route by each user's effective
-    backend, and the fail-closed startup gate refuses to boot when
-    an extraction-eligible user routes to an unresolvable binary),
-    so the wizard must know which backends are in play beyond the
-    global one. Parsing and degrade behavior live in
+    A users.yaml entry on a non-global backend makes that backend
+    load-bearing at runtime, so installer validation must account for
+    backends in play beyond the global one. Parsing and degrade
+    behavior live in
     `_users_yaml_entries` (empty result on any malformed input).
     """
     backends: set[str] = set()
@@ -1243,12 +1316,18 @@ def _cmd_config() -> None:
 
     # -- Default backend --
     print("-- Default backend --")
+    backend_choices = _backend_choices_for_config(service_user)
+    if not backend_choices:
+        raise SystemExit(
+            "No installed Kai backends were found. Install at least one supported backend "
+            "(claude, codex, goose, or opencode) globally, then re-run make config."
+        )
     # Prefill reads DEFAULT_BACKEND, falling back to the deprecated
     # AGENT_BACKEND key so a re-run against a legacy install.conf keeps
     # the operator's prior choice; the wizard writes DEFAULT_BACKEND only.
     agent_backend = _prompt_choice(
         "Default backend",
-        sorted(VALID_BACKENDS),
+        backend_choices,
         _resolve_renamed_key(
             existing_env.get,
             new_key="DEFAULT_BACKEND",
@@ -1269,51 +1348,10 @@ def _cmd_config() -> None:
     # Gate on the global backend selection only. Per-user
     # `backend: codex` overrides in users.yaml do NOT trigger
     # the auth-mode setup here; codex AUTH for those users stays
-    # out-of-band (per-OS-user `codex login`). Their BINARY path is
-    # collected by the per-user backend scan after the provider
-    # block, which feeds this same codex_bin variable.
+    # out-of-band (per-OS-user `codex login`). The command path comes
+    # from admin-owned backends.yaml.
     codex_auth_mode = ""
     codex_api_key = ""
-    codex_bin = ""
-    # OpenCode binary path collected by the global-opencode block
-    # below (and re-prompted by the memory-extraction defense-in-depth
-    # gate if a future refactor exposes a path where the global block
-    # did not run). Empty when opencode is not in play so the
-    # persistence gate at the tail of this function skips emitting
-    # OPENCODE_BIN to install.conf.
-    opencode_bin = ""
-    # Goose binary path: same collection and persistence shape as
-    # opencode above (global-goose block, extraction defense-in-depth
-    # re-prompt, empty-skip persistence gate for GOOSE_BIN).
-    goose_bin = ""
-    # Claude binary path: same collection and persistence shape as
-    # opencode (global-claude block, extraction defense-in-depth
-    # re-prompt, empty-skip persistence gate for CLAUDE_BIN).
-    claude_bin = ""
-    if agent_backend == "claude":
-        # Claude binary path: wizard-prompted and persisted in
-        # install.conf so `make install` writes both /etc/kai/env's
-        # CLAUDE_BIN and the sudoers SETENV rule from the same source
-        # of truth. Default suggestion uses `which claude` from the
-        # operator's PATH; falls back to the empty string when which
-        # finds nothing (claude has two canonical install locations,
-        # the native installer's ~/.local/bin/claude and the Homebrew
-        # cask's /opt/homebrew/bin/claude, so an empty default forces
-        # the operator to type the path explicitly rather than accept
-        # a wrong guess between the two). The _cmd_apply env
-        # passthrough (`sudo CLAUDE_BIN=... make install`) still works
-        # as the ad-hoc deploy escape hatch; the wizard path is the
-        # canonical source of truth.
-        while True:
-            which_claude = shutil.which("claude") or ""
-            claude_bin = _prompt(
-                "Claude binary path",
-                existing_env.get("CLAUDE_BIN", which_claude),
-                required=True,
-            )
-            if _validate_claude_bin(claude_bin):
-                break
-            print(f"  Path '{claude_bin}' is not an absolute path to an existing executable.")
     if agent_backend == "codex":
         codex_auth_mode = _prompt_choice(
             "Codex auth mode",
@@ -1326,22 +1364,6 @@ def _cmd_config() -> None:
                 existing_env.get("OPENAI_API_KEY", ""),
                 required=True,
             )
-        # Codex binary path: wizard-prompted and persisted in install.conf
-        # so `make install` writes both /etc/kai/env's CODEX_BIN and the
-        # sudoers SETENV rule from the same source of truth. Default
-        # suggestion keeps a valid saved path, otherwise uses `which codex`
-        # from the operator's PATH. This recovers automatically when an
-        # upgrade moves the binary. Falls back to Homebrew only when which
-        # finds nothing; validation still prevents accepting a missing path.
-        while True:
-            codex_bin = _prompt(
-                "Codex binary path",
-                _resolve_codex_bin_prompt_default(existing_env),
-                required=True,
-            )
-            if _validate_codex_bin(codex_bin):
-                break
-            print(f"  Path '{codex_bin}' is not an absolute path to an existing executable.")
         if codex_auth_mode == "subscription":
             print("  After install, log in to codex as the target os_user:")
             print("    <os_user> ~$ codex login")
@@ -1349,8 +1371,8 @@ def _cmd_config() -> None:
             print("  If users.yaml has per-user `backend: codex` entries with")
             print("  different os_users, log in as each of those too.")
 
-    # OpenCode setup: binary-path wizard prompt + post-install auth
-    # reminder. OpenCode joins BACKENDS_NEEDING_PROVIDER_PROMPT so the
+    # OpenCode setup: post-install auth reminder. OpenCode joins
+    # BACKENDS_NEEDING_PROVIDER_PROMPT so the
     # operator names the provider used by the (backend, provider, role)
     # registry; the API-key sub-prompt skips for opencode because
     # opencode auth lives in `~/.local/share/opencode/auth.json` and
@@ -1362,60 +1384,13 @@ def _cmd_config() -> None:
     # Gate on the global backend selection only. Per-user
     # `backend: opencode` overrides in users.yaml do NOT
     # trigger the setup here; opencode AUTH for those users stays
-    # out-of-band (`opencode auth login` per OS user). Their BINARY
-    # path is collected by the per-user backend scan after the
-    # provider block, which feeds this same opencode_bin variable.
+    # out-of-band (`opencode auth login` per OS user). The command path
+    # comes from admin-owned backends.yaml.
     if agent_backend == "opencode":
-        # OpenCode binary path: wizard-prompted and persisted in
-        # install.conf so `make install` writes both /etc/kai/env's
-        # OPENCODE_BIN and the sudoers SETENV rule from the same
-        # source of truth. Default suggestion uses `which opencode`
-        # from the operator's PATH; falls back to the empty string
-        # when which finds nothing (opencode has no single canonical
-        # install location across operator platforms, so an empty
-        # default forces the operator to type the path explicitly
-        # rather than accept a wrong default). The _cmd_apply env
-        # passthrough (`sudo OPENCODE_BIN=... make install`) still
-        # works as the ad-hoc deploy escape hatch; the wizard path is
-        # the canonical source of truth.
-        while True:
-            which_opencode = shutil.which("opencode") or ""
-            opencode_bin = _prompt(
-                "OpenCode binary path",
-                existing_env.get("OPENCODE_BIN", which_opencode),
-                required=True,
-            )
-            if _validate_opencode_bin(opencode_bin):
-                break
-            print(f"  Path '{opencode_bin}' is not an absolute path to an existing executable.")
         print("  After install, authenticate OpenCode for at least one provider:")
         print("    <service_user> ~$ opencode auth login")
         print("  Kai writes the active model into OPENCODE_CONFIG_CONTENT at process spawn;")
         print("  OpenCode resolves it against the credentials in ~/.local/share/opencode/auth.json.")
-
-    # Goose setup: binary-path wizard prompt. Mirrors the opencode
-    # block above: the wizard-persisted path drives /etc/kai/env's
-    # GOOSE_BIN and the per-user sudoers SETENV rule from one source
-    # of truth, and resolve_oneshot_binary("goose") prefers it over
-    # PATH discovery at run time. Default suggestion uses `which
-    # goose` from the operator's PATH (Homebrew installs land there);
-    # falls back to the empty string when which finds nothing so the
-    # operator types the path explicitly rather than accepting a
-    # wrong default. Provider auth needs no extra reminder here: the
-    # provider prompt below collects the API key for key-based
-    # providers, and keychain auth via `goose configure` is per-user
-    # and out of band.
-    if agent_backend == "goose":
-        while True:
-            which_goose = shutil.which("goose") or ""
-            goose_bin = _prompt(
-                "Goose binary path",
-                existing_env.get("GOOSE_BIN", which_goose),
-                required=True,
-            )
-            if _validate_goose_bin(goose_bin):
-                break
-            print(f"  Path '{goose_bin}' is not an absolute path to an existing executable.")
 
     # Multi-provider backends (opencode, goose): operator picks the
     # provider that drives the (backend, provider, role) registry
@@ -1499,67 +1474,9 @@ def _cmd_config() -> None:
     if extra_provider_keys:
         print()
 
-    # Per-user entries on a non-global backend make that backend's
-    # binary load-bearing: the chat spawn and the per-user memory-
-    # extraction dispatch both route by each user's effective
-    # backend, and the fail-closed startup gate refuses to boot when
-    # an extraction-eligible user routes to an unresolvable binary.
-    # The blocks above collect a binary only for the global backend,
-    # so collect here for every other backend per-user entries put
-    # in play; the values flow into the same codex_bin / opencode_bin
-    # / goose_bin variables, so the existing persistence (env var,
-    # install.conf, sudoers SETENV rule) needs no new emission sites.
-    # Prompt loops mirror the global blocks, including each backend's
-    # default posture (codex falls back to Homebrew; claude, goose,
-    # and opencode force an explicit path when `which` finds nothing).
-    peruser_backends = _users_yaml_agent_backends(users_yaml_path)
-    if "claude" in peruser_backends and not claude_bin:
-        print("  users.yaml has a claude entry; the daemon needs a resolvable claude binary.")
-        while True:
-            which_claude = shutil.which("claude") or ""
-            claude_bin = _prompt(
-                "Claude binary path",
-                existing_env.get("CLAUDE_BIN", which_claude),
-                required=True,
-            )
-            if _validate_claude_bin(claude_bin):
-                break
-            print(f"  Path '{claude_bin}' is not an absolute path to an existing executable.")
-    if "codex" in peruser_backends and not codex_bin:
-        print("  users.yaml has a codex entry; the daemon needs a resolvable codex binary.")
-        while True:
-            codex_bin = _prompt(
-                "Codex binary path",
-                _resolve_codex_bin_prompt_default(existing_env),
-                required=True,
-            )
-            if _validate_codex_bin(codex_bin):
-                break
-            print(f"  Path '{codex_bin}' is not an absolute path to an existing executable.")
-    if "opencode" in peruser_backends and not opencode_bin:
-        print("  users.yaml has an opencode entry; the daemon needs a resolvable opencode binary.")
-        while True:
-            which_opencode = shutil.which("opencode") or ""
-            opencode_bin = _prompt(
-                "OpenCode binary path",
-                existing_env.get("OPENCODE_BIN", which_opencode),
-                required=True,
-            )
-            if _validate_opencode_bin(opencode_bin):
-                break
-            print(f"  Path '{opencode_bin}' is not an absolute path to an existing executable.")
-    if "goose" in peruser_backends and not goose_bin:
-        print("  users.yaml has a goose entry; the daemon needs a resolvable goose binary.")
-        while True:
-            which_goose = shutil.which("goose") or ""
-            goose_bin = _prompt(
-                "Goose binary path",
-                existing_env.get("GOOSE_BIN", which_goose),
-                required=True,
-            )
-            if _validate_goose_bin(goose_bin):
-                break
-            print(f"  Path '{goose_bin}' is not an absolute path to an existing executable.")
+    # Per-user backend entries do not collect command paths here.
+    # The installed backend registry is the command-path authority for
+    # every backend, whether selected globally or per-user.
 
     # -- Agent --
     # Determine the effective provider for model choices. Claude
@@ -1958,87 +1875,8 @@ def _cmd_config() -> None:
                 # config; the wizard prompts that used to ask for both
                 # were retired with the env vars they emitted.
                 #
-                # No codex-memory-specific os_user gate fires here.
-                # Codex now follows claude's `resolve_claude_user`
-                # symmetry: missing `os_user` spawns codex in-process
-                # as the bot user, the same self-sudo-skip path
-                # claude uses. The earlier global-codex block already
-                # collected CODEX_BIN; nothing else specific to codex
-                # memory needs setup at this point. CODEX_BIN must be
-                # collected on every global-codex install; this second
-                # prompt is a defense-in-depth no-op when the earlier
-                # block already ran.
-                if agent_backend == "codex" and not codex_bin:
-                    while True:
-                        codex_bin = _prompt(
-                            "Codex binary path (required by codex memory reasoner)",
-                            _resolve_codex_bin_prompt_default(existing_env),
-                            required=True,
-                        )
-                        if _validate_codex_bin(codex_bin):
-                            break
-                        print(f"  Path '{codex_bin}' is not an absolute path to an existing executable.")
-                # Symmetric defense-in-depth for the opencode global
-                # backend. The global-opencode block above already
-                # collected opencode_bin on the normal flow; the gate
-                # here exists for the same future-refactor reason
-                # codex documents above: a refactor that moved the
-                # memory-extraction prompt before the global-backend
-                # block could reach this point with opencode_bin
-                # still empty. Default-suggestion value differs from
-                # codex (empty fallback instead of Homebrew) because
-                # opencode has no canonical install location across
-                # platforms; an empty default forces the operator to
-                # type the path explicitly rather than accept a wrong
-                # default.
-                if agent_backend == "opencode" and not opencode_bin:
-                    while True:
-                        which_opencode = shutil.which("opencode") or ""
-                        opencode_bin = _prompt(
-                            "OpenCode binary path (required by opencode memory reasoner)",
-                            existing_env.get("OPENCODE_BIN", which_opencode),
-                            required=True,
-                        )
-                        if _validate_opencode_bin(opencode_bin):
-                            break
-                        print(f"  Path '{opencode_bin}' is not an absolute path to an existing executable.")
-                # Same defense-in-depth shape for the goose global
-                # backend: the global-goose block above collects
-                # goose_bin on the normal flow; this gate covers a
-                # future refactor that reaches the extraction prompts
-                # with goose_bin still empty. Defaults mirror the
-                # global block (`which goose`, else empty so the
-                # operator types the path explicitly).
-                if agent_backend == "goose" and not goose_bin:
-                    while True:
-                        which_goose = shutil.which("goose") or ""
-                        goose_bin = _prompt(
-                            "Goose binary path (required by goose memory reasoner)",
-                            existing_env.get("GOOSE_BIN", which_goose),
-                            required=True,
-                        )
-                        if _validate_goose_bin(goose_bin):
-                            break
-                        print(f"  Path '{goose_bin}' is not an absolute path to an existing executable.")
-                # Same defense-in-depth shape for the claude global
-                # backend, completing the four-backend set: the
-                # global-claude block above collects claude_bin on
-                # the normal flow; this gate covers a future refactor
-                # that reaches the extraction prompts with claude_bin
-                # still empty. Defaults mirror the global block
-                # (`which claude`, else empty so the operator types
-                # the path explicitly).
-                if agent_backend == "claude" and not claude_bin:
-                    while True:
-                        which_claude = shutil.which("claude") or ""
-                        claude_bin = _prompt(
-                            "Claude binary path (required by claude memory reasoner)",
-                            existing_env.get("CLAUDE_BIN", which_claude),
-                            required=True,
-                        )
-                        if _validate_claude_bin(claude_bin):
-                            break
-                        print(f"  Path '{claude_bin}' is not an absolute path to an existing executable.")
+                # Command-path validation is owned by install apply and
+                # the admin-owned backend registry, not by make config.
                 # Extraction timeout is the LLM-call hard cap inside
                 # memory_extraction.py:541. Default 10s is too aggressive
                 # for production - real extractions routinely take 20-30s
@@ -2251,42 +2089,6 @@ def _cmd_config() -> None:
         existing_key_value = existing_env.get(provider_key_var, "")
         if existing_key_value:
             env[provider_key_var] = existing_key_value
-
-    # Persist the wizard-collected codex binary path whenever any
-    # codex surface (agent backend or memory reasoner) is in play.
-    # Gating on `codex_bin` rather than `agent_backend == "codex"`
-    # covers the supported claude+codex / goose+codex memory cases
-    # where the codex binary is required solely because the memory
-    # reasoner is codex; the second collection block at the memory
-    # gate above guarantees `codex_bin` is set on those paths. The
-    # same value drives /etc/kai/env's CODEX_BIN and the sudoers
-    # SETENV rule so the two can never drift. _cmd_apply's env-var
-    # override block keeps working for ad-hoc deploys (sudo
-    # CODEX_BIN=... kai install apply) but the wizard path remains
-    # the canonical source of truth.
-    if codex_bin:
-        env["CODEX_BIN"] = codex_bin
-    # Same gating shape as codex above: the value persists only when
-    # the wizard collected one (truthy opencode_bin), so a claude or
-    # goose install does not pollute install.conf with an empty
-    # OPENCODE_BIN= line. The single env emission drives both
-    # /etc/kai/env's OPENCODE_BIN and the sudoers SETENV rule so the
-    # two cannot drift.
-    if opencode_bin:
-        env["OPENCODE_BIN"] = opencode_bin
-    # Same gating shape again for goose: persist only when the wizard
-    # collected a value, so non-goose installs do not carry an empty
-    # GOOSE_BIN= line. The single emission drives both /etc/kai/env's
-    # GOOSE_BIN and the sudoers SETENV rule so the two cannot drift.
-    if goose_bin:
-        env["GOOSE_BIN"] = goose_bin
-    # Same gating shape again for claude: persist only when the wizard
-    # collected a value, so installs that never collected one carry no
-    # CLAUDE_BIN= line and keep resolving claude via the service PATH.
-    # The single emission drives both /etc/kai/env's CLAUDE_BIN and
-    # the sudoers SETENV rule so the two cannot drift.
-    if claude_bin:
-        env["CLAUDE_BIN"] = claude_bin
 
     # Remove stale renamed keys if present - leaving both the old and
     # new key causes silent confusion (the deprecation warning is
@@ -3192,19 +2994,11 @@ def _generate_sudoers(
     opencode, and goose binaries (plus a `NOPASSWD: /bin/kill` rule for the
     cross-user kill escalation) are emitted for every distinct `os_user`
     value in users.yaml. Users matching `service_user` are skipped (the
-    runtime detects self-sudo via resolve_claude_user() and spawns the
-    agent directly without sudo). The claude rule defaults to the
-    service user's `~/.local/bin/claude` (the native installer
-    location); operators with a custom install location (e.g. the
-    Homebrew cask) override via CLAUDE_BIN. The codex binary path
-    defaults to the first executable common install location; unusual
-    installs override with the CODEX_BIN env var at install time. The
-    opencode rule uses the
-    service user's `~/.local/bin/opencode` path (where the upstream
-    installer drops the binary by default); operators with a custom
-    install location can override via OPENCODE_BIN. The goose rule
-    defaults to /opt/homebrew/bin/goose (the Homebrew cask location)
-    with the same GOOSE_BIN override shape.
+    runtime detects self-sudo and spawns the agent directly without
+    sudo). In normal protected installs, callers pass command paths
+    from the admin-owned backend registry generated by `_cmd_apply`.
+    The local fallbacks remain only for direct/dev callers that invoke
+    this formatter without registry-derived paths.
 
     Args:
         service_user: The OS username that runs the Kai service.
@@ -3255,40 +3049,14 @@ def _generate_sudoers(
         target_users.append(candidate)
 
     if target_users:
-        # Anchor the rule path to the wizard-collected CLAUDE_BIN when
-        # present, else the default resolver's service-user native
-        # install / Homebrew fallback.
-        # The runtime spawn uses the same precedence (claude.py reads
-        # CLAUDE_BIN, else tries the same native/Homebrew fallbacks
-        # before spawning bare `claude`), so the rule references the
-        # same binary the bot invokes. We deliberately do NOT call
-        # shutil.which here: resolving against whatever
-        # PATH root has when `sudo make install` runs can pick up any
-        # user's `~/.local/bin/claude` that happens to be on PATH at
-        # install time, baking the wrong path into the rule and
-        # breaking the bot's sudo dispatch.
+        # In protected installs, these arguments come from
+        # /etc/kai/backends.yaml generation. Direct/dev callers that
+        # omit them still get deterministic local fallbacks for the
+        # legacy formatter contract.
         svc_home = _user_home(service_user)
         claude_bin_resolved = claude_bin or _resolve_default_claude_bin(service_user)
-        # Codex binary path is now threaded as an argument. The wizard
-        # prompts for and persists the value in install.conf; _cmd_apply
-        # passes it to _apply_sudoers which passes it here. When a user
-        # later switches users.yaml to codex without re-running the
-        # wizard, resolve a common absolute Codex install path that the
-        # runtime uses too. That keeps sudoers and runtime in sync while
-        # still letting CODEX_BIN override unusual installs explicitly.
         codex_bin_resolved = codex_bin or _resolve_default_codex_bin()
-        # OpenCode binary path. Upstream's install script drops the
-        # binary under the SERVICE user's ~/.local/bin/opencode by
-        # default, so the same `svc_home` anchoring applies as the
-        # claude rule above. Operators with a custom install location
-        # override via OPENCODE_BIN (the wizard prompts for and
-        # persists the value the same way CODEX_BIN is handled).
         opencode_bin_resolved = opencode_bin or f"{svc_home}/.local/bin/opencode"
-        # Goose binary path. Homebrew's block-goose-cli cask drops the
-        # binary under /opt/homebrew/bin/goose on macOS; the wizard
-        # prompts for and persists GOOSE_BIN the same way CODEX_BIN
-        # and OPENCODE_BIN are handled, so the fallback fires only on
-        # a first-time install where the wizard has not run yet.
         goose_bin_resolved = goose_bin or "/opt/homebrew/bin/goose"
         # kill(1) for the cross-user kill escalation (#456). The bot
         # runs `sudo -n -u <target> /bin/kill -<sig> <pid>` against
@@ -4684,45 +4452,12 @@ def _cmd_apply() -> None:
         _apply_models(install_path, dry_run)
 
         # -- Step 5: Write secrets --
-        # Inject CODEX_BIN from the apply-time env so the operator's
-        # explicit `sudo CODEX_BIN=... kai install apply` is honored
-        # without round-tripping through the wizard. Apply-time env
-        # wins over any value already in install.conf.
-        #
-        # Gate the apply-time shell env pass-through on the global
-        # DEFAULT_BACKEND only: it is an ad-hoc escape hatch for global
-        # backend installs (`sudo CODEX_BIN=... kai install apply`).
-        # Per-user backend entries do NOT need it; their binary paths
-        # are collected by the `make config` per-user backend scan
-        # and arrive here through install.conf, which `_apply_sudoers`
-        # consumes below. Codex AUTH for per-user entries stays
-        # out-of-band (per-OS-user `codex login`).
-        env_codex_bin = os.environ.get("CODEX_BIN")
-        if env_codex_bin and env.get("DEFAULT_BACKEND") == "codex":
-            env["CODEX_BIN"] = env_codex_bin
-        # Mirror the same env pass-through for OPENCODE_BIN so an
-        # `sudo OPENCODE_BIN=... kai install apply` invocation pins
-        # the same path the running bot will resolve via
-        # resolve_oneshot_binary("opencode"). Same scoping as
-        # CODEX_BIN above: global installs only; per-user opencode
-        # entries get their path from the wizard scan via
-        # install.conf, with auth out-of-band (`opencode auth login`).
-        env_opencode_bin = os.environ.get("OPENCODE_BIN")
-        if env_opencode_bin and env.get("DEFAULT_BACKEND") == "opencode":
-            env["OPENCODE_BIN"] = env_opencode_bin
-        # And for GOOSE_BIN, completing the per-backend trio. Same
-        # split as the two above: shell env override for global goose
-        # installs, install.conf from the wizard scan for per-user
-        # entries.
-        env_goose_bin = os.environ.get("GOOSE_BIN")
-        if env_goose_bin and env.get("DEFAULT_BACKEND") == "goose":
-            env["GOOSE_BIN"] = env_goose_bin
-        # And for CLAUDE_BIN, completing the per-backend set. The
-        # DEFAULT_BACKEND gate compares against the runtime default
-        # because the wizard omits the key on claude installs.
-        env_claude_bin = os.environ.get("CLAUDE_BIN")
-        if env_claude_bin and env.get("DEFAULT_BACKEND", "claude") == "claude":
-            env["CLAUDE_BIN"] = env_claude_bin
+        # Backend executable paths are no longer accepted from
+        # install.conf or apply-time environment variables. They are
+        # discovered by the installer and written to admin-owned
+        # /etc/kai/backends.yaml below.
+        for backend_bin_key in ("CLAUDE_BIN", "CODEX_BIN", "OPENCODE_BIN", "GOOSE_BIN"):
+            env.pop(backend_bin_key, None)
         # DEFAULT_TIMEOUT migration. Operators upgrading without
         # re-running the wizard carry the legacy AGENT_TIMEOUT_SECONDS
         # key in install.conf; rewrite to the canonical name at apply
@@ -4779,10 +4514,6 @@ def _cmd_apply() -> None:
         _apply_sudoers(
             service_user,
             dry_run,
-            claude_bin=env.get("CLAUDE_BIN"),
-            codex_bin=env.get("CODEX_BIN"),
-            opencode_bin=env.get("OPENCODE_BIN"),
-            goose_bin=env.get("GOOSE_BIN"),
             agent_backend=agent_backend,
         )
 
@@ -5937,34 +5668,63 @@ def _apply_secrets(
         print(f"  Copied {yaml_dst}")
 
 
-def _build_backend_registry(service_user: str, env: dict[str, str]) -> str:
-    """Build the installed backend registry from admin-owned install state."""
-    svc_home = _user_home(service_user)
-    entries = {
-        "claude": {
-            "driver": "claude",
-            "runtime": "local_process",
-            "command": env.get("CLAUDE_BIN") or _resolve_default_claude_bin(service_user),
-            "allowed_models": sorted((*PROVIDER_MODELS["anthropic"].keys(), "claude-*")),
-        },
-        "codex": {
-            "driver": "codex",
-            "runtime": "local_process",
-            "command": env.get("CODEX_BIN") or _resolve_default_codex_bin(),
-            "allowed_models": sorted(CODEX_MODELS.keys()),
-        },
-        "goose": {
-            "driver": "goose",
-            "runtime": "local_process",
-            "command": env.get("GOOSE_BIN") or "/opt/homebrew/bin/goose",
-        },
-        "opencode": {
-            "driver": "opencode",
-            "runtime": "local_process",
-            "command": env.get("OPENCODE_BIN") or f"{svc_home}/.local/bin/opencode",
-        },
-    }
-    return render_backend_registry(entries)
+def _configured_install_backends(env: dict[str, str], users_yaml_path: str | Path | None = None) -> set[str]:
+    """Return backend IDs used by global config or users.yaml overrides."""
+    configured = {env.get("DEFAULT_BACKEND", "claude").strip().lower() or "claude"}
+    configured |= _collect_backends_from_yaml(users_yaml_path or USERS_YAML)
+    return configured & VALID_BACKENDS
+
+
+def _backend_registry_entries(service_user: str, env: dict[str, str], users_yaml_path: str | Path | None = None) -> dict[str, dict[str, object]]:
+    """Build backend registry entries from discovered global installs."""
+    discovered = _discover_backend_commands(service_user)
+    if not discovered:
+        raise SystemExit(
+            "No supported backend command was found. Install at least one of: "
+            "claude, codex, goose, opencode."
+        )
+
+    missing = sorted(_configured_install_backends(env, users_yaml_path) - discovered.keys())
+    if missing:
+        raise SystemExit(
+            "Configured backend(s) are not installed globally: "
+            f"{', '.join(missing)}. Install them, or change DEFAULT_BACKEND/users.yaml to an installed backend."
+        )
+
+    entries: dict[str, dict[str, object]] = {}
+    for backend, command in sorted(discovered.items()):
+        if backend == "claude":
+            entries[backend] = {
+                "driver": "claude",
+                "runtime": "local_process",
+                "command": command,
+                "allowed_models": sorted((*PROVIDER_MODELS["anthropic"].keys(), "claude-*")),
+            }
+        elif backend == "codex":
+            entries[backend] = {
+                "driver": "codex",
+                "runtime": "local_process",
+                "command": command,
+                "allowed_models": sorted(CODEX_MODELS.keys()),
+            }
+        elif backend == "goose":
+            entries[backend] = {
+                "driver": "goose",
+                "runtime": "local_process",
+                "command": command,
+            }
+        elif backend == "opencode":
+            entries[backend] = {
+                "driver": "opencode",
+                "runtime": "local_process",
+                "command": command,
+            }
+    return entries
+
+
+def _build_backend_registry(service_user: str, env: dict[str, str], users_yaml_path: str | Path | None = None) -> str:
+    """Build the installed backend registry from discovered global commands."""
+    return render_backend_registry(_backend_registry_entries(service_user, env, users_yaml_path))
 
 
 def _apply_backend_registry(service_user: str, env: dict[str, str], dry_run: bool) -> None:
@@ -6120,17 +5880,12 @@ def _apply_sudoers(
     SETENV: NOPASSWD: rule. Without this, hand-added per-user rules
     were silently wiped on every `sudo make install`.
 
-    `claude_bin`, `codex_bin`, `opencode_bin`, and `goose_bin` are
-    threaded from `_cmd_apply`'s env dict (which sources them from
-    install.conf, after the apply-time env-var override block) so the
-    SETENV rules pin the same absolute paths the running bot will
-    invoke. `claude_bin` falls back to the service user's
-    `~/.local/bin/claude` (the native installer location);
-    `codex_bin` falls back to a common absolute codex install path;
-    `opencode_bin`
-    falls back to the service user's `~/.local/bin/opencode`;
-    `goose_bin` falls back to /opt/homebrew/bin/goose. The fallbacks
-    fire only on installs where the wizard has not collected a value.
+    Backend command paths are resolved from installer discovery and
+    rendered into /etc/kai/backends.yaml. This function reuses the
+    same registry entry builder so sudoers and the runtime registry
+    have one command source. The optional `*_bin` parameters are kept
+    for direct/dev formatter compatibility; `_cmd_apply` does not feed
+    them from install.conf or process environment.
 
     `agent_backend` is the install's global backend (the env dict's
     DEFAULT_BACKEND, defaulting to claude when the key is absent, which
@@ -6151,13 +5906,19 @@ def _apply_sudoers(
     # dry run, since the operator's next step is `sudo make install` which
     # would hit the same error with worse blast radius (partial install).
     os_users = _collect_os_users_from_yaml(users_yaml_path)
+    registry_entries = _backend_registry_entries(service_user, {"DEFAULT_BACKEND": agent_backend}, users_yaml_path)
+    registry_commands = {
+        backend: str(entry["command"])
+        for backend, entry in registry_entries.items()
+        if isinstance(entry, dict) and isinstance(entry.get("command"), str)
+    }
     sudoers_content = _generate_sudoers(
         service_user,
         os_users,
-        claude_bin=claude_bin,
-        codex_bin=codex_bin,
-        opencode_bin=opencode_bin,
-        goose_bin=goose_bin,
+        claude_bin=registry_commands.get("claude"),
+        codex_bin=registry_commands.get("codex"),
+        opencode_bin=registry_commands.get("opencode"),
+        goose_bin=registry_commands.get("goose"),
     )
 
     # Backstop check: each per-user rule pins a backend binary to a
@@ -6177,30 +5938,25 @@ def _apply_sudoers(
     # backend switch cannot strand a user without a rule.
     if os_users:
         backends_in_use = {agent_backend} | _collect_backends_from_yaml(users_yaml_path)
-        svc_home = _user_home(service_user)
         # Each entry's path must resolve to exactly what _generate_sudoers
         # pins for that backend's rule (including the fallbacks); a new
         # backend with a sudoers rule needs an entry in both places.
         expected_bins: dict[str, tuple[Path, str]] = {
             "claude": (
-                Path(claude_bin or _resolve_default_claude_bin(service_user)),
-                "Run 'make install' after installing claude globally, or re-run "
-                "'make config' and point CLAUDE_BIN at the actual install location.",
+                Path(registry_commands.get("claude", "")),
+                "Install claude globally and rerun make install so /etc/kai/backends.yaml is regenerated.",
             ),
             "codex": (
-                Path(codex_bin or _resolve_default_codex_bin()),
-                "Run 'make install' after installing codex globally, or re-run "
-                "'make config' and point CODEX_BIN at the actual install location.",
+                Path(registry_commands.get("codex", "")),
+                "Install codex globally and rerun make install so /etc/kai/backends.yaml is regenerated.",
             ),
             "opencode": (
-                Path(opencode_bin or f"{svc_home}/.local/bin/opencode"),
-                "Run 'make install' after installing opencode globally, or re-run "
-                "'make config' and point OPENCODE_BIN at the actual install location.",
+                Path(registry_commands.get("opencode", "")),
+                "Install opencode globally and rerun make install so /etc/kai/backends.yaml is regenerated.",
             ),
             "goose": (
-                Path(goose_bin or "/opt/homebrew/bin/goose"),
-                "Run 'make install' after installing goose globally, or re-run "
-                "'make config' and point GOOSE_BIN at the actual install location.",
+                Path(registry_commands.get("goose", "")),
+                "Install goose globally and rerun make install so /etc/kai/backends.yaml is regenerated.",
             ),
         }
         for backend in sorted(backends_in_use & expected_bins.keys()):
