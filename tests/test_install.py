@@ -72,6 +72,29 @@ from kai.install import (
     cli,
 )
 
+
+@pytest.fixture(autouse=True)
+def _isolate_installed_backend_discovery(monkeypatch, tmp_path):
+    """Keep install tests independent of host-installed backend CLIs.
+
+    CI runners have none of claude/codex/goose/opencode installed,
+    while developer machines may have a real /etc/kai/backends.yaml.
+    Most install tests are not about command discovery, so give them a
+    deterministic registry-shaped discovery result. Tests that exercise
+    missing/discovered backend behavior override this fixture locally.
+    """
+    monkeypatch.setattr("kai.install.BACKENDS_YAML", tmp_path / "absent-backends.yaml")
+    monkeypatch.setattr(
+        "kai.install._discover_backend_commands",
+        lambda service_user: {
+            "claude": "/test/bin/claude",
+            "codex": "/test/bin/codex",
+            "goose": "/test/bin/goose",
+            "opencode": "/test/bin/opencode",
+        },
+    )
+
+
 # ── Validation helpers ───────────────────────────────────────────────
 
 
@@ -7420,7 +7443,7 @@ class TestApplyBackendRegistry:
         )
         _apply_backend_registry("kai", {}, dry_run=True)
         output = capsys.readouterr().out
-        assert "/etc/kai/backends.yaml" in output
+        assert "backends.yaml" in output
         assert "0644" in output
 
     def test_configured_backend_must_be_discovered(self, monkeypatch):
