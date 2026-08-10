@@ -16,10 +16,14 @@ into four tables:
    workspace path, voice mode/name preferences, and future extensibility.
    Keys are namespaced strings like "voice_mode:{chat_id}".
 
-4. **workspace_history** - Recently used workspace paths for the /workspaces
+4. **telegram_update_queue** - Durable inbound Telegram webhook updates.
+   Webhook mode persists accepted updates before acknowledging them, then a
+   worker claims and processes rows so restarts can replay unfinished work.
+
+5. **workspace_history** - Recently used workspace paths for the /workspaces
    inline keyboard. Sorted by last_used_at for recency ordering.
 
-5. **allowed_workspaces** - Per-user allowed workspace paths, managed via
+6. **allowed_workspaces** - Per-user allowed workspace paths, managed via
    /workspace allow and /workspace deny. Unioned with global ALLOWED_WORKSPACES
    env var for the effective access list.
 
@@ -44,6 +48,21 @@ log = logging.getLogger(__name__)
 
 # Module-level database connection, initialized by init_db() at startup
 _db: aiosqlite.Connection | None = None
+
+
+class TelegramUpdateQueueRow(TypedDict):
+    """Row shape for durable inbound Telegram webhook work."""
+
+    id: int
+    update_id: int
+    payload: str
+    status: str
+    attempt_count: int
+    last_error: str | None
+    locked_at: str | None
+    processed_at: str | None
+    created_at: str
+    updated_at: str
 
 
 def _get_db() -> aiosqlite.Connection:
@@ -154,6 +173,22 @@ async def init_db(db_path: Path) -> None:
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            )
+        """)
+        log.debug("Creating telegram_update_queue table")
+        await _get_db().execute("""
+            CREATE TABLE IF NOT EXISTS telegram_update_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                update_id INTEGER NOT NULL UNIQUE,
+                payload TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                locked_at TIMESTAMP,
+                processed_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                CHECK (status IN ('pending', 'processing', 'done'))
             )
         """)
         log.debug("Creating allowed_workspaces table")
@@ -292,6 +327,155 @@ async def get_stats(chat_id: int) -> dict | None:
         if not row:
             return None
         return dict(row)
+
+
+# ── Durable Telegram update queue ───────────────────────────────────
+
+
+def _telegram_update_queue_row(row: aiosqlite.Row) -> TelegramUpdateQueueRow:
+    return {
+        "id": row["id"],
+        "update_id": row["update_id"],
+        "payload": row["payload"],
+        "status": row["status"],
+        "attempt_count": row["attempt_count"],
+        "last_error": row["last_error"],
+        "locked_at": row["locked_at"],
+        "processed_at": row["processed_at"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+async def enqueue_telegram_update(update_id: int, payload: str) -> tuple[int, bool]:
+    """
+    Persist a Telegram webhook update before acknowledging it.
+
+    update_id is unique per bot. Duplicate Telegram retries return the existing
+    row ID and inserted=False rather than creating duplicate work.
+    """
+    cursor = await _get_db().execute(
+        """
+        INSERT OR IGNORE INTO telegram_update_queue (update_id, payload)
+        VALUES (?, ?)
+        """,
+        (update_id, payload),
+    )
+    await _get_db().commit()
+    if cursor.rowcount == 1:
+        if cursor.lastrowid is None:
+            raise RuntimeError("INSERT did not return a row ID")
+        return cursor.lastrowid, True
+
+    async with _get_db().execute(
+        "SELECT id FROM telegram_update_queue WHERE update_id = ?",
+        (update_id,),
+    ) as existing:
+        row = await existing.fetchone()
+    if row is None:
+        raise RuntimeError("Telegram update enqueue did not insert or find a row")
+    return row["id"], False
+
+
+async def claim_next_telegram_update() -> TelegramUpdateQueueRow | None:
+    """
+    Atomically claim the oldest pending Telegram update for processing.
+
+    The row transitions pending -> processing and attempt_count increments.
+    Returns None when no pending work exists.
+    """
+    db = _get_db()
+    await db.execute("BEGIN IMMEDIATE")
+    try:
+        async with db.execute(
+            """
+            SELECT id FROM telegram_update_queue
+            WHERE status = 'pending'
+            ORDER BY id
+            LIMIT 1
+            """
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            await db.commit()
+            return None
+
+        row_id = row["id"]
+        await db.execute(
+            """
+            UPDATE telegram_update_queue
+            SET status = 'processing',
+                attempt_count = attempt_count + 1,
+                locked_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'pending'
+            """,
+            (row_id,),
+        )
+        async with db.execute(
+            "SELECT * FROM telegram_update_queue WHERE id = ?",
+            (row_id,),
+        ) as claimed_cursor:
+            claimed = await claimed_cursor.fetchone()
+        if claimed is None:
+            raise RuntimeError(f"Claimed Telegram update row {row_id} disappeared")
+        await db.commit()
+        return _telegram_update_queue_row(claimed)
+    except Exception:
+        await db.rollback()
+        raise
+
+
+async def complete_telegram_update(row_id: int) -> bool:
+    """Mark a claimed Telegram update as done."""
+    cursor = await _get_db().execute(
+        """
+        UPDATE telegram_update_queue
+        SET status = 'done',
+            processed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = 'processing'
+        """,
+        (row_id,),
+    )
+    await _get_db().commit()
+    return cursor.rowcount > 0
+
+
+async def retry_telegram_update(row_id: int, error: str) -> bool:
+    """Return a claimed Telegram update to pending after processing failure."""
+    cursor = await _get_db().execute(
+        """
+        UPDATE telegram_update_queue
+        SET status = 'pending',
+            last_error = ?,
+            locked_at = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = 'processing'
+        """,
+        (error, row_id),
+    )
+    await _get_db().commit()
+    return cursor.rowcount > 0
+
+
+async def requeue_processing_telegram_updates() -> int:
+    """
+    Requeue updates left in processing by a previous process crash.
+
+    Called during webhook startup before the worker begins claiming rows.
+    """
+    cursor = await _get_db().execute(
+        """
+        UPDATE telegram_update_queue
+        SET status = 'pending',
+            locked_at = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE status = 'processing'
+        """
+    )
+    await _get_db().commit()
+    return cursor.rowcount
 
 
 # ── Job management ───────────────────────────────────────────────────

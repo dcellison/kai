@@ -54,6 +54,62 @@ class TestSessions:
         assert await sessions.get_stats(999) is None
 
 
+class TestTelegramUpdateQueue:
+    async def test_enqueue_is_idempotent_by_update_id(self, db):
+        first_id, first_inserted = await sessions.enqueue_telegram_update(1001, '{"update_id":1001}')
+        second_id, second_inserted = await sessions.enqueue_telegram_update(1001, '{"update_id":1001,"retry":true}')
+
+        assert first_inserted is True
+        assert second_inserted is False
+        assert second_id == first_id
+
+        async with sessions._get_db().execute("SELECT COUNT(*) FROM telegram_update_queue") as cursor:
+            row = await cursor.fetchone()
+        assert row[0] == 1
+
+    async def test_claim_and_complete_update(self, db):
+        row_id, _ = await sessions.enqueue_telegram_update(1002, '{"update_id":1002}')
+
+        claimed = await sessions.claim_next_telegram_update()
+
+        assert claimed is not None
+        assert claimed["id"] == row_id
+        assert claimed["update_id"] == 1002
+        assert claimed["payload"] == '{"update_id":1002}'
+        assert claimed["status"] == "processing"
+        assert claimed["attempt_count"] == 1
+        assert await sessions.claim_next_telegram_update() is None
+
+        assert await sessions.complete_telegram_update(row_id) is True
+        assert await sessions.complete_telegram_update(row_id) is False
+        assert await sessions.claim_next_telegram_update() is None
+
+    async def test_retry_returns_processing_update_to_pending(self, db):
+        row_id, _ = await sessions.enqueue_telegram_update(1003, '{"update_id":1003}')
+        first_claim = await sessions.claim_next_telegram_update()
+        assert first_claim is not None
+
+        assert await sessions.retry_telegram_update(row_id, "temporary failure") is True
+
+        second_claim = await sessions.claim_next_telegram_update()
+        assert second_claim is not None
+        assert second_claim["id"] == row_id
+        assert second_claim["attempt_count"] == 2
+        assert second_claim["last_error"] == "temporary failure"
+
+    async def test_requeue_processing_updates_for_startup_recovery(self, db):
+        row_id, _ = await sessions.enqueue_telegram_update(1004, '{"update_id":1004}')
+        first_claim = await sessions.claim_next_telegram_update()
+        assert first_claim is not None
+
+        assert await sessions.requeue_processing_telegram_updates() == 1
+
+        recovered_claim = await sessions.claim_next_telegram_update()
+        assert recovered_claim is not None
+        assert recovered_claim["id"] == row_id
+        assert recovered_claim["attempt_count"] == 2
+
+
 class TestMemoryProjectRows:
     """Persistence layer for chat-registered memory projects. The
     merge/validation logic lives in kai.memory_projects; these tests
@@ -1484,17 +1540,18 @@ class TestInitDbTransaction:
 
     @pytest.mark.asyncio
     async def test_fresh_db_creates_all_tables(self, tmp_path):
-        """A fresh database gets all four tables in one transaction."""
+        """A fresh database gets the core tables in one transaction."""
         db_path = tmp_path / "fresh.db"
         await sessions.init_db(db_path)
         try:
             db = sessions._get_db()
-            # Check all four tables exist
+            # Check representative core tables exist.
             cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
             tables = {row[0] for row in await cursor.fetchall()}
             assert "sessions" in tables
             assert "jobs" in tables
             assert "settings" in tables
+            assert "telegram_update_queue" in tables
             assert "workspace_history" in tables
         finally:
             await sessions.close_db()
@@ -1515,6 +1572,7 @@ class TestInitDbTransaction:
             assert "sessions" in tables
             assert "jobs" in tables
             assert "settings" in tables
+            assert "telegram_update_queue" in tables
             assert "workspace_history" in tables
         finally:
             await sessions.close_db()
