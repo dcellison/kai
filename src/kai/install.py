@@ -5809,12 +5809,12 @@ def _apply_secrets(
         print(f"[DRY RUN] Would write: {env_path} (mode 0600)")
         if users_yaml_src is not None:
             print(f"[DRY RUN] Would copy: {users_yaml_src} -> {etc_kai / 'users.yaml'} (mode 0600)")
-        # TODO: services.yaml and workspaces.yaml still copy from
+        # TODO: services.yaml, workspaces.yaml, and memory-projects.yaml still copy from
         # PROJECT_ROOT pending follow-up issues that mirror the
         # users.yaml staging flow for those files. The asymmetry is
         # intentional and tracked; users.yaml moves first because it
         # is auth-bearing.
-        for yaml_name in ("services.yaml", "workspaces.yaml"):
+        for yaml_name in ("services.yaml", "workspaces.yaml", "memory-projects.yaml"):
             if (PROJECT_ROOT / yaml_name).exists():
                 print(f"[DRY RUN] Would copy: {etc_kai / yaml_name} (mode 0600)")
         return
@@ -5841,11 +5841,11 @@ def _apply_secrets(
     # Copy optional YAML config files to /etc/kai/ if they exist in the
     # source directory. All get root-only permissions (mode 0600) since
     # they may contain sensitive configuration (API keys in services.yaml).
-    # TODO: services.yaml and workspaces.yaml still read from
+    # TODO: services.yaml, workspaces.yaml, and memory-projects.yaml still read from
     # PROJECT_ROOT pending follow-up issues that mirror the users.yaml
     # staging flow. The asymmetry is documented in-code so it is
     # visible to anyone touching this function.
-    for yaml_name in ("services.yaml", "workspaces.yaml"):
+    for yaml_name in ("services.yaml", "workspaces.yaml", "memory-projects.yaml"):
         yaml_src = PROJECT_ROOT / yaml_name
         yaml_dst = etc_kai / yaml_name
         if yaml_src.exists():

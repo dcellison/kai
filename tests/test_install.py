@@ -7300,6 +7300,19 @@ class TestApplySecretsDryRun:
         assert str(staging) in output
         assert "/etc/kai/users.yaml" in output
 
+    def test_dry_run_previews_optional_protected_yaml_configs(self, tmp_path, monkeypatch, capsys):
+        """Dry run previews every optional YAML file runtime can load from /etc/kai."""
+        for name in ("services.yaml", "workspaces.yaml", "memory-projects.yaml"):
+            (tmp_path / name).write_text("{}\n")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+
+        _apply_secrets({"TELEGRAM_BOT_TOKEN": "test"}, dry_run=True)
+
+        output = capsys.readouterr().out
+        assert "/etc/kai/services.yaml" in output
+        assert "/etc/kai/workspaces.yaml" in output
+        assert "/etc/kai/memory-projects.yaml" in output
+
 
 class TestApplyBackendRegistry:
     def test_build_registry_uses_env_paths(self, monkeypatch):
@@ -7366,10 +7379,10 @@ class TestApplySecretsUsersYamlStaging:
 
     @staticmethod
     def _no_other_yamls(monkeypatch, tmp_path):
-        """Make `PROJECT_ROOT/services.yaml` and `workspaces.yaml` absent.
+        """Make optional protected YAML configs absent from PROJECT_ROOT.
 
         Keeps the test focused on the users.yaml staging path; the
-        legacy project-tree copy for the other two files is out of
+        legacy project-tree copy for the other config files is out of
         scope here.
         """
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
@@ -7417,6 +7430,21 @@ class TestApplySecretsUsersYamlStaging:
         assert 0o600 in users_modes
         users_owners = [(uid, gid) for p, uid, gid in chowned if p == "/etc/kai/users.yaml"]
         assert (0, 0) in users_owners
+
+    def test_copies_optional_protected_yaml_configs(self, tmp_path, monkeypatch):
+        """services/workspaces/memory-projects are installed as root-owned 0600 config."""
+        for name in ("services.yaml", "workspaces.yaml", "memory-projects.yaml"):
+            (tmp_path / name).write_text("{}\n")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        copied, chmodded, chowned = self._intercept_filesystem(monkeypatch)
+
+        _apply_secrets({"TELEGRAM_BOT_TOKEN": "test"}, dry_run=False, users_yaml_staging_path=None)
+
+        for name in ("services.yaml", "workspaces.yaml", "memory-projects.yaml"):
+            dst = f"/etc/kai/{name}"
+            assert (str(tmp_path / name), dst) in copied
+            assert (dst, 0o600) in chmodded
+            assert (dst, 0, 0) in chowned
 
     def test_skips_when_path_is_none(self, tmp_path, monkeypatch):
         """No staging path -> no users.yaml copy."""
