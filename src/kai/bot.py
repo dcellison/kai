@@ -3597,6 +3597,12 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
     agent_backend, provider = get_user_backend_and_provider(user_config, config)
     model_override = resolve_user_model(ModelRole.PR_REVIEW, user_config, config)
     github_token = await sessions.get_setting(f"github_token:{actor_id}")
+    if getattr(config, "protected_install", False) is True and not github_token:
+        await update.message.reply_text(
+            "PR review requires a stored per-user GitHub token in protected installs. "
+            "Send `/github token <token>` first."
+        )
+        return
 
     # Only pass the workspace as `local_repo_path` when its `origin`
     # remote actually matches the target repo. Otherwise the bundle

@@ -892,6 +892,7 @@ async def _process_github_event_for_user(
     settings = await sessions.resolve_github_settings(chat_id, config)
     target_chat_id = settings["notify_chat_id"]
     github_token = await sessions.get_setting(f"github_token:{chat_id}")
+    protected_install = getattr(config, "protected_install", False) is True
 
     # Resolve per-user os_user for subprocess isolation. None falls
     # back to "run as the bot's own OS user" inside the agent backend.
@@ -933,6 +934,19 @@ async def _process_github_event_for_user(
     if settings["pr_review"] and event_type == "pull_request":
         action = payload.get("action", "")
         if action in ("opened", "reopened", "synchronize") and github_operations_authorized:
+            if protected_install and not github_token:
+                log.warning(
+                    "Skipping automated GitHub review for user %d: protected install requires a per-user token",
+                    chat_id,
+                )
+                await bot.send_message(
+                    chat_id=target_chat_id,
+                    text=(
+                        f"PR review skipped for {repo_full_name}: protected installs require a stored "
+                        "per-user GitHub token. Send `/github token <token>` first."
+                    ),
+                )
+                return
             pr = payload.get("pull_request", {})
             pr_number = pr.get("number", 0)
             repo = repo_full_name
@@ -1004,6 +1018,19 @@ async def _process_github_event_for_user(
     if settings["issue_triage"] and event_type == "issues":
         action = payload.get("action", "")
         if action == "opened" and github_operations_authorized:
+            if protected_install and not github_token:
+                log.warning(
+                    "Skipping issue triage for user %d: protected install requires a per-user token",
+                    chat_id,
+                )
+                await bot.send_message(
+                    chat_id=target_chat_id,
+                    text=(
+                        f"Issue triage skipped for {repo_full_name}: protected installs require a stored "
+                        "per-user GitHub token. Send `/github token <token>` first."
+                    ),
+                )
+                return
             issue = payload.get("issue", {})
             issue_number = issue.get("number", 0)
             repo = repo_full_name
@@ -1029,6 +1056,7 @@ async def _process_github_event_for_user(
                     provider=provider,
                     model_override=issue_triage_model_override,
                     allowed_triage_projects=user_config.allowed_triage_projects if user_config else [],
+                    github_token=github_token,
                 )
             )
             _background_tasks.add(task)

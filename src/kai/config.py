@@ -1268,6 +1268,11 @@ class Config:
     # Deprecated: temporary external-only fallback for existing GitHub and
     # generic webhook callers. Never use this for Telegram or internal APIs.
     webhook_secret: str = ""
+    # True when load_config() populated secrets from the protected
+    # installation env file (/etc/kai/env). Runtime code uses this to
+    # tighten boundaries that would break local single-user installs if
+    # enforced unconditionally.
+    protected_install: bool = False
 
     # Voice input (speech-to-text via whisper-cpp)
     voice_enabled: bool = False
@@ -3444,6 +3449,7 @@ def load_config() -> Config:
         github_webhook_secret=github_webhook_secret,
         generic_webhook_secret=generic_webhook_secret,
         webhook_secret=legacy_webhook_secret,
+        protected_install=bool(protected_env),
         voice_enabled=os.environ.get("VOICE_ENABLED", "").lower() in ("1", "true", "yes"),
         tts_enabled=os.environ.get("TTS_ENABLED", "").lower() in ("1", "true", "yes"),
         workspace_base=workspace_base,

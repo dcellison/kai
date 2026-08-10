@@ -1664,6 +1664,47 @@ class TestTriageIssue:
         assert "Secret Board" not in apply_kwargs["projects_json"]
 
     @pytest.mark.asyncio
+    async def test_github_token_flows_to_all_gh_subprocesses(self):
+        """A per-user token is used for every triage gh subprocess stage."""
+        payload = _issue_payload(title="Login broken")
+        triage_json = json.dumps(
+            {
+                "labels": ["bug"],
+                "duplicate_of": None,
+                "related": [],
+                "project": None,
+                "summary": "Login is broken.",
+                "priority": "high",
+            }
+        )
+        gh_envs: list[dict | None] = []
+
+        async def mock_exec(*args, **kwargs):
+            if args and args[0] == "gh":
+                gh_envs.append(kwargs.get("env"))
+                if "issue" in args and "list" in args:
+                    return _mock_subprocess(stdout="[]")
+                if "project" in args and "list" in args:
+                    return _mock_subprocess(stdout="[]")
+                if "label" in args and "list" in args:
+                    return _mock_subprocess(stdout=json.dumps([{"name": "bug"}]))
+                return _mock_subprocess(stdout="[]")
+            return _mock_subprocess(stdout=triage_json)
+
+        with (
+            patch("kai.triage.asyncio.create_subprocess_exec", side_effect=mock_exec),
+            patch("kai.triage.aiohttp.ClientSession") as mock_session_cls,
+        ):
+            mock_session, _ = _mock_aiohttp_session_post(status=200)
+            _attach_session_to_class(mock_session, mock_session_cls)
+            await triage_issue(payload, 8080, "secret", github_token="ghp_user")
+
+        assert gh_envs
+        assert all(env is not None for env in gh_envs)
+        assert all(env["GH_TOKEN"] == "ghp_user" for env in gh_envs)
+        assert all(env["GITHUB_TOKEN"] == "ghp_user" for env in gh_envs)
+
+    @pytest.mark.asyncio
     async def test_handles_error(self):
         """Claude subprocess failure logs error and sends Telegram notification."""
         payload = _issue_payload()

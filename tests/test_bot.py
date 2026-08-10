@@ -5964,6 +5964,39 @@ class TestHandleReviewCommand:
         assert mock_generate.call_args.kwargs["github_token"] == "ghp_user"
 
     @pytest.mark.asyncio
+    async def test_protected_install_requires_github_token(self, tmp_path, monkeypatch):
+        """Manual /review does not use the daemon gh identity in protected installs."""
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update()
+        config = _make_config(
+            protected_install=True,
+            user_configs={
+                1: UserConfig(
+                    telegram_id=1,
+                    name="op",
+                    github_repos=["dcellison/kai"],
+                ),
+            },
+        )
+        ctx = _make_context(config=config, args=["dcellison/kai", "681"])
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch(
+                "kai.review._resolve_workspace_remote_repo",
+                new=AsyncMock(return_value="dcellison/kai"),
+            ),
+            patch("kai.bot.sessions.get_setting", new=AsyncMock(return_value=None)),
+            patch("kai.bot.review.generate_pr_review", new_callable=AsyncMock) as mock_generate,
+        ):
+            await handle_review_command(update, ctx)
+
+        mock_generate.assert_not_called()
+        reply = update.message.reply_text.call_args.args[0]
+        assert "per-user GitHub token" in reply
+
+    @pytest.mark.asyncio
     async def test_short_form_falls_back_to_sole_configured_repo(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
         monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)

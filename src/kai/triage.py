@@ -28,6 +28,7 @@ of the model's response before acting on it.
 import asyncio
 import json
 import logging
+import os
 import re
 import tempfile
 from dataclasses import dataclass
@@ -55,6 +56,23 @@ _TRIAGE_TIMEOUT = 300
 # Header prepended to every triage comment on GitHub. Distinguishes
 # automated triage from human comments.
 _TRIAGE_HEADER = "## Triage by Kai\n\n"
+
+
+def _github_cli_env(github_token: str | None = None) -> dict[str, str] | None:
+    """
+    Return an environment for gh subprocesses using a per-user token.
+
+    None preserves gh's default authentication behavior, which is still
+    useful for local/single-user installs. Protected installs enforce
+    token presence before entering this module.
+    """
+    token = github_token.strip() if github_token else ""
+    if not token:
+        return None
+    env = os.environ.copy()
+    env["GH_TOKEN"] = token
+    env["GITHUB_TOKEN"] = token
+    return env
 
 
 @dataclass(frozen=True)
@@ -131,7 +149,13 @@ def _sanitize_search_query(title: str) -> str:
     return cleaned[:128]
 
 
-async def search_related_issues(repo: str, title: str, body: str, issue_number: int = 0) -> str:
+async def search_related_issues(
+    repo: str,
+    title: str,
+    body: str,
+    issue_number: int = 0,
+    github_token: str | None = None,
+) -> str:
     """
     Search for related issues in the repo using the GitHub CLI.
 
@@ -171,6 +195,7 @@ async def search_related_issues(repo: str, title: str, body: str, issue_number: 
             "number,title,state,labels",
             "--limit",
             "10",
+            env=_github_cli_env(github_token),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -200,7 +225,7 @@ async def search_related_issues(repo: str, title: str, body: str, issue_number: 
         return "[]"
 
 
-async def list_projects(owner: str) -> str:
+async def list_projects(owner: str, github_token: str | None = None) -> str:
     """
     List GitHub Projects for a user/org via the GitHub CLI.
 
@@ -222,6 +247,7 @@ async def list_projects(owner: str) -> str:
             owner,
             "--format",
             "json",
+            env=_github_cli_env(github_token),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -653,7 +679,7 @@ def _parse_triage_json(raw: str) -> dict:
     return result
 
 
-async def _label_exists(repo: str, label: str) -> bool:
+async def _label_exists(repo: str, label: str, github_token: str | None = None) -> bool:
     """
     Return True only when a label already exists in the repo.
 
@@ -676,6 +702,7 @@ async def _label_exists(repo: str, label: str) -> bool:
         label,
         "--json",
         "name",
+        env=_github_cli_env(github_token),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -714,6 +741,7 @@ async def apply_triage(
     projects_json: str = "[]",
     notify_chat_id: int | None = None,
     allowed_triage_projects: list[str] | None = None,
+    github_token: str | None = None,
 ) -> None:
     """
     Apply triage results: labels, project assignment, comment, and notification.
@@ -885,7 +913,7 @@ async def apply_triage(
     skipped_labels: list[str] = []
 
     for label in requested_labels:
-        if not await _label_exists(metadata.repo, label):
+        if not await _label_exists(metadata.repo, label, github_token=github_token):
             skipped_labels.append(label)
             log.warning(
                 "Skipping triage label '%s' for %s#%d because it does not exist in the repository",
@@ -904,6 +932,7 @@ async def apply_triage(
             metadata.repo,
             "--add-label",
             label,
+            env=_github_cli_env(github_token),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -963,6 +992,7 @@ async def apply_triage(
                 owner,
                 "--url",
                 metadata.url,
+                env=_github_cli_env(github_token),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -1044,6 +1074,7 @@ async def apply_triage(
             metadata.repo,
             "--body-file",
             str(body_path),
+            env=_github_cli_env(github_token),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -1125,6 +1156,7 @@ async def triage_issue(
     provider: str = "",
     model_override: str = "",
     allowed_triage_projects: list[str] | None = None,
+    github_token: str | None = None,
 ) -> None:
     """
     Full triage pipeline: analyze issue, apply labels, post results.
@@ -1151,11 +1183,17 @@ async def triage_issue(
         metadata = extract_issue_metadata(payload)
 
         # Step 1: Search for related/duplicate issues
-        related_issues = await search_related_issues(metadata.repo, metadata.title, metadata.body, metadata.number)
+        related_issues = await search_related_issues(
+            metadata.repo,
+            metadata.title,
+            metadata.body,
+            metadata.number,
+            github_token=github_token,
+        )
 
         # Step 2: List available project boards
         owner = metadata.repo.split("/")[0]
-        projects = await list_projects(owner)
+        projects = await list_projects(owner, github_token=github_token)
 
         allowed_projects = _filter_projects_json(projects, allowed_triage_projects)
 
@@ -1191,6 +1229,7 @@ async def triage_issue(
             projects_json=allowed_projects,
             notify_chat_id=notify_chat_id,
             allowed_triage_projects=allowed_triage_projects,
+            github_token=github_token,
         )
 
     except Exception as exc:

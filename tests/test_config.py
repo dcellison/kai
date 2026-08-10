@@ -706,6 +706,7 @@ class TestDualModeLoading:
         config = load_config()
         assert config.telegram_bot_token == "protected-token"
         assert config.allowed_user_ids == {999}
+        assert config.protected_install is True
 
     def test_protected_env_strips_quotes(self, monkeypatch):
         """Quote marks around values in /etc/kai/env are stripped."""
@@ -725,6 +726,7 @@ class TestDualModeLoading:
         )
         config = load_config()
         assert config.telegram_bot_token == "tok"
+        assert config.protected_install is True
 
     def test_falls_back_to_dotenv(self, monkeypatch, tmp_path):
         """When /etc/kai/env is not readable, load_dotenv is called.

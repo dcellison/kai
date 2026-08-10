@@ -472,6 +472,7 @@ def _build_test_app(
         mock_config.default_models = {}
         mock_config.default_backend = "claude"
         mock_config.default_provider = ""
+        mock_config.protected_install = False
         # get_user_config is synchronous in real Config; it must not return a
         # coroutine or authorization could be tested against a mock object.
         mock_config.get_user_config = lambda uid: default_user if uid == 12345 else None
@@ -1342,6 +1343,7 @@ class TestGetSubscribedUsers:
         config.default_models = {}
         config.default_backend = "claude"
         config.default_provider = ""
+        config.protected_install = False
         return config
 
     def _make_user(
@@ -1553,6 +1555,7 @@ class TestPerUserRouting:
         config.default_models = {}
         config.default_backend = "claude"
         config.default_provider = ""
+        config.protected_install = False
         # get_user_config returns the UserConfig for a given ID
         config.get_user_config = lambda uid: config.user_configs.get(uid)
         return config
@@ -2192,6 +2195,40 @@ class TestPerUserRouting:
             assert mock_review.call_args[1]["provider"] == "openai"
 
     @pytest.mark.asyncio
+    async def test_protected_review_requires_user_github_token(self, _clear_cooldowns, _mock_resolve_repo):
+        """Protected installs do not fall back to the daemon gh identity for PR review."""
+        user = self._make_user_config(111, repos=["owner/repo"])
+        config = self._make_config_with_users([user])
+        config.protected_install = True
+        app = _build_test_app(config=config)
+        payload = _make_pr_payload("opened")
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        with (
+            _mock_settings(pr_review=True, notify_chat_id=-100111),
+            patch("kai.webhook.sessions.get_setting", new_callable=AsyncMock, return_value=None),
+            patch("kai.webhook.review.review_pr", new_callable=AsyncMock) as mock_review,
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "pull_request",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert resp.status == 200
+
+            await asyncio.sleep(0.01)
+            mock_review.assert_not_called()
+            app[TELEGRAM_BOT_KEY].send_message.assert_called_once()
+            call = app[TELEGRAM_BOT_KEY].send_message.call_args.kwargs
+            assert call["chat_id"] == -100111
+            assert "per-user GitHub token" in call["text"]
+
+    @pytest.mark.asyncio
     async def test_triage_receives_user_backend(self, _clear_cooldowns):
         """Per-user backend/provider are passed to triage_issue."""
         base = self._make_user_config(111, repos=["owner/repo"])
@@ -2229,6 +2266,40 @@ class TestPerUserRouting:
             assert mock_triage.call_args[1]["agent_backend"] == "goose"
             assert mock_triage.call_args[1]["provider"] == "anthropic"
             assert mock_triage.call_args[1]["allowed_triage_projects"] == ["Sprint 1"]
+
+    @pytest.mark.asyncio
+    async def test_protected_triage_requires_user_github_token(self, _clear_cooldowns):
+        """Protected installs do not fall back to the daemon gh identity for issue triage."""
+        user = self._make_user_config(111, repos=["owner/repo"])
+        config = self._make_config_with_users([user])
+        config.protected_install = True
+        app = _build_test_app(config=config)
+        payload = _make_issue_payload("opened")
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        with (
+            _mock_settings(issue_triage=True, notify_chat_id=-100111),
+            patch("kai.webhook.sessions.get_setting", new_callable=AsyncMock, return_value=None),
+            patch("kai.webhook.triage.triage_issue", new_callable=AsyncMock) as mock_triage,
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "issues",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert resp.status == 200
+
+            await asyncio.sleep(0.01)
+            mock_triage.assert_not_called()
+            app[TELEGRAM_BOT_KEY].send_message.assert_called_once()
+            call = app[TELEGRAM_BOT_KEY].send_message.call_args.kwargs
+            assert call["chat_id"] == -100111
+            assert "per-user GitHub token" in call["text"]
 
     @pytest.mark.asyncio
     async def test_review_uses_global_backend_when_no_user_override(self, _clear_cooldowns, _mock_resolve_repo):
