@@ -579,9 +579,9 @@ async def _handle_telegram_update(request: web.Request) -> web.Response:
     receipt before Telegram's timeout. The per-chat lock in bot.py serializes
     concurrent messages, so ordering is preserved.
 
-    Always returns 200 on valid-secret requests, even on errors. Telegram retries
-    on non-200 responses, so surfacing internal errors as HTTP errors would cause
-    an infinite retry loop. Errors are logged instead.
+    Returns 200 after the update is queued. Payload errors still return 200 to
+    avoid permanent Telegram retries, but a local enqueue failure returns 500
+    because no work was accepted and a retry may succeed.
     """
     secret = request.app[TELEGRAM_WEBHOOK_SECRET_KEY]
     provided = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
@@ -600,15 +600,28 @@ async def _handle_telegram_update(request: web.Request) -> web.Response:
 
     try:
         update = Update.de_json(data, bot)
-        if update:
-            # Fire-and-forget: return 200 to Telegram immediately while
-            # processing continues in the background. Without this, Claude's
-            # response time would exceed Telegram's webhook timeout.
-            task = asyncio.create_task(telegram_app.process_update(update))
-            _background_tasks.add(task)
-            task.add_done_callback(_background_tasks.discard)
     except Exception:
-        log.exception("Error processing Telegram update")
+        log.exception("Error deserializing Telegram update")
+        return web.Response(status=200)
+    if not update:
+        return web.Response(status=200)
+
+    # Fire-and-forget: return 200 to Telegram immediately while processing
+    # continues in the background. Without this, Claude's response time would
+    # exceed Telegram's webhook timeout.
+    process_update = None
+    try:
+        process_update = telegram_app.process_update(update)
+        task = asyncio.create_task(process_update)
+    except Exception:
+        if process_update is not None:
+            close = getattr(process_update, "close", None)
+            if close is not None:
+                close()
+        log.exception("Failed to enqueue Telegram update")
+        return web.Response(status=500, text="Failed to enqueue update")
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     return web.Response(status=200)
 

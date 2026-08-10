@@ -681,6 +681,20 @@ class TestTelegramUpdate:
         assert resp.status == 200
         telegram_request.app[TELEGRAM_APP_KEY].process_update.assert_not_called()
 
+    async def test_enqueue_failure_returns_500(self, telegram_request, monkeypatch):
+        """If no background task is queued, do not acknowledge the update as accepted."""
+        fake_update = MagicMock()
+        monkeypatch.setattr("kai.webhook.Update.de_json", MagicMock(return_value=fake_update))
+        monkeypatch.setattr("kai.webhook.asyncio.create_task", MagicMock(side_effect=RuntimeError("loop closing")))
+        telegram_request.json = AsyncMock(return_value={"update_id": 123})
+        webhook_mod._background_tasks.clear()
+
+        resp = await _handle_telegram_update(telegram_request)
+
+        assert resp.status == 500
+        telegram_request.app[TELEGRAM_APP_KEY].process_update.assert_called_once_with(fake_update)
+        assert webhook_mod._background_tasks == set()
+
 
 # ── webhook shutdown background task drain ─────────────────────────
 
