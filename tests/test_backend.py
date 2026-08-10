@@ -1776,7 +1776,7 @@ class TestAssembleTurnContext:
             session_context="",
             workspace_reminder="",
             workspace=ws,
-            backend_name="claude_code",
+            backend_name="claude",
             job_type="interactive",
             session_id="sess-1",
         )
@@ -1786,7 +1786,7 @@ class TestAssembleTurnContext:
         kwargs = scoped_mock.call_args.kwargs
         assert kwargs["user_id"] == "42"
         assert kwargs["workspace"] == ws
-        assert kwargs["backend_name"] == "claude_code"
+        assert kwargs["backend_name"] == "claude"
         assert kwargs["job_type"] == "interactive"
         assert kwargs["session_id"] == "sess-1"
 

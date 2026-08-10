@@ -439,7 +439,7 @@ class SubprocessPool:
         needs_restart = False
 
         # Read the backend identifier off the instance. Every concrete
-        # backend sets `backend_name` as a class attribute (claude_code
+        # backend sets `backend_name` as a class attribute (claude
         # / goose / codex / opencode). The ABC default is the empty
         # string, so a test double or legacy stub that never overrides
         # falls through to "claude" with a warning; this preserves the

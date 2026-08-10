@@ -5609,7 +5609,7 @@ class TestFormatScopedContextWithRecallPayload:
             "what is kai?",
             user_id="123",
             workspace=project_root,
-            backend_name="claude_code",
+            backend_name="claude",
             job_type="interactive",
             session_id="sess-1",
         )

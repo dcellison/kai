@@ -92,7 +92,7 @@ class ClaudeCodeBackend(AgentBackend):
     # Stable identifier consumed by pool/bot dispatch and tagged into
     # the `memory.recall` line so log analysts can attribute recall
     # behavior to the caller backend.
-    backend_name = "claude_code"
+    backend_name = "claude"
 
     def __init__(
         self,

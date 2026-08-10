@@ -868,7 +868,7 @@ def _backend_name_for_instance(instance: object) -> str:
     """Map a backend instance to its config-key backend name.
 
     Reads the `backend_name` class attribute every concrete backend sets
-    (claude_code / goose / codex / opencode). A falsy value indicates a
+    (claude / goose / codex / opencode). A falsy value indicates a
     test double or legacy stub that never overrode the ABC default of
     `""`; for those, log a warning and fall back to "claude" so the
     historical default for unknown shapes is preserved.

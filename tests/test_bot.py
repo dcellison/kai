@@ -88,19 +88,19 @@ class TestBackendNameForInstance:
     off the instance rather than inspecting the concrete class name.
 
     Real backends each set the attribute to their canonical identifier
-    (claude.py: "claude_code"; goose.py: "goose"; codex.py: "codex").
+    (claude.py: "claude"; goose.py: "goose"; codex.py: "codex").
     A test double or legacy stub that never overrode the ABC default
     falls back to "claude" with a warning so model validation still
     routes through the provider-only path.
     """
 
     def test_claude_backend_returns_class_attribute(self):
-        """ClaudeCodeBackend.backend_name is "claude_code" (the shadow-log tag)."""
+        """ClaudeCodeBackend.backend_name is "claude"."""
         from kai.claude import ClaudeCodeBackend
 
         instance = MagicMock(spec=ClaudeCodeBackend)
         instance.backend_name = ClaudeCodeBackend.backend_name
-        assert _backend_name_for_instance(instance) == "claude_code"
+        assert _backend_name_for_instance(instance) == "claude"
 
     def test_goose_backend_returns_goose(self):
         """GooseBackend.backend_name is "goose"."""

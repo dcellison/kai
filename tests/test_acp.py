@@ -2242,7 +2242,7 @@ class TestSignalTargetUserPidFreeFunctions:
                 pid=4242,
                 sig=signal.SIGTERM,
                 purpose="chat",
-                backend="claude_code",
+                backend="claude",
             )
 
         assert list(captured["argv"]) == [
@@ -2275,7 +2275,7 @@ class TestSignalTargetUserPidFreeFunctions:
                 pid=4242,
                 sig=int(signal.SIGKILL),
                 purpose="chat",
-                backend="claude_code",
+                backend="claude",
             )
 
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
