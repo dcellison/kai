@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import hmac as hmac_mod
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from aiohttp import web
@@ -351,6 +351,88 @@ class TestUpdateJob:
         body = json.loads(resp.body.decode())
         assert "error" in body
         assert "json" in body["error"].lower()
+
+    async def test_update_schedule_registration_false_rolls_back_job(self, db, mock_request):
+        """PATCH rolls back DB changes if scheduler registration returns False."""
+        job_id = await sessions.create_job(
+            chat_id=123,
+            name="old name",
+            job_type="reminder",
+            prompt="old prompt",
+            schedule_type="interval",
+            schedule_data='{"seconds": 300}',
+            auto_remove=False,
+            notify_on_check=True,
+        )
+        queued_job = MagicMock()
+        queued_job.name = f"cron_{job_id}"
+        mock_request.app[TELEGRAM_APP_KEY].job_queue.jobs.return_value = [queued_job]
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.match_info = {"id": str(job_id)}
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "new name",
+                "prompt": "new prompt",
+                "schedule_data": {"seconds": 600},
+                "auto_remove": True,
+                "notify_on_check": False,
+            }
+        )
+
+        with patch(
+            "kai.cron.register_job_by_id",
+            new_callable=AsyncMock,
+            side_effect=[False, True],
+        ) as mock_register:
+            resp = await _handle_update_job(mock_request)
+
+        assert resp.status == 500
+        body = json.loads(resp.body.decode())
+        assert body["error"] == "Failed to register job"
+        queued_job.schedule_removal.assert_called_once()
+        mock_register.assert_has_awaits(
+            [
+                call(mock_request.app[TELEGRAM_APP_KEY], job_id),
+                call(mock_request.app[TELEGRAM_APP_KEY], job_id),
+            ]
+        )
+        job = await sessions.get_job_by_id(job_id)
+        assert job is not None
+        assert job["name"] == "old name"
+        assert job["prompt"] == "old prompt"
+        assert job["schedule_type"] == "interval"
+        assert job["schedule_data"] == '{"seconds": 300}'
+        assert job["auto_remove"] is False
+        assert job["notify_on_check"] is True
+
+    async def test_update_schedule_registration_exception_rolls_back_job(self, db, mock_request):
+        """PATCH rolls back DB changes if scheduler registration raises."""
+        job_id = await sessions.create_job(
+            chat_id=123,
+            name="old name",
+            job_type="reminder",
+            prompt="old prompt",
+            schedule_type="daily",
+            schedule_data='{"times": ["09:00"]}',
+        )
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.match_info = {"id": str(job_id)}
+        mock_request.json = AsyncMock(return_value={"schedule_data": {"times": ["10:00"]}})
+
+        with patch(
+            "kai.cron.register_job_by_id",
+            new_callable=AsyncMock,
+            side_effect=[RuntimeError("scheduler unavailable"), True],
+        ):
+            resp = await _handle_update_job(mock_request)
+
+        assert resp.status == 500
+        body = json.loads(resp.body.decode())
+        assert body["error"] == "Failed to register job"
+        job = await sessions.get_job_by_id(job_id)
+        assert job is not None
+        assert job["schedule_type"] == "daily"
+        assert job["schedule_data"] == '{"times": ["09:00"]}'
 
 
 # ── POST /api/send-file ─────────────────────────────────────────────

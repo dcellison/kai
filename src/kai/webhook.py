@@ -1436,6 +1436,8 @@ async def _handle_update_job(request: web.Request, principal: InternalAPIPrincip
     if not isinstance(payload, dict):
         return web.json_response({"error": "Request body must be a JSON object"}, status=400)
 
+    existing_job: dict | None = None
+
     # Validate schedule_type if provided
     new_schedule_type = payload.get("schedule_type")
     if new_schedule_type and new_schedule_type not in _VALID_SCHEDULE_TYPES:
@@ -1473,6 +1475,18 @@ async def _handle_update_job(request: web.Request, principal: InternalAPIPrincip
         return web.json_response({"error": str(e)}, status=400)
     except UnauthorizedChatIdError as e:
         return web.json_response({"error": str(e)}, status=403)
+
+    # If the schedule changes, keep the previous row so a failed scheduler
+    # re-registration can be compensated. Without this, PATCH can leave the DB
+    # saying a job is active on the new schedule while APScheduler has no
+    # corresponding in-memory job.
+    schedule_changed = new_schedule_type is not None or schedule_data is not None
+    if schedule_changed:
+        if existing_job is None:
+            existing_job = await sessions.get_job_by_id(job_id)
+        if existing_job is None or existing_job["chat_id"] != chat_id:
+            return web.json_response({"error": "Job not found or inactive"}, status=404)
+
     updated = await sessions.update_job(
         job_id,
         chat_id=chat_id,
@@ -1487,11 +1501,8 @@ async def _handle_update_job(request: web.Request, principal: InternalAPIPrincip
     if not updated:
         return web.json_response({"error": "Job not found or inactive"}, status=404)
 
-    # If schedule changed, re-register with APScheduler. Remove old entries
-    # and re-register with the new schedule from the database.
-    schedule_changed = new_schedule_type is not None or schedule_data is not None
     if schedule_changed:
-        # Remove old APScheduler entries
+        assert existing_job is not None
         telegram_app = request.app[TELEGRAM_APP_KEY]
         jq = telegram_app.job_queue
         assert jq is not None
@@ -1499,11 +1510,48 @@ async def _handle_update_job(request: web.Request, principal: InternalAPIPrincip
         for j in jq.jobs():
             if j.name == prefix or (j.name and j.name.startswith(f"{prefix}_")):
                 j.schedule_removal()
-        # Re-register with new schedule
-        await cron.register_job_by_id(telegram_app, job_id)
+        try:
+            registered = await cron.register_job_by_id(telegram_app, job_id)
+        except Exception:
+            log.exception("Failed to re-register updated job %d with scheduler", job_id)
+            await _restore_job_after_failed_reschedule(telegram_app, job_id, chat_id, existing_job)
+            return web.json_response({"error": "Failed to register job"}, status=500)
+        if not registered:
+            log.error("Failed to re-register updated job %d with scheduler", job_id)
+            await _restore_job_after_failed_reschedule(telegram_app, job_id, chat_id, existing_job)
+            return web.json_response({"error": "Failed to register job"}, status=500)
 
     log.info("Updated job %d via API", job_id)
     return web.json_response({"updated": job_id})
+
+
+async def _restore_job_after_failed_reschedule(
+    telegram_app: Application,
+    job_id: int,
+    chat_id: int,
+    previous_job: dict,
+) -> None:
+    """Best-effort rollback after PATCH committed but scheduler registration failed."""
+    restored = await sessions.update_job(
+        job_id,
+        chat_id=chat_id,
+        name=previous_job["name"],
+        prompt=previous_job["prompt"],
+        schedule_type=previous_job["schedule_type"],
+        schedule_data=previous_job["schedule_data"],
+        auto_remove=previous_job["auto_remove"],
+        notify_on_check=previous_job["notify_on_check"],
+    )
+    if not restored:
+        log.error("Failed to restore job %d after scheduler registration failure", job_id)
+        return
+    try:
+        restored_registered = await cron.register_job_by_id(telegram_app, job_id)
+    except Exception:
+        log.exception("Failed to restore scheduler entry for job %d after rollback", job_id)
+        return
+    if not restored_registered:
+        log.error("Failed to restore scheduler entry for job %d after rollback", job_id)
 
 
 # ── Service proxy ────────────────────────────────────────────────────
