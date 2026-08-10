@@ -313,6 +313,80 @@ def get_available_services() -> list[dict]:
 # ── HTTP proxy call ─────────────────────────────────────────────────
 
 
+def _origin(parts: urllib.parse.SplitResult) -> tuple[str, str, int | None] | None:
+    """Return a comparable URL origin, rejecting userinfo-bearing URLs."""
+    if parts.username is not None or parts.password is not None:
+        return None
+    if not parts.scheme or not parts.hostname:
+        return None
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    return (parts.scheme.lower(), parts.hostname.lower(), port)
+
+
+def _build_service_url(base_url: str, path_suffix: str) -> tuple[str | None, str | None]:
+    """
+    Build a service URL while pinning the final request to the base origin.
+
+    `path_suffix` is treated as path data, not as a URL reference. This preserves
+    existing Jina Reader usage where the suffix is itself a target URL string
+    (for example `https://example.com`) while preventing URL-authority changes
+    such as `https://api.example.com@attacker.example` or
+    `//attacker.example`.
+
+    Returns:
+        (url, None) on success, or (None, user-facing error) on rejection.
+    """
+    base = urllib.parse.urlsplit(base_url)
+    if base.username is not None or base.password is not None:
+        return None, "service URL must include scheme/host and must not contain userinfo"
+    if not base.scheme or not base.hostname:
+        return None, "service URL must include scheme/host and must not contain userinfo"
+
+    if not path_suffix:
+        return base_url, None
+
+    base_origin = _origin(base)
+    if base_origin is None:
+        return None, "service URL must include scheme/host and must not contain userinfo"
+
+    # Decode once before validation so encoded query/fragment/traversal/origin
+    # markers cannot bypass the checks. The original suffix is still used for
+    # the outbound path so legitimate percent-encoding is preserved.
+    decoded = urllib.parse.unquote(path_suffix)
+    if "?" in decoded:
+        return None, "path_suffix must not contain query string"
+    if "#" in decoded:
+        return None, "path_suffix must not contain fragment"
+    if "\\" in decoded:
+        return None, "path_suffix must not contain backslashes"
+    if decoded.startswith("//"):
+        return None, "path_suffix must not start with an authority marker"
+
+    decoded_without_leading_slashes = decoded.lstrip("/")
+    if decoded_without_leading_slashes.startswith("@"):
+        return None, "path_suffix must not start with userinfo"
+
+    decoded_segments = [segment for segment in decoded.split("/") if segment]
+    if any(segment == ".." for segment in decoded_segments):
+        return None, "path_suffix must not contain '..' segments"
+
+    suffix = path_suffix.lstrip("/")
+    if base.path.endswith("/"):
+        path = f"{base.path}{suffix}"
+    else:
+        path = f"{base.path}/{suffix}"
+
+    final_url = urllib.parse.urlunsplit((base.scheme, base.netloc, path, base.query, ""))
+    final = urllib.parse.urlsplit(final_url)
+    if _origin(final) != base_origin:
+        return None, "path_suffix changed service origin"
+
+    return final_url, None
+
+
 async def call_service(
     name: str,
     *,
@@ -374,7 +448,7 @@ async def call_service(
 
     # Check whether the service allows path_suffix at all. Default is deny
     # to prevent services from being used as open HTTP proxies (SSRF).
-    # Services that need it (Jina Reader, ntfy) opt in explicitly in
+    # Services that need it (for example Jina Reader) opt in explicitly in
     # services.yaml with allow_path_suffix: true.
     if path_suffix and not svc.allow_path_suffix:
         return ServiceResponse(
@@ -382,23 +456,10 @@ async def call_service(
             error=f"Service '{name}' does not allow path_suffix",
         )
 
-    # Validate path_suffix to prevent request smuggling via crafted paths.
-    # Reject query strings, fragments, and path traversal segments.
-    # Decode percent-encoding first so %2e%2e, %3F, %23 can't bypass
-    # the raw-string checks (#222). Note: full URLs as path_suffix are
-    # valid (e.g., Jina Reader uses path_suffix="https://example.com"
-    # appended to "https://r.jina.ai/").
-    if path_suffix:
-        # unquote uses UTF-8 with errors='replace'; overlong sequences
-        # (e.g., %c0%ae for '.') become replacement chars, not '.', so no bypass.
-        decoded = urllib.parse.unquote(path_suffix)
-        if "?" in decoded or "#" in decoded:
-            return ServiceResponse(success=False, error="path_suffix must not contain query string or fragment")
-        if "/.." in decoded or decoded.startswith(".."):
-            return ServiceResponse(success=False, error="path_suffix must not contain '..' segments")
-
-    # Construct the full URL (base + optional path suffix)
-    url = svc.url + path_suffix
+    url, url_error = _build_service_url(svc.url, path_suffix)
+    if url_error:
+        return ServiceResponse(success=False, error=url_error)
+    assert url is not None
 
     log.info("Calling service '%s': %s %s", name, svc.method, url)
 

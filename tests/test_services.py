@@ -725,6 +725,111 @@ services:
 
         assert result.success is True
 
+    async def test_suffix_is_joined_as_path_component(self, tmp_path, monkeypatch):
+        """A suffix on a base URL without a trailing slash stays under the same origin."""
+        monkeypatch.setenv("API_KEY", "tok")
+        path = _write_yaml(
+            tmp_path,
+            """
+services:
+  topicapi:
+    url: https://topic.example.com
+    method: POST
+    allow_path_suffix: true
+    auth:
+      type: none
+""",
+        )
+        load_services(path)
+
+        mock_response = _mock_streamed_response(b"ok")
+        mock_session = MagicMock()
+        mock_session.request = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("kai.services.aiohttp.ClientSession", return_value=mock_session):
+            result = await call_service("topicapi", path_suffix="my-topic")
+
+        assert result.success is True
+        call_kwargs = mock_session.request.call_args
+        url = call_kwargs.kwargs.get("url") or call_kwargs[1].get("url")
+        assert url == "https://topic.example.com/my-topic"
+
+    async def test_userinfo_origin_change_suffix_rejected(self, tmp_path, monkeypatch):
+        """A suffix like @attacker.example must not change the request authority."""
+        monkeypatch.setenv("API_KEY", "tok")
+        path = _write_yaml(
+            tmp_path,
+            """
+services:
+  topicapi:
+    url: https://topic.example.com
+    method: POST
+    allow_path_suffix: true
+    auth:
+      type: none
+""",
+        )
+        load_services(path)
+
+        result = await call_service("topicapi", path_suffix="@attacker.example")
+        assert result.success is False
+        assert "userinfo" in result.error
+
+        result = await call_service("topicapi", path_suffix="/@attacker.example")
+        assert result.success is False
+        assert "userinfo" in result.error
+
+        result = await call_service("topicapi", path_suffix="%40attacker.example")
+        assert result.success is False
+        assert "userinfo" in result.error
+
+    async def test_network_path_origin_change_suffix_rejected(self, tmp_path, monkeypatch):
+        """Raw or encoded //host suffixes must not become URL authorities."""
+        monkeypatch.setenv("API_KEY", "tok")
+        path = _write_yaml(
+            tmp_path,
+            """
+services:
+  topicapi:
+    url: https://topic.example.com
+    method: POST
+    allow_path_suffix: true
+    auth:
+      type: none
+""",
+        )
+        load_services(path)
+
+        result = await call_service("topicapi", path_suffix="//attacker.example")
+        assert result.success is False
+        assert "authority" in result.error
+
+        result = await call_service("topicapi", path_suffix="%2f%2fattacker.example")
+        assert result.success is False
+        assert "authority" in result.error
+
+    async def test_service_base_url_with_userinfo_rejected(self, tmp_path, monkeypatch):
+        """Configured service URLs with userinfo are not valid proxy origins."""
+        monkeypatch.setenv("API_KEY", "tok")
+        path = _write_yaml(
+            tmp_path,
+            """
+services:
+  badapi:
+    url: https://user@example.com
+    method: GET
+    auth:
+      type: none
+""",
+        )
+        load_services(path)
+
+        result = await call_service("badapi")
+        assert result.success is False
+        assert "userinfo" in result.error
+
     async def test_no_suffix_works_regardless(self, tmp_path, monkeypatch):
         """Calling without path_suffix works whether allow is set or not."""
         monkeypatch.setenv("API_KEY", "tok")
