@@ -24,6 +24,8 @@ import time
 
 import pyotp
 
+from kai.protected_config import ProtectedConfigError, validate_protected_file_metadata
+
 # Root-owned files, mode 0600. Only accessible via sudo.
 # The sudoers rule in /etc/sudoers.d/kai authorizes the bot process
 # to run exactly these two commands on exactly these paths, NOPASSWD.
@@ -128,10 +130,11 @@ def _totp_files_present() -> tuple[bool, bool]:
 
     def _present(path: str) -> bool:
         try:
-            os.stat(path)
-            return True
+            return validate_protected_file_metadata(path, missing_ok=True)
         except FileNotFoundError:
             return False
+        except ProtectedConfigError as exc:
+            raise TotpStateError(str(exc)) from exc
         except OSError as exc:
             raise TotpStateError(f"Could not determine TOTP state for {path}: {exc}") from exc
 
@@ -146,6 +149,10 @@ def _read_secret() -> str:
     disabled by strictly checking that *both* protected files are absent
     before reaching this helper.
     """
+    try:
+        validate_protected_file_metadata(TOTP_SECRET_PATH)
+    except (OSError, ProtectedConfigError) as exc:
+        raise TotpStateError(str(exc)) from exc
     try:
         result = subprocess.run(
             ["sudo", "-n", "cat", TOTP_SECRET_PATH],
@@ -180,6 +187,10 @@ def _read_attempts() -> dict:
     fail open.
     """
     try:
+        validate_protected_file_metadata(TOTP_ATTEMPTS_PATH)
+    except (OSError, ProtectedConfigError) as exc:
+        raise TotpStateError(str(exc)) from exc
+    try:
         result = subprocess.run(
             ["sudo", "-n", "cat", TOTP_ATTEMPTS_PATH],
             capture_output=True,
@@ -205,6 +216,10 @@ def _write_attempts(state: dict) -> None:
     Raises TotpStateError unless sudo tee confirms success.  Authentication is
     not granted when resetting the failure counter cannot be persisted.
     """
+    try:
+        validate_protected_file_metadata(TOTP_ATTEMPTS_PATH)
+    except (OSError, ProtectedConfigError) as exc:
+        raise TotpStateError(str(exc)) from exc
     try:
         result = subprocess.run(
             ["sudo", "-n", "tee", TOTP_ATTEMPTS_PATH],

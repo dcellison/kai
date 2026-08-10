@@ -19,6 +19,8 @@ from typing import Any
 
 import yaml
 
+from kai.protected_config import ProtectedConfigError, validate_protected_file_metadata
+
 DEFAULT_BACKENDS_YAML = Path("/etc/kai/backends.yaml")
 BACKENDS_YAML_ENV = "KAI_BACKENDS_YAML"
 INSTALL_DIR_ENV = "KAI_INSTALL_DIR"
@@ -90,7 +92,14 @@ def load_backend_registry(path: Path | None = None) -> dict[str, BackendRegistry
         if explicit_path:
             raise BackendRegistryError(f"backend registry {registry_path} does not exist")
         return {}
-    _validate_registry_file_permissions(registry_path)
+    try:
+        validate_protected_file_metadata(
+            registry_path,
+            max_mode=0o644,
+            require_root_owner=bool(os.environ.get(INSTALL_DIR_ENV, "").strip()),
+        )
+    except ProtectedConfigError as e:
+        raise BackendRegistryError(str(e)) from e
     try:
         raw = yaml.safe_load(registry_path.read_text()) or {}
     except OSError as e:
@@ -130,18 +139,6 @@ def load_backend_registry(path: Path | None = None) -> dict[str, BackendRegistry
             allowed_models=model_tuple,
         )
     return entries
-
-
-def _validate_registry_file_permissions(path: Path) -> None:
-    """Reject registry files writable by group or other users."""
-    try:
-        mode = stat.S_IMODE(path.stat().st_mode)
-    except OSError as e:
-        raise BackendRegistryError(f"could not stat backend registry {path}: {e}") from e
-    if mode & 0o022:
-        raise BackendRegistryError(
-            f"backend registry {path} has unsafe permissions {mode:#04o}; remove group/other write access"
-        )
 
 
 def _validate_absolute_executable(backend: str, command: str, source: str) -> str:

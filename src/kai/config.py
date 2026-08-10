@@ -25,6 +25,7 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
+from kai.protected_config import ProtectedConfigError, validate_protected_file_metadata
 from kai.user_isolation import validate_protected_user_isolation
 
 log = logging.getLogger(__name__)
@@ -1501,6 +1502,11 @@ def _read_protected_file(path: str) -> str | None:
         File contents as a string, or None on any failure (missing file,
         no sudoers rule, timeout, etc.).
     """
+    try:
+        if not validate_protected_file_metadata(path, missing_ok=True):
+            return None
+    except ProtectedConfigError as e:
+        raise SystemExit(str(e)) from e
     try:
         result = subprocess.run(
             ["sudo", "-n", "cat", path],

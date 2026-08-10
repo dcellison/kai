@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -8,6 +9,7 @@ import yaml
 from kai.backend_registry import (
     BackendRegistryError,
     backend_registry_is_authoritative,
+    load_backend_registry,
     render_backend_registry,
     resolve_backend_command,
 )
@@ -101,6 +103,37 @@ def test_registry_file_must_not_be_group_or_world_writable(tmp_path, monkeypatch
 
     with pytest.raises(BackendRegistryError, match="unsafe permissions"):
         resolve_backend_command("claude")
+
+
+def test_installed_registry_file_must_be_root_owned(tmp_path, monkeypatch):
+    """Installed mode treats the registry as an admin-owned capability map."""
+    registry = tmp_path / "backends.yaml"
+    registry.write_text("version: 1\nbackends: {}\n")
+    monkeypatch.setenv("KAI_INSTALL_DIR", "/opt/kai")
+    monkeypatch.setattr("kai.backend_registry.DEFAULT_BACKENDS_YAML", registry)
+    real_stat = Path.stat
+
+    def fake_stat(self, *args, **kwargs):
+        result = real_stat(self, *args, **kwargs)
+        if self == registry:
+            return SimpleNamespace(st_mode=result.st_mode, st_uid=12345)
+        return result
+
+    monkeypatch.setattr("kai.backend_registry.Path.stat", fake_stat)
+
+    with pytest.raises(BackendRegistryError, match="root ownership"):
+        load_backend_registry()
+
+
+def test_explicit_dev_registry_does_not_require_root_owner(tmp_path, monkeypatch):
+    """A test/dev registry can be user-owned when installed mode is not active."""
+    registry = tmp_path / "backends.yaml"
+    registry.write_text("version: 1\nbackends: {}\n")
+    registry.chmod(0o644)
+    monkeypatch.setenv("KAI_BACKENDS_YAML", str(registry))
+    monkeypatch.delenv("KAI_INSTALL_DIR", raising=False)
+
+    assert load_backend_registry() == {}
 
 
 @pytest.mark.parametrize("mode", [0o775, 0o757])

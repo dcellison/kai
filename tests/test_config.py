@@ -638,7 +638,10 @@ class TestReadProtectedFile:
             stdout="KEY=value\n",
             stderr="",
         )
-        with patch("kai.config.subprocess.run", return_value=mock_result):
+        with (
+            patch("kai.config.validate_protected_file_metadata", return_value=True),
+            patch("kai.config.subprocess.run", return_value=mock_result),
+        ):
             result = _read_protected_file("/etc/kai/env")
         assert result == "KEY=value\n"
 
@@ -650,27 +653,61 @@ class TestReadProtectedFile:
             stdout="",
             stderr="sudo: a password is required\n",
         )
-        with patch("kai.config.subprocess.run", return_value=mock_result):
+        with (
+            patch("kai.config.validate_protected_file_metadata", return_value=True),
+            patch("kai.config.subprocess.run", return_value=mock_result),
+        ):
             result = _read_protected_file("/etc/kai/env")
         assert result is None
 
     def test_timeout_returns_none(self):
         """Returns None when subprocess times out."""
-        with patch(
-            "kai.config.subprocess.run",
-            side_effect=subprocess.TimeoutExpired(cmd="sudo", timeout=5),
+        with (
+            patch("kai.config.validate_protected_file_metadata", return_value=True),
+            patch(
+                "kai.config.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(cmd="sudo", timeout=5),
+            ),
         ):
             result = _read_protected_file("/etc/kai/env")
         assert result is None
 
     def test_oserror_returns_none(self):
         """Returns None when subprocess raises OSError (e.g., sudo not found)."""
-        with patch(
-            "kai.config.subprocess.run",
-            side_effect=OSError("No such file or directory"),
+        with (
+            patch("kai.config.validate_protected_file_metadata", return_value=True),
+            patch(
+                "kai.config.subprocess.run",
+                side_effect=OSError("No such file or directory"),
+            ),
         ):
             result = _read_protected_file("/etc/kai/env")
         assert result is None
+
+    def test_missing_metadata_returns_none_without_sudo(self):
+        """Absent protected file remains an optional-missing result."""
+        with (
+            patch("kai.config.validate_protected_file_metadata", return_value=False),
+            patch("kai.config.subprocess.run") as run,
+        ):
+            result = _read_protected_file("/etc/kai/env")
+        assert result is None
+        run.assert_not_called()
+
+    def test_unsafe_metadata_raises_system_exit(self):
+        """Unsafe protected config metadata fails closed, not as missing config."""
+        from kai.protected_config import ProtectedConfigError
+
+        with (
+            patch(
+                "kai.config.validate_protected_file_metadata",
+                side_effect=ProtectedConfigError("unsafe protected config"),
+            ),
+            patch("kai.config.subprocess.run") as run,
+            pytest.raises(SystemExit, match="unsafe protected config"),
+        ):
+            _read_protected_file("/etc/kai/env")
+        run.assert_not_called()
 
 
 # ── Dual-mode config loading ─────────────────────────────────────

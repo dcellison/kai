@@ -38,6 +38,12 @@ def _reset_totp_cache():
     kai.totp._totp_is_configured = False
 
 
+@pytest.fixture(autouse=True)
+def _protected_metadata_ok(monkeypatch):
+    """Protected metadata checks are mocked unless a test overrides them."""
+    monkeypatch.setattr("kai.totp.validate_protected_file_metadata", lambda *args, **kwargs: True)
+
+
 # A stable base32 secret used across tests.
 _TEST_SECRET = "JBSWY3DPEHPK3PXP"
 
@@ -245,6 +251,18 @@ def test_is_totp_configured_fails_closed_on_secret_read_error():
         pytest.raises(TotpStateError, match="secret read failed"),
     ):
         is_totp_configured()
+
+
+def test_totp_files_present_fails_closed_on_unsafe_metadata(monkeypatch):
+    """Unsafe protected file metadata is unavailable, not disabled TOTP."""
+
+    def _unsafe_metadata(*args, **kwargs):
+        raise kai.totp.ProtectedConfigError("unsafe protected config")
+
+    monkeypatch.setattr("kai.totp.validate_protected_file_metadata", _unsafe_metadata)
+
+    with pytest.raises(TotpStateError, match="unsafe protected config"):
+        kai.totp._totp_files_present()
 
 
 # ── get_lockout_remaining ────────────────────────────────────────────
