@@ -68,6 +68,7 @@ from kai.install import (
     _validate_positive_int,
     _validate_telegram_id,
     _validate_user_ids,
+    _webhook_secret_migration_status,
     cli,
 )
 
@@ -4278,6 +4279,75 @@ class TestCmdStatus:
         _cmd_status()
         output = capsys.readouterr().out
         assert "Installation Status" in output
+
+    def test_reports_legacy_webhook_secret_fallback(self, tmp_path, monkeypatch, capsys):
+        conf_path = tmp_path / "install.conf"
+        conf_path.write_text(
+            json.dumps(
+                {
+                    "platform": "darwin",
+                    "install_dir": str(tmp_path / "opt-kai"),
+                    "data_dir": str(tmp_path / "var-lib-kai"),
+                    "env": {
+                        "WEBHOOK_SECRET": "legacy-secret",
+                        "GITHUB_WEBHOOK_SECRET": "github-secret",
+                        "GENERIC_WEBHOOK_SECRET": "generic-secret",
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setattr(
+            "kai.install.subprocess.run",
+            lambda *a, **kw: subprocess.CompletedProcess(args=[], returncode=1, stdout=""),
+        )
+
+        _cmd_status()
+
+        output = capsys.readouterr().out
+        assert "legacy WEBHOOK_SECRET fallback configured" in output
+        assert "legacy-secret" not in output
+        assert "github-secret" not in output
+        assert "generic-secret" not in output
+
+    def test_reports_named_webhook_secrets_without_legacy_fallback(self, tmp_path, monkeypatch, capsys):
+        conf_path = tmp_path / "install.conf"
+        conf_path.write_text(
+            json.dumps(
+                {
+                    "platform": "darwin",
+                    "install_dir": str(tmp_path / "opt-kai"),
+                    "data_dir": str(tmp_path / "var-lib-kai"),
+                    "env": {
+                        "GITHUB_WEBHOOK_SECRET": "github-secret",
+                        "GENERIC_WEBHOOK_SECRET": "generic-secret",
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setattr(
+            "kai.install.subprocess.run",
+            lambda *a, **kw: subprocess.CompletedProcess(args=[], returncode=1, stdout=""),
+        )
+
+        _cmd_status()
+
+        output = capsys.readouterr().out
+        assert "named GitHub/generic secrets configured" in output
+        assert "no legacy fallback" in output
+        assert "github-secret" not in output
+        assert "generic-secret" not in output
+
+    def test_webhook_secret_migration_status_is_non_secret(self):
+        assert "legacy WEBHOOK_SECRET fallback configured" in _webhook_secret_migration_status(
+            {
+                "WEBHOOK_SECRET": "legacy-secret",
+                "GITHUB_WEBHOOK_SECRET": "github-secret",
+                "GENERIC_WEBHOOK_SECRET": "generic-secret",
+            }
+        )
+        assert "legacy-secret" not in _webhook_secret_migration_status({"WEBHOOK_SECRET": "legacy-secret"})
 
 
 # ── Venv creation ────────────────────────────────────────────────────

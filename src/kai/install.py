@@ -6348,12 +6348,16 @@ def _cmd_status() -> None:
     platform = "darwin" if sys.platform == "darwin" else "linux"
     install_dir = _DEFAULT_INSTALL_DIR
     data_dir = _DEFAULT_DATA_DIR
+    conf_env: dict[str, str] = {}
     if INSTALL_CONF.exists():
         try:
             conf = json.loads(INSTALL_CONF.read_text())
             platform = conf.get("platform", platform)
             install_dir = conf.get("install_dir", install_dir)
             data_dir = conf.get("data_dir", data_dir)
+            raw_env = conf.get("env", {})
+            if isinstance(raw_env, dict):
+                conf_env = {str(key): str(value) for key, value in raw_env.items()}
         except (json.JSONDecodeError, OSError):
             pass
 
@@ -6365,6 +6369,7 @@ def _cmd_status() -> None:
     print(_check_path(Path("/etc/kai/services.yaml"), "Services"))
     print(_check_path(Path("/etc/sudoers.d/kai"), "Sudoers"))
     print(_check_service_status(platform))
+    print(_webhook_secret_migration_status(conf_env))
 
     # Check workspace path traversal if install.conf has a service user
     if INSTALL_CONF.exists():
@@ -6393,6 +6398,18 @@ def _cmd_status() -> None:
                 version = line.split("=")[1].strip().strip('"').strip("'")
                 print(f"Version: {version}")
                 break
+
+
+def _webhook_secret_migration_status(env: dict[str, str]) -> str:
+    """Return a non-secret diagnostic for external webhook migration state."""
+    if env.get("WEBHOOK_SECRET", "").strip():
+        return (
+            "Webhook secret migration: legacy WEBHOOK_SECRET fallback configured "
+            "(GitHub/generic callers may still depend on it)"
+        )
+    if env.get("GITHUB_WEBHOOK_SECRET", "").strip() and env.get("GENERIC_WEBHOOK_SECRET", "").strip():
+        return "Webhook secret migration: named GitHub/generic secrets configured; no legacy fallback in install.conf"
+    return "Webhook secret migration: no legacy fallback in install.conf"
 
 
 # ── CLI dispatch ─────────────────────────────────────────────────────
