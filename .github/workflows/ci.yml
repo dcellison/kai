@@ -24,5 +24,8 @@ jobs:
       - name: Lint and format check
         run: make BIN= check
 
+      - name: Type check
+        run: make BIN= typecheck
+
       - name: Run tests
         run: make BIN= test

@@ -22,6 +22,7 @@ kai = "kai.main:main"
 [project.optional-dependencies]
 dev = [
     "ruff>=0.9.0",
+    "pyright>=1.1.390",
     "pytest>=8.0",
     "pytest-asyncio>=0.24.0",
 ]
@@ -80,3 +81,18 @@ markers = [
 # the specific class or test that triggers them; that keeps the
 # suppression scoped to the known third-party code path and the
 # blast radius bounded.
+
+[tool.pyright]
+pythonVersion = "3.13"
+pythonPlatform = "All"
+include = [
+    "src/kai/backend_registry.py",
+    "src/kai/github_api.py",
+    "src/kai/internal_api_auth.py",
+    "src/kai/locks.py",
+    "src/kai/prompt_utils.py",
+    "src/kai/services.py",
+    "src/kai/sessions.py",
+    "src/kai/user_isolation.py",
+    "src/kai/workspace_utils.py",
+]

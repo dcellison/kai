@@ -2,7 +2,7 @@
 # where tools are installed globally (no .venv).
 BIN = .venv/bin/
 
-.PHONY: run lint format check test setup config install install-status tts-model refresh-models
+.PHONY: run lint format check typecheck test setup config install install-status tts-model refresh-models
 
 run:
 	$(BIN)python -m kai
@@ -15,6 +15,9 @@ format:
 
 check: lint
 	$(BIN)ruff format --check .
+
+typecheck:
+	$(BIN)pyright --pythonpath "$$($(BIN)python -c 'import sys; print(sys.executable)')"
 
 test:
 	$(BIN)python -m pytest tests/ -v

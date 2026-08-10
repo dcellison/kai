@@ -134,13 +134,16 @@ async def save_session(chat_id: int, session_id: str, model: str, cost_usd: floa
 
 ### Type Safety
 
-The codebase passes Pyright in strict mode. All code changes are
-expected to maintain this:
+CI runs Pyright on a maintained baseline of typed trust-boundary modules.
+All code changes in that baseline are expected to keep it clean:
 
 - Type annotations on all function signatures.
 - `assert` for narrowing `Optional` types from external libraries.
 - Extract `@property` returns to local variables before narrowing
   (Pyright limitation).
+
+The full codebase is not yet Pyright-clean. Expand the baseline
+incrementally as modules are cleaned up.
 
 ### Security
 

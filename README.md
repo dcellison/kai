@@ -148,6 +148,7 @@ make setup      # Install in editable mode with dev tools
 make lint       # Run ruff
 make format     # Format with ruff
 make check      # Lint and format check
+make typecheck  # Run Pyright on the maintained typed baseline
 make test       # Run pytest
 make run        # Start Kai locally
 ```
