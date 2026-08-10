@@ -866,11 +866,13 @@ class TestApplyTriage:
             await apply_triage(meta, result, 8080, "secret")
 
         assert mock_session.post.called
-        # Verify gh issue edit --add-label was called for both labels
+        # Verify only existing repo labels are applied. Missing labels are skipped.
         add_label_calls = [cmd for cmd in commands_run if "issue" in cmd and "edit" in cmd and "--add-label" in cmd]
         applied_labels = {cmd[list(cmd).index("--add-label") + 1] for cmd in add_label_calls}
-        assert "bug" in applied_labels
-        assert "enhancement" in applied_labels
+        assert applied_labels == {"bug"}
+
+        body = mock_session.post.call_args[1]["json"]
+        assert "Skipped labels: enhancement" in body["text"]
 
         # Verify a comment was posted
         comment_calls = [cmd for cmd in commands_run if "issue" in cmd and "comment" in cmd]
@@ -1006,8 +1008,8 @@ class TestApplyTriage:
         assert "high" in body["text"]
 
     @pytest.mark.asyncio
-    async def test_creates_missing_labels(self):
-        """Labels that don't exist in the repo are created before applying."""
+    async def test_skips_missing_labels(self):
+        """Labels that don't exist in the repo are skipped, not created."""
         meta = _make_metadata(labels=[])
         result = _triage_result(labels=["custom-label"])
 
@@ -1029,9 +1031,15 @@ class TestApplyTriage:
             await apply_triage(meta, result, 8080, "secret")
 
         assert mock_session.post.called
-        # Should have called gh label create
+        # Missing labels must not be created or applied.
         create_calls = [cmd for cmd in commands_run if "label" in cmd and "create" in cmd]
-        assert len(create_calls) > 0
+        assert len(create_calls) == 0
+        add_label_calls = [cmd for cmd in commands_run if "issue" in cmd and "edit" in cmd and "--add-label" in cmd]
+        assert len(add_label_calls) == 0
+
+        body = mock_session.post.call_args[1]["json"]
+        assert "Labels: (none added)" in body["text"]
+        assert "Skipped labels: custom-label" in body["text"]
 
     @pytest.mark.asyncio
     async def test_labels_string_ignored(self):
@@ -1075,6 +1083,9 @@ async def _apply_triage_capture(meta: IssueMetadata, result: dict, **kwargs) -> 
     captured: dict[str, str | None] = {"comment": None, "telegram": None}
 
     async def mock_exec(*args, **_kwargs):
+        if "label" in args and "list" in args and "--search" in args:
+            search_term = args[list(args).index("--search") + 1]
+            return _mock_subprocess(stdout=json.dumps([{"name": search_term}]))
         if "issue" in args and "comment" in args and "--body-file" in args:
             body_path = args[list(args).index("--body-file") + 1]
             captured["comment"] = Path(body_path).read_text()

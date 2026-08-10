@@ -52,19 +52,6 @@ log = logging.getLogger(__name__)
 # Timeout for the triage subprocess in seconds.
 _TRIAGE_TIMEOUT = 300
 
-# Default colors for auto-created labels. Maps label name to a hex color
-# (without the # prefix). Unlisted labels get a neutral gray.
-_LABEL_COLORS: dict[str, str] = {
-    "bug": "d73a4a",
-    "enhancement": "0075ca",
-    "documentation": "0e8a16",
-    "question": "d876e3",
-    "good first issue": "7057ff",
-}
-
-# Fallback color for labels not in the _LABEL_COLORS map.
-_DEFAULT_LABEL_COLOR = "ededed"
-
 # Header prepended to every triage comment on GitHub. Distinguishes
 # automated triage from human comments.
 _TRIAGE_HEADER = "## Triage by Kai\n\n"
@@ -631,19 +618,19 @@ def _parse_triage_json(raw: str) -> dict:
     return result
 
 
-async def _ensure_label_exists(repo: str, label: str) -> None:
+async def _label_exists(repo: str, label: str) -> bool:
     """
-    Check if a label exists in the repo, creating it if not.
+    Return True only when a label already exists in the repo.
 
-    Uses gh label list --search to check, then gh label create if missing.
-    Default colors are assigned based on the label name (e.g., red for bug,
-    blue for enhancement). Unlisted labels get a neutral gray.
+    Uses gh label list --search and requires an exact case-insensitive match,
+    because GitHub's search is fuzzy. Missing labels are intentionally not
+    created here: triage output is model-controlled, so label mutation must be
+    bounded by the repository's existing labels.
 
     Args:
         repo: Full repository name (e.g., "dcellison/kai").
-        label: The label name to check/create.
+        label: The label name to check.
     """
-    # Check if label already exists
     proc = await asyncio.create_subprocess_exec(
         "gh",
         "label",
@@ -657,43 +644,31 @@ async def _ensure_label_exists(repo: str, label: str) -> None:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, _ = await proc.communicate()
+    stdout, stderr = await proc.communicate()
 
-    if proc.returncode == 0:
-        try:
-            existing = json.loads(stdout.decode())
-            # Check for exact match (search is fuzzy)
-            for lbl in existing:
-                if lbl.get("name", "").lower() == label.lower():
-                    return
-        except json.JSONDecodeError:
-            pass
-
-    # Label doesn't exist; create it
-    color = _LABEL_COLORS.get(label.lower(), _DEFAULT_LABEL_COLOR)
-    proc = await asyncio.create_subprocess_exec(
-        "gh",
-        "label",
-        "create",
-        label,
-        "--repo",
-        repo,
-        "--color",
-        color,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await proc.communicate()
-
-    if proc.returncode == 0:
-        log.info("Created label '%s' in %s", label, repo)
-    else:
+    if proc.returncode != 0:
         log.warning(
-            "Failed to create label '%s' in %s: %s",
-            label,
+            "Failed to list labels for %s while checking '%s': %s",
             repo,
+            label,
             stderr.decode().strip(),
         )
+        return False
+
+    try:
+        existing = json.loads(stdout.decode())
+    except json.JSONDecodeError:
+        log.warning(
+            "gh label list returned invalid JSON for %s while checking '%s'",
+            repo,
+            label,
+        )
+        return False
+
+    if not isinstance(existing, list):
+        return False
+
+    return any(isinstance(lbl, dict) and lbl.get("name", "").lower() == label.lower() for lbl in existing)
 
 
 async def apply_triage(
@@ -865,12 +840,22 @@ async def apply_triage(
     if priority not in ("low", "medium", "high", "critical"):
         priority = "medium"
 
-    # Step 1: Apply labels (skip any already on the issue)
+    # Step 1: Apply labels (skip any already on the issue; never create labels)
     existing_labels = {lbl.lower() for lbl in metadata.labels}
-    new_labels = [lbl for lbl in labels if lbl.lower() not in existing_labels]
+    requested_labels = [lbl for lbl in labels if lbl.lower() not in existing_labels]
+    applied_labels: list[str] = []
+    skipped_labels: list[str] = []
 
-    for label in new_labels:
-        await _ensure_label_exists(metadata.repo, label)
+    for label in requested_labels:
+        if not await _label_exists(metadata.repo, label):
+            skipped_labels.append(label)
+            log.warning(
+                "Skipping triage label '%s' for %s#%d because it does not exist in the repository",
+                label,
+                metadata.repo,
+                metadata.number,
+            )
+            continue
 
         proc = await asyncio.create_subprocess_exec(
             "gh",
@@ -895,6 +880,7 @@ async def apply_triage(
                 stderr.decode().strip(),
             )
         else:
+            applied_labels.append(label)
             log.info("Added label '%s' to %s#%d", label, metadata.repo, metadata.number)
 
     # Step 2: Add to project board if assigned.
@@ -951,7 +937,7 @@ async def apply_triage(
             log.exception("Failed to add %s#%d to project", metadata.repo, metadata.number)
 
     # Step 3: Post triage comment
-    labels_str = ", ".join(new_labels) if new_labels else "(none added)"
+    labels_str = ", ".join(applied_labels) if applied_labels else "(none added)"
     # Render order per spec section 9: Triage summary, blank line,
     # Status (always), Blocked by (only when status=blocked), Priority,
     # Labels applied, optional duplicate / related / project, Next
@@ -973,6 +959,8 @@ async def apply_triage(
             f"**Labels applied:** {labels_str}",
         ]
     )
+    if skipped_labels:
+        comment_parts.append(f"**Labels skipped:** {', '.join(skipped_labels)}")
     if duplicate_of:
         comment_parts.append(f"**Possible duplicate of:** #{duplicate_of}")
     if related:
@@ -1030,9 +1018,11 @@ async def apply_triage(
         metadata.title,
         f"Status: {status}",
         f"Priority: {priority}",
-        f"Labels: {', '.join(new_labels) if new_labels else '(none added)'}",
+        f"Labels: {', '.join(applied_labels) if applied_labels else '(none added)'}",
         f"Next: {next_action}",
     ]
+    if skipped_labels:
+        telegram_parts.append(f"Skipped labels: {', '.join(skipped_labels)}")
     if missing_info:
         question_word = "question" if len(missing_info) == 1 else "questions"
         telegram_parts.append(f"Needs info: {len(missing_info)} {question_word}")
