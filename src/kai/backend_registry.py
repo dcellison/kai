@@ -205,7 +205,9 @@ def resolve_default_backend(configured_backend: str = "") -> str:
     if configured:
         if configured not in _BACKEND_ENV_VARS:
             valid = ", ".join(sorted(_BACKEND_ENV_VARS))
-            raise BackendRegistryError(f"configured default backend {configured!r} is not valid; valid backends: {valid}")
+            raise BackendRegistryError(
+                f"configured default backend {configured!r} is not valid; valid backends: {valid}"
+            )
         if registry is not None and configured not in registry:
             installed = ", ".join(sorted(registry)) or "<none>"
             raise BackendRegistryError(

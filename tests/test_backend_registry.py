@@ -12,8 +12,8 @@ from kai.backend_registry import (
     load_backend_registry,
     load_backend_registry_default_backend,
     render_backend_registry,
-    resolve_default_backend,
     resolve_backend_command,
+    resolve_default_backend,
 )
 
 
@@ -367,9 +367,7 @@ def test_resolve_default_backend_uses_sole_registry_backend(tmp_path, monkeypatc
     codex = _exe(tmp_path / "codex")
     registry = tmp_path / "backends.yaml"
     registry.write_text(
-        render_backend_registry(
-            {"codex": {"driver": "codex", "runtime": "local_process", "command": str(codex)}}
-        )
+        render_backend_registry({"codex": {"driver": "codex", "runtime": "local_process", "command": str(codex)}})
     )
     monkeypatch.setenv("KAI_BACKENDS_YAML", str(registry))
 
@@ -398,9 +396,7 @@ def test_resolve_default_backend_rejects_configured_backend_missing_from_registr
     codex = _exe(tmp_path / "codex")
     registry = tmp_path / "backends.yaml"
     registry.write_text(
-        render_backend_registry(
-            {"codex": {"driver": "codex", "runtime": "local_process", "command": str(codex)}}
-        )
+        render_backend_registry({"codex": {"driver": "codex", "runtime": "local_process", "command": str(codex)}})
     )
     monkeypatch.setenv("KAI_BACKENDS_YAML", str(registry))
 

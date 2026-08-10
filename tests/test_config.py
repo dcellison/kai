@@ -3054,9 +3054,7 @@ class TestDefaultBackendEnvResolution:
         codex.chmod(0o755)
         registry = tmp_path / "backends.yaml"
         registry.write_text(
-            render_backend_registry(
-                {"codex": {"driver": "codex", "runtime": "local_process", "command": str(codex)}}
-            )
+            render_backend_registry({"codex": {"driver": "codex", "runtime": "local_process", "command": str(codex)}})
         )
         monkeypatch.setenv("KAI_BACKENDS_YAML", str(registry))
 

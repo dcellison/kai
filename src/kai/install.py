@@ -2827,15 +2827,19 @@ def _build_codex_login_reminder(
     are no longer read.
     """
     default_backend = (
-        _resolve_renamed_key(
-            env.get,
-            new_key="DEFAULT_BACKEND",
-            legacy_keys=["AGENT_BACKEND"],
-            context="install.conf",
-            default="",
+        (
+            _resolve_renamed_key(
+                env.get,
+                new_key="DEFAULT_BACKEND",
+                legacy_keys=["AGENT_BACKEND"],
+                context="install.conf",
+                default="",
+            )
+            or ""
         )
-        or ""
-    ).strip().lower()
+        .strip()
+        .lower()
+    )
     if default_backend != "codex":
         return None
     if env.get("CODEX_AUTH_MODE", "subscription") != "subscription":
@@ -5689,15 +5693,19 @@ def _configured_install_backends(
 def _resolve_install_default_backend(env: dict[str, str], discovered: dict[str, str] | None = None) -> str:
     """Resolve install-time default backend without provider-specific fallback."""
     configured = (
-        _resolve_renamed_key(
-            env.get,
-            new_key="DEFAULT_BACKEND",
-            legacy_keys=["AGENT_BACKEND"],
-            context="install.conf",
-            default="",
+        (
+            _resolve_renamed_key(
+                env.get,
+                new_key="DEFAULT_BACKEND",
+                legacy_keys=["AGENT_BACKEND"],
+                context="install.conf",
+                default="",
+            )
+            or ""
         )
-        or ""
-    ).strip().lower()
+        .strip()
+        .lower()
+    )
     if configured:
         if configured not in VALID_BACKENDS:
             raise SystemExit(
@@ -5710,8 +5718,7 @@ def _resolve_install_default_backend(env: dict[str, str], discovered: dict[str, 
         return next(iter(installed))
     installed_label = ", ".join(sorted(installed)) or "<none>"
     raise SystemExit(
-        "DEFAULT_BACKEND is not set. Re-run `make config` and choose one of the installed backends: "
-        f"{installed_label}."
+        f"DEFAULT_BACKEND is not set. Re-run `make config` and choose one of the installed backends: {installed_label}."
     )
 
 
@@ -5726,7 +5733,9 @@ def _backend_registry_entries(
         )
 
     default_backend = _resolve_install_default_backend(env, discovered)
-    missing = sorted(_configured_install_backends(env, users_yaml_path, default_backend=default_backend) - discovered.keys())
+    missing = sorted(
+        _configured_install_backends(env, users_yaml_path, default_backend=default_backend) - discovered.keys()
+    )
     if missing:
         raise SystemExit(
             "Configured backend(s) are not installed globally: "
