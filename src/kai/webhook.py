@@ -908,6 +908,7 @@ async def _process_github_event_for_user(
                     agent_backend=agent_backend,
                     provider=provider,
                     model_override=issue_triage_model_override,
+                    allowed_triage_projects=user_config.allowed_triage_projects if user_config else [],
                 )
             )
             _background_tasks.add(task)

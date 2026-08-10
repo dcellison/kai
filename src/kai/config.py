@@ -1072,6 +1072,9 @@ class UserConfig:
         github_repos: Admin-controlled repositories this user may access
             through Kai's shared GitHub review and triage authority. The
             mutable notification subscription list cannot expand this set.
+        allowed_triage_projects: Admin-controlled GitHub Project titles that
+            issue triage may add issues to. Empty means project assignment is
+            disabled for this user.
         allowed_services: External proxy service names this user's persistent
             agent may call. Empty by default, including for admins.
     """
@@ -1109,6 +1112,10 @@ class UserConfig:
     github_notify_chat_id: int | None = None
     pr_review: bool | None = None
     issue_triage: bool | None = None
+    # GitHub Project titles this user's automated issue triage may assign.
+    # Admin-controlled and fail-closed: omission means triage can still
+    # comment/label, but cannot mutate project boards.
+    allowed_triage_projects: list[str] = field(default_factory=list)
     # External services the persistent agent may call through Kai's
     # credential-injecting proxy. Admin-controlled via users.yaml and
     # fail-closed: omission means no services, including for admins.
@@ -2589,6 +2596,33 @@ def _load_user_configs(
                 name,
             )
 
+        raw_allowed_triage_projects = entry.get("allowed_triage_projects", [])
+        allowed_triage_projects: list[str] = []
+        if isinstance(raw_allowed_triage_projects, list):
+            for raw_project in raw_allowed_triage_projects:
+                if not isinstance(raw_project, str):
+                    log.warning(
+                        "users.yaml: invalid allowed_triage_projects entry for %s: %r (expected a project title)",
+                        name,
+                        raw_project,
+                    )
+                    continue
+                project_title = raw_project.strip()
+                if not project_title or project_title == "*":
+                    log.warning(
+                        "users.yaml: invalid allowed_triage_projects entry for %s: %r (blank titles and wildcards are not allowed)",
+                        name,
+                        raw_project,
+                    )
+                    continue
+                if project_title not in allowed_triage_projects:
+                    allowed_triage_projects.append(project_title)
+        else:
+            log.warning(
+                "users.yaml: allowed_triage_projects for %s must be a list (ignoring)",
+                name,
+            )
+
         # Parse optional github_notify_chat_id (integer, can be negative
         # for group chats). Follows the same pattern as telegram_id validation.
         github_notify_chat_id: int | None = None
@@ -2693,6 +2727,7 @@ def _load_user_configs(
             github_notify_chat_id=github_notify_chat_id,
             pr_review=pr_review,
             issue_triage=issue_triage,
+            allowed_triage_projects=allowed_triage_projects,
             allowed_services=allowed_services,
             models=user_models,
         )

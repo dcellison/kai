@@ -62,6 +62,12 @@ users:
     # github_notify_chat_id: -100123456789
     # pr_review: true
     # issue_triage: true
+    # Issue triage can comment and apply existing repo labels when enabled.
+    # Project-board assignment is additionally fail-closed: list exact GitHub
+    # Project titles here if Kai may add this user's triaged issues to them.
+    # allowed_triage_projects:
+    #   - Sprint 1
+    #   - Bug triage
 
   # Example: regular user with minimal config
   # - telegram_id: 987654321

@@ -925,12 +925,52 @@ class TestApplyTriage:
         ):
             mock_session, _ = _mock_aiohttp_session_post(status=200)
             _attach_session_to_class(mock_session, mock_session_cls)
-            await apply_triage(meta, result, 8080, "secret", projects_json=projects_json)
+            await apply_triage(
+                meta,
+                result,
+                8080,
+                "secret",
+                projects_json=projects_json,
+                allowed_triage_projects=["Sprint 1"],
+            )
 
         assert mock_session.post.called
         # Should have called gh project item-add
         item_add_calls = [cmd for cmd in commands_run if "project" in cmd and "item-add" in cmd]
         assert len(item_add_calls) > 0
+
+    @pytest.mark.asyncio
+    async def test_project_assignment_requires_allowlist(self):
+        """Model-selected projects are skipped unless explicitly allowlisted."""
+        meta = _make_metadata()
+        result = _triage_result(project="Sprint 1")
+        projects_json = json.dumps({"projects": [{"title": "Sprint 1", "number": 1}]})
+
+        commands_run = []
+        captured: dict[str, str | None] = {"comment": None}
+
+        async def mock_exec(*args, **kwargs):
+            commands_run.append(args)
+            if "issue" in args and "comment" in args and "--body-file" in args:
+                body_path = args[list(args).index("--body-file") + 1]
+                captured["comment"] = Path(body_path).read_text()
+            return _mock_subprocess(stdout="[]")
+
+        with (
+            patch("kai.triage.asyncio.create_subprocess_exec", side_effect=mock_exec),
+            patch("kai.triage.aiohttp.ClientSession") as mock_session_cls,
+        ):
+            mock_session, _ = _mock_aiohttp_session_post(status=200)
+            _attach_session_to_class(mock_session, mock_session_cls)
+            await apply_triage(meta, result, 8080, "secret", projects_json=projects_json)
+
+        assert mock_session.post.called
+        item_add_calls = [cmd for cmd in commands_run if "project" in cmd and "item-add" in cmd]
+        assert len(item_add_calls) == 0
+        assert "**Added to project:** Sprint 1" not in captured["comment"]
+        assert "**Project skipped:** Sprint 1" in captured["comment"]
+        body = mock_session.post.call_args[1]["json"]
+        assert "Skipped project: Sprint 1" in body["text"]
 
     @pytest.mark.asyncio
     async def test_no_project_skips_assignment(self):
@@ -1504,7 +1544,12 @@ class TestTriageActionability:
             blocked_by=None,
         )
         projects_json = json.dumps({"projects": [{"title": "Sprint 1", "number": 1}]})
-        comment, telegram = await _apply_triage_capture(meta, result, projects_json=projects_json)
+        comment, telegram = await _apply_triage_capture(
+            meta,
+            result,
+            projects_json=projects_json,
+            allowed_triage_projects=["Sprint 1"],
+        )
         # All existing fields render.
         assert "**Triage summary:** Login broken on Safari." in comment
         assert "**Priority:** high" in comment
@@ -1571,6 +1616,52 @@ class TestTriageIssue:
         assert call_count > 0
         # Telegram notification was sent
         mock_session.post.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_project_prompt_and_apply_inputs_are_allowlist_filtered(self):
+        """Only allowlisted projects are shown to the model and passed to apply."""
+        payload = _issue_payload(title="Login broken")
+        projects_json = json.dumps(
+            {
+                "projects": [
+                    {"title": "Sprint 1", "number": 1},
+                    {"title": "Secret Board", "number": 2},
+                ]
+            }
+        )
+        triage_json = json.dumps(
+            {
+                "labels": [],
+                "duplicate_of": None,
+                "related": [],
+                "project": "Sprint 1",
+                "summary": "Login is broken.",
+                "priority": "high",
+            }
+        )
+
+        captured_prompt: dict[str, str] = {}
+
+        async def mock_run_triage(prompt: str, **kwargs):
+            captured_prompt["prompt"] = prompt
+            return triage_json
+
+        with (
+            patch("kai.triage.search_related_issues", new=AsyncMock(return_value="[]")),
+            patch("kai.triage.list_projects", new=AsyncMock(return_value=projects_json)),
+            patch("kai.triage.run_triage", side_effect=mock_run_triage),
+            patch("kai.triage.apply_triage", new_callable=AsyncMock) as mock_apply,
+        ):
+            await triage_issue(payload, 8080, "secret", allowed_triage_projects=["Sprint 1"])
+
+        assert "Sprint 1" in captured_prompt["prompt"]
+        assert "Secret Board" not in captured_prompt["prompt"]
+
+        mock_apply.assert_awaited_once()
+        apply_kwargs = mock_apply.call_args.kwargs
+        assert apply_kwargs["allowed_triage_projects"] == ["Sprint 1"]
+        assert "Sprint 1" in apply_kwargs["projects_json"]
+        assert "Secret Board" not in apply_kwargs["projects_json"]
 
     @pytest.mark.asyncio
     async def test_handles_error(self):

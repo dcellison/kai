@@ -45,6 +45,7 @@ class TestUserConfig:
         assert uc.github_notify_chat_id is None
         assert uc.pr_review is None
         assert uc.issue_triage is None
+        assert uc.allowed_triage_projects == []
         assert uc.allowed_services == []
         assert uc.backend is None
         assert uc.provider is None
@@ -65,6 +66,7 @@ class TestUserConfig:
             github_notify_chat_id=-100123456789,
             pr_review=True,
             issue_triage=False,
+            allowed_triage_projects=["Sprint 1"],
             allowed_services=["perplexity"],
             backend="goose",
             provider="openai",
@@ -79,6 +81,7 @@ class TestUserConfig:
         assert uc.github_notify_chat_id == -100123456789
         assert uc.pr_review is True
         assert uc.issue_triage is False
+        assert uc.allowed_triage_projects == ["Sprint 1"]
         assert uc.allowed_services == ["perplexity"]
         assert uc.backend == "goose"
         assert uc.provider == "openai"
@@ -653,6 +656,59 @@ class TestLoadUserConfigs:
 
         assert configs[111].allowed_services == []
         assert "allowed_services for alice must be a list" in caplog.text
+
+    # ── allowed_triage_projects field ──
+
+    def test_allowed_triage_projects_parsed_deduplicated_and_ordered(self, tmp_path):
+        data = self._yaml_dict(
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                allowed_triage_projects:
+                  - Sprint 1
+                  - Bug triage
+                  - Sprint 1
+            """,
+        )
+        with patch("kai.config._read_protected_yaml", return_value=data):
+            configs = _load_user_configs("claude", "")
+
+        assert configs[111].allowed_triage_projects == ["Sprint 1", "Bug triage"]
+
+    def test_allowed_triage_projects_invalid_entries_fail_closed(self, tmp_path, caplog):
+        data = self._yaml_dict(
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                allowed_triage_projects:
+                  - Sprint 1
+                  - '*'
+                  - ''
+                  - 42
+            """,
+        )
+        with patch("kai.config._read_protected_yaml", return_value=data):
+            configs = _load_user_configs("claude", "")
+
+        assert configs[111].allowed_triage_projects == ["Sprint 1"]
+        assert "invalid allowed_triage_projects entry" in caplog.text
+
+    def test_allowed_triage_projects_not_list_is_ignored(self, tmp_path, caplog):
+        data = self._yaml_dict(
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                allowed_triage_projects: Sprint 1
+            """,
+        )
+        with patch("kai.config._read_protected_yaml", return_value=data):
+            configs = _load_user_configs("claude", "")
+
+        assert configs[111].allowed_triage_projects == []
+        assert "allowed_triage_projects for alice must be a list" in caplog.text
 
     # ── github_repos field ──
 

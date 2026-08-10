@@ -238,6 +238,41 @@ async def list_projects(owner: str) -> str:
         return "[]"
 
 
+def _allowed_project_titles(allowed_projects: list[str] | None) -> set[str]:
+    """Normalize the admin-controlled triage project allowlist."""
+    if not allowed_projects:
+        return set()
+    return {project.strip().lower() for project in allowed_projects if project.strip()}
+
+
+def _project_list_from_json(projects_json: str) -> list[dict]:
+    """Extract the GitHub Projects list from gh project JSON output."""
+    try:
+        projects_data = json.loads(projects_json) if projects_json else []
+    except json.JSONDecodeError:
+        return []
+
+    project_list = projects_data.get("projects", []) if isinstance(projects_data, dict) else projects_data
+    if not isinstance(project_list, list):
+        return []
+
+    return [project for project in project_list if isinstance(project, dict)]
+
+
+def _filter_projects_json(projects_json: str, allowed_projects: list[str] | None) -> str:
+    """Return project JSON containing only explicitly allowed project titles."""
+    allowed_titles = _allowed_project_titles(allowed_projects)
+    if not allowed_titles:
+        return "[]"
+
+    filtered = [
+        project
+        for project in _project_list_from_json(projects_json)
+        if str(project.get("title", "")).strip().lower() in allowed_titles
+    ]
+    return json.dumps({"projects": filtered})
+
+
 def build_triage_prompt(
     metadata: IssueMetadata,
     related_issues: str,
@@ -678,6 +713,7 @@ async def apply_triage(
     webhook_secret: str,
     projects_json: str = "[]",
     notify_chat_id: int | None = None,
+    allowed_triage_projects: list[str] | None = None,
 ) -> None:
     """
     Apply triage results: labels, project assignment, comment, and notification.
@@ -693,6 +729,8 @@ async def apply_triage(
         webhook_secret: Secret for authenticating with the send-message API.
         projects_json: Raw JSON from list_projects(), reused to avoid a
             redundant gh project list call when looking up project numbers.
+        allowed_triage_projects: Admin-controlled project titles triage may
+            assign. Empty/None disables project assignment.
     """
     # Type-guard Claude's response fields. Claude may return wrong types
     # (e.g., "labels": "bug" instead of ["bug"], or ["bug", 42, null]).
@@ -883,56 +921,69 @@ async def apply_triage(
             applied_labels.append(label)
             log.info("Added label '%s' to %s#%d", label, metadata.repo, metadata.number)
 
-    # Step 2: Add to project board if assigned.
+    # Step 2: Add to project board if assigned and explicitly allowed.
     # Reuses projects_json from the earlier list_projects() call instead of
     # shelling out to gh project list again.
+    project_added: str | None = None
+    project_skipped: str | None = None
+    project_number: int | None = None
     if project:
+        allowed_titles = _allowed_project_titles(allowed_triage_projects)
+        if project.lower() not in allowed_titles:
+            project_skipped = project
+            log.warning(
+                "Skipping triage project '%s' for %s#%d because it is not in allowed_triage_projects",
+                project,
+                metadata.repo,
+                metadata.number,
+            )
+        else:
+            project_list = _project_list_from_json(projects_json)
+            for p in project_list:
+                if str(p.get("title", "")).strip().lower() == project.lower():
+                    raw_project_number = p.get("number")
+                    if isinstance(raw_project_number, int) and not isinstance(raw_project_number, bool):
+                        project_number = raw_project_number
+                    break
+
+            if project_number is None:
+                project_skipped = project
+                log.warning("Allowed project '%s' not found for %s", project, metadata.repo.split("/")[0])
+
+    if project and project_number is not None and project_skipped is None:
         owner = metadata.repo.split("/")[0]
 
         try:
-            projects_data = json.loads(projects_json) if projects_json else []
-            # gh project list --format json returns {"projects": [...]} as a dict
-            project_list = projects_data.get("projects", []) if isinstance(projects_data, dict) else projects_data
+            proc = await asyncio.create_subprocess_exec(
+                "gh",
+                "project",
+                "item-add",
+                str(project_number),
+                "--owner",
+                owner,
+                "--url",
+                metadata.url,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
 
-            project_number = None
-            if isinstance(project_list, list):
-                for p in project_list:
-                    if p.get("title", "").lower() == project.lower():
-                        project_number = p.get("number")
-                        break
-
-            if project_number:
-                proc = await asyncio.create_subprocess_exec(
-                    "gh",
-                    "project",
-                    "item-add",
-                    str(project_number),
-                    "--owner",
-                    owner,
-                    "--url",
-                    metadata.url,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+            if proc.returncode == 0:
+                project_added = project
+                log.info(
+                    "Added %s#%d to project '%s'",
+                    metadata.repo,
+                    metadata.number,
+                    project,
                 )
-                _, stderr = await proc.communicate()
-
-                if proc.returncode == 0:
-                    log.info(
-                        "Added %s#%d to project '%s'",
-                        metadata.repo,
-                        metadata.number,
-                        project,
-                    )
-                else:
-                    log.warning(
-                        "Failed to add %s#%d to project '%s': %s",
-                        metadata.repo,
-                        metadata.number,
-                        project,
-                        stderr.decode().strip(),
-                    )
             else:
-                log.warning("Project '%s' not found for %s", project, owner)
+                log.warning(
+                    "Failed to add %s#%d to project '%s': %s",
+                    metadata.repo,
+                    metadata.number,
+                    project,
+                    stderr.decode().strip(),
+                )
         except Exception:
             log.exception("Failed to add %s#%d to project", metadata.repo, metadata.number)
 
@@ -966,8 +1017,10 @@ async def apply_triage(
     if related:
         related_str = ", ".join(f"#{n}" for n in related)
         comment_parts.append(f"**Related issues:** {related_str}")
-    if project:
-        comment_parts.append(f"**Added to project:** {project}")
+    if project_added:
+        comment_parts.append(f"**Added to project:** {project_added}")
+    if project_skipped:
+        comment_parts.append(f"**Project skipped:** {project_skipped}")
     comment_parts.append(f"**Next action:** {next_action}")
     if missing_info:
         comment_parts.append("**Missing information:**")
@@ -1031,8 +1084,10 @@ async def apply_triage(
     if related:
         related_str = ", ".join(f"#{n}" for n in related)
         telegram_parts.append(f"Related: {related_str}")
-    if project:
-        telegram_parts.append(f"Project: {project}")
+    if project_added:
+        telegram_parts.append(f"Project: {project_added}")
+    if project_skipped:
+        telegram_parts.append(f"Skipped project: {project_skipped}")
     if status == "blocked" and blocked_by is not None:
         blocked_by_display = f"#{blocked_by}" if isinstance(blocked_by, int) else blocked_by
         telegram_parts.append(f"Blocked by: {blocked_by_display}")
@@ -1069,6 +1124,7 @@ async def triage_issue(
     agent_backend: str = "claude",
     provider: str = "",
     model_override: str = "",
+    allowed_triage_projects: list[str] | None = None,
 ) -> None:
     """
     Full triage pipeline: analyze issue, apply labels, post results.
@@ -1101,8 +1157,10 @@ async def triage_issue(
         owner = metadata.repo.split("/")[0]
         projects = await list_projects(owner)
 
+        allowed_projects = _filter_projects_json(projects, allowed_triage_projects)
+
         # Step 3: Build the triage prompt
-        prompt = build_triage_prompt(metadata, related_issues, projects)
+        prompt = build_triage_prompt(metadata, related_issues, allowed_projects)
 
         # Step 4: Run the triage subprocess (matching the active backend)
         raw_response = await run_triage(
@@ -1126,7 +1184,13 @@ async def triage_issue(
         # Step 6: Apply triage (labels, project, comment, telegram).
         # Pass projects JSON to avoid a redundant gh project list call.
         await apply_triage(
-            metadata, triage_result, webhook_port, webhook_secret, projects_json=projects, notify_chat_id=notify_chat_id
+            metadata,
+            triage_result,
+            webhook_port,
+            webhook_secret,
+            projects_json=allowed_projects,
+            notify_chat_id=notify_chat_id,
+            allowed_triage_projects=allowed_triage_projects,
         )
 
     except Exception as exc:

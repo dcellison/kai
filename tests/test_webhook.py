@@ -2179,7 +2179,12 @@ class TestPerUserRouting:
     async def test_triage_receives_user_backend(self, _clear_cooldowns):
         """Per-user backend/provider are passed to triage_issue."""
         base = self._make_user_config(111, repos=["owner/repo"])
-        user = dataclasses.replace(base, backend="goose", provider="anthropic")
+        user = dataclasses.replace(
+            base,
+            backend="goose",
+            provider="anthropic",
+            allowed_triage_projects=["Sprint 1"],
+        )
         config = self._make_config_with_users([user])
         config.default_backend = "claude"
         config.default_provider = ""
@@ -2207,6 +2212,7 @@ class TestPerUserRouting:
             mock_triage.assert_called_once()
             assert mock_triage.call_args[1]["agent_backend"] == "goose"
             assert mock_triage.call_args[1]["provider"] == "anthropic"
+            assert mock_triage.call_args[1]["allowed_triage_projects"] == ["Sprint 1"]
 
     @pytest.mark.asyncio
     async def test_review_uses_global_backend_when_no_user_override(self, _clear_cooldowns, _mock_resolve_repo):
