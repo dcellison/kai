@@ -2028,7 +2028,6 @@ class TestCmdConfig:
             "polling",  # transport
             agent_backend,  # agent backend
             *backend_block,  # llm_provider + api_key (non-claude only)
-            "sonnet",  # model
             "false",  # customize per-role models (decline; use registry defaults)
             "120",  # timeout
             "0",  # max session age hours (0 = no limit)
@@ -3332,7 +3331,6 @@ class TestCmdConfigDefaultModelDispatch:
             "darwin",  # platform
             "fake-token",  # bot token
             "polling",  # transport
-            "claude",  # agent backend
             "/usr/bin/true",  # claude binary path
             # no DEFAULT_MODEL prompt; agent default comes from MODEL_REGISTRY
             "false",  # customize per-role models (decline; use registry defaults)
@@ -3459,7 +3457,7 @@ class TestCmdConfigDefaultModelDispatch:
         of install.conf entirely: the set-or-absent contract means
         absence IS the 'use codex's own config' signal. Pairs with
         the non-default test below to pin both emission branches."""
-        self._setup(monkeypatch, tmp_path)
+        self._setup(monkeypatch, tmp_path, existing_env={"DEFAULT_BACKEND": "codex"})
         _, env = self._run(
             monkeypatch,
             tmp_path,
@@ -3468,11 +3466,37 @@ class TestCmdConfigDefaultModelDispatch:
         )
         assert "CODEX_EFFORT_LEVEL" not in env
 
+    def test_existing_default_claude_install_skips_default_backend_prompt(self, tmp_path, monkeypatch):
+        """Re-running `make config` for the normal installed shape
+        must not ask the operator to choose DEFAULT_BACKEND. An absent
+        env key already means claude, and users.yaml is the per-user
+        backend-selection surface."""
+        from unittest.mock import MagicMock
+
+        self._setup(monkeypatch, tmp_path, existing_env={})
+        helper_mock = MagicMock(return_value="sonnet")
+        monkeypatch.setattr("kai.install._prompt_default_model", helper_mock)
+
+        recorded_prompts: list[str] = []
+        inputs_iter = iter(self._inputs_for_claude_backend())
+
+        def mock_input(prompt: str) -> str:
+            recorded_prompts.append(prompt)
+            return next(inputs_iter)
+
+        monkeypatch.setattr("builtins.input", mock_input)
+        _cmd_config()
+
+        assert not helper_mock.called
+        assert not any(prompt.startswith("Default backend") for prompt in recorded_prompts)
+        env = json.loads((tmp_path / "install.conf").read_text())["env"]
+        assert "DEFAULT_BACKEND" not in env
+
     def test_codex_effort_non_default_writes_env_key(self, tmp_path, monkeypatch):
         """A chosen effort tier round-trips from the wizard prompt
         into install.conf, lowercased by the prompt's normalization
         (mixed case pins the .strip().lower() behavior)."""
-        self._setup(monkeypatch, tmp_path)
+        self._setup(monkeypatch, tmp_path, existing_env={"DEFAULT_BACKEND": "codex"})
         base = list(self._inputs_for_codex_subscription())
         idx = base.index("8080")
         # The slot immediately before the webhook port is the codex
@@ -3514,7 +3538,7 @@ class TestCmdConfigDefaultModelDispatch:
 
         from kai.config import CODEX_EFFORT_LEVELS
 
-        self._setup(monkeypatch, tmp_path)
+        self._setup(monkeypatch, tmp_path, existing_env={"DEFAULT_BACKEND": "codex"})
         helper_mock = MagicMock(return_value="gpt-5.5")
         monkeypatch.setattr("kai.install._prompt_default_model", helper_mock)
         monkeypatch.setattr("kai.install._validate_codex_bin", lambda p: bool(p))
@@ -3547,7 +3571,7 @@ class TestCmdConfigDefaultModelDispatch:
         install.conf drops DEFAULT_MODEL so runtime uses the registry
         agent default for goose/openai.
         """
-        self._setup(monkeypatch, tmp_path, existing_env={"DEFAULT_MODEL": "sonnet"})
+        self._setup(monkeypatch, tmp_path, existing_env={"DEFAULT_BACKEND": "goose", "DEFAULT_MODEL": "sonnet"})
         monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
         helper, env = self._run(
             monkeypatch,
@@ -3599,7 +3623,7 @@ class TestCmdConfigDefaultModelDispatch:
         does not prompt; runtime falls through to MODEL_REGISTRY's
         goose/openai agent default.
         """
-        self._setup(monkeypatch, tmp_path, existing_env={})
+        self._setup(monkeypatch, tmp_path, existing_env={"DEFAULT_BACKEND": "goose"})
         monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
         helper, env = self._run(
             monkeypatch,
@@ -3619,7 +3643,7 @@ class TestCmdConfigDefaultModelDispatch:
         drops it instead of prompting for a replacement. Runtime then
         uses MODEL_REGISTRY's agent default.
         """
-        self._setup(monkeypatch, tmp_path, existing_env={"DEFAULT_MODEL": "opus"})
+        self._setup(monkeypatch, tmp_path, existing_env={"DEFAULT_BACKEND": "goose", "DEFAULT_MODEL": "opus"})
         monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
         helper, env = self._run(
             monkeypatch,
@@ -3648,7 +3672,7 @@ class TestCmdConfigDefaultModelDispatch:
         self._setup(
             monkeypatch,
             tmp_path,
-            existing_env={"DEFAULT_MODEL": "gpt-5.4"},
+            existing_env={"DEFAULT_BACKEND": "codex", "DEFAULT_MODEL": "gpt-5.4"},
         )
         memory_inputs = [
             "true",  # MEMORY_ENABLED
@@ -10605,7 +10629,7 @@ class TestWizardPerUserGooseProviderKeys:
         """Global goose+deepseek: the key prompt fires through the
         global block now that deepseek has a PROVIDER_KEY_VARS row;
         the auth-less fallback message must not appear."""
-        self._setup(monkeypatch, tmp_path, self.PLAIN_USERS_YAML)
+        self._setup(monkeypatch, tmp_path, self.PLAIN_USERS_YAML, existing_env={"DEFAULT_BACKEND": "goose"})
         monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
         inputs = list(TestCmdConfigDefaultModelDispatch._inputs_for_goose_openai())
         inputs[inputs.index("openai")] = "deepseek"
@@ -10622,7 +10646,7 @@ class TestWizardPerUserGooseProviderKeys:
         the global block collects DEEPSEEK_API_KEY, so the per-user
         scan must not prompt again (the unmodified goose chain is
         consumed exactly)."""
-        self._setup(monkeypatch, tmp_path, self.GOOSE_DEEPSEEK_USERS_YAML)
+        self._setup(monkeypatch, tmp_path, self.GOOSE_DEEPSEEK_USERS_YAML, existing_env={"DEFAULT_BACKEND": "goose"})
         monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
         inputs = list(TestCmdConfigDefaultModelDispatch._inputs_for_goose_openai())
         inputs[inputs.index("openai")] = "deepseek"
@@ -10656,7 +10680,11 @@ class TestWizardPerUserGooseProviderKeys:
             monkeypatch,
             tmp_path,
             self.PLAIN_USERS_YAML,
-            existing_env={"TELEGRAM_BOT_TOKEN": "fake-token", "OPENAI_API_KEY": "sk-old"},
+            existing_env={
+                "DEFAULT_BACKEND": "codex",
+                "TELEGRAM_BOT_TOKEN": "fake-token",
+                "OPENAI_API_KEY": "sk-old",
+            },
         )
         monkeypatch.setattr("kai.install._validate_codex_bin", lambda p: bool(p))
 
@@ -10786,7 +10814,7 @@ class TestWizardPerUserBackendBinaries:
         lands in env, the same collection contract the other three
         backends follow. The answer is a real executable so the
         unstubbed _validate_claude_bin passes on any runner."""
-        self._setup(monkeypatch, tmp_path, self.CLAUDE_USERS_YAML)
+        self._setup(monkeypatch, tmp_path, self.CLAUDE_USERS_YAML, existing_env={"DEFAULT_BACKEND": "goose"})
         monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
         inputs = list(TestCmdConfigDefaultModelDispatch._inputs_for_goose_openai())
         i = inputs.index("openai-key")
@@ -10802,7 +10830,7 @@ class TestWizardPerUserBackendBinaries:
         global block already collected codex_bin, so the per-user
         block must not prompt again (the unmodified codex chain is
         consumed exactly)."""
-        self._setup(monkeypatch, tmp_path, self.CODEX_USERS_YAML)
+        self._setup(monkeypatch, tmp_path, self.CODEX_USERS_YAML, existing_env={"DEFAULT_BACKEND": "codex"})
         monkeypatch.setattr("kai.install._validate_codex_bin", lambda p: bool(p))
 
         env = self._run(monkeypatch, tmp_path, TestCmdConfigDefaultModelDispatch._inputs_for_codex_subscription())

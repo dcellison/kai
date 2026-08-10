@@ -1242,22 +1242,37 @@ def _cmd_config() -> None:
     print()
 
     # -- Default backend --
-    print("-- Default backend --")
-    # Prefill reads DEFAULT_BACKEND, falling back to the deprecated
-    # AGENT_BACKEND key so a re-run against a legacy install.conf keeps
-    # the operator's prior choice; the wizard writes DEFAULT_BACKEND only.
-    agent_backend = _prompt_choice(
-        "Default backend",
-        sorted(VALID_BACKENDS),
-        _resolve_renamed_key(
-            existing_env.get,
-            new_key="DEFAULT_BACKEND",
-            legacy_keys=["AGENT_BACKEND"],
-            context="install.conf",
-            default="claude",
+    # The default backend is no longer a normal reconfiguration
+    # question: users.yaml is the user-facing backend-selection
+    # surface, and an absent DEFAULT_BACKEND already means "claude" at
+    # runtime. Prompt only on first-time setup, or when existing
+    # install state is pinned to a non-default backend (or contains a
+    # non-claude invalid value) so a re-run does not silently convert a
+    # codex / goose / opencode installation back to claude.
+    existing_backend = (
+        (
+            _resolve_renamed_key(
+                existing_env.get,
+                new_key="DEFAULT_BACKEND",
+                legacy_keys=["AGENT_BACKEND"],
+                context="install.conf",
+                default="claude",
+            )
+            or "claude"
         )
-        or "claude",
+        .strip()
+        .lower()
     )
+    if not users_yaml_exists or existing_backend != "claude":
+        print("-- Default backend --")
+        agent_backend = _prompt_choice(
+            "Default backend",
+            sorted(VALID_BACKENDS),
+            existing_backend,
+        )
+        print()
+    else:
+        agent_backend = "claude"
 
     # Codex auth handling runs BEFORE the legacy provider/key block so
     # subscription mode is not gated on an OPENAI_API_KEY the operator
