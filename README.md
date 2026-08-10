@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/github/license/dcellison/kai)](LICENSE)
 [![Version](https://img.shields.io/github/v/tag/dcellison/kai?label=version)](https://github.com/dcellison/kai/releases)
 
-Kai is a local, Telegram-first personal engineering system: a persistent AI collaborator with repo-aware coding, memory, scheduling, PR review, and multi-backend resilience.
+Kai is a local, Telegram-first personal engineering system: a persistent AI collaborator with repo-aware coding, memory, scheduling, PR review, and multi-backend operation.
 
 Run Kai on your own machine, reach it from Telegram, and give it real access to your local workspaces. Kai can inspect repositories, run shell commands, write code, review pull requests, triage issues, remember durable context, handle files, and run scheduled jobs while staying under your control. Your machine, your data, your rules.
 
@@ -20,8 +20,8 @@ Most AI coding tools are either interactive terminals or hosted chat surfaces. K
 - **Persistent agent sessions:** Each user gets a lazily-created subprocess with durable context and idle eviction.
 - **Memory across sessions:** Kai preserves identity, personal memory, and conversation history so useful context survives restarts and workspace switches.
 - **Background engineering workflows:** PR review, issue triage, webhooks, reminders, and condition-monitoring jobs run outside the active chat session.
-- **Backend resilience:** Claude Code is the default backend, with OpenAI Codex CLI, Goose, and OpenCode available as alternatives.
-- **Multi-user direction:** One Kai instance can serve multiple Telegram users with isolated history, files, settings, and optional OS-level process separation.
+- **Multi-backend operation:** Each user can run through any installed supported backend, with an explicit installation default and optional per-user overrides.
+- **Multi-user isolation:** One Kai instance can serve multiple Telegram users with isolated history, files, settings, and optional OS-level process separation.
 
 ## Core Capabilities
 
@@ -55,12 +55,12 @@ In Kai, a backend is more than a model provider. Each backend is a full coding h
 
 | Backend | Runtime | Model Selection Shape | Notes |
 |---|---|---|---|
-| Claude Code | `claude` CLI | Claude aliases and full model IDs | Default backend. |
+| Claude Code | `claude` CLI | Claude aliases and full model IDs | Uses Claude Code's local authentication. |
 | OpenAI Codex CLI | `codex` CLI | Codex CLI model IDs | Uses Codex's own model catalog, separate from OpenAI API model lists. |
 | Goose | `goose acp` | Provider-native model IDs | ACP backend with provider selected through Goose configuration or env. |
 | OpenCode | `opencode acp` | `provider/model` IDs | ACP backend with model resolution owned by OpenCode. |
 
-Only the backend you use needs to be installed and authenticated. Kai does not require every supported backend to exist on every machine.
+Kai does not require every supported backend to exist on every machine. Every backend selected as the installation default or in a user's configuration must be installed and authenticated for the OS account that will run it.
 
 ## Quick Start
 
@@ -80,10 +80,27 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
 make config
+```
+
+`make config` runs without `sudo`. It discovers the supported backend CLIs installed on the machine, requires an explicit installation default when more than one is available, and writes `install.conf` as the configuration artifact for the selected deployment mode. It does not accept user-supplied backend executable paths. Model defaults come from Kai's backend/provider/role model registry; admin-set per-user model baselines belong in the `models:` map in `users.yaml`, while users can change their active conversational model with `/model`.
+
+For a `single_user` deployment, `make config` also writes the runtime files under the operator's account. Start Kai from the checkout:
+
+```bash
 make run
 ```
 
-`make config` writes the runtime env file and mandatory `users.yaml` for the deployment mode you select. Pick `single_user` for a local repo checkout under your own account. Pick `protected` when you want source, data, and secrets split across protected system directories. Protected mode requires every Telegram user to have a unique `os_user` that differs from the Kai service account; this keeps persistent agents from inheriting the daemon's protected-config capabilities. Single-user mode continues to support running the agent as the operator account.
+For a `protected` deployment, preview and apply the staged configuration:
+
+```bash
+make DRY_RUN=1 install
+make install
+make install-status
+```
+
+`make install` invokes `sudo` internally and installs source, data, and secrets under separate protected system directories. It also generates the admin-owned `/etc/kai/backends.yaml` registry containing the discovered executable paths, allowed model surfaces, and selected default backend. Runtime configuration names backend identifiers; it cannot redirect a protected backend to an arbitrary executable. After a successful protected install, `install.conf` may be deleted because it can contain secrets; re-run `make config` before a later reconfiguration.
+
+Protected mode requires every Telegram user to have a unique `os_user` that differs from the Kai service account; this keeps persistent agents from inheriting the daemon's protected-config capabilities. Single-user mode runs the agent as the operator account.
 
 Protected Linux installations that use Codex image input also require `setfacl` (normally provided by the distribution's `acl` package). Kai uses a read-only named ACL so an image can remain private to the service and its intended `os_user`; if ACL support is unavailable, that image is dropped with a user-visible notice instead of being made world-readable.
 
@@ -97,8 +114,9 @@ Kai has real local authority, so the security model is part of the product rathe
 - **Optional TOTP gate:** Time-based one-time passwords can protect the chat surface after idle timeout.
 - **Local execution:** Kai runs on your machine. Conversations do not pass through a Kai-hosted relay.
 - **Path confinement:** File exchange is constrained to allowed workspace and file-storage paths.
+- **Protected backend registry:** Protected installs resolve backend identifiers through admin-owned `/etc/kai/backends.yaml`; executable paths and allowed model surfaces are installation state, not user input.
 - **Service proxy:** Third-party API keys live in server-side config and are injected only for services explicitly allowed to that user in `users.yaml`; keys are never placed in conversation context.
-- **GitHub operation boundary:** Shared-identity PR review and issue triage run only for repositories explicitly authorized to that user in admin-controlled `users.yaml`; notification subscriptions cannot grant operation access.
+- **GitHub operation boundary:** PR review and issue triage run only for repositories explicitly authorized to that user in admin-controlled `users.yaml`. Protected installs require the user's stored GitHub token, and notification subscriptions cannot grant operation access.
 - **Per-user isolation:** Users have separate history, files, workspaces, jobs, settings, and agent subprocesses.
 - **Principal-bound internal API:** Agent API credentials resolve to a fixed user and explicit scopes in the outer service; request data cannot select another principal.
 - **Separated webhook credentials:** GitHub, generic, and Telegram ingress use distinct secrets that are not exposed to persistent agent subprocesses.

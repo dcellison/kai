@@ -2,7 +2,7 @@
 # daemon fails closed at startup if it cannot find or parse it.
 #
 # Canonical paths:
-#   protected installs (`sudo make install`): /etc/kai/users.yaml
+#   protected installs (`make install`, which invokes sudo): /etc/kai/users.yaml
 #   single-user installs (`make config` then `make run`):
 #       ${XDG_CONFIG_HOME:-$HOME/.config}/kai/users.yaml
 #
@@ -11,8 +11,8 @@
 #
 # Required fields per user: telegram_id, name.
 # All other fields are optional. Omitted fields inherit installation
-# defaults from .env / /etc/kai/env (model, timeout, workspace_base)
-# or the hardcoded defaults documented in the templates/.env header.
+# defaults from the backend/provider model registry, .env or /etc/kai/env,
+# and the hardcoded defaults documented in the templates/.env header.
 
 users:
   # Example: admin user with full settings
@@ -34,20 +34,25 @@ users:
     # Inherits the global WORKSPACE_BASE installation default if unset.
     # workspace_base: ~/projects
 
-    # Optional per-user defaults. Users can override these at runtime
-    # via /settings. Omitted fields inherit installation defaults
-    # (DEFAULT_MODEL, DEFAULT_TIMEOUT).
-    # model: opus             # haiku/sonnet/opus for claude; provider/model for opencode
-    # timeout: 300            # response timeout in seconds (max 600)
-
-    # Default backend. Overrides the global DEFAULT_BACKEND from .env for
-    # this user only. Default is "claude" (Claude Code CLI). Other
-    # options: "goose" (Goose ACP, requires provider + API key),
-    # "codex" (OpenAI Codex CLI), "opencode" (OpenCode ACP; model is
-    # a full "provider/model" ID, auth managed by `opencode auth login`).
+    # Backend override. When omitted, this user inherits the installation
+    # default selected during `make config`. Protected installs accept only
+    # backend identifiers present in admin-owned /etc/kai/backends.yaml;
+    # users cannot configure executable paths here. Supported identifiers:
+    # "claude", "codex", "goose", and "opencode". Goose and OpenCode
+    # also require a provider; OpenCode models use full "provider/model" IDs
+    # and authentication is managed by `opencode auth login`.
     # backend: goose
     # provider: openai    # required for goose and opencode (selects the model registry)
-    # model: anthropic/claude-sonnet-4-6   # opencode example (full provider/model ID)
+
+    # Optional per-user model and timeout defaults. Users can override the
+    # conversational model and timeout at runtime via /model and /settings.
+    # Omitted model roles inherit the selected backend/provider/role defaults
+    # from the model registry. Model identifiers must match that backend's
+    # surface; OpenCode uses full provider/model IDs.
+    # models:
+    #   agent: gpt-5.5-pro
+    #   pr_review: gpt-5.5
+    # timeout: 300            # response timeout in seconds (max 600)
 
     # GitHub settings. github_repos is the admin-controlled authorization
     # boundary for GitHub review and triage operations, as well as the
