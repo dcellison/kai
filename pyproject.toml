@@ -95,5 +95,6 @@ include = [
     "src/kai/services.py",
     "src/kai/sessions.py",
     "src/kai/user_isolation.py",
+    "src/kai/workshop",
     "src/kai/workspace_utils.py",
 ]
