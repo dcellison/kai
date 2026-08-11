@@ -1,6 +1,6 @@
 # Kai Workshop: Phase 0 Implementation Map
 
-**Status:** Draft for architecture review
+**Status:** Active migration plan; canonical conversation shadow implemented, production authority held
 **Date:** 2026-08-11
 **Scope:** Map the current Kai implementation onto the proposed Kai Workshop architecture without changing production behavior.
 
@@ -458,3 +458,45 @@ The retirement phase is complete when:
 - no silent legacy fallback, dual authority, or mitigation-only configuration remains.
 
 Any compatibility code remaining at that point must be an intentional, documented, tested product surface. Everything else is transition debt and blocks completion of the Workshop migration.
+
+## 18. First canonical conversation authority review
+
+**Review date:** 2026-08-11
+
+**Scope:** Whether the canonical Workshop store may replace JSONL transcript reads or direct Telegram delivery after the first conversation-shadow sequence.
+
+**Decision:** **Hold both authority changes.** The canonical store remains a non-authoritative shadow. JSONL remains the transcript authority, and existing Telegram delivery remains the external-effect authority.
+
+The review distinguishes implemented structural evidence from live operational evidence. Passing deterministic tests is necessary, but it is not equivalent to proving sustained parity in the installed system.
+
+| Gate | Evidence | Result |
+|---|---|---|
+| Durable typed identities, event envelope, append/idempotency contract, additive schema, and deterministic projection replay | Foundation and replay contracts introduced in the first Workshop PR; projection rebuild tests compare complete message and delivery projections | Pass |
+| Deterministic default workshop, principal, agent, channel, and Telegram binding bootstrap | Bootstrap is idempotent across separate databases and service restarts; status output is non-secret | Pass |
+| Authenticated plain-text Telegram ingress shadowing | Binding resolution separates sender principal from channel identity; duplicate update/message delivery is idempotent, including after restart | Pass |
+| Successful assistant-result and delivery-observation shadowing | Assistant replies use the canonical channel and agent principal; result retries and delivery observations are idempotent and replayable | Pass as observation only |
+| Event-to-projection and canonical-to-JSONL parity diagnostics | `make install-status` replays relevant event facts, detects projection and two-way eligible-history divergence, and exposes counts without content or identities | Pass in automated tests |
+| Installed-system parity across fresh messages and a service restart | The diagnostic has not yet accumulated reviewed, sustained clean observations from the deployed installation | Not yet proven |
+| Media ingress and artifact provenance | Photo, document, and voice paths are deliberately excluded from the current text shadow; canonical artifact metadata does not yet exist | Missing |
+| Canonical timeline query and client synchronization | No supported timeline query, snapshot cursor, resumable event stream, or read-only Workshop client exists | Missing |
+| Durable outbound delivery | Current delivery events observe direct Telegram attempts after the fact; there is no `delivery.requested` outbox, lease, retry policy, or crash recovery | Missing |
+| Legacy transcript consumers | Context assembly, memory provenance, evaluation, and operator history tools still read JSONL directly | Not migrated |
+
+### 18.1 Authority consequences
+
+- Canonical shadow failures remain fail-open and must not affect Telegram responses.
+- Production context assembly and transcript views must continue to read JSONL.
+- Direct Telegram sends must continue to own delivery behavior for private chats, schedules, GitHub notifications, generic webhooks, files, and voice.
+- `message.created` and delivery observation events are evidence, not permission to retry an external effect.
+- No rollback window begins because no authority has moved.
+
+### 18.2 Next bounded sequence
+
+1. **Deploy and observe:** install the merged shadow sequence, create fresh plain-text exchanges, run `make install-status` before and after a service restart, and retain only counts/state as evidence. A single clean sample is a smoke test, not sustained parity.
+2. **Canonical timeline query contract, unused by production:** add a transport-independent, paginated channel timeline reader with stable cursors and principal/channel authorization inputs. It must not accept Telegram IDs and must not replace JSONL reads.
+3. **Authenticated read-only diagnostic surface:** expose snapshot and replay semantics to a minimal local Workshop diagnostic client. It must reuse principal authorization, reveal no cross-channel data, and accept no commands.
+4. **Media and artifact shadow:** introduce canonical artifact metadata and provenance for successful photo, document, and voice ingress while preserving current files, prompts, and Telegram behavior.
+5. **Durable delivery outbox:** define `delivery.requested`, attempts, idempotent claims, retry/failure policy, and crash recovery before any direct Telegram send is replaced.
+6. **Repeat the authority review:** require sustained installed parity, media coverage, read-client restart/reconnect evidence, and live delivery recovery before approving a cutover PR.
+
+The next code PR is item 2: a test-first, production-unused canonical timeline query. It advances the Phase 1 read model without creating dual-read behavior or weakening the hold decision.
