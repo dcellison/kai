@@ -597,11 +597,10 @@ class TestEnsureWebhook:
 
     @pytest.mark.asyncio
     async def test_missing_github_secret_raises(self):
-        """GitHub registration cannot borrow a generic or legacy secret."""
+        """GitHub registration cannot borrow the generic secret."""
         config = _make_config(
             github_webhook_secret="",
             generic_webhook_secret="generic-secret",
-            webhook_secret="legacy-secret",
         )
 
         with pytest.raises(GitHubAPIError, match="GITHUB_WEBHOOK_SECRET"):

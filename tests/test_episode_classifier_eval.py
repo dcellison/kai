@@ -42,7 +42,6 @@ _ARTIFACT = Path(__file__).parent / "artifacts" / "episode_classifier_eval.json"
 _BASE_CONFIG = Config(
     telegram_bot_token="test-token",
     allowed_user_ids={12345},
-    webhook_secret="test-secret",
 )
 
 

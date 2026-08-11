@@ -1266,9 +1266,6 @@ class Config:
         webhook_port: Port for the local aiohttp server (webhooks + scheduling API)
         github_webhook_secret: HMAC secret for verifying GitHub webhook payloads.
         generic_webhook_secret: Header secret for the generic webhook endpoint.
-        webhook_secret: Deprecated WEBHOOK_SECRET compatibility credential. During
-            the migration window it is accepted only by the GitHub and generic
-            external webhook routes, never by Telegram or internal APIs.
         voice_enabled: Whether to transcribe Telegram voice notes via whisper-cpp
         whisper_model_path: Path to the whisper-cpp GGML model file
         tts_enabled: Whether to enable Piper text-to-speech for voice responses
@@ -1353,9 +1350,6 @@ class Config:
     webhook_port: int = 8080
     github_webhook_secret: str = ""
     generic_webhook_secret: str = ""
-    # Deprecated: temporary external-only fallback for existing GitHub and
-    # generic webhook callers. Never use this for Telegram or internal APIs.
-    webhook_secret: str = ""
     # True when load_config() populated secrets from the protected
     # installation env file (/etc/kai/env). Runtime code uses this to
     # tighten boundaries that would break local single-user installs if
@@ -3510,12 +3504,10 @@ def load_config() -> Config:
 
     github_webhook_secret = os.environ.get("GITHUB_WEBHOOK_SECRET", "").strip()
     generic_webhook_secret = os.environ.get("GENERIC_WEBHOOK_SECRET", "").strip()
-    legacy_webhook_secret = os.environ.get("WEBHOOK_SECRET", "").strip()
-    if legacy_webhook_secret:
+    if os.environ.get("WEBHOOK_SECRET", "").strip():
         log.warning(
-            "WEBHOOK_SECRET is deprecated; temporary compatibility authentication "
-            "is enabled for /webhook/github and /webhook only. It never "
-            "authenticates Telegram or /api/* routes."
+            "WEBHOOK_SECRET is no longer supported and is ignored; configure "
+            "GITHUB_WEBHOOK_SECRET and GENERIC_WEBHOOK_SECRET instead"
         )
 
     configured_ingress_secrets = [
@@ -3547,7 +3539,6 @@ def load_config() -> Config:
         webhook_port=webhook_port,
         github_webhook_secret=github_webhook_secret,
         generic_webhook_secret=generic_webhook_secret,
-        webhook_secret=legacy_webhook_secret,
         protected_install=bool(protected_env),
         voice_enabled=os.environ.get("VOICE_ENABLED", "").lower() in ("1", "true", "yes"),
         tts_enabled=os.environ.get("TTS_ENABLED", "").lower() in ("1", "true", "yes"),

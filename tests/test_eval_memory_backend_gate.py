@@ -26,7 +26,6 @@ from kai.eval import memory_backend_gate as g
 _BASE_CONFIG = Config(
     telegram_bot_token="test-token",
     allowed_user_ids={12345},
-    webhook_secret="test-secret",
     memory_enabled=False,
     memory_extraction_enabled=False,
 )

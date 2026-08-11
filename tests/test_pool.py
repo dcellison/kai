@@ -49,7 +49,6 @@ def _make_config(**overrides) -> Config:
         "agent_max_session_hours": 0,
         "agent_idle_timeout": 1800,
         "webhook_port": 8080,
-        "webhook_secret": "secret",
     }
     defaults.update(overrides)
     return Config(**defaults)
@@ -73,14 +72,11 @@ class TestInstanceCreation:
         b = pool.get(222)
         assert a is not b
         assert a._api_context.webhook_secret != b._api_context.webhook_secret
-        assert a._api_context.webhook_secret != "secret"
-        assert b._api_context.webhook_secret != "secret"
 
     def test_internal_api_credential_exists_without_external_webhooks(self):
         """Disabling public ingress must not remove the agent's scoped API."""
         pool = SubprocessPool(
             config=_make_config(
-                webhook_secret="",
                 github_webhook_secret="",
                 generic_webhook_secret="",
             ),

@@ -990,8 +990,8 @@ def _cmd_config() -> None:
 
     If install.conf already exists, its values are used as defaults so re-running
     only asks about changes. Auto-detects platform, generates distinct named
-    webhook secrets, and offers an explicit safe-default choice to preserve or
-    retire an existing legacy secret. Validates all inputs before writing.
+    webhook secrets, and removes unsupported legacy webhook credentials.
+    Validates all inputs before writing.
 
     No sudo required - this runs as the current user.
     """
@@ -1009,7 +1009,7 @@ def _cmd_config() -> None:
             print(f"Warning: could not read existing {INSTALL_CONF}: {e}\n")
 
     existing_env: dict = existing.get("env", {})
-    legacy_webhook_secret = existing_env.get("WEBHOOK_SECRET", "")
+    had_legacy_webhook_secret = bool(str(existing_env.get("WEBHOOK_SECRET", "")).strip())
 
     # Auto-detect platform
     if sys.platform == "darwin":
@@ -1703,11 +1703,12 @@ def _cmd_config() -> None:
             break
         print("  Must be a valid port number (1-65535).")
 
-    # Named credentials are the long-term configuration. Keep them distinct
-    # from an existing legacy credential so the runtime can identify and log
-    # callers that still depend on compatibility authentication.
+    # Each external ingress has a dedicated credential. A legacy WEBHOOK_SECRET
+    # from an older generated artifact is deliberately not carried forward.
+    if had_legacy_webhook_secret:
+        print("  WEBHOOK_SECRET is no longer supported and will be omitted from the generated configuration.")
     default_github_secret = existing_env.get("GITHUB_WEBHOOK_SECRET", "")
-    reserved_webhook_secrets = {legacy_webhook_secret, tg_webhook_secret}
+    reserved_webhook_secrets = {tg_webhook_secret}
     while not default_github_secret or default_github_secret in reserved_webhook_secrets:
         default_github_secret = secrets.token_hex(32)
     while True:
@@ -1718,34 +1719,13 @@ def _cmd_config() -> None:
         )
         if github_webhook_secret not in reserved_webhook_secrets:
             break
-        print("  GitHub, Telegram, and legacy webhook secrets must use different values.")
+        print("  GitHub and Telegram webhook secrets must use different values.")
         default_github_secret = secrets.token_hex(32)
 
-    if tg_webhook_secret and tg_webhook_secret == legacy_webhook_secret:
-        print("  Telegram and legacy webhook secrets must be different; Telegram will use a generated token.")
-        tg_webhook_secret = ""
-
     generic_webhook_secret = existing_env.get("GENERIC_WEBHOOK_SECRET", "")
-    reserved_webhook_secrets = {github_webhook_secret, legacy_webhook_secret, tg_webhook_secret}
+    reserved_webhook_secrets = {github_webhook_secret, tg_webhook_secret}
     while not generic_webhook_secret or generic_webhook_secret in reserved_webhook_secrets:
         generic_webhook_secret = secrets.token_hex(32)
-
-    # install.conf is generated output from this wizard. An upgraded install
-    # must therefore retire the legacy fallback here rather than by editing or
-    # post-processing that artifact. Preserve compatibility on Enter: callers
-    # have to be migrated and tested before the operator explicitly chooses
-    # false. Fresh installations never carry WEBHOOK_SECRET and skip the prompt.
-    if legacy_webhook_secret:
-        print()
-        print("A deprecated WEBHOOK_SECRET compatibility fallback is present.")
-        print("Retire it only after GitHub and generic webhook callers use their named secrets.")
-        retain_legacy_webhook_secret = _prompt_bool(
-            "Retain deprecated WEBHOOK_SECRET fallback",
-            True,
-        )
-        if not retain_legacy_webhook_secret:
-            legacy_webhook_secret = ""
-            print("  WEBHOOK_SECRET will be omitted from the generated configuration.")
     print()
 
     # -- Workspaces --
@@ -2049,9 +2029,6 @@ def _cmd_config() -> None:
         "VOICE_ENABLED": str(voice_enabled).lower(),
         "TTS_ENABLED": str(tts_enabled).lower(),
     }
-    if legacy_webhook_secret:
-        env["WEBHOOK_SECRET"] = legacy_webhook_secret
-
     # DEFAULT_BACKEND is the global default backend; users.yaml entries
     # can override it per user. The wizard writes the selected backend
     # explicitly; absence is not a backend-selection signal.
@@ -4268,6 +4245,21 @@ def _cmd_apply() -> None:
         env["DEFAULT_PROVIDER"] = env.pop("LLM_PROVIDER")
     elif "LLM_PROVIDER" in env:
         del env["LLM_PROVIDER"]
+    # WEBHOOK_SECRET no longer authenticates any runtime route. Never
+    # redeploy it from an older install.conf. Refuse the upgrade before
+    # stopping Kai when either named replacement is absent; silently
+    # stripping the old credential would otherwise disable an endpoint
+    # that the shared credential previously enabled.
+    if str(env.get("WEBHOOK_SECRET", "")).strip():
+        missing_named_webhook_secrets = [
+            key for key in ("GITHUB_WEBHOOK_SECRET", "GENERIC_WEBHOOK_SECRET") if not str(env.get(key, "")).strip()
+        ]
+        if missing_named_webhook_secrets:
+            raise SystemExit(
+                "install.conf contains unsupported WEBHOOK_SECRET but is missing named replacement(s): "
+                f"{', '.join(missing_named_webhook_secrets)}. Run 'make config' once before 'make install'."
+            )
+    env.pop("WEBHOOK_SECRET", None)
     # Top-level installer metadata: present only when the wizard
     # staged a first-time users.yaml that has not yet been applied.
     # The empty-string -> None coercion treats a hand-edited conf
@@ -6466,11 +6458,11 @@ def _webhook_secret_migration_status(env: dict[str, str], *, source: str = "inst
     """Return a non-secret diagnostic for external webhook migration state."""
     prefix = f"Webhook secret migration ({source}):"
     if env.get("WEBHOOK_SECRET", "").strip():
-        return f"{prefix} legacy WEBHOOK_SECRET fallback configured (GitHub/generic callers may still depend on it)"
+        return f"{prefix} unsupported WEBHOOK_SECRET present (ignored by runtime; remove from configuration)"
     if env.get("GITHUB_WEBHOOK_SECRET", "").strip() and env.get("GENERIC_WEBHOOK_SECRET", "").strip():
-        return f"{prefix} named GitHub/generic secrets configured; no legacy fallback"
+        return f"{prefix} named GitHub/generic secrets configured; unsupported WEBHOOK_SECRET absent"
     missing = [key for key in ("GITHUB_WEBHOOK_SECRET", "GENERIC_WEBHOOK_SECRET") if not env.get(key, "").strip()]
-    return f"{prefix} no legacy fallback; missing named secret(s): {', '.join(missing)}"
+    return f"{prefix} unsupported WEBHOOK_SECRET absent; missing named secret(s): {', '.join(missing)}"
 
 
 def _deployed_webhook_secret_migration_status(env_path: Path) -> str:

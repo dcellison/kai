@@ -26,7 +26,6 @@ from kai.oneshot import OneShotResult
 _BASE_CONFIG = Config(
     telegram_bot_token="test",
     allowed_user_ids={1},
-    webhook_secret="test",
 )
 
 

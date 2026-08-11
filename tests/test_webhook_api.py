@@ -20,7 +20,6 @@ from kai.webhook import (
     GENERIC_WEBHOOK_SECRET_KEY,
     GITHUB_WEBHOOK_SECRET_KEY,
     INTERNAL_API_AUTH_KEY,
-    LEGACY_WEBHOOK_SECRET_KEY,
     POOL_KEY,
     PR_REVIEW_COOLDOWN_KEY,
     TELEGRAM_APP_KEY,
@@ -758,16 +757,6 @@ class TestTelegramUpdate:
         assert resp.status == 401
         telegram_request.app[TELEGRAM_APP_KEY].process_update.assert_not_called()
 
-    async def test_legacy_webhook_secret_is_not_accepted(self, telegram_request):
-        """The external transition credential never crosses into Telegram auth."""
-        telegram_request.app[LEGACY_WEBHOOK_SECRET_KEY] = "legacy-secret"
-        telegram_request.headers = {"X-Telegram-Bot-Api-Secret-Token": "legacy-secret"}
-
-        resp = await _handle_telegram_update(telegram_request)
-
-        assert resp.status == 401
-        telegram_request.app[TELEGRAM_APP_KEY].process_update.assert_not_called()
-
     async def test_missing_secret_returns_401(self, telegram_request):
         """Missing secret header returns 401."""
         telegram_request.headers = {}
@@ -1059,38 +1048,19 @@ class TestGitHubWebhook:
         assert resp.status == 401
         github_request.app[TELEGRAM_BOT_KEY].send_message.assert_not_called()
 
-    async def test_legacy_signature_is_accepted_and_logged(self, github_request, caplog):
-        """An existing GitHub registration stays live and produces migration telemetry."""
+    async def test_legacy_signature_is_rejected(self, github_request):
+        """WEBHOOK_SECRET no longer authenticates the GitHub ingress domain."""
         body = b'{"zen": "migration"}'
-        github_request.app[LEGACY_WEBHOOK_SECRET_KEY] = "legacy-secret"
         github_request.read = AsyncMock(return_value=body)
         github_request.headers = {
             "X-Hub-Signature-256": _sign_body("legacy-secret", body),
             "X-GitHub-Event": "ping",
         }
 
-        with caplog.at_level("WARNING", logger="kai.webhook"):
-            resp = await _handle_github(github_request)
+        resp = await _handle_github(github_request)
 
-        assert resp.status == 200
-        assert "Legacy WEBHOOK_SECRET authenticated /webhook/github" in caplog.text
-        assert "GITHUB_WEBHOOK_SECRET" in caplog.text
-
-    async def test_named_signature_does_not_log_legacy_use(self, github_request, caplog):
-        """The primary named credential wins even while compatibility is configured."""
-        body = b'{"zen": "named"}'
-        github_request.app[LEGACY_WEBHOOK_SECRET_KEY] = "legacy-secret"
-        github_request.read = AsyncMock(return_value=body)
-        github_request.headers = {
-            "X-Hub-Signature-256": _sign_body("test-secret", body),
-            "X-GitHub-Event": "ping",
-        }
-
-        with caplog.at_level("WARNING", logger="kai.webhook"):
-            resp = await _handle_github(github_request)
-
-        assert resp.status == 200
-        assert "Legacy WEBHOOK_SECRET authenticated" not in caplog.text
+        assert resp.status == 401
+        github_request.app[TELEGRAM_BOT_KEY].send_message.assert_not_called()
 
     async def test_ping_event_returns_pong(self, github_request):
         """GitHub ping events are acknowledged without sending to Telegram."""
@@ -1249,29 +1219,15 @@ class TestGenericWebhook:
 
         assert resp.status == 401
 
-    async def test_legacy_secret_is_accepted_and_logged(self, generic_request, caplog):
-        """An unknown external caller gets a compatibility window with telemetry."""
-        generic_request.app[LEGACY_WEBHOOK_SECRET_KEY] = "legacy-secret"
+    async def test_legacy_secret_is_rejected(self, generic_request):
+        """WEBHOOK_SECRET no longer authenticates the generic ingress domain."""
         generic_request.headers = {"X-Webhook-Secret": "legacy-secret"}
         generic_request.json = AsyncMock(return_value={"message": "legacy caller"})
 
-        with caplog.at_level("WARNING", logger="kai.webhook"):
-            resp = await _handle_generic(generic_request)
+        resp = await _handle_generic(generic_request)
 
-        assert resp.status == 200
-        assert "Legacy WEBHOOK_SECRET authenticated /webhook" in caplog.text
-        assert "GENERIC_WEBHOOK_SECRET" in caplog.text
-
-    async def test_named_secret_does_not_log_legacy_use(self, generic_request, caplog):
-        """The generic route checks its named credential before the fallback."""
-        generic_request.app[LEGACY_WEBHOOK_SECRET_KEY] = "legacy-secret"
-        generic_request.json = AsyncMock(return_value={"message": "named caller"})
-
-        with caplog.at_level("WARNING", logger="kai.webhook"):
-            resp = await _handle_generic(generic_request)
-
-        assert resp.status == 200
-        assert "Legacy WEBHOOK_SECRET authenticated" not in caplog.text
+        assert resp.status == 401
+        generic_request.app[TELEGRAM_BOT_KEY].send_message.assert_not_called()
 
 
 # ── GET /api/jobs ──────────────────────────────────────────────────
@@ -1990,18 +1946,6 @@ class TestChatIdAuthorization:
     async def test_external_signing_secret_is_not_an_api_credential(self, mock_request):
         """Possession of the GitHub/generic signing secret does not authorize API calls."""
         mock_request.headers = {"X-Webhook-Secret": "signing-secret"}
-        mock_request.json = AsyncMock(return_value={"text": "hello"})
-
-        resp = await _handle_send_message(mock_request)
-
-        assert resp.status == 401
-        mock_request.app[TELEGRAM_BOT_KEY].send_message.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_legacy_webhook_secret_is_not_an_api_credential(self, mock_request):
-        """The transition fallback remains external-only."""
-        mock_request.app[LEGACY_WEBHOOK_SECRET_KEY] = "legacy-secret"
-        mock_request.headers = {"X-Webhook-Secret": "legacy-secret"}
         mock_request.json = AsyncMock(return_value={"text": "hello"})
 
         resp = await _handle_send_message(mock_request)

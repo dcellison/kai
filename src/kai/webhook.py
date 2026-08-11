@@ -33,10 +33,9 @@ Routes are organized into these groups:
 
 Every ingress domain has an independent credential. Telegram uses its configured
 or process-generated secret token, GitHub uses GITHUB_WEBHOOK_SECRET, and the
-generic endpoint uses GENERIC_WEBHOOK_SECRET. During migration only, the
-deprecated WEBHOOK_SECRET is an external-only fallback for the GitHub and generic
-routes; successful fallback use is logged. Internal API routes always use random,
-principal-bound process credentials and do not depend on external webhook secrets.
+generic endpoint uses GENERIC_WEBHOOK_SECRET. Internal API routes always use
+random, principal-bound process credentials and do not depend on external webhook
+secrets.
 
 GitHub events are formatted into human-readable Markdown messages and sent
 to the configured Telegram chat. The formatter pattern (dispatch dict mapping
@@ -91,7 +90,6 @@ CONFIG_KEY: web.AppKey[Config] = web.AppKey("config", Config)
 GENERIC_WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("generic_webhook_secret", str)
 GITHUB_WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("github_webhook_secret", str)
 INTERNAL_API_AUTH_KEY: web.AppKey[InternalAPIAuth] = web.AppKey("internal_api_auth", InternalAPIAuth)
-LEGACY_WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("legacy_webhook_secret", str)
 NOTIFICATION_CHAT_IDS_KEY: web.AppKey[set[int]] = web.AppKey("notification_chat_ids", set)
 POOL_KEY: web.AppKey[object] = web.AppKey("pool", object)
 PR_REVIEW_COOLDOWN_KEY: web.AppKey[int] = web.AppKey("pr_review_cooldown", int)
@@ -424,24 +422,16 @@ def _strip_markdown(text: str) -> str:
 
 
 def _require_generic_webhook_secret(handler):
-    """Validate the generic credential, with observable legacy fallback."""
+    """Validate the dedicated generic webhook credential."""
 
     @functools.wraps(handler)
     async def wrapper(request: web.Request) -> web.Response:
         secret = request.app[GENERIC_WEBHOOK_SECRET_KEY]
-        legacy_secret = request.app.get(LEGACY_WEBHOOK_SECRET_KEY, "")
         provided = request.headers.get("X-Webhook-Secret", "")
         if secret and hmac.compare_digest(provided, secret):
             return await handler(request)
-        if legacy_secret and hmac.compare_digest(provided, legacy_secret):
-            log.warning(
-                "Legacy WEBHOOK_SECRET authenticated /webhook from %s; migrate this caller to GENERIC_WEBHOOK_SECRET",
-                request.remote,
-            )
-            return await handler(request)
-        else:
-            log.warning("Auth failure on %s from %s", request.path, request.remote)
-            return web.Response(status=401, text="Invalid secret")
+        log.warning("Auth failure on %s from %s", request.path, request.remote)
+        return web.Response(status=401, text="Invalid secret")
 
     return wrapper
 
@@ -701,21 +691,12 @@ async def _handle_github(request: web.Request) -> web.Response:
     Unsupported events are silently acknowledged with {"msg": "ignored"}.
     """
     secret = request.app[GITHUB_WEBHOOK_SECRET_KEY]
-    legacy_secret = request.app.get(LEGACY_WEBHOOK_SECRET_KEY, "")
 
     body = await request.read()
 
     # Validate HMAC-SHA256 signature from GitHub
     signature = request.headers.get("X-Hub-Signature-256", "")
-    if secret and _verify_github_signature(secret, body, signature):
-        pass
-    elif legacy_secret and _verify_github_signature(legacy_secret, body, signature):
-        log.warning(
-            "Legacy WEBHOOK_SECRET authenticated /webhook/github from %s; "
-            "migrate the GitHub webhook to GITHUB_WEBHOOK_SECRET",
-            request.remote,
-        )
-    else:
+    if not secret or not _verify_github_signature(secret, body, signature):
         log.warning("GitHub webhook: invalid signature")
         return web.Response(status=401, text="Invalid signature")
 
@@ -2339,22 +2320,19 @@ def _register_routes(app: web.Application, config: Config) -> None:
     """Register independently gated external routes and always-on internal APIs."""
     app.router.add_get("/health", _handle_health)
 
-    if config.webhook_secret:
-        app[LEGACY_WEBHOOK_SECRET_KEY] = config.webhook_secret
-
     if config.telegram_webhook_url:
         if not config.telegram_webhook_secret:
             raise RuntimeError("Telegram webhook mode requires a non-empty secret")
         app[TELEGRAM_WEBHOOK_SECRET_KEY] = config.telegram_webhook_secret
         app.router.add_post("/webhook/telegram", _handle_telegram_update)
 
-    if config.github_webhook_secret or config.webhook_secret:
+    if config.github_webhook_secret:
         app[GITHUB_WEBHOOK_SECRET_KEY] = config.github_webhook_secret
         app.router.add_post("/webhook/github", _handle_github)
     else:
         log.warning("GITHUB_WEBHOOK_SECRET not set - GitHub webhook endpoint disabled")
 
-    if config.generic_webhook_secret or config.webhook_secret:
+    if config.generic_webhook_secret:
         app[GENERIC_WEBHOOK_SECRET_KEY] = config.generic_webhook_secret
         app.router.add_post("/webhook", _handle_generic)
     else:

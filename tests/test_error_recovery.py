@@ -234,7 +234,6 @@ class TestErrorMessageLifecycle:
             "config": Config(
                 telegram_bot_token="t",
                 allowed_user_ids={1},
-                webhook_secret="s",
                 tts_enabled=False,  # voice-mode lookup is skipped
             ),
         }

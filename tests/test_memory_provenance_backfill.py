@@ -90,7 +90,6 @@ from kai.memory_provenance_backfill import (
 _BASE_CONFIG = Config(
     telegram_bot_token="test-token",
     allowed_user_ids={12345},
-    webhook_secret="test-secret",
     memory_enabled=True,
 )
 

@@ -619,7 +619,7 @@ def _make_config(**overrides) -> Config:
 
     Accepts any Config field as a keyword override. Used by both the pure
     function tests (workspace_base, allowed_workspaces) and the handler
-    tests (tts_enabled, voice_enabled, webhook_secret, etc.).
+    tests (tts_enabled, voice_enabled, named webhook secrets, etc.).
 
     `claude_workspace=` is accepted as a back-compat alias for pre-#353
     tests that wanted a specific home directory. Config no longer has
@@ -644,7 +644,6 @@ def _make_config(**overrides) -> Config:
         "allowed_workspaces": [],
         "github_webhook_secret": "github-test-secret",
         "generic_webhook_secret": "generic-test-secret",
-        "webhook_secret": "test-secret",
         "webhook_port": 8080,
         "tts_enabled": False,
         "voice_enabled": False,

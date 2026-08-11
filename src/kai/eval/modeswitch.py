@@ -298,15 +298,14 @@ def _build_test_configs(memory_enabled_value: bool) -> Config:
     that will read it.
 
     The verify subcommand never spawns subprocesses or hits the
-    network, so the Telegram and webhook fields are placeholder
-    strings. allowed_user_ids contains the fixture chat_id so the
+    network, so the Telegram token is a placeholder string.
+    allowed_user_ids contains the fixture chat_id so the
     user-id scoping in build_session_context resolves the per-user
     MEMORY.md path correctly.
     """
     return Config(
         telegram_bot_token="modeswitch-test",
         allowed_user_ids={_FIXTURE_CHAT_ID},
-        webhook_secret="modeswitch-test",
         memory_enabled=memory_enabled_value,
     )
 

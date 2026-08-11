@@ -122,17 +122,17 @@ Kai has real local authority, so the security model is part of the product rathe
 - **Separated webhook credentials:** GitHub, generic, and Telegram ingress use distinct secrets that are not exposed to persistent agent subprocesses.
 - **Optional OS isolation:** A user's backend subprocess can run under a dedicated OS account through generated sudoers rules.
 
-Upgraded installations may temporarily retain the former shared
-`WEBHOOK_SECRET`. After all GitHub and generic webhook callers have been moved
-to their named secrets, run `make config` and answer `false` to **Retain
-deprecated WEBHOOK_SECRET fallback**. Pressing Enter keeps compatibility. The
-generated `install.conf` can then be reviewed with `make DRY_RUN=1 install`
-before `make install` deploys it.
+The former shared `WEBHOOK_SECRET` is no longer supported and never
+authenticates a runtime route. `make config` omits it from regenerated
+configuration, and `make install` strips it from older artifacts before writing
+the deployed environment. If an older artifact lacks either named replacement,
+installation fails before stopping Kai and asks for a one-time `make config`.
+GitHub and generic callers must use their dedicated named secrets.
 
 Run `make install-status` to inspect the authoritative deployed migration
 state in `/etc/kai/env`. The command uses sudo because that file is root-only;
-it reports only whether the legacy and named variables are configured, never
-their values. It also labels the separate `install.conf` artifact state so
+it reports only whether the unsupported and named variables are configured,
+never their values. It also labels the separate `install.conf` artifact state so
 configuration drift is visible rather than mistaken for deployed truth.
 
 The current remediation status and compatibility exceptions are tracked in

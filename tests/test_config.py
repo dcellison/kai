@@ -415,7 +415,7 @@ class TestLoadConfigOptional:
         assert config.github_webhook_secret == "github-secret"
         assert config.generic_webhook_secret == "generic-secret"
 
-    def test_legacy_webhook_secret_stays_separate_for_external_fallback(self, monkeypatch, caplog):
+    def test_legacy_webhook_secret_is_ignored(self, monkeypatch, caplog):
         _set_required(monkeypatch)
         monkeypatch.setenv("WEBHOOK_SECRET", "legacy-secret")
 
@@ -424,11 +424,10 @@ class TestLoadConfigOptional:
 
         assert config.github_webhook_secret == ""
         assert config.generic_webhook_secret == ""
-        assert config.webhook_secret == "legacy-secret"
-        assert "deprecated" in caplog.text
-        assert "/webhook/github and /webhook only" in caplog.text
+        assert not hasattr(config, "webhook_secret")
+        assert "no longer supported and is ignored" in caplog.text
 
-    def test_explicit_generic_secret_wins_over_legacy(self, monkeypatch, caplog):
+    def test_explicit_generic_secret_is_unchanged_when_legacy_is_present(self, monkeypatch, caplog):
         _set_required(monkeypatch)
         monkeypatch.setenv("GENERIC_WEBHOOK_SECRET", "generic-secret")
         monkeypatch.setenv("WEBHOOK_SECRET", "legacy-secret")
@@ -438,8 +437,8 @@ class TestLoadConfigOptional:
 
         assert config.generic_webhook_secret == "generic-secret"
         assert config.github_webhook_secret == ""
-        assert config.webhook_secret == "legacy-secret"
-        assert "temporary compatibility authentication" in caplog.text
+        assert not hasattr(config, "webhook_secret")
+        assert "no longer supported and is ignored" in caplog.text
 
     @pytest.mark.parametrize(
         ("left_name", "right_name"),
@@ -537,7 +536,6 @@ class TestTelegramWebhookConfig:
         """Webhook mode gets a process credential without reusing another domain's secret."""
         _set_required(monkeypatch)
         monkeypatch.setenv("TELEGRAM_WEBHOOK_URL", "https://example.com/webhook/telegram")
-        monkeypatch.setenv("WEBHOOK_SECRET", "legacy-secret")
         monkeypatch.setattr("kai.config.secrets.token_urlsafe", lambda _n: "generated-telegram-secret")
 
         config = load_config()
@@ -547,7 +545,6 @@ class TestTelegramWebhookConfig:
         """TELEGRAM_WEBHOOK_SECRET uses its own value when explicitly set."""
         _set_required(monkeypatch)
         monkeypatch.setenv("TELEGRAM_WEBHOOK_URL", "https://example.com/webhook/telegram")
-        monkeypatch.setenv("WEBHOOK_SECRET", "legacy-secret")
         monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "tg-only-secret")
         config = load_config()
         assert config.telegram_webhook_secret == "tg-only-secret"

@@ -33,7 +33,6 @@ from kai.eval import extraction
 _TEST_CONFIG = Config(
     telegram_bot_token="test-token",
     allowed_user_ids={12345},
-    webhook_secret="test-secret",
 )
 
 # Hash of `_PROMPT_V5_PINNED` captured at #426 landing. If the

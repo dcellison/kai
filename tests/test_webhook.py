@@ -2362,7 +2362,6 @@ class TestNotificationChatIdMutations:
         config.user_configs = {111: admin}
         config.allowed_user_ids = {111}
         config.get_admins.return_value = [admin]
-        config.webhook_secret = None
         config.telegram_webhook_url = None
         config.telegram_webhook_secret = None
         config.github_webhook_secret = None

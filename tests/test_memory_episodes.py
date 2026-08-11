@@ -50,7 +50,6 @@ from kai.memory_extraction import (
 _BASE_CONFIG = Config(
     telegram_bot_token="test-token",
     allowed_user_ids={12345},
-    webhook_secret="test-secret",
     default_backend="claude",
 )
 

@@ -44,7 +44,6 @@ from kai.eval._unscoped_recall_capture import (
 _BASE_CONFIG = Config(
     telegram_bot_token="test-token",
     allowed_user_ids={12345},
-    webhook_secret="test-secret",
     memory_enabled=True,
     memory_search_limit=10,
     memory_token_budget=2000,

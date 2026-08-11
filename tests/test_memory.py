@@ -29,7 +29,6 @@ from kai.config import Config, UserConfig
 _BASE_CONFIG = Config(
     telegram_bot_token="test-token",
     allowed_user_ids={12345},
-    webhook_secret="test-secret",
 )
 
 

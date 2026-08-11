@@ -1924,13 +1924,12 @@ class TestCmdConfig:
         # Should preserve existing values when user accepts defaults
         assert conf["install_dir"] == "/custom/path"
         assert conf["env"]["TELEGRAM_BOT_TOKEN"] == "existing-token"
-        # The legacy value remains available to both external routes during
-        # observation. New named credentials are distinct so fallback use can
-        # be identified and logged endpoint by endpoint.
+        # Named credentials are generated independently and the unsupported
+        # legacy value is not carried forward into the regenerated artifact.
         assert conf["env"]["GITHUB_WEBHOOK_SECRET"] != "existing-secret"
         assert conf["env"]["GENERIC_WEBHOOK_SECRET"] != "existing-secret"
         assert conf["env"]["GITHUB_WEBHOOK_SECRET"] != conf["env"]["GENERIC_WEBHOOK_SECRET"]
-        assert conf["env"]["WEBHOOK_SECRET"] == "existing-secret"
+        assert "WEBHOOK_SECRET" not in conf["env"]
         # With a canonical users.yaml already present the wizard skips the
         # user-creation prompts entirely and never stages a new file, so
         # no admin prompt is shown and no top-level staging key is written.
@@ -1941,13 +1940,11 @@ class TestCmdConfig:
         output = capsys.readouterr().out
         assert "Admin Telegram ID" not in output
         assert "-- User setup --" not in output
-        assert "A deprecated WEBHOOK_SECRET compatibility fallback is present" in output
+        assert "WEBHOOK_SECRET is no longer supported and will be omitted" in output
         assert "users_yaml_staging_path" not in conf
 
-    def test_regeneration_can_retire_legacy_webhook_fallback(self, tmp_path, monkeypatch, capsys):
-        """The operator retires compatibility through make config; the
-        generated artifact omits only the legacy key and keeps named secrets.
-        """
+    def test_regeneration_automatically_removes_legacy_webhook_secret(self, tmp_path, monkeypatch, capsys):
+        """Regeneration omits the unsupported key and keeps named secrets."""
         monkeypatch.chdir(tmp_path)
         conf_path = tmp_path / "install.conf"
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
@@ -1972,12 +1969,7 @@ class TestCmdConfig:
         }
         conf_path.write_text(json.dumps(existing))
 
-        def answer(prompt: str) -> str:
-            if "Retain deprecated WEBHOOK_SECRET fallback" in prompt:
-                return "false"
-            return ""
-
-        monkeypatch.setattr("builtins.input", answer)
+        monkeypatch.setattr("builtins.input", lambda prompt: "")
 
         _cmd_config()
 
@@ -1987,7 +1979,7 @@ class TestCmdConfig:
         assert generated["env"]["GENERIC_WEBHOOK_SECRET"] == "generic-secret"
         assert generated["env"]["TELEGRAM_BOT_TOKEN"] == "existing-token"
         output = capsys.readouterr().out
-        assert "WEBHOOK_SECRET will be omitted from the generated configuration" in output
+        assert "WEBHOOK_SECRET is no longer supported and will be omitted" in output
 
     def test_validates_required_fields(self):
         """Required-field validation rejects empty input."""
@@ -4081,6 +4073,67 @@ class TestCmdApplyDefaultModelGate:
         assert written_env.get("DEFAULT_PROVIDER") == "openai"
         assert "LLM_PROVIDER" not in written_env
 
+    def test_apply_drops_unsupported_WEBHOOK_SECRET(self, tmp_path, monkeypatch):
+        """An old install.conf cannot redeploy the retired credential."""
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+        conf_path = self._write_install_conf(
+            tmp_path,
+            {
+                "DEFAULT_MODEL": "sonnet",
+                "DEFAULT_BACKEND": "claude",
+                "WEBHOOK_SECRET": "legacy-secret",
+                "GITHUB_WEBHOOK_SECRET": "github-secret",
+                "GENERIC_WEBHOOK_SECRET": "generic-secret",
+            },
+        )
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        self._patch_side_effects(monkeypatch)
+        secrets_mock = MagicMock()
+        monkeypatch.setattr("kai.install._apply_secrets", secrets_mock)
+        monkeypatch.setenv("DRY_RUN", "1")
+
+        _cmd_apply()
+
+        written_env = secrets_mock.call_args.args[0]
+        assert "WEBHOOK_SECRET" not in written_env
+        assert written_env["GITHUB_WEBHOOK_SECRET"] == "github-secret"
+        assert written_env["GENERIC_WEBHOOK_SECRET"] == "generic-secret"
+
+    @pytest.mark.parametrize(
+        "named_secrets",
+        [
+            {},
+            {"GITHUB_WEBHOOK_SECRET": "github-secret"},
+            {"GENERIC_WEBHOOK_SECRET": "generic-secret"},
+        ],
+    )
+    def test_apply_refuses_legacy_secret_without_all_named_replacements(
+        self,
+        tmp_path,
+        monkeypatch,
+        named_secrets,
+    ):
+        """Retirement cannot silently disable a formerly shared route."""
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+        conf_path = self._write_install_conf(
+            tmp_path,
+            {
+                "DEFAULT_MODEL": "sonnet",
+                "DEFAULT_BACKEND": "claude",
+                "WEBHOOK_SECRET": "legacy-secret",
+                **named_secrets,
+            },
+        )
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        stop_service = self._patch_side_effects(monkeypatch)
+
+        with pytest.raises(SystemExit, match="Run 'make config' once before 'make install'"):
+            _cmd_apply()
+
+        stop_service.assert_not_called()
+
     def test_apply_migrates_legacy_AGENT_TIMEOUT_SECONDS(self, tmp_path, monkeypatch):
         """A legacy install.conf carrying AGENT_TIMEOUT_SECONDS migrates
         to DEFAULT_TIMEOUT in the env dict; /etc/kai/env is written with
@@ -4336,7 +4389,7 @@ class TestCmdStatus:
         output = capsys.readouterr().out
         assert "Installation Status" in output
 
-    def test_reports_legacy_webhook_secret_fallback(self, tmp_path, monkeypatch, capsys):
+    def test_reports_unsupported_webhook_secret(self, tmp_path, monkeypatch, capsys):
         conf_path = tmp_path / "install.conf"
         conf_path.write_text(
             json.dumps(
@@ -4361,7 +4414,8 @@ class TestCmdStatus:
         _cmd_status()
 
         output = capsys.readouterr().out
-        assert "legacy WEBHOOK_SECRET fallback configured" in output
+        assert "unsupported WEBHOOK_SECRET present" in output
+        assert "ignored by runtime" in output
         assert "legacy-secret" not in output
         assert "github-secret" not in output
         assert "generic-secret" not in output
@@ -4391,7 +4445,7 @@ class TestCmdStatus:
 
         output = capsys.readouterr().out
         assert "named GitHub/generic secrets configured" in output
-        assert "no legacy fallback" in output
+        assert "unsupported WEBHOOK_SECRET absent" in output
         assert "github-secret" not in output
         assert "generic-secret" not in output
 
@@ -4423,13 +4477,13 @@ class TestCmdStatus:
 
         output = capsys.readouterr().out
         assert f"Webhook secret migration (deployed {deployed_env}): named GitHub/generic secrets configured" in output
-        assert "Webhook secret migration (install.conf artifact): legacy WEBHOOK_SECRET fallback configured" in output
+        assert "Webhook secret migration (install.conf artifact): unsupported WEBHOOK_SECRET present" in output
         assert "deployed-github-secret" not in output
         assert "deployed-generic-secret" not in output
         assert "artifact-legacy-secret" not in output
 
     def test_webhook_secret_migration_status_is_non_secret(self):
-        assert "legacy WEBHOOK_SECRET fallback configured" in _webhook_secret_migration_status(
+        assert "unsupported WEBHOOK_SECRET present" in _webhook_secret_migration_status(
             {
                 "WEBHOOK_SECRET": "legacy-secret",
                 "GITHUB_WEBHOOK_SECRET": "github-secret",
@@ -4451,18 +4505,19 @@ class TestCmdStatus:
 
         assert f"deployed {env_path}" in status
         assert "named GitHub/generic secrets configured" in status
-        assert "no legacy fallback" in status
+        assert "unsupported WEBHOOK_SECRET absent" in status
         assert "github-deployed-value" not in status
         assert "generic-deployed-value" not in status
 
-    def test_deployed_status_reports_legacy_fallback_without_value(self, tmp_path, monkeypatch):
+    def test_deployed_status_reports_unsupported_secret_without_value(self, tmp_path, monkeypatch):
         env_path = tmp_path / "env"
         env_path.write_text('WEBHOOK_SECRET="legacy-deployed-value"\n')
         monkeypatch.setattr("kai.install.validate_protected_file_metadata", lambda *args, **kwargs: True)
 
         status = _deployed_webhook_secret_migration_status(env_path)
 
-        assert "legacy WEBHOOK_SECRET fallback configured" in status
+        assert "unsupported WEBHOOK_SECRET present" in status
+        assert "ignored by runtime" in status
         assert "legacy-deployed-value" not in status
 
     def test_deployed_status_is_explicit_when_permission_denied(self, tmp_path, monkeypatch):
@@ -8250,7 +8305,8 @@ class TestCmdApplyStagingHandoff:
             "platform": "darwin",
             "env": {
                 "TELEGRAM_BOT_TOKEN": "tok",
-                "WEBHOOK_SECRET": "secret",
+                "GITHUB_WEBHOOK_SECRET": "github-secret",
+                "GENERIC_WEBHOOK_SECRET": "generic-secret",
                 "DEFAULT_MODEL": "sonnet",
                 "DEFAULT_BACKEND": "claude",
             },
@@ -8758,6 +8814,8 @@ class TestCmdApplySingleUserRefuses:
             "env": {
                 "TELEGRAM_BOT_TOKEN": "tok",
                 "WEBHOOK_SECRET": "secret",
+                "GITHUB_WEBHOOK_SECRET": "github-secret",
+                "GENERIC_WEBHOOK_SECRET": "generic-secret",
                 "DEFAULT_MODEL": "sonnet",
                 "DEFAULT_BACKEND": "claude",
             },

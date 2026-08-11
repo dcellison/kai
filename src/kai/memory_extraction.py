@@ -570,7 +570,7 @@ FORMAT each fact as:
 
   - "User prefers Celsius" -> scope_hint: "global". True in every
     project.
-  - "The webhook secret is read from the WEBHOOK_SECRET env var"
+  - "The GitHub webhook secret is read from GITHUB_WEBHOOK_SECRET"
     -> scope_hint: "project". An implementation detail of the
     project under discussion; in a different project the same
     sentence could be false.

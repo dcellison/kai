@@ -75,7 +75,6 @@ from kai.eval.retrieval_scoped import (
 _BASE_CONFIG = Config(
     telegram_bot_token="test-token",
     allowed_user_ids={12345},
-    webhook_secret="test-secret",
     memory_enabled=True,
     memory_search_limit=10,
     memory_token_budget=2000,
@@ -718,7 +717,6 @@ class TestProjectRegistryBootstrap:
                 Config(
                     telegram_bot_token="t",
                     allowed_user_ids={1},
-                    webhook_secret="s",
                 )
             )
 
@@ -1227,7 +1225,6 @@ class TestInitMemoryStartupLine:
         cfg = Config(
             telegram_bot_token="t",
             allowed_user_ids={1},
-            webhook_secret="s",
             memory_enabled=True,
         )
         monkeypatch.setattr("kai.config.load_config", lambda: cfg)

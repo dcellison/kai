@@ -49,17 +49,6 @@ def test_external_webhook_routes_are_enabled_independently() -> None:
     assert ("POST", "/webhook/github") not in generic_routes
 
 
-def test_legacy_credential_temporarily_enables_both_external_routes() -> None:
-    app = web.Application()
-
-    _register_routes(app, _config(webhook_secret="legacy-secret"))
-
-    routes = _routes(app)
-    assert ("POST", "/webhook/github") in routes
-    assert ("POST", "/webhook") in routes
-    assert ("POST", "/api/schedule") in routes
-
-
 def test_telegram_route_is_independent_of_other_webhooks() -> None:
     app = web.Application()
 
