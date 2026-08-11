@@ -62,8 +62,7 @@ from kai.backend import (
     assemble_turn_context,
     build_foreign_workspace_reminder,
     build_session_context,
-    ensure_user_memory,
-    ensure_user_preferences,
+    ensure_user_context_files,
     sanitize_agent_environment,
 )
 from kai.backend_registry import BackendRegistryError, backend_registry_is_authoritative, resolve_backend_command
@@ -809,8 +808,11 @@ class CodexBackend(AgentBackend):
         session_ctx = ""
         if self._fresh_session:
             self._fresh_session = False
-            ensure_user_memory(chat_id, DATA_DIR)
-            ensure_user_preferences(chat_id, DATA_DIR)
+            ensure_user_context_files(
+                chat_id,
+                DATA_DIR,
+                defer_user_file_reads=self.defer_user_file_reads,
+            )
             session_ctx = build_session_context(
                 workspace=self.workspace,
                 home_workspace=self.home_workspace,

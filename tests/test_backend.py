@@ -13,6 +13,8 @@ import stat
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from kai.agent_failure import AgentFailureKind
 from kai.backend import (
     AgentResponse,
@@ -20,6 +22,7 @@ from kai.backend import (
     StreamEvent,
     build_foreign_workspace_reminder,
     build_session_context,
+    ensure_user_context_files,
     ensure_user_home,
     ensure_user_memory,
     ensure_user_preferences,
@@ -936,6 +939,36 @@ class TestEnsureUserHome:
         assert not (result / ".claude" / "CLAUDE.md").exists()
 
 
+class TestEnsureUserContextFiles:
+    """Protected installs never touch user-owned context files in the daemon."""
+
+    def test_protected_handoff_skips_all_lazy_bootstrap(self, tmp_path):
+        with (
+            patch("kai.backend.ensure_user_memory") as ensure_memory,
+            patch("kai.backend.ensure_user_preferences") as ensure_preferences,
+        ):
+            ensure_user_context_files(
+                42,
+                tmp_path,
+                defer_user_file_reads=True,
+            )
+
+        ensure_memory.assert_not_called()
+        ensure_preferences.assert_not_called()
+        assert not (tmp_path / "memory").exists()
+        assert not (tmp_path / "preferences").exists()
+
+    def test_development_path_retains_lazy_bootstrap(self, tmp_path):
+        with (
+            patch("kai.backend.ensure_user_memory") as ensure_memory,
+            patch("kai.backend.ensure_user_preferences") as ensure_preferences,
+        ):
+            ensure_user_context_files(42, tmp_path)
+
+        ensure_memory.assert_called_once_with(42, tmp_path)
+        ensure_preferences.assert_called_once_with(42, tmp_path)
+
+
 class TestResolveHomeWorkspace:
     """
     Tests for the public resolver used by pool.py and bot.py.
@@ -945,7 +978,12 @@ class TestResolveHomeWorkspace:
     answer cannot drift between session init and `/workspace home`.
     """
 
-    def _config(self, user_configs: dict | None = None) -> Config:
+    def _config(
+        self,
+        user_configs: dict | None = None,
+        *,
+        protected_install: bool = False,
+    ) -> Config:
         """Build a minimal Config with optional user_configs dict.
 
         Post-#565 tranche A `Config.user_configs` is a non-optional
@@ -956,6 +994,7 @@ class TestResolveHomeWorkspace:
             telegram_bot_token="test",
             allowed_user_ids={1},
             user_configs=user_configs if user_configs is not None else {},
+            protected_install=protected_install,
         )
 
     def test_prefers_users_yaml(self, tmp_path):
@@ -991,6 +1030,35 @@ class TestResolveHomeWorkspace:
         result = resolve_home_workspace(42, config, data_dir=tmp_path)
         assert result == tmp_path / "home" / "42"
         assert result.is_dir()
+
+    def test_protected_install_uses_preprovisioned_home_without_mutation(self, tmp_path):
+        config = self._config(
+            user_configs={42: UserConfig(telegram_id=42, name="real-user", os_user="alice")},
+            protected_install=True,
+        )
+        home = tmp_path / "home" / "42"
+        home.mkdir(parents=True)
+
+        with patch("kai.backend.ensure_user_home") as ensure_home:
+            result = resolve_home_workspace(42, config, data_dir=tmp_path)
+
+        assert result == home
+        ensure_home.assert_not_called()
+
+    def test_protected_install_requires_install_provisioning(self, tmp_path):
+        config = self._config(
+            user_configs={42: UserConfig(telegram_id=42, name="real-user", os_user="alice")},
+            protected_install=True,
+        )
+
+        with (
+            patch("kai.backend.ensure_user_home") as ensure_home,
+            pytest.raises(RuntimeError, match=r"Run `make install`"),
+        ):
+            resolve_home_workspace(42, config, data_dir=tmp_path)
+
+        ensure_home.assert_not_called()
+        assert not (tmp_path / "home" / "42").exists()
 
     def test_anon_when_chat_id_none(self, tmp_path):
         """

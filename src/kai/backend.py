@@ -750,17 +750,38 @@ def ensure_user_preferences(chat_id: int | None, data_dir: Path) -> None:
         )
 
 
+def ensure_user_context_files(
+    chat_id: int | None,
+    data_dir: Path,
+    *,
+    defer_user_file_reads: bool = False,
+) -> None:
+    """Prepare writable memory/preferences files for an agent session.
+
+    ``defer_user_file_reads`` identifies the protected-install handoff: the
+    outer service must neither read nor mutate the target OS user's private
+    files. Those files are provisioned with the correct ownership by
+    ``make install`` and are consumed later by the user-owned backend process.
+
+    Development and single-user runs retain the historical lazy bootstrap.
+    """
+    if defer_user_file_reads:
+        return
+    ensure_user_memory(chat_id, data_dir)
+    ensure_user_preferences(chat_id, data_dir)
+
+
 def ensure_user_home(chat_id: int | None, data_dir: Path) -> Path:
     """
     Lazily create the per-user home workspace directory.
 
     Returns the path that should be used as the user's home workspace
     when users.yaml does not set an explicit home_workspace override.
-    Idempotent and cheap: a stat and a possible mkdir. Called on every
-    session init (and on `/workspace home`) so that any user without a
-    pre-created `home/<chat_id>/` - single-user dev, test runs, or a
-    user added to users.yaml after install - still lands in a valid
-    directory on their first message.
+    Idempotent and cheap: a stat and a possible mkdir. Used by development
+    and single-user session initialization so a user without a pre-created
+    `home/<chat_id>/` still lands in a valid directory on first message.
+    Protected installs do not call this helper at runtime; their per-user
+    directories are provisioned by ``make install`` under the target owner.
 
     This is the companion to ensure_user_memory() above. Same scope
     caveats apply (copied verbatim because the multi-user ownership
@@ -915,12 +936,11 @@ def resolve_home_workspace(
     Resolution order:
     1. `user.home_workspace` from users.yaml when set (admin override,
        returned as-is with no second-guessing).
-    2. `<data_dir>/home/<chat_id>/`, auto-created via ensure_user_home()
-       for interactive users. For notification-only chat_ids (a chat
-       that received a routed notification but has no users.yaml
-       entry of its own) the path is returned without bootstrapping,
-       so the bot does not silently provision an empty home directory
-       for a chat that will never have an interactive session.
+    2. `<data_dir>/home/<chat_id>/`. Development and single-user runs lazily
+       create it via ensure_user_home(). Protected installs require it to have
+       been provisioned by ``make install``. For notification-only chat_ids (a
+       chat that received a routed notification but has no users.yaml entry of
+       its own) the path is returned without bootstrapping.
 
     All call sites (pool.py session init / get_workspace fallback,
     bot.py `/workspace home` handler and workspace listings) MUST go
@@ -971,9 +991,21 @@ def resolve_home_workspace(
     if _is_notification_only_chat_id(chat_id, config):
         return data_dir / "home" / str(chat_id)
 
-    # Interactive user: use the per-user Kai-managed directory under
-    # data_dir. ensure_user_home is idempotent so calling it on every
-    # resolution is cheap.
+    # A protected install has a separate service identity and backend OS
+    # identity. Runtime must not lazily create this directory as the service
+    # user: doing so produces the wrong owner and defeats the private 0700
+    # boundary. The installer is the authoritative provisioning step.
+    if chat_id is not None and getattr(config, "protected_install", False) is True:
+        path = data_dir / "home" / str(chat_id)
+        if not path.is_dir():
+            raise RuntimeError(
+                f"Protected user home is not provisioned for chat_id {chat_id}: "
+                f"{path}. Run `make install` to provision configured users."
+            )
+        return path
+
+    # Development / single-user path: use the per-user Kai-managed directory
+    # under data_dir. ensure_user_home supplies the historical lazy bootstrap.
     return ensure_user_home(chat_id, data_dir)
 
 

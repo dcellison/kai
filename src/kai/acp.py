@@ -55,8 +55,7 @@ from kai.backend import (
     assemble_turn_context,
     build_foreign_workspace_reminder,
     build_session_context,
-    ensure_user_memory,
-    ensure_user_preferences,
+    ensure_user_context_files,
     sanitize_agent_environment,
 )
 from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude_user
@@ -1208,18 +1207,17 @@ class AcpBackend(AgentBackend):
         # session_context, semantic memory, workspace reminder stacked
         # above).
         #
-        # The ensure_user_memory / ensure_user_preferences calls below
-        # run exactly once per session because _fresh_session flips to
-        # False unconditionally. A transient OSError inside either
-        # helper is logged as a warning but not retried on subsequent
-        # messages of the same session. Failure modes are persistent
-        # (permissions, missing parent dir), not transient, so the
-        # one-shot behavior is acceptable.
+        # Development/single-user lazy bootstrap runs once per session.
+        # Protected installs skip service-side file mutation here because
+        # make install has already provisioned the user-owned files.
         session_ctx = ""
         if self._fresh_session:
             self._fresh_session = False
-            ensure_user_memory(chat_id, DATA_DIR)
-            ensure_user_preferences(chat_id, DATA_DIR)
+            ensure_user_context_files(
+                chat_id,
+                DATA_DIR,
+                defer_user_file_reads=self.defer_user_file_reads,
+            )
             session_ctx = build_session_context(
                 workspace=self.workspace,
                 home_workspace=self.home_workspace,

@@ -37,8 +37,7 @@ from kai.backend import (
     assemble_turn_context,
     build_foreign_workspace_reminder,
     build_session_context,
-    ensure_user_memory,
-    ensure_user_preferences,
+    ensure_user_context_files,
     sanitize_agent_environment,
 )
 from kai.backend_registry import BackendRegistryError, backend_registry_is_authoritative, resolve_backend_command
@@ -747,21 +746,17 @@ class ClaudeCodeBackend(AgentBackend):
         # the lifecycle into it would couple the helper to per-
         # backend internals it has no other reason to know about.
         #
-        # The single-call MEMORY.md/PREFERENCES.md bootstrap retry
-        # caveat from before extraction still applies: the seed runs
-        # exactly once per session because `_fresh_session` flips to
-        # False unconditionally; a transient OSError inside
-        # `ensure_user_memory` / `ensure_user_preferences` is logged
-        # as a warning but not retried on subsequent messages of the
-        # same session. Failure modes here are persistent
-        # (permissions, missing parent dir), not transient, so the
-        # one-shot behavior is acceptable; documenting it so future
-        # readers do not assume self-healing.
+        # Development/single-user lazy bootstrap runs once per session.
+        # Protected installs skip service-side file mutation here because
+        # make install has already provisioned the user-owned files.
         session_ctx = ""
         if self._fresh_session:
             self._fresh_session = False
-            ensure_user_memory(chat_id, DATA_DIR)
-            ensure_user_preferences(chat_id, DATA_DIR)
+            ensure_user_context_files(
+                chat_id,
+                DATA_DIR,
+                defer_user_file_reads=self.defer_user_file_reads,
+            )
             session_ctx = build_session_context(
                 workspace=self.workspace,
                 home_workspace=self.home_workspace,

@@ -206,8 +206,7 @@ class TestPiStartup:
 class TestPiTurns:
     @pytest.fixture(autouse=True)
     def no_context_io(self, monkeypatch):
-        monkeypatch.setattr("kai.pi.ensure_user_memory", lambda *a, **kw: None)
-        monkeypatch.setattr("kai.pi.ensure_user_preferences", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.pi.ensure_user_context_files", lambda *a, **kw: None)
         monkeypatch.setattr("kai.pi.build_session_context", lambda **kw: "")
         monkeypatch.setattr("kai.pi.build_foreign_workspace_reminder", lambda *a, **kw: None)
 

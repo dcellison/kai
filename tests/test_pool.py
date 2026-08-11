@@ -476,7 +476,7 @@ class TestPerUserBackendRouting:
             assert isinstance(instance, expected_type)
             assert instance.max_session_hours == 6.5
 
-    def test_protected_install_defers_user_file_reads_for_all_backends(self):
+    def test_protected_install_defers_user_file_reads_for_all_backends(self, tmp_path):
         """Protected installs stop backend context from reading user files in the daemon."""
         from kai.claude import ClaudeCodeBackend
         from kai.codex import CodexBackend
@@ -496,6 +496,8 @@ class TestPerUserBackendRouting:
                 model="anthropic/claude-sonnet-4-6",
             ),
         }
+        for chat_id in users:
+            (tmp_path / "home" / str(chat_id)).mkdir(parents=True)
         config = _make_config(protected_install=True, user_configs=users)
         pool = SubprocessPool(config=config, services_info=[])
         for chat_id, expected_type in [
