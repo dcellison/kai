@@ -72,3 +72,36 @@ compatibility exception. The next security work should be selected from:
 - deeper review of the new backend registry and OS-user isolation paths,
 - or normal hardening/refactoring of large trust-boundary modules after the
   current behavior is pinned by tests.
+
+## Transitional risk: local-process backend executables
+
+The backend registry currently prevents operators from supplying arbitrary
+executable paths, but the registered executables may still live in locations
+owned by an agent target OS user. An agent running as that user could replace a
+shared executable and cross an OS-user boundary when Kai later invokes it for a
+different user.
+
+A root-owned managed backend package store was considered, but is deliberately
+deferred. Implementing dependency-closure discovery, provenance verification,
+promotion, health checks, and rollback for host executables would be a large
+transitional subsystem. Kai Workspace instead assigns binary/image preparation
+to its worker Runtime Backend contract and makes isolated container workers the
+personal-production boundary. The current server-process runtime is therefore
+classified as a trusted-host compatibility and migration mode.
+
+As an interim control, install reports a non-blocking warning when ordinary
+ownership/group/mode checks show that a registered command, its resolved
+executable, or either path chain can be modified by the service user or a
+configured agent `os_user`. This makes the limitation visible without breaking
+working Homebrew and other operator-managed installations. The admin-owned
+registry, fixed backend identifiers, exact-command sudoers rules, and existing
+group/other-writable executable rejection remain in force.
+
+Initial inspection of the currently installed macOS executables found no
+non-system dynamic-library dependencies or package-relative runtime search
+paths. That is favorable evidence for relocation, but it is not proof that the
+programs have no runtime dependency on surrounding files. Strict macOS code
+signature verification also does not currently provide a uniform integrity
+mechanism across all four installed backends. These observations are retained
+as context if a protected host-process package store is reconsidered, but that
+store is not part of the current remediation plan.

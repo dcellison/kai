@@ -3,6 +3,7 @@
 import contextlib
 import json
 import os
+import pwd
 import shutil
 import signal
 import stat
@@ -28,6 +29,7 @@ from kai.install import (
     _apply_source,
     _apply_sudoers,
     _apply_venv,
+    _backend_command_trust_issues,
     _check_path,
     _check_service_status,
     _check_traversal,
@@ -7465,6 +7467,71 @@ class TestApplyBackendRegistry:
         output = capsys.readouterr().out
         assert "backends.yaml" in output
         assert "0644" in output
+
+    def test_command_trust_check_reports_agent_owned_executable(self, tmp_path):
+        executable = tmp_path / "codex"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o555)
+        username = pwd.getpwuid(os.getuid()).pw_name
+
+        issues = _backend_command_trust_issues(str(executable), username)
+
+        assert any(f"resolved executable {executable} is owned by {username}" in issue for issue in issues)
+
+    def test_command_trust_check_reports_replaceable_registered_symlink(self, tmp_path):
+        target_dir = tmp_path / "target"
+        target_dir.mkdir()
+        executable = target_dir / "codex"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o555)
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        registered = bin_dir / "codex"
+        registered.symlink_to(executable)
+        username = pwd.getpwuid(os.getuid()).pw_name
+
+        issues = _backend_command_trust_issues(str(registered), username)
+
+        assert f"registered path can be replaced through {bin_dir}" in issues
+
+    def test_command_trust_check_accepts_path_unwritable_to_identity(self, tmp_path, monkeypatch):
+        import types
+
+        executable = tmp_path / "codex"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o555)
+        fake_uid = os.getuid() + 100_000
+        fake_gid = os.getgid() + 100_000
+        monkeypatch.setattr(
+            "kai.install.pwd.getpwnam",
+            lambda username: types.SimpleNamespace(pw_uid=fake_uid, pw_gid=fake_gid),
+        )
+        monkeypatch.setattr("kai.install.os.getgrouplist", lambda username, gid: [gid])
+
+        assert _backend_command_trust_issues(str(executable), "isolated-agent") == ()
+
+    def test_dry_run_warns_for_agent_writable_backend_command(self, tmp_path, capsys, monkeypatch):
+        executable = tmp_path / "codex"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+        username = pwd.getpwuid(os.getuid()).pw_name
+        monkeypatch.setattr(
+            "kai.install._discover_backend_commands",
+            lambda service_user: {"codex": str(executable)},
+        )
+
+        _apply_backend_registry(
+            username,
+            {"DEFAULT_BACKEND": "codex"},
+            dry_run=True,
+            users_yaml_path=tmp_path / "absent-users.yaml",
+        )
+
+        captured = capsys.readouterr()
+        assert "Would write" in captured.out
+        assert "local-process backend executable trust is limited" in captured.err
+        assert f"codex: {executable} can be modified by agent OS user {username}" in captured.err
+        assert "trusted-host compatibility runtime" in captured.err
 
     def test_configured_backend_must_be_discovered(self, monkeypatch):
         monkeypatch.setattr("kai.install._discover_backend_commands", lambda service_user: {"codex": "/global/codex"})

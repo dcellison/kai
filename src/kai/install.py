@@ -29,6 +29,7 @@ import pwd
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -4504,7 +4505,7 @@ def _cmd_apply() -> None:
         )
 
         # -- Step 6: Deploy installed backend registry --
-        _apply_backend_registry(service_user, env, dry_run)
+        _apply_backend_registry(service_user, env, dry_run, users_yaml_path=effective_users_yaml)
 
         # -- Step 7: Deploy Goose config (if any goose-backed user) --
         # The function gates itself: global DEFAULT_BACKEND=goose or a
@@ -5796,9 +5797,156 @@ def _build_backend_registry(service_user: str, env: dict[str, str], users_yaml_p
         raise SystemExit(str(exc)) from None
 
 
-def _apply_backend_registry(service_user: str, env: dict[str, str], dry_run: bool) -> None:
+def _identity_can_modify_file(file_stat: os.stat_result, uid: int, gids: set[int]) -> bool:
+    """Return whether an identity can alter a regular file in place.
+
+    File ownership is sufficient even when the current mode is read-only:
+    the owner can normally chmod the file first. Root is included for
+    completeness, although protected user validation rejects root as an
+    agent target.
+    """
+    if uid == 0 or file_stat.st_uid == uid:
+        return True
+    if file_stat.st_gid in gids:
+        return bool(file_stat.st_mode & stat.S_IWGRP)
+    return bool(file_stat.st_mode & stat.S_IWOTH)
+
+
+def _identity_can_replace_entry(
+    parent_stat: os.stat_result,
+    child_stat: os.stat_result,
+    uid: int,
+    gids: set[int],
+) -> bool:
+    """Return whether an identity can replace a child directory entry."""
+    if uid == 0:
+        return True
+    if parent_stat.st_uid == uid:
+        # The owner can chmod the directory to add write/search first.
+        has_write_and_search = True
+    elif parent_stat.st_gid in gids:
+        has_write_and_search = bool(parent_stat.st_mode & stat.S_IWGRP) and bool(parent_stat.st_mode & stat.S_IXGRP)
+    else:
+        has_write_and_search = bool(parent_stat.st_mode & stat.S_IWOTH) and bool(parent_stat.st_mode & stat.S_IXOTH)
+    if not has_write_and_search:
+        return False
+    if parent_stat.st_mode & stat.S_ISVTX:
+        # Sticky directories (notably /tmp) permit removal/rename only
+        # to root, the directory owner, or the child owner.
+        return uid in (parent_stat.st_uid, child_stat.st_uid)
+    return True
+
+
+def _first_agent_replaceable_parent(path: Path, uid: int, gids: set[int]) -> Path | None:
+    """Return the first path parent through which an identity can replace an entry."""
+    child = path
+    for parent in path.parents:
+        try:
+            child_stat = child.lstat()
+            parent_stat = parent.stat()
+        except OSError:
+            return None
+        if _identity_can_replace_entry(parent_stat, child_stat, uid, gids):
+            return parent
+        child = parent
+    return None
+
+
+def _backend_command_trust_issues(command: str, username: str) -> tuple[str, ...]:
+    """Describe basic DAC paths by which an agent OS user can replace a command.
+
+    This is an advisory local-process check, not a complete MAC/ACL audit.
+    It follows the command symlink and separately examines the registered
+    path and resolved target path so a safe target behind a user-replaceable
+    Homebrew-style symlink is still reported.
+    """
+    try:
+        identity = pwd.getpwnam(username)
+    except (KeyError, OSError):
+        return ()
+    try:
+        gids = set(os.getgrouplist(username, identity.pw_gid))
+    except (KeyError, OSError, OverflowError):
+        # macOS uses an unsigned sentinel GID for `nobody` that does
+        # not fit getgrouplist()'s C int argument. The primary group
+        # still gives this advisory check a safe, useful fallback.
+        gids = {identity.pw_gid}
+
+    registered = Path(command)
+    try:
+        target = registered.resolve(strict=True)
+        target_stat = target.stat()
+    except (OSError, RuntimeError):
+        # Existence/executability validation reports unusable commands.
+        return ()
+
+    issues: list[str] = []
+    if _identity_can_modify_file(target_stat, identity.pw_uid, gids):
+        if target_stat.st_uid == identity.pw_uid:
+            issues.append(f"resolved executable {target} is owned by {username}")
+        else:
+            issues.append(f"resolved executable {target} is writable by {username}")
+
+    registered_parent = _first_agent_replaceable_parent(registered, identity.pw_uid, gids)
+    if registered_parent is not None:
+        issues.append(f"registered path can be replaced through {registered_parent}")
+
+    if target != registered:
+        target_parent = _first_agent_replaceable_parent(target, identity.pw_uid, gids)
+        if target_parent is not None and target_parent != registered_parent:
+            issues.append(f"resolved path can be replaced through {target_parent}")
+
+    return tuple(issues)
+
+
+def _backend_command_trust_warnings(
+    commands: dict[str, str], service_user: str, users_yaml_path: str | Path
+) -> tuple[str, ...]:
+    """Return warnings for registered commands modifiable by agent identities."""
+    target_users = [service_user, *_collect_os_users_from_yaml(users_yaml_path)]
+    seen_users: set[str] = set()
+    warnings: list[str] = []
+    for username in target_users:
+        if username in seen_users:
+            continue
+        seen_users.add(username)
+        for backend, command in sorted(commands.items()):
+            issues = _backend_command_trust_issues(command, username)
+            if issues:
+                warnings.append(
+                    f"{backend}: {command} can be modified by agent OS user {username} ({'; '.join(issues)})"
+                )
+    return tuple(warnings)
+
+
+def _apply_backend_registry(
+    service_user: str,
+    env: dict[str, str],
+    dry_run: bool,
+    users_yaml_path: str | Path | None = None,
+) -> None:
     """Write the non-secret installed backend registry."""
-    content = _build_backend_registry(service_user, env)
+    if users_yaml_path is None:
+        users_yaml_path = USERS_YAML
+    content = _build_backend_registry(service_user, env, users_yaml_path)
+    raw_registry = yaml.safe_load(content) or {}
+    raw_backends = raw_registry.get("backends", {}) if isinstance(raw_registry, dict) else {}
+    commands = {
+        str(backend): str(entry["command"])
+        for backend, entry in raw_backends.items()
+        if isinstance(entry, dict) and isinstance(entry.get("command"), str)
+    }
+    trust_warnings = _backend_command_trust_warnings(commands, service_user, users_yaml_path)
+    if trust_warnings:
+        print("Warning: local-process backend executable trust is limited:", file=sys.stderr)
+        for warning in trust_warnings:
+            print(f"  - {warning}", file=sys.stderr)
+        print(
+            "  These commands remain supported for the trusted-host compatibility runtime, "
+            "but they do not provide hostile multi-user isolation. Isolated Kai Workspace "
+            "workers are the planned boundary.",
+            file=sys.stderr,
+        )
     if dry_run:
         print(f"[DRY RUN] Would write: {BACKENDS_YAML} (mode 0644)")
         return
