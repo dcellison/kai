@@ -31,6 +31,7 @@ class WorkshopEventType(StrEnum):
     AGENT_CREATED = "agent.created"
     CHANNEL_AGENT_ATTACHED = "channel.agent_attached"
     MESSAGE_CREATED = "message.created"
+    ARTIFACT_CREATED = "artifact.created"
     DELIVERY_SUCCEEDED = "delivery.succeeded"
     DELIVERY_FAILED = "delivery.failed"
 
@@ -114,6 +115,10 @@ class MessageId(OpaqueId):
     prefix = "msg"
 
 
+class ArtifactId(OpaqueId):
+    prefix = "art"
+
+
 class DeliveryId(OpaqueId):
     prefix = "dlv"
 
@@ -138,6 +143,7 @@ _ID_TYPES: dict[str, type[OpaqueId]] = {
         AgentId,
         ChannelAgentId,
         MessageId,
+        ArtifactId,
         DeliveryId,
         EventId,
     )

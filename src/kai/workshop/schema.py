@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 5
+WORKSHOP_SCHEMA_VERSION = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,12 +240,46 @@ _CLIENT_ENROLLMENT_SCHEMA = SchemaMigration(
     ),
 )
 
+_ARTIFACT_SCHEMA = SchemaMigration(
+    version=6,
+    name="canonical_artifact_metadata",
+    statements=(
+        """
+        CREATE TABLE artifacts (
+            id TEXT PRIMARY KEY,
+            workshop_id TEXT NOT NULL REFERENCES workshops(id) ON DELETE CASCADE,
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+            created_by_principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+            kind TEXT NOT NULL CHECK (kind IN ('photo', 'document', 'voice')),
+            media_type TEXT NOT NULL,
+            byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
+            content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
+            original_filename TEXT CHECK (
+                original_filename IS NULL OR (
+                    length(trim(original_filename)) > 0 AND length(original_filename) <= 255
+                )
+            ),
+            storage_path TEXT NOT NULL,
+            source_transport TEXT NOT NULL,
+            source_unique_id TEXT NOT NULL,
+            created_event_position INTEGER NOT NULL UNIQUE REFERENCES event_log(position) ON DELETE RESTRICT,
+            created_at TEXT NOT NULL,
+            UNIQUE (message_id, source_transport, source_unique_id)
+        )
+        """,
+        "CREATE INDEX artifacts_channel_position_idx ON artifacts (channel_id, created_event_position)",
+        "CREATE INDEX artifacts_message_idx ON artifacts (message_id)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
     _CHANNEL_MEMBERSHIP_SCHEMA,
     _CLIENT_SESSION_SCHEMA,
     _CLIENT_ENROLLMENT_SCHEMA,
+    _ARTIFACT_SCHEMA,
 )
 
 

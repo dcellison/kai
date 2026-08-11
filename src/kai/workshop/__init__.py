@@ -6,6 +6,12 @@ Telegram routing, histories, and responses remain authoritative until replay
 and parity evidence supports an explicit cutover.
 """
 
+from kai.workshop.artifacts import (
+    ArtifactMessageNotFoundError,
+    ArtifactStorageBoundaryError,
+    InboundArtifact,
+    record_inbound_artifact,
+)
 from kai.workshop.authorization import CanonicalChannelAuthorizer
 from kai.workshop.client_api import (
     WorkshopClientAuthenticator,
@@ -26,6 +32,7 @@ from kai.workshop.client_sessions import (
 )
 from kai.workshop.domain import (
     AgentId,
+    ArtifactId,
     ChannelAgentId,
     ChannelBindingId,
     ChannelId,
@@ -64,6 +71,9 @@ from kai.workshop.timeline import (
 __all__ = [
     "AgentId",
     "AppendResult",
+    "ArtifactId",
+    "ArtifactMessageNotFoundError",
+    "ArtifactStorageBoundaryError",
     "AuthenticatedWorkshopClientSession",
     "CanonicalChannelAuthorizer",
     "ChannelAgentId",
@@ -82,6 +92,7 @@ __all__ = [
     "EventIntegrityError",
     "ExternalIdentityId",
     "IdempotencyConflictError",
+    "InboundArtifact",
     "IssuedWorkshopClientSession",
     "IssuedWorkshopEnrollmentGrant",
     "MessageId",
@@ -104,6 +115,7 @@ __all__ = [
     "WorkshopId",
     "WorkshopMembershipId",
     "read_channel_timeline",
+    "record_inbound_artifact",
     "register_workshop_enrollment_routes",
     "register_workshop_read_routes",
 ]

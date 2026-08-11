@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
 from typing import Any
 
 import aiosqlite
 
 from kai.workshop.domain import WorkshopEventType
 from kai.workshop.store import StoredEvent
+
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_IDENTIFIER_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
+_MEDIA_TYPE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$")
 
 
 def _required_text(payload: dict[str, Any], key: str) -> str:
@@ -21,11 +27,15 @@ class CanonicalConversationProjection:
     """Rebuild the initial Workshop collaboration records from events."""
 
     name = "canonical_conversations"
+    # Artifact events were not emitted before artifact support existed, so
+    # adding their first handler does not change replay of any prior event.
+    # Keep the version stable to avoid an unnecessary production rebuild.
     version = 3
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         for table in (
             "deliveries",
+            "artifacts",
             "messages",
             "channel_agents",
             "channel_bindings",
@@ -159,6 +169,83 @@ class CanonicalConversationProjection:
                     _required_text(payload, "author_principal_id"),
                     reply_to,
                     _required_text(payload, "body"),
+                    event.position,
+                    occurred_at,
+                ),
+            )
+        elif envelope.event_type == WorkshopEventType.ARTIFACT_CREATED:
+            created_by = _required_text(payload, "created_by_principal_id")
+            if envelope.actor_principal_id != created_by:
+                raise ValueError("Workshop artifact actor must match created_by_principal_id")
+            channel_id = _required_text(payload, "channel_id")
+            message_id = _required_text(payload, "message_id")
+            async with connection.execute(
+                "SELECT c.workshop_id, m.channel_id, m.author_principal_id, p.kind "
+                "FROM messages m JOIN channels c ON c.id = m.channel_id "
+                "JOIN principals p ON p.id = m.author_principal_id WHERE m.id = ?",
+                (message_id,),
+            ) as cursor:
+                message_row = await cursor.fetchone()
+            if message_row is None or tuple(message_row) != (
+                envelope.workshop_id,
+                channel_id,
+                created_by,
+                "human",
+            ):
+                raise ValueError("Workshop artifact must belong to its human-authored message")
+            kind = _required_text(payload, "kind")
+            if kind not in {"photo", "document", "voice"}:
+                raise ValueError("Workshop artifact kind is unsupported")
+            byte_size = payload.get("byte_size")
+            if not isinstance(byte_size, int) or isinstance(byte_size, bool) or byte_size < 0:
+                raise ValueError("Workshop artifact byte_size must be a non-negative integer")
+            content_sha256 = _required_text(payload, "content_sha256")
+            if not _SHA256_PATTERN.fullmatch(content_sha256):
+                raise ValueError("Workshop artifact content_sha256 must be lowercase SHA-256")
+            original_filename = payload.get("original_filename")
+            if original_filename is not None and (
+                not isinstance(original_filename, str)
+                or not original_filename
+                or original_filename != original_filename.strip()
+                or len(original_filename) > 255
+                or original_filename in {".", ".."}
+                or "/" in original_filename
+                or "\\" in original_filename
+                or "\0" in original_filename
+            ):
+                raise ValueError("Workshop artifact original_filename must be a bounded string or null")
+            media_type = _required_text(payload, "media_type")
+            if not _MEDIA_TYPE_PATTERN.fullmatch(media_type):
+                raise ValueError("Workshop artifact media_type must be a lowercase MIME type")
+            storage_path = _required_text(payload, "storage_path")
+            if not Path(storage_path).is_absolute():
+                raise ValueError("Workshop artifact storage_path must be absolute")
+            source_transport = _required_text(payload, "source_transport")
+            if not _IDENTIFIER_PATTERN.fullmatch(source_transport):
+                raise ValueError("Workshop artifact source_transport must be a lowercase identifier")
+            source_unique_id = _required_text(payload, "source_unique_id")
+            if source_unique_id != source_unique_id.strip() or len(source_unique_id) > 512:
+                raise ValueError("Workshop artifact source_unique_id must be bounded")
+            await connection.execute(
+                "INSERT INTO artifacts "
+                "(id, workshop_id, channel_id, message_id, created_by_principal_id, kind, "
+                "media_type, byte_size, content_sha256, original_filename, storage_path, "
+                "source_transport, source_unique_id, created_event_position, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    envelope.aggregate_id,
+                    envelope.workshop_id,
+                    channel_id,
+                    message_id,
+                    created_by,
+                    kind,
+                    media_type,
+                    byte_size,
+                    content_sha256,
+                    original_filename,
+                    storage_path,
+                    source_transport,
+                    source_unique_id,
                     event.position,
                     occurred_at,
                 ),
