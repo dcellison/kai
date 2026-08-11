@@ -233,6 +233,26 @@ class TestPerUserBackendRouting:
         assert instance.provider == "openai"
         assert instance.model == "gpt-5.4"
 
+    def test_user_gets_pi_with_provider_model_and_os_user(self):
+        from kai.pi import PiBackend
+
+        user = UserConfig(
+            telegram_id=111,
+            name="alice",
+            backend="pi",
+            provider="openai",
+            model="openai/gpt-5.6-sol:xhigh",
+            os_user="alice-os",
+        )
+        pool = SubprocessPool(config=_make_config(user_configs={111: user}), services_info=[])
+
+        instance = pool.get(111)
+
+        assert isinstance(instance, PiBackend)
+        assert instance.provider == "openai"
+        assert instance.model == "openai/gpt-5.6-sol:xhigh"
+        assert instance.os_user == "alice-os"
+
     def test_user_without_backend_gets_global(self):
         """User with no backend gets the global backend (claude)."""
         user = UserConfig(telegram_id=111, name="alice")
@@ -428,12 +448,20 @@ class TestPerUserBackendRouting:
         from kai.claude import ClaudeCodeBackend
         from kai.codex import CodexBackend
         from kai.opencode import OpenCodeBackend
+        from kai.pi import PiBackend
 
         users = {
             111: UserConfig(telegram_id=111, name="a", backend="claude", provider="anthropic", model="sonnet"),
             222: UserConfig(telegram_id=222, name="b", backend="codex"),
             333: UserConfig(telegram_id=333, name="c", backend="goose", provider="anthropic", model="sonnet"),
             444: UserConfig(telegram_id=444, name="d", backend="opencode", model="anthropic/claude-sonnet-4-6"),
+            555: UserConfig(
+                telegram_id=555,
+                name="e",
+                backend="pi",
+                provider="anthropic",
+                model="anthropic/claude-sonnet-4-6",
+            ),
         }
         config = _make_config(agent_max_session_hours=6.5, user_configs=users)
         pool = SubprocessPool(config=config, services_info=[])
@@ -442,6 +470,7 @@ class TestPerUserBackendRouting:
             (222, CodexBackend),
             (333, GooseBackend),
             (444, OpenCodeBackend),
+            (555, PiBackend),
         ]:
             instance = pool.get(chat_id)
             assert isinstance(instance, expected_type)
@@ -452,12 +481,20 @@ class TestPerUserBackendRouting:
         from kai.claude import ClaudeCodeBackend
         from kai.codex import CodexBackend
         from kai.opencode import OpenCodeBackend
+        from kai.pi import PiBackend
 
         users = {
             111: UserConfig(telegram_id=111, name="a", backend="claude", provider="anthropic", model="sonnet"),
             222: UserConfig(telegram_id=222, name="b", backend="codex"),
             333: UserConfig(telegram_id=333, name="c", backend="goose", provider="anthropic", model="sonnet"),
             444: UserConfig(telegram_id=444, name="d", backend="opencode", model="anthropic/claude-sonnet-4-6"),
+            555: UserConfig(
+                telegram_id=555,
+                name="e",
+                backend="pi",
+                provider="anthropic",
+                model="anthropic/claude-sonnet-4-6",
+            ),
         }
         config = _make_config(protected_install=True, user_configs=users)
         pool = SubprocessPool(config=config, services_info=[])
@@ -466,6 +503,7 @@ class TestPerUserBackendRouting:
             (222, CodexBackend),
             (333, GooseBackend),
             (444, OpenCodeBackend),
+            (555, PiBackend),
         ]:
             instance = pool.get(chat_id)
             assert isinstance(instance, expected_type)

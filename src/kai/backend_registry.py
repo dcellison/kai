@@ -31,6 +31,7 @@ _BACKEND_ENV_VARS: dict[str, str] = {
     "opencode": "OPENCODE_BIN",
     "goose": "GOOSE_BIN",
 }
+_SUPPORTED_BACKENDS = frozenset((*_BACKEND_ENV_VARS, "pi"))
 _SUPPORTED_RUNTIME = "local_process"
 
 
@@ -118,8 +119,8 @@ def load_backend_registry(path: Path | None = None) -> dict[str, BackendRegistry
         backend = str(backend_id).strip().lower()
         if not backend:
             raise BackendRegistryError(f"backend registry {registry_path}: empty backend id")
-        if backend not in _BACKEND_ENV_VARS:
-            valid = ", ".join(sorted(_BACKEND_ENV_VARS))
+        if backend not in _SUPPORTED_BACKENDS:
+            valid = ", ".join(sorted(_SUPPORTED_BACKENDS))
             raise BackendRegistryError(
                 f"backend registry {registry_path}: unsupported backend {backend!r}; valid backends: {valid}"
             )
@@ -203,8 +204,8 @@ def resolve_default_backend(configured_backend: str = "") -> str:
         registry = load_backend_registry()
 
     if configured:
-        if configured not in _BACKEND_ENV_VARS:
-            valid = ", ".join(sorted(_BACKEND_ENV_VARS))
+        if configured not in _SUPPORTED_BACKENDS:
+            valid = ", ".join(sorted(_SUPPORTED_BACKENDS))
             raise BackendRegistryError(
                 f"configured default backend {configured!r} is not valid; valid backends: {valid}"
             )
@@ -251,10 +252,15 @@ def _validate_absolute_executable(backend: str, command: str, source: str) -> st
 
 def _legacy_env_or_path_command(backend: str, *, allow_bare_fallback: bool) -> str:
     env_var = _BACKEND_ENV_VARS.get(backend)
-    if env_var is None:
+    if backend not in _SUPPORTED_BACKENDS:
         raise ValueError(f"unknown backend for command resolution: {backend!r}")
-    override = os.environ.get(env_var)
+    # Pi landed after executable paths became an admin-registry concern,
+    # so it intentionally has no PI_BIN compatibility surface. Dev mode
+    # resolves it through PATH (or the explicit bare-command fallback)
+    # while protected installs always use /etc/kai/backends.yaml.
+    override = os.environ.get(env_var) if env_var is not None else None
     if override:
+        assert env_var is not None  # override can only be populated from a named legacy variable
         if allow_bare_fallback:
             return override
         return _validate_absolute_executable(backend, override, env_var)
@@ -263,7 +269,8 @@ def _legacy_env_or_path_command(backend: str, *, allow_bare_fallback: bool) -> s
     resolved = shutil.which(backend)
     if resolved is not None:
         return resolved
-    raise BackendRegistryError(f"{env_var} unset, `{backend}` not on PATH")
+    source = f"{env_var} unset" if env_var is not None else "no legacy binary override is supported"
+    raise BackendRegistryError(f"{source}, `{backend}` not on PATH")
 
 
 def resolve_backend_command(backend: str, *, allow_bare_fallback: bool = False) -> str:

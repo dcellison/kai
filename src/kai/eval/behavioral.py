@@ -116,9 +116,10 @@ from kai.eval._probes import (
     load_probes,
     probe_set_hash,
 )
+from kai.oneshot import OneShotError, PiOneShotReasoner
 from kai.prompt_utils import make_boundary
 
-_SUPPORTED_BEHAVIORAL_BACKENDS = frozenset({"claude", "codex"})
+_SUPPORTED_BEHAVIORAL_BACKENDS = frozenset({"claude", "codex", "pi"})
 
 log = logging.getLogger(__name__)
 
@@ -296,9 +297,13 @@ class BehavioralConfig:
     seed: str
     max_concurrency: int
     # The evaluator currently has protocol-specific implementations for
-    # exactly these two backends. Callers must select one explicitly;
-    # unsupported identities are rejected before any subprocess starts.
+    # these backends. Callers must select one explicitly; unsupported
+    # identities are rejected before any subprocess starts.
     backend: str
+    # Multi-provider reasoners carry the effective provider explicitly.
+    # Empty remains valid for the single-provider backends and for older
+    # programmatic test fixtures.
+    provider: str = ""
     # Eval-only synthetic-pollution count. Defaults to 0 so existing
     # tests and existing CLI invocations stay byte-for-byte identical
     # to today's behavior; a non-zero value opts the run into the
@@ -1188,6 +1193,21 @@ async def _run_one_arm(
     `_parse_codex_gen_stdout` which joins multi-item turns with a
     blank-line separator.
     """
+    if config.backend == "pi":
+        started = time.monotonic()
+        reasoner = PiOneShotReasoner(cwd=cwd, provider=config.provider)
+        try:
+            result = await reasoner.run(
+                prompt=arm_prompt,
+                model=config.gen_model,
+                timeout=config.gen_timeout_s,
+                purpose="behavioral_generation",
+            )
+        except OneShotError:
+            return None, (time.monotonic() - started) * 1000
+        text = result.text.strip()
+        elapsed_ms = (time.monotonic() - started) * 1000
+        return (text or None), elapsed_ms
     if config.backend == "codex":
         cmd = _build_gen_cmd_codex(config)
         stdin_payload = _render_codex_stdin("", arm_prompt)
@@ -1242,6 +1262,22 @@ async def _run_one_judge(
         response_a=response_a,
         response_b=response_b,
     )
+    if config.backend == "pi":
+        started = time.monotonic()
+        reasoner = PiOneShotReasoner(cwd=cwd, provider=config.provider)
+        try:
+            result = await reasoner.run(
+                prompt=payload,
+                system_prompt=_JUDGE_SYSTEM_PROMPT,
+                model=config.judge_model,
+                timeout=config.judge_timeout_s,
+                purpose="behavioral_judge",
+                json_schema=_JUDGE_SCHEMA,
+            )
+        except OneShotError:
+            return None, (time.monotonic() - started) * 1000
+        parsed = _parse_judge_stdout(result.text.encode("utf-8"))
+        return parsed, (time.monotonic() - started) * 1000
     if config.backend == "codex":
         cmd = _build_judge_cmd_codex(config)
         # System prompt is prepended to stdin because codex `exec`
@@ -1729,10 +1765,9 @@ def _pick_qualitative_examples(outcomes: list[ProbeOutcome]) -> dict[str, dict[s
 def _capture_agent_cli_version(backend: str) -> tuple[str, str]:
     """Capture the active agent CLI's version string for the run record.
 
-    Returns `(field_name, value)` where `field_name` is the output
-    JSON key the caller should write under: `"claude_cli_version"` on
-    a claude run, `"codex_cli_version"` on a codex run. The harness
-    writes exactly one of those keys and leaves the other absent.
+    Returns `(field_name, value)` where `field_name` identifies the
+    active backend CLI version in the output JSON. The harness writes
+    exactly one backend-specific key.
     Unsupported backends are rejected rather than being routed through
     a different backend's CLI protocol.
 
@@ -1762,6 +1797,10 @@ def _capture_agent_cli_version(backend: str) -> tuple[str, str]:
         field_name = "claude_cli_version"
         claude_bin = resolve_backend_command("claude", allow_bare_fallback=True)
         argv = [claude_bin, "--version"]
+    elif backend == "pi":
+        field_name = "pi_cli_version"
+        pi_bin = resolve_backend_command("pi", allow_bare_fallback=True)
+        argv = [pi_bin, "--version"]
     else:
         raise ValueError(f"unsupported behavioral-eval backend: {backend!r}")
     try:
@@ -1821,9 +1860,8 @@ def build_output_json(
     machinery. Schema versioned via _OUTPUT_SCHEMA_VERSION; bump it
     when downstream parsers would need to be re-tested.
 
-    `cli_version_field` is the JSON key under which to write the CLI
-    version - "claude_cli_version" on a claude run, "codex_cli_version"
-    on a codex run. The envelope writes EXACTLY ONE of those keys;
+    `cli_version_field` is the backend-specific JSON key under which
+    to write the CLI version. The envelope writes EXACTLY ONE such key;
     the call site computes the pair via _capture_agent_cli_version so
     it is structurally impossible to populate both. This shape was
     chosen over taking two optional Optional[str] arguments because
@@ -1888,14 +1926,16 @@ def _render_summary(output: dict[str, Any]) -> str:
     """
     counts = output["outcomes"]
     # CLI version line dispatches on whichever key is present.
-    # The harness writes exactly one of `claude_cli_version` /
-    # `codex_cli_version` per run; reading the literal claude key
+    # The harness writes exactly one backend-specific CLI version key
+    # per run; reading the literal claude key
     # (the pre-codex shape) would KeyError on a codex run before the
     # JSON file could be written. Fall back to "unknown" if neither
     # key is present so this never raises - a missing version line
     # is a softer failure than a CLI crash mid-render.
     if "codex_cli_version" in output:
         cli_line = f"Codex CLI: {output['codex_cli_version']}"
+    elif "pi_cli_version" in output:
+        cli_line = f"Pi CLI: {output['pi_cli_version']}"
     elif "claude_cli_version" in output:
         cli_line = f"Claude CLI: {output['claude_cli_version']}"
     else:
@@ -2281,6 +2321,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
         pollution_lines=args.pollution_lines,
         data_dir=data_dir,
         backend=eval_backend,
+        provider=eval_provider,
     )
 
     # Capture CLI version for the run record. The helper returns a

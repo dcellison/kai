@@ -335,3 +335,18 @@ class TestUnknownBackend:
         from 'fix the code that asked for the wrong backend'."""
         with pytest.raises(ValueError, match="unknown backend"):
             resolve_oneshot_binary("not-a-real-backend")
+
+
+class TestPiResolution:
+    def test_resolves_via_path_without_pi_bin_override(self, monkeypatch):
+        monkeypatch.setenv("PI_BIN", "/untrusted/operator/path")
+        monkeypatch.setattr(
+            "kai.oneshot_binary.shutil.which",
+            lambda name: "/opt/homebrew/bin/pi" if name == "pi" else None,
+        )
+        assert resolve_oneshot_binary("pi") == "/opt/homebrew/bin/pi"
+
+    def test_unreachable_raises(self, monkeypatch):
+        monkeypatch.setattr("kai.oneshot_binary.shutil.which", lambda name: None)
+        with pytest.raises(BinaryResolutionError, match=r"pi.*PATH"):
+            resolve_oneshot_binary("pi")

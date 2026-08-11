@@ -168,6 +168,23 @@ def test_registry_defaults_driver_and_runtime_to_backend_local_process(tmp_path,
     assert entry.runtime == "local_process"
 
 
+def test_registry_accepts_pi_without_model_ceiling(tmp_path, monkeypatch):
+    pi = _exe(tmp_path / "pi")
+    registry = tmp_path / "backends.yaml"
+    registry.write_text(
+        render_backend_registry(
+            {"pi": {"driver": "pi", "runtime": "local_process", "command": str(pi)}},
+            default_backend="pi",
+        )
+    )
+    monkeypatch.setenv("KAI_BACKENDS_YAML", str(registry))
+
+    entry = load_backend_registry()["pi"]
+    assert entry.command == str(pi)
+    assert entry.allowed_models == ()
+    assert resolve_default_backend("") == "pi"
+
+
 def test_registry_allowed_models_entries_must_be_strings(tmp_path, monkeypatch):
     codex = _exe(tmp_path / "codex")
     registry = tmp_path / "backends.yaml"
@@ -307,6 +324,18 @@ def test_explicit_missing_registry_fails(monkeypatch):
 
     with pytest.raises(BackendRegistryError, match="does not exist"):
         resolve_backend_command("claude")
+
+
+def test_pi_dev_resolution_uses_path_and_has_no_pi_bin_override(tmp_path, monkeypatch):
+    real_pi = _exe(tmp_path / "pi")
+    attacker_pi = _exe(tmp_path / "attacker-pi")
+    monkeypatch.delenv("KAI_BACKENDS_YAML", raising=False)
+    monkeypatch.delenv("KAI_INSTALL_DIR", raising=False)
+    monkeypatch.setenv("PI_BIN", str(attacker_pi))
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    assert resolve_backend_command("pi") == str(real_pi)
+    assert resolve_backend_command("pi", allow_bare_fallback=True) == "pi"
 
 
 def test_render_backend_registry_is_stable():

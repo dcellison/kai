@@ -1,5 +1,5 @@
 """
-Issue triage agent - one-shot subprocess (Claude, Codex, Goose, or OpenCode) for automated issue triage.
+Issue triage agent - provider-neutral one-shot subprocess for automated issue triage.
 
 Provides functionality to:
 1. Extract metadata from GitHub issue webhook payloads
@@ -44,6 +44,7 @@ from kai.oneshot import (
     OneShotError,
     OneShotTimeout,
     OpenCodeOneShotReasoner,
+    PiOneShotReasoner,
 )
 from kai.prompt_utils import make_boundary
 
@@ -471,10 +472,9 @@ async def run_triage(
         prompt: The complete triage prompt (from build_triage_prompt).
         claude_user: Optional OS user to run the subprocess as (the
             reasoners apply the sudo -H -u wrap).
-        agent_backend: Which LLM backend to use ("claude", "codex",
-            "opencode", or "goose").
+        agent_backend: Which registered LLM backend to use.
         provider: LLM provider name (e.g. "anthropic", "openai").
-            Only used when agent_backend is "goose".
+            Used explicitly by the goose and Pi argv builders.
 
     Returns:
         The raw triage response text from the LLM (expected to be JSON).
@@ -581,6 +581,30 @@ async def run_triage(
             raise RuntimeError(f"Triage subprocess timed out after {_TRIAGE_TIMEOUT}s") from exc
         except OneShotError as exc:
             raise RuntimeError(f"Goose triage failed: {exc}") from exc
+        return result.text
+    if agent_backend == "pi":
+        if not provider:
+            raise ValueError(
+                "agent_backend is 'pi' but provider is empty. Set DEFAULT_PROVIDER in .env or per-user config."
+            )
+        triage_model = get_model_for(
+            ModelRole.ISSUE_TRIAGE,
+            agent_backend,
+            provider,
+            override=model_override,
+        )
+        reasoner = PiOneShotReasoner(os_user=claude_user, provider=provider)
+        try:
+            result = await reasoner.run(
+                prompt=prompt,
+                model=triage_model,
+                timeout=_TRIAGE_TIMEOUT,
+                purpose="issue_triage",
+            )
+        except OneShotTimeout as exc:
+            raise RuntimeError(f"Triage subprocess timed out after {_TRIAGE_TIMEOUT}s") from exc
+        except OneShotError as exc:
+            raise RuntimeError(f"Pi triage failed: {exc}") from exc
         return result.text
     if agent_backend == "claude":
         # Dispatch to the Claude one-shot reasoner in free-form mode

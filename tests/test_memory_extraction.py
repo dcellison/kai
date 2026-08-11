@@ -3689,6 +3689,13 @@ class TestMemoryReasonerSelection:
         assert isinstance(reasoner, GooseOneShotReasoner)
         assert reasoner._provider == "deepseek"
 
+    def test_pi_backend_builds_pi_reasoner(self):
+        from kai.oneshot import PiOneShotReasoner
+
+        reasoner = memory_extraction._build_memory_reasoner("pi", os_user=None, provider="anthropic")
+        assert isinstance(reasoner, PiOneShotReasoner)
+        assert reasoner._provider == "anthropic"
+
     def test_unknown_backend_still_raises_defensive_runtime_error(self):
         """The defensive RuntimeError remains the safety net for any
         backend the eligibility gate does not allow through. Every

@@ -1684,6 +1684,61 @@ class TestParseCodexGenStdout:
         assert _parse_codex_gen_stdout(b"") == ""
 
 
+class TestPiBehavioralDispatch:
+    @pytest.mark.asyncio
+    async def test_generation_uses_pi_oneshot_reasoner(self, tmp_path):
+        from kai.oneshot import OneShotResult
+
+        fake = MagicMock()
+        fake.run = AsyncMock(return_value=OneShotResult(text="generated answer", backend="pi", model="anthropic/model"))
+        config = _make_config(backend="pi", provider="anthropic", gen_model="anthropic/model")
+        with patch("kai.eval.behavioral.PiOneShotReasoner", return_value=fake) as ctor:
+            text, _elapsed = await behavioral._run_one_arm(
+                config=config,
+                arm_prompt="question",
+                cwd=tmp_path,
+                env={},
+            )
+
+        assert text == "generated answer"
+        ctor.assert_called_once_with(cwd=tmp_path, provider="anthropic")
+        assert fake.run.call_args.kwargs == {
+            "prompt": "question",
+            "model": "anthropic/model",
+            "timeout": 120,
+            "purpose": "behavioral_generation",
+        }
+
+    @pytest.mark.asyncio
+    async def test_judge_uses_pi_schema_envelope(self, tmp_path):
+        from kai.oneshot import OneShotResult
+
+        envelope = json.dumps(
+            {
+                "is_error": False,
+                "structured_output": {"choice": "tie", "reasoning": "equivalent"},
+            }
+        )
+        fake = MagicMock()
+        fake.run = AsyncMock(return_value=OneShotResult(text=envelope, backend="pi", model="anthropic/model"))
+        config = _make_config(backend="pi", provider="anthropic", judge_model="anthropic/model")
+        with patch("kai.eval.behavioral.PiOneShotReasoner", return_value=fake):
+            parsed, _elapsed = await behavioral._run_one_judge(
+                config=config,
+                question="question",
+                ground_truth_text="fact",
+                response_a="A",
+                response_b="B",
+                cwd=tmp_path,
+                env={},
+            )
+
+        assert parsed == ("tie", "equivalent")
+        assert fake.run.call_args.kwargs["json_schema"] == behavioral._JUDGE_SCHEMA
+        assert fake.run.call_args.kwargs["system_prompt"] == behavioral._JUDGE_SYSTEM_PROMPT
+        assert fake.run.call_args.kwargs["purpose"] == "behavioral_judge"
+
+
 class TestCaptureAgentCliVersionCodex:
     """Backend dispatch for the version-capture helper, plus the
     `CODEX_BIN` override for the codex branch."""
@@ -1730,6 +1785,17 @@ class TestCaptureAgentCliVersionCodex:
             field, _value = _capture_agent_cli_version("codex")
         assert field == "codex_cli_version"
         assert mock_run.call_args[0][0] == ["/tmp/fake-codex", "--version"]
+
+    def test_pi_branch_uses_registry_command(self):
+        fake_result = MagicMock(returncode=0, stdout="0.79.9\n")
+        with (
+            patch("kai.eval.behavioral.resolve_backend_command", return_value="/opt/homebrew/bin/pi") as resolve,
+            patch("kai.eval.behavioral.subprocess.run", return_value=fake_result) as mock_run,
+        ):
+            field, value = _capture_agent_cli_version("pi")
+        assert (field, value) == ("pi_cli_version", "0.79.9")
+        resolve.assert_called_once_with("pi", allow_bare_fallback=True)
+        assert mock_run.call_args[0][0] == ["/opt/homebrew/bin/pi", "--version"]
 
     def test_unknown_backend_fails_closed(self):
         with pytest.raises(ValueError, match="unsupported behavioral-eval backend: 'goose'"):
@@ -1781,6 +1847,20 @@ class TestOutputJsonMutuallyExclusiveVersionFields:
         assert "codex_cli_version" not in output
         assert "backend" not in output
 
+    def test_pi_run_writes_pi_field_only(self):
+        probes, outcomes = self._outcomes_and_probes()
+        output = build_output_json(
+            probes=probes,
+            outcomes=outcomes,
+            drift_count=0,
+            config=_make_config(backend="pi", provider="anthropic"),
+            cli_version_field="pi_cli_version",
+            cli_version_value="0.79.9",
+        )
+        assert output["pi_cli_version"] == "0.79.9"
+        assert "claude_cli_version" not in output
+        assert "codex_cli_version" not in output
+
 
 class TestRenderSummaryVersionDispatch:
     """The summary line picks the right label based on which version key is
@@ -1820,6 +1900,18 @@ class TestRenderSummaryVersionDispatch:
         summary = _render_summary(output)
         assert "Codex CLI: codex 0.130.0" in summary
         assert "Claude CLI:" not in summary
+
+    def test_pi_run_renders_pi_label(self):
+        probes, outcomes = self._outcomes_and_probes()
+        output = build_output_json(
+            probes=probes,
+            outcomes=outcomes,
+            drift_count=0,
+            config=_make_config(backend="pi", provider="anthropic"),
+            cli_version_field="pi_cli_version",
+            cli_version_value="0.79.9",
+        )
+        assert "Pi CLI: 0.79.9" in _render_summary(output)
 
     def test_shared_summary_lines_match_between_backends(self):
         probes, outcomes = self._outcomes_and_probes()

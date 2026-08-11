@@ -568,7 +568,7 @@ class TestRunTriageOpenCodeDispatch:
             return_value=OneShotResult(
                 text='{"labels": []}',
                 backend="opencode",
-                model="anthropic/claude-sonnet-4-5",
+                model="anthropic/claude-sonnet-4-6",
             )
         )
 
@@ -713,6 +713,38 @@ class TestRunTriageCodexDispatch:
             pytest.raises(RuntimeError, match=r"Codex triage failed"),
         ):
             await run_triage("prompt", agent_backend="codex")
+
+
+class TestRunTriagePiDispatch:
+    @pytest.mark.asyncio
+    async def test_pi_routes_provider_model_and_user(self):
+        from kai.oneshot import OneShotResult
+
+        fake = MagicMock()
+        fake.run = AsyncMock(
+            return_value=OneShotResult(
+                text='{"labels": []}',
+                backend="pi",
+                model="anthropic/claude-sonnet-4-5",
+            )
+        )
+        with patch("kai.triage.PiOneShotReasoner", return_value=fake) as ctor:
+            result = await run_triage(
+                "prompt",
+                agent_backend="pi",
+                provider="anthropic",
+                claude_user="daniel",
+            )
+
+        assert result == '{"labels": []}'
+        ctor.assert_called_once_with(os_user="daniel", provider="anthropic")
+        assert fake.run.call_args.kwargs["model"] == "anthropic/claude-sonnet-4-6"
+        assert fake.run.call_args.kwargs["purpose"] == "issue_triage"
+
+    @pytest.mark.asyncio
+    async def test_pi_requires_provider(self):
+        with pytest.raises(ValueError, match="provider is empty"):
+            await run_triage("prompt", agent_backend="pi", provider="")
 
 
 class TestGooseTriageModelResolutionViaRegistry:

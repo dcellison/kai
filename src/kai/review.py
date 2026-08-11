@@ -1,5 +1,5 @@
 """
-PR review agent - one-shot subprocess (Claude, Codex, Goose, or OpenCode) for automated code review.
+PR review agent - provider-neutral one-shot subprocess for automated code review.
 
 Provides functionality to:
 1. Fetch PR diffs and metadata via the GitHub CLI
@@ -49,6 +49,7 @@ from kai.oneshot import (
     OneShotError,
     OneShotTimeout,
     OpenCodeOneShotReasoner,
+    PiOneShotReasoner,
 )
 from kai.prompt_utils import make_boundary
 
@@ -3006,17 +3007,17 @@ async def run_review(
     `goose run -i - ... --max-turns 1` argv and the provider
     wire-name translation.
 
+    Pi path: `PiOneShotReasoner`, which owns the strict JSONL RPC
+    exchange and disables tools, persistence, approval, and project
+    resources for the bounded call.
+
     Args:
         prompt: The complete review prompt (from build_review_prompt).
         claude_user: Optional OS user to run the subprocess as (the
             reasoners apply the sudo -H -u wrap).
-        agent_backend: Which LLM backend to use ("claude", "codex",
-            "opencode", or "goose").
+        agent_backend: Which registered LLM backend to use.
         provider: LLM provider name (e.g. "anthropic", "openai").
-            Only used when agent_backend is "goose"; codex always
-            uses openai, claude always uses anthropic, opencode
-            routes through `provider/model` strings on the model
-            itself.
+            Used explicitly by the goose and Pi argv builders.
 
     Returns:
         The review text output from the LLM.
@@ -3119,6 +3120,30 @@ async def run_review(
             raise RuntimeError(f"Review subprocess timed out after {timeout_s}s") from exc
         except OneShotError as exc:
             raise RuntimeError(f"Goose review failed: {exc}") from exc
+        return result.text
+    if agent_backend == "pi":
+        if not provider:
+            raise ValueError(
+                "agent_backend is 'pi' but provider is empty. Set DEFAULT_PROVIDER in .env or per-user config."
+            )
+        review_model = get_model_for(
+            ModelRole.PR_REVIEW,
+            agent_backend,
+            provider,
+            override=model_override,
+        )
+        reasoner = PiOneShotReasoner(os_user=claude_user, provider=provider)
+        try:
+            result = await reasoner.run(
+                prompt=prompt,
+                model=review_model,
+                timeout=timeout_s,
+                purpose="pr_review",
+            )
+        except OneShotTimeout as exc:
+            raise RuntimeError(f"Review subprocess timed out after {timeout_s}s") from exc
+        except OneShotError as exc:
+            raise RuntimeError(f"Pi review failed: {exc}") from exc
         return result.text
     if agent_backend == "claude":
         # Dispatch to the Claude one-shot reasoner in free-form mode

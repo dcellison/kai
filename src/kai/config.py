@@ -57,8 +57,9 @@ DATA_DIR = Path(os.environ.get("KAI_DATA_DIR") or str(PROJECT_ROOT))
 # "goose" uses Goose ACP, "codex" uses OpenAI Codex CLI's app-server
 # JSON-RPC protocol, "opencode" uses OpenCode's ACP (model selected
 # via OPENCODE_CONFIG_CONTENT; auth managed by the operator through
-# `opencode auth login`). Shared between load_config() and install.py.
-VALID_BACKENDS = {"claude", "goose", "codex", "opencode"}
+# `opencode auth login`), and "pi" uses Pi's JSONL RPC mode. Shared
+# between load_config() and install.py.
+VALID_BACKENDS = {"claude", "goose", "codex", "opencode", "pi"}
 
 # Backends that ship a `OneShotReasoner` implementation in
 # `src/kai/oneshot.py`. Every site that gates on "does this backend
@@ -85,12 +86,12 @@ VALID_BACKENDS = {"claude", "goose", "codex", "opencode"}
 # validation, wizard prompts, smoke, the /memory retrieval-only
 # note) keys off this set rather than VALID_BACKENDS so that gap
 # stays representable.
-ONESHOT_REASONER_BACKENDS: frozenset[str] = frozenset({"claude", "codex", "goose", "opencode"})
+ONESHOT_REASONER_BACKENDS: frozenset[str] = frozenset({"claude", "codex", "goose", "opencode", "pi"})
 
 # The single authoritative (backend, provider) allowlist. Every site
 # that needs to know "what providers can this backend talk to" reads
 # from this map. Claude and codex are 1:1 with one provider each;
-# opencode and goose are 1:N. load_config validates that every user's
+# opencode, goose, and pi are 1:N. load_config validates that every user's
 # (backend, provider) pair is a member. Adding a new
 # backend is one row here; adding a new provider to an existing
 # backend is one tuple element. Tuple values (not frozensets) so the
@@ -102,6 +103,21 @@ BACKEND_PROVIDERS: dict[str, tuple[str, ...]] = {
     "codex": ("openai",),
     "opencode": ("anthropic", "deepseek", "google", "ollama", "openai", "openrouter"),
     "goose": ("anthropic", "deepseek", "google", "ollama", "openai", "openrouter"),
+    # Pi also exposes subscription-backed identities managed by its
+    # per-user `/login` flow. `anthropic` covers either Anthropic API-key
+    # or Claude Pro/Max OAuth auth; ChatGPT and Copilot have distinct Pi
+    # provider IDs. Models remain open-ended because Pi owns and updates
+    # those catalogs with each release.
+    "pi": (
+        "anthropic",
+        "deepseek",
+        "github-copilot",
+        "google",
+        "ollama",
+        "openai",
+        "openai-codex",
+        "openrouter",
+    ),
 }
 
 # Backends whose runtime configuration requires the operator (or
@@ -423,6 +439,37 @@ _BACKEND_PROVIDER_TIER_MODELS: dict[tuple[str, str], dict[str, str]] = {
     ("goose", "ollama"): {"agent": "llama4:70b", "balanced": "llama4:70b", "cheap": "llama4:8b"},
 }
 
+# Pi and OpenCode both select API-provider registry defaults with the
+# provider-prefixed `provider/model` shape. Pi also accepts a bare runtime
+# model when the effective provider is explicit.
+for _pi_provider in ("anthropic", "deepseek", "google", "ollama", "openai", "openrouter"):
+    _BACKEND_PROVIDER_TIER_MODELS[("pi", _pi_provider)] = dict(
+        _BACKEND_PROVIDER_TIER_MODELS[("opencode", _pi_provider)]
+    )
+
+# OpenRouter's Pi catalog uses dotted Claude generation IDs, unlike the
+# hyphenated model IDs exposed by OpenCode's provider registry.
+_BACKEND_PROVIDER_TIER_MODELS[("pi", "openrouter")] = {
+    "agent": "openrouter/anthropic/claude-sonnet-4.6",
+    "balanced": "openrouter/anthropic/claude-sonnet-4.6",
+    "cheap": "openrouter/anthropic/claude-haiku-4.5",
+}
+
+# Pi's subscription providers are authenticated per target OS user through
+# `pi` -> `/login`. These are curated startup/automation defaults only; Kai's
+# `/model` input remains open-ended so a Pi upgrade can expose new models
+# without requiring a Kai release. IDs below are present in Pi 0.79.9.
+_BACKEND_PROVIDER_TIER_MODELS[("pi", "openai-codex")] = {
+    "agent": "openai-codex/gpt-5.5",
+    "balanced": "openai-codex/gpt-5.5",
+    "cheap": "openai-codex/gpt-5.4-mini",
+}
+_BACKEND_PROVIDER_TIER_MODELS[("pi", "github-copilot")] = {
+    "agent": "github-copilot/gpt-5.5",
+    "balanced": "github-copilot/gpt-5.5",
+    "cheap": "github-copilot/gpt-5-mini",
+}
+
 
 def _build_registry() -> dict[tuple[str, str, ModelRole], str]:
     """Fan out the (backend, provider) tier maps over every ModelRole.
@@ -581,6 +628,19 @@ def _check_model_registry_complete() -> None:
                         f"MODEL_REGISTRY has opencode rows that are not in `provider/model` "
                         f"shape: {details}. Update _BACKEND_PROVIDER_TIER_MODELS in config.py."
                     )
+            if backend == "pi":
+                invalid_pi = [
+                    (role, MODEL_REGISTRY[(backend, provider, role)])
+                    for role in ModelRole
+                    if not is_pi_model_shape(MODEL_REGISTRY[(backend, provider, role)], provider)
+                ]
+                if invalid_pi:
+                    details = ", ".join(f"{role.value}={model}" for role, model in invalid_pi)
+                    raise SystemExit(
+                        "MODEL_REGISTRY has pi rows that are not in matching "
+                        f"`provider/model` shape: {details}. "
+                        "Update _BACKEND_PROVIDER_TIER_MODELS in config.py."
+                    )
 
 
 def get_effective_provider(backend: str, llm_provider: str) -> str:
@@ -690,6 +750,8 @@ def is_opencode_model_shape(model: str) -> bool:
     """
     if not model:
         return False
+    if "/" not in model:
+        return False
     # Split on every "/" and require at least two non-empty segments.
     # The first segment is opencode's provider prefix; remaining
     # segments form the model_id, which itself may contain slashes
@@ -702,6 +764,26 @@ def is_opencode_model_shape(model: str) -> bool:
     if len(parts) < 2:
         return False
     return all(parts)
+
+
+def is_pi_model_shape(model: str, provider: str = "") -> bool:
+    """Validate Pi's `provider/model[:thinking]` selection shape.
+
+    Pi resolves the installed/authenticated model set at runtime, so Kai
+    cannot maintain an accurate static allowlist. The provider prefix is
+    still load-bearing: it must be present and, when Kai has an effective
+    provider, must agree with that provider. Colons remain valid inside
+    model IDs (notably Ollama tags); Pi itself distinguishes an optional
+    recognized thinking suffix from the underlying model ID.
+    """
+    if not model:
+        return False
+    if "/" not in model:
+        return bool(provider and model.strip())
+    parts = model.split("/")
+    if len(parts) < 2 or not all(parts):
+        return False
+    return not provider or parts[0] == provider
 
 
 def _backend_registry_allowed_models(backend: str) -> tuple[str, ...] | None:
@@ -784,14 +866,20 @@ def validate_model_for_backend(model: str, backend: str, eff_provider: str) -> b
     with a clear error on the next message, the same contract
     opencode accepts for its structurally-validated IDs.
 
+    Pi also validates structurally. It accepts the documented
+    `provider/model[:thinking]` form or a bare model only when an
+    explicit effective provider supplies the missing identity.
+
     Canonical model validator: every model-selection site in the
-    codebase routes through this function so codex / goose / opencode
-    share no fallback path.
+    codebase routes through this function so backends share no
+    fallback path.
     """
     if backend == "codex":
         base_allowed = model in CODEX_MODELS
     elif backend == "opencode":
         base_allowed = is_opencode_model_shape(model)
+    elif backend == "pi":
+        base_allowed = is_pi_model_shape(model, eff_provider)
     elif (backend == "claude" or (backend == "goose" and eff_provider == "anthropic")) and model.startswith("claude-"):
         base_allowed = True
     else:
@@ -932,7 +1020,7 @@ def models_for_backend(agent_backend: str, eff_provider: str) -> dict[str, str] 
     """
     if agent_backend == "codex":
         models = CODEX_MODELS
-    elif agent_backend == "opencode" or eff_provider in OPEN_ENDED_PROVIDERS:
+    elif agent_backend in {"opencode", "pi"} or eff_provider in OPEN_ENDED_PROVIDERS:
         return None
     else:
         models = PROVIDER_MODELS.get(eff_provider)
@@ -2544,20 +2632,31 @@ def _load_user_configs(
         # PROVIDER_MODELS[eff_provider] via the provider-only delegate.
         # Cascade: user override -> global config, same as pool.py.
         if model is not None and not validate_model_for_backend(model, eff_backend, eff_provider):
-            if eff_backend == "codex":
-                valid = sorted(CODEX_MODELS.keys())
-                surface_label = "codex"
+            if eff_backend == "pi":
+                log.warning(
+                    "users.yaml: invalid Pi model '%s' for %s (expected "
+                    "provider/model[:thinking] matching provider '%s', or a bare model "
+                    "with that explicit provider); ignoring",
+                    model,
+                    name,
+                    eff_provider,
+                )
+                model = None
             else:
-                valid = sorted(PROVIDER_MODELS.get(eff_provider, {}).keys())
-                surface_label = f"provider '{eff_provider}'"
-            log.warning(
-                "users.yaml: invalid model '%s' for %s (%s, must be one of %s); ignoring",
-                model,
-                name,
-                surface_label,
-                valid,
-            )
-            model = None
+                if eff_backend == "codex":
+                    valid = sorted(CODEX_MODELS.keys())
+                    surface_label = "codex"
+                else:
+                    valid = sorted(PROVIDER_MODELS.get(eff_provider, {}).keys())
+                    surface_label = f"provider '{eff_provider}'"
+                log.warning(
+                    "users.yaml: invalid model '%s' for %s (%s, must be one of %s); ignoring",
+                    model,
+                    name,
+                    surface_label,
+                    valid,
+                )
+                model = None
 
         # Validate optional timeout (positive integer)
         user_timeout = entry.get("timeout")
@@ -3491,6 +3590,12 @@ def load_config() -> Config:
     # letting them propagate to a confusing runtime failure.
     if not validate_model_for_backend(default_model, default_backend, global_provider):
         source_label = "DEFAULT_MODEL" if configured_default_model else "MODEL_REGISTRY agent default"
+        if default_backend == "pi":
+            raise SystemExit(
+                f"{source_label} '{default_model}' is not valid for pi: expected "
+                f"provider/model[:thinking] matching provider '{global_provider}', or a bare model "
+                "with that explicit provider."
+            )
         if default_backend == "codex":
             valid = sorted(CODEX_MODELS.keys())
             raise SystemExit(

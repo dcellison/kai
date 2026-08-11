@@ -84,6 +84,7 @@ from typing import Any
 
 from kai.config import (
     DATA_DIR,
+    ONESHOT_REASONER_BACKENDS,
     Config,
     MemoryProjectConfig,
     ModelRole,
@@ -100,6 +101,7 @@ from kai.oneshot import (
     OneShotError,
     OneShotReasoner,
     OpenCodeOneShotReasoner,
+    PiOneShotReasoner,
 )
 
 log = logging.getLogger(__name__)
@@ -431,7 +433,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # ── Resolver overrides ───────────────────────────────────────
     parser.add_argument(
         "--backend",
-        choices=["claude", "codex", "goose", "opencode"],
+        choices=sorted(ONESHOT_REASONER_BACKENDS),
         help=(
             "Override the target user's effective backend. Default: "
             "resolve from user config via memory_reclassify's "
@@ -663,14 +665,14 @@ def _build_drafting_reasoner(
 
     Mirrors `kai.memory_extraction._build_memory_reasoner` in shape
     but lives here so the generator does not import the extraction-
-    flavored error text from that helper. The four valid backends
+    flavored error text from that helper. The valid backends
     match `ONESHOT_REASONER_BACKENDS`; the RuntimeError branch is a
     defensive net for a future change that widens the set without
     updating this dispatch.
 
-    `provider` is consumed by goose only (goose carries the wire-
-    name on its argv); the other backends derive provider implicitly
-    or embed it in the model string.
+    `provider` is consumed by goose and Pi (both carry it on argv);
+    the other backends derive provider implicitly or embed it in the
+    model string.
     """
     if effective_backend == "claude":
         return ClaudeOneShotReasoner(os_user=os_user)
@@ -680,10 +682,12 @@ def _build_drafting_reasoner(
         return OpenCodeOneShotReasoner(os_user=os_user)
     if effective_backend == "goose":
         return GooseOneShotReasoner(os_user=os_user, provider=provider)
+    if effective_backend == "pi":
+        return PiOneShotReasoner(os_user=os_user, provider=provider)
     raise RuntimeError(
         f"gen_collision_probes: unsupported effective backend "
         f"{effective_backend!r}; expected one of "
-        f"claude/codex/opencode/goose"
+        f"claude/codex/opencode/goose/pi"
     )
 
 

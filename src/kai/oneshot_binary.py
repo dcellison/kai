@@ -2,7 +2,7 @@
 Shared agent-binary resolver for the one-shot reasoner family.
 
 Single source of truth for "where is the agent binary" across the
-one-shot backends (claude, codex, opencode, goose).
+one-shot backends (claude, codex, opencode, goose, pi).
 `kai.config.load_config()` uses this to fail-fast at startup when the
 memory reasoner backend points at an unreachable binary; the
 `kai.oneshot` reasoner classes use it to build argv with the resolved
@@ -185,6 +185,17 @@ def resolve_oneshot_binary(backend: str) -> str:
         resolved = shutil.which("goose")
         if resolved is None:
             raise BinaryResolutionError("could not resolve goose binary: GOOSE_BIN unset, `goose` not on PATH")
+        return resolved
+
+    if backend == "pi":
+        # Pi joined Kai after protected backend registries became the
+        # deployment contract.  Development installs still get the same PATH
+        # discovery convenience as the other backends, but deliberately do
+        # not introduce a PI_BIN escape hatch that could diverge from the
+        # operator-controlled registry used in production.
+        resolved = shutil.which("pi")
+        if resolved is None:
+            raise BinaryResolutionError("could not resolve pi binary: `pi` not on PATH")
         return resolved
 
     # Unknown backend. Unlike a resolution miss this is a caller bug

@@ -237,7 +237,7 @@ class SubprocessPool:
 
         # os_user for sudo -u isolation. None = run as bot user.
         # Resolved here (rather than inside each branch) because all
-        # four backends consume it for per-user subprocess isolation.
+        # conversational backends consume it for per-user subprocess isolation.
         # Each agent's auth state is per-OS-user and operator-
         # provisioned under the target user's home (claude OAuth
         # credentials, codex auth.json, goose keychain or env keys,
@@ -314,6 +314,25 @@ class SubprocessPool:
                 memory_enabled=self._config.memory_enabled,
                 max_session_hours=self._config.agent_max_session_hours,
                 codex_effort_level=self._config.codex_effort_level,
+                defer_user_file_reads=getattr(self._config, "protected_install", False) is True,
+            )
+
+        if backend == "pi":
+            from kai.pi import PiBackend
+
+            return PiBackend(
+                model=model,
+                workspace=workspace,
+                home_workspace=home_ws,
+                webhook_port=self._config.webhook_port,
+                webhook_secret=internal_api_credential,
+                timeout_seconds=timeout,
+                services_info=services_info,
+                workspace_config=ws_config,
+                provider=effective_provider,
+                memory_enabled=self._config.memory_enabled,
+                os_user=os_user,
+                max_session_hours=self._config.agent_max_session_hours,
                 defer_user_file_reads=getattr(self._config, "protected_install", False) is True,
             )
 

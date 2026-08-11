@@ -893,6 +893,38 @@ class TestRunReviewGooseDispatch:
             await run_review("prompt", agent_backend="goose", provider="")
 
 
+class TestRunReviewPiDispatch:
+    @pytest.mark.asyncio
+    async def test_pi_routes_provider_model_and_user(self):
+        from kai.oneshot import OneShotResult
+
+        fake = MagicMock()
+        fake.run = AsyncMock(
+            return_value=OneShotResult(
+                text="review from pi",
+                backend="pi",
+                model="anthropic/claude-sonnet-4-6",
+            )
+        )
+        with patch("kai.review.PiOneShotReasoner", return_value=fake) as ctor:
+            result = await run_review(
+                "prompt",
+                agent_backend="pi",
+                provider="anthropic",
+                claude_user="daniel",
+            )
+
+        assert result == "review from pi"
+        ctor.assert_called_once_with(os_user="daniel", provider="anthropic")
+        assert fake.run.call_args.kwargs["model"] == "anthropic/claude-sonnet-4-6"
+        assert fake.run.call_args.kwargs["purpose"] == "pr_review"
+
+    @pytest.mark.asyncio
+    async def test_pi_requires_provider(self):
+        with pytest.raises(ValueError, match="provider is empty"):
+            await run_review("prompt", agent_backend="pi", provider="")
+
+
 class TestRunReviewOpenCodeDispatch:
     """
     `run_review` with `agent_backend="opencode"` dispatches to

@@ -617,6 +617,11 @@ def _discover_backend_commands(service_user: str) -> dict[str, str]:
             str(Path(svc_home) / ".local" / "bin" / "opencode"),
             shutil.which("opencode") or "",
         ),
+        "pi": (
+            "/opt/homebrew/bin/pi",
+            "/usr/local/bin/pi",
+            shutil.which("pi") or "",
+        ),
     }
     discovered: dict[str, str] = {}
     for backend, backend_candidates in candidates.items():
@@ -1323,7 +1328,7 @@ def _cmd_config() -> None:
     if not backend_choices:
         raise SystemExit(
             "No installed Kai backends were found. Install at least one supported backend "
-            "(claude, codex, goose, or opencode) globally, then re-run make config."
+            "(claude, codex, goose, opencode, or pi) globally, then re-run make config."
         )
     # Prefill reads DEFAULT_BACKEND, falling back to the deprecated
     # AGENT_BACKEND key so a re-run against a legacy install.conf keeps
@@ -1405,6 +1410,12 @@ def _cmd_config() -> None:
         print("    <service_user> ~$ opencode auth login")
         print("  Kai writes the active model into OPENCODE_CONFIG_CONTENT at process spawn;")
         print("  OpenCode resolves it against the credentials in ~/.local/share/opencode/auth.json.")
+    if agent_backend == "pi":
+        print("  After install, authenticate Pi for at least one provider as each target os_user:")
+        print("    <os_user> ~$ pi")
+        print("    /login")
+        print("  Kai starts Pi with the configured provider/model; Pi resolves credentials")
+        print("  from that user's ~/.pi/agent/auth.json or provider environment.")
 
     # Multi-provider backends (opencode, goose): operator picks the
     # provider that drives the (backend, provider, role) registry
@@ -1441,7 +1452,7 @@ def _cmd_config() -> None:
             sorted(valid_providers),
             provider_prefill,
         )
-        if agent_backend != "opencode":
+        if agent_backend not in {"opencode", "pi"}:
             llm_api_key_var = PROVIDER_KEY_VARS.get(llm_provider, "")
             if llm_api_key_var:
                 llm_api_key = _prompt(
@@ -2974,6 +2985,7 @@ def _generate_sudoers(
     codex_bin: str | None = None,
     opencode_bin: str | None = None,
     goose_bin: str | None = None,
+    pi_bin: str | None = None,
 ) -> str:
     """
     Generate sudoers rules for the service user to read protected config files.
@@ -2987,7 +2999,7 @@ def _generate_sudoers(
     in the current PATH (e.g., when running in a minimal environment).
 
     Per-user `(target_user) SETENV: NOPASSWD:` rules for the claude, codex,
-    opencode, and goose binaries (plus a `NOPASSWD: /bin/kill` rule for the
+    opencode, goose, and pi binaries (plus a `NOPASSWD: /bin/kill` rule for the
     cross-user kill escalation) are emitted for every distinct `os_user`
     value in users.yaml. Users matching `service_user` are skipped (the
     runtime detects self-sudo and spawns the agent directly without
@@ -3054,6 +3066,7 @@ def _generate_sudoers(
         codex_bin_resolved = codex_bin or _resolve_default_codex_bin()
         opencode_bin_resolved = opencode_bin or f"{svc_home}/.local/bin/opencode"
         goose_bin_resolved = goose_bin or "/opt/homebrew/bin/goose"
+        pi_bin_resolved = pi_bin or "/opt/homebrew/bin/pi"
         # kill(1) for the cross-user kill escalation (#456). The bot
         # runs `sudo -n -u <target> /bin/kill -<sig> <pid>` against
         # the inner claude grandchild because POSIX signal permissions
@@ -3092,8 +3105,8 @@ def _generate_sudoers(
         rules += textwrap.dedent("""\
 
             # Per-target sudoers rules for the cross-os-user inner agent spawn.
-            # The claude, codex, opencode, and goose rules grant arbitrary code
-            # execution as <target> (all four agents have shell/file tools); the
+            # The claude, codex, opencode, goose, and pi rules grant arbitrary
+            # code execution as <target> (all five agents have shell/file tools); the
             # kill rule grants signal delivery to any <target>-owned process. The
             # kill rule's scope is broader than a PID-locked rule because sudoers
             # argument matching is not safe per sudo(8). The kill rule is a strict
@@ -3105,6 +3118,7 @@ def _generate_sudoers(
             rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {codex_bin_resolved}\n"
             rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {opencode_bin_resolved}\n"
             rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {goose_bin_resolved}\n"
+            rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {pi_bin_resolved}\n"
             rules += f"{service_user} ALL=({target}) NOPASSWD: {kill_bin}\n"
 
     return rules
@@ -5737,7 +5751,7 @@ def _backend_registry_entries(
     discovered = _discover_backend_commands(service_user)
     if not discovered:
         raise SystemExit(
-            "No supported backend command was found. Install at least one of: claude, codex, goose, opencode."
+            "No supported backend command was found. Install at least one of: claude, codex, goose, opencode, pi."
         )
 
     default_backend = _resolve_install_default_backend(env, discovered)
@@ -5775,6 +5789,12 @@ def _backend_registry_entries(
         elif backend == "opencode":
             entries[backend] = {
                 "driver": "opencode",
+                "runtime": "local_process",
+                "command": command,
+            }
+        elif backend == "pi":
+            entries[backend] = {
+                "driver": "pi",
                 "runtime": "local_process",
                 "command": command,
             }
@@ -6129,6 +6149,7 @@ def _apply_sudoers(
         codex_bin=registry_commands.get("codex"),
         opencode_bin=registry_commands.get("opencode"),
         goose_bin=registry_commands.get("goose"),
+        pi_bin=registry_commands.get("pi"),
     )
 
     # Backstop check: each per-user rule pins a backend binary to a
@@ -6143,7 +6164,7 @@ def _apply_sudoers(
     # in users.yaml): telling an opencode-only operator to install
     # claude would manufacture a requirement that does not exist and
     # train operators to ignore the warning. The rules themselves are
-    # still emitted for all four binaries: a rule pointing at an
+    # still emitted for all five binaries: a rule pointing at an
     # absent path is inert, and unconditional emission means a later
     # backend switch cannot strand a user without a rule.
     if os_users:
@@ -6167,6 +6188,10 @@ def _apply_sudoers(
             "goose": (
                 Path(registry_commands.get("goose", "")),
                 "Install goose globally and rerun make install so /etc/kai/backends.yaml is regenerated.",
+            ),
+            "pi": (
+                Path(registry_commands.get("pi", "")),
+                "Install pi globally and rerun make install so /etc/kai/backends.yaml is regenerated.",
             ),
         }
         for backend in sorted(backends_in_use & expected_bins.keys()):

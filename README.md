@@ -59,6 +59,7 @@ In Kai, a backend is more than a model provider. Each backend is a full coding h
 | OpenAI Codex CLI | `codex` CLI | Codex CLI model IDs | Uses Codex's own model catalog, separate from OpenAI API model lists. |
 | Goose | `goose acp` | Provider-native model IDs | ACP backend with provider selected through Goose configuration or env. |
 | OpenCode | `opencode acp` | `provider/model` IDs | ACP backend with model resolution owned by OpenCode. |
+| Pi | `pi --mode rpc` | `provider/model[:thinking]` IDs | JSONL RPC backend using the target OS user's Pi authentication; bounded one-shot tasks disable tools and project resources. |
 
 Kai does not require every supported backend to exist on every machine. Every backend selected as the installation default or in a user's configuration must be installed and authenticated for the OS account that will run it.
 

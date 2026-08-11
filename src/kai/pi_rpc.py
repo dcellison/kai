@@ -3,11 +3,10 @@
 Pi's subprocess protocol is neither JSON-RPC nor ACP.  Commands, command
 responses, and asynchronous agent events all share stdout as strict JSONL.
 This module owns the framing and the small set of event semantics that the
-future conversational backend and one-shot reasoner must agree on.
+conversational backend and one-shot reasoner agree on.
 
-It intentionally does not launch Pi or make ``pi`` a selectable backend.
-Process lifecycle, user isolation, and Kai ``StreamEvent`` conversion belong
-to those two callers.
+It intentionally does not launch Pi itself. Process lifecycle, user isolation,
+and Kai ``StreamEvent`` conversion belong to those two callers.
 """
 
 from __future__ import annotations

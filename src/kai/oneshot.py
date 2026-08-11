@@ -12,9 +12,10 @@ persistent state, a hard per-call timeout, stdin-only prompt delivery,
 optional structured-output schema, and an envelope that the CALLER
 parses (the reasoner returns raw text, not parsed memory objects).
 
-Four sibling implementations of the same `OneShotReasoner` protocol
+Five sibling implementations of the same `OneShotReasoner` protocol
 live here: `ClaudeOneShotReasoner`, `CodexOneShotReasoner`,
-`OpenCodeOneShotReasoner`, and `GooseOneShotReasoner`. Memory
+`OpenCodeOneShotReasoner`, `GooseOneShotReasoner`, and
+`PiOneShotReasoner`. Memory
 extraction, episode generation, PR review, and issue triage all
 dispatch onto this family by the user's effective backend.
 
@@ -48,6 +49,17 @@ from kai.opencode import (
     concat_opencode_text,
     extract_opencode_text_delta,
     handle_opencode_permission_request,
+)
+from kai.pi import _assistant_message_error, _assistant_message_text, _pi_provider_env_vars, _split_pi_model
+from kai.pi_rpc import (
+    PI_RPC_STREAM_LIMIT,
+    PiRpcError,
+    PiRpcProtocolError,
+    PiRpcTransport,
+    pi_rpc_extension_error,
+    pi_rpc_is_settled,
+    pi_rpc_text_delta,
+    require_pi_rpc_response,
 )
 from kai.prompt_utils import make_boundary
 
@@ -161,8 +173,8 @@ class OneShotResult:
             parses for the JSON envelope it expects (`is_error`,
             `structured_output`, etc.). The reasoner does not parse
             the envelope; that contract lives in memory_extraction.
-        backend: Provider tag ("claude", "codex", "goose", or
-            "opencode"). Surfaces in structured logs and run-record
+        backend: Provider tag ("claude", "codex", "goose",
+            "opencode", or "pi"). Surfaces in structured logs and run-record
             JSON so cross-backend comparisons are possible.
         model: Model name passed to the provider, or None when the
             caller did not request a specific model. The reasoner
@@ -209,12 +221,13 @@ class OneShotReasoner(Protocol):
     identify which caller spawned the subprocess.
 
     Constructors are not part of this protocol and differ where the
-    underlying CLI demands it: `GooseOneShotReasoner` additionally
-    requires a `provider` argument (goose is multi-provider and its
-    argv carries the provider's wire-level name), while the claude /
-    codex / opencode reasoners derive their provider implicitly.
+    underlying CLI demands it: `GooseOneShotReasoner` and
+    `PiOneShotReasoner` additionally accept a `provider` argument
+    because both CLIs carry provider selection explicitly, while the
+    claude / codex / opencode reasoners derive it implicitly or from
+    the model identifier.
     Callers constructing reasoners by backend name must thread the
-    user's effective provider when the backend is goose.
+    user's effective provider when the backend is goose or Pi.
     """
 
     async def run(
@@ -398,13 +411,21 @@ def _preserved_auth_vars_for(backend: str) -> tuple[str, ...]:
         return _OPENCODE_PRESERVED_AUTH_VARS
     if backend == "goose":
         return _GOOSE_PRESERVED_AUTH_VARS
+    if backend == "pi":
+        raise ValueError("pi preserve-env requires an explicit provider-specific allowlist")
     raise ValueError(f"unknown backend for preserve-env: {backend!r}")
 
 
 # ── Shared wrap / kill helpers ──────────────────────────────────────
 
 
-def _wrap_cmd_for_user(cmd: list[str], target_user: str, backend: str) -> list[str]:
+def _wrap_cmd_for_user(
+    cmd: list[str],
+    target_user: str,
+    backend: str,
+    *,
+    preserve_vars: tuple[str, ...] | None = None,
+) -> list[str]:
     """
     Prefix `cmd` with `sudo -H -u <target> --preserve-env=<csv> --`.
 
@@ -419,16 +440,16 @@ def _wrap_cmd_for_user(cmd: list[str], target_user: str, backend: str) -> list[s
     `claude` / `codex` against that PATH before applying its sudoers
     check (the sudoers rule pins the resolved absolute path).
     """
-    preserve = ",".join(_preserved_auth_vars_for(backend))
-    return [
+    preserve = ",".join(preserve_vars if preserve_vars is not None else _preserved_auth_vars_for(backend))
+    wrapped = [
         "sudo",
         "-H",
         "-u",
         target_user,
-        f"--preserve-env={preserve}",
-        "--",
-        *cmd,
     ]
+    if preserve:
+        wrapped.append(f"--preserve-env={preserve}")
+    return [*wrapped, "--", *cmd]
 
 
 def _os_user_log_field(effective_user: str | None) -> str:
@@ -2535,3 +2556,287 @@ class GooseOneShotReasoner:
             raw_metadata=raw_metadata,
             duration_ms=duration_ms,
         )
+
+
+# ── Pi implementation ───────────────────────────────────────────────
+
+
+# Pi can authenticate either from the target user's ~/.pi/agent/auth.json or
+# through provider keys.  HOME reaches the former (and is rewritten by
+# sudo -H); the remaining entries are the documented provider-key surface.
+# Control-plane credentials and Kai's internal principal never enter this
+# bounded, tool-free subprocess.
+_PI_ENV_BASE_ALLOWLIST = ("PATH", "HOME")
+
+
+class PiOneShotReasoner:
+    """Run one bounded, stateless model call through Pi's JSONL RPC mode.
+
+    The process is started with tools, approval, session persistence, and all
+    project resource discovery disabled.  One prompt is accepted, streamed,
+    and completed only at Pi's ``agent_settled`` event; ``message_end`` is the
+    authoritative final text.  The subprocess is torn down on every exit path.
+    """
+
+    def __init__(self, *, cwd: Path | None = None, os_user: str | None = None, provider: str = "") -> None:
+        self._cwd = cwd if cwd is not None else _EXTRACTOR_CWD
+        self._os_user = os_user
+        self._provider = provider
+
+    async def run(
+        self,
+        *,
+        prompt: str,
+        system_prompt: str | None = None,
+        model: str | None = None,
+        timeout: float | None = None,
+        purpose: str,
+        json_schema: dict[str, Any] | None = None,
+    ) -> OneShotResult:
+        self._cwd.mkdir(parents=True, exist_ok=True)
+        self._cwd.chmod(0o755)
+
+        try:
+            resolved_binary = resolve_oneshot_binary("pi")
+        except BinaryResolutionError as exc:
+            raise OneShotRoutingError(str(exc)) from exc
+
+        cmd: list[str] = [resolved_binary, "--mode", "rpc"]
+        if self._provider:
+            cmd.extend(["--provider", self._provider])
+        if model is not None:
+            cmd.extend(["--model", model])
+        cmd.extend(
+            [
+                "--no-session",
+                "--no-tools",
+                "--no-approve",
+                "--no-extensions",
+                "--no-skills",
+                "--no-prompt-templates",
+                "--no-context-files",
+            ]
+        )
+
+        effective_user = resolve_claude_user(self._os_user)
+        if effective_user is not None:
+            cmd = _wrap_cmd_for_user(
+                cmd,
+                effective_user,
+                "pi",
+                preserve_vars=_pi_provider_env_vars(self._provider),
+            )
+        env_allowlist = (*_PI_ENV_BASE_ALLOWLIST, *_pi_provider_env_vars(self._provider))
+        subprocess_env = {key: os.environ[key] for key in env_allowlist if key in os.environ}
+        rendered_prompt = _render_goose_stdin(system_prompt, prompt)
+        os_user_field = _os_user_log_field(effective_user)
+
+        start = time.monotonic()
+        proc: asyncio.subprocess.Process | None = None
+        stderr_task: asyncio.Task[None] | None = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(self._cwd),
+                env=subprocess_env,
+                limit=PI_RPC_STREAM_LIMIT,
+                start_new_session=bool(effective_user),
+            )
+            stderr_task = asyncio.create_task(_drain_pi_stderr(proc))
+            try:
+                response_text, completion_error = await asyncio.wait_for(
+                    self._drive_exchange(proc=proc, rendered_prompt=rendered_prompt, model=model),
+                    timeout=timeout,
+                )
+            except TimeoutError:
+                duration_ms = int((time.monotonic() - start) * 1000)
+                log.info(
+                    "oneshot_reasoner purpose=%s backend=pi model=%s duration_ms=%d "
+                    "outcome=timeout error_category=timeout os_user=%s",
+                    purpose,
+                    model,
+                    duration_ms,
+                    os_user_field,
+                )
+                raise OneShotTimeout() from None
+            except PiRpcError as exc:
+                duration_ms = int((time.monotonic() - start) * 1000)
+                if proc.returncode not in (None, 0):
+                    raise OneShotSubprocessError(returncode=proc.returncode, stderr=b"") from exc
+                raise OneShotOutputError(f"pi RPC failed: {exc}") from exc
+
+            duration_ms = int((time.monotonic() - start) * 1000)
+            if completion_error is not None:
+                raise OneShotOutputError(f"pi model request failed: {completion_error}")
+
+            raw_metadata = {
+                "returncode": 0,
+                "stderr": b"",
+                "cwd": str(self._cwd),
+                "cmd": list(cmd),
+                "resolved_binary": resolved_binary,
+            }
+            result_text = self._normalize_output(response_text, json_schema)
+            log.info(
+                "oneshot_reasoner purpose=%s backend=pi model=%s duration_ms=%d "
+                "outcome=success returncode=0 os_user=%s",
+                purpose,
+                model,
+                duration_ms,
+                os_user_field,
+            )
+            return OneShotResult(
+                text=result_text,
+                backend="pi",
+                model=model,
+                raw_metadata=raw_metadata,
+                duration_ms=duration_ms,
+            )
+        finally:
+            if proc is not None:
+                await _shutdown_pi_proc(proc, effective_user=effective_user, purpose=purpose)
+            if stderr_task is not None:
+                stderr_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await stderr_task
+
+    async def _drive_exchange(
+        self,
+        *,
+        proc: asyncio.subprocess.Process,
+        rendered_prompt: str,
+        model: str | None,
+    ) -> tuple[str, str | None]:
+        assert proc.stdin is not None
+        assert proc.stdout is not None
+        transport = PiRpcTransport(proc.stdin, proc.stdout)
+
+        # Validate the active model before spending a one-shot call.  This
+        # catches a CLI/provider silently substituting its own default.
+        state_id = "kai-oneshot-state"
+        await transport.send({"id": state_id, "type": "get_state"})
+        state_message = await transport.receive()
+        state = require_pi_rpc_response(state_message, request_id=state_id, command="get_state")
+        if not isinstance(state, dict):
+            raise PiRpcProtocolError("Pi get_state response requires an object")
+        if model is not None:
+            expected_provider, expected_model, expected_thinking = _split_pi_model(model, self._provider)
+            active_model = state.get("model")
+            if not isinstance(active_model, dict):
+                raise PiRpcProtocolError(f"Pi did not activate configured model {model!r}")
+            if active_model.get("provider") != expected_provider or active_model.get("id") != expected_model:
+                raise PiRpcProtocolError(
+                    "Pi activated a different model than configured: "
+                    f"expected {expected_provider}/{expected_model}, "
+                    f"got {active_model.get('provider')}/{active_model.get('id')}"
+                )
+            if expected_thinking is not None and state.get("thinkingLevel") != expected_thinking:
+                raise PiRpcProtocolError(
+                    f"Pi did not activate configured thinking level {expected_thinking!r}; "
+                    f"got {state.get('thinkingLevel')!r}"
+                )
+
+        prompt_id = "kai-oneshot-prompt"
+        await transport.send({"id": prompt_id, "type": "prompt", "message": rendered_prompt})
+        accepted = False
+        streamed = ""
+        completed: list[str] = []
+        completion_error: str | None = None
+        while True:
+            message = await transport.receive()
+            message_type = message.get("type")
+            if message_type == "response":
+                if accepted:
+                    raise PiRpcProtocolError("Pi emitted more than one response for a one-shot prompt")
+                require_pi_rpc_response(message, request_id=prompt_id, command="prompt")
+                accepted = True
+                continue
+
+            delta = pi_rpc_text_delta(message)
+            if delta is not None:
+                streamed += delta
+                continue
+            if message_type == "message_end":
+                authoritative = _assistant_message_text(message.get("message"))
+                if authoritative:
+                    completed.append(authoritative)
+                completion_error = _assistant_message_error(message.get("message")) or completion_error
+                continue
+            if message_type == "auto_retry_end" and message.get("success") is False:
+                detail = message.get("finalError") or message.get("error")
+                completion_error = detail if isinstance(detail, str) and detail else "Pi exhausted automatic retries"
+                continue
+            extension_error = pi_rpc_extension_error(message)
+            if extension_error is not None:
+                raise PiRpcProtocolError(f"Pi extension failed despite extensions being disabled: {extension_error}")
+            if message_type in {"tool_execution_start", "tool_execution_update", "tool_execution_end"}:
+                raise PiRpcProtocolError(f"Pi emitted {message_type} despite tools being disabled")
+            if message_type == "extension_ui_request":
+                raise PiRpcProtocolError("Pi requested extension UI despite extensions being disabled")
+            if pi_rpc_is_settled(message):
+                if not accepted:
+                    raise PiRpcProtocolError("Pi settled a prompt before acknowledging it")
+                return "\n\n".join(completed) or streamed, completion_error
+
+    @staticmethod
+    def _normalize_output(response_text: str, json_schema: dict[str, Any] | None) -> str:
+        if json_schema is None:
+            return response_text
+        if not response_text:
+            raise OneShotOutputError("pi produced no response text")
+        try:
+            payload = _parse_schema_payload(response_text)
+        except json.JSONDecodeError as exc:
+            raise OneShotOutputError(
+                f"pi response text did not contain a JSON object: {exc}; response begins: {response_text[:200]!r}"
+            ) from None
+        if not isinstance(payload, dict):
+            raise OneShotOutputError("pi response JSON was not an object")
+        required_fields = json_schema.get("required")
+        if isinstance(required_fields, list):
+            missing = [field for field in required_fields if field not in payload]
+            if missing:
+                raise OneShotOutputError(f"pi response JSON missing required fields: {missing}")
+        return json.dumps({"is_error": False, "structured_output": payload})
+
+
+async def _drain_pi_stderr(proc: asyncio.subprocess.Process) -> None:
+    if proc.stderr is None:
+        return
+    while True:
+        try:
+            line = await proc.stderr.readline()
+        except Exception:
+            return
+        if not line:
+            return
+        text = line.decode(errors="replace").strip()
+        if text:
+            log.debug("Pi (one-shot) stderr: %s", text[:200])
+
+
+async def _shutdown_pi_proc(
+    proc: asyncio.subprocess.Process,
+    *,
+    effective_user: str | None,
+    purpose: str,
+) -> None:
+    if proc.returncode is not None:
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        return
+    if effective_user is not None:
+        with contextlib.suppress(BaseException):
+            await _kill_target_user_tree(
+                target_user=effective_user,
+                pgid=proc.pid,
+                purpose=purpose,
+                backend="pi",
+            )
+    with contextlib.suppress(OSError):
+        proc.kill()
+    with contextlib.suppress(BaseException):
+        await asyncio.wait_for(proc.wait(), timeout=5)

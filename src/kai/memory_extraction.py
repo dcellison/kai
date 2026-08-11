@@ -44,6 +44,7 @@ from kai.oneshot import (
     OneShotSubprocessError,
     OneShotTimeout,
     OpenCodeOneShotReasoner,
+    PiOneShotReasoner,
 )
 from kai.oneshot import _ensure_extractor_cwd as _ensure_extractor_cwd
 
@@ -2031,8 +2032,8 @@ def _build_memory_reasoner(
     to inject fake reasoners; the parameters are accepted but not
     inspected on the test side because patches use `return_value=`.
 
-    `provider` is consumed by the goose reasoner only: goose's
-    one-shot argv carries an explicit `--provider` flag, while the
+    `provider` is consumed by the goose and Pi reasoners: both
+    one-shot argv shapes carry an explicit provider flag, while the
     other backends encode the provider implicitly (claude/codex are
     single-provider; opencode embeds it in the model string). The
     other branches accept and ignore it so the call sites stay
@@ -2050,6 +2051,8 @@ def _build_memory_reasoner(
         return OpenCodeOneShotReasoner(os_user=os_user)
     if effective_backend == "goose":
         return GooseOneShotReasoner(os_user=os_user, provider=provider)
+    if effective_backend == "pi":
+        return PiOneShotReasoner(os_user=os_user, provider=provider)
     raise RuntimeError(f"extraction reached _build_memory_reasoner for non-extraction backend: {effective_backend!r}")
 
 

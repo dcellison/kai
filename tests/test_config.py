@@ -2590,6 +2590,13 @@ class TestModelRegistry:
                     f"opencode/{provider} {role.value}={value!r} is not provider/model"
                 )
 
+    def test_pi_rows_must_match_their_provider_prefix(self, monkeypatch):
+        monkeypatch.setitem(MODEL_REGISTRY, ("pi", "anthropic", ModelRole.AGENT), "openai/gpt-5.5")
+        with pytest.raises(SystemExit) as excinfo:
+            _check_model_registry_complete()
+        assert "pi" in str(excinfo.value)
+        assert "provider/model" in str(excinfo.value)
+
     def test_completeness_check_raises_on_missing_opencode_row(self, monkeypatch):
         """
         Synthetic missing-row case for opencode: drop a registry
@@ -2973,6 +2980,19 @@ class TestValidateModelForBackend:
         assert validate_model_for_backend("openrouter/anthropic/claude-sonnet-4-5", "opencode", "") is True
         assert validate_model_for_backend("/", "opencode", "") is False
 
+    def test_pi_accepts_prefixed_or_explicit_provider_model_shape(self):
+        from kai.config import validate_model_for_backend
+
+        assert validate_model_for_backend("anthropic/claude-sonnet-4-6", "pi", "anthropic") is True
+        assert validate_model_for_backend("openai/gpt-5.6-sol:xhigh", "pi", "openai") is True
+        assert validate_model_for_backend("ollama/llama4:70b", "pi", "ollama") is True
+        assert validate_model_for_backend("sonnet", "pi", "anthropic") is True
+        assert validate_model_for_backend("sonnet", "pi", "") is False
+        assert validate_model_for_backend("openai/gpt-5.5", "pi", "anthropic") is False
+        assert validate_model_for_backend("anthropic//model", "pi", "anthropic") is False
+        assert validate_model_for_backend("openai-codex/gpt-5.5", "pi", "openai-codex") is True
+        assert validate_model_for_backend("github-copilot/gpt-5.5", "pi", "github-copilot") is True
+
 
 class TestModelsForBackend:
     """Wizard/runtime model-keyboard list helper."""
@@ -3004,15 +3024,21 @@ class TestModelsForBackend:
         assert models_for_backend("opencode", "") is None
         assert models_for_backend("opencode", "anthropic") is None
 
+    def test_pi_returns_none(self):
+        """Pi discovers the target user's authenticated models at runtime."""
+        from kai.config import models_for_backend
+
+        assert models_for_backend("pi", "anthropic") is None
+
 
 class TestValidBackends:
     """Pin the VALID_BACKENDS set membership."""
 
-    def test_all_four_backends_listed(self):
-        """claude, goose, codex, opencode."""
+    def test_all_five_backends_listed(self):
+        """Every supported conversational backend is explicit."""
         from kai.config import VALID_BACKENDS
 
-        assert sorted(VALID_BACKENDS) == ["claude", "codex", "goose", "opencode"]
+        assert sorted(VALID_BACKENDS) == ["claude", "codex", "goose", "opencode", "pi"]
 
     def test_opencode_provider_prompt_gate(self):
         """OpenCode joins BACKENDS_NEEDING_PROVIDER_PROMPT (it talks
@@ -3025,6 +3051,7 @@ class TestValidBackends:
 
         assert "opencode" in BACKEND_PROVIDERS
         assert "opencode" in BACKENDS_NEEDING_PROVIDER_PROMPT
+        assert "pi" in BACKENDS_NEEDING_PROVIDER_PROMPT
         # Single-provider backends are absent from the prompt gate so
         # their provider stays implicit.
         assert "claude" not in BACKENDS_NEEDING_PROVIDER_PROMPT
@@ -3864,17 +3891,17 @@ class TestOneShotReasonerBackendsConstant:
 
     def test_membership(self):
         """Every backend with a OneShotReasoner implementation in
-        `src/kai/oneshot.py` is a member: claude, codex, opencode,
-        and goose all ship one today.
+        `src/kai/oneshot.py` is a member.
         """
         assert "claude" in ONESHOT_REASONER_BACKENDS
         assert "codex" in ONESHOT_REASONER_BACKENDS
         assert "opencode" in ONESHOT_REASONER_BACKENDS
         assert "goose" in ONESHOT_REASONER_BACKENDS
+        assert "pi" in ONESHOT_REASONER_BACKENDS
         # Pin the exact contents so an accidental addition is caught
         # at test time; intentional additions update this assertion
         # in lockstep with the constant's definition.
-        assert frozenset({"claude", "codex", "goose", "opencode"}) == ONESHOT_REASONER_BACKENDS
+        assert frozenset({"claude", "codex", "goose", "opencode", "pi"}) == ONESHOT_REASONER_BACKENDS
 
     def test_is_frozenset(self):
         """The constant must be a `frozenset` so callers only do
@@ -4060,7 +4087,7 @@ class TestBackendProviders:
     def test_membership_contents(self):
         from kai.config import BACKEND_PROVIDERS
 
-        assert set(BACKEND_PROVIDERS.keys()) == {"claude", "codex", "opencode", "goose"}
+        assert set(BACKEND_PROVIDERS.keys()) == {"claude", "codex", "opencode", "goose", "pi"}
         assert BACKEND_PROVIDERS["claude"] == ("anthropic",)
         assert BACKEND_PROVIDERS["codex"] == ("openai",)
         # Multi-provider backends include deepseek (new); openrouter and ollama
@@ -4068,6 +4095,9 @@ class TestBackendProviders:
         assert "deepseek" in BACKEND_PROVIDERS["opencode"]
         assert "deepseek" in BACKEND_PROVIDERS["goose"]
         assert "openrouter" in BACKEND_PROVIDERS["opencode"]
+        assert set(BACKEND_PROVIDERS["opencode"]).issubset(BACKEND_PROVIDERS["pi"])
+        assert "openai-codex" in BACKEND_PROVIDERS["pi"]
+        assert "github-copilot" in BACKEND_PROVIDERS["pi"]
 
     def test_strict_subset_of_valid_backends(self):
         """Every backend listed in BACKEND_PROVIDERS must also be in
@@ -4135,6 +4165,9 @@ class TestModelRegistryTripleKey:
         assert MODEL_REGISTRY[("opencode", "deepseek", ModelRole.PR_REVIEW)] == "deepseek/deepseek-v4-pro"
         assert MODEL_REGISTRY[("opencode", "deepseek", ModelRole.MEMORY_EXTRACTION)] == "deepseek/deepseek-v4-flash"
         assert MODEL_REGISTRY[("goose", "anthropic", ModelRole.PR_REVIEW)] == "claude-sonnet-4-6"
+        assert MODEL_REGISTRY[("pi", "openai-codex", ModelRole.PR_REVIEW)] == "openai-codex/gpt-5.5"
+        assert MODEL_REGISTRY[("pi", "github-copilot", ModelRole.MEMORY_EXTRACTION)] == ("github-copilot/gpt-5-mini")
+        assert MODEL_REGISTRY[("pi", "openrouter", ModelRole.PR_REVIEW)] == ("openrouter/anthropic/claude-sonnet-4.6")
 
     def test_codex_rows_are_in_codex_models(self):
         """The completeness check enforces this at startup; pinning

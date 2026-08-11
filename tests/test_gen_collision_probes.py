@@ -326,6 +326,7 @@ class TestBuildDraftingReasoner:
             CodexOneShotReasoner,
             GooseOneShotReasoner,
             OpenCodeOneShotReasoner,
+            PiOneShotReasoner,
         )
 
         assert isinstance(
@@ -343,6 +344,10 @@ class TestBuildDraftingReasoner:
         assert isinstance(
             gcp._build_drafting_reasoner("goose", os_user=None, provider="anthropic"),
             GooseOneShotReasoner,
+        )
+        assert isinstance(
+            gcp._build_drafting_reasoner("pi", os_user=None, provider="anthropic"),
+            PiOneShotReasoner,
         )
 
     def test_unknown_backend_raises(self):

@@ -80,7 +80,7 @@ from kai.install import (
 def _isolate_installed_backend_discovery(monkeypatch, tmp_path):
     """Keep install tests independent of host-installed backend CLIs.
 
-    CI runners have none of claude/codex/goose/opencode installed,
+    CI runners have none of claude/codex/goose/opencode/pi installed,
     while developer machines may have a real /etc/kai/backends.yaml.
     Most install tests are not about command discovery, so give them a
     deterministic registry-shaped discovery result. Tests that exercise
@@ -95,6 +95,7 @@ def _isolate_installed_backend_discovery(monkeypatch, tmp_path):
             "codex": "/test/bin/codex",
             "goose": "/test/bin/goose",
             "opencode": "/test/bin/opencode",
+            "pi": "/test/bin/pi",
         },
     )
 
@@ -520,6 +521,16 @@ class TestGenerateSudoers:
         bob_lines = [line for line in result.splitlines() if "(bob)" in line and "codex" in line]
         assert len(alice_lines) == 1, alice_lines
         assert len(bob_lines) == 1, bob_lines
+
+    def test_pi_rule_emitted_per_target_from_registry_path(self):
+        result = _generate_sudoers(
+            "kai",
+            os_users=["alice", "bob"],
+            pi_bin="/opt/homebrew/bin/pi",
+        )
+
+        assert "kai ALL=(alice) SETENV: NOPASSWD: /opt/homebrew/bin/pi" in result
+        assert "kai ALL=(bob) SETENV: NOPASSWD: /opt/homebrew/bin/pi" in result
 
     # -- Issue #456: per-target kill rule for cross-user signal escalation ----
 
@@ -7572,6 +7583,7 @@ class TestApplyBackendRegistry:
                 "codex": "/global/codex",
                 "opencode": "/global/opencode",
                 "goose": "/global/goose",
+                "pi": "/global/pi",
             },
         )
         rendered = kai.install._build_backend_registry(
@@ -7590,6 +7602,8 @@ class TestApplyBackendRegistry:
         assert data["backends"]["codex"]["command"] == "/global/codex"
         assert data["backends"]["opencode"]["command"] == "/global/opencode"
         assert data["backends"]["goose"]["command"] == "/global/goose"
+        assert data["backends"]["pi"]["command"] == "/global/pi"
+        assert "allowed_models" not in data["backends"]["pi"]
         assert data["default_backend"] == "codex"
         assert "gpt-5.6-sol" in data["backends"]["codex"]["allowed_models"]
         assert "fable" in data["backends"]["claude"]["allowed_models"]
@@ -7603,6 +7617,7 @@ class TestApplyBackendRegistry:
                 "codex": "/registry/codex",
                 "opencode": "/registry/opencode",
                 "goose": "/registry/goose",
+                "pi": "/registry/pi",
             },
         )
         env = {
@@ -7622,9 +7637,10 @@ class TestApplyBackendRegistry:
             codex_bin=commands["codex"],
             opencode_bin=commands["opencode"],
             goose_bin=commands["goose"],
+            pi_bin=commands["pi"],
         )
 
-        for backend in ("claude", "codex", "opencode", "goose"):
+        for backend in ("claude", "codex", "opencode", "goose", "pi"):
             command = registry["backends"][backend]["command"]
             assert f"kai ALL=(alice) SETENV: NOPASSWD: {command}" in sudoers
 
