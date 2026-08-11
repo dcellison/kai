@@ -22,6 +22,7 @@ class WorkshopEventType(StrEnum):
     """The collaboration-only vocabulary supported by the first schema."""
 
     WORKSHOP_CREATED = "workshop.created"
+    WORKSHOP_MEMBER_ADDED = "workshop.member_added"
     PRINCIPAL_CREATED = "principal.created"
     EXTERNAL_IDENTITY_BOUND = "external_identity.bound"
     CHANNEL_CREATED = "channel.created"
@@ -48,6 +49,14 @@ class OpaqueId(str):
     @classmethod
     def new(cls) -> Self:
         return cls(f"{cls.prefix}_{uuid.uuid4().hex}")
+
+    @classmethod
+    def derived(cls, namespace: OpaqueId, stable_name: str) -> Self:
+        """Derive a stable typed ID within an already-random Workshop namespace."""
+        if not stable_name:
+            raise ValueError("stable_name must be non-empty")
+        namespace_uuid = uuid.UUID(hex=namespace.partition("_")[2])
+        return cls(f"{cls.prefix}_{uuid.uuid5(namespace_uuid, f'{cls.prefix}:{stable_name}').hex}")
 
 
 class WorkshopId(OpaqueId):

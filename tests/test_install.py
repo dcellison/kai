@@ -3013,6 +3013,8 @@ class TestCmdApply:
 
         output = capsys.readouterr().out
         assert "[DRY RUN]" in output
+        assert "[DRY RUN] Workshop bootstrap: pending" in output
+        assert "1 human principal(s)" in output
         # Verify nothing was actually created
         assert not (tmp_path / "opt" / "kai").exists()
         # Secrets reminder should NOT appear during dry run
@@ -4399,6 +4401,7 @@ class TestCmdStatus:
         _cmd_status()
         output = capsys.readouterr().out
         assert "Installation Status" in output
+        assert "Workshop bootstrap:" in output
 
     def test_reports_unsupported_webhook_secret(self, tmp_path, monkeypatch, capsys):
         conf_path = tmp_path / "install.conf"

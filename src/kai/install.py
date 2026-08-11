@@ -64,6 +64,7 @@ from kai.config import (
 )
 from kai.protected_config import ProtectedConfigError, validate_protected_file_metadata
 from kai.user_isolation import validate_protected_user_isolation
+from kai.workshop.diagnostics import workshop_bootstrap_status
 
 # Config file written by `config`, read by `apply`.
 # Anchored to PROJECT_ROOT so it resolves correctly regardless of CWD.
@@ -4418,6 +4419,16 @@ def _cmd_apply() -> None:
         print(f"Creating new installation at {install_dir}")
     print()
 
+    if dry_run:
+        expected_humans = len(_protected_user_assignments(effective_users_yaml))
+        print(
+            "[DRY RUN] "
+            + workshop_bootstrap_status(
+                data_path / "kai.db",
+                expected_humans=expected_humans,
+            )
+        )
+
     # -- Stop service before making changes --
     _stop_service(platform, dry_run)
 
@@ -6449,6 +6460,19 @@ def _cmd_status() -> None:
         print("Webhook secret migration (install.conf artifact): unavailable")
     else:
         print(_webhook_secret_migration_status(conf_env, source="install.conf artifact"))
+
+    expected_humans: int | None = None
+    if os.geteuid() == 0:
+        try:
+            expected_humans = len(_protected_user_assignments(USERS_YAML))
+        except ValueError:
+            pass
+    print(
+        workshop_bootstrap_status(
+            Path(data_dir) / "kai.db",
+            expected_humans=expected_humans,
+        )
+    )
 
     # Check workspace path traversal if install.conf has a service user
     if INSTALL_CONF.exists():

@@ -104,6 +104,11 @@ class WorkshopEventStore:
         await migrate_workshop_schema(connection)
         return cls(connection, owns_connection=False)
 
+    @classmethod
+    def from_initialized_connection(cls, connection: aiosqlite.Connection) -> WorkshopEventStore:
+        """Use a connection whose Workshop schema was initialized by Kai startup."""
+        return cls(connection, owns_connection=False)
+
     @property
     def connection(self) -> aiosqlite.Connection:
         return self._connection
@@ -238,6 +243,16 @@ class WorkshopEventStore:
         async with self._connection.execute(sql, parameters) as cursor:
             rows = await cursor.fetchall()
         return [self._stored_event_from_row(row) for row in rows]
+
+    async def event_by_idempotency_key(self, idempotency_key: str) -> StoredEvent | None:
+        if not idempotency_key.strip():
+            raise ValueError("idempotency_key must be non-empty")
+        async with self._connection.execute(
+            "SELECT * FROM event_log WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._stored_event_from_row(row) if row is not None else None
 
     async def rebuild_projection(self, projection: Projection) -> ProjectionCheckpoint:
         """Atomically reset and replay one projection from position zero."""

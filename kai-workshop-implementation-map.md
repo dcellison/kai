@@ -273,6 +273,7 @@ Identifiers should be opaque, globally unique strings. Telegram numeric identifi
 ### 11.2 Minimal event vocabulary
 
 - `workshop.created`
+- `workshop.member_added`
 - `principal.created`
 - `external_identity.bound`
 - `channel.created`

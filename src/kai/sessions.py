@@ -42,6 +42,9 @@ from typing import TYPE_CHECKING, TypedDict
 import aiosqlite
 
 from kai.job_types import JOB_TYPE_AGENT, LEGACY_JOB_TYPE_AGENT, normalize_job_type
+from kai.workshop.bootstrap import BootstrapHuman, BootstrapResult, bootstrap_default_workshop
+from kai.workshop.schema import migrate_workshop_schema
+from kai.workshop.store import WorkshopEventStore
 
 if TYPE_CHECKING:
     from kai.config import Config, WorkspaceConfig
@@ -128,6 +131,7 @@ async def init_db(db_path: Path) -> None:
         if row and row[0] != "wal":
             log.warning("Failed to enable WAL mode; journal_mode is %s", row[0])
     await _get_db().execute("PRAGMA busy_timeout=5000")
+    await _get_db().execute("PRAGMA foreign_keys=ON")
     _restrict_sqlite_files(db_path)
 
     try:
@@ -266,6 +270,10 @@ async def init_db(db_path: Path) -> None:
             await _get_db().execute("DROP TABLE workspace_history")
             await _get_db().execute("ALTER TABLE workspace_history_new RENAME TO workspace_history")
 
+        # Additive Workshop schema only. Canonical bootstrap records are
+        # created separately after the protected user configuration has
+        # loaded; no message path reads these tables yet.
+        await migrate_workshop_schema(_get_db(), manage_transaction=False)
         await _get_db().commit()
         _restrict_sqlite_files(db_path)
     except Exception:
@@ -287,6 +295,12 @@ async def init_db(db_path: Path) -> None:
 
 
 # ── Session management ───────────────────────────────────────────────
+
+
+async def bootstrap_workshop_foundation(humans: tuple[BootstrapHuman, ...]) -> BootstrapResult:
+    """Seed non-authoritative Workshop records on Kai's initialized DB."""
+    store = WorkshopEventStore.from_initialized_connection(_get_db())
+    return await bootstrap_default_workshop(store, humans)
 
 
 async def get_session(chat_id: int) -> str | None:

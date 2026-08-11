@@ -45,6 +45,21 @@ from telegram.error import NetworkError
 from kai import cron, services, sessions, webhook
 from kai.bot import create_bot
 from kai.config import DATA_DIR, PROJECT_ROOT, _read_protected_file, load_config
+from kai.workshop.bootstrap import BootstrapHuman
+
+
+def _workshop_bootstrap_humans(config) -> tuple[BootstrapHuman, ...]:
+    """Map authorized humans to transport bindings without notification groups."""
+    return tuple(
+        BootstrapHuman(
+            display_name=user.name,
+            role="admin" if user.role == "admin" else "member",
+            transport="telegram",
+            external_subject=str(user.telegram_id),
+            external_channel_id=str(user.telegram_id),
+        )
+        for user in sorted(config.user_configs.values(), key=lambda user: user.telegram_id)
+    )
 
 
 def setup_logging() -> None:
@@ -245,6 +260,19 @@ def _start() -> None:
         use_webhook = config.telegram_webhook_url is not None
 
         await sessions.init_db(config.session_db_path)
+
+        # Seed the non-authoritative Workshop identity/channel projection.
+        # Only configured interactive users participate; GitHub notification
+        # destinations are delivery targets and never become principals or
+        # inbound channel bindings through this migration.
+        workshop_bootstrap = await sessions.bootstrap_workshop_foundation(_workshop_bootstrap_humans(config))
+        logging.info(
+            "Workshop bootstrap ready (humans=%d, channels=%d, new_events=%d, existing_events=%d)",
+            workshop_bootstrap.human_count,
+            workshop_bootstrap.channel_count,
+            workshop_bootstrap.created_events,
+            workshop_bootstrap.existing_events,
+        )
 
         # Load user-registered memory projects into the detection
         # cache. Must follow init_db (the rows live in the session

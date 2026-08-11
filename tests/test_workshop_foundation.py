@@ -75,6 +75,7 @@ class TestEventEnvelope:
     def test_initial_event_vocabulary_is_collaboration_only(self):
         assert {event_type.value for event_type in WorkshopEventType} == {
             "workshop.created",
+            "workshop.member_added",
             "principal.created",
             "external_identity.bound",
             "channel.created",

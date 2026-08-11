@@ -19,7 +19,31 @@ from unittest.mock import patch
 
 import pytest
 
-from kai.main import _file_age, _file_cleanup_loop, setup_logging
+from kai.config import UserConfig
+from kai.main import _file_age, _file_cleanup_loop, _workshop_bootstrap_humans, setup_logging
+
+
+class TestWorkshopBootstrapMapping:
+    def test_only_interactive_user_identity_becomes_a_channel_binding(self):
+        config = SimpleNamespace(
+            user_configs={
+                101: UserConfig(
+                    telegram_id=101,
+                    name="Admin",
+                    role="admin",
+                    github_notify_chat_id=-999,
+                )
+            }
+        )
+
+        humans = _workshop_bootstrap_humans(config)
+
+        assert len(humans) == 1
+        assert humans[0].external_subject == "101"
+        assert humans[0].external_channel_id == "101"
+        assert humans[0].role == "admin"
+        assert "-999" not in repr(humans)
+
 
 # ── setup_logging() ──────────────────────────────────────────────────
 

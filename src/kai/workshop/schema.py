@@ -138,11 +138,17 @@ _INITIAL_SCHEMA = SchemaMigration(
 _MIGRATIONS = (_INITIAL_SCHEMA,)
 
 
-async def migrate_workshop_schema(connection: aiosqlite.Connection) -> None:
-    """Apply all pending Workshop migrations in one explicit transaction."""
-    await connection.execute("PRAGMA foreign_keys=ON")
+async def migrate_workshop_schema(
+    connection: aiosqlite.Connection,
+    *,
+    manage_transaction: bool = True,
+) -> None:
+    """Apply pending migrations, optionally inside the caller's transaction."""
+    if manage_transaction:
+        await connection.execute("PRAGMA foreign_keys=ON")
     try:
-        await connection.execute("BEGIN IMMEDIATE")
+        if manage_transaction:
+            await connection.execute("BEGIN IMMEDIATE")
         await connection.execute(
             """
             CREATE TABLE IF NOT EXISTS workshop_schema_migrations (
@@ -167,7 +173,9 @@ async def migrate_workshop_schema(connection: aiosqlite.Connection) -> None:
                 "INSERT INTO workshop_schema_migrations (version, name) VALUES (?, ?)",
                 (migration.version, migration.name),
             )
-        await connection.commit()
+        if manage_transaction:
+            await connection.commit()
     except Exception:
-        await connection.rollback()
+        if manage_transaction:
+            await connection.rollback()
         raise
