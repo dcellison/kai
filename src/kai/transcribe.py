@@ -17,6 +17,7 @@ from raw audio bytes to transcript string.
 
 import asyncio
 import logging
+import sys
 import tempfile
 from pathlib import Path
 
@@ -78,17 +79,28 @@ async def transcribe_voice(audio_data: bytes, model_path: Path) -> str:
             label="ffmpeg",
         )
 
-        # Step 2: Transcribe WAV → text via whisper-cli
+        # Step 2: Transcribe WAV → text via whisper-cli. The Metal path in
+        # current whisper.cpp builds is not reliable from Kai's macOS
+        # LaunchDaemon context: it can hang until the outer timeout, while the
+        # same input completes promptly on CPU. Keep GPU selection unchanged
+        # on other platforms.
+        whisper_command = ["whisper-cli"]
+        if sys.platform == "darwin":
+            whisper_command.append("--no-gpu")
+        whisper_command.extend(
+            [
+                "--model",
+                str(model_path),
+                "--file",
+                str(wav_path),
+                "--no-prints",
+                "--no-timestamps",
+                "--language",
+                "en",
+            ]
+        )
         stdout = await _run(
-            "whisper-cli",
-            "--model",
-            str(model_path),
-            "--file",
-            str(wav_path),
-            "--no-prints",
-            "--no-timestamps",
-            "--language",
-            "en",
+            *whisper_command,
             label="whisper-cli",
         )
 

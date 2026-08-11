@@ -159,7 +159,7 @@ class TestTranscribeVoice:
 
     @pytest.mark.asyncio
     async def test_whisper_args(self, tmp_path):
-        """Verifies whisper-cli is called with model path and --no-timestamps."""
+        """Verifies the common whisper-cli model and output arguments."""
         model = tmp_path / "model.bin"
         model.touch()
 
@@ -178,3 +178,41 @@ class TestTranscribeVoice:
         assert "--model" in whisper_args
         assert str(model) in whisper_args
         assert "--no-timestamps" in whisper_args
+
+    @pytest.mark.asyncio
+    async def test_whisper_disables_gpu_on_macos(self, tmp_path):
+        """macOS service transcription avoids the unreliable Metal path."""
+        model = tmp_path / "model.bin"
+        model.touch()
+        captured_args = []
+
+        async def _mock_exec(*args, **kwargs):
+            captured_args.append(args)
+            return _make_proc(stdout=b"text", returncode=0)
+
+        with (
+            patch("kai.transcribe.sys.platform", "darwin"),
+            patch("asyncio.create_subprocess_exec", side_effect=_mock_exec),
+        ):
+            await transcribe_voice(b"audio", model)
+
+        assert "--no-gpu" in captured_args[1]
+
+    @pytest.mark.asyncio
+    async def test_whisper_leaves_gpu_selection_unchanged_elsewhere(self, tmp_path):
+        """Non-macOS installations retain whisper.cpp's platform default."""
+        model = tmp_path / "model.bin"
+        model.touch()
+        captured_args = []
+
+        async def _mock_exec(*args, **kwargs):
+            captured_args.append(args)
+            return _make_proc(stdout=b"text", returncode=0)
+
+        with (
+            patch("kai.transcribe.sys.platform", "linux"),
+            patch("asyncio.create_subprocess_exec", side_effect=_mock_exec),
+        ):
+            await transcribe_voice(b"audio", model)
+
+        assert "--no-gpu" not in captured_args[1]
