@@ -7,6 +7,7 @@ and parity evidence supports an explicit cutover.
 """
 
 from kai.workshop.authorization import CanonicalChannelAuthorizer
+from kai.workshop.client_api import WorkshopClientAuthenticator, register_workshop_read_routes
 from kai.workshop.domain import (
     AgentId,
     ChannelAgentId,
@@ -65,9 +66,11 @@ __all__ = [
     "TimelineCursorError",
     "TimelineMessage",
     "TimelinePage",
+    "WorkshopClientAuthenticator",
     "WorkshopEventStore",
     "WorkshopEventType",
     "WorkshopId",
     "WorkshopMembershipId",
     "read_channel_timeline",
+    "register_workshop_read_routes",
 ]
