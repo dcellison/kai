@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, TypedDict
 import aiosqlite
 
 from kai.job_types import JOB_TYPE_AGENT, LEGACY_JOB_TYPE_AGENT, normalize_job_type
+from kai.workshop.artifacts import InboundArtifact, record_inbound_artifact
 from kai.workshop.bootstrap import BootstrapHuman, BootstrapResult, bootstrap_default_workshop
 from kai.workshop.inbound import InboundMessage, record_inbound_message
 from kai.workshop.outbound import (
@@ -324,6 +325,19 @@ async def record_workshop_inbound_message(message: InboundMessage) -> AppendResu
     async with _workshop_event_lock:
         store = WorkshopEventStore.from_initialized_connection(_get_db())
         return await record_inbound_message(store, message)
+
+
+async def record_workshop_inbound_artifact(
+    artifact: InboundArtifact,
+    *,
+    storage_root: Path,
+) -> AppendResult:
+    """Serialize one canonical artifact shadow write on Kai's shared database."""
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        store = WorkshopEventStore.from_initialized_connection(_get_db())
+        return await record_inbound_artifact(store, artifact, storage_root=storage_root)
 
 
 async def record_workshop_outbound_message(message: OutboundMessage) -> AppendResult:

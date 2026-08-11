@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from kai import sessions
 from kai.workshop.artifacts import (
     ArtifactMessageNotFoundError,
     ArtifactStorageBoundaryError,
@@ -141,7 +142,6 @@ class TestArtifactShadowRecording:
             )
         finally:
             await store.close()
-
     async def test_duplicate_is_idempotent_across_restart_but_changed_content_conflicts(self, tmp_path: Path):
         db_path = tmp_path / "kai.db"
         storage_root = tmp_path / "files"
@@ -165,6 +165,23 @@ class TestArtifactShadowRecording:
             retry = await record_inbound_artifact(restarted, artifact, storage_root=storage_root)
             assert retry.inserted is False
             assert retry.event == first.event
+
+            resaved = storage_root / "document-replayed.txt"
+            resaved.write_bytes(b"first content")
+            replayed_upload = _artifact(
+                message_id,
+                resaved,
+                kind="document",
+                media_type="text/plain",
+                original_filename="document.txt",
+            )
+            retry_after_resave = await record_inbound_artifact(
+                restarted,
+                replayed_upload,
+                storage_root=storage_root,
+            )
+            assert retry_after_resave.inserted is False
+            assert retry_after_resave.event == first.event
 
             saved.write_bytes(b"changed content")
             with pytest.raises(IdempotencyConflictError):
@@ -204,7 +221,6 @@ class TestArtifactShadowRecording:
                 assert (await cursor.fetchone())[0] == 0
         finally:
             await store.close()
-
     async def test_rejects_missing_outside_and_symlink_escape_paths(self, tmp_path: Path):
         store = await _open_store(tmp_path / "kai.db")
         storage_root = tmp_path / "files"
@@ -258,3 +274,30 @@ class TestArtifactShadowRecording:
             assert tuple(row) == (recorded.event.envelope.aggregate_id, "voice", "audio/ogg")
         finally:
             await store.close()
+
+
+class TestSharedDatabaseArtifactRecording:
+    async def test_records_through_serialized_session_adapter(self, tmp_path: Path):
+        storage_root = tmp_path / "files"
+        storage_root.mkdir()
+        saved = storage_root / "photo.jpg"
+        saved.write_bytes(b"photo")
+        await sessions.init_db(tmp_path / "kai.db")
+        try:
+            await sessions.bootstrap_workshop_foundation(
+                (BootstrapHuman("Alice", "admin", "telegram", "101", "101"),)
+            )
+            inbound = await sessions.record_workshop_inbound_message(
+                InboundMessage("telegram", "9001", "42", "101", "101", "Photo", _NOW)
+            )
+
+            result = await sessions.record_workshop_inbound_artifact(
+                _artifact(MessageId(str(inbound.event.envelope.aggregate_id)), saved),
+                storage_root=storage_root,
+            )
+
+            assert result.inserted is True
+            async with sessions._get_db().execute("SELECT COUNT(*) FROM artifacts") as cursor:
+                assert (await cursor.fetchone())[0] == 1
+        finally:
+            await sessions.close_db()

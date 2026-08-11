@@ -80,6 +80,7 @@ from kai.pool import SubprocessPool
 from kai.telegram_utils import chunk_text
 from kai.transcribe import TranscriptionError, transcribe_voice
 from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
+from kai.workshop.artifacts import InboundArtifact
 from kai.workshop.domain import MessageId
 from kai.workshop.inbound import InboundMessage
 from kai.workshop.outbound import DeliveryObservation, OutboundMessage
@@ -3931,8 +3932,63 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     caption = update.message.caption or "What's in this image?"
     caption += f"\n[File saved to: {saved}]"
+    workshop_inbound_message_id: MessageId | None = None
+    inbound_recorder = context.bot_data.get("workshop_inbound_recorder")
+    if inbound_recorder is not None:
+        try:
+            result = await inbound_recorder(
+                InboundMessage(
+                    transport="telegram",
+                    update_id=str(update.update_id),
+                    message_id=str(update.message.message_id),
+                    sender_subject=str(_user_id(update)),
+                    channel_subject=str(chat_id),
+                    body=caption,
+                    occurred_at=update.message.date,
+                )
+            )
+            aggregate_id = result.event.envelope.aggregate_id
+            if not isinstance(aggregate_id, MessageId):
+                raise RuntimeError("Workshop inbound recorder returned a non-message aggregate")
+            workshop_inbound_message_id = aggregate_id
+        except Exception:
+            log.exception(
+                "Workshop photo message shadow write failed (update_id=%s, message_id=%s)",
+                update.update_id,
+                update.message.message_id,
+            )
+    artifact_recorder = context.bot_data.get("workshop_artifact_recorder")
+    if workshop_inbound_message_id is not None and artifact_recorder is not None:
+        try:
+            await artifact_recorder(
+                InboundArtifact(
+                    message_id=workshop_inbound_message_id,
+                    kind="photo",
+                    media_type="image/jpeg",
+                    storage_path=saved,
+                    source_transport="telegram",
+                    source_unique_id=photo.file_unique_id,
+                    occurred_at=update.message.date,
+                    original_filename=None,
+                ),
+                storage_root=DATA_DIR / "files",
+            )
+        except Exception:
+            log.exception(
+                "Workshop photo artifact shadow write failed (update_id=%s, message_id=%s)",
+                update.update_id,
+                update.message.message_id,
+            )
     # Capture the user LogEntry for transcript provenance threading.
-    user_log = log_message(direction="user", chat_id=chat_id, text=caption, media={"type": "photo"})
+    user_log = log_message(
+        direction="user",
+        chat_id=chat_id,
+        text=caption,
+        media={
+            "type": "photo",
+            "workshop_message_shadowed": workshop_inbound_message_id is not None,
+        },
+    )
     content = [
         {"type": "text", "text": caption},
         {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
@@ -3953,6 +4009,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 pool,
                 model,
                 user_log=user_log,
+                workshop_inbound_message_id=workshop_inbound_message_id,
             )
         finally:
             _clear_responding(chat_id)
@@ -4871,6 +4928,7 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
     app = builder.build()
     app.bot_data["config"] = config
     app.bot_data["workshop_inbound_recorder"] = sessions.record_workshop_inbound_message
+    app.bot_data["workshop_artifact_recorder"] = sessions.record_workshop_inbound_artifact
     app.bot_data["workshop_outbound_recorder"] = sessions.record_workshop_outbound_message
     app.bot_data["workshop_delivery_recorder"] = sessions.record_workshop_delivery_observation
     app.bot_data["pool"] = SubprocessPool(

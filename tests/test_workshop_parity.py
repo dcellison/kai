@@ -25,13 +25,13 @@ def _write_history(history_root: Path, records: list[dict], *, malformed: str | 
     (directory / "2026-08-11.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _record(direction: str, text: str, *, seconds: int) -> dict:
+def _record(direction: str, text: str, *, seconds: int, media: dict | None = None) -> dict:
     return {
         "ts": (_NOW + timedelta(seconds=seconds)).isoformat(),
         "dir": direction,
         "chat_id": 101,
         "text": text,
-        "media": None,
+        "media": media,
     }
 
 
@@ -117,6 +117,35 @@ class TestWorkshopMessageParityStatus:
 
         assert "parity: clean" in status
         assert "JSONL matched=2, JSONL missing=0" in status
+
+    async def test_includes_only_explicitly_shadowed_photo_history(self, tmp_path: Path):
+        db_path = tmp_path / "kai.db"
+        history_root = tmp_path / "history"
+        await _build_conversation(db_path)
+        _write_history(
+            history_root,
+            [
+                _record(
+                    "user",
+                    "Old unshadowed photo",
+                    seconds=-5,
+                    media={"type": "photo"},
+                ),
+                _record("assistant", "Old photo response", seconds=-4),
+                _record(
+                    "user",
+                    "Secret question",
+                    seconds=0,
+                    media={"type": "photo", "workshop_message_shadowed": True},
+                ),
+                _record("assistant", "Secret answer", seconds=2),
+            ],
+        )
+
+        status = workshop_message_parity_status(db_path, history_root)
+
+        assert "parity: clean" in status
+        assert "JSONL matched=2, JSONL missing=0, JSONL unmatched=0" in status
 
     async def test_projection_drift_is_reported_without_leaking_changed_text(self, tmp_path: Path):
         db_path = tmp_path / "kai.db"

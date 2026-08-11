@@ -163,9 +163,10 @@ async def record_inbound_artifact(
     resolved_path = _resolve_storage_path(artifact.storage_path, storage_root)
     byte_size, content_sha256 = _file_identity(resolved_path)
     token = _stable_source_token(artifact)
+    idempotency_key = f"workshop-artifact:v1:{token}"
 
-    result = await store.append(
-        EventEnvelope.create(
+    def create_envelope(storage_path: str) -> EventEnvelope:
+        return EventEnvelope.create(
             event_id=EventId.derived(resolved_message.workshop_id, f"artifact-event:{token}"),
             event_type=WorkshopEventType.ARTIFACT_CREATED,
             event_version=1,
@@ -174,7 +175,7 @@ async def record_inbound_artifact(
             aggregate_id=ArtifactId.derived(resolved_message.workshop_id, f"artifact:{token}"),
             actor_principal_id=resolved_message.created_by_principal_id,
             occurred_at=artifact.occurred_at,
-            idempotency_key=f"workshop-artifact:v1:{token}",
+            idempotency_key=idempotency_key,
             payload={
                 "channel_id": resolved_message.channel_id,
                 "message_id": artifact.message_id,
@@ -184,12 +185,25 @@ async def record_inbound_artifact(
                 "byte_size": byte_size,
                 "content_sha256": content_sha256,
                 "original_filename": artifact.original_filename,
-                "storage_path": str(resolved_path),
+                "storage_path": storage_path,
                 "source_transport": artifact.source_transport,
                 "source_unique_id": artifact.source_unique_id,
             },
             metadata={"source": "artifact_shadow"},
         )
-    )
+
+    envelope = create_envelope(str(resolved_path))
+    existing = await store.event_by_idempotency_key(idempotency_key)
+    if existing is not None:
+        existing_path = existing.envelope.payload.get("storage_path")
+        if isinstance(existing_path, str) and create_envelope(existing_path).content_hash == existing.envelope.content_hash:
+            result = AppendResult(event=existing, inserted=False)
+        else:
+            # Preserve the event store's uniform conflict behavior and error
+            # type for retries that differ in any semantic property other
+            # than the timestamped compatibility storage path.
+            result = await store.append(envelope)
+    else:
+        result = await store.append(envelope)
     await store.project_pending(CanonicalConversationProjection())
     return result

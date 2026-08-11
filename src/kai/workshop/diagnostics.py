@@ -375,9 +375,14 @@ def _read_legacy_keys(history_root: Path, external_channel_id: str) -> tuple[lis
             if str(chat_id) != external_channel_id:
                 continue
             if direction == "user":
-                is_shadowed_text = record.get("media") is None
-                pending_user_turns.append(is_shadowed_text)
-                if is_shadowed_text:
+                media = record.get("media")
+                is_shadowed_message = media is None or (
+                    isinstance(media, dict)
+                    and media.get("type") == "photo"
+                    and media.get("workshop_message_shadowed") is True
+                )
+                pending_user_turns.append(is_shadowed_message)
+                if is_shadowed_message:
                     keys.append((direction, hashlib.sha256(text.encode("utf-8")).hexdigest()))
                 continue
             if text.startswith(_SCHEDULED_ASSISTANT_PREFIXES):
