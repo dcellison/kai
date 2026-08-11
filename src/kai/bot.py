@@ -58,6 +58,7 @@ from telegram.ext import (
 )
 
 from kai import github_api, memory_command, review, services, sessions, webhook
+from kai.agent_failure import render_agent_failure
 from kai.backend import require_backend_name, resolve_home_workspace
 from kai.config import (
     DATA_DIR,
@@ -4576,9 +4577,9 @@ async def _handle_response(
         # suspenders against a future change that re-introduces None,
         # so the literal "Error: None" string can't reappear via this
         # surface even on a regression.
-        real_error = final_response.error or "no error detail provided"
-        error_text = f"Error: {real_error}"
-        log_message(direction="assistant", chat_id=chat_id, text=f"[error: {real_error}]")
+        error_text = render_agent_failure(final_response.failure_kind, final_response.error, config, chat_id)
+        visible_error = error_text.removeprefix("Error: ")
+        log_message(direction="assistant", chat_id=chat_id, text=f"[error: {visible_error}]")
         # Send the error notice as a NEW message (not an edit of the
         # live streamed message), so any tool-use, partial reasoning,
         # and intermediate output the user was watching stays visible.

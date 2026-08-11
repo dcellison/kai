@@ -23,6 +23,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from kai.agent_failure import AgentFailureKind, classify_agent_failure
 from kai.config import (
     DATA_DIR,
     PROJECT_ROOT,
@@ -176,6 +177,8 @@ class AgentResponse:
         session_id: Session identifier (used for session continuity).
         duration_ms: Wall-clock duration of the interaction in milliseconds.
         error: Error message if success is False, None otherwise.
+        failure_kind: Stable backend-neutral failure category. Automatically
+            derived from ``error`` when omitted on an unsuccessful response.
     """
 
     success: bool
@@ -183,6 +186,13 @@ class AgentResponse:
     session_id: str | None = None
     duration_ms: int = 0
     error: str | None = None
+    failure_kind: AgentFailureKind | None = None
+
+    def __post_init__(self) -> None:
+        if self.success:
+            self.failure_kind = None
+        elif self.failure_kind is None:
+            self.failure_kind = classify_agent_failure(self.error)
 
 
 @dataclass

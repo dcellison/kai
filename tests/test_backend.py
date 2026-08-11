@@ -13,6 +13,7 @@ import stat
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from kai.agent_failure import AgentFailureKind
 from kai.backend import (
     AgentResponse,
     ApiContext,
@@ -1099,6 +1100,27 @@ class TestDataTypes:
         assert resp.session_id is None
         assert resp.duration_ms == 0
         assert resp.error is None
+        assert resp.failure_kind is None
+
+    def test_failed_agent_response_classifies_native_backend_errors(self):
+        """All five harness families feed the same portable failure contract."""
+        cases = {
+            "Failed to authenticate: OAuth session expired and could not be refreshed": (
+                AgentFailureKind.AUTHENTICATION_EXPIRED
+            ),
+            "Codex auth failed": AgentFailureKind.AUTHENTICATION_REQUIRED,
+            "Error: no credentials configured for provider anthropic": AgentFailureKind.AUTHENTICATION_REQUIRED,
+            "Provider unavailable while starting opencode": AgentFailureKind.PROVIDER_UNAVAILABLE,
+            "You have no credits remaining. Add credits to continue using the API": AgentFailureKind.QUOTA_EXHAUSTED,
+        }
+
+        for error, expected in cases.items():
+            response = AgentResponse(success=False, text="", error=error)
+            assert response.failure_kind is expected
+
+    def test_unknown_agent_failure_remains_unknown(self):
+        response = AgentResponse(success=False, text="", error="unrecognized harness failure 8675309")
+        assert response.failure_kind is AgentFailureKind.UNKNOWN
 
     def test_stream_event_defaults(self):
         """StreamEvent has sensible defaults."""

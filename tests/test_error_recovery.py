@@ -226,8 +226,14 @@ class TestErrorMessageLifecycle:
         update.effective_chat.id = 12345
         return update, live_msg
 
-    def _make_context(self):
-        from kai.config import Config
+    def _make_context(
+        self,
+        *,
+        backend: str = "codex",
+        provider: str = "openai",
+        codex_auth_mode: str = "subscription",
+    ):
+        from kai.config import Config, UserConfig
 
         ctx = MagicMock()
         ctx.bot_data = {
@@ -235,6 +241,18 @@ class TestErrorMessageLifecycle:
                 telegram_bot_token="t",
                 allowed_user_ids={1},
                 tts_enabled=False,  # voice-mode lookup is skipped
+                default_backend=backend,
+                default_provider=provider,
+                codex_auth_mode=codex_auth_mode,
+                user_configs={
+                    12345: UserConfig(
+                        telegram_id=12345,
+                        name="Daniel",
+                        os_user="daniel",
+                        backend=backend,
+                        provider=provider,
+                    )
+                },
             ),
         }
         ctx.bot.send_chat_action = AsyncMock()
@@ -320,7 +338,74 @@ class TestErrorMessageLifecycle:
 
         error_calls = self._error_path_calls(mock_reply_safe)
         assert len(error_calls) == 1
-        assert error_calls[0].args[1] == "Error: Authentication failed"
+        assert error_calls[0].args[1] == (
+            "Error: Authentication for Codex is required. Kai did not complete this request.\n\n"
+            "Run `codex login` as OS user daniel on the Kai host, then retry."
+        )
+
+    @pytest.mark.asyncio
+    async def test_expired_auth_error_is_sanitized_and_actionable(self):
+        """Native OAuth detail is classified but not echoed into Telegram."""
+        update, _live_msg = self._make_update_with_live_msg()
+        ctx = self._make_context()
+        native_error = "Failed to authenticate: OAuth session expired and could not be refreshed"
+        pool = self._make_pool_text_then_error(native_error)
+
+        with (
+            patch("kai.bot.log_message"),
+            patch("kai.bot.sessions"),
+            patch("kai.bot._edit_message_safe", new_callable=AsyncMock),
+            patch("kai.bot._reply_safe", new_callable=AsyncMock) as mock_reply_safe,
+        ):
+            await bot._handle_response(update, ctx, chat_id=12345, prompt="hi", pool=pool, model="gpt-5.6-sol")
+
+        error_calls = self._error_path_calls(mock_reply_safe)
+        assert len(error_calls) == 1
+        rendered = error_calls[0].args[1]
+        assert "Authentication for Codex has expired" in rendered
+        assert "codex login" in rendered
+        assert "daniel" in rendered
+        assert native_error not in rendered
+
+    @pytest.mark.asyncio
+    async def test_expired_claude_subscription_directs_user_to_sign_in(self):
+        update, _live_msg = self._make_update_with_live_msg()
+        ctx = self._make_context(backend="claude", provider="anthropic")
+        pool = self._make_pool_text_then_error(
+            "Failed to authenticate: OAuth session expired and could not be refreshed"
+        )
+
+        with (
+            patch("kai.bot.log_message"),
+            patch("kai.bot.sessions"),
+            patch("kai.bot._edit_message_safe", new_callable=AsyncMock),
+            patch("kai.bot._reply_safe", new_callable=AsyncMock) as mock_reply_safe,
+        ):
+            await bot._handle_response(update, ctx, chat_id=12345, prompt="hi", pool=pool, model="sonnet")
+
+        rendered = self._error_path_calls(mock_reply_safe)[0].args[1]
+        assert "Authentication for Claude Code has expired" in rendered
+        assert "Open Claude Code as OS user daniel" in rendered
+        assert "sign in again" in rendered
+        assert "codex login" not in rendered
+
+    @pytest.mark.asyncio
+    async def test_codex_api_key_mode_does_not_recommend_subscription_login(self):
+        update, _live_msg = self._make_update_with_live_msg()
+        ctx = self._make_context(codex_auth_mode="api_key")
+        pool = self._make_pool_text_then_error("Codex auth failed")
+
+        with (
+            patch("kai.bot.log_message"),
+            patch("kai.bot.sessions"),
+            patch("kai.bot._edit_message_safe", new_callable=AsyncMock),
+            patch("kai.bot._reply_safe", new_callable=AsyncMock) as mock_reply_safe,
+        ):
+            await bot._handle_response(update, ctx, chat_id=12345, prompt="hi", pool=pool, model="gpt-5.6-sol")
+
+        rendered = self._error_path_calls(mock_reply_safe)[0].args[1]
+        assert "OpenAI API credentials" in rendered
+        assert "codex login" not in rendered
 
     @pytest.mark.asyncio
     async def test_no_error_none_literal_in_user_facing_output(self):
