@@ -4077,6 +4077,29 @@ _IMAGE_MEDIA_TYPES = {
     ".gif": "image/gif",
     ".webp": "image/webp",
 }
+_DOCUMENT_MEDIA_TYPE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$")
+
+
+def _canonical_document_media_type(file_name: str, claimed_media_type: str | None) -> str:
+    """Return stable artifact MIME metadata without trusting malformed input."""
+    suffix = Path(file_name).suffix.lower()
+    if suffix in _IMAGE_MEDIA_TYPES:
+        return _IMAGE_MEDIA_TYPES[suffix]
+    if isinstance(claimed_media_type, str):
+        normalized = claimed_media_type.split(";", 1)[0].strip().lower()
+        if _DOCUMENT_MEDIA_TYPE_PATTERN.fullmatch(normalized):
+            return normalized
+    if suffix in _TEXT_EXTENSIONS:
+        return "text/plain"
+    return "application/octet-stream"
+
+
+def _canonical_document_filename(file_name: str) -> str | None:
+    """Return a bounded cross-platform basename for artifact provenance."""
+    filename = Path(file_name.replace("\\", "/")).name.strip()
+    if not filename or filename in {".", ".."} or len(filename) > 255 or "\0" in filename:
+        return None
+    return filename
 
 
 @_require_auth
@@ -4106,6 +4129,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     pool = _get_pool(context)
     model = pool.get_model(chat_id)
     reader_user = _upload_reader_user(context, chat_id)
+    artifact_media_type = _canonical_document_media_type(file_name, doc.mime_type)
 
     if suffix in _IMAGE_MEDIA_TYPES:
         # Handle images sent as documents (uncompressed upload)
@@ -4125,12 +4149,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         img_caption = caption or f"What's in this image ({file_name})?"
         img_caption += f"\n[File saved to: {saved}]"
 
-        user_log = log_message(
-            direction="user",
-            chat_id=chat_id,
-            text=caption or file_name,
-            media={"type": "document", "filename": file_name},
-        )
+        history_text = caption or file_name
         content = [
             {"type": "text", "text": img_caption},
             {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
@@ -4155,12 +4174,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         header = f"File: {file_name}\n```\n{text_content}\n```\n[File saved to: {saved}]"
 
-        user_log = log_message(
-            direction="user",
-            chat_id=chat_id,
-            text=caption or f"[file: {file_name}]",
-            media={"type": "document", "filename": file_name},
-        )
+        history_text = caption or f"[file: {file_name}]"
         if caption:
             content = f"{caption}\n\n{header}"
         else:
@@ -4177,13 +4191,66 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await update.message.reply_text(f"Couldn't save the upload for agent access: {exc}")
             return
 
-        user_log = log_message(
-            direction="user",
-            chat_id=chat_id,
-            text=caption or f"[file: {file_name}]",
-            media={"type": "document", "filename": file_name},
-        )
+        history_text = caption or f"[file: {file_name}]"
         content = (caption or f"File received: {file_name}") + f"\n[File saved to: {saved}]"
+
+    workshop_inbound_message_id: MessageId | None = None
+    inbound_recorder = context.bot_data.get("workshop_inbound_recorder")
+    if inbound_recorder is not None:
+        try:
+            result = await inbound_recorder(
+                InboundMessage(
+                    transport="telegram",
+                    update_id=str(update.update_id),
+                    message_id=str(update.message.message_id),
+                    sender_subject=str(_user_id(update)),
+                    channel_subject=str(chat_id),
+                    body=history_text,
+                    occurred_at=update.message.date,
+                )
+            )
+            aggregate_id = result.event.envelope.aggregate_id
+            if not isinstance(aggregate_id, MessageId):
+                raise RuntimeError("Workshop inbound recorder returned a non-message aggregate")
+            workshop_inbound_message_id = aggregate_id
+        except Exception:
+            log.exception(
+                "Workshop document message shadow write failed (update_id=%s, message_id=%s)",
+                update.update_id,
+                update.message.message_id,
+            )
+    artifact_recorder = context.bot_data.get("workshop_artifact_recorder")
+    if workshop_inbound_message_id is not None and artifact_recorder is not None:
+        try:
+            await artifact_recorder(
+                InboundArtifact(
+                    message_id=workshop_inbound_message_id,
+                    kind="document",
+                    media_type=artifact_media_type,
+                    storage_path=saved,
+                    source_transport="telegram",
+                    source_unique_id=doc.file_unique_id,
+                    occurred_at=update.message.date,
+                    original_filename=_canonical_document_filename(file_name),
+                ),
+                storage_root=DATA_DIR / "files",
+            )
+        except Exception:
+            log.exception(
+                "Workshop document artifact shadow write failed (update_id=%s, message_id=%s)",
+                update.update_id,
+                update.message.message_id,
+            )
+    user_log = log_message(
+        direction="user",
+        chat_id=chat_id,
+        text=history_text,
+        media={
+            "type": "document",
+            "filename": file_name,
+            "workshop_message_shadowed": workshop_inbound_message_id is not None,
+        },
+    )
 
     was_queued = await _notify_if_queued(update, chat_id)
     lock = await _acquire_lock_or_kill(chat_id, pool, update)
@@ -4200,6 +4267,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 pool,
                 model,
                 user_log=user_log,
+                workshop_inbound_message_id=workshop_inbound_message_id,
             )
         finally:
             _clear_responding(chat_id)

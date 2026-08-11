@@ -3073,8 +3073,180 @@ class TestHandleDocument:
         update.message.document = MagicMock()
         update.message.document.file_name = file_name
         update.message.document.file_id = "doc_file_id"
+        update.message.document.file_unique_id = "stable-document-id"
         update.message.document.mime_type = mime_type
         return data
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("file_name", "mime_type", "data", "expected_body", "expected_media_type", "expected_filename"),
+        (
+            ("logo.png", "application/octet-stream", b"png-data", "logo.png", "image/png", "logo.png"),
+            (
+                "script.py",
+                "Text/X-Python; charset=UTF-8",
+                b"print('hi')",
+                "[file: script.py]",
+                "text/x-python",
+                "script.py",
+            ),
+            (
+                "archive.zip",
+                "not a mime type",
+                b"PK...",
+                "[file: archive.zip]",
+                "application/octet-stream",
+                "archive.zip",
+            ),
+            (
+                "folder\\report.pdf",
+                "application/pdf",
+                b"pdf-data",
+                "[file: folder\\report.pdf]",
+                "application/pdf",
+                "report.pdf",
+            ),
+        ),
+    )
+    async def test_records_authenticated_document_message_and_artifact(
+        self,
+        tmp_path,
+        file_name,
+        mime_type,
+        data,
+        expected_body,
+        expected_media_type,
+        expected_filename,
+    ):
+        update = _make_update(chat_id=1, user_id=1)
+        self._setup_doc(update, file_name, mime_type, data)
+        saved = (tmp_path / "files" / "1" / "saved-document").resolve()
+        saved.parent.mkdir(parents=True)
+        saved.write_bytes(data)
+        mock_file = MagicMock()
+        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(data))
+        ctx = _make_context(config=_make_config(allowed_user_ids={1}))
+        ctx.bot.get_file = AsyncMock(return_value=mock_file)
+        inbound = AsyncMock()
+        inbound_id = MessageId("msg_00000000000000000000000000000001")
+        inbound.return_value.event.envelope.aggregate_id = inbound_id
+        artifact = AsyncMock()
+        ctx.bot_data["workshop_inbound_recorder"] = inbound
+        ctx.bot_data["workshop_artifact_recorder"] = artifact
+
+        with (
+            patch("kai.bot.DATA_DIR", tmp_path),
+            patch("kai.bot._save_upload", return_value=saved),
+            patch("kai.bot._handle_response", new_callable=AsyncMock) as response,
+            patch("kai.bot.log_message") as history,
+            patch("kai.bot._set_responding"),
+            patch("kai.bot._clear_responding"),
+            patch("kai.bot.get_lock", return_value=_fake_lock()),
+        ):
+            await handle_document(update, ctx)
+
+        inbound.assert_awaited_once_with(
+            InboundMessage(
+                transport="telegram",
+                update_id="9001",
+                message_id="42",
+                sender_subject="1",
+                channel_subject="1",
+                body=expected_body,
+                occurred_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
+            )
+        )
+        artifact.assert_awaited_once_with(
+            InboundArtifact(
+                message_id=inbound_id,
+                kind="document",
+                media_type=expected_media_type,
+                storage_path=saved,
+                source_transport="telegram",
+                source_unique_id="stable-document-id",
+                occurred_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
+                original_filename=expected_filename,
+            ),
+            storage_root=tmp_path / "files",
+        )
+        history.assert_called_once_with(
+            direction="user",
+            chat_id=1,
+            text=expected_body,
+            media={
+                "type": "document",
+                "filename": file_name,
+                "workshop_message_shadowed": True,
+            },
+        )
+        assert response.await_args.kwargs["workshop_inbound_message_id"] == inbound_id
+
+    @pytest.mark.asyncio
+    async def test_inbound_shadow_failure_skips_artifact_and_preserves_response(self, tmp_path, caplog):
+        update = _make_update(chat_id=1, user_id=1)
+        self._setup_doc(update, "report.txt", "text/plain", b"report")
+        saved = (tmp_path / "files" / "1" / "report.txt").resolve()
+        saved.parent.mkdir(parents=True)
+        saved.write_bytes(b"report")
+        mock_file = MagicMock()
+        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"report"))
+        ctx = _make_context(config=_make_config(allowed_user_ids={1}))
+        ctx.bot.get_file = AsyncMock(return_value=mock_file)
+        ctx.bot_data["workshop_inbound_recorder"] = AsyncMock(side_effect=RuntimeError("shadow failed"))
+        artifact = AsyncMock()
+        ctx.bot_data["workshop_artifact_recorder"] = artifact
+
+        with (
+            patch("kai.bot.DATA_DIR", tmp_path),
+            patch("kai.bot._save_upload", return_value=saved),
+            patch("kai.bot._handle_response", new_callable=AsyncMock) as response,
+            patch("kai.bot.log_message") as history,
+            patch("kai.bot._set_responding"),
+            patch("kai.bot._clear_responding"),
+            patch("kai.bot.get_lock", return_value=_fake_lock()),
+            caplog.at_level(logging.ERROR),
+        ):
+            await handle_document(update, ctx)
+
+        artifact.assert_not_awaited()
+        response.assert_awaited_once()
+        assert response.await_args.kwargs["workshop_inbound_message_id"] is None
+        assert history.call_args.kwargs["media"]["workshop_message_shadowed"] is False
+        assert "Workshop document message shadow write failed" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_artifact_shadow_failure_preserves_message_and_response(self, tmp_path, caplog):
+        update = _make_update(chat_id=1, user_id=1)
+        self._setup_doc(update, "report.txt", "text/plain", b"report")
+        saved = (tmp_path / "files" / "1" / "report.txt").resolve()
+        saved.parent.mkdir(parents=True)
+        saved.write_bytes(b"report")
+        mock_file = MagicMock()
+        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"report"))
+        ctx = _make_context(config=_make_config(allowed_user_ids={1}))
+        ctx.bot.get_file = AsyncMock(return_value=mock_file)
+        inbound = AsyncMock()
+        inbound_id = MessageId("msg_00000000000000000000000000000001")
+        inbound.return_value.event.envelope.aggregate_id = inbound_id
+        ctx.bot_data["workshop_inbound_recorder"] = inbound
+        ctx.bot_data["workshop_artifact_recorder"] = AsyncMock(side_effect=RuntimeError("artifact failed"))
+
+        with (
+            patch("kai.bot.DATA_DIR", tmp_path),
+            patch("kai.bot._save_upload", return_value=saved),
+            patch("kai.bot._handle_response", new_callable=AsyncMock) as response,
+            patch("kai.bot.log_message") as history,
+            patch("kai.bot._set_responding"),
+            patch("kai.bot._clear_responding"),
+            patch("kai.bot.get_lock", return_value=_fake_lock()),
+            caplog.at_level(logging.ERROR),
+        ):
+            await handle_document(update, ctx)
+
+        response.assert_awaited_once()
+        assert response.await_args.kwargs["workshop_inbound_message_id"] == inbound_id
+        assert history.call_args.kwargs["media"]["workshop_message_shadowed"] is True
+        assert "Workshop document artifact shadow write failed" in caplog.text
 
     @pytest.mark.asyncio
     async def test_image_document(self, tmp_path):
