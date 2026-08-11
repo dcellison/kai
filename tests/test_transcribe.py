@@ -6,6 +6,7 @@ timeout, stderr truncation) and the transcribe_voice() pipeline (model
 validation, full pipeline with mocked subprocesses).
 """
 
+import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -15,11 +16,12 @@ from kai.transcribe import TranscriptionError, _run, transcribe_voice
 # ── Test helpers ─────────────────────────────────────────────────────
 
 
-def _make_proc(stdout=b"", stderr=b"", returncode=0):
+def _make_proc(stdout=b"", stderr=b"", returncode=0, pid=1234):
     """Create a mock subprocess with controllable communicate() output."""
     proc = MagicMock()
     proc.communicate = AsyncMock(return_value=(stdout, stderr))
     proc.returncode = returncode
+    proc.pid = pid
     proc.kill = MagicMock()
     proc.wait = AsyncMock()
     return proc
@@ -98,6 +100,56 @@ class TestRun:
         snippet = msg.split(": ", 1)[1] if ": " in msg else msg
         assert len(snippet) <= 200
 
+    @pytest.mark.asyncio
+    async def test_macos_whisper_is_removed_from_background_scheduling(self):
+        """Whisper alone escapes the LaunchDaemon's inherited background policy."""
+        whisper_proc = _make_proc(stdout=b"hello\n", pid=4321)
+        policy_proc = _make_proc()
+
+        with (
+            patch("kai.transcribe.sys.platform", "darwin"),
+            patch(
+                "asyncio.create_subprocess_exec",
+                new_callable=AsyncMock,
+                side_effect=[whisper_proc, policy_proc],
+            ) as exec_mock,
+        ):
+            result = await _run("whisper-cli", "--no-gpu", label="whisper-cli")
+
+        assert result == "hello\n"
+        assert exec_mock.await_args_list[1].args == (
+            "/usr/sbin/taskpolicy",
+            "-B",
+            "-p",
+            "4321",
+        )
+
+    @pytest.mark.asyncio
+    async def test_macos_non_whisper_process_keeps_background_scheduling(self):
+        """The scheduling exception is not applied to unrelated subprocesses."""
+        proc = _make_proc()
+
+        with (
+            patch("kai.transcribe.sys.platform", "darwin"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=proc) as exec_mock,
+        ):
+            await _run("ffmpeg", label="ffmpeg")
+
+        exec_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_non_macos_whisper_keeps_platform_scheduling(self):
+        """Other platforms do not invoke the macOS scheduling utility."""
+        proc = _make_proc()
+
+        with (
+            patch("kai.transcribe.sys.platform", "linux"),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=proc) as exec_mock,
+        ):
+            await _run("whisper-cli", label="whisper-cli")
+
+        exec_mock.assert_awaited_once()
+
 
 # ── transcribe_voice() ───────────────────────────────────────────────
 
@@ -132,7 +184,7 @@ class TestTranscribeVoice:
             result = await transcribe_voice(b"fake-audio", model)
 
         assert result == "Hello world"
-        assert call_count == 2
+        assert call_count == (3 if sys.platform == "darwin" else 2)
 
     @pytest.mark.asyncio
     async def test_ffmpeg_args(self, tmp_path):

@@ -23,6 +23,9 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+_MACOS_TASKPOLICY = "/usr/sbin/taskpolicy"
+_TASKPOLICY_TIMEOUT_SECONDS = 5
+
 
 class TranscriptionError(Exception):
     """
@@ -140,6 +143,9 @@ async def _run(*cmd: str, label: str) -> str:
             f"{label} not found. Install with: brew install {'whisper-cpp' if 'whisper' in label else label}"
         ) from None
 
+    if label == "whisper-cli" and sys.platform == "darwin":
+        await _remove_macos_background_policy(proc.pid)
+
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
     except TimeoutError:
@@ -152,3 +158,35 @@ async def _run(*cmd: str, label: str) -> str:
         raise TranscriptionError(f"{label} failed (exit {proc.returncode}): {err}")
 
     return stdout.decode()
+
+
+async def _remove_macos_background_policy(pid: int) -> None:
+    """Remove launchd's inherited background scheduling from Whisper only."""
+    try:
+        policy_proc = await asyncio.create_subprocess_exec(
+            _MACOS_TASKPOLICY,
+            "-B",
+            "-p",
+            str(pid),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        log.warning("Could not adjust Whisper scheduling: %s is missing", _MACOS_TASKPOLICY)
+        return
+
+    try:
+        _, stderr = await asyncio.wait_for(policy_proc.communicate(), timeout=_TASKPOLICY_TIMEOUT_SECONDS)
+    except TimeoutError:
+        policy_proc.kill()
+        await policy_proc.wait()
+        log.warning("Could not adjust Whisper scheduling: taskpolicy timed out")
+        return
+
+    if policy_proc.returncode != 0:
+        detail = stderr.decode(errors="replace").strip()[:200]
+        log.warning(
+            "Could not adjust Whisper scheduling: taskpolicy exited %d%s",
+            policy_proc.returncode,
+            f": {detail}" if detail else "",
+        )
