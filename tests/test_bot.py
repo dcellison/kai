@@ -3354,6 +3354,199 @@ class TestHandleDocument:
 
 class TestHandleVoice:
     @pytest.mark.asyncio
+    async def test_records_authenticated_voice_message_and_artifact(self, tmp_path):
+        model_file = tmp_path / "model.bin"
+        model_file.touch()
+        update = _make_update(chat_id=1, user_id=1)
+        voice = MagicMock(
+            file_id="voice-download-capability",
+            file_unique_id="stable-voice-id",
+            duration=5,
+        )
+        update.message.voice = voice
+        mock_file = MagicMock()
+        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"audio-data"))
+        saved = (tmp_path / "files" / "1" / "saved.oga").resolve()
+        saved.parent.mkdir(parents=True)
+        saved.write_bytes(b"audio-data")
+        ctx = _make_context(
+            config=_make_config(allowed_user_ids={1}, voice_enabled=True, whisper_model_path=model_file)
+        )
+        ctx.bot.get_file = AsyncMock(return_value=mock_file)
+        inbound = AsyncMock()
+        inbound_id = MessageId("msg_00000000000000000000000000000001")
+        inbound.return_value.event.envelope.aggregate_id = inbound_id
+        artifact = AsyncMock()
+        ctx.bot_data["workshop_inbound_recorder"] = inbound
+        ctx.bot_data["workshop_artifact_recorder"] = artifact
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/tool"),
+            patch("kai.bot.DATA_DIR", tmp_path),
+            patch("kai.bot.transcribe_voice", new_callable=AsyncMock, return_value="Hello there"),
+            patch("kai.bot._save_upload", return_value=saved) as save_upload,
+            patch("kai.bot.log_message") as history,
+            patch("kai.bot._handle_response", new_callable=AsyncMock) as response,
+            patch("kai.bot._set_responding"),
+            patch("kai.bot._clear_responding"),
+            patch("kai.bot.get_lock", return_value=_fake_lock()),
+        ):
+            await handle_voice(update, ctx)
+
+        inbound.assert_awaited_once_with(
+            InboundMessage(
+                transport="telegram",
+                update_id="9001",
+                message_id="42",
+                sender_subject="1",
+                channel_subject="1",
+                body="Hello there",
+                occurred_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
+            )
+        )
+        save_upload.assert_called_once_with(b"audio-data", "voice.oga", user_id=1)
+        artifact.assert_awaited_once_with(
+            InboundArtifact(
+                message_id=inbound_id,
+                kind="voice",
+                media_type="audio/ogg",
+                storage_path=saved,
+                source_transport="telegram",
+                source_unique_id="stable-voice-id",
+                occurred_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
+                original_filename=None,
+            ),
+            storage_root=tmp_path / "files",
+        )
+        history.assert_called_once_with(
+            direction="user",
+            chat_id=1,
+            text="Hello there",
+            media={"type": "voice", "duration": 5, "workshop_message_shadowed": True},
+            reader_user=None,
+        )
+        assert response.await_args.args[3] == "[Voice message transcription]: Hello there"
+        assert response.await_args.kwargs["workshop_inbound_message_id"] == inbound_id
+
+    @pytest.mark.asyncio
+    async def test_inbound_shadow_failure_skips_voice_artifact_and_preserves_response(self, tmp_path, caplog):
+        model_file = tmp_path / "model.bin"
+        model_file.touch()
+        update = _make_update(chat_id=1, user_id=1)
+        update.message.voice = MagicMock(file_id="v1", file_unique_id="stable-voice-id", duration=5)
+        mock_file = MagicMock()
+        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"audio-data"))
+        ctx = _make_context(
+            config=_make_config(allowed_user_ids={1}, voice_enabled=True, whisper_model_path=model_file)
+        )
+        ctx.bot.get_file = AsyncMock(return_value=mock_file)
+        ctx.bot_data["workshop_inbound_recorder"] = AsyncMock(side_effect=RuntimeError("shadow failed"))
+        artifact = AsyncMock()
+        ctx.bot_data["workshop_artifact_recorder"] = artifact
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/tool"),
+            patch("kai.bot.transcribe_voice", new_callable=AsyncMock, return_value="Hello there"),
+            patch("kai.bot._save_upload") as save_upload,
+            patch("kai.bot.log_message") as history,
+            patch("kai.bot._handle_response", new_callable=AsyncMock) as response,
+            patch("kai.bot._set_responding"),
+            patch("kai.bot._clear_responding"),
+            patch("kai.bot.get_lock", return_value=_fake_lock()),
+            caplog.at_level(logging.ERROR),
+        ):
+            await handle_voice(update, ctx)
+
+        save_upload.assert_not_called()
+        artifact.assert_not_awaited()
+        response.assert_awaited_once()
+        assert response.await_args.kwargs["workshop_inbound_message_id"] is None
+        assert history.call_args.kwargs["media"] == {
+            "type": "voice",
+            "duration": 5,
+            "workshop_message_shadowed": False,
+        }
+        assert "Workshop voice message shadow write failed" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_voice_artifact_failure_preserves_message_and_response(self, tmp_path, caplog):
+        model_file = tmp_path / "model.bin"
+        model_file.touch()
+        update = _make_update(chat_id=1, user_id=1)
+        update.message.voice = MagicMock(file_id="v1", file_unique_id="stable-voice-id", duration=5)
+        mock_file = MagicMock()
+        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"audio-data"))
+        saved = (tmp_path / "files" / "1" / "saved.oga").resolve()
+        saved.parent.mkdir(parents=True)
+        saved.write_bytes(b"audio-data")
+        ctx = _make_context(
+            config=_make_config(allowed_user_ids={1}, voice_enabled=True, whisper_model_path=model_file)
+        )
+        ctx.bot.get_file = AsyncMock(return_value=mock_file)
+        inbound = AsyncMock()
+        inbound_id = MessageId("msg_00000000000000000000000000000001")
+        inbound.return_value.event.envelope.aggregate_id = inbound_id
+        ctx.bot_data["workshop_inbound_recorder"] = inbound
+        ctx.bot_data["workshop_artifact_recorder"] = AsyncMock(side_effect=RuntimeError("artifact failed"))
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/tool"),
+            patch("kai.bot.DATA_DIR", tmp_path),
+            patch("kai.bot.transcribe_voice", new_callable=AsyncMock, return_value="Hello there"),
+            patch("kai.bot._save_upload", return_value=saved),
+            patch("kai.bot.log_message") as history,
+            patch("kai.bot._handle_response", new_callable=AsyncMock) as response,
+            patch("kai.bot._set_responding"),
+            patch("kai.bot._clear_responding"),
+            patch("kai.bot.get_lock", return_value=_fake_lock()),
+            caplog.at_level(logging.ERROR),
+        ):
+            await handle_voice(update, ctx)
+
+        response.assert_awaited_once()
+        assert response.await_args.kwargs["workshop_inbound_message_id"] == inbound_id
+        assert history.call_args.kwargs["media"]["workshop_message_shadowed"] is True
+        assert "Workshop voice artifact shadow write failed" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_voice_artifact_save_failure_preserves_message_and_response(self, tmp_path, caplog):
+        model_file = tmp_path / "model.bin"
+        model_file.touch()
+        update = _make_update(chat_id=1, user_id=1)
+        update.message.voice = MagicMock(file_id="v1", file_unique_id="stable-voice-id", duration=5)
+        mock_file = MagicMock()
+        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"audio-data"))
+        ctx = _make_context(
+            config=_make_config(allowed_user_ids={1}, voice_enabled=True, whisper_model_path=model_file)
+        )
+        ctx.bot.get_file = AsyncMock(return_value=mock_file)
+        inbound = AsyncMock()
+        inbound_id = MessageId("msg_00000000000000000000000000000001")
+        inbound.return_value.event.envelope.aggregate_id = inbound_id
+        artifact = AsyncMock()
+        ctx.bot_data["workshop_inbound_recorder"] = inbound
+        ctx.bot_data["workshop_artifact_recorder"] = artifact
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/tool"),
+            patch("kai.bot.transcribe_voice", new_callable=AsyncMock, return_value="Hello there"),
+            patch("kai.bot._save_upload", side_effect=OSError("storage unavailable")),
+            patch("kai.bot.log_message") as history,
+            patch("kai.bot._handle_response", new_callable=AsyncMock) as response,
+            patch("kai.bot._set_responding"),
+            patch("kai.bot._clear_responding"),
+            patch("kai.bot.get_lock", return_value=_fake_lock()),
+            caplog.at_level(logging.ERROR),
+        ):
+            await handle_voice(update, ctx)
+
+        artifact.assert_not_awaited()
+        response.assert_awaited_once()
+        assert response.await_args.kwargs["workshop_inbound_message_id"] == inbound_id
+        assert history.call_args.kwargs["media"]["workshop_message_shadowed"] is True
+        assert "Workshop voice artifact shadow write failed" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_voice_not_enabled(self):
         update = _make_update()
         update.message.voice = MagicMock()
@@ -3427,7 +3620,7 @@ class TestHandleVoice:
 
     @pytest.mark.asyncio
     async def test_successful_transcription(self, tmp_path):
-        """Echoes transcript, then sends to Claude."""
+        """Echoes transcript, then sends it to the configured agent."""
         model_file = tmp_path / "model.bin"
         model_file.touch()
         update = _make_update()
@@ -3455,7 +3648,7 @@ class TestHandleVoice:
         # Echo the transcript
         echo_call = update.message.reply_text.call_args
         assert "Hello there" in echo_call[0][0]
-        # Then send to Claude
+        # Then send to the configured agent
         prompt = mock_resp.call_args[0][3]
         assert "Hello there" in prompt
 

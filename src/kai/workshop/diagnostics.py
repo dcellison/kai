@@ -378,7 +378,7 @@ def _read_legacy_keys(history_root: Path, external_channel_id: str) -> tuple[lis
                 media = record.get("media")
                 is_shadowed_message = media is None or (
                     isinstance(media, dict)
-                    and media.get("type") in {"photo", "document"}
+                    and media.get("type") in {"photo", "document", "voice"}
                     and media.get("workshop_message_shadowed") is True
                 )
                 pending_user_turns.append(is_shadowed_message)

@@ -4280,12 +4280,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 @_require_auth
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Handle voice messages — transcribe via whisper-cpp and send to Claude.
+    Handle voice messages — transcribe via whisper-cpp and send to the agent.
 
     Pipeline: download audio → check dependencies → transcribe → echo
-    transcription to user → send to Claude as "[Voice message transcription]: ..."
+    transcription to user → send to the agent as "[Voice message transcription]: ..."
 
-    The echo step shows the user what was heard before Claude processes it,
+    The echo step shows the user what was heard before the agent processes it,
     providing transparency and a chance to correct misheard speech.
     """
     if not update.message or not update.message.voice:
@@ -4323,7 +4323,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     file = await context.bot.get_file(voice.file_id)
     audio_data = bytes(await file.download_as_bytearray())
 
-    voice_media = {"type": "voice", "duration": voice.duration}
+    voice_media: dict[str, object] = {"type": "voice", "duration": voice.duration}
     voice_placeholder = f"[voice message, {voice.duration}s]"
 
     # Transcription failure paths preserve the historical placeholder
@@ -4359,6 +4359,61 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # Echo the transcription so the user sees what Kai heard
     await _reply_safe(update.message, f"_Heard:_ {transcript}")
 
+    workshop_inbound_message_id: MessageId | None = None
+    inbound_recorder = context.bot_data.get("workshop_inbound_recorder")
+    if inbound_recorder is not None:
+        try:
+            result = await inbound_recorder(
+                InboundMessage(
+                    transport="telegram",
+                    update_id=str(update.update_id),
+                    message_id=str(update.message.message_id),
+                    sender_subject=str(_user_id(update)),
+                    channel_subject=str(chat_id),
+                    body=transcript,
+                    occurred_at=update.message.date,
+                )
+            )
+            aggregate_id = result.event.envelope.aggregate_id
+            if not isinstance(aggregate_id, MessageId):
+                raise RuntimeError("Workshop inbound recorder returned a non-message aggregate")
+            workshop_inbound_message_id = aggregate_id
+        except Exception:
+            log.exception(
+                "Workshop voice message shadow write failed (update_id=%s, message_id=%s)",
+                update.update_id,
+                update.message.message_id,
+            )
+
+    artifact_recorder = context.bot_data.get("workshop_artifact_recorder")
+    if workshop_inbound_message_id is not None and artifact_recorder is not None:
+        try:
+            # whisper-cpp uses a temporary copy that disappears after
+            # transcription. Preserve the original Telegram Ogg/Opus bytes
+            # inside the existing per-user upload boundary so canonical
+            # artifact provenance never points at an ephemeral path. This
+            # path is not added to the backend prompt.
+            saved_voice = _save_upload(audio_data, "voice.oga", user_id=chat_id)
+            await artifact_recorder(
+                InboundArtifact(
+                    message_id=workshop_inbound_message_id,
+                    kind="voice",
+                    media_type="audio/ogg",
+                    storage_path=saved_voice,
+                    source_transport="telegram",
+                    source_unique_id=voice.file_unique_id,
+                    occurred_at=update.message.date,
+                    original_filename=None,
+                ),
+                storage_root=DATA_DIR / "files",
+            )
+        except Exception:
+            log.exception(
+                "Workshop voice artifact shadow write failed (update_id=%s, message_id=%s)",
+                update.update_id,
+                update.message.message_id,
+            )
+
     # Log the transcript itself as the user's message so the JSONL line
     # carries what the extractor actually saw. This is the only history-
     # output behaviour change in the provenance work: previous behaviour
@@ -4368,7 +4423,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         direction="user",
         chat_id=chat_id,
         text=transcript,
-        media=voice_media,
+        media={
+            **voice_media,
+            "workshop_message_shadowed": workshop_inbound_message_id is not None,
+        },
         reader_user=reader_user,
     )
 
@@ -4390,6 +4448,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 pool,
                 model,
                 user_log=user_log,
+                workshop_inbound_message_id=workshop_inbound_message_id,
             )
         finally:
             _clear_responding(chat_id)

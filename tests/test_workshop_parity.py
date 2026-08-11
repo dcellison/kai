@@ -176,6 +176,28 @@ class TestWorkshopMessageParityStatus:
         assert "parity: clean" in status
         assert "JSONL matched=2, JSONL missing=0, JSONL unmatched=0" in status
 
+    async def test_includes_explicitly_shadowed_voice_history(self, tmp_path: Path):
+        db_path = tmp_path / "kai.db"
+        history_root = tmp_path / "history"
+        await _build_conversation(db_path)
+        _write_history(
+            history_root,
+            [
+                _record(
+                    "user",
+                    "Secret question",
+                    seconds=0,
+                    media={"type": "voice", "duration": 5, "workshop_message_shadowed": True},
+                ),
+                _record("assistant", "Secret answer", seconds=2),
+            ],
+        )
+
+        status = workshop_message_parity_status(db_path, history_root)
+
+        assert "parity: clean" in status
+        assert "JSONL matched=2, JSONL missing=0, JSONL unmatched=0" in status
+
     async def test_projection_drift_is_reported_without_leaking_changed_text(self, tmp_path: Path):
         db_path = tmp_path / "kai.db"
         history_root = tmp_path / "history"
