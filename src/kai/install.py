@@ -3587,6 +3587,66 @@ def _secure_codex_turn_image_staging(data_path: Path, dry_run: bool) -> None:
         print(f"  Secured Codex image staging root {staging_root} (mode 0711)")
 
 
+def _secure_upload_directories(
+    data_path: Path,
+    known_user_dir_names: set[str],
+    svc_uid: int,
+    svc_gid: int,
+    dry_run: bool,
+) -> None:
+    """Reconcile service-owned upload directories without touching uploads.
+
+    Kai writes Telegram uploads before handing their exact paths to an agent
+    OS user.  The service therefore owns the shared upload root and each
+    configured user's directory; the agent receives read access to individual
+    files through the upload handoff ACL.  Older installs may instead have a
+    per-user directory owned by that agent user, which prevents Kai from
+    enforcing the traversal-only directory mode at upload time.
+
+    Validate every managed path before changing any of them, then repair only
+    directory ownership and mode.  Historical files and unknown directories
+    are deliberately left untouched.
+    """
+    files_root = data_path / "files"
+    if files_root.is_symlink():
+        raise RuntimeError(f"Refusing unsafe upload path: {files_root}")
+    if not files_root.exists():
+        return
+    if not files_root.is_dir():
+        raise RuntimeError(f"Refusing unsafe upload path: {files_root}")
+
+    managed_paths = [files_root]
+    for name in sorted(known_user_dir_names):
+        user_dir = files_root / name
+        if user_dir.is_symlink():
+            raise RuntimeError(f"Refusing unsafe upload path: {user_dir}")
+        if not user_dir.exists():
+            continue
+        if not user_dir.is_dir():
+            raise RuntimeError(f"Refusing unsafe upload path: {user_dir}")
+        managed_paths.append(user_dir)
+
+    repairs: list[Path] = []
+    for path in managed_paths:
+        current = path.stat()
+        if (
+            current.st_uid != svc_uid
+            or current.st_gid != svc_gid
+            or stat.S_IMODE(current.st_mode) != _PRIVATE_USER_ROOT_MODE
+        ):
+            repairs.append(path)
+
+    if dry_run:
+        for path in repairs:
+            print(f"[DRY RUN] Would secure upload directory: {path} ({svc_uid}:{svc_gid}, mode 0711)")
+        return
+
+    for path in repairs:
+        _set_ownership(path, svc_uid, svc_gid, recursive=False)
+        os.chmod(path, _PRIVATE_USER_ROOT_MODE)
+        print(f"  Secured upload directory {path} ({svc_uid}:{svc_gid}, mode 0711)")
+
+
 def _managed_identity_state(user_home: Path) -> tuple[Path, Path, str | None, str | None]:
     """Inspect and validate one managed user's canonical/compatibility files.
 
@@ -3788,6 +3848,17 @@ def _apply_migrate(
             ) from exc
         per_user_ids[str(chat_id)] = (pwd_entry.pw_uid, pwd_entry.pw_gid)
     known_user_dir_names = {str(chat_id) for chat_id, _os_user in memory_owners if chat_id is not None}
+
+    # Upload directories are service-owned even when memory/preferences/home
+    # belong to the agent OS user.  The service creates private files and
+    # grants the configured agent exact-file read access during handoff.
+    _secure_upload_directories(
+        data_path,
+        known_user_dir_names,
+        svc_uid,
+        svc_gid,
+        dry_run,
+    )
 
     # Resolve the primary operator's chat_id (first yaml entry). When
     # users.yaml is absent or empty (first-ever install, single-user

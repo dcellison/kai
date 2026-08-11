@@ -57,6 +57,7 @@ from kai.install import (
     _retire_install_home_claude,
     _retire_install_home_dir,
     _secure_codex_turn_image_staging,
+    _secure_upload_directories,
     _set_ownership,
     _src_checksum,
     _start_service,
@@ -5060,6 +5061,112 @@ class TestSecureCodexTurnImageStaging:
 
         with pytest.raises(RuntimeError, match="Refusing unsafe Codex image staging path"):
             _secure_codex_turn_image_staging(data_path, dry_run=False)
+
+
+class TestSecureUploadDirectories:
+    def test_repairs_managed_directories_without_touching_existing_files(self, tmp_path, monkeypatch, capsys):
+        files_root = tmp_path / "data" / "files"
+        user_dir = files_root / "12345"
+        user_dir.mkdir(parents=True)
+        files_root.chmod(0o755)
+        user_dir.chmod(0o775)
+        historical = user_dir / "photo.jpg"
+        historical.write_bytes(b"keep")
+        historical.chmod(0o644)
+        chowned: list[tuple[Path, int, int]] = []
+        monkeypatch.setattr(
+            "kai.install.os.chown",
+            lambda path, uid, gid: chowned.append((Path(path), uid, gid)),
+        )
+
+        _secure_upload_directories(
+            tmp_path / "data",
+            {"12345"},
+            svc_uid=9876,
+            svc_gid=9877,
+            dry_run=False,
+        )
+
+        assert chowned == [
+            (files_root, 9876, 9877),
+            (user_dir, 9876, 9877),
+        ]
+        assert stat.S_IMODE(files_root.stat().st_mode) == 0o711
+        assert stat.S_IMODE(user_dir.stat().st_mode) == 0o711
+        assert historical.read_bytes() == b"keep"
+        assert stat.S_IMODE(historical.stat().st_mode) == 0o644
+        assert historical not in {path for path, _uid, _gid in chowned}
+        assert "Secured upload directory" in capsys.readouterr().out
+
+    def test_dry_run_reports_repairs_without_mutating(self, tmp_path, monkeypatch, capsys):
+        user_dir = tmp_path / "data" / "files" / "12345"
+        user_dir.mkdir(parents=True)
+        files_root = user_dir.parent
+        files_root.chmod(0o755)
+        user_dir.chmod(0o775)
+        chown = MagicMock()
+        monkeypatch.setattr("kai.install.os.chown", chown)
+
+        _secure_upload_directories(
+            tmp_path / "data",
+            {"12345"},
+            svc_uid=9876,
+            svc_gid=9877,
+            dry_run=True,
+        )
+
+        assert stat.S_IMODE(files_root.stat().st_mode) == 0o755
+        assert stat.S_IMODE(user_dir.stat().st_mode) == 0o775
+        chown.assert_not_called()
+        output = capsys.readouterr().out
+        assert f"[DRY RUN] Would secure upload directory: {files_root}" in output
+        assert f"[DRY RUN] Would secure upload directory: {user_dir}" in output
+
+    def test_refuses_managed_symlink_before_any_repair(self, tmp_path, monkeypatch):
+        files_root = tmp_path / "data" / "files"
+        files_root.mkdir(parents=True)
+        files_root.chmod(0o755)
+        target = tmp_path / "attacker-controlled"
+        target.mkdir()
+        (files_root / "12345").symlink_to(target, target_is_directory=True)
+        chown = MagicMock()
+        monkeypatch.setattr("kai.install.os.chown", chown)
+
+        with pytest.raises(RuntimeError, match="Refusing unsafe upload path"):
+            _secure_upload_directories(
+                tmp_path / "data",
+                {"12345"},
+                svc_uid=9876,
+                svc_gid=9877,
+                dry_run=False,
+            )
+
+        assert stat.S_IMODE(files_root.stat().st_mode) == 0o755
+        chown.assert_not_called()
+
+    def test_leaves_unknown_directories_untouched(self, tmp_path, monkeypatch):
+        files_root = tmp_path / "data" / "files"
+        unknown = files_root / "not-configured"
+        unknown.mkdir(parents=True)
+        files_root.chmod(0o711)
+        unknown.chmod(0o775)
+        chowned: list[Path] = []
+        monkeypatch.setattr(
+            "kai.install.os.chown",
+            lambda path, _uid, _gid: chowned.append(Path(path)),
+        )
+        current = files_root.stat()
+
+        _secure_upload_directories(
+            tmp_path / "data",
+            set(),
+            svc_uid=current.st_uid,
+            svc_gid=current.st_gid,
+            dry_run=False,
+        )
+
+        assert chowned == []
+        assert stat.S_IMODE(unknown.stat().st_mode) == 0o775
 
 
 class TestApplyMigrate:
