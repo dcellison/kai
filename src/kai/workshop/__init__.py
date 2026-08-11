@@ -30,6 +30,14 @@ from kai.workshop.store import (
     StoredEvent,
     WorkshopEventStore,
 )
+from kai.workshop.timeline import (
+    ChannelTimelineAuthorizer,
+    TimelineAccessDeniedError,
+    TimelineCursorError,
+    TimelineMessage,
+    TimelinePage,
+    read_channel_timeline,
+)
 
 __all__ = [
     "AgentId",
@@ -37,6 +45,7 @@ __all__ = [
     "ChannelAgentId",
     "ChannelBindingId",
     "ChannelId",
+    "ChannelTimelineAuthorizer",
     "DeliveryId",
     "EventEnvelope",
     "EventId",
@@ -48,8 +57,13 @@ __all__ = [
     "Projection",
     "ProjectionCheckpoint",
     "StoredEvent",
+    "TimelineAccessDeniedError",
+    "TimelineCursorError",
+    "TimelineMessage",
+    "TimelinePage",
     "WorkshopEventStore",
     "WorkshopEventType",
     "WorkshopId",
     "WorkshopMembershipId",
+    "read_channel_timeline",
 ]
