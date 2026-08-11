@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 6
+WORKSHOP_SCHEMA_VERSION = 7
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +273,85 @@ _ARTIFACT_SCHEMA = SchemaMigration(
     ),
 )
 
+_DELIVERY_OUTBOX_SCHEMA = SchemaMigration(
+    version=7,
+    name="durable_delivery_outbox_foundation",
+    statements=(
+        """
+        CREATE TABLE delivery_outbox (
+            -- These canonical IDs are deliberately not foreign keys. Projection
+            -- rebuilds temporarily delete and restore their rows, while durable
+            -- delivery work and attempt history must survive that operation.
+            id TEXT PRIMARY KEY,
+            workshop_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            channel_binding_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            transport TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (
+                status IN ('pending', 'leased', 'retry_wait', 'succeeded', 'failed')
+            ),
+            max_attempts INTEGER NOT NULL CHECK (max_attempts BETWEEN 1 AND 20),
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (
+                attempt_count >= 0 AND attempt_count <= max_attempts
+            ),
+            available_at TEXT NOT NULL,
+            lease_id TEXT,
+            lease_owner TEXT,
+            lease_expires_at TEXT,
+            last_error_code TEXT,
+            requested_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            UNIQUE (message_id, channel_binding_id, mode),
+            CHECK (
+                (
+                    status = 'leased'
+                    AND lease_id IS NOT NULL
+                    AND lease_owner IS NOT NULL
+                    AND lease_expires_at IS NOT NULL
+                ) OR (
+                    status != 'leased'
+                    AND lease_id IS NULL
+                    AND lease_owner IS NULL
+                    AND lease_expires_at IS NULL
+                )
+            ),
+            CHECK (
+                (status IN ('succeeded', 'failed') AND completed_at IS NOT NULL)
+                OR (status NOT IN ('succeeded', 'failed') AND completed_at IS NULL)
+            )
+        )
+        """,
+        "CREATE INDEX delivery_outbox_due_idx ON delivery_outbox (status, available_at, requested_event_position)",
+        "CREATE INDEX delivery_outbox_lease_expiry_idx ON delivery_outbox (status, lease_expires_at)",
+        """
+        CREATE TABLE delivery_attempts (
+            id TEXT PRIMARY KEY,
+            delivery_id TEXT NOT NULL REFERENCES delivery_outbox(id) ON DELETE CASCADE,
+            attempt_number INTEGER NOT NULL CHECK (attempt_number > 0),
+            worker_id TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            lease_expires_at TEXT NOT NULL,
+            completed_at TEXT,
+            outcome TEXT CHECK (
+                outcome IN ('succeeded', 'retry_scheduled', 'failed', 'lease_expired')
+            ),
+            error_code TEXT,
+            UNIQUE (delivery_id, attempt_number),
+            CHECK (
+                (completed_at IS NULL AND outcome IS NULL)
+                OR (completed_at IS NOT NULL AND outcome IS NOT NULL)
+            )
+        )
+        """,
+        "CREATE INDEX delivery_attempts_delivery_idx ON delivery_attempts (delivery_id, attempt_number)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -280,6 +359,7 @@ _MIGRATIONS = (
     _CLIENT_SESSION_SCHEMA,
     _CLIENT_ENROLLMENT_SCHEMA,
     _ARTIFACT_SCHEMA,
+    _DELIVERY_OUTBOX_SCHEMA,
 )
 
 

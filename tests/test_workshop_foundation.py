@@ -15,6 +15,7 @@ from kai.workshop.domain import (
     ArtifactId,
     ChannelId,
     ChannelMembershipId,
+    DeliveryAttemptId,
     DeliveryId,
     EventEnvelope,
     EventId,
@@ -69,6 +70,7 @@ class TestWorkshopIdentifiers:
             (MessageId, "msg_0000000000000000000000000000000"),
             (ArtifactId, "msg_00000000000000000000000000000001"),
             (DeliveryId, "msg_00000000000000000000000000000001"),
+            (DeliveryAttemptId, "dlv_00000000000000000000000000000001"),
             (EventId, "evt_000000000000000000000000000000011"),
         ],
     )
@@ -91,6 +93,7 @@ class TestEventEnvelope:
             "channel.agent_attached",
             "message.created",
             "artifact.created",
+            "delivery.requested",
             "delivery.succeeded",
             "delivery.failed",
         }
@@ -161,12 +164,14 @@ class TestWorkshopSchema:
             "messages",
             "artifacts",
             "deliveries",
+            "delivery_outbox",
+            "delivery_attempts",
             "event_log",
             "projection_checkpoints",
         }
 
         assert expected <= await workshop_store.schema_tables()
-        assert await workshop_store.schema_version() == 6
+        assert await workshop_store.schema_version() == 7
 
     async def test_schema_migration_is_idempotent(self, tmp_path: Path):
         path = tmp_path / "workshop.db"
@@ -174,7 +179,7 @@ class TestWorkshopSchema:
         await first.close()
 
         second = await WorkshopEventStore.open(path)
-        assert await second.schema_version() == 6
+        assert await second.schema_version() == 7
         async with second.connection.execute(
             "SELECT COUNT(*) FROM workshop_schema_migrations WHERE version = 1"
         ) as cursor:
@@ -195,7 +200,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 6
+            assert await upgraded.schema_version() == 7
             assert {
                 "deliveries",
                 "channel_memberships",
@@ -203,11 +208,13 @@ class TestWorkshopSchema:
                 "workshop_client_enrollment_grants",
                 "workshop_client_sessions",
                 "artifacts",
+                "delivery_outbox",
+                "delivery_attempts",
             } <= await upgraded.schema_tables()
             async with upgraded.connection.execute(
                 "SELECT version FROM workshop_schema_migrations ORDER BY version"
             ) as cursor:
-                assert [row[0] for row in await cursor.fetchall()] == [1, 2, 3, 4, 5, 6]
+                assert [row[0] for row in await cursor.fetchall()] == [1, 2, 3, 4, 5, 6, 7]
         finally:
             await upgraded.close()
 
@@ -229,13 +236,15 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 6
+            assert await upgraded.schema_version() == 7
             assert {
                 "channel_memberships",
                 "workshop_client_devices",
                 "workshop_client_enrollment_grants",
                 "workshop_client_sessions",
                 "artifacts",
+                "delivery_outbox",
+                "delivery_attempts",
             } <= await upgraded.schema_tables()
             async with upgraded.connection.execute("SELECT name FROM workshops WHERE id = ?", (workshop_id,)) as cursor:
                 assert (await cursor.fetchone())[0] == "Existing"
@@ -268,12 +277,14 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 6
+            assert await upgraded.schema_version() == 7
             assert {
                 "workshop_client_devices",
                 "workshop_client_enrollment_grants",
                 "workshop_client_sessions",
                 "artifacts",
+                "delivery_outbox",
+                "delivery_attempts",
             } <= await upgraded.schema_tables()
             async with upgraded.connection.execute(
                 "SELECT display_name FROM principals WHERE id = ?",
@@ -319,9 +330,10 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 6
+            assert await upgraded.schema_version() == 7
             assert "workshop_client_enrollment_grants" in await upgraded.schema_tables()
             assert "artifacts" in await upgraded.schema_tables()
+            assert "delivery_outbox" in await upgraded.schema_tables()
             async with upgraded.connection.execute(
                 "SELECT display_name FROM workshop_client_devices WHERE principal_id = ?",
                 (principal_id,),
@@ -362,8 +374,52 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 6
+            assert await upgraded.schema_version() == 7
             assert "artifacts" in await upgraded.schema_tables()
+            assert "delivery_outbox" in await upgraded.schema_tables()
+            async with upgraded.connection.execute(
+                "SELECT display_name FROM principals WHERE id = ?",
+                (principal_id,),
+            ) as cursor:
+                assert (await cursor.fetchone())[0] == "Existing human"
+        finally:
+            await upgraded.close()
+
+    async def test_version_six_database_adds_outbox_without_replacing_artifacts(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        from kai.workshop import schema
+
+        path = tmp_path / "workshop.db"
+        with monkeypatch.context() as migration_context:
+            migration_context.setattr(schema, "WORKSHOP_SCHEMA_VERSION", 6)
+            migration_context.setattr(
+                schema,
+                "_MIGRATIONS",
+                (
+                    schema._INITIAL_SCHEMA,
+                    schema._DELIVERY_SCHEMA,
+                    schema._CHANNEL_MEMBERSHIP_SCHEMA,
+                    schema._CLIENT_SESSION_SCHEMA,
+                    schema._CLIENT_ENROLLMENT_SCHEMA,
+                    schema._ARTIFACT_SCHEMA,
+                ),
+            )
+            version_six = await WorkshopEventStore.open(path)
+            principal_id = PrincipalId.new()
+            await version_six.connection.execute(
+                "INSERT INTO principals (id, kind, display_name, created_at) VALUES (?, 'human', ?, ?)",
+                (principal_id, "Existing human", "2026-08-11T12:00:00Z"),
+            )
+            await version_six.connection.commit()
+            await version_six.close()
+
+        upgraded = await WorkshopEventStore.open(path)
+        try:
+            assert await upgraded.schema_version() == 7
+            assert {"delivery_outbox", "delivery_attempts"} <= await upgraded.schema_tables()
             async with upgraded.connection.execute(
                 "SELECT display_name FROM principals WHERE id = ?",
                 (principal_id,),
@@ -420,6 +476,31 @@ class TestWorkshopSchema:
 
 
 class TestWorkshopEventStore:
+    async def test_transactional_append_requires_and_preserves_caller_transaction(self, workshop_store):
+        with pytest.raises(RuntimeError, match="active transaction"):
+            await workshop_store.append_in_transaction(_message_event())
+
+        await workshop_store.connection.execute("BEGIN IMMEDIATE")
+        result = await workshop_store.append_in_transaction(_message_event())
+        assert result.inserted is True
+        await workshop_store.connection.rollback()
+        assert await workshop_store.read_events() == []
+
+    async def test_transactional_duplicate_does_not_rollback_caller_work(self, workshop_store):
+        original = await workshop_store.append(_message_event())
+        await workshop_store.connection.execute("CREATE TABLE transaction_probe (value TEXT NOT NULL)")
+        await workshop_store.connection.commit()
+
+        await workshop_store.connection.execute("BEGIN IMMEDIATE")
+        await workshop_store.connection.execute("INSERT INTO transaction_probe (value) VALUES ('kept')")
+        duplicate = await workshop_store.append_in_transaction(_message_event())
+        await workshop_store.connection.commit()
+
+        assert duplicate.inserted is False
+        assert duplicate.event == original.event
+        async with workshop_store.connection.execute("SELECT value FROM transaction_probe") as cursor:
+            assert (await cursor.fetchone())[0] == "kept"
+
     async def test_append_assigns_monotonic_positions_and_replays_in_order(self, workshop_store):
         first = await workshop_store.append(_message_event(idempotency_key="telegram:message:1", text="one"))
         second = await workshop_store.append(_message_event(idempotency_key="telegram:message:2", text="two"))

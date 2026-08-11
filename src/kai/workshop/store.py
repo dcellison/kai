@@ -136,53 +136,58 @@ class WorkshopEventStore:
         """Append once, returning the prior event for a semantic retry."""
         try:
             await self._connection.execute("BEGIN IMMEDIATE")
-            try:
-                cursor = await self._connection.execute(
-                    """
-                    INSERT INTO event_log (
-                        event_id, envelope_version, event_type, event_version,
-                        workshop_id, aggregate_type, aggregate_id,
-                        actor_principal_id, occurred_at, idempotency_key,
-                        payload_json, metadata_json, content_hash
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        envelope.event_id,
-                        envelope.envelope_version,
-                        envelope.event_type,
-                        envelope.event_version,
-                        envelope.workshop_id,
-                        envelope.aggregate_type,
-                        envelope.aggregate_id,
-                        envelope.actor_principal_id,
-                        _format_timestamp(envelope.occurred_at),
-                        envelope.idempotency_key,
-                        envelope.payload_json,
-                        envelope.metadata_json,
-                        envelope.content_hash,
-                    ),
-                )
-            except aiosqlite.IntegrityError as exc:
-                existing = await self._find_existing(envelope)
-                if existing is None:
-                    raise
-                if existing.envelope.content_hash != envelope.content_hash:
-                    identity = envelope.idempotency_key or str(envelope.event_id)
-                    raise IdempotencyConflictError(
-                        f"Event identity {identity!r} was reused with different content"
-                    ) from exc
-                await self._connection.rollback()
-                return AppendResult(event=existing, inserted=False)
-
-            position = cursor.lastrowid
-            if position is None:
-                raise RuntimeError("SQLite did not return an event position")
-            stored = await self._event_at_position(int(position))
+            result = await self.append_in_transaction(envelope)
             await self._connection.commit()
-            return AppendResult(event=stored, inserted=True)
+            return result
         except Exception:
             await self._connection.rollback()
             raise
+
+    async def append_in_transaction(self, envelope: EventEnvelope) -> AppendResult:
+        """Append without committing, so a caller can atomically persist related state."""
+        if not self._connection.in_transaction:
+            raise RuntimeError("append_in_transaction requires an active transaction")
+        try:
+            cursor = await self._connection.execute(
+                """
+                INSERT INTO event_log (
+                    event_id, envelope_version, event_type, event_version,
+                    workshop_id, aggregate_type, aggregate_id,
+                    actor_principal_id, occurred_at, idempotency_key,
+                    payload_json, metadata_json, content_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    envelope.event_id,
+                    envelope.envelope_version,
+                    envelope.event_type,
+                    envelope.event_version,
+                    envelope.workshop_id,
+                    envelope.aggregate_type,
+                    envelope.aggregate_id,
+                    envelope.actor_principal_id,
+                    _format_timestamp(envelope.occurred_at),
+                    envelope.idempotency_key,
+                    envelope.payload_json,
+                    envelope.metadata_json,
+                    envelope.content_hash,
+                ),
+            )
+        except aiosqlite.IntegrityError as exc:
+            existing = await self._find_existing(envelope)
+            if existing is None:
+                raise
+            if existing.envelope.content_hash != envelope.content_hash:
+                identity = envelope.idempotency_key or str(envelope.event_id)
+                raise IdempotencyConflictError(
+                    f"Event identity {identity!r} was reused with different content"
+                ) from exc
+            return AppendResult(event=existing, inserted=False)
+
+        position = cursor.lastrowid
+        if position is None:
+            raise RuntimeError("SQLite did not return an event position")
+        return AppendResult(event=await self._event_at_position(int(position)), inserted=True)
 
     async def _find_existing(self, envelope: EventEnvelope) -> StoredEvent | None:
         clauses = ["event_id = ?"]
