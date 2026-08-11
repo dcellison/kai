@@ -9,6 +9,7 @@ from typing import Protocol
 from aiohttp import web
 
 from kai.workshop.authorization import CanonicalChannelAuthorizer
+from kai.workshop.client_sessions import EnrollmentGrantUnavailableError, WorkshopClientEnrollmentManager
 from kai.workshop.domain import ChannelId, PrincipalId
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.timeline import (
@@ -19,7 +20,9 @@ from kai.workshop.timeline import (
 )
 
 _TIMELINE_PATH = "/v1/channels/{channel_id}/timeline"
+_ENROLLMENT_REDEMPTION_PATH = "/v1/client/enrollment/redeem"
 _ALLOWED_QUERY_PARAMETERS = frozenset({"cursor", "limit"})
+_ENROLLMENT_REQUEST_FIELDS = frozenset({"enrollment_token", "device_display_name"})
 _DECIMAL_INTEGER = re.compile(r"^[0-9]+$")
 
 
@@ -128,6 +131,76 @@ async def _handle_channel_timeline(
     )
 
 
+async def _handle_enrollment_redemption(
+    request: web.Request,
+    *,
+    enrollment_manager: WorkshopClientEnrollmentManager,
+) -> web.Response:
+    """Exchange one opaque grant without accepting a client identity claim."""
+    if request.content_type != "application/json":
+        return _error_response(
+            status=415,
+            code="unsupported_media_type",
+            message="Content-Type must be application/json",
+        )
+
+    try:
+        payload = await request.json()
+    except (UnicodeDecodeError, ValueError):
+        payload = None
+    if not isinstance(payload, dict) or set(payload) != _ENROLLMENT_REQUEST_FIELDS:
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid enrollment request",
+        )
+
+    enrollment_token = payload["enrollment_token"]
+    device_display_name = payload["device_display_name"]
+    if not isinstance(enrollment_token, str) or not isinstance(device_display_name, str):
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid enrollment request",
+        )
+
+    try:
+        redeemed = await enrollment_manager.redeem_grant(
+            enrollment_token,
+            device_display_name,
+        )
+    except EnrollmentGrantUnavailableError:
+        # Malformed, unknown, expired, revoked, and reused grants deliberately
+        # share one response so this endpoint is not a grant-enumeration oracle.
+        return _error_response(
+            status=401,
+            code="enrollment_unavailable",
+            message="Enrollment unavailable",
+        )
+    except (TypeError, ValueError):
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid enrollment request",
+        )
+
+    return _json_response(
+        {
+            "version": 1,
+            "device": {
+                "device_id": str(redeemed.device.device_id),
+                "display_name": redeemed.device.display_name,
+            },
+            "session": {
+                "session_id": str(redeemed.session.session_id),
+                "token": redeemed.session.token,
+                "expires_at": _format_timestamp(redeemed.session.expires_at),
+            },
+        },
+        status=201,
+    )
+
+
 def register_workshop_read_routes(
     app: web.Application,
     *,
@@ -148,3 +221,23 @@ def register_workshop_read_routes(
         )
 
     app.router.add_get(_TIMELINE_PATH, handle_channel_timeline)
+
+
+def register_workshop_enrollment_routes(
+    app: web.Application,
+    *,
+    enrollment_manager: WorkshopClientEnrollmentManager,
+) -> None:
+    """Register grant redemption on an explicitly supplied application.
+
+    Production does not call this function yet. Grant issuance remains a
+    trusted operator/server capability and is intentionally absent here.
+    """
+
+    async def handle_enrollment_redemption(request: web.Request) -> web.Response:
+        return await _handle_enrollment_redemption(
+            request,
+            enrollment_manager=enrollment_manager,
+        )
+
+    app.router.add_post(_ENROLLMENT_REDEMPTION_PATH, handle_enrollment_redemption)
