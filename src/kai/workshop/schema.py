@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 4
+WORKSHOP_SCHEMA_VERSION = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,11 +212,40 @@ _CLIENT_SESSION_SCHEMA = SchemaMigration(
     ),
 )
 
+_CLIENT_ENROLLMENT_SCHEMA = SchemaMigration(
+    version=5,
+    name="single_use_human_client_enrollment",
+    statements=(
+        """
+        CREATE TABLE workshop_client_enrollment_grants (
+            id TEXT PRIMARY KEY,
+            principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+            token_hash TEXT NOT NULL UNIQUE CHECK (length(token_hash) = 64),
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            redeemed_at TEXT,
+            revoked_at TEXT,
+            device_id TEXT,
+            session_id TEXT REFERENCES workshop_client_sessions(id) ON DELETE RESTRICT,
+            FOREIGN KEY (device_id, principal_id)
+                REFERENCES workshop_client_devices(id, principal_id) ON DELETE RESTRICT,
+            CHECK (
+                (redeemed_at IS NULL AND device_id IS NULL AND session_id IS NULL)
+                OR (redeemed_at IS NOT NULL AND device_id IS NOT NULL AND session_id IS NOT NULL)
+            )
+        )
+        """,
+        "CREATE INDEX workshop_client_enrollment_principal_idx "
+        "ON workshop_client_enrollment_grants (principal_id, redeemed_at, revoked_at, expires_at)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
     _CHANNEL_MEMBERSHIP_SCHEMA,
     _CLIENT_SESSION_SCHEMA,
+    _CLIENT_ENROLLMENT_SCHEMA,
 )
 
 

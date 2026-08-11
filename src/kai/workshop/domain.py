@@ -78,6 +78,10 @@ class ClientSessionId(OpaqueId):
     prefix = "cse"
 
 
+class EnrollmentGrantId(OpaqueId):
+    prefix = "enr"
+
+
 class ExternalIdentityId(OpaqueId):
     prefix = "xid"
 
@@ -125,6 +129,7 @@ _ID_TYPES: dict[str, type[OpaqueId]] = {
         PrincipalId,
         DeviceId,
         ClientSessionId,
+        EnrollmentGrantId,
         ExternalIdentityId,
         WorkshopMembershipId,
         ChannelId,
