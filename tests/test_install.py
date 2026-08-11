@@ -6267,7 +6267,9 @@ class TestMakeInstallStatus:
             check=True,
         )
 
-        assert "sudo .venv/bin/python -m kai install status" in result.stdout
+        command_lines = [line for line in result.stdout.splitlines() if line.startswith("sudo ")]
+        assert len(command_lines) == 1
+        assert command_lines[0].endswith("python -m kai install status")
 
 
 # ── _set_ownership ───────────────────────────────────────────────────
