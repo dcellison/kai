@@ -80,6 +80,7 @@ from kai.pool import SubprocessPool
 from kai.telegram_utils import chunk_text
 from kai.transcribe import TranscriptionError, transcribe_voice
 from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
+from kai.workshop.inbound import InboundMessage
 from kai.workspace_utils import is_workspace_allowed
 
 _UPLOAD_ROOT_MODE = 0o711
@@ -4402,6 +4403,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # the provenance writer. None on JSONL write failure; the extraction
     # path then skips provenance stamping for this exchange.
     user_log = log_message(direction="user", chat_id=chat_id, text=prompt)
+    recorder = context.bot_data.get("workshop_inbound_recorder")
+    if recorder is not None:
+        try:
+            await recorder(
+                InboundMessage(
+                    transport="telegram",
+                    update_id=str(update.update_id),
+                    message_id=str(update.message.message_id),
+                    sender_subject=str(_user_id(update)),
+                    channel_subject=str(chat_id),
+                    body=prompt,
+                    occurred_at=update.message.date,
+                )
+            )
+        except Exception:
+            log.exception(
+                "Workshop inbound shadow write failed (update_id=%s, message_id=%s)",
+                update.update_id,
+                update.message.message_id,
+            )
     pool = _get_pool(context)
     model = pool.get_model(chat_id)
 
@@ -4771,6 +4792,7 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
 
     app = builder.build()
     app.bot_data["config"] = config
+    app.bot_data["workshop_inbound_recorder"] = sessions.record_workshop_inbound_message
     app.bot_data["pool"] = SubprocessPool(
         config=config,
         services_info=services.get_available_services(),

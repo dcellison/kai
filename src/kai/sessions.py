@@ -33,6 +33,7 @@ at startup. The database file is kai.db at the project root.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -43,8 +44,9 @@ import aiosqlite
 
 from kai.job_types import JOB_TYPE_AGENT, LEGACY_JOB_TYPE_AGENT, normalize_job_type
 from kai.workshop.bootstrap import BootstrapHuman, BootstrapResult, bootstrap_default_workshop
+from kai.workshop.inbound import InboundMessage, record_inbound_message
 from kai.workshop.schema import migrate_workshop_schema
-from kai.workshop.store import WorkshopEventStore
+from kai.workshop.store import AppendResult, WorkshopEventStore
 
 if TYPE_CHECKING:
     from kai.config import Config, WorkspaceConfig
@@ -53,6 +55,7 @@ log = logging.getLogger(__name__)
 
 # Module-level database connection, initialized by init_db() at startup
 _db: aiosqlite.Connection | None = None
+_workshop_event_lock: asyncio.Lock | None = None
 
 
 class TelegramUpdateQueueRow(TypedDict):
@@ -116,9 +119,10 @@ async def init_db(db_path: Path) -> None:
     Args:
         db_path: Path to the SQLite database file (created if missing).
     """
-    global _db
+    global _db, _workshop_event_lock
     _restrict_sqlite_file(db_path)
     _db = await aiosqlite.connect(str(db_path))
+    _workshop_event_lock = asyncio.Lock()
     _get_db().row_factory = aiosqlite.Row
     # PRAGMAs are database configuration, not schema. They must execute
     # before any transaction begins.
@@ -291,6 +295,7 @@ async def init_db(db_path: Path) -> None:
             except Exception:
                 pass
         _db = None
+        _workshop_event_lock = None
         raise
 
 
@@ -299,8 +304,20 @@ async def init_db(db_path: Path) -> None:
 
 async def bootstrap_workshop_foundation(humans: tuple[BootstrapHuman, ...]) -> BootstrapResult:
     """Seed non-authoritative Workshop records on Kai's initialized DB."""
-    store = WorkshopEventStore.from_initialized_connection(_get_db())
-    return await bootstrap_default_workshop(store, humans)
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        store = WorkshopEventStore.from_initialized_connection(_get_db())
+        return await bootstrap_default_workshop(store, humans)
+
+
+async def record_workshop_inbound_message(message: InboundMessage) -> AppendResult:
+    """Serialize one canonical shadow write on Kai's shared SQLite connection."""
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        store = WorkshopEventStore.from_initialized_connection(_get_db())
+        return await record_inbound_message(store, message)
 
 
 async def get_session(chat_id: int) -> str | None:
@@ -1469,7 +1486,7 @@ async def resolve_github_settings(chat_id: int, config: Config) -> GitHubSetting
 
 async def close_db() -> None:
     """Close the database connection. Called during shutdown from main.py."""
-    global _db
+    global _db, _workshop_event_lock
     if _db:
         try:
             await _get_db().close()
@@ -1477,3 +1494,4 @@ async def close_db() -> None:
             # Clear even if close() raises so subsequent _get_db() calls
             # get a clear RuntimeError instead of using a broken connection
             _db = None
+    _workshop_event_lock = None

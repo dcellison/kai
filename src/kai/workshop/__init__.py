@@ -1,8 +1,8 @@
 """Transport-independent Kai Workshop domain and persistence foundations.
 
-This package is intentionally not wired into Kai's production startup or
-message paths yet.  The bootstrap migration will integrate it after the
-domain and event-store contracts have been reviewed independently.
+The current production service seeds this state and shadow-records accepted
+inbound text, but existing Telegram routing, histories, and responses remain
+authoritative until replay and parity evidence supports an explicit cutover.
 """
 
 from kai.workshop.domain import (

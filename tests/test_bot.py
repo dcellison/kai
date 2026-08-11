@@ -11,12 +11,14 @@ import asyncio
 import json
 import logging
 import stat
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from telegram.error import BadRequest
 
+from kai import sessions
 from kai.backend import AgentResponse, StreamEvent
 from kai.bot import (
     _QUEUED_MESSAGE_MARKER,
@@ -78,6 +80,7 @@ from kai.bot import (
 from kai.config import PROVIDER_MODELS, Config, UserConfig, get_default_model_for_backend
 from kai.review import CollectionWarning, PRReviewResult
 from kai.tts import DEFAULT_VOICE, VOICES
+from kai.workshop.inbound import InboundMessage
 from kai.workspace_utils import is_workspace_allowed
 
 # ── _backend_name_for_instance ───────────────────────────────────────
@@ -725,6 +728,11 @@ class TestCreateBotTransportMode:
         app = create_bot(config, use_webhook=False)
         assert app.updater is not None
 
+    def test_installs_workshop_shadow_recorder(self):
+        app = create_bot(_make_config())
+
+        assert app.bot_data["workshop_inbound_recorder"] is sessions.record_workshop_inbound_message
+
 
 # ══════════════════════════════════════════════════════════════════════
 # Handler tests - mock Telegram Update/Context objects
@@ -734,7 +742,7 @@ class TestCreateBotTransportMode:
 # ── Test helpers ─────────────────────────────────────────────────────
 
 
-def _make_update(text="hello", chat_id=12345, user_id=1):
+def _make_update(text="hello", chat_id=12345, user_id=1, *, update_id=9001, message_id=42):
     """Create a mock Telegram Update for handler tests."""
     update = MagicMock()
     update.message.text = text
@@ -744,6 +752,9 @@ def _make_update(text="hello", chat_id=12345, user_id=1):
     update.message.photo = None
     update.message.document = None
     update.message.voice = None
+    update.message.message_id = message_id
+    update.message.date = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
+    update.update_id = update_id
     update.effective_chat.id = chat_id
     update.effective_chat.send_message = AsyncMock()
     update.effective_user.id = user_id
@@ -2738,6 +2749,75 @@ class TestHandleMessage:
             await handle_message(update, ctx)
         mock_resp.assert_called_once()
         mock_log.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_records_authenticated_message_after_totp_gate(self):
+        update = _make_update(text="canonical input", chat_id=1, user_id=1)
+        ctx = _make_context(config=_make_config(allowed_user_ids={1}))
+        recorder = AsyncMock()
+        ctx.bot_data["workshop_inbound_recorder"] = recorder
+        with (
+            patch("kai.bot.is_totp_configured", return_value=False),
+            patch("kai.bot._handle_response", new_callable=AsyncMock),
+            patch("kai.bot.log_message"),
+            patch("kai.bot._set_responding"),
+            patch("kai.bot._clear_responding"),
+            patch("kai.bot.get_lock", return_value=_fake_lock()),
+        ):
+            await handle_message(update, ctx)
+
+        recorder.assert_awaited_once_with(
+            InboundMessage(
+                transport="telegram",
+                update_id="9001",
+                message_id="42",
+                sender_subject="1",
+                channel_subject="1",
+                body="canonical input",
+                occurred_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_does_not_record_when_totp_denies_message(self):
+        update = _make_update(chat_id=1, user_id=1)
+        ctx = _make_context(config=_make_config(allowed_user_ids={1}))
+        recorder = AsyncMock()
+        ctx.bot_data["workshop_inbound_recorder"] = recorder
+        with patch("kai.bot._check_totp_text", new_callable=AsyncMock, return_value=False):
+            await handle_message(update, ctx)
+
+        recorder.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_does_not_record_unauthorized_message(self):
+        update = _make_update(chat_id=99, user_id=99)
+        ctx = _make_context(config=_make_config(allowed_user_ids={1}))
+        recorder = AsyncMock()
+        ctx.bot_data["workshop_inbound_recorder"] = recorder
+
+        await handle_message(update, ctx)
+
+        recorder.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_shadow_failure_does_not_change_existing_response_path(self, caplog):
+        update = _make_update(chat_id=1, user_id=1)
+        ctx = _make_context(config=_make_config(allowed_user_ids={1}))
+        ctx.bot_data["workshop_inbound_recorder"] = AsyncMock(side_effect=RuntimeError("shadow failed"))
+        with (
+            patch("kai.bot.is_totp_configured", return_value=False),
+            patch("kai.bot._handle_response", new_callable=AsyncMock) as mock_response,
+            patch("kai.bot.log_message"),
+            patch("kai.bot._set_responding"),
+            patch("kai.bot._clear_responding"),
+            patch("kai.bot.get_lock", return_value=_fake_lock()),
+            caplog.at_level(logging.ERROR),
+        ):
+            await handle_message(update, ctx)
+
+        mock_response.assert_awaited_once()
+        assert "Workshop inbound shadow write failed" in caplog.text
 
     @pytest.mark.asyncio
     async def test_empty_message(self):
