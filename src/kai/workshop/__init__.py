@@ -1,8 +1,9 @@
 """Transport-independent Kai Workshop domain and persistence foundations.
 
 The current production service seeds this state and shadow-records accepted
-inbound text, but existing Telegram routing, histories, and responses remain
-authoritative until replay and parity evidence supports an explicit cutover.
+inbound text, successful assistant results, and delivery observations. Existing
+Telegram routing, histories, and responses remain authoritative until replay
+and parity evidence supports an explicit cutover.
 """
 
 from kai.workshop.domain import (
@@ -10,6 +11,7 @@ from kai.workshop.domain import (
     ChannelAgentId,
     ChannelBindingId,
     ChannelId,
+    DeliveryId,
     EventEnvelope,
     EventId,
     ExternalIdentityId,
@@ -35,6 +37,7 @@ __all__ = [
     "ChannelAgentId",
     "ChannelBindingId",
     "ChannelId",
+    "DeliveryId",
     "EventEnvelope",
     "EventId",
     "EventIntegrityError",

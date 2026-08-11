@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 1
+WORKSHOP_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,7 +135,28 @@ _INITIAL_SCHEMA = SchemaMigration(
     ),
 )
 
-_MIGRATIONS = (_INITIAL_SCHEMA,)
+_DELIVERY_SCHEMA = SchemaMigration(
+    version=2,
+    name="canonical_delivery_observations",
+    statements=(
+        """
+        CREATE TABLE deliveries (
+            id TEXT PRIMARY KEY,
+            message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            transport TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('succeeded', 'failed')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_event_position INTEGER NOT NULL UNIQUE REFERENCES event_log(position) ON DELETE RESTRICT,
+            UNIQUE (message_id, transport, mode)
+        )
+        """,
+    ),
+)
+
+_MIGRATIONS = (_INITIAL_SCHEMA, _DELIVERY_SCHEMA)
 
 
 async def migrate_workshop_schema(

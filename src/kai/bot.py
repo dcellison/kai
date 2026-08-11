@@ -41,7 +41,7 @@ import shutil
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
@@ -80,7 +80,9 @@ from kai.pool import SubprocessPool
 from kai.telegram_utils import chunk_text
 from kai.transcribe import TranscriptionError, transcribe_voice
 from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
+from kai.workshop.domain import MessageId
 from kai.workshop.inbound import InboundMessage
+from kai.workshop.outbound import DeliveryObservation, OutboundMessage
 from kai.workspace_utils import is_workspace_allowed
 
 _UPLOAD_ROOT_MODE = 0o711
@@ -793,27 +795,33 @@ async def _reply_safe(msg: Message, text: str) -> Message:
         return await msg.reply_text(text)
 
 
-async def _edit_message_safe(msg: Message, text: str) -> None:
+async def _edit_message_safe(msg: Message, text: str) -> bool:
     """
     Edit an existing message with Markdown, falling back to plain text.
 
     Used during streaming to update the live response message. On BadRequest
     (Telegram rejecting the markup), retries without parse_mode. All other
     errors are silently ignored since edits are best-effort during streaming
-    (e.g., message not modified, message deleted by user, network blip).
+    (e.g., message not modified, message deleted by user, network blip). Returns
+    whether either edit attempt succeeded so shadow delivery observations can
+    describe the outcome without changing this best-effort behavior.
     """
     truncated = _truncate_for_telegram(text)
     try:
         await msg.edit_text(truncated, parse_mode=ParseMode.MARKDOWN)
+        return True
     except BadRequest:
         try:
             await msg.edit_text(truncated)
+            return True
         except Exception:
             # Editing is best-effort during streaming; log at debug so persistent
             # issues (e.g., revoked bot token) leave a diagnostic trail
             log.debug("Failed to edit message (plain-text fallback)", exc_info=True)
+            return False
     except Exception:
         log.debug("Failed to edit message", exc_info=True)
+        return False
 
 
 async def _send_response(update: Update, text: str) -> None:
@@ -4403,10 +4411,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # the provenance writer. None on JSONL write failure; the extraction
     # path then skips provenance stamping for this exchange.
     user_log = log_message(direction="user", chat_id=chat_id, text=prompt)
+    workshop_inbound_message_id: MessageId | None = None
     recorder = context.bot_data.get("workshop_inbound_recorder")
     if recorder is not None:
         try:
-            await recorder(
+            result = await recorder(
                 InboundMessage(
                     transport="telegram",
                     update_id=str(update.update_id),
@@ -4417,6 +4426,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     occurred_at=update.message.date,
                 )
             )
+            aggregate_id = result.event.envelope.aggregate_id
+            if not isinstance(aggregate_id, MessageId):
+                raise RuntimeError("Workshop inbound recorder returned a non-message aggregate")
+            workshop_inbound_message_id = aggregate_id
         except Exception:
             log.exception(
                 "Workshop inbound shadow write failed (update_id=%s, message_id=%s)",
@@ -4441,6 +4454,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 pool,
                 model,
                 user_log=user_log,
+                workshop_inbound_message_id=workshop_inbound_message_id,
             )
         finally:
             _clear_responding(chat_id)
@@ -4459,6 +4473,7 @@ async def _handle_response(
     pool: SubprocessPool,
     model: str,
     user_log: LogEntry | None = None,
+    workshop_inbound_message_id: MessageId | None = None,
 ) -> None:
     """
     Stream Claude's response and deliver it to the user.
@@ -4626,6 +4641,51 @@ async def _handle_response(
     # path then skips provenance stamping for this exchange.
     assistant_log = log_message(direction="assistant", chat_id=chat_id, text=final_text)
 
+    workshop_outbound_message_id: MessageId | None = None
+    outbound_recorder = context.bot_data.get("workshop_outbound_recorder")
+    if workshop_inbound_message_id is not None and outbound_recorder is not None:
+        try:
+            outbound_result = await outbound_recorder(
+                OutboundMessage(
+                    in_reply_to_message_id=workshop_inbound_message_id,
+                    body=final_text,
+                    occurred_at=datetime.now(UTC),
+                )
+            )
+            aggregate_id = outbound_result.event.envelope.aggregate_id
+            if not isinstance(aggregate_id, MessageId):
+                raise RuntimeError("Workshop outbound recorder returned a non-message aggregate")
+            workshop_outbound_message_id = aggregate_id
+        except Exception:
+            log.exception(
+                "Workshop outbound shadow write failed (inbound_message_id=%s)",
+                workshop_inbound_message_id,
+            )
+
+    async def _observe_delivery(mode: str, succeeded: bool) -> None:
+        if workshop_outbound_message_id is None:
+            return
+        delivery_recorder = context.bot_data.get("workshop_delivery_recorder")
+        if delivery_recorder is None:
+            return
+        try:
+            await delivery_recorder(
+                DeliveryObservation(
+                    message_id=workshop_outbound_message_id,
+                    transport="telegram",
+                    mode=mode,
+                    succeeded=succeeded,
+                    occurred_at=datetime.now(UTC),
+                )
+            )
+        except Exception:
+            log.exception(
+                "Workshop delivery shadow write failed (message_id=%s, mode=%s, succeeded=%s)",
+                workshop_outbound_message_id,
+                mode,
+                succeeded,
+            )
+
     # Fire-and-forget: embed this exchange in semantic memory.
     # Runs in a background task so it does not delay response delivery.
     # Failures are logged but never propagate to the user.
@@ -4727,34 +4787,52 @@ async def _handle_response(
         voice_name = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
         try:
             audio = await synthesize_speech(final_text, config.piper_model_dir, voice_name)
-            await context.bot.send_voice(chat_id=chat_id, voice=audio)
-            return
         except TTSError as e:
             log.warning("TTS failed, falling back to text: %s", e)
+        else:
+            try:
+                await context.bot.send_voice(chat_id=chat_id, voice=audio)
+            except Exception:
+                await _observe_delivery("voice", False)
+                raise
+            await _observe_delivery("voice", True)
+            return
 
     # Send text response (normal mode, or voice-only fallback)
-    if live_msg:
-        # Update the live message with the final text
-        if len(final_text) <= 4096:
-            if final_text != last_edit_text:
-                await _edit_message_safe(live_msg, final_text)
+    text_delivery_succeeded = True
+    try:
+        if live_msg:
+            # Update the live message with the final text
+            if len(final_text) <= 4096:
+                if final_text != last_edit_text:
+                    text_delivery_succeeded = await _edit_message_safe(live_msg, final_text)
+            else:
+                # Response exceeds Telegram's limit — edit first chunk, send the rest
+                chunks = chunk_text(final_text)
+                text_delivery_succeeded = await _edit_message_safe(live_msg, chunks[0])
+                for chunk in chunks[1:]:
+                    await _reply_safe(update.message, chunk)
         else:
-            # Response exceeds Telegram's limit — edit first chunk, send the rest
-            chunks = chunk_text(final_text)
-            await _edit_message_safe(live_msg, chunks[0])
-            for chunk in chunks[1:]:
-                await _reply_safe(update.message, chunk)
-    else:
-        await _send_response(update, final_text)
+            await _send_response(update, final_text)
+    except Exception:
+        await _observe_delivery("text", False)
+        raise
+    await _observe_delivery("text", text_delivery_succeeded)
 
     # Text+voice mode: send voice note after text
     if voice_mode == "on" and final_text:
         voice_name = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
         try:
             audio = await synthesize_speech(final_text, config.piper_model_dir, voice_name)
-            await context.bot.send_voice(chat_id=chat_id, voice=audio)
         except TTSError as e:
             log.warning("TTS failed: %s", e)
+        else:
+            try:
+                await context.bot.send_voice(chat_id=chat_id, voice=audio)
+            except Exception:
+                await _observe_delivery("voice", False)
+                raise
+            await _observe_delivery("voice", True)
 
 
 # ── Application factory ─────────────────────────────────────────────
@@ -4793,6 +4871,8 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
     app = builder.build()
     app.bot_data["config"] = config
     app.bot_data["workshop_inbound_recorder"] = sessions.record_workshop_inbound_message
+    app.bot_data["workshop_outbound_recorder"] = sessions.record_workshop_outbound_message
+    app.bot_data["workshop_delivery_recorder"] = sessions.record_workshop_delivery_observation
     app.bot_data["pool"] = SubprocessPool(
         config=config,
         services_info=services.get_available_services(),

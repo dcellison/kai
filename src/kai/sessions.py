@@ -45,6 +45,12 @@ import aiosqlite
 from kai.job_types import JOB_TYPE_AGENT, LEGACY_JOB_TYPE_AGENT, normalize_job_type
 from kai.workshop.bootstrap import BootstrapHuman, BootstrapResult, bootstrap_default_workshop
 from kai.workshop.inbound import InboundMessage, record_inbound_message
+from kai.workshop.outbound import (
+    DeliveryObservation,
+    OutboundMessage,
+    record_delivery_observation,
+    record_outbound_message,
+)
 from kai.workshop.schema import migrate_workshop_schema
 from kai.workshop.store import AppendResult, WorkshopEventStore
 
@@ -318,6 +324,24 @@ async def record_workshop_inbound_message(message: InboundMessage) -> AppendResu
     async with _workshop_event_lock:
         store = WorkshopEventStore.from_initialized_connection(_get_db())
         return await record_inbound_message(store, message)
+
+
+async def record_workshop_outbound_message(message: OutboundMessage) -> AppendResult:
+    """Serialize one assistant-result shadow write on Kai's shared database."""
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        store = WorkshopEventStore.from_initialized_connection(_get_db())
+        return await record_outbound_message(store, message)
+
+
+async def record_workshop_delivery_observation(observation: DeliveryObservation) -> AppendResult:
+    """Serialize one transport-delivery observation on Kai's shared database."""
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        store = WorkshopEventStore.from_initialized_connection(_get_db())
+        return await record_delivery_observation(store, observation)
 
 
 async def get_session(chat_id: int) -> str | None:

@@ -13,6 +13,7 @@ import pytest
 from kai.workshop.domain import (
     AgentId,
     ChannelId,
+    DeliveryId,
     EventEnvelope,
     EventId,
     MessageId,
@@ -63,6 +64,7 @@ class TestWorkshopIdentifiers:
             (ChannelId, "chn_not-hex"),
             (AgentId, ""),
             (MessageId, "msg_0000000000000000000000000000000"),
+            (DeliveryId, "msg_00000000000000000000000000000001"),
             (EventId, "evt_000000000000000000000000000000011"),
         ],
     )
@@ -83,6 +85,8 @@ class TestEventEnvelope:
             "agent.created",
             "channel.agent_attached",
             "message.created",
+            "delivery.succeeded",
+            "delivery.failed",
         }
 
     def test_create_builds_a_versioned_transport_independent_envelope(self):
@@ -145,12 +149,13 @@ class TestWorkshopSchema:
             "agents",
             "channel_agents",
             "messages",
+            "deliveries",
             "event_log",
             "projection_checkpoints",
         }
 
         assert expected <= await workshop_store.schema_tables()
-        assert await workshop_store.schema_version() == 1
+        assert await workshop_store.schema_version() == 2
 
     async def test_schema_migration_is_idempotent(self, tmp_path: Path):
         path = tmp_path / "workshop.db"
@@ -158,13 +163,35 @@ class TestWorkshopSchema:
         await first.close()
 
         second = await WorkshopEventStore.open(path)
-        assert await second.schema_version() == 1
+        assert await second.schema_version() == 2
         async with second.connection.execute(
             "SELECT COUNT(*) FROM workshop_schema_migrations WHERE version = 1"
         ) as cursor:
             row = await cursor.fetchone()
         assert row[0] == 1
         await second.close()
+
+    async def test_version_one_database_upgrades_additively(self, tmp_path: Path, monkeypatch):
+        from kai.workshop import schema
+
+        path = tmp_path / "workshop.db"
+        with monkeypatch.context() as migration_context:
+            migration_context.setattr(schema, "WORKSHOP_SCHEMA_VERSION", 1)
+            migration_context.setattr(schema, "_MIGRATIONS", (schema._INITIAL_SCHEMA,))
+            version_one = await WorkshopEventStore.open(path)
+            assert await version_one.schema_version() == 1
+            await version_one.close()
+
+        upgraded = await WorkshopEventStore.open(path)
+        try:
+            assert await upgraded.schema_version() == 2
+            assert "deliveries" in await upgraded.schema_tables()
+            async with upgraded.connection.execute(
+                "SELECT version FROM workshop_schema_migrations ORDER BY version"
+            ) as cursor:
+                assert [row[0] for row in await cursor.fetchall()] == [1, 2]
+        finally:
+            await upgraded.close()
 
     async def test_schema_is_additive_to_an_existing_kai_database(self, tmp_path: Path):
         path = tmp_path / "kai.db"

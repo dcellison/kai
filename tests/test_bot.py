@@ -80,7 +80,9 @@ from kai.bot import (
 from kai.config import PROVIDER_MODELS, Config, UserConfig, get_default_model_for_backend
 from kai.review import CollectionWarning, PRReviewResult
 from kai.tts import DEFAULT_VOICE, VOICES
+from kai.workshop.domain import MessageId
 from kai.workshop.inbound import InboundMessage
+from kai.workshop.outbound import DeliveryObservation, OutboundMessage
 from kai.workspace_utils import is_workspace_allowed
 
 # ── _backend_name_for_instance ───────────────────────────────────────
@@ -732,6 +734,8 @@ class TestCreateBotTransportMode:
         app = create_bot(_make_config())
 
         assert app.bot_data["workshop_inbound_recorder"] is sessions.record_workshop_inbound_message
+        assert app.bot_data["workshop_outbound_recorder"] is sessions.record_workshop_outbound_message
+        assert app.bot_data["workshop_delivery_recorder"] is sessions.record_workshop_delivery_observation
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -964,7 +968,8 @@ class TestEditMessageSafe:
     async def test_markdown_edit_success(self):
         msg = MagicMock()
         msg.edit_text = AsyncMock()
-        await _edit_message_safe(msg, "hello")
+        result = await _edit_message_safe(msg, "hello")
+        assert result is True
         msg.edit_text.assert_called_once()
 
     @pytest.mark.asyncio
@@ -972,7 +977,8 @@ class TestEditMessageSafe:
         """BadRequest on Markdown triggers plain text retry."""
         msg = MagicMock()
         msg.edit_text = AsyncMock(side_effect=[BadRequest("bad"), None])
-        await _edit_message_safe(msg, "text")
+        result = await _edit_message_safe(msg, "text")
+        assert result is True
         assert msg.edit_text.call_count == 2
 
     @pytest.mark.asyncio
@@ -981,7 +987,8 @@ class TestEditMessageSafe:
         msg = MagicMock()
         msg.edit_text = AsyncMock(side_effect=[BadRequest("bad"), RuntimeError("fail")])
         with caplog.at_level(logging.DEBUG, logger="kai.bot"):
-            await _edit_message_safe(msg, "text")
+            result = await _edit_message_safe(msg, "text")
+        assert result is False
         assert "Failed to edit message" in caplog.text
 
     @pytest.mark.asyncio
@@ -990,7 +997,8 @@ class TestEditMessageSafe:
         msg = MagicMock()
         msg.edit_text = AsyncMock(side_effect=RuntimeError("network"))
         with caplog.at_level(logging.DEBUG, logger="kai.bot"):
-            await _edit_message_safe(msg, "text")
+            result = await _edit_message_safe(msg, "text")
+        assert result is False
         assert "Failed to edit message" in caplog.text
 
     @pytest.mark.asyncio
@@ -2755,10 +2763,12 @@ class TestHandleMessage:
         update = _make_update(text="canonical input", chat_id=1, user_id=1)
         ctx = _make_context(config=_make_config(allowed_user_ids={1}))
         recorder = AsyncMock()
+        inbound_id = MessageId("msg_00000000000000000000000000000001")
+        recorder.return_value.event.envelope.aggregate_id = inbound_id
         ctx.bot_data["workshop_inbound_recorder"] = recorder
         with (
             patch("kai.bot.is_totp_configured", return_value=False),
-            patch("kai.bot._handle_response", new_callable=AsyncMock),
+            patch("kai.bot._handle_response", new_callable=AsyncMock) as response,
             patch("kai.bot.log_message"),
             patch("kai.bot._set_responding"),
             patch("kai.bot._clear_responding"),
@@ -2777,6 +2787,7 @@ class TestHandleMessage:
                 occurred_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
             )
         )
+        assert response.await_args.kwargs["workshop_inbound_message_id"] == inbound_id
 
     @pytest.mark.asyncio
     async def test_does_not_record_when_totp_denies_message(self):
@@ -3148,6 +3159,222 @@ class TestHandleResponse:
             ),
             "log_message": MagicMock(),
         }
+
+    @staticmethod
+    def _install_workshop_recorders(ctx, message_id: MessageId):
+        outbound = AsyncMock()
+        outbound.return_value.event.envelope.aggregate_id = message_id
+        delivery = AsyncMock()
+        ctx.bot_data["workshop_outbound_recorder"] = outbound
+        ctx.bot_data["workshop_delivery_recorder"] = delivery
+        return outbound, delivery
+
+    @pytest.mark.asyncio
+    async def test_shadows_successful_assistant_result_and_text_delivery(self):
+        from kai.bot import _handle_response
+
+        inbound_id = MessageId("msg_00000000000000000000000000000001")
+        outbound_id = MessageId("msg_00000000000000000000000000000002")
+        update = _make_update()
+        pool = _make_mock_claude()
+        pool.send = MagicMock(return_value=_fake_stream(_done_event("Canonical answer")))
+        ctx = _make_context(pool=pool)
+        outbound, delivery = self._install_workshop_recorders(ctx, outbound_id)
+
+        with patch.multiple("kai.bot", **self._base_patches()):
+            await _handle_response(
+                update,
+                ctx,
+                12345,
+                "test",
+                pool,
+                "sonnet",
+                workshop_inbound_message_id=inbound_id,
+            )
+
+        outbound.assert_awaited_once()
+        outbound_message = outbound.await_args.args[0]
+        assert isinstance(outbound_message, OutboundMessage)
+        assert outbound_message.in_reply_to_message_id == inbound_id
+        assert outbound_message.body == "Canonical answer"
+        delivery.assert_awaited_once()
+        observation = delivery.await_args.args[0]
+        assert isinstance(observation, DeliveryObservation)
+        assert observation.message_id == outbound_id
+        assert (observation.transport, observation.mode, observation.succeeded) == (
+            "telegram",
+            "text",
+            True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_outbound_shadow_failure_does_not_change_delivery(self, caplog):
+        from kai.bot import _handle_response
+
+        inbound_id = MessageId("msg_00000000000000000000000000000001")
+        update = _make_update()
+        pool = _make_mock_claude()
+        pool.send = MagicMock(return_value=_fake_stream(_done_event("Still delivered")))
+        ctx = _make_context(pool=pool)
+        ctx.bot_data["workshop_outbound_recorder"] = AsyncMock(side_effect=RuntimeError("shadow failed"))
+        delivery = AsyncMock()
+        ctx.bot_data["workshop_delivery_recorder"] = delivery
+
+        with patch.multiple("kai.bot", **self._base_patches()), caplog.at_level(logging.ERROR):
+            await _handle_response(
+                update,
+                ctx,
+                12345,
+                "test",
+                pool,
+                "sonnet",
+                workshop_inbound_message_id=inbound_id,
+            )
+
+        assert update.message.reply_text.called
+        delivery.assert_not_awaited()
+        assert "Workshop outbound shadow write failed" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_delivery_shadow_failure_does_not_change_existing_response_path(self, caplog):
+        from kai.bot import _handle_response
+
+        inbound_id = MessageId("msg_00000000000000000000000000000001")
+        outbound_id = MessageId("msg_00000000000000000000000000000002")
+        update = _make_update()
+        pool = _make_mock_claude()
+        pool.send = MagicMock(return_value=_fake_stream(_done_event("Delivered despite shadow failure")))
+        ctx = _make_context(pool=pool)
+        outbound, _ = self._install_workshop_recorders(ctx, outbound_id)
+        ctx.bot_data["workshop_delivery_recorder"] = AsyncMock(side_effect=RuntimeError("shadow failed"))
+
+        with patch.multiple("kai.bot", **self._base_patches()), caplog.at_level(logging.ERROR):
+            await _handle_response(
+                update,
+                ctx,
+                12345,
+                "test",
+                pool,
+                "sonnet",
+                workshop_inbound_message_id=inbound_id,
+            )
+
+        outbound.assert_awaited_once()
+        assert update.message.reply_text.called
+        assert "Workshop delivery shadow write failed" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_text_delivery_failure_is_observed_and_original_error_propagates(self):
+        from kai.bot import _handle_response
+
+        inbound_id = MessageId("msg_00000000000000000000000000000001")
+        outbound_id = MessageId("msg_00000000000000000000000000000002")
+        update = _make_update()
+        pool = _make_mock_claude()
+        pool.send = MagicMock(return_value=_fake_stream(_done_event("Undelivered")))
+        ctx = _make_context(pool=pool)
+        _, delivery = self._install_workshop_recorders(ctx, outbound_id)
+
+        with (
+            patch.multiple("kai.bot", **self._base_patches()),
+            patch("kai.bot._send_response", new_callable=AsyncMock, side_effect=ConnectionError("network")),
+            pytest.raises(ConnectionError, match="network"),
+        ):
+            await _handle_response(
+                update,
+                ctx,
+                12345,
+                "test",
+                pool,
+                "sonnet",
+                workshop_inbound_message_id=inbound_id,
+            )
+
+        assert delivery.await_args.args[0].succeeded is False
+
+    @pytest.mark.asyncio
+    async def test_best_effort_final_edit_failure_is_observed_without_new_exception(self):
+        from kai.bot import _handle_response
+
+        inbound_id = MessageId("msg_00000000000000000000000000000001")
+        outbound_id = MessageId("msg_00000000000000000000000000000002")
+        update = _make_update()
+        pool = _make_mock_claude()
+        pool.send = MagicMock(return_value=_fake_stream(_text_event("Stable sentence."), _done_event("Final answer.")))
+        ctx = _make_context(pool=pool)
+        _, delivery = self._install_workshop_recorders(ctx, outbound_id)
+
+        with (
+            patch.multiple("kai.bot", **self._base_patches()),
+            patch("kai.bot._edit_message_safe", new_callable=AsyncMock, return_value=False),
+        ):
+            await _handle_response(
+                update,
+                ctx,
+                12345,
+                "test",
+                pool,
+                "sonnet",
+                workshop_inbound_message_id=inbound_id,
+            )
+
+        assert delivery.await_args.args[0].succeeded is False
+
+    @pytest.mark.asyncio
+    async def test_voice_only_delivery_success_is_observed(self):
+        from kai.bot import _handle_response
+
+        inbound_id = MessageId("msg_00000000000000000000000000000001")
+        outbound_id = MessageId("msg_00000000000000000000000000000002")
+        update = _make_update()
+        pool = _make_mock_claude()
+        pool.send = MagicMock(return_value=_fake_stream(_done_event("Spoken")))
+        ctx = _make_context(config=_make_config(tts_enabled=True), pool=pool)
+        _, delivery = self._install_workshop_recorders(ctx, outbound_id)
+        patches = self._base_patches()
+        patches["sessions"].get_setting = AsyncMock(return_value="only")
+
+        with (
+            patch.multiple("kai.bot", **patches),
+            patch("kai.bot.synthesize_speech", new_callable=AsyncMock, return_value=b"audio"),
+        ):
+            await _handle_response(
+                update,
+                ctx,
+                12345,
+                "test",
+                pool,
+                "sonnet",
+                workshop_inbound_message_id=inbound_id,
+            )
+
+        observation = delivery.await_args.args[0]
+        assert (observation.mode, observation.succeeded) == ("voice", True)
+
+    @pytest.mark.asyncio
+    async def test_failed_backend_does_not_create_workshop_outbound_message(self):
+        from kai.bot import _handle_response
+
+        inbound_id = MessageId("msg_00000000000000000000000000000001")
+        update = _make_update()
+        pool = _make_mock_claude()
+        pool.send = MagicMock(return_value=_fake_stream(_done_event("bad", success=False, error="bad")))
+        ctx = _make_context(pool=pool)
+        outbound = AsyncMock()
+        ctx.bot_data["workshop_outbound_recorder"] = outbound
+
+        with patch.multiple("kai.bot", **self._base_patches()):
+            await _handle_response(
+                update,
+                ctx,
+                12345,
+                "test",
+                pool,
+                "sonnet",
+                workshop_inbound_message_id=inbound_id,
+            )
+
+        outbound.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_normal_flow(self):

@@ -21,10 +21,11 @@ class CanonicalConversationProjection:
     """Rebuild the initial Workshop collaboration records from events."""
 
     name = "canonical_conversations"
-    version = 1
+    version = 2
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         for table in (
+            "deliveries",
             "messages",
             "channel_agents",
             "channel_bindings",
@@ -144,5 +145,29 @@ class CanonicalConversationProjection:
                     _required_text(payload, "body"),
                     event.position,
                     occurred_at,
+                ),
+            )
+        elif envelope.event_type in {
+            WorkshopEventType.DELIVERY_SUCCEEDED,
+            WorkshopEventType.DELIVERY_FAILED,
+        }:
+            status = "succeeded" if envelope.event_type == WorkshopEventType.DELIVERY_SUCCEEDED else "failed"
+            await connection.execute(
+                "INSERT INTO deliveries "
+                "(id, message_id, channel_id, transport, mode, status, created_at, updated_at, "
+                "last_event_position) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "status = excluded.status, updated_at = excluded.updated_at, "
+                "last_event_position = excluded.last_event_position",
+                (
+                    envelope.aggregate_id,
+                    _required_text(payload, "message_id"),
+                    _required_text(payload, "channel_id"),
+                    _required_text(payload, "transport"),
+                    _required_text(payload, "mode"),
+                    status,
+                    occurred_at,
+                    occurred_at,
+                    event.position,
                 ),
             )
