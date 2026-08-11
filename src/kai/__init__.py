@@ -1,3 +1,3 @@
-"""Kai — Telegram gateway to Claude Code CLI."""
+"""Kai — Telegram gateway to AI coding-agent backends."""
 
-__version__ = "1.4.0"
+__version__ = "2.0.0"
