@@ -102,24 +102,30 @@ def _agent_message_delta(text: str, item_id: str = "item-1") -> bytes:
     )
 
 
-def _item_started_agent(item_id: str = "item-1") -> bytes:
+def _item_started_agent(item_id: str = "item-1", *, phase: str | None = None) -> bytes:
     """Build an item/started notification for an agentMessage item."""
+    item = {"id": item_id, "type": "agentMessage", "text": ""}
+    if phase is not None:
+        item["phase"] = phase
     return _json_line(
         {
             "jsonrpc": "2.0",
             "method": "item/started",
-            "params": {"item": {"id": item_id, "type": "agentMessage", "text": ""}},
+            "params": {"item": item},
         }
     )
 
 
-def _item_completed_agent(text: str, item_id: str = "item-1") -> bytes:
+def _item_completed_agent(text: str, item_id: str = "item-1", *, phase: str | None = None) -> bytes:
     """Build an item/completed notification for an agentMessage item."""
+    item = {"id": item_id, "type": "agentMessage", "text": text}
+    if phase is not None:
+        item["phase"] = phase
     return _json_line(
         {
             "jsonrpc": "2.0",
             "method": "item/completed",
-            "params": {"item": {"id": item_id, "type": "agentMessage", "text": text}},
+            "params": {"item": item},
         }
     )
 
@@ -625,12 +631,9 @@ class TestStreamParsing:
     @pytest.mark.asyncio
     async def test_multi_agent_message_items_join_with_blank_line(self):
         """
-        A single turn can emit multiple agentMessage items (e.g. preamble
-        before a tool call, post-tool summary after). The visible text must
-        commit each item's content with a blank-line separator; item N's
-        completion must NEVER override prior items' accumulated text
-        (the bug that produced "summary here.The..." truncations during
-        the live smoke test).
+        Providers can omit phase classification. Preserve the compatibility
+        behavior by committing every unclassified item with a blank-line
+        separator; item N's completion must NEVER override prior items.
         """
         c = _make_codex()
         c._proc = _make_mock_proc(
@@ -660,6 +663,90 @@ class TestStreamParsing:
         # appended, NOT substituted for item 1's. This is the regression
         # guard for the smoke-test overwrite bug.
         assert final.response.text == "Hello world.\n\nNext, more text."
+
+    @pytest.mark.asyncio
+    async def test_classified_commentary_is_hidden_when_final_answer_follows(self):
+        """Operational preambles must not become part of the Telegram reply."""
+        c = _make_codex()
+        c._proc = _make_mock_proc(
+            [
+                _item_started_agent(item_id="commentary", phase="commentary"),
+                _agent_message_delta(
+                    "I'm checking the required identity and preference files first.",
+                    item_id="commentary",
+                ),
+                _item_completed_agent(
+                    "I'm checking the required identity and preference files first.",
+                    item_id="commentary",
+                    phase="commentary",
+                ),
+                _item_started_agent(item_id="answer", phase="final_answer"),
+                _agent_message_delta("Hello. I'm here. 👋", item_id="answer"),
+                _item_completed_agent("Hello. I'm here. 👋", item_id="answer", phase="final_answer"),
+                _turn_completed("completed"),
+            ]
+        )
+        c._session_id = "test-session"
+        c._fresh_session = False
+        c._next_id = 3
+
+        events = await _collect_events(c)
+
+        assert events
+        assert all("checking the required" not in event.text_so_far for event in events)
+        final = events[-1]
+        assert final.done is True
+        assert final.response is not None
+        assert final.response.success is True
+        assert final.response.text == "Hello. I'm here. 👋"
+
+    @pytest.mark.asyncio
+    async def test_commentary_only_success_falls_back_instead_of_returning_blank(self):
+        """A provider that emits no final answer still returns its only text."""
+        c = _make_codex()
+        c._proc = _make_mock_proc(
+            [
+                _item_started_agent(phase="commentary"),
+                _agent_message_delta("Only classified message", item_id="item-1"),
+                _item_completed_agent("Only classified message", phase="commentary"),
+                _turn_completed("completed"),
+            ]
+        )
+        c._session_id = "test-session"
+        c._fresh_session = False
+        c._next_id = 3
+
+        events = await _collect_events(c)
+
+        assert len(events) == 1
+        assert events[0].done is True
+        assert events[0].response is not None
+        assert events[0].response.success is True
+        assert events[0].response.text == "Only classified message"
+
+    @pytest.mark.asyncio
+    async def test_commentary_only_eof_is_an_error_and_does_not_leak_preamble(self):
+        """An interrupted preamble is not a successful partial answer."""
+        c = _make_codex()
+        c._proc = _make_mock_proc(
+            [
+                _item_started_agent(phase="commentary"),
+                _agent_message_delta("Checking files", item_id="item-1"),
+                b"",
+            ]
+        )
+        c._session_id = "test-session"
+        c._fresh_session = False
+        c._next_id = 3
+
+        events = await _collect_events(c)
+
+        assert len(events) == 1
+        assert events[0].done is True
+        assert events[0].response is not None
+        assert events[0].response.success is False
+        assert events[0].response.text == ""
+        assert "unexpectedly" in events[0].response.error
 
     @pytest.mark.asyncio
     async def test_item_completed_overrides_only_current_item(self):

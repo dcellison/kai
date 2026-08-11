@@ -947,31 +947,30 @@ class CodexBackend(AgentBackend):
         # DEBUG and skipped (schema-drift defense).
         #
         # Multi-agentMessage tracking: a single turn can emit MORE
-        # than one agentMessage item (e.g. preamble, tool call,
-        # post-tool summary). Per the codex protocol README, deltas
-        # are scoped to a single itemId; concatenating them across
-        # items without separators tacks the second item's first
-        # word onto the first item's terminator ("summary here.The"
-        # -> the operator's smoke-test observation). We track each
-        # item's text separately, commit completed items into a
-        # joined-with-blank-line prefix, and only let item/completed
-        # override the CURRENT item's text - never the prior
-        # committed content. The visible text streamed to telegram
-        # is `committed + ("\n\n" + current if current)`.
+        # than one agentMessage item. Current app-server versions classify
+        # these with `phase=commentary` for preamble/progress narration and
+        # `phase=final_answer` for terminal answer text. Explicit commentary
+        # is not user-visible; Telegram is a conversation surface, not an
+        # execution log. Providers may omit phase, so unclassified items keep
+        # the historical visible behavior. Deltas are scoped to an itemId;
+        # visible completed items are joined with blank lines and completion
+        # can only override the CURRENT item's text.
         # When images were dropped above, the committed prefix is
         # seeded with a notice so the user learns the model never saw
         # them; the drop is otherwise invisible (the reply reads as a
         # normal answer to the caption text). The seed carries no
         # trailing separator because every commit join below inserts
-        # "\n\n" after a non-empty committed prefix. `got_model_text`
+        # "\n\n" after a non-empty committed prefix. The visible-output flag
         # exists because the seed makes the visible text non-empty
         # before the model says anything; the EOF branch below must
         # judge "did the model produce output" from this flag, not
         # from visible-text truthiness, or a process that dies
         # silently after an image drop would surface as a successful
-        # notice-only reply.
+        # notice-only reply. A completed turn containing commentary only falls
+        # back to that text rather than producing a blank successful response.
         committed_text = ""
-        got_model_text = False
+        got_visible_model_text = False
+        suppressed_commentary: list[str] = []
         if dropped_images:
             noun = "image" if dropped_images == 1 else "images"
             committed_text = (
@@ -980,9 +979,30 @@ class CodexBackend(AgentBackend):
             )
         current_item_id: str | None = None
         current_item_text = ""
+        current_item_phase: str | None = None
+
+        def _join_visible(text: str) -> None:
+            nonlocal committed_text
+            committed_text = committed_text + "\n\n" + text if committed_text else text
+
+        def _commit_current_item() -> bool:
+            """Finish the current item and report whether visible text changed."""
+            nonlocal current_item_id, current_item_text, current_item_phase, got_visible_model_text
+            visible_changed = False
+            if current_item_text:
+                if current_item_phase == "commentary":
+                    suppressed_commentary.append(current_item_text)
+                else:
+                    _join_visible(current_item_text)
+                    got_visible_model_text = True
+                    visible_changed = True
+            current_item_id = None
+            current_item_text = ""
+            current_item_phase = None
+            return visible_changed
 
         def _visible_text() -> str:
-            if not current_item_id:
+            if not current_item_id or current_item_phase == "commentary":
                 return committed_text
             if not committed_text:
                 return current_item_text
@@ -1038,9 +1058,9 @@ class CodexBackend(AgentBackend):
                 if line:
                     last_activity = time.monotonic()
                 else:
-                    # EOF - process died. Success iff the model said
-                    # anything; the notice seed alone does not count
-                    # (see `got_model_text` above).
+                    # EOF - process died. Success iff the model produced
+                    # user-visible text; commentary and the image-drop notice
+                    # alone do not count.
                     log.error("Codex process EOF")
                     await self._kill()
                     visible = _visible_text()
@@ -1048,9 +1068,9 @@ class CodexBackend(AgentBackend):
                         text_so_far=visible,
                         done=True,
                         response=AgentResponse(
-                            success=got_model_text,
+                            success=got_visible_model_text,
                             text=visible,
-                            error=None if got_model_text else "Codex process ended unexpectedly",
+                            error=None if got_visible_model_text else "Codex process ended unexpectedly",
                         ),
                     )
                     return
@@ -1093,17 +1113,15 @@ class CodexBackend(AgentBackend):
                 if method == "item/started":
                     item = msg.get("params", {}).get("item", {})
                     if item.get("type") == "agentMessage":
-                        # Begin a new in-flight agentMessage. Anything
-                        # currently in current_item_text was uncommitted
-                        # (no item/completed arrived); commit it now
-                        # so the new item's deltas start fresh and we
-                        # don't lose mid-stream text on the boundary.
-                        if current_item_id and current_item_text:
-                            committed_text = (
-                                committed_text + "\n\n" + current_item_text if committed_text else current_item_text
-                            )
+                        # Begin a new in-flight agentMessage. Commit any prior
+                        # uncompleted item according to its phase so the new
+                        # item's deltas start fresh.
+                        if current_item_id:
+                            _commit_current_item()
                         current_item_id = item.get("id")
                         current_item_text = ""
+                        phase = item.get("phase")
+                        current_item_phase = phase if phase in ("commentary", "final_answer") else None
                     else:
                         log.debug("Codex: item/started type=%s id=%s", item.get("type"), item.get("id"))
 
@@ -1112,19 +1130,19 @@ class CodexBackend(AgentBackend):
                     delta_text = params.get("delta", "")
                     delta_item_id = params.get("itemId")
                     if delta_text:
-                        got_model_text = True
                         # Defensive: if a delta arrives without a
                         # prior item/started (out-of-order or schema
                         # drift), treat it as opening a new item.
                         if delta_item_id and delta_item_id != current_item_id:
-                            if current_item_id and current_item_text:
-                                committed_text = (
-                                    committed_text + "\n\n" + current_item_text if committed_text else current_item_text
-                                )
+                            if current_item_id:
+                                _commit_current_item()
                             current_item_id = delta_item_id
                             current_item_text = ""
+                            current_item_phase = None
                         current_item_text += delta_text
-                        yield StreamEvent(text_so_far=_visible_text())
+                        if current_item_phase != "commentary":
+                            got_visible_model_text = True
+                            yield StreamEvent(text_so_far=_visible_text())
 
                 elif method == "item/completed":
                     item = msg.get("params", {}).get("item", {})
@@ -1136,20 +1154,13 @@ class CodexBackend(AgentBackend):
                         final_text = item.get("text", "")
                         if final_text:
                             current_item_text = final_text
-                        # Commit the in-flight item to the prefix and
-                        # reset. Subsequent items append after a blank
-                        # line; subsequent deltas can never overwrite
-                        # this text. `got_model_text` is set here as
-                        # well as on deltas because an item/completed
-                        # can carry text that never streamed as deltas.
-                        if current_item_text:
-                            got_model_text = True
-                            committed_text = (
-                                committed_text + "\n\n" + current_item_text if committed_text else current_item_text
-                            )
-                        current_item_id = None
-                        current_item_text = ""
-                        yield StreamEvent(text_so_far=_visible_text())
+                        completed_phase = item.get("phase")
+                        if completed_phase in ("commentary", "final_answer"):
+                            current_item_phase = completed_phase
+                        # Completion can carry text that never streamed. Only
+                        # yield when committing it changes user-visible text.
+                        if _commit_current_item():
+                            yield StreamEvent(text_so_far=_visible_text())
                     else:
                         log.debug("Codex: item/completed type=%s", item.get("type"))
 
@@ -1159,12 +1170,12 @@ class CodexBackend(AgentBackend):
                     # Flush any uncommitted current_item_text so the
                     # final response carries it (schema-drift defense:
                     # a missing item/completed should not lose text).
-                    if current_item_id and current_item_text:
-                        committed_text = (
-                            committed_text + "\n\n" + current_item_text if committed_text else current_item_text
-                        )
-                        current_item_id = None
-                        current_item_text = ""
+                    if current_item_id:
+                        _commit_current_item()
+                    if status == "completed" and not got_visible_model_text and suppressed_commentary:
+                        for commentary_text in suppressed_commentary:
+                            _join_visible(commentary_text)
+                        got_visible_model_text = True
                     final_visible = committed_text
                     if status == "completed":
                         yield StreamEvent(
