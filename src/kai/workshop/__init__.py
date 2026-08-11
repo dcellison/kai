@@ -6,11 +6,13 @@ Telegram routing, histories, and responses remain authoritative until replay
 and parity evidence supports an explicit cutover.
 """
 
+from kai.workshop.authorization import CanonicalChannelAuthorizer
 from kai.workshop.domain import (
     AgentId,
     ChannelAgentId,
     ChannelBindingId,
     ChannelId,
+    ChannelMembershipId,
     DeliveryId,
     EventEnvelope,
     EventId,
@@ -42,9 +44,11 @@ from kai.workshop.timeline import (
 __all__ = [
     "AgentId",
     "AppendResult",
+    "CanonicalChannelAuthorizer",
     "ChannelAgentId",
     "ChannelBindingId",
     "ChannelId",
+    "ChannelMembershipId",
     "ChannelTimelineAuthorizer",
     "DeliveryId",
     "EventEnvelope",

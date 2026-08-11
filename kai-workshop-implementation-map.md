@@ -261,6 +261,7 @@ The first code milestone should be **canonical conversation shadowing**. It esta
 - `external_identities`
 - `workshop_memberships`
 - `channels`
+- `channel_memberships`
 - `channel_bindings`
 - `agents`
 - `channel_agents`
@@ -277,6 +278,7 @@ Identifiers should be opaque, globally unique strings. Telegram numeric identifi
 - `principal.created`
 - `external_identity.bound`
 - `channel.created`
+- `channel.member_added`
 - `transport.channel_bound`
 - `agent.created`
 - `channel.agent_attached`
@@ -494,10 +496,10 @@ The review distinguishes implemented structural evidence from live operational e
 
 1. **Deploy and observe:** install the merged shadow sequence, create fresh plain-text exchanges, run `make install-status` before and after a service restart, and retain only counts/state as evidence. A single clean sample is a smoke test, not sustained parity.
 2. **Canonical timeline query contract, unused by production:** implemented as a transport-independent, paginated channel timeline reader with stable cursors and mandatory principal/channel authorization. It accepts no Telegram IDs and replaces no JSONL reads.
-3. **Canonical channel authorization policy:** model who may read each channel. Workshop membership alone must not imply access to every direct channel; the current shared default workshop makes that unsafe. Bind the timeline authorization protocol to this policy before exposing a read surface.
+3. **Canonical channel authorization policy:** implemented with explicit, replayable channel memberships. Workshop membership alone does not imply access to every direct channel; the current shared default workshop makes that unsafe. The concrete timeline authorizer requires both an explicit channel membership and membership in the channel's workshop.
 4. **Authenticated read-only diagnostic surface:** expose snapshot and replay semantics to a minimal local Workshop diagnostic client. It must reuse principal authorization, reveal no cross-channel data, and accept no commands.
 5. **Media and artifact shadow:** introduce canonical artifact metadata and provenance for successful photo, document, and voice ingress while preserving current files, prompts, and Telegram behavior.
 6. **Durable delivery outbox:** define `delivery.requested`, attempts, idempotent claims, retry/failure policy, and crash recovery before any direct Telegram send is replaced.
 7. **Repeat the authority review:** require sustained installed parity, media coverage, read-client restart/reconnect evidence, and live delivery recovery before approving a cutover PR.
 
-The next code PR is item 3: a test-first canonical channel authorization policy. The timeline reader deliberately has no permissive default and remains production-unused until that policy exists. This advances the Phase 1 read model without creating dual-read behavior or weakening the hold decision.
+The next code PR is item 4: an authenticated, read-only local diagnostic surface backed by the canonical timeline query and channel policy. It must accept no commands and remains separate from production Telegram and JSONL authority. This advances the Phase 1 read model without creating dual-read behavior or weakening the hold decision.

@@ -26,6 +26,7 @@ class WorkshopEventType(StrEnum):
     PRINCIPAL_CREATED = "principal.created"
     EXTERNAL_IDENTITY_BOUND = "external_identity.bound"
     CHANNEL_CREATED = "channel.created"
+    CHANNEL_MEMBER_ADDED = "channel.member_added"
     TRANSPORT_CHANNEL_BOUND = "transport.channel_bound"
     AGENT_CREATED = "agent.created"
     CHANNEL_AGENT_ATTACHED = "channel.agent_attached"
@@ -81,6 +82,10 @@ class ChannelId(OpaqueId):
     prefix = "chn"
 
 
+class ChannelMembershipId(OpaqueId):
+    prefix = "chm"
+
+
 class ChannelBindingId(OpaqueId):
     prefix = "cbd"
 
@@ -113,6 +118,7 @@ _ID_TYPES: dict[str, type[OpaqueId]] = {
         ExternalIdentityId,
         WorkshopMembershipId,
         ChannelId,
+        ChannelMembershipId,
         ChannelBindingId,
         AgentId,
         ChannelAgentId,

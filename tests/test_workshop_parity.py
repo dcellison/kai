@@ -167,6 +167,48 @@ class TestWorkshopMessageParityStatus:
         assert "101" not in status
         assert "202" not in status
 
+    async def test_channel_authorization_projection_drift_is_reported(self, tmp_path: Path):
+        db_path = tmp_path / "kai.db"
+        history_root = tmp_path / "history"
+        await _build_conversation(db_path)
+        _write_history(
+            history_root,
+            [_record("user", "Secret question", seconds=0), _record("assistant", "Secret answer", seconds=2)],
+        )
+        store = await WorkshopEventStore.open(db_path)
+        try:
+            await store.connection.execute("DELETE FROM channel_memberships WHERE role = 'owner'")
+            await store.connection.commit()
+        finally:
+            await store.close()
+
+        status = workshop_message_parity_status(db_path, history_root)
+
+        assert "parity: diverged" in status
+        assert "replay mismatches=1" in status
+        assert "Secret" not in status
+
+    async def test_workshop_membership_projection_drift_is_reported(self, tmp_path: Path):
+        db_path = tmp_path / "kai.db"
+        history_root = tmp_path / "history"
+        await _build_conversation(db_path)
+        _write_history(
+            history_root,
+            [_record("user", "Secret question", seconds=0), _record("assistant", "Secret answer", seconds=2)],
+        )
+        store = await WorkshopEventStore.open(db_path)
+        try:
+            await store.connection.execute("DELETE FROM workshop_memberships WHERE role = 'admin'")
+            await store.connection.commit()
+        finally:
+            await store.close()
+
+        status = workshop_message_parity_status(db_path, history_root)
+
+        assert "parity: diverged" in status
+        assert "replay mismatches=1" in status
+        assert "Secret" not in status
+
     async def test_missing_jsonl_record_is_reported(self, tmp_path: Path):
         db_path = tmp_path / "kai.db"
         history_root = tmp_path / "history"

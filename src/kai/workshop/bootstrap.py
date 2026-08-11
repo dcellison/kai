@@ -14,6 +14,7 @@ from kai.workshop.domain import (
     ChannelAgentId,
     ChannelBindingId,
     ChannelId,
+    ChannelMembershipId,
     EventEnvelope,
     ExternalIdentityId,
     OpaqueId,
@@ -185,6 +186,14 @@ async def bootstrap_default_workshop(
         external_identity_id = ExternalIdentityId.derived(workshop_id, f"external-identity:{token}")
         membership_id = WorkshopMembershipId.derived(workshop_id, f"membership:human:{token}")
         channel_id = ChannelId.derived(workshop_id, f"direct-channel:{channel_token}")
+        human_channel_membership_id = ChannelMembershipId.derived(
+            workshop_id,
+            f"channel-membership:{channel_token}:human:{token}",
+        )
+        agent_channel_membership_id = ChannelMembershipId.derived(
+            workshop_id,
+            f"channel-membership:{channel_token}:agent:kai",
+        )
         binding_id = ChannelBindingId.derived(workshop_id, f"channel-binding:{channel_token}")
         channel_agent_id = ChannelAgentId.derived(workshop_id, f"channel-agent:{channel_token}:kai")
         await ensure(
@@ -218,6 +227,28 @@ async def bootstrap_default_workshop(
             aggregate_type="channel",
             aggregate_id=channel_id,
             payload={"kind": "direct", "name": "Direct"},
+        )
+        await ensure(
+            idempotency_key=_idempotency_key("channel-membership-human", channel_token),
+            event_type=WorkshopEventType.CHANNEL_MEMBER_ADDED,
+            aggregate_type="channel_membership",
+            aggregate_id=human_channel_membership_id,
+            payload={
+                "channel_id": channel_id,
+                "principal_id": principal_id,
+                "role": "owner",
+            },
+        )
+        await ensure(
+            idempotency_key=_idempotency_key("channel-membership-agent", channel_token),
+            event_type=WorkshopEventType.CHANNEL_MEMBER_ADDED,
+            aggregate_type="channel_membership",
+            aggregate_id=agent_channel_membership_id,
+            payload={
+                "channel_id": channel_id,
+                "principal_id": agent_principal_id,
+                "role": "participant",
+            },
         )
         await ensure(
             idempotency_key=_idempotency_key("channel-binding", channel_token),

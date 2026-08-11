@@ -13,6 +13,7 @@ import pytest
 from kai.workshop.domain import (
     AgentId,
     ChannelId,
+    ChannelMembershipId,
     DeliveryId,
     EventEnvelope,
     EventId,
@@ -62,6 +63,7 @@ class TestWorkshopIdentifiers:
             (WorkshopId, "prn_00000000000000000000000000000001"),
             (PrincipalId, "principal-1"),
             (ChannelId, "chn_not-hex"),
+            (ChannelMembershipId, "cag_00000000000000000000000000000001"),
             (AgentId, ""),
             (MessageId, "msg_0000000000000000000000000000000"),
             (DeliveryId, "msg_00000000000000000000000000000001"),
@@ -81,6 +83,7 @@ class TestEventEnvelope:
             "principal.created",
             "external_identity.bound",
             "channel.created",
+            "channel.member_added",
             "transport.channel_bound",
             "agent.created",
             "channel.agent_attached",
@@ -145,6 +148,7 @@ class TestWorkshopSchema:
             "external_identities",
             "workshop_memberships",
             "channels",
+            "channel_memberships",
             "channel_bindings",
             "agents",
             "channel_agents",
@@ -155,7 +159,7 @@ class TestWorkshopSchema:
         }
 
         assert expected <= await workshop_store.schema_tables()
-        assert await workshop_store.schema_version() == 2
+        assert await workshop_store.schema_version() == 3
 
     async def test_schema_migration_is_idempotent(self, tmp_path: Path):
         path = tmp_path / "workshop.db"
@@ -163,7 +167,7 @@ class TestWorkshopSchema:
         await first.close()
 
         second = await WorkshopEventStore.open(path)
-        assert await second.schema_version() == 2
+        assert await second.schema_version() == 3
         async with second.connection.execute(
             "SELECT COUNT(*) FROM workshop_schema_migrations WHERE version = 1"
         ) as cursor:
@@ -184,12 +188,37 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 2
-            assert "deliveries" in await upgraded.schema_tables()
+            assert await upgraded.schema_version() == 3
+            assert {"deliveries", "channel_memberships"} <= await upgraded.schema_tables()
             async with upgraded.connection.execute(
                 "SELECT version FROM workshop_schema_migrations ORDER BY version"
             ) as cursor:
-                assert [row[0] for row in await cursor.fetchall()] == [1, 2]
+                assert [row[0] for row in await cursor.fetchall()] == [1, 2, 3]
+        finally:
+            await upgraded.close()
+
+    async def test_version_two_database_upgrades_without_replacing_existing_records(self, tmp_path: Path, monkeypatch):
+        from kai.workshop import schema
+
+        path = tmp_path / "workshop.db"
+        with monkeypatch.context() as migration_context:
+            migration_context.setattr(schema, "WORKSHOP_SCHEMA_VERSION", 2)
+            migration_context.setattr(schema, "_MIGRATIONS", (schema._INITIAL_SCHEMA, schema._DELIVERY_SCHEMA))
+            version_two = await WorkshopEventStore.open(path)
+            workshop_id = WorkshopId.new()
+            await version_two.connection.execute(
+                "INSERT INTO workshops (id, name, created_at) VALUES (?, ?, ?)",
+                (workshop_id, "Existing", "2026-08-11T12:00:00Z"),
+            )
+            await version_two.connection.commit()
+            await version_two.close()
+
+        upgraded = await WorkshopEventStore.open(path)
+        try:
+            assert await upgraded.schema_version() == 3
+            assert "channel_memberships" in await upgraded.schema_tables()
+            async with upgraded.connection.execute("SELECT name FROM workshops WHERE id = ?", (workshop_id,)) as cursor:
+                assert (await cursor.fetchone())[0] == "Existing"
         finally:
             await upgraded.close()
 

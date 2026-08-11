@@ -66,7 +66,7 @@ class TestDefaultWorkshopBootstrap:
             [_human(202, "Second"), _human(101, "Admin", role="admin")],
         )
 
-        assert result.created_events == 16
+        assert result.created_events == 20
         assert result.existing_events == 0
         assert result.human_count == 2
         assert result.channel_count == 2
@@ -90,6 +90,11 @@ class TestDefaultWorkshopBootstrap:
             bindings = await cursor.fetchall()
         async with connection.execute("SELECT COUNT(*) FROM channel_agents") as cursor:
             channel_agent_count = (await cursor.fetchone())[0]
+        async with connection.execute(
+            "SELECT p.kind, cm.role, COUNT(*) FROM channel_memberships cm "
+            "JOIN principals p ON p.id = cm.principal_id GROUP BY p.kind, cm.role ORDER BY p.kind"
+        ) as cursor:
+            channel_memberships = [tuple(row) for row in await cursor.fetchall()]
 
         assert len(workshops) == 1
         assert workshops[0][1] == "Kai Workshop"
@@ -104,6 +109,7 @@ class TestDefaultWorkshopBootstrap:
         assert all(row[1] == "direct" for row in channels)
         assert [(row[0], row[1]) for row in bindings] == [("telegram", "101"), ("telegram", "202")]
         assert channel_agent_count == 2
+        assert channel_memberships == [("agent", "participant", 2), ("human", "owner", 2)]
 
     async def test_human_principal_and_conversation_have_distinct_ids(self, store):
         await bootstrap_default_workshop(store, [_human(101, "Admin", role="admin")])
@@ -128,9 +134,9 @@ class TestDefaultWorkshopBootstrap:
         second = await bootstrap_default_workshop(store, [_human(101, "Admin", role="admin")])
         second_events = await store.read_events()
 
-        assert first.created_events == 10
+        assert first.created_events == 12
         assert second.created_events == 0
-        assert second.existing_events == 10
+        assert second.existing_events == 12
         assert second.workshop_id == first.workshop_id
         assert second.agent_id == first.agent_id
         assert second_events == first_events
@@ -167,11 +173,30 @@ class TestDefaultWorkshopBootstrap:
             [_human(101, "Admin", role="admin"), _human(202, "Second")],
         )
 
-        assert result.created_events == 6
-        assert result.existing_events == 10
+        assert result.created_events == 8
+        assert result.existing_events == 12
         assert result.human_count == 2
         assert result.channel_count == 2
-        assert len(await store.read_events()) == 16
+        assert len(await store.read_events()) == 20
+
+    async def test_existing_bootstrap_receives_missing_channel_memberships(self, store):
+        await bootstrap_default_workshop(
+            store,
+            [_human(101, "Admin", role="admin"), _human(202, "Second")],
+        )
+        await store.connection.execute("DELETE FROM channel_memberships")
+        await store.connection.execute("DELETE FROM event_log WHERE event_type = 'channel.member_added'")
+        await store.connection.commit()
+
+        result = await bootstrap_default_workshop(
+            store,
+            [_human(101, "Admin", role="admin"), _human(202, "Second")],
+        )
+
+        assert result.created_events == 4
+        assert result.existing_events == 16
+        async with store.connection.execute("SELECT COUNT(*) FROM channel_memberships") as cursor:
+            assert (await cursor.fetchone())[0] == 4
 
     async def test_duplicate_external_identity_or_channel_is_rejected(self, store):
         with pytest.raises(ValueError, match="Duplicate bootstrap external identity"):
@@ -239,7 +264,8 @@ class TestWorkshopBootstrapStatus:
         status = workshop_bootstrap_status(db_path, expected_humans=1)
 
         assert status == (
-            "Workshop bootstrap: initialized; workshops=1, humans=1, Telegram bindings=1, agents=1; expected humans=1"
+            "Workshop bootstrap: initialized; workshops=1, humans=1, Telegram bindings=1, "
+            "channel memberships=2, agents=1; expected humans=1"
         )
         assert "Secret Name" not in status
         assert "101" not in status

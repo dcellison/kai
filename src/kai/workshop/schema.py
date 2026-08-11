@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 2
+WORKSHOP_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,7 +156,25 @@ _DELIVERY_SCHEMA = SchemaMigration(
     ),
 )
 
-_MIGRATIONS = (_INITIAL_SCHEMA, _DELIVERY_SCHEMA)
+_CHANNEL_MEMBERSHIP_SCHEMA = SchemaMigration(
+    version=3,
+    name="explicit_channel_memberships",
+    statements=(
+        """
+        CREATE TABLE channel_memberships (
+            id TEXT PRIMARY KEY,
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+            role TEXT NOT NULL CHECK (role IN ('owner', 'participant')),
+            created_at TEXT NOT NULL,
+            UNIQUE (channel_id, principal_id)
+        )
+        """,
+        "CREATE INDEX channel_memberships_principal_channel_idx ON channel_memberships (principal_id, channel_id)",
+    ),
+)
+
+_MIGRATIONS = (_INITIAL_SCHEMA, _DELIVERY_SCHEMA, _CHANNEL_MEMBERSHIP_SCHEMA)
 
 
 async def migrate_workshop_schema(
