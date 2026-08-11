@@ -57,6 +57,7 @@ from kai.install import (
     _retire_install_home_claude,
     _retire_install_home_dir,
     _secure_codex_turn_image_staging,
+    _secure_history_directories,
     _secure_upload_directories,
     _set_ownership,
     _src_checksum,
@@ -99,6 +100,7 @@ def _isolate_installed_backend_discovery(monkeypatch, tmp_path):
             "pi": "/test/bin/pi",
         },
     )
+    monkeypatch.setattr("kai.install.replace_named_read_access", MagicMock())
 
 
 # ── Validation helpers ───────────────────────────────────────────────
@@ -5064,7 +5066,7 @@ class TestSecureCodexTurnImageStaging:
 
 
 class TestSecureUploadDirectories:
-    def test_repairs_managed_directories_without_touching_existing_files(self, tmp_path, monkeypatch, capsys):
+    def test_repairs_managed_directories_and_secures_existing_files(self, tmp_path, monkeypatch, capsys):
         files_root = tmp_path / "data" / "files"
         user_dir = files_root / "12345"
         user_dir.mkdir(parents=True)
@@ -5090,12 +5092,12 @@ class TestSecureUploadDirectories:
         assert chowned == [
             (files_root, 9876, 9877),
             (user_dir, 9876, 9877),
+            (historical, 9876, 9877),
         ]
         assert stat.S_IMODE(files_root.stat().st_mode) == 0o711
         assert stat.S_IMODE(user_dir.stat().st_mode) == 0o711
         assert historical.read_bytes() == b"keep"
-        assert stat.S_IMODE(historical.stat().st_mode) == 0o644
-        assert historical not in {path for path, _uid, _gid in chowned}
+        assert stat.S_IMODE(historical.stat().st_mode) == 0o600
         assert "Secured upload directory" in capsys.readouterr().out
 
     def test_dry_run_reports_repairs_without_mutating(self, tmp_path, monkeypatch, capsys):
@@ -5121,6 +5123,48 @@ class TestSecureUploadDirectories:
         output = capsys.readouterr().out
         assert f"[DRY RUN] Would secure upload directory: {files_root}" in output
         assert f"[DRY RUN] Would secure upload directory: {user_dir}" in output
+
+    def test_replaces_file_acl_with_only_configured_reader(self, tmp_path, monkeypatch):
+        user_dir = tmp_path / "data" / "files" / "12345"
+        user_dir.mkdir(parents=True)
+        historical = user_dir / "photo.jpg"
+        historical.write_bytes(b"keep")
+        monkeypatch.setattr("kai.install.os.chown", MagicMock())
+        replace = MagicMock()
+        monkeypatch.setattr("kai.install.replace_named_read_access", replace)
+
+        _secure_upload_directories(
+            tmp_path / "data",
+            {"12345"},
+            svc_uid=9876,
+            svc_gid=9877,
+            dry_run=False,
+            reader_users={"12345": "daniel"},
+        )
+
+        replace.assert_any_call(historical, "daniel", directory=False)
+
+    def test_refuses_file_symlink_before_any_repair(self, tmp_path, monkeypatch):
+        user_dir = tmp_path / "data" / "files" / "12345"
+        user_dir.mkdir(parents=True)
+        target = tmp_path / "attacker-controlled"
+        target.write_text("unchanged")
+        (user_dir / "photo.jpg").symlink_to(target)
+        chown = MagicMock()
+        monkeypatch.setattr("kai.install.os.chown", chown)
+
+        with pytest.raises(RuntimeError, match="Refusing unsafe upload path"):
+            _secure_upload_directories(
+                tmp_path / "data",
+                {"12345"},
+                svc_uid=9876,
+                svc_gid=9877,
+                dry_run=False,
+                reader_users={"12345": "daniel"},
+            )
+
+        assert target.read_text() == "unchanged"
+        chown.assert_not_called()
 
     def test_refuses_managed_symlink_before_any_repair(self, tmp_path, monkeypatch):
         files_root = tmp_path / "data" / "files"
@@ -5167,6 +5211,97 @@ class TestSecureUploadDirectories:
 
         assert chowned == []
         assert stat.S_IMODE(unknown.stat().st_mode) == 0o775
+
+
+class TestSecureHistoryDirectories:
+    def test_secures_configured_and_unknown_history(self, tmp_path, monkeypatch):
+        history_root = tmp_path / "data" / "history"
+        configured = history_root / "12345"
+        unknown = history_root / "-100999"
+        configured.mkdir(parents=True)
+        unknown.mkdir()
+        configured_file = configured / "2026-08-11.jsonl"
+        unknown_file = unknown / "2026-08-11.jsonl"
+        legacy_file = history_root / "2025-01-01.jsonl"
+        for path in (configured_file, unknown_file, legacy_file):
+            path.write_text("{}\n")
+            path.chmod(0o644)
+        history_root.chmod(0o755)
+        configured.chmod(0o755)
+        unknown.chmod(0o755)
+        monkeypatch.setattr("kai.install.os.chown", MagicMock())
+        replace = MagicMock()
+        monkeypatch.setattr("kai.install.replace_named_read_access", replace)
+
+        _secure_history_directories(
+            tmp_path / "data",
+            {"12345": "daniel"},
+            svc_uid=9876,
+            svc_gid=9877,
+            dry_run=False,
+        )
+
+        assert stat.S_IMODE(history_root.stat().st_mode) == 0o711
+        assert stat.S_IMODE(configured.stat().st_mode) == 0o700
+        assert stat.S_IMODE(unknown.stat().st_mode) == 0o700
+        assert stat.S_IMODE(configured_file.stat().st_mode) == 0o600
+        assert stat.S_IMODE(unknown_file.stat().st_mode) == 0o600
+        assert stat.S_IMODE(legacy_file.stat().st_mode) == 0o600
+        replace.assert_any_call(configured, "daniel", directory=True)
+        replace.assert_any_call(configured_file, "daniel", directory=False)
+        replace.assert_any_call(unknown, None, directory=True)
+        replace.assert_any_call(unknown_file, None, directory=False)
+        replace.assert_any_call(legacy_file, None, directory=False)
+
+    def test_dry_run_reports_without_mutation(self, tmp_path, monkeypatch, capsys):
+        user_dir = tmp_path / "data" / "history" / "12345"
+        user_dir.mkdir(parents=True)
+        history_root = user_dir.parent
+        transcript = user_dir / "2026-08-11.jsonl"
+        transcript.write_text("{}\n")
+        history_root.chmod(0o755)
+        user_dir.chmod(0o755)
+        transcript.chmod(0o644)
+        chown = MagicMock()
+        replace = MagicMock()
+        monkeypatch.setattr("kai.install.os.chown", chown)
+        monkeypatch.setattr("kai.install.replace_named_read_access", replace)
+
+        _secure_history_directories(
+            tmp_path / "data",
+            {"12345": "daniel"},
+            svc_uid=9876,
+            svc_gid=9877,
+            dry_run=True,
+        )
+
+        assert stat.S_IMODE(history_root.stat().st_mode) == 0o755
+        assert stat.S_IMODE(user_dir.stat().st_mode) == 0o755
+        assert stat.S_IMODE(transcript.stat().st_mode) == 0o644
+        chown.assert_not_called()
+        replace.assert_not_called()
+        assert "[DRY RUN] Would secure history tree" in capsys.readouterr().out
+
+    def test_refuses_symlink_before_any_mutation(self, tmp_path, monkeypatch):
+        user_dir = tmp_path / "data" / "history" / "12345"
+        user_dir.mkdir(parents=True)
+        target = tmp_path / "attacker-controlled"
+        target.write_text("unchanged")
+        (user_dir / "2026-08-11.jsonl").symlink_to(target)
+        chown = MagicMock()
+        monkeypatch.setattr("kai.install.os.chown", chown)
+
+        with pytest.raises(RuntimeError, match="Refusing unsafe history path"):
+            _secure_history_directories(
+                tmp_path / "data",
+                {"12345": "daniel"},
+                svc_uid=9876,
+                svc_gid=9877,
+                dry_run=False,
+            )
+
+        assert target.read_text() == "unchanged"
+        chown.assert_not_called()
 
 
 class TestApplyMigrate:

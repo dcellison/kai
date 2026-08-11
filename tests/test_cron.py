@@ -386,12 +386,17 @@ class TestJobCallbackReminder:
     @pytest.mark.asyncio()
     async def test_logs_message_to_history(self, mock_context):
         """Reminder delivery is recorded in message history."""
+        user_config = MagicMock(os_user="daniel")
+        config = MagicMock()
+        config.get_user_config.return_value = user_config
+        mock_context.bot_data["config"] = config
         with patch("kai.cron.log_message") as mock_log:
             await _job_callback(mock_context)
         mock_log.assert_called_once()
         call_kwargs = mock_log.call_args.kwargs
         assert call_kwargs["direction"] == "assistant"
         assert call_kwargs["chat_id"] == 12345
+        assert call_kwargs["reader_user"] == "daniel"
 
     @pytest.mark.asyncio()
     async def test_forbidden_deactivates_and_removes(self, mock_context):

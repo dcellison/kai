@@ -1,7 +1,9 @@
 """Tests for history.py message logging and retrieval."""
 
 import json
+import stat
 from datetime import UTC, datetime, timedelta
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -74,6 +76,69 @@ class TestLogMessage:
         assert not (_log_dir / f"{today}.jsonl").exists()
         # File is in the per-user subdirectory
         assert (_log_dir / "1" / f"{today}.jsonl").exists()
+
+    def test_creates_private_history_tree(self, _log_dir):
+        log_message(direction="user", chat_id=1, text="private")
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
+
+        assert stat.S_IMODE(_log_dir.stat().st_mode) == 0o711
+        assert stat.S_IMODE((_log_dir / "1").stat().st_mode) == 0o700
+        assert stat.S_IMODE((_log_dir / "1" / f"{today}.jsonl").stat().st_mode) == 0o600
+
+    def test_grants_mapped_reader_on_new_directory_and_file(self, _log_dir, monkeypatch):
+        grant = MagicMock()
+        monkeypatch.setattr(history, "grant_named_read_access", grant)
+
+        result = log_message(
+            direction="user",
+            chat_id=1,
+            text="private",
+            reader_user="daniel",
+        )
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
+
+        assert result is not None
+        assert grant.call_args_list == [
+            call(_log_dir / "1", "daniel", directory=True),
+            call(_log_dir / "1" / f"{today}.jsonl", "daniel", directory=False),
+        ]
+
+    def test_existing_file_does_not_accumulate_duplicate_acl(self, _log_dir, monkeypatch):
+        grant = MagicMock()
+        monkeypatch.setattr(history, "grant_named_read_access", grant)
+
+        log_message(direction="user", chat_id=1, text="first", reader_user="daniel")
+        grant.reset_mock()
+        log_message(direction="user", chat_id=1, text="second", reader_user="daniel")
+
+        grant.assert_not_called()
+
+    def test_acl_failure_keeps_file_private_and_returns_none(self, _log_dir, monkeypatch):
+        def fail_for_file(_path, _reader, *, directory):
+            if not directory:
+                raise OSError("acl failed")
+
+        monkeypatch.setattr(history, "grant_named_read_access", fail_for_file)
+
+        result = log_message(direction="user", chat_id=1, text="private", reader_user="daniel")
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
+        path = _log_dir / "1" / f"{today}.jsonl"
+
+        assert result is None
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    def test_refuses_symlinked_daily_file(self, _log_dir):
+        user_dir = _log_dir / "1"
+        user_dir.mkdir()
+        target = _log_dir / "target"
+        target.write_text("unchanged")
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
+        (user_dir / f"{today}.jsonl").symlink_to(target)
+
+        result = log_message(direction="user", chat_id=1, text="attack")
+
+        assert result is None
+        assert target.read_text() == "unchanged"
 
 
 # ── get_recent_history ───────────────────────────────────────────────
@@ -603,16 +668,7 @@ class TestLogEntryContract:
     def test_oserror_returns_none(self, monkeypatch, _log_dir):
         """An OSError during the JSONL append yields None, not a
         populated entry that would point at a never-written line."""
-        import builtins
-
-        original = builtins.open
-
-        def boom(path, mode="r", *args, **kwargs):
-            if "a" in mode:
-                raise OSError("disk full")
-            return original(path, mode, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "open", boom)
+        monkeypatch.setattr(history.os, "open", MagicMock(side_effect=OSError("disk full")))
         entry = log_message(direction="user", chat_id=1, text="lost")
         assert entry is None
 

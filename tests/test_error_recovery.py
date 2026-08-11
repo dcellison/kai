@@ -421,7 +421,7 @@ class TestErrorMessageLifecycle:
 
         captured_log: list[str] = []
 
-        def _capture_log(*, direction, chat_id, text):
+        def _capture_log(*, direction, chat_id, text, reader_user=None):
             captured_log.append(text)
 
         with (
@@ -459,7 +459,7 @@ class TestErrorMessageLifecycle:
 
         captured_log: list[str] = []
 
-        def _capture_log(*, direction, chat_id, text):
+        def _capture_log(*, direction, chat_id, text, reader_user=None):
             captured_log.append(text)
 
         with (

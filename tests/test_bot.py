@@ -2882,7 +2882,12 @@ class TestHandlePhoto:
 
         mock_file = MagicMock()
         mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"image-data"))
-        ctx = _make_context(config=_make_config(allowed_user_ids={1}))
+        ctx = _make_context(
+            config=_make_config(
+                allowed_user_ids={1},
+                user_configs={1: UserConfig(telegram_id=1, name="Daniel", os_user="daniel")},
+            )
+        )
         ctx.bot.get_file = AsyncMock(return_value=mock_file)
         inbound = AsyncMock()
         inbound_id = MessageId("msg_00000000000000000000000000000001")
@@ -2932,6 +2937,7 @@ class TestHandlePhoto:
             direction="user",
             chat_id=1,
             text=body,
+            reader_user="daniel",
             media={"type": "photo", "workshop_message_shadowed": True},
         )
         assert response.await_args.kwargs["workshop_inbound_message_id"] == inbound_id
@@ -3173,6 +3179,7 @@ class TestHandleDocument:
             direction="user",
             chat_id=1,
             text=expected_body,
+            reader_user=None,
             media={
                 "type": "document",
                 "filename": file_name,

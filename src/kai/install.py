@@ -62,6 +62,7 @@ from kai.config import (
     models_for_backend,
     validate_model_for_backend,
 )
+from kai.named_access import replace_named_read_access
 from kai.protected_config import ProtectedConfigError, validate_protected_file_metadata
 from kai.user_isolation import validate_protected_user_isolation
 from kai.workshop.diagnostics import workshop_bootstrap_status, workshop_message_parity_status
@@ -3593,8 +3594,9 @@ def _secure_upload_directories(
     svc_uid: int,
     svc_gid: int,
     dry_run: bool,
+    reader_users: dict[str, str] | None = None,
 ) -> None:
-    """Reconcile service-owned upload directories without touching uploads.
+    """Reconcile service-owned upload directories and historical uploads.
 
     Kai writes Telegram uploads before handing their exact paths to an agent
     OS user.  The service therefore owns the shared upload root and each
@@ -3603,10 +3605,11 @@ def _secure_upload_directories(
     per-user directory owned by that agent user, which prevents Kai from
     enforcing the traversal-only directory mode at upload time.
 
-    Validate every managed path before changing any of them, then repair only
-    directory ownership and mode.  Historical files and unknown directories
-    are deliberately left untouched.
+    Validate every managed tree before changing any of it. Historical files
+    become service-owned and private, with a named read ACL for only the
+    configured agent OS user. Unknown directories remain untouched.
     """
+    reader_users = reader_users or {}
     files_root = data_path / "files"
     if files_root.is_symlink():
         raise RuntimeError(f"Refusing unsafe upload path: {files_root}")
@@ -3616,6 +3619,7 @@ def _secure_upload_directories(
         raise RuntimeError(f"Refusing unsafe upload path: {files_root}")
 
     managed_paths = [files_root]
+    managed_trees: dict[str, tuple[list[Path], list[Path]]] = {}
     for name in sorted(known_user_dir_names):
         user_dir = files_root / name
         if user_dir.is_symlink():
@@ -3625,6 +3629,7 @@ def _secure_upload_directories(
         if not user_dir.is_dir():
             raise RuntimeError(f"Refusing unsafe upload path: {user_dir}")
         managed_paths.append(user_dir)
+        managed_trees[name] = _validate_regular_tree(user_dir, label="upload")
 
     repairs: list[Path] = []
     for path in managed_paths:
@@ -3639,12 +3644,117 @@ def _secure_upload_directories(
     if dry_run:
         for path in repairs:
             print(f"[DRY RUN] Would secure upload directory: {path} ({svc_uid}:{svc_gid}, mode 0711)")
+        for name, (directories, files) in managed_trees.items():
+            print(
+                f"[DRY RUN] Would secure {len(files)} upload file(s) and "
+                f"{len(directories)} nested directory entry/entries under {files_root / name}"
+            )
         return
 
     for path in repairs:
         _set_ownership(path, svc_uid, svc_gid, recursive=False)
         os.chmod(path, _PRIVATE_USER_ROOT_MODE)
         print(f"  Secured upload directory {path} ({svc_uid}:{svc_gid}, mode 0711)")
+
+    replace_named_read_access(files_root, None, directory=True)
+    for name, (directories, files) in managed_trees.items():
+        reader_user = reader_users.get(name)
+        user_dir = files_root / name
+        replace_named_read_access(user_dir, None, directory=True)
+        for directory in directories:
+            os.chown(directory, svc_uid, svc_gid)
+            os.chmod(directory, _PRIVATE_USER_DIR_MODE)
+            replace_named_read_access(directory, reader_user, directory=True)
+        for path in files:
+            os.chown(path, svc_uid, svc_gid)
+            os.chmod(path, _PRIVATE_USER_FILE_MODE)
+            replace_named_read_access(path, reader_user, directory=False)
+        if files or directories:
+            print(f"  Secured historical uploads under {user_dir}")
+
+
+def _validate_regular_tree(root: Path, *, label: str) -> tuple[list[Path], list[Path]]:
+    """Return nested directories/files after rejecting every unsafe entry."""
+    directories: list[Path] = []
+    files: list[Path] = []
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        for entry in current.iterdir():
+            if entry.is_symlink():
+                raise RuntimeError(f"Refusing unsafe {label} path: {entry}")
+            if entry.is_dir():
+                directories.append(entry)
+                pending.append(entry)
+            elif entry.is_file():
+                files.append(entry)
+            else:
+                raise RuntimeError(f"Refusing unsafe {label} path: {entry}")
+    return sorted(directories), sorted(files)
+
+
+def _secure_history_directories(
+    data_path: Path,
+    reader_users: dict[str, str],
+    svc_uid: int,
+    svc_gid: int,
+    dry_run: bool,
+) -> None:
+    """Make transcripts private while preserving mapped-agent search access."""
+    history_root = data_path / "history"
+    if history_root.is_symlink():
+        raise RuntimeError(f"Refusing unsafe history path: {history_root}")
+    if not history_root.exists():
+        return
+    if not history_root.is_dir():
+        raise RuntimeError(f"Refusing unsafe history path: {history_root}")
+
+    user_trees: dict[Path, tuple[list[Path], list[Path]]] = {}
+    root_files: list[Path] = []
+    for entry in history_root.iterdir():
+        if entry.is_symlink():
+            raise RuntimeError(f"Refusing unsafe history path: {entry}")
+        if entry.is_dir():
+            user_trees[entry] = _validate_regular_tree(entry, label="history")
+        elif entry.is_file():
+            root_files.append(entry)
+        else:
+            raise RuntimeError(f"Refusing unsafe history path: {entry}")
+
+    if dry_run:
+        print(f"[DRY RUN] Would secure history root: {history_root} ({svc_uid}:{svc_gid}, mode 0711)")
+        for user_dir, (directories, files) in sorted(user_trees.items()):
+            reader = reader_users.get(user_dir.name)
+            access = f"readable by {reader}" if reader else "service-private"
+            print(
+                f"[DRY RUN] Would secure history tree: {user_dir} "
+                f"({len(files)} file(s), {len(directories)} nested directory entry/entries, {access})"
+            )
+        if root_files:
+            print(f"[DRY RUN] Would secure {len(root_files)} legacy flat history file(s)")
+        return
+
+    os.chown(history_root, svc_uid, svc_gid)
+    os.chmod(history_root, _PRIVATE_USER_ROOT_MODE)
+    replace_named_read_access(history_root, None, directory=True)
+    for path in root_files:
+        os.chown(path, svc_uid, svc_gid)
+        os.chmod(path, _PRIVATE_USER_FILE_MODE)
+        replace_named_read_access(path, None, directory=False)
+    for user_dir, (directories, files) in user_trees.items():
+        reader = reader_users.get(user_dir.name)
+        os.chown(user_dir, svc_uid, svc_gid)
+        os.chmod(user_dir, _PRIVATE_USER_DIR_MODE)
+        replace_named_read_access(user_dir, reader, directory=True)
+        for directory in directories:
+            os.chown(directory, svc_uid, svc_gid)
+            os.chmod(directory, _PRIVATE_USER_DIR_MODE)
+            replace_named_read_access(directory, reader, directory=True)
+        for path in files:
+            os.chown(path, svc_uid, svc_gid)
+            os.chmod(path, _PRIVATE_USER_FILE_MODE)
+            replace_named_read_access(path, reader, directory=False)
+    print(f"  Secured conversation history under {history_root}")
 
 
 def _managed_identity_state(user_home: Path) -> tuple[Path, Path, str | None, str | None]:
@@ -3834,6 +3944,7 @@ def _apply_migrate(
     # the misconfiguration after disk mutation would leave operators
     # diagnosing a half-applied state.
     per_user_ids: dict[str, tuple[int, int]] = {}
+    reader_users: dict[str, str] = {}
     for chat_id, os_user in memory_owners:
         if os_user is None:
             continue
@@ -3847,18 +3958,8 @@ def _apply_migrate(
                 f"users.yaml entry, then re-run sudo make install."
             ) from exc
         per_user_ids[str(chat_id)] = (pwd_entry.pw_uid, pwd_entry.pw_gid)
+        reader_users[str(chat_id)] = os_user
     known_user_dir_names = {str(chat_id) for chat_id, _os_user in memory_owners if chat_id is not None}
-
-    # Upload directories are service-owned even when memory/preferences/home
-    # belong to the agent OS user.  The service creates private files and
-    # grants the configured agent exact-file read access during handoff.
-    _secure_upload_directories(
-        data_path,
-        known_user_dir_names,
-        svc_uid,
-        svc_gid,
-        dry_run,
-    )
 
     # Resolve the primary operator's chat_id (first yaml entry). When
     # users.yaml is absent or empty (first-ever install, single-user
@@ -3967,6 +4068,28 @@ def _apply_migrate(
             print(f"[DRY RUN] Would migrate {copied} uploaded file(s) to {files_dst}")
         elif not copied and not dry_run:
             print("  Uploaded files already migrated or no files to copy")
+
+    # Reconcile after the legacy upload copy so newly migrated files cannot
+    # retain their source ownership/mode. Upload directories stay
+    # service-owned; only the configured agent OS user receives exact-file
+    # read access. History uses the same ownership boundary but grants the
+    # mapped user directory traversal/listing so grep/jq transcript search
+    # continues to work.
+    _secure_upload_directories(
+        data_path,
+        known_user_dir_names,
+        svc_uid,
+        svc_gid,
+        dry_run,
+        reader_users=reader_users,
+    )
+    _secure_history_directories(
+        data_path,
+        reader_users,
+        svc_uid,
+        svc_gid,
+        dry_run,
+    )
 
     # -- Memory directory ownership --
     # Two ownership tiers in a single tree:
@@ -4854,7 +4977,7 @@ def _apply_directories(
         (data_path, svc_uid, svc_gid, 0o755),  # user-owned data dir
         (data_path / "logs", svc_uid, svc_gid, 0o755),
         (data_path / "files", svc_uid, svc_gid, _PRIVATE_USER_ROOT_MODE),
-        (data_path / "history", svc_uid, svc_gid, 0o755),
+        (data_path / "history", svc_uid, svc_gid, _PRIVATE_USER_ROOT_MODE),
         (data_path / "memory", svc_uid, svc_gid, _PRIVATE_USER_ROOT_MODE),
         # Per-user preferences root (#400). Top-level dir is service-
         # owned so the bot can lazily create new preferences/<chat_id>/

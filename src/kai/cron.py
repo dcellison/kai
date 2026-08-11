@@ -48,6 +48,15 @@ _CONDITION_NOT_MET_PREFIX = (
 )
 
 
+def _history_reader_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str | None:
+    """Resolve the OS user allowed to search one scheduled chat's history."""
+    config = context.bot_data.get("config")
+    if config is None:
+        return None
+    user_config = config.get_user_config(chat_id)
+    return user_config.os_user if user_config and user_config.os_user else None
+
+
 async def _send_chunked(bot: ExtBot, chat_id: int, text: str) -> None:
     """
     Send a potentially long message as multiple Telegram-safe chunks.
@@ -259,6 +268,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
     prompt = data["prompt"]
     auto_remove = data["auto_remove"]
     job_id = data["job_id"]
+    reader_user = _history_reader_user(context, chat_id)
 
     log.info("Job %d '%s' fired (type=%s)", job_id, data["name"], job_type)
 
@@ -267,7 +277,12 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
         # Strip stray backslash escapes (e.g. \! from bash double-quoting in curl)
         prompt = prompt.replace("\\!", "!").replace("\\.", ".").replace("\\?", "?")
         try:
-            log_message(direction="assistant", chat_id=chat_id, text=f"[Reminder: {data['name']}] {prompt}")
+            log_message(
+                direction="assistant",
+                chat_id=chat_id,
+                text=f"[Reminder: {data['name']}] {prompt}",
+                reader_user=reader_user,
+            )
             await context.bot.send_message(chat_id=chat_id, text=prompt)
         except Forbidden:
             log.warning("Job %d: chat %d is gone, deactivating", job_id, chat_id)
@@ -336,7 +351,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
             clean_text = f"{after_marker}\n{rest}".strip() if after_marker else rest
             msg = f"[Job: {data['name']}]\n{clean_text}" if clean_text else f"[Job: {data['name']}] Condition met."
             try:
-                log_message(direction="assistant", chat_id=chat_id, text=msg)
+                log_message(direction="assistant", chat_id=chat_id, text=msg, reader_user=reader_user)
                 await _send_chunked(context.bot, chat_id, msg)
             except Forbidden:
                 log.warning("Job %d: chat %d is gone, deactivating", job_id, chat_id)
@@ -361,7 +376,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
                     f"[Job: {data['name']}]\n{clean_text}" if clean_text else f"[Job: {data['name']}] Still checking..."
                 )
                 try:
-                    log_message(direction="assistant", chat_id=chat_id, text=msg)
+                    log_message(direction="assistant", chat_id=chat_id, text=msg, reader_user=reader_user)
                     await _send_chunked(context.bot, chat_id, msg)
                 except Forbidden:
                     log.warning("Job %d: chat %d is gone, deactivating", job_id, chat_id)
@@ -382,7 +397,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
             # Non-conditional or non-auto-remove: always deliver the response
             msg = f"[Job: {data['name']}]\n{response_text}"
             try:
-                log_message(direction="assistant", chat_id=chat_id, text=msg)
+                log_message(direction="assistant", chat_id=chat_id, text=msg, reader_user=reader_user)
                 await _send_chunked(context.bot, chat_id, msg)
             except Forbidden:
                 log.warning("Job %d: chat %d is gone, deactivating", job_id, chat_id)

@@ -3984,6 +3984,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         direction="user",
         chat_id=chat_id,
         text=caption,
+        reader_user=reader_user,
         media={
             "type": "photo",
             "workshop_message_shadowed": workshop_inbound_message_id is not None,
@@ -4245,6 +4246,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         direction="user",
         chat_id=chat_id,
         text=history_text,
+        reader_user=reader_user,
         media={
             "type": "document",
             "filename": file_name,
@@ -4294,6 +4296,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     chat_id = _chat_id(update)
+    reader_user = _upload_reader_user(context, chat_id)
     pool = _get_pool(context)
     config: Config = context.bot_data["config"]
 
@@ -4332,12 +4335,24 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         transcript = await transcribe_voice(audio_data, config.whisper_model_path)
     except TranscriptionError as e:
-        log_message(direction="user", chat_id=chat_id, text=voice_placeholder, media=voice_media)
+        log_message(
+            direction="user",
+            chat_id=chat_id,
+            text=voice_placeholder,
+            media=voice_media,
+            reader_user=reader_user,
+        )
         await update.message.reply_text(f"Transcription failed: {e}")
         return
 
     if not transcript:
-        log_message(direction="user", chat_id=chat_id, text=voice_placeholder, media=voice_media)
+        log_message(
+            direction="user",
+            chat_id=chat_id,
+            text=voice_placeholder,
+            media=voice_media,
+            reader_user=reader_user,
+        )
         await update.message.reply_text("Couldn't make out any speech in that voice message.")
         return
 
@@ -4349,7 +4364,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # output behaviour change in the provenance work: previous behaviour
     # wrote only the duration placeholder, which silently lost the user's
     # actual words and made source view useless for voice-derived rows.
-    user_log = log_message(direction="user", chat_id=chat_id, text=transcript, media=voice_media)
+    user_log = log_message(
+        direction="user",
+        chat_id=chat_id,
+        text=transcript,
+        media=voice_media,
+        reader_user=reader_user,
+    )
 
     prompt = f"[Voice message transcription]: {transcript}"
     model = pool.get_model(chat_id)
@@ -4532,10 +4553,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     chat_id = _chat_id(update)
     prompt = update.message.text
+    reader_user = _upload_reader_user(context, chat_id)
     # Capture the user LogEntry so _handle_response can thread it to
     # the provenance writer. None on JSONL write failure; the extraction
     # path then skips provenance stamping for this exchange.
-    user_log = log_message(direction="user", chat_id=chat_id, text=prompt)
+    user_log = log_message(direction="user", chat_id=chat_id, text=prompt, reader_user=reader_user)
     workshop_inbound_message_id: MessageId | None = None
     recorder = context.bot_data.get("workshop_inbound_recorder")
     if recorder is not None:
@@ -4630,6 +4652,7 @@ async def _handle_response(
     assert update.message is not None
     # Check voice mode before starting
     config: Config = context.bot_data["config"]
+    reader_user = _upload_reader_user(context, chat_id)
     voice_mode = "off"
     if config.tts_enabled:
         voice_mode = await sessions.get_setting(f"voice_mode:{chat_id}") or "off"
@@ -4725,9 +4748,19 @@ async def _handle_response(
     # may try to address it instead of the current message.
     if final_response is None:
         if stopped_by_user:
-            log_message(direction="assistant", chat_id=chat_id, text="[stopped by user]")
+            log_message(
+                direction="assistant",
+                chat_id=chat_id,
+                text="[stopped by user]",
+                reader_user=reader_user,
+            )
         else:
-            log_message(direction="assistant", chat_id=chat_id, text="[no response]")
+            log_message(
+                direction="assistant",
+                chat_id=chat_id,
+                text="[no response]",
+                reader_user=reader_user,
+            )
             await update.message.reply_text("Error: No response from agent")
         return
 
@@ -4740,7 +4773,12 @@ async def _handle_response(
         # surface even on a regression.
         error_text = render_agent_failure(final_response.failure_kind, final_response.error, config, chat_id)
         visible_error = error_text.removeprefix("Error: ")
-        log_message(direction="assistant", chat_id=chat_id, text=f"[error: {visible_error}]")
+        log_message(
+            direction="assistant",
+            chat_id=chat_id,
+            text=f"[error: {visible_error}]",
+            reader_user=reader_user,
+        )
         # Send the error notice as a NEW message (not an edit of the
         # live streamed message), so any tool-use, partial reasoning,
         # and intermediate output the user was watching stays visible.
@@ -4764,7 +4802,12 @@ async def _handle_response(
     # the exact JSONL ts/date/sha256 the line landed with. None means
     # the append failed (logged by log_message itself); the extraction
     # path then skips provenance stamping for this exchange.
-    assistant_log = log_message(direction="assistant", chat_id=chat_id, text=final_text)
+    assistant_log = log_message(
+        direction="assistant",
+        chat_id=chat_id,
+        text=final_text,
+        reader_user=reader_user,
+    )
 
     workshop_outbound_message_id: MessageId | None = None
     outbound_recorder = context.bot_data.get("workshop_outbound_recorder")

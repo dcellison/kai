@@ -23,12 +23,14 @@ summary of the last few messages for ambient recall at session start.
 import hashlib
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from kai.config import DATA_DIR
+from kai.named_access import grant_named_read_access
 
 log = logging.getLogger(__name__)
 
@@ -107,6 +109,7 @@ def log_message(
     chat_id: int,
     text: str,
     media: dict | None = None,
+    reader_user: str | None = None,
 ) -> LogEntry | None:
     """
     Append a single message record to today's JSONL chat log.
@@ -129,6 +132,8 @@ def log_message(
         chat_id: Telegram chat ID the message belongs to.
         text: The message text content.
         media: Optional metadata dict for non-text messages (photos, voice, documents).
+        reader_user: Optional mapped OS user allowed to search this user's
+            otherwise service-private history.
     """
     # Per-user subdirectory: DATA_DIR/history/<chat_id>/YYYY-MM-DD.jsonl
     # Separates users on disk so grep/jq searches are naturally scoped
@@ -157,9 +162,47 @@ def log_message(
     # caller, defeating the safety property the LogEntry | None
     # contract is meant to provide.
     try:
-        user_dir.mkdir(parents=True, exist_ok=True)
-        with open(filepath, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        if _LOG_DIR.is_symlink():
+            raise OSError(f"refusing symlinked history root: {_LOG_DIR}")
+        if _LOG_DIR.exists() and not _LOG_DIR.is_dir():
+            raise OSError(f"refusing non-directory history root: {_LOG_DIR}")
+        _LOG_DIR.mkdir(parents=True, exist_ok=True, mode=0o711)
+        os.chmod(_LOG_DIR, 0o711)
+
+        if user_dir.is_symlink():
+            raise OSError(f"refusing symlinked user history directory: {user_dir}")
+        if user_dir.exists() and not user_dir.is_dir():
+            raise OSError(f"refusing non-directory user history path: {user_dir}")
+        new_user_dir = not user_dir.exists()
+        user_dir.mkdir(mode=0o700, exist_ok=True)
+        # On Linux, chmod after setfacl rewrites the ACL mask and can silently
+        # revoke the mapped reader. The installer owns reconciliation for
+        # existing trees; runtime sets the base mode only at creation time.
+        if new_user_dir or not reader_user:
+            os.chmod(user_dir, 0o700)
+        if new_user_dir and reader_user:
+            grant_named_read_access(user_dir, reader_user, directory=True)
+
+        if filepath.is_symlink():
+            raise OSError(f"refusing symlinked history file: {filepath}")
+        if filepath.exists() and not filepath.is_file():
+            raise OSError(f"refusing non-regular history file: {filepath}")
+        new_file = not filepath.exists()
+        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(filepath, flags, 0o600)
+        try:
+            if new_file or not reader_user:
+                os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as f:
+                fd = -1
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        if new_file and reader_user:
+            grant_named_read_access(filepath, reader_user, directory=False)
     except OSError:
         log.exception("Failed to write chat log")
         # Returning None (not a populated LogEntry) is the contract
