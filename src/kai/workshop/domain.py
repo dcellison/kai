@@ -70,6 +70,14 @@ class PrincipalId(OpaqueId):
     prefix = "prn"
 
 
+class DeviceId(OpaqueId):
+    prefix = "dev"
+
+
+class ClientSessionId(OpaqueId):
+    prefix = "cse"
+
+
 class ExternalIdentityId(OpaqueId):
     prefix = "xid"
 
@@ -115,6 +123,8 @@ _ID_TYPES: dict[str, type[OpaqueId]] = {
     for identifier_type in (
         WorkshopId,
         PrincipalId,
+        DeviceId,
+        ClientSessionId,
         ExternalIdentityId,
         WorkshopMembershipId,
         ChannelId,

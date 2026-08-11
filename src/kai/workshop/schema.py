@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 3
+WORKSHOP_SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,7 +174,50 @@ _CHANNEL_MEMBERSHIP_SCHEMA = SchemaMigration(
     ),
 )
 
-_MIGRATIONS = (_INITIAL_SCHEMA, _DELIVERY_SCHEMA, _CHANNEL_MEMBERSHIP_SCHEMA)
+_CLIENT_SESSION_SCHEMA = SchemaMigration(
+    version=4,
+    name="revocable_human_client_sessions",
+    statements=(
+        """
+        CREATE TABLE workshop_client_devices (
+            id TEXT PRIMARY KEY,
+            principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+            display_name TEXT NOT NULL CHECK (
+                length(trim(display_name)) > 0 AND length(display_name) <= 200
+            ),
+            created_at TEXT NOT NULL,
+            last_seen_at TEXT,
+            revoked_at TEXT,
+            UNIQUE (id, principal_id)
+        )
+        """,
+        "CREATE INDEX workshop_client_devices_principal_idx ON workshop_client_devices (principal_id, revoked_at)",
+        """
+        CREATE TABLE workshop_client_sessions (
+            id TEXT PRIMARY KEY,
+            device_id TEXT NOT NULL,
+            principal_id TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE CHECK (length(token_hash) = 64),
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            last_seen_at TEXT,
+            revoked_at TEXT,
+            FOREIGN KEY (device_id, principal_id)
+                REFERENCES workshop_client_devices(id, principal_id) ON DELETE CASCADE
+        )
+        """,
+        "CREATE INDEX workshop_client_sessions_principal_idx "
+        "ON workshop_client_sessions (principal_id, revoked_at, expires_at)",
+        "CREATE INDEX workshop_client_sessions_device_idx ON workshop_client_sessions (device_id, revoked_at)",
+    ),
+)
+
+_MIGRATIONS = (
+    _INITIAL_SCHEMA,
+    _DELIVERY_SCHEMA,
+    _CHANNEL_MEMBERSHIP_SCHEMA,
+    _CLIENT_SESSION_SCHEMA,
+)
 
 
 async def migrate_workshop_schema(
