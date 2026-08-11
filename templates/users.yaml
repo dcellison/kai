@@ -38,11 +38,13 @@ users:
     # default selected during `make config`. Protected installs accept only
     # backend identifiers present in admin-owned /etc/kai/backends.yaml;
     # users cannot configure executable paths here. Supported identifiers:
-    # "claude", "codex", "goose", and "opencode". Goose and OpenCode
-    # also require a provider; OpenCode models use full "provider/model" IDs
-    # and authentication is managed by `opencode auth login`.
+    # "claude", "codex", "goose", "opencode", and "pi". Goose, OpenCode,
+    # and Pi also require a provider. OpenCode models use full
+    # "provider/model" IDs and authentication is managed by
+    # `opencode auth login`; Pi models use "provider/model[:thinking]" and
+    # authentication is managed by Pi for the target OS user.
     # backend: goose
-    # provider: openai    # required for goose and opencode (selects the model registry)
+    # provider: openai    # required for goose, opencode, and pi (selects the model registry)
 
     # Optional per-user model and timeout defaults. Users can override the
     # conversational model and timeout at runtime via /model and /settings.

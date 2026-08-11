@@ -157,6 +157,7 @@ See [TOTP Authentication](https://github.com/dcellison/kai/wiki/TOTP-Authenticat
 
 Most operational documentation lives in the wiki so it can grow without turning the README into a control panel manual.
 
+- [Changelog](CHANGELOG.md)
 - [Wiki Home](https://github.com/dcellison/kai/wiki)
 - [Getting Started](https://github.com/dcellison/kai/wiki/Getting-Started)
 - [System Architecture](https://github.com/dcellison/kai/wiki/System-Architecture)
