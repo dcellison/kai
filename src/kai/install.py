@@ -88,6 +88,11 @@ _DEFAULT_SERVICE_USER = "kai"
 # Current install.conf schema version
 _CONF_VERSION = 1
 
+# Claude discovers instructions through CLAUDE.md, while Kai's canonical
+# managed identity is backend-neutral AGENTS.md. Keep the compatibility file
+# deliberately content-free so there is only one editable source of truth.
+_CLAUDE_IDENTITY_ADAPTER = "@../AGENTS.md\n"
+
 # Plist label for the launchd service
 _LAUNCHD_LABEL = "com.syrinx.kai"
 
@@ -2916,6 +2921,53 @@ def _collect_user_memory_owners(users_yaml_path: str | Path) -> list[tuple[int, 
     return result
 
 
+def _collect_user_effective_backends(
+    users_yaml_path: str | Path,
+    default_backend: str | None,
+) -> dict[int, str | None]:
+    """Return each valid chat ID's explicit or inherited backend.
+
+    ``None`` is accepted only for direct migration-helper callers that do not
+    have the apply command's resolved default. Production apply always passes
+    a validated default backend. Unknown explicit values fail the install
+    rather than provisioning the wrong backend-native identity surface.
+    """
+    path = Path(users_yaml_path)
+    if default_backend is not None:
+        default_backend = default_backend.strip().lower()
+        if default_backend not in VALID_BACKENDS:
+            raise ValueError(f"Invalid default backend {default_backend!r} for identity provisioning")
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    if not text.strip():
+        return {}
+    data = yaml.safe_load(text)
+    if not isinstance(data, dict) or not isinstance(data.get("users"), list):
+        return {}
+
+    result: dict[int, str | None] = {}
+    for entry in data["users"]:
+        if not isinstance(entry, dict):
+            continue
+        telegram_id = entry.get("telegram_id")
+        if not isinstance(telegram_id, int) or telegram_id in result:
+            continue
+        raw_backend = _entry_backend(entry)
+        if isinstance(raw_backend, str) and raw_backend.strip():
+            backend = raw_backend.strip().lower()
+            if backend not in VALID_BACKENDS:
+                raise ValueError(
+                    f"users.yaml entry chat_id={telegram_id} names unknown backend {backend!r}. Source: {path}."
+                )
+        else:
+            backend = default_backend
+        result[telegram_id] = backend
+    return result
+
+
 def _collect_user_home_overrides(users_yaml_path: str | Path) -> dict[int, Path]:
     """
     Read users.yaml and return a chat_id -> home_workspace override mapping.
@@ -3535,6 +3587,60 @@ def _secure_codex_turn_image_staging(data_path: Path, dry_run: bool) -> None:
         print(f"  Secured Codex image staging root {staging_root} (mode 0711)")
 
 
+def _managed_identity_state(user_home: Path) -> tuple[Path, Path, str | None, str | None]:
+    """Inspect and validate one managed user's canonical/compatibility files.
+
+    The installer runs as root over a directory owned by an agent OS user, so
+    it must never follow an instruction-file symlink. Two different regular
+    files are also ambiguous: silently choosing either would discard operator
+    customization. Validation happens before any identity write.
+    """
+    claude_dir = user_home / ".claude"
+    if user_home.is_symlink() or claude_dir.is_symlink():
+        raise RuntimeError(f"Refusing symlinked managed identity directory under {user_home}")
+    if user_home.exists() and not user_home.is_dir():
+        raise RuntimeError(f"Refusing non-directory managed user home: {user_home}")
+    if claude_dir.exists() and not claude_dir.is_dir():
+        raise RuntimeError(f"Refusing non-directory Claude identity path: {claude_dir}")
+    agents_path = user_home / "AGENTS.md"
+    claude_path = claude_dir / "CLAUDE.md"
+    for label, path in (("canonical identity", agents_path), ("Claude adapter", claude_path)):
+        if path.is_symlink():
+            raise RuntimeError(f"Refusing symlinked {label} path: {path}")
+        if path.exists() and not path.is_file():
+            raise RuntimeError(f"Refusing non-regular {label} path: {path}")
+
+    agents_content = agents_path.read_text() if agents_path.is_file() else None
+    claude_content = claude_path.read_text() if claude_path.is_file() else None
+    if agents_content is None and claude_content == _CLAUDE_IDENTITY_ADAPTER:
+        raise RuntimeError(f"Claude identity adapter exists but canonical identity is missing: {agents_path}")
+    if (
+        agents_content is not None
+        and claude_content is not None
+        and claude_content not in (_CLAUDE_IDENTITY_ADAPTER, agents_content)
+    ):
+        raise RuntimeError(
+            f"Conflicting customized identity files: {agents_path} and {claude_path}. "
+            "Reconcile their content before re-running `make install`; neither file was changed."
+        )
+    return agents_path, claude_path, agents_content, claude_content
+
+
+def _write_managed_identity_atomic(path: Path, content: str) -> None:
+    """Atomically write a private managed identity file in its directory."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_DIR_MODE)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.chmod(temporary, _PRIVATE_USER_FILE_MODE)
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
 def _apply_migrate(
     data_path: Path,
     install_path: Path,
@@ -3542,6 +3648,7 @@ def _apply_migrate(
     svc_gid: int,
     dry_run: bool,
     users_yaml_path: Path | None = None,
+    default_backend: str | None = None,
 ) -> None:
     """
     Migrate runtime data from the development directory to the data directory.
@@ -3560,6 +3667,10 @@ def _apply_migrate(
         users_yaml_path: Path to the installed users.yaml. None means
             the module-level USERS_YAML (the post-_apply_secrets
             location); tests redirect it by patching that attribute.
+        default_backend: Validated installation default used by users without
+            a per-user backend. Production apply always supplies it. ``None``
+            is retained for focused helper tests and means the installer must
+            preserve, rather than infer, any backend-specific adapter.
     """
     # None resolves to the module-level USERS_YAML at call time rather
     # than in the signature: a def-time default would bake the
@@ -3956,6 +4067,10 @@ def _apply_migrate(
         # resolve_home_workspace returns it verbatim at runtime. Case
         # 1: no override - provision the per-user default slot.
         user_dir = override if override is not None else home_root / str(chat_id)
+        if user_dir.is_symlink():
+            raise RuntimeError(f"Refusing symlinked managed user home: {user_dir}")
+        if user_dir.exists() and not user_dir.is_dir():
+            raise RuntimeError(f"Refusing non-directory managed user home: {user_dir}")
         user_dir_exists = user_dir.exists()
         if dry_run:
             if str(chat_id) in per_user_ids:
@@ -3979,159 +4094,122 @@ def _apply_migrate(
         if not user_dir_exists:
             print(f"  Created {user_dir}")
 
-    # -- CLAUDE.md per-user pre-creation --
-    # Mirror the MEMORY.md / PREFERENCES.md per-user pattern above. For
-    # every users.yaml entry we pre-create
-    # <DATA_DIR>/home/<chat_id>/.claude/CLAUDE.md from the template, so
-    # `backend.build_session_context`'s identity-injection path and
-    # the inner Claude's native CLAUDE.md discovery in the home
-    # workspace both have a real file to read. Without this seed, a
-    # new user's home workspace is an empty directory and the bot
-    # runs with no baseline identity for that chat_id - the gap that
-    # PR #449 inadvertently exposed and #450 reverted.
-    #
-    # Lazy bootstrap at runtime (backend.ensure_user_home) is the
-    # fallback for chat_ids added between installs; this eager pass
-    # is for users present in users.yaml at install time so they get
-    # the right ownership (chowned to their os_user via the
-    # _set_ownership call) instead of service-owned-via-mkdir.
-    home_template = PROJECT_ROOT / "templates" / ".claude" / "CLAUDE.md"
-    # Cache the template existence check once; the path is fixed for
-    # the duration of the loop and is_file() would otherwise stat the
-    # same inode N times for N users.
+    # -- Canonical per-user identity and backend-native adapters --
+    # AGENTS.md is the sole editable Kai-managed identity source. Claude's
+    # native CLAUDE.md surface imports it; every other backend consumes
+    # AGENTS.md directly. Existing customized CLAUDE.md content is migrated
+    # losslessly before compatibility files are changed.
+    home_template = PROJECT_ROOT / "templates" / "AGENTS.md"
     home_template_exists = home_template.is_file()
+    effective_backends = _collect_user_effective_backends(users_yaml_path, default_backend)
 
+    # Validate every managed identity surface before changing any of them.
+    # This prevents a conflict for a later user from leaving earlier users
+    # partially migrated.
+    managed_identities: list[tuple[int, str | None, Path, Path, str | None, str | None]] = []
     for chat_id, _os_user in memory_owners:
         if chat_id is None:
             continue
         override = home_overrides.get(chat_id)
-        # Case 3: override outside DATA_DIR is operator-managed; the
-        # home-creation loop above skipped it for the same reason and
-        # we follow suit here. Touching it from the installer would
-        # write under a path the operator owns.
         if override is not None and not override.is_relative_to(data_path_resolved):
             continue
         user_home = override if override is not None else home_root / str(chat_id)
-        claude_dir = user_home / ".claude"
-        claude_dst = claude_dir / "CLAUDE.md"
+        agents_path, claude_path, agents_content, claude_content = _managed_identity_state(user_home)
+        managed_identities.append(
+            (
+                chat_id,
+                effective_backends.get(chat_id, default_backend),
+                agents_path,
+                claude_path,
+                agents_content,
+                claude_content,
+            )
+        )
 
+    for chat_id, backend_name, agents_path, claude_path, agents_content, claude_content in managed_identities:
         if dry_run:
-            if not claude_dst.exists():
-                if home_template_exists:
-                    print(f"[DRY RUN] Would seed {claude_dst} from {home_template}")
+            if agents_content is None:
+                if claude_content is not None:
+                    print(f"[DRY RUN] Would migrate {claude_path} -> {agents_path} (preserving customized content)")
+                elif home_template_exists:
+                    print(f"[DRY RUN] Would seed {agents_path} from {home_template}")
                 else:
-                    print(f"[DRY RUN] Would seed {claude_dst} with placeholder (template missing)")
-            else:
-                # Migration preview for an existing per-user copy. The
-                # seed branch above only fires when claude_dst is
-                # missing; the migration preview fires when claude_dst
-                # exists and the sentinel header may or may not be in
-                # place. Inspecting claude_dst here, before the
-                # `continue` below, ensures the dry-run preview reaches
-                # parity with what the live branch will do; without
-                # this branch, the dry-run output would silently omit
-                # the migration step the live install would execute.
-                #
-                # The helper's three-state return is the structural
-                # distinction that lets the preview print accurate text
-                # per case. Truthy/falsy alone would conflate sentinel-
-                # present (False) with the failure paths (None), producing
-                # a misleading "already present" line when the helper had
-                # actually warned about a different problem.
-                if home_template_exists:
-                    migration_result = _migrate_recalled_memory_section(claude_dst, home_template, dry_run=True)
-                    if migration_result is True:
-                        print(f"[DRY RUN] Would append Reading Recalled Memory section to {claude_dst}")
-                    elif migration_result is False:
-                        # Sentinel present; surface the no-op explicitly so
-                        # the operator sees the migration was considered.
-                        print(
-                            f"[DRY RUN] {claude_dst}: Reading Recalled Memory "
-                            f"section already present, no migration needed"
-                        )
-                    # else: migration_result is None; the helper already
-                    # printed its own WARNING for the specific failure path.
-                    # No additional preview line needed.
-                else:
-                    # Template missing entirely; the helper is never called
-                    # because of the short-circuit above, so no warning has
-                    # been printed in this iteration. Surface the gap so the
-                    # dry-run preview is honest about what the install can
-                    # and cannot do for this user.
-                    print(f"[DRY RUN] {claude_dst}: cannot evaluate migration (template missing at {home_template})")
+                    print(f"[DRY RUN] Would seed {agents_path} with placeholder (template missing)")
+
+            migration_source: Path | None = None
+            if agents_content is not None:
+                migration_source = agents_path
+            elif claude_content is not None:
+                migration_source = claude_path
+            if migration_source is not None and home_template_exists:
+                migration_result = _migrate_recalled_memory_section(
+                    migration_source,
+                    home_template,
+                    dry_run=True,
+                )
+                if migration_result is True:
+                    print(f"[DRY RUN] Would append Reading Recalled Memory section to {agents_path}")
+                elif migration_result is False:
+                    print(
+                        f"[DRY RUN] {agents_path}: Reading Recalled Memory section already present, no migration needed"
+                    )
+            elif migration_source is not None and not home_template_exists:
+                print(f"[DRY RUN] {agents_path}: cannot evaluate migration (template missing at {home_template})")
+
+            if backend_name == "claude":
+                if claude_content != _CLAUDE_IDENTITY_ADAPTER:
+                    print(f"[DRY RUN] Would write Claude identity adapter: {claude_path}")
+            elif backend_name is not None and claude_content is not None:
+                print(f"[DRY RUN] Would remove retired Claude identity copy: {claude_path}")
+            elif backend_name is None and claude_content is not None:
+                print(f"[DRY RUN] Would keep legacy identity copy synchronized: {claude_path}")
             continue
 
-        # Idempotent: never overwrite an operator-customized destination.
-        # `not exists()` is the same guard ensure_user_memory and
-        # ensure_user_preferences use; matches the seed-step contract.
-        claude_dir.mkdir(parents=True, exist_ok=True)
-        # mkdir's mode= is masked by umask; force the private mode
-        # explicitly. The user-owned home slot is now 0700, so no
-        # sibling user needs traversal through this subdir.
-        os.chmod(claude_dir, _PRIVATE_USER_DIR_MODE)
-        if not claude_dst.exists():
-            # Wrap the actual file write in try/except so an OSError
-            # (broken symlink at claude_dst, mounted FS, permissions)
-            # surfaces with a clear operator-readable line BEFORE the
-            # traceback aborts the install. Matches the rmtree wrap
-            # in `_retire_install_home_claude`; install-time policy
-            # is to abort loudly on a real error, not log-and-continue
-            # (that swallow is `backend.ensure_user_home`'s contract
-            # for the runtime path where session-init cannot crash).
-            try:
-                if home_template_exists:
-                    shutil.copy2(home_template, claude_dst)
-                    print(f"  Seeded {claude_dst} from CLAUDE.md template")
+        try:
+            if agents_content is None:
+                if claude_content is not None:
+                    _write_managed_identity_atomic(agents_path, claude_content)
+                    print(f"  Migrated identity {claude_path} -> {agents_path}")
+                elif home_template_exists:
+                    _write_managed_identity_atomic(agents_path, home_template.read_text())
+                    print(f"  Seeded {agents_path} from AGENTS.md template")
                 else:
-                    # Last-resort placeholder so the inner Claude has
-                    # something to read. Mirrors MEMORY.md / PREFERENCES.md
-                    # missing-template precedent above.
-                    claude_dst.write_text("# Identity\n")
-                    print(f"  WARNING: {home_template} not found; wrote placeholder to {claude_dst}")
-            except OSError as exc:
-                print(f"  ERROR: could not seed {claude_dst}: {exc}")
-                raise
+                    _write_managed_identity_atomic(agents_path, "# Identity\n")
+                    print(f"  WARNING: {home_template} not found; wrote placeholder to {agents_path}")
 
-        # Append the Reading Recalled Memory section to pre-existing
-        # per-user CLAUDE.md copies that predate the section. Lands
-        # AFTER the seed step (so a fresh-seeded file from the current
-        # template carries the section already, and the helper's
-        # sentinel check is a clean no-op) and BEFORE the
-        # `_set_ownership` chown step below (so the migration's
-        # atomic `Path.replace`, which produces a new inode owned by
-        # the install runner, gets reconciled back to the per-user
-        # `os_user` in the same iteration; the chown comment block
-        # below names the #347 regression shape this prevents).
-        if home_template_exists and _migrate_recalled_memory_section(claude_dst, home_template, dry_run=False) is True:
-            print(f"  Appended Reading Recalled Memory section to {claude_dst}")
+            if (
+                home_template_exists
+                and _migrate_recalled_memory_section(agents_path, home_template, dry_run=False) is True
+            ):
+                print(f"  Appended Reading Recalled Memory section to {agents_path}")
 
-        # Recursive chown over the .claude/ subdir so both the
-        # directory and the freshly-seeded CLAUDE.md land on the
-        # per-user os_user. The home-creation loop above only chowns
-        # user_dir non-recursively, so without this pass the .claude/
-        # tree would inherit service-user ownership from mkdir and
-        # the inner subprocess (sudo -H -u <os_user>) could read but
-        # not write CLAUDE.md - the same #347 regression the per-user
-        # memory pattern fixed.
-        #
-        # The chown runs UNCONDITIONALLY on every install, even when
-        # the seed step skipped because CLAUDE.md already existed.
-        # Functionally mirrors the MEMORY.md / PREFERENCES.md
-        # ownership reconciliation: idempotent per-install reset
-        # corrects os_user drift. (Structurally those blocks use a
-        # separate iterdir-based pass over the whole tree; this block
-        # inlines the chown into the per-user seed loop because the
-        # tree we care about is one .claude/ subdir per chat_id,
-        # which iterdir would walk anyway.) Without the unconditional
-        # reset, a chat_id whose os_user changed in users.yaml between
-        # installs would keep its old ownership and the new subprocess
-        # could not write the identity file.
-        if str(chat_id) in per_user_ids:
-            uid, gid = per_user_ids[str(chat_id)]
-            _set_ownership(claude_dir, uid, gid, recursive=True)
-        else:
-            _set_ownership(claude_dir, svc_uid, svc_gid, recursive=True)
-        _set_private_user_tree_modes(claude_dir)
+            if backend_name == "claude":
+                claude_path.parent.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_DIR_MODE)
+                os.chmod(claude_path.parent, _PRIVATE_USER_DIR_MODE)
+                if not claude_path.is_file() or claude_path.read_text() != _CLAUDE_IDENTITY_ADAPTER:
+                    _write_managed_identity_atomic(claude_path, _CLAUDE_IDENTITY_ADAPTER)
+                    print(f"  Wrote Claude identity adapter {claude_path}")
+            elif backend_name is not None:
+                if claude_path.is_file():
+                    claude_path.unlink()
+                    print(f"  Removed retired Claude identity copy {claude_path}")
+            elif claude_path.is_file():
+                # Compatibility for direct helper callers that lack a resolved
+                # backend. Do not infer one; keep the old file synchronized so
+                # a repeated migration remains unambiguous.
+                canonical_content = agents_path.read_text()
+                if claude_path.read_text() != canonical_content:
+                    _write_managed_identity_atomic(claude_path, canonical_content)
+
+            os.chmod(agents_path, _PRIVATE_USER_FILE_MODE)
+            uid, gid = per_user_ids.get(str(chat_id), (svc_uid, svc_gid))
+            _set_ownership(agents_path, uid, gid, recursive=False)
+            if claude_path.parent.is_dir():
+                _set_ownership(claude_path.parent, uid, gid, recursive=True)
+                _set_private_user_tree_modes(claude_path.parent)
+        except OSError as exc:
+            print(f"  ERROR: could not provision managed identity for chat_id={chat_id}: {exc}")
+            raise
 
     # -- Per-os-user temp directories (#454) --
     # The inner Claude binary writes a content-hashed settings cache
@@ -4548,7 +4626,14 @@ def _cmd_apply() -> None:
         )
 
         # -- Step 9: Migrate runtime data --
-        _apply_migrate(data_path, install_path, svc_uid, svc_gid, dry_run)
+        _apply_migrate(
+            data_path,
+            install_path,
+            svc_uid,
+            svc_gid,
+            dry_run,
+            default_backend=agent_backend,
+        )
 
         # -- Step 10: Generate service definition --
         webhook_port = int(env.get("WEBHOOK_PORT", "8080"))
@@ -4896,9 +4981,9 @@ def _migrate_identity_to_claude_md(
 
 
 # Sentinel header used by `_migrate_recalled_memory_section` to detect
-# whether a per-user CLAUDE.md already carries the Reading Recalled
+# whether a per-user AGENTS.md already carries the Reading Recalled
 # Memory section. Module-level constant so the migration helper, the
-# dry-run preview branch in the per-user CLAUDE.md seed loop, and the
+# dry-run preview branch in the per-user identity provisioning loop, and the
 # sibling install tests all read the same literal. A drift in this
 # string would let the migration re-append on every install (sentinel
 # always missing) and silently double-write the section.
@@ -4906,24 +4991,24 @@ _RECALLED_MEMORY_SECTION_HEADER = "## Reading Recalled Memory"
 
 
 def _migrate_recalled_memory_section(
-    claude_dst: Path,
+    identity_dst: Path,
     template_path: Path,
     *,
     dry_run: bool,
 ) -> bool | None:
     """
     Idempotently append the Reading Recalled Memory section from the
-    tracked CLAUDE.md template to an existing per-user CLAUDE.md copy.
+    tracked AGENTS.md template to an existing per-user AGENTS.md copy.
 
     Three return states so the dry-run preview can distinguish the
     legitimate no-op from any failure path:
 
     - True: the section would be (or was) appended. Sentinel absent in
-      claude_dst, template present and well-formed.
-    - False: the section is already present in claude_dst (sentinel
+      identity_dst, template present and well-formed.
+    - False: the section is already present in identity_dst (sentinel
       header matched line-strip-equal). Nothing to do; not an error.
-    - None: helper could not proceed. Failure paths include claude_dst
-      not a regular file, claude_dst unreadable, template_path
+    - None: helper could not proceed. Failure paths include identity_dst
+      not a regular file, identity_dst unreadable, template_path
       unreadable, and template missing the section header. Each path
       prints its own operator-facing warning before returning None, so
       the caller does not need to surface additional output.
@@ -4949,7 +5034,7 @@ def _migrate_recalled_memory_section(
     Atomic via Path.replace on a temp file in the same directory. The
     rename closes the partial-write window where a crash or signal
     mid-write could leave the per-user copy half-populated. The temp
-    file lives in claude_dst's parent so the rename stays within one
+    file lives in identity_dst's parent so the rename stays within one
     filesystem; `Path.replace` delegates to `os.replace`, which calls
     `rename(2)` and surfaces `EXDEV` as `OSError` for cross-filesystem
     targets. No silent fallback to copy+unlink (that is `shutil.move`'s
@@ -4960,7 +5045,7 @@ def _migrate_recalled_memory_section(
     rename(2); the post-rename file inherits the temp file's ownership
     (the install runner, typically root via `sudo make install`), not
     the per-user `os_user` the inner Claude subprocess writes as. The
-    per-user CLAUDE.md seed loop calls this helper BEFORE the
+    per-user AGENTS.md provisioning loop calls this helper BEFORE the
     `_set_ownership` chown step, so the appended file's ownership is
     reconciled in the same iteration; the comment block at the chown
     site documents the #347 regression shape this prevents.
@@ -4973,11 +5058,11 @@ def _migrate_recalled_memory_section(
     of pre-migration per-user copies is empirically zero.
 
     Args:
-        claude_dst: The per-user CLAUDE.md to append to. Path returned
+        identity_dst: The per-user AGENTS.md to append to. Path returned
             by the per-user seed loop's resolution of
-            `<DATA_DIR>/home/<chat_id>/.claude/CLAUDE.md`.
+            `<DATA_DIR>/home/<chat_id>/AGENTS.md`.
         template_path: The tracked template
-            (`templates/.claude/CLAUDE.md`). Section text is extracted
+            (`templates/AGENTS.md`). Section text is extracted
             from here on every call so a future revision to the
             section's wording in the template propagates to the next
             install's migration run.
@@ -4988,12 +5073,12 @@ def _migrate_recalled_memory_section(
     """
     # Skip if the per-user copy does not exist. The seed step earlier
     # in the loop just wrote a fresh copy from the current template if
-    # claude_dst was missing, so by the time live execution reaches
-    # this helper, claude_dst should exist; the explicit check guards
+    # identity_dst was missing, so by the time live execution reaches
+    # this helper, identity_dst should exist; the explicit check guards
     # the dry-run branch (where the seed is a preview-only print) and
     # the operator-managed-override branch (where the seed is skipped
     # entirely).
-    if not claude_dst.is_file():
+    if not identity_dst.is_file():
         return None
 
     # Read the per-user copy and check for the sentinel header on a
@@ -5003,13 +5088,13 @@ def _migrate_recalled_memory_section(
     # is the precise check that matches what the migration's own
     # append produces.
     try:
-        existing = claude_dst.read_text()
+        existing = identity_dst.read_text()
     except OSError as exc:
         # Broken symlink, permissions, mount issue. Match the
         # ensure_user_home swallow pattern: surface to operator log,
         # continue the install rather than abort. The next install
         # retries; the lazy seed path will also retry on first message.
-        print(f"  WARNING: could not read {claude_dst} for migration: {exc}")
+        print(f"  WARNING: could not read {identity_dst} for migration: {exc}")
         return None
 
     for line in existing.splitlines():
@@ -5039,11 +5124,11 @@ def _migrate_recalled_memory_section(
         # not in the template; warn so the operator notices and either
         # restores the template or removes this helper from the install
         # flow. Mirrors the placeholder-warning shape the per-user
-        # CLAUDE.md seed loop uses ("WARNING: <template> not found").
+        # AGENTS.md provisioning loop uses ("WARNING: <template> not found").
         print(
             f"  WARNING: {template_path} is missing the "
             f"{_RECALLED_MEMORY_SECTION_HEADER!r} section; "
-            f"cannot migrate {claude_dst}"
+            f"cannot migrate {identity_dst}"
         )
         return None
 
@@ -5083,17 +5168,17 @@ def _migrate_recalled_memory_section(
     # leaves a recoverable artifact at a known path rather than a random
     # mkstemp name. The try/except cleans up the temp file when
     # write_text fails partway, so a partial-write does not leave debris
-    # in the .claude/ directory.
-    temp_path = claude_dst.parent / (claude_dst.name + ".tmp")
+    # in the identity file's directory.
+    temp_path = identity_dst.parent / (identity_dst.name + ".tmp")
     try:
         temp_path.write_text(new_content)
-        temp_path.replace(claude_dst)
+        temp_path.replace(identity_dst)
     except OSError as exc:
         # Clean up the partial temp file before propagating so a retry
         # is not blocked by a stale .tmp file. unlink(missing_ok=True)
         # handles the case where write_text never created the file.
         temp_path.unlink(missing_ok=True)
-        print(f"  ERROR: could not migrate {claude_dst}: {exc}")
+        print(f"  ERROR: could not migrate {identity_dst}: {exc}")
         raise
 
     return True
@@ -5106,12 +5191,12 @@ def _retire_install_home_claude(install_path: Path, dry_run: bool) -> None:
 
     Both paths predate the per-user `home_workspace` migration in #353.
     Since #353 every session resolves identity from the per-user
-    `<DATA_DIR>/home/<chat_id>/.claude/CLAUDE.md`; nothing in the
+    `<DATA_DIR>/home/<chat_id>/AGENTS.md`; nothing in the
     runtime reads either of the paths this helper deletes. Issue #447
     retires the install-tree scaffolding entirely. The per-user
-    `CLAUDE.md` is seeded by `_apply_migrate`'s home block (eager,
+    `AGENTS.md` is seeded by `_apply_migrate`'s home block (eager,
     install-time) and `backend.ensure_user_home` (lazy, first-message
-    fallback) from the still-tracked `templates/.claude/CLAUDE.md`.
+    fallback) from the tracked `templates/AGENTS.md`.
 
     Behavior is idempotent: pre-checks (`is_dir()` for the subtree,
     `is_symlink() or is_file()` for IDENTITY.md) make a missing path
@@ -5316,7 +5401,7 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
     # Config templates (e.g. goose-config.yaml) referenced by later
     # install steps like _apply_goose_config(). Root-owned since
     # these are static templates, not runtime data. Per-user runtime
-    # CLAUDE.md is seeded by `_apply_migrate`'s home block (eager)
+    # AGENTS.md is seeded by `_apply_migrate`'s home block (eager)
     # and `backend.ensure_user_home` (lazy, first-message fallback);
     # neither touches the install tree.
     config_src = PROJECT_ROOT / "templates" / "config"

@@ -737,7 +737,7 @@ class AcpBackend(AgentBackend):
         self._next_id: int = 1
         self._lock = asyncio.Lock()  # Serializes all message sends
         # True until the first send() finishes; first-message context
-        # (CLAUDE.md / PREFERENCES.md / session_context) is injected
+        # (AGENTS.md / PREFERENCES.md / session_context) is injected
         # exactly once per session.
         self._fresh_session: bool = True
         self._stderr_task: asyncio.Task | None = None
@@ -1225,6 +1225,7 @@ class AcpBackend(AgentBackend):
                 workspace_config=self.workspace_config,
                 chat_id=chat_id,
                 data_dir=DATA_DIR,
+                backend_name=self.backend_name,
                 memory_enabled=self.memory_enabled,
                 defer_user_file_reads=self.defer_user_file_reads,
             )

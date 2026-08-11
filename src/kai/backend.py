@@ -17,6 +17,7 @@ prompt assembly that is identical across all backends.
 import logging
 import os
 import shutil
+import tempfile
 import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
@@ -31,6 +32,7 @@ from kai.config import (
     Config,
     WorkspaceConfig,
     canonicalize_model_for_backend,
+    get_user_backend_and_provider,
     validate_model_for_backend,
 )
 from kai.history import get_recent_history
@@ -40,6 +42,7 @@ log = logging.getLogger(__name__)
 _PRIVATE_USER_ROOT_MODE = 0o711
 _PRIVATE_USER_DIR_MODE = 0o700
 _PRIVATE_USER_FILE_MODE = 0o600
+_CLAUDE_IDENTITY_ADAPTER = "@../AGENTS.md\n"
 
 
 def _chmod_private_user_root(path: Path) -> None:
@@ -358,6 +361,7 @@ def build_session_context(
     workspace_config: WorkspaceConfig | None,
     chat_id: int | None,
     data_dir: Path,
+    backend_name: str | None = None,
     memory_enabled: bool = False,
     defer_user_file_reads: bool = False,
 ) -> str:
@@ -377,6 +381,9 @@ def build_session_context(
         workspace_config: Per-workspace config (for system_prompt).
         chat_id: Telegram chat ID for history scoping and API routing.
         data_dir: Root data directory (memory, history, files live here).
+        backend_name: Canonical backend identifier used to validate explicit
+            identity routing. Required whenever the active workspace differs
+            from the home workspace.
         memory_enabled: Operator-intent flag (Config.memory_enabled).
             Drives the memory subsystem marker emission and gates
             MEMORY.md injection. Reflects intent, not runtime success;
@@ -397,7 +404,16 @@ def build_session_context(
     # and read_text()) and permission errors, matching the pattern
     # in get_workspace_system_prompt().
     if workspace != home_workspace:
-        identity_path = home_workspace / ".claude" / "CLAUDE.md"
+        if backend_name is None:
+            raise ValueError("backend_name is required for foreign-workspace identity routing")
+        if backend_name not in VALID_BACKENDS:
+            raise ValueError(f"Unknown backend for identity routing: {backend_name!r}")
+        # AGENTS.md is the canonical content source for every backend. Claude's
+        # native home-workspace surface is a thin import adapter, but injecting
+        # that literal adapter text into a foreign-workspace prompt would not
+        # cause Claude's file loader to expand it. Read (or ask the isolated
+        # subprocess to read) the canonical source directly here.
+        identity_path = home_workspace / "AGENTS.md"
         if defer_user_file_reads:
             parts.append(
                 "[Your core identity and instructions are stored at "
@@ -418,7 +434,7 @@ def build_session_context(
     # startup, the marker still says "enabled" so write attempts
     # surface the failure as 503s rather than silently re-routing to
     # MEMORY.md. Always emit (per-deployment, not per-user) so the
-    # routing rule in CLAUDE.md / PREFERENCES.md can branch on a
+    # routing rule in AGENTS.md / PREFERENCES.md can branch on a
     # uniformly-present signal.
     mode = "enabled" if memory_enabled else "disabled"
     parts.append(f"[Memory subsystem: {mode}]")
@@ -771,7 +787,76 @@ def ensure_user_context_files(
     ensure_user_preferences(chat_id, data_dir)
 
 
-def ensure_user_home(chat_id: int | None, data_dir: Path) -> Path:
+def _write_private_text_atomic(path: Path, content: str) -> None:
+    """Atomically replace a private user file without a partial-write window."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_DIR_MODE)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temp_path = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.chmod(temp_path, _PRIVATE_USER_FILE_MODE)
+        temp_path.replace(path)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def _ensure_development_identity_files(home: Path, backend_name: str) -> None:
+    """Seed the canonical identity and the selected backend's adapter.
+
+    Protected installations use the stricter installer migration instead.
+    This helper preserves the historical lazy bootstrap for development and
+    single-user runs while retaining the same one-source identity contract.
+    """
+    if backend_name not in VALID_BACKENDS:
+        raise ValueError(f"Unknown backend for identity provisioning: {backend_name!r}")
+
+    agents_dst = home / "AGENTS.md"
+    claude_dir = home / ".claude"
+    claude_dst = claude_dir / "CLAUDE.md"
+    template = PROJECT_ROOT / "templates" / "AGENTS.md"
+
+    if claude_dir.is_symlink():
+        raise RuntimeError(f"Refusing symlinked Kai identity directory: {claude_dir}")
+    if claude_dir.exists() and not claude_dir.is_dir():
+        raise RuntimeError(f"Kai Claude identity path is not a directory: {claude_dir}")
+    if agents_dst.is_symlink() or claude_dst.is_symlink():
+        raise RuntimeError(f"Refusing symlinked Kai identity surface under {home}")
+    if agents_dst.exists() and not agents_dst.is_file():
+        raise RuntimeError(f"Kai identity path is not a regular file: {agents_dst}")
+    if claude_dst.exists() and not claude_dst.is_file():
+        raise RuntimeError(f"Kai Claude adapter path is not a regular file: {claude_dst}")
+
+    claude_content = claude_dst.read_text() if claude_dst.is_file() else None
+    if not agents_dst.exists():
+        if claude_content is not None:
+            if claude_content == _CLAUDE_IDENTITY_ADAPTER:
+                raise RuntimeError(f"Claude identity adapter exists but canonical identity is missing: {agents_dst}")
+            _write_private_text_atomic(agents_dst, claude_content)
+        elif template.is_file():
+            shutil.copy2(template, agents_dst)
+            _chmod_private_user_file(agents_dst)
+        else:
+            _write_private_text_atomic(agents_dst, "# Identity\n")
+
+    agents_content = agents_dst.read_text()
+    if claude_content not in (None, _CLAUDE_IDENTITY_ADAPTER, agents_content):
+        raise RuntimeError(
+            f"Conflicting customized identity files: {agents_dst} and {claude_dst}. Reconcile them before continuing."
+        )
+    if backend_name == "claude":
+        claude_dir.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_DIR_MODE)
+        _chmod_private_user_dir(claude_dir)
+        if claude_content != _CLAUDE_IDENTITY_ADAPTER:
+            _write_private_text_atomic(claude_dst, _CLAUDE_IDENTITY_ADAPTER)
+    elif claude_content in (_CLAUDE_IDENTITY_ADAPTER, agents_content):
+        claude_dst.unlink(missing_ok=True)
+
+    _chmod_private_user_file(agents_dst)
+
+
+def ensure_user_home(chat_id: int | None, data_dir: Path, *, backend_name: str) -> Path:
     """
     Lazily create the per-user home workspace directory.
 
@@ -814,17 +899,10 @@ def ensure_user_home(chat_id: int | None, data_dir: Path) -> Path:
     os_user entries added after install still require a reinstall so
     install.py can apply the correct ownership.
 
-    Like ensure_user_memory and ensure_user_preferences, this seeds
-    `<home>/.claude/CLAUDE.md` from `templates/.claude/CLAUDE.md` when
-    the file is absent. Without that seed, a user added to users.yaml
-    AFTER install (or any dev / single-user path without an install
-    pass) gets an empty home workspace and the bot's identity-injection
-    path in `build_session_context` silently fails on the missing file -
-    the gap PR #449 inadvertently exposed and #450 reverted. The
-    install-time eager pass in `install.py:_apply_migrate` covers
-    users present in users.yaml at install time so their CLAUDE.md
-    lands with the right per-user ownership; this lazy fallback
-    bootstraps anyone else on their first message.
+    The lazy path also seeds the canonical `AGENTS.md`. Claude receives a
+    `.claude/CLAUDE.md` adapter importing that file; other backends use
+    `AGENTS.md` directly. Existing customized CLAUDE.md content is migrated
+    into AGENTS.md before the adapter is written.
     """
     # chat_id of None means we have no real Telegram session to key on
     # (test runs, health checks, smoke runs without users.yaml). Use a
@@ -864,34 +942,13 @@ def ensure_user_home(chat_id: int | None, data_dir: Path) -> Path:
     except PermissionError:
         pass
 
-    # Lazy bootstrap of `<home>/.claude/CLAUDE.md`. Parallel to
-    # ensure_user_memory and ensure_user_preferences: stat, possible
-    # mkdir, possible copy2. The OSError swallow matches the sibling
-    # bootstraps - a permissions issue here must not prevent the bot
-    # from answering a message. The read path in
-    # build_session_context already handles missing files gracefully,
-    # so a failed seed degrades to the silent-no-identity behavior we
-    # had before #447 rather than crashing the session.
+    # Lazy identity bootstrap. Protected installs never reach this path;
+    # install.py owns their migration and per-user ownership reconciliation.
     try:
-        claude_dir = path / ".claude"
-        claude_dst = claude_dir / "CLAUDE.md"
-        if not claude_dst.exists():
-            claude_dir.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_DIR_MODE)
-            _chmod_private_user_dir(claude_dir)
-            template = PROJECT_ROOT / "templates" / ".claude" / "CLAUDE.md"
-            if template.is_file():
-                shutil.copy2(template, claude_dst)
-            else:
-                # No template on this host (incomplete install tree).
-                # Match ensure_user_memory's `# Memory\n` /
-                # ensure_user_preferences' `# Preferences\n` last-resort
-                # placeholder so the inner agent has a writable file.
-                claude_dst.write_text("# Identity\n")
-        _chmod_private_user_dir(claude_dir)
-        _chmod_private_user_file(claude_dst)
+        _ensure_development_identity_files(path, backend_name)
     except OSError:
         log.warning(
-            "ensure_user_home: could not seed CLAUDE.md at %s",
+            "ensure_user_home: could not seed backend identity at %s",
             path,
             exc_info=True,
         )
@@ -1005,8 +1062,10 @@ def resolve_home_workspace(
         return path
 
     # Development / single-user path: use the per-user Kai-managed directory
-    # under data_dir. ensure_user_home supplies the historical lazy bootstrap.
-    return ensure_user_home(chat_id, data_dir)
+    # under data_dir. The effective backend selects the native identity surface
+    # without assigning priority to any backend.
+    backend_name, _provider = get_user_backend_and_provider(user, config)
+    return ensure_user_home(chat_id, data_dir, backend_name=backend_name)
 
 
 def build_foreign_workspace_reminder(workspace: Path, home_workspace: Path) -> str | None:
@@ -1076,7 +1135,7 @@ def extract_text_query(prompt: str | list) -> str:
     The memory retrieval query MUST come from the raw user message, not
     from the prompt after session context, memory recall, or reminder
     blocks have been prepended. On a fresh session the prepended
-    CLAUDE.md, MEMORY.md, history, and API docs reach ~10-20KB; if any
+    AGENTS.md, MEMORY.md, history, and API docs reach ~10-20KB; if any
     of that ends up in the embedding query, the first message's memory
     retrieval is essentially random and the user-visible behavior is
     "Kai never remembers anything on the first turn of a new session."
@@ -1115,7 +1174,7 @@ async def assemble_turn_context(
     Backend-neutral assembly of the per-turn prompt around a single
     user message. Captures the original user text as the memory
     search query BEFORE any context is prepended (so the embedding
-    vector is not polluted by injected CLAUDE.md / history / API docs
+    vector is not polluted by injected AGENTS.md / history / API docs
     on fresh sessions), then layers prefixes in an order whose
     inverse is the final reading order:
 
@@ -1172,7 +1231,7 @@ async def assemble_turn_context(
     # permanent prompt-shape fixture for interactive backends.
     prompt = prepend_to_prompt(prompt, USER_MESSAGE_MARKER)
 
-    # First-session context (CLAUDE.md + PREFERENCES.md + recent
+    # First-session context (AGENTS.md + PREFERENCES.md + recent
     # history + API context) is built by the caller because the
     # fresh-session lifecycle is backend-owned. Empty string is the
     # normal non-fresh-session value.

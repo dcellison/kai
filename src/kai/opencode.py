@@ -292,6 +292,10 @@ class OpenCodeBackend(AcpBackend):
         which is the right behavior for an unconfigured-on-purpose
         adapter (e.g. operator running tests).
         """
+        # OpenCode otherwise falls back to Claude instruction files when an
+        # AGENTS.md is absent. Kai's identity contract is explicit: OpenCode
+        # receives AGENTS.md only.
+        base_env["OPENCODE_DISABLE_CLAUDE_CODE_PROMPT"] = "1"
         if self.model:
             base_env["OPENCODE_CONFIG_CONTENT"] = json.dumps({"model": self.model})
         return base_env
@@ -322,6 +326,7 @@ class OpenCodeBackend(AcpBackend):
         """
         return (
             "OPENCODE_CONFIG_CONTENT",
+            "OPENCODE_DISABLE_CLAUDE_CODE_PROMPT",
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             "GOOGLE_API_KEY",

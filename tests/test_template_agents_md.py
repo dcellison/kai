@@ -1,6 +1,6 @@
-"""Tests for the tracked inner-agent CLAUDE.md template.
+"""Tests for the tracked backend-neutral AGENTS.md template.
 
-The template at templates/.claude/CLAUDE.md is the source for every per-user
+The template at templates/AGENTS.md is the source for every per-user
 inner-agent identity file. It ships to new users via the install-time seed
 step and is the upstream of the _migrate_recalled_memory_section helper.
 Regressions to the structure or wording of pinned sections would propagate
@@ -22,7 +22,7 @@ from kai.config import PROJECT_ROOT
 # Path to the tracked template. Resolved through PROJECT_ROOT so the test
 # follows whatever install/dev anchoring config.py has bound rather than
 # hardcoding a relative path that breaks under either layout.
-_TEMPLATE = PROJECT_ROOT / "templates" / ".claude" / "CLAUDE.md"
+_TEMPLATE = PROJECT_ROOT / "templates" / "AGENTS.md"
 
 # The section header serves as the migration helper's sentinel. Pinning
 # it here means a rename in the template fails this test before it

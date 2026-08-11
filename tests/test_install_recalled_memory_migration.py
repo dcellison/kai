@@ -1,13 +1,13 @@
 """Tests for the Reading Recalled Memory migration helper.
 
 Covers `kai.install._migrate_recalled_memory_section` and its wiring into
-the per-user CLAUDE.md seed loop in `_apply_migrate`.
+the per-user AGENTS.md provisioning loop in `_apply_migrate`.
 
 The helper appends the `## Reading Recalled Memory` section from the
-tracked CLAUDE.md template to pre-existing per-user copies that predate
+tracked AGENTS.md template to pre-existing per-user copies that predate
 the section. Without it, operators already on prior installs would
 never pick up the new section (the seed step in `_apply_migrate`'s
-per-user CLAUDE.md block guards with `if not claude_dst.exists()`, so
+per-user AGENTS.md block guards with `if not identity_dst.exists()`, so
 a stale per-user copy survives reinstall untouched), and the rule
 would only apply to users added after the section landed in the template.
 
@@ -209,7 +209,7 @@ class TestMigrateRecalledMemorySection:
         # Per-user copy is byte-for-byte unchanged.
         assert per_user.read_text() == _STALE_PER_USER_COPY
         # Warning surfaces to operator stdout per the placeholder-warning
-        # shape the per-user CLAUDE.md seed loop uses when the template
+        # shape the per-user AGENTS.md provisioning loop uses when the template
         # is missing.
         warning = capsys.readouterr().out
         assert "WARNING" in warning
@@ -218,7 +218,7 @@ class TestMigrateRecalledMemorySection:
     # ── Case 5: per-user copy is a broken symlink ──
 
     def test_skip_with_warning_on_broken_symlink(self, tmp_path, capsys):
-        """Broken symlink at claude_dst: skip with warning, no exception escapes.
+        """Broken symlink at identity_dst: skip with warning, no exception escapes.
 
         Returns None (failure path) so the dry-run preview can suppress the
         "already present" line that would otherwise mislead the operator.
@@ -291,7 +291,7 @@ class TestApplyMigrateRecalledMemoryIntegration:
     """Spec §6.3: three integration cases covering the dry-run wiring.
 
     Drives the migration through `_apply_migrate` so the dry-run preview
-    branch (the `if dry_run:` branch in the per-user CLAUDE.md seed
+    branch (the `if dry_run:` branch in the per-user AGENTS.md provisioning
     loop) and the live branch (after `copy2`, before `_set_ownership`)
     are exercised together. The patches mirror the sibling
     TestApplyMigrateClaudeMdSeed in test_install.py so we do not need
@@ -311,12 +311,12 @@ class TestApplyMigrateRecalledMemoryIntegration:
 
         return _Pw()
 
-    def _build_install_layout(self, tmp_path, template_content, claude_dst_content=None):
+    def _build_install_layout(self, tmp_path, template_content, agents_dst_content=None):
         """Set up an install layout with a populated template and optional pre-existing per-user copy."""
         src = tmp_path / "source"
         ws_claude = src / "templates" / ".claude"
         ws_claude.mkdir(parents=True)
-        (ws_claude / "CLAUDE.md").write_text(template_content)
+        (src / "templates" / "AGENTS.md").write_text(template_content)
         # MEMORY.md and PREFERENCES.md templates are referenced by the
         # sibling seed blocks in _apply_migrate; provide them so the
         # function does not divert into a placeholder branch that
@@ -328,10 +328,10 @@ class TestApplyMigrateRecalledMemoryIntegration:
         self._write_users_yaml(users_yaml, [{"telegram_id": 12345, "os_user": "alice"}])
 
         data_path = tmp_path / "data"
-        if claude_dst_content is not None:
-            claude_dir = data_path / "home" / "12345" / ".claude"
-            claude_dir.mkdir(parents=True)
-            (claude_dir / "CLAUDE.md").write_text(claude_dst_content)
+        if agents_dst_content is not None:
+            user_home = data_path / "home" / "12345"
+            user_home.mkdir(parents=True)
+            (user_home / "AGENTS.md").write_text(agents_dst_content)
 
         install_path = tmp_path / "install"
         install_path.mkdir()
@@ -345,7 +345,7 @@ class TestApplyMigrateRecalledMemoryIntegration:
         src, data_path, install_path, users_yaml = self._build_install_layout(
             tmp_path,
             template_content=_TEMPLATE_WITH_SECTION,
-            claude_dst_content=_STALE_PER_USER_COPY,
+            agents_dst_content=_STALE_PER_USER_COPY,
         )
 
         with (
@@ -363,14 +363,14 @@ class TestApplyMigrateRecalledMemoryIntegration:
                 users_yaml_path=Path(users_yaml),
             )
 
-        claude_dst = data_path / "home" / "12345" / ".claude" / "CLAUDE.md"
+        agents_dst = data_path / "home" / "12345" / "AGENTS.md"
         # File contents unchanged (dry-run).
-        assert claude_dst.read_text() == _STALE_PER_USER_COPY
+        assert agents_dst.read_text() == _STALE_PER_USER_COPY
         # The dry-run preview surfaces in stdout so an operator running
         # `make install --dry-run` sees the planned migration.
         output = capsys.readouterr().out
         assert "[DRY RUN] Would append Reading Recalled Memory section" in output
-        assert str(claude_dst) in output
+        assert str(agents_dst) in output
 
     # ── Case B: current + dry-run ──
 
@@ -381,7 +381,7 @@ class TestApplyMigrateRecalledMemoryIntegration:
             template_content=_TEMPLATE_WITH_SECTION,
             # Per-user copy carries the section already (e.g. seeded
             # from a current template or migrated in a prior install).
-            claude_dst_content=_TEMPLATE_WITH_SECTION,
+            agents_dst_content=_TEMPLATE_WITH_SECTION,
         )
 
         with (
@@ -399,20 +399,20 @@ class TestApplyMigrateRecalledMemoryIntegration:
                 users_yaml_path=Path(users_yaml),
             )
 
-        claude_dst = data_path / "home" / "12345" / ".claude" / "CLAUDE.md"
-        assert claude_dst.read_text() == _TEMPLATE_WITH_SECTION
+        agents_dst = data_path / "home" / "12345" / "AGENTS.md"
+        assert agents_dst.read_text() == _TEMPLATE_WITH_SECTION
         output = capsys.readouterr().out
         assert "Reading Recalled Memory section already present" in output
 
     # ── Case D: dry-run when the tracked template is missing entirely ──
 
-    def test_dry_run_surfaces_template_missing_when_claude_dst_exists(self, tmp_path, capsys):
-        """claude_dst exists + template absent + dry-run: surface the gap.
+    def test_dry_run_surfaces_template_missing_when_agents_dst_exists(self, tmp_path, capsys):
+        """agents_dst exists + template absent + dry-run: surface the gap.
 
         Without an explicit preview line for this case the dry-run output
         would silently omit the migration step the operator might assume
-        would run. The seed branch above only fires when claude_dst is
-        missing, so under the (claude_dst exists, template missing)
+        would run. The seed branch above only fires when agents_dst is
+        missing, so under the (agents_dst exists, template missing)
         combination the operator would otherwise see no relevant output.
         """
         src, data_path, install_path, users_yaml = self._build_install_layout(
@@ -421,12 +421,12 @@ class TestApplyMigrateRecalledMemoryIntegration:
             # template; passing None here is not how the helper is set
             # up. We rebuild the layout manually to omit the template.
             template_content=_TEMPLATE_WITH_SECTION,
-            claude_dst_content=_STALE_PER_USER_COPY,
+            agents_dst_content=_STALE_PER_USER_COPY,
         )
-        # Remove the CLAUDE.md template so home_template_exists is False
+        # Remove the AGENTS.md template so home_template_exists is False
         # at the seed-loop's check. MEMORY.md and PREFERENCES.md templates
         # remain so the sibling seed blocks do not emit unrelated noise.
-        (src / "templates" / ".claude" / "CLAUDE.md").unlink()
+        (src / "templates" / "AGENTS.md").unlink()
 
         with (
             patch("kai.install.PROJECT_ROOT", src),
@@ -443,9 +443,9 @@ class TestApplyMigrateRecalledMemoryIntegration:
                 users_yaml_path=Path(users_yaml),
             )
 
-        claude_dst = data_path / "home" / "12345" / ".claude" / "CLAUDE.md"
+        agents_dst = data_path / "home" / "12345" / "AGENTS.md"
         # File unchanged in dry-run mode.
-        assert claude_dst.read_text() == _STALE_PER_USER_COPY
+        assert agents_dst.read_text() == _STALE_PER_USER_COPY
         # The dry-run preview names the failure explicitly so the operator
         # knows the migration was considered and could not proceed.
         output = capsys.readouterr().out
@@ -466,7 +466,7 @@ class TestApplyMigrateRecalledMemoryIntegration:
         src, data_path, install_path, users_yaml = self._build_install_layout(
             tmp_path,
             template_content=_TEMPLATE_WITH_SECTION,
-            claude_dst_content=_STALE_PER_USER_COPY,
+            agents_dst_content=_STALE_PER_USER_COPY,
         )
 
         with (
@@ -484,19 +484,19 @@ class TestApplyMigrateRecalledMemoryIntegration:
                 users_yaml_path=Path(users_yaml),
             )
 
-        claude_dst = data_path / "home" / "12345" / ".claude" / "CLAUDE.md"
-        content = claude_dst.read_text()
+        agents_dst = data_path / "home" / "12345" / "AGENTS.md"
+        content = agents_dst.read_text()
         # The section landed.
         assert _RECALLED_MEMORY_SECTION_HEADER in content
         # The operator's prior content survived.
         assert "OPERATOR LOCAL EDIT" in content
-        # _set_ownership was called for the per-user .claude/ subdir
+        # _set_ownership was called for the per-user AGENTS.md
         # AFTER the migration ran (the migration is sync, so any
         # _set_ownership call we see was issued after the migration's
         # Path.replace returned). At least one recursive call against
-        # the claude_dir is the contract; the seed loop calls
+        # the canonical identity is the contract; the provisioning loop calls
         # _set_ownership unconditionally per-iteration.
         called_paths = [call.args[0] for call in set_ownership_mock.call_args_list]
-        assert any("12345" in str(p) and ".claude" in str(p) for p in called_paths), (
-            f"_set_ownership was not called against the per-user .claude/ dir: {called_paths}"
+        assert agents_dst in called_paths, (
+            f"_set_ownership was not called against the per-user AGENTS.md: {called_paths}"
         )

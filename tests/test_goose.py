@@ -381,6 +381,16 @@ class TestHandshake:
         assert call_kwargs["env"]["GOOSE_MODEL"] == "claude-opus-4-8"
 
     @pytest.mark.asyncio
+    async def test_native_context_discovery_is_agents_only(self):
+        g = _make_goose()
+        proc = _make_mock_proc(_handshake_lines())
+
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await g._ensure_started()
+
+        assert json.loads(mock_exec.call_args[1]["env"]["CONTEXT_FILE_NAMES"]) == ["AGENTS.md"]
+
+    @pytest.mark.asyncio
     async def test_model_passthrough_for_non_anthropic(self):
         """Non-Anthropic providers pass model value through unchanged."""
         g = _make_goose(model="sonnet", provider="openai")
@@ -1271,6 +1281,7 @@ class TestPreservedEnvVars:
         assert g.preserved_env_vars() == (
             "GOOSE_MODEL",
             "GOOSE_PROVIDER",
+            "CONTEXT_FILE_NAMES",
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             "GOOGLE_API_KEY",
@@ -1305,7 +1316,7 @@ class TestPreservedEnvVars:
         argv = list(captured["argv"])
         assert argv[:4] == ["sudo", "-H", "-u", "goose-user"]
         assert argv[4] == (
-            "--preserve-env=GOOSE_MODEL,GOOSE_PROVIDER,ANTHROPIC_API_KEY,"
+            "--preserve-env=GOOSE_MODEL,GOOSE_PROVIDER,CONTEXT_FILE_NAMES,ANTHROPIC_API_KEY,"
             "OPENAI_API_KEY,GOOGLE_API_KEY,OPENROUTER_API_KEY,DEEPSEEK_API_KEY,"
             "ANTHROPIC_HOST,OPENAI_HOST,OPENAI_BASE_PATH,OLLAMA_HOST,"
             "KAI_WEBHOOK_SECRET,TMPDIR"

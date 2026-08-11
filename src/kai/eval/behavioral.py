@@ -701,10 +701,10 @@ async def _run_subprocess(
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        # Neutral cwd: no CLAUDE.md discovery at subprocess startup.
+        # Neutral cwd: no AGENTS.md / CLAUDE.md discovery at startup.
         # Without this, claude --print would walk up from the harness's
         # cwd and pick up the operator's per-user
-        # home_workspace/.claude/CLAUDE.md (Kai's bot identity: voice
+        # home_workspace identity files (Kai's bot identity: voice
         # rules, persona, scheduling API docs). The judge's evaluations
         # would then be filtered through Kai's persona, and the generator
         # would receive bot-voice priming; both confounds the spec

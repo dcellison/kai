@@ -16,6 +16,7 @@ The Goose ACP protocol:
     Finish:   JSON-RPC result with matching id + stopReason
 """
 
+import json
 import logging
 import os
 
@@ -152,6 +153,10 @@ class GooseBackend(AcpBackend):
             base_env["GOOSE_MODEL"] = mapped
         if self.provider:
             base_env["GOOSE_PROVIDER"] = goose_provider_id(self.provider)
+        # Kai provisions one canonical backend-neutral instruction file.
+        # Restrict Goose's context discovery to that surface so it cannot
+        # consume a stale Claude compatibility file after a backend switch.
+        base_env["CONTEXT_FILE_NAMES"] = json.dumps(["AGENTS.md"])
         return base_env
 
     def preserved_env_vars(self) -> tuple[str, ...]:
@@ -179,6 +184,7 @@ class GooseBackend(AcpBackend):
         return (
             "GOOSE_MODEL",
             "GOOSE_PROVIDER",
+            "CONTEXT_FILE_NAMES",
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             "GOOGLE_API_KEY",

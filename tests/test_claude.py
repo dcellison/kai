@@ -1660,9 +1660,8 @@ class TestContextInjection:
     def home_workspace(self, tmp_path, monkeypatch):
         """Create a home workspace with identity file and DATA_DIR memory."""
         home = tmp_path / "home"
-        claude_dir = home / ".claude"
-        claude_dir.mkdir(parents=True)
-        (claude_dir / "CLAUDE.md").write_text("You are Kai.")
+        home.mkdir(parents=True)
+        (home / "AGENTS.md").write_text("You are Kai.")
 
         # Personal memory now lives under DATA_DIR, not the workspace
         data_dir = tmp_path / "data"
@@ -1975,7 +1974,7 @@ class TestContextInjection:
     async def test_memory_query_captured_before_session_context_pollution(self, home_workspace, foreign_workspace):
         """Pin the read-path invariant for the integration: when Claude
         is on a fresh session (so build_session_context fires and the
-        prompt grows to include CLAUDE.md, recent history, API docs,
+        prompt grows to include AGENTS.md, recent history, API docs,
         etc.), format_context must still receive the RAW user text as
         the embedding query, not the post-prepend prompt. Pre-fix
         shape was protected inside claude._send_locked by capturing

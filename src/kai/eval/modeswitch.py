@@ -459,6 +459,7 @@ async def _run_verify() -> int:
                 workspace_config=None,
                 chat_id=_FIXTURE_CHAT_ID,
                 data_dir=tmp_root,
+                backend_name="codex",
                 memory_enabled=False,
             )
 
@@ -542,6 +543,7 @@ async def _run_verify() -> int:
                 workspace_config=None,
                 chat_id=_FIXTURE_CHAT_ID,
                 data_dir=tmp_root,
+                backend_name="codex",
                 memory_enabled=True,
             )
 

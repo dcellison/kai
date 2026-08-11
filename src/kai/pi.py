@@ -356,6 +356,7 @@ class PiBackend(AgentBackend):
                 workspace_config=self.workspace_config,
                 chat_id=chat_id,
                 data_dir=DATA_DIR,
+                backend_name=self.backend_name,
                 memory_enabled=self.memory_enabled,
                 defer_user_file_reads=self.defer_user_file_reads,
             )

@@ -68,11 +68,10 @@ class TestBuildSessionContext:
         assert "core identity and instructions" not in result
 
     def test_foreign_workspace_injects_identity(self, tmp_path):
-        """Identity injected from home CLAUDE.md when in foreign workspace."""
+        """Canonical AGENTS.md identity is injected in a foreign workspace."""
         home = tmp_path / "home"
         home.mkdir()
-        (home / ".claude").mkdir()
-        (home / ".claude" / "CLAUDE.md").write_text("Be helpful.")
+        (home / "AGENTS.md").write_text("Be helpful.")
 
         foreign = tmp_path / "foreign"
         foreign.mkdir()
@@ -88,6 +87,7 @@ class TestBuildSessionContext:
                 workspace_config=None,
                 chat_id=None,
                 data_dir=data_dir,
+                backend_name="claude",
             )
 
         assert result is not None
@@ -98,8 +98,7 @@ class TestBuildSessionContext:
         """Protected mode avoids daemon-side reads of user-owned files."""
         home = tmp_path / "home" / "12345"
         home.mkdir(parents=True)
-        (home / ".claude").mkdir()
-        (home / ".claude" / "CLAUDE.md").write_text("PRIVATE IDENTITY")
+        (home / "AGENTS.md").write_text("PRIVATE IDENTITY")
 
         foreign = tmp_path / "foreign"
         foreign.mkdir()
@@ -119,15 +118,42 @@ class TestBuildSessionContext:
                 workspace_config=None,
                 chat_id=12345,
                 data_dir=data_dir,
+                backend_name="codex",
                 defer_user_file_reads=True,
             )
 
         assert "PRIVATE IDENTITY" not in result
         assert "PRIVATE PREFS" not in result
         assert "PRIVATE MEMORY" not in result
-        assert str(home / ".claude" / "CLAUDE.md") in result
+        assert str(home / "AGENTS.md") in result
         assert str(pref_dir / "PREFERENCES.md") in result
         assert str(memory_dir / "MEMORY.md") in result
+
+    @pytest.mark.parametrize("backend_name", ["claude", "codex", "goose", "opencode", "pi"])
+    def test_foreign_workspace_uses_canonical_identity_for_every_backend(self, tmp_path, backend_name):
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "AGENTS.md").write_text("CANONICAL IDENTITY")
+        (home / ".claude").mkdir()
+        (home / ".claude" / "CLAUDE.md").write_text("@../AGENTS.md\n")
+        foreign = tmp_path / "foreign"
+        foreign.mkdir()
+        data_dir = tmp_path / "data"
+        (data_dir / "memory").mkdir(parents=True)
+
+        with patch("kai.backend.get_recent_history", return_value=""):
+            result = build_session_context(
+                workspace=foreign,
+                home_workspace=home,
+                api=self._api(),
+                workspace_config=None,
+                chat_id=None,
+                data_dir=data_dir,
+                backend_name=backend_name,
+            )
+
+        assert "CANONICAL IDENTITY" in result
+        assert "@../AGENTS.md" not in result
 
     def test_memory_exists(self, tmp_path):
         """Memory content included when file exists and is non-empty."""
@@ -745,7 +771,7 @@ class TestEnsureUserHome:
 
     def test_creates_directory(self, tmp_path):
         """First call materializes home/<chat_id>/ under data_dir."""
-        result = ensure_user_home(12345, tmp_path)
+        result = ensure_user_home(12345, tmp_path, backend_name="codex")
         assert result == tmp_path / "home" / "12345"
         assert result.is_dir()
 
@@ -755,12 +781,12 @@ class TestEnsureUserHome:
         the directory after first creation; clobbering it would lose
         user-authored files (cloned repos, notes, etc.).
         """
-        first = ensure_user_home(12345, tmp_path)
+        first = ensure_user_home(12345, tmp_path, backend_name="codex")
         # Drop a sentinel so we can verify the second call leaves it alone.
         sentinel = first / "userfile.txt"
         sentinel.write_text("user content")
 
-        second = ensure_user_home(12345, tmp_path)
+        second = ensure_user_home(12345, tmp_path, backend_name="codex")
         assert second == first
         assert sentinel.read_text() == "user content"
 
@@ -770,7 +796,7 @@ class TestEnsureUserHome:
         admin-less startup paths (tests, health checks). Returning None
         would force defensive None-checks at every call site.
         """
-        result = ensure_user_home(None, tmp_path)
+        result = ensure_user_home(None, tmp_path, backend_name="codex")
         assert result == tmp_path / "home" / "anon"
         assert result.is_dir()
 
@@ -791,7 +817,7 @@ class TestEnsureUserHome:
         (tmp_path / "home").mkdir()
         prev_umask = _os.umask(0o777)
         try:
-            result = ensure_user_home(99, tmp_path)
+            result = ensure_user_home(99, tmp_path, backend_name="codex")
         finally:
             _os.umask(prev_umask)
 
@@ -799,70 +825,68 @@ class TestEnsureUserHome:
         assert mode == 0o700, f"expected 0o700, got {oct(mode)}"
         assert stat.S_IMODE((tmp_path / "home").stat().st_mode) == 0o711
 
-    def test_seeds_claude_md_from_template(self, tmp_path):
-        """
-        Lazy bootstrap: ensure_user_home seeds <home>/.claude/CLAUDE.md
-        from templates/.claude/CLAUDE.md when absent. Without this seed,
-        a user added to users.yaml AFTER install (or any dev path
-        without an install pass) gets an empty home workspace and the
-        bot's identity-injection path silently fails on the missing
-        file. Parallel to ensure_user_memory's MEMORY.md seed.
-        """
-        # Build a fake source tree under tmp_path so we can patch
-        # PROJECT_ROOT to it. The real PROJECT_ROOT has a template, but
-        # using the real path would make this test order-dependent on
-        # whether the template currently exists in the working tree.
+    def test_claude_seeds_canonical_identity_and_adapter(self, tmp_path):
         fake_root = tmp_path / "src_root"
-        template_dir = fake_root / "templates" / ".claude"
-        template_dir.mkdir(parents=True)
-        template = template_dir / "CLAUDE.md"
-        template.write_text("# Kai template\n")
+        (fake_root / "templates").mkdir(parents=True)
+        (fake_root / "templates" / "AGENTS.md").write_text("# Kai template\n")
 
-        data_dir = tmp_path / "data"
         with patch("kai.backend.PROJECT_ROOT", fake_root):
-            home = ensure_user_home(99, data_dir)
+            home = ensure_user_home(99, tmp_path / "data", backend_name="claude")
 
+        agents_dst = home / "AGENTS.md"
         claude_dst = home / ".claude" / "CLAUDE.md"
-        assert claude_dst.is_file(), f"Expected lazy seed at {claude_dst}"
-        assert claude_dst.read_text() == "# Kai template\n"
-        assert stat.S_IMODE((home / ".claude").stat().st_mode) == 0o700
+        assert agents_dst.read_text() == "# Kai template\n"
+        assert claude_dst.read_text() == "@../AGENTS.md\n"
+        assert stat.S_IMODE(agents_dst.stat().st_mode) == 0o600
         assert stat.S_IMODE(claude_dst.stat().st_mode) == 0o600
 
-    def test_seed_is_idempotent(self, tmp_path):
-        """An existing per-user CLAUDE.md is never overwritten on later calls."""
+    @pytest.mark.parametrize("backend_name", ["codex", "goose", "opencode", "pi"])
+    def test_non_claude_backend_seeds_only_agents_md(self, tmp_path, backend_name):
         fake_root = tmp_path / "src_root"
-        template_dir = fake_root / "templates" / ".claude"
-        template_dir.mkdir(parents=True)
-        (template_dir / "CLAUDE.md").write_text("# UPSTREAM\n")
+        (fake_root / "templates").mkdir(parents=True)
+        (fake_root / "templates" / "AGENTS.md").write_text("# Kai template\n")
 
-        data_dir = tmp_path / "data"
         with patch("kai.backend.PROJECT_ROOT", fake_root):
-            home = ensure_user_home(99, data_dir)
+            home = ensure_user_home(99, tmp_path / "data", backend_name=backend_name)
 
-        # Operator customizes after first seed.
-        claude_dst = home / ".claude" / "CLAUDE.md"
-        claude_dst.write_text("# OPERATOR CUSTOMIZED\n")
+        assert (home / "AGENTS.md").read_text() == "# Kai template\n"
+        assert not (home / ".claude" / "CLAUDE.md").exists()
 
-        # Second call must leave the customized content alone.
+    def test_existing_claude_identity_migrates_without_content_loss(self, tmp_path):
+        fake_root = tmp_path / "src_root"
+        (fake_root / "templates").mkdir(parents=True)
+        (fake_root / "templates" / "AGENTS.md").write_text("# UPSTREAM\n")
+        home = tmp_path / "data" / "home" / "99"
+        (home / ".claude").mkdir(parents=True)
+        (home / ".claude" / "CLAUDE.md").write_text("# OPERATOR CUSTOMIZED\n")
+
         with patch("kai.backend.PROJECT_ROOT", fake_root):
-            ensure_user_home(99, data_dir)
+            ensure_user_home(99, tmp_path / "data", backend_name="claude")
 
-        assert claude_dst.read_text() == "# OPERATOR CUSTOMIZED\n"
+        assert (home / "AGENTS.md").read_text() == "# OPERATOR CUSTOMIZED\n"
+        assert (home / ".claude" / "CLAUDE.md").read_text() == "@../AGENTS.md\n"
+
+    def test_conflicting_customized_identity_files_fail_closed(self, tmp_path):
+        home = tmp_path / "data" / "home" / "99"
+        (home / ".claude").mkdir(parents=True)
+        (home / "AGENTS.md").write_text("# canonical\n")
+        (home / ".claude" / "CLAUDE.md").write_text("# different\n")
+
+        with pytest.raises(RuntimeError, match="Conflicting customized identity files"):
+            ensure_user_home(99, tmp_path / "data", backend_name="claude")
+
+        assert (home / "AGENTS.md").read_text() == "# canonical\n"
+        assert (home / ".claude" / "CLAUDE.md").read_text() == "# different\n"
 
     def test_seed_writes_placeholder_when_template_missing(self, tmp_path):
-        """Missing template: last-resort placeholder so the file is writable."""
         fake_root = tmp_path / "src_root"
-        # Intentionally do not create templates/.claude/CLAUDE.md.
-        (fake_root / "templates" / ".claude").mkdir(parents=True)
+        (fake_root / "templates").mkdir(parents=True)
 
-        data_dir = tmp_path / "data"
         with patch("kai.backend.PROJECT_ROOT", fake_root):
-            home = ensure_user_home(99, data_dir)
+            home = ensure_user_home(99, tmp_path / "data", backend_name="codex")
 
-        claude_dst = home / ".claude" / "CLAUDE.md"
-        assert claude_dst.is_file()
-        # Placeholder mirrors the MEMORY.md / PREFERENCES.md precedent.
-        assert claude_dst.read_text() == "# Identity\n"
+        assert (home / "AGENTS.md").read_text() == "# Identity\n"
+        assert not (home / ".claude" / "CLAUDE.md").exists()
 
     def test_chmod_eperm_does_not_crash(self, tmp_path):
         """
@@ -890,9 +914,9 @@ class TestEnsureUserHome:
         def chmod_eperm(path, mode, **kwargs):
             # Match the production failure shape: EPERM only on the
             # per-user dir we are trying to harden; let any other chmod
-            # call (e.g. inside the .claude/ seed branch via shutil.copy2)
-            # fall through to the real implementation. The **kwargs catch
-            # is needed because shutil.copy2 passes follow_symlinks=True.
+            # call inside identity provisioning to fall through to the real
+            # implementation. Keep **kwargs for compatibility with callers
+            # that pass follow_symlinks.
             if str(path) == str(target):
                 raise PermissionError(1, "Operation not permitted", str(path))
             real_chmod(path, mode, **kwargs)
@@ -900,7 +924,7 @@ class TestEnsureUserHome:
         with patch("kai.backend.os.chmod", side_effect=chmod_eperm):
             # Must not raise. The caller depends on this returning the
             # path so the session context build can proceed.
-            result = ensure_user_home(12345, tmp_path)
+            result = ensure_user_home(12345, tmp_path, backend_name="codex")
 
         assert result == target
 
@@ -914,14 +938,14 @@ class TestEnsureUserHome:
         # Build the source tree before patching so the setup mkdirs do
         # not hit the patched failure.
         fake_root = tmp_path / "src_root"
-        (fake_root / "templates" / ".claude").mkdir(parents=True)
-        (fake_root / "templates" / ".claude" / "CLAUDE.md").write_text("# Kai\n")
+        (fake_root / "templates").mkdir(parents=True)
+        (fake_root / "templates" / "AGENTS.md").write_text("# Kai\n")
 
         def boom(*_args, **_kwargs) -> None:
             raise OSError("simulated permission denied")
 
         data_dir = tmp_path / "data"
-        # Patch the seed step's copy2 to raise. The outer path.mkdir
+        # Patch the seed step's template copy to raise. The outer path.mkdir
         # for data_dir/home/<chat_id>/ runs cleanly (the function-
         # under-test handles its own dir creation before reaching the
         # seed branch); only the seed copy fails. Must not raise: the
@@ -931,12 +955,12 @@ class TestEnsureUserHome:
             patch("kai.backend.PROJECT_ROOT", fake_root),
             patch("kai.backend.shutil.copy2", side_effect=boom),
         ):
-            result = ensure_user_home(99, data_dir)
+            result = ensure_user_home(99, data_dir, backend_name="codex")
 
         assert result == data_dir / "home" / "99"
         # The seed file should NOT have been written; the OSError
         # handler should have logged and continued silently.
-        assert not (result / ".claude" / "CLAUDE.md").exists()
+        assert not (result / "AGENTS.md").exists()
 
 
 class TestEnsureUserContextFiles:
@@ -993,6 +1017,7 @@ class TestResolveHomeWorkspace:
         return Config(
             telegram_bot_token="test",
             allowed_user_ids={1},
+            default_backend="codex",
             user_configs=user_configs if user_configs is not None else {},
             protected_install=protected_install,
         )

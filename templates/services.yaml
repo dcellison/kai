@@ -14,7 +14,7 @@
 #   5. Restart Kai.
 #
 # Kai injects authentication from the server-side env at call time — API keys never
-# enter Claude's context. See <DATA_DIR>/home/<chat_id>/.claude/CLAUDE.md for usage docs.
+# enter the selected agent's context. See <DATA_DIR>/home/<chat_id>/AGENTS.md for usage docs.
 #
 # Auth types:
 #   bearer  — Authorization: Bearer $KEY

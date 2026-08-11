@@ -7079,55 +7079,53 @@ class TestRetireInstallHomeDir:
 # ── Per-user CLAUDE.md seed (in _apply_migrate's home block) ─────────
 
 
-class TestApplyMigrateClaudeMdSeed:
-    """
-    _apply_migrate's home block seeds <DATA_DIR>/home/<chat_id>/.claude/
-    CLAUDE.md from templates/.claude/CLAUDE.md for every users.yaml
-    entry. Without this seed, a new user's home workspace is an empty
-    directory and the bot has no baseline identity to read. The pattern
-    mirrors the MEMORY.md / PREFERENCES.md seed blocks above this one
-    in the same function. Lazy bootstrap (backend.ensure_user_home) is
-    the fallback for chat_ids added between installs and is covered by
-    its own test module.
-    """
+class TestApplyMigrateManagedIdentity:
+    """Install-time canonical identity migration and backend adapters."""
 
     def _write_users_yaml(self, path: Path, entries: list[dict]) -> None:
         path.write_text(yaml.safe_dump({"users": entries}))
 
-    def _stub_pwd_getpwnam(self):
-        # Map any os_user to a fixed uid/gid pair. _apply_migrate
-        # validates os_user existence up front via pwd.getpwnam; in
-        # tests we redirect to a stub so we do not need real OS
-        # accounts on the test host. The chown calls inside the
-        # function are themselves stubbed out via patch("os.chown")
-        # in each test, so the uid/gid values here are placeholders.
+    def _source(self, tmp_path: Path, *, identity: str | None = "# Kai template\n") -> Path:
+        src = tmp_path / "source"
+        templates = src / "templates"
+        claude_templates = templates / ".claude"
+        claude_templates.mkdir(parents=True)
+        if identity is not None:
+            (templates / "AGENTS.md").write_text(identity)
+        (claude_templates / "MEMORY.md").write_text("# Memory\n")
+        (claude_templates / "PREFERENCES.md").write_text("# Preferences\n")
+        return src
+
+    @staticmethod
+    def _pwd():
         class _Pw:
             pw_uid = 1234
             pw_gid = 1234
 
         return _Pw()
 
-    def test_fresh_install_seeds_per_user_claude_md(self, tmp_path):
-        """A users.yaml entry produces a populated CLAUDE.md at the per-user path."""
-        src = tmp_path / "source"
-        ws_claude = src / "templates" / ".claude"
-        ws_claude.mkdir(parents=True)
-        (ws_claude / "CLAUDE.md").write_text("# Kai template\n")
-        # The seed loop is shared with MEMORY.md / PREFERENCES.md; supply
-        # those templates too so the rest of _apply_migrate does not
-        # diverge into placeholder branches.
-        (ws_claude / "MEMORY.md").write_text("# Memory\n")
-        (ws_claude / "PREFERENCES.md").write_text("# Preferences\n")
+    def _apply(
+        self,
+        tmp_path: Path,
+        *,
+        backend: str,
+        entry_backend: str | None = None,
+        dry_run: bool = False,
+        source_identity: str | None = "# Kai template\n",
+    ) -> tuple[Path, Path, Path]:
+        src = self._source(tmp_path, identity=source_identity)
         users_yaml = tmp_path / "users.yaml"
-        self._write_users_yaml(users_yaml, [{"telegram_id": 12345, "os_user": "alice"}])
-
+        entry = {"telegram_id": 12345, "os_user": "alice"}
+        if entry_backend is not None:
+            entry["backend"] = entry_backend
+        self._write_users_yaml(users_yaml, [entry])
         data_path = tmp_path / "data"
         install_path = tmp_path / "install"
-        install_path.mkdir()
+        install_path.mkdir(exist_ok=True)
 
         with (
             patch("kai.install.PROJECT_ROOT", src),
-            patch("kai.install.pwd.getpwnam", return_value=self._stub_pwd_getpwnam()),
+            patch("kai.install.pwd.getpwnam", return_value=self._pwd()),
             patch("kai.install._set_ownership"),
             patch("os.chown"),
         ):
@@ -7136,123 +7134,138 @@ class TestApplyMigrateClaudeMdSeed:
                 install_path,
                 svc_uid=0,
                 svc_gid=0,
-                dry_run=False,
-                users_yaml_path=Path(users_yaml),
+                dry_run=dry_run,
+                users_yaml_path=users_yaml,
+                default_backend=backend,
+            )
+        return data_path / "home" / "12345", users_yaml, src
+
+    def test_fresh_claude_user_gets_agents_and_thin_adapter(self, tmp_path):
+        home, _users, _src = self._apply(tmp_path, backend="claude")
+        assert (home / "AGENTS.md").read_text() == "# Kai template\n"
+        assert (home / ".claude" / "CLAUDE.md").read_text() == "@../AGENTS.md\n"
+        assert stat.S_IMODE((home / "AGENTS.md").stat().st_mode) == 0o600
+        assert stat.S_IMODE((home / ".claude" / "CLAUDE.md").stat().st_mode) == 0o600
+
+    @pytest.mark.parametrize("backend", ["codex", "goose", "opencode", "pi"])
+    def test_fresh_non_claude_user_gets_only_agents(self, tmp_path, backend):
+        home, _users, _src = self._apply(tmp_path, backend=backend)
+        assert (home / "AGENTS.md").read_text() == "# Kai template\n"
+        assert not (home / ".claude" / "CLAUDE.md").exists()
+
+    def test_explicit_user_backend_overrides_install_default(self, tmp_path):
+        home, _users, _src = self._apply(
+            tmp_path,
+            backend="codex",
+            entry_backend="claude",
+        )
+        assert (home / ".claude" / "CLAUDE.md").read_text() == "@../AGENTS.md\n"
+
+    def test_unknown_user_backend_does_not_fall_back(self, tmp_path):
+        with pytest.raises(ValueError, match="unknown backend"):
+            self._apply(
+                tmp_path,
+                backend="codex",
+                entry_backend="not-a-backend",
             )
 
-        claude_dst = data_path / "home" / "12345" / ".claude" / "CLAUDE.md"
-        assert claude_dst.is_file(), f"Expected seed at {claude_dst}"
-        assert claude_dst.read_text() == "# Kai template\n"
+        assert not (tmp_path / "data" / "home" / "12345" / "AGENTS.md").exists()
 
-    def test_existing_per_user_claude_md_survives_reinstall(self, tmp_path):
-        """Idempotent: an operator-customized destination is never overwritten."""
-        src = tmp_path / "source"
-        ws_claude = src / "templates" / ".claude"
-        ws_claude.mkdir(parents=True)
-        (ws_claude / "CLAUDE.md").write_text("# Kai template\n")
-        (ws_claude / "MEMORY.md").write_text("# Memory\n")
-        (ws_claude / "PREFERENCES.md").write_text("# Preferences\n")
-        users_yaml = tmp_path / "users.yaml"
-        self._write_users_yaml(users_yaml, [{"telegram_id": 12345, "os_user": "alice"}])
+    def test_existing_claude_content_migrates_before_adapter(self, tmp_path):
+        home = tmp_path / "data" / "home" / "12345"
+        (home / ".claude").mkdir(parents=True)
+        old_content = "# OPERATOR CUSTOMIZED\nKeep this exact text.\n"
+        (home / ".claude" / "CLAUDE.md").write_text(old_content)
 
-        data_path = tmp_path / "data"
-        claude_dir = data_path / "home" / "12345" / ".claude"
-        claude_dir.mkdir(parents=True)
-        claude_dst = claude_dir / "CLAUDE.md"
-        claude_dst.write_text("# OPERATOR CUSTOMIZED\n")
+        migrated_home, _users, _src = self._apply(
+            tmp_path,
+            backend="claude",
+            source_identity="# Template without migration section\n",
+        )
 
-        install_path = tmp_path / "install"
-        install_path.mkdir()
+        assert migrated_home == home
+        assert (home / "AGENTS.md").read_text() == old_content
+        assert (home / ".claude" / "CLAUDE.md").read_text() == "@../AGENTS.md\n"
 
-        with (
-            patch("kai.install.PROJECT_ROOT", src),
-            patch("kai.install.pwd.getpwnam", return_value=self._stub_pwd_getpwnam()),
-            patch("kai.install._set_ownership"),
-            patch("os.chown"),
-        ):
-            _apply_migrate(
-                data_path,
-                install_path,
-                svc_uid=0,
-                svc_gid=0,
-                dry_run=False,
-                users_yaml_path=Path(users_yaml),
-            )
+    def test_non_claude_migration_removes_retired_copy(self, tmp_path):
+        home = tmp_path / "data" / "home" / "12345"
+        (home / ".claude").mkdir(parents=True)
+        old_content = "# OPERATOR CUSTOMIZED\n"
+        (home / ".claude" / "CLAUDE.md").write_text(old_content)
 
-        # Customized content survives.
-        assert claude_dst.read_text() == "# OPERATOR CUSTOMIZED\n"
+        self._apply(
+            tmp_path,
+            backend="pi",
+            source_identity="# Template without migration section\n",
+        )
 
-    def test_missing_template_writes_placeholder(self, tmp_path):
-        """Missing template: last-resort placeholder so the file is writable."""
-        src = tmp_path / "source"
-        ws_claude = src / "templates" / ".claude"
-        ws_claude.mkdir(parents=True)
-        # CLAUDE.md template intentionally absent; MEMORY.md / PREFERENCES.md
-        # present so the rest of _apply_migrate runs normally.
-        (ws_claude / "MEMORY.md").write_text("# Memory\n")
-        (ws_claude / "PREFERENCES.md").write_text("# Preferences\n")
-        users_yaml = tmp_path / "users.yaml"
-        self._write_users_yaml(users_yaml, [{"telegram_id": 12345, "os_user": "alice"}])
+        assert (home / "AGENTS.md").read_text() == old_content
+        assert not (home / ".claude" / "CLAUDE.md").exists()
 
-        data_path = tmp_path / "data"
-        install_path = tmp_path / "install"
-        install_path.mkdir()
+    def test_conflicting_customized_files_abort_without_changes(self, tmp_path):
+        home = tmp_path / "data" / "home" / "12345"
+        (home / ".claude").mkdir(parents=True)
+        (home / "AGENTS.md").write_text("# canonical\n")
+        (home / ".claude" / "CLAUDE.md").write_text("# different\n")
 
-        with (
-            patch("kai.install.PROJECT_ROOT", src),
-            patch("kai.install.pwd.getpwnam", return_value=self._stub_pwd_getpwnam()),
-            patch("kai.install._set_ownership"),
-            patch("os.chown"),
-        ):
-            _apply_migrate(
-                data_path,
-                install_path,
-                svc_uid=0,
-                svc_gid=0,
-                dry_run=False,
-                users_yaml_path=Path(users_yaml),
-            )
+        with pytest.raises(RuntimeError, match="Conflicting customized identity files"):
+            self._apply(tmp_path, backend="claude")
 
-        claude_dst = data_path / "home" / "12345" / ".claude" / "CLAUDE.md"
-        assert claude_dst.is_file()
-        assert claude_dst.read_text() == "# Identity\n"
+        assert (home / "AGENTS.md").read_text() == "# canonical\n"
+        assert (home / ".claude" / "CLAUDE.md").read_text() == "# different\n"
 
-    def test_dry_run_predicts_seed(self, tmp_path, capsys):
-        """Dry-run names the source and destination for the seed it would write."""
-        src = tmp_path / "source"
-        ws_claude = src / "templates" / ".claude"
-        ws_claude.mkdir(parents=True)
-        (ws_claude / "CLAUDE.md").write_text("# Kai template\n")
-        (ws_claude / "MEMORY.md").write_text("# Memory\n")
-        (ws_claude / "PREFERENCES.md").write_text("# Preferences\n")
-        users_yaml = tmp_path / "users.yaml"
-        self._write_users_yaml(users_yaml, [{"telegram_id": 12345, "os_user": "alice"}])
+    def test_symlinked_identity_surface_is_refused(self, tmp_path):
+        home = tmp_path / "data" / "home" / "12345"
+        home.mkdir(parents=True)
+        target = tmp_path / "outside"
+        target.write_text("outside\n")
+        (home / "AGENTS.md").symlink_to(target)
 
-        data_path = tmp_path / "data"
-        install_path = tmp_path / "install"
-        install_path.mkdir()
+        with pytest.raises(RuntimeError, match="Refusing symlinked canonical identity"):
+            self._apply(tmp_path, backend="codex")
 
-        with (
-            patch("kai.install.PROJECT_ROOT", src),
-            patch("kai.install.pwd.getpwnam", return_value=self._stub_pwd_getpwnam()),
-        ):
-            _apply_migrate(
-                data_path,
-                install_path,
-                svc_uid=0,
-                svc_gid=0,
-                dry_run=True,
-                users_yaml_path=Path(users_yaml),
-            )
+        assert target.read_text() == "outside\n"
+
+    def test_symlinked_claude_directory_is_refused(self, tmp_path):
+        home = tmp_path / "data" / "home" / "12345"
+        home.mkdir(parents=True)
+        outside = tmp_path / "outside-claude"
+        outside.mkdir()
+        (home / ".claude").symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(RuntimeError, match="symlinked managed identity directory"):
+            self._apply(tmp_path, backend="claude")
+
+        assert list(outside.iterdir()) == []
+
+    def test_dry_run_reports_migration_and_changes_nothing(self, tmp_path, capsys):
+        home = tmp_path / "data" / "home" / "12345"
+        (home / ".claude").mkdir(parents=True)
+        old_content = "# customized\n"
+        claude_path = home / ".claude" / "CLAUDE.md"
+        claude_path.write_text(old_content)
+
+        self._apply(
+            tmp_path,
+            backend="claude",
+            dry_run=True,
+            source_identity="# Template without migration section\n",
+        )
 
         output = capsys.readouterr().out
-        expected_dst = data_path / "home" / "12345" / ".claude" / "CLAUDE.md"
-        # Dry-run preview names the per-user destination path. The
-        # template source path is in the same line; pin one substring
-        # so a path-format change does not flake the test.
-        assert f"Would seed {expected_dst}" in output
-        # Dry run never touches disk.
-        assert not expected_dst.exists()
+        assert f"Would migrate {claude_path} -> {home / 'AGENTS.md'}" in output
+        assert f"Would write Claude identity adapter: {claude_path}" in output
+        assert not (home / "AGENTS.md").exists()
+        assert claude_path.read_text() == old_content
+
+    def test_missing_template_writes_agents_placeholder(self, tmp_path):
+        home, _users, _src = self._apply(
+            tmp_path,
+            backend="codex",
+            source_identity=None,
+        )
+        assert (home / "AGENTS.md").read_text() == "# Identity\n"
+        assert not (home / ".claude" / "CLAUDE.md").exists()
 
 
 # ── _migrate_identity_to_claude_md ───────────────────────────────────

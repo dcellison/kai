@@ -190,6 +190,10 @@ class TestBuildEnv:
         assert env["BAZ"] == "qux"
         assert "OPENCODE_CONFIG_CONTENT" in env
 
+    def test_claude_prompt_fallback_is_disabled(self):
+        env = _make_opencode().build_env({})
+        assert env["OPENCODE_DISABLE_CLAUDE_CODE_PROMPT"] == "1"
+
 
 # ── build_initialize_params ─────────────────────────────────────────
 
@@ -841,6 +845,7 @@ class TestPreservedEnvVars:
         b = _make_opencode()
         assert b.preserved_env_vars() == (
             "OPENCODE_CONFIG_CONTENT",
+            "OPENCODE_DISABLE_CLAUDE_CODE_PROMPT",
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             "GOOGLE_API_KEY",
@@ -871,7 +876,7 @@ class TestPreservedEnvVars:
         argv = list(captured["argv"])
         assert argv[:4] == ["sudo", "-H", "-u", "oc-user"]
         assert argv[4] == (
-            "--preserve-env=OPENCODE_CONFIG_CONTENT,ANTHROPIC_API_KEY,"
+            "--preserve-env=OPENCODE_CONFIG_CONTENT,OPENCODE_DISABLE_CLAUDE_CODE_PROMPT,ANTHROPIC_API_KEY,"
             "OPENAI_API_KEY,GOOGLE_API_KEY,OPENROUTER_API_KEY,DEEPSEEK_API_KEY,"
             "KAI_WEBHOOK_SECRET,TMPDIR"
         )
