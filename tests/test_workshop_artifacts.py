@@ -142,6 +142,7 @@ class TestArtifactShadowRecording:
             )
         finally:
             await store.close()
+
     async def test_duplicate_is_idempotent_across_restart_but_changed_content_conflicts(self, tmp_path: Path):
         db_path = tmp_path / "kai.db"
         storage_root = tmp_path / "files"
@@ -221,6 +222,7 @@ class TestArtifactShadowRecording:
                 assert (await cursor.fetchone())[0] == 0
         finally:
             await store.close()
+
     async def test_rejects_missing_outside_and_symlink_escape_paths(self, tmp_path: Path):
         store = await _open_store(tmp_path / "kai.db")
         storage_root = tmp_path / "files"
@@ -284,9 +286,7 @@ class TestSharedDatabaseArtifactRecording:
         saved.write_bytes(b"photo")
         await sessions.init_db(tmp_path / "kai.db")
         try:
-            await sessions.bootstrap_workshop_foundation(
-                (BootstrapHuman("Alice", "admin", "telegram", "101", "101"),)
-            )
+            await sessions.bootstrap_workshop_foundation((BootstrapHuman("Alice", "admin", "telegram", "101", "101"),))
             inbound = await sessions.record_workshop_inbound_message(
                 InboundMessage("telegram", "9001", "42", "101", "101", "Photo", _NOW)
             )

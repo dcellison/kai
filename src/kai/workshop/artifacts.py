@@ -196,7 +196,10 @@ async def record_inbound_artifact(
     existing = await store.event_by_idempotency_key(idempotency_key)
     if existing is not None:
         existing_path = existing.envelope.payload.get("storage_path")
-        if isinstance(existing_path, str) and create_envelope(existing_path).content_hash == existing.envelope.content_hash:
+        if (
+            isinstance(existing_path, str)
+            and create_envelope(existing_path).content_hash == existing.envelope.content_hash
+        ):
             result = AppendResult(event=existing, inserted=False)
         else:
             # Preserve the event store's uniform conflict behavior and error
