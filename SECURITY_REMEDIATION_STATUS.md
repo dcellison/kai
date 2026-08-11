@@ -5,7 +5,7 @@ assessment findings. It is intentionally operational: it distinguishes closed
 items from compatibility exceptions so future hardening work does not remove a
 working migration path by accident.
 
-Last reviewed: 2026-08-10
+Last reviewed: 2026-08-11
 
 ## Compatibility rule
 
@@ -67,11 +67,13 @@ acceptance.
 The original assessment findings are remediated or explicitly documented as a
 compatibility exception. The next security work should be selected from:
 
-- adding an operator command or diagnostic that reports whether the legacy
-  `WEBHOOK_SECRET` fallback is still configured,
-- deeper review of the new backend registry and OS-user isolation paths,
-- or normal hardening/refactoring of large trust-boundary modules after the
-  current behavior is pinned by tests.
+- running the privileged `make install-status` diagnostic and confirming the
+  deployed environment no longer contains the legacy `WEBHOOK_SECRET`;
+- verifying external GitHub and generic webhook callers use their named secret
+  domains before removing runtime fallback support; or
+- beginning Kai Workspace architecture validation. Large trust-boundary module
+  decomposition remains normal engineering debt rather than a blocking
+  security fix.
 
 ## Transitional risk: local-process backend executables
 

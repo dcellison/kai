@@ -129,6 +129,12 @@ deprecated WEBHOOK_SECRET fallback**. Pressing Enter keeps compatibility. The
 generated `install.conf` can then be reviewed with `make DRY_RUN=1 install`
 before `make install` deploys it.
 
+Run `make install-status` to inspect the authoritative deployed migration
+state in `/etc/kai/env`. The command uses sudo because that file is root-only;
+it reports only whether the legacy and named variables are configured, never
+their values. It also labels the separate `install.conf` artifact state so
+configuration drift is visible rather than mistaken for deployed truth.
+
 The current remediation status and compatibility exceptions are tracked in
 [Security Remediation Status](SECURITY_REMEDIATION_STATUS.md).
 

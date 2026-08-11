@@ -45,7 +45,7 @@ install:
 	sudo $(BIN)python -m kai install apply $(if $(strip $(DRY_RUN)),--dry-run,)
 
 install-status:
-	$(BIN)python -m kai install status
+	sudo $(BIN)python -m kai install status
 
 # Refresh helper for PROVIDER_MODELS. Queries each curated provider's
 # /v1/models endpoint and prints a diff against the in-tree list;

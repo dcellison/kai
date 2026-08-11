@@ -62,6 +62,7 @@ from kai.config import (
     models_for_backend,
     validate_model_for_backend,
 )
+from kai.protected_config import ProtectedConfigError, validate_protected_file_metadata
 from kai.user_isolation import validate_protected_user_isolation
 
 # Config file written by `config`, read by `apply`.
@@ -76,6 +77,7 @@ INSTALL_CONF = PROJECT_ROOT / "install.conf"
 # real runtime config.
 USERS_YAML = Path("/etc/kai/users.yaml")
 BACKENDS_YAML = Path("/etc/kai/backends.yaml")
+_DEPLOYED_ENV_FILE = Path("/etc/kai/env")
 
 # Default installation paths
 _DEFAULT_INSTALL_DIR = "/opt/kai"
@@ -6392,17 +6394,19 @@ def _check_service_status(platform: str) -> str:
 
 def _cmd_status() -> None:
     """
-    Report the current installation state. No sudo required.
+    Report the current installation state.
 
     Checks for the existence of installation directories, config files,
-    and service status. Reports ownership for security verification.
+    and service status. Reports ownership for security verification. The
+    command remains useful without sudo, but authoritative deployed-secret
+    migration state requires permission to read /etc/kai/env.
     """
     # Load install.conf once for platform, install_dir, and data_dir.
     # Falls back to auto-detected platform and default paths if missing.
     platform = "darwin" if sys.platform == "darwin" else "linux"
     install_dir = _DEFAULT_INSTALL_DIR
     data_dir = _DEFAULT_DATA_DIR
-    conf_env: dict[str, str] = {}
+    conf_env: dict[str, str] | None = None
     if INSTALL_CONF.exists():
         try:
             conf = json.loads(INSTALL_CONF.read_text())
@@ -6419,11 +6423,15 @@ def _cmd_status() -> None:
     print("=" * 30)
     print(_check_path(Path(install_dir), "Installation"))
     print(_check_path(Path(data_dir), "Data"))
-    print(_check_path(Path("/etc/kai/env"), "Secrets"))
+    print(_check_path(_DEPLOYED_ENV_FILE, "Secrets"))
     print(_check_path(Path("/etc/kai/services.yaml"), "Services"))
     print(_check_path(Path("/etc/sudoers.d/kai"), "Sudoers"))
     print(_check_service_status(platform))
-    print(_webhook_secret_migration_status(conf_env))
+    print(_deployed_webhook_secret_migration_status(_DEPLOYED_ENV_FILE))
+    if conf_env is None:
+        print("Webhook secret migration (install.conf artifact): unavailable")
+    else:
+        print(_webhook_secret_migration_status(conf_env, source="install.conf artifact"))
 
     # Check workspace path traversal if install.conf has a service user
     if INSTALL_CONF.exists():
@@ -6454,16 +6462,50 @@ def _cmd_status() -> None:
                 break
 
 
-def _webhook_secret_migration_status(env: dict[str, str]) -> str:
+def _webhook_secret_migration_status(env: dict[str, str], *, source: str = "install.conf artifact") -> str:
     """Return a non-secret diagnostic for external webhook migration state."""
+    prefix = f"Webhook secret migration ({source}):"
     if env.get("WEBHOOK_SECRET", "").strip():
-        return (
-            "Webhook secret migration: legacy WEBHOOK_SECRET fallback configured "
-            "(GitHub/generic callers may still depend on it)"
-        )
+        return f"{prefix} legacy WEBHOOK_SECRET fallback configured (GitHub/generic callers may still depend on it)"
     if env.get("GITHUB_WEBHOOK_SECRET", "").strip() and env.get("GENERIC_WEBHOOK_SECRET", "").strip():
-        return "Webhook secret migration: named GitHub/generic secrets configured; no legacy fallback in install.conf"
-    return "Webhook secret migration: no legacy fallback in install.conf"
+        return f"{prefix} named GitHub/generic secrets configured; no legacy fallback"
+    missing = [key for key in ("GITHUB_WEBHOOK_SECRET", "GENERIC_WEBHOOK_SECRET") if not env.get(key, "").strip()]
+    return f"{prefix} no legacy fallback; missing named secret(s): {', '.join(missing)}"
+
+
+def _deployed_webhook_secret_migration_status(env_path: Path) -> str:
+    """Report deployed webhook-secret state without retaining or exposing values."""
+    source = f"deployed {env_path}"
+    try:
+        validate_protected_file_metadata(env_path, max_mode=0o600, require_root_owner=True)
+    except FileNotFoundError:
+        return f"Webhook secret migration ({source}): deployed environment file not found"
+    except ProtectedConfigError as exc:
+        return f"Webhook secret migration ({source}): NOT VERIFIED ({exc})"
+
+    configured: dict[str, str] = {}
+    interesting_keys = {"WEBHOOK_SECRET", "GITHUB_WEBHOOK_SECRET", "GENERIC_WEBHOOK_SECRET"}
+    try:
+        with env_path.open(encoding="utf-8") as env_file:
+            for line in env_file:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                key, separator, raw_value = stripped.partition("=")
+                key = key.strip()
+                if not separator or key not in interesting_keys:
+                    continue
+                # The installer writes quoted values. Store only a marker,
+                # never the value, so this diagnostic cannot accidentally
+                # expose a credential through output or later formatting.
+                value = raw_value.strip()
+                configured[key] = "configured" if value not in ("", "''", '""') else ""
+    except PermissionError:
+        return f"Webhook secret migration ({source}): NOT VERIFIED (permission denied; run `make install-status`)"
+    except (OSError, UnicodeError) as exc:
+        return f"Webhook secret migration ({source}): NOT VERIFIED (could not read deployed environment: {exc})"
+
+    return _webhook_secret_migration_status(configured, source=source)
 
 
 # ── CLI dispatch ─────────────────────────────────────────────────────

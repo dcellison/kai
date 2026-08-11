@@ -40,6 +40,7 @@ from kai.install import (
     _collect_os_users_from_yaml,
     _collect_user_memory_owners,
     _copy_tree,
+    _deployed_webhook_secret_migration_status,
     _file_checksum,
     _generate_env_file,
     _generate_launchd_plist,
@@ -86,6 +87,7 @@ def _isolate_installed_backend_discovery(monkeypatch, tmp_path):
     missing/discovered backend behavior override this fixture locally.
     """
     monkeypatch.setattr("kai.install.BACKENDS_YAML", tmp_path / "absent-backends.yaml")
+    monkeypatch.setattr("kai.install._DEPLOYED_ENV_FILE", tmp_path / "absent-env")
     monkeypatch.setattr(
         "kai.install._discover_backend_commands",
         lambda service_user: {
@@ -4393,6 +4395,39 @@ class TestCmdStatus:
         assert "github-secret" not in output
         assert "generic-secret" not in output
 
+    def test_reports_deployed_state_separately_from_install_conf(self, tmp_path, monkeypatch, capsys):
+        deployed_env = tmp_path / "deployed-env"
+        deployed_env.write_text(
+            'GITHUB_WEBHOOK_SECRET="deployed-github-secret"\nGENERIC_WEBHOOK_SECRET="deployed-generic-secret"\n'
+        )
+        conf_path = tmp_path / "install.conf"
+        conf_path.write_text(
+            json.dumps(
+                {
+                    "platform": "darwin",
+                    "install_dir": str(tmp_path / "opt-kai"),
+                    "data_dir": str(tmp_path / "var-lib-kai"),
+                    "env": {"WEBHOOK_SECRET": "artifact-legacy-secret"},
+                }
+            )
+        )
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setattr("kai.install._DEPLOYED_ENV_FILE", deployed_env)
+        monkeypatch.setattr("kai.install.validate_protected_file_metadata", lambda *args, **kwargs: True)
+        monkeypatch.setattr(
+            "kai.install.subprocess.run",
+            lambda *a, **kw: subprocess.CompletedProcess(args=[], returncode=1, stdout=""),
+        )
+
+        _cmd_status()
+
+        output = capsys.readouterr().out
+        assert f"Webhook secret migration (deployed {deployed_env}): named GitHub/generic secrets configured" in output
+        assert "Webhook secret migration (install.conf artifact): legacy WEBHOOK_SECRET fallback configured" in output
+        assert "deployed-github-secret" not in output
+        assert "deployed-generic-secret" not in output
+        assert "artifact-legacy-secret" not in output
+
     def test_webhook_secret_migration_status_is_non_secret(self):
         assert "legacy WEBHOOK_SECRET fallback configured" in _webhook_secret_migration_status(
             {
@@ -4402,6 +4437,68 @@ class TestCmdStatus:
             }
         )
         assert "legacy-secret" not in _webhook_secret_migration_status({"WEBHOOK_SECRET": "legacy-secret"})
+
+    def test_deployed_status_reports_named_secrets_without_values(self, tmp_path, monkeypatch):
+        env_path = tmp_path / "env"
+        env_path.write_text(
+            "# protected configuration\n"
+            'GITHUB_WEBHOOK_SECRET="github-deployed-value"\n'
+            'GENERIC_WEBHOOK_SECRET="generic-deployed-value"\n'
+        )
+        monkeypatch.setattr("kai.install.validate_protected_file_metadata", lambda *args, **kwargs: True)
+
+        status = _deployed_webhook_secret_migration_status(env_path)
+
+        assert f"deployed {env_path}" in status
+        assert "named GitHub/generic secrets configured" in status
+        assert "no legacy fallback" in status
+        assert "github-deployed-value" not in status
+        assert "generic-deployed-value" not in status
+
+    def test_deployed_status_reports_legacy_fallback_without_value(self, tmp_path, monkeypatch):
+        env_path = tmp_path / "env"
+        env_path.write_text('WEBHOOK_SECRET="legacy-deployed-value"\n')
+        monkeypatch.setattr("kai.install.validate_protected_file_metadata", lambda *args, **kwargs: True)
+
+        status = _deployed_webhook_secret_migration_status(env_path)
+
+        assert "legacy WEBHOOK_SECRET fallback configured" in status
+        assert "legacy-deployed-value" not in status
+
+    def test_deployed_status_is_explicit_when_permission_denied(self, tmp_path, monkeypatch):
+        env_path = tmp_path / "env"
+        env_path.write_text('WEBHOOK_SECRET="must-not-appear"\n')
+        monkeypatch.setattr("kai.install.validate_protected_file_metadata", lambda *args, **kwargs: True)
+        real_open = Path.open
+
+        def deny_deployed_env(self, *args, **kwargs):
+            if self == env_path:
+                raise PermissionError("denied")
+            return real_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", deny_deployed_env)
+
+        status = _deployed_webhook_secret_migration_status(env_path)
+
+        assert "NOT VERIFIED" in status
+        assert "permission denied" in status
+        assert "make install-status" in status
+        assert "must-not-appear" not in status
+
+    def test_deployed_status_rejects_untrusted_metadata(self, tmp_path, monkeypatch):
+        env_path = tmp_path / "env"
+        env_path.write_text('WEBHOOK_SECRET="must-not-appear"\n')
+
+        def reject_metadata(*args, **kwargs):
+            raise kai.install.ProtectedConfigError("unsafe permissions")
+
+        monkeypatch.setattr("kai.install.validate_protected_file_metadata", reject_metadata)
+
+        status = _deployed_webhook_secret_migration_status(env_path)
+
+        assert "NOT VERIFIED" in status
+        assert "unsafe permissions" in status
+        assert "must-not-appear" not in status
 
 
 # ── Venv creation ────────────────────────────────────────────────────
@@ -6155,6 +6252,22 @@ class TestMakeInstallDryRun:
         )
 
         assert "install apply --dry-run" not in result.stdout
+
+
+class TestMakeInstallStatus:
+    """The Make status target must have access to deployed protected state."""
+
+    @pytest.mark.skipif(shutil.which("make") is None, reason="make is not installed")
+    def test_status_runs_privileged_installer_command(self):
+        result = subprocess.run(
+            ["make", "-n", "install-status"],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        assert "sudo .venv/bin/python -m kai install status" in result.stdout
 
 
 # ── _set_ownership ───────────────────────────────────────────────────
