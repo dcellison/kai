@@ -406,7 +406,7 @@ No entry may use an indefinite condition such as "keep for compatibility." A gen
 | Telegram `chat_id` used as internal identity, namespace, and routing key | Durable principal, channel, agent, and binding IDs | Private chats, notification-only groups, duplicate updates, and restart routing all resolve correctly through bindings | Confine Telegram IDs to external identity, transport binding, and idempotency records; remove chat-shaped domain keys | Planned |
 | `SubprocessPool` keyed by Telegram chat ID | Durable channel/agent session plus run and attempt orchestration | All five harnesses pass continuity, restart, cancellation, and isolation tests through durable identities | Remove chat-key compatibility lookup and move lifecycle ownership behind the orchestrator/runtime contract | Planned |
 | Direct backend invocation from Telegram handlers | Transport-neutral command and run services | Telegram and the first Workshop client produce equivalent authorized runs and visible results | Remove handler-owned orchestration; leave authentication, parsing, and rendering in the Telegram adapter | Planned |
-| Direct Telegram delivery from handlers, schedules, and webhooks | Durable delivery outbox and Telegram delivery adapter | Delivery outcome events preserve binding identity; retry, crash recovery, ordering, private-chat and notification-group delivery tests pass; live delivery is verified | Register the outbox worker only in an explicit cutover; remove direct Bot API sends from domain paths and delete delivery fallback flags after installed verification | Active (production-unused durable request/lease/attempt/retry/recovery, fragment progress, binding-aware terminal outcome facts, per-binding FIFO claims, atomic canonical assistant-result plus delivery-request transaction, canonical outbound-only notification channels, Telegram adapter/worker, and explicit runtime owner; installed direct-chat recovery and notification-group delivery passed, while production cutover is held on durable streaming finalization, work classification, and lifecycle integration) |
+| Direct Telegram delivery from handlers, schedules, and webhooks | Durable delivery outbox and Telegram delivery adapter | Delivery outcome events preserve binding identity; retry, crash recovery, ordering, private-chat and notification-group delivery tests pass; live delivery is verified | Register the outbox worker only in an explicit cutover; remove direct Bot API sends from domain paths and delete delivery fallback flags after installed verification | Active (production-unused durable request/lease/attempt/retry/recovery, binding-aware terminal outcomes, per-binding FIFO claims, immutable streaming edit/send plans, edit-capable finalization worker, and explicit runtime owner; installed direct-chat recovery and notification-group delivery passed, while production cutover is held on authority epochs, aggregate diagnostics, commit-outcome resolution, and lifecycle integration) |
 | Operator-invoked Workshop delivery qualification CLI | Installed evidence followed by the production delivery worker | A configured direct-chat reply is prepared without sending, survives a service restart, recovers an intentionally abandoned lease, reaches Telegram once through the exact selected delivery, and records a terminal binding-aware outcome; a configured notification group resolves through its outbound-only canonical channel, receives one atomically prepared qualification message through the exact selected delivery, and does not become an inbound conversation | Remove the qualification command and its explicit-claim-only surface after the production worker has equivalent installed restart/recovery evidence and direct delivery is retired | Active (the installed direct-chat recovery and notification-group delivery gates passed on 2026-08-12; retain until equivalent production-worker evidence exists, while the command remains unregistered and incapable of draining unrelated work) |
 | Schedule firing directly into the pool or Telegram | Durable Workshop run creation | Scheduled definitions and executions survive restart and expose run/attempt state without duplicate work | Remove schedule-specific execution path; retain schedules only as authenticated run triggers | Planned |
 | GitHub and generic webhook paths that route directly to Telegram or the pool | Canonical integration commands/events plus delivery/run services | Existing GitHub group notifications, generic callers, deduplication, and secret separation pass end-to-end tests | Remove direct routing while retaining verified webhook adapters and supported external contracts | Planned |
@@ -775,3 +775,90 @@ first. The review must resolve startup handling of historical conversation
 work, non-secret diagnostics and reconciliation, fail-closed user-visible
 errors, shutdown ordering, and rollback before authorizing any production
 registration.
+
+## 22. Fifth canonical conversation authority review
+
+**Review date:** 2026-08-12
+
+**Scope:** Whether the complete production-unused Telegram streaming-
+finalization boundary is sufficient to activate one authenticated direct-chat
+plain-text reply path and its dedicated worker store/runtime.
+
+**Decision:** **Hold production activation while adding a durable conversation-
+delivery authority epoch and aggregate readiness diagnostic.** The operation
+plan, edit-capable adapter, retry and ambiguity rules, and runtime owner are
+now adequate for the eventual route. The remaining risk is not Telegram
+mechanics. It is proving which durable rows a newly authoritative worker owns,
+both on first activation and after a rollback and later reactivation.
+
+Purpose and execution-contract isolation prevent qualification and legacy
+send-fragment rows from entering this worker. They do not distinguish a
+streaming-finalization row created before production activation from one
+created while the route is authoritative. Starting the worker would therefore
+make every matching historical row eligible. Likewise, merely stopping the
+worker and restoring direct sends would leave committed non-terminal rows that
+could be delivered unexpectedly after a later restart or reactivation.
+
+| Gate | Evidence | Result |
+|---|---|---|
+| Immutable finalization plan | One transaction resolves the canonical direct binding and optional confirmed preview, then records the assistant reply, delivery, and exact edit/send sequence. Idempotency, rollback, restart, fragmentation, and binding-isolation tests pass. | Pass, production-unused |
+| Finalization execution | The dedicated worker claims only Telegram text `conversation_reply` work under `streaming_finalization`; confirmed operations resume monotonically and ambiguous effects become terminally uncertain. | Pass, production-unused |
+| Worker lifecycle ownership | The runtime owner recovers before readiness, exposes worker death, and cooperatively drains an active iteration during shutdown. | Pass, production-unused |
+| Live route eligibility | The authenticated plain-text handler is identifiable, but it shares `_handle_response` with media and voice. Eligibility must be passed explicitly with the canonical inbound ID and voice mode off. | Design ready; not wired |
+| Dedicated database ownership | A worker can open and own a separate `WorkshopEventStore` connection. Startup must finish recovery before webhook or polling ingress, and shutdown must stop ingress and the runtime before closing Telegram and database resources. | Design ready; not wired |
+| Historical-work ownership | Purpose and execution-contract filters do not record whether matching conversation work belongs to the current production authority period. | Blocker |
+| Rollback and reactivation | Kai cannot durably deactivate one authority period, prove its work reconciled, and prevent those rows from replaying during a later period. | Blocker |
+| Commit-outcome fallback | The atomic service rolls back ordinary failures, but the live adapter still needs to resolve deterministic state after a database exception. It may use the legacy final-send path only after proving that no authoritative finalization committed; an indeterminate outcome must fail closed with a bounded operational message. | Blocker for route wiring, after authority epochs |
+| Operator diagnostics | `install-status` reports bootstrap and transcript parity but no classified conversation-delivery readiness, active authority period, non-terminal work, terminal failures, or uncertain effects. | Blocker |
+| Installed qualification | Existing qualification proves durable Telegram send, restart recovery, and both direct and notification-group targets. Automated finalization tests prove edit semantics. Another send-only qualification would not prove handler eligibility, authority activation, or lifecycle wiring. | No additional installed qualification before the authority-epoch foundation; installed cutover evidence remains mandatory afterward |
+
+### 22.1 Authority and compatibility consequences
+
+- Direct Telegram delivery remains authoritative for every production path.
+- No finalization runtime or dedicated worker store is registered by this
+  review.
+- JSONL remains the transcript/context authority during this delivery-only
+  transition. A Workshop-owned text reply must not also record a legacy
+  delivery observation after the later cutover.
+- Commands, media, voice, text-plus-voice, schedules, GitHub and generic
+  webhooks, files, and notification-group routing remain outside this cutover.
+- An individual terminal worker failure may be reported by aggregate
+  diagnostics without crashing Kai. Unexpected worker-loop termination must
+  still make the service unhealthy.
+- Diagnostic and reconciliation output must contain counts and state names
+  only. It must never expose message bodies, Telegram IDs, delivery IDs, lease
+  IDs, worker IDs, or provider errors.
+
+### 22.2 Next bounded implementation milestone
+
+Add a production-unused durable **conversation-delivery authority epoch** and
+non-secret readiness diagnostic. The boundary must:
+
+1. transactionally activate at most one authority epoch and retain its durable
+   identity across ordinary service restarts;
+2. require atomic streaming-finalization enqueue to resolve and stamp the
+   active epoch internally, accepting no epoch or authority claim from the
+   handler;
+3. restrict finalization claim, lease recovery, ordering, and settlement to
+   the exact active epoch, so pre-activation and previously deactivated work
+   can never be drained by a later worker;
+4. fail activation when unclassified or unreconciled matching historical work
+   exists, without deleting, silently reclassifying, or delivering it;
+5. refuse deactivation while that epoch has pending, leased, or retry-wait
+   work, and retain failed or uncertain terminal evidence for explicit
+   operator reconciliation;
+6. expose aggregate `install-status` readiness for epoch state and classified
+   pending, leased, retrying, succeeded, failed, and uncertain work without
+   revealing identifiers or content;
+7. keep activation, deactivation, production enqueue, worker registration, and
+   direct-send replacement uncalled by `main.py` and handlers.
+
+This epoch is transitional delivery-authority state, not a user-visible
+Workshop concept. Record it in the transition register and retire it only when
+all supported transports use one durable delivery authority and rollback no
+longer crosses a direct-send/outbox boundary.
+
+After this foundation, conduct a sixth explicit cutover review. That review
+must verify deterministic post-error commit resolution, the locked `sessions`
+adapters, startup and shutdown wiring, aggregate diagnostics, and an executable
+rollback procedure before authorizing one production handler path.
