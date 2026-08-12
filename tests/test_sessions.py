@@ -126,6 +126,20 @@ class TestTelegramUpdateQueue:
         assert await sessions.complete_telegram_update(row_id) is False
         assert await sessions.claim_next_telegram_update() is None
 
+    async def test_claim_specific_pending_update(self, db):
+        first_id, _ = await sessions.enqueue_telegram_update(1006, '{"update_id":1006}')
+        second_id, _ = await sessions.enqueue_telegram_update(1007, '{"update_id":1007}')
+
+        claimed = await sessions.claim_telegram_update(second_id)
+
+        assert claimed is not None
+        assert claimed["id"] == second_id
+        assert claimed["attempt_count"] == 1
+        assert await sessions.claim_telegram_update(second_id) is None
+        next_claim = await sessions.claim_next_telegram_update()
+        assert next_claim is not None
+        assert next_claim["id"] == first_id
+
     async def test_retry_returns_processing_update_to_pending(self, db):
         row_id, _ = await sessions.enqueue_telegram_update(1003, '{"update_id":1003}')
         first_claim = await sessions.claim_next_telegram_update()

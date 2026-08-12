@@ -584,6 +584,33 @@ async def claim_next_telegram_update() -> TelegramUpdateQueueRow | None:
         raise
 
 
+async def claim_telegram_update(row_id: int) -> TelegramUpdateQueueRow | None:
+    """
+    Atomically claim one pending Telegram update by durable queue row ID.
+
+    This is used for control updates that must be able to interrupt the update
+    currently being processed by the ordinary FIFO worker.  Returning None
+    means another worker already claimed or completed the row.
+    """
+    async with _get_db().execute(
+        """
+        UPDATE telegram_update_queue
+        SET status = 'processing',
+            attempt_count = attempt_count + 1,
+            locked_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = 'pending'
+        RETURNING *
+        """,
+        (row_id,),
+    ) as cursor:
+        claimed = await cursor.fetchone()
+    await _get_db().commit()
+    if claimed is None:
+        return None
+    return _telegram_update_queue_row(claimed)
+
+
 async def complete_telegram_update(row_id: int) -> bool:
     """Mark a claimed Telegram update as done."""
     cursor = await _get_db().execute(

@@ -120,6 +120,7 @@ _webhook_registered: bool = False
 _background_tasks: set[asyncio.Task] = set()
 _BACKGROUND_TASK_DRAIN_TIMEOUT = 30.0
 _telegram_queue_worker_task: asyncio.Task | None = None
+_telegram_queue_worker_active_row_id: int | None = None
 _TELEGRAM_UPDATE_MAX_ATTEMPTS = 5
 
 # Webhook health monitor task, started in start() and cancelled in stop().
@@ -212,12 +213,17 @@ async def _process_queued_telegram_update(
 
 
 async def _telegram_update_queue_worker(telegram_app: Application, bot: Bot) -> None:
+    global _telegram_queue_worker_active_row_id
     try:
         while True:
             row = await sessions.claim_next_telegram_update()
             if row is None:
                 return
-            await _process_queued_telegram_update(row, telegram_app, bot)
+            _telegram_queue_worker_active_row_id = row["id"]
+            try:
+                await _process_queued_telegram_update(row, telegram_app, bot)
+            finally:
+                _telegram_queue_worker_active_row_id = None
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -239,6 +245,49 @@ def _ensure_telegram_update_queue_worker(telegram_app: Application, bot: Bot) ->
     _telegram_queue_worker_task = task
     _background_tasks.add(task)
     task.add_done_callback(_telegram_worker_done)
+
+
+def _is_telegram_stop_update(data: object) -> bool:
+    """Return whether a raw Telegram update contains a /stop command message."""
+    if not isinstance(data, dict):
+        return False
+    message = data.get("message")
+    if not isinstance(message, dict):
+        return False
+    text = message.get("text")
+    if not isinstance(text, str):
+        return False
+    return re.match(r"^/stop(?:@[A-Za-z0-9_]+)?(?:\s|$)", text) is not None
+
+
+async def _process_priority_telegram_update(
+    row_id: int,
+    telegram_app: Application,
+    bot: Bot,
+) -> None:
+    """Claim and process one persisted control update outside the FIFO worker."""
+    try:
+        row = await sessions.claim_telegram_update(row_id)
+        if row is not None:
+            await _process_queued_telegram_update(row, telegram_app, bot)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Priority Telegram update queue task crashed for row %s", row_id)
+
+
+def _dispatch_priority_telegram_stop(
+    row_id: int,
+    data: object,
+    telegram_app: Application,
+    bot: Bot,
+) -> None:
+    """Dispatch a persisted /stop concurrently when the FIFO worker is busy."""
+    if _telegram_queue_worker_active_row_id is None or not _is_telegram_stop_update(data):
+        return
+    task = asyncio.create_task(_process_priority_telegram_update(row_id, telegram_app, bot))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 # If Telegram reports an error within this window, re-register the webhook.
@@ -631,7 +680,10 @@ async def _handle_telegram_update(request: web.Request) -> web.Response:
 
     Validates the X-Telegram-Bot-Api-Secret-Token header against the configured
     secret, persists the raw update to the durable inbound queue, and starts a
-    background worker that dispatches queued updates to process_update().
+    background worker that dispatches queued updates to process_update().  A
+    persisted /stop command may use a separately tracked task while that FIFO
+    worker is busy so it can interrupt the active request; other updates remain
+    serialized.
 
     IMPORTANT: queued updates are processed by a background task, not awaited.
     Claude responses can take 30+ seconds, and Telegram's webhook client times
@@ -666,7 +718,7 @@ async def _handle_telegram_update(request: web.Request) -> web.Response:
         return web.Response(status=200)
 
     try:
-        await sessions.enqueue_telegram_update(update_id, json.dumps(data))
+        row_id, _inserted = await sessions.enqueue_telegram_update(update_id, json.dumps(data))
     except Exception:
         log.exception("Failed to persist Telegram update %s", update_id)
         return web.Response(status=500, text="Failed to enqueue update")
@@ -675,6 +727,11 @@ async def _handle_telegram_update(request: web.Request) -> web.Response:
         _ensure_telegram_update_queue_worker(telegram_app, bot)
     except Exception:
         log.exception("Failed to start Telegram update queue worker")
+    else:
+        try:
+            _dispatch_priority_telegram_stop(row_id, data, telegram_app, bot)
+        except Exception:
+            log.exception("Failed to dispatch priority Telegram /stop row %s", row_id)
 
     return web.Response(status=200)
 

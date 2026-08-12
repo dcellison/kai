@@ -733,6 +733,13 @@ def telegram_request():
 
 
 class TestTelegramUpdate:
+    def test_priority_classifier_matches_only_stop_commands(self):
+        assert webhook_mod._is_telegram_stop_update({"message": {"text": "/stop"}}) is True
+        assert webhook_mod._is_telegram_stop_update({"message": {"text": "/stop@kai_bot"}}) is True
+        assert webhook_mod._is_telegram_stop_update({"message": {"text": "/stop now"}}) is True
+        assert webhook_mod._is_telegram_stop_update({"message": {"text": "/stopping"}}) is False
+        assert webhook_mod._is_telegram_stop_update({"message": {"caption": "/stop"}}) is False
+
     async def test_valid_secret_dispatches_update(self, db, telegram_request, monkeypatch):
         """Valid secret and JSON body dispatches to process_update."""
         fake_update = MagicMock()
@@ -782,6 +789,81 @@ class TestTelegramUpdate:
 
         assert resp.status == 200
         telegram_request.app[TELEGRAM_APP_KEY].process_update.assert_not_called()
+
+    async def test_persisted_stop_interrupts_busy_fifo_worker(self, db, telegram_request, monkeypatch):
+        """A queued /stop dispatches while an earlier webhook update is still running."""
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        stop_processed = asyncio.Event()
+
+        def deserialize(data, _bot):
+            return MagicMock(update_id=data["update_id"])
+
+        async def process(update):
+            if update.update_id == 2001:
+                first_started.set()
+                await release_first.wait()
+            elif update.update_id == 2002:
+                stop_processed.set()
+
+        monkeypatch.setattr("kai.webhook.Update.de_json", deserialize)
+        telegram_request.app[TELEGRAM_APP_KEY].process_update = AsyncMock(side_effect=process)
+
+        telegram_request.json = AsyncMock(return_value={"update_id": 2001, "message": {"text": "work"}})
+        assert (await _handle_telegram_update(telegram_request)).status == 200
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+
+        telegram_request.json = AsyncMock(return_value={"update_id": 2002, "message": {"text": "/stop"}})
+        assert (await _handle_telegram_update(telegram_request)).status == 200
+        await asyncio.wait_for(stop_processed.wait(), timeout=1)
+
+        assert release_first.is_set() is False
+        release_first.set()
+        assert webhook_mod._telegram_queue_worker_task is not None
+        await webhook_mod._telegram_queue_worker_task
+        await asyncio.gather(*webhook_mod._background_tasks)
+
+        async with sessions._get_db().execute(
+            "SELECT status, attempt_count FROM telegram_update_queue ORDER BY id"
+        ) as cursor:
+            rows = await cursor.fetchall()
+        assert [(row["status"], row["attempt_count"]) for row in rows] == [
+            ("done", 1),
+            ("done", 1),
+        ]
+
+    async def test_ordinary_update_remains_fifo_while_worker_is_busy(self, db, telegram_request, monkeypatch):
+        """The interrupt path does not broadly parallelize Telegram updates."""
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        second_processed = asyncio.Event()
+
+        def deserialize(data, _bot):
+            return MagicMock(update_id=data["update_id"])
+
+        async def process(update):
+            if update.update_id == 2011:
+                first_started.set()
+                await release_first.wait()
+            elif update.update_id == 2012:
+                second_processed.set()
+
+        monkeypatch.setattr("kai.webhook.Update.de_json", deserialize)
+        telegram_request.app[TELEGRAM_APP_KEY].process_update = AsyncMock(side_effect=process)
+
+        telegram_request.json = AsyncMock(return_value={"update_id": 2011, "message": {"text": "one"}})
+        assert (await _handle_telegram_update(telegram_request)).status == 200
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+
+        telegram_request.json = AsyncMock(return_value={"update_id": 2012, "message": {"text": "two"}})
+        assert (await _handle_telegram_update(telegram_request)).status == 200
+        await asyncio.sleep(0)
+        assert second_processed.is_set() is False
+
+        release_first.set()
+        assert webhook_mod._telegram_queue_worker_task is not None
+        await webhook_mod._telegram_queue_worker_task
+        assert second_processed.is_set() is True
 
     async def test_persistence_failure_returns_500(self, telegram_request, monkeypatch):
         """If the durable queue write fails, do not acknowledge the update as accepted."""
