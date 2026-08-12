@@ -1312,3 +1312,250 @@ exact-epoch delivery work, and run settlement. The review must also define
 terminal replay suppression and how the existing per-conversation lock maps to
 one active attempt. Do not activate live run facts or add a generic execution
 worker until that review closes every remaining blocker.
+
+## 29. Second run-authority integration review
+
+**Review date:** 2026-08-12
+
+**Scope:** Whether the fenced authority in section 28 can now wrap the live
+authenticated private-text path without duplicate coding-agent execution,
+false terminal facts, or a transport-specific execution identity.
+
+**Decision:** **Hold live activation. Implement the command and terminal
+transaction coordinators as production-unused services before changing the
+Telegram handler.** The attempt authority correctly fences an owner once a
+run exists, but the surrounding live path still has four gaps across which a
+retried Telegram update can invoke a backend without a durable proof that it
+must not do so:
+
+1. canonical inbound recording and run acceptance are separate commits;
+2. the compatibility run snapshots a model separately from the protected
+   backend instance that later executes;
+3. canonical reply finalization and run settlement are separate transactions;
+4. ingress replay does not inspect terminal or active-attempt state before
+   calling the backend.
+
+The current production path remains unchanged by this review. No run or
+attempt facts are emitted, no worker is registered, and Telegram continues to
+use the already-qualified conversation delivery authority.
+
+### 29.1 Observed live boundary
+
+The authenticated private-text handler currently performs these operations:
+
+1. write the human message to transitional JSONL history;
+2. append and project the canonical inbound Workshop message;
+3. resolve the canonical human, channel, attached agent, private compatibility
+   pool key, and a synchronous model value;
+4. wait for the Telegram-chat lock;
+5. call the compatibility pool, which may create the backend instance, restore
+   workspace and persisted settings, and restart the process before sending;
+6. publish optional, confirmed non-final Telegram streaming previews;
+7. on success, commit the canonical assistant message, exact-epoch delivery
+   request, and immutable edit/send operation plan in one transaction; and
+8. return normally, after which webhook mode marks the durable Telegram update
+   complete.
+
+The final-delivery transaction is a strong boundary, but it contains no run or
+attempt settlement. Backend failure, no response, `/stop`, preview-binding
+failure, and finalization failure currently produce transitional JSONL and/or
+direct Telegram notices rather than one canonical terminal outcome. Most of
+those branches return normally, so webhook mode considers the ingress update
+handled.
+
+An uncaught exception or process exit instead causes the durable Telegram
+queue to retry the same update. Because the handler has no run-state guard,
+that retry can call the coding agent again even if the first process already
+edited files, invoked tools, or changed a remote system. Polling enters the
+same handler without the compatibility update queue, so duplicate-execution
+suppression must belong to the canonical run boundary rather than to webhook
+queue bookkeeping.
+
+### 29.2 Atomic command acceptance
+
+The authoritative command boundary must accept an authenticated client
+message through one `BEGIN IMMEDIATE` transaction that:
+
+1. resolves the external identity and channel binding;
+2. appends the deterministic human `message.created` fact;
+3. projects that message sufficiently to resolve its human membership and
+   exactly one attached agent;
+4. appends the deterministic `run.accepted` fact; and
+5. projects and returns the resulting run plus a replay disposition.
+
+The service must use transaction-local forms of inbound recording and run
+acceptance. Calling the current public helpers in sequence would nest or split
+transactions and preserve the crash gap. Exact retries must observe both prior
+facts and verify that they describe identical content and authority. Finding
+only one fact, an ambiguous binding, a changed body under the same transport
+identity, a non-human author, or an ambiguous agent attachment must fail
+closed before backend preparation.
+
+Transitional JSONL history is not an authority input and need not share this
+SQLite transaction. It may be updated after canonical acceptance, but its
+failure or duplication may never decide whether the backend runs.
+
+### 29.3 Protected execution preparation
+
+`PreparedConversationRun.model` is not an execution-authority snapshot. The
+current synchronous `SubprocessPool.get_model()` returns the global default
+when no instance exists, while `send()` can later create a per-user backend
+and apply persisted model settings. Even an existing instance can still have
+pending settings restoration. Recording the former while executing the latter
+would make the durable attempt audit false.
+
+The protected preparation boundary must therefore resolve, under the
+canonical execution lane, one hidden compatibility runtime and its effective
+registered backend, provider, model, workspace, and process configuration
+before the attempt grant. It must apply pending persisted settings before
+snapshotting the selection. The same prepared runtime—not a second lookup—must
+perform the fenced dispatch. The public command supplies only its canonical
+run identity; it cannot supply a pool key, backend, provider, model, command,
+executable, environment, or credential.
+
+If the prepared runtime no longer matches the durable selection immediately
+before dispatch, Kai must abandon the pre-dispatch grant and allow expiry
+recovery before preparing a new higher-fenced attempt. It must not silently
+change the selection attached to an active attempt.
+
+### 29.4 Execution lane and dispatch point
+
+The in-process serialization identity for an authoritative run is
+`(channel_id, agent_id)`, derived from the accepted run. A Telegram chat ID is
+only a compatibility adapter key and cannot remain the lock identity once a
+desktop or another authenticated client can address the same channel.
+
+For the first cutover, eligible private text must use one canonical lane
+coordinator as its sole dispatch lock. Routes excluded from the cutover may
+retain their current Telegram-chat locks. Taking both independently would
+create two apparent locks for the same backend and would not provide a real
+serialization guarantee.
+
+Inside the canonical lane, dispatch proceeds in this order:
+
+1. inspect the accepted run and any active or terminal attempt;
+2. prepare the protected compatibility runtime and effective selection;
+3. grant one pre-dispatch attempt with a bounded lease;
+4. append `run_attempt.started` and `run.started` atomically immediately
+   before calling the prepared runtime; and
+5. invoke the backend only while the exact owner, fence, lease version, and
+   prepared selection remain current.
+
+The `started` commit is deliberately conservative. A crash after it commits
+but before the process call is indistinguishable from a crash just after the
+call. Both are treated as may-have-executed and are never automatically
+redispatched. A grant that expires before `started` remains safe to replace
+with a higher fence.
+
+The database's unique active-attempt invariant is the durable authority; the
+in-memory lane prevents ordinary local concurrency but is not relied upon for
+restart safety.
+
+### 29.5 Atomic terminal finalization
+
+Successful completion requires one transaction that verifies the exact active
+claim and atomically appends and projects:
+
+- the deterministic canonical assistant result replying to the run's inbound
+  message;
+- the exact active-epoch delivery request;
+- the immutable Telegram streaming-finalization operation plan;
+- `run_attempt.completed`; and
+- `run.completed`, referencing that canonical result `MessageId`.
+
+No transaction may commit a completed run without its visible canonical
+result and delivery work, or commit a successful result while leaving the run
+started. The current outbound finalizer and execution authority both own their
+transactions; integration therefore requires transaction-local primitives
+behind one coordinator, not one public service calling the other.
+
+Failure, confirmed cancellation, no response, and interrupted execution need
+the same shape: a bounded, backend-neutral canonical user-visible outcome,
+its exact-epoch delivery request and immutable operation plan, and the winning
+attempt/run terminal facts must commit together. Native errors, prompts,
+credentials, executable paths, and provider payloads remain excluded. A
+confirmed non-final preview may be retained and finalized by the immutable
+plan, but seeing a preview never authorizes backend replay.
+
+Commit-uncertain handling must retry the entire deterministic transaction and
+then inspect all expected facts. It must never fall back to direct Telegram
+delivery or a second backend invocation when the first commit may have
+succeeded.
+
+### 29.6 Replay disposition
+
+Every accepted command must receive one durable disposition before any
+backend call:
+
+| Durable state | Handler action |
+|---|---|
+| No canonical message/run | Atomically accept the command; do not dispatch before commit |
+| Accepted, no active attempt | Eligible for protected preparation and one grant |
+| Active pre-dispatch grant | Do not create another owner; the live owner continues or expiry returns the run to accepted |
+| Started attempt | Never redispatch; the live owner may settle while its fence is current |
+| Expired started attempt | Atomically record interrupted failure plus its visible delivery outcome; require explicit human retry as a new run |
+| Completed, failed, or cancelled | Never call the backend; verify/resume the already-committed outbox work and finish the ingress receipt |
+
+Webhook queue completion may occur once the terminal outcome and delivery
+request are durably committed; it need not wait for Telegram delivery. A
+nonterminal replay owned elsewhere must remain deferred or retryable rather
+than returning success and losing the command. These rules also apply to
+future clients even when they do not use the Telegram update queue.
+
+The existing `recover_expired()` contract is sufficient for pre-dispatch
+grant expiry, but its started-attempt path currently fails the run without a
+canonical visible outcome or delivery request. That recovery path cannot be
+registered in production until it uses the terminal coordinator.
+
+### 29.7 Cancellation integration
+
+`/stop` currently sets a Telegram-chat event, kills the compatibility pool
+entry, and immediately tells Telegram that stopping began. It neither records
+durable human intent nor identifies a fenced run owner.
+
+The authoritative form must resolve the active run in the canonical
+channel/agent lane, commit `run.cancellation_requested`, and then signal the
+live owner associated with the exact claim. Only that owner may confirm
+`run.cancelled`, and only after backend shutdown is known to have completed.
+If Kai loses the owner or cannot prove shutdown, lease recovery records
+`execution_interrupted` rather than falsely claiming cancellation. A late stop
+against a terminal run is an idempotent no-op and cannot replace completion.
+
+### 29.8 Cutover gates
+
+| Gate | Current evidence | Result |
+|---|---|---|
+| Canonical target authorization | Message resolves one human member, channel, and attached agent | Pass, production-used |
+| Fenced attempt authority | One active owner, monotonic fence, lease version, protected registry check, and conservative expiry | Pass, production-unused |
+| Atomic command acceptance | Inbound recording and acceptance own separate transactions | Blocker |
+| Truthful execution selection | Synchronous reported model can differ from the runtime selected by `send()` | Blocker |
+| Canonical execution lane | Live lock and stop event are keyed by Telegram chat ID | Blocker |
+| Started boundary | Authority contract is conservative and tested; live backend call is not wrapped | Integration blocker |
+| Atomic successful terminal state | Reply/delivery/plan commit does not include attempt/run completion | Blocker |
+| Atomic failure and cancellation outcome | Live branches use direct Telegram/JSONL; expired-start recovery has no visible outbox outcome | Blocker |
+| Terminal replay suppression | Handler never checks run or attempt state before dispatch | Blocker |
+| Generic execution worker | Not present and not yet justified | Correctly deferred |
+
+### 29.9 Next bounded implementation sequence
+
+The first implementation after this review is a production-unused **atomic
+conversation-command acceptance service**. It must append canonical inbound
+and `run.accepted` facts in one transaction, return a typed replay disposition,
+and include deterministic conflict, rollback, projection-rebuild, and
+duplicate-command tests. Existing production adapters remain unchanged.
+
+Then, in separate bounded changes:
+
+1. add protected asynchronous execution preparation that binds the effective
+   registry selection to the exact compatibility runtime;
+2. add a production-unused transaction coordinator for successful and bounded
+   unsuccessful terminal outcomes, exact-epoch delivery work, and fenced run
+   settlement;
+3. add canonical lane and cancellation/recovery coordination without exposing
+   Telegram IDs as execution authority;
+4. exercise duplicate-ingress, crash-before-dispatch, crash-after-start,
+   commit-uncertain, late-stop, and terminal-delivery recovery tests; and
+5. conduct a final activation review before wiring authenticated private text.
+
+Do not register a generic execution worker, emit live run facts, or change the
+installed Telegram path in the command-acceptance slice.
