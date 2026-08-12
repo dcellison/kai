@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from argparse import Namespace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ from unittest.mock import AsyncMock
 import pytest
 from telegram.error import BadRequest
 
+from kai import workshop_cli
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.delivery_authority import (
     DeliveryAuthorityHistoricalWorkError,
@@ -296,3 +298,43 @@ class TestDeliveryAuthorityDiagnostic:
         assert workshop_delivery_authority_status(path).startswith(
             "Workshop delivery authority: NOT READY; epochs=0, unclassified=1"
         )
+
+
+class TestDeliveryAuthorityOperatorCLI:
+    async def test_status_and_clean_deactivation_expose_no_epoch_identifier(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        capsys,
+    ):
+        path = tmp_path / "kai.db"
+        store = await WorkshopEventStore.open(path)
+        activation = await WorkshopConversationDeliveryAuthority(store).activate()
+        await store.close()
+        monkeypatch.setattr(workshop_cli, "DATA_DIR", tmp_path)
+
+        assert await workshop_cli._run(Namespace(command="delivery-authority", action="status")) == 0
+        status_output = capsys.readouterr().out
+        assert "Conversation delivery authority: active" in status_output
+        assert str(activation.epoch.epoch_id) not in status_output
+
+        assert (
+            await workshop_cli._run(
+                Namespace(
+                    command="delivery-authority",
+                    action="deactivate",
+                    acknowledge_terminal_failures=False,
+                )
+            )
+            == 0
+        )
+        assert "Conversation delivery authority: deactivated" in capsys.readouterr().out
+
+        reopened = await WorkshopEventStore.open(path)
+        try:
+            assert (
+                await WorkshopConversationDeliveryAuthority(reopened).active_epoch_in_transaction(required=False)
+                is None
+            )
+        finally:
+            await reopened.close()

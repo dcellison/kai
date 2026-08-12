@@ -1,4 +1,4 @@
-"""Durable, production-unused Telegram streaming-preview bindings."""
+"""Durable Telegram streaming-preview bindings."""
 
 from __future__ import annotations
 

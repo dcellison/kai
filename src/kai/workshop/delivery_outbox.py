@@ -234,9 +234,9 @@ def _retry_delay(attempt_number: int) -> timedelta:
 class WorkshopDeliveryOutbox:
     """Durable delivery state with lease-based, at-least-once work claims.
 
-    Only explicit qualification and production-unused application services use
-    this class. Existing direct Telegram delivery remains authoritative until
-    a later cutover registers a production worker.
+    Production private-text finalization and explicit qualification use this
+    class. Other Telegram paths retain their existing delivery behavior until
+    separately bounded cutovers move them.
     """
 
     def __init__(

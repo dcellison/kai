@@ -2,12 +2,16 @@
 
 import sqlite3
 import stat
+from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 import pytest
 
 from kai import sessions
+from kai.workshop.domain import MessageId
+from kai.workshop.outbound import OutboundMessage
 
 
 @pytest.fixture
@@ -52,6 +56,44 @@ class TestSessions:
 
     async def test_get_stats_unknown(self, db):
         assert await sessions.get_stats(999) is None
+
+
+class TestWorkshopFinalizationAdapter:
+    async def test_sqlite_error_is_resolved_by_deterministic_retry(self, db):
+        message = OutboundMessage(
+            in_reply_to_message_id=MessageId("msg_00000000000000000000000000000001"),
+            body="Answer",
+            occurred_at=datetime(2026, 8, 12, tzinfo=UTC),
+        )
+        expected = object()
+        recorder = AsyncMock(side_effect=[aiosqlite.OperationalError("commit result lost"), expected])
+
+        with patch("kai.sessions.record_outbound_message_with_streaming_finalization", recorder):
+            result = await sessions.record_workshop_streaming_finalization(message)
+
+        assert result is expected
+        assert recorder.await_count == 2
+
+    async def test_second_failure_is_classified_as_commit_uncertain(self, db):
+        message = OutboundMessage(
+            in_reply_to_message_id=MessageId("msg_00000000000000000000000000000001"),
+            body="Answer",
+            occurred_at=datetime(2026, 8, 12, tzinfo=UTC),
+        )
+        recorder = AsyncMock(
+            side_effect=[
+                aiosqlite.OperationalError("commit result lost"),
+                aiosqlite.OperationalError("resolution unavailable"),
+            ]
+        )
+
+        with (
+            patch("kai.sessions.record_outbound_message_with_streaming_finalization", recorder),
+            pytest.raises(sessions.WorkshopFinalizationCommitUncertainError),
+        ):
+            await sessions.record_workshop_streaming_finalization(message)
+
+        assert recorder.await_count == 2
 
 
 class TestTelegramUpdateQueue:

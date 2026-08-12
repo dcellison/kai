@@ -1,16 +1,21 @@
-"""Lifecycle contracts for the production-unused Telegram delivery owner."""
+"""Lifecycle contracts for the Workshop Telegram delivery owner."""
 
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
+from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
 from kai.workshop.delivery_outbox import DeliveryRecoveryResult
+from kai.workshop.store import WorkshopEventStore
 from kai.workshop.telegram_delivery_runtime import (
     TelegramDeliveryRuntimeState,
     TelegramDeliveryRuntimeStateError,
     TelegramDeliveryWorkerExitedError,
+    WorkshopTelegramConversationDeliveryService,
     WorkshopTelegramDeliveryRuntime,
 )
 
@@ -207,3 +212,24 @@ async def test_recovery_failure_prevents_readiness_and_worker_creation():
     with pytest.raises(RuntimeError, match="lease recovery failed"):
         await runtime.stop()
     assert runtime.state == TelegramDeliveryRuntimeState.STOPPED
+
+
+async def test_conversation_service_activates_once_and_reuses_epoch_after_restart(tmp_path: Path):
+    database = tmp_path / "kai.db"
+    bot = AsyncMock()
+
+    first_service = await WorkshopTelegramConversationDeliveryService.open_and_start(database, bot)
+    assert first_service.ready
+    observer = await WorkshopEventStore.open(database)
+    first_epoch = await WorkshopConversationDeliveryAuthority(observer).active_epoch()
+    await observer.close()
+    await first_service.stop()
+
+    second_service = await WorkshopTelegramConversationDeliveryService.open_and_start(database, bot)
+    assert second_service.ready
+    observer = await WorkshopEventStore.open(database)
+    second_epoch = await WorkshopConversationDeliveryAuthority(observer).active_epoch()
+    await observer.close()
+    await second_service.stop()
+
+    assert second_epoch.epoch_id == first_epoch.epoch_id

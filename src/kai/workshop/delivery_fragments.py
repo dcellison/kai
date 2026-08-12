@@ -1,4 +1,4 @@
-"""Durable per-fragment progress for production-unused Workshop delivery."""
+"""Durable per-fragment progress for Workshop delivery."""
 
 from __future__ import annotations
 

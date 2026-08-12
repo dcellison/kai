@@ -1,4 +1,4 @@
-"""Production-unused authority epochs for Workshop conversation delivery."""
+"""Durable authority epochs for Workshop conversation delivery."""
 
 from __future__ import annotations
 
@@ -62,8 +62,9 @@ def _parse_timestamp(value: str) -> datetime:
 class WorkshopConversationDeliveryAuthority:
     """Own the durable activation boundary for one future Telegram route.
 
-    This service is not constructed by production startup. It deliberately
-    keeps authority activation separate from worker registration and routing.
+    Production startup activates or resumes one epoch before Telegram ingress.
+    The separate service remains usable by operator tooling and tests without
+    implicitly constructing a delivery worker.
     """
 
     def __init__(

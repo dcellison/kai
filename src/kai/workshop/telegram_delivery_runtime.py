@@ -1,12 +1,23 @@
-"""Production-unused lifecycle ownership for Workshop Telegram delivery."""
+"""Lifecycle ownership for Workshop Telegram delivery."""
 
 from __future__ import annotations
 
 import asyncio
 from enum import StrEnum
-from typing import Protocol
+from pathlib import Path
+from typing import Protocol, cast
 
-from kai.workshop.delivery_outbox import DeliveryRecoveryResult
+from telegram import Bot
+
+from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
+from kai.workshop.delivery_fragments import WorkshopDeliveryFragments
+from kai.workshop.delivery_outbox import DeliveryRecoveryResult, WorkshopDeliveryOutbox
+from kai.workshop.store import WorkshopEventStore
+from kai.workshop.telegram_delivery import (
+    TelegramTextBot,
+    WorkshopTelegramStreamingFinalizationAdapter,
+    WorkshopTelegramStreamingFinalizationWorker,
+)
 
 
 class _DeliveryLeaseRecovery(Protocol):
@@ -18,7 +29,7 @@ class _TelegramDeliveryWorkerLoop(Protocol):
 
 
 class TelegramDeliveryRuntimeState(StrEnum):
-    """Observable lifecycle state for the production-unused runtime owner."""
+    """Observable lifecycle state for the delivery runtime owner."""
 
     STOPPED = "stopped"
     STARTING = "starting"
@@ -38,8 +49,8 @@ class TelegramDeliveryWorkerExitedError(RuntimeError):
 class WorkshopTelegramDeliveryRuntime:
     """Own exactly one recoverable Telegram worker task when explicitly started.
 
-    Nothing constructs or starts this owner in production yet. It defines the
-    lifecycle boundary a later, separately reviewed cutover can register.
+    Production uses this owner for the conversation-finalization worker. The
+    qualification worker remains operator-invoked and outside this runtime.
     """
 
     def __init__(
@@ -194,3 +205,63 @@ class WorkshopTelegramDeliveryRuntime:
         if failure is not None:
             self._failure = failure
             self._state = TelegramDeliveryRuntimeState.FAILED
+
+
+class WorkshopTelegramConversationDeliveryService:
+    """Own the active authority epoch, dedicated store, and worker runtime."""
+
+    def __init__(
+        self,
+        store: WorkshopEventStore,
+        runtime: WorkshopTelegramDeliveryRuntime,
+    ) -> None:
+        self._store = store
+        self._runtime = runtime
+        self._closed = False
+
+    @classmethod
+    async def open_and_start(
+        cls,
+        database_path: Path,
+        bot: Bot,
+        *,
+        worker_id: str = "kai-telegram-conversation-finalization",
+    ) -> WorkshopTelegramConversationDeliveryService:
+        """Activate authority and recover work before returning ready."""
+        store = await WorkshopEventStore.open(database_path)
+        try:
+            epoch = (await WorkshopConversationDeliveryAuthority(store).activate()).epoch
+            outbox = WorkshopDeliveryOutbox(store)
+            worker = WorkshopTelegramStreamingFinalizationWorker(
+                outbox,
+                WorkshopDeliveryFragments(store),
+                WorkshopTelegramStreamingFinalizationAdapter(cast(TelegramTextBot, bot)),
+                worker_id=worker_id,
+                authority_epoch_id=epoch.epoch_id,
+            )
+            runtime = WorkshopTelegramDeliveryRuntime(worker, worker)
+            await runtime.start()
+        except BaseException:
+            await store.close()
+            raise
+        return cls(store, runtime)
+
+    @property
+    def ready(self) -> bool:
+        return not self._closed and self._runtime.ready
+
+    @property
+    def runtime(self) -> WorkshopTelegramDeliveryRuntime:
+        return self._runtime
+
+    async def wait(self) -> None:
+        await self._runtime.wait()
+
+    async def stop(self) -> None:
+        if self._closed:
+            return
+        try:
+            await self._runtime.stop()
+        finally:
+            self._closed = True
+            await self._store.close()

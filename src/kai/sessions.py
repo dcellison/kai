@@ -54,11 +54,18 @@ from kai.workshop.inbound import InboundMessage, record_inbound_message
 from kai.workshop.outbound import (
     DeliveryObservation,
     OutboundMessage,
+    OutboundStreamingFinalizationResult,
     record_delivery_observation,
     record_outbound_message,
+    record_outbound_message_with_streaming_finalization,
 )
 from kai.workshop.schema import migrate_workshop_schema
 from kai.workshop.store import AppendResult, WorkshopEventStore
+from kai.workshop.streaming_preview import (
+    ConfirmedTelegramStreamingPreview,
+    TelegramStreamingPreviewBinding,
+    bind_confirmed_telegram_streaming_preview,
+)
 
 if TYPE_CHECKING:
     from kai.config import Config, WorkspaceConfig
@@ -68,6 +75,10 @@ log = logging.getLogger(__name__)
 # Module-level database connection, initialized by init_db() at startup
 _db: aiosqlite.Connection | None = None
 _workshop_event_lock: asyncio.Lock | None = None
+
+
+class WorkshopFinalizationCommitUncertainError(RuntimeError):
+    """The canonical reply transaction could not be resolved safely."""
 
 
 class TelegramUpdateQueueRow(TypedDict):
@@ -360,6 +371,44 @@ async def record_workshop_outbound_message(message: OutboundMessage) -> AppendRe
     async with _workshop_event_lock:
         store = WorkshopEventStore.from_initialized_connection(_get_db())
         return await record_outbound_message(store, message)
+
+
+async def record_workshop_streaming_preview(
+    preview: ConfirmedTelegramStreamingPreview,
+) -> TelegramStreamingPreviewBinding:
+    """Serialize one confirmed non-final Telegram preview binding."""
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        store = WorkshopEventStore.from_initialized_connection(_get_db())
+        return await bind_confirmed_telegram_streaming_preview(store, preview)
+
+
+async def record_workshop_streaming_finalization(
+    message: OutboundMessage,
+) -> OutboundStreamingFinalizationResult:
+    """Atomically record one authoritative reply and its delivery plan.
+
+    An SQLite error may have happened while the commit result was crossing the
+    driver boundary. Repeating the deterministic operation on the same locked
+    connection resolves both outcomes: it either creates the rolled-back work
+    or observes the already-committed message, delivery, and fragment plan.
+    A second failure is reported as uncertain so the handler never falls back
+    to a direct send that could duplicate committed outbox work.
+    """
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        store = WorkshopEventStore.from_initialized_connection(_get_db())
+        try:
+            return await record_outbound_message_with_streaming_finalization(store, message)
+        except aiosqlite.Error:
+            try:
+                return await record_outbound_message_with_streaming_finalization(store, message)
+            except Exception as resolution_error:
+                raise WorkshopFinalizationCommitUncertainError(
+                    "Could not determine whether the Workshop reply transaction committed"
+                ) from resolution_error
 
 
 async def record_workshop_delivery_observation(observation: DeliveryObservation) -> AppendResult:

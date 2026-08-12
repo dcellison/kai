@@ -46,6 +46,7 @@ from kai import cron, services, sessions, webhook
 from kai.bot import create_bot
 from kai.config import DATA_DIR, PROJECT_ROOT, _read_protected_file, load_config
 from kai.workshop.bootstrap import BootstrapHuman, BootstrapNotificationChannel
+from kai.workshop.telegram_delivery_runtime import WorkshopTelegramConversationDeliveryService
 
 
 def _workshop_bootstrap_humans(config) -> tuple[BootstrapHuman, ...]:
@@ -307,6 +308,7 @@ def _start() -> None:
         load_db_registry(await sessions.get_memory_project_rows())
 
         app = create_bot(config, use_webhook=use_webhook)
+        conversation_delivery: WorkshopTelegramConversationDeliveryService | None = None
 
         # Determine the default user (admin or first user) for per-user
         # data migrations and workspace restoration. users.yaml is
@@ -405,6 +407,15 @@ def _start() -> None:
             # Reload scheduled jobs from the database into APScheduler
             await cron.init_jobs(app)
 
+            # Activate exactly one durable authority epoch and recover its
+            # conversation-finalization work on a dedicated SQLite connection
+            # before either webhook or polling ingress can accept updates.
+            conversation_delivery = await WorkshopTelegramConversationDeliveryService.open_and_start(
+                config.session_db_path,
+                app.bot,
+            )
+            logging.info("Workshop Telegram conversation delivery is ready")
+
             # Start the HTTP server (always runs - serves scheduling API, GitHub
             # webhooks, file exchange, and health check regardless of transport mode).
             # In webhook mode, this also registers the Telegram webhook with the API.
@@ -474,7 +485,10 @@ def _start() -> None:
                     old_flag.unlink(missing_ok=True)
 
             logging.info("Kai is running. Press Ctrl+C to stop.")
-            await asyncio.Event().wait()  # Block forever until shutdown signal
+            # The delivery worker is part of service health. Unexpected worker
+            # exit reaches the top-level crash path instead of leaving a loaded
+            # Kai process that can accept replies it cannot deliver.
+            await conversation_delivery.wait()
         finally:
             # Shutdown in reverse order of startup
             await webhook.stop()
@@ -482,6 +496,13 @@ def _start() -> None:
             # since the Updater was suppressed at build time)
             if not use_webhook and app.updater:
                 await app.updater.stop()
+            if conversation_delivery is not None:
+                try:
+                    await conversation_delivery.stop()
+                except Exception:
+                    # If wait() already exposed a worker failure, retain that
+                    # original exception while still completing shutdown.
+                    logging.exception("Workshop Telegram conversation delivery stopped with an error")
             await app.stop()
             await app.bot_data["pool"].shutdown()
             await app.shutdown()

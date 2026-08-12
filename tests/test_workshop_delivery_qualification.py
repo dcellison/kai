@@ -162,6 +162,19 @@ class TestDeliveryQualificationCLI:
         with pytest.raises(SystemExit):
             workshop_cli._parser().parse_args(["delivery-qualification"])
 
+    def test_authority_requires_an_explicit_action(self):
+        with pytest.raises(SystemExit):
+            workshop_cli._parser().parse_args(["delivery-authority"])
+
+    def test_authority_deactivation_acknowledgement_is_explicit(self):
+        without_ack = workshop_cli._parser().parse_args(["delivery-authority", "deactivate"])
+        with_ack = workshop_cli._parser().parse_args(
+            ["delivery-authority", "deactivate", "--acknowledge-terminal-failures"]
+        )
+
+        assert without_ack.acknowledge_terminal_failures is False
+        assert with_ack.acknowledge_terminal_failures is True
+
     def test_prepare_requires_a_telegram_user(self):
         with pytest.raises(SystemExit):
             workshop_cli._parser().parse_args(["delivery-qualification", "prepare"])

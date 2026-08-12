@@ -22,6 +22,7 @@ from kai import sessions
 from kai.backend import AgentResponse, StreamEvent
 from kai.bot import (
     _QUEUED_MESSAGE_MARKER,
+    ResponseDeliveryRoute,
     _acquire_lock_or_kill,
     _backend_name_for_instance,
     _clear_responding,
@@ -84,6 +85,7 @@ from kai.workshop.artifacts import InboundArtifact
 from kai.workshop.domain import MessageId
 from kai.workshop.inbound import InboundMessage
 from kai.workshop.outbound import DeliveryObservation, OutboundMessage
+from kai.workshop.streaming_preview import ConfirmedTelegramStreamingPreview
 from kai.workspace_utils import is_workspace_allowed
 
 # ── _backend_name_for_instance ───────────────────────────────────────
@@ -738,6 +740,8 @@ class TestCreateBotTransportMode:
         assert app.bot_data["workshop_artifact_recorder"] is sessions.record_workshop_inbound_artifact
         assert app.bot_data["workshop_outbound_recorder"] is sessions.record_workshop_outbound_message
         assert app.bot_data["workshop_delivery_recorder"] is sessions.record_workshop_delivery_observation
+        assert app.bot_data["workshop_streaming_preview_recorder"] is sessions.record_workshop_streaming_preview
+        assert app.bot_data["workshop_streaming_finalizer"] is sessions.record_workshop_streaming_finalization
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2758,6 +2762,7 @@ class TestHandleMessage:
         ):
             await handle_message(update, ctx)
         mock_resp.assert_called_once()
+        assert mock_resp.await_args.kwargs["delivery_route"] == ResponseDeliveryRoute.LEGACY
         mock_log.assert_called_once()
 
     @pytest.mark.asyncio
@@ -2790,6 +2795,7 @@ class TestHandleMessage:
             )
         )
         assert response.await_args.kwargs["workshop_inbound_message_id"] == inbound_id
+        assert response.await_args.kwargs["delivery_route"] == ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT
 
     @pytest.mark.asyncio
     async def test_does_not_record_when_totp_denies_message(self):
@@ -3682,6 +3688,187 @@ class TestHandleResponse:
         ctx.bot_data["workshop_outbound_recorder"] = outbound
         ctx.bot_data["workshop_delivery_recorder"] = delivery
         return outbound, delivery
+
+    @staticmethod
+    def _install_workshop_finalizer(ctx, message_id: MessageId):
+        preview = AsyncMock()
+        finalizer = AsyncMock()
+        finalizer.return_value.message.event.envelope.aggregate_id = message_id
+        ctx.bot_data["workshop_streaming_preview_recorder"] = preview
+        ctx.bot_data["workshop_streaming_finalizer"] = finalizer
+        return preview, finalizer
+
+    @pytest.mark.asyncio
+    async def test_workshop_private_text_commits_without_direct_send_or_shadow_observation(self):
+        from kai.bot import _handle_response
+
+        inbound_id = MessageId("msg_00000000000000000000000000000001")
+        outbound_id = MessageId("msg_00000000000000000000000000000002")
+        update = _make_update()
+        pool = _make_mock_claude()
+        pool.send = MagicMock(return_value=_fake_stream(_done_event("Durable answer")))
+        ctx = _make_context(pool=pool)
+        _, finalizer = self._install_workshop_finalizer(ctx, outbound_id)
+        outbound, delivery = self._install_workshop_recorders(ctx, outbound_id)
+
+        with (
+            patch.multiple("kai.bot", **self._base_patches()),
+            patch("kai.bot._send_response", new_callable=AsyncMock) as direct_send,
+        ):
+            await _handle_response(
+                update,
+                ctx,
+                12345,
+                "test",
+                pool,
+                "sonnet",
+                workshop_inbound_message_id=inbound_id,
+                delivery_route=ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT,
+            )
+
+        finalizer.assert_awaited_once()
+        assert finalizer.await_args.args[0].body == "Durable answer"
+        direct_send.assert_not_awaited()
+        outbound.assert_not_awaited()
+        delivery.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_workshop_streaming_preview_is_bound_and_final_edit_is_left_to_worker(self):
+        from kai.bot import _handle_response
+
+        inbound_id = MessageId("msg_00000000000000000000000000000001")
+        outbound_id = MessageId("msg_00000000000000000000000000000002")
+        update = _make_update()
+        live_message = MagicMock(message_id=7001)
+        update.message.reply_text = AsyncMock(return_value=live_message)
+        pool = _make_mock_claude()
+        pool.send = MagicMock(
+            return_value=_fake_stream(
+                _text_event("Stable streamed sentence."),
+                _done_event("Final durable answer."),
+            )
+        )
+        ctx = _make_context(pool=pool)
+        preview, finalizer = self._install_workshop_finalizer(ctx, outbound_id)
+
+        with (
+            patch.multiple("kai.bot", **self._base_patches()),
+            patch("kai.bot._edit_message_safe", new_callable=AsyncMock) as direct_edit,
+        ):
+            await _handle_response(
+                update,
+                ctx,
+                12345,
+                "test",
+                pool,
+                "sonnet",
+                workshop_inbound_message_id=inbound_id,
+                delivery_route=ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT,
+            )
+
+        bound = preview.await_args.args[0]
+        assert isinstance(bound, ConfirmedTelegramStreamingPreview)
+        assert bound.inbound_message_id == inbound_id
+        assert bound.external_message_id == 7001
+        finalizer.assert_awaited_once()
+        direct_edit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_definite_workshop_failure_retains_direct_delivery(self):
+        from kai.bot import _handle_response
+
+        inbound_id = MessageId("msg_00000000000000000000000000000001")
+        outbound_id = MessageId("msg_00000000000000000000000000000002")
+        update = _make_update()
+        pool = _make_mock_claude()
+        pool.send = MagicMock(return_value=_fake_stream(_done_event("Fallback answer")))
+        ctx = _make_context(pool=pool)
+        _, finalizer = self._install_workshop_finalizer(ctx, outbound_id)
+        finalizer.side_effect = RuntimeError("definite preparation failure")
+        outbound, _ = self._install_workshop_recorders(ctx, outbound_id)
+
+        with (
+            patch.multiple("kai.bot", **self._base_patches()),
+            patch("kai.bot._send_response", new_callable=AsyncMock) as direct_send,
+        ):
+            await _handle_response(
+                update,
+                ctx,
+                12345,
+                "test",
+                pool,
+                "sonnet",
+                workshop_inbound_message_id=inbound_id,
+                delivery_route=ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT,
+            )
+
+        finalizer.assert_awaited_once()
+        direct_send.assert_awaited_once_with(update, "Fallback answer")
+        outbound.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_uncertain_workshop_commit_refuses_duplicate_direct_send(self):
+        from kai.bot import _handle_response
+
+        inbound_id = MessageId("msg_00000000000000000000000000000001")
+        outbound_id = MessageId("msg_00000000000000000000000000000002")
+        update = _make_update()
+        pool = _make_mock_claude()
+        pool.send = MagicMock(return_value=_fake_stream(_done_event("Possibly committed answer")))
+        ctx = _make_context(pool=pool)
+        _, finalizer = self._install_workshop_finalizer(ctx, outbound_id)
+        finalizer.side_effect = sessions.WorkshopFinalizationCommitUncertainError("unknown")
+
+        with (
+            patch.multiple("kai.bot", **self._base_patches()),
+            patch("kai.bot._send_response", new_callable=AsyncMock) as direct_send,
+        ):
+            await _handle_response(
+                update,
+                ctx,
+                12345,
+                "test",
+                pool,
+                "sonnet",
+                workshop_inbound_message_id=inbound_id,
+                delivery_route=ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT,
+            )
+
+        direct_send.assert_not_awaited()
+        assert "avoid a duplicate" in update.message.reply_text.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_text_plus_voice_never_enters_workshop_text_cutover(self):
+        from kai.bot import _handle_response
+
+        inbound_id = MessageId("msg_00000000000000000000000000000001")
+        outbound_id = MessageId("msg_00000000000000000000000000000002")
+        update = _make_update()
+        pool = _make_mock_claude()
+        pool.send = MagicMock(return_value=_fake_stream(_done_event("Text and voice")))
+        ctx = _make_context(config=_make_config(tts_enabled=True), pool=pool)
+        _, finalizer = self._install_workshop_finalizer(ctx, outbound_id)
+        self._install_workshop_recorders(ctx, outbound_id)
+        patches = self._base_patches()
+        patches["sessions"].get_setting = AsyncMock(return_value="on")
+
+        with (
+            patch.multiple("kai.bot", **patches),
+            patch("kai.bot.synthesize_speech", new_callable=AsyncMock, return_value=b"audio"),
+        ):
+            await _handle_response(
+                update,
+                ctx,
+                12345,
+                "test",
+                pool,
+                "sonnet",
+                workshop_inbound_message_id=inbound_id,
+                delivery_route=ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT,
+            )
+
+        finalizer.assert_not_awaited()
+        update.message.reply_text.assert_awaited()
 
     @pytest.mark.asyncio
     async def test_shadows_successful_assistant_result_and_text_delivery(self):

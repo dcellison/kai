@@ -42,6 +42,7 @@ import subprocess
 import sys
 import time
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
@@ -77,6 +78,7 @@ from kai.config import (
 from kai.history import LogEntry, log_message
 from kai.locks import get_lock, get_stop_event
 from kai.pool import SubprocessPool
+from kai.sessions import WorkshopFinalizationCommitUncertainError
 from kai.telegram_utils import chunk_text
 from kai.transcribe import TranscriptionError, transcribe_voice
 from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
@@ -84,6 +86,7 @@ from kai.workshop.artifacts import InboundArtifact
 from kai.workshop.domain import MessageId
 from kai.workshop.inbound import InboundMessage
 from kai.workshop.outbound import DeliveryObservation, OutboundMessage
+from kai.workshop.streaming_preview import ConfirmedTelegramStreamingPreview
 from kai.workspace_utils import is_workspace_allowed
 
 _UPLOAD_ROOT_MODE = 0o711
@@ -132,6 +135,14 @@ log = logging.getLogger(__name__)
 # Telegram rate-limits message edits; 2 seconds keeps us safely below the limit
 # while still giving the user a sense of streaming output.
 EDIT_INTERVAL = 2.0
+
+
+class ResponseDeliveryRoute(StrEnum):
+    """Explicit final-delivery authority selected by an ingress handler."""
+
+    LEGACY = "legacy"
+    WORKSHOP_PRIVATE_TEXT = "workshop_private_text"
+
 
 # Flag file written while processing a message. If the process crashes mid-response,
 # main.py detects this file at startup and notifies the user to resend. Lives under
@@ -4661,6 +4672,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 model,
                 user_log=user_log,
                 workshop_inbound_message_id=workshop_inbound_message_id,
+                delivery_route=(
+                    ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT
+                    if chat_id == _user_id(update)
+                    else ResponseDeliveryRoute.LEGACY
+                ),
             )
         finally:
             _clear_responding(chat_id)
@@ -4680,6 +4696,7 @@ async def _handle_response(
     model: str,
     user_log: LogEntry | None = None,
     workshop_inbound_message_id: MessageId | None = None,
+    delivery_route: ResponseDeliveryRoute = ResponseDeliveryRoute.LEGACY,
 ) -> None:
     """
     Stream Claude's response and deliver it to the user.
@@ -4709,6 +4726,8 @@ async def _handle_response(
         model: Current model name (for session tracking).
     """
     assert update.message is not None
+    if not isinstance(delivery_route, ResponseDeliveryRoute):
+        raise ValueError("delivery_route must be a ResponseDeliveryRoute")
     # Check voice mode before starting
     config: Config = context.bot_data["config"]
     reader_user = _upload_reader_user(context, chat_id)
@@ -4716,6 +4735,13 @@ async def _handle_response(
     if config.tts_enabled:
         voice_mode = await sessions.get_setting(f"voice_mode:{chat_id}") or "off"
     voice_only = voice_mode == "only"
+    workshop_delivery_candidate = (
+        delivery_route == ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT
+        and voice_mode == "off"
+        and workshop_inbound_message_id is not None
+        and context.bot_data.get("workshop_streaming_preview_recorder") is not None
+        and context.bot_data.get("workshop_streaming_finalizer") is not None
+    )
 
     # Keep activity indicator visible until the response completes.
     # Telegram hides the typing indicator after ~5 seconds, so we
@@ -4785,6 +4811,23 @@ async def _handle_response(
                 live_msg = await _reply_safe(update.message, _truncate_for_telegram(publishable))
                 last_edit_time = now
                 last_edit_text = publishable
+                if workshop_delivery_candidate:
+                    preview_recorder = context.bot_data["workshop_streaming_preview_recorder"]
+                    try:
+                        await preview_recorder(
+                            ConfirmedTelegramStreamingPreview(
+                                inbound_message_id=workshop_inbound_message_id,
+                                external_message_id=live_msg.message_id,
+                                confirmed_at=datetime.now(UTC),
+                            )
+                        )
+                    except Exception:
+                        workshop_delivery_candidate = False
+                        log.exception(
+                            "Workshop streaming-preview binding failed; retaining direct delivery "
+                            "(inbound_message_id=%s)",
+                            workshop_inbound_message_id,
+                        )
             elif now - last_edit_time >= EDIT_INTERVAL:
                 await _edit_message_safe(live_msg, publishable)
                 last_edit_time = now
@@ -4869,8 +4912,41 @@ async def _handle_response(
     )
 
     workshop_outbound_message_id: MessageId | None = None
+    workshop_delivery_committed = False
+    if workshop_delivery_candidate:
+        finalizer = context.bot_data["workshop_streaming_finalizer"]
+        try:
+            finalization_result = await finalizer(
+                OutboundMessage(
+                    in_reply_to_message_id=workshop_inbound_message_id,
+                    body=final_text,
+                    occurred_at=datetime.now(UTC),
+                )
+            )
+            aggregate_id = finalization_result.message.event.envelope.aggregate_id
+            if not isinstance(aggregate_id, MessageId):
+                raise RuntimeError("Workshop finalizer returned a non-message aggregate")
+            workshop_outbound_message_id = aggregate_id
+            workshop_delivery_committed = True
+        except WorkshopFinalizationCommitUncertainError:
+            log.critical(
+                "Workshop finalization commit outcome is uncertain; refusing direct fallback (inbound_message_id=%s)",
+                workshop_inbound_message_id,
+                exc_info=True,
+            )
+            await _reply_safe(
+                update.message,
+                "Kai could not safely confirm final delivery. The reply was not sent again to avoid a duplicate.",
+            )
+            return
+        except Exception:
+            log.exception(
+                "Workshop authoritative finalization failed; retaining direct delivery (inbound_message_id=%s)",
+                workshop_inbound_message_id,
+            )
+
     outbound_recorder = context.bot_data.get("workshop_outbound_recorder")
-    if workshop_inbound_message_id is not None and outbound_recorder is not None:
+    if not workshop_delivery_committed and workshop_inbound_message_id is not None and outbound_recorder is not None:
         try:
             outbound_result = await outbound_recorder(
                 OutboundMessage(
@@ -5009,6 +5085,9 @@ async def _handle_response(
         _pending_memory_tasks.add(task)
         task.add_done_callback(_pending_memory_tasks.discard)
 
+    if workshop_delivery_committed:
+        return
+
     # Voice-only mode: synthesize and send voice, fall back to text on failure
     if voice_only and final_text:
         voice_name = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
@@ -5101,6 +5180,8 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
     app.bot_data["workshop_artifact_recorder"] = sessions.record_workshop_inbound_artifact
     app.bot_data["workshop_outbound_recorder"] = sessions.record_workshop_outbound_message
     app.bot_data["workshop_delivery_recorder"] = sessions.record_workshop_delivery_observation
+    app.bot_data["workshop_streaming_preview_recorder"] = sessions.record_workshop_streaming_preview
+    app.bot_data["workshop_streaming_finalizer"] = sessions.record_workshop_streaming_finalization
     app.bot_data["pool"] = SubprocessPool(
         config=config,
         services_info=services.get_available_services(),

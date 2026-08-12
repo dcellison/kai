@@ -1,4 +1,4 @@
-"""Production-unused Telegram adapter and worker for Workshop delivery claims."""
+"""Telegram adapters and workers for durable Workshop delivery claims."""
 
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ class TelegramSentMessage(Protocol):
 
 
 class TelegramTextBot(Protocol):
-    """The Bot API surface needed by the production-unused text adapter."""
+    """The Bot API surface needed by the durable text adapters."""
 
     async def send_message(
         self,

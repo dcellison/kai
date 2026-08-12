@@ -309,10 +309,10 @@ async def record_outbound_message_with_streaming_finalization(
 ) -> OutboundStreamingFinalizationResult:
     """Atomically persist a reply, delivery request, and immutable operation plan.
 
-    This service is deliberately production-unused. Its only routing input is
-    the canonical inbound message ID. It resolves the direct Telegram binding
-    and any confirmed non-final preview internally, and it neither sends nor
-    edits Telegram.
+    The authenticated private-text route calls this service after agent
+    completion. Its only routing input is the canonical inbound message ID. It
+    resolves the direct Telegram binding and any confirmed non-final preview
+    internally, and it neither sends nor edits Telegram itself.
     """
     connection = store.connection
     try:

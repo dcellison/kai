@@ -13,6 +13,10 @@ from telegram import Bot
 from telegram.error import TelegramError
 
 from kai.config import DATA_DIR, load_config
+from kai.workshop.delivery_authority import (
+    DeliveryAuthorityError,
+    WorkshopConversationDeliveryAuthority,
+)
 from kai.workshop.delivery_fragments import WorkshopDeliveryFragments
 from kai.workshop.delivery_outbox import (
     QUALIFICATION_PURPOSE,
@@ -58,6 +62,22 @@ def _parser() -> argparse.ArgumentParser:
     )
     interrupted.add_argument("--delivery-id", required=True)
     interrupted.add_argument("--lease-seconds", type=int, default=5, choices=range(1, 301), metavar="1..300")
+
+    authority = commands.add_parser(
+        "delivery-authority",
+        help="inspect or deactivate the live conversation-delivery authority",
+    )
+    authority_actions = authority.add_subparsers(dest="action", required=True)
+    authority_actions.add_parser("status")
+    deactivate = authority_actions.add_parser(
+        "deactivate",
+        help="deactivate only after all non-terminal work is reconciled",
+    )
+    deactivate.add_argument(
+        "--acknowledge-terminal-failures",
+        action="store_true",
+        help="explicitly acknowledge retained terminal failure evidence",
+    )
     return parser
 
 
@@ -93,8 +113,21 @@ def _qualification_database(data_dir: Path) -> Path:
 
 async def _run(args: argparse.Namespace) -> int:
     store = await WorkshopEventStore.open(_qualification_database(DATA_DIR))
-    qualification = WorkshopDeliveryQualification(store)
     try:
+        if args.command == "delivery-authority":
+            authority = WorkshopConversationDeliveryAuthority(store)
+            if args.action == "status":
+                active = await authority.active_epoch_in_transaction(required=False)
+                print(f"Conversation delivery authority: {'active' if active is not None else 'inactive'}")
+                return 0
+            await authority.deactivate(
+                acknowledge_terminal_failures=args.acknowledge_terminal_failures,
+            )
+            print("Conversation delivery authority: deactivated")
+            print("No delivery work was deleted or reassigned.")
+            return 0
+
+        qualification = WorkshopDeliveryQualification(store)
         if args.action == "prepare":
             result = await qualification.prepare(args.telegram_user_id)
             _print_state(result.delivery)
@@ -165,6 +198,8 @@ def cli(args: list[str]) -> None:
     parsed = _parser().parse_args(args)
     try:
         code = asyncio.run(_run(parsed))
+    except DeliveryAuthorityError as exc:
+        raise SystemExit(f"Workshop delivery authority failed: {exc}") from exc
     except (DeliveryQualificationError, DeliveryTargetNotFoundError) as exc:
         raise SystemExit(f"Workshop delivery qualification failed: {exc}") from exc
     raise SystemExit(code)
