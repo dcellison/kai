@@ -1680,3 +1680,36 @@ grant, the conservative `started` boundary, and exact-runtime dispatch. Then
 integrate durable cancellation and interrupted-execution recovery with that
 lane. The lane identity must be canonical `(channel_id, agent_id)` and must not
 expose a Telegram chat ID as execution authority.
+
+## 33. Canonical execution coordinator
+
+**Implementation date:** 2026-08-12
+
+The production-unused coordinator now owns one canonical
+`(channel_id, agent_id)` lane from an accepted `RunId` through protected
+preparation, internal owner/fence grant, exact-runtime validation, the durable
+started boundary, dispatch, lease renewal, and atomic terminal settlement. It
+loads the prompt from the canonical inbound message; callers cannot supply a
+transport identity, prompt override, backend, provider, model, command, path,
+environment, or credential. Concurrent replay cannot invoke a second backend.
+
+Cancellation records durable human intent, stops only the exact prepared
+runtime, and confirms cancellation only after shutdown completes. A failed
+shutdown becomes a bounded interruption rather than a false cancellation.
+Pre-dispatch drift leaves an expirable grant and never calls the backend.
+Expired started work now commits a fixed visible interruption, exact-epoch
+delivery work, interrupted attempt, and failed run atomically; the obsolete
+invisible-recovery path no longer exists. Native backend errors never enter
+canonical history.
+
+Focused tests cover success ordering, stored-prompt authority, duplicate
+dispatch suppression, bounded failures, exact-runtime cancellation, drift and
+grant recovery, post-start interruption, terminal replay, and absence from
+production construction. No installed behavior changes.
+
+### 33.1 Next bounded milestone
+
+Conduct the activation review, then route authenticated private Telegram text
+through this coordinator while retaining the current streaming presentation
+and delivery worker. That activation is the first slice in this sequence that
+will require `make install` and an operator-visible Telegram qualification.

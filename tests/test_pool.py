@@ -803,6 +803,44 @@ class TestPreparedExecution:
         send.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_prepared_cancellation_stops_only_the_exact_current_runtime(self):
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        with (
+            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
+            patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value={}),
+        ):
+            prepared = await pool.prepare_execution(111)
+        instance = pool.get(111)
+        with patch.object(instance, "shutdown", new_callable=AsyncMock) as shutdown:
+            await prepared.cancel()
+        shutdown.assert_awaited_once_with()
+        assert pool.get_if_exists(111) is None
+
+        pool._pool[111] = MagicMock()
+        with (
+            pytest.raises(RuntimeError, match="no longer current"),
+        ):
+            await prepared.cancel()
+
+    @pytest.mark.asyncio
+    async def test_prepared_cancellation_preserves_replacement_created_during_shutdown(self):
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        with (
+            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
+            patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value={}),
+        ):
+            prepared = await pool.prepare_execution(111)
+        instance = pool.get(111)
+        replacement = MagicMock()
+
+        async def replace_during_shutdown():
+            pool._pool[111] = replacement
+
+        with patch.object(instance, "shutdown", side_effect=replace_during_shutdown):
+            await prepared.cancel()
+        assert pool.get_if_exists(111) is replacement
+
+    @pytest.mark.asyncio
     async def test_restore_applies_db_user_settings(self, tmp_path):
         """DB per-user settings override users.yaml baseline on restore."""
         ws = tmp_path / "saved_ws"

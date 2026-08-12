@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
 from kai.workshop.domain import MessageId, RunExecutionOwnerId
 from kai.workshop.inbound import InboundMessage, record_inbound_message
 from kai.workshop.outbound import OutboundMessage, record_outbound_message
@@ -37,20 +38,20 @@ async def _open_authority(
             BootstrapHuman(
                 display_name="Workshop Human",
                 role="admin",
-                transport="desktop",
-                external_subject="human-1",
-                external_channel_id="human-1",
+                transport="telegram",
+                external_subject="101",
+                external_channel_id="101",
             ),
         ),
     )
     inbound = await record_inbound_message(
         store,
         InboundMessage(
-            transport="desktop",
+            transport="telegram",
             update_id="command-1",
             message_id="message-1",
-            sender_subject="human-1",
-            channel_subject="human-1",
+            sender_subject="101",
+            channel_subject="101",
             body="Perform one durable unit of work",
             occurred_at=_NOW,
         ),
@@ -65,6 +66,7 @@ async def _open_authority(
         ),
         registered_backend_ids=frozenset({"codex", "pi"}),
     )
+    await WorkshopConversationDeliveryAuthority(store).activate()
     return store, authority, inbound_id
 
 

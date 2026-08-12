@@ -87,6 +87,14 @@ class PreparedBackendExecution:
     def workspace(self) -> Path:
         return self._fingerprint.workspace
 
+    def validate_current(self) -> None:
+        """Fail before dispatch if the protected runtime selection drifted."""
+        self._pool._validate_prepared(self)
+
+    async def cancel(self) -> None:
+        """Stop only the exact runtime bound to this protected handle."""
+        await self._pool._cancel_prepared(self)
+
     async def stream(self, prompt: str | list) -> AsyncGenerator[StreamEvent]:
         if self._consumed:
             raise RuntimeError("Prepared backend execution is one-shot")
@@ -461,14 +469,9 @@ class SubprocessPool:
         prompt: str | list,
     ) -> AsyncGenerator[StreamEvent]:
         """Dispatch through a prepared handle only while its runtime remains exact."""
+        self._validate_prepared(prepared)
         chat_id = prepared._chat_id
-        instance = self.get_if_exists(chat_id)
-        if instance is not prepared._instance:
-            raise RuntimeError("Prepared backend runtime is no longer current")
-        if chat_id in self._pending_workspace_restore or chat_id in self._pending_settings_restore:
-            raise RuntimeError("Prepared backend runtime has pending effective settings")
-        if _runtime_fingerprint(instance) != prepared._fingerprint:
-            raise RuntimeError("Prepared backend runtime changed before dispatch")
+        instance = prepared._instance
         self._last_activity[chat_id] = time.monotonic()
         self._in_flight.add(chat_id)
         try:
@@ -477,6 +480,32 @@ class SubprocessPool:
         finally:
             self._in_flight.discard(chat_id)
             self._last_activity[chat_id] = time.monotonic()
+
+    def _validate_prepared(self, prepared: PreparedBackendExecution) -> None:
+        chat_id = prepared._chat_id
+        instance = self.get_if_exists(chat_id)
+        if instance is not prepared._instance:
+            raise RuntimeError("Prepared backend runtime is no longer current")
+        if chat_id in self._pending_workspace_restore or chat_id in self._pending_settings_restore:
+            raise RuntimeError("Prepared backend runtime has pending effective settings")
+        if _runtime_fingerprint(instance) != prepared._fingerprint:
+            raise RuntimeError("Prepared backend runtime changed before dispatch")
+
+    async def _cancel_prepared(self, prepared: PreparedBackendExecution) -> None:
+        self._validate_prepared(prepared)
+        chat_id = prepared._chat_id
+        instance = prepared._instance
+        try:
+            await asyncio.wait_for(instance.shutdown(), timeout=_FORCE_KILL_TIMEOUT)
+        except Exception:
+            instance.force_kill()
+            log.warning("prepared cancellation: shutdown failed for user %d, sent SIGKILL", chat_id)
+        finally:
+            # Never remove or stop a replacement installed while the exact
+            # prepared runtime was shutting down.
+            if self._pool.get(chat_id) is instance:
+                self._pool.pop(chat_id, None)
+                self._last_activity.pop(chat_id, None)
 
     async def _attempt_workspace_restore(self, chat_id: int, instance: AgentBackend) -> Path:
         """Restore the saved workspace into a live instance.

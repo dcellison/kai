@@ -92,7 +92,7 @@ class TestProtectedExecutionPreparation:
             assert prepared.selection.provider == "anthropic"
             assert prepared.selection.model == "sonnet"
             assert prepared.workspace == home
-            assert "101" not in repr(prepared)
+            assert "_runtime" not in repr(prepared)
             assert not hasattr(prepared, "chat_id")
         finally:
             await pool.shutdown()

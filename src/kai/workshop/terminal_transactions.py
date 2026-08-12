@@ -56,6 +56,7 @@ class TerminalFailureCode(StrEnum):
     TRANSIENT = "transient"
     BACKEND_CRASHED = "backend_crashed"
     NO_RESPONSE = "no_response"
+    EXECUTION_INTERRUPTED = "execution_interrupted"
     UNKNOWN = "unknown"
 
 
@@ -80,6 +81,9 @@ _FAILURE_MESSAGES = {
         "The configured agent stopped unexpectedly. Kai did not complete this request."
     ),
     TerminalFailureCode.NO_RESPONSE: "The configured agent returned no response. Kai did not complete this request.",
+    TerminalFailureCode.EXECUTION_INTERRUPTED: (
+        "Kai was interrupted while the configured agent was working. This request was not retried."
+    ),
     TerminalFailureCode.UNKNOWN: "The configured agent could not complete this request.",
 }
 
@@ -159,6 +163,24 @@ class WorkshopRunTerminalTransactionCoordinator:
             )
         )
 
+    async def interrupt_expired(
+        self,
+        claim: RunExecutionClaim,
+        *,
+        occurred_at: datetime,
+    ) -> TerminalTransactionResult:
+        """Atomically expose and settle an expired post-dispatch interruption."""
+        return await self._resolve_possible_commit(
+            lambda: self._settle_once(
+                claim,
+                outcome=TerminalOutcome.FAILED,
+                body=_FAILURE_MESSAGES[TerminalFailureCode.EXECUTION_INTERRUPTED],
+                occurred_at=occurred_at,
+                failure_code=TerminalFailureCode.EXECUTION_INTERRUPTED,
+                expired_interruption=True,
+            )
+        )
+
     async def _resolve_possible_commit(
         self,
         operation: Callable[[], Awaitable[TerminalTransactionResult]],
@@ -181,6 +203,7 @@ class WorkshopRunTerminalTransactionCoordinator:
         body: str,
         occurred_at: datetime,
         failure_code: TerminalFailureCode | None = None,
+        expired_interruption: bool = False,
     ) -> TerminalTransactionResult:
         if not isinstance(claim, RunExecutionClaim):
             raise ValueError("claim must be a RunExecutionClaim")
@@ -207,11 +230,17 @@ class WorkshopRunTerminalTransactionCoordinator:
                 )
             elif outcome == TerminalOutcome.FAILED:
                 assert failure_code is not None
-                execution = await self._authority.fail_in_transaction(
-                    claim,
-                    failure_code=failure_code.value,
-                    occurred_at=occurred_at,
-                )
+                if expired_interruption:
+                    execution = await self._authority.interrupt_expired_in_transaction(
+                        claim,
+                        occurred_at=occurred_at,
+                    )
+                else:
+                    execution = await self._authority.fail_in_transaction(
+                        claim,
+                        failure_code=failure_code.value,
+                        occurred_at=occurred_at,
+                    )
             else:
                 execution = await self._authority.confirm_cancellation_in_transaction(
                     claim,

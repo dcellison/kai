@@ -245,6 +245,33 @@ class WorkshopRunExecutionAuthority:
             raise RunExecutionConflictError("Durable Workshop run attempt was not found")
         return attempt
 
+    async def active_attempt(self, run_id: RunId) -> RunAttempt | None:
+        """Return the sole nonterminal attempt for a run, failing on corruption."""
+        if not isinstance(run_id, RunId):
+            raise ValueError("run_id must be a RunId")
+        async with self._store.connection.execute(
+            "SELECT id FROM run_attempts WHERE run_id = ? AND status IN ('granted', 'started') ORDER BY id",
+            (run_id,),
+        ) as cursor:
+            rows = list(await cursor.fetchall())
+        if len(rows) > 1:
+            raise RunExecutionConflictError("Durable run has multiple active attempts")
+        return None if not rows else await self._require_attempt(RunAttemptId(str(rows[0][0])))
+
+    async def expired_attempts(self, *, occurred_at: datetime) -> tuple[RunAttempt, ...]:
+        """Return expired active claims in deterministic recovery order."""
+        occurred_at = _timestamp(occurred_at, field_name="occurred_at")
+        async with self._store.connection.execute(
+            "SELECT id FROM run_attempts WHERE status IN ('granted', 'started') "
+            "AND lease_expires_at <= ? ORDER BY lease_expires_at, id",
+            (occurred_at.isoformat(),),
+        ) as cursor:
+            rows = list(await cursor.fetchall())
+        attempts = []
+        for row in rows:
+            attempts.append(await self._require_attempt(RunAttemptId(str(row[0]))))
+        return tuple(attempts)
+
     async def grant(
         self,
         run_id: RunId,
@@ -550,66 +577,171 @@ class WorkshopRunExecutionAuthority:
             terminal_code=None,
         )
 
-    async def recover_expired(self, *, occurred_at: datetime) -> RunRecoveryResult:
+    async def expire_grant(
+        self,
+        claim: RunExecutionClaim,
+        *,
+        occurred_at: datetime,
+    ) -> RunExecutionResult:
+        """Expire authority that never crossed the backend-dispatch boundary."""
         occurred_at = _timestamp(occurred_at, field_name="occurred_at")
         connection = self._store.connection
-        expired = interrupted = 0
         try:
             await connection.execute("BEGIN IMMEDIATE")
-            projection = CanonicalConversationProjection()
-            await self._store.project_pending_in_transaction(projection)
-            async with connection.execute(
-                "SELECT id FROM run_attempts WHERE status IN ('granted', 'started') "
-                "AND lease_expires_at <= ? ORDER BY lease_expires_at, id",
-                (occurred_at.isoformat(),),
-            ) as cursor:
-                attempt_ids = [RunAttemptId(str(row[0])) for row in await cursor.fetchall()]
-            for attempt_id in attempt_ids:
-                attempt = await self._require_attempt(attempt_id)
-                run = await self._require_run(attempt.run_id)
-                claim = RunExecutionClaim.from_attempt(attempt)
-                actor = await _agent_principal(self._store, run)
-                if attempt.status == RunAttemptStatus.GRANTED:
-                    event = self._attempt_terminal_envelope(
-                        run,
-                        claim,
-                        actor=actor,
-                        event_type=WorkshopEventType.RUN_ATTEMPT_EXPIRED,
-                        operation="expired",
-                        terminal_code="lease_expired",
-                        occurred_at=occurred_at,
-                    )
-                    await self._store.append_in_transaction(event)
-                    expired += 1
-                else:
-                    attempt_event = self._attempt_terminal_envelope(
-                        run,
-                        claim,
-                        actor=actor,
-                        event_type=WorkshopEventType.RUN_ATTEMPT_INTERRUPTED,
-                        operation="interrupted",
-                        terminal_code="execution_interrupted",
-                        occurred_at=occurred_at,
-                    )
-                    await self._store.append_in_transaction(attempt_event)
-                    await self._store.append_in_transaction(
-                        self._run_terminal_envelope(
-                            run,
-                            claim,
-                            actor=actor,
-                            event_type=WorkshopEventType.RUN_FAILED,
-                            operation="failed",
-                            terminal_code="execution_interrupted",
-                            occurred_at=occurred_at,
-                        )
-                    )
-                    interrupted += 1
-            await self._store.project_pending_in_transaction(projection)
+            result = await self.expire_grant_in_transaction(claim, occurred_at=occurred_at)
             await connection.commit()
-            return RunRecoveryResult(expired_before_dispatch=expired, interrupted_after_dispatch=interrupted)
+            return result
         except Exception:
             await connection.rollback()
             raise
+
+    async def expire_grant_in_transaction(
+        self,
+        claim: RunExecutionClaim,
+        *,
+        occurred_at: datetime,
+    ) -> RunExecutionResult:
+        """Expire one granted claim inside a caller-owned recovery transaction."""
+        if not self._store.connection.in_transaction:
+            raise RuntimeError("grant expiry in transaction requires an active transaction")
+        occurred_at = _timestamp(occurred_at, field_name="occurred_at")
+        projection = CanonicalConversationProjection()
+        await self._store.project_pending_in_transaction(projection)
+        run, attempt = await self._current_claim(claim)
+        key = _attempt_key(claim.attempt_id, "expired")
+        prior = await self._store.event_by_idempotency_key(key)
+        if prior is not None:
+            expected = _attempt_payload(claim)
+            expected["terminal_code"] = "lease_expired"
+            if (
+                prior.envelope.event_type != WorkshopEventType.RUN_ATTEMPT_EXPIRED
+                or prior.envelope.aggregate_id != claim.attempt_id
+                or prior.envelope.payload != expected
+            ):
+                raise RunExecutionConflictError("Grant expiry retry has conflicting facts")
+            return RunExecutionResult(run=run, attempt=attempt, events=(prior,), changed=False)
+        if (
+            attempt.status != RunAttemptStatus.GRANTED
+            or attempt.lease_version != claim.lease_version
+            or occurred_at < attempt.lease_expires_at
+        ):
+            raise StaleRunExecutionAuthorityError("Execution grant is not eligible for expiry")
+        actor = await _agent_principal(self._store, run)
+        appended = await self._store.append_in_transaction(
+            self._attempt_terminal_envelope(
+                run,
+                claim,
+                actor=actor,
+                event_type=WorkshopEventType.RUN_ATTEMPT_EXPIRED,
+                operation="expired",
+                terminal_code="lease_expired",
+                occurred_at=occurred_at,
+            )
+        )
+        await self._store.project_pending_in_transaction(projection)
+        return RunExecutionResult(
+            run=await self._require_run(claim.run_id),
+            attempt=await self._require_attempt(claim.attempt_id),
+            events=(appended.event,),
+            changed=True,
+        )
+
+    async def interrupt_expired_in_transaction(
+        self,
+        claim: RunExecutionClaim,
+        *,
+        occurred_at: datetime,
+    ) -> RunExecutionResult:
+        """Settle an expired started claim inside an atomic visible transaction."""
+        if not self._store.connection.in_transaction:
+            raise RuntimeError("interruption in transaction requires an active transaction")
+        occurred_at = _timestamp(occurred_at, field_name="occurred_at")
+        projection = CanonicalConversationProjection()
+        await self._store.project_pending_in_transaction(projection)
+        run, attempt = await self._current_claim(claim)
+        attempt_key = _attempt_key(claim.attempt_id, "interrupted")
+        run_key = _run_key(claim.run_id, "failed")
+        prior_attempt = await self._store.event_by_idempotency_key(attempt_key)
+        prior_run = await self._store.event_by_idempotency_key(run_key)
+        actor = await _agent_principal(self._store, run)
+        expected_attempt = _attempt_payload(claim)
+        expected_attempt["terminal_code"] = "execution_interrupted"
+        expected_run = {
+            "attempt_id": claim.attempt_id,
+            "failure_code": "execution_interrupted",
+        }
+        if prior_attempt is not None or prior_run is not None:
+            if (
+                prior_attempt is None
+                or prior_run is None
+                or prior_attempt.envelope.event_type != WorkshopEventType.RUN_ATTEMPT_INTERRUPTED
+                or prior_attempt.envelope.payload != expected_attempt
+                or prior_run.envelope.event_type != WorkshopEventType.RUN_FAILED
+                or prior_run.envelope.payload != expected_run
+            ):
+                raise RunExecutionConflictError("Interrupted recovery retry has conflicting facts")
+            return RunExecutionResult(
+                run=run,
+                attempt=attempt,
+                events=(prior_attempt, prior_run),
+                changed=False,
+            )
+        if (
+            attempt.status != RunAttemptStatus.STARTED
+            or attempt.lease_version != claim.lease_version
+            or occurred_at < attempt.lease_expires_at
+        ):
+            raise StaleRunExecutionAuthorityError("Started execution is not eligible for interruption recovery")
+        first = await self._store.append_in_transaction(
+            self._attempt_terminal_envelope(
+                run,
+                claim,
+                actor=actor,
+                event_type=WorkshopEventType.RUN_ATTEMPT_INTERRUPTED,
+                operation="interrupted",
+                terminal_code="execution_interrupted",
+                occurred_at=occurred_at,
+            )
+        )
+        second = await self._store.append_in_transaction(
+            self._run_terminal_envelope(
+                run,
+                claim,
+                actor=actor,
+                event_type=WorkshopEventType.RUN_FAILED,
+                operation="failed",
+                terminal_code="execution_interrupted",
+                occurred_at=occurred_at,
+            )
+        )
+        await self._store.project_pending_in_transaction(projection)
+        return RunExecutionResult(
+            run=await self._require_run(claim.run_id),
+            attempt=await self._require_attempt(claim.attempt_id),
+            events=(first.event, second.event),
+            changed=True,
+        )
+
+    async def recover_expired(self, *, occurred_at: datetime) -> RunRecoveryResult:
+        """Recover expired authority through the canonical terminal contract."""
+        occurred_at = _timestamp(occurred_at, field_name="occurred_at")
+        expired = interrupted = 0
+        for attempt in await self.expired_attempts(occurred_at=occurred_at):
+            claim = RunExecutionClaim.from_attempt(attempt)
+            if attempt.status == RunAttemptStatus.GRANTED:
+                await self.expire_grant(claim, occurred_at=occurred_at)
+                expired += 1
+            else:
+                # Local import avoids making terminal transaction definitions
+                # part of the authority module's construction dependency.
+                from kai.workshop.terminal_transactions import WorkshopRunTerminalTransactionCoordinator
+
+                await WorkshopRunTerminalTransactionCoordinator(self).interrupt_expired(
+                    claim,
+                    occurred_at=occurred_at,
+                )
+                interrupted += 1
+        return RunRecoveryResult(expired_before_dispatch=expired, interrupted_after_dispatch=interrupted)
 
     async def _settle(
         self,

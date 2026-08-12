@@ -34,6 +34,14 @@ class PreparedWorkshopExecution:
         async for event in self._runtime.stream(prompt):
             yield event
 
+    def validate_current(self) -> None:
+        """Verify the exact runtime immediately before the started boundary."""
+        self._runtime.validate_current()
+
+    async def cancel(self) -> None:
+        """Stop only this prepared compatibility runtime."""
+        await self._runtime.cancel()
+
 
 class WorkshopProtectedExecutionPreparationService:
     """Resolve canonical run authority into one protected compatibility runtime."""
