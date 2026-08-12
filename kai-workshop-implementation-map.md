@@ -406,7 +406,7 @@ No entry may use an indefinite condition such as "keep for compatibility." A gen
 | Telegram `chat_id` used as internal identity, namespace, and routing key | Durable principal, channel, agent, and binding IDs | Private chats, notification-only groups, duplicate updates, and restart routing all resolve correctly through bindings | Confine Telegram IDs to external identity, transport binding, and idempotency records; remove chat-shaped domain keys | Planned |
 | `SubprocessPool` keyed by Telegram chat ID | Durable channel/agent session plus run and attempt orchestration | All five harnesses pass continuity, restart, cancellation, and isolation tests through durable identities | Remove chat-key compatibility lookup and move lifecycle ownership behind the orchestrator/runtime contract | Planned |
 | Direct backend invocation from Telegram handlers | Transport-neutral command and run services | Telegram and the first Workshop client produce equivalent authorized runs and visible results | Remove handler-owned orchestration; leave authentication, parsing, and rendering in the Telegram adapter | Planned |
-| Direct Telegram delivery from handlers, schedules, and webhooks | Durable delivery outbox and Telegram delivery adapter | Delivery outcome events preserve binding identity; retry, crash recovery, ordering, private-chat and notification-group delivery tests pass; live delivery is verified | Register the outbox worker only in an explicit cutover; remove direct Bot API sends from domain paths and delete delivery fallback flags after installed verification | Active (production-unused durable request/lease/attempt/retry/recovery, fragment progress, binding-aware terminal outcome facts, per-binding FIFO claims, atomic canonical assistant-result plus delivery-request transaction, canonical outbound-only notification channels, and unregistered Telegram adapter/worker; installed direct-chat recovery and notification-group delivery passed, but startup registration and authority change remain absent) |
+| Direct Telegram delivery from handlers, schedules, and webhooks | Durable delivery outbox and Telegram delivery adapter | Delivery outcome events preserve binding identity; retry, crash recovery, ordering, private-chat and notification-group delivery tests pass; live delivery is verified | Register the outbox worker only in an explicit cutover; remove direct Bot API sends from domain paths and delete delivery fallback flags after installed verification | Active (production-unused durable request/lease/attempt/retry/recovery, fragment progress, binding-aware terminal outcome facts, per-binding FIFO claims, atomic canonical assistant-result plus delivery-request transaction, canonical outbound-only notification channels, Telegram adapter/worker, and explicit runtime owner; installed direct-chat recovery and notification-group delivery passed, while production cutover is held on durable streaming finalization, work classification, and lifecycle integration) |
 | Operator-invoked Workshop delivery qualification CLI | Installed evidence followed by the production delivery worker | A configured direct-chat reply is prepared without sending, survives a service restart, recovers an intentionally abandoned lease, reaches Telegram once through the exact selected delivery, and records a terminal binding-aware outcome; a configured notification group resolves through its outbound-only canonical channel, receives one atomically prepared qualification message through the exact selected delivery, and does not become an inbound conversation | Remove the qualification command and its explicit-claim-only surface after the production worker has equivalent installed restart/recovery evidence and direct delivery is retired | Active (the installed direct-chat recovery and notification-group delivery gates passed on 2026-08-12; retain until equivalent production-worker evidence exists, while the command remains unregistered and incapable of draining unrelated work) |
 | Schedule firing directly into the pool or Telegram | Durable Workshop run creation | Scheduled definitions and executions survive restart and expose run/attempt state without duplicate work | Remove schedule-specific execution path; retain schedules only as authenticated run triggers | Planned |
 | GitHub and generic webhook paths that route directly to Telegram or the pool | Canonical integration commands/events plus delivery/run services | Existing GitHub group notifications, generic callers, deduplication, and secret separation pass end-to-end tests | Remove direct routing while retaining verified webhook adapters and supported external contracts | Planned |
@@ -593,3 +593,61 @@ Automated contracts cover clean startup, recovery-before-ready ordering, duplica
 ### 20.2 Next bounded review
 
 Conduct a focused cutover review for one normal direct-chat text-reply path. The review must define how Kai's application lifecycle will supervise the owner and how one reply path will switch atomically from canonical result creation to durable delivery without double-sending. GitHub notification routing, schedules, files, and voice remain separate later cutovers.
+
+## 21. Fourth canonical conversation authority review
+
+**Review date:** 2026-08-12
+
+**Scope:** Whether the explicit Telegram delivery runtime owner is sufficient to cut one normal direct-chat plain-text reply path over to canonical atomic enqueue and the Workshop outbox.
+
+**Decision:** **Hold the production cutover while implementing one production-unused streaming-finalization boundary.** The lifecycle owner clears the previous task-ownership blocker, but starting it or replacing the current final send now could duplicate a normal reply or deliver stale qualification work. The next work is a bounded delivery-adapter foundation, not a broad handler or lifecycle refactor.
+
+The normal reply path is not a single final `send_message` call. `_handle_response` may create a Telegram message from a stable streaming prefix, edit it repeatedly, and then either edit that same message to the final text or send chunked continuation messages. In some exchanges the last streaming edit already equals the terminal agent response, so the current final branch deliberately performs no further Bot API call. The existing Workshop worker can only send new final-text fragments. Enqueuing the same final response without accounting for that live message would therefore produce a second Telegram copy.
+
+| Gate | Evidence | Result |
+|---|---|---|
+| Atomic canonical reply and delivery request | `record_outbound_message_with_delivery` resolves the canonical inbound message and Telegram binding, commits the assistant message and pending delivery together, and has rollback, idempotency, restart, and concurrency coverage. | Pass, production-unused |
+| Delivery worker lifecycle owner | The owner recovers leases before readiness, owns one task, exposes unexpected termination, and cooperatively awaits active work without cancellation. Focused and full-suite tests pass. | Pass in automated tests; intentionally not installed-active |
+| Plain-text route isolation | `handle_message` is a distinct authenticated ingress, but `_handle_response` is also shared by photo, document, and voice paths and contains text, voice-only, and text-plus-voice delivery modes. | Partial; cutover eligibility must be an explicit typed input from the caller, never inferred from prompt shape or backend behavior |
+| Streaming finalization | A live Telegram message may already contain all or part of the final answer before canonical enqueue. The current outbox has no durable edit target or edit-fragment operation. | Blocker; a send-only worker would duplicate or abandon the live response |
+| Historical-work isolation | The worker currently claims every eligible Telegram text delivery. Existing qualification rows are intentionally production-unused but are not classified separately from future conversation replies. | Blocker; first production startup must not drain historical qualification work |
+| Database ownership | Canonical handler writes use Kai's initialized SQLite connection under the Workshop event lock. A continuously polling worker on that same connection could interleave transaction boundaries with handler work. | Blocker; the runtime needs its own opened Workshop store/connection and must close it after the worker stops |
+| Main-loop supervision and shutdown order | `main.py` currently blocks on an unrelated never-set event. The runtime's `wait()` can instead expose worker death to the existing fatal top-level error path. | Design ready, not wired; start must finish before updates are accepted, and shutdown must stop the worker before closing its store or Telegram client |
+| JSONL compatibility | JSONL remains the transcript/context authority and is written before current final delivery. Canonical-to-JSONL parity remains observable. | Preserve for this delivery cutover; transcript authority is a separate later review |
+| Rollback and old work | Disabling a worker while committed conversation deliveries remain non-terminal could cause a later reactivation to send an old reply. | Blocker; activation and rollback require explicit work classification and reconciliation diagnostics |
+
+### 21.1 Authority consequences
+
+- The runtime owner remains unstarted and direct Telegram delivery remains authoritative.
+- Installing the runtime-owner code does not exercise or qualify production lifecycle wiring.
+- Normal reply streaming, commands, media, voice, schedules, GitHub and generic webhooks, files, and notification-group routing remain unchanged.
+- A handler must never both enqueue an authoritative final reply and invoke the legacy final-send branch.
+- Worker failure after activation must make Kai unhealthy and trigger the existing process supervisor; it must not leave a loaded service silently unable to deliver.
+- Existing qualification work must not become eligible merely because the production worker starts.
+
+### 21.2 Next bounded implementation milestone
+
+Add a production-unused durable Telegram streaming-finalization contract. It should:
+
+1. classify delivery work by durable purpose so a future production worker can claim normal conversation replies without draining direct-chat or notification-group qualification rows;
+2. bind a confirmed streaming-preview Telegram message ID to the canonical direct channel and inbound message without accepting a chat destination from the caller;
+3. let atomic assistant-result enqueue resolve that preview internally and create an immutable fragment plan whose first operation edits the preview and whose remaining operations send continuation fragments, or whose operations all send when no preview exists;
+4. keep streaming previews explicitly non-final so the authoritative finalization always has a distinct operation, including when the backend's last streaming snapshot equals its terminal response;
+5. classify edit failures and external-effect ambiguity as rigorously as send failures, retaining fail-closed reconciliation rather than automatic duplicate delivery;
+6. remain uncalled by production handlers and leave the runtime unregistered.
+
+Tests must cover a short streamed reply, a streamed reply whose final snapshot was already published, a long fragmented reply, a response with no preview, a deleted or uneditable preview, restart after confirmed fragment progress, send/edit ambiguity, qualification-work exclusion, and binding isolation.
+
+### 21.3 Later cutover contract
+
+Only after the production-unused finalization contract passes another review should one cutover PR:
+
+- select Workshop delivery explicitly in `handle_message` only for an authenticated plain-text direct message with a confirmed canonical inbound ID and voice mode off;
+- retain the legacy path for commands, photo, document, voice, text-plus-voice, voice-only, and any ingress that could not be canonically accepted;
+- expose a locked `sessions` adapter for atomic reply-plus-delivery creation instead of giving the handler a raw store;
+- construct the worker on a dedicated Workshop store connection, finish recovery before accepting Telegram updates, supervise `runtime.wait()` as the service lifetime, and stop the runtime before closing that store or the Telegram application;
+- skip the legacy final send only after authoritative enqueue succeeds, and fail closed with a bounded user-visible operational error when commit outcome is uncertain;
+- report classified pending, leased, retrying, failed, and uncertain conversation work through non-secret installed diagnostics;
+- document rollback as: stop the worker, reconcile all non-terminal conversation deliveries, restore the legacy route, and prove no old delivery can replay on later activation.
+
+Installed qualification must then demonstrate one streamed short reply finalized in place with no second copy, one fragmented long reply in order, a restart between enqueue and delivery, cooperative shutdown during active work, fatal recovery from an injected worker fault, clean canonical/JSONL parity, and unchanged media, voice, GitHub notification-group, schedule, file, and command behavior.
