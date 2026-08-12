@@ -1643,3 +1643,40 @@ settles the fenced attempt/run together with the canonical result or bounded
 failure outcome, exact-epoch delivery request, and immutable delivery plan.
 Do not wire Telegram or register recovery until that coordinator and its
 commit-uncertain tests pass.
+
+## 32. Atomic terminal transaction coordinator
+
+**Implementation date:** 2026-08-12
+
+The production-unused terminal coordinator now commits one canonical visible
+outcome, its exact active-epoch delivery request, immutable edit/send plan,
+fenced attempt terminal fact, and run terminal fact in one `BEGIN IMMEDIATE`
+transaction. Successful completion records the canonical result `MessageId`.
+Failure accepts only typed backend-neutral codes and selects fixed bounded text
+internally; confirmed cancellation resolves its durable human-requested code
+and fixed visible text internally. Native backend errors cannot enter these
+facts.
+
+The existing outbound finalizer and execution authority now expose guarded
+transaction-local primitives while their public behavior remains unchanged.
+Exact retries require the message, delivery, plan, attempt, and run transition
+to share one prior state. A stale fence, plan failure, partial prior state, or
+losing terminal outcome rolls back without settling the run. If SQLite loses a
+commit result, the coordinator repeats the whole deterministic transaction;
+one unresolved retry becomes an explicit commit-uncertain error and never a
+direct-send or backend-replay instruction.
+
+Tests pin successful, failed, and cancelled settlement; exact replay; event
+ordering; stale-fence and injected-plan rollback; partial-state rejection;
+single-terminal arbitration; commit-result recovery; unresolved commit
+uncertainty; and absence from production construction. No worker, Telegram
+handler, recovery path, backend dispatch, schema migration, or installed
+behavior changed.
+
+### 32.1 Next bounded milestone
+
+Add production-unused canonical lane coordination around preparation, attempt
+grant, the conservative `started` boundary, and exact-runtime dispatch. Then
+integrate durable cancellation and interrupted-execution recovery with that
+lane. The lane identity must be canonical `(channel_id, agent_id)` and must not
+expose a Telegram chat ID as execution authority.

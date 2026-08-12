@@ -232,6 +232,11 @@ class WorkshopRunExecutionAuthority:
         self._selection_resolver = selection_resolver
         self._registered_backend_ids = registered_backend_ids
 
+    @property
+    def event_store(self) -> WorkshopEventStore:
+        """Return the store used by transaction coordinators in this package."""
+        return self._store
+
     async def attempt(self, attempt_id: RunAttemptId) -> RunAttempt:
         if not isinstance(attempt_id, RunAttemptId):
             raise ValueError("attempt_id must be a RunAttemptId")
@@ -461,6 +466,26 @@ class WorkshopRunExecutionAuthority:
             result_message_id=result_message_id,
         )
 
+    async def complete_in_transaction(
+        self,
+        claim: RunExecutionClaim,
+        *,
+        result_message_id: MessageId,
+        occurred_at: datetime,
+    ) -> RunExecutionResult:
+        """Complete a claim inside a caller-owned terminal transaction."""
+        if not isinstance(result_message_id, MessageId):
+            raise ValueError("result_message_id must be a MessageId")
+        return await self._settle_in_transaction(
+            claim,
+            operation="completed",
+            attempt_type=WorkshopEventType.RUN_ATTEMPT_COMPLETED,
+            run_type=WorkshopEventType.RUN_COMPLETED,
+            occurred_at=occurred_at,
+            terminal_code=None,
+            result_message_id=result_message_id,
+        )
+
     async def fail(
         self,
         claim: RunExecutionClaim,
@@ -477,22 +502,52 @@ class WorkshopRunExecutionAuthority:
             terminal_code=_require_code(failure_code, field_name="failure_code"),
         )
 
+    async def fail_in_transaction(
+        self,
+        claim: RunExecutionClaim,
+        *,
+        failure_code: str,
+        occurred_at: datetime,
+    ) -> RunExecutionResult:
+        """Fail a claim inside a caller-owned terminal transaction."""
+        return await self._settle_in_transaction(
+            claim,
+            operation="failed",
+            attempt_type=WorkshopEventType.RUN_ATTEMPT_FAILED,
+            run_type=WorkshopEventType.RUN_FAILED,
+            occurred_at=occurred_at,
+            terminal_code=_require_code(failure_code, field_name="failure_code"),
+        )
+
     async def confirm_cancellation(
         self,
         claim: RunExecutionClaim,
         *,
         occurred_at: datetime,
     ) -> RunExecutionResult:
-        run = await self._require_run(claim.run_id)
-        if run.cancellation_code is None:
-            raise RunExecutionConflictError("Run has no durable cancellation request")
         return await self._settle(
             claim,
             operation="cancelled",
             attempt_type=WorkshopEventType.RUN_ATTEMPT_CANCELLED,
             run_type=WorkshopEventType.RUN_CANCELLED,
             occurred_at=occurred_at,
-            terminal_code=run.cancellation_code,
+            terminal_code=None,
+        )
+
+    async def confirm_cancellation_in_transaction(
+        self,
+        claim: RunExecutionClaim,
+        *,
+        occurred_at: datetime,
+    ) -> RunExecutionResult:
+        """Confirm cancellation inside a caller-owned terminal transaction."""
+        return await self._settle_in_transaction(
+            claim,
+            operation="cancelled",
+            attempt_type=WorkshopEventType.RUN_ATTEMPT_CANCELLED,
+            run_type=WorkshopEventType.RUN_CANCELLED,
+            occurred_at=occurred_at,
+            terminal_code=None,
         )
 
     async def recover_expired(self, *, occurred_at: datetime) -> RunRecoveryResult:
@@ -571,110 +626,138 @@ class WorkshopRunExecutionAuthority:
         connection = self._store.connection
         try:
             await connection.execute("BEGIN IMMEDIATE")
-            projection = CanonicalConversationProjection()
-            await self._store.project_pending_in_transaction(projection)
-            run, attempt = await self._current_claim(claim)
-            attempt_key = _attempt_key(claim.attempt_id, operation)
-            prior_attempt = await self._store.event_by_idempotency_key(attempt_key)
-            run_key = _run_key(claim.run_id, operation)
-            prior_run = await self._store.event_by_idempotency_key(run_key)
-            actor = await _agent_principal(self._store, run)
-            if prior_attempt is not None or prior_run is not None:
-                if prior_attempt is None or prior_run is None:
-                    raise RunExecutionConflictError("Atomic run transition is missing one of its events")
-                expected_attempt_payload = _attempt_payload(claim)
-                if terminal_code is not None:
-                    expected_attempt_payload["terminal_code"] = terminal_code
-                expected_run_payload: dict[str, object] = {"attempt_id": claim.attempt_id}
-                if run_type == WorkshopEventType.RUN_COMPLETED:
-                    expected_run_payload["result_message_id"] = result_message_id
-                elif run_type == WorkshopEventType.RUN_FAILED:
-                    expected_run_payload["failure_code"] = terminal_code
-                elif run_type == WorkshopEventType.RUN_CANCELLED:
-                    expected_run_payload["cancellation_code"] = terminal_code
-                if (
-                    prior_attempt.envelope.event_type != attempt_type
-                    or prior_attempt.envelope.aggregate_id != claim.attempt_id
-                    or prior_attempt.envelope.actor_principal_id != actor
-                    or prior_attempt.envelope.payload != expected_attempt_payload
-                    or prior_run.envelope.event_type != run_type
-                    or prior_run.envelope.aggregate_id != claim.run_id
-                    or prior_run.envelope.actor_principal_id != actor
-                    or prior_run.envelope.payload != expected_run_payload
-                ):
-                    raise RunExecutionConflictError("Run transition retry has conflicting facts")
-                await connection.commit()
-                return RunExecutionResult(
-                    run=run,
-                    attempt=attempt,
-                    events=(prior_attempt, prior_run),
-                    changed=False,
-                )
-            if attempt.lease_version != claim.lease_version:
-                raise StaleRunExecutionAuthorityError("Execution claim has a stale lease version")
-            allowed_statuses = (
-                {RunAttemptStatus.GRANTED}
-                if operation == "started"
-                else {RunAttemptStatus.GRANTED, RunAttemptStatus.STARTED}
-                if operation == "cancelled"
-                else {RunAttemptStatus.STARTED}
+            result = await self._settle_in_transaction(
+                claim,
+                operation=operation,
+                attempt_type=attempt_type,
+                run_type=run_type,
+                occurred_at=occurred_at,
+                terminal_code=terminal_code,
+                result_message_id=result_message_id,
             )
-            if attempt.status not in allowed_statuses or occurred_at >= attempt.lease_expires_at:
-                raise StaleRunExecutionAuthorityError("Execution claim no longer holds active authority")
-            if operation == "started" and run.cancellation_requested_at is not None:
-                raise RunExecutionConflictError("Execution cannot start after cancellation was requested")
-            if operation == "started":
-                attempt_event = self._attempt_transition_envelope(
-                    run,
-                    claim,
-                    actor=actor,
-                    event_type=attempt_type,
-                    operation=operation,
-                    occurred_at=occurred_at,
-                )
-                run_event = self._run_transition_envelope(
-                    run,
-                    claim,
-                    actor=actor,
-                    event_type=run_type,
-                    operation=operation,
-                    occurred_at=occurred_at,
-                )
-            else:
-                attempt_event = self._attempt_terminal_envelope(
-                    run,
-                    claim,
-                    actor=actor,
-                    event_type=attempt_type,
-                    operation=operation,
-                    terminal_code=terminal_code,
-                    occurred_at=occurred_at,
-                )
-                run_event = self._run_terminal_envelope(
-                    run,
-                    claim,
-                    actor=actor,
-                    event_type=run_type,
-                    operation=operation,
-                    terminal_code=terminal_code,
-                    result_message_id=result_message_id,
-                    occurred_at=occurred_at,
-                )
-            first = await self._store.append_in_transaction(attempt_event)
-            second = await self._store.append_in_transaction(run_event)
-            await self._store.project_pending_in_transaction(projection)
-            updated_run = await self._require_run(claim.run_id)
-            updated_attempt = await self._require_attempt(claim.attempt_id)
             await connection.commit()
-            return RunExecutionResult(
-                run=updated_run,
-                attempt=updated_attempt,
-                events=(first.event, second.event),
-                changed=True,
-            )
+            return result
         except Exception:
             await connection.rollback()
             raise
+
+    async def _settle_in_transaction(
+        self,
+        claim: RunExecutionClaim,
+        *,
+        operation: str,
+        attempt_type: WorkshopEventType,
+        run_type: WorkshopEventType,
+        occurred_at: datetime,
+        terminal_code: str | None,
+        result_message_id: MessageId | None = None,
+    ) -> RunExecutionResult:
+        if not self._store.connection.in_transaction:
+            raise RuntimeError("run settlement in transaction requires an active transaction")
+        occurred_at = _timestamp(occurred_at, field_name="occurred_at")
+        projection = CanonicalConversationProjection()
+        await self._store.project_pending_in_transaction(projection)
+        run, attempt = await self._current_claim(claim)
+        if operation == "cancelled":
+            if run.cancellation_code is None:
+                raise RunExecutionConflictError("Run has no durable cancellation request")
+            terminal_code = run.cancellation_code
+        attempt_key = _attempt_key(claim.attempt_id, operation)
+        prior_attempt = await self._store.event_by_idempotency_key(attempt_key)
+        run_key = _run_key(claim.run_id, operation)
+        prior_run = await self._store.event_by_idempotency_key(run_key)
+        actor = await _agent_principal(self._store, run)
+        if prior_attempt is not None or prior_run is not None:
+            if prior_attempt is None or prior_run is None:
+                raise RunExecutionConflictError("Atomic run transition is missing one of its events")
+            expected_attempt_payload = _attempt_payload(claim)
+            if terminal_code is not None:
+                expected_attempt_payload["terminal_code"] = terminal_code
+            expected_run_payload: dict[str, object] = {"attempt_id": claim.attempt_id}
+            if run_type == WorkshopEventType.RUN_COMPLETED:
+                expected_run_payload["result_message_id"] = result_message_id
+            elif run_type == WorkshopEventType.RUN_FAILED:
+                expected_run_payload["failure_code"] = terminal_code
+            elif run_type == WorkshopEventType.RUN_CANCELLED:
+                expected_run_payload["cancellation_code"] = terminal_code
+            if (
+                prior_attempt.envelope.event_type != attempt_type
+                or prior_attempt.envelope.aggregate_id != claim.attempt_id
+                or prior_attempt.envelope.actor_principal_id != actor
+                or prior_attempt.envelope.payload != expected_attempt_payload
+                or prior_run.envelope.event_type != run_type
+                or prior_run.envelope.aggregate_id != claim.run_id
+                or prior_run.envelope.actor_principal_id != actor
+                or prior_run.envelope.payload != expected_run_payload
+            ):
+                raise RunExecutionConflictError("Run transition retry has conflicting facts")
+            return RunExecutionResult(
+                run=run,
+                attempt=attempt,
+                events=(prior_attempt, prior_run),
+                changed=False,
+            )
+        if attempt.lease_version != claim.lease_version:
+            raise StaleRunExecutionAuthorityError("Execution claim has a stale lease version")
+        allowed_statuses = (
+            {RunAttemptStatus.GRANTED}
+            if operation == "started"
+            else {RunAttemptStatus.GRANTED, RunAttemptStatus.STARTED}
+            if operation == "cancelled"
+            else {RunAttemptStatus.STARTED}
+        )
+        if attempt.status not in allowed_statuses or occurred_at >= attempt.lease_expires_at:
+            raise StaleRunExecutionAuthorityError("Execution claim no longer holds active authority")
+        if operation == "started" and run.cancellation_requested_at is not None:
+            raise RunExecutionConflictError("Execution cannot start after cancellation was requested")
+        if operation == "started":
+            attempt_event = self._attempt_transition_envelope(
+                run,
+                claim,
+                actor=actor,
+                event_type=attempt_type,
+                operation=operation,
+                occurred_at=occurred_at,
+            )
+            run_event = self._run_transition_envelope(
+                run,
+                claim,
+                actor=actor,
+                event_type=run_type,
+                operation=operation,
+                occurred_at=occurred_at,
+            )
+        else:
+            attempt_event = self._attempt_terminal_envelope(
+                run,
+                claim,
+                actor=actor,
+                event_type=attempt_type,
+                operation=operation,
+                terminal_code=terminal_code,
+                occurred_at=occurred_at,
+            )
+            run_event = self._run_terminal_envelope(
+                run,
+                claim,
+                actor=actor,
+                event_type=run_type,
+                operation=operation,
+                terminal_code=terminal_code,
+                result_message_id=result_message_id,
+                occurred_at=occurred_at,
+            )
+        first = await self._store.append_in_transaction(attempt_event)
+        second = await self._store.append_in_transaction(run_event)
+        await self._store.project_pending_in_transaction(projection)
+        updated_run = await self._require_run(claim.run_id)
+        updated_attempt = await self._require_attempt(claim.attempt_id)
+        return RunExecutionResult(
+            run=updated_run,
+            attempt=updated_attempt,
+            events=(first.event, second.event),
+            changed=True,
+        )
 
     async def _current_claim(self, claim: RunExecutionClaim) -> tuple[DurableRun, RunAttempt]:
         if not isinstance(claim, RunExecutionClaim):
