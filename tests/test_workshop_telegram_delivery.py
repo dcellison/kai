@@ -324,6 +324,23 @@ class TestWorkshopTelegramDeliveryAdapter:
 
 
 class TestWorkshopTelegramDeliveryWorker:
+    async def test_explicit_delivery_does_not_drain_other_binding(self, tmp_path: Path):
+        store, message_id, private_binding = await _open_with_outbound(tmp_path / "kai.db")
+        group_binding = await _add_group_binding(store, message_id)
+        private_delivery = await _request(store, message_id, private_binding)
+        group_delivery = await _request(store, message_id, group_binding)
+        bot = _successful_bot()
+        worker = _worker(store, bot)
+        try:
+            result = await worker.run_delivery(group_delivery)
+
+            assert result.outcome == TelegramWorkOutcome.SUCCEEDED
+            assert result.delivery_id == group_delivery
+            assert bot.send_message.await_args.kwargs["chat_id"] == -1001234567890
+            assert (await WorkshopDeliveryOutbox(store).state(private_delivery)).status == "pending"
+        finally:
+            await store.close()
+
     async def test_successfully_delivers_and_completes_private_chat_work(self, tmp_path: Path):
         store, message_id, binding_id = await _open_with_outbound(tmp_path / "kai.db")
         delivery_id = await _request(store, message_id, binding_id)

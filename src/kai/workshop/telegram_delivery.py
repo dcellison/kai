@@ -238,6 +238,22 @@ class WorkshopTelegramDeliveryWorker:
             transport="telegram",
             modes=("text",),
         )
+        return await self._run_claim(claim)
+
+    async def run_delivery(self, delivery_id: DeliveryId) -> TelegramWorkResult:
+        """Run only one explicitly selected delivery without draining the outbox."""
+        if not isinstance(delivery_id, DeliveryId):
+            raise ValueError("delivery_id must be a DeliveryId")
+        claim = await self._outbox.claim_next(
+            self._worker_id,
+            lease_duration=self._lease_duration,
+            transport="telegram",
+            modes=("text",),
+            delivery_id=delivery_id,
+        )
+        return await self._run_claim(claim)
+
+    async def _run_claim(self, claim: DeliveryClaim | None) -> TelegramWorkResult:
         if claim is None:
             return TelegramWorkResult(outcome=TelegramWorkOutcome.IDLE)
 

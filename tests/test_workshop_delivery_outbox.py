@@ -577,6 +577,75 @@ class TestDeliveryOrdering:
 
 
 class TestDeliveryClaims:
+    async def test_exact_claim_never_drains_other_due_work(self, tmp_path: Path):
+        store, message_id, private_binding = await _open_with_outbound(tmp_path / "kai.db")
+        group_binding = await _add_group_binding(store, message_id)
+        private = await WorkshopDeliveryOutbox(store).request_delivery(_request(message_id, private_binding))
+        group = await WorkshopDeliveryOutbox(store).request_delivery(_request(message_id, group_binding))
+        try:
+            claim = await WorkshopDeliveryOutbox(store).claim_next(
+                "qualification-worker",
+                delivery_id=group.delivery.delivery_id,
+                transport="telegram",
+                modes=("text",),
+            )
+
+            assert claim is not None
+            assert claim.delivery_id == group.delivery.delivery_id
+            assert (await WorkshopDeliveryOutbox(store).state(private.delivery.delivery_id)).status == "pending"
+        finally:
+            await store.close()
+
+    async def test_exact_claim_recovers_only_selected_expired_lease(self, tmp_path: Path):
+        store, message_id, private_binding = await _open_with_outbound(tmp_path / "kai.db")
+        group_binding = await _add_group_binding(store, message_id)
+        clock = _Clock()
+        outbox = WorkshopDeliveryOutbox(store, clock=clock)
+        private = await outbox.request_delivery(_request(message_id, private_binding))
+        group = await outbox.request_delivery(_request(message_id, group_binding))
+        try:
+            private_claim = await outbox.claim_next(
+                "private-worker",
+                delivery_id=private.delivery.delivery_id,
+                lease_duration=timedelta(seconds=5),
+            )
+            group_claim = await outbox.claim_next(
+                "group-worker",
+                delivery_id=group.delivery.delivery_id,
+                lease_duration=timedelta(seconds=5),
+            )
+            assert private_claim is not None
+            assert group_claim is not None
+            clock.advance(timedelta(seconds=5))
+
+            recovered_group = await outbox.claim_next(
+                "qualification-worker",
+                delivery_id=group.delivery.delivery_id,
+            )
+
+            assert recovered_group is not None
+            assert recovered_group.attempt_number == 2
+            assert (await outbox.state(private.delivery.delivery_id)).status == "leased"
+        finally:
+            await store.close()
+
+    async def test_exact_claim_respects_same_binding_predecessor(self, tmp_path: Path):
+        store, first_message, binding_id = await _open_with_outbound(tmp_path / "kai.db")
+        second_message = await _add_outbound(store, 1)
+        first = await WorkshopDeliveryOutbox(store).request_delivery(_request(first_message, binding_id))
+        second = await WorkshopDeliveryOutbox(store).request_delivery(_request(second_message, binding_id))
+        try:
+            claim = await WorkshopDeliveryOutbox(store).claim_next(
+                "qualification-worker",
+                delivery_id=second.delivery.delivery_id,
+            )
+
+            assert claim is None
+            assert (await WorkshopDeliveryOutbox(store).state(first.delivery.delivery_id)).status == "pending"
+            assert (await WorkshopDeliveryOutbox(store).state(second.delivery.delivery_id)).status == "pending"
+        finally:
+            await store.close()
+
     async def test_claim_is_exclusive_and_contains_only_registered_delivery_target(self, tmp_path: Path):
         path = tmp_path / "kai.db"
         store, message_id, binding_id = await _open_with_outbound(path)

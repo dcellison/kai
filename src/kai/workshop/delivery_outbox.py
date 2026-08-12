@@ -261,6 +261,7 @@ class WorkshopDeliveryOutbox:
         lease_duration: timedelta = timedelta(seconds=30),
         transport: str | None = None,
         modes: tuple[str, ...] | None = None,
+        delivery_id: DeliveryId | None = None,
     ) -> DeliveryClaim | None:
         _validate_worker_id(worker_id)
         if lease_duration <= timedelta(0) or lease_duration > _MAX_LEASE:
@@ -273,12 +274,14 @@ class WorkshopDeliveryOutbox:
             for mode in modes:
                 if not _IDENTIFIER_PATTERN.fullmatch(mode):
                     raise ValueError("modes must contain lowercase identifiers")
+        if delivery_id is not None and not isinstance(delivery_id, DeliveryId):
+            raise ValueError("delivery_id must be a DeliveryId when supplied")
 
         connection = self._store.connection
         now = self._now()
         try:
             await connection.execute("BEGIN IMMEDIATE")
-            await self._recover_expired_in_transaction(now)
+            await self._recover_expired_in_transaction(now, delivery_id=delivery_id)
             now_text = _format_timestamp(now)
             filters = [
                 "o.status IN ('pending', 'retry_wait')",
@@ -292,6 +295,9 @@ class WorkshopDeliveryOutbox:
                 ")",
             ]
             parameters: list[object] = [now_text]
+            if delivery_id is not None:
+                filters.append("o.id = ?")
+                parameters.append(delivery_id)
             if transport is not None:
                 filters.append("o.transport = ?")
                 parameters.append(transport)
@@ -455,7 +461,7 @@ class WorkshopDeliveryOutbox:
             if row[0] != "leased" or row[3] != claim.attempt_id:
                 raise StaleDeliveryLeaseError("Delivery attempt no longer owns the active lease")
             if row[4] is None or _parse_timestamp(str(row[4])) <= now:
-                await self._recover_expired_in_transaction(now)
+                await self._recover_expired_in_transaction(now, delivery_id=claim.delivery_id)
                 await connection.commit()
                 raise StaleDeliveryLeaseError("Delivery attempt lease has expired")
 
@@ -539,14 +545,22 @@ class WorkshopDeliveryOutbox:
             await connection.rollback()
             raise
 
-    async def _recover_expired_in_transaction(self, now: datetime) -> DeliveryRecoveryResult:
+    async def _recover_expired_in_transaction(
+        self,
+        now: datetime,
+        *,
+        delivery_id: DeliveryId | None = None,
+    ) -> DeliveryRecoveryResult:
         connection = self._store.connection
         now_text = _format_timestamp(now)
+        identity_filter = " AND id = ?" if delivery_id is not None else ""
+        parameters: tuple[object, ...] = (now_text, delivery_id) if delivery_id is not None else (now_text,)
         async with connection.execute(
             "SELECT id, lease_id, attempt_count, max_attempts, workshop_id, channel_id, "
             "channel_binding_id, message_id, transport, mode FROM delivery_outbox "
-            "WHERE status = 'leased' AND lease_expires_at <= ? ORDER BY requested_event_position",
-            (now_text,),
+            f"WHERE status = 'leased' AND lease_expires_at <= ?{identity_filter} "
+            "ORDER BY requested_event_position",
+            parameters,
         ) as cursor:
             rows = await cursor.fetchall()
         requeued = 0

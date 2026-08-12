@@ -20,6 +20,10 @@ elif len(sys.argv) > 1 and sys.argv[1] == "memory":
     from kai.memory_admin import cli as memory_cli
 
     memory_cli(sys.argv[2:])
+elif len(sys.argv) > 1 and sys.argv[1] == "workshop":
+    from kai.workshop_cli import cli as workshop_cli
+
+    workshop_cli(sys.argv[2:])
 else:
     # Default: start the Telegram bot
     from kai.main import main
