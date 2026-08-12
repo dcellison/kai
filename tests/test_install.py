@@ -4718,6 +4718,33 @@ class TestApplyVenv:
         assert not (install / "build").exists()
         assert "Installed package into venv" in output
 
+    def test_normalizes_source_metadata_created_by_pip(self, tmp_path, monkeypatch):
+        """Packaging metadata created after the source copy cannot retain 0700."""
+        install = tmp_path / "opt" / "kai"
+        (install / "venv" / "bin").mkdir(parents=True)
+        (install / "venv" / "bin" / "python").touch(mode=0o755)
+        (install / "pyproject.toml").write_text("[project]\nname = 'kai'\n")
+        src = install / "src" / "kai"
+        src.mkdir(parents=True)
+        (src / "__init__.py").write_text("# init")
+
+        metadata = install / "src" / "kai.egg-info"
+        metadata_file = metadata / "PKG-INFO"
+
+        def fake_run(*args, **kwargs):
+            metadata.mkdir(mode=0o700)
+            metadata_file.write_text("Metadata-Version: 2.4\n")
+            metadata_file.chmod(0o600)
+            return subprocess.CompletedProcess(args=[], returncode=0)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr("kai.install._set_ownership", lambda *a, **kw: None)
+
+        _apply_venv(install, is_update=True, dry_run=False)
+
+        assert stat.S_IMODE(metadata.stat().st_mode) == 0o755
+        assert stat.S_IMODE(metadata_file.stat().st_mode) == 0o644
+
     def test_reinstalls_on_source_change_dry_run(self, tmp_path, monkeypatch, capsys):
         """Dry run compares incoming source even though the copy is skipped."""
         install = tmp_path / "opt" / "kai"

@@ -5925,6 +5925,12 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
     subprocess.run(pip_install_cmd, check=True)
     print("  Installed package into venv")
 
+    # Building from the installed source can create fresh packaging metadata
+    # (for example ``src/kai.egg-info``) after _apply_source normalized that
+    # tree. pip inherits the caller's umask, so normalize the source again
+    # before the service starts.
+    _set_static_install_tree_modes(src_dst)
+
     # Save checksums for future update detection. Both are written after a
     # successful install so that a partial failure (e.g., pip crash mid-install)
     # leaves stale checksums and triggers a retry on the next run.
