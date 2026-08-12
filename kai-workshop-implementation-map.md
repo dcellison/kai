@@ -80,7 +80,8 @@ The outer process is already a control plane in the practical sense: it authenti
 | Accepted inbound Telegram work | `telegram_update_queue` in [`sessions.py`](src/kai/sessions.py) | Telegram update ID | Strong Telegram-specific durability pattern; not yet a general command inbox. |
 | Transcript | Per-user/date JSONL in [`history.py`](src/kai/history.py) | Chat ID + timestamp | No stable message ID, channel ID, thread ID, edit lineage, delivery state, or transactional relation to SQLite. |
 | Harness session metadata | `sessions` table plus live backend instance | Chat ID | The stored session ID is used for statistics and clearing; process/session reconstruction still belongs to the live backend. |
-| Active harness process | `SubprocessPool` in [`pool.py`](src/kai/pool.py) | Chat ID | One implicit agent process per conversation key; no durable agent, run, attempt, lease, or worker identity. |
+| Durable run lifecycle | Workshop event log and replayed `runs` projection | Run ID | Production-unused accepted/started/completed/failed/cancelled facts exist, but live execution does not create them and attempts are not yet modeled. |
+| Active harness process | `SubprocessPool` in [`pool.py`](src/kai/pool.py) | Chat ID | One implicit agent process per conversation key; durable agent and run identities now exist but are not connected to process, attempt, lease, or worker ownership. |
 | User settings | Generic `settings` rows in [`sessions.py`](src/kai/sessions.py) | Namespaced strings containing chat ID | Flexible but not typed, versioned, or attached to transport-independent principals/channels. |
 | Scheduled jobs | `jobs` table and APScheduler registration | Integer job ID + chat ID | Job definitions survive restart, but executions are not durable runs with attempts and event history. |
 | Project workspace selection | Settings, `allowed_workspaces`, `workspace_history`, static configuration | Chat ID + filesystem path | A project workspace is not a first-class durable object and is coupled to the current chat. |
@@ -287,8 +288,13 @@ Identifiers should be opaque, globally unique strings. Telegram numeric identifi
 - `delivery.requested`
 - `delivery.succeeded`
 - `delivery.failed`
+- `run.accepted`
+- `run.started`
+- `run.completed`
+- `run.failed`
+- `run.cancelled`
 
-The delivery foundation now adds only the request and outcome facts the system can define consistently; mutable leases and attempts remain operational outbox state rather than replayed collaboration events. Run event families should be designed before execution becomes authoritative. The schema should not invent detailed tool or backend-worker events that the current harnesses cannot yet emit consistently.
+The delivery foundation adds only the request and outcome facts the system can define consistently; mutable leases and attempts remain operational outbox state rather than replayed collaboration events. The initial run family likewise records only backend-neutral lifecycle facts. The schema must not invent detailed tool or backend-worker events that the current harnesses cannot yet emit consistently.
 
 ### 11.3 Small PR sequence
 
@@ -405,7 +411,7 @@ No entry may use an indefinite condition such as "keep for compatibility." A gen
 | JSONL transcript writes and reads | Canonical message projection, with an explicit export facility if still useful | Canonical reads serve complete context and transcript views; migration/parity diagnostics report no unexplained divergence | Stop JSONL writes; remove production reads and dual-write recovery code; retain only a documented importer/exporter if required | Planned |
 | Telegram `chat_id` used as internal identity, namespace, and routing key | Durable principal, channel, agent, and binding IDs | Private chats, notification-only groups, duplicate updates, and restart routing all resolve correctly through bindings | Confine Telegram IDs to external identity, transport binding, and idempotency records; remove chat-shaped domain keys | Active (authoritative private text now enters execution by canonical message ID, but the compatibility resolver still derives the current pool key from the human principal's protected Telegram identity; settings, locks, history, files, memory, and excluded routes remain chat-keyed) |
 | `SubprocessPool` keyed by Telegram chat ID | Durable channel/agent session plus run and attempt orchestration | All five harnesses pass continuity, restart, cancellation, and isolation tests through durable identities | Remove chat-key compatibility lookup and move lifecycle ownership behind the orchestrator/runtime contract | Active (a canonical conversation-run service hides the private-text pool lookup behind a temporary compatibility resolution; the pool and all five harness processes remain keyed by that resolved integer) |
-| Direct backend invocation from Telegram handlers | Transport-neutral command and run services | Telegram and the first Workshop client produce equivalent authorized runs and visible results | Remove handler-owned orchestration; leave authentication, parsing, and rendering in the Telegram adapter | Active (authoritative private text invokes through the canonical conversation-run service using only its inbound `MessageId`; media, voice-enabled text, commands, schedules, integrations, and the future Workshop client are not yet migrated, and durable run/attempt state does not yet exist) |
+| Direct backend invocation from Telegram handlers | Transport-neutral command and run services | Telegram and the first Workshop client produce equivalent authorized runs and visible results | Remove handler-owned orchestration; leave authentication, parsing, and rendering in the Telegram adapter | Active (authoritative private text invokes through the canonical conversation-run service using only its inbound `MessageId`; a transport-neutral durable run lifecycle now exists production-unused, but live execution does not yet record it; media, voice-enabled text, commands, schedules, integrations, and the future Workshop client remain unmigrated, and attempts do not yet exist) |
 | Direct Telegram delivery from handlers, schedules, and webhooks | Durable delivery outbox and Telegram delivery adapter | Delivery outcome events preserve binding identity; retry, crash recovery, ordering, private-chat and notification-group delivery tests pass; live delivery is verified | Migrate each remaining transport path separately; the private-text direct fallback is retired | Active (authenticated private-chat text with voice mode off uses atomic streaming finalization and a supervised exact-epoch worker and now fails closed rather than demoting to direct/shadow delivery; commands, media, voice, schedules, webhooks, files, and groups retain existing delivery) |
 | Operator-invoked Workshop delivery qualification CLI | Installed evidence followed by the production delivery worker | A configured direct-chat reply is prepared without sending, survives a service restart, recovers an intentionally abandoned lease, reaches Telegram once through the exact selected delivery, and records a terminal binding-aware outcome; a configured notification group resolves through its outbound-only canonical channel, receives one atomically prepared qualification message through the exact selected delivery, and does not become an inbound conversation | Remove the qualification command and its explicit-claim-only surface after the production worker has equivalent installed restart/recovery evidence and direct delivery is retired | Active (the installed direct-chat recovery and notification-group delivery gates passed on 2026-08-12; retain until equivalent production-worker evidence exists, while the command remains unregistered and incapable of draining unrelated work) |
 | Conversation-delivery authority epochs | A single durable delivery authority after direct-send rollback is retired | Activation/deactivation, restart, historical-row isolation, exact-epoch worker ownership, aggregate diagnostics, and installed rollback/reactivation evidence pass; no supported rollback crosses the direct-send/outbox boundary | Remove epoch stamping, activation/deactivation state, exact-epoch claim filters, transitional readiness output, schema columns/tables where safely migratable, and their compatibility tests | Active (production startup resumes or creates the exact epoch before ingress; installed private-text streaming, all-send, fragmentation, restart/no-replay, aggregate authority, and parity checks passed on 2026-08-12) |
@@ -1036,8 +1042,9 @@ The boundary is intentionally narrow:
   channels retain their current execution paths;
 - process locks, settings, JSONL history, memory, and the live harness pool
   remain keyed by their existing compatibility identity;
-- no durable `run`, `attempt`, lease, cancellation, or normalized lifecycle
-  events are created by this service yet;
+- the production conversation service does not yet create the durable run
+  lifecycle facts defined in section 26, and attempts and execution leases do
+  not yet exist;
 - no Workshop desktop/web endpoint is registered by this change.
 
 Automated contracts require one canonical human channel member, exactly one
@@ -1045,9 +1052,59 @@ attached agent, exactly one valid compatibility identity, resolver-message
 identity preservation, hidden pool-key delegation, handler invocation by
 canonical message ID, and unchanged private-text delivery authority.
 
-The next bounded milestone is a production-unused durable run lifecycle behind
-this service: accept one authorized canonical message as one run, record stable
-accepted/started/completed/failed/cancelled facts without harness-specific
-payloads, and prove deterministic replay. It must not move process ownership,
-register a Workshop client endpoint, or change Telegram delivery in the same
-step.
+Section 26 records the completed production-unused durable run lifecycle that
+now sits behind this boundary.
+
+## 26. Production-unused durable run lifecycle
+
+**Implementation date:** 2026-08-12
+
+Schema version 15 adds a canonical `RunId`, a replayed `runs` projection, and
+five version-1 lifecycle facts: `run.accepted`, `run.started`, `run.completed`,
+`run.failed`, and `run.cancelled`. One human-authored inbound `MessageId`
+deterministically identifies at most one run. Acceptance resolves the canonical
+human membership, channel, workshop, and exactly one attached agent without
+requiring a Telegram identity or accepting any caller-selected execution
+identity.
+
+The lifecycle state machine is deliberately small:
+
+```text
+accepted --> started --> completed
+    |           |  +--> failed
+    +-----------+-----> cancelled
+```
+
+The requesting human is the recorded actor for acceptance and cancellation.
+The attached agent principal is the recorded actor for start, completion, and
+failure. Terminal failures and cancellations persist only bounded lowercase
+classification codes; provider messages, prompts, output text, credentials,
+transport IDs, executable paths, and harness-specific payloads are excluded.
+Lifecycle timestamps cannot precede their prior canonical fact.
+
+Deterministic event IDs and idempotency keys make acceptance and every
+transition safely repeatable. Retrying an earlier transition after a later
+state returns its original event and current run state. Conflicting terminal
+facts, invalid ordering, unknown runs, ambiguous canonical agent attachment,
+actor mismatch, malformed payloads, and time reversal fail closed. The
+canonical projection rebuilds complete run state from position zero alongside
+the conversation records on which it depends.
+
+This foundation is production-unused:
+
+- `main.py`, `bot.py`, the conversation-run service, and all client APIs do not
+  construct or call `WorkshopRunLifecycle`;
+- it starts no process or worker and owns no lease, attempt, backend session,
+  workspace, credential, or delivery;
+- it does not alter Telegram ingress, streaming, outbox finalization, JSONL,
+  memory, media, commands, schedules, integrations, or any backend driver;
+- upgrading creates an empty `runs` table and advances the canonical projection
+  version; existing conversations replay without synthesizing historical runs.
+
+The next bounded step is an explicit run-authority cutover review. It must
+decide the atomic boundary between inbound acceptance, run acceptance, backend
+start, terminal run state, canonical assistant output, and durable delivery;
+define what restart can truthfully recover when a local harness process is not
+durable; and specify cancellation semantics before the live private-text path
+may emit any run facts. Attempt and worker identity should remain a later slice
+unless that review proves they are required for truthful activation.

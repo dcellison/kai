@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
 
-from kai.workshop.domain import WorkshopEventType
+from kai.workshop.domain import AgentId, ChannelId, MessageId, PrincipalId, RunId, WorkshopEventType, WorkshopId
 from kai.workshop.store import StoredEvent
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _IDENTIFIER_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 _MEDIA_TYPE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$")
+_RUN_TERMINAL_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
 def _required_text(payload: dict[str, Any], key: str) -> str:
@@ -23,6 +25,151 @@ def _required_text(payload: dict[str, Any], key: str) -> str:
     return value
 
 
+def _parse_projection_timestamp(value: object) -> datetime:
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(UTC)
+
+
+def _require_exact_payload(payload: dict[str, Any], keys: set[str]) -> None:
+    if set(payload) != keys:
+        raise ValueError(f"Workshop event payload must contain exactly {sorted(keys)!r}")
+
+
+async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent) -> None:
+    envelope = event.envelope
+    if not isinstance(envelope.aggregate_id, RunId) or envelope.aggregate_type != "run":
+        raise ValueError("Workshop run events require a typed run aggregate")
+
+    occurred_at = envelope.occurred_at.isoformat()
+    payload = envelope.payload
+    if envelope.event_type == WorkshopEventType.RUN_ACCEPTED:
+        _require_exact_payload(
+            payload,
+            {"inbound_message_id", "channel_id", "requested_by_principal_id", "agent_id"},
+        )
+        inbound_message_id = MessageId(_required_text(payload, "inbound_message_id"))
+        channel_id = ChannelId(_required_text(payload, "channel_id"))
+        requested_by = PrincipalId(_required_text(payload, "requested_by_principal_id"))
+        agent_id = AgentId(_required_text(payload, "agent_id"))
+        async with connection.execute(
+            "SELECT c.workshop_id, m.channel_id, m.author_principal_id, ca.agent_id, m.created_at "
+            "FROM messages m "
+            "JOIN principals p ON p.id = m.author_principal_id AND p.kind = 'human' "
+            "JOIN channels c ON c.id = m.channel_id "
+            "JOIN channel_memberships cm ON cm.channel_id = m.channel_id "
+            "AND cm.principal_id = m.author_principal_id "
+            "JOIN channel_agents ca ON ca.channel_id = m.channel_id "
+            "JOIN agents a ON a.id = ca.agent_id AND a.workshop_id = c.workshop_id "
+            "WHERE m.id = ?",
+            (inbound_message_id,),
+        ) as cursor:
+            rows = list(await cursor.fetchall())
+        expected = (envelope.workshop_id, channel_id, requested_by, agent_id)
+        if len(rows) != 1 or tuple(rows[0][:4]) != expected:
+            raise ValueError("Workshop run must match one human message and attached channel agent")
+        inbound_created_at = _parse_projection_timestamp(rows[0][4])
+        if envelope.occurred_at < inbound_created_at:
+            raise ValueError("Workshop run cannot be accepted before its inbound message")
+        if envelope.actor_principal_id != requested_by:
+            raise ValueError("Workshop run acceptance actor must be its requesting human")
+        await connection.execute(
+            "INSERT INTO runs "
+            "(id, workshop_id, channel_id, requested_by_principal_id, agent_id, "
+            "inbound_message_id, status, accepted_at, last_event_position) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'accepted', ?, ?)",
+            (
+                envelope.aggregate_id,
+                envelope.workshop_id,
+                channel_id,
+                requested_by,
+                agent_id,
+                inbound_message_id,
+                occurred_at,
+                event.position,
+            ),
+        )
+        return
+
+    async with connection.execute(
+        "SELECT r.workshop_id, r.status, r.requested_by_principal_id, a.principal_id, "
+        "r.accepted_at, r.started_at "
+        "FROM runs r JOIN agents a ON a.id = r.agent_id WHERE r.id = ?",
+        (envelope.aggregate_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is None or WorkshopId(str(row[0])) != envelope.workshop_id:
+        raise ValueError("Workshop run transition references an unknown run")
+    status = str(row[1])
+    requested_by = PrincipalId(str(row[2]))
+    agent_principal = PrincipalId(str(row[3]))
+    accepted_at = _parse_projection_timestamp(row[4])
+    started_at = None if row[5] is None else _parse_projection_timestamp(row[5])
+
+    if envelope.event_type == WorkshopEventType.RUN_STARTED:
+        _require_exact_payload(payload, set())
+        if status != "accepted" or envelope.actor_principal_id != agent_principal or envelope.occurred_at < accepted_at:
+            raise ValueError("Workshop run can start only once through its attached agent")
+        await connection.execute(
+            "UPDATE runs SET status = 'started', started_at = ?, last_event_position = ? WHERE id = ?",
+            (occurred_at, event.position, envelope.aggregate_id),
+        )
+        return
+
+    if envelope.event_type == WorkshopEventType.RUN_COMPLETED:
+        _require_exact_payload(payload, set())
+        if (
+            status != "started"
+            or envelope.actor_principal_id != agent_principal
+            or started_at is None
+            or envelope.occurred_at < started_at
+        ):
+            raise ValueError("Workshop run can complete only from started through its attached agent")
+        await connection.execute(
+            "UPDATE runs SET status = 'completed', terminal_at = ?, last_event_position = ? WHERE id = ?",
+            (occurred_at, event.position, envelope.aggregate_id),
+        )
+        return
+
+    if envelope.event_type == WorkshopEventType.RUN_FAILED:
+        _require_exact_payload(payload, {"failure_code"})
+        failure_code = _required_text(payload, "failure_code")
+        if not _RUN_TERMINAL_CODE_PATTERN.fullmatch(failure_code):
+            raise ValueError("Workshop run failure_code must be a lowercase identifier")
+        if (
+            status != "started"
+            or envelope.actor_principal_id != agent_principal
+            or started_at is None
+            or envelope.occurred_at < started_at
+        ):
+            raise ValueError("Workshop run can fail only from started through its attached agent")
+        await connection.execute(
+            "UPDATE runs SET status = 'failed', terminal_at = ?, terminal_code = ?, "
+            "last_event_position = ? WHERE id = ?",
+            (occurred_at, failure_code, event.position, envelope.aggregate_id),
+        )
+        return
+
+    if envelope.event_type == WorkshopEventType.RUN_CANCELLED:
+        _require_exact_payload(payload, {"cancellation_code"})
+        cancellation_code = _required_text(payload, "cancellation_code")
+        if not _RUN_TERMINAL_CODE_PATTERN.fullmatch(cancellation_code):
+            raise ValueError("Workshop run cancellation_code must be a lowercase identifier")
+        lifecycle_floor = started_at if started_at is not None else accepted_at
+        if (
+            status not in {"accepted", "started"}
+            or envelope.actor_principal_id != requested_by
+            or envelope.occurred_at < lifecycle_floor
+        ):
+            raise ValueError("Workshop run can be cancelled only while nonterminal by its requesting human")
+        await connection.execute(
+            "UPDATE runs SET status = 'cancelled', terminal_at = ?, terminal_code = ?, "
+            "last_event_position = ? WHERE id = ?",
+            (occurred_at, cancellation_code, event.position, envelope.aggregate_id),
+        )
+        return
+
+    raise ValueError(f"Unsupported Workshop run event: {envelope.event_type}")
+
+
 class CanonicalConversationProjection:
     """Rebuild the initial Workshop collaboration records from events."""
 
@@ -30,12 +177,15 @@ class CanonicalConversationProjection:
     # Artifact events were not emitted before artifact support existed, so
     # adding their first handler does not change replay of any prior event.
     # Keep the version stable to avoid an unnecessary production rebuild.
-    version = 4
+    version = 5
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
+        async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
+            existing_tables = {str(row[0]) for row in await cursor.fetchall()}
         for table in (
             "deliveries",
             "artifacts",
+            "runs",
             "messages",
             "channel_agents",
             "channel_bindings",
@@ -47,12 +197,23 @@ class CanonicalConversationProjection:
             "principals",
             "workshops",
         ):
-            await connection.execute(f"DELETE FROM {table}")
+            if table in existing_tables:
+                await connection.execute(f"DELETE FROM {table}")
 
     async def apply(self, connection: aiosqlite.Connection, event: StoredEvent) -> None:
         envelope = event.envelope
         payload = envelope.payload
         occurred_at = envelope.occurred_at.isoformat()
+
+        if envelope.event_type in {
+            WorkshopEventType.RUN_ACCEPTED,
+            WorkshopEventType.RUN_STARTED,
+            WorkshopEventType.RUN_COMPLETED,
+            WorkshopEventType.RUN_FAILED,
+            WorkshopEventType.RUN_CANCELLED,
+        }:
+            await _apply_run_event(connection, event)
+            return
 
         if envelope.event_type == WorkshopEventType.WORKSHOP_CREATED:
             await connection.execute(

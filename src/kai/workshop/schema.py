@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 14
+WORKSHOP_SCHEMA_VERSION = 15
 
 
 @dataclass(frozen=True, slots=True)
@@ -529,6 +529,48 @@ _DELIVERY_AUTHORITY_EPOCH_SCHEMA = SchemaMigration(
     ),
 )
 
+_DURABLE_RUN_LIFECYCLE_SCHEMA = SchemaMigration(
+    version=15,
+    name="durable_workshop_run_lifecycle",
+    statements=(
+        """
+        CREATE TABLE runs (
+            id TEXT PRIMARY KEY,
+            workshop_id TEXT NOT NULL REFERENCES workshops(id) ON DELETE CASCADE,
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            requested_by_principal_id TEXT NOT NULL
+                REFERENCES principals(id) ON DELETE RESTRICT,
+            agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
+            inbound_message_id TEXT NOT NULL UNIQUE
+                REFERENCES messages(id) ON DELETE RESTRICT,
+            status TEXT NOT NULL CHECK (
+                status IN ('accepted', 'started', 'completed', 'failed', 'cancelled')
+            ),
+            accepted_at TEXT NOT NULL,
+            started_at TEXT,
+            terminal_at TEXT,
+            terminal_code TEXT,
+            last_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            CHECK (
+                (status = 'accepted' AND started_at IS NULL
+                    AND terminal_at IS NULL AND terminal_code IS NULL)
+                OR (status = 'started' AND started_at IS NOT NULL
+                    AND terminal_at IS NULL AND terminal_code IS NULL)
+                OR (status = 'completed' AND started_at IS NOT NULL
+                    AND terminal_at IS NOT NULL AND terminal_code IS NULL)
+                OR (status = 'failed' AND started_at IS NOT NULL
+                    AND terminal_at IS NOT NULL AND terminal_code IS NOT NULL)
+                OR (status = 'cancelled' AND terminal_at IS NOT NULL
+                    AND terminal_code IS NOT NULL)
+            )
+        )
+        """,
+        "CREATE INDEX runs_channel_status_idx ON runs (channel_id, status, accepted_at)",
+        "CREATE INDEX runs_agent_status_idx ON runs (agent_id, status, accepted_at)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -544,6 +586,7 @@ _MIGRATIONS = (
     _TELEGRAM_STREAMING_PREVIEW_SCHEMA,
     _STREAMING_FINALIZATION_SCHEMA,
     _DELIVERY_AUTHORITY_EPOCH_SCHEMA,
+    _DURABLE_RUN_LIFECYCLE_SCHEMA,
 )
 
 

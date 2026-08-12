@@ -19,7 +19,7 @@ _AGGREGATE_TYPE_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 class WorkshopEventType(StrEnum):
-    """The collaboration-only vocabulary supported by the first schema."""
+    """The backend-neutral canonical fact vocabulary supported by Workshop."""
 
     WORKSHOP_CREATED = "workshop.created"
     WORKSHOP_MEMBER_ADDED = "workshop.member_added"
@@ -35,6 +35,11 @@ class WorkshopEventType(StrEnum):
     DELIVERY_REQUESTED = "delivery.requested"
     DELIVERY_SUCCEEDED = "delivery.succeeded"
     DELIVERY_FAILED = "delivery.failed"
+    RUN_ACCEPTED = "run.accepted"
+    RUN_STARTED = "run.started"
+    RUN_COMPLETED = "run.completed"
+    RUN_FAILED = "run.failed"
+    RUN_CANCELLED = "run.cancelled"
 
 
 class OpaqueId(str):
@@ -132,6 +137,10 @@ class DeliveryAuthorityEpochId(OpaqueId):
     prefix = "dae"
 
 
+class RunId(OpaqueId):
+    prefix = "run"
+
+
 class EventId(OpaqueId):
     prefix = "evt"
 
@@ -156,6 +165,7 @@ _ID_TYPES: dict[str, type[OpaqueId]] = {
         DeliveryId,
         DeliveryAttemptId,
         DeliveryAuthorityEpochId,
+        RunId,
         EventId,
     )
 }

@@ -49,16 +49,11 @@ class ConversationPool(Protocol):
     async def get_effective_workspace(self, chat_id: int) -> Path: ...
 
 
-async def resolve_canonical_conversation_run(
+async def resolve_canonical_conversation_target(
     store: WorkshopEventStore,
     inbound_message_id: MessageId,
-) -> CompatibilityConversationRunResolution:
-    """Resolve a human-authored message to exactly one channel agent.
-
-    The public run request contains only a canonical message ID. During the
-    migration, the resolved human's Telegram identity supplies the existing
-    pool/config key internally. A caller cannot provide or override that key.
-    """
+) -> CanonicalConversationRunTarget:
+    """Resolve a human-authored message to exactly one canonical channel agent."""
     if not isinstance(inbound_message_id, MessageId):
         raise ValueError("inbound_message_id must be a MessageId")
 
@@ -79,10 +74,29 @@ async def resolve_canonical_conversation_run(
             "Inbound message must resolve to one human channel member and one attached agent"
         )
 
-    requested_by_principal_id = PrincipalId(str(target_rows[0][2]))
+    return CanonicalConversationRunTarget(
+        inbound_message_id=inbound_message_id,
+        workshop_id=WorkshopId(str(target_rows[0][0])),
+        channel_id=ChannelId(str(target_rows[0][1])),
+        requested_by_principal_id=PrincipalId(str(target_rows[0][2])),
+        agent_id=AgentId(str(target_rows[0][3])),
+    )
+
+
+async def resolve_canonical_conversation_run(
+    store: WorkshopEventStore,
+    inbound_message_id: MessageId,
+) -> CompatibilityConversationRunResolution:
+    """Resolve a canonical target plus the current private pool adapter key.
+
+    The public run request contains only a canonical message ID. During the
+    migration, the resolved human's Telegram identity supplies the existing
+    pool/config key internally. A caller cannot provide or override that key.
+    """
+    target = await resolve_canonical_conversation_target(store, inbound_message_id)
     async with store.connection.execute(
         "SELECT external_subject FROM external_identities WHERE principal_id = ? AND provider = 'telegram'",
-        (requested_by_principal_id,),
+        (target.requested_by_principal_id,),
     ) as cursor:
         identity_rows = list(await cursor.fetchall())
     if len(identity_rows) != 1:
@@ -92,13 +106,7 @@ async def resolve_canonical_conversation_run(
         raise ConversationRunUnavailableError("Telegram compatibility identity is not a positive user ID")
 
     return CompatibilityConversationRunResolution(
-        target=CanonicalConversationRunTarget(
-            inbound_message_id=inbound_message_id,
-            workshop_id=WorkshopId(str(target_rows[0][0])),
-            channel_id=ChannelId(str(target_rows[0][1])),
-            requested_by_principal_id=requested_by_principal_id,
-            agent_id=AgentId(str(target_rows[0][3])),
-        ),
+        target=target,
         _legacy_pool_key=int(external_subject),
     )
 
