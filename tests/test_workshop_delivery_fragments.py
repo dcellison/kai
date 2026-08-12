@@ -11,6 +11,7 @@ import pytest
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.delivery_fragments import DeliveryFragmentPlanConflictError, WorkshopDeliveryFragments
 from kai.workshop.delivery_outbox import (
+    QUALIFICATION_PURPOSE,
     DeliveryRequest,
     IncompleteDeliveryFragmentsError,
     UnsettledDeliveryFragmentError,
@@ -89,6 +90,7 @@ async def _open_with_delivery(
             message_id=message_id,
             channel_binding_id=binding_id,
             mode="text",
+            purpose=QUALIFICATION_PURPOSE,
             occurred_at=_NOW,
         )
     )
@@ -100,7 +102,7 @@ class TestDeliveryFragmentPlan:
         clock = _Clock()
         store, outbox, fragments = await _open_with_delivery(tmp_path / "kai.db", clock)
         try:
-            claim = await outbox.claim_next("worker-1")
+            claim = await outbox.claim_next("worker-1", purposes=(QUALIFICATION_PURPOSE,))
             assert claim is not None
 
             first = await fragments.prepare(claim, ("first", "second"))
@@ -117,7 +119,7 @@ class TestDeliveryFragmentPlan:
         clock = _Clock()
         store, outbox, fragments = await _open_with_delivery(tmp_path / "kai.db", clock)
         try:
-            claim = await outbox.claim_next("worker-1")
+            claim = await outbox.claim_next("worker-1", purposes=(QUALIFICATION_PURPOSE,))
             assert claim is not None
             await fragments.prepare(claim, ("first", "second"))
             first = await fragments.begin_next(claim)
@@ -138,7 +140,7 @@ class TestDeliveryFragmentPlan:
         clock = _Clock()
         store, outbox, fragments = await _open_with_delivery(tmp_path / "kai.db", clock)
         try:
-            claim = await outbox.claim_next("worker-1")
+            claim = await outbox.claim_next("worker-1", purposes=(QUALIFICATION_PURPOSE,))
             assert claim is not None
             await fragments.prepare(claim, ("first", "second"))
             assert await fragments.begin_next(claim) is not None
@@ -155,7 +157,9 @@ class TestDeliveryFragmentRecovery:
         clock = _Clock()
         store, outbox, fragments = await _open_with_delivery(tmp_path / "kai.db", clock)
         try:
-            first_claim = await outbox.claim_next("worker-1", lease_duration=timedelta(seconds=10))
+            first_claim = await outbox.claim_next(
+                "worker-1", purposes=(QUALIFICATION_PURPOSE,), lease_duration=timedelta(seconds=10)
+            )
             assert first_claim is not None
             await fragments.prepare(first_claim, ("first", "second"))
             first = await fragments.begin_next(first_claim)
@@ -163,8 +167,8 @@ class TestDeliveryFragmentRecovery:
             await fragments.mark_sent(first_claim, first, external_message_id=1001)
 
             clock.advance(timedelta(seconds=10))
-            assert (await outbox.recover_expired_leases()).requeued == 1
-            second_claim = await outbox.claim_next("worker-2")
+            assert (await outbox.recover_expired_leases(purposes=(QUALIFICATION_PURPOSE,))).requeued == 1
+            second_claim = await outbox.claim_next("worker-2", purposes=(QUALIFICATION_PURPOSE,))
             assert second_claim is not None and second_claim.attempt_number == 2
             await fragments.prepare(second_claim, ("first", "second"))
             resumed = await fragments.begin_next(second_claim)
@@ -185,13 +189,15 @@ class TestDeliveryFragmentRecovery:
         clock = _Clock()
         store, outbox, fragments = await _open_with_delivery(tmp_path / "kai.db", clock)
         try:
-            claim = await outbox.claim_next("worker-1", lease_duration=timedelta(seconds=10))
+            claim = await outbox.claim_next(
+                "worker-1", purposes=(QUALIFICATION_PURPOSE,), lease_duration=timedelta(seconds=10)
+            )
             assert claim is not None
             await fragments.prepare(claim, ("first", "second"))
             assert await fragments.begin_next(claim) is not None
 
             clock.advance(timedelta(seconds=10))
-            recovered = await outbox.recover_expired_leases()
+            recovered = await outbox.recover_expired_leases(purposes=(QUALIFICATION_PURPOSE,))
             state = await outbox.state(claim.delivery_id)
             persisted = await fragments.fragments(claim.delivery_id)
 
@@ -200,7 +206,7 @@ class TestDeliveryFragmentRecovery:
             assert state.status == "failed"
             assert state.last_error_code == "delivery_send_uncertain"
             assert persisted[0].status == "uncertain"
-            assert await outbox.claim_next("worker-2") is None
+            assert await outbox.claim_next("worker-2", purposes=(QUALIFICATION_PURPOSE,)) is None
         finally:
             await store.close()
 
@@ -208,7 +214,7 @@ class TestDeliveryFragmentRecovery:
         clock = _Clock()
         store, outbox, fragments = await _open_with_delivery(tmp_path / "kai.db", clock)
         try:
-            claim = await outbox.claim_next("worker-1")
+            claim = await outbox.claim_next("worker-1", purposes=(QUALIFICATION_PURPOSE,))
             assert claim is not None
             await fragments.prepare(claim, ("first", "second"))
             first = await fragments.begin_next(claim)

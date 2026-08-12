@@ -6,6 +6,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Literal, cast
 
 import aiosqlite
 
@@ -30,6 +31,11 @@ _MAX_ATTEMPTS = 20
 _MAX_MINIMUM_RETRY_DELAY = timedelta(days=1)
 _RETRY_BASE_SECONDS = 5
 _RETRY_MAX_SECONDS = 300
+
+DeliveryPurpose = Literal["conversation_reply", "qualification"]
+CONVERSATION_REPLY_PURPOSE: DeliveryPurpose = "conversation_reply"
+QUALIFICATION_PURPOSE: DeliveryPurpose = "qualification"
+_DELIVERY_PURPOSES = frozenset({CONVERSATION_REPLY_PURPOSE, QUALIFICATION_PURPOSE})
 
 
 class DeliveryOutboxError(RuntimeError):
@@ -61,6 +67,7 @@ class DeliveryRequest:
     message_id: MessageId
     channel_binding_id: ChannelBindingId
     mode: str
+    purpose: DeliveryPurpose
     occurred_at: datetime
     max_attempts: int = 5
 
@@ -71,6 +78,7 @@ class DeliveryRequest:
             raise ValueError("channel_binding_id must be a ChannelBindingId")
         if not _IDENTIFIER_PATTERN.fullmatch(self.mode):
             raise ValueError("mode must be a lowercase identifier")
+        _validate_purpose(self.purpose)
         if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
             raise ValueError("occurred_at must be timezone-aware")
         if (
@@ -89,6 +97,7 @@ class DeliveryState:
     channel_binding_id: ChannelBindingId
     transport: str
     mode: str
+    purpose: DeliveryPurpose
     status: str
     max_attempts: int
     attempt_count: int
@@ -116,6 +125,7 @@ class DeliveryClaim:
     transport: str
     external_channel_id: str
     mode: str
+    purpose: DeliveryPurpose
     body: str
     lease_expires_at: datetime
 
@@ -146,6 +156,24 @@ def _validate_worker_id(worker_id: str) -> None:
 def _validate_error_code(error_code: str) -> None:
     if not _IDENTIFIER_PATTERN.fullmatch(error_code):
         raise ValueError("error_code must be a lowercase identifier")
+
+
+def _validate_purpose(purpose: str) -> None:
+    if purpose not in _DELIVERY_PURPOSES:
+        raise ValueError("purpose must be conversation_reply or qualification")
+
+
+def _validate_purposes(purposes: tuple[DeliveryPurpose, ...]) -> None:
+    if not purposes or len(set(purposes)) != len(purposes):
+        raise ValueError("purposes must contain unique values")
+    for purpose in purposes:
+        _validate_purpose(purpose)
+
+
+def _delivery_purpose(value: object) -> DeliveryPurpose:
+    purpose = str(value)
+    _validate_purpose(purpose)
+    return cast(DeliveryPurpose, purpose)
 
 
 def _retry_delay(attempt_number: int) -> timedelta:
@@ -205,6 +233,7 @@ class WorkshopDeliveryOutbox:
                 or existing.channel_binding_id != request.channel_binding_id
                 or existing.transport != transport
                 or existing.max_attempts != request.max_attempts
+                or existing.purpose != request.purpose
             ):
                 raise DeliveryRequestConflictError("Delivery request identity has different semantics")
             return DeliveryRequestResult(delivery=existing, inserted=False)
@@ -213,17 +242,17 @@ class WorkshopDeliveryOutbox:
         event = EventEnvelope.create(
             event_id=EventId.derived(
                 workshop_id,
-                f"delivery-request-event:{request.message_id}:{request.channel_binding_id}:{request.mode}",
+                f"delivery-request-event:v2:{request.message_id}:{request.channel_binding_id}:{request.mode}",
             ),
             event_type=WorkshopEventType.DELIVERY_REQUESTED,
-            event_version=1,
+            event_version=2,
             workshop_id=workshop_id,
             aggregate_type="delivery",
             aggregate_id=delivery_id,
             actor_principal_id=author_principal_id,
             occurred_at=occurred_at,
             idempotency_key=(
-                f"workshop-delivery-request:v1:{request.message_id}:{request.channel_binding_id}:{request.mode}"
+                f"workshop-delivery-request:v2:{request.message_id}:{request.channel_binding_id}:{request.mode}"
             ),
             payload={
                 "message_id": request.message_id,
@@ -231,6 +260,7 @@ class WorkshopDeliveryOutbox:
                 "channel_binding_id": request.channel_binding_id,
                 "transport": transport,
                 "mode": request.mode,
+                "purpose": request.purpose,
                 "max_attempts": request.max_attempts,
             },
             metadata={"source": "delivery_outbox"},
@@ -242,9 +272,9 @@ class WorkshopDeliveryOutbox:
         timestamp = _format_timestamp(occurred_at)
         await connection.execute(
             "INSERT INTO delivery_outbox "
-            "(id, workshop_id, channel_id, channel_binding_id, message_id, transport, mode, "
+            "(id, workshop_id, channel_id, channel_binding_id, message_id, transport, mode, purpose, "
             "status, max_attempts, attempt_count, available_at, requested_event_position, "
-            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, ?, ?, ?, ?)",
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, ?, ?, ?, ?)",
             (
                 delivery_id,
                 workshop_id,
@@ -253,6 +283,7 @@ class WorkshopDeliveryOutbox:
                 request.message_id,
                 transport,
                 request.mode,
+                request.purpose,
                 request.max_attempts,
                 timestamp,
                 appended.event.position,
@@ -267,12 +298,14 @@ class WorkshopDeliveryOutbox:
         self,
         worker_id: str,
         *,
+        purposes: tuple[DeliveryPurpose, ...],
         lease_duration: timedelta = timedelta(seconds=30),
         transport: str | None = None,
         modes: tuple[str, ...] | None = None,
         delivery_id: DeliveryId | None = None,
     ) -> DeliveryClaim | None:
         _validate_worker_id(worker_id)
+        _validate_purposes(purposes)
         if lease_duration <= timedelta(0) or lease_duration > _MAX_LEASE:
             raise ValueError("lease_duration must be positive and at most five minutes")
         if transport is not None and not _IDENTIFIER_PATTERN.fullmatch(transport):
@@ -290,7 +323,7 @@ class WorkshopDeliveryOutbox:
         now = self._now()
         try:
             await connection.execute("BEGIN IMMEDIATE")
-            await self._recover_expired_in_transaction(now, delivery_id=delivery_id)
+            await self._recover_expired_in_transaction(now, purposes=purposes, delivery_id=delivery_id)
             now_text = _format_timestamp(now)
             filters = [
                 "o.status IN ('pending', 'retry_wait')",
@@ -299,11 +332,15 @@ class WorkshopDeliveryOutbox:
                 "NOT EXISTS ("
                 "SELECT 1 FROM delivery_outbox predecessor "
                 "WHERE predecessor.channel_binding_id = o.channel_binding_id "
+                "AND predecessor.purpose = o.purpose "
                 "AND predecessor.requested_event_position < o.requested_event_position "
                 "AND predecessor.status NOT IN ('succeeded', 'failed')"
                 ")",
             ]
             parameters: list[object] = [now_text]
+            purpose_placeholders = ", ".join("?" for _ in purposes)
+            filters.append(f"o.purpose IN ({purpose_placeholders})")
+            parameters.extend(purposes)
             if delivery_id is not None:
                 filters.append("o.id = ?")
                 parameters.append(delivery_id)
@@ -316,7 +353,7 @@ class WorkshopDeliveryOutbox:
                 parameters.extend(modes)
             async with connection.execute(
                 "SELECT o.id, o.workshop_id, o.channel_id, o.channel_binding_id, o.message_id, "
-                "o.transport, o.mode, o.attempt_count, m.body, cb.external_channel_id "
+                "o.transport, o.mode, o.purpose, o.attempt_count, m.body, cb.external_channel_id "
                 "FROM delivery_outbox o "
                 "JOIN messages m ON m.id = o.message_id AND m.channel_id = o.channel_id "
                 "JOIN channel_bindings cb ON cb.id = o.channel_binding_id "
@@ -331,7 +368,7 @@ class WorkshopDeliveryOutbox:
                 return None
 
             delivery_id = DeliveryId(str(row[0]))
-            attempt_number = int(row[7]) + 1
+            attempt_number = int(row[8]) + 1
             attempt_id = DeliveryAttemptId.new()
             expires_at = now + lease_duration
             expires_text = _format_timestamp(expires_at)
@@ -368,8 +405,9 @@ class WorkshopDeliveryOutbox:
                 message_id=MessageId(str(row[4])),
                 transport=str(row[5]),
                 mode=str(row[6]),
-                body=str(row[8]),
-                external_channel_id=str(row[9]),
+                purpose=_delivery_purpose(row[7]),
+                body=str(row[9]),
+                external_channel_id=str(row[10]),
                 lease_expires_at=expires_at,
             )
         except Exception:
@@ -402,11 +440,16 @@ class WorkshopDeliveryOutbox:
             minimum_retry_delay=minimum_retry_delay,
         )
 
-    async def recover_expired_leases(self) -> DeliveryRecoveryResult:
+    async def recover_expired_leases(
+        self,
+        *,
+        purposes: tuple[DeliveryPurpose, ...],
+    ) -> DeliveryRecoveryResult:
+        _validate_purposes(purposes)
         connection = self._store.connection
         try:
             await connection.execute("BEGIN IMMEDIATE")
-            result = await self._recover_expired_in_transaction(self._now())
+            result = await self._recover_expired_in_transaction(self._now(), purposes=purposes)
             await connection.commit()
             return result
         except Exception:
@@ -470,7 +513,11 @@ class WorkshopDeliveryOutbox:
             if row[0] != "leased" or row[3] != claim.attempt_id:
                 raise StaleDeliveryLeaseError("Delivery attempt no longer owns the active lease")
             if row[4] is None or _parse_timestamp(str(row[4])) <= now:
-                await self._recover_expired_in_transaction(now, delivery_id=claim.delivery_id)
+                await self._recover_expired_in_transaction(
+                    now,
+                    purposes=(claim.purpose,),
+                    delivery_id=claim.delivery_id,
+                )
                 await connection.commit()
                 raise StaleDeliveryLeaseError("Delivery attempt lease has expired")
 
@@ -558,16 +605,21 @@ class WorkshopDeliveryOutbox:
         self,
         now: datetime,
         *,
+        purposes: tuple[DeliveryPurpose, ...],
         delivery_id: DeliveryId | None = None,
     ) -> DeliveryRecoveryResult:
         connection = self._store.connection
         now_text = _format_timestamp(now)
+        purpose_placeholders = ", ".join("?" for _ in purposes)
         identity_filter = " AND id = ?" if delivery_id is not None else ""
-        parameters: tuple[object, ...] = (now_text, delivery_id) if delivery_id is not None else (now_text,)
+        parameters: tuple[object, ...] = (now_text, *purposes)
+        if delivery_id is not None:
+            parameters = (*parameters, delivery_id)
         async with connection.execute(
             "SELECT id, lease_id, attempt_count, max_attempts, workshop_id, channel_id, "
             "channel_binding_id, message_id, transport, mode FROM delivery_outbox "
-            f"WHERE status = 'leased' AND lease_expires_at <= ?{identity_filter} "
+            f"WHERE status = 'leased' AND lease_expires_at <= ? "
+            f"AND purpose IN ({purpose_placeholders}){identity_filter} "
             "ORDER BY requested_event_position",
             parameters,
         ) as cursor:
@@ -727,6 +779,7 @@ class WorkshopDeliveryOutbox:
             channel_binding_id=ChannelBindingId(str(row["channel_binding_id"])),
             transport=str(row["transport"]),
             mode=str(row["mode"]),
+            purpose=_delivery_purpose(row["purpose"]),
             status=str(row["status"]),
             max_attempts=int(row["max_attempts"]),
             attempt_count=int(row["attempt_count"]),

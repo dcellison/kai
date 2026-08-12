@@ -14,7 +14,13 @@ from telegram.error import BadRequest, Forbidden, InvalidToken, NetworkError, Re
 
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.delivery_fragments import DeliveryFragment, WorkshopDeliveryFragments
-from kai.workshop.delivery_outbox import DeliveryClaim, DeliveryRequest, WorkshopDeliveryOutbox
+from kai.workshop.delivery_outbox import (
+    CONVERSATION_REPLY_PURPOSE,
+    QUALIFICATION_PURPOSE,
+    DeliveryClaim,
+    DeliveryRequest,
+    WorkshopDeliveryOutbox,
+)
 from kai.workshop.domain import (
     ChannelBindingId,
     ChannelId,
@@ -58,6 +64,7 @@ def _claim(
         transport=transport,
         external_channel_id=external_channel_id,
         mode=mode,
+        purpose=QUALIFICATION_PURPOSE,
         body=body,
         lease_expires_at=_NOW + timedelta(seconds=30),
     )
@@ -97,6 +104,7 @@ def _worker(
         WorkshopDeliveryFragments(store),
         WorkshopTelegramDeliveryAdapter(bot),
         worker_id="telegram-worker-1",
+        purpose=QUALIFICATION_PURPOSE,
         poll_interval=poll_interval,
     )
 
@@ -158,12 +166,14 @@ async def _request(
     binding_id: ChannelBindingId,
     *,
     mode: str = "text",
+    purpose=QUALIFICATION_PURPOSE,
 ) -> DeliveryId:
     result = await WorkshopDeliveryOutbox(store).request_delivery(
         DeliveryRequest(
             message_id=message_id,
             channel_binding_id=binding_id,
             mode=mode,
+            purpose=purpose,
             occurred_at=_NOW,
         )
     )
@@ -324,6 +334,25 @@ class TestWorkshopTelegramDeliveryAdapter:
 
 
 class TestWorkshopTelegramDeliveryWorker:
+    async def test_qualification_worker_cannot_drain_conversation_work(self, tmp_path: Path):
+        store, message_id, binding_id = await _open_with_outbound(tmp_path / "kai.db")
+        delivery_id = await _request(
+            store,
+            message_id,
+            binding_id,
+            purpose=CONVERSATION_REPLY_PURPOSE,
+        )
+        bot = _successful_bot()
+        worker = _worker(store, bot)
+        try:
+            result = await worker.run_once()
+
+            assert result.outcome == TelegramWorkOutcome.IDLE
+            assert (await WorkshopDeliveryOutbox(store).state(delivery_id)).status == "pending"
+            bot.send_message.assert_not_awaited()
+        finally:
+            await store.close()
+
     async def test_explicit_delivery_does_not_drain_other_binding(self, tmp_path: Path):
         store, message_id, private_binding = await _open_with_outbound(tmp_path / "kai.db")
         group_binding = await _add_group_binding(store, message_id)

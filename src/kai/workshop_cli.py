@@ -14,7 +14,12 @@ from telegram.error import TelegramError
 
 from kai.config import DATA_DIR, load_config
 from kai.workshop.delivery_fragments import WorkshopDeliveryFragments
-from kai.workshop.delivery_outbox import DeliveryState, DeliveryTargetNotFoundError, WorkshopDeliveryOutbox
+from kai.workshop.delivery_outbox import (
+    QUALIFICATION_PURPOSE,
+    DeliveryState,
+    DeliveryTargetNotFoundError,
+    WorkshopDeliveryOutbox,
+)
 from kai.workshop.delivery_qualification import DeliveryQualificationError, WorkshopDeliveryQualification
 from kai.workshop.domain import DeliveryId
 from kai.workshop.store import WorkshopEventStore
@@ -134,6 +139,7 @@ async def _run(args: argparse.Namespace) -> int:
                     WorkshopDeliveryFragments(store),
                     WorkshopTelegramDeliveryAdapter(bot),
                     worker_id=worker_id,
+                    purpose=QUALIFICATION_PURPOSE,
                 )
                 result = await worker.run_delivery(delivery_id)
         except TelegramError as exc:

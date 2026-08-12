@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from kai.workshop.delivery_outbox import (
+    QUALIFICATION_PURPOSE,
     DeliveryClaim,
     DeliveryRequest,
     DeliveryRequestResult,
@@ -75,6 +76,7 @@ class WorkshopDeliveryQualification:
                 message_id=MessageId(str(row[0])),
                 channel_binding_id=ChannelBindingId(str(row[1])),
                 mode="text",
+                purpose=QUALIFICATION_PURPOSE,
                 occurred_at=datetime.now(UTC),
                 max_attempts=3,
             )
@@ -157,6 +159,7 @@ class WorkshopDeliveryQualification:
                     message_id=message_id,
                     channel_binding_id=binding_id,
                     mode="text",
+                    purpose=QUALIFICATION_PURPOSE,
                     occurred_at=occurred_at,
                     max_attempts=3,
                 )
@@ -182,6 +185,7 @@ class WorkshopDeliveryQualification:
         """Claim exact work and exit before sending to test lease recovery."""
         claim = await self._outbox.claim_next(
             worker_id,
+            purposes=(QUALIFICATION_PURPOSE,),
             lease_duration=lease_duration,
             transport="telegram",
             modes=("text",),

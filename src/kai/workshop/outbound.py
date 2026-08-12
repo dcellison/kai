@@ -6,7 +6,12 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 
-from kai.workshop.delivery_outbox import DeliveryRequest, DeliveryRequestResult, WorkshopDeliveryOutbox
+from kai.workshop.delivery_outbox import (
+    CONVERSATION_REPLY_PURPOSE,
+    DeliveryRequest,
+    DeliveryRequestResult,
+    WorkshopDeliveryOutbox,
+)
 from kai.workshop.domain import (
     ChannelBindingId,
     ChannelId,
@@ -210,6 +215,7 @@ async def record_outbound_message_with_delivery(
                 message_id=message_id,
                 channel_binding_id=channel_binding_id,
                 mode="text",
+                purpose=CONVERSATION_REPLY_PURPOSE,
                 occurred_at=message.occurred_at,
                 max_attempts=5,
             )

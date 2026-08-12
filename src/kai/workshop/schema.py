@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 10
+WORKSHOP_SCHEMA_VERSION = 11
 
 
 @dataclass(frozen=True, slots=True)
@@ -439,6 +439,19 @@ _DELIVERY_BINDING_ORDER_SCHEMA = SchemaMigration(
     ),
 )
 
+_DELIVERY_PURPOSE_SCHEMA = SchemaMigration(
+    version=11,
+    name="durable_delivery_purpose",
+    statements=(
+        "ALTER TABLE delivery_outbox ADD COLUMN purpose TEXT NOT NULL "
+        "DEFAULT 'qualification' CHECK (purpose IN ('conversation_reply', 'qualification'))",
+        "CREATE INDEX delivery_outbox_purpose_due_idx "
+        "ON delivery_outbox (purpose, status, available_at, requested_event_position)",
+        "CREATE INDEX delivery_outbox_purpose_binding_order_idx "
+        "ON delivery_outbox (purpose, channel_binding_id, requested_event_position, status)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -450,6 +463,7 @@ _MIGRATIONS = (
     _DELIVERY_FRAGMENT_SCHEMA,
     _BINDING_AWARE_DELIVERY_SCHEMA,
     _DELIVERY_BINDING_ORDER_SCHEMA,
+    _DELIVERY_PURPOSE_SCHEMA,
 )
 
 

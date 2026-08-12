@@ -651,3 +651,11 @@ Only after the production-unused finalization contract passes another review sho
 - document rollback as: stop the worker, reconcile all non-terminal conversation deliveries, restore the legacy route, and prove no old delivery can replay on later activation.
 
 Installed qualification must then demonstrate one streamed short reply finalized in place with no second copy, one fragmented long reply in order, a restart between enqueue and delivery, cooperative shutdown during active work, fatal recovery from an injected worker fault, clean canonical/JSONL parity, and unchanged media, voice, GitHub notification-group, schedule, file, and command behavior.
+
+### 21.4 Durable delivery-purpose foundation
+
+The first streaming-finalization prerequisite is now implemented without production registration. Every new delivery request must identify one durable purpose: `conversation_reply` or `qualification`. Existing version-10 outbox rows migrate to `qualification`, which is the fail-safe classification for all delivery work created before normal conversation routing exists.
+
+Claims, expired-lease recovery, and per-binding ordering are purpose-scoped. A qualification row therefore cannot be claimed, recovered, or used as an ordering predecessor by a conversation worker, and the Telegram worker instance owns exactly one purpose. The installed qualification command is fixed to `qualification`; the production-unused atomic assistant-result service is fixed to `conversation_reply`. Neither accepts a purpose from an external caller.
+
+Migration, conflict, lane-isolation, recovery-isolation, and worker-exclusion tests pin this boundary. The runtime remains unregistered and normal Telegram delivery remains unchanged. The next bounded slice is canonical binding of a confirmed streaming preview to its direct channel and inbound message; it must remain production-unused and must not yet edit or send through the Workshop worker.

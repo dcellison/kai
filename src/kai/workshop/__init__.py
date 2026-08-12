@@ -39,8 +39,11 @@ from kai.workshop.delivery_fragments import (
     WorkshopDeliveryFragments,
 )
 from kai.workshop.delivery_outbox import (
+    CONVERSATION_REPLY_PURPOSE,
+    QUALIFICATION_PURPOSE,
     DeliveryClaim,
     DeliveryOutboxError,
+    DeliveryPurpose,
     DeliveryRecoveryResult,
     DeliveryRequest,
     DeliveryRequestConflictError,
@@ -108,6 +111,8 @@ from kai.workshop.timeline import (
 )
 
 __all__ = [
+    "CONVERSATION_REPLY_PURPOSE",
+    "QUALIFICATION_PURPOSE",
     "AgentId",
     "AppendResult",
     "ArtifactId",
@@ -131,6 +136,7 @@ __all__ = [
     "DeliveryFragmentUncertainError",
     "DeliveryId",
     "DeliveryOutboxError",
+    "DeliveryPurpose",
     "DeliveryRecoveryResult",
     "DeliveryRequest",
     "DeliveryRequestConflictError",

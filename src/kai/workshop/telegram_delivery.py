@@ -26,7 +26,13 @@ from telegram.warnings import PTBDeprecationWarning
 
 from kai.telegram_utils import chunk_text
 from kai.workshop.delivery_fragments import DeliveryFragment, WorkshopDeliveryFragments
-from kai.workshop.delivery_outbox import DeliveryClaim, DeliveryState, WorkshopDeliveryOutbox
+from kai.workshop.delivery_outbox import (
+    DeliveryClaim,
+    DeliveryPurpose,
+    DeliveryRecoveryResult,
+    DeliveryState,
+    WorkshopDeliveryOutbox,
+)
 from kai.workshop.domain import DeliveryId
 
 _NUMERIC_CHAT_ID_PATTERN = re.compile(r"^-?[1-9][0-9]{0,19}$")
@@ -219,6 +225,7 @@ class WorkshopTelegramDeliveryWorker:
         adapter: WorkshopTelegramDeliveryAdapter,
         *,
         worker_id: str,
+        purpose: DeliveryPurpose,
         lease_duration: timedelta = timedelta(seconds=30),
         poll_interval: float = 1.0,
     ) -> None:
@@ -228,12 +235,14 @@ class WorkshopTelegramDeliveryWorker:
         self._fragments = fragments
         self._adapter = adapter
         self._worker_id = worker_id
+        self._purpose: DeliveryPurpose = purpose
         self._lease_duration = lease_duration
         self._poll_interval = poll_interval
 
     async def run_once(self) -> TelegramWorkResult:
         claim = await self._outbox.claim_next(
             self._worker_id,
+            purposes=(self._purpose,),
             lease_duration=self._lease_duration,
             transport="telegram",
             modes=("text",),
@@ -246,12 +255,17 @@ class WorkshopTelegramDeliveryWorker:
             raise ValueError("delivery_id must be a DeliveryId")
         claim = await self._outbox.claim_next(
             self._worker_id,
+            purposes=(self._purpose,),
             lease_duration=self._lease_duration,
             transport="telegram",
             modes=("text",),
             delivery_id=delivery_id,
         )
         return await self._run_claim(claim)
+
+    async def recover_expired_leases(self) -> DeliveryRecoveryResult:
+        """Recover only work in this worker's explicitly assigned purpose lanes."""
+        return await self._outbox.recover_expired_leases(purposes=(self._purpose,))
 
     async def _run_claim(self, claim: DeliveryClaim | None) -> TelegramWorkResult:
         if claim is None:

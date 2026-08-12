@@ -11,6 +11,7 @@ import pytest
 
 from kai import sessions
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+from kai.workshop.delivery_outbox import CONVERSATION_REPLY_PURPOSE
 from kai.workshop.domain import (
     ChannelBindingId,
     EventEnvelope,
@@ -181,6 +182,7 @@ class TestAtomicOutboundDelivery:
             assert result.delivery.delivery.message_id == result.message.event.envelope.aggregate_id
             assert result.delivery.delivery.transport == "telegram"
             assert result.delivery.delivery.mode == "text"
+            assert result.delivery.delivery.purpose == CONVERSATION_REPLY_PURPOSE
             assert result.delivery.delivery.status == "pending"
             assert result.delivery.delivery.attempt_count == 0
             async with store.connection.execute(

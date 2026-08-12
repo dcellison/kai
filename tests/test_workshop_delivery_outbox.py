@@ -12,6 +12,8 @@ import pytest
 
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.delivery_outbox import (
+    CONVERSATION_REPLY_PURPOSE,
+    QUALIFICATION_PURPOSE,
     DeliveryRequest,
     DeliveryRequestConflictError,
     DeliveryTargetNotFoundError,
@@ -158,12 +160,14 @@ def _request(
     binding_id: ChannelBindingId,
     *,
     mode: str = "text",
+    purpose=QUALIFICATION_PURPOSE,
     max_attempts: int = 5,
 ) -> DeliveryRequest:
     return DeliveryRequest(
         message_id=message_id,
         channel_binding_id=binding_id,
         mode=mode,
+        purpose=purpose,
         occurred_at=_NOW,
         max_attempts=max_attempts,
     )
@@ -195,12 +199,15 @@ class TestDeliveryRequests:
             ]
             assert len(events) == 1
             assert events[0].position == result.delivery.requested_event_position
+            assert events[0].envelope.event_version == 2
+            assert result.delivery.purpose == QUALIFICATION_PURPOSE
             assert events[0].envelope.payload == {
                 "message_id": message_id,
                 "channel_id": result.delivery.channel_id,
                 "channel_binding_id": binding_id,
                 "transport": "telegram",
                 "mode": "text",
+                "purpose": QUALIFICATION_PURPOSE,
                 "max_attempts": 5,
             }
             async with store.connection.execute("SELECT COUNT(*) FROM delivery_attempts") as cursor:
@@ -233,6 +240,16 @@ class TestDeliveryRequests:
             await outbox.request_delivery(_request(message_id, binding_id, max_attempts=5))
             with pytest.raises(DeliveryRequestConflictError):
                 await outbox.request_delivery(_request(message_id, binding_id, max_attempts=4))
+        finally:
+            await store.close()
+
+    async def test_duplicate_request_with_changed_purpose_fails_closed(self, tmp_path: Path):
+        store, message_id, binding_id = await _open_with_outbound(tmp_path / "kai.db")
+        try:
+            outbox = WorkshopDeliveryOutbox(store)
+            await outbox.request_delivery(_request(message_id, binding_id))
+            with pytest.raises(DeliveryRequestConflictError):
+                await outbox.request_delivery(_request(message_id, binding_id, purpose=CONVERSATION_REPLY_PURPOSE))
         finally:
             await store.close()
 
@@ -292,7 +309,7 @@ class TestDeliveryOutcomes:
         outbox = WorkshopDeliveryOutbox(store, clock=_Clock())
         try:
             requested = await outbox.request_delivery(_request(message_id, binding_id))
-            claim = await outbox.claim_next("telegram-worker")
+            claim = await outbox.claim_next("telegram-worker", purposes=(QUALIFICATION_PURPOSE,))
             assert claim is not None
 
             succeeded = await outbox.mark_succeeded(claim)
@@ -336,7 +353,7 @@ class TestDeliveryOutcomes:
         outbox = WorkshopDeliveryOutbox(store, clock=clock)
         try:
             requested = await outbox.request_delivery(_request(message_id, binding_id, max_attempts=2))
-            first = await outbox.claim_next("telegram-worker")
+            first = await outbox.claim_next("telegram-worker", purposes=(QUALIFICATION_PURPOSE,))
             assert first is not None
             retry = await outbox.mark_failed(first, retryable=True, error_code="network_timeout")
             assert retry.status == "retry_wait"
@@ -348,7 +365,7 @@ class TestDeliveryOutcomes:
             ]
 
             clock.advance(timedelta(seconds=5))
-            second = await outbox.claim_next("telegram-worker")
+            second = await outbox.claim_next("telegram-worker", purposes=(QUALIFICATION_PURPOSE,))
             assert second is not None
             failed = await outbox.mark_failed(second, retryable=True, error_code="network_timeout")
             assert failed.status == "failed"
@@ -375,7 +392,7 @@ class TestDeliveryOutcomes:
         outbox = WorkshopDeliveryOutbox(store, clock=_Clock())
         try:
             requested = await outbox.request_delivery(_request(message_id, binding_id))
-            claim = await outbox.claim_next("telegram-worker")
+            claim = await outbox.claim_next("telegram-worker", purposes=(QUALIFICATION_PURPOSE,))
             assert claim is not None
             await store.connection.execute(
                 "CREATE TRIGGER reject_delivery_success BEFORE INSERT ON event_log "
@@ -405,10 +422,10 @@ class TestDeliveryOutcomes:
             direct = await outbox.request_delivery(_request(message_id, direct_binding_id))
             group = await outbox.request_delivery(_request(message_id, group_binding_id))
 
-            first = await outbox.claim_next("telegram-worker")
+            first = await outbox.claim_next("telegram-worker", purposes=(QUALIFICATION_PURPOSE,))
             assert first is not None
             await outbox.mark_succeeded(first)
-            second = await outbox.claim_next("telegram-worker")
+            second = await outbox.claim_next("telegram-worker", purposes=(QUALIFICATION_PURPOSE,))
             assert second is not None
             await outbox.mark_succeeded(second)
             await store.project_pending(CanonicalConversationProjection())
@@ -442,7 +459,7 @@ class TestDeliveryOutcomes:
                 ),
             )
             requested = await outbox.request_delivery(_request(message_id, binding_id))
-            claim = await outbox.claim_next("telegram-worker")
+            claim = await outbox.claim_next("telegram-worker", purposes=(QUALIFICATION_PURPOSE,))
             assert claim is not None
             await outbox.mark_succeeded(claim)
 
@@ -497,6 +514,35 @@ class TestDeliveryOutcomes:
 
 
 class TestDeliveryOrdering:
+    async def test_purpose_lanes_do_not_claim_or_block_each_other(self, tmp_path: Path):
+        store, first_message_id, binding_id = await _open_with_outbound(tmp_path / "kai.db")
+        second_message_id = await _add_outbound(store, 1)
+        outbox = WorkshopDeliveryOutbox(store, clock=_Clock())
+        try:
+            qualification = await outbox.request_delivery(_request(first_message_id, binding_id))
+            conversation = await outbox.request_delivery(
+                _request(second_message_id, binding_id, purpose=CONVERSATION_REPLY_PURPOSE)
+            )
+
+            conversation_claim = await outbox.claim_next(
+                "conversation-worker",
+                purposes=(CONVERSATION_REPLY_PURPOSE,),
+            )
+            assert conversation_claim is not None
+            assert conversation_claim.delivery_id == conversation.delivery.delivery_id
+            assert conversation_claim.purpose == CONVERSATION_REPLY_PURPOSE
+            assert (await outbox.state(qualification.delivery.delivery_id)).status == "pending"
+
+            qualification_claim = await outbox.claim_next(
+                "qualification-worker",
+                purposes=(QUALIFICATION_PURPOSE,),
+            )
+            assert qualification_claim is not None
+            assert qualification_claim.delivery_id == qualification.delivery.delivery_id
+            assert qualification_claim.purpose == QUALIFICATION_PURPOSE
+        finally:
+            await store.close()
+
     async def test_concurrent_workers_cannot_overtake_on_one_binding(self, tmp_path: Path):
         path = tmp_path / "kai.db"
         store, first_message_id, binding_id = await _open_with_outbound(path)
@@ -507,15 +553,19 @@ class TestDeliveryOrdering:
         second_store = await WorkshopEventStore.open(path)
         try:
             first_claim, competing_claim = await asyncio.gather(
-                outbox.claim_next("worker-1"),
-                WorkshopDeliveryOutbox(second_store, clock=_Clock()).claim_next("worker-2"),
+                outbox.claim_next("worker-1", purposes=(QUALIFICATION_PURPOSE,)),
+                WorkshopDeliveryOutbox(second_store, clock=_Clock()).claim_next(
+                    "worker-2", purposes=(QUALIFICATION_PURPOSE,)
+                ),
             )
             claims = [claim for claim in (first_claim, competing_claim) if claim is not None]
             assert len(claims) == 1
             assert claims[0].delivery_id == first_request.delivery.delivery_id
 
             await outbox.mark_succeeded(claims[0])
-            next_claim = await WorkshopDeliveryOutbox(second_store, clock=_Clock()).claim_next("worker-2")
+            next_claim = await WorkshopDeliveryOutbox(second_store, clock=_Clock()).claim_next(
+                "worker-2", purposes=(QUALIFICATION_PURPOSE,)
+            )
             assert next_claim is not None
             assert next_claim.delivery_id == second_request.delivery.delivery_id
         finally:
@@ -530,18 +580,18 @@ class TestDeliveryOrdering:
         try:
             first_request = await outbox.request_delivery(_request(first_message_id, binding_id))
             second_request = await outbox.request_delivery(_request(second_message_id, binding_id))
-            first_claim = await outbox.claim_next("telegram-worker")
+            first_claim = await outbox.claim_next("telegram-worker", purposes=(QUALIFICATION_PURPOSE,))
             assert first_claim is not None
             await outbox.mark_failed(first_claim, retryable=True, error_code="network_timeout")
 
-            assert await outbox.claim_next("telegram-worker") is None
+            assert await outbox.claim_next("telegram-worker", purposes=(QUALIFICATION_PURPOSE,)) is None
             clock.advance(timedelta(seconds=5))
-            retry_claim = await outbox.claim_next("telegram-worker")
+            retry_claim = await outbox.claim_next("telegram-worker", purposes=(QUALIFICATION_PURPOSE,))
             assert retry_claim is not None
             assert retry_claim.delivery_id == first_request.delivery.delivery_id
             await outbox.mark_failed(retry_claim, retryable=False, error_code="provider_rejected")
 
-            next_claim = await outbox.claim_next("telegram-worker")
+            next_claim = await outbox.claim_next("telegram-worker", purposes=(QUALIFICATION_PURPOSE,))
             assert next_claim is not None
             assert next_claim.delivery_id == second_request.delivery.delivery_id
         finally:
@@ -555,12 +605,12 @@ class TestDeliveryOrdering:
             first_request = await outbox.request_delivery(_request(first_message_id, binding_id, mode="text"))
             second_request = await outbox.request_delivery(_request(second_message_id, binding_id, mode="photo"))
 
-            assert await outbox.claim_next("photo-worker", modes=("photo",)) is None
-            first_claim = await outbox.claim_next("text-worker", modes=("text",))
+            assert await outbox.claim_next("photo-worker", purposes=(QUALIFICATION_PURPOSE,), modes=("photo",)) is None
+            first_claim = await outbox.claim_next("text-worker", purposes=(QUALIFICATION_PURPOSE,), modes=("text",))
             assert first_claim is not None
             assert first_claim.delivery_id == first_request.delivery.delivery_id
             await outbox.mark_succeeded(first_claim)
-            second_claim = await outbox.claim_next("photo-worker", modes=("photo",))
+            second_claim = await outbox.claim_next("photo-worker", purposes=(QUALIFICATION_PURPOSE,), modes=("photo",))
             assert second_claim is not None
             assert second_claim.delivery_id == second_request.delivery.delivery_id
         finally:
@@ -574,10 +624,10 @@ class TestDeliveryOrdering:
             direct = await outbox.request_delivery(_request(message_id, direct_binding_id))
             group = await outbox.request_delivery(_request(message_id, group_binding_id))
 
-            direct_claim = await outbox.claim_next("worker-1")
+            direct_claim = await outbox.claim_next("worker-1", purposes=(QUALIFICATION_PURPOSE,))
             assert direct_claim is not None
             assert direct_claim.delivery_id == direct.delivery.delivery_id
-            group_claim = await outbox.claim_next("worker-2")
+            group_claim = await outbox.claim_next("worker-2", purposes=(QUALIFICATION_PURPOSE,))
             assert group_claim is not None
             assert group_claim.delivery_id == group.delivery.delivery_id
         finally:
@@ -585,6 +635,46 @@ class TestDeliveryOrdering:
 
 
 class TestDeliveryClaims:
+    async def test_recovery_is_scoped_to_worker_purpose(self, tmp_path: Path):
+        store, message_id, private_binding = await _open_with_outbound(tmp_path / "kai.db")
+        group_binding = await _add_group_binding(store, message_id)
+        clock = _Clock()
+        outbox = WorkshopDeliveryOutbox(store, clock=clock)
+        qualification = await outbox.request_delivery(_request(message_id, private_binding))
+        conversation = await outbox.request_delivery(
+            _request(message_id, group_binding, purpose=CONVERSATION_REPLY_PURPOSE)
+        )
+        try:
+            assert (
+                await outbox.claim_next(
+                    "qualification-worker",
+                    purposes=(QUALIFICATION_PURPOSE,),
+                    delivery_id=qualification.delivery.delivery_id,
+                    lease_duration=timedelta(seconds=5),
+                )
+                is not None
+            )
+            assert (
+                await outbox.claim_next(
+                    "conversation-worker",
+                    purposes=(CONVERSATION_REPLY_PURPOSE,),
+                    delivery_id=conversation.delivery.delivery_id,
+                    lease_duration=timedelta(seconds=5),
+                )
+                is not None
+            )
+            clock.advance(timedelta(seconds=5))
+
+            recovered = await outbox.recover_expired_leases(
+                purposes=(CONVERSATION_REPLY_PURPOSE,),
+            )
+
+            assert recovered.requeued == 1
+            assert (await outbox.state(conversation.delivery.delivery_id)).status == "retry_wait"
+            assert (await outbox.state(qualification.delivery.delivery_id)).status == "leased"
+        finally:
+            await store.close()
+
     async def test_exact_claim_never_drains_other_due_work(self, tmp_path: Path):
         store, message_id, private_binding = await _open_with_outbound(tmp_path / "kai.db")
         group_binding = await _add_group_binding(store, message_id)
@@ -593,6 +683,7 @@ class TestDeliveryClaims:
         try:
             claim = await WorkshopDeliveryOutbox(store).claim_next(
                 "qualification-worker",
+                purposes=(QUALIFICATION_PURPOSE,),
                 delivery_id=group.delivery.delivery_id,
                 transport="telegram",
                 modes=("text",),
@@ -614,11 +705,13 @@ class TestDeliveryClaims:
         try:
             private_claim = await outbox.claim_next(
                 "private-worker",
+                purposes=(QUALIFICATION_PURPOSE,),
                 delivery_id=private.delivery.delivery_id,
                 lease_duration=timedelta(seconds=5),
             )
             group_claim = await outbox.claim_next(
                 "group-worker",
+                purposes=(QUALIFICATION_PURPOSE,),
                 delivery_id=group.delivery.delivery_id,
                 lease_duration=timedelta(seconds=5),
             )
@@ -628,6 +721,7 @@ class TestDeliveryClaims:
 
             recovered_group = await outbox.claim_next(
                 "qualification-worker",
+                purposes=(QUALIFICATION_PURPOSE,),
                 delivery_id=group.delivery.delivery_id,
             )
 
@@ -645,6 +739,7 @@ class TestDeliveryClaims:
         try:
             claim = await WorkshopDeliveryOutbox(store).claim_next(
                 "qualification-worker",
+                purposes=(QUALIFICATION_PURPOSE,),
                 delivery_id=second.delivery.delivery_id,
             )
 
@@ -662,8 +757,10 @@ class TestDeliveryClaims:
         second_store = await WorkshopEventStore.open(path)
         try:
             first, second = await asyncio.gather(
-                WorkshopDeliveryOutbox(store, clock=clock).claim_next("worker-1"),
-                WorkshopDeliveryOutbox(second_store, clock=clock).claim_next("worker-2"),
+                WorkshopDeliveryOutbox(store, clock=clock).claim_next("worker-1", purposes=(QUALIFICATION_PURPOSE,)),
+                WorkshopDeliveryOutbox(second_store, clock=clock).claim_next(
+                    "worker-2", purposes=(QUALIFICATION_PURPOSE,)
+                ),
             )
             claims = [claim for claim in (first, second) if claim is not None]
             assert len(claims) == 1
@@ -686,15 +783,15 @@ class TestDeliveryClaims:
         outbox = WorkshopDeliveryOutbox(store, clock=clock)
         try:
             requested = await outbox.request_delivery(_request(message_id, binding_id))
-            first = await outbox.claim_next("telegram-worker")
+            first = await outbox.claim_next("telegram-worker", purposes=(QUALIFICATION_PURPOSE,))
             assert first is not None
             failed = await outbox.mark_failed(first, retryable=True, error_code="network_timeout")
             assert failed.status == "retry_wait"
             assert failed.available_at == _NOW + timedelta(seconds=5)
-            assert await outbox.claim_next("telegram-worker") is None
+            assert await outbox.claim_next("telegram-worker", purposes=(QUALIFICATION_PURPOSE,)) is None
 
             clock.advance(timedelta(seconds=5))
-            second = await outbox.claim_next("telegram-worker")
+            second = await outbox.claim_next("telegram-worker", purposes=(QUALIFICATION_PURPOSE,))
             assert second is not None
             assert second.delivery_id == requested.delivery.delivery_id
             assert second.attempt_number == 2
@@ -712,12 +809,12 @@ class TestDeliveryClaims:
         outbox = WorkshopDeliveryOutbox(store, clock=clock)
         try:
             await outbox.request_delivery(_request(message_id, binding_id, max_attempts=1))
-            claim = await outbox.claim_next("telegram-worker")
+            claim = await outbox.claim_next("telegram-worker", purposes=(QUALIFICATION_PURPOSE,))
             assert claim is not None
             failed = await outbox.mark_failed(claim, retryable=True, error_code="network_timeout")
             assert failed.status == "failed"
             assert failed.completed_at == _NOW
-            assert await outbox.claim_next("telegram-worker") is None
+            assert await outbox.claim_next("telegram-worker", purposes=(QUALIFICATION_PURPOSE,)) is None
         finally:
             await store.close()
 
@@ -727,7 +824,7 @@ class TestDeliveryClaims:
         outbox = WorkshopDeliveryOutbox(store, clock=clock)
         try:
             await outbox.request_delivery(_request(message_id, binding_id))
-            claim = await outbox.claim_next("telegram-worker")
+            claim = await outbox.claim_next("telegram-worker", purposes=(QUALIFICATION_PURPOSE,))
             assert claim is not None
 
             failed = await outbox.mark_failed(
@@ -748,10 +845,12 @@ class TestDeliveryClaims:
         outbox = WorkshopDeliveryOutbox(store, clock=clock)
         try:
             await outbox.request_delivery(_request(message_id, binding_id))
-            stale = await outbox.claim_next("worker-1", lease_duration=timedelta(seconds=10))
+            stale = await outbox.claim_next(
+                "worker-1", purposes=(QUALIFICATION_PURPOSE,), lease_duration=timedelta(seconds=10)
+            )
             assert stale is not None
             clock.advance(timedelta(seconds=10))
-            current = await outbox.claim_next("worker-2")
+            current = await outbox.claim_next("worker-2", purposes=(QUALIFICATION_PURPOSE,))
             assert current is not None
             assert current.attempt_number == 2
             with pytest.raises(StaleDeliveryLeaseError):
@@ -766,7 +865,9 @@ class TestDeliveryClaims:
         outbox = WorkshopDeliveryOutbox(store, clock=clock)
         try:
             await outbox.request_delivery(_request(message_id, binding_id))
-            expired = await outbox.claim_next("worker-1", lease_duration=timedelta(seconds=10))
+            expired = await outbox.claim_next(
+                "worker-1", purposes=(QUALIFICATION_PURPOSE,), lease_duration=timedelta(seconds=10)
+            )
             assert expired is not None
             clock.advance(timedelta(seconds=10))
 
@@ -785,14 +886,18 @@ class TestDeliveryRecovery:
         clock = _Clock()
         outbox = WorkshopDeliveryOutbox(store, clock=clock)
         requested = await outbox.request_delivery(_request(message_id, binding_id))
-        claim = await outbox.claim_next("worker-before-restart", lease_duration=timedelta(seconds=10))
+        claim = await outbox.claim_next(
+            "worker-before-restart", purposes=(QUALIFICATION_PURPOSE,), lease_duration=timedelta(seconds=10)
+        )
         assert claim is not None
         await store.close()
 
         clock.advance(timedelta(seconds=10))
         reopened = await WorkshopEventStore.open(path)
         try:
-            recovered = await WorkshopDeliveryOutbox(reopened, clock=clock).recover_expired_leases()
+            recovered = await WorkshopDeliveryOutbox(reopened, clock=clock).recover_expired_leases(
+                purposes=(QUALIFICATION_PURPOSE,)
+            )
             assert recovered.requeued == 1
             assert recovered.failed == 0
             state = await WorkshopDeliveryOutbox(reopened, clock=clock).state(requested.delivery.delivery_id)
@@ -812,14 +917,18 @@ class TestDeliveryRecovery:
         clock = _Clock()
         outbox = WorkshopDeliveryOutbox(store, clock=clock)
         requested = await outbox.request_delivery(_request(message_id, binding_id, max_attempts=1))
-        claim = await outbox.claim_next("worker-before-restart", lease_duration=timedelta(seconds=10))
+        claim = await outbox.claim_next(
+            "worker-before-restart", purposes=(QUALIFICATION_PURPOSE,), lease_duration=timedelta(seconds=10)
+        )
         assert claim is not None
         await store.close()
 
         clock.advance(timedelta(seconds=10))
         reopened = await WorkshopEventStore.open(path)
         try:
-            recovered = await WorkshopDeliveryOutbox(reopened, clock=clock).recover_expired_leases()
+            recovered = await WorkshopDeliveryOutbox(reopened, clock=clock).recover_expired_leases(
+                purposes=(QUALIFICATION_PURPOSE,)
+            )
             assert recovered.requeued == 0
             assert recovered.failed == 1
             assert (await WorkshopDeliveryOutbox(reopened).state(requested.delivery.delivery_id)).status == "failed"
@@ -842,7 +951,7 @@ class TestDeliveryRecovery:
         outbox = WorkshopDeliveryOutbox(store, clock=clock)
         try:
             requested = await outbox.request_delivery(_request(message_id, binding_id))
-            claim = await outbox.claim_next("telegram-worker")
+            claim = await outbox.claim_next("telegram-worker", purposes=(QUALIFICATION_PURPOSE,))
             assert claim is not None
 
             await store.rebuild_projection(CanonicalConversationProjection())

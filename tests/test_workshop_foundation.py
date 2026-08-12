@@ -172,10 +172,12 @@ class TestWorkshopSchema:
         }
 
         assert expected <= await workshop_store.schema_tables()
-        assert await workshop_store.schema_version() == 10
+        assert await workshop_store.schema_version() == 11
         async with workshop_store.connection.execute("PRAGMA index_list(delivery_outbox)") as cursor:
             indexes = {str(row[1]) for row in await cursor.fetchall()}
         assert "delivery_outbox_binding_order_idx" in indexes
+        assert "delivery_outbox_purpose_due_idx" in indexes
+        assert "delivery_outbox_purpose_binding_order_idx" in indexes
 
     async def test_schema_migration_is_idempotent(self, tmp_path: Path):
         path = tmp_path / "workshop.db"
@@ -183,7 +185,7 @@ class TestWorkshopSchema:
         await first.close()
 
         second = await WorkshopEventStore.open(path)
-        assert await second.schema_version() == 10
+        assert await second.schema_version() == 11
         async with second.connection.execute(
             "SELECT COUNT(*) FROM workshop_schema_migrations WHERE version = 1"
         ) as cursor:
@@ -204,7 +206,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 10
+            assert await upgraded.schema_version() == 11
             assert {
                 "deliveries",
                 "channel_memberships",
@@ -219,7 +221,7 @@ class TestWorkshopSchema:
             async with upgraded.connection.execute(
                 "SELECT version FROM workshop_schema_migrations ORDER BY version"
             ) as cursor:
-                assert [row[0] for row in await cursor.fetchall()] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+                assert [row[0] for row in await cursor.fetchall()] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
         finally:
             await upgraded.close()
 
@@ -241,7 +243,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 10
+            assert await upgraded.schema_version() == 11
             assert {
                 "channel_memberships",
                 "workshop_client_devices",
@@ -282,7 +284,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 10
+            assert await upgraded.schema_version() == 11
             assert {
                 "workshop_client_devices",
                 "workshop_client_enrollment_grants",
@@ -335,7 +337,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 10
+            assert await upgraded.schema_version() == 11
             assert "workshop_client_enrollment_grants" in await upgraded.schema_tables()
             assert "artifacts" in await upgraded.schema_tables()
             assert "delivery_outbox" in await upgraded.schema_tables()
@@ -379,7 +381,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 10
+            assert await upgraded.schema_version() == 11
             assert "artifacts" in await upgraded.schema_tables()
             assert "delivery_outbox" in await upgraded.schema_tables()
             async with upgraded.connection.execute(
@@ -423,7 +425,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 10
+            assert await upgraded.schema_version() == 11
             assert {"delivery_outbox", "delivery_attempts"} <= await upgraded.schema_tables()
             async with upgraded.connection.execute(
                 "SELECT display_name FROM principals WHERE id = ?",
@@ -467,7 +469,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 10
+            assert await upgraded.schema_version() == 11
             assert {"delivery_outbox", "delivery_attempts", "delivery_fragments"} <= await upgraded.schema_tables()
             async with upgraded.connection.execute(
                 "SELECT display_name FROM principals WHERE id = ?",
@@ -571,12 +573,125 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 10
+            assert await upgraded.schema_version() == 11
             async with upgraded.connection.execute(
                 "SELECT message_id, channel_binding_id, transport, mode, status FROM deliveries WHERE id = ?",
                 (delivery_id,),
             ) as cursor:
                 assert tuple(await cursor.fetchone()) == (message_id, None, "telegram", "text", "succeeded")
+        finally:
+            await upgraded.close()
+
+    async def test_version_ten_outbox_rows_migrate_as_qualification_work(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        from kai.workshop import schema
+        from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+        from kai.workshop.inbound import InboundMessage, record_inbound_message
+        from kai.workshop.outbound import OutboundMessage, record_outbound_message
+
+        path = tmp_path / "workshop.db"
+        timestamp = "2026-08-12T12:00:00.000000Z"
+        with monkeypatch.context() as migration_context:
+            migration_context.setattr(schema, "WORKSHOP_SCHEMA_VERSION", 10)
+            migration_context.setattr(schema, "_MIGRATIONS", schema._MIGRATIONS[:10])
+            version_ten = await WorkshopEventStore.open(path)
+            await bootstrap_default_workshop(
+                version_ten,
+                (
+                    BootstrapHuman(
+                        display_name="Existing human",
+                        role="admin",
+                        transport="telegram",
+                        external_subject="101",
+                        external_channel_id="101",
+                    ),
+                ),
+            )
+            inbound = await record_inbound_message(
+                version_ten,
+                InboundMessage(
+                    transport="telegram",
+                    update_id="9001",
+                    message_id="42",
+                    sender_subject="101",
+                    channel_subject="101",
+                    body="Existing inbound",
+                    occurred_at=datetime(2026, 8, 12, 12, 0, tzinfo=UTC),
+                ),
+            )
+            outbound = await record_outbound_message(
+                version_ten,
+                OutboundMessage(
+                    in_reply_to_message_id=MessageId(str(inbound.event.envelope.aggregate_id)),
+                    body="Existing reply",
+                    occurred_at=datetime(2026, 8, 12, 12, 0, tzinfo=UTC),
+                ),
+            )
+            message_id = MessageId(str(outbound.event.envelope.aggregate_id))
+            async with version_ten.connection.execute(
+                "SELECT c.workshop_id, m.channel_id, cb.id, m.author_principal_id "
+                "FROM messages m JOIN channels c ON c.id = m.channel_id "
+                "JOIN channel_bindings cb ON cb.channel_id = m.channel_id "
+                "WHERE m.id = ? AND cb.transport = 'telegram'",
+                (message_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            assert row is not None
+            workshop_id = WorkshopId(str(row[0]))
+            channel_id = ChannelId(str(row[1]))
+            binding_id = str(row[2])
+            delivery_id = DeliveryId.derived(workshop_id, f"delivery:{message_id}:{binding_id}:text")
+            requested = await version_ten.append(
+                EventEnvelope.create(
+                    event_type=WorkshopEventType.DELIVERY_REQUESTED,
+                    event_version=1,
+                    workshop_id=workshop_id,
+                    aggregate_type="delivery",
+                    aggregate_id=delivery_id,
+                    actor_principal_id=PrincipalId(str(row[3])),
+                    occurred_at=datetime(2026, 8, 12, 12, 0, tzinfo=UTC),
+                    payload={
+                        "message_id": message_id,
+                        "channel_id": channel_id,
+                        "channel_binding_id": binding_id,
+                        "transport": "telegram",
+                        "mode": "text",
+                        "max_attempts": 3,
+                    },
+                )
+            )
+            await version_ten.connection.execute(
+                "INSERT INTO delivery_outbox "
+                "(id, workshop_id, channel_id, channel_binding_id, message_id, transport, mode, "
+                "status, max_attempts, attempt_count, available_at, requested_event_position, "
+                "created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'telegram', 'text', 'pending', 3, 0, ?, ?, ?, ?)",
+                (
+                    delivery_id,
+                    workshop_id,
+                    channel_id,
+                    binding_id,
+                    message_id,
+                    timestamp,
+                    requested.event.position,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            await version_ten.connection.commit()
+            await version_ten.close()
+
+        upgraded = await WorkshopEventStore.open(path)
+        try:
+            assert await upgraded.schema_version() == 11
+            async with upgraded.connection.execute(
+                "SELECT purpose, status, attempt_count FROM delivery_outbox WHERE id = ?",
+                (delivery_id,),
+            ) as cursor:
+                assert tuple(await cursor.fetchone()) == ("qualification", "pending", 0)
         finally:
             await upgraded.close()
 
