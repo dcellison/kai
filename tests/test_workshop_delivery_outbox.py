@@ -96,6 +96,30 @@ async def _open_with_outbound(path: Path) -> tuple[WorkshopEventStore, MessageId
     return store, message_id, ChannelBindingId(str(row[0]))
 
 
+async def _add_outbound(store: WorkshopEventStore, sequence: int) -> MessageId:
+    inbound = await record_inbound_message(
+        store,
+        InboundMessage(
+            transport="telegram",
+            update_id=str(9001 + sequence),
+            message_id=str(42 + sequence),
+            sender_subject="101",
+            channel_subject="101",
+            body=f"Message {sequence}",
+            occurred_at=_NOW + timedelta(seconds=sequence),
+        ),
+    )
+    outbound = await record_outbound_message(
+        store,
+        OutboundMessage(
+            in_reply_to_message_id=MessageId(str(inbound.event.envelope.aggregate_id)),
+            body=f"Reply {sequence}",
+            occurred_at=_NOW + timedelta(seconds=sequence),
+        ),
+    )
+    return MessageId(str(outbound.event.envelope.aggregate_id))
+
+
 async def _add_group_binding(
     store: WorkshopEventStore,
     message_id: MessageId,
@@ -133,12 +157,13 @@ def _request(
     message_id: MessageId,
     binding_id: ChannelBindingId,
     *,
+    mode: str = "text",
     max_attempts: int = 5,
 ) -> DeliveryRequest:
     return DeliveryRequest(
         message_id=message_id,
         channel_binding_id=binding_id,
-        mode="text",
+        mode=mode,
         occurred_at=_NOW,
         max_attempts=max_attempts,
     )
@@ -459,6 +484,94 @@ class TestDeliveryOutcomes:
 
             with pytest.raises(ValueError, match="message and binding must belong to the same channel"):
                 await store.project_pending(CanonicalConversationProjection())
+        finally:
+            await store.close()
+
+
+class TestDeliveryOrdering:
+    async def test_concurrent_workers_cannot_overtake_on_one_binding(self, tmp_path: Path):
+        path = tmp_path / "kai.db"
+        store, first_message_id, binding_id = await _open_with_outbound(path)
+        second_message_id = await _add_outbound(store, 1)
+        outbox = WorkshopDeliveryOutbox(store, clock=_Clock())
+        first_request = await outbox.request_delivery(_request(first_message_id, binding_id))
+        second_request = await outbox.request_delivery(_request(second_message_id, binding_id))
+        second_store = await WorkshopEventStore.open(path)
+        try:
+            first_claim, competing_claim = await asyncio.gather(
+                outbox.claim_next("worker-1"),
+                WorkshopDeliveryOutbox(second_store, clock=_Clock()).claim_next("worker-2"),
+            )
+            claims = [claim for claim in (first_claim, competing_claim) if claim is not None]
+            assert len(claims) == 1
+            assert claims[0].delivery_id == first_request.delivery.delivery_id
+
+            await outbox.mark_succeeded(claims[0])
+            next_claim = await WorkshopDeliveryOutbox(second_store, clock=_Clock()).claim_next("worker-2")
+            assert next_claim is not None
+            assert next_claim.delivery_id == second_request.delivery.delivery_id
+        finally:
+            await second_store.close()
+            await store.close()
+
+    async def test_retry_wait_blocks_later_delivery_until_predecessor_is_terminal(self, tmp_path: Path):
+        store, first_message_id, binding_id = await _open_with_outbound(tmp_path / "kai.db")
+        second_message_id = await _add_outbound(store, 1)
+        clock = _Clock()
+        outbox = WorkshopDeliveryOutbox(store, clock=clock)
+        try:
+            first_request = await outbox.request_delivery(_request(first_message_id, binding_id))
+            second_request = await outbox.request_delivery(_request(second_message_id, binding_id))
+            first_claim = await outbox.claim_next("telegram-worker")
+            assert first_claim is not None
+            await outbox.mark_failed(first_claim, retryable=True, error_code="network_timeout")
+
+            assert await outbox.claim_next("telegram-worker") is None
+            clock.advance(timedelta(seconds=5))
+            retry_claim = await outbox.claim_next("telegram-worker")
+            assert retry_claim is not None
+            assert retry_claim.delivery_id == first_request.delivery.delivery_id
+            await outbox.mark_failed(retry_claim, retryable=False, error_code="provider_rejected")
+
+            next_claim = await outbox.claim_next("telegram-worker")
+            assert next_claim is not None
+            assert next_claim.delivery_id == second_request.delivery.delivery_id
+        finally:
+            await store.close()
+
+    async def test_mode_filter_cannot_bypass_earlier_work_on_same_binding(self, tmp_path: Path):
+        store, first_message_id, binding_id = await _open_with_outbound(tmp_path / "kai.db")
+        second_message_id = await _add_outbound(store, 1)
+        outbox = WorkshopDeliveryOutbox(store, clock=_Clock())
+        try:
+            first_request = await outbox.request_delivery(_request(first_message_id, binding_id, mode="text"))
+            second_request = await outbox.request_delivery(_request(second_message_id, binding_id, mode="photo"))
+
+            assert await outbox.claim_next("photo-worker", modes=("photo",)) is None
+            first_claim = await outbox.claim_next("text-worker", modes=("text",))
+            assert first_claim is not None
+            assert first_claim.delivery_id == first_request.delivery.delivery_id
+            await outbox.mark_succeeded(first_claim)
+            second_claim = await outbox.claim_next("photo-worker", modes=("photo",))
+            assert second_claim is not None
+            assert second_claim.delivery_id == second_request.delivery.delivery_id
+        finally:
+            await store.close()
+
+    async def test_different_bindings_progress_independently(self, tmp_path: Path):
+        store, message_id, direct_binding_id = await _open_with_outbound(tmp_path / "kai.db")
+        outbox = WorkshopDeliveryOutbox(store, clock=_Clock())
+        try:
+            group_binding_id = await _add_group_binding(store, message_id)
+            direct = await outbox.request_delivery(_request(message_id, direct_binding_id))
+            group = await outbox.request_delivery(_request(message_id, group_binding_id))
+
+            direct_claim = await outbox.claim_next("worker-1")
+            assert direct_claim is not None
+            assert direct_claim.delivery_id == direct.delivery.delivery_id
+            group_claim = await outbox.claim_next("worker-2")
+            assert group_claim is not None
+            assert group_claim.delivery_id == group.delivery.delivery_id
         finally:
             await store.close()
 

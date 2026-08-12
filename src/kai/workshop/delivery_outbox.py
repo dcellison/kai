@@ -284,6 +284,12 @@ class WorkshopDeliveryOutbox:
                 "o.status IN ('pending', 'retry_wait')",
                 "o.available_at <= ?",
                 "o.attempt_count < o.max_attempts",
+                "NOT EXISTS ("
+                "SELECT 1 FROM delivery_outbox predecessor "
+                "WHERE predecessor.channel_binding_id = o.channel_binding_id "
+                "AND predecessor.requested_event_position < o.requested_event_position "
+                "AND predecessor.status NOT IN ('succeeded', 'failed')"
+                ")",
             ]
             parameters: list[object] = [now_text]
             if transport is not None:

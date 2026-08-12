@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 9
+WORKSHOP_SCHEMA_VERSION = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -430,6 +430,15 @@ _BINDING_AWARE_DELIVERY_SCHEMA = SchemaMigration(
     ),
 )
 
+_DELIVERY_BINDING_ORDER_SCHEMA = SchemaMigration(
+    version=10,
+    name="delivery_binding_order_index",
+    statements=(
+        "CREATE INDEX delivery_outbox_binding_order_idx "
+        "ON delivery_outbox (channel_binding_id, requested_event_position, status)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -440,6 +449,7 @@ _MIGRATIONS = (
     _DELIVERY_OUTBOX_SCHEMA,
     _DELIVERY_FRAGMENT_SCHEMA,
     _BINDING_AWARE_DELIVERY_SCHEMA,
+    _DELIVERY_BINDING_ORDER_SCHEMA,
 )
 
 
