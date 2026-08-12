@@ -60,6 +60,7 @@ from kai.install import (
     _secure_history_directories,
     _secure_upload_directories,
     _set_ownership,
+    _set_static_install_tree_modes,
     _src_checksum,
     _start_service,
     _stop_service,
@@ -4643,6 +4644,42 @@ class TestApplyVenv:
         assert "Venv unchanged" in output
         assert "checksums match" in output
 
+    def test_matching_checksums_repair_restrictive_venv_modes(self, tmp_path, capsys):
+        """The no-change fast path repairs modes inherited from umask 077."""
+        install = tmp_path / "opt" / "kai"
+        venv = install / "venv"
+        venv_bin = venv / "bin"
+        venv_bin.mkdir(parents=True)
+        venv_python = venv_bin / "python"
+        venv_python.touch(mode=0o755)
+        package = venv / "lib" / "python3.13" / "site-packages" / "kai"
+        package.mkdir(parents=True)
+        module = package / "__init__.py"
+        module.write_text("# init")
+
+        (install / "pyproject.toml").write_text("[project]\nname = 'kai'\n")
+        src = install / "src" / "kai"
+        src.mkdir(parents=True)
+        (src / "__init__.py").write_text("# init")
+        (install / ".pyproject.sha256").write_text(
+            _file_checksum(install / "pyproject.toml") + "\n"
+        )
+        (install / ".src.sha256").write_text(_src_checksum(install / "src") + "\n")
+
+        for directory in (venv, venv_bin, package.parent, package):
+            directory.chmod(0o700)
+        module.chmod(0o600)
+
+        _apply_venv(install, is_update=True, dry_run=False)
+
+        output = capsys.readouterr().out
+        assert "Restored service-readable venv modes" in output
+        assert "Venv unchanged" in output
+        assert stat.S_IMODE(venv.stat().st_mode) == 0o755
+        assert stat.S_IMODE(package.stat().st_mode) == 0o755
+        assert stat.S_IMODE(module.stat().st_mode) == 0o644
+        assert stat.S_IMODE(venv_python.stat().st_mode) == 0o755
+
     def test_reinstalls_on_source_change(self, tmp_path, monkeypatch, capsys):
         """Triggers reinstall when source files change but pyproject.toml does not."""
         install = tmp_path / "opt" / "kai"
@@ -6967,6 +7004,59 @@ class TestApplySource:
         # <install>/config/ should be root-owned (static template, not runtime data)
         own_calls = [c for c in mock_own.call_args_list if c[0] == (config_dst, 0, 0) and c[1].get("recursive") is True]
         assert len(own_calls) == 1
+
+    def test_normalizes_static_tree_modes_under_restrictive_umask(self, tmp_path):
+        """Copied code remains readable when the installer caller uses umask 077."""
+        project = tmp_path / "source"
+        package = project / "src" / "kai" / "nested"
+        package.mkdir(parents=True)
+        (package / "module.py").write_text("value = 1\n")
+        (project / "pyproject.toml").write_text("[project]\nname = 'kai'\n")
+        config = project / "templates" / "config"
+        config.mkdir(parents=True)
+        (config / "goose-config.yaml").write_text("extensions: []\n")
+        install = tmp_path / "install"
+        install.mkdir()
+
+        previous_umask = os.umask(0o077)
+        try:
+            with (
+                patch("kai.install.PROJECT_ROOT", project),
+                patch("kai.install._set_ownership"),
+                patch("os.chown"),
+            ):
+                _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
+        finally:
+            os.umask(previous_umask)
+
+        assert stat.S_IMODE((install / "src").stat().st_mode) == 0o755
+        assert stat.S_IMODE((install / "src" / "kai" / "nested").stat().st_mode) == 0o755
+        assert stat.S_IMODE((install / "src" / "kai" / "nested" / "module.py").stat().st_mode) == 0o644
+        assert stat.S_IMODE((install / "config").stat().st_mode) == 0o755
+        assert stat.S_IMODE((install / "config" / "goose-config.yaml").stat().st_mode) == 0o644
+
+
+    def test_preserves_executable_intent_and_skips_symlinks(self, tmp_path):
+        tree = tmp_path / "tree"
+        tree.mkdir(mode=0o700)
+        executable = tree / "tool"
+        executable.write_text("#!/bin/sh\n")
+        executable.chmod(0o700)
+        regular = tree / "data"
+        regular.write_text("data\n")
+        regular.chmod(0o600)
+        target = tmp_path / "outside"
+        target.write_text("outside\n")
+        target.chmod(0o600)
+        (tree / "link").symlink_to(target)
+
+        assert _set_static_install_tree_modes(tree) is True
+
+        assert stat.S_IMODE(tree.stat().st_mode) == 0o755
+        assert stat.S_IMODE(executable.stat().st_mode) == 0o755
+        assert stat.S_IMODE(regular.stat().st_mode) == 0o644
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+        assert _set_static_install_tree_modes(tree) is False
 
     def test_dry_run_includes_templates_config(self, tmp_path, capsys):
         """Dry run names templates/config/ when it exists."""

@@ -2449,6 +2449,55 @@ def _set_private_user_tree_modes(path: Path) -> None:
         os.chmod(path, _PRIVATE_USER_FILE_MODE)
 
 
+def _set_static_install_tree_modes(path: Path) -> bool:
+    """Make root-owned installed code traversable and readable by the service.
+
+    Installer callers may have a restrictive umask (for example ``077``).
+    Directory creation performed by ``mkdir``, ``venv``, and ``pip`` inherits
+    that umask, which can otherwise leave root-owned installed code at 0700 and
+    prevent the unprivileged Kai service from importing it.  Static install
+    trees contain no secrets: directories are normalized to 0755 and regular
+    files to 0644, while files that already carry an executable bit retain an
+    executable mode of 0755.  Symlinks are skipped so chmod never follows an
+    operator-created link outside the tree.
+
+    Returns True when at least one mode was changed.
+    """
+    if path.is_symlink() or not path.exists():
+        return False
+
+    changed = False
+
+    def normalize(candidate: Path, expected_mode: int) -> None:
+        nonlocal changed
+        current_mode = stat.S_IMODE(candidate.stat().st_mode)
+        if current_mode != expected_mode:
+            os.chmod(candidate, expected_mode)
+            changed = True
+
+    if path.is_dir():
+        normalize(path, 0o755)
+        for root, dirs, files in os.walk(path, followlinks=False):
+            root_path = Path(root)
+            if not root_path.is_symlink():
+                normalize(root_path, 0o755)
+            for dirname in dirs:
+                child = root_path / dirname
+                if not child.is_symlink():
+                    normalize(child, 0o755)
+            for filename in files:
+                child = root_path / filename
+                if child.is_symlink():
+                    continue
+                current_mode = stat.S_IMODE(child.stat().st_mode)
+                normalize(child, 0o755 if current_mode & 0o111 else 0o644)
+    else:
+        current_mode = stat.S_IMODE(path.stat().st_mode)
+        normalize(path, 0o755 if current_mode & 0o111 else 0o644)
+
+    return changed
+
+
 def _copy_tree(
     src: Path,
     dst: Path,
@@ -5649,6 +5698,7 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
     # included by the subsequent non-editable pip install.
     _copy_tree(src_src, src_dst, _SOURCE_EXCLUDES, replace=True)
     _set_ownership(src_dst, 0, 0, recursive=True)
+    _set_static_install_tree_modes(src_dst)
     print(f"  Copied source to {src_dst}")
 
     shutil.copy2(pyproject_src, pyproject_dst)
@@ -5675,6 +5725,7 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
         # no parent-creation step is needed here).
         _copy_tree(config_src, config_dst)
         _set_ownership(config_dst, 0, 0, recursive=True)
+        _set_static_install_tree_modes(config_dst)
         print(f"  Copied config templates to {config_dst}")
 
     # Retire the now-vestigial `<install>/home/` directory. On a clean
@@ -5744,6 +5795,13 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
     build_path = install_path / "build"
 
     if is_update and venv_path.exists():
+        # A prior install (or pip update) may have run beneath a restrictive
+        # caller umask. Repair the entire root-owned static venv before the
+        # checksum fast path so a no-change install also restores service
+        # access. Dry-run must remain side-effect free.
+        if not dry_run and _set_static_install_tree_modes(venv_path):
+            print("  Restored service-readable venv modes")
+
         # Homebrew removes the old Cellar path when Python is upgraded. A venv
         # created with symlinks can therefore remain on disk while its Python
         # interpreter becomes a dangling symlink. Detect that before the
@@ -5876,6 +5934,10 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
 
     # Set venv ownership to root (read-only for service user)
     _set_ownership(venv_path, 0, 0, recursive=True)
+    # pip creates package directories using the caller's umask. Normalize
+    # after every install so newly written package metadata and modules stay
+    # importable by the unprivileged service.
+    _set_static_install_tree_modes(venv_path)
 
 
 def _apply_models(install_path: Path, dry_run: bool) -> None:
