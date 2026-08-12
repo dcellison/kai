@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 8
+WORKSHOP_SCHEMA_VERSION = 9
 
 
 @dataclass(frozen=True, slots=True)
@@ -394,6 +394,42 @@ _DELIVERY_FRAGMENT_SCHEMA = SchemaMigration(
     ),
 )
 
+_BINDING_AWARE_DELIVERY_SCHEMA = SchemaMigration(
+    version=9,
+    name="binding_aware_delivery_outcomes",
+    statements=(
+        "ALTER TABLE deliveries RENAME TO legacy_deliveries_v8",
+        """
+        CREATE TABLE deliveries (
+            id TEXT PRIMARY KEY,
+            message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            channel_binding_id TEXT REFERENCES channel_bindings(id) ON DELETE CASCADE,
+            transport TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('succeeded', 'failed')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_event_position INTEGER NOT NULL UNIQUE REFERENCES event_log(position) ON DELETE RESTRICT
+        )
+        """,
+        """
+        INSERT INTO deliveries (
+            id, message_id, channel_id, channel_binding_id, transport, mode,
+            status, created_at, updated_at, last_event_position
+        )
+        SELECT id, message_id, channel_id, NULL, transport, mode,
+               status, created_at, updated_at, last_event_position
+        FROM legacy_deliveries_v8
+        """,
+        "DROP TABLE legacy_deliveries_v8",
+        "CREATE UNIQUE INDEX deliveries_legacy_identity_idx "
+        "ON deliveries (message_id, transport, mode) WHERE channel_binding_id IS NULL",
+        "CREATE UNIQUE INDEX deliveries_binding_identity_idx "
+        "ON deliveries (message_id, channel_binding_id, mode) WHERE channel_binding_id IS NOT NULL",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -403,6 +439,7 @@ _MIGRATIONS = (
     _ARTIFACT_SCHEMA,
     _DELIVERY_OUTBOX_SCHEMA,
     _DELIVERY_FRAGMENT_SCHEMA,
+    _BINDING_AWARE_DELIVERY_SCHEMA,
 )
 
 

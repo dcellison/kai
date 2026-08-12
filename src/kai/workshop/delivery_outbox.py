@@ -416,7 +416,9 @@ class WorkshopDeliveryOutbox:
             await connection.execute("BEGIN IMMEDIATE")
             async with connection.execute(
                 "SELECT o.status, o.attempt_count, o.max_attempts, o.lease_id, "
-                "o.lease_expires_at, a.outcome FROM delivery_outbox o JOIN delivery_attempts a "
+                "o.lease_expires_at, a.outcome, a.completed_at, a.error_code, "
+                "o.workshop_id, o.channel_id, o.channel_binding_id, o.message_id, o.transport, o.mode "
+                "FROM delivery_outbox o JOIN delivery_attempts a "
                 "ON a.delivery_id = o.id AND a.id = ? WHERE o.id = ?",
                 (claim.attempt_id, claim.delivery_id),
             ) as cursor:
@@ -425,6 +427,21 @@ class WorkshopDeliveryOutbox:
                 raise StaleDeliveryLeaseError("Delivery attempt does not exist")
             if row[5] is not None:
                 if succeeded and row[5] == desired_outcome and row[0] == "succeeded":
+                    if row[6] is None:
+                        raise DeliveryOutboxError("Completed delivery attempt has no completion timestamp")
+                    await self._append_outcome_event(
+                        delivery_id=claim.delivery_id,
+                        workshop_id=WorkshopId(str(row[8])),
+                        channel_id=ChannelId(str(row[9])),
+                        channel_binding_id=ChannelBindingId(str(row[10])),
+                        message_id=MessageId(str(row[11])),
+                        transport=str(row[12]),
+                        mode=str(row[13]),
+                        attempt_number=int(row[1]),
+                        status="succeeded",
+                        error_code=None,
+                        occurred_at=_parse_timestamp(str(row[6])),
+                    )
                     state = await self._state_by_id(claim.delivery_id)
                     await connection.commit()
                     return state
@@ -495,6 +512,20 @@ class WorkshopDeliveryOutbox:
                     claim.attempt_id,
                 ),
             )
+            if status in {"succeeded", "failed"}:
+                await self._append_outcome_event(
+                    delivery_id=claim.delivery_id,
+                    workshop_id=WorkshopId(str(row[8])),
+                    channel_id=ChannelId(str(row[9])),
+                    channel_binding_id=ChannelBindingId(str(row[10])),
+                    message_id=MessageId(str(row[11])),
+                    transport=str(row[12]),
+                    mode=str(row[13]),
+                    attempt_number=attempt_count,
+                    status=status,
+                    error_code=error_code,
+                    occurred_at=now,
+                )
             state = await self._state_by_id(claim.delivery_id)
             await connection.commit()
             return state
@@ -506,7 +537,8 @@ class WorkshopDeliveryOutbox:
         connection = self._store.connection
         now_text = _format_timestamp(now)
         async with connection.execute(
-            "SELECT id, lease_id, attempt_count, max_attempts FROM delivery_outbox "
+            "SELECT id, lease_id, attempt_count, max_attempts, workshop_id, channel_id, "
+            "channel_binding_id, message_id, transport, mode FROM delivery_outbox "
             "WHERE status = 'leased' AND lease_expires_at <= ? ORDER BY requested_event_position",
             (now_text,),
         ) as cursor:
@@ -545,10 +577,70 @@ class WorkshopDeliveryOutbox:
                 (status, now_text, error_code, now_text, completed_at, delivery_id, attempt_id),
             )
             if terminal:
+                await self._append_outcome_event(
+                    delivery_id=delivery_id,
+                    workshop_id=WorkshopId(str(row[4])),
+                    channel_id=ChannelId(str(row[5])),
+                    channel_binding_id=ChannelBindingId(str(row[6])),
+                    message_id=MessageId(str(row[7])),
+                    transport=str(row[8]),
+                    mode=str(row[9]),
+                    attempt_number=int(row[2]),
+                    status="failed",
+                    error_code=error_code,
+                    occurred_at=now,
+                )
                 failed += 1
             else:
                 requeued += 1
         return DeliveryRecoveryResult(requeued=requeued, failed=failed)
+
+    async def _append_outcome_event(
+        self,
+        *,
+        delivery_id: DeliveryId,
+        workshop_id: WorkshopId,
+        channel_id: ChannelId,
+        channel_binding_id: ChannelBindingId,
+        message_id: MessageId,
+        transport: str,
+        mode: str,
+        attempt_number: int,
+        status: str,
+        error_code: str | None,
+        occurred_at: datetime,
+    ) -> None:
+        if status not in {"succeeded", "failed"}:
+            raise DeliveryOutboxError("Delivery outcome status is not terminal")
+        payload: dict[str, object] = {
+            "message_id": message_id,
+            "channel_id": channel_id,
+            "channel_binding_id": channel_binding_id,
+            "transport": transport,
+            "mode": mode,
+            "attempt_number": attempt_number,
+        }
+        if error_code is not None:
+            payload["error_code"] = error_code
+        event_type = (
+            WorkshopEventType.DELIVERY_SUCCEEDED if status == "succeeded" else WorkshopEventType.DELIVERY_FAILED
+        )
+        event = EventEnvelope.create(
+            event_id=EventId.derived(
+                workshop_id,
+                f"delivery-outcome-event:v2:{delivery_id}:{status}",
+            ),
+            event_type=event_type,
+            event_version=2,
+            workshop_id=workshop_id,
+            aggregate_type="delivery",
+            aggregate_id=delivery_id,
+            occurred_at=occurred_at,
+            idempotency_key=f"workshop-delivery-outcome:v2:{delivery_id}:{status}",
+            payload=payload,
+            metadata={"source": "delivery_outbox"},
+        )
+        await self._store.append_in_transaction(event)
 
     async def _resolve_target(
         self,

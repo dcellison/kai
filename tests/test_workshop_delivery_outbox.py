@@ -20,13 +20,20 @@ from kai.workshop.delivery_outbox import (
 )
 from kai.workshop.domain import (
     ChannelBindingId,
+    ChannelId,
+    DeliveryId,
     EventEnvelope,
     MessageId,
     WorkshopEventType,
     WorkshopId,
 )
 from kai.workshop.inbound import InboundMessage, record_inbound_message
-from kai.workshop.outbound import OutboundMessage, record_outbound_message
+from kai.workshop.outbound import (
+    DeliveryObservation,
+    OutboundMessage,
+    record_delivery_observation,
+    record_outbound_message,
+)
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import WorkshopEventStore
 
@@ -87,6 +94,39 @@ async def _open_with_outbound(path: Path) -> tuple[WorkshopEventStore, MessageId
         row = await cursor.fetchone()
     assert row is not None
     return store, message_id, ChannelBindingId(str(row[0]))
+
+
+async def _add_group_binding(
+    store: WorkshopEventStore,
+    message_id: MessageId,
+) -> ChannelBindingId:
+    async with store.connection.execute(
+        "SELECT c.workshop_id, m.channel_id FROM messages m JOIN channels c ON c.id = m.channel_id WHERE m.id = ?",
+        (message_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    workshop_id = WorkshopId(str(row[0]))
+    channel_id = str(row[1])
+    group_binding_id = ChannelBindingId.new()
+    await store.append(
+        EventEnvelope.create(
+            event_type=WorkshopEventType.TRANSPORT_CHANNEL_BOUND,
+            event_version=1,
+            workshop_id=workshop_id,
+            aggregate_type="channel_binding",
+            aggregate_id=group_binding_id,
+            occurred_at=_NOW,
+            idempotency_key=f"test:notification-group-binding:{group_binding_id}",
+            payload={
+                "channel_id": channel_id,
+                "transport": "telegram",
+                "external_channel_id": "-100123",
+            },
+        )
+    )
+    await store.project_pending(CanonicalConversationProjection())
+    return group_binding_id
 
 
 def _request(
@@ -166,33 +206,7 @@ class TestDeliveryRequests:
     async def test_same_message_can_target_multiple_registered_telegram_bindings(self, tmp_path: Path):
         store, message_id, direct_binding_id = await _open_with_outbound(tmp_path / "kai.db")
         try:
-            async with store.connection.execute(
-                "SELECT c.workshop_id, m.channel_id FROM messages m "
-                "JOIN channels c ON c.id = m.channel_id WHERE m.id = ?",
-                (message_id,),
-            ) as cursor:
-                row = await cursor.fetchone()
-            assert row is not None
-            workshop_id = WorkshopId(str(row[0]))
-            channel_id = str(row[1])
-            group_binding_id = ChannelBindingId.new()
-            await store.append(
-                EventEnvelope.create(
-                    event_type=WorkshopEventType.TRANSPORT_CHANNEL_BOUND,
-                    event_version=1,
-                    workshop_id=workshop_id,
-                    aggregate_type="channel_binding",
-                    aggregate_id=group_binding_id,
-                    occurred_at=_NOW,
-                    idempotency_key="test:notification-group-binding",
-                    payload={
-                        "channel_id": channel_id,
-                        "transport": "telegram",
-                        "external_channel_id": "-100123",
-                    },
-                )
-            )
-            await store.project_pending(CanonicalConversationProjection())
+            group_binding_id = await _add_group_binding(store, message_id)
             outbox = WorkshopDeliveryOutbox(store)
 
             direct = await outbox.request_delivery(_request(message_id, direct_binding_id))
@@ -235,6 +249,216 @@ class TestDeliveryRequests:
                 assert (await cursor.fetchone())[0] == 0
             async with store.connection.execute("SELECT COUNT(*) FROM delivery_outbox") as cursor:
                 assert (await cursor.fetchone())[0] == 0
+        finally:
+            await store.close()
+
+
+class TestDeliveryOutcomes:
+    async def test_success_appends_and_projects_exact_binding_aware_fact_idempotently(self, tmp_path: Path):
+        store, message_id, binding_id = await _open_with_outbound(tmp_path / "kai.db")
+        outbox = WorkshopDeliveryOutbox(store, clock=_Clock())
+        try:
+            requested = await outbox.request_delivery(_request(message_id, binding_id))
+            claim = await outbox.claim_next("telegram-worker")
+            assert claim is not None
+
+            succeeded = await outbox.mark_succeeded(claim)
+            assert succeeded.status == "succeeded"
+            assert await outbox.mark_succeeded(claim) == succeeded
+
+            events = [
+                event
+                for event in await store.read_events()
+                if event.envelope.event_type
+                in {WorkshopEventType.DELIVERY_SUCCEEDED, WorkshopEventType.DELIVERY_FAILED}
+            ]
+            assert len(events) == 1
+            event = events[0]
+            assert event.envelope.event_type == WorkshopEventType.DELIVERY_SUCCEEDED
+            assert event.envelope.event_version == 2
+            assert event.envelope.aggregate_id == requested.delivery.delivery_id
+            assert event.envelope.payload == {
+                "message_id": message_id,
+                "channel_id": requested.delivery.channel_id,
+                "channel_binding_id": binding_id,
+                "transport": "telegram",
+                "mode": "text",
+                "attempt_number": 1,
+            }
+            assert event.envelope.metadata == {"source": "delivery_outbox"}
+
+            await store.project_pending(CanonicalConversationProjection())
+            async with store.connection.execute(
+                "SELECT id, channel_binding_id, status FROM deliveries WHERE id = ?",
+                (requested.delivery.delivery_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            assert tuple(row) == (requested.delivery.delivery_id, binding_id, "succeeded")
+        finally:
+            await store.close()
+
+    async def test_retry_scheduling_has_no_terminal_fact_but_exhaustion_does(self, tmp_path: Path):
+        store, message_id, binding_id = await _open_with_outbound(tmp_path / "kai.db")
+        clock = _Clock()
+        outbox = WorkshopDeliveryOutbox(store, clock=clock)
+        try:
+            requested = await outbox.request_delivery(_request(message_id, binding_id, max_attempts=2))
+            first = await outbox.claim_next("telegram-worker")
+            assert first is not None
+            retry = await outbox.mark_failed(first, retryable=True, error_code="network_timeout")
+            assert retry.status == "retry_wait"
+            assert not [
+                event
+                for event in await store.read_events()
+                if event.envelope.event_type
+                in {WorkshopEventType.DELIVERY_SUCCEEDED, WorkshopEventType.DELIVERY_FAILED}
+            ]
+
+            clock.advance(timedelta(seconds=5))
+            second = await outbox.claim_next("telegram-worker")
+            assert second is not None
+            failed = await outbox.mark_failed(second, retryable=True, error_code="network_timeout")
+            assert failed.status == "failed"
+
+            events = [
+                event
+                for event in await store.read_events()
+                if event.envelope.event_type
+                in {WorkshopEventType.DELIVERY_SUCCEEDED, WorkshopEventType.DELIVERY_FAILED}
+            ]
+            assert len(events) == 1
+            event = events[0]
+            assert event.envelope.event_type == WorkshopEventType.DELIVERY_FAILED
+            assert event.envelope.event_version == 2
+            assert event.envelope.aggregate_id == requested.delivery.delivery_id
+            assert event.envelope.payload["attempt_number"] == 2
+            assert event.envelope.payload["channel_binding_id"] == binding_id
+            assert event.envelope.payload["error_code"] == "network_timeout"
+        finally:
+            await store.close()
+
+    async def test_failed_event_append_rolls_terminal_state_and_attempt_back(self, tmp_path: Path):
+        store, message_id, binding_id = await _open_with_outbound(tmp_path / "kai.db")
+        outbox = WorkshopDeliveryOutbox(store, clock=_Clock())
+        try:
+            requested = await outbox.request_delivery(_request(message_id, binding_id))
+            claim = await outbox.claim_next("telegram-worker")
+            assert claim is not None
+            await store.connection.execute(
+                "CREATE TRIGGER reject_delivery_success BEFORE INSERT ON event_log "
+                "WHEN NEW.event_type = 'delivery.succeeded' "
+                "BEGIN SELECT RAISE(ABORT, 'test outcome rejection'); END"
+            )
+            await store.connection.commit()
+
+            with pytest.raises(aiosqlite.IntegrityError, match="test outcome rejection"):
+                await outbox.mark_succeeded(claim)
+
+            assert (await outbox.state(requested.delivery.delivery_id)).status == "leased"
+            async with store.connection.execute(
+                "SELECT completed_at, outcome FROM delivery_attempts WHERE id = ?",
+                (claim.attempt_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            assert tuple(row) == (None, None)
+        finally:
+            await store.close()
+
+    async def test_same_message_projects_one_outcome_per_registered_binding(self, tmp_path: Path):
+        store, message_id, direct_binding_id = await _open_with_outbound(tmp_path / "kai.db")
+        outbox = WorkshopDeliveryOutbox(store, clock=_Clock())
+        try:
+            group_binding_id = await _add_group_binding(store, message_id)
+            direct = await outbox.request_delivery(_request(message_id, direct_binding_id))
+            group = await outbox.request_delivery(_request(message_id, group_binding_id))
+
+            first = await outbox.claim_next("telegram-worker")
+            assert first is not None
+            await outbox.mark_succeeded(first)
+            second = await outbox.claim_next("telegram-worker")
+            assert second is not None
+            await outbox.mark_succeeded(second)
+            await store.project_pending(CanonicalConversationProjection())
+
+            async with store.connection.execute(
+                "SELECT id, channel_binding_id FROM deliveries WHERE message_id = ? ORDER BY id",
+                (message_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+            assert sorted((row[0], row[1]) for row in rows) == sorted(
+                (
+                    (direct.delivery.delivery_id, direct_binding_id),
+                    (group.delivery.delivery_id, group_binding_id),
+                )
+            )
+        finally:
+            await store.close()
+
+    async def test_legacy_shadow_observation_and_binding_aware_outcome_replay_together(self, tmp_path: Path):
+        store, message_id, binding_id = await _open_with_outbound(tmp_path / "kai.db")
+        outbox = WorkshopDeliveryOutbox(store, clock=_Clock())
+        try:
+            legacy = await record_delivery_observation(
+                store,
+                DeliveryObservation(
+                    message_id=message_id,
+                    transport="telegram",
+                    mode="text",
+                    succeeded=True,
+                    occurred_at=_NOW,
+                ),
+            )
+            requested = await outbox.request_delivery(_request(message_id, binding_id))
+            claim = await outbox.claim_next("telegram-worker")
+            assert claim is not None
+            await outbox.mark_succeeded(claim)
+
+            await store.rebuild_projection(CanonicalConversationProjection())
+            async with store.connection.execute(
+                "SELECT id, channel_binding_id FROM deliveries WHERE message_id = ? ORDER BY id",
+                (message_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+            assert sorted((row[0], row[1]) for row in rows) == sorted(
+                (
+                    (legacy.event.envelope.aggregate_id, None),
+                    (requested.delivery.delivery_id, binding_id),
+                )
+            )
+        finally:
+            await store.close()
+
+    async def test_projection_rejects_binding_aware_fact_with_mismatched_channel(self, tmp_path: Path):
+        store, message_id, binding_id = await _open_with_outbound(tmp_path / "kai.db")
+        try:
+            async with store.connection.execute(
+                "SELECT c.workshop_id FROM messages m JOIN channels c ON c.id = m.channel_id WHERE m.id = ?",
+                (message_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            assert row is not None
+            workshop_id = WorkshopId(str(row[0]))
+            await store.append(
+                EventEnvelope.create(
+                    event_type=WorkshopEventType.DELIVERY_SUCCEEDED,
+                    event_version=2,
+                    workshop_id=workshop_id,
+                    aggregate_type="delivery",
+                    aggregate_id=DeliveryId.new(),
+                    occurred_at=_NOW,
+                    payload={
+                        "message_id": message_id,
+                        "channel_id": ChannelId.new(),
+                        "channel_binding_id": binding_id,
+                        "transport": "telegram",
+                        "mode": "text",
+                        "attempt_number": 1,
+                    },
+                )
+            )
+
+            with pytest.raises(ValueError, match="message and binding must belong to the same channel"):
+                await store.project_pending(CanonicalConversationProjection())
         finally:
             await store.close()
 
@@ -389,6 +613,36 @@ class TestDeliveryRecovery:
                 (claim.attempt_id,),
             ) as cursor:
                 assert tuple(await cursor.fetchone()) == ("lease_expired", "lease_expired")
+        finally:
+            await reopened.close()
+
+    async def test_restart_recovery_appends_failure_fact_when_expired_lease_is_exhausted(self, tmp_path: Path):
+        path = tmp_path / "kai.db"
+        store, message_id, binding_id = await _open_with_outbound(path)
+        clock = _Clock()
+        outbox = WorkshopDeliveryOutbox(store, clock=clock)
+        requested = await outbox.request_delivery(_request(message_id, binding_id, max_attempts=1))
+        claim = await outbox.claim_next("worker-before-restart", lease_duration=timedelta(seconds=10))
+        assert claim is not None
+        await store.close()
+
+        clock.advance(timedelta(seconds=10))
+        reopened = await WorkshopEventStore.open(path)
+        try:
+            recovered = await WorkshopDeliveryOutbox(reopened, clock=clock).recover_expired_leases()
+            assert recovered.requeued == 0
+            assert recovered.failed == 1
+            assert (await WorkshopDeliveryOutbox(reopened).state(requested.delivery.delivery_id)).status == "failed"
+            events = [
+                event
+                for event in await reopened.read_events()
+                if event.envelope.event_type == WorkshopEventType.DELIVERY_FAILED
+            ]
+            assert len(events) == 1
+            assert events[0].envelope.event_version == 2
+            assert events[0].envelope.aggregate_id == requested.delivery.delivery_id
+            assert events[0].envelope.payload["channel_binding_id"] == binding_id
+            assert events[0].envelope.payload["error_code"] == "lease_expired"
         finally:
             await reopened.close()
 

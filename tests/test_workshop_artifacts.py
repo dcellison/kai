@@ -267,7 +267,7 @@ class TestArtifactShadowRecording:
 
             checkpoint = await store.rebuild_projection(CanonicalConversationProjection())
 
-            assert checkpoint.version == 3
+            assert checkpoint.version == 4
             async with store.connection.execute(
                 "SELECT id, kind, media_type FROM artifacts WHERE message_id = ?",
                 (message_id,),

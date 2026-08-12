@@ -172,7 +172,7 @@ class TestWorkshopSchema:
         }
 
         assert expected <= await workshop_store.schema_tables()
-        assert await workshop_store.schema_version() == 8
+        assert await workshop_store.schema_version() == 9
 
     async def test_schema_migration_is_idempotent(self, tmp_path: Path):
         path = tmp_path / "workshop.db"
@@ -180,7 +180,7 @@ class TestWorkshopSchema:
         await first.close()
 
         second = await WorkshopEventStore.open(path)
-        assert await second.schema_version() == 8
+        assert await second.schema_version() == 9
         async with second.connection.execute(
             "SELECT COUNT(*) FROM workshop_schema_migrations WHERE version = 1"
         ) as cursor:
@@ -201,7 +201,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 8
+            assert await upgraded.schema_version() == 9
             assert {
                 "deliveries",
                 "channel_memberships",
@@ -216,7 +216,7 @@ class TestWorkshopSchema:
             async with upgraded.connection.execute(
                 "SELECT version FROM workshop_schema_migrations ORDER BY version"
             ) as cursor:
-                assert [row[0] for row in await cursor.fetchall()] == [1, 2, 3, 4, 5, 6, 7, 8]
+                assert [row[0] for row in await cursor.fetchall()] == [1, 2, 3, 4, 5, 6, 7, 8, 9]
         finally:
             await upgraded.close()
 
@@ -238,7 +238,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 8
+            assert await upgraded.schema_version() == 9
             assert {
                 "channel_memberships",
                 "workshop_client_devices",
@@ -279,7 +279,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 8
+            assert await upgraded.schema_version() == 9
             assert {
                 "workshop_client_devices",
                 "workshop_client_enrollment_grants",
@@ -332,7 +332,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 8
+            assert await upgraded.schema_version() == 9
             assert "workshop_client_enrollment_grants" in await upgraded.schema_tables()
             assert "artifacts" in await upgraded.schema_tables()
             assert "delivery_outbox" in await upgraded.schema_tables()
@@ -376,7 +376,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 8
+            assert await upgraded.schema_version() == 9
             assert "artifacts" in await upgraded.schema_tables()
             assert "delivery_outbox" in await upgraded.schema_tables()
             async with upgraded.connection.execute(
@@ -420,7 +420,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 8
+            assert await upgraded.schema_version() == 9
             assert {"delivery_outbox", "delivery_attempts"} <= await upgraded.schema_tables()
             async with upgraded.connection.execute(
                 "SELECT display_name FROM principals WHERE id = ?",
@@ -464,13 +464,116 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 8
+            assert await upgraded.schema_version() == 9
             assert {"delivery_outbox", "delivery_attempts", "delivery_fragments"} <= await upgraded.schema_tables()
             async with upgraded.connection.execute(
                 "SELECT display_name FROM principals WHERE id = ?",
                 (principal_id,),
             ) as cursor:
                 assert (await cursor.fetchone())[0] == "Existing human"
+        finally:
+            await upgraded.close()
+
+    async def test_version_eight_database_migrates_legacy_delivery_identity_additively(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        from kai.workshop import schema
+
+        path = tmp_path / "workshop.db"
+        workshop_id = WorkshopId.new()
+        principal_id = PrincipalId.new()
+        channel_id = ChannelId.new()
+        message_id = MessageId.new()
+        delivery_id = DeliveryId.new()
+        timestamp = "2026-08-12T12:00:00Z"
+        with monkeypatch.context() as migration_context:
+            migration_context.setattr(schema, "WORKSHOP_SCHEMA_VERSION", 8)
+            migration_context.setattr(
+                schema,
+                "_MIGRATIONS",
+                (
+                    schema._INITIAL_SCHEMA,
+                    schema._DELIVERY_SCHEMA,
+                    schema._CHANNEL_MEMBERSHIP_SCHEMA,
+                    schema._CLIENT_SESSION_SCHEMA,
+                    schema._CLIENT_ENROLLMENT_SCHEMA,
+                    schema._ARTIFACT_SCHEMA,
+                    schema._DELIVERY_OUTBOX_SCHEMA,
+                    schema._DELIVERY_FRAGMENT_SCHEMA,
+                ),
+            )
+            version_eight = await WorkshopEventStore.open(path)
+            await version_eight.connection.execute(
+                "INSERT INTO workshops (id, name, created_at) VALUES (?, 'Existing', ?)",
+                (workshop_id, timestamp),
+            )
+            await version_eight.connection.execute(
+                "INSERT INTO principals (id, kind, display_name, created_at) VALUES (?, 'agent', 'Kai', ?)",
+                (principal_id, timestamp),
+            )
+            await version_eight.connection.execute(
+                "INSERT INTO channels (id, workshop_id, kind, created_at) VALUES (?, ?, 'direct', ?)",
+                (channel_id, workshop_id, timestamp),
+            )
+            await version_eight.connection.commit()
+            message_event = await version_eight.append(
+                EventEnvelope.create(
+                    event_type=WorkshopEventType.MESSAGE_CREATED,
+                    event_version=1,
+                    workshop_id=workshop_id,
+                    aggregate_type="message",
+                    aggregate_id=message_id,
+                    actor_principal_id=principal_id,
+                    occurred_at=datetime(2026, 8, 12, 12, 0, tzinfo=UTC),
+                    payload={
+                        "channel_id": channel_id,
+                        "author_principal_id": principal_id,
+                        "body": "Existing message",
+                    },
+                )
+            )
+            await version_eight.connection.execute(
+                "INSERT INTO messages "
+                "(id, channel_id, author_principal_id, body, created_event_position, created_at) "
+                "VALUES (?, ?, ?, 'Existing message', ?, ?)",
+                (message_id, channel_id, principal_id, message_event.event.position, timestamp),
+            )
+            await version_eight.connection.commit()
+            delivery_event = await version_eight.append(
+                EventEnvelope.create(
+                    event_type=WorkshopEventType.DELIVERY_SUCCEEDED,
+                    event_version=1,
+                    workshop_id=workshop_id,
+                    aggregate_type="delivery",
+                    aggregate_id=delivery_id,
+                    occurred_at=datetime(2026, 8, 12, 12, 0, tzinfo=UTC),
+                    payload={
+                        "message_id": message_id,
+                        "channel_id": channel_id,
+                        "transport": "telegram",
+                        "mode": "text",
+                    },
+                )
+            )
+            await version_eight.connection.execute(
+                "INSERT INTO deliveries "
+                "(id, message_id, channel_id, transport, mode, status, created_at, updated_at, "
+                "last_event_position) VALUES (?, ?, ?, 'telegram', 'text', 'succeeded', ?, ?, ?)",
+                (delivery_id, message_id, channel_id, timestamp, timestamp, delivery_event.event.position),
+            )
+            await version_eight.connection.commit()
+            await version_eight.close()
+
+        upgraded = await WorkshopEventStore.open(path)
+        try:
+            assert await upgraded.schema_version() == 9
+            async with upgraded.connection.execute(
+                "SELECT message_id, channel_binding_id, transport, mode, status FROM deliveries WHERE id = ?",
+                (delivery_id,),
+            ) as cursor:
+                assert tuple(await cursor.fetchone()) == (message_id, None, "telegram", "text", "succeeded")
         finally:
             await upgraded.close()
 

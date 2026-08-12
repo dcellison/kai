@@ -30,7 +30,7 @@ class CanonicalConversationProjection:
     # Artifact events were not emitted before artifact support existed, so
     # adding their first handler does not change replay of any prior event.
     # Keep the version stable to avoid an unnecessary production rebuild.
-    version = 3
+    version = 4
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         for table in (
@@ -255,18 +255,43 @@ class CanonicalConversationProjection:
             WorkshopEventType.DELIVERY_FAILED,
         }:
             status = "succeeded" if envelope.event_type == WorkshopEventType.DELIVERY_SUCCEEDED else "failed"
+            message_id = _required_text(payload, "message_id")
+            channel_id = _required_text(payload, "channel_id")
+            transport = _required_text(payload, "transport")
+            if envelope.event_version == 1:
+                channel_binding_id = None
+                async with connection.execute(
+                    "SELECT 1 FROM messages WHERE id = ? AND channel_id = ?",
+                    (message_id, channel_id),
+                ) as cursor:
+                    message_row = await cursor.fetchone()
+                if message_row is None:
+                    raise ValueError("Workshop delivery message must belong to its channel")
+            elif envelope.event_version == 2:
+                channel_binding_id = _required_text(payload, "channel_binding_id")
+                async with connection.execute(
+                    "SELECT 1 FROM messages m JOIN channel_bindings cb ON cb.channel_id = m.channel_id "
+                    "WHERE m.id = ? AND m.channel_id = ? AND cb.id = ? AND cb.transport = ?",
+                    (message_id, channel_id, channel_binding_id, transport),
+                ) as cursor:
+                    binding_row = await cursor.fetchone()
+                if binding_row is None:
+                    raise ValueError("Workshop delivery message and binding must belong to the same channel")
+            else:
+                raise ValueError("Workshop delivery event version is unsupported")
             await connection.execute(
                 "INSERT INTO deliveries "
-                "(id, message_id, channel_id, transport, mode, status, created_at, updated_at, "
-                "last_event_position) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "(id, message_id, channel_id, channel_binding_id, transport, mode, status, "
+                "created_at, updated_at, last_event_position) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(id) DO UPDATE SET "
                 "status = excluded.status, updated_at = excluded.updated_at, "
                 "last_event_position = excluded.last_event_position",
                 (
                     envelope.aggregate_id,
-                    _required_text(payload, "message_id"),
-                    _required_text(payload, "channel_id"),
-                    _required_text(payload, "transport"),
+                    message_id,
+                    channel_id,
+                    channel_binding_id,
+                    transport,
                     _required_text(payload, "mode"),
                     status,
                     occurred_at,
