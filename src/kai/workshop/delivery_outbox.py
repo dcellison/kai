@@ -27,6 +27,7 @@ _IDENTIFIER_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _WORKER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _MAX_LEASE = timedelta(minutes=5)
 _MAX_ATTEMPTS = 20
+_MAX_MINIMUM_RETRY_DELAY = timedelta(days=1)
 _RETRY_BASE_SECONDS = 5
 _RETRY_MAX_SECONDS = 300
 
@@ -250,10 +251,20 @@ class WorkshopDeliveryOutbox:
         worker_id: str,
         *,
         lease_duration: timedelta = timedelta(seconds=30),
+        transport: str | None = None,
+        modes: tuple[str, ...] | None = None,
     ) -> DeliveryClaim | None:
         _validate_worker_id(worker_id)
         if lease_duration <= timedelta(0) or lease_duration > _MAX_LEASE:
             raise ValueError("lease_duration must be positive and at most five minutes")
+        if transport is not None and not _IDENTIFIER_PATTERN.fullmatch(transport):
+            raise ValueError("transport must be a lowercase identifier when supplied")
+        if modes is not None:
+            if not modes or len(set(modes)) != len(modes):
+                raise ValueError("modes must contain unique values when supplied")
+            for mode in modes:
+                if not _IDENTIFIER_PATTERN.fullmatch(mode):
+                    raise ValueError("modes must contain lowercase identifiers")
 
         connection = self._store.connection
         now = self._now()
@@ -261,6 +272,19 @@ class WorkshopDeliveryOutbox:
             await connection.execute("BEGIN IMMEDIATE")
             await self._recover_expired_in_transaction(now)
             now_text = _format_timestamp(now)
+            filters = [
+                "o.status IN ('pending', 'retry_wait')",
+                "o.available_at <= ?",
+                "o.attempt_count < o.max_attempts",
+            ]
+            parameters: list[object] = [now_text]
+            if transport is not None:
+                filters.append("o.transport = ?")
+                parameters.append(transport)
+            if modes is not None:
+                placeholders = ", ".join("?" for _ in modes)
+                filters.append(f"o.mode IN ({placeholders})")
+                parameters.extend(modes)
             async with connection.execute(
                 "SELECT o.id, o.workshop_id, o.channel_id, o.channel_binding_id, o.message_id, "
                 "o.transport, o.mode, o.attempt_count, m.body, cb.external_channel_id "
@@ -268,10 +292,9 @@ class WorkshopDeliveryOutbox:
                 "JOIN messages m ON m.id = o.message_id AND m.channel_id = o.channel_id "
                 "JOIN channel_bindings cb ON cb.id = o.channel_binding_id "
                 "AND cb.channel_id = o.channel_id AND cb.transport = o.transport "
-                "WHERE o.status IN ('pending', 'retry_wait') AND o.available_at <= ? "
-                "AND o.attempt_count < o.max_attempts "
+                f"WHERE {' AND '.join(filters)} "
                 "ORDER BY o.requested_event_position LIMIT 1",
-                (now_text,),
+                parameters,
             ) as cursor:
                 row = await cursor.fetchone()
             if row is None:
@@ -333,15 +356,21 @@ class WorkshopDeliveryOutbox:
         *,
         retryable: bool,
         error_code: str,
+        minimum_retry_delay: timedelta | None = None,
     ) -> DeliveryState:
         if not isinstance(retryable, bool):
             raise ValueError("retryable must be a boolean")
         _validate_error_code(error_code)
+        if minimum_retry_delay is not None and (
+            minimum_retry_delay <= timedelta(0) or minimum_retry_delay > _MAX_MINIMUM_RETRY_DELAY
+        ):
+            raise ValueError("minimum_retry_delay must be positive and at most one day")
         return await self._complete(
             claim,
             succeeded=False,
             retryable=retryable,
             error_code=error_code,
+            minimum_retry_delay=minimum_retry_delay,
         )
 
     async def recover_expired_leases(self) -> DeliveryRecoveryResult:
@@ -367,6 +396,7 @@ class WorkshopDeliveryOutbox:
         succeeded: bool,
         retryable: bool,
         error_code: str | None,
+        minimum_retry_delay: timedelta | None = None,
     ) -> DeliveryState:
         if not isinstance(claim, DeliveryClaim):
             raise ValueError("claim must be a DeliveryClaim")
@@ -408,7 +438,10 @@ class WorkshopDeliveryOutbox:
             elif retryable and attempt_count < max_attempts:
                 outcome = "retry_scheduled"
                 status = "retry_wait"
-                available_at = now + _retry_delay(attempt_count)
+                retry_delay = _retry_delay(attempt_count)
+                if minimum_retry_delay is not None:
+                    retry_delay = max(retry_delay, minimum_retry_delay)
+                available_at = now + retry_delay
                 completed_at = None
             else:
                 outcome = "failed"

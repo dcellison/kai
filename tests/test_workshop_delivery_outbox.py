@@ -307,6 +307,27 @@ class TestDeliveryClaims:
         finally:
             await store.close()
 
+    async def test_provider_retry_floor_cannot_be_shortened_by_default_policy(self, tmp_path: Path):
+        store, message_id, binding_id = await _open_with_outbound(tmp_path / "kai.db")
+        clock = _Clock()
+        outbox = WorkshopDeliveryOutbox(store, clock=clock)
+        try:
+            await outbox.request_delivery(_request(message_id, binding_id))
+            claim = await outbox.claim_next("telegram-worker")
+            assert claim is not None
+
+            failed = await outbox.mark_failed(
+                claim,
+                retryable=True,
+                error_code="telegram_rate_limited",
+                minimum_retry_delay=timedelta(seconds=20),
+            )
+
+            assert failed.status == "retry_wait"
+            assert failed.available_at == _NOW + timedelta(seconds=20)
+        finally:
+            await store.close()
+
     async def test_stale_claim_cannot_complete_reassigned_delivery(self, tmp_path: Path):
         store, message_id, binding_id = await _open_with_outbound(tmp_path / "kai.db")
         clock = _Clock()

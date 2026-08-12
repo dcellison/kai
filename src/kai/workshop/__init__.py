@@ -72,6 +72,15 @@ from kai.workshop.store import (
     StoredEvent,
     WorkshopEventStore,
 )
+from kai.workshop.telegram_delivery import (
+    TelegramDeliveryContractError,
+    TelegramDeliveryFailure,
+    TelegramTextBot,
+    TelegramWorkOutcome,
+    TelegramWorkResult,
+    WorkshopTelegramDeliveryAdapter,
+    WorkshopTelegramDeliveryWorker,
+)
 from kai.workshop.timeline import (
     ChannelTimelineAuthorizer,
     TimelineAccessDeniedError,
@@ -124,6 +133,11 @@ __all__ = [
     "RedeemedWorkshopClient",
     "StaleDeliveryLeaseError",
     "StoredEvent",
+    "TelegramDeliveryContractError",
+    "TelegramDeliveryFailure",
+    "TelegramTextBot",
+    "TelegramWorkOutcome",
+    "TelegramWorkResult",
     "TimelineAccessDeniedError",
     "TimelineCursorError",
     "TimelineMessage",
@@ -138,6 +152,8 @@ __all__ = [
     "WorkshopEventType",
     "WorkshopId",
     "WorkshopMembershipId",
+    "WorkshopTelegramDeliveryAdapter",
+    "WorkshopTelegramDeliveryWorker",
     "read_channel_timeline",
     "record_inbound_artifact",
     "register_workshop_enrollment_routes",
