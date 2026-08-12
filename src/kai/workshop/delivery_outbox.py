@@ -690,22 +690,30 @@ class WorkshopDeliveryOutbox:
             delivery_id = DeliveryId(str(row[0]))
             attempt_id = DeliveryAttemptId(str(row[1]))
             async with connection.execute(
-                "SELECT COUNT(*) FROM delivery_fragments WHERE delivery_id = ? AND status IN ('sending', 'uncertain')",
+                "SELECT operation FROM delivery_fragments "
+                "WHERE delivery_id = ? AND status IN ('sending', 'uncertain') ORDER BY fragment_index",
                 (delivery_id,),
             ) as cursor:
-                uncertain_row = await cursor.fetchone()
-            send_uncertain = uncertain_row is not None and int(uncertain_row[0]) > 0
-            if send_uncertain:
+                uncertain_rows = list(await cursor.fetchall())
+            external_effect_uncertain = bool(uncertain_rows)
+            if external_effect_uncertain:
                 await connection.execute(
                     "UPDATE delivery_fragments SET status = 'uncertain', updated_at = ? "
                     "WHERE delivery_id = ? AND status = 'sending'",
                     (now_text, delivery_id),
                 )
-            terminal = send_uncertain or int(row[2]) >= int(row[3])
+            terminal = external_effect_uncertain or int(row[2]) >= int(row[3])
             status = "failed" if terminal else "retry_wait"
             completed_at = now_text if terminal else None
-            attempt_outcome = "failed" if send_uncertain else "lease_expired"
-            error_code = "delivery_send_uncertain" if send_uncertain else "lease_expired"
+            attempt_outcome = "failed" if external_effect_uncertain else "lease_expired"
+            uncertain_operations = {str(fragment_row[0]) for fragment_row in uncertain_rows}
+            if uncertain_operations == {"edit"}:
+                uncertainty_code = "delivery_edit_uncertain"
+            elif uncertain_operations == {"send"}:
+                uncertainty_code = "delivery_send_uncertain"
+            else:
+                uncertainty_code = "delivery_effect_uncertain"
+            error_code = uncertainty_code if external_effect_uncertain else "lease_expired"
             await connection.execute(
                 "UPDATE delivery_attempts SET completed_at = ?, outcome = ?, "
                 "error_code = ? WHERE id = ? AND completed_at IS NULL",

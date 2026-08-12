@@ -730,3 +730,48 @@ restart, apply the established Markdown fallback to both sends and edits, and
 classify deleted/uneditable targets and ambiguous edit/send outcomes without
 automatic duplicate delivery. It must remain unregistered until another
 explicit cutover review.
+
+### 21.7 Streaming-finalization execution foundation
+
+The production-unused Telegram finalization adapter and worker now execute the
+immutable operation plan without widening the existing send-only worker. The
+new worker is fixed to `conversation_reply`, `streaming_finalization`, Telegram,
+and text work. It cannot claim qualification rows or `send_fragments` work; the
+existing worker remains unable to claim streaming-finalization rows.
+
+For an edit operation, the adapter uses the canonical binding's Telegram target
+and the persisted positive preview message ID. It applies Kai's Markdown-first,
+plain-text-fallback presentation behavior. Telegram's explicit "message is not
+modified" response confirms that the desired terminal snapshot already exists
+and completes the distinct edit operation. A deleted or uneditable target
+fails permanently with a sanitized edit-specific code; it never falls back to
+sending a duplicate message. Successful edit evidence must identify the exact
+persisted target message.
+
+Confirmed fragment progress is monotonic. After a successful edit, a retry or
+restart skips that edit and resumes at the first pending continuation send. A
+rate limit can retry only an operation proven not to have taken effect. Timeout,
+network ambiguity, invalid success evidence, cancellation, or lease expiry
+after an operation enters `sending` becomes terminal `uncertain` state and is
+never retried automatically. Lease recovery distinguishes uncertain edits from
+uncertain sends in its non-secret error classification.
+
+Automated contracts cover exact edit targeting, Markdown fallback, an already
+identical terminal snapshot, deleted/uneditable previews, mismatched success
+evidence, edit and continuation-send ambiguity, short edit-only replies,
+edit-plus-send fragmentation order, all-send plans, retry and restart after a
+confirmed edit, crash recovery, and execution-contract and purpose isolation.
+
+The adapter and worker remain unregistered. No production handler imports or
+calls them, no live delivery route changes, and normal Telegram, media, voice,
+commands, schedules, GitHub/generic webhooks, files, and notification-group
+behavior remain authoritative on their existing paths.
+
+The next bounded step is a fifth explicit cutover review. It must decide
+whether the complete production-unused finalization boundary is sufficient to
+wire one authenticated direct-chat plain-text path and its dedicated worker
+store/runtime, or whether another installed qualification path is required
+first. The review must resolve startup handling of historical conversation
+work, non-secret diagnostics and reconciliation, fail-closed user-visible
+errors, shutdown ordering, and rollback before authorizing any production
+registration.

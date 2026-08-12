@@ -110,6 +110,8 @@ from kai.workshop.telegram_delivery import (
     TelegramWorkResult,
     WorkshopTelegramDeliveryAdapter,
     WorkshopTelegramDeliveryWorker,
+    WorkshopTelegramStreamingFinalizationAdapter,
+    WorkshopTelegramStreamingFinalizationWorker,
 )
 from kai.workshop.telegram_delivery_runtime import (
     TelegramDeliveryRuntimeState,
@@ -219,6 +221,8 @@ __all__ = [
     "WorkshopTelegramDeliveryAdapter",
     "WorkshopTelegramDeliveryRuntime",
     "WorkshopTelegramDeliveryWorker",
+    "WorkshopTelegramStreamingFinalizationAdapter",
+    "WorkshopTelegramStreamingFinalizationWorker",
     "bind_confirmed_telegram_streaming_preview",
     "read_channel_timeline",
     "record_inbound_artifact",
