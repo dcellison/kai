@@ -6,8 +6,17 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 
+from kai.telegram_utils import chunk_text
+from kai.workshop.delivery_fragments import (
+    EDIT_OPERATION,
+    SEND_OPERATION,
+    DeliveryFragmentOperation,
+    DeliveryFragmentPlanResult,
+    WorkshopDeliveryFragments,
+)
 from kai.workshop.delivery_outbox import (
     CONVERSATION_REPLY_PURPOSE,
+    STREAMING_FINALIZATION_CONTRACT,
     DeliveryRequest,
     DeliveryRequestResult,
     WorkshopDeliveryOutbox,
@@ -25,6 +34,7 @@ from kai.workshop.domain import (
 )
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import AppendResult, IdempotencyConflictError, WorkshopEventStore
+from kai.workshop.streaming_preview import resolve_telegram_streaming_target
 
 _IDENTIFIER_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 
@@ -39,6 +49,10 @@ class OutboundDeliveryBindingError(LookupError):
 
 class OutboundDeliveryStateConflictError(RuntimeError):
     """Only one half of an atomic outbound message and delivery already exists."""
+
+
+class OutboundStreamingPreviewConflictError(RuntimeError):
+    """A persisted preview no longer matches its canonical routing identities."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +101,13 @@ class _ResolvedOutbound:
 class OutboundDeliveryResult:
     message: AppendResult
     delivery: DeliveryRequestResult
+
+
+@dataclass(frozen=True, slots=True)
+class OutboundStreamingFinalizationResult:
+    message: AppendResult
+    delivery: DeliveryRequestResult
+    plan: DeliveryFragmentPlanResult
 
 
 async def _resolve_outbound(store: WorkshopEventStore, message_id: MessageId) -> _ResolvedOutbound:
@@ -174,6 +195,55 @@ async def _resolve_telegram_binding(
     return ChannelBindingId(str(rows[0][0]))
 
 
+async def _confirmed_preview_message_id(
+    store: WorkshopEventStore,
+    *,
+    inbound_message_id: MessageId,
+    workshop_id: WorkshopId,
+    channel_id: ChannelId,
+    channel_binding_id: ChannelBindingId,
+) -> int | None:
+    async with store.connection.execute(
+        "SELECT workshop_id, channel_id, channel_binding_id, external_message_id, state "
+        "FROM telegram_streaming_previews WHERE inbound_message_id = ?",
+        (inbound_message_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is None:
+        return None
+    if (
+        str(row[0]) != workshop_id
+        or str(row[1]) != channel_id
+        or str(row[2]) != channel_binding_id
+        or str(row[4]) != "confirmed_non_final"
+    ):
+        raise OutboundStreamingPreviewConflictError(
+            "Confirmed streaming preview does not match the canonical reply target"
+        )
+    external_message_id = int(row[3])
+    if external_message_id <= 0:
+        raise OutboundStreamingPreviewConflictError("Confirmed streaming preview has an invalid message ID")
+    return external_message_id
+
+
+def _streaming_finalization_operations(
+    body: str,
+    *,
+    preview_message_id: int | None,
+) -> tuple[DeliveryFragmentOperation, ...]:
+    bodies = tuple(chunk_text(body, max_len=4096))
+    if preview_message_id is None:
+        return tuple(DeliveryFragmentOperation(SEND_OPERATION, fragment) for fragment in bodies)
+    return (
+        DeliveryFragmentOperation(
+            EDIT_OPERATION,
+            bodies[0],
+            target_external_message_id=preview_message_id,
+        ),
+        *(DeliveryFragmentOperation(SEND_OPERATION, fragment) for fragment in bodies[1:]),
+    )
+
+
 async def record_outbound_message(store: WorkshopEventStore, message: OutboundMessage) -> AppendResult:
     """Append one canonical assistant reply to an existing inbound message."""
     binding = await _resolve_outbound(store, message.in_reply_to_message_id)
@@ -227,6 +297,86 @@ async def record_outbound_message_with_delivery(
         await store.project_pending_in_transaction(projection)
         await connection.commit()
         return OutboundDeliveryResult(message=message_result, delivery=delivery_result)
+    except Exception:
+        await connection.rollback()
+        raise
+
+
+async def record_outbound_message_with_streaming_finalization(
+    store: WorkshopEventStore,
+    message: OutboundMessage,
+) -> OutboundStreamingFinalizationResult:
+    """Atomically persist a reply, delivery request, and immutable operation plan.
+
+    This service is deliberately production-unused. Its only routing input is
+    the canonical inbound message ID. It resolves the direct Telegram binding
+    and any confirmed non-final preview internally, and it neither sends nor
+    edits Telegram.
+    """
+    connection = store.connection
+    try:
+        await connection.execute("BEGIN IMMEDIATE")
+        binding = await _resolve_outbound(store, message.in_reply_to_message_id)
+        streaming_target = await resolve_telegram_streaming_target(
+            store,
+            message.in_reply_to_message_id,
+        )
+        if streaming_target.workshop_id != binding.workshop_id or streaming_target.channel_id != binding.channel_id:
+            raise OutboundStreamingPreviewConflictError(
+                "Telegram streaming target does not match the canonical agent reply target"
+            )
+        preview_message_id = await _confirmed_preview_message_id(
+            store,
+            inbound_message_id=message.in_reply_to_message_id,
+            workshop_id=binding.workshop_id,
+            channel_id=binding.channel_id,
+            channel_binding_id=streaming_target.channel_binding_id,
+        )
+        operations = _streaming_finalization_operations(
+            message.body,
+            preview_message_id=preview_message_id,
+        )
+        message_result = await _existing_outbound(store, binding, message)
+        if message_result is None:
+            message_result = await store.append_in_transaction(_outbound_envelope(binding, message))
+
+        projection = CanonicalConversationProjection()
+        await store.project_pending_in_transaction(projection)
+        message_id = message_result.event.envelope.aggregate_id
+        if not isinstance(message_id, MessageId):
+            raise RuntimeError("Canonical outbound event did not identify a message")
+        delivery_result = await WorkshopDeliveryOutbox(store).request_delivery_in_transaction(
+            DeliveryRequest(
+                message_id=message_id,
+                channel_binding_id=streaming_target.channel_binding_id,
+                mode="text",
+                purpose=CONVERSATION_REPLY_PURPOSE,
+                occurred_at=message.occurred_at,
+                execution_contract=STREAMING_FINALIZATION_CONTRACT,
+                max_attempts=5,
+            )
+        )
+        plan_result = await WorkshopDeliveryFragments(store).prepare_operations_in_transaction(
+            delivery_result.delivery.delivery_id,
+            operations,
+            occurred_at=message.occurred_at,
+        )
+        prior_states = {
+            message_result.inserted,
+            delivery_result.inserted,
+            plan_result.inserted,
+        }
+        if len(prior_states) != 1:
+            raise OutboundDeliveryStateConflictError(
+                "Canonical reply, delivery request, and operation plan did not share one prior state"
+            )
+        await store.project_pending_in_transaction(projection)
+        await connection.commit()
+        return OutboundStreamingFinalizationResult(
+            message=message_result,
+            delivery=delivery_result,
+            plan=plan_result,
+        )
     except Exception:
         await connection.rollback()
         raise

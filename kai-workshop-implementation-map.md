@@ -691,3 +691,42 @@ first operation edits that confirmed preview and whose remaining operations
 send continuation fragments. When no preview exists, every operation must be a
 send. It must still leave production routing and the runtime registration
 unchanged.
+
+### 21.6 Atomic streaming-finalization plan foundation
+
+The production-unused atomic finalization boundary is now implemented. Schema
+version 13 gives every delivery a durable execution contract and every fragment
+an immutable `send` or `edit` operation with an optional validated existing
+Telegram message target. Existing outbox work migrates to `send_fragments`, and
+existing fragments migrate to `send`, preserving the behavior and eligibility
+of every pre-migration row.
+
+Given only a canonical inbound message ID and the terminal assistant text, the
+application service resolves the agent, direct channel, Telegram binding, and
+optional confirmed preview internally. In one SQLite transaction it creates or
+reuses the canonical assistant reply, creates its `conversation_reply`
+delivery under the `streaming_finalization` execution contract, and persists
+the complete immutable operation plan. A confirmed preview produces one edit
+of its exact Telegram message followed by zero or more continuation sends. No
+preview produces only sends. The edit remains explicit even when the last
+streaming snapshot already equals the terminal response.
+
+The transaction fails closed on routing disagreement, changed content, changed
+plan semantics, or any message/delivery/plan half-state. Insert failure at any
+stage rolls back all newly created state. Restart and later observation time do
+not change the deterministic reply, delivery, or operation plan.
+
+This foundation cannot yet make an external effect. The current Telegram
+worker explicitly claims only `send_fragments` work, and its adapter rejects an
+edit operation before calling Telegram. Claims and expired-lease recovery are
+execution-contract scoped, so the send-only worker cannot drain or mutate a
+streaming-finalization plan. No production handler calls the atomic service and
+the runtime remains unregistered.
+
+The next bounded slice is a production-unused, edit-capable Telegram
+finalization adapter and worker. It must execute only the
+`streaming_finalization` contract, preserve ordered confirmed progress across
+restart, apply the established Markdown fallback to both sends and edits, and
+classify deleted/uneditable targets and ambiguous edit/send outcomes without
+automatic duplicate delivery. It must remain unregistered until another
+explicit cutover review.

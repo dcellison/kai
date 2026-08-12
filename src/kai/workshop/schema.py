@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 12
+WORKSHOP_SCHEMA_VERSION = 13
 
 
 @dataclass(frozen=True, slots=True)
@@ -477,6 +477,25 @@ _TELEGRAM_STREAMING_PREVIEW_SCHEMA = SchemaMigration(
     ),
 )
 
+_STREAMING_FINALIZATION_SCHEMA = SchemaMigration(
+    version=13,
+    name="immutable_streaming_finalization_operations",
+    statements=(
+        "ALTER TABLE delivery_outbox ADD COLUMN execution_contract TEXT NOT NULL "
+        "DEFAULT 'send_fragments' CHECK (execution_contract IN "
+        "('send_fragments', 'streaming_finalization'))",
+        "ALTER TABLE delivery_fragments ADD COLUMN operation TEXT NOT NULL "
+        "DEFAULT 'send' CHECK (operation IN ('send', 'edit'))",
+        "ALTER TABLE delivery_fragments ADD COLUMN target_external_message_id INTEGER "
+        "CHECK ((operation = 'send' AND target_external_message_id IS NULL) OR "
+        "(operation = 'edit' AND target_external_message_id > 0))",
+        "CREATE INDEX delivery_outbox_contract_due_idx ON delivery_outbox "
+        "(execution_contract, purpose, status, available_at, requested_event_position)",
+        "CREATE INDEX delivery_outbox_contract_binding_order_idx ON delivery_outbox "
+        "(execution_contract, purpose, channel_binding_id, requested_event_position, status)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -490,6 +509,7 @@ _MIGRATIONS = (
     _DELIVERY_BINDING_ORDER_SCHEMA,
     _DELIVERY_PURPOSE_SCHEMA,
     _TELEGRAM_STREAMING_PREVIEW_SCHEMA,
+    _STREAMING_FINALIZATION_SCHEMA,
 )
 
 

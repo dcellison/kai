@@ -63,7 +63,7 @@ class TelegramStreamingPreviewBinding:
 
 
 @dataclass(frozen=True, slots=True)
-class _ResolvedPreviewTarget:
+class ResolvedTelegramStreamingTarget:
     workshop_id: WorkshopId
     channel_id: ChannelId
     channel_binding_id: ChannelBindingId
@@ -77,10 +77,10 @@ def _parse_timestamp(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
 
 
-async def _resolve_target(
+async def resolve_telegram_streaming_target(
     store: WorkshopEventStore,
     inbound_message_id: MessageId,
-) -> _ResolvedPreviewTarget:
+) -> ResolvedTelegramStreamingTarget:
     async with store.connection.execute(
         "SELECT c.workshop_id, m.channel_id, c.kind, p.kind, m.reply_to_message_id, "
         "json_extract(e.metadata_json, '$.source'), "
@@ -118,7 +118,7 @@ async def _resolve_target(
         bindings = list(await cursor.fetchall())
     if len(bindings) != 1 or int(bindings[0][1]) != 1:
         raise StreamingPreviewBindingError("Canonical direct channel must have exactly one Telegram binding")
-    return _ResolvedPreviewTarget(
+    return ResolvedTelegramStreamingTarget(
         workshop_id=WorkshopId(str(row[0])),
         channel_id=channel_id,
         channel_binding_id=ChannelBindingId(str(bindings[0][0])),
@@ -153,7 +153,7 @@ async def bind_confirmed_telegram_streaming_preview(
     connection = store.connection
     try:
         await connection.execute("BEGIN IMMEDIATE")
-        target = await _resolve_target(store, preview.inbound_message_id)
+        target = await resolve_telegram_streaming_target(store, preview.inbound_message_id)
         async with connection.execute(
             "SELECT inbound_message_id, workshop_id, channel_id, channel_binding_id, "
             "external_message_id, state, confirmed_at "

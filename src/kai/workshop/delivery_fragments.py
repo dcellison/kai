@@ -5,14 +5,24 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Literal, cast
 
 import aiosqlite
 
-from kai.workshop.delivery_outbox import DeliveryClaim, StaleDeliveryLeaseError
+from kai.workshop.delivery_outbox import (
+    STREAMING_FINALIZATION_CONTRACT,
+    DeliveryClaim,
+    StaleDeliveryLeaseError,
+)
 from kai.workshop.domain import DeliveryAttemptId, DeliveryId
 from kai.workshop.store import WorkshopEventStore
 
 _MAX_FRAGMENTS = 1000
+
+DeliveryFragmentOperationKind = Literal["send", "edit"]
+SEND_OPERATION: DeliveryFragmentOperationKind = "send"
+EDIT_OPERATION: DeliveryFragmentOperationKind = "edit"
+_OPERATION_KINDS = frozenset({SEND_OPERATION, EDIT_OPERATION})
 
 
 class DeliveryFragmentError(RuntimeError):
@@ -41,6 +51,36 @@ class DeliveryFragment:
     attempt_id: DeliveryAttemptId | None
     external_message_id: str | None
     sent_at: datetime | None
+    operation: DeliveryFragmentOperationKind = SEND_OPERATION
+    target_external_message_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryFragmentOperation:
+    operation: DeliveryFragmentOperationKind
+    body: str
+    target_external_message_id: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.operation not in _OPERATION_KINDS:
+            raise ValueError("operation must be send or edit")
+        if not isinstance(self.body, str) or not self.body or len(self.body) > 4096:
+            raise ValueError("body must contain between 1 and 4096 characters")
+        if self.operation == SEND_OPERATION:
+            if self.target_external_message_id is not None:
+                raise ValueError("send operations cannot identify an existing Telegram message")
+        elif (
+            not isinstance(self.target_external_message_id, int)
+            or isinstance(self.target_external_message_id, bool)
+            or self.target_external_message_id <= 0
+        ):
+            raise ValueError("edit operations require a positive target_external_message_id")
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryFragmentPlanResult:
+    fragments: tuple[DeliveryFragment, ...]
+    inserted: bool
 
 
 def _format_timestamp(value: datetime) -> str:
@@ -73,37 +113,99 @@ class WorkshopDeliveryFragments:
     async def prepare(self, claim: DeliveryClaim, bodies: tuple[str, ...]) -> tuple[DeliveryFragment, ...]:
         self._validate_claim(claim)
         self._validate_bodies(bodies)
+        operations = tuple(DeliveryFragmentOperation(SEND_OPERATION, body) for body in bodies)
         connection = self._store.connection
         now = self._now()
         try:
             await connection.execute("BEGIN IMMEDIATE")
             await self._require_lease_owner(connection, claim, now=now, require_unexpired=True)
-            existing = await self._rows(connection, claim.delivery_id)
-            if existing:
-                existing_bodies = tuple(str(row["body"]) for row in existing)
-                counts = {int(row["fragment_count"]) for row in existing}
-                if existing_bodies != bodies or counts != {len(bodies)}:
-                    raise DeliveryFragmentPlanConflictError("Delivery fragment plan is immutable")
-                fragments = tuple(self._from_row(row) for row in existing)
-                await connection.commit()
-                return fragments
-
-            timestamp = _format_timestamp(now)
-            await connection.executemany(
-                "INSERT INTO delivery_fragments "
-                "(delivery_id, fragment_index, fragment_count, body, status, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, 'pending', ?, ?)",
-                (
-                    (claim.delivery_id, index, len(bodies), body, timestamp, timestamp)
-                    for index, body in enumerate(bodies)
-                ),
-            )
-            fragments = tuple(self._from_row(row) for row in await self._rows(connection, claim.delivery_id))
+            result = await self._prepare_in_transaction(claim.delivery_id, operations, occurred_at=now)
             await connection.commit()
-            return fragments
+            return result.fragments
         except Exception:
             await connection.rollback()
             raise
+
+    async def prepare_operations_in_transaction(
+        self,
+        delivery_id: DeliveryId,
+        operations: tuple[DeliveryFragmentOperation, ...],
+        *,
+        occurred_at: datetime,
+    ) -> DeliveryFragmentPlanResult:
+        """Create an immutable plan inside an application-service transaction."""
+        if not self._store.connection.in_transaction:
+            raise RuntimeError("prepare_operations_in_transaction requires an active transaction")
+        if not isinstance(delivery_id, DeliveryId):
+            raise ValueError("delivery_id must be a DeliveryId")
+        if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
+            raise ValueError("occurred_at must be timezone-aware")
+        self._validate_operations(operations)
+        async with self._store.connection.execute(
+            "SELECT execution_contract, status, attempt_count FROM delivery_outbox WHERE id = ?",
+            (delivery_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None or str(row["execution_contract"]) != STREAMING_FINALIZATION_CONTRACT:
+            raise DeliveryFragmentStateError("Delivery does not own the streaming-finalization contract")
+        if str(row["status"]) != "pending" or int(row["attempt_count"]) != 0:
+            raise DeliveryFragmentStateError("Streaming-finalization plan must be created before its first claim")
+        return await self._prepare_in_transaction(delivery_id, operations, occurred_at=occurred_at)
+
+    async def _prepare_in_transaction(
+        self,
+        delivery_id: DeliveryId,
+        operations: tuple[DeliveryFragmentOperation, ...],
+        *,
+        occurred_at: datetime,
+    ) -> DeliveryFragmentPlanResult:
+        self._validate_operations(operations)
+        existing = await self._rows(self._store.connection, delivery_id)
+        if existing:
+            existing_plan = tuple(
+                DeliveryFragmentOperation(
+                    operation=self._operation_kind(row["operation"]),
+                    body=str(row["body"]),
+                    target_external_message_id=(
+                        int(row["target_external_message_id"])
+                        if row["target_external_message_id"] is not None
+                        else None
+                    ),
+                )
+                for row in existing
+            )
+            counts = {int(row["fragment_count"]) for row in existing}
+            if existing_plan != operations or counts != {len(operations)}:
+                raise DeliveryFragmentPlanConflictError("Delivery fragment plan is immutable")
+            return DeliveryFragmentPlanResult(
+                fragments=tuple(self._from_row(row) for row in existing),
+                inserted=False,
+            )
+
+        timestamp = _format_timestamp(occurred_at)
+        await self._store.connection.executemany(
+            "INSERT INTO delivery_fragments "
+            "(delivery_id, fragment_index, fragment_count, body, operation, "
+            "target_external_message_id, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+            (
+                (
+                    delivery_id,
+                    index,
+                    len(operations),
+                    operation.body,
+                    operation.operation,
+                    operation.target_external_message_id,
+                    timestamp,
+                    timestamp,
+                )
+                for index, operation in enumerate(operations)
+            ),
+        )
+        return DeliveryFragmentPlanResult(
+            fragments=tuple(self._from_row(row) for row in await self._rows(self._store.connection, delivery_id)),
+            inserted=True,
+        )
 
     async def begin_next(self, claim: DeliveryClaim) -> DeliveryFragment | None:
         self._validate_claim(claim)
@@ -300,6 +402,20 @@ class WorkshopDeliveryFragments:
             raise ValueError("each fragment body must contain between 1 and 4096 characters")
 
     @staticmethod
+    def _validate_operations(operations: tuple[DeliveryFragmentOperation, ...]) -> None:
+        if not isinstance(operations, tuple) or not operations or len(operations) > _MAX_FRAGMENTS:
+            raise ValueError(f"operations must contain between 1 and {_MAX_FRAGMENTS} entries")
+        if any(not isinstance(operation, DeliveryFragmentOperation) for operation in operations):
+            raise ValueError("operations must contain DeliveryFragmentOperation values")
+
+    @staticmethod
+    def _operation_kind(value: object) -> DeliveryFragmentOperationKind:
+        operation = str(value)
+        if operation not in _OPERATION_KINDS:
+            raise DeliveryFragmentStateError("Delivery fragment has an unsupported operation")
+        return cast(DeliveryFragmentOperationKind, operation)
+
+    @staticmethod
     def _validate_claim(claim: DeliveryClaim) -> None:
         if not isinstance(claim, DeliveryClaim):
             raise ValueError("claim must be a DeliveryClaim")
@@ -333,6 +449,10 @@ class WorkshopDeliveryFragments:
             attempt_id=(DeliveryAttemptId(str(row["attempt_id"])) if row["attempt_id"] is not None else None),
             external_message_id=(str(row["external_message_id"]) if row["external_message_id"] is not None else None),
             sent_at=(_parse_timestamp(str(row["sent_at"])) if row["sent_at"] is not None else None),
+            operation=WorkshopDeliveryFragments._operation_kind(row["operation"]),
+            target_external_message_id=(
+                int(row["target_external_message_id"]) if row["target_external_message_id"] is not None else None
+            ),
         )
 
     def _now(self) -> datetime:

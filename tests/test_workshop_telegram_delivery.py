@@ -13,10 +13,15 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, InvalidToken, NetworkError, RetryAfter, TelegramError, TimedOut
 
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
-from kai.workshop.delivery_fragments import DeliveryFragment, WorkshopDeliveryFragments
+from kai.workshop.delivery_fragments import (
+    DeliveryFragment,
+    DeliveryFragmentOperationKind,
+    WorkshopDeliveryFragments,
+)
 from kai.workshop.delivery_outbox import (
     CONVERSATION_REPLY_PURPOSE,
     QUALIFICATION_PURPOSE,
+    SEND_FRAGMENTS_CONTRACT,
     DeliveryClaim,
     DeliveryRequest,
     WorkshopDeliveryOutbox,
@@ -65,12 +70,19 @@ def _claim(
         external_channel_id=external_channel_id,
         mode=mode,
         purpose=QUALIFICATION_PURPOSE,
+        execution_contract=SEND_FRAGMENTS_CONTRACT,
         body=body,
         lease_expires_at=_NOW + timedelta(seconds=30),
     )
 
 
-def _fragment(claim: DeliveryClaim, *, body: str | None = None) -> DeliveryFragment:
+def _fragment(
+    claim: DeliveryClaim,
+    *,
+    body: str | None = None,
+    operation: DeliveryFragmentOperationKind = "send",
+    target_external_message_id: int | None = None,
+) -> DeliveryFragment:
     return DeliveryFragment(
         delivery_id=claim.delivery_id,
         fragment_index=0,
@@ -80,6 +92,8 @@ def _fragment(claim: DeliveryClaim, *, body: str | None = None) -> DeliveryFragm
         attempt_id=claim.attempt_id,
         external_message_id=None,
         sent_at=None,
+        operation=operation,
+        target_external_message_id=target_external_message_id,
     )
 
 
@@ -233,6 +247,18 @@ class TestWorkshopTelegramDeliveryAdapter:
             text="Hello from Workshop",
             parse_mode=ParseMode.MARKDOWN,
         )
+
+    async def test_send_only_adapter_rejects_edit_operation_without_calling_telegram(self):
+        bot = _successful_bot()
+        claim = _claim()
+
+        with pytest.raises(TelegramDeliveryContractError, match="telegram_operation_unsupported"):
+            await WorkshopTelegramDeliveryAdapter(bot).deliver_fragment(
+                claim,
+                _fragment(claim, operation="edit", target_external_message_id=7001),
+            )
+
+        bot.send_message.assert_not_awaited()
 
     async def test_markdown_rejection_retries_once_as_plain_text(self):
         bot = AsyncMock()

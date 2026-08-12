@@ -37,6 +37,11 @@ CONVERSATION_REPLY_PURPOSE: DeliveryPurpose = "conversation_reply"
 QUALIFICATION_PURPOSE: DeliveryPurpose = "qualification"
 _DELIVERY_PURPOSES = frozenset({CONVERSATION_REPLY_PURPOSE, QUALIFICATION_PURPOSE})
 
+DeliveryExecutionContract = Literal["send_fragments", "streaming_finalization"]
+SEND_FRAGMENTS_CONTRACT: DeliveryExecutionContract = "send_fragments"
+STREAMING_FINALIZATION_CONTRACT: DeliveryExecutionContract = "streaming_finalization"
+_DELIVERY_EXECUTION_CONTRACTS = frozenset({SEND_FRAGMENTS_CONTRACT, STREAMING_FINALIZATION_CONTRACT})
+
 
 class DeliveryOutboxError(RuntimeError):
     """Base class for fail-closed delivery outbox errors."""
@@ -69,6 +74,7 @@ class DeliveryRequest:
     mode: str
     purpose: DeliveryPurpose
     occurred_at: datetime
+    execution_contract: DeliveryExecutionContract = SEND_FRAGMENTS_CONTRACT
     max_attempts: int = 5
 
     def __post_init__(self) -> None:
@@ -79,6 +85,7 @@ class DeliveryRequest:
         if not _IDENTIFIER_PATTERN.fullmatch(self.mode):
             raise ValueError("mode must be a lowercase identifier")
         _validate_purpose(self.purpose)
+        _validate_execution_contract(self.execution_contract)
         if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
             raise ValueError("occurred_at must be timezone-aware")
         if (
@@ -98,6 +105,7 @@ class DeliveryState:
     transport: str
     mode: str
     purpose: DeliveryPurpose
+    execution_contract: DeliveryExecutionContract
     status: str
     max_attempts: int
     attempt_count: int
@@ -126,6 +134,7 @@ class DeliveryClaim:
     external_channel_id: str
     mode: str
     purpose: DeliveryPurpose
+    execution_contract: DeliveryExecutionContract
     body: str
     lease_expires_at: datetime
 
@@ -170,10 +179,28 @@ def _validate_purposes(purposes: tuple[DeliveryPurpose, ...]) -> None:
         _validate_purpose(purpose)
 
 
+def _validate_execution_contract(execution_contract: str) -> None:
+    if execution_contract not in _DELIVERY_EXECUTION_CONTRACTS:
+        raise ValueError("execution_contract must be send_fragments or streaming_finalization")
+
+
+def _validate_execution_contracts(contracts: tuple[DeliveryExecutionContract, ...]) -> None:
+    if not contracts or len(set(contracts)) != len(contracts):
+        raise ValueError("execution_contracts must contain unique values")
+    for contract in contracts:
+        _validate_execution_contract(contract)
+
+
 def _delivery_purpose(value: object) -> DeliveryPurpose:
     purpose = str(value)
     _validate_purpose(purpose)
     return cast(DeliveryPurpose, purpose)
+
+
+def _delivery_execution_contract(value: object) -> DeliveryExecutionContract:
+    contract = str(value)
+    _validate_execution_contract(contract)
+    return cast(DeliveryExecutionContract, contract)
 
 
 def _retry_delay(attempt_number: int) -> timedelta:
@@ -234,35 +261,44 @@ class WorkshopDeliveryOutbox:
                 or existing.transport != transport
                 or existing.max_attempts != request.max_attempts
                 or existing.purpose != request.purpose
+                or existing.execution_contract != request.execution_contract
             ):
                 raise DeliveryRequestConflictError("Delivery request identity has different semantics")
             return DeliveryRequestResult(delivery=existing, inserted=False)
 
         occurred_at = request.occurred_at.astimezone(UTC)
+        streaming_finalization = request.execution_contract == STREAMING_FINALIZATION_CONTRACT
+        event_version = 3 if streaming_finalization else 2
+        event_identity_version = "v3" if streaming_finalization else "v2"
+        payload: dict[str, object] = {
+            "message_id": request.message_id,
+            "channel_id": channel_id,
+            "channel_binding_id": request.channel_binding_id,
+            "transport": transport,
+            "mode": request.mode,
+            "purpose": request.purpose,
+            "max_attempts": request.max_attempts,
+        }
+        if streaming_finalization:
+            payload["execution_contract"] = request.execution_contract
         event = EventEnvelope.create(
             event_id=EventId.derived(
                 workshop_id,
-                f"delivery-request-event:v2:{request.message_id}:{request.channel_binding_id}:{request.mode}",
+                f"delivery-request-event:{event_identity_version}:"
+                f"{request.message_id}:{request.channel_binding_id}:{request.mode}",
             ),
             event_type=WorkshopEventType.DELIVERY_REQUESTED,
-            event_version=2,
+            event_version=event_version,
             workshop_id=workshop_id,
             aggregate_type="delivery",
             aggregate_id=delivery_id,
             actor_principal_id=author_principal_id,
             occurred_at=occurred_at,
             idempotency_key=(
-                f"workshop-delivery-request:v2:{request.message_id}:{request.channel_binding_id}:{request.mode}"
+                f"workshop-delivery-request:{event_identity_version}:"
+                f"{request.message_id}:{request.channel_binding_id}:{request.mode}"
             ),
-            payload={
-                "message_id": request.message_id,
-                "channel_id": channel_id,
-                "channel_binding_id": request.channel_binding_id,
-                "transport": transport,
-                "mode": request.mode,
-                "purpose": request.purpose,
-                "max_attempts": request.max_attempts,
-            },
+            payload=payload,
             metadata={"source": "delivery_outbox"},
         )
         appended = await self._store.append_in_transaction(event)
@@ -273,8 +309,9 @@ class WorkshopDeliveryOutbox:
         await connection.execute(
             "INSERT INTO delivery_outbox "
             "(id, workshop_id, channel_id, channel_binding_id, message_id, transport, mode, purpose, "
+            "execution_contract, "
             "status, max_attempts, attempt_count, available_at, requested_event_position, "
-            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, ?, ?, ?, ?)",
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, ?, ?, ?, ?)",
             (
                 delivery_id,
                 workshop_id,
@@ -284,6 +321,7 @@ class WorkshopDeliveryOutbox:
                 transport,
                 request.mode,
                 request.purpose,
+                request.execution_contract,
                 request.max_attempts,
                 timestamp,
                 appended.event.position,
@@ -299,6 +337,7 @@ class WorkshopDeliveryOutbox:
         worker_id: str,
         *,
         purposes: tuple[DeliveryPurpose, ...],
+        execution_contracts: tuple[DeliveryExecutionContract, ...] = (SEND_FRAGMENTS_CONTRACT,),
         lease_duration: timedelta = timedelta(seconds=30),
         transport: str | None = None,
         modes: tuple[str, ...] | None = None,
@@ -306,6 +345,7 @@ class WorkshopDeliveryOutbox:
     ) -> DeliveryClaim | None:
         _validate_worker_id(worker_id)
         _validate_purposes(purposes)
+        _validate_execution_contracts(execution_contracts)
         if lease_duration <= timedelta(0) or lease_duration > _MAX_LEASE:
             raise ValueError("lease_duration must be positive and at most five minutes")
         if transport is not None and not _IDENTIFIER_PATTERN.fullmatch(transport):
@@ -323,7 +363,12 @@ class WorkshopDeliveryOutbox:
         now = self._now()
         try:
             await connection.execute("BEGIN IMMEDIATE")
-            await self._recover_expired_in_transaction(now, purposes=purposes, delivery_id=delivery_id)
+            await self._recover_expired_in_transaction(
+                now,
+                purposes=purposes,
+                execution_contracts=execution_contracts,
+                delivery_id=delivery_id,
+            )
             now_text = _format_timestamp(now)
             filters = [
                 "o.status IN ('pending', 'retry_wait')",
@@ -341,6 +386,9 @@ class WorkshopDeliveryOutbox:
             purpose_placeholders = ", ".join("?" for _ in purposes)
             filters.append(f"o.purpose IN ({purpose_placeholders})")
             parameters.extend(purposes)
+            contract_placeholders = ", ".join("?" for _ in execution_contracts)
+            filters.append(f"o.execution_contract IN ({contract_placeholders})")
+            parameters.extend(execution_contracts)
             if delivery_id is not None:
                 filters.append("o.id = ?")
                 parameters.append(delivery_id)
@@ -353,7 +401,8 @@ class WorkshopDeliveryOutbox:
                 parameters.extend(modes)
             async with connection.execute(
                 "SELECT o.id, o.workshop_id, o.channel_id, o.channel_binding_id, o.message_id, "
-                "o.transport, o.mode, o.purpose, o.attempt_count, m.body, cb.external_channel_id "
+                "o.transport, o.mode, o.purpose, o.execution_contract, o.attempt_count, "
+                "m.body, cb.external_channel_id "
                 "FROM delivery_outbox o "
                 "JOIN messages m ON m.id = o.message_id AND m.channel_id = o.channel_id "
                 "JOIN channel_bindings cb ON cb.id = o.channel_binding_id "
@@ -368,7 +417,7 @@ class WorkshopDeliveryOutbox:
                 return None
 
             delivery_id = DeliveryId(str(row[0]))
-            attempt_number = int(row[8]) + 1
+            attempt_number = int(row[9]) + 1
             attempt_id = DeliveryAttemptId.new()
             expires_at = now + lease_duration
             expires_text = _format_timestamp(expires_at)
@@ -406,8 +455,9 @@ class WorkshopDeliveryOutbox:
                 transport=str(row[5]),
                 mode=str(row[6]),
                 purpose=_delivery_purpose(row[7]),
-                body=str(row[9]),
-                external_channel_id=str(row[10]),
+                execution_contract=_delivery_execution_contract(row[8]),
+                body=str(row[10]),
+                external_channel_id=str(row[11]),
                 lease_expires_at=expires_at,
             )
         except Exception:
@@ -444,12 +494,18 @@ class WorkshopDeliveryOutbox:
         self,
         *,
         purposes: tuple[DeliveryPurpose, ...],
+        execution_contracts: tuple[DeliveryExecutionContract, ...] = (SEND_FRAGMENTS_CONTRACT,),
     ) -> DeliveryRecoveryResult:
         _validate_purposes(purposes)
+        _validate_execution_contracts(execution_contracts)
         connection = self._store.connection
         try:
             await connection.execute("BEGIN IMMEDIATE")
-            result = await self._recover_expired_in_transaction(self._now(), purposes=purposes)
+            result = await self._recover_expired_in_transaction(
+                self._now(),
+                purposes=purposes,
+                execution_contracts=execution_contracts,
+            )
             await connection.commit()
             return result
         except Exception:
@@ -516,6 +572,7 @@ class WorkshopDeliveryOutbox:
                 await self._recover_expired_in_transaction(
                     now,
                     purposes=(claim.purpose,),
+                    execution_contracts=(claim.execution_contract,),
                     delivery_id=claim.delivery_id,
                 )
                 await connection.commit()
@@ -606,20 +663,23 @@ class WorkshopDeliveryOutbox:
         now: datetime,
         *,
         purposes: tuple[DeliveryPurpose, ...],
+        execution_contracts: tuple[DeliveryExecutionContract, ...],
         delivery_id: DeliveryId | None = None,
     ) -> DeliveryRecoveryResult:
         connection = self._store.connection
         now_text = _format_timestamp(now)
         purpose_placeholders = ", ".join("?" for _ in purposes)
+        contract_placeholders = ", ".join("?" for _ in execution_contracts)
         identity_filter = " AND id = ?" if delivery_id is not None else ""
-        parameters: tuple[object, ...] = (now_text, *purposes)
+        parameters: tuple[object, ...] = (now_text, *purposes, *execution_contracts)
         if delivery_id is not None:
             parameters = (*parameters, delivery_id)
         async with connection.execute(
             "SELECT id, lease_id, attempt_count, max_attempts, workshop_id, channel_id, "
             "channel_binding_id, message_id, transport, mode FROM delivery_outbox "
             f"WHERE status = 'leased' AND lease_expires_at <= ? "
-            f"AND purpose IN ({purpose_placeholders}){identity_filter} "
+            f"AND purpose IN ({purpose_placeholders}) "
+            f"AND execution_contract IN ({contract_placeholders}){identity_filter} "
             "ORDER BY requested_event_position",
             parameters,
         ) as cursor:
@@ -780,6 +840,7 @@ class WorkshopDeliveryOutbox:
             transport=str(row["transport"]),
             mode=str(row["mode"]),
             purpose=_delivery_purpose(row["purpose"]),
+            execution_contract=_delivery_execution_contract(row["execution_contract"]),
             status=str(row["status"]),
             max_attempts=int(row["max_attempts"]),
             attempt_count=int(row["attempt_count"]),

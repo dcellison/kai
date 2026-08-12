@@ -27,6 +27,7 @@ from telegram.warnings import PTBDeprecationWarning
 from kai.telegram_utils import chunk_text
 from kai.workshop.delivery_fragments import DeliveryFragment, WorkshopDeliveryFragments
 from kai.workshop.delivery_outbox import (
+    SEND_FRAGMENTS_CONTRACT,
     DeliveryClaim,
     DeliveryPurpose,
     DeliveryRecoveryResult,
@@ -185,6 +186,8 @@ class WorkshopTelegramDeliveryAdapter:
             raise TelegramDeliveryContractError("telegram_transport_mismatch")
         if claim.mode != "text":
             raise TelegramDeliveryContractError("telegram_mode_unsupported")
+        if fragment.operation != "send" or fragment.target_external_message_id is not None:
+            raise TelegramDeliveryContractError("telegram_operation_unsupported")
         if not fragment.body or len(fragment.body) > _TELEGRAM_TEXT_LIMIT:
             raise TelegramDeliveryContractError("telegram_text_size_unsupported")
 
@@ -243,6 +246,7 @@ class WorkshopTelegramDeliveryWorker:
         claim = await self._outbox.claim_next(
             self._worker_id,
             purposes=(self._purpose,),
+            execution_contracts=(SEND_FRAGMENTS_CONTRACT,),
             lease_duration=self._lease_duration,
             transport="telegram",
             modes=("text",),
@@ -256,6 +260,7 @@ class WorkshopTelegramDeliveryWorker:
         claim = await self._outbox.claim_next(
             self._worker_id,
             purposes=(self._purpose,),
+            execution_contracts=(SEND_FRAGMENTS_CONTRACT,),
             lease_duration=self._lease_duration,
             transport="telegram",
             modes=("text",),
@@ -265,7 +270,10 @@ class WorkshopTelegramDeliveryWorker:
 
     async def recover_expired_leases(self) -> DeliveryRecoveryResult:
         """Recover only work in this worker's explicitly assigned purpose lanes."""
-        return await self._outbox.recover_expired_leases(purposes=(self._purpose,))
+        return await self._outbox.recover_expired_leases(
+            purposes=(self._purpose,),
+            execution_contracts=(SEND_FRAGMENTS_CONTRACT,),
+        )
 
     async def _run_claim(self, claim: DeliveryClaim | None) -> TelegramWorkResult:
         if claim is None:

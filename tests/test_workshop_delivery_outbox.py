@@ -14,6 +14,8 @@ from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.delivery_outbox import (
     CONVERSATION_REPLY_PURPOSE,
     QUALIFICATION_PURPOSE,
+    SEND_FRAGMENTS_CONTRACT,
+    STREAMING_FINALIZATION_CONTRACT,
     DeliveryRequest,
     DeliveryRequestConflictError,
     DeliveryTargetNotFoundError,
@@ -161,6 +163,7 @@ def _request(
     *,
     mode: str = "text",
     purpose=QUALIFICATION_PURPOSE,
+    execution_contract=SEND_FRAGMENTS_CONTRACT,
     max_attempts: int = 5,
 ) -> DeliveryRequest:
     return DeliveryRequest(
@@ -169,6 +172,7 @@ def _request(
         mode=mode,
         purpose=purpose,
         occurred_at=_NOW,
+        execution_contract=execution_contract,
         max_attempts=max_attempts,
     )
 
@@ -201,6 +205,7 @@ class TestDeliveryRequests:
             assert events[0].position == result.delivery.requested_event_position
             assert events[0].envelope.event_version == 2
             assert result.delivery.purpose == QUALIFICATION_PURPOSE
+            assert result.delivery.execution_contract == SEND_FRAGMENTS_CONTRACT
             assert events[0].envelope.payload == {
                 "message_id": message_id,
                 "channel_id": result.delivery.channel_id,
@@ -250,6 +255,22 @@ class TestDeliveryRequests:
             await outbox.request_delivery(_request(message_id, binding_id))
             with pytest.raises(DeliveryRequestConflictError):
                 await outbox.request_delivery(_request(message_id, binding_id, purpose=CONVERSATION_REPLY_PURPOSE))
+        finally:
+            await store.close()
+
+    async def test_duplicate_request_with_changed_execution_contract_fails_closed(self, tmp_path: Path):
+        store, message_id, binding_id = await _open_with_outbound(tmp_path / "kai.db")
+        try:
+            outbox = WorkshopDeliveryOutbox(store)
+            await outbox.request_delivery(_request(message_id, binding_id))
+            with pytest.raises(DeliveryRequestConflictError):
+                await outbox.request_delivery(
+                    _request(
+                        message_id,
+                        binding_id,
+                        execution_contract=STREAMING_FINALIZATION_CONTRACT,
+                    )
+                )
         finally:
             await store.close()
 
