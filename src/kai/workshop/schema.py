@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 7
+WORKSHOP_SCHEMA_VERSION = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,6 +352,48 @@ _DELIVERY_OUTBOX_SCHEMA = SchemaMigration(
     ),
 )
 
+_DELIVERY_FRAGMENT_SCHEMA = SchemaMigration(
+    version=8,
+    name="durable_delivery_fragment_progress",
+    statements=(
+        """
+        CREATE TABLE delivery_fragments (
+            delivery_id TEXT NOT NULL REFERENCES delivery_outbox(id) ON DELETE CASCADE,
+            fragment_index INTEGER NOT NULL CHECK (fragment_index >= 0),
+            fragment_count INTEGER NOT NULL CHECK (fragment_count > 0),
+            body TEXT NOT NULL CHECK (length(body) BETWEEN 1 AND 4096),
+            status TEXT NOT NULL CHECK (status IN ('pending', 'sending', 'sent', 'uncertain')),
+            attempt_id TEXT REFERENCES delivery_attempts(id) ON DELETE RESTRICT,
+            external_message_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            sent_at TEXT,
+            PRIMARY KEY (delivery_id, fragment_index),
+            CHECK (fragment_index < fragment_count),
+            CHECK (
+                (
+                    status = 'pending'
+                    AND attempt_id IS NULL
+                    AND external_message_id IS NULL
+                    AND sent_at IS NULL
+                ) OR (
+                    status IN ('sending', 'uncertain')
+                    AND attempt_id IS NOT NULL
+                    AND external_message_id IS NULL
+                    AND sent_at IS NULL
+                ) OR (
+                    status = 'sent'
+                    AND attempt_id IS NOT NULL
+                    AND external_message_id IS NOT NULL
+                    AND sent_at IS NOT NULL
+                )
+            )
+        )
+        """,
+        "CREATE INDEX delivery_fragments_status_idx ON delivery_fragments (delivery_id, status, fragment_index)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -360,6 +402,7 @@ _MIGRATIONS = (
     _CLIENT_ENROLLMENT_SCHEMA,
     _ARTIFACT_SCHEMA,
     _DELIVERY_OUTBOX_SCHEMA,
+    _DELIVERY_FRAGMENT_SCHEMA,
 )
 
 

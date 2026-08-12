@@ -24,12 +24,22 @@ from telegram.error import (
 )
 from telegram.warnings import PTBDeprecationWarning
 
+from kai.telegram_utils import chunk_text
+from kai.workshop.delivery_fragments import DeliveryFragment, WorkshopDeliveryFragments
 from kai.workshop.delivery_outbox import DeliveryClaim, DeliveryState, WorkshopDeliveryOutbox
 from kai.workshop.domain import DeliveryId
 
 _NUMERIC_CHAT_ID_PATTERN = re.compile(r"^-?[1-9][0-9]{0,19}$")
 _USERNAME_CHAT_ID_PATTERN = re.compile(r"^@[A-Za-z][A-Za-z0-9_]{4,31}$")
 _TELEGRAM_TEXT_LIMIT = 4096
+_MAX_TELEGRAM_FRAGMENTS = 1000
+_MAX_TELEGRAM_TEXT_SIZE = _TELEGRAM_TEXT_LIMIT * _MAX_TELEGRAM_FRAGMENTS
+
+
+class TelegramSentMessage(Protocol):
+    """The successful Bot API response evidence retained by the outbox."""
+
+    message_id: int
 
 
 class TelegramTextBot(Protocol):
@@ -41,7 +51,7 @@ class TelegramTextBot(Protocol):
         chat_id: int | str,
         text: str,
         parse_mode: str | None = None,
-    ) -> object: ...
+    ) -> TelegramSentMessage: ...
 
 
 class TelegramDeliveryFailure(RuntimeError):
@@ -53,11 +63,13 @@ class TelegramDeliveryFailure(RuntimeError):
         retryable: bool,
         error_code: str,
         minimum_retry_delay: timedelta | None = None,
+        ambiguous: bool = False,
     ) -> None:
         super().__init__(error_code)
         self.retryable = retryable
         self.error_code = error_code
         self.minimum_retry_delay = minimum_retry_delay
+        self.ambiguous = ambiguous
 
 
 class TelegramDeliveryContractError(TelegramDeliveryFailure):
@@ -111,6 +123,7 @@ def _classify_telegram_error(error: TelegramError) -> TelegramDeliveryFailure:
             warnings.simplefilter("ignore", PTBDeprecationWarning)
             retry_after = error.retry_after
         minimum_retry_delay = retry_after if isinstance(retry_after, timedelta) else timedelta(seconds=retry_after)
+        minimum_retry_delay = max(minimum_retry_delay, timedelta(seconds=1))
         if minimum_retry_delay > timedelta(days=1):
             return TelegramDeliveryFailure(
                 retryable=False,
@@ -122,35 +135,58 @@ def _classify_telegram_error(error: TelegramError) -> TelegramDeliveryFailure:
             minimum_retry_delay=minimum_retry_delay,
         )
     if isinstance(error, TimedOut):
-        return TelegramDeliveryFailure(retryable=True, error_code="telegram_timeout")
+        return TelegramDeliveryFailure(
+            retryable=False,
+            error_code="telegram_timeout_uncertain",
+            ambiguous=True,
+        )
     if isinstance(error, Conflict):
         return TelegramDeliveryFailure(retryable=True, error_code="telegram_conflict")
     if isinstance(error, NetworkError):
-        return TelegramDeliveryFailure(retryable=True, error_code="telegram_network_error")
-    return TelegramDeliveryFailure(retryable=True, error_code="telegram_error")
+        return TelegramDeliveryFailure(
+            retryable=False,
+            error_code="telegram_network_uncertain",
+            ambiguous=True,
+        )
+    return TelegramDeliveryFailure(
+        retryable=False,
+        error_code="telegram_error_uncertain",
+        ambiguous=True,
+    )
+
+
+def _telegram_fragments(body: str) -> tuple[str, ...]:
+    if not body or len(body) > _MAX_TELEGRAM_TEXT_SIZE:
+        raise TelegramDeliveryContractError("telegram_text_size_unsupported")
+    fragments = tuple(chunk_text(body, max_len=_TELEGRAM_TEXT_LIMIT))
+    if not fragments or len(fragments) > _MAX_TELEGRAM_FRAGMENTS:
+        raise TelegramDeliveryContractError("telegram_text_size_unsupported")
+    return fragments
 
 
 class WorkshopTelegramDeliveryAdapter:
-    """Deliver one bounded Telegram text claim through one Bot API message."""
+    """Deliver one durably selected Telegram text fragment."""
 
     def __init__(self, bot: TelegramTextBot) -> None:
         self._bot = bot
 
-    async def deliver(self, claim: DeliveryClaim) -> None:
+    async def deliver_fragment(self, claim: DeliveryClaim, fragment: DeliveryFragment) -> int:
         if not isinstance(claim, DeliveryClaim):
             raise ValueError("claim must be a DeliveryClaim")
+        if not isinstance(fragment, DeliveryFragment) or fragment.delivery_id != claim.delivery_id:
+            raise ValueError("fragment must belong to the claimed delivery")
         if claim.transport != "telegram":
             raise TelegramDeliveryContractError("telegram_transport_mismatch")
         if claim.mode != "text":
             raise TelegramDeliveryContractError("telegram_mode_unsupported")
-        if not claim.body or len(claim.body) > _TELEGRAM_TEXT_LIMIT:
+        if not fragment.body or len(fragment.body) > _TELEGRAM_TEXT_LIMIT:
             raise TelegramDeliveryContractError("telegram_text_size_unsupported")
 
         target = _telegram_target(claim.external_channel_id)
         try:
-            await self._bot.send_message(
+            sent = await self._bot.send_message(
                 chat_id=target,
-                text=claim.body,
+                text=fragment.body,
                 parse_mode=ParseMode.MARKDOWN,
             )
         except BadRequest:
@@ -158,11 +194,19 @@ class WorkshopTelegramDeliveryAdapter:
             # rejection is retried once as plain text. A second BadRequest is
             # classified as permanent by the common Telegram error policy.
             try:
-                await self._bot.send_message(chat_id=target, text=claim.body)
+                sent = await self._bot.send_message(chat_id=target, text=fragment.body)
             except TelegramError as error:
                 raise _classify_telegram_error(error) from error
         except TelegramError as error:
             raise _classify_telegram_error(error) from error
+        message_id = getattr(sent, "message_id", None)
+        if not isinstance(message_id, int) or isinstance(message_id, bool) or message_id <= 0:
+            raise TelegramDeliveryFailure(
+                retryable=False,
+                error_code="telegram_response_invalid",
+                ambiguous=True,
+            )
+        return message_id
 
 
 class WorkshopTelegramDeliveryWorker:
@@ -171,6 +215,7 @@ class WorkshopTelegramDeliveryWorker:
     def __init__(
         self,
         outbox: WorkshopDeliveryOutbox,
+        fragments: WorkshopDeliveryFragments,
         adapter: WorkshopTelegramDeliveryAdapter,
         *,
         worker_id: str,
@@ -180,6 +225,7 @@ class WorkshopTelegramDeliveryWorker:
         if poll_interval <= 0 or poll_interval > 60:
             raise ValueError("poll_interval must be positive and at most 60 seconds")
         self._outbox = outbox
+        self._fragments = fragments
         self._adapter = adapter
         self._worker_id = worker_id
         self._lease_duration = lease_duration
@@ -196,25 +242,25 @@ class WorkshopTelegramDeliveryWorker:
             return TelegramWorkResult(outcome=TelegramWorkOutcome.IDLE)
 
         try:
-            await self._adapter.deliver(claim)
+            bodies = _telegram_fragments(claim.body)
+            await self._fragments.prepare(claim, bodies)
         except TelegramDeliveryFailure as failure:
-            state = await self._outbox.mark_failed(
-                claim,
-                retryable=failure.retryable,
-                error_code=failure.error_code,
-                minimum_retry_delay=failure.minimum_retry_delay,
-            )
-            return TelegramWorkResult(
-                outcome=(
-                    TelegramWorkOutcome.RETRY_SCHEDULED if state.status == "retry_wait" else TelegramWorkOutcome.FAILED
-                ),
-                delivery_id=claim.delivery_id,
-                attempt_number=claim.attempt_number,
-                error_code=failure.error_code,
-            )
+            return await self._settle_failure(claim, None, failure)
 
-        state = await self._outbox.mark_succeeded(claim)
-        return self._success_result(claim, state)
+        while True:
+            fragment = await self._fragments.begin_next(claim)
+            if fragment is None:
+                state = await self._outbox.mark_succeeded(claim)
+                return self._success_result(claim, state)
+            try:
+                external_message_id = await self._adapter.deliver_fragment(claim, fragment)
+            except TelegramDeliveryFailure as failure:
+                return await self._settle_failure(claim, fragment, failure)
+            await self._fragments.mark_sent(
+                claim,
+                fragment,
+                external_message_id=external_message_id,
+            )
 
     async def run(self, stop_event: asyncio.Event) -> None:
         if not isinstance(stop_event, asyncio.Event):
@@ -236,4 +282,30 @@ class WorkshopTelegramDeliveryWorker:
             outcome=TelegramWorkOutcome.SUCCEEDED,
             delivery_id=claim.delivery_id,
             attempt_number=claim.attempt_number,
+        )
+
+    async def _settle_failure(
+        self,
+        claim: DeliveryClaim,
+        fragment: DeliveryFragment | None,
+        failure: TelegramDeliveryFailure,
+    ) -> TelegramWorkResult:
+        if fragment is not None:
+            if failure.ambiguous:
+                await self._fragments.mark_uncertain(claim, fragment)
+            else:
+                await self._fragments.release_after_definitive_failure(claim, fragment)
+        state = await self._outbox.mark_failed(
+            claim,
+            retryable=failure.retryable and not failure.ambiguous,
+            error_code=failure.error_code,
+            minimum_retry_delay=failure.minimum_retry_delay,
+        )
+        return TelegramWorkResult(
+            outcome=(
+                TelegramWorkOutcome.RETRY_SCHEDULED if state.status == "retry_wait" else TelegramWorkOutcome.FAILED
+            ),
+            delivery_id=claim.delivery_id,
+            attempt_number=claim.attempt_number,
+            error_code=failure.error_code,
         )

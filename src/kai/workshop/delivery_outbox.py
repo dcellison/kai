@@ -48,6 +48,14 @@ class StaleDeliveryLeaseError(DeliveryOutboxError):
     """A worker tried to complete work after losing its lease."""
 
 
+class IncompleteDeliveryFragmentsError(DeliveryOutboxError):
+    """A worker tried to complete delivery before every fragment was sent."""
+
+
+class UnsettledDeliveryFragmentError(DeliveryOutboxError):
+    """A worker tried to settle delivery while a fragment was still in flight."""
+
+
 @dataclass(frozen=True, slots=True)
 class DeliveryRequest:
     message_id: MessageId
@@ -430,7 +438,26 @@ class WorkshopDeliveryOutbox:
 
             attempt_count = int(row[1])
             max_attempts = int(row[2])
+            async with connection.execute(
+                "SELECT COUNT(*), "
+                "SUM(CASE WHEN status = 'sent' THEN 0 ELSE 1 END), "
+                "SUM(CASE WHEN status = 'sending' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status = 'uncertain' THEN 1 ELSE 0 END) "
+                "FROM delivery_fragments WHERE delivery_id = ?",
+                (claim.delivery_id,),
+            ) as cursor:
+                fragment_row = await cursor.fetchone()
+            if fragment_row is None:
+                raise DeliveryOutboxError("Delivery fragment aggregate query returned no row")
+            fragment_count = int(fragment_row[0])
+            incomplete_fragments = int(fragment_row[1]) if fragment_count > 0 else 0
+            sending_fragments = int(fragment_row[2]) if fragment_count > 0 else 0
+            uncertain_fragments = int(fragment_row[3]) if fragment_count > 0 else 0
+            if sending_fragments > 0 or (retryable and uncertain_fragments > 0):
+                raise UnsettledDeliveryFragmentError("Delivery has an in-flight or uncertain fragment")
             if succeeded:
+                if incomplete_fragments > 0:
+                    raise IncompleteDeliveryFragmentsError("Delivery has incomplete or uncertain fragments")
                 outcome = "succeeded"
                 status = "succeeded"
                 available_at = now
@@ -489,19 +516,33 @@ class WorkshopDeliveryOutbox:
         for row in rows:
             delivery_id = DeliveryId(str(row[0]))
             attempt_id = DeliveryAttemptId(str(row[1]))
-            terminal = int(row[2]) >= int(row[3])
+            async with connection.execute(
+                "SELECT COUNT(*) FROM delivery_fragments WHERE delivery_id = ? AND status IN ('sending', 'uncertain')",
+                (delivery_id,),
+            ) as cursor:
+                uncertain_row = await cursor.fetchone()
+            send_uncertain = uncertain_row is not None and int(uncertain_row[0]) > 0
+            if send_uncertain:
+                await connection.execute(
+                    "UPDATE delivery_fragments SET status = 'uncertain', updated_at = ? "
+                    "WHERE delivery_id = ? AND status = 'sending'",
+                    (now_text, delivery_id),
+                )
+            terminal = send_uncertain or int(row[2]) >= int(row[3])
             status = "failed" if terminal else "retry_wait"
             completed_at = now_text if terminal else None
+            attempt_outcome = "failed" if send_uncertain else "lease_expired"
+            error_code = "delivery_send_uncertain" if send_uncertain else "lease_expired"
             await connection.execute(
-                "UPDATE delivery_attempts SET completed_at = ?, outcome = 'lease_expired', "
-                "error_code = 'lease_expired' WHERE id = ? AND completed_at IS NULL",
-                (now_text, attempt_id),
+                "UPDATE delivery_attempts SET completed_at = ?, outcome = ?, "
+                "error_code = ? WHERE id = ? AND completed_at IS NULL",
+                (now_text, attempt_outcome, error_code, attempt_id),
             )
             await connection.execute(
                 "UPDATE delivery_outbox SET status = ?, available_at = ?, lease_id = NULL, "
-                "lease_owner = NULL, lease_expires_at = NULL, last_error_code = 'lease_expired', "
+                "lease_owner = NULL, lease_expires_at = NULL, last_error_code = ?, "
                 "updated_at = ?, completed_at = ? WHERE id = ? AND lease_id = ?",
-                (status, now_text, now_text, completed_at, delivery_id, attempt_id),
+                (status, now_text, error_code, now_text, completed_at, delivery_id, attempt_id),
             )
             if terminal:
                 failed += 1

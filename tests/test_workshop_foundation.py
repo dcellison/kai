@@ -166,12 +166,13 @@ class TestWorkshopSchema:
             "deliveries",
             "delivery_outbox",
             "delivery_attempts",
+            "delivery_fragments",
             "event_log",
             "projection_checkpoints",
         }
 
         assert expected <= await workshop_store.schema_tables()
-        assert await workshop_store.schema_version() == 7
+        assert await workshop_store.schema_version() == 8
 
     async def test_schema_migration_is_idempotent(self, tmp_path: Path):
         path = tmp_path / "workshop.db"
@@ -179,7 +180,7 @@ class TestWorkshopSchema:
         await first.close()
 
         second = await WorkshopEventStore.open(path)
-        assert await second.schema_version() == 7
+        assert await second.schema_version() == 8
         async with second.connection.execute(
             "SELECT COUNT(*) FROM workshop_schema_migrations WHERE version = 1"
         ) as cursor:
@@ -200,7 +201,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 7
+            assert await upgraded.schema_version() == 8
             assert {
                 "deliveries",
                 "channel_memberships",
@@ -210,11 +211,12 @@ class TestWorkshopSchema:
                 "artifacts",
                 "delivery_outbox",
                 "delivery_attempts",
+                "delivery_fragments",
             } <= await upgraded.schema_tables()
             async with upgraded.connection.execute(
                 "SELECT version FROM workshop_schema_migrations ORDER BY version"
             ) as cursor:
-                assert [row[0] for row in await cursor.fetchall()] == [1, 2, 3, 4, 5, 6, 7]
+                assert [row[0] for row in await cursor.fetchall()] == [1, 2, 3, 4, 5, 6, 7, 8]
         finally:
             await upgraded.close()
 
@@ -236,7 +238,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 7
+            assert await upgraded.schema_version() == 8
             assert {
                 "channel_memberships",
                 "workshop_client_devices",
@@ -277,7 +279,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 7
+            assert await upgraded.schema_version() == 8
             assert {
                 "workshop_client_devices",
                 "workshop_client_enrollment_grants",
@@ -330,7 +332,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 7
+            assert await upgraded.schema_version() == 8
             assert "workshop_client_enrollment_grants" in await upgraded.schema_tables()
             assert "artifacts" in await upgraded.schema_tables()
             assert "delivery_outbox" in await upgraded.schema_tables()
@@ -374,7 +376,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 7
+            assert await upgraded.schema_version() == 8
             assert "artifacts" in await upgraded.schema_tables()
             assert "delivery_outbox" in await upgraded.schema_tables()
             async with upgraded.connection.execute(
@@ -418,8 +420,52 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 7
+            assert await upgraded.schema_version() == 8
             assert {"delivery_outbox", "delivery_attempts"} <= await upgraded.schema_tables()
+            async with upgraded.connection.execute(
+                "SELECT display_name FROM principals WHERE id = ?",
+                (principal_id,),
+            ) as cursor:
+                assert (await cursor.fetchone())[0] == "Existing human"
+        finally:
+            await upgraded.close()
+
+    async def test_version_seven_database_adds_delivery_fragments_without_replacing_outbox(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        from kai.workshop import schema
+
+        path = tmp_path / "workshop.db"
+        with monkeypatch.context() as migration_context:
+            migration_context.setattr(schema, "WORKSHOP_SCHEMA_VERSION", 7)
+            migration_context.setattr(
+                schema,
+                "_MIGRATIONS",
+                (
+                    schema._INITIAL_SCHEMA,
+                    schema._DELIVERY_SCHEMA,
+                    schema._CHANNEL_MEMBERSHIP_SCHEMA,
+                    schema._CLIENT_SESSION_SCHEMA,
+                    schema._CLIENT_ENROLLMENT_SCHEMA,
+                    schema._ARTIFACT_SCHEMA,
+                    schema._DELIVERY_OUTBOX_SCHEMA,
+                ),
+            )
+            version_seven = await WorkshopEventStore.open(path)
+            principal_id = PrincipalId.new()
+            await version_seven.connection.execute(
+                "INSERT INTO principals (id, kind, display_name, created_at) VALUES (?, 'human', ?, ?)",
+                (principal_id, "Existing human", "2026-08-12T12:00:00Z"),
+            )
+            await version_seven.connection.commit()
+            await version_seven.close()
+
+        upgraded = await WorkshopEventStore.open(path)
+        try:
+            assert await upgraded.schema_version() == 8
+            assert {"delivery_outbox", "delivery_attempts", "delivery_fragments"} <= await upgraded.schema_tables()
             async with upgraded.connection.execute(
                 "SELECT display_name FROM principals WHERE id = ?",
                 (principal_id,),

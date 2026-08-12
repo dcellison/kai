@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -12,6 +13,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, InvalidToken, NetworkError, RetryAfter, TelegramError, TimedOut
 
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+from kai.workshop.delivery_fragments import DeliveryFragment, WorkshopDeliveryFragments
 from kai.workshop.delivery_outbox import DeliveryClaim, DeliveryRequest, WorkshopDeliveryOutbox
 from kai.workshop.domain import (
     ChannelBindingId,
@@ -61,10 +63,49 @@ def _claim(
     )
 
 
+def _fragment(claim: DeliveryClaim, *, body: str | None = None) -> DeliveryFragment:
+    return DeliveryFragment(
+        delivery_id=claim.delivery_id,
+        fragment_index=0,
+        fragment_count=1,
+        body=body if body is not None else claim.body,
+        status="sending",
+        attempt_id=claim.attempt_id,
+        external_message_id=None,
+        sent_at=None,
+    )
+
+
+def _successful_bot(*message_ids: int) -> AsyncMock:
+    bot = AsyncMock()
+    messages = [SimpleNamespace(message_id=message_id) for message_id in message_ids or (1001,)]
+    if len(messages) == 1:
+        bot.send_message.return_value = messages[0]
+    else:
+        bot.send_message.side_effect = messages
+    return bot
+
+
+def _worker(
+    store: WorkshopEventStore,
+    bot: AsyncMock,
+    *,
+    poll_interval: float = 1.0,
+) -> WorkshopTelegramDeliveryWorker:
+    return WorkshopTelegramDeliveryWorker(
+        WorkshopDeliveryOutbox(store),
+        WorkshopDeliveryFragments(store),
+        WorkshopTelegramDeliveryAdapter(bot),
+        worker_id="telegram-worker-1",
+        poll_interval=poll_interval,
+    )
+
+
 async def _open_with_outbound(
     path: Path,
     *,
     transport: str = "telegram",
+    outbound_body: str = "Hello back",
 ) -> tuple[WorkshopEventStore, MessageId, ChannelBindingId]:
     subject = "101" if transport == "telegram" else "person@example.com"
     store = await WorkshopEventStore.open(path)
@@ -96,7 +137,7 @@ async def _open_with_outbound(
         store,
         OutboundMessage(
             in_reply_to_message_id=MessageId(str(inbound.event.envelope.aggregate_id)),
-            body="Hello back",
+            body=outbound_body,
             occurred_at=_NOW,
         ),
     )
@@ -171,10 +212,11 @@ class TestWorkshopTelegramDeliveryAdapter:
         external_channel_id,
         expected_target,
     ):
-        bot = AsyncMock()
+        bot = _successful_bot()
         adapter = WorkshopTelegramDeliveryAdapter(bot)
+        claim = _claim(external_channel_id=external_channel_id)
 
-        await adapter.deliver(_claim(external_channel_id=external_channel_id))
+        assert await adapter.deliver_fragment(claim, _fragment(claim)) == 1001
 
         bot.send_message.assert_awaited_once_with(
             chat_id=expected_target,
@@ -184,10 +226,11 @@ class TestWorkshopTelegramDeliveryAdapter:
 
     async def test_markdown_rejection_retries_once_as_plain_text(self):
         bot = AsyncMock()
-        bot.send_message.side_effect = [BadRequest("can't parse entities"), object()]
+        bot.send_message.side_effect = [BadRequest("can't parse entities"), SimpleNamespace(message_id=1002)]
         adapter = WorkshopTelegramDeliveryAdapter(bot)
+        claim = _claim()
 
-        await adapter.deliver(_claim())
+        assert await adapter.deliver_fragment(claim, _fragment(claim)) == 1002
 
         assert bot.send_message.await_args_list[0].kwargs["parse_mode"] == ParseMode.MARKDOWN
         assert bot.send_message.await_args_list[1].kwargs == {
@@ -196,13 +239,13 @@ class TestWorkshopTelegramDeliveryAdapter:
         }
 
     @pytest.mark.parametrize(
-        ("error", "retryable", "error_code"),
+        ("error", "retryable", "error_code", "ambiguous"),
         [
-            (TimedOut(), True, "telegram_timeout"),
-            (NetworkError("reset"), True, "telegram_network_error"),
-            (TelegramError("unknown"), True, "telegram_error"),
-            (Forbidden("blocked"), False, "telegram_forbidden"),
-            (InvalidToken(), False, "telegram_invalid_token"),
+            (TimedOut(), False, "telegram_timeout_uncertain", True),
+            (NetworkError("reset"), False, "telegram_network_uncertain", True),
+            (TelegramError("unknown"), False, "telegram_error_uncertain", True),
+            (Forbidden("blocked"), False, "telegram_forbidden", False),
+            (InvalidToken(), False, "telegram_invalid_token", False),
         ],
     )
     async def test_classifies_telegram_failures_without_persisting_provider_messages(
@@ -210,24 +253,28 @@ class TestWorkshopTelegramDeliveryAdapter:
         error,
         retryable,
         error_code,
+        ambiguous,
     ):
         bot = AsyncMock()
         bot.send_message.side_effect = error
+        claim = _claim()
 
         with pytest.raises(TelegramDeliveryFailure) as raised:
-            await WorkshopTelegramDeliveryAdapter(bot).deliver(_claim())
+            await WorkshopTelegramDeliveryAdapter(bot).deliver_fragment(claim, _fragment(claim))
 
         assert raised.value.retryable is retryable
         assert raised.value.error_code == error_code
+        assert raised.value.ambiguous is ambiguous
         assert str(raised.value) == error_code
 
     async def test_rate_limit_is_retryable(self, monkeypatch):
         monkeypatch.setenv("PTB_TIMEDELTA", "1")
         bot = AsyncMock()
         bot.send_message.side_effect = RetryAfter(timedelta(seconds=7))
+        claim = _claim()
 
         with pytest.raises(TelegramDeliveryFailure) as raised:
-            await WorkshopTelegramDeliveryAdapter(bot).deliver(_claim())
+            await WorkshopTelegramDeliveryAdapter(bot).deliver_fragment(claim, _fragment(claim))
 
         assert raised.value.retryable is True
         assert raised.value.error_code == "telegram_rate_limited"
@@ -236,27 +283,42 @@ class TestWorkshopTelegramDeliveryAdapter:
     async def test_second_bad_request_is_permanent(self):
         bot = AsyncMock()
         bot.send_message.side_effect = [BadRequest("markup"), BadRequest("chat not found")]
+        claim = _claim()
 
         with pytest.raises(TelegramDeliveryFailure) as raised:
-            await WorkshopTelegramDeliveryAdapter(bot).deliver(_claim())
+            await WorkshopTelegramDeliveryAdapter(bot).deliver_fragment(claim, _fragment(claim))
 
         assert raised.value.retryable is False
         assert raised.value.error_code == "telegram_bad_request"
 
+    async def test_success_without_a_message_id_is_treated_as_uncertain(self):
+        bot = AsyncMock()
+        bot.send_message.return_value = object()
+        claim = _claim()
+
+        with pytest.raises(TelegramDeliveryFailure) as raised:
+            await WorkshopTelegramDeliveryAdapter(bot).deliver_fragment(claim, _fragment(claim))
+
+        assert raised.value.error_code == "telegram_response_invalid"
+        assert raised.value.ambiguous is True
+
     @pytest.mark.parametrize(
-        "claim",
+        ("claim", "fragment_body"),
         [
-            _claim(transport="email"),
-            _claim(mode="photo"),
-            _claim(external_channel_id="not a Telegram target"),
-            _claim(body="x" * 4097),
+            (_claim(transport="email"), None),
+            (_claim(mode="photo"), None),
+            (_claim(external_channel_id="not a Telegram target"), None),
+            (_claim(body="x" * 4097), "x" * 4097),
         ],
     )
-    async def test_rejects_unsupported_claims_before_calling_telegram(self, claim):
+    async def test_rejects_unsupported_claims_before_calling_telegram(self, claim, fragment_body):
         bot = AsyncMock()
 
         with pytest.raises(TelegramDeliveryContractError):
-            await WorkshopTelegramDeliveryAdapter(bot).deliver(claim)
+            await WorkshopTelegramDeliveryAdapter(bot).deliver_fragment(
+                claim,
+                _fragment(claim, body=fragment_body),
+            )
 
         bot.send_message.assert_not_awaited()
 
@@ -265,12 +327,8 @@ class TestWorkshopTelegramDeliveryWorker:
     async def test_successfully_delivers_and_completes_private_chat_work(self, tmp_path: Path):
         store, message_id, binding_id = await _open_with_outbound(tmp_path / "kai.db")
         delivery_id = await _request(store, message_id, binding_id)
-        bot = AsyncMock()
-        worker = WorkshopTelegramDeliveryWorker(
-            WorkshopDeliveryOutbox(store),
-            WorkshopTelegramDeliveryAdapter(bot),
-            worker_id="telegram-worker-1",
-        )
+        bot = _successful_bot()
+        worker = _worker(store, bot)
         try:
             result = await worker.run_once()
 
@@ -283,40 +341,80 @@ class TestWorkshopTelegramDeliveryWorker:
         finally:
             await store.close()
 
+    async def test_long_text_is_sent_as_durable_ordered_fragments(self, tmp_path: Path):
+        body = ("A" * 4096) + "\n" + ("B" * 20)
+        store, message_id, binding_id = await _open_with_outbound(
+            tmp_path / "kai.db",
+            outbound_body=body,
+        )
+        delivery_id = await _request(store, message_id, binding_id)
+        bot = _successful_bot(1001, 1002)
+        worker = _worker(store, bot)
+        try:
+            result = await worker.run_once()
+            persisted = await WorkshopDeliveryFragments(store).fragments(delivery_id)
+
+            assert result.outcome == TelegramWorkOutcome.SUCCEEDED
+            assert [call.kwargs["text"] for call in bot.send_message.await_args_list] == [
+                "A" * 4096,
+                "B" * 20,
+            ]
+            assert [fragment.status for fragment in persisted] == ["sent", "sent"]
+            assert [fragment.external_message_id for fragment in persisted] == ["1001", "1002"]
+        finally:
+            await store.close()
+
     async def test_notification_group_binding_is_the_only_send_target(self, tmp_path: Path):
         store, message_id, _ = await _open_with_outbound(tmp_path / "kai.db")
         group_binding_id = await _add_group_binding(store, message_id)
         await _request(store, message_id, group_binding_id)
-        bot = AsyncMock()
-        worker = WorkshopTelegramDeliveryWorker(
-            WorkshopDeliveryOutbox(store),
-            WorkshopTelegramDeliveryAdapter(bot),
-            worker_id="telegram-worker-1",
-        )
+        bot = _successful_bot()
+        worker = _worker(store, bot)
         try:
             assert (await worker.run_once()).outcome == TelegramWorkOutcome.SUCCEEDED
             assert bot.send_message.await_args.kwargs["chat_id"] == -1001234567890
         finally:
             await store.close()
 
-    async def test_retryable_failure_schedules_bounded_outbox_retry(self, tmp_path: Path):
+    async def test_retryable_failure_schedules_bounded_outbox_retry(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv("PTB_TIMEDELTA", "1")
         store, message_id, binding_id = await _open_with_outbound(tmp_path / "kai.db")
         delivery_id = await _request(store, message_id, binding_id)
         bot = AsyncMock()
-        bot.send_message.side_effect = TimedOut()
-        worker = WorkshopTelegramDeliveryWorker(
-            WorkshopDeliveryOutbox(store),
-            WorkshopTelegramDeliveryAdapter(bot),
-            worker_id="telegram-worker-1",
-        )
+        bot.send_message.side_effect = RetryAfter(timedelta(seconds=7))
+        worker = _worker(store, bot)
         try:
             result = await worker.run_once()
 
             assert result.outcome == TelegramWorkOutcome.RETRY_SCHEDULED
-            assert result.error_code == "telegram_timeout"
+            assert result.error_code == "telegram_rate_limited"
             state = await WorkshopDeliveryOutbox(store).state(delivery_id)
             assert state.status == "retry_wait"
-            assert state.last_error_code == "telegram_timeout"
+            assert state.last_error_code == "telegram_rate_limited"
+            assert [fragment.status for fragment in await WorkshopDeliveryFragments(store).fragments(delivery_id)] == [
+                "pending"
+            ]
+        finally:
+            await store.close()
+
+    async def test_ambiguous_timeout_fails_terminally_without_automatic_resend(self, tmp_path: Path):
+        store, message_id, binding_id = await _open_with_outbound(tmp_path / "kai.db")
+        delivery_id = await _request(store, message_id, binding_id)
+        bot = AsyncMock()
+        bot.send_message.side_effect = TimedOut()
+        worker = _worker(store, bot)
+        try:
+            result = await worker.run_once()
+            state = await WorkshopDeliveryOutbox(store).state(delivery_id)
+            persisted = await WorkshopDeliveryFragments(store).fragments(delivery_id)
+
+            assert result.outcome == TelegramWorkOutcome.FAILED
+            assert result.error_code == "telegram_timeout_uncertain"
+            assert state.status == "failed"
+            assert state.last_error_code == "telegram_timeout_uncertain"
+            assert persisted[0].status == "uncertain"
+            assert await worker.run_once() == type(result)(outcome=TelegramWorkOutcome.IDLE)
+            assert bot.send_message.await_count == 1
         finally:
             await store.close()
 
@@ -325,11 +423,7 @@ class TestWorkshopTelegramDeliveryWorker:
         delivery_id = await _request(store, message_id, binding_id)
         bot = AsyncMock()
         bot.send_message.side_effect = Forbidden("blocked")
-        worker = WorkshopTelegramDeliveryWorker(
-            WorkshopDeliveryOutbox(store),
-            WorkshopTelegramDeliveryAdapter(bot),
-            worker_id="telegram-worker-1",
-        )
+        worker = _worker(store, bot)
         try:
             result = await worker.run_once()
 
@@ -354,11 +448,7 @@ class TestWorkshopTelegramDeliveryWorker:
         )
         other_delivery = await _request(store, message_id, binding_id, mode=mode)
         bot = AsyncMock()
-        worker = WorkshopTelegramDeliveryWorker(
-            WorkshopDeliveryOutbox(store),
-            WorkshopTelegramDeliveryAdapter(bot),
-            worker_id="telegram-worker-1",
-        )
+        worker = _worker(store, bot)
         try:
             assert (await worker.run_once()).outcome == TelegramWorkOutcome.IDLE
             assert (await WorkshopDeliveryOutbox(store).state(other_delivery)).status == "pending"
@@ -371,11 +461,7 @@ class TestWorkshopTelegramDeliveryWorker:
         delivery_id = await _request(store, message_id, binding_id)
         bot = AsyncMock()
         bot.send_message.side_effect = RuntimeError("programming error")
-        worker = WorkshopTelegramDeliveryWorker(
-            WorkshopDeliveryOutbox(store),
-            WorkshopTelegramDeliveryAdapter(bot),
-            worker_id="telegram-worker-1",
-        )
+        worker = _worker(store, bot)
         try:
             with pytest.raises(RuntimeError, match="programming error"):
                 await worker.run_once()
@@ -394,11 +480,7 @@ class TestWorkshopTelegramDeliveryWorker:
 
         bot = AsyncMock()
         bot.send_message.side_effect = blocked_send
-        worker = WorkshopTelegramDeliveryWorker(
-            WorkshopDeliveryOutbox(store),
-            WorkshopTelegramDeliveryAdapter(bot),
-            worker_id="telegram-worker-1",
-        )
+        worker = _worker(store, bot)
         task = asyncio.create_task(worker.run_once())
         try:
             await entered.wait()
@@ -414,12 +496,7 @@ class TestWorkshopTelegramDeliveryWorker:
     async def test_idle_run_stops_without_polling_when_already_signaled(self, tmp_path: Path):
         store, _, _ = await _open_with_outbound(tmp_path / "kai.db")
         bot = AsyncMock()
-        worker = WorkshopTelegramDeliveryWorker(
-            WorkshopDeliveryOutbox(store),
-            WorkshopTelegramDeliveryAdapter(bot),
-            worker_id="telegram-worker-1",
-            poll_interval=0.01,
-        )
+        worker = _worker(store, bot, poll_interval=0.01)
         stop_event = asyncio.Event()
         stop_event.set()
         try:

@@ -30,6 +30,14 @@ from kai.workshop.client_sessions import (
     WorkshopClientEnrollmentManager,
     WorkshopClientSessionManager,
 )
+from kai.workshop.delivery_fragments import (
+    DeliveryFragment,
+    DeliveryFragmentError,
+    DeliveryFragmentPlanConflictError,
+    DeliveryFragmentStateError,
+    DeliveryFragmentUncertainError,
+    WorkshopDeliveryFragments,
+)
 from kai.workshop.delivery_outbox import (
     DeliveryClaim,
     DeliveryOutboxError,
@@ -39,7 +47,9 @@ from kai.workshop.delivery_outbox import (
     DeliveryRequestResult,
     DeliveryState,
     DeliveryTargetNotFoundError,
+    IncompleteDeliveryFragmentsError,
     StaleDeliveryLeaseError,
+    UnsettledDeliveryFragmentError,
     WorkshopDeliveryOutbox,
 )
 from kai.workshop.domain import (
@@ -75,6 +85,7 @@ from kai.workshop.store import (
 from kai.workshop.telegram_delivery import (
     TelegramDeliveryContractError,
     TelegramDeliveryFailure,
+    TelegramSentMessage,
     TelegramTextBot,
     TelegramWorkOutcome,
     TelegramWorkResult,
@@ -107,6 +118,11 @@ __all__ = [
     "ClientSessionId",
     "DeliveryAttemptId",
     "DeliveryClaim",
+    "DeliveryFragment",
+    "DeliveryFragmentError",
+    "DeliveryFragmentPlanConflictError",
+    "DeliveryFragmentStateError",
+    "DeliveryFragmentUncertainError",
     "DeliveryId",
     "DeliveryOutboxError",
     "DeliveryRecoveryResult",
@@ -124,6 +140,7 @@ __all__ = [
     "ExternalIdentityId",
     "IdempotencyConflictError",
     "InboundArtifact",
+    "IncompleteDeliveryFragmentsError",
     "IssuedWorkshopClientSession",
     "IssuedWorkshopEnrollmentGrant",
     "MessageId",
@@ -135,6 +152,7 @@ __all__ = [
     "StoredEvent",
     "TelegramDeliveryContractError",
     "TelegramDeliveryFailure",
+    "TelegramSentMessage",
     "TelegramTextBot",
     "TelegramWorkOutcome",
     "TelegramWorkResult",
@@ -143,10 +161,12 @@ __all__ = [
     "TimelineMessage",
     "TimelinePage",
     "TrackedClientDevice",
+    "UnsettledDeliveryFragmentError",
     "WorkshopBearerSessionAuthenticator",
     "WorkshopClientAuthenticator",
     "WorkshopClientEnrollmentManager",
     "WorkshopClientSessionManager",
+    "WorkshopDeliveryFragments",
     "WorkshopDeliveryOutbox",
     "WorkshopEventStore",
     "WorkshopEventType",
