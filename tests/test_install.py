@@ -4661,9 +4661,7 @@ class TestApplyVenv:
         src = install / "src" / "kai"
         src.mkdir(parents=True)
         (src / "__init__.py").write_text("# init")
-        (install / ".pyproject.sha256").write_text(
-            _file_checksum(install / "pyproject.toml") + "\n"
-        )
+        (install / ".pyproject.sha256").write_text(_file_checksum(install / "pyproject.toml") + "\n")
         (install / ".src.sha256").write_text(_src_checksum(install / "src") + "\n")
 
         for directory in (venv, venv_bin, package.parent, package):
@@ -7034,7 +7032,6 @@ class TestApplySource:
         assert stat.S_IMODE((install / "src" / "kai" / "nested" / "module.py").stat().st_mode) == 0o644
         assert stat.S_IMODE((install / "config").stat().st_mode) == 0o755
         assert stat.S_IMODE((install / "config" / "goose-config.yaml").stat().st_mode) == 0o644
-
 
     def test_preserves_executable_intent_and_skips_symlinks(self, tmp_path):
         tree = tmp_path / "tree"
