@@ -80,7 +80,7 @@ The outer process is already a control plane in the practical sense: it authenti
 | Accepted inbound Telegram work | `telegram_update_queue` in [`sessions.py`](src/kai/sessions.py) | Telegram update ID | Strong Telegram-specific durability pattern; not yet a general command inbox. |
 | Transcript | Per-user/date JSONL in [`history.py`](src/kai/history.py) | Chat ID + timestamp | No stable message ID, channel ID, thread ID, edit lineage, delivery state, or transactional relation to SQLite. |
 | Harness session metadata | `sessions` table plus live backend instance | Chat ID | The stored session ID is used for statistics and clearing; process/session reconstruction still belongs to the live backend. |
-| Durable run lifecycle | Workshop event log and replayed `runs` projection | Run ID | Production-unused accepted/started/completed/failed/cancelled facts exist; the cutover review holds live activation until attempts, cancellation intent, result atomicity, and replay suppression exist. |
+| Durable run lifecycle | Workshop event log plus replayed `runs` and `run_attempts` projections | Run ID + attempt ID | Production-unused acceptance and fenced execution authority exist; the cutover review still holds live activation until atomic acceptance, terminal-result finalization, user-visible failure/cancellation outcomes, and replay suppression are integrated. |
 | Active harness process | `SubprocessPool` in [`pool.py`](src/kai/pool.py) | Chat ID | One implicit agent process per conversation key; durable agent and run identities now exist but are not connected to process, attempt, lease, or worker ownership. |
 | User settings | Generic `settings` rows in [`sessions.py`](src/kai/sessions.py) | Namespaced strings containing chat ID | Flexible but not typed, versioned, or attached to transport-independent principals/channels. |
 | Scheduled jobs | `jobs` table and APScheduler registration | Integer job ID + chat ID | Job definitions survive restart, but executions are not durable runs with attempts and event history. |
@@ -1042,9 +1042,9 @@ The boundary is intentionally narrow:
   channels retain their current execution paths;
 - process locks, settings, JSONL history, memory, and the live harness pool
   remain keyed by their existing compatibility identity;
-- the production conversation service does not yet create the durable run
-  lifecycle facts defined in section 26, and attempts and execution leases do
-  not yet exist;
+- the production conversation service does not yet create the durable run or
+  attempt facts defined in sections 26 and 28; the execution authority and
+  leases exist only as production-unused contracts;
 - no Workshop desktop/web endpoint is registered by this change.
 
 Automated contracts require one canonical human channel member, exactly one
@@ -1067,7 +1067,7 @@ human membership, channel, workshop, and exactly one attached agent without
 requiring a Telegram identity or accepting any caller-selected execution
 identity.
 
-The lifecycle state machine is deliberately small:
+The version-1 lifecycle state machine was deliberately small:
 
 ```text
 accepted --> started --> completed
@@ -1075,31 +1075,36 @@ accepted --> started --> completed
     +-----------+-----> cancelled
 ```
 
-The requesting human is the recorded actor for acceptance and cancellation.
-The attached agent principal is the recorded actor for start, completion, and
-failure. Terminal failures and cancellations persist only bounded lowercase
-classification codes; provider messages, prompts, output text, credentials,
-transport IDs, executable paths, and harness-specific payloads are excluded.
-Lifecycle timestamps cannot precede their prior canonical fact.
+The requesting human is the recorded actor for acceptance. Version-1 events
+remain replayable, but their direct transition helper was removed when schema
+version 16 introduced the execution authority in section 28. New cancellation
+is a human-authored request followed by an execution-authority acknowledgement;
+new start and terminal facts require a fenced attempt. Terminal failures and
+cancellations persist only bounded lowercase classification codes; provider
+messages, prompts, output text, credentials, transport IDs, executable paths,
+and harness-specific payloads are excluded. Lifecycle timestamps cannot
+precede their prior canonical fact.
 
-Deterministic event IDs and idempotency keys make acceptance and every
-transition safely repeatable. Retrying an earlier transition after a later
-state returns its original event and current run state. Conflicting terminal
-facts, invalid ordering, unknown runs, ambiguous canonical agent attachment,
-actor mismatch, malformed payloads, and time reversal fail closed. The
-canonical projection rebuilds complete run state from position zero alongside
-the conversation records on which it depends.
+Deterministic event IDs and idempotency keys make acceptance repeatable.
+Execution transition idempotency and arbitration now belong exclusively to the
+fenced authority described in section 28. Conflicting terminal facts, invalid
+ordering, unknown runs, ambiguous canonical agent attachment, actor mismatch,
+malformed payloads, and time reversal fail closed. The canonical projection
+rebuilds complete run state from position zero alongside the conversation
+records on which it depends.
 
 This foundation is production-unused:
 
 - `main.py`, `bot.py`, the conversation-run service, and all client APIs do not
-  construct or call `WorkshopRunLifecycle`;
+  construct or call `WorkshopRunLifecycle` or
+  `WorkshopRunExecutionAuthority`;
 - it starts no process or worker and owns no lease, attempt, backend session,
   workspace, credential, or delivery;
 - it does not alter Telegram ingress, streaming, outbox finalization, JSONL,
   memory, media, commands, schedules, integrations, or any backend driver;
-- upgrading creates an empty `runs` table and advances the canonical projection
-  version; existing conversations replay without synthesizing historical runs.
+- schema version 15 created an empty `runs` table; version 16 adds empty attempt
+  state and nullable authority columns. Existing conversations replay without
+  synthesizing historical runs or attempts.
 
 The explicit run-authority cutover review is complete in section 27. It holds
 live activation and proves that attempt identity is required for truthful
@@ -1215,9 +1220,9 @@ run facts exist. Activation requires these corrections:
 | Stable failure classification | Backend-native errors map conservatively to bounded backend-neutral categories | Pass as a building block |
 | Durable final delivery | Canonical result and exact-epoch streaming-finalization plan recover without duplicate final delivery | Pass, production-used |
 | Atomic inbound acceptance | Inbound message and run acceptance currently use separate service calls | Blocker |
-| Attempt authority and ownership | No attempt ID, owner, lease, or may-have-executed recovery state exists | Blocker |
-| Cancellation intent and acknowledgement | `/stop` uses a volatile event and immediate process kill; no durable request/acknowledgement race exists | Blocker |
-| Terminal result atomicity | Run completion is not part of the canonical result/finalization transaction | Blocker |
+| Attempt authority and ownership | Typed attempts, exclusive active ownership, leases, monotonic fencing, and conservative expiry recovery are replayed and tested | Pass, production-unused |
+| Cancellation intent and acknowledgement | Human request and fenced acknowledgement are separate facts with one terminal arbiter; live `/stop` is not integrated | Pass as a production-unused foundation; integration blocker remains |
+| Terminal result atomicity | Completion must reference a canonical result, but result creation, delivery request, and completion are not yet one transaction | Blocker |
 | Terminal replay suppression | Replayed ingress has no run-state guard before backend invocation | Blocker |
 | Installed qualification | No live run facts should exist until all preceding blockers pass in automated review | Not yet applicable |
 
@@ -1247,3 +1252,63 @@ Do not add a generic background execution worker or wire Telegram in this
 slice. After the foundation passes, conduct a second run-authority review of
 the atomic inbound/acceptance adapter and terminal-result finalization
 integration before authorizing any live lifecycle facts.
+
+## 28. Production-unused fenced run execution authority
+
+**Implementation date:** 2026-08-12
+
+Schema version 16 and canonical projection version 6 implement the bounded
+foundation required by section 27 without registering a worker or altering any
+live conversation path.
+
+Each accepted run may have at most one active `run_attempt`. An attempt records
+a typed attempt ID, monotonically increasing attempt sequence and fence token,
+one opaque execution-owner ID, a bounded renewable lease, and the protected
+backend/provider/model selection resolved from installation policy. It records
+the execution contract identifier but never a command, executable path,
+credential, prompt, output, or native backend error. Callers cannot supply the
+selection, and a resolved backend must exist in the protected registry set.
+
+The authority boundary is conservative:
+
+- a lease grant is pre-dispatch and may expire back to an accepted run;
+- `run.started` version 2 is emitted atomically with `run_attempt.started` at
+  the may-have-executed boundary;
+- an expired pre-dispatch grant may receive a new, higher fence;
+- an expired started attempt becomes `execution_interrupted`, atomically fails
+  its run, and cannot be automatically redispatched;
+- renewals advance a lease version, so an older claim cannot start or settle;
+- completion, failure, and confirmed cancellation require the exact active
+  owner, fence, and lease version and race through one SQLite transaction;
+- successful completion identifies one canonical agent result replying to the
+  run's inbound message;
+- human cancellation intent leaves the run nonterminal until the fenced owner
+  confirms that execution stopped.
+
+Deterministic event identities make exact retries return prior authority facts
+while conflicting retries fail closed. Projection rules independently verify
+actor, run, attempt, selection shape, lease ordering, cancellation intent,
+result-message authorship, and terminal ordering. Rebuild tests restore the
+same run and attempt state from position zero. Migration, stale-owner,
+renewal, pre/post-dispatch expiry, protected selection, canonical result,
+terminal conflict, and cancellation/completion race tests pin the contract.
+
+The earlier lifecycle service now owns acceptance only. Its unfenced direct
+start/complete/fail/cancel methods were removed so future wiring cannot choose
+between competing transition authorities. Version-1 events remain replayable
+for schema compatibility, although no production path emitted them.
+
+This remains production-unused. No production module imports or constructs the
+execution authority; it starts no process, owns no worker, and changes no
+Telegram, backend, memory, media, command, schedule, integration, history, or
+delivery behavior.
+
+### 28.1 Next bounded milestone
+
+Conduct the second run-authority integration review promised by section 27.
+Specify the atomic command boundary for canonical inbound plus acceptance and
+the atomic terminal boundary for canonical result or bounded failure outcome,
+exact-epoch delivery work, and run settlement. The review must also define
+terminal replay suppression and how the existing per-conversation lock maps to
+one active attempt. Do not activate live run facts or add a generic execution
+worker until that review closes every remaining blocker.

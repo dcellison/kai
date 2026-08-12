@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -22,8 +21,6 @@ from kai.workshop.domain import (
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import StoredEvent, WorkshopEventStore
 
-_TERMINAL_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
-
 
 class RunStatus(StrEnum):
     ACCEPTED = "accepted"
@@ -39,10 +36,6 @@ class RunLifecycleError(RuntimeError):
 
 class RunNotFoundError(RunLifecycleError, LookupError):
     """A typed run ID does not identify a durable run."""
-
-
-class InvalidRunTransitionError(RunLifecycleError):
-    """The requested lifecycle transition is not valid from current state."""
 
 
 class RunLifecycleConflictError(RunLifecycleError):
@@ -62,6 +55,9 @@ class DurableRun:
     started_at: datetime | None
     terminal_at: datetime | None
     terminal_code: str | None
+    cancellation_requested_at: datetime | None
+    cancellation_code: str | None
+    result_message_id: MessageId | None
     last_event_position: int
 
 
@@ -78,12 +74,6 @@ def _require_timestamp(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
-def _require_terminal_code(value: str, *, field_name: str) -> str:
-    if not isinstance(value, str) or not _TERMINAL_CODE_PATTERN.fullmatch(value):
-        raise ValueError(f"{field_name} must be a lowercase identifier of at most 64 characters")
-    return value
-
-
 def _parse_timestamp(value: object) -> datetime:
     return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(UTC)
 
@@ -96,6 +86,7 @@ async def _load_run(store: WorkshopEventStore, run_id: RunId) -> DurableRun | No
     async with store.connection.execute(
         "SELECT id, workshop_id, channel_id, requested_by_principal_id, agent_id, "
         "inbound_message_id, status, accepted_at, started_at, terminal_at, terminal_code, "
+        "cancellation_requested_at, cancellation_code, result_message_id, "
         "last_event_position FROM runs WHERE id = ?",
         (run_id,),
     ) as cursor:
@@ -114,7 +105,10 @@ async def _load_run(store: WorkshopEventStore, run_id: RunId) -> DurableRun | No
         started_at=_optional_timestamp(row[8]),
         terminal_at=_optional_timestamp(row[9]),
         terminal_code=str(row[10]) if row[10] is not None else None,
-        last_event_position=int(row[11]),
+        cancellation_requested_at=_optional_timestamp(row[11]),
+        cancellation_code=str(row[12]) if row[12] is not None else None,
+        result_message_id=MessageId(str(row[13])) if row[13] is not None else None,
+        last_event_position=int(row[14]),
     )
 
 
@@ -128,17 +122,6 @@ async def _load_run_by_inbound_message(
     ) as cursor:
         row = await cursor.fetchone()
     return None if row is None else await _load_run(store, RunId(str(row[0])))
-
-
-async def _agent_principal_id(store: WorkshopEventStore, run: DurableRun) -> PrincipalId:
-    async with store.connection.execute(
-        "SELECT principal_id FROM agents WHERE id = ? AND workshop_id = ?",
-        (run.agent_id, run.workshop_id),
-    ) as cursor:
-        row = await cursor.fetchone()
-    if row is None:
-        raise RunLifecycleConflictError("Durable run no longer resolves its attached agent principal")
-    return PrincipalId(str(row[0]))
 
 
 def _event_key(run_id: RunId, status: RunStatus) -> str:
@@ -257,121 +240,6 @@ class WorkshopRunLifecycle:
                 raise RunLifecycleConflictError("Accepted run was not projected")
             await connection.commit()
             return RunLifecycleResult(run=run, event=appended.event, changed=appended.inserted)
-        except Exception:
-            await connection.rollback()
-            raise
-
-    async def start(self, run_id: RunId, *, occurred_at: datetime) -> RunLifecycleResult:
-        return await self._transition(run_id, RunStatus.STARTED, occurred_at=occurred_at, terminal_code=None)
-
-    async def complete(self, run_id: RunId, *, occurred_at: datetime) -> RunLifecycleResult:
-        return await self._transition(run_id, RunStatus.COMPLETED, occurred_at=occurred_at, terminal_code=None)
-
-    async def fail(
-        self,
-        run_id: RunId,
-        *,
-        failure_code: str,
-        occurred_at: datetime,
-    ) -> RunLifecycleResult:
-        return await self._transition(
-            run_id,
-            RunStatus.FAILED,
-            occurred_at=occurred_at,
-            terminal_code=_require_terminal_code(failure_code, field_name="failure_code"),
-        )
-
-    async def cancel(
-        self,
-        run_id: RunId,
-        *,
-        cancellation_code: str,
-        occurred_at: datetime,
-    ) -> RunLifecycleResult:
-        return await self._transition(
-            run_id,
-            RunStatus.CANCELLED,
-            occurred_at=occurred_at,
-            terminal_code=_require_terminal_code(cancellation_code, field_name="cancellation_code"),
-        )
-
-    async def _transition(
-        self,
-        run_id: RunId,
-        status: RunStatus,
-        *,
-        occurred_at: datetime,
-        terminal_code: str | None,
-    ) -> RunLifecycleResult:
-        if not isinstance(run_id, RunId):
-            raise ValueError("run_id must be a RunId")
-        occurred_at = _require_timestamp(occurred_at)
-        if status not in {RunStatus.STARTED, RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
-            raise ValueError("Unsupported durable run transition")
-
-        connection = self._store.connection
-        try:
-            await connection.execute("BEGIN IMMEDIATE")
-            projection = CanonicalConversationProjection()
-            await self._store.project_pending_in_transaction(projection)
-            run = await _load_run(self._store, run_id)
-            if run is None:
-                raise RunNotFoundError("Durable Workshop run was not found")
-            actor = (
-                run.requested_by_principal_id
-                if status == RunStatus.CANCELLED
-                else await _agent_principal_id(self._store, run)
-            )
-            payload: dict[str, object]
-            if status == RunStatus.FAILED:
-                assert terminal_code is not None
-                payload = {"failure_code": terminal_code}
-            elif status == RunStatus.CANCELLED:
-                assert terminal_code is not None
-                payload = {"cancellation_code": terminal_code}
-            else:
-                payload = {}
-
-            existing_event = await _existing_event(
-                self._store,
-                run=run,
-                status=status,
-                actor_principal_id=actor,
-                payload=payload,
-            )
-            if existing_event is not None:
-                await connection.commit()
-                return RunLifecycleResult(run=run, event=existing_event, changed=False)
-
-            allowed_from = {
-                RunStatus.STARTED: {RunStatus.ACCEPTED},
-                RunStatus.COMPLETED: {RunStatus.STARTED},
-                RunStatus.FAILED: {RunStatus.STARTED},
-                RunStatus.CANCELLED: {RunStatus.ACCEPTED, RunStatus.STARTED},
-            }[status]
-            if run.status not in allowed_from:
-                raise InvalidRunTransitionError(f"Cannot transition durable run from {run.status} to {status}")
-
-            event = EventEnvelope.create(
-                event_id=EventId.derived(run.run_id, str(status)),
-                event_type=_event_type(status),
-                event_version=1,
-                workshop_id=run.workshop_id,
-                aggregate_type="run",
-                aggregate_id=run.run_id,
-                actor_principal_id=actor,
-                occurred_at=occurred_at,
-                idempotency_key=_event_key(run.run_id, status),
-                payload=payload,
-                metadata={"source": "workshop_run_lifecycle"},
-            )
-            appended = await self._store.append_in_transaction(event)
-            await self._store.project_pending_in_transaction(projection)
-            updated = await _load_run(self._store, run.run_id)
-            if updated is None:
-                raise RunLifecycleConflictError("Transitioned run was not projected")
-            await connection.commit()
-            return RunLifecycleResult(run=updated, event=appended.event, changed=appended.inserted)
         except Exception:
             await connection.rollback()
             raise

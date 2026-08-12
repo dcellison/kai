@@ -37,9 +37,18 @@ class WorkshopEventType(StrEnum):
     DELIVERY_FAILED = "delivery.failed"
     RUN_ACCEPTED = "run.accepted"
     RUN_STARTED = "run.started"
+    RUN_CANCELLATION_REQUESTED = "run.cancellation_requested"
     RUN_COMPLETED = "run.completed"
     RUN_FAILED = "run.failed"
     RUN_CANCELLED = "run.cancelled"
+    RUN_ATTEMPT_GRANTED = "run_attempt.granted"
+    RUN_ATTEMPT_STARTED = "run_attempt.started"
+    RUN_ATTEMPT_LEASE_RENEWED = "run_attempt.lease_renewed"
+    RUN_ATTEMPT_EXPIRED = "run_attempt.expired"
+    RUN_ATTEMPT_INTERRUPTED = "run_attempt.interrupted"
+    RUN_ATTEMPT_COMPLETED = "run_attempt.completed"
+    RUN_ATTEMPT_FAILED = "run_attempt.failed"
+    RUN_ATTEMPT_CANCELLED = "run_attempt.cancelled"
 
 
 class OpaqueId(str):
@@ -141,6 +150,14 @@ class RunId(OpaqueId):
     prefix = "run"
 
 
+class RunAttemptId(OpaqueId):
+    prefix = "rat"
+
+
+class RunExecutionOwnerId(OpaqueId):
+    prefix = "reo"
+
+
 class EventId(OpaqueId):
     prefix = "evt"
 
@@ -166,6 +183,8 @@ _ID_TYPES: dict[str, type[OpaqueId]] = {
         DeliveryAttemptId,
         DeliveryAuthorityEpochId,
         RunId,
+        RunAttemptId,
+        RunExecutionOwnerId,
         EventId,
     )
 }

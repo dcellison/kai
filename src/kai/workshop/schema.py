@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 15
+WORKSHOP_SCHEMA_VERSION = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -571,6 +571,64 @@ _DURABLE_RUN_LIFECYCLE_SCHEMA = SchemaMigration(
     ),
 )
 
+_RUN_EXECUTION_AUTHORITY_SCHEMA = SchemaMigration(
+    version=16,
+    name="durable_run_execution_authority",
+    statements=(
+        "ALTER TABLE runs ADD COLUMN cancellation_requested_at TEXT",
+        "ALTER TABLE runs ADD COLUMN cancellation_code TEXT",
+        "ALTER TABLE runs ADD COLUMN result_message_id TEXT REFERENCES messages(id) ON DELETE RESTRICT",
+        """
+        CREATE TABLE run_attempts (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+            attempt_sequence INTEGER NOT NULL CHECK (attempt_sequence > 0),
+            owner_id TEXT NOT NULL,
+            fence_token INTEGER NOT NULL CHECK (fence_token > 0),
+            status TEXT NOT NULL CHECK (
+                status IN (
+                    'granted', 'started', 'expired', 'interrupted',
+                    'completed', 'failed', 'cancelled'
+                )
+            ),
+            backend TEXT NOT NULL,
+            provider TEXT,
+            model TEXT NOT NULL,
+            execution_contract TEXT NOT NULL,
+            lease_version INTEGER NOT NULL DEFAULT 1 CHECK (lease_version > 0),
+            granted_at TEXT NOT NULL,
+            lease_expires_at TEXT NOT NULL,
+            started_at TEXT,
+            terminal_at TEXT,
+            terminal_code TEXT,
+            last_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            UNIQUE (run_id, attempt_sequence),
+            UNIQUE (run_id, fence_token),
+            CHECK (
+                (status = 'granted' AND started_at IS NULL
+                    AND terminal_at IS NULL AND terminal_code IS NULL)
+                OR (status = 'started' AND started_at IS NOT NULL
+                    AND terminal_at IS NULL AND terminal_code IS NULL)
+                OR (status = 'expired' AND started_at IS NULL
+                    AND terminal_at IS NOT NULL AND terminal_code IS NOT NULL)
+                OR (status IN ('interrupted', 'failed') AND started_at IS NOT NULL
+                    AND terminal_at IS NOT NULL AND terminal_code IS NOT NULL)
+                OR (status = 'cancelled'
+                    AND terminal_at IS NOT NULL AND terminal_code IS NOT NULL)
+                OR (status = 'completed' AND started_at IS NOT NULL
+                    AND terminal_at IS NOT NULL
+                    AND terminal_code IS NULL)
+            )
+        )
+        """,
+        "CREATE UNIQUE INDEX run_attempts_active_run_idx ON run_attempts (run_id) "
+        "WHERE status IN ('granted', 'started')",
+        "CREATE INDEX run_attempts_lease_idx ON run_attempts (status, lease_expires_at)",
+        "CREATE INDEX run_attempts_owner_idx ON run_attempts (owner_id, fence_token, status)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -587,6 +645,7 @@ _MIGRATIONS = (
     _STREAMING_FINALIZATION_SCHEMA,
     _DELIVERY_AUTHORITY_EPOCH_SCHEMA,
     _DURABLE_RUN_LIFECYCLE_SCHEMA,
+    _RUN_EXECUTION_AUTHORITY_SCHEMA,
 )
 
 

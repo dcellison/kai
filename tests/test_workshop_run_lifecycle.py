@@ -20,9 +20,6 @@ from kai.workshop.domain import (
 from kai.workshop.inbound import InboundMessage, record_inbound_message
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.run_lifecycle import (
-    InvalidRunTransitionError,
-    RunLifecycleConflictError,
-    RunNotFoundError,
     RunStatus,
     WorkshopRunLifecycle,
 )
@@ -112,13 +109,12 @@ class TestDurableRunAcceptance:
         try:
             lifecycle = WorkshopRunLifecycle(store)
             first = await lifecycle.accept(inbound_id, occurred_at=_NOW + timedelta(seconds=1))
-            await lifecycle.start(first.run.run_id, occurred_at=_NOW + timedelta(seconds=2))
 
             retry = await lifecycle.accept(inbound_id, occurred_at=_NOW + timedelta(hours=1))
 
             assert retry.changed is False
             assert retry.event.position == first.event.position
-            assert retry.run.status == RunStatus.STARTED
+            assert retry.run.status == RunStatus.ACCEPTED
             async with store.connection.execute(
                 "SELECT COUNT(*) FROM event_log WHERE event_type = 'run.accepted'"
             ) as cursor:
@@ -157,148 +153,19 @@ class TestDurableRunAcceptance:
             await store.close()
 
 
-class TestDurableRunTransitions:
-    async def test_rejects_transition_before_prior_lifecycle_fact(self, tmp_path: Path):
-        store, inbound_id = await _open_with_inbound(tmp_path / "kai.db")
-        try:
-            lifecycle = WorkshopRunLifecycle(store)
-            accepted = await lifecycle.accept(inbound_id, occurred_at=_NOW + timedelta(seconds=2))
-
-            with pytest.raises(ValueError, match="start only once"):
-                await lifecycle.start(accepted.run.run_id, occurred_at=_NOW + timedelta(seconds=1))
-
-            assert (await lifecycle.state(accepted.run.run_id)).status == RunStatus.ACCEPTED
-            async with store.connection.execute(
-                "SELECT COUNT(*) FROM event_log WHERE event_type = 'run.started'"
-            ) as cursor:
-                assert (await cursor.fetchone())[0] == 0
-        finally:
-            await store.close()
-
-    async def test_completes_only_after_start_and_retries_prior_transition(self, tmp_path: Path):
-        store, inbound_id = await _open_with_inbound(tmp_path / "kai.db")
-        try:
-            lifecycle = WorkshopRunLifecycle(store)
-            accepted = await lifecycle.accept(inbound_id, occurred_at=_NOW + timedelta(seconds=1))
-            started = await lifecycle.start(accepted.run.run_id, occurred_at=_NOW + timedelta(seconds=2))
-            completed = await lifecycle.complete(accepted.run.run_id, occurred_at=_NOW + timedelta(seconds=3))
-            start_retry = await lifecycle.start(accepted.run.run_id, occurred_at=_NOW + timedelta(hours=1))
-
-            assert started.run.status == RunStatus.STARTED
-            assert completed.run.status == RunStatus.COMPLETED
-            assert completed.run.started_at == _NOW + timedelta(seconds=2)
-            assert completed.run.terminal_at == _NOW + timedelta(seconds=3)
-            assert completed.run.terminal_code is None
-            assert start_retry.changed is False
-            assert start_retry.event.position == started.event.position
-            assert start_retry.run.status == RunStatus.COMPLETED
-        finally:
-            await store.close()
-
-    async def test_failure_records_only_stable_code(self, tmp_path: Path):
-        store, inbound_id = await _open_with_inbound(tmp_path / "kai.db")
-        try:
-            lifecycle = WorkshopRunLifecycle(store)
-            accepted = await lifecycle.accept(inbound_id, occurred_at=_NOW + timedelta(seconds=1))
-            await lifecycle.start(accepted.run.run_id, occurred_at=_NOW + timedelta(seconds=2))
-
-            failed = await lifecycle.fail(
-                accepted.run.run_id,
-                failure_code="authentication_required",
-                occurred_at=_NOW + timedelta(seconds=3),
-            )
-
-            assert failed.run.status == RunStatus.FAILED
-            assert failed.run.terminal_code == "authentication_required"
-            assert failed.event.envelope.payload == {"failure_code": "authentication_required"}
-            assert "provider" not in failed.event.envelope.payload_json
-            assert "error" not in failed.event.envelope.payload_json
-        finally:
-            await store.close()
-
-    @pytest.mark.parametrize("start_first", [False, True])
-    async def test_requesting_human_can_cancel_nonterminal_run(self, tmp_path: Path, start_first: bool):
-        store, inbound_id = await _open_with_inbound(tmp_path / f"kai-{start_first}.db")
-        try:
-            lifecycle = WorkshopRunLifecycle(store)
-            accepted = await lifecycle.accept(inbound_id, occurred_at=_NOW + timedelta(seconds=1))
-            if start_first:
-                await lifecycle.start(accepted.run.run_id, occurred_at=_NOW + timedelta(seconds=2))
-
-            cancelled = await lifecycle.cancel(
-                accepted.run.run_id,
-                cancellation_code="requested_by_human",
-                occurred_at=_NOW + timedelta(seconds=3),
-            )
-
-            assert cancelled.run.status == RunStatus.CANCELLED
-            assert cancelled.run.terminal_code == "requested_by_human"
-            assert cancelled.event.envelope.actor_principal_id == accepted.run.requested_by_principal_id
-        finally:
-            await store.close()
-
-    async def test_invalid_and_conflicting_terminal_transitions_fail_closed(self, tmp_path: Path):
-        store, inbound_id = await _open_with_inbound(tmp_path / "kai.db")
-        try:
-            lifecycle = WorkshopRunLifecycle(store)
-            accepted = await lifecycle.accept(inbound_id, occurred_at=_NOW + timedelta(seconds=1))
-            with pytest.raises(InvalidRunTransitionError, match="accepted to completed"):
-                await lifecycle.complete(accepted.run.run_id, occurred_at=_NOW + timedelta(seconds=2))
-
-            await lifecycle.start(accepted.run.run_id, occurred_at=_NOW + timedelta(seconds=3))
-            await lifecycle.fail(
-                accepted.run.run_id,
-                failure_code="backend_unavailable",
-                occurred_at=_NOW + timedelta(seconds=4),
-            )
-            with pytest.raises(RunLifecycleConflictError, match="conflicting facts"):
-                await lifecycle.fail(
-                    accepted.run.run_id,
-                    failure_code="authentication_required",
-                    occurred_at=_NOW + timedelta(seconds=5),
-                )
-            with pytest.raises(InvalidRunTransitionError, match="failed to cancelled"):
-                await lifecycle.cancel(
-                    accepted.run.run_id,
-                    cancellation_code="requested_by_human",
-                    occurred_at=_NOW + timedelta(seconds=6),
-                )
-        finally:
-            await store.close()
-
-    async def test_rejects_unknown_run_and_unbounded_terminal_code(self, tmp_path: Path):
-        store, _ = await _open_with_inbound(tmp_path / "kai.db")
-        try:
-            lifecycle = WorkshopRunLifecycle(store)
-            with pytest.raises(RunNotFoundError):
-                await lifecycle.start(RunId.new(), occurred_at=_NOW)
-            with pytest.raises(ValueError, match="lowercase identifier"):
-                await lifecycle.fail(RunId.new(), failure_code="Raw provider error!", occurred_at=_NOW)
-        finally:
-            await store.close()
-
-
 class TestDurableRunReplay:
     async def test_canonical_rebuild_restores_lifecycle_exactly(self, tmp_path: Path):
         store, inbound_id = await _open_with_inbound(tmp_path / "kai.db")
         try:
             lifecycle = WorkshopRunLifecycle(store)
-            accepted = await lifecycle.accept(inbound_id, occurred_at=_NOW + timedelta(seconds=1))
-            await lifecycle.start(accepted.run.run_id, occurred_at=_NOW + timedelta(seconds=2))
-            before = (
-                await lifecycle.fail(
-                    accepted.run.run_id,
-                    failure_code="backend_unavailable",
-                    occurred_at=_NOW + timedelta(seconds=3),
-                )
-            ).run
+            before = (await lifecycle.accept(inbound_id, occurred_at=_NOW + timedelta(seconds=1))).run
             await store.connection.execute("DELETE FROM runs")
             await store.connection.commit()
 
             checkpoint = await store.rebuild_projection(CanonicalConversationProjection())
-            after = await lifecycle.state(accepted.run.run_id)
+            after = await lifecycle.state(before.run_id)
 
-            assert checkpoint.version == 5
+            assert checkpoint.version == 6
             assert after == before
         finally:
             await store.close()
@@ -353,8 +220,9 @@ class TestDurableRunMigration:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 15
+            assert await upgraded.schema_version() == 16
             assert "runs" in await upgraded.schema_tables()
+            assert "run_attempts" in await upgraded.schema_tables()
             async with upgraded.connection.execute("SELECT name FROM workshops") as cursor:
                 assert (await cursor.fetchone())[0] == "Existing"
             async with upgraded.connection.execute("SELECT COUNT(*) FROM runs") as cursor:

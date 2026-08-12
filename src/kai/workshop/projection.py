@@ -9,13 +9,25 @@ from typing import Any
 
 import aiosqlite
 
-from kai.workshop.domain import AgentId, ChannelId, MessageId, PrincipalId, RunId, WorkshopEventType, WorkshopId
+from kai.workshop.domain import (
+    AgentId,
+    ChannelId,
+    MessageId,
+    PrincipalId,
+    RunAttemptId,
+    RunExecutionOwnerId,
+    RunId,
+    WorkshopEventType,
+    WorkshopId,
+)
 from kai.workshop.store import StoredEvent
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _IDENTIFIER_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 _MEDIA_TYPE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$")
 _RUN_TERMINAL_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_EXECUTION_IDENTIFIER_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
+_MODEL_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 
 
 def _required_text(payload: dict[str, Any], key: str) -> str:
@@ -91,7 +103,8 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
 
     async with connection.execute(
         "SELECT r.workshop_id, r.status, r.requested_by_principal_id, a.principal_id, "
-        "r.accepted_at, r.started_at "
+        "r.accepted_at, r.started_at, r.inbound_message_id, "
+        "r.cancellation_requested_at, r.cancellation_code, r.channel_id "
         "FROM runs r JOIN agents a ON a.id = r.agent_id WHERE r.id = ?",
         (envelope.aggregate_id,),
     ) as cursor:
@@ -103,9 +116,43 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
     agent_principal = PrincipalId(str(row[3]))
     accepted_at = _parse_projection_timestamp(row[4])
     started_at = None if row[5] is None else _parse_projection_timestamp(row[5])
+    inbound_message_id = MessageId(str(row[6]))
+    cancellation_requested_at = row[7]
+
+    if envelope.event_type == WorkshopEventType.RUN_CANCELLATION_REQUESTED:
+        _require_exact_payload(payload, {"cancellation_code"})
+        cancellation_code = _required_text(payload, "cancellation_code")
+        if not _RUN_TERMINAL_CODE_PATTERN.fullmatch(cancellation_code):
+            raise ValueError("Workshop run cancellation_code must be a lowercase identifier")
+        if status not in {"accepted", "started"} or envelope.actor_principal_id != requested_by:
+            raise ValueError("Workshop cancellation can be requested only for a nonterminal run by its human")
+        lifecycle_floor = started_at if started_at is not None else accepted_at
+        if envelope.occurred_at < lifecycle_floor:
+            raise ValueError("Workshop cancellation request cannot precede current run state")
+        if cancellation_requested_at is not None:
+            raise ValueError("Workshop run already has a cancellation request")
+        await connection.execute(
+            "UPDATE runs SET cancellation_requested_at = ?, cancellation_code = ?, "
+            "last_event_position = ? WHERE id = ?",
+            (occurred_at, cancellation_code, event.position, envelope.aggregate_id),
+        )
+        return
 
     if envelope.event_type == WorkshopEventType.RUN_STARTED:
-        _require_exact_payload(payload, set())
+        if envelope.event_version == 1:
+            _require_exact_payload(payload, set())
+        elif envelope.event_version == 2:
+            _require_exact_payload(payload, {"attempt_id"})
+            attempt_transition_at = await _require_run_attempt(
+                connection,
+                RunAttemptId(_required_text(payload, "attempt_id")),
+                envelope.aggregate_id,
+                {"started"},
+            )
+            if envelope.occurred_at < attempt_transition_at:
+                raise ValueError("Workshop run cannot start before its execution attempt")
+        else:
+            raise ValueError("Unsupported Workshop run.started event version")
         if status != "accepted" or envelope.actor_principal_id != agent_principal or envelope.occurred_at < accepted_at:
             raise ValueError("Workshop run can start only once through its attached agent")
         await connection.execute(
@@ -115,7 +162,30 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
         return
 
     if envelope.event_type == WorkshopEventType.RUN_COMPLETED:
-        _require_exact_payload(payload, set())
+        result_message_id: MessageId | None = None
+        if envelope.event_version == 1:
+            _require_exact_payload(payload, set())
+        elif envelope.event_version == 2:
+            _require_exact_payload(payload, {"attempt_id", "result_message_id"})
+            attempt_transition_at = await _require_run_attempt(
+                connection,
+                RunAttemptId(_required_text(payload, "attempt_id")),
+                envelope.aggregate_id,
+                {"completed"},
+            )
+            if envelope.occurred_at < attempt_transition_at:
+                raise ValueError("Workshop run cannot complete before its execution attempt")
+            result_message_id = MessageId(_required_text(payload, "result_message_id"))
+            async with connection.execute(
+                "SELECT COUNT(*) FROM messages WHERE id = ? AND channel_id = ? "
+                "AND author_principal_id = ? AND reply_to_message_id = ?",
+                (result_message_id, ChannelId(str(row[9])), agent_principal, inbound_message_id),
+            ) as cursor:
+                result_row = await cursor.fetchone()
+            if result_row is None or int(result_row[0]) != 1:
+                raise ValueError("Workshop completed run must reference its canonical agent result")
+        else:
+            raise ValueError("Unsupported Workshop run.completed event version")
         if (
             status != "started"
             or envelope.actor_principal_id != agent_principal
@@ -124,13 +194,26 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
         ):
             raise ValueError("Workshop run can complete only from started through its attached agent")
         await connection.execute(
-            "UPDATE runs SET status = 'completed', terminal_at = ?, last_event_position = ? WHERE id = ?",
-            (occurred_at, event.position, envelope.aggregate_id),
+            "UPDATE runs SET status = 'completed', terminal_at = ?, result_message_id = ?, "
+            "last_event_position = ? WHERE id = ?",
+            (occurred_at, result_message_id, event.position, envelope.aggregate_id),
         )
         return
 
     if envelope.event_type == WorkshopEventType.RUN_FAILED:
-        _require_exact_payload(payload, {"failure_code"})
+        expected_keys = {"failure_code"} if envelope.event_version == 1 else {"attempt_id", "failure_code"}
+        if envelope.event_version not in {1, 2}:
+            raise ValueError("Unsupported Workshop run.failed event version")
+        _require_exact_payload(payload, expected_keys)
+        if envelope.event_version == 2:
+            attempt_transition_at = await _require_run_attempt(
+                connection,
+                RunAttemptId(_required_text(payload, "attempt_id")),
+                envelope.aggregate_id,
+                {"failed", "interrupted"},
+            )
+            if envelope.occurred_at < attempt_transition_at:
+                raise ValueError("Workshop run cannot fail before its execution attempt")
         failure_code = _required_text(payload, "failure_code")
         if not _RUN_TERMINAL_CODE_PATTERN.fullmatch(failure_code):
             raise ValueError("Workshop run failure_code must be a lowercase identifier")
@@ -149,17 +232,30 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
         return
 
     if envelope.event_type == WorkshopEventType.RUN_CANCELLED:
-        _require_exact_payload(payload, {"cancellation_code"})
+        expected_keys = {"cancellation_code"} if envelope.event_version == 1 else {"attempt_id", "cancellation_code"}
+        if envelope.event_version not in {1, 2}:
+            raise ValueError("Unsupported Workshop run.cancelled event version")
+        _require_exact_payload(payload, expected_keys)
         cancellation_code = _required_text(payload, "cancellation_code")
         if not _RUN_TERMINAL_CODE_PATTERN.fullmatch(cancellation_code):
             raise ValueError("Workshop run cancellation_code must be a lowercase identifier")
         lifecycle_floor = started_at if started_at is not None else accepted_at
-        if (
-            status not in {"accepted", "started"}
-            or envelope.actor_principal_id != requested_by
-            or envelope.occurred_at < lifecycle_floor
-        ):
-            raise ValueError("Workshop run can be cancelled only while nonterminal by its requesting human")
+        if envelope.event_version == 1:
+            valid_actor = envelope.actor_principal_id == requested_by
+        else:
+            attempt_transition_at = await _require_run_attempt(
+                connection,
+                RunAttemptId(_required_text(payload, "attempt_id")),
+                envelope.aggregate_id,
+                {"cancelled"},
+            )
+            if envelope.occurred_at < attempt_transition_at:
+                raise ValueError("Workshop run cannot cancel before its execution attempt")
+            valid_actor = envelope.actor_principal_id == agent_principal and cancellation_requested_at is not None
+            if cancellation_code != str(row[8]):
+                raise ValueError("Workshop cancellation acknowledgement must match its request code")
+        if status not in {"accepted", "started"} or not valid_actor or envelope.occurred_at < lifecycle_floor:
+            raise ValueError("Workshop run cancellation acknowledgement is not authorized")
         await connection.execute(
             "UPDATE runs SET status = 'cancelled', terminal_at = ?, terminal_code = ?, "
             "last_event_position = ? WHERE id = ?",
@@ -170,14 +266,242 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
     raise ValueError(f"Unsupported Workshop run event: {envelope.event_type}")
 
 
+async def _require_run_attempt(
+    connection: aiosqlite.Connection,
+    attempt_id: RunAttemptId,
+    run_id: RunId,
+    statuses: set[str],
+) -> datetime:
+    async with connection.execute(
+        "SELECT status, started_at, terminal_at FROM run_attempts WHERE id = ? AND run_id = ?",
+        (attempt_id, run_id),
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is None or str(row[0]) not in statuses:
+        raise ValueError("Workshop run transition does not match its execution attempt")
+    transition_at = row[2] if row[2] is not None else row[1]
+    if transition_at is None:
+        raise ValueError("Workshop run attempt is missing its transition timestamp")
+    return _parse_projection_timestamp(transition_at)
+
+
+def _execution_text(payload: dict[str, Any], key: str, *, pattern: re.Pattern[str] | None = None) -> str:
+    value = _required_text(payload, key)
+    if (
+        len(value) > 128
+        or value != value.strip()
+        or any(character.isspace() and character != " " for character in value)
+    ):
+        raise ValueError(f"Workshop execution {key} is not bounded text")
+    if pattern is not None and not pattern.fullmatch(value):
+        raise ValueError(f"Workshop execution {key} is not a valid identifier")
+    return value
+
+
+async def _apply_run_attempt_event(connection: aiosqlite.Connection, event: StoredEvent) -> None:
+    envelope = event.envelope
+    if not isinstance(envelope.aggregate_id, RunAttemptId) or envelope.aggregate_type != "run_attempt":
+        raise ValueError("Workshop run-attempt events require a typed attempt aggregate")
+    if envelope.event_version != 1:
+        raise ValueError("Unsupported Workshop run-attempt event version")
+    payload = envelope.payload
+    occurred_at = envelope.occurred_at
+    occurred_text = occurred_at.isoformat()
+
+    if envelope.event_type == WorkshopEventType.RUN_ATTEMPT_GRANTED:
+        _require_exact_payload(
+            payload,
+            {
+                "run_id",
+                "attempt_sequence",
+                "owner_id",
+                "fence_token",
+                "backend",
+                "provider",
+                "model",
+                "execution_contract",
+                "lease_version",
+                "lease_expires_at",
+            },
+        )
+        run_id = RunId(_required_text(payload, "run_id"))
+        owner_id = RunExecutionOwnerId(_required_text(payload, "owner_id"))
+        sequence = payload["attempt_sequence"]
+        fence_token = payload["fence_token"]
+        lease_version = payload["lease_version"]
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in (sequence, fence_token, lease_version)
+        ):
+            raise ValueError("Workshop attempt sequence, fence, and lease version must be positive integers")
+        if sequence != fence_token or lease_version != 1:
+            raise ValueError("Initial Workshop attempt fencing state is invalid")
+        backend = _execution_text(payload, "backend", pattern=_EXECUTION_IDENTIFIER_PATTERN)
+        provider_value = payload["provider"]
+        if provider_value is not None and (
+            not isinstance(provider_value, str) or not _EXECUTION_IDENTIFIER_PATTERN.fullmatch(provider_value)
+        ):
+            raise ValueError("Workshop execution provider is not a valid identifier")
+        provider = str(provider_value) if provider_value is not None else None
+        model = _execution_text(payload, "model", pattern=_MODEL_IDENTIFIER_PATTERN)
+        execution_contract = _execution_text(payload, "execution_contract", pattern=_EXECUTION_IDENTIFIER_PATTERN)
+        lease_expires_at = _parse_projection_timestamp(payload["lease_expires_at"])
+        if lease_expires_at <= occurred_at:
+            raise ValueError("Workshop attempt lease must expire after it is granted")
+        async with connection.execute(
+            "SELECT r.workshop_id, r.status, r.accepted_at, r.cancellation_requested_at, a.principal_id, "
+            "COALESCE(MAX(ra.attempt_sequence), 0) "
+            "FROM runs r JOIN agents a ON a.id = r.agent_id "
+            "LEFT JOIN run_attempts ra ON ra.run_id = r.id WHERE r.id = ? GROUP BY r.id",
+            (run_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if (
+            row is None
+            or WorkshopId(str(row[0])) != envelope.workshop_id
+            or str(row[1]) != "accepted"
+            or row[3] is not None
+            or envelope.actor_principal_id != PrincipalId(str(row[4]))
+            or occurred_at < _parse_projection_timestamp(row[2])
+            or sequence != int(row[5]) + 1
+        ):
+            raise ValueError("Workshop attempt grant is not authorized for this accepted run")
+        await connection.execute(
+            "INSERT INTO run_attempts "
+            "(id, run_id, attempt_sequence, owner_id, fence_token, status, backend, provider, model, "
+            "execution_contract, lease_version, granted_at, lease_expires_at, last_event_position) "
+            "VALUES (?, ?, ?, ?, ?, 'granted', ?, ?, ?, ?, 1, ?, ?, ?)",
+            (
+                envelope.aggregate_id,
+                run_id,
+                sequence,
+                owner_id,
+                fence_token,
+                backend,
+                provider,
+                model,
+                execution_contract,
+                occurred_text,
+                lease_expires_at.isoformat(),
+                event.position,
+            ),
+        )
+        return
+
+    run_id = RunId(_required_text(payload, "run_id"))
+    owner_id = RunExecutionOwnerId(_required_text(payload, "owner_id"))
+    fence_token = payload.get("fence_token")
+    lease_version = payload.get("lease_version")
+    if (
+        isinstance(fence_token, bool)
+        or not isinstance(fence_token, int)
+        or isinstance(lease_version, bool)
+        or not isinstance(lease_version, int)
+    ):
+        raise ValueError("Workshop attempt fence and lease version must be integers")
+    async with connection.execute(
+        "SELECT ra.run_id, ra.status, ra.owner_id, ra.fence_token, ra.lease_version, "
+        "ra.lease_expires_at, ra.granted_at, ra.started_at, r.workshop_id, "
+        "r.cancellation_requested_at, a.principal_id "
+        "FROM run_attempts ra JOIN runs r ON r.id = ra.run_id "
+        "JOIN agents a ON a.id = r.agent_id WHERE ra.id = ?",
+        (envelope.aggregate_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    if (
+        row is None
+        or RunId(str(row[0])) != run_id
+        or RunExecutionOwnerId(str(row[2])) != owner_id
+        or int(row[3]) != fence_token
+        or WorkshopId(str(row[8])) != envelope.workshop_id
+        or envelope.actor_principal_id != PrincipalId(str(row[10]))
+    ):
+        raise ValueError("Workshop attempt event does not match its fenced owner")
+    status = str(row[1])
+    current_lease_version = int(row[4])
+    lease_expires_at = _parse_projection_timestamp(row[5])
+    granted_at = _parse_projection_timestamp(row[6])
+    attempt_started_at = None if row[7] is None else _parse_projection_timestamp(row[7])
+
+    if envelope.event_type == WorkshopEventType.RUN_ATTEMPT_STARTED:
+        _require_exact_payload(payload, {"run_id", "owner_id", "fence_token", "lease_version"})
+        if (
+            status != "granted"
+            or lease_version != current_lease_version
+            or occurred_at < granted_at
+            or occurred_at >= lease_expires_at
+            or row[9] is not None
+        ):
+            raise ValueError("Workshop attempt cannot start without a current grant")
+        await connection.execute(
+            "UPDATE run_attempts SET status = 'started', started_at = ?, last_event_position = ? WHERE id = ?",
+            (occurred_text, event.position, envelope.aggregate_id),
+        )
+        return
+
+    if envelope.event_type == WorkshopEventType.RUN_ATTEMPT_LEASE_RENEWED:
+        _require_exact_payload(
+            payload,
+            {"run_id", "owner_id", "fence_token", "lease_version", "lease_expires_at"},
+        )
+        new_expiry = _parse_projection_timestamp(payload["lease_expires_at"])
+        if (
+            status not in {"granted", "started"}
+            or lease_version != current_lease_version + 1
+            or occurred_at < (attempt_started_at or granted_at)
+            or occurred_at >= lease_expires_at
+            or new_expiry <= lease_expires_at
+        ):
+            raise ValueError("Workshop attempt lease renewal is stale or does not extend authority")
+        await connection.execute(
+            "UPDATE run_attempts SET lease_version = ?, lease_expires_at = ?, last_event_position = ? WHERE id = ?",
+            (lease_version, new_expiry.isoformat(), event.position, envelope.aggregate_id),
+        )
+        return
+
+    terminal_specs: dict[str, tuple[set[str], str, str | None, bool]] = {
+        WorkshopEventType.RUN_ATTEMPT_EXPIRED: ({"granted"}, "expired", "lease_expired", True),
+        WorkshopEventType.RUN_ATTEMPT_INTERRUPTED: ({"started"}, "interrupted", "execution_interrupted", True),
+        WorkshopEventType.RUN_ATTEMPT_COMPLETED: ({"started"}, "completed", None, False),
+        WorkshopEventType.RUN_ATTEMPT_FAILED: ({"started"}, "failed", None, False),
+        WorkshopEventType.RUN_ATTEMPT_CANCELLED: ({"granted", "started"}, "cancelled", None, False),
+    }
+    spec = terminal_specs.get(envelope.event_type)
+    if spec is None:
+        raise ValueError(f"Unsupported Workshop run-attempt event: {envelope.event_type}")
+    allowed, terminal_status, fixed_code, requires_expiry = spec
+    expected = {"run_id", "owner_id", "fence_token", "lease_version"}
+    if fixed_code is not None or terminal_status in {"failed", "cancelled"}:
+        expected.add("terminal_code")
+    _require_exact_payload(payload, expected)
+    terminal_code = fixed_code
+    if "terminal_code" in payload:
+        terminal_code = _required_text(payload, "terminal_code")
+    if terminal_code is not None and not _RUN_TERMINAL_CODE_PATTERN.fullmatch(terminal_code):
+        raise ValueError("Workshop attempt terminal_code must be a lowercase identifier")
+    if status not in allowed or lease_version != current_lease_version:
+        raise ValueError("Workshop attempt terminal transition is stale")
+    if occurred_at < (attempt_started_at or granted_at):
+        raise ValueError("Workshop attempt terminal transition cannot precede its current state")
+    if requires_expiry and occurred_at < lease_expires_at:
+        raise ValueError("Workshop attempt cannot expire before its lease")
+    if not requires_expiry and occurred_at >= lease_expires_at:
+        raise ValueError("Workshop attempt owner cannot settle an expired lease")
+    if terminal_status == "cancelled" and row[9] is None:
+        raise ValueError("Workshop attempt cannot confirm cancellation without durable human intent")
+    await connection.execute(
+        "UPDATE run_attempts SET status = ?, terminal_at = ?, terminal_code = ?, last_event_position = ? WHERE id = ?",
+        (terminal_status, occurred_text, terminal_code, event.position, envelope.aggregate_id),
+    )
+
+
 class CanonicalConversationProjection:
     """Rebuild the initial Workshop collaboration records from events."""
 
     name = "canonical_conversations"
-    # Artifact events were not emitted before artifact support existed, so
-    # adding their first handler does not change replay of any prior event.
-    # Keep the version stable to avoid an unnecessary production rebuild.
-    version = 5
+    # Run execution authority adds replayed attempt state and new run columns.
+    # Rebuild once so every installed projection shares the same v2 run rules.
+    version = 6
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -185,6 +509,7 @@ class CanonicalConversationProjection:
         for table in (
             "deliveries",
             "artifacts",
+            "run_attempts",
             "runs",
             "messages",
             "channel_agents",
@@ -207,12 +532,26 @@ class CanonicalConversationProjection:
 
         if envelope.event_type in {
             WorkshopEventType.RUN_ACCEPTED,
+            WorkshopEventType.RUN_CANCELLATION_REQUESTED,
             WorkshopEventType.RUN_STARTED,
             WorkshopEventType.RUN_COMPLETED,
             WorkshopEventType.RUN_FAILED,
             WorkshopEventType.RUN_CANCELLED,
         }:
             await _apply_run_event(connection, event)
+            return
+
+        if envelope.event_type in {
+            WorkshopEventType.RUN_ATTEMPT_GRANTED,
+            WorkshopEventType.RUN_ATTEMPT_STARTED,
+            WorkshopEventType.RUN_ATTEMPT_LEASE_RENEWED,
+            WorkshopEventType.RUN_ATTEMPT_EXPIRED,
+            WorkshopEventType.RUN_ATTEMPT_INTERRUPTED,
+            WorkshopEventType.RUN_ATTEMPT_COMPLETED,
+            WorkshopEventType.RUN_ATTEMPT_FAILED,
+            WorkshopEventType.RUN_ATTEMPT_CANCELLED,
+        }:
+            await _apply_run_attempt_event(connection, event)
             return
 
         if envelope.event_type == WorkshopEventType.WORKSHOP_CREATED:
