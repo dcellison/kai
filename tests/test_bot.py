@@ -82,7 +82,12 @@ from kai.config import PROVIDER_MODELS, Config, UserConfig, get_default_model_fo
 from kai.review import CollectionWarning, PRReviewResult
 from kai.tts import DEFAULT_VOICE, VOICES
 from kai.workshop.artifacts import InboundArtifact
-from kai.workshop.domain import MessageId
+from kai.workshop.conversation_runs import (
+    CanonicalConversationRunTarget,
+    PreparedConversationRun,
+    WorkshopConversationRunService,
+)
+from kai.workshop.domain import AgentId, ChannelId, MessageId, PrincipalId, WorkshopId
 from kai.workshop.inbound import InboundMessage
 from kai.workshop.outbound import DeliveryObservation, OutboundMessage
 from kai.workshop.streaming_preview import ConfirmedTelegramStreamingPreview
@@ -742,6 +747,7 @@ class TestCreateBotTransportMode:
         assert app.bot_data["workshop_delivery_recorder"] is sessions.record_workshop_delivery_observation
         assert app.bot_data["workshop_streaming_preview_recorder"] is sessions.record_workshop_streaming_preview
         assert app.bot_data["workshop_streaming_finalizer"] is sessions.record_workshop_streaming_finalization
+        assert isinstance(app.bot_data["workshop_conversation_run_service"], WorkshopConversationRunService)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2773,6 +2779,11 @@ class TestHandleMessage:
         inbound_id = MessageId("msg_00000000000000000000000000000001")
         recorder.return_value.event.envelope.aggregate_id = inbound_id
         ctx.bot_data["workshop_inbound_recorder"] = recorder
+        prepared_run = MagicMock(spec=PreparedConversationRun)
+        prepared_run.model = "gpt-5.6-sol"
+        run_service = MagicMock(spec=WorkshopConversationRunService)
+        run_service.prepare = AsyncMock(return_value=prepared_run)
+        ctx.bot_data["workshop_conversation_run_service"] = run_service
         with (
             patch("kai.bot.is_totp_configured", return_value=False),
             patch("kai.bot._handle_response", new_callable=AsyncMock) as response,
@@ -2796,6 +2807,8 @@ class TestHandleMessage:
         )
         assert response.await_args.kwargs["workshop_inbound_message_id"] == inbound_id
         assert response.await_args.kwargs["delivery_route"] == ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT
+        run_service.prepare.assert_awaited_once_with(inbound_id)
+        assert response.await_args.kwargs["workshop_run"] is prepared_run
 
     @pytest.mark.asyncio
     async def test_does_not_record_when_totp_denies_message(self):
@@ -3698,6 +3711,21 @@ class TestHandleResponse:
         ctx.bot_data["workshop_streaming_finalizer"] = finalizer
         return preview, finalizer
 
+    @staticmethod
+    def _prepared_workshop_run(pool, inbound_message_id: MessageId) -> PreparedConversationRun:
+        return PreparedConversationRun(
+            target=CanonicalConversationRunTarget(
+                inbound_message_id=inbound_message_id,
+                workshop_id=WorkshopId("wsp_00000000000000000000000000000001"),
+                channel_id=ChannelId("chn_00000000000000000000000000000001"),
+                requested_by_principal_id=PrincipalId("prn_00000000000000000000000000000001"),
+                agent_id=AgentId("agt_00000000000000000000000000000001"),
+            ),
+            model="sonnet",
+            _pool=pool,
+            _legacy_pool_key=12345,
+        )
+
     @pytest.mark.asyncio
     async def test_workshop_private_text_commits_without_direct_send_or_shadow_observation(self):
         from kai.bot import _handle_response
@@ -3724,6 +3752,7 @@ class TestHandleResponse:
                 "sonnet",
                 workshop_inbound_message_id=inbound_id,
                 delivery_route=ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT,
+                workshop_run=self._prepared_workshop_run(pool, inbound_id),
             )
 
         finalizer.assert_awaited_once()
@@ -3764,6 +3793,7 @@ class TestHandleResponse:
                 "sonnet",
                 workshop_inbound_message_id=inbound_id,
                 delivery_route=ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT,
+                workshop_run=self._prepared_workshop_run(pool, inbound_id),
             )
 
         bound = preview.await_args.args[0]
@@ -3801,6 +3831,7 @@ class TestHandleResponse:
                 "sonnet",
                 workshop_inbound_message_id=inbound_id,
                 delivery_route=ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT,
+                workshop_run=self._prepared_workshop_run(pool, inbound_id),
             )
 
         finalizer.assert_awaited_once()
@@ -3874,6 +3905,7 @@ class TestHandleResponse:
                 "sonnet",
                 workshop_inbound_message_id=inbound_id,
                 delivery_route=ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT,
+                workshop_run=self._prepared_workshop_run(pool, inbound_id),
             )
 
         preview.assert_awaited_once()
@@ -3919,6 +3951,7 @@ class TestHandleResponse:
                 "sonnet",
                 workshop_inbound_message_id=inbound_id,
                 delivery_route=ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT,
+                workshop_run=self._prepared_workshop_run(pool, inbound_id),
             )
 
         preview.assert_awaited_once()
@@ -3955,6 +3988,7 @@ class TestHandleResponse:
                 "sonnet",
                 workshop_inbound_message_id=inbound_id,
                 delivery_route=ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT,
+                workshop_run=self._prepared_workshop_run(pool, inbound_id),
             )
 
         direct_send.assert_not_awaited()

@@ -83,6 +83,7 @@ from kai.telegram_utils import chunk_text
 from kai.transcribe import TranscriptionError, transcribe_voice
 from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
 from kai.workshop.artifacts import InboundArtifact
+from kai.workshop.conversation_runs import PreparedConversationRun, WorkshopConversationRunService
 from kai.workshop.domain import MessageId
 from kai.workshop.inbound import InboundMessage
 from kai.workshop.outbound import DeliveryObservation, OutboundMessage
@@ -4611,9 +4612,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """
     Handle plain text messages — the primary interaction path.
 
-    Logs the message, acquires the per-chat lock, sets the crash recovery
-    flag, sends the prompt to Claude, and delegates to _handle_response()
-    for streaming and delivery.
+    Logs the message, acquires the per-chat lock, and delegates accepted
+    private text to the canonical Workshop run service. Telegram remains the
+    renderer; the run service owns canonical execution-target resolution.
     """
     if not update.message or not update.message.text:
         return
@@ -4654,7 +4655,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 update.message.message_id,
             )
     pool = _get_pool(context)
-    model = pool.get_model(chat_id)
+    delivery_route = (
+        ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT if chat_id == _user_id(update) else ResponseDeliveryRoute.LEGACY
+    )
+    workshop_run: PreparedConversationRun | None = None
+    if delivery_route == ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT and workshop_inbound_message_id is not None:
+        run_service: WorkshopConversationRunService | None = context.bot_data.get("workshop_conversation_run_service")
+        if run_service is not None:
+            try:
+                workshop_run = await run_service.prepare(workshop_inbound_message_id)
+            except Exception:
+                log.exception(
+                    "Workshop conversation run preparation failed (inbound_message_id=%s)",
+                    workshop_inbound_message_id,
+                )
+    model = workshop_run.model if workshop_run is not None else pool.get_model(chat_id)
 
     was_queued = await _notify_if_queued(update, chat_id)
     lock = await _acquire_lock_or_kill(chat_id, pool, update)
@@ -4672,11 +4687,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 model,
                 user_log=user_log,
                 workshop_inbound_message_id=workshop_inbound_message_id,
-                delivery_route=(
-                    ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT
-                    if chat_id == _user_id(update)
-                    else ResponseDeliveryRoute.LEGACY
-                ),
+                delivery_route=delivery_route,
+                workshop_run=workshop_run,
             )
         finally:
             _clear_responding(chat_id)
@@ -4697,6 +4709,7 @@ async def _handle_response(
     user_log: LogEntry | None = None,
     workshop_inbound_message_id: MessageId | None = None,
     delivery_route: ResponseDeliveryRoute = ResponseDeliveryRoute.LEGACY,
+    workshop_run: PreparedConversationRun | None = None,
 ) -> None:
     """
     Stream Claude's response and deliver it to the user.
@@ -4739,6 +4752,7 @@ async def _handle_response(
     workshop_delivery_candidate = (
         workshop_delivery_requested
         and workshop_inbound_message_id is not None
+        and workshop_run is not None
         and context.bot_data.get("workshop_streaming_preview_recorder") is not None
         and context.bot_data.get("workshop_streaming_finalizer") is not None
     )
@@ -4791,7 +4805,12 @@ async def _handle_response(
 
         # Stream events from Claude. Pass chat_id so the inner Claude
         # can include it in API calls for correct multi-user routing.
-        async for event in pool.send(prompt, chat_id=chat_id):
+        event_stream = (
+            workshop_run.stream(prompt)
+            if workshop_delivery_candidate and workshop_run is not None
+            else pool.send(prompt, chat_id=chat_id)
+        )
+        async for event in event_stream:
             # Check for /stop between stream chunks
             if stop_event.is_set():
                 stop_event.clear()
@@ -5135,7 +5154,10 @@ async def _handle_response(
         # let a /workspace switch that lands during the ingestion
         # delay re-route the exchange's facts to a project the
         # conversation never touched.
-        ingest_workspace = str(await pool.get_effective_workspace(chat_id))
+        if workshop_delivery_candidate and workshop_run is not None:
+            ingest_workspace = str(await workshop_run.effective_workspace())
+        else:
+            ingest_workspace = str(await pool.get_effective_workspace(chat_id))
         task = asyncio.create_task(_ingest_memory())
         _pending_memory_tasks.add(task)
         task.add_done_callback(_pending_memory_tasks.discard)
@@ -5237,9 +5259,14 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
     app.bot_data["workshop_delivery_recorder"] = sessions.record_workshop_delivery_observation
     app.bot_data["workshop_streaming_preview_recorder"] = sessions.record_workshop_streaming_preview
     app.bot_data["workshop_streaming_finalizer"] = sessions.record_workshop_streaming_finalization
-    app.bot_data["pool"] = SubprocessPool(
+    pool = SubprocessPool(
         config=config,
         services_info=services.get_available_services(),
+    )
+    app.bot_data["pool"] = pool
+    app.bot_data["workshop_conversation_run_service"] = WorkshopConversationRunService(
+        pool,
+        sessions.resolve_workshop_conversation_run,
     )
 
     # Default every recognized command to sensitive. `/start` and `/help`

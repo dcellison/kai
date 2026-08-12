@@ -50,6 +50,11 @@ from kai.workshop.bootstrap import (
     BootstrapResult,
     bootstrap_default_workshop,
 )
+from kai.workshop.conversation_runs import (
+    CompatibilityConversationRunResolution,
+    resolve_canonical_conversation_run,
+)
+from kai.workshop.domain import MessageId
 from kai.workshop.inbound import InboundMessage, record_inbound_message
 from kai.workshop.outbound import (
     DeliveryObservation,
@@ -349,6 +354,17 @@ async def record_workshop_inbound_message(message: InboundMessage) -> AppendResu
     async with _workshop_event_lock:
         store = WorkshopEventStore.from_initialized_connection(_get_db())
         return await record_inbound_message(store, message)
+
+
+async def resolve_workshop_conversation_run(
+    inbound_message_id: MessageId,
+) -> CompatibilityConversationRunResolution:
+    """Resolve one canonical inbound message for transport-neutral execution."""
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        store = WorkshopEventStore.from_initialized_connection(_get_db())
+        return await resolve_canonical_conversation_run(store, inbound_message_id)
 
 
 async def record_workshop_inbound_artifact(
