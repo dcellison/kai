@@ -13,6 +13,7 @@ from telegram import Bot
 from telegram.error import TelegramError
 
 from kai.config import DATA_DIR, load_config
+from kai.workshop.client_access import WorkshopClientAccess, WorkshopClientAccessError
 from kai.workshop.delivery_authority import (
     DeliveryAuthorityError,
     WorkshopConversationDeliveryAuthority,
@@ -25,7 +26,7 @@ from kai.workshop.delivery_outbox import (
     WorkshopDeliveryOutbox,
 )
 from kai.workshop.delivery_qualification import DeliveryQualificationError, WorkshopDeliveryQualification
-from kai.workshop.domain import DeliveryId
+from kai.workshop.domain import DeliveryId, DeviceId, EnrollmentGrantId
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.telegram_delivery import (
     TelegramWorkOutcome,
@@ -78,6 +79,29 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="explicitly acknowledge retained terminal failure evidence",
     )
+
+    client_access = commands.add_parser(
+        "client-access",
+        help="issue or revoke human Workshop client credentials",
+    )
+    client_actions = client_access.add_subparsers(dest="action", required=True)
+    issue = client_actions.add_parser(
+        "issue-enrollment",
+        help="issue one short-lived enrollment token for a configured Telegram human",
+    )
+    issue.add_argument("--telegram-user-id", required=True, type=int)
+    revoke_device = client_actions.add_parser(
+        "revoke-device",
+        help="revoke one client device and all of its sessions",
+    )
+    revoke_device.add_argument("--telegram-user-id", required=True, type=int)
+    revoke_device.add_argument("--device-id", required=True)
+    revoke_enrollment = client_actions.add_parser(
+        "revoke-enrollment",
+        help="revoke one unredeemed enrollment grant",
+    )
+    revoke_enrollment.add_argument("--telegram-user-id", required=True, type=int)
+    revoke_enrollment.add_argument("--grant-id", required=True)
     return parser
 
 
@@ -86,6 +110,20 @@ def _delivery_id(value: str) -> DeliveryId:
         return DeliveryId(value)
     except (TypeError, ValueError) as exc:
         raise DeliveryQualificationError("Invalid delivery ID") from exc
+
+
+def _device_id(value: str) -> DeviceId:
+    try:
+        return DeviceId(value)
+    except (TypeError, ValueError) as exc:
+        raise WorkshopClientAccessError("Invalid device ID") from exc
+
+
+def _enrollment_grant_id(value: str) -> EnrollmentGrantId:
+    try:
+        return EnrollmentGrantId(value)
+    except (TypeError, ValueError) as exc:
+        raise WorkshopClientAccessError("Invalid enrollment grant ID") from exc
 
 
 def _print_state(state: DeliveryState) -> None:
@@ -114,6 +152,28 @@ def _qualification_database(data_dir: Path) -> Path:
 async def _run(args: argparse.Namespace) -> int:
     store = await WorkshopEventStore.open(_qualification_database(DATA_DIR))
     try:
+        if args.command == "client-access":
+            access = WorkshopClientAccess(store)
+            if args.action == "issue-enrollment":
+                issued = await access.issue_enrollment(args.telegram_user_id)
+                print(f"Enrollment: {issued.grant.grant_id}")
+                print(f"Channel: {issued.channel_id}")
+                print(f"Expires: {issued.grant.expires_at.isoformat()}")
+                print(f"Token: {issued.grant.token}")
+                print("The token is shown once; Kai stores only its hash.")
+                return 0
+            if args.action == "revoke-device":
+                device_id = _device_id(args.device_id)
+                await access.revoke_device(args.telegram_user_id, device_id)
+                print(f"Device: {device_id}")
+                print("Status: revoked (all device sessions revoked)")
+                return 0
+            grant_id = _enrollment_grant_id(args.grant_id)
+            await access.revoke_enrollment(args.telegram_user_id, grant_id)
+            print(f"Enrollment: {grant_id}")
+            print("Status: revoked")
+            return 0
+
         if args.command == "delivery-authority":
             authority = WorkshopConversationDeliveryAuthority(store)
             if args.action == "status":
@@ -200,6 +260,10 @@ def cli(args: list[str]) -> None:
         code = asyncio.run(_run(parsed))
     except DeliveryAuthorityError as exc:
         raise SystemExit(f"Workshop delivery authority failed: {exc}") from exc
+    except WorkshopClientAccessError as exc:
+        raise SystemExit(f"Workshop client access failed: {exc}") from exc
     except (DeliveryQualificationError, DeliveryTargetNotFoundError) as exc:
+        if parsed.command == "client-access":
+            raise SystemExit(f"Workshop client access failed: {exc}") from exc
         raise SystemExit(f"Workshop delivery qualification failed: {exc}") from exc
     raise SystemExit(code)

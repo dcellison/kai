@@ -1,7 +1,8 @@
-"""HTTP contract for production-unregistered Workshop client enrollment."""
+"""HTTP contract for Workshop client enrollment redemption."""
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -11,7 +12,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
-from kai.workshop.client_api import register_workshop_enrollment_routes
+from kai.workshop.client_api import WorkshopEnrollmentRateLimiter, register_workshop_enrollment_routes
 from kai.workshop.client_sessions import WorkshopClientEnrollmentManager, WorkshopClientSessionManager
 from kai.workshop.domain import PrincipalId
 from kai.workshop.store import WorkshopEventStore
@@ -53,9 +54,18 @@ def _manager(store: WorkshopEventStore, clock: _Clock) -> WorkshopClientEnrollme
     )
 
 
-async def _open_client(manager: WorkshopClientEnrollmentManager) -> TestClient:
+async def _open_client(
+    manager: WorkshopClientEnrollmentManager,
+    *,
+    rate_limiter: WorkshopEnrollmentRateLimiter | None = None,
+) -> TestClient:
     app = web.Application()
-    register_workshop_enrollment_routes(app, enrollment_manager=manager)
+    register_workshop_enrollment_routes(
+        app,
+        enrollment_manager=manager,
+        rate_limiter=rate_limiter or WorkshopEnrollmentRateLimiter(),
+        request_lock=asyncio.Lock(),
+    )
     client = TestClient(TestServer(app))
     await client.start_server()
     return client
@@ -80,6 +90,8 @@ class TestWorkshopEnrollmentHTTPContract:
 
             assert response.status == 201
             assert response.headers["Cache-Control"] == "private, no-store"
+            assert response.headers["Content-Security-Policy"] == "default-src 'none'"
+            assert response.headers["Referrer-Policy"] == "no-referrer"
             assert response.headers["X-Content-Type-Options"] == "nosniff"
             assert payload == {
                 "version": 1,
@@ -220,6 +232,40 @@ class TestWorkshopEnrollmentHTTPContract:
             assert (await client.get(_PATH)).status == 405
             assert (await client.put(_PATH, json={})).status == 405
             assert (await client.post("/v1/client/enrollment", json={})).status == 404
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_redemption_attempts_are_rate_limited_before_grant_lookup(self, tmp_path: Path):
+        store, _ = await _open_store(tmp_path / "kai.db")
+        now = [100.0]
+        limiter = WorkshopEnrollmentRateLimiter(
+            per_source_limit=2,
+            global_limit=4,
+            window_seconds=60,
+            clock=lambda: now[0],
+        )
+        client = await _open_client(_manager(store, _Clock()), rate_limiter=limiter)
+        try:
+            request = {"enrollment_token": "not-a-grant", "device_display_name": "Client"}
+            first = await client.post(_PATH, json=request, headers={"CF-Connecting-IP": "203.0.113.7"})
+            second = await client.post(_PATH, json=request, headers={"CF-Connecting-IP": "203.0.113.7"})
+            blocked = await client.post(_PATH, json=request, headers={"CF-Connecting-IP": "203.0.113.7"})
+
+            assert first.status == second.status == 401
+            assert blocked.status == 429
+            assert blocked.headers["Retry-After"] == "60"
+            assert await blocked.json() == {
+                "error": {"code": "rate_limited", "message": "Too many enrollment attempts"}
+            }
+
+            now[0] += 60
+            allowed_again = await client.post(
+                _PATH,
+                json=request,
+                headers={"CF-Connecting-IP": "203.0.113.7"},
+            )
+            assert allowed_again.status == 401
         finally:
             await client.close()
             await store.close()

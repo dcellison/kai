@@ -2387,6 +2387,7 @@ class TestNotificationChatIdMutations:
         try:
             with (
                 patch("kai.webhook.sessions.get_setting", new_callable=AsyncMock, return_value="-100222"),
+                patch("kai.webhook._register_workshop_client_api", new_callable=AsyncMock),
                 patch("kai.webhook.web.AppRunner", return_value=fake_runner),
                 patch("kai.webhook.web.TCPSite", return_value=fake_site),
             ):

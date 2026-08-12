@@ -11,6 +11,7 @@ Provides functionality to:
 6. Proxy authenticated requests to external services (service layer)
 7. Send text messages and files to the Telegram chat (messaging APIs)
 8. Monitor webhook health and auto-recover from Telegram delivery failures
+9. Redeem Workshop client enrollment grants and read authorized timelines
 
 The server always runs on aiohttp alongside the Telegram bot in the same event
 loop, regardless of transport mode. In polling mode, Telegram updates arrive via
@@ -30,6 +31,8 @@ Routes are organized into these groups:
     - /api/memory/search    - Search memories by query (POST)
     - /api/memory/stats     - Memory statistics for a user (GET)
     - /api/memory/all       - Delete all memories for a user (DELETE, requires confirm token)
+    - /v1/client/enrollment/redeem - Exchange an operator-issued Workshop grant
+    - /v1/channels/{id}/timeline   - Read one authorized canonical timeline
 
 Every ingress domain has an independent credential. Telegram uses its configured
 or process-generated secret token, GitHub uses GITHUB_WEBHOOK_SECRET, and the
@@ -63,6 +66,17 @@ from kai.config import DATA_DIR, IMAGE_EXTENSIONS, Config, ModelRole, UserConfig
 from kai.internal_api_auth import InternalAPIAuth, InternalAPIPrincipal, InternalAPIScope
 from kai.job_types import CANONICAL_JOB_TYPES, normalize_job_type
 from kai.telegram_utils import chunk_text
+from kai.workshop.client_api import (
+    WorkshopEnrollmentRateLimiter,
+    register_workshop_enrollment_routes,
+    register_workshop_read_routes,
+)
+from kai.workshop.client_sessions import (
+    WorkshopBearerSessionAuthenticator,
+    WorkshopClientEnrollmentManager,
+    WorkshopClientSessionManager,
+)
+from kai.workshop.store import WorkshopEventStore
 
 log = logging.getLogger(__name__)
 
@@ -109,6 +123,7 @@ class UnauthorizedChatIdError(Exception):
 # Module-level server state, managed by start() and stop()
 _app: web.Application | None = None
 _runner: web.AppRunner | None = None
+_workshop_client_store: WorkshopEventStore | None = None
 # Tracks whether we registered a Telegram webhook with the API, so stop()
 # knows whether to call delete_webhook(). Only True in webhook mode.
 _webhook_registered: bool = False
@@ -2411,6 +2426,34 @@ def _register_routes(app: web.Application, config: Config) -> None:
     app.router.add_delete("/api/memory/all", _handle_memory_delete_all)
 
 
+async def _register_workshop_client_api(app: web.Application, database: Path) -> None:
+    """Open one protected client-state connection and register its HTTP boundary."""
+    global _workshop_client_store
+    if _workshop_client_store is not None:
+        raise RuntimeError("Workshop client API store is already open")
+
+    store = await WorkshopEventStore.open(database)
+    try:
+        request_lock = asyncio.Lock()
+        sessions_manager = WorkshopClientSessionManager(store)
+        register_workshop_enrollment_routes(
+            app,
+            enrollment_manager=WorkshopClientEnrollmentManager(store),
+            rate_limiter=WorkshopEnrollmentRateLimiter(),
+            request_lock=request_lock,
+        )
+        register_workshop_read_routes(
+            app,
+            store=store,
+            authenticator=WorkshopBearerSessionAuthenticator(sessions_manager),
+            request_lock=request_lock,
+        )
+    except Exception:
+        await store.close()
+        raise
+    _workshop_client_store = store
+
+
 async def start(telegram_app, config) -> None:
     """
     Start the HTTP server and optionally register the Telegram webhook.
@@ -2504,6 +2547,7 @@ async def start(telegram_app, config) -> None:
                     val,
                 )
     _register_routes(_app, config)
+    await _register_workshop_client_api(_app, Path(config.session_db_path))
 
     _runner = web.AppRunner(_app, access_log=None)
     await _runner.setup()
@@ -2578,7 +2622,7 @@ async def stop() -> None:
     if the network is down at shutdown time, Telegram will just overwrite the
     stale webhook on the next set_webhook call at startup.
     """
-    global _app, _runner, _webhook_registered, _health_monitor_task
+    global _app, _runner, _webhook_registered, _health_monitor_task, _workshop_client_store
     # Cancel the webhook health monitor before tearing down the server
     if _health_monitor_task is not None:
         _health_monitor_task.cancel()
@@ -2599,11 +2643,16 @@ async def stop() -> None:
                 log.warning("Failed to deregister Telegram webhook (will re-register on next start)")
         _webhook_registered = False
     await _drain_background_tasks(_BACKGROUND_TASK_DRAIN_TIMEOUT)
-    if _runner:
-        await _runner.cleanup()
-        log.info("Webhook server stopped")
-    _runner = None
-    _app = None
+    try:
+        if _runner:
+            await _runner.cleanup()
+            log.info("Webhook server stopped")
+    finally:
+        _runner = None
+        _app = None
+        if _workshop_client_store is not None:
+            await _workshop_client_store.close()
+            _workshop_client_store = None
 
 
 def is_running() -> bool:

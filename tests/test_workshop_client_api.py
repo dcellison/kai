@@ -1,7 +1,8 @@
-"""HTTP contracts for the production-unregistered Workshop read API."""
+"""HTTP contracts for the authenticated Workshop read API."""
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -81,7 +82,12 @@ async def _open_client(
     authenticator: _Authenticator,
 ) -> TestClient:
     app = web.Application()
-    register_workshop_read_routes(app, store=store, authenticator=authenticator)
+    register_workshop_read_routes(
+        app,
+        store=store,
+        authenticator=authenticator,
+        request_lock=asyncio.Lock(),
+    )
     client = TestClient(TestServer(app))
     await client.start_server()
     return client
@@ -102,6 +108,8 @@ class TestWorkshopTimelineHTTPContract:
 
             assert response.status == 200
             assert response.headers["Cache-Control"] == "private, no-store"
+            assert response.headers["Content-Security-Policy"] == "default-src 'none'"
+            assert response.headers["Referrer-Policy"] == "no-referrer"
             assert response.headers["X-Content-Type-Options"] == "nosniff"
             assert payload == {
                 "version": 1,
