@@ -83,10 +83,16 @@ from kai.telegram_utils import chunk_text
 from kai.transcribe import TranscriptionError, transcribe_voice
 from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
 from kai.workshop.artifacts import InboundArtifact
+from kai.workshop.conversation_commands import ConversationCommandDisposition
 from kai.workshop.conversation_runs import PreparedConversationRun, WorkshopConversationRunService
-from kai.workshop.domain import MessageId
+from kai.workshop.domain import MessageId, RunId
+from kai.workshop.execution_coordinator import (
+    CanonicalCancellationDisposition,
+    CanonicalExecutionDisposition,
+)
 from kai.workshop.inbound import InboundMessage
 from kai.workshop.outbound import DeliveryObservation, OutboundMessage
+from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
 from kai.workshop.streaming_preview import ConfirmedTelegramStreamingPreview
 from kai.workspace_utils import is_workspace_allowed
 
@@ -1600,6 +1606,20 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """
     assert update.message is not None
     chat_id = _chat_id(update)
+    execution: WorkshopPrivateTextExecutionService | None = context.bot_data.get("workshop_private_text_execution")
+    if execution is not None and chat_id == _user_id(update):
+        disposition = await execution.request_cancellation(
+            telegram_user_id=_user_id(update),
+            telegram_chat_id=chat_id,
+        )
+        if disposition == CanonicalCancellationDisposition.REQUESTED:
+            await update.message.reply_text("Stopping...")
+            return
+        if disposition == CanonicalCancellationDisposition.INTERRUPTED:
+            await update.message.reply_text(
+                "Kai could not confirm a clean stop. The interrupted request will not be retried automatically."
+            )
+            return
     pool = _get_pool(context)
     stop_event = get_stop_event(chat_id)
     stop_event.set()
@@ -4607,6 +4627,161 @@ async def _check_totp_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return False
 
 
+def _schedule_memory_ingestion(
+    *,
+    prompt: str | list,
+    assistant_text: str,
+    chat_id: int,
+    session_id: str | None,
+    config: Config,
+    workspace: str,
+    user_log: LogEntry | None,
+    assistant_log: LogEntry | None,
+) -> None:
+    """Preserve the existing fire-and-forget semantic-memory write path."""
+    from kai.memory import is_enabled as memory_is_enabled
+
+    if memory_is_enabled():
+
+        async def _ingest_memory() -> None:
+            try:
+                from kai import memory_extraction
+
+                if isinstance(prompt, str):
+                    user_text = prompt
+                else:
+                    user_text = next(
+                        (block["text"] for block in prompt if block.get("type") == "text"),
+                        "",
+                    )
+                if not user_text:
+                    return
+                user_config = config.get_user_config(chat_id)
+                effective_backend = (
+                    user_config.backend if user_config and user_config.backend else config.default_backend
+                )
+                if config.memory_extraction_enabled and effective_backend in ONESHOT_REASONER_BACKENDS:
+                    prior_pairs: list[tuple[str, str]] = []
+                    if config.episode_classifier_context_turns > 0:
+                        from kai.history import get_recent_pairs
+
+                        fetched = get_recent_pairs(chat_id, config.episode_classifier_context_turns + 1)
+                        prior_pairs = fetched[:-1]
+                    await memory_extraction.extract_and_store(
+                        user_text=user_text,
+                        assistant_text=assistant_text,
+                        user_id=str(chat_id),
+                        session_id=session_id,
+                        config=config,
+                        prior_pairs=prior_pairs,
+                        workspace=workspace,
+                        user_log=user_log,
+                        assistant_log=assistant_log,
+                    )
+            except Exception:
+                log.warning("Memory ingestion failed", exc_info=True)
+
+        task = asyncio.create_task(_ingest_memory())
+        _pending_memory_tasks.add(task)
+        task.add_done_callback(_pending_memory_tasks.discard)
+
+
+async def _handle_workshop_private_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    run_id: RunId,
+    inbound_message_id: MessageId,
+    prompt: str,
+    user_log: LogEntry | None,
+) -> None:
+    """Render streaming previews while Workshop owns execution and final delivery."""
+    assert update.message is not None
+    source_message = update.message
+    execution: WorkshopPrivateTextExecutionService = context.bot_data["workshop_private_text_execution"]
+    config: Config = context.bot_data["config"]
+    live_msg = None
+    last_edit_time = 0.0
+    last_edit_text = ""
+
+    async def observe(event) -> None:
+        nonlocal live_msg, last_edit_time, last_edit_text
+        if not event.text_so_far:
+            return
+        publishable = _stream_publishable_prefix(event.text_so_far)
+        if publishable is None or publishable == last_edit_text:
+            return
+        now = time.monotonic()
+        if live_msg is None:
+            live_msg = await _reply_safe(source_message, _truncate_for_telegram(publishable))
+            await sessions.record_workshop_streaming_preview(
+                ConfirmedTelegramStreamingPreview(
+                    inbound_message_id=inbound_message_id,
+                    external_message_id=live_msg.message_id,
+                    confirmed_at=datetime.now(UTC),
+                )
+            )
+            last_edit_time = now
+            last_edit_text = publishable
+        elif now - last_edit_time >= EDIT_INTERVAL:
+            await _edit_message_safe(live_msg, publishable)
+            last_edit_time = now
+            last_edit_text = publishable
+
+    typing_task = asyncio.create_task(_keep_private_text_typing(context, chat_id))
+    try:
+        result = await execution.execute(run_id, stream_observer=observe)
+    finally:
+        typing_task.cancel()
+        try:
+            await typing_task
+        except asyncio.CancelledError:
+            pass
+
+    if result.disposition == CanonicalExecutionDisposition.PREPARATION_DEFERRED:
+        await _reply_safe(update.message, "Kai could not safely prepare this request. Please try again.")
+        return
+    if result.disposition in {
+        CanonicalExecutionDisposition.ACTIVE_REPLAY,
+        CanonicalExecutionDisposition.CANCELLATION_PENDING_REPLAY,
+        CanonicalExecutionDisposition.TERMINAL_REPLAY,
+    }:
+        return
+    if result.terminal is None:
+        raise RuntimeError("Canonical execution settled without a terminal transaction")
+
+    final_text = result.terminal.body
+    if result.session_id and result.selection is not None:
+        await sessions.save_session(chat_id, result.session_id, result.selection.model)
+    assistant_log = log_message(
+        direction="assistant",
+        chat_id=chat_id,
+        text=final_text,
+        reader_user=_upload_reader_user(context, chat_id),
+    )
+    if result.disposition == CanonicalExecutionDisposition.COMPLETED and result.workspace is not None:
+        _schedule_memory_ingestion(
+            prompt=prompt,
+            assistant_text=final_text,
+            chat_id=chat_id,
+            session_id=result.session_id,
+            config=config,
+            workspace=result.workspace,
+            user_log=user_log,
+            assistant_log=assistant_log,
+        )
+
+
+async def _keep_private_text_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    while True:
+        try:
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        except Exception:
+            pass
+        await asyncio.sleep(4)
+
+
 @_require_auth
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -4625,15 +4800,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id = _chat_id(update)
     prompt = update.message.text
     reader_user = _upload_reader_user(context, chat_id)
-    # Capture the user LogEntry so _handle_response can thread it to
-    # the provenance writer. None on JSONL write failure; the extraction
-    # path then skips provenance stamping for this exchange.
-    user_log = log_message(direction="user", chat_id=chat_id, text=prompt, reader_user=reader_user)
+    config: Config = context.bot_data["config"]
+    voice_mode = "off"
+    if config.tts_enabled:
+        voice_mode = await sessions.get_setting(f"voice_mode:{chat_id}") or "off"
+    private_text_activation = chat_id == _user_id(update) and voice_mode == "off"
+
     workshop_inbound_message_id: MessageId | None = None
-    recorder = context.bot_data.get("workshop_inbound_recorder")
-    if recorder is not None:
+    workshop_run_id: RunId | None = None
+    acceptance_disposition: ConversationCommandDisposition | None = None
+    if private_text_activation:
+        execution: WorkshopPrivateTextExecutionService | None = context.bot_data.get("workshop_private_text_execution")
+        if execution is None:
+            log.error("Workshop private-text execution service is unavailable; refusing legacy backend fallback")
+            await _reply_safe(update.message, "Kai's durable execution service is unavailable. Please try again.")
+            return
         try:
-            result = await recorder(
+            acceptance = await execution.accept(
                 InboundMessage(
                     transport="telegram",
                     update_id=str(update.update_id),
@@ -4644,22 +4827,73 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     occurred_at=update.message.date,
                 )
             )
-            aggregate_id = result.event.envelope.aggregate_id
+            aggregate_id = acceptance.message.event.envelope.aggregate_id
             if not isinstance(aggregate_id, MessageId):
-                raise RuntimeError("Workshop inbound recorder returned a non-message aggregate")
+                raise RuntimeError("Workshop command acceptance returned a non-message aggregate")
             workshop_inbound_message_id = aggregate_id
+            workshop_run_id = acceptance.run.run_id
+            acceptance_disposition = acceptance.disposition
         except Exception:
             log.exception(
-                "Workshop inbound shadow write failed (update_id=%s, message_id=%s)",
+                "Workshop private-text acceptance failed; refusing legacy backend fallback "
+                "(update_id=%s, message_id=%s)",
                 update.update_id,
                 update.message.message_id,
             )
-    pool = _get_pool(context)
-    delivery_route = (
-        ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT if chat_id == _user_id(update) else ResponseDeliveryRoute.LEGACY
+            await _reply_safe(update.message, "Kai could not safely accept this request. Please try again.")
+            return
+    else:
+        recorder = context.bot_data.get("workshop_inbound_recorder")
+        if recorder is not None:
+            try:
+                result = await recorder(
+                    InboundMessage(
+                        transport="telegram",
+                        update_id=str(update.update_id),
+                        message_id=str(update.message.message_id),
+                        sender_subject=str(_user_id(update)),
+                        channel_subject=str(chat_id),
+                        body=prompt,
+                        occurred_at=update.message.date,
+                    )
+                )
+                aggregate_id = result.event.envelope.aggregate_id
+                if not isinstance(aggregate_id, MessageId):
+                    raise RuntimeError("Workshop inbound recorder returned a non-message aggregate")
+                workshop_inbound_message_id = aggregate_id
+            except Exception:
+                log.exception(
+                    "Workshop inbound shadow write failed (update_id=%s, message_id=%s)",
+                    update.update_id,
+                    update.message.message_id,
+                )
+
+    # Capture the user LogEntry so response processing can thread it to
+    # provenance. Exact durable replays must not duplicate JSONL history.
+    user_log = (
+        log_message(direction="user", chat_id=chat_id, text=prompt, reader_user=reader_user)
+        if acceptance_disposition in {None, ConversationCommandDisposition.NEWLY_ACCEPTED}
+        else None
     )
+    if private_text_activation:
+        if workshop_run_id is None or workshop_inbound_message_id is None:
+            raise RuntimeError("Accepted private text is missing canonical run authority")
+        await _handle_workshop_private_text(
+            update,
+            context,
+            chat_id=chat_id,
+            run_id=workshop_run_id,
+            inbound_message_id=workshop_inbound_message_id,
+            prompt=prompt,
+            user_log=user_log,
+        )
+        return
+
+    pool = _get_pool(context)
+    delivery_route = ResponseDeliveryRoute.LEGACY
     workshop_run: PreparedConversationRun | None = None
-    if delivery_route == ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT and workshop_inbound_message_id is not None:
+    if chat_id == _user_id(update) and workshop_inbound_message_id is not None:
+        delivery_route = ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT
         run_service: WorkshopConversationRunService | None = context.bot_data.get("workshop_conversation_run_service")
         if run_service is not None:
             try:
@@ -4848,6 +5082,7 @@ async def _handle_response(
                 last_edit_time = now
                 last_edit_text = publishable
                 if workshop_delivery_candidate:
+                    assert workshop_inbound_message_id is not None
                     preview_recorder = context.bot_data["workshop_streaming_preview_recorder"]
                     try:
                         await preview_recorder(
@@ -4962,6 +5197,7 @@ async def _handle_response(
     workshop_outbound_message_id: MessageId | None = None
     workshop_delivery_committed = False
     if workshop_delivery_candidate:
+        assert workshop_inbound_message_id is not None
         finalizer = context.bot_data["workshop_streaming_finalizer"]
         try:
             finalization_result = await finalizer(
@@ -5063,104 +5299,25 @@ async def _handle_response(
                 succeeded,
             )
 
-    # Fire-and-forget: embed this exchange in semantic memory.
-    # Runs in a background task so it does not delay response delivery.
-    # Failures are logged but never propagate to the user.
+    # Capture the workspace before scheduling ingestion so a later workspace
+    # switch cannot re-route facts from this exchange.
     from kai.memory import is_enabled as memory_is_enabled
 
-    if memory_is_enabled() and chat_id is not None:
-
-        async def _ingest_memory() -> None:
-            try:
-                from kai import memory_extraction
-
-                # Extract user text from prompt. For multimodal prompts
-                # (image + text), pull the first text block rather than
-                # storing the Python repr of the list.
-                if isinstance(prompt, str):
-                    user_text = prompt
-                else:
-                    user_text = next(
-                        (block["text"] for block in prompt if block.get("type") == "text"),
-                        "",
-                    )
-                # Skip image-only exchanges - no meaningful text to embed.
-                if not user_text:
-                    return
-
-                # Track 2: Haiku extraction. Runs only under the Claude
-                # backend and only when explicitly enabled. Fire-and-
-                # forget INSIDE the existing fire-and-forget task - the
-                # subprocess latency never blocks reply delivery.
-                #
-                # Spec 360 removed the previous Track 1 raw-user write
-                # that used to run alongside this call. The verbatim
-                # user storage was producing retrieval blocks dense
-                # with `User said:` lines that mimicked real user input
-                # and confused the inner agent on memory-adjacent
-                # topics. Extracted facts (Track 2) remain the only
-                # write path.
-                #
-                # Backend check uses the same per-user fall-through
-                # pattern as `_get_user_provider` (user override wins,
-                # else global). A global-only check would miss users
-                # with a per-user override, so the explicit fall-through
-                # is mandatory here.
-                user_config = config.get_user_config(chat_id)
-                effective_backend = (
-                    user_config.backend if user_config and user_config.backend else config.default_backend
-                )
-                if config.memory_extraction_enabled and effective_backend in ONESHOT_REASONER_BACKENDS:
-                    # Windowed PRIOR CONTEXT for the episode classifier
-                    # (issue #392). Fetch one extra pair beyond the
-                    # configured window and drop the most recent: the
-                    # current exchange has already been written to JSONL
-                    # by the log_message(direction="assistant", ...) call
-                    # above, so the newest pair returned by
-                    # `get_recent_pairs` IS the current exchange. The
-                    # `[:-1]` slice handles short-history cases
-                    # gracefully without a guard - on an empty `fetched`
-                    # list the slice is `[][:-1] == []`, on a single
-                    # element list it is `[]` (the only pair IS the
-                    # current exchange, nothing prior to drop into
-                    # `prior_pairs`), and on a multi-pair list it
-                    # drops only the most-recent entry. N=0 disables
-                    # windowing entirely; skip the disk read in that
-                    # case.
-                    prior_pairs: list[tuple[str, str]] = []
-                    if config.episode_classifier_context_turns > 0:
-                        from kai.history import get_recent_pairs
-
-                        fetched = get_recent_pairs(chat_id, config.episode_classifier_context_turns + 1)
-                        prior_pairs = fetched[:-1]
-                    await memory_extraction.extract_and_store(
-                        user_text=user_text,
-                        assistant_text=final_text,
-                        user_id=str(chat_id),
-                        session_id=final_response.session_id,
-                        config=config,
-                        prior_pairs=prior_pairs,
-                        workspace=ingest_workspace,
-                        user_log=user_log,
-                        assistant_log=assistant_log,
-                    )
-            except Exception:
-                log.warning("Memory ingestion failed", exc_info=True)
-
-        # Workspace for write-scope routing, captured BEFORE the
-        # fire-and-forget task is scheduled. The exchange being
-        # extracted happened in THIS workspace; reading
-        # pool.get_effective_workspace inside the task instead would
-        # let a /workspace switch that lands during the ingestion
-        # delay re-route the exchange's facts to a project the
-        # conversation never touched.
+    if memory_is_enabled():
         if workshop_delivery_candidate and workshop_run is not None:
             ingest_workspace = str(await workshop_run.effective_workspace())
         else:
             ingest_workspace = str(await pool.get_effective_workspace(chat_id))
-        task = asyncio.create_task(_ingest_memory())
-        _pending_memory_tasks.add(task)
-        task.add_done_callback(_pending_memory_tasks.discard)
+        _schedule_memory_ingestion(
+            prompt=prompt,
+            assistant_text=final_text,
+            chat_id=chat_id,
+            session_id=final_response.session_id,
+            config=config,
+            workspace=ingest_workspace,
+            user_log=user_log,
+            assistant_log=assistant_log,
+        )
 
     if workshop_delivery_committed:
         return

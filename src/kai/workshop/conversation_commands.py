@@ -1,4 +1,4 @@
-"""Production-unused atomic acceptance for canonical Workshop commands."""
+"""Atomic acceptance for canonical Workshop commands."""
 
 from __future__ import annotations
 
@@ -43,8 +43,8 @@ class ConversationCommandAcceptance:
 class WorkshopConversationCommandService:
     """Atomically append canonical inbound and run-acceptance facts.
 
-    This service starts no process and is not constructed by production code.
-    Its disposition is the durable input to a later execution coordinator.
+    This service starts no process. Its disposition is the durable input to
+    the execution coordinator owned by the production private-text runtime.
     """
 
     def __init__(self, store: WorkshopEventStore) -> None:

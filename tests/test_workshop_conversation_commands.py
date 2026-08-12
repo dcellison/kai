@@ -279,12 +279,8 @@ class TestConversationCommandReplay:
         finally:
             await store.close()
 
-    def test_service_remains_unregistered_in_production(self):
+    def test_service_is_registered_only_through_private_text_runtime_owner(self):
         source_root = Path(__file__).parents[1] / "src" / "kai"
-        service_path = source_root / "workshop" / "conversation_commands.py"
-        for path in source_root.rglob("*.py"):
-            if path == service_path:
-                continue
-            source = path.read_text(encoding="utf-8")
-            assert "conversation_commands" not in source
-            assert "WorkshopConversationCommandService" not in source
+        owner_source = (source_root / "workshop" / "private_text_execution.py").read_text(encoding="utf-8")
+        assert "WorkshopConversationCommandService" in owner_source
+        assert "WorkshopConversationCommandService" not in (source_root / "main.py").read_text(encoding="utf-8")

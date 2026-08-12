@@ -41,6 +41,7 @@ class _Prepared:
     ) -> None:
         self.run = run
         self.selection = RunExecutionSelection("codex", "gpt-5.6-sol")
+        self.workspace = Path("/private/tmp/kai-workshop-test-workspace")
         self.response = response or AgentResponse(success=True, text="Canonical answer")
         self.wait = wait
         self.on_stream = on_stream
@@ -142,6 +143,33 @@ class TestCanonicalExecutionCoordinator:
             assert prepared.validated is True
             assert prepared.prompts == ["Canonical prompt 1"]
             assert await _terminal_bodies(store) == ["Canonical prompt 1", "Canonical answer"]
+        finally:
+            await store.close()
+
+    async def test_stream_observer_sees_only_nonterminal_events(self, tmp_path: Path):
+        store, run = await _accepted(tmp_path / "kai.db")
+        prepared = _Prepared(run)
+        observed: list[StreamEvent] = []
+
+        async def observe(event: StreamEvent) -> None:
+            observed.append(event)
+
+        original_stream = prepared.stream
+
+        async def stream_with_preview(prompt: str) -> AsyncIterator[StreamEvent]:
+            yield StreamEvent(text_so_far="Stable preview.", done=False)
+            async for event in original_stream(prompt):
+                yield event
+
+        prepared.stream = stream_with_preview  # type: ignore[method-assign]
+        try:
+            result = await _coordinator(store, _Preparation(prepared)).execute(
+                run.run_id,
+                stream_observer=observe,
+            )
+
+            assert result.disposition == CanonicalExecutionDisposition.COMPLETED
+            assert [event.text_so_far for event in observed] == ["Stable preview."]
         finally:
             await store.close()
 

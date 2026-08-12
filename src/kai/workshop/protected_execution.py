@@ -1,4 +1,4 @@
-"""Production-unused protected preparation for Workshop execution."""
+"""Protected preparation for Workshop execution."""
 
 from __future__ import annotations
 

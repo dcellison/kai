@@ -82,12 +82,14 @@ from kai.config import PROVIDER_MODELS, Config, UserConfig, get_default_model_fo
 from kai.review import CollectionWarning, PRReviewResult
 from kai.tts import DEFAULT_VOICE, VOICES
 from kai.workshop.artifacts import InboundArtifact
+from kai.workshop.conversation_commands import ConversationCommandDisposition
 from kai.workshop.conversation_runs import (
     CanonicalConversationRunTarget,
     PreparedConversationRun,
     WorkshopConversationRunService,
 )
-from kai.workshop.domain import AgentId, ChannelId, MessageId, PrincipalId, WorkshopId
+from kai.workshop.domain import AgentId, ChannelId, MessageId, PrincipalId, RunId, WorkshopId
+from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.inbound import InboundMessage
 from kai.workshop.outbound import DeliveryObservation, OutboundMessage
 from kai.workshop.streaming_preview import ConfirmedTelegramStreamingPreview
@@ -1188,6 +1190,21 @@ class TestHandleStop:
         claude.force_kill.assert_called_once()
         reply = update.message.reply_text.call_args[0][0]
         assert "stopping" in reply.lower()
+
+    @pytest.mark.asyncio
+    async def test_private_text_stop_uses_canonical_cancellation_without_pool_kill(self):
+        pool = _make_mock_claude()
+        update = _make_update(chat_id=1, user_id=1)
+        ctx = _make_context(claude=pool, config=_make_config(allowed_user_ids={1}))
+        execution = MagicMock()
+        execution.request_cancellation = AsyncMock(return_value=CanonicalCancellationDisposition.REQUESTED)
+        ctx.bot_data["workshop_private_text_execution"] = execution
+
+        await handle_stop(update, ctx)
+
+        execution.request_cancellation.assert_awaited_once_with(telegram_user_id=1, telegram_chat_id=1)
+        pool.force_kill.assert_not_called()
+        assert update.message.reply_text.await_args.args[0] == "Stopping..."
 
 
 # ── handle_stats ─────────────────────────────────────────────────────
@@ -2784,24 +2801,25 @@ class TestHandleMessage:
         ctx = _make_context(config=_make_config(allowed_user_ids={1}))
         recorder = AsyncMock()
         inbound_id = MessageId("msg_00000000000000000000000000000001")
-        recorder.return_value.event.envelope.aggregate_id = inbound_id
         ctx.bot_data["workshop_inbound_recorder"] = recorder
-        prepared_run = MagicMock(spec=PreparedConversationRun)
-        prepared_run.model = "gpt-5.6-sol"
-        run_service = MagicMock(spec=WorkshopConversationRunService)
-        run_service.prepare = AsyncMock(return_value=prepared_run)
-        ctx.bot_data["workshop_conversation_run_service"] = run_service
+        run_id = RunId("run_00000000000000000000000000000001")
+        execution = MagicMock()
+        execution.accept = AsyncMock()
+        execution.accept.return_value.message.event.envelope.aggregate_id = inbound_id
+        execution.accept.return_value.run.run_id = run_id
+        execution.accept.return_value.disposition = ConversationCommandDisposition.NEWLY_ACCEPTED
+        ctx.bot_data["workshop_private_text_execution"] = execution
         with (
             patch("kai.bot.is_totp_configured", return_value=False),
-            patch("kai.bot._handle_response", new_callable=AsyncMock) as response,
+            patch("kai.bot._handle_workshop_private_text", new_callable=AsyncMock) as response,
             patch("kai.bot.log_message"),
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
-            patch("kai.bot.get_lock", return_value=_fake_lock()),
+            patch("kai.bot._set_responding") as set_responding,
+            patch("kai.bot._clear_responding") as clear_responding,
+            patch("kai.bot.get_lock", return_value=_fake_lock()) as get_lock,
         ):
             await handle_message(update, ctx)
 
-        recorder.assert_awaited_once_with(
+        execution.accept.assert_awaited_once_with(
             InboundMessage(
                 transport="telegram",
                 update_id="9001",
@@ -2812,10 +2830,48 @@ class TestHandleMessage:
                 occurred_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
             )
         )
-        assert response.await_args.kwargs["workshop_inbound_message_id"] == inbound_id
-        assert response.await_args.kwargs["delivery_route"] == ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT
-        run_service.prepare.assert_awaited_once_with(inbound_id)
-        assert response.await_args.kwargs["workshop_run"] is prepared_run
+        recorder.assert_not_awaited()
+        assert response.await_args.kwargs["inbound_message_id"] == inbound_id
+        assert response.await_args.kwargs["run_id"] == run_id
+        get_lock.assert_not_called()
+        set_responding.assert_not_called()
+        clear_responding.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_private_text_without_durable_service_fails_closed(self):
+        update = _make_update(text="do not dispatch", chat_id=1, user_id=1)
+        pool = _make_mock_claude()
+        ctx = _make_context(claude=pool, config=_make_config(allowed_user_ids={1}))
+
+        with patch("kai.bot.is_totp_configured", return_value=False):
+            await handle_message(update, ctx)
+
+        pool.send.assert_not_called()
+        assert "durable execution service is unavailable" in update.message.reply_text.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_private_text_terminal_replay_does_not_duplicate_jsonl_user_history(self):
+        update = _make_update(text="same durable update", chat_id=1, user_id=1)
+        ctx = _make_context(config=_make_config(allowed_user_ids={1}))
+        execution = MagicMock()
+        execution.accept = AsyncMock()
+        execution.accept.return_value.message.event.envelope.aggregate_id = MessageId(
+            "msg_00000000000000000000000000000001"
+        )
+        execution.accept.return_value.run.run_id = RunId("run_00000000000000000000000000000001")
+        execution.accept.return_value.disposition = ConversationCommandDisposition.TERMINAL_REPLAY
+        ctx.bot_data["workshop_private_text_execution"] = execution
+
+        with (
+            patch("kai.bot.is_totp_configured", return_value=False),
+            patch("kai.bot._handle_workshop_private_text", new_callable=AsyncMock) as execute,
+            patch("kai.bot.log_message") as history,
+        ):
+            await handle_message(update, ctx)
+
+        execute.assert_awaited_once()
+        assert execute.await_args.kwargs["user_log"] is None
+        history.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_does_not_record_when_totp_denies_message(self):
@@ -2840,8 +2896,8 @@ class TestHandleMessage:
         recorder.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_shadow_failure_does_not_change_existing_response_path(self, caplog):
-        update = _make_update(chat_id=1, user_id=1)
+    async def test_group_shadow_failure_does_not_change_existing_response_path(self, caplog):
+        update = _make_update(chat_id=-100, user_id=1)
         ctx = _make_context(config=_make_config(allowed_user_ids={1}))
         ctx.bot_data["workshop_inbound_recorder"] = AsyncMock(side_effect=RuntimeError("shadow failed"))
         with (

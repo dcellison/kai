@@ -1,16 +1,16 @@
-"""Production-unused canonical coordination for durable Workshop execution."""
+"""Canonical coordination for durable Workshop execution."""
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Protocol
 
 from kai.agent_failure import AgentFailureKind
-from kai.backend import AgentResponse
+from kai.backend import AgentResponse, StreamEvent
 from kai.workshop.domain import AgentId, ChannelId, RunExecutionOwnerId, RunId
 from kai.workshop.protected_execution import PreparedWorkshopExecution
 from kai.workshop.run_execution_authority import (
@@ -31,6 +31,9 @@ from kai.workshop.terminal_transactions import (
 
 class ProtectedPreparation(Protocol):
     async def prepare(self, run_id: RunId) -> PreparedWorkshopExecution: ...
+
+
+type StreamObserver = Callable[[StreamEvent], Awaitable[None]]
 
 
 class CanonicalExecutionDisposition(StrEnum):
@@ -55,6 +58,9 @@ class CanonicalExecutionResult:
     disposition: CanonicalExecutionDisposition
     run: DurableRun
     terminal: TerminalTransactionResult | None = None
+    session_id: str | None = None
+    workspace: str | None = None
+    selection: RunExecutionSelection | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,7 +79,7 @@ class _ActiveExecution:
     cancel_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     claim_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     cancellation_requested: bool = False
-    cancellation_error: BaseException | None = None
+    cancellation_error: Exception | None = None
     prepared: PreparedWorkshopExecution | None = None
     authority: WorkshopRunExecutionAuthority | None = None
     claim: RunExecutionClaim | None = None
@@ -98,8 +104,7 @@ class WorkshopCanonicalExecutionCoordinator:
 
     The public execution input is only a canonical ``RunId``. Prompt, lane,
     compatibility runtime identity, backend selection, owner, and delivery
-    authority are all derived behind this boundary. Production does not yet
-    construct this coordinator.
+    authority are all derived behind this boundary.
     """
 
     def __init__(
@@ -110,6 +115,7 @@ class WorkshopCanonicalExecutionCoordinator:
         registered_backend_ids: frozenset[str],
         clock: Callable[[], datetime] | None = None,
         lease_duration: timedelta = timedelta(minutes=5),
+        database_lock: asyncio.Lock | None = None,
     ) -> None:
         if not registered_backend_ids:
             raise ValueError("registered_backend_ids must not be empty")
@@ -123,9 +129,14 @@ class WorkshopCanonicalExecutionCoordinator:
         self._lanes: dict[tuple[ChannelId, AgentId], asyncio.Lock] = {}
         self._active: dict[RunId, _ActiveExecution] = {}
         self._map_lock = asyncio.Lock()
-        self._database_lock = asyncio.Lock()
+        self._database_lock = database_lock or asyncio.Lock()
 
-    async def execute(self, run_id: RunId) -> CanonicalExecutionResult:
+    async def execute(
+        self,
+        run_id: RunId,
+        *,
+        stream_observer: StreamObserver | None = None,
+    ) -> CanonicalExecutionResult:
         if not isinstance(run_id, RunId):
             raise ValueError("run_id must be a RunId")
         run = await self._run(run_id)
@@ -140,7 +151,7 @@ class WorkshopCanonicalExecutionCoordinator:
             async with self._map_lock:
                 self._active[run_id] = active
             try:
-                return await self._execute_owned(active, run)
+                return await self._execute_owned(active, run, stream_observer=stream_observer)
             finally:
                 active.finished.set()
                 active.ready.set()
@@ -181,7 +192,7 @@ class WorkshopCanonicalExecutionCoordinator:
                     active.cancellation_error = None
                     active.cancellation_done.set()
                     return CanonicalCancellationDisposition.ALREADY_TERMINAL
-                except BaseException as exc:
+                except Exception as exc:
                     active.cancellation_error = exc
                 finally:
                     active.cancellation_done.set()
@@ -211,7 +222,13 @@ class WorkshopCanonicalExecutionCoordinator:
                     interrupted += 1
         return CanonicalRecoveryResult(expired, interrupted)
 
-    async def _execute_owned(self, active: _ActiveExecution, run: DurableRun) -> CanonicalExecutionResult:
+    async def _execute_owned(
+        self,
+        active: _ActiveExecution,
+        run: DurableRun,
+        *,
+        stream_observer: StreamObserver | None,
+    ) -> CanonicalExecutionResult:
         try:
             async with self._database_lock:
                 prepared = await self._preparation.prepare(run.run_id)
@@ -238,7 +255,7 @@ class WorkshopCanonicalExecutionCoordinator:
             active.claim = started.claim
             active.started = True
 
-            response = await self._consume_with_renewal(active, prepared)
+            response = await self._consume_with_renewal(active, prepared, stream_observer=stream_observer)
             if active.cancellation_requested:
                 return await self._settle_requested_cancellation(active)
             terminal = WorkshopRunTerminalTransactionCoordinator(authority)
@@ -268,13 +285,25 @@ class WorkshopCanonicalExecutionCoordinator:
                         occurred_at=self._now(),
                     )
                     disposition = CanonicalExecutionDisposition.FAILED
-            return CanonicalExecutionResult(disposition, settled.execution.run, settled)
+            return CanonicalExecutionResult(
+                disposition,
+                settled.execution.run,
+                settled,
+                session_id=response.session_id if response is not None and response.success else None,
+                workspace=str(prepared.workspace),
+                selection=prepared.selection,
+            )
         except Exception:
             if active.cancellation_requested and active.claim is not None:
                 return await self._settle_requested_cancellation(active)
             if active.settling:
                 raise
             if active.started and active.authority is not None and active.claim is not None:
+                if active.prepared is not None:
+                    try:
+                        await active.prepared.cancel()
+                    except Exception:
+                        pass
                 async with self._database_lock:
                     active.settling = True
                     settled = await WorkshopRunTerminalTransactionCoordinator(active.authority).fail(
@@ -282,7 +311,13 @@ class WorkshopCanonicalExecutionCoordinator:
                         failure_code=TerminalFailureCode.EXECUTION_INTERRUPTED,
                         occurred_at=self._now(),
                     )
-                return CanonicalExecutionResult(CanonicalExecutionDisposition.FAILED, settled.execution.run, settled)
+                return CanonicalExecutionResult(
+                    CanonicalExecutionDisposition.FAILED,
+                    settled.execution.run,
+                    settled,
+                    workspace=str(active.prepared.workspace) if active.prepared is not None else None,
+                    selection=active.prepared.selection if active.prepared is not None else None,
+                )
             return CanonicalExecutionResult(
                 CanonicalExecutionDisposition.PREPARATION_DEFERRED, await self._run(run.run_id)
             )
@@ -299,7 +334,13 @@ class WorkshopCanonicalExecutionCoordinator:
                         failure_code=TerminalFailureCode.EXECUTION_INTERRUPTED,
                         occurred_at=self._now(),
                     )
-                return CanonicalExecutionResult(CanonicalExecutionDisposition.FAILED, result.execution.run, result)
+                return CanonicalExecutionResult(
+                    CanonicalExecutionDisposition.FAILED,
+                    result.execution.run,
+                    result,
+                    workspace=str(active.prepared.workspace) if active.prepared is not None else None,
+                    selection=active.prepared.selection if active.prepared is not None else None,
+                )
             return CanonicalExecutionResult(
                 CanonicalExecutionDisposition.PREPARATION_DEFERRED,
                 await self._run(active.run_id),
@@ -310,25 +351,40 @@ class WorkshopCanonicalExecutionCoordinator:
                 active.claim,
                 occurred_at=self._now(),
             )
-        return CanonicalExecutionResult(CanonicalExecutionDisposition.CANCELLED, result.execution.run, result)
+        return CanonicalExecutionResult(
+            CanonicalExecutionDisposition.CANCELLED,
+            result.execution.run,
+            result,
+            workspace=str(active.prepared.workspace) if active.prepared is not None else None,
+            selection=active.prepared.selection if active.prepared is not None else None,
+        )
 
-    async def _consume(self, prepared: PreparedWorkshopExecution) -> AgentResponse | None:
+    async def _consume(
+        self,
+        prepared: PreparedWorkshopExecution,
+        *,
+        stream_observer: StreamObserver | None,
+    ) -> AgentResponse | None:
         prompt = await self._prompt(prepared.run)
         response: AgentResponse | None = None
         async for event in prepared.stream(prompt):
             if event.done:
                 response = event.response
                 break
+            if stream_observer is not None:
+                await stream_observer(event)
         return response
 
     async def _consume_with_renewal(
         self,
         active: _ActiveExecution,
         prepared: PreparedWorkshopExecution,
+        *,
+        stream_observer: StreamObserver | None,
     ) -> AgentResponse | None:
         renewal = asyncio.create_task(self._renew_while_running(active))
         try:
-            return await self._consume(prepared)
+            return await self._consume(prepared, stream_observer=stream_observer)
         finally:
             active.renewal_stop.set()
             await renewal

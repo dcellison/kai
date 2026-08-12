@@ -59,6 +59,7 @@ def _make_context(user_data: dict | None = None) -> MagicMock:
     cfg.totp_challenge_seconds = 120
     cfg.totp_lockout_attempts = 3
     cfg.totp_lockout_minutes = 15
+    cfg.tts_enabled = False
     return ctx
 
 

@@ -93,6 +93,7 @@ _CANCELLATION_MESSAGE = "This request was cancelled."
 @dataclass(frozen=True, slots=True)
 class TerminalTransactionResult:
     outcome: TerminalOutcome
+    body: str
     finalization: OutboundStreamingFinalizationResult
     execution: RunExecutionResult
     changed: bool
@@ -264,6 +265,7 @@ class WorkshopRunTerminalTransactionCoordinator:
                 raise _PossibleCommitError("Workshop terminal commit result was unavailable") from commit_error
             return TerminalTransactionResult(
                 outcome=outcome,
+                body=body,
                 finalization=finalization,
                 execution=execution,
                 changed=changed,

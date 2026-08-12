@@ -214,7 +214,7 @@ class WorkshopRunExecutionAuthority:
 
     The injected resolver is the protected policy boundary: callers identify a
     run and an execution owner, but cannot substitute a command, backend, or
-    model. No production object constructs this service yet.
+    model.
     """
 
     def __init__(

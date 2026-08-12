@@ -43,9 +43,11 @@ from telegram import BotCommand
 from telegram.error import NetworkError
 
 from kai import cron, services, sessions, webhook
+from kai.backend_registry import load_backend_registry
 from kai.bot import create_bot
 from kai.config import DATA_DIR, PROJECT_ROOT, _read_protected_file, load_config
 from kai.workshop.bootstrap import BootstrapHuman, BootstrapNotificationChannel
+from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
 from kai.workshop.telegram_delivery_runtime import WorkshopTelegramConversationDeliveryService
 
 
@@ -80,6 +82,16 @@ async def _workshop_bootstrap_notification_channels(config) -> tuple[BootstrapNo
         )
         for destination, members in sorted(members_by_group.items())
     )
+
+
+def _workshop_registered_backend_ids(config) -> frozenset[str]:
+    """Resolve the protected registry, with configured dev backends as fallback."""
+    registry = load_backend_registry()
+    if registry:
+        return frozenset(registry)
+    configured = {config.default_backend}
+    configured.update(user.backend for user in config.user_configs.values() if user.backend)
+    return frozenset(configured)
 
 
 def setup_logging() -> None:
@@ -309,6 +321,7 @@ def _start() -> None:
 
         app = create_bot(config, use_webhook=use_webhook)
         conversation_delivery: WorkshopTelegramConversationDeliveryService | None = None
+        private_text_execution: WorkshopPrivateTextExecutionService | None = None
 
         # Determine the default user (admin or first user) for per-user
         # data migrations and workspace restoration. users.yaml is
@@ -416,6 +429,14 @@ def _start() -> None:
             )
             logging.info("Workshop Telegram conversation delivery is ready")
 
+            private_text_execution = await WorkshopPrivateTextExecutionService.open_and_start(
+                config.session_db_path,
+                app.bot_data["pool"],
+                registered_backend_ids=_workshop_registered_backend_ids(config),
+            )
+            app.bot_data["workshop_private_text_execution"] = private_text_execution
+            logging.info("Workshop private-text execution is ready")
+
             # Start the HTTP server (always runs - serves scheduling API, GitHub
             # webhooks, file exchange, and health check regardless of transport mode).
             # In webhook mode, this also registers the Telegram webhook with the API.
@@ -488,7 +509,10 @@ def _start() -> None:
             # The delivery worker is part of service health. Unexpected worker
             # exit reaches the top-level crash path instead of leaving a loaded
             # Kai process that can accept replies it cannot deliver.
-            await conversation_delivery.wait()
+            await asyncio.gather(
+                conversation_delivery.wait(),
+                private_text_execution.wait(),
+            )
         finally:
             # Shutdown in reverse order of startup
             await webhook.stop()
@@ -496,6 +520,12 @@ def _start() -> None:
             # since the Updater was suppressed at build time)
             if not use_webhook and app.updater:
                 await app.updater.stop()
+            if private_text_execution is not None:
+                app.bot_data.pop("workshop_private_text_execution", None)
+                try:
+                    await private_text_execution.stop()
+                except Exception:
+                    logging.exception("Workshop private-text execution stopped with an error")
             if conversation_delivery is not None:
                 try:
                     await conversation_delivery.stop()

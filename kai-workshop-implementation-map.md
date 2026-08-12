@@ -411,7 +411,7 @@ No entry may use an indefinite condition such as "keep for compatibility." A gen
 | JSONL transcript writes and reads | Canonical message projection, with an explicit export facility if still useful | Canonical reads serve complete context and transcript views; migration/parity diagnostics report no unexplained divergence | Stop JSONL writes; remove production reads and dual-write recovery code; retain only a documented importer/exporter if required | Planned |
 | Telegram `chat_id` used as internal identity, namespace, and routing key | Durable principal, channel, agent, and binding IDs | Private chats, notification-only groups, duplicate updates, and restart routing all resolve correctly through bindings | Confine Telegram IDs to external identity, transport binding, and idempotency records; remove chat-shaped domain keys | Active (authoritative private text now enters execution by canonical message ID, but the compatibility resolver still derives the current pool key from the human principal's protected Telegram identity; settings, locks, history, files, memory, and excluded routes remain chat-keyed) |
 | `SubprocessPool` keyed by Telegram chat ID | Durable channel/agent session plus run and attempt orchestration | All five harnesses pass continuity, restart, cancellation, and isolation tests through durable identities | Remove chat-key compatibility lookup and move lifecycle ownership behind the orchestrator/runtime contract | Active (a canonical conversation-run service hides the private-text pool lookup behind a temporary compatibility resolution; the pool and all five harness processes remain keyed by that resolved integer) |
-| Direct backend invocation from Telegram handlers | Transport-neutral command and run services | Telegram and the first Workshop client produce equivalent authorized runs and visible results | Remove handler-owned orchestration; leave authentication, parsing, and rendering in the Telegram adapter | Active (authoritative private text invokes through the canonical conversation-run service using only its inbound `MessageId`; a transport-neutral durable run lifecycle exists production-unused; the run-authority review holds live lifecycle activation until execution attempts, cancellation intent, atomic terminal results, and terminal replay suppression exist) |
+| Direct backend invocation from Telegram handlers | Transport-neutral command and run services | Telegram and the first Workshop client produce equivalent authorized runs and visible results | Remove handler-owned orchestration; leave authentication, parsing, and rendering in the Telegram adapter | Active (authenticated private-chat text with voice mode off now accepts and executes by canonical `RunId`, with fenced attempts, durable cancellation, atomic terminal settlement, and replay suppression; media, voice modes, groups, schedules, and integrations retain their compatibility orchestration) |
 | Direct Telegram delivery from handlers, schedules, and webhooks | Durable delivery outbox and Telegram delivery adapter | Delivery outcome events preserve binding identity; retry, crash recovery, ordering, private-chat and notification-group delivery tests pass; live delivery is verified | Migrate each remaining transport path separately; the private-text direct fallback is retired | Active (authenticated private-chat text with voice mode off uses atomic streaming finalization and a supervised exact-epoch worker and now fails closed rather than demoting to direct/shadow delivery; commands, media, voice, schedules, webhooks, files, and groups retain existing delivery) |
 | Operator-invoked Workshop delivery qualification CLI | Installed evidence followed by the production delivery worker | A configured direct-chat reply is prepared without sending, survives a service restart, recovers an intentionally abandoned lease, reaches Telegram once through the exact selected delivery, and records a terminal binding-aware outcome; a configured notification group resolves through its outbound-only canonical channel, receives one atomically prepared qualification message through the exact selected delivery, and does not become an inbound conversation | Remove the qualification command and its explicit-claim-only surface after the production worker has equivalent installed restart/recovery evidence and direct delivery is retired | Active (the installed direct-chat recovery and notification-group delivery gates passed on 2026-08-12; retain until equivalent production-worker evidence exists, while the command remains unregistered and incapable of draining unrelated work) |
 | Conversation-delivery authority epochs | A single durable delivery authority after direct-send rollback is retired | Activation/deactivation, restart, historical-row isolation, exact-epoch worker ownership, aggregate diagnostics, and installed rollback/reactivation evidence pass; no supported rollback crosses the direct-send/outbox boundary | Remove epoch stamping, activation/deactivation state, exact-epoch claim filters, transitional readiness output, schema columns/tables where safely migratable, and their compatibility tests | Active (production startup resumes or creates the exact epoch before ingress; installed private-text streaming, all-send, fragmentation, restart/no-replay, aggregate authority, and parity checks passed on 2026-08-12) |
@@ -1713,3 +1713,37 @@ Conduct the activation review, then route authenticated private Telegram text
 through this coordinator while retaining the current streaming presentation
 and delivery worker. That activation is the first slice in this sequence that
 will require `make install` and an operator-visible Telegram qualification.
+
+## 34. Authenticated private-text execution activation
+
+**Implementation date:** 2026-08-12
+
+Authenticated Telegram private-chat text with voice mode off now uses one
+production-owned Workshop execution service. The service atomically accepts
+the canonical command, resolves the protected runtime from the deployed
+backend registry, dispatches under the canonical `(channel_id, agent_id)`
+lane, renews its fenced lease, and commits exactly one terminal message,
+delivery plan, attempt outcome, and run outcome. The handler cannot fall back
+to direct backend invocation or direct final Telegram delivery if this service
+is unavailable.
+
+Telegram still renders stable non-final streaming prefixes. A confirmed
+preview is durably bound to the canonical inbound message; final presentation
+is left to the supervised Workshop outbox worker. Exact update replay does not
+invoke the backend or duplicate transitional JSONL user history. `/stop`
+resolves the active canonical private run and stops only its prepared runtime
+before cancellation is confirmed.
+
+Startup opens a dedicated event-store connection, completes expired-attempt
+recovery before polling or webhook ingress begins, and supervises the recovery
+loop alongside the delivery worker. Shutdown removes the handler-visible
+service and closes it before the delivery worker and shared session database.
+The old per-chat responding marker and Telegram-chat execution lock are not
+used by this route; durable run state and the canonical lane are authoritative.
+
+Photo, document, voice, voice-enabled text, groups, schedules, and webhook
+notifications remain on their established compatibility paths. This bounded
+activation therefore requires an installed private-text qualification after
+merge: one ordinary response, one duplicate/replay check, one `/stop` check,
+and a clean `make install-status` run with no pending, failed, or uncertain
+conversation deliveries.

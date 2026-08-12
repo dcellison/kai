@@ -1,4 +1,4 @@
-"""Contracts for production-unused protected Workshop execution preparation."""
+"""Contracts for protected Workshop execution preparation."""
 
 from __future__ import annotations
 
@@ -146,8 +146,12 @@ class TestProtectedExecutionPreparation:
             await pool.shutdown()
             await store.close()
 
-    def test_service_remains_unregistered(self):
+    def test_service_is_registered_only_through_private_text_runtime_owner(self):
         source_root = Path(__file__).parents[1] / "src" / "kai"
-        for relative_path in ("main.py", "bot.py", "sessions.py"):
-            source = (source_root / relative_path).read_text(encoding="utf-8")
-            assert "WorkshopProtectedExecutionPreparationService" not in source
+        main_source = (source_root / "main.py").read_text(encoding="utf-8")
+        owner_source = (source_root / "workshop" / "private_text_execution.py").read_text(encoding="utf-8")
+        assert "WorkshopPrivateTextExecutionService.open_and_start" in main_source
+        assert "WorkshopProtectedExecutionPreparationService" in owner_source
+        assert "WorkshopProtectedExecutionPreparationService" not in (source_root / "bot.py").read_text(
+            encoding="utf-8"
+        )
