@@ -1,8 +1,8 @@
 # Kai Workshop: Phase 0 Implementation Map
 
-**Status:** Active migration plan; canonical conversation shadow implemented, production authority held
+**Status:** Active migration plan; first canonical conversation delivery authority live
 **Date:** 2026-08-12
-**Scope:** Map the current Kai implementation onto the proposed Kai Workshop architecture without changing production behavior.
+**Scope:** Map and execute the current Kai implementation's migration onto the proposed Kai Workshop architecture.
 
 ## 1. Naming and scope
 
@@ -406,9 +406,9 @@ No entry may use an indefinite condition such as "keep for compatibility." A gen
 | Telegram `chat_id` used as internal identity, namespace, and routing key | Durable principal, channel, agent, and binding IDs | Private chats, notification-only groups, duplicate updates, and restart routing all resolve correctly through bindings | Confine Telegram IDs to external identity, transport binding, and idempotency records; remove chat-shaped domain keys | Planned |
 | `SubprocessPool` keyed by Telegram chat ID | Durable channel/agent session plus run and attempt orchestration | All five harnesses pass continuity, restart, cancellation, and isolation tests through durable identities | Remove chat-key compatibility lookup and move lifecycle ownership behind the orchestrator/runtime contract | Planned |
 | Direct backend invocation from Telegram handlers | Transport-neutral command and run services | Telegram and the first Workshop client produce equivalent authorized runs and visible results | Remove handler-owned orchestration; leave authentication, parsing, and rendering in the Telegram adapter | Planned |
-| Direct Telegram delivery from handlers, schedules, and webhooks | Durable delivery outbox and Telegram delivery adapter | Delivery outcome events preserve binding identity; retry, crash recovery, ordering, private-chat and notification-group delivery tests pass; live delivery is verified | Remove the retained direct fallback for private text after installed cutover evidence; migrate each remaining transport path separately | Active (authenticated private-chat text with voice mode off now uses atomic streaming finalization and a supervised exact-epoch worker; installed cutover verification remains pending, while commands, media, voice, schedules, webhooks, files, groups, and definite preparation-error fallback retain existing delivery) |
+| Direct Telegram delivery from handlers, schedules, and webhooks | Durable delivery outbox and Telegram delivery adapter | Delivery outcome events preserve binding identity; retry, crash recovery, ordering, private-chat and notification-group delivery tests pass; live delivery is verified | Migrate each remaining transport path separately; the private-text direct fallback is retired | Active (authenticated private-chat text with voice mode off uses atomic streaming finalization and a supervised exact-epoch worker and now fails closed rather than demoting to direct/shadow delivery; commands, media, voice, schedules, webhooks, files, and groups retain existing delivery) |
 | Operator-invoked Workshop delivery qualification CLI | Installed evidence followed by the production delivery worker | A configured direct-chat reply is prepared without sending, survives a service restart, recovers an intentionally abandoned lease, reaches Telegram once through the exact selected delivery, and records a terminal binding-aware outcome; a configured notification group resolves through its outbound-only canonical channel, receives one atomically prepared qualification message through the exact selected delivery, and does not become an inbound conversation | Remove the qualification command and its explicit-claim-only surface after the production worker has equivalent installed restart/recovery evidence and direct delivery is retired | Active (the installed direct-chat recovery and notification-group delivery gates passed on 2026-08-12; retain until equivalent production-worker evidence exists, while the command remains unregistered and incapable of draining unrelated work) |
-| Conversation-delivery authority epochs | A single durable delivery authority after direct-send rollback is retired | Activation/deactivation, restart, historical-row isolation, exact-epoch worker ownership, aggregate diagnostics, and installed rollback/reactivation evidence pass; no supported rollback crosses the direct-send/outbox boundary | Remove epoch stamping, activation/deactivation state, exact-epoch claim filters, transitional readiness output, schema columns/tables where safely migratable, and their compatibility tests | Active (production startup resumes or creates the exact epoch before ingress; the first private-text cutover is live in code and awaits installed verification) |
+| Conversation-delivery authority epochs | A single durable delivery authority after direct-send rollback is retired | Activation/deactivation, restart, historical-row isolation, exact-epoch worker ownership, aggregate diagnostics, and installed rollback/reactivation evidence pass; no supported rollback crosses the direct-send/outbox boundary | Remove epoch stamping, activation/deactivation state, exact-epoch claim filters, transitional readiness output, schema columns/tables where safely migratable, and their compatibility tests | Active (production startup resumes or creates the exact epoch before ingress; installed private-text streaming, all-send, fragmentation, restart/no-replay, aggregate authority, and parity checks passed on 2026-08-12) |
 | Schedule firing directly into the pool or Telegram | Durable Workshop run creation | Scheduled definitions and executions survive restart and expose run/attempt state without duplicate work | Remove schedule-specific execution path; retain schedules only as authenticated run triggers | Planned |
 | GitHub and generic webhook paths that route directly to Telegram or the pool | Canonical integration commands/events plus delivery/run services | Existing GitHub group notifications, generic callers, deduplication, and secret separation pass end-to-end tests | Remove direct routing while retaining verified webhook adapters and supported external contracts | Planned |
 | Per-chat settings, files, memory references, and project selection | Principal/channel/agent/project-workspace records and artifact metadata | Existing per-user isolation, context assembly, memory provenance, file delivery, and workspace access remain equivalent | Migrate namespaces and remove Telegram-derived ownership from domain storage; retire recorded compatibility `storage_path` values when an authoritative artifact store replaces local per-chat files | Active (artifact metadata foundation and photo/document/voice shadow) |
@@ -968,3 +968,40 @@ The code cutover is not considered qualified until the deployed system proves:
 After that evidence, the next implementation milestone is removal of the
 private-text direct fallback and its shadow-delivery compatibility branch—not
 another delivery foundation.
+
+## 24. Private-text fallback retirement
+
+**Review date:** 2026-08-12
+
+**Evidence:** The installed cutover produced one in-place streamed response,
+one no-preview response, and one two-fragment response with a clean boundary
+between numbered items 91 and 92. A service restart replayed no confirmed
+fragment and the next response arrived once. The authoritative diagnostic then
+reported one active epoch, four succeeded deliveries, zero pending, leased,
+retrying, failed, or uncertain deliveries, no prior-epoch work, exact canonical
+projection parity, and no missing or unmatched JSONL records. Existing installed
+outbox qualification had already exercised abandoned-lease recovery, while the
+exact-epoch conversation worker's committed-work recovery remains pinned by its
+integrated restart tests. Route-selection tests and the deliberately narrow
+production selector preserve previously verified command, media, voice, file,
+group, schedule, and webhook behavior.
+
+**Decision:** **Retire direct and shadow fallback for the authoritative private
+text route.** Once an authenticated private-chat text request with voice mode
+off selects Workshop delivery, it may not demote back to legacy delivery:
+
+- missing canonical inbound identity or runtime adapters stop before backend
+  invocation and return a bounded operational notice;
+- a definite streaming-preview binding failure replaces the non-final preview
+  with a bounded notice and stops;
+- a definite finalization failure replaces an existing preview, or sends one
+  bounded notice when no preview exists, and stops;
+- an uncertain finalization result continues to refuse a resend because the
+  durable commit may already exist;
+- none of these branches writes an outbound shadow result, delivery observation,
+  or direct copy of the agent response.
+
+This retirement is scoped to the authoritative private-text route. The shadow
+recorders and direct-delivery implementation remain transitional dependencies
+for explicitly excluded routes until each receives its own authority review and
+cutover.

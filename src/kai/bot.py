@@ -4735,13 +4735,30 @@ async def _handle_response(
     if config.tts_enabled:
         voice_mode = await sessions.get_setting(f"voice_mode:{chat_id}") or "off"
     voice_only = voice_mode == "only"
+    workshop_delivery_requested = delivery_route == ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT and voice_mode == "off"
     workshop_delivery_candidate = (
-        delivery_route == ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT
-        and voice_mode == "off"
+        workshop_delivery_requested
         and workshop_inbound_message_id is not None
         and context.bot_data.get("workshop_streaming_preview_recorder") is not None
         and context.bot_data.get("workshop_streaming_finalizer") is not None
     )
+    if workshop_delivery_requested and not workshop_delivery_candidate:
+        log.error(
+            "Workshop authoritative delivery prerequisites are unavailable; refusing direct fallback "
+            "(inbound_message_id=%s)",
+            workshop_inbound_message_id,
+        )
+        log_message(
+            direction="assistant",
+            chat_id=chat_id,
+            text="[error: durable delivery preparation failed]",
+            reader_user=reader_user,
+        )
+        await _reply_safe(
+            update.message,
+            "Kai could not safely prepare durable delivery for this reply. Please try again.",
+        )
+        return
 
     # Keep activity indicator visible until the response completes.
     # Telegram hides the typing indicator after ~5 seconds, so we
@@ -4822,12 +4839,21 @@ async def _handle_response(
                             )
                         )
                     except Exception:
-                        workshop_delivery_candidate = False
                         log.exception(
-                            "Workshop streaming-preview binding failed; retaining direct delivery "
+                            "Workshop streaming-preview binding failed; refusing direct fallback "
                             "(inbound_message_id=%s)",
                             workshop_inbound_message_id,
                         )
+                        log_message(
+                            direction="assistant",
+                            chat_id=chat_id,
+                            text="[error: durable delivery preparation failed]",
+                            reader_user=reader_user,
+                        )
+                        notice = "Kai could not safely prepare durable delivery for this reply. Please try again."
+                        if not await _edit_message_safe(live_msg, notice):
+                            await _reply_safe(update.message, notice)
+                        return
             elif now - last_edit_time >= EDIT_INTERVAL:
                 await _edit_message_safe(live_msg, publishable)
                 last_edit_time = now
@@ -4900,16 +4926,19 @@ async def _handle_response(
         await sessions.save_session(chat_id, final_response.session_id, model)
 
     final_text = final_response.text
-    # Capture the assistant LogEntry so the provenance writer can stamp
-    # the exact JSONL ts/date/sha256 the line landed with. None means
-    # the append failed (logged by log_message itself); the extraction
-    # path then skips provenance stamping for this exchange.
-    assistant_log = log_message(
-        direction="assistant",
-        chat_id=chat_id,
-        text=final_text,
-        reader_user=reader_user,
-    )
+    # Authoritative Workshop replies enter JSONL only after their durable
+    # finalization commit is confirmed. Legacy routes retain their existing
+    # write timing. None means the append failed (logged by log_message itself);
+    # the extraction path then skips provenance stamping for this exchange.
+    if workshop_delivery_candidate:
+        assistant_log = None
+    else:
+        assistant_log = log_message(
+            direction="assistant",
+            chat_id=chat_id,
+            text=final_text,
+            reader_user=reader_user,
+        )
 
     workshop_outbound_message_id: MessageId | None = None
     workshop_delivery_committed = False
@@ -4934,6 +4963,14 @@ async def _handle_response(
                 workshop_inbound_message_id,
                 exc_info=True,
             )
+            # Preserve the answer for reconciliation: the durable transaction
+            # may already contain the identical canonical assistant message.
+            log_message(
+                direction="assistant",
+                chat_id=chat_id,
+                text=final_text,
+                reader_user=reader_user,
+            )
             await _reply_safe(
                 update.message,
                 "Kai could not safely confirm final delivery. The reply was not sent again to avoid a duplicate.",
@@ -4941,9 +4978,27 @@ async def _handle_response(
             return
         except Exception:
             log.exception(
-                "Workshop authoritative finalization failed; retaining direct delivery (inbound_message_id=%s)",
+                "Workshop authoritative finalization failed; refusing direct fallback (inbound_message_id=%s)",
                 workshop_inbound_message_id,
             )
+            log_message(
+                direction="assistant",
+                chat_id=chat_id,
+                text="[error: durable delivery finalization failed]",
+                reader_user=reader_user,
+            )
+            notice = "Kai could not safely finalize durable delivery for this reply. Please try again."
+            if live_msg is None or not await _edit_message_safe(live_msg, notice):
+                await _reply_safe(update.message, notice)
+            return
+
+    if workshop_delivery_candidate:
+        assistant_log = log_message(
+            direction="assistant",
+            chat_id=chat_id,
+            text=final_text,
+            reader_user=reader_user,
+        )
 
     outbound_recorder = context.bot_data.get("workshop_outbound_recorder")
     if not workshop_delivery_committed and workshop_inbound_message_id is not None and outbound_recorder is not None:

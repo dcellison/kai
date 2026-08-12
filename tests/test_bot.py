@@ -3774,21 +3774,22 @@ class TestHandleResponse:
         direct_edit.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_definite_workshop_failure_retains_direct_delivery(self):
+    async def test_definite_workshop_failure_refuses_direct_delivery(self):
         from kai.bot import _handle_response
 
         inbound_id = MessageId("msg_00000000000000000000000000000001")
         outbound_id = MessageId("msg_00000000000000000000000000000002")
         update = _make_update()
         pool = _make_mock_claude()
-        pool.send = MagicMock(return_value=_fake_stream(_done_event("Fallback answer")))
+        pool.send = MagicMock(return_value=_fake_stream(_done_event("Durable answer")))
         ctx = _make_context(pool=pool)
         _, finalizer = self._install_workshop_finalizer(ctx, outbound_id)
         finalizer.side_effect = RuntimeError("definite preparation failure")
         outbound, _ = self._install_workshop_recorders(ctx, outbound_id)
+        patches = self._base_patches()
 
         with (
-            patch.multiple("kai.bot", **self._base_patches()),
+            patch.multiple("kai.bot", **patches),
             patch("kai.bot._send_response", new_callable=AsyncMock) as direct_send,
         ):
             await _handle_response(
@@ -3803,8 +3804,130 @@ class TestHandleResponse:
             )
 
         finalizer.assert_awaited_once()
-        direct_send.assert_awaited_once_with(update, "Fallback answer")
-        outbound.assert_awaited_once()
+        direct_send.assert_not_awaited()
+        outbound.assert_not_awaited()
+        assert "could not safely finalize durable delivery" in update.message.reply_text.await_args.args[0]
+        assert patches["log_message"].call_args.kwargs["text"] == "[error: durable delivery finalization failed]"
+
+    @pytest.mark.asyncio
+    async def test_workshop_private_text_without_canonical_inbound_refuses_agent_and_direct_delivery(self):
+        from kai.bot import _handle_response
+
+        update = _make_update()
+        pool = _make_mock_claude()
+        ctx = _make_context(pool=pool)
+        self._install_workshop_finalizer(ctx, MessageId("msg_00000000000000000000000000000002"))
+        patches = self._base_patches()
+
+        with (
+            patch.multiple("kai.bot", **patches),
+            patch("kai.bot._send_response", new_callable=AsyncMock) as direct_send,
+        ):
+            await _handle_response(
+                update,
+                ctx,
+                12345,
+                "test",
+                pool,
+                "sonnet",
+                workshop_inbound_message_id=None,
+                delivery_route=ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT,
+            )
+
+        pool.send.assert_not_called()
+        direct_send.assert_not_awaited()
+        assert "could not safely prepare durable delivery" in update.message.reply_text.await_args.args[0]
+        assert patches["log_message"].call_args.kwargs["text"] == "[error: durable delivery preparation failed]"
+
+    @pytest.mark.asyncio
+    async def test_workshop_preview_binding_failure_replaces_preview_with_notice_and_stops(self):
+        from kai.bot import _handle_response
+
+        inbound_id = MessageId("msg_00000000000000000000000000000001")
+        outbound_id = MessageId("msg_00000000000000000000000000000002")
+        update = _make_update()
+        live_message = MagicMock(message_id=7001)
+        update.message.reply_text = AsyncMock(return_value=live_message)
+        pool = _make_mock_claude()
+        pool.send = MagicMock(
+            return_value=_fake_stream(
+                _text_event("Stable streamed sentence."),
+                _done_event("Final durable answer."),
+            )
+        )
+        ctx = _make_context(pool=pool)
+        preview, finalizer = self._install_workshop_finalizer(ctx, outbound_id)
+        preview.side_effect = RuntimeError("preview binding failed")
+        patches = self._base_patches()
+
+        with (
+            patch.multiple("kai.bot", **patches),
+            patch("kai.bot._edit_message_safe", new_callable=AsyncMock, return_value=True) as direct_edit,
+            patch("kai.bot._send_response", new_callable=AsyncMock) as direct_send,
+        ):
+            await _handle_response(
+                update,
+                ctx,
+                12345,
+                "test",
+                pool,
+                "sonnet",
+                workshop_inbound_message_id=inbound_id,
+                delivery_route=ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT,
+            )
+
+        preview.assert_awaited_once()
+        finalizer.assert_not_awaited()
+        direct_send.assert_not_awaited()
+        direct_edit.assert_awaited_once()
+        assert "could not safely prepare durable delivery" in direct_edit.await_args.args[1]
+        assert patches["log_message"].call_args.kwargs["text"] == "[error: durable delivery preparation failed]"
+
+    @pytest.mark.asyncio
+    async def test_workshop_finalization_failure_replaces_bound_preview_without_direct_answer(self):
+        from kai.bot import _handle_response
+
+        inbound_id = MessageId("msg_00000000000000000000000000000001")
+        outbound_id = MessageId("msg_00000000000000000000000000000002")
+        update = _make_update()
+        live_message = MagicMock(message_id=7001)
+        update.message.reply_text = AsyncMock(return_value=live_message)
+        pool = _make_mock_claude()
+        pool.send = MagicMock(
+            return_value=_fake_stream(
+                _text_event("Stable streamed sentence."),
+                _done_event("Undelivered durable answer."),
+            )
+        )
+        ctx = _make_context(pool=pool)
+        preview, finalizer = self._install_workshop_finalizer(ctx, outbound_id)
+        finalizer.side_effect = RuntimeError("finalization failed")
+        outbound, delivery = self._install_workshop_recorders(ctx, outbound_id)
+        patches = self._base_patches()
+
+        with (
+            patch.multiple("kai.bot", **patches),
+            patch("kai.bot._edit_message_safe", new_callable=AsyncMock, return_value=True) as direct_edit,
+            patch("kai.bot._send_response", new_callable=AsyncMock) as direct_send,
+        ):
+            await _handle_response(
+                update,
+                ctx,
+                12345,
+                "test",
+                pool,
+                "sonnet",
+                workshop_inbound_message_id=inbound_id,
+                delivery_route=ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT,
+            )
+
+        preview.assert_awaited_once()
+        finalizer.assert_awaited_once()
+        direct_send.assert_not_awaited()
+        outbound.assert_not_awaited()
+        delivery.assert_not_awaited()
+        assert "could not safely finalize durable delivery" in direct_edit.await_args.args[1]
+        assert patches["log_message"].call_args.kwargs["text"] == "[error: durable delivery finalization failed]"
 
     @pytest.mark.asyncio
     async def test_uncertain_workshop_commit_refuses_duplicate_direct_send(self):
@@ -3869,6 +3992,31 @@ class TestHandleResponse:
 
         finalizer.assert_not_awaited()
         update.message.reply_text.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_legacy_route_does_not_retry_failed_jsonl_append(self):
+        from kai.bot import _handle_response
+
+        update = _make_update()
+        pool = _make_mock_claude()
+        pool.send = MagicMock(return_value=_fake_stream(_done_event("Legacy answer")))
+        ctx = _make_context(pool=pool)
+        patches = self._base_patches()
+        patches["log_message"].return_value = None
+
+        with patch.multiple("kai.bot", **patches):
+            await _handle_response(
+                update,
+                ctx,
+                12345,
+                "test",
+                pool,
+                "sonnet",
+                delivery_route=ResponseDeliveryRoute.LEGACY,
+            )
+
+        patches["log_message"].assert_called_once()
+        assert patches["log_message"].call_args.kwargs["text"] == "Legacy answer"
 
     @pytest.mark.asyncio
     async def test_shadows_successful_assistant_result_and_text_delivery(self):
