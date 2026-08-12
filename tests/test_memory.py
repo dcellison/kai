@@ -120,8 +120,35 @@ try:
 except ImportError:
     _HAS_MEM0 = False
 
-# Skip integration tests when mem0ai is not installed
-integration = pytest.mark.skipif(not _HAS_MEM0, reason="mem0ai not installed")
+
+def _memory_model_is_cached() -> bool:
+    """Check the test embedding model without permitting network access."""
+    if not _HAS_MEM0:
+        return False
+    try:
+        from huggingface_hub import snapshot_download
+
+        snapshot_download(
+            "sentence-transformers/all-MiniLM-L6-v2",
+            local_files_only=True,
+        )
+    except Exception:
+        return False
+    return True
+
+
+_HAS_MEMORY_MODEL = _memory_model_is_cached()
+
+# Real-memory tests are optional. They may use a previously populated cache,
+# but a test invocation never downloads model data or probes Hugging Face.
+integration = pytest.mark.skipif(
+    not _HAS_MEM0 or not _HAS_MEMORY_MODEL,
+    reason=(
+        "mem0ai is not installed"
+        if not _HAS_MEM0
+        else "all-MiniLM-L6-v2 is not cached; initialize Kai memory once before running integration tests"
+    ),
+)
 
 
 @pytest.fixture(scope="module")

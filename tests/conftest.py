@@ -35,6 +35,18 @@ from unittest.mock import patch
 
 import pytest
 
+# Test runs must never make model-registry requests. Memory integration
+# tests use the already-cached embedding model; tests/test_memory.py skips
+# those cases with a clear reason when the cache is not populated. These
+# overrides must precede the first mem0/transformers/huggingface_hub import
+# because each library snapshots its offline setting at import time.
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+# Mem0 otherwise starts a PostHog client and flushes anonymous telemetry at
+# interpreter exit. Test isolation covers outbound telemetry as well as model
+# lookup, and disabling it also avoids an unnecessary telemetry Qdrant store.
+os.environ["MEM0_TELEMETRY"] = "false"
+
 # Hard override (NOT setdefault). A dev who happens to run the
 # suite with `MEM0_DIR=$HOME/.mem0` exported in their shell is the
 # exact scenario this fix targets; respecting an inherited value
