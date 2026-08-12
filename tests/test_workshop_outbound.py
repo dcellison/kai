@@ -2,21 +2,32 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import aiosqlite
 import pytest
 
 from kai import sessions
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
-from kai.workshop.domain import MessageId
+from kai.workshop.domain import (
+    ChannelBindingId,
+    EventEnvelope,
+    MessageId,
+    WorkshopEventType,
+    WorkshopId,
+)
 from kai.workshop.inbound import InboundMessage, record_inbound_message
 from kai.workshop.outbound import (
     DeliveryObservation,
+    OutboundDeliveryBindingError,
+    OutboundDeliveryStateConflictError,
     OutboundMessage,
     OutboundMessageNotFoundError,
     record_delivery_observation,
     record_outbound_message,
+    record_outbound_message_with_delivery,
 )
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
@@ -157,6 +168,229 @@ class TestOutboundMessage:
                 await record_outbound_message(store, _outbound(MessageId.new()))
         finally:
             await store.close()
+
+
+class TestAtomicOutboundDelivery:
+    async def test_commits_message_projection_request_event_and_pending_work_together(self, tmp_path: Path):
+        store, inbound_id = await _open_with_inbound(tmp_path / "kai.db")
+        try:
+            result = await record_outbound_message_with_delivery(store, _outbound(inbound_id))
+
+            assert result.message.inserted is True
+            assert result.delivery.inserted is True
+            assert result.delivery.delivery.message_id == result.message.event.envelope.aggregate_id
+            assert result.delivery.delivery.transport == "telegram"
+            assert result.delivery.delivery.mode == "text"
+            assert result.delivery.delivery.status == "pending"
+            assert result.delivery.delivery.attempt_count == 0
+            async with store.connection.execute(
+                "SELECT body, reply_to_message_id FROM messages WHERE id = ?",
+                (result.message.event.envelope.aggregate_id,),
+            ) as cursor:
+                assert tuple(await cursor.fetchone()) == ("Hello back", inbound_id)
+            async with store.connection.execute(
+                "SELECT event_type FROM event_log WHERE position IN (?, ?) ORDER BY position",
+                (result.message.event.position, result.delivery.delivery.requested_event_position),
+            ) as cursor:
+                assert [row[0] for row in await cursor.fetchall()] == [
+                    "message.created",
+                    "delivery.requested",
+                ]
+            async with store.connection.execute(
+                "SELECT last_position FROM projection_checkpoints WHERE name = 'canonical_conversations'"
+            ) as cursor:
+                assert (await cursor.fetchone())[0] == result.delivery.delivery.requested_event_position
+        finally:
+            await store.close()
+
+    async def test_retry_is_idempotent_across_restart_and_observation_time(self, tmp_path: Path):
+        path = tmp_path / "kai.db"
+        store, inbound_id = await _open_with_inbound(path)
+        first = await record_outbound_message_with_delivery(store, _outbound(inbound_id))
+        await store.close()
+
+        reopened = await WorkshopEventStore.open(path)
+        try:
+            retry = await record_outbound_message_with_delivery(
+                reopened,
+                OutboundMessage(inbound_id, "Hello back", _NOW + timedelta(minutes=5)),
+            )
+
+            assert retry.message.inserted is False
+            assert retry.delivery.inserted is False
+            assert retry.message.event == first.message.event
+            assert retry.delivery.delivery == first.delivery.delivery
+            async with reopened.connection.execute(
+                "SELECT COUNT(*) FROM event_log WHERE event_type IN ('message.created', 'delivery.requested')"
+            ) as cursor:
+                # One inbound message, one assistant message, and one request.
+                assert (await cursor.fetchone())[0] == 3
+            async with reopened.connection.execute("SELECT COUNT(*) FROM delivery_outbox") as cursor:
+                assert (await cursor.fetchone())[0] == 1
+        finally:
+            await reopened.close()
+
+    async def test_concurrent_retry_across_connections_creates_one_message_and_delivery(self, tmp_path: Path):
+        path = tmp_path / "kai.db"
+        first_store, inbound_id = await _open_with_inbound(path)
+        second_store = await WorkshopEventStore.open(path)
+        try:
+            first, second = await asyncio.gather(
+                record_outbound_message_with_delivery(first_store, _outbound(inbound_id)),
+                record_outbound_message_with_delivery(second_store, _outbound(inbound_id)),
+            )
+
+            assert sorted((first.message.inserted, second.message.inserted)) == [False, True]
+            assert sorted((first.delivery.inserted, second.delivery.inserted)) == [False, True]
+            assert first.message.event == second.message.event
+            assert first.delivery.delivery == second.delivery.delivery
+            async with first_store.connection.execute(
+                "SELECT COUNT(*) FROM event_log WHERE event_type IN ('message.created', 'delivery.requested')"
+            ) as cursor:
+                assert (await cursor.fetchone())[0] == 3
+            async with first_store.connection.execute("SELECT COUNT(*) FROM delivery_outbox") as cursor:
+                assert (await cursor.fetchone())[0] == 1
+        finally:
+            await first_store.close()
+            await second_store.close()
+
+    async def test_changed_body_fails_closed_without_changing_delivery(self, tmp_path: Path):
+        store, inbound_id = await _open_with_inbound(tmp_path / "kai.db")
+        try:
+            first = await record_outbound_message_with_delivery(store, _outbound(inbound_id, body="original"))
+
+            with pytest.raises(IdempotencyConflictError):
+                await record_outbound_message_with_delivery(store, _outbound(inbound_id, body="changed"))
+
+            async with store.connection.execute(
+                "SELECT body FROM messages WHERE id = ?", (first.message.event.envelope.aggregate_id,)
+            ) as cursor:
+                assert (await cursor.fetchone())[0] == "original"
+            async with store.connection.execute("SELECT COUNT(*) FROM delivery_outbox") as cursor:
+                assert (await cursor.fetchone())[0] == 1
+        finally:
+            await store.close()
+
+    async def test_missing_telegram_binding_rolls_back_without_creating_reply(self, tmp_path: Path):
+        store, inbound_id = await _open_with_inbound(tmp_path / "kai.db")
+        try:
+            await store.connection.execute("DELETE FROM channel_bindings")
+            await store.connection.commit()
+
+            with pytest.raises(OutboundDeliveryBindingError):
+                await record_outbound_message_with_delivery(store, _outbound(inbound_id))
+
+            await self._assert_no_outbound_delivery_state(store, inbound_id)
+        finally:
+            await store.close()
+
+    async def test_ambiguous_telegram_binding_rolls_back_without_guessing(self, tmp_path: Path):
+        store, inbound_id = await _open_with_inbound(tmp_path / "kai.db")
+        try:
+            async with store.connection.execute(
+                "SELECT c.workshop_id, m.channel_id FROM messages m "
+                "JOIN channels c ON c.id = m.channel_id WHERE m.id = ?",
+                (inbound_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            assert row is not None
+            workshop_id = WorkshopId(str(row[0]))
+            channel_id = str(row[1])
+            await store.append(
+                EventEnvelope.create(
+                    event_type=WorkshopEventType.TRANSPORT_CHANNEL_BOUND,
+                    event_version=1,
+                    workshop_id=workshop_id,
+                    aggregate_type="channel_binding",
+                    aggregate_id=ChannelBindingId.new(),
+                    occurred_at=_NOW,
+                    idempotency_key="test:second-telegram-binding",
+                    payload={
+                        "channel_id": channel_id,
+                        "transport": "telegram",
+                        "external_channel_id": "202",
+                    },
+                )
+            )
+            await store.project_pending(CanonicalConversationProjection())
+
+            with pytest.raises(OutboundDeliveryBindingError):
+                await record_outbound_message_with_delivery(store, _outbound(inbound_id))
+
+            await self._assert_no_outbound_delivery_state(store, inbound_id)
+        finally:
+            await store.close()
+
+    async def test_outbox_insert_failure_rolls_back_message_event_and_projection(self, tmp_path: Path):
+        store, inbound_id = await _open_with_inbound(tmp_path / "kai.db")
+        try:
+            await store.connection.execute(
+                "CREATE TRIGGER reject_atomic_delivery BEFORE INSERT ON delivery_outbox "
+                "BEGIN SELECT RAISE(ABORT, 'test delivery rejection'); END"
+            )
+            await store.connection.commit()
+
+            with pytest.raises(aiosqlite.IntegrityError, match="test delivery rejection"):
+                await record_outbound_message_with_delivery(store, _outbound(inbound_id))
+
+            await self._assert_no_outbound_delivery_state(store, inbound_id)
+        finally:
+            await store.close()
+
+    async def test_projection_failure_rolls_back_message_event_and_delivery(self, tmp_path: Path):
+        store, inbound_id = await _open_with_inbound(tmp_path / "kai.db")
+        try:
+            await store.connection.execute(
+                "CREATE TRIGGER reject_atomic_projection BEFORE INSERT ON messages "
+                "WHEN NEW.reply_to_message_id IS NOT NULL "
+                "BEGIN SELECT RAISE(ABORT, 'test projection rejection'); END"
+            )
+            await store.connection.commit()
+
+            with pytest.raises(aiosqlite.IntegrityError, match="test projection rejection"):
+                await record_outbound_message_with_delivery(store, _outbound(inbound_id))
+
+            await self._assert_no_outbound_delivery_state(store, inbound_id)
+        finally:
+            await store.close()
+
+    async def test_preexisting_message_without_delivery_is_rejected_as_half_state(self, tmp_path: Path):
+        store, inbound_id = await _open_with_inbound(tmp_path / "kai.db")
+        try:
+            prior = await record_outbound_message(store, _outbound(inbound_id))
+
+            with pytest.raises(OutboundDeliveryStateConflictError):
+                await record_outbound_message_with_delivery(store, _outbound(inbound_id))
+
+            async with store.connection.execute("SELECT COUNT(*) FROM delivery_outbox") as cursor:
+                assert (await cursor.fetchone())[0] == 0
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM event_log WHERE event_type = 'delivery.requested'"
+            ) as cursor:
+                assert (await cursor.fetchone())[0] == 0
+            async with store.connection.execute(
+                "SELECT body FROM messages WHERE id = ?", (prior.event.envelope.aggregate_id,)
+            ) as cursor:
+                assert (await cursor.fetchone())[0] == "Hello back"
+        finally:
+            await store.close()
+
+    @staticmethod
+    async def _assert_no_outbound_delivery_state(store: WorkshopEventStore, inbound_id: MessageId) -> None:
+        async with store.connection.execute(
+            "SELECT COUNT(*) FROM event_log WHERE "
+            "(event_type = 'message.created' AND json_extract(payload_json, '$.reply_to_message_id') = ?) "
+            "OR event_type = 'delivery.requested'",
+            (inbound_id,),
+        ) as cursor:
+            assert (await cursor.fetchone())[0] == 0
+        async with store.connection.execute(
+            "SELECT COUNT(*) FROM messages WHERE reply_to_message_id = ?",
+            (inbound_id,),
+        ) as cursor:
+            assert (await cursor.fetchone())[0] == 0
+        async with store.connection.execute("SELECT COUNT(*) FROM delivery_outbox") as cursor:
+            assert (await cursor.fetchone())[0] == 0
 
 
 class TestDeliveryObservation:

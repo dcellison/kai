@@ -170,6 +170,14 @@ def _request(
 
 
 class TestDeliveryRequests:
+    async def test_transactional_request_requires_caller_transaction(self, tmp_path: Path):
+        store, message_id, binding_id = await _open_with_outbound(tmp_path / "kai.db")
+        try:
+            with pytest.raises(RuntimeError, match="active transaction"):
+                await WorkshopDeliveryOutbox(store).request_delivery_in_transaction(_request(message_id, binding_id))
+        finally:
+            await store.close()
+
     async def test_request_atomically_records_event_and_pending_work_without_delivering(self, tmp_path: Path):
         store, message_id, binding_id = await _open_with_outbound(tmp_path / "kai.db")
         try:

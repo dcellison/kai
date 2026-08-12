@@ -156,8 +156,9 @@ def _retry_delay(attempt_number: int) -> timedelta:
 class WorkshopDeliveryOutbox:
     """Durable delivery state with lease-based, at-least-once work claims.
 
-    No production worker or transport adapter uses this class yet. Existing
-    direct Telegram delivery remains authoritative until a later cutover.
+    Only explicit qualification and production-unused application services use
+    this class. Existing direct Telegram delivery remains authoritative until
+    a later cutover registers a production worker.
     """
 
     def __init__(
@@ -173,86 +174,94 @@ class WorkshopDeliveryOutbox:
         connection = self._store.connection
         try:
             await connection.execute("BEGIN IMMEDIATE")
-            resolved = await self._resolve_target(request)
-            workshop_id, channel_id, author_principal_id, transport = resolved
-            delivery_id = DeliveryId.derived(
-                workshop_id,
-                f"delivery:{request.message_id}:{request.channel_binding_id}:{request.mode}",
-            )
-
-            existing = await self._state_for_identity(
-                request.message_id,
-                request.channel_binding_id,
-                request.mode,
-            )
-            if existing is not None:
-                if (
-                    existing.delivery_id != delivery_id
-                    or existing.channel_binding_id != request.channel_binding_id
-                    or existing.transport != transport
-                    or existing.max_attempts != request.max_attempts
-                ):
-                    raise DeliveryRequestConflictError("Delivery request identity has different semantics")
-                await connection.commit()
-                return DeliveryRequestResult(delivery=existing, inserted=False)
-
-            occurred_at = request.occurred_at.astimezone(UTC)
-            event = EventEnvelope.create(
-                event_id=EventId.derived(
-                    workshop_id,
-                    f"delivery-request-event:{request.message_id}:{request.channel_binding_id}:{request.mode}",
-                ),
-                event_type=WorkshopEventType.DELIVERY_REQUESTED,
-                event_version=1,
-                workshop_id=workshop_id,
-                aggregate_type="delivery",
-                aggregate_id=delivery_id,
-                actor_principal_id=author_principal_id,
-                occurred_at=occurred_at,
-                idempotency_key=(
-                    f"workshop-delivery-request:v1:{request.message_id}:{request.channel_binding_id}:{request.mode}"
-                ),
-                payload={
-                    "message_id": request.message_id,
-                    "channel_id": channel_id,
-                    "channel_binding_id": request.channel_binding_id,
-                    "transport": transport,
-                    "mode": request.mode,
-                    "max_attempts": request.max_attempts,
-                },
-                metadata={"source": "delivery_outbox"},
-            )
-            appended = await self._store.append_in_transaction(event)
-            if not appended.inserted:
-                raise DeliveryRequestConflictError("Delivery request event exists without outbox state")
-
-            timestamp = _format_timestamp(occurred_at)
-            await connection.execute(
-                "INSERT INTO delivery_outbox "
-                "(id, workshop_id, channel_id, channel_binding_id, message_id, transport, mode, "
-                "status, max_attempts, attempt_count, available_at, requested_event_position, "
-                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, ?, ?, ?, ?)",
-                (
-                    delivery_id,
-                    workshop_id,
-                    channel_id,
-                    request.channel_binding_id,
-                    request.message_id,
-                    transport,
-                    request.mode,
-                    request.max_attempts,
-                    timestamp,
-                    appended.event.position,
-                    timestamp,
-                    timestamp,
-                ),
-            )
-            state = await self._state_by_id(delivery_id)
+            result = await self.request_delivery_in_transaction(request)
             await connection.commit()
-            return DeliveryRequestResult(delivery=state, inserted=True)
+            return result
         except Exception:
             await connection.rollback()
             raise
+
+    async def request_delivery_in_transaction(self, request: DeliveryRequest) -> DeliveryRequestResult:
+        """Persist one delivery request without committing an existing transaction."""
+        connection = self._store.connection
+        if not connection.in_transaction:
+            raise RuntimeError("request_delivery_in_transaction requires an active transaction")
+
+        resolved = await self._resolve_target(request)
+        workshop_id, channel_id, author_principal_id, transport = resolved
+        delivery_id = DeliveryId.derived(
+            workshop_id,
+            f"delivery:{request.message_id}:{request.channel_binding_id}:{request.mode}",
+        )
+
+        existing = await self._state_for_identity(
+            request.message_id,
+            request.channel_binding_id,
+            request.mode,
+        )
+        if existing is not None:
+            if (
+                existing.delivery_id != delivery_id
+                or existing.channel_binding_id != request.channel_binding_id
+                or existing.transport != transport
+                or existing.max_attempts != request.max_attempts
+            ):
+                raise DeliveryRequestConflictError("Delivery request identity has different semantics")
+            return DeliveryRequestResult(delivery=existing, inserted=False)
+
+        occurred_at = request.occurred_at.astimezone(UTC)
+        event = EventEnvelope.create(
+            event_id=EventId.derived(
+                workshop_id,
+                f"delivery-request-event:{request.message_id}:{request.channel_binding_id}:{request.mode}",
+            ),
+            event_type=WorkshopEventType.DELIVERY_REQUESTED,
+            event_version=1,
+            workshop_id=workshop_id,
+            aggregate_type="delivery",
+            aggregate_id=delivery_id,
+            actor_principal_id=author_principal_id,
+            occurred_at=occurred_at,
+            idempotency_key=(
+                f"workshop-delivery-request:v1:{request.message_id}:{request.channel_binding_id}:{request.mode}"
+            ),
+            payload={
+                "message_id": request.message_id,
+                "channel_id": channel_id,
+                "channel_binding_id": request.channel_binding_id,
+                "transport": transport,
+                "mode": request.mode,
+                "max_attempts": request.max_attempts,
+            },
+            metadata={"source": "delivery_outbox"},
+        )
+        appended = await self._store.append_in_transaction(event)
+        if not appended.inserted:
+            raise DeliveryRequestConflictError("Delivery request event exists without outbox state")
+
+        timestamp = _format_timestamp(occurred_at)
+        await connection.execute(
+            "INSERT INTO delivery_outbox "
+            "(id, workshop_id, channel_id, channel_binding_id, message_id, transport, mode, "
+            "status, max_attempts, attempt_count, available_at, requested_event_position, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, ?, ?, ?, ?)",
+            (
+                delivery_id,
+                workshop_id,
+                channel_id,
+                request.channel_binding_id,
+                request.message_id,
+                transport,
+                request.mode,
+                request.max_attempts,
+                timestamp,
+                appended.event.position,
+                timestamp,
+                timestamp,
+            ),
+        )
+        state = await self._state_by_id(delivery_id)
+        return DeliveryRequestResult(delivery=state, inserted=True)
 
     async def claim_next(
         self,

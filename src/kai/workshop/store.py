@@ -297,50 +297,57 @@ class WorkshopEventStore:
 
     async def project_pending(self, projection: Projection) -> ProjectionCheckpoint:
         """Atomically apply events after a projection checkpoint."""
+        try:
+            await self._connection.execute("BEGIN IMMEDIATE")
+            checkpoint = await self.project_pending_in_transaction(projection)
+            await self._connection.commit()
+            return checkpoint
+        except Exception:
+            await self._connection.rollback()
+            raise
+
+    async def project_pending_in_transaction(self, projection: Projection) -> ProjectionCheckpoint:
+        """Apply pending events without committing an existing transaction."""
+        if not self._connection.in_transaction:
+            raise RuntimeError("project_pending_in_transaction requires an active transaction")
         if not _PROJECTION_NAME_PATTERN.fullmatch(projection.name):
             raise ValueError("Projection name must be a lowercase identifier")
         if not isinstance(projection.version, int) or isinstance(projection.version, bool) or projection.version < 1:
             raise ValueError("Projection version must be a positive integer")
 
-        try:
-            await self._connection.execute("BEGIN IMMEDIATE")
-            async with self._connection.execute(
-                "SELECT version, last_position FROM projection_checkpoints WHERE name = ?",
-                (projection.name,),
-            ) as cursor:
-                checkpoint_row = await cursor.fetchone()
+        async with self._connection.execute(
+            "SELECT version, last_position FROM projection_checkpoints WHERE name = ?",
+            (projection.name,),
+        ) as cursor:
+            checkpoint_row = await cursor.fetchone()
 
-            if checkpoint_row is None or int(checkpoint_row[0]) < projection.version:
-                await projection.reset(self._connection)
-                after_position = 0
-            elif int(checkpoint_row[0]) > projection.version:
-                raise RuntimeError(
-                    f"Projection {projection.name!r} is newer than this build: "
-                    f"stored={int(checkpoint_row[0])}, supported={projection.version}"
-                )
-            else:
-                after_position = int(checkpoint_row[1])
-
-            events = await self.read_events(after_position=after_position)
-            for event in events:
-                await projection.apply(self._connection, event)
-            last_position = events[-1].position if events else after_position
-            updated_at = _format_timestamp(datetime.now(UTC))
-            await self._connection.execute(
-                """
-                INSERT INTO projection_checkpoints (name, version, last_position, updated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(name) DO UPDATE SET
-                    version = excluded.version,
-                    last_position = excluded.last_position,
-                    updated_at = excluded.updated_at
-                """,
-                (projection.name, projection.version, last_position, updated_at),
+        if checkpoint_row is None or int(checkpoint_row[0]) < projection.version:
+            await projection.reset(self._connection)
+            after_position = 0
+        elif int(checkpoint_row[0]) > projection.version:
+            raise RuntimeError(
+                f"Projection {projection.name!r} is newer than this build: "
+                f"stored={int(checkpoint_row[0])}, supported={projection.version}"
             )
-            await self._connection.commit()
-        except Exception:
-            await self._connection.rollback()
-            raise
+        else:
+            after_position = int(checkpoint_row[1])
+
+        events = await self.read_events(after_position=after_position)
+        for event in events:
+            await projection.apply(self._connection, event)
+        last_position = events[-1].position if events else after_position
+        updated_at = _format_timestamp(datetime.now(UTC))
+        await self._connection.execute(
+            """
+            INSERT INTO projection_checkpoints (name, version, last_position, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                version = excluded.version,
+                last_position = excluded.last_position,
+                updated_at = excluded.updated_at
+            """,
+            (projection.name, projection.version, last_position, updated_at),
+        )
         return ProjectionCheckpoint(
             name=projection.name,
             version=projection.version,

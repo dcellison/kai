@@ -787,6 +787,26 @@ class MessageCountProjection(Projection):
 
 
 class TestProjectionReplay:
+    async def test_transactional_projection_requires_and_preserves_caller_transaction(self, workshop_store):
+        projection = MessageCountProjection()
+        with pytest.raises(RuntimeError, match="active transaction"):
+            await workshop_store.project_pending_in_transaction(projection)
+
+        await workshop_store.append(_message_event())
+        await workshop_store.connection.execute("BEGIN IMMEDIATE")
+        checkpoint = await workshop_store.project_pending_in_transaction(projection)
+        assert workshop_store.connection.in_transaction is True
+        assert checkpoint.last_position == 1
+        async with workshop_store.connection.execute("SELECT SUM(message_count) FROM test_message_counts") as cursor:
+            assert (await cursor.fetchone())[0] == 1
+        await workshop_store.connection.rollback()
+
+        async with workshop_store.connection.execute(
+            "SELECT COUNT(*) FROM projection_checkpoints WHERE name = ?",
+            (projection.name,),
+        ) as cursor:
+            assert (await cursor.fetchone())[0] == 0
+
     async def test_rebuild_is_deterministic_and_records_checkpoint(self, workshop_store):
         await workshop_store.append(_message_event(idempotency_key="telegram:message:1", text="one"))
         await workshop_store.append(_message_event(idempotency_key="telegram:message:2", text="two"))
