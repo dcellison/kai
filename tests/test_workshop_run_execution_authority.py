@@ -386,7 +386,7 @@ class TestRunExecutionMigration:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 16
+            assert await upgraded.schema_version() == 17
             assert "run_attempts" in await upgraded.schema_tables()
             async with upgraded.connection.execute("PRAGMA table_info(runs)") as cursor:
                 columns = {str(row[1]) for row in await cursor.fetchall()}

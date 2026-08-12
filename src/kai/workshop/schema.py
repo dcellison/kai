@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 16
+WORKSHOP_SCHEMA_VERSION = 17
 
 
 @dataclass(frozen=True, slots=True)
@@ -629,6 +629,96 @@ _RUN_EXECUTION_AUTHORITY_SCHEMA = SchemaMigration(
     ),
 )
 
+_CLIENT_SECURITY_STATE_ISOLATION_SCHEMA = SchemaMigration(
+    version=17,
+    name="isolate_client_security_state_from_projection_rebuilds",
+    statements=(
+        """
+        CREATE TABLE workshop_client_devices_v17 (
+            -- principal_id is deliberately not a foreign key. Principals are
+            -- replayed collaboration projections, while devices are mutable
+            -- security state that must survive projection reset/replay.
+            id TEXT PRIMARY KEY,
+            principal_id TEXT NOT NULL,
+            display_name TEXT NOT NULL CHECK (
+                length(trim(display_name)) > 0 AND length(display_name) <= 200
+            ),
+            created_at TEXT NOT NULL,
+            last_seen_at TEXT,
+            revoked_at TEXT,
+            UNIQUE (id, principal_id)
+        )
+        """,
+        """
+        CREATE TABLE workshop_client_sessions_v17 (
+            id TEXT PRIMARY KEY,
+            device_id TEXT NOT NULL,
+            principal_id TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE CHECK (length(token_hash) = 64),
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            last_seen_at TEXT,
+            revoked_at TEXT,
+            FOREIGN KEY (device_id, principal_id)
+                REFERENCES workshop_client_devices_v17(id, principal_id) ON DELETE CASCADE
+        )
+        """,
+        """
+        CREATE TABLE workshop_client_enrollment_grants_v17 (
+            id TEXT PRIMARY KEY,
+            principal_id TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE CHECK (length(token_hash) = 64),
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            redeemed_at TEXT,
+            revoked_at TEXT,
+            device_id TEXT,
+            session_id TEXT REFERENCES workshop_client_sessions_v17(id) ON DELETE RESTRICT,
+            FOREIGN KEY (device_id, principal_id)
+                REFERENCES workshop_client_devices_v17(id, principal_id) ON DELETE RESTRICT,
+            CHECK (
+                (redeemed_at IS NULL AND device_id IS NULL AND session_id IS NULL)
+                OR (redeemed_at IS NOT NULL AND device_id IS NOT NULL AND session_id IS NOT NULL)
+            )
+        )
+        """,
+        """
+        INSERT INTO workshop_client_devices_v17 (
+            id, principal_id, display_name, created_at, last_seen_at, revoked_at
+        ) SELECT id, principal_id, display_name, created_at, last_seen_at, revoked_at
+          FROM workshop_client_devices
+        """,
+        """
+        INSERT INTO workshop_client_sessions_v17 (
+            id, device_id, principal_id, token_hash, created_at, expires_at,
+            last_seen_at, revoked_at
+        ) SELECT id, device_id, principal_id, token_hash, created_at, expires_at,
+                 last_seen_at, revoked_at
+          FROM workshop_client_sessions
+        """,
+        """
+        INSERT INTO workshop_client_enrollment_grants_v17 (
+            id, principal_id, token_hash, created_at, expires_at, redeemed_at,
+            revoked_at, device_id, session_id
+        ) SELECT id, principal_id, token_hash, created_at, expires_at, redeemed_at,
+                 revoked_at, device_id, session_id
+          FROM workshop_client_enrollment_grants
+        """,
+        "DROP TABLE workshop_client_enrollment_grants",
+        "DROP TABLE workshop_client_sessions",
+        "DROP TABLE workshop_client_devices",
+        "ALTER TABLE workshop_client_devices_v17 RENAME TO workshop_client_devices",
+        "ALTER TABLE workshop_client_sessions_v17 RENAME TO workshop_client_sessions",
+        "ALTER TABLE workshop_client_enrollment_grants_v17 RENAME TO workshop_client_enrollment_grants",
+        "CREATE INDEX workshop_client_devices_principal_idx ON workshop_client_devices (principal_id, revoked_at)",
+        "CREATE INDEX workshop_client_sessions_principal_idx "
+        "ON workshop_client_sessions (principal_id, revoked_at, expires_at)",
+        "CREATE INDEX workshop_client_sessions_device_idx ON workshop_client_sessions (device_id, revoked_at)",
+        "CREATE INDEX workshop_client_enrollment_principal_idx "
+        "ON workshop_client_enrollment_grants (principal_id, redeemed_at, revoked_at, expires_at)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -646,6 +736,7 @@ _MIGRATIONS = (
     _DELIVERY_AUTHORITY_EPOCH_SCHEMA,
     _DURABLE_RUN_LIFECYCLE_SCHEMA,
     _RUN_EXECUTION_AUTHORITY_SCHEMA,
+    _CLIENT_SECURITY_STATE_ISOLATION_SCHEMA,
 )
 
 

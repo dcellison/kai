@@ -18,6 +18,7 @@ from kai.workshop.client_sessions import (
     WorkshopClientSessionManager,
 )
 from kai.workshop.domain import EnrollmentGrantId, PrincipalId
+from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import WorkshopEventStore
 
 _NOW = datetime(2026, 8, 11, 17, 0, tzinfo=UTC)
@@ -255,3 +256,85 @@ class TestWorkshopEnrollmentRevocation:
                 await _manager(restarted, clock).redeem_grant(grant.token, "Alice laptop")
         finally:
             await restarted.close()
+
+
+class TestWorkshopClientSecurityStateIsolation:
+    async def test_version_sixteen_upgrade_and_projection_rebuild_preserve_security_state(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        from kai.workshop import schema
+
+        db_path = tmp_path / "kai.db"
+        with monkeypatch.context() as migration_context:
+            migration_context.setattr(schema, "WORKSHOP_SCHEMA_VERSION", 16)
+            migration_context.setattr(schema, "_MIGRATIONS", schema._MIGRATIONS[:16])
+            store, alice_id, _, _ = await _open_store(db_path)
+            clock = _Clock()
+            enrollment = _manager(store, clock)
+            sessions = WorkshopClientSessionManager(
+                store,
+                clock=clock,
+                token_secret_factory=iter(("x" * 43, "y" * 43, "z" * 43)).__next__,
+            )
+
+            active_device = await sessions.register_device(alice_id, "Active device")
+            active_session = await sessions.issue_session(alice_id, active_device.device_id)
+            revoked_session = await sessions.issue_session(alice_id, active_device.device_id)
+            assert await sessions.revoke_session(alice_id, revoked_session.session_id) is True
+
+            revoked_device = await sessions.register_device(alice_id, "Revoked device")
+            revoked_device_session = await sessions.issue_session(alice_id, revoked_device.device_id)
+            assert await sessions.revoke_device(alice_id, revoked_device.device_id) is True
+
+            active_grant = await enrollment.issue_grant(alice_id)
+            revoked_grant = await enrollment.issue_grant(alice_id)
+            assert await enrollment.revoke_grant(alice_id, revoked_grant.grant_id) is True
+            redeemed_grant = await enrollment.issue_grant(alice_id)
+            redeemed = await enrollment.redeem_grant(redeemed_grant.token, "Redeemed device")
+            await store.close()
+
+        upgraded = await WorkshopEventStore.open(db_path)
+        try:
+
+            async def security_rows(table: str) -> list[tuple[object, ...]]:
+                async with upgraded.connection.execute(f"SELECT * FROM {table} ORDER BY id") as cursor:
+                    return [tuple(row) for row in await cursor.fetchall()]
+
+            before = {
+                table: await security_rows(table)
+                for table in (
+                    "workshop_client_devices",
+                    "workshop_client_sessions",
+                    "workshop_client_enrollment_grants",
+                )
+            }
+            await upgraded.rebuild_projection(CanonicalConversationProjection())
+            after = {table: await security_rows(table) for table in before}
+
+            assert await upgraded.schema_version() == 17
+            assert after == before
+            async with upgraded.connection.execute("PRAGMA foreign_key_check") as cursor:
+                assert await cursor.fetchall() == []
+            for table in ("workshop_client_devices", "workshop_client_enrollment_grants"):
+                async with upgraded.connection.execute(f"PRAGMA foreign_key_list({table})") as cursor:
+                    assert "principals" not in {str(row[2]) for row in await cursor.fetchall()}
+
+            session_manager = WorkshopClientSessionManager(upgraded, clock=clock)
+            assert await session_manager.authenticate_token(active_session.token) is not None
+            assert await session_manager.authenticate_token(revoked_session.token) is None
+            assert await session_manager.authenticate_token(revoked_device_session.token) is None
+            assert await session_manager.authenticate_token(redeemed.session.token) is not None
+
+            enrollment_manager = WorkshopClientEnrollmentManager(
+                upgraded,
+                clock=clock,
+                session_secret_factory=lambda: "w" * 43,
+            )
+            with pytest.raises(EnrollmentGrantUnavailableError):
+                await enrollment_manager.redeem_grant(revoked_grant.token, "Rejected device")
+            new_client = await enrollment_manager.redeem_grant(active_grant.token, "New device")
+            assert new_client.device.principal_id == alice_id
+        finally:
+            await upgraded.close()

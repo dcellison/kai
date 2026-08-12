@@ -192,7 +192,9 @@ class WorkshopClientSessionManager:
         try:
             await connection.execute("BEGIN IMMEDIATE")
             async with connection.execute(
-                "SELECT 1 FROM workshop_client_devices WHERE id = ? AND principal_id = ? AND revoked_at IS NULL",
+                "SELECT 1 FROM workshop_client_devices d "
+                "JOIN principals p ON p.id = d.principal_id AND p.kind = 'human' "
+                "WHERE d.id = ? AND d.principal_id = ? AND d.revoked_at IS NULL",
                 (device_id, principal_id),
             ) as cursor:
                 device_available = await cursor.fetchone() is not None
@@ -231,7 +233,9 @@ class WorkshopClientSessionManager:
                 "SELECT s.principal_id, s.device_id, s.token_hash, s.expires_at, "
                 "s.revoked_at, d.revoked_at FROM workshop_client_sessions s "
                 "JOIN workshop_client_devices d ON d.id = s.device_id "
-                "AND d.principal_id = s.principal_id WHERE s.id = ?",
+                "AND d.principal_id = s.principal_id "
+                "JOIN principals p ON p.id = s.principal_id AND p.kind = 'human' "
+                "WHERE s.id = ?",
                 (session_id,),
             ) as cursor:
                 row = await cursor.fetchone()
