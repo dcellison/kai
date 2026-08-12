@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -12,7 +13,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
-from kai.workshop.client_api import register_workshop_read_routes
+from kai.workshop.client_api import WorkshopEventStreamLimiter, register_workshop_read_routes
 from kai.workshop.domain import ChannelId, PrincipalId
 from kai.workshop.inbound import InboundMessage, record_inbound_message
 from kai.workshop.store import WorkshopEventStore
@@ -61,8 +62,8 @@ async def _open_store(path: Path) -> tuple[WorkshopEventStore, PrincipalId, Chan
     return store, alice_id, alice_channel, bob_id, bob_channel
 
 
-async def _record_messages(store: WorkshopEventStore, count: int) -> None:
-    for ordinal in range(1, count + 1):
+async def _record_messages(store: WorkshopEventStore, count: int, *, start: int = 1) -> None:
+    for ordinal in range(start, start + count):
         await record_inbound_message(
             store,
             InboundMessage(
@@ -80,6 +81,11 @@ async def _record_messages(store: WorkshopEventStore, count: int) -> None:
 async def _open_client(
     store: WorkshopEventStore,
     authenticator: _Authenticator,
+    *,
+    event_poll_interval: float = 0.01,
+    event_heartbeat_interval: float = 0.05,
+    event_authentication_recheck_interval: float = 0.01,
+    event_stream_limiter: WorkshopEventStreamLimiter | None = None,
 ) -> TestClient:
     app = web.Application()
     register_workshop_read_routes(
@@ -87,10 +93,43 @@ async def _open_client(
         store=store,
         authenticator=authenticator,
         request_lock=asyncio.Lock(),
+        event_poll_interval=event_poll_interval,
+        event_heartbeat_interval=event_heartbeat_interval,
+        event_authentication_recheck_interval=event_authentication_recheck_interval,
+        event_stream_limiter=event_stream_limiter,
     )
     client = TestClient(TestServer(app))
     await client.start_server()
     return client
+
+
+async def _read_sse_event(response) -> dict[str, object]:
+    event_name: str | None = None
+    event_id: str | None = None
+    data_lines: list[str] = []
+    while True:
+        raw_line = await asyncio.wait_for(response.content.readline(), timeout=1.0)
+        assert raw_line, "Event stream ended before the next event"
+        line = raw_line.decode().rstrip("\r\n")
+        if not line:
+            if event_name is None:
+                continue
+            return {
+                "event": event_name,
+                "id": event_id,
+                "data": json.loads("\n".join(data_lines)),
+            }
+        if line.startswith(":"):
+            continue
+        field, separator, value = line.partition(":")
+        if separator and value.startswith(" "):
+            value = value[1:]
+        if field == "event":
+            event_name = value
+        elif field == "id":
+            event_id = value
+        elif field == "data":
+            data_lines.append(value)
 
 
 class TestWorkshopTimelineHTTPContract:
@@ -243,8 +282,280 @@ class TestWorkshopTimelineHTTPContract:
             )
 
             assert response.status == 405
+            events_response = await client.post(
+                f"/v1/channels/{alice_channel}/events",
+                headers={"Authorization": "Bearer alice-token"},
+                json={"body": "must not be accepted"},
+            )
+            assert events_response.status == 405
             async with store.connection.execute("SELECT COUNT(*) FROM messages") as cursor:
                 assert (await cursor.fetchone())[0] == 0
+        finally:
+            await client.close()
+            await store.close()
+
+
+class TestWorkshopTimelineEventStreamHTTPContract:
+    async def test_replays_authorized_canonical_messages_as_versioned_sse(self, tmp_path: Path):
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        await _record_messages(store, 2)
+        client = await _open_client(store, _Authenticator({"alice-token": alice_id}))
+        response = None
+        try:
+            response = await client.get(
+                f"/v1/channels/{alice_channel}/events?after_position=0",
+                headers={"Authorization": "Bearer alice-token"},
+            )
+            first = await _read_sse_event(response)
+            second = await _read_sse_event(response)
+
+            assert response.status == 200
+            assert response.content_type == "text/event-stream"
+            assert response.charset == "utf-8"
+            assert response.headers["Cache-Control"] == "private, no-store"
+            assert response.headers["Content-Security-Policy"] == "default-src 'none'"
+            assert response.headers["Referrer-Policy"] == "no-referrer"
+            assert response.headers["X-Content-Type-Options"] == "nosniff"
+            assert response.headers["X-Accel-Buffering"] == "no"
+            assert [first["event"], second["event"]] == [
+                "timeline.message.created",
+                "timeline.message.created",
+            ]
+            assert int(str(first["id"])) < int(str(second["id"]))
+            assert first["data"] == {
+                "version": 1,
+                "channel_id": alice_channel,
+                "message": {
+                    "message_id": first["data"]["message"]["message_id"],
+                    "channel_id": alice_channel,
+                    "author_principal_id": alice_id,
+                    "author_kind": "human",
+                    "author_display_name": "Alice",
+                    "reply_to_message_id": None,
+                    "body": "Message 1",
+                    "event_position": int(str(first["id"])),
+                    "created_at": "2026-08-11T14:00:01Z",
+                },
+            }
+            assert second["data"]["message"]["body"] == "Message 2"
+        finally:
+            if response is not None:
+                response.close()
+            await client.close()
+            await store.close()
+
+    async def test_future_only_stream_receives_message_committed_after_connect(self, tmp_path: Path):
+        database = tmp_path / "kai.db"
+        writer, alice_id, alice_channel, _, _ = await _open_store(database)
+        reader = await WorkshopEventStore.open(database)
+        client = await _open_client(reader, _Authenticator({"alice-token": alice_id}))
+        response = None
+        try:
+            response = await client.get(
+                f"/v1/channels/{alice_channel}/events",
+                headers={"Authorization": "Bearer alice-token"},
+            )
+            await _record_messages(writer, 1)
+
+            event = await _read_sse_event(response)
+
+            assert event["event"] == "timeline.message.created"
+            assert event["data"]["message"]["body"] == "Message 1"
+        finally:
+            if response is not None:
+                response.close()
+            await client.close()
+            await reader.close()
+            await writer.close()
+
+    async def test_last_event_id_resumes_after_store_restart_and_overrides_initial_query(self, tmp_path: Path):
+        database = tmp_path / "kai.db"
+        store, alice_id, alice_channel, _, _ = await _open_store(database)
+        await _record_messages(store, 1)
+        first_client = await _open_client(store, _Authenticator({"alice-token": alice_id}))
+        first_response = await first_client.get(
+            f"/v1/channels/{alice_channel}/events?after_position=0",
+            headers={"Authorization": "Bearer alice-token"},
+        )
+        first_event = await _read_sse_event(first_response)
+        first_response.close()
+        await first_client.close()
+        await _record_messages(store, 1, start=2)
+        await store.close()
+
+        restarted = await WorkshopEventStore.open(database)
+        second_client = await _open_client(restarted, _Authenticator({"new-token": alice_id}))
+        second_response = None
+        try:
+            second_response = await second_client.get(
+                f"/v1/channels/{alice_channel}/events?after_position=0",
+                headers={
+                    "Authorization": "Bearer new-token",
+                    "Last-Event-ID": str(first_event["id"]),
+                },
+            )
+            second_event = await _read_sse_event(second_response)
+
+            assert int(str(second_event["id"])) > int(str(first_event["id"]))
+            assert second_event["data"]["message"]["body"] == "Message 2"
+        finally:
+            if second_response is not None:
+                second_response.close()
+            await second_client.close()
+            await restarted.close()
+
+    async def test_open_stream_rechecks_authentication_and_closes_after_revocation(self, tmp_path: Path):
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        authenticator = _Authenticator({"alice-token": alice_id})
+        client = await _open_client(store, authenticator)
+        response = None
+        try:
+            response = await client.get(
+                f"/v1/channels/{alice_channel}/events",
+                headers={"Authorization": "Bearer alice-token"},
+            )
+            assert (await response.content.readline()).startswith(b": connected")
+            assert await response.content.readline() == b"retry: 2000\n"
+            assert await response.content.readline() == b"\n"
+
+            authenticator.principals_by_token.clear()
+
+            assert await asyncio.wait_for(response.content.read(), timeout=1.0) == b""
+            assert len(authenticator.calls) >= 2
+        finally:
+            if response is not None:
+                response.close()
+            await client.close()
+            await store.close()
+
+    async def test_idle_polling_does_not_rewrite_session_last_seen_on_every_poll(self, tmp_path: Path):
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        authenticator = _Authenticator({"alice-token": alice_id})
+        client = await _open_client(
+            store,
+            authenticator,
+            event_poll_interval=0.005,
+            event_heartbeat_interval=0.01,
+            event_authentication_recheck_interval=0.2,
+        )
+        response = None
+        try:
+            response = await client.get(
+                f"/v1/channels/{alice_channel}/events",
+                headers={"Authorization": "Bearer alice-token"},
+            )
+            await asyncio.sleep(0.05)
+
+            assert authenticator.calls == ["Bearer alice-token"]
+        finally:
+            if response is not None:
+                response.close()
+            await client.close()
+            await store.close()
+
+    async def test_concurrent_stream_capacity_is_bounded_and_released_on_disconnect(self, tmp_path: Path):
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        limiter = WorkshopEventStreamLimiter(per_principal_limit=1, global_limit=1)
+        client = await _open_client(
+            store,
+            _Authenticator({"alice-token": alice_id}),
+            event_poll_interval=0.005,
+            event_heartbeat_interval=0.01,
+            event_stream_limiter=limiter,
+        )
+        first_response = None
+        replacement_response = None
+        try:
+            headers = {"Authorization": "Bearer alice-token"}
+            path = f"/v1/channels/{alice_channel}/events"
+            first_response = await client.get(path, headers=headers)
+            rejected = await client.get(path, headers=headers)
+
+            assert first_response.status == 200
+            assert rejected.status == 429
+            assert rejected.headers["Retry-After"] == "5"
+            assert await rejected.json() == {
+                "error": {
+                    "code": "stream_capacity_exceeded",
+                    "message": "Too many active event streams",
+                }
+            }
+
+            first_response.close()
+            first_response = None
+            await asyncio.sleep(0.05)
+            replacement_response = await client.get(path, headers=headers)
+            assert replacement_response.status == 200
+        finally:
+            if first_response is not None:
+                first_response.close()
+            if replacement_response is not None:
+                replacement_response.close()
+            await client.close()
+            await store.close()
+
+    async def test_unauthenticated_event_stream_is_rejected_before_input_or_storage(self, tmp_path: Path):
+        store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+        client = await _open_client(store, _Authenticator({"alice-token": alice_id}))
+        await store.close()
+        try:
+            response = await client.get("/v1/channels/not-an-id/events?after_position=invalid")
+
+            assert response.status == 401
+            assert response.headers["WWW-Authenticate"] == "Bearer"
+            assert await response.json() == {
+                "error": {"code": "authentication_required", "message": "Authentication required"}
+            }
+        finally:
+            await client.close()
+
+    async def test_cross_channel_and_unknown_event_streams_have_same_denial(self, tmp_path: Path):
+        store, alice_id, _, _, bob_channel = await _open_store(tmp_path / "kai.db")
+        client = await _open_client(store, _Authenticator({"alice-token": alice_id}))
+        try:
+            headers = {"Authorization": "Bearer alice-token"}
+            cross_channel = await client.get(f"/v1/channels/{bob_channel}/events", headers=headers)
+            unknown_channel = await client.get(f"/v1/channels/{ChannelId.new()}/events", headers=headers)
+
+            assert cross_channel.status == unknown_channel.status == 403
+            assert (
+                await cross_channel.json()
+                == await unknown_channel.json()
+                == {"error": {"code": "access_denied", "message": "Access denied"}}
+            )
+        finally:
+            await client.close()
+            await store.close()
+
+    @pytest.mark.parametrize(
+        ("query", "headers", "status", "error"),
+        [
+            ("?after_position=-1", {}, 400, "invalid_request"),
+            ("?after_position=one", {}, 400, "invalid_request"),
+            ("?after_position=1&after_position=2", {}, 400, "invalid_request"),
+            ("?cursor=unused", {}, 400, "invalid_request"),
+            ("", {"Last-Event-ID": "invalid"}, 400, "invalid_request"),
+            ("?after_position=999999", {}, 409, "resynchronization_required"),
+        ],
+    )
+    async def test_invalid_or_unresumable_event_position_is_bounded(
+        self,
+        tmp_path: Path,
+        query: str,
+        headers: dict[str, str],
+        status: int,
+        error: str,
+    ):
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        client = await _open_client(store, _Authenticator({"alice-token": alice_id}))
+        try:
+            response = await client.get(
+                f"/v1/channels/{alice_channel}/events{query}",
+                headers={"Authorization": "Bearer alice-token", **headers},
+            )
+
+            assert response.status == status
+            assert (await response.json())["error"]["code"] == error
         finally:
             await client.close()
             await store.close()

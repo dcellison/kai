@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
+import aiosqlite
+
 from kai.workshop.domain import ChannelId, MessageId, PrincipalId
 from kai.workshop.store import WorkshopEventStore
 
@@ -24,6 +26,10 @@ class TimelineAccessDeniedError(PermissionError):
 
 class TimelineCursorError(ValueError):
     """A timeline pagination cursor is invalid for the requested channel."""
+
+
+class TimelineResumeError(ValueError):
+    """A live timeline position cannot be resumed against this event store."""
 
 
 class ChannelTimelineAuthorizer(Protocol):
@@ -54,6 +60,14 @@ class TimelinePage:
     messages: tuple[TimelineMessage, ...]
     next_cursor: str | None
     through_position: int
+
+
+@dataclass(frozen=True, slots=True)
+class TimelineUpdateBatch:
+    """Canonical messages after one resumable channel event position."""
+
+    messages: tuple[TimelineMessage, ...]
+    next_position: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +167,31 @@ async def _latest_message_position(store: WorkshopEventStore, channel_id: Channe
     return int(row[0])
 
 
+async def _latest_event_position(store: WorkshopEventStore) -> int:
+    async with store.connection.execute("SELECT COALESCE(MAX(position), 0) FROM event_log") as cursor:
+        row = await cursor.fetchone()
+    if row is None:
+        raise RuntimeError("Event-log boundary query returned no row")
+    return int(row[0])
+
+
+def _messages_from_rows(rows: list[aiosqlite.Row]) -> tuple[TimelineMessage, ...]:
+    return tuple(
+        TimelineMessage(
+            message_id=MessageId(str(row[0])),
+            channel_id=ChannelId(str(row[1])),
+            author_principal_id=PrincipalId(str(row[2])),
+            author_kind=str(row[3]),
+            author_display_name=str(row[4]),
+            reply_to_message_id=MessageId(str(row[5])) if row[5] is not None else None,
+            body=str(row[6]),
+            event_position=int(row[7]),
+            created_at=_parse_timestamp(str(row[8])),
+        )
+        for row in rows
+    )
+
+
 async def read_channel_timeline(
     store: WorkshopEventStore,
     *,
@@ -188,20 +227,7 @@ async def read_channel_timeline(
 
     has_more = len(rows) > limit
     page_rows = rows[:limit]
-    messages = tuple(
-        TimelineMessage(
-            message_id=MessageId(str(row[0])),
-            channel_id=ChannelId(str(row[1])),
-            author_principal_id=PrincipalId(str(row[2])),
-            author_kind=str(row[3]),
-            author_display_name=str(row[4]),
-            reply_to_message_id=MessageId(str(row[5])) if row[5] is not None else None,
-            body=str(row[6]),
-            event_position=int(row[7]),
-            created_at=_parse_timestamp(str(row[8])),
-        )
-        for row in page_rows
-    )
+    messages = _messages_from_rows(page_rows)
     next_cursor = None
     if has_more:
         next_cursor = _encode_cursor(
@@ -212,3 +238,53 @@ async def read_channel_timeline(
             )
         )
     return TimelinePage(messages, next_cursor, state.through_position)
+
+
+async def read_channel_timeline_updates(
+    store: WorkshopEventStore,
+    *,
+    principal_id: PrincipalId,
+    channel_id: ChannelId,
+    authorizer: ChannelTimelineAuthorizer,
+    after_position: int | None,
+    limit: int = 100,
+) -> TimelineUpdateBatch:
+    """Read an authorized resumable batch of new canonical channel messages.
+
+    ``None`` begins at the current channel boundary, which makes a new stream
+    future-only. Supplying a prior SSE event position replays every later
+    canonical message in order. Positions ahead of the durable event log fail
+    closed so a restored or mismatched client is forced through timeline
+    resynchronization instead of silently missing future messages.
+    """
+    _validate_request(principal_id, channel_id, limit)
+    if after_position is not None and (
+        not isinstance(after_position, int)
+        or isinstance(after_position, bool)
+        or after_position < 0
+        or after_position > _MAX_SQLITE_INTEGER
+    ):
+        raise TimelineResumeError("Invalid timeline resume position")
+    await _authorize(authorizer, principal_id, channel_id)
+
+    if not await _channel_exists(store, channel_id):
+        raise TimelineAccessDeniedError("Timeline access denied")
+
+    if after_position is None:
+        return TimelineUpdateBatch((), await _latest_message_position(store, channel_id))
+    if after_position > await _latest_event_position(store):
+        raise TimelineResumeError("Timeline resume position is ahead of the event log")
+
+    async with store.connection.execute(
+        "SELECT m.id, m.channel_id, m.author_principal_id, p.kind, p.display_name, "
+        "m.reply_to_message_id, m.body, m.created_event_position, m.created_at "
+        "FROM messages m JOIN principals p ON p.id = m.author_principal_id "
+        "WHERE m.channel_id = ? AND m.created_event_position > ? "
+        "ORDER BY m.created_event_position ASC LIMIT ?",
+        (channel_id, after_position, limit),
+    ) as query_cursor:
+        rows = list(await query_cursor.fetchall())
+
+    messages = _messages_from_rows(rows)
+    next_position = messages[-1].event_position if messages else after_position
+    return TimelineUpdateBatch(messages, next_position)

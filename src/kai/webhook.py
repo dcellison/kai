@@ -11,7 +11,7 @@ Provides functionality to:
 6. Proxy authenticated requests to external services (service layer)
 7. Send text messages and files to the Telegram chat (messaging APIs)
 8. Monitor webhook health and auto-recover from Telegram delivery failures
-9. Redeem Workshop client enrollment grants and read authorized timelines
+9. Redeem Workshop client enrollment grants and synchronize authorized timelines
 
 The server always runs on aiohttp alongside the Telegram bot in the same event
 loop, regardless of transport mode. In polling mode, Telegram updates arrive via
@@ -33,6 +33,7 @@ Routes are organized into these groups:
     - /api/memory/all       - Delete all memories for a user (DELETE, requires confirm token)
     - /v1/client/enrollment/redeem - Exchange an operator-issued Workshop grant
     - /v1/channels/{id}/timeline   - Read one authorized canonical timeline
+    - /v1/channels/{id}/events     - Resume authorized canonical message events
 
 Every ingress domain has an independent credential. Telegram uses its configured
 or process-generated secret token, GitHub uses GITHUB_WEBHOOK_SECRET, and the

@@ -15,6 +15,7 @@ from kai.workshop.artifacts import (
 from kai.workshop.authorization import CanonicalChannelAuthorizer
 from kai.workshop.client_api import (
     WorkshopClientAuthenticator,
+    WorkshopEventStreamLimiter,
     register_workshop_enrollment_routes,
     register_workshop_read_routes,
 )
@@ -125,7 +126,10 @@ from kai.workshop.timeline import (
     TimelineCursorError,
     TimelineMessage,
     TimelinePage,
+    TimelineResumeError,
+    TimelineUpdateBatch,
     read_channel_timeline,
+    read_channel_timeline_updates,
 )
 
 __all__ = [
@@ -206,6 +210,8 @@ __all__ = [
     "TimelineCursorError",
     "TimelineMessage",
     "TimelinePage",
+    "TimelineResumeError",
+    "TimelineUpdateBatch",
     "TrackedClientDevice",
     "UnsettledDeliveryFragmentError",
     "WorkshopBearerSessionAuthenticator",
@@ -215,6 +221,7 @@ __all__ = [
     "WorkshopDeliveryFragments",
     "WorkshopDeliveryOutbox",
     "WorkshopEventStore",
+    "WorkshopEventStreamLimiter",
     "WorkshopEventType",
     "WorkshopId",
     "WorkshopMembershipId",
@@ -225,6 +232,7 @@ __all__ = [
     "WorkshopTelegramStreamingFinalizationWorker",
     "bind_confirmed_telegram_streaming_preview",
     "read_channel_timeline",
+    "read_channel_timeline_updates",
     "record_inbound_artifact",
     "register_workshop_enrollment_routes",
     "register_workshop_read_routes",

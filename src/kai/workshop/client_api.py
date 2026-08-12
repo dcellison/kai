@@ -1,9 +1,10 @@
-"""Authenticated HTTP contracts for Workshop client enrollment and timeline reads."""
+"""Authenticated HTTP contracts for Workshop enrollment and read-only synchronization."""
 
 from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import math
 import re
 import time
@@ -22,14 +23,21 @@ from kai.workshop.timeline import (
     TimelineAccessDeniedError,
     TimelineCursorError,
     TimelineMessage,
+    TimelineResumeError,
+    TimelineUpdateBatch,
     read_channel_timeline,
+    read_channel_timeline_updates,
 )
 
 _TIMELINE_PATH = "/v1/channels/{channel_id}/timeline"
+_TIMELINE_EVENTS_PATH = "/v1/channels/{channel_id}/events"
 _ENROLLMENT_REDEMPTION_PATH = "/v1/client/enrollment/redeem"
-_ALLOWED_QUERY_PARAMETERS = frozenset({"cursor", "limit"})
+_ALLOWED_TIMELINE_QUERY_PARAMETERS = frozenset({"cursor", "limit"})
+_ALLOWED_EVENT_QUERY_PARAMETERS = frozenset({"after_position"})
 _ENROLLMENT_REQUEST_FIELDS = frozenset({"enrollment_token", "device_display_name"})
 _DECIMAL_INTEGER = re.compile(r"^[0-9]+$")
+_EVENT_BATCH_SIZE = 100
+_SSE_RETRY_MILLISECONDS = 2000
 
 
 class WorkshopClientAuthenticator(Protocol):
@@ -111,12 +119,48 @@ class WorkshopEnrollmentRateLimiter:
         return None
 
 
-def _json_response(payload: dict[str, object], *, status: int) -> web.Response:
-    response = web.json_response(payload, status=status)
+class WorkshopEventStreamLimiter:
+    """Bound concurrent long-lived streams per principal and process."""
+
+    def __init__(self, *, per_principal_limit: int = 4, global_limit: int = 32) -> None:
+        if per_principal_limit < 1 or global_limit < per_principal_limit:
+            raise ValueError("Event-stream concurrency bounds are invalid")
+        self._per_principal_limit = per_principal_limit
+        self._global_limit = global_limit
+        self._active_total = 0
+        self._active_by_principal: dict[PrincipalId, int] = {}
+
+    def acquire(self, principal_id: PrincipalId) -> bool:
+        if not isinstance(principal_id, PrincipalId):
+            return False
+        active_for_principal = self._active_by_principal.get(principal_id, 0)
+        if self._active_total >= self._global_limit or active_for_principal >= self._per_principal_limit:
+            return False
+        self._active_total += 1
+        self._active_by_principal[principal_id] = active_for_principal + 1
+        return True
+
+    def release(self, principal_id: PrincipalId) -> None:
+        active_for_principal = self._active_by_principal.get(principal_id, 0)
+        if active_for_principal < 1 or self._active_total < 1:
+            raise RuntimeError("Event-stream capacity was released without an active claim")
+        if active_for_principal == 1:
+            del self._active_by_principal[principal_id]
+        else:
+            self._active_by_principal[principal_id] = active_for_principal - 1
+        self._active_total -= 1
+
+
+def _apply_client_security_headers(response: web.StreamResponse) -> None:
     response.headers["Cache-Control"] = "private, no-store"
     response.headers["Content-Security-Policy"] = "default-src 'none'"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["X-Content-Type-Options"] = "nosniff"
+
+
+def _json_response(payload: dict[str, object], *, status: int) -> web.Response:
+    response = web.json_response(payload, status=status)
+    _apply_client_security_headers(response)
     return response
 
 
@@ -132,7 +176,7 @@ def _single_query_value(request: web.Request, name: str) -> str | None:
 
 
 def _parse_timeline_request(request: web.Request) -> tuple[ChannelId, str | None, int]:
-    if not set(request.query).issubset(_ALLOWED_QUERY_PARAMETERS):
+    if not set(request.query).issubset(_ALLOWED_TIMELINE_QUERY_PARAMETERS):
         raise ValueError("Unsupported query parameter")
 
     channel_id = ChannelId(request.match_info["channel_id"])
@@ -145,6 +189,22 @@ def _parse_timeline_request(request: web.Request) -> tuple[ChannelId, str | None
     else:
         limit = int(limit_value)
     return channel_id, cursor, limit
+
+
+def _parse_event_stream_request(request: web.Request) -> tuple[ChannelId, int | None]:
+    if not set(request.query).issubset(_ALLOWED_EVENT_QUERY_PARAMETERS):
+        raise ValueError("Unsupported query parameter")
+
+    channel_id = ChannelId(request.match_info["channel_id"])
+    last_event_ids = request.headers.getall("Last-Event-ID", [])
+    if len(last_event_ids) > 1:
+        raise ValueError("Duplicate Last-Event-ID header")
+    value = last_event_ids[0] if last_event_ids else _single_query_value(request, "after_position")
+    if value is None:
+        return channel_id, None
+    if not _DECIMAL_INTEGER.fullmatch(value):
+        raise ValueError("Invalid timeline resume position")
+    return channel_id, int(value)
 
 
 def _format_timestamp(value: datetime) -> str:
@@ -210,6 +270,159 @@ async def _handle_channel_timeline(
         },
         status=200,
     )
+
+
+def _serialize_timeline_event(message: TimelineMessage) -> bytes:
+    payload = json.dumps(
+        {
+            "version": 1,
+            "channel_id": str(message.channel_id),
+            "message": _serialize_message(message),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return (f"id: {message.event_position}\nevent: timeline.message.created\ndata: {payload}\n\n").encode()
+
+
+async def _authorized_update_batch(
+    request: web.Request,
+    *,
+    store: WorkshopEventStore,
+    authenticator: WorkshopClientAuthenticator,
+    request_lock: asyncio.Lock,
+    expected_principal_id: PrincipalId | None,
+    channel_id: ChannelId,
+    after_position: int | None,
+    reauthenticate: bool,
+) -> tuple[PrincipalId | None, TimelineUpdateBatch | None]:
+    async with request_lock:
+        principal_id = expected_principal_id
+        if reauthenticate:
+            principal_id = await authenticator.authenticate(request)
+            if not isinstance(principal_id, PrincipalId) or principal_id != expected_principal_id:
+                return None, None
+        if not isinstance(principal_id, PrincipalId):
+            return None, None
+        try:
+            batch = await read_channel_timeline_updates(
+                store,
+                principal_id=principal_id,
+                channel_id=channel_id,
+                authorizer=CanonicalChannelAuthorizer(store),
+                after_position=after_position,
+                limit=_EVENT_BATCH_SIZE,
+            )
+        except TimelineAccessDeniedError:
+            return principal_id, None
+    return principal_id, batch
+
+
+async def _handle_channel_event_stream(
+    request: web.Request,
+    *,
+    store: WorkshopEventStore,
+    authenticator: WorkshopClientAuthenticator,
+    request_lock: asyncio.Lock,
+    poll_interval: float,
+    heartbeat_interval: float,
+    authentication_recheck_interval: float,
+    stream_limiter: WorkshopEventStreamLimiter,
+) -> web.StreamResponse:
+    try:
+        async with request_lock:
+            principal_id = await authenticator.authenticate(request)
+            if not isinstance(principal_id, PrincipalId):
+                response = _error_response(
+                    status=401,
+                    code="authentication_required",
+                    message="Authentication required",
+                )
+                response.headers["WWW-Authenticate"] = "Bearer"
+                return response
+            channel_id, after_position = _parse_event_stream_request(request)
+            initial_batch = await read_channel_timeline_updates(
+                store,
+                principal_id=principal_id,
+                channel_id=channel_id,
+                authorizer=CanonicalChannelAuthorizer(store),
+                after_position=after_position,
+                limit=_EVENT_BATCH_SIZE,
+            )
+    except TimelineAccessDeniedError:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except TimelineResumeError:
+        return _error_response(
+            status=409,
+            code="resynchronization_required",
+            message="Timeline resynchronization required",
+        )
+    except (TypeError, ValueError):
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid event-stream request",
+        )
+
+    if not stream_limiter.acquire(principal_id):
+        response = _error_response(
+            status=429,
+            code="stream_capacity_exceeded",
+            message="Too many active event streams",
+        )
+        response.headers["Retry-After"] = "5"
+        return response
+
+    response = web.StreamResponse(status=200)
+    try:
+        response.content_type = "text/event-stream"
+        response.charset = "utf-8"
+        _apply_client_security_headers(response)
+        response.headers["X-Accel-Buffering"] = "no"
+        await response.prepare(request)
+
+        position = initial_batch.next_position
+        batch = initial_batch
+        last_heartbeat = time.monotonic()
+        last_authentication_check = last_heartbeat
+        await response.write(f": connected\nretry: {_SSE_RETRY_MILLISECONDS}\n\n".encode())
+        while True:
+            if batch.messages:
+                for message in batch.messages:
+                    await response.write(_serialize_timeline_event(message))
+                position = batch.next_position
+                batch = TimelineUpdateBatch((), position)
+                last_heartbeat = time.monotonic()
+                continue
+
+            now = time.monotonic()
+            if now - last_heartbeat >= heartbeat_interval:
+                await response.write(b": keep-alive\n\n")
+                last_heartbeat = now
+            await asyncio.sleep(poll_interval)
+
+            reauthenticate = time.monotonic() - last_authentication_check >= authentication_recheck_interval
+            _, next_batch = await _authorized_update_batch(
+                request,
+                store=store,
+                authenticator=authenticator,
+                request_lock=request_lock,
+                expected_principal_id=principal_id,
+                channel_id=channel_id,
+                after_position=position,
+                reauthenticate=reauthenticate,
+            )
+            if reauthenticate:
+                last_authentication_check = time.monotonic()
+            if next_batch is None:
+                break
+            batch = next_batch
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    finally:
+        stream_limiter.release(principal_id)
+    return response
 
 
 async def _handle_enrollment_redemption(
@@ -300,8 +513,15 @@ def register_workshop_read_routes(
     store: WorkshopEventStore,
     authenticator: WorkshopClientAuthenticator,
     request_lock: asyncio.Lock,
+    event_poll_interval: float = 1.0,
+    event_heartbeat_interval: float = 15.0,
+    event_authentication_recheck_interval: float = 15.0,
+    event_stream_limiter: WorkshopEventStreamLimiter | None = None,
 ) -> None:
     """Register the read-only contract on an explicitly supplied application."""
+    if event_poll_interval <= 0 or event_heartbeat_interval <= 0 or event_authentication_recheck_interval <= 0:
+        raise ValueError("Event-stream intervals must be positive")
+    stream_limiter = event_stream_limiter or WorkshopEventStreamLimiter()
 
     async def handle_channel_timeline(request: web.Request) -> web.Response:
         async with request_lock:
@@ -311,7 +531,20 @@ def register_workshop_read_routes(
                 authenticator=authenticator,
             )
 
+    async def handle_channel_event_stream(request: web.Request) -> web.StreamResponse:
+        return await _handle_channel_event_stream(
+            request,
+            store=store,
+            authenticator=authenticator,
+            request_lock=request_lock,
+            poll_interval=event_poll_interval,
+            heartbeat_interval=event_heartbeat_interval,
+            authentication_recheck_interval=event_authentication_recheck_interval,
+            stream_limiter=stream_limiter,
+        )
+
     app.router.add_get(_TIMELINE_PATH, handle_channel_timeline)
+    app.router.add_get(_TIMELINE_EVENTS_PATH, handle_channel_event_stream)
 
 
 def register_workshop_enrollment_routes(

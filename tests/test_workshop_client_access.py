@@ -155,7 +155,9 @@ class TestWorkshopClientProductionRegistration:
 
             assert ("POST", "/v1/client/enrollment/redeem") in routes
             assert ("GET", "/v1/channels/{channel_id}/timeline") in routes
+            assert ("GET", "/v1/channels/{channel_id}/events") in routes
             assert ("POST", "/v1/channels/{channel_id}/timeline") not in routes
+            assert ("POST", "/v1/channels/{channel_id}/events") not in routes
             assert ("POST", "/v1/client/enrollment") not in routes
 
             operator_store = await WorkshopEventStore.open(database)
@@ -179,6 +181,14 @@ class TestWorkshopClientProductionRegistration:
             )
             assert timeline.status == 200
             assert (await timeline.json())["channel_id"] == issued.channel_id
+
+            events = await client.get(
+                f"/v1/channels/{issued.channel_id}/events",
+                headers={"Authorization": f"Bearer {redeemed['session']['token']}"},
+            )
+            assert events.status == 200
+            assert events.content_type == "text/event-stream"
+            events.close()
         finally:
             if client is not None:
                 await client.close()
