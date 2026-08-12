@@ -190,56 +190,71 @@ class WorkshopRunLifecycle:
         connection = self._store.connection
         try:
             await connection.execute("BEGIN IMMEDIATE")
-            projection = CanonicalConversationProjection()
-            await self._store.project_pending_in_transaction(projection)
-            existing_run = await _load_run_by_inbound_message(self._store, inbound_message_id)
-            if existing_run is not None:
-                existing_payload: dict[str, object] = {
-                    "inbound_message_id": existing_run.inbound_message_id,
-                    "channel_id": existing_run.channel_id,
-                    "requested_by_principal_id": existing_run.requested_by_principal_id,
-                    "agent_id": existing_run.agent_id,
-                }
-                existing_event = await _existing_event(
-                    self._store,
-                    run=existing_run,
-                    status=RunStatus.ACCEPTED,
-                    actor_principal_id=existing_run.requested_by_principal_id,
-                    payload=existing_payload,
-                )
-                if existing_event is None:
-                    raise RunLifecycleConflictError("Durable run is missing its acceptance event")
-                await connection.commit()
-                return RunLifecycleResult(run=existing_run, event=existing_event, changed=False)
-
-            target = await resolve_canonical_conversation_target(self._store, inbound_message_id)
-            run_id = RunId.derived(target.workshop_id, f"conversation:{inbound_message_id}")
-            payload: dict[str, object] = {
-                "inbound_message_id": target.inbound_message_id,
-                "channel_id": target.channel_id,
-                "requested_by_principal_id": target.requested_by_principal_id,
-                "agent_id": target.agent_id,
-            }
-            event = EventEnvelope.create(
-                event_id=EventId.derived(run_id, "accepted"),
-                event_type=WorkshopEventType.RUN_ACCEPTED,
-                event_version=1,
-                workshop_id=target.workshop_id,
-                aggregate_type="run",
-                aggregate_id=run_id,
-                actor_principal_id=target.requested_by_principal_id,
-                occurred_at=occurred_at,
-                idempotency_key=_event_key(run_id, RunStatus.ACCEPTED),
-                payload=payload,
-                metadata={"source": "workshop_run_lifecycle"},
-            )
-            appended = await self._store.append_in_transaction(event)
-            await self._store.project_pending_in_transaction(projection)
-            run = await _load_run(self._store, run_id)
-            if run is None:
-                raise RunLifecycleConflictError("Accepted run was not projected")
+            result = await self.accept_in_transaction(inbound_message_id, occurred_at=occurred_at)
             await connection.commit()
-            return RunLifecycleResult(run=run, event=appended.event, changed=appended.inserted)
+            return result
         except Exception:
             await connection.rollback()
             raise
+
+    async def accept_in_transaction(
+        self,
+        inbound_message_id: MessageId,
+        *,
+        occurred_at: datetime,
+    ) -> RunLifecycleResult:
+        """Accept one run inside a caller-owned transaction."""
+        if not isinstance(inbound_message_id, MessageId):
+            raise ValueError("inbound_message_id must be a MessageId")
+        occurred_at = _require_timestamp(occurred_at)
+        if not self._store.connection.in_transaction:
+            raise RuntimeError("accept_in_transaction requires an active transaction")
+
+        projection = CanonicalConversationProjection()
+        await self._store.project_pending_in_transaction(projection)
+        existing_run = await _load_run_by_inbound_message(self._store, inbound_message_id)
+        if existing_run is not None:
+            existing_payload: dict[str, object] = {
+                "inbound_message_id": existing_run.inbound_message_id,
+                "channel_id": existing_run.channel_id,
+                "requested_by_principal_id": existing_run.requested_by_principal_id,
+                "agent_id": existing_run.agent_id,
+            }
+            existing_event = await _existing_event(
+                self._store,
+                run=existing_run,
+                status=RunStatus.ACCEPTED,
+                actor_principal_id=existing_run.requested_by_principal_id,
+                payload=existing_payload,
+            )
+            if existing_event is None:
+                raise RunLifecycleConflictError("Durable run is missing its acceptance event")
+            return RunLifecycleResult(run=existing_run, event=existing_event, changed=False)
+
+        target = await resolve_canonical_conversation_target(self._store, inbound_message_id)
+        run_id = RunId.derived(target.workshop_id, f"conversation:{inbound_message_id}")
+        payload: dict[str, object] = {
+            "inbound_message_id": target.inbound_message_id,
+            "channel_id": target.channel_id,
+            "requested_by_principal_id": target.requested_by_principal_id,
+            "agent_id": target.agent_id,
+        }
+        event = EventEnvelope.create(
+            event_id=EventId.derived(run_id, "accepted"),
+            event_type=WorkshopEventType.RUN_ACCEPTED,
+            event_version=1,
+            workshop_id=target.workshop_id,
+            aggregate_type="run",
+            aggregate_id=run_id,
+            actor_principal_id=target.requested_by_principal_id,
+            occurred_at=occurred_at,
+            idempotency_key=_event_key(run_id, RunStatus.ACCEPTED),
+            payload=payload,
+            metadata={"source": "workshop_run_lifecycle"},
+        )
+        appended = await self._store.append_in_transaction(event)
+        await self._store.project_pending_in_transaction(projection)
+        run = await _load_run(self._store, run_id)
+        if run is None:
+            raise RunLifecycleConflictError("Accepted run was not projected")
+        return RunLifecycleResult(run=run, event=appended.event, changed=appended.inserted)

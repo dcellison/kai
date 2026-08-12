@@ -1559,3 +1559,59 @@ Then, in separate bounded changes:
 
 Do not register a generic execution worker, emit live run facts, or change the
 installed Telegram path in the command-acceptance slice.
+
+## 30. Production-unused atomic conversation-command acceptance
+
+**Implementation date:** 2026-08-12
+
+The first bounded implementation from section 29 now provides one
+production-unused `WorkshopConversationCommandService`. It accepts a validated
+`InboundMessage` and owns a single `BEGIN IMMEDIATE` transaction spanning both
+the deterministic canonical `message.created` event and its deterministic
+`run.accepted` event. Both projections advance before commit, so no successful
+call can expose a canonical command without its run or an accepted run without
+its command.
+
+The existing inbound recorder and run lifecycle retain their public contracts.
+They now also expose transaction-local primitives that reject use without an
+active caller-owned transaction. The command service is the only coordinator
+of those primitives. If one event existed before the transaction and the other
+would be new, the service rolls back and reports a state conflict instead of
+silently repairing a half-authoritative command.
+
+Exact retries verify the stored message content and acceptance authority, then
+return a typed durable disposition:
+
+- `newly_accepted`: both facts committed by this call;
+- `ready_replay`: both facts already existed and no active attempt or
+  cancellation request blocks later preparation;
+- `active_replay`: a granted or started attempt already owns the run;
+- `cancellation_pending_replay`: durable human cancellation intent exists;
+- `terminal_replay`: the run is completed, failed, or cancelled.
+
+No disposition invokes a backend. A started run without an active attempt,
+multiple active attempts, changed content under the same transport identity,
+ambiguous canonical attachment, or any partial prior state fails closed.
+Concurrent duplicate commands on independent SQLite connections serialize to
+one new acceptance and one ready replay. Rollback, exact retry, conflicting
+content, partial-state rejection, active/cancellation/terminal classification,
+and projection-rebuild tests pin the contract.
+
+This foundation remains production-unused. `main.py`, `bot.py`, and
+`sessions.py` do not import or construct it. It changes no Telegram ingress,
+compatibility queue, backend process, lock, stop event, streaming preview,
+outbox, JSONL history, memory, media, command, schedule, integration, or
+installed behavior. No schema migration or generic worker was added.
+
+### 30.1 Next bounded milestone
+
+Add production-unused **protected asynchronous execution preparation**. It
+must resolve the hidden compatibility runtime and fully effective registered
+backend/provider/model selection as one object after pending persisted settings
+have been applied. The exact prepared runtime must later perform dispatch, so
+the attempt selection cannot differ from what executes. Callers continue to
+supply only canonical run identity and never a transport pool key, backend,
+provider, model, command, executable path, environment, or credential.
+
+Do not grant live attempts, call a backend, change the Telegram handler, or
+register a worker in that slice.

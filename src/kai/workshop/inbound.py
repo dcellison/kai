@@ -100,32 +100,47 @@ async def _resolve_binding(store: WorkshopEventStore, message: InboundMessage) -
     )
 
 
+def _inbound_envelope(binding: _ResolvedInboundBinding, message: InboundMessage) -> EventEnvelope:
+    token = _stable_token(message)
+    return EventEnvelope.create(
+        event_id=EventId.derived(binding.workshop_id, f"inbound-message-event:{token}"),
+        event_type=WorkshopEventType.MESSAGE_CREATED,
+        event_version=1,
+        workshop_id=binding.workshop_id,
+        aggregate_type="message",
+        aggregate_id=MessageId.derived(binding.workshop_id, f"inbound-message:{token}"),
+        actor_principal_id=binding.principal_id,
+        occurred_at=message.occurred_at,
+        idempotency_key=f"workshop-inbound:v1:{message.transport}:{token}",
+        payload={
+            "channel_id": binding.channel_id,
+            "author_principal_id": binding.principal_id,
+            "body": message.body,
+        },
+        metadata={
+            "source": message.transport,
+            "transport_update_id": message.update_id,
+            "transport_message_id": message.message_id,
+        },
+    )
+
+
+async def record_inbound_message_in_transaction(
+    store: WorkshopEventStore,
+    message: InboundMessage,
+) -> AppendResult:
+    """Append and project one inbound message inside a caller-owned transaction."""
+    if not store.connection.in_transaction:
+        raise RuntimeError("record_inbound_message_in_transaction requires an active transaction")
+    binding = await _resolve_binding(store, message)
+    result = await store.append_in_transaction(_inbound_envelope(binding, message))
+    await store.project_pending_in_transaction(CanonicalConversationProjection())
+    return result
+
+
 async def record_inbound_message(store: WorkshopEventStore, message: InboundMessage) -> AppendResult:
     """Append and project one authenticated inbound transport message."""
     binding = await _resolve_binding(store, message)
-    token = _stable_token(message)
-    result = await store.append(
-        EventEnvelope.create(
-            event_id=EventId.derived(binding.workshop_id, f"inbound-message-event:{token}"),
-            event_type=WorkshopEventType.MESSAGE_CREATED,
-            event_version=1,
-            workshop_id=binding.workshop_id,
-            aggregate_type="message",
-            aggregate_id=MessageId.derived(binding.workshop_id, f"inbound-message:{token}"),
-            actor_principal_id=binding.principal_id,
-            occurred_at=message.occurred_at,
-            idempotency_key=f"workshop-inbound:v1:{message.transport}:{token}",
-            payload={
-                "channel_id": binding.channel_id,
-                "author_principal_id": binding.principal_id,
-                "body": message.body,
-            },
-            metadata={
-                "source": message.transport,
-                "transport_update_id": message.update_id,
-                "transport_message_id": message.message_id,
-            },
-        )
-    )
+    result = await store.append(_inbound_envelope(binding, message))
     await store.project_pending(CanonicalConversationProjection())
     return result
