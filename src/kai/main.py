@@ -45,11 +45,11 @@ from telegram.error import NetworkError
 from kai import cron, services, sessions, webhook
 from kai.bot import create_bot
 from kai.config import DATA_DIR, PROJECT_ROOT, _read_protected_file, load_config
-from kai.workshop.bootstrap import BootstrapHuman
+from kai.workshop.bootstrap import BootstrapHuman, BootstrapNotificationChannel
 
 
 def _workshop_bootstrap_humans(config) -> tuple[BootstrapHuman, ...]:
-    """Map authorized humans to transport bindings without notification groups."""
+    """Map authorized humans to their interactive direct-channel bindings."""
     return tuple(
         BootstrapHuman(
             display_name=user.name,
@@ -59,6 +59,25 @@ def _workshop_bootstrap_humans(config) -> tuple[BootstrapHuman, ...]:
             external_channel_id=str(user.telegram_id),
         )
         for user in sorted(config.user_configs.values(), key=lambda user: user.telegram_id)
+    )
+
+
+async def _workshop_bootstrap_notification_channels(config) -> tuple[BootstrapNotificationChannel, ...]:
+    """Map effective Telegram group destinations without changing live routing."""
+    members_by_group: dict[int, set[str]] = {}
+    for user in sorted(config.user_configs.values(), key=lambda item: item.telegram_id):
+        effective = await sessions.resolve_github_settings(user.telegram_id, config)
+        destination = effective["notify_chat_id"]
+        if destination >= 0:
+            continue
+        members_by_group.setdefault(destination, set()).add(str(user.telegram_id))
+    return tuple(
+        BootstrapNotificationChannel(
+            transport="telegram",
+            external_channel_id=str(destination),
+            member_external_subjects=tuple(sorted(members)),
+        )
+        for destination, members in sorted(members_by_group.items())
     )
 
 
@@ -262,10 +281,13 @@ def _start() -> None:
         await sessions.init_db(config.session_db_path)
 
         # Seed the non-authoritative Workshop identity/channel projection.
-        # Only configured interactive users participate; GitHub notification
-        # destinations are delivery targets and never become principals or
-        # inbound channel bindings through this migration.
-        workshop_bootstrap = await sessions.bootstrap_workshop_foundation(_workshop_bootstrap_humans(config))
+        # Notification groups are outbound-only channels: they share existing
+        # principals but never create an inbound identity or alter live GitHub
+        # routing through this migration.
+        workshop_bootstrap = await sessions.bootstrap_workshop_foundation(
+            _workshop_bootstrap_humans(config),
+            notification_channels=await _workshop_bootstrap_notification_channels(config),
+        )
         logging.info(
             "Workshop bootstrap ready (humans=%d, channels=%d, new_events=%d, existing_events=%d)",
             workshop_bootstrap.human_count,

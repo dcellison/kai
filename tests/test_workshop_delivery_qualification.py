@@ -6,10 +6,11 @@ import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import aiosqlite
 import pytest
 
 from kai import workshop_cli
-from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+from kai.workshop.bootstrap import BootstrapHuman, BootstrapNotificationChannel, bootstrap_default_workshop
 from kai.workshop.delivery_qualification import DeliveryQualificationError, WorkshopDeliveryQualification
 from kai.workshop.domain import DeliveryId, MessageId
 from kai.workshop.inbound import InboundMessage, record_inbound_message
@@ -30,6 +31,13 @@ async def _store(path: Path) -> WorkshopEventStore:
                 transport="telegram",
                 external_subject="101",
                 external_channel_id="101",
+            ),
+        ),
+        notification_channels=(
+            BootstrapNotificationChannel(
+                transport="telegram",
+                external_channel_id="-100123",
+                member_external_subjects=("101",),
             ),
         ),
     )
@@ -93,6 +101,61 @@ class TestDeliveryQualification:
         finally:
             await store.close()
 
+    async def test_prepare_notification_group_atomically_creates_one_exact_delivery(self, tmp_path: Path):
+        store = await _store(tmp_path / "kai.db")
+        qualification = WorkshopDeliveryQualification(store)
+        try:
+            first = await qualification.prepare_notification_group(-100123)
+            second = await qualification.prepare_notification_group(-100123)
+
+            assert first.inserted is True
+            assert second.inserted is False
+            assert second.delivery.delivery_id == first.delivery.delivery_id
+            assert first.delivery.max_attempts == 3
+            async with store.connection.execute(
+                "SELECT c.kind, cb.external_channel_id, m.body FROM messages m "
+                "JOIN channels c ON c.id = m.channel_id "
+                "JOIN channel_bindings cb ON cb.channel_id = c.id WHERE m.id = ?",
+                (first.delivery.message_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            assert tuple(row) == (
+                "notification",
+                "-100123",
+                "Kai Workshop notification-group delivery qualification.",
+            )
+            async with store.connection.execute("SELECT COUNT(*) FROM delivery_outbox") as cursor:
+                assert (await cursor.fetchone())[0] == 1
+        finally:
+            await store.close()
+
+    async def test_notification_group_prepare_rolls_message_back_when_outbox_insert_fails(self, tmp_path: Path):
+        store = await _store(tmp_path / "kai.db")
+        try:
+            await store.connection.execute(
+                "CREATE TRIGGER reject_notification_delivery BEFORE INSERT ON delivery_outbox "
+                "BEGIN SELECT RAISE(ABORT, 'test delivery rejection'); END"
+            )
+            await store.connection.commit()
+
+            with pytest.raises(aiosqlite.IntegrityError, match="test delivery rejection"):
+                await WorkshopDeliveryQualification(store).prepare_notification_group(-100123)
+
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM event_log WHERE "
+                "idempotency_key LIKE 'workshop-delivery-qualification:%' "
+                "OR event_type = 'delivery.requested'"
+            ) as cursor:
+                assert (await cursor.fetchone())[0] == 0
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM messages m JOIN channels c ON c.id = m.channel_id WHERE c.kind = 'notification'"
+            ) as cursor:
+                assert (await cursor.fetchone())[0] == 0
+            async with store.connection.execute("SELECT COUNT(*) FROM delivery_outbox") as cursor:
+                assert (await cursor.fetchone())[0] == 0
+        finally:
+            await store.close()
+
 
 class TestDeliveryQualificationCLI:
     def test_requires_an_explicit_action(self):
@@ -102,6 +165,10 @@ class TestDeliveryQualificationCLI:
     def test_prepare_requires_a_telegram_user(self):
         with pytest.raises(SystemExit):
             workshop_cli._parser().parse_args(["delivery-qualification", "prepare"])
+
+    def test_notification_prepare_requires_an_explicit_group(self):
+        with pytest.raises(SystemExit):
+            workshop_cli._parser().parse_args(["delivery-qualification", "prepare-notification-group"])
 
     @pytest.mark.parametrize("action", ["status", "run", "simulate-interruption"])
     def test_delivery_actions_require_an_exact_delivery_id(self, action: str):
@@ -163,6 +230,23 @@ class TestDeliveryQualificationFailures:
         try:
             with pytest.raises(ValueError, match="positive signed 64-bit"):
                 await WorkshopDeliveryQualification(store).prepare(user_id)
+        finally:
+            await store.close()
+
+    @pytest.mark.parametrize("chat_id", [0, 1, True, -(2**63) - 1])
+    async def test_notification_prepare_rejects_non_group_chat_id(self, tmp_path: Path, chat_id):
+        store = await _store(tmp_path / "kai.db")
+        try:
+            with pytest.raises(ValueError, match="negative signed 64-bit"):
+                await WorkshopDeliveryQualification(store).prepare_notification_group(chat_id)
+        finally:
+            await store.close()
+
+    async def test_notification_prepare_requires_a_canonical_configured_group(self, tmp_path: Path):
+        store = await _store(tmp_path / "kai.db")
+        try:
+            with pytest.raises(DeliveryQualificationError, match="does not resolve"):
+                await WorkshopDeliveryQualification(store).prepare_notification_group(-100999)
         finally:
             await store.close()
 

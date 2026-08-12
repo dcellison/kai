@@ -88,7 +88,10 @@ async def _resolve_binding(store: WorkshopEventStore, message: InboundMessage) -
     if len(rows) != 1:
         raise InboundBindingNotFoundError("Inbound transport identity and channel do not resolve uniquely")
     row = rows[0]
-    if str(row[3]) == "direct" and message.sender_subject != message.channel_subject:
+    channel_kind = str(row[3])
+    if channel_kind not in {"direct", "group"}:
+        raise InboundBindingNotFoundError("Transport channel is not configured for inbound conversation")
+    if channel_kind == "direct" and message.sender_subject != message.channel_subject:
         raise InboundBindingNotFoundError("Direct transport channel is not bound to the authenticated sender")
     return _ResolvedInboundBinding(
         workshop_id=WorkshopId(str(row[0])),

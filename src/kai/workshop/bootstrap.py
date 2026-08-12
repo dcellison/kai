@@ -52,6 +52,27 @@ class BootstrapHuman:
 
 
 @dataclass(frozen=True, slots=True)
+class BootstrapNotificationChannel:
+    """One outbound-only transport destination shared by configured humans."""
+
+    transport: str
+    external_channel_id: str
+    member_external_subjects: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not _TRANSPORT_PATTERN.fullmatch(self.transport):
+            raise ValueError("transport must be a lowercase identifier")
+        if not self.external_channel_id.strip():
+            raise ValueError("external_channel_id must be non-empty")
+        if not self.member_external_subjects:
+            raise ValueError("member_external_subjects must be non-empty")
+        if len(set(self.member_external_subjects)) != len(self.member_external_subjects):
+            raise ValueError("member_external_subjects must be unique")
+        if any(not subject.strip() for subject in self.member_external_subjects):
+            raise ValueError("member_external_subjects must contain non-empty values")
+
+
+@dataclass(frozen=True, slots=True)
 class BootstrapResult:
     workshop_id: WorkshopId
     agent_id: AgentId
@@ -103,9 +124,15 @@ async def _ensure_event(
 async def bootstrap_default_workshop(
     store: WorkshopEventStore,
     humans: Iterable[BootstrapHuman],
+    *,
+    notification_channels: Iterable[BootstrapNotificationChannel] = (),
 ) -> BootstrapResult:
     """Seed one Workshop and its configured humans without changing routing."""
     ordered_humans = sorted(humans, key=lambda human: (human.transport, human.external_subject))
+    ordered_notifications = sorted(
+        notification_channels,
+        key=lambda channel: (channel.transport, channel.external_channel_id),
+    )
     seen_identities: set[tuple[str, str]] = set()
     seen_channels: set[tuple[str, str]] = set()
     for human in ordered_humans:
@@ -117,6 +144,14 @@ async def bootstrap_default_workshop(
             raise ValueError(f"Duplicate bootstrap external channel for transport {human.transport!r}")
         seen_identities.add(identity)
         seen_channels.add(channel)
+    for channel in ordered_notifications:
+        identity = (channel.transport, channel.external_channel_id)
+        if identity in seen_channels:
+            raise ValueError(f"Duplicate bootstrap external channel for transport {channel.transport!r}")
+        seen_channels.add(identity)
+        for subject in channel.member_external_subjects:
+            if (channel.transport, subject) not in seen_identities:
+                raise ValueError("Notification channel member must reference a configured external identity")
 
     created_events = 0
     existing_events = 0
@@ -269,6 +304,79 @@ async def bootstrap_default_workshop(
             payload={"channel_id": channel_id, "agent_id": agent_id},
         )
 
+    for notification in ordered_notifications:
+        channel_token = _stable_token(notification.transport, notification.external_channel_id)
+        channel_id = ChannelId.derived(workshop_id, f"notification-channel:{channel_token}")
+        agent_channel_membership_id = ChannelMembershipId.derived(
+            workshop_id,
+            f"notification-channel-membership:{channel_token}:agent:kai",
+        )
+        binding_id = ChannelBindingId.derived(
+            workshop_id,
+            f"notification-channel-binding:{channel_token}",
+        )
+        channel_agent_id = ChannelAgentId.derived(
+            workshop_id,
+            f"notification-channel-agent:{channel_token}:kai",
+        )
+        await ensure(
+            idempotency_key=_idempotency_key("notification-channel", channel_token),
+            event_type=WorkshopEventType.CHANNEL_CREATED,
+            aggregate_type="channel",
+            aggregate_id=channel_id,
+            payload={"kind": "notification", "name": "Notifications"},
+        )
+        for subject in sorted(notification.member_external_subjects):
+            human_token = _stable_token(notification.transport, subject)
+            principal_id = PrincipalId.derived(workshop_id, f"human:{human_token}")
+            membership_id = ChannelMembershipId.derived(
+                workshop_id,
+                f"notification-channel-membership:{channel_token}:human:{human_token}",
+            )
+            await ensure(
+                idempotency_key=_idempotency_key(
+                    "notification-channel-membership-human",
+                    f"{channel_token}:{human_token}",
+                ),
+                event_type=WorkshopEventType.CHANNEL_MEMBER_ADDED,
+                aggregate_type="channel_membership",
+                aggregate_id=membership_id,
+                payload={
+                    "channel_id": channel_id,
+                    "principal_id": principal_id,
+                    "role": "participant",
+                },
+            )
+        await ensure(
+            idempotency_key=_idempotency_key("notification-channel-membership-agent", channel_token),
+            event_type=WorkshopEventType.CHANNEL_MEMBER_ADDED,
+            aggregate_type="channel_membership",
+            aggregate_id=agent_channel_membership_id,
+            payload={
+                "channel_id": channel_id,
+                "principal_id": agent_principal_id,
+                "role": "participant",
+            },
+        )
+        await ensure(
+            idempotency_key=_idempotency_key("notification-channel-binding", channel_token),
+            event_type=WorkshopEventType.TRANSPORT_CHANNEL_BOUND,
+            aggregate_type="channel_binding",
+            aggregate_id=binding_id,
+            payload={
+                "channel_id": channel_id,
+                "transport": notification.transport,
+                "external_channel_id": notification.external_channel_id,
+            },
+        )
+        await ensure(
+            idempotency_key=_idempotency_key("notification-channel-agent", channel_token),
+            event_type=WorkshopEventType.CHANNEL_AGENT_ATTACHED,
+            aggregate_type="channel_agent",
+            aggregate_id=channel_agent_id,
+            payload={"channel_id": channel_id, "agent_id": agent_id},
+        )
+
     await store.rebuild_projection(CanonicalConversationProjection())
     return BootstrapResult(
         workshop_id=workshop_id,
@@ -276,5 +384,5 @@ async def bootstrap_default_workshop(
         created_events=created_events,
         existing_events=existing_events,
         human_count=len(ordered_humans),
-        channel_count=len(ordered_humans),
+        channel_count=len(ordered_humans) + len(ordered_notifications),
     )

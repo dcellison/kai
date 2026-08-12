@@ -15,12 +15,18 @@ from datetime import UTC, datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from kai.config import UserConfig
-from kai.main import _file_age, _file_cleanup_loop, _workshop_bootstrap_humans, setup_logging
+from kai.main import (
+    _file_age,
+    _file_cleanup_loop,
+    _workshop_bootstrap_humans,
+    _workshop_bootstrap_notification_channels,
+    setup_logging,
+)
 
 
 class TestWorkshopBootstrapMapping:
@@ -43,6 +49,26 @@ class TestWorkshopBootstrapMapping:
         assert humans[0].external_channel_id == "101"
         assert humans[0].role == "admin"
         assert "-999" not in repr(humans)
+
+    async def test_effective_negative_destinations_become_deduplicated_notification_channels(self):
+        config = SimpleNamespace(
+            user_configs={
+                101: UserConfig(telegram_id=101, name="Admin", role="admin"),
+                202: UserConfig(telegram_id=202, name="Second"),
+                303: UserConfig(telegram_id=303, name="Direct"),
+            }
+        )
+
+        async def effective(user_id, _config):
+            return {"notify_chat_id": -999 if user_id in {101, 202} else 303}
+
+        with patch("kai.main.sessions.resolve_github_settings", new=AsyncMock(side_effect=effective)):
+            channels = await _workshop_bootstrap_notification_channels(config)
+
+        assert len(channels) == 1
+        assert channels[0].transport == "telegram"
+        assert channels[0].external_channel_id == "-999"
+        assert channels[0].member_external_subjects == ("101", "202")
 
 
 # ── setup_logging() ──────────────────────────────────────────────────

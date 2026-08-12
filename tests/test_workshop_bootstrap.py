@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from kai import sessions
-from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+from kai.workshop.bootstrap import BootstrapHuman, BootstrapNotificationChannel, bootstrap_default_workshop
 from kai.workshop.diagnostics import workshop_bootstrap_status
 from kai.workshop.store import WorkshopEventStore
 
@@ -57,6 +57,27 @@ class TestBootstrapInput:
 
         with pytest.raises(ValueError, match=match):
             BootstrapHuman(**values)
+
+    @pytest.mark.parametrize(
+        ("changes", "match"),
+        [
+            ({"transport": "Telegram"}, "transport"),
+            ({"external_channel_id": ""}, "external_channel_id"),
+            ({"member_external_subjects": ()}, "member_external_subjects"),
+            ({"member_external_subjects": ("101", "101")}, "unique"),
+            ({"member_external_subjects": ("",)}, "non-empty"),
+        ],
+    )
+    def test_invalid_notification_channel_fails_before_database_changes(self, changes, match):
+        values = {
+            "transport": "telegram",
+            "external_channel_id": "-100123",
+            "member_external_subjects": ("101",),
+        }
+        values.update(changes)
+
+        with pytest.raises(ValueError, match=match):
+            BootstrapNotificationChannel(**values)
 
 
 class TestDefaultWorkshopBootstrap:
@@ -110,6 +131,68 @@ class TestDefaultWorkshopBootstrap:
         assert [(row[0], row[1]) for row in bindings] == [("telegram", "101"), ("telegram", "202")]
         assert channel_agent_count == 2
         assert channel_memberships == [("agent", "participant", 2), ("human", "owner", 2)]
+
+    async def test_creates_one_outbound_only_notification_channel_for_shared_members(self, store):
+        humans = [_human(202, "Second"), _human(101, "Admin", role="admin")]
+        notification = BootstrapNotificationChannel(
+            transport="telegram",
+            external_channel_id="-100123",
+            member_external_subjects=("202", "101"),
+        )
+
+        first = await bootstrap_default_workshop(
+            store,
+            humans,
+            notification_channels=(notification,),
+        )
+        second = await bootstrap_default_workshop(
+            store,
+            list(reversed(humans)),
+            notification_channels=(notification,),
+        )
+
+        assert first.created_events == 26
+        assert first.channel_count == 3
+        assert second.created_events == 0
+        assert second.existing_events == 26
+        async with store.connection.execute(
+            "SELECT c.kind, c.name, cb.transport, cb.external_channel_id "
+            "FROM channels c JOIN channel_bindings cb ON cb.channel_id = c.id "
+            "WHERE c.kind = 'notification'"
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert tuple(row) == ("notification", "Notifications", "telegram", "-100123")
+        async with store.connection.execute(
+            "SELECT p.kind, cm.role FROM channel_memberships cm "
+            "JOIN channels c ON c.id = cm.channel_id "
+            "JOIN principals p ON p.id = cm.principal_id "
+            "WHERE c.kind = 'notification' ORDER BY p.kind, p.display_name"
+        ) as cursor:
+            memberships = [tuple(row) for row in await cursor.fetchall()]
+        assert memberships == [
+            ("agent", "participant"),
+            ("human", "participant"),
+            ("human", "participant"),
+        ]
+
+    async def test_notification_channel_requires_configured_members_and_unique_destination(self, store):
+        notification = BootstrapNotificationChannel("telegram", "-100123", ("999",))
+        with pytest.raises(ValueError, match="configured external identity"):
+            await bootstrap_default_workshop(
+                store,
+                [_human(101, "Admin")],
+                notification_channels=(notification,),
+            )
+        assert await store.read_events() == []
+
+        collision = BootstrapNotificationChannel("telegram", "101", ("101",))
+        with pytest.raises(ValueError, match="Duplicate bootstrap external channel"):
+            await bootstrap_default_workshop(
+                store,
+                [_human(101, "Admin")],
+                notification_channels=(collision,),
+            )
+        assert await store.read_events() == []
 
     async def test_human_principal_and_conversation_have_distinct_ids(self, store):
         await bootstrap_default_workshop(store, [_human(101, "Admin", role="admin")])

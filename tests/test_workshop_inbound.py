@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from kai import sessions
-from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+from kai.workshop.bootstrap import BootstrapHuman, BootstrapNotificationChannel, bootstrap_default_workshop
 from kai.workshop.inbound import InboundBindingNotFoundError, InboundMessage, record_inbound_message
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
 
@@ -201,6 +201,19 @@ class TestInboundShadowRecording:
         try:
             with pytest.raises(InboundBindingNotFoundError, match="Direct transport channel"):
                 await record_inbound_message(store, _message(sender="101", channel="202"))
+        finally:
+            await store.close()
+
+    async def test_notification_channel_never_becomes_an_inbound_group(self, tmp_path: Path):
+        store = await WorkshopEventStore.open(tmp_path / "kai.db")
+        await bootstrap_default_workshop(
+            store,
+            [_human(101)],
+            notification_channels=(BootstrapNotificationChannel("telegram", "-100123", ("101",)),),
+        )
+        try:
+            with pytest.raises(InboundBindingNotFoundError, match="not configured for inbound"):
+                await record_inbound_message(store, _message(sender="101", channel="-100123"))
         finally:
             await store.close()
 

@@ -66,6 +66,7 @@ class _ReplayMessage:
 @dataclass(frozen=True, slots=True)
 class _ReplayState:
     principal_kinds: dict[str, str]
+    channel_kinds: dict[str, str]
     workshop_memberships: dict[str, tuple[str, str, str]]
     channel_bindings: dict[str, tuple[str, str, str]]
     channel_memberships: dict[str, tuple[str, str, str]]
@@ -177,6 +178,7 @@ def _insert_replayed_fact(facts: dict[str, Any], fact_id: str, value: Any) -> No
 
 def _replay_state(connection: sqlite3.Connection) -> _ReplayState:
     principal_kinds: dict[str, str] = {}
+    channel_kinds: dict[str, str] = {}
     workshop_memberships: dict[str, tuple[str, str, str]] = {}
     channel_bindings: dict[str, tuple[str, str, str]] = {}
     channel_memberships: dict[str, tuple[str, str, str]] = {}
@@ -189,6 +191,7 @@ def _replay_state(connection: sqlite3.Connection) -> _ReplayState:
             envelope.event_type
             in {
                 WorkshopEventType.PRINCIPAL_CREATED,
+                WorkshopEventType.CHANNEL_CREATED,
                 WorkshopEventType.WORKSHOP_MEMBER_ADDED,
                 WorkshopEventType.CHANNEL_MEMBER_ADDED,
                 WorkshopEventType.TRANSPORT_CHANNEL_BOUND,
@@ -200,6 +203,13 @@ def _replay_state(connection: sqlite3.Connection) -> _ReplayState:
         if envelope.event_type == WorkshopEventType.PRINCIPAL_CREATED:
             _insert_replayed_fact(
                 principal_kinds,
+                aggregate_id,
+                _required_payload_text(payload, "kind"),
+            )
+            continue
+        if envelope.event_type == WorkshopEventType.CHANNEL_CREATED:
+            _insert_replayed_fact(
+                channel_kinds,
                 aggregate_id,
                 _required_payload_text(payload, "kind"),
             )
@@ -265,6 +275,7 @@ def _replay_state(connection: sqlite3.Connection) -> _ReplayState:
         )
     return _ReplayState(
         principal_kinds=principal_kinds,
+        channel_kinds=channel_kinds,
         workshop_memberships=workshop_memberships,
         channel_bindings=channel_bindings,
         channel_memberships=channel_memberships,
@@ -308,6 +319,9 @@ def _projection_mismatches(connection: sqlite3.Connection, replayed: _ReplayStat
     actual_principal_kinds = {
         str(row[0]): str(row[1]) for row in connection.execute("SELECT id, kind FROM principals").fetchall()
     }
+    actual_channel_kinds = {
+        str(row[0]): str(row[1]) for row in connection.execute("SELECT id, kind FROM channels").fetchall()
+    }
     actual_bindings = {
         str(row[0]): (str(row[1]), str(row[2]), str(row[3]))
         for row in connection.execute(
@@ -325,6 +339,7 @@ def _projection_mismatches(connection: sqlite3.Connection, replayed: _ReplayStat
     mismatches = (
         _mapping_mismatches(expected, actual)
         + _mapping_mismatches(replayed.principal_kinds, actual_principal_kinds)
+        + _mapping_mismatches(replayed.channel_kinds, actual_channel_kinds)
         + _mapping_mismatches(replayed.workshop_memberships, actual_workshop_memberships)
         + _mapping_mismatches(replayed.channel_bindings, actual_bindings)
         + _mapping_mismatches(replayed.channel_memberships, actual_channel_memberships)
@@ -433,7 +448,7 @@ def _legacy_parity(
     bindings: dict[str, str] = {}
     duplicate_bindings = 0
     for channel_id, transport, external_channel_id in replayed.channel_bindings.values():
-        if transport != "telegram":
+        if transport != "telegram" or replayed.channel_kinds.get(channel_id) != "direct":
             continue
         if channel_id in bindings:
             duplicate_bindings += 1

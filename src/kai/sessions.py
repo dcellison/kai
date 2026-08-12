@@ -44,7 +44,12 @@ import aiosqlite
 
 from kai.job_types import JOB_TYPE_AGENT, LEGACY_JOB_TYPE_AGENT, normalize_job_type
 from kai.workshop.artifacts import InboundArtifact, record_inbound_artifact
-from kai.workshop.bootstrap import BootstrapHuman, BootstrapResult, bootstrap_default_workshop
+from kai.workshop.bootstrap import (
+    BootstrapHuman,
+    BootstrapNotificationChannel,
+    BootstrapResult,
+    bootstrap_default_workshop,
+)
 from kai.workshop.inbound import InboundMessage, record_inbound_message
 from kai.workshop.outbound import (
     DeliveryObservation,
@@ -309,13 +314,21 @@ async def init_db(db_path: Path) -> None:
 # ── Session management ───────────────────────────────────────────────
 
 
-async def bootstrap_workshop_foundation(humans: tuple[BootstrapHuman, ...]) -> BootstrapResult:
+async def bootstrap_workshop_foundation(
+    humans: tuple[BootstrapHuman, ...],
+    *,
+    notification_channels: tuple[BootstrapNotificationChannel, ...] = (),
+) -> BootstrapResult:
     """Seed non-authoritative Workshop records on Kai's initialized DB."""
     if _workshop_event_lock is None:
         raise RuntimeError("Database not initialized - call init_db() first")
     async with _workshop_event_lock:
         store = WorkshopEventStore.from_initialized_connection(_get_db())
-        return await bootstrap_default_workshop(store, humans)
+        return await bootstrap_default_workshop(
+            store,
+            humans,
+            notification_channels=notification_channels,
+        )
 
 
 async def record_workshop_inbound_message(message: InboundMessage) -> AppendResult:

@@ -6,7 +6,8 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+from kai.workshop.bootstrap import BootstrapHuman, BootstrapNotificationChannel, bootstrap_default_workshop
+from kai.workshop.delivery_qualification import WorkshopDeliveryQualification
 from kai.workshop.diagnostics import workshop_message_parity_status
 from kai.workshop.domain import MessageId
 from kai.workshop.inbound import InboundMessage, record_inbound_message
@@ -90,6 +91,32 @@ class TestWorkshopMessageParityStatus:
         assert "Secret" not in status
         assert "101" not in status
         assert "Private Operator Name" not in status
+
+    async def test_outbound_only_notification_message_is_not_compared_to_direct_chat_jsonl(self, tmp_path: Path):
+        db_path = tmp_path / "kai.db"
+        history_root = tmp_path / "history"
+        await _build_conversation(db_path)
+        store = await WorkshopEventStore.open(db_path)
+        try:
+            await bootstrap_default_workshop(
+                store,
+                (BootstrapHuman("Private Operator Name", "admin", "telegram", "101", "101"),),
+                notification_channels=(BootstrapNotificationChannel("telegram", "-100123", ("101",)),),
+            )
+            await WorkshopDeliveryQualification(store).prepare_notification_group(-100123)
+        finally:
+            await store.close()
+        _write_history(
+            history_root,
+            [_record("user", "Secret question", seconds=0), _record("assistant", "Secret answer", seconds=2)],
+        )
+
+        status = workshop_message_parity_status(db_path, history_root)
+
+        assert status == (
+            "Workshop message parity: clean; canonical=3, projected=3, replay mismatches=0, "
+            "JSONL matched=2, JSONL missing=0, JSONL unmatched=0, Telegram channels=1"
+        )
 
     async def test_legacy_prefix_and_unrelated_records_do_not_create_false_divergence(self, tmp_path: Path):
         db_path = tmp_path / "kai.db"

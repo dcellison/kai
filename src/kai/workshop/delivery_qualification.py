@@ -11,8 +11,21 @@ from kai.workshop.delivery_outbox import (
     DeliveryState,
     WorkshopDeliveryOutbox,
 )
-from kai.workshop.domain import ChannelBindingId, DeliveryId, MessageId
-from kai.workshop.store import WorkshopEventStore
+from kai.workshop.domain import (
+    ChannelBindingId,
+    ChannelId,
+    DeliveryId,
+    EventEnvelope,
+    EventId,
+    MessageId,
+    PrincipalId,
+    WorkshopEventType,
+    WorkshopId,
+)
+from kai.workshop.projection import CanonicalConversationProjection
+from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
+
+_NOTIFICATION_QUALIFICATION_BODY = "Kai Workshop notification-group delivery qualification."
 
 
 class DeliveryQualificationError(RuntimeError):
@@ -66,6 +79,98 @@ class WorkshopDeliveryQualification:
                 max_attempts=3,
             )
         )
+
+    async def prepare_notification_group(self, telegram_chat_id: int) -> DeliveryRequestResult:
+        """Atomically create and queue one recognizable outbound-only group message."""
+        if (
+            not isinstance(telegram_chat_id, int)
+            or isinstance(telegram_chat_id, bool)
+            or not -(2**63) <= telegram_chat_id < 0
+        ):
+            raise ValueError("telegram_chat_id must be a negative signed 64-bit integer")
+
+        async with self._store.connection.execute(
+            "SELECT c.workshop_id, c.id, cb.id, a.principal_id "
+            "FROM channels c "
+            "JOIN channel_bindings cb ON cb.channel_id = c.id AND cb.transport = 'telegram' "
+            "JOIN channel_agents ca ON ca.channel_id = c.id "
+            "JOIN agents a ON a.id = ca.agent_id AND a.workshop_id = c.workshop_id "
+            "JOIN principals p ON p.id = a.principal_id AND p.kind = 'agent' "
+            "WHERE c.kind = 'notification' AND cb.external_channel_id = ?",
+            (str(telegram_chat_id),),
+        ) as cursor:
+            rows = list(await cursor.fetchall())
+        if len(rows) != 1:
+            raise DeliveryQualificationError(
+                "Telegram notification group does not resolve to one canonical outbound-only channel; restart Kai "
+                "after configuring the group"
+            )
+
+        workshop_id = WorkshopId(str(rows[0][0]))
+        channel_id = ChannelId(str(rows[0][1]))
+        binding_id = ChannelBindingId(str(rows[0][2]))
+        agent_principal_id = PrincipalId(str(rows[0][3]))
+        message_id = MessageId.derived(workshop_id, f"notification-group-qualification:{binding_id}")
+        idempotency_key = f"workshop-delivery-qualification:v1:notification-group:{binding_id}"
+        payload = {
+            "channel_id": channel_id,
+            "author_principal_id": agent_principal_id,
+            "body": _NOTIFICATION_QUALIFICATION_BODY,
+        }
+        occurred_at = datetime.now(UTC)
+        connection = self._store.connection
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            existing = await self._store.event_by_idempotency_key(idempotency_key)
+            message_inserted = existing is None
+            if existing is None:
+                await self._store.append_in_transaction(
+                    EventEnvelope.create(
+                        event_id=EventId.derived(
+                            workshop_id,
+                            f"notification-group-qualification-event:{binding_id}",
+                        ),
+                        event_type=WorkshopEventType.MESSAGE_CREATED,
+                        event_version=1,
+                        workshop_id=workshop_id,
+                        aggregate_type="message",
+                        aggregate_id=message_id,
+                        actor_principal_id=agent_principal_id,
+                        occurred_at=occurred_at,
+                        idempotency_key=idempotency_key,
+                        payload=payload,
+                        metadata={"source": "delivery_qualification"},
+                    )
+                )
+            elif (
+                existing.envelope.event_type != WorkshopEventType.MESSAGE_CREATED
+                or existing.envelope.aggregate_id != message_id
+                or existing.envelope.actor_principal_id != agent_principal_id
+                or existing.envelope.payload != payload
+            ):
+                raise IdempotencyConflictError(f"Event identity {idempotency_key!r} was reused with different content")
+
+            projection = CanonicalConversationProjection()
+            await self._store.project_pending_in_transaction(projection)
+            delivery = await self._outbox.request_delivery_in_transaction(
+                DeliveryRequest(
+                    message_id=message_id,
+                    channel_binding_id=binding_id,
+                    mode="text",
+                    occurred_at=occurred_at,
+                    max_attempts=3,
+                )
+            )
+            if message_inserted != delivery.inserted:
+                raise DeliveryQualificationError(
+                    "Notification-group qualification message and delivery do not share one prior state"
+                )
+            await self._store.project_pending_in_transaction(projection)
+            await connection.commit()
+            return delivery
+        except Exception:
+            await connection.rollback()
+            raise
 
     async def simulate_interruption(
         self,

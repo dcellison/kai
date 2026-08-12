@@ -37,6 +37,12 @@ def _parser() -> argparse.ArgumentParser:
     prepare = actions.add_parser("prepare", help="queue the latest canonical Kai reply without sending it")
     prepare.add_argument("--telegram-user-id", required=True, type=int)
 
+    prepare_group = actions.add_parser(
+        "prepare-notification-group",
+        help="atomically create and queue one outbound-only notification-group qualification",
+    )
+    prepare_group.add_argument("--telegram-chat-id", required=True, type=int)
+
     for action in ("status", "run"):
         action_parser = actions.add_parser(action)
         action_parser.add_argument("--delivery-id", required=True)
@@ -91,6 +97,14 @@ async def _run(args: argparse.Namespace) -> int:
                 print("Prepared only; no Telegram message was sent.")
             else:
                 print("The latest canonical reply was already prepared; no Telegram message was sent.")
+            return 0
+        if args.action == "prepare-notification-group":
+            result = await qualification.prepare_notification_group(args.telegram_chat_id)
+            _print_state(result.delivery)
+            if result.inserted:
+                print("Prepared notification-group qualification only; no Telegram message was sent.")
+            else:
+                print("The notification-group qualification was already prepared; no Telegram message was sent.")
             return 0
 
         delivery_id = _delivery_id(args.delivery_id)
