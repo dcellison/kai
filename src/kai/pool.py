@@ -13,10 +13,13 @@ independent lifecycle, and OS-level enforcement via sudo -u when os_user is
 configured in users.yaml.
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import time
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 from pathlib import Path
 
 from kai import sessions
@@ -46,6 +49,62 @@ _EVICTION_CHECK_INTERVAL = 60
 # Maximum time to wait for shutdown() in force_kill before falling
 # back to raw SIGKILL (seconds).
 _FORCE_KILL_TIMEOUT = 5
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedBackendSelection:
+    """Effective backend-neutral selection bound to one prepared runtime."""
+
+    backend: str
+    provider: str
+    model: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedRuntimeFingerprint:
+    selection: PreparedBackendSelection
+    workspace: Path
+    timeout_seconds: int
+
+
+class PreparedBackendExecution:
+    """One-shot handle that can dispatch only through its exact prepared runtime."""
+
+    __slots__ = ("_chat_id", "_consumed", "_fingerprint", "_instance", "_pool")
+
+    def __init__(self, pool: SubprocessPool, chat_id: int, instance: AgentBackend) -> None:
+        self._pool = pool
+        self._chat_id = chat_id
+        self._instance = instance
+        self._fingerprint = _runtime_fingerprint(instance)
+        self._consumed = False
+
+    @property
+    def selection(self) -> PreparedBackendSelection:
+        return self._fingerprint.selection
+
+    @property
+    def workspace(self) -> Path:
+        return self._fingerprint.workspace
+
+    async def stream(self, prompt: str | list) -> AsyncGenerator[StreamEvent]:
+        if self._consumed:
+            raise RuntimeError("Prepared backend execution is one-shot")
+        self._consumed = True
+        async for event in self._pool._send_prepared(self, prompt):
+            yield event
+
+
+def _runtime_fingerprint(instance: AgentBackend) -> _PreparedRuntimeFingerprint:
+    return _PreparedRuntimeFingerprint(
+        selection=PreparedBackendSelection(
+            backend=require_backend_name(instance),
+            provider=instance.provider,
+            model=instance.model,
+        ),
+        workspace=instance.workspace,
+        timeout_seconds=instance.timeout_seconds,
+    )
 
 
 class SubprocessPool:
@@ -358,6 +417,20 @@ class SubprocessPool:
 
     # ── Prompt routing ──────────────────────────────────────────────
 
+    async def _prepare_instance(self, chat_id: int) -> AgentBackend:
+        """Apply every pending effective setting before returning one runtime."""
+        instance = self.get(chat_id)
+        if chat_id in self._pending_workspace_restore:
+            await self._attempt_workspace_restore(chat_id, instance)
+        if chat_id in self._pending_settings_restore:
+            await self._apply_user_db_settings(chat_id, instance)
+            self._pending_settings_restore.discard(chat_id)
+        return instance
+
+    async def prepare_execution(self, chat_id: int) -> PreparedBackendExecution:
+        """Bind the effective selection to the exact runtime that may dispatch later."""
+        return PreparedBackendExecution(self, chat_id, await self._prepare_instance(chat_id))
+
     async def send(self, prompt: str | list, *, chat_id: int) -> AsyncGenerator[StreamEvent]:
         """
         Route a prompt to the user's subprocess.
@@ -372,12 +445,30 @@ class SubprocessPool:
 
         Marks the user as in-flight to prevent eviction mid-stream.
         """
-        instance = self.get(chat_id)
-        if chat_id in self._pending_workspace_restore:
-            await self._attempt_workspace_restore(chat_id, instance)
-        if chat_id in self._pending_settings_restore:
-            await self._apply_user_db_settings(chat_id, instance)
-            self._pending_settings_restore.discard(chat_id)
+        instance = await self._prepare_instance(chat_id)
+        self._last_activity[chat_id] = time.monotonic()
+        self._in_flight.add(chat_id)
+        try:
+            async for event in instance.send(prompt, chat_id=chat_id):
+                yield event
+        finally:
+            self._in_flight.discard(chat_id)
+            self._last_activity[chat_id] = time.monotonic()
+
+    async def _send_prepared(
+        self,
+        prepared: PreparedBackendExecution,
+        prompt: str | list,
+    ) -> AsyncGenerator[StreamEvent]:
+        """Dispatch through a prepared handle only while its runtime remains exact."""
+        chat_id = prepared._chat_id
+        instance = self.get_if_exists(chat_id)
+        if instance is not prepared._instance:
+            raise RuntimeError("Prepared backend runtime is no longer current")
+        if chat_id in self._pending_workspace_restore or chat_id in self._pending_settings_restore:
+            raise RuntimeError("Prepared backend runtime has pending effective settings")
+        if _runtime_fingerprint(instance) != prepared._fingerprint:
+            raise RuntimeError("Prepared backend runtime changed before dispatch")
         self._last_activity[chat_id] = time.monotonic()
         self._in_flight.add(chat_id)
         try:

@@ -1615,3 +1615,31 @@ provider, model, command, executable path, environment, or credential.
 
 Do not grant live attempts, call a backend, change the Telegram handler, or
 register a worker in that slice.
+
+## 31. Protected execution preparation
+
+**Implementation date:** 2026-08-12
+
+The production-unused preparation service now resolves an accepted canonical
+run to its hidden compatibility identity, applies pending workspace and user
+settings, and snapshots the effective registered backend, provider, model, and
+workspace from the exact runtime object. A one-shot prepared handle dispatches
+only if that same pool object and its generic runtime fingerprint remain
+current; replacement, pending settings, or selection/workspace/timeout drift
+fails before the backend call. The transport pool key remains private.
+
+The ordinary pool send path uses the same preparation primitive, preserving
+existing behavior while eliminating the earlier difference between reported
+and executed selection. Tests cover per-user selection overriding a different
+global default, persisted setting application, exact-runtime dispatch,
+one-shot use, drift rejection, registry enforcement, and cancellation intent.
+No production module constructs the Workshop preparation service, so this
+change emits no live attempt and performs no live dispatch.
+
+### 31.1 Next bounded milestone
+
+Add one production-unused terminal transaction coordinator that atomically
+settles the fenced attempt/run together with the canonical result or bounded
+failure outcome, exact-epoch delivery request, and immutable delivery plan.
+Do not wire Telegram or register recovery until that coordinator and its
+commit-uncertain tests pass.

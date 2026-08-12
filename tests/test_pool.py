@@ -744,6 +744,64 @@ class TestWorkspaceRestoration:
                     pass
             mock_change.assert_called_once()
 
+
+class TestPreparedExecution:
+    @pytest.mark.asyncio
+    async def test_preparation_applies_pending_settings_and_binds_exact_runtime(self):
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        instance = pool.get(111)
+        with (
+            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
+            patch(
+                "kai.pool.sessions.get_user_settings",
+                new_callable=AsyncMock,
+                return_value={"model": "opus", "timeout": "120"},
+            ),
+            patch.object(instance, "restart", new_callable=AsyncMock) as restart,
+            patch.object(instance, "send", new_callable=MagicMock) as send,
+        ):
+
+            async def empty_send(*args, **kwargs):
+                return
+                yield
+
+            send.side_effect = empty_send
+            prepared = await pool.prepare_execution(111)
+
+            assert prepared.selection.backend == "claude"
+            assert prepared.selection.provider == "anthropic"
+            assert prepared.selection.model == "opus"
+            assert prepared.workspace == instance.workspace
+            assert instance.timeout_seconds == 120
+            assert 111 not in pool._pending_workspace_restore
+            assert 111 not in pool._pending_settings_restore
+            restart.assert_awaited_once()
+
+            async for _ in prepared.stream("hello"):
+                pass
+            send.assert_called_once_with("hello", chat_id=111)
+            with pytest.raises(RuntimeError, match="one-shot"):
+                async for _ in prepared.stream("again"):
+                    pass
+
+    @pytest.mark.asyncio
+    async def test_prepared_execution_rejects_runtime_drift_before_dispatch(self):
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        with (
+            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
+            patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value={}),
+        ):
+            prepared = await pool.prepare_execution(111)
+        instance = pool.get(111)
+        instance.model = "opus"
+        with (
+            patch.object(instance, "send", new_callable=MagicMock) as send,
+            pytest.raises(RuntimeError, match="changed before dispatch"),
+        ):
+            async for _ in prepared.stream("must not run"):
+                pass
+        send.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_restore_applies_db_user_settings(self, tmp_path):
         """DB per-user settings override users.yaml baseline on restore."""
