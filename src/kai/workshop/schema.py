@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 11
+WORKSHOP_SCHEMA_VERSION = 12
 
 
 @dataclass(frozen=True, slots=True)
@@ -452,6 +452,31 @@ _DELIVERY_PURPOSE_SCHEMA = SchemaMigration(
     ),
 )
 
+_TELEGRAM_STREAMING_PREVIEW_SCHEMA = SchemaMigration(
+    version=12,
+    name="durable_telegram_streaming_preview_bindings",
+    statements=(
+        """
+        CREATE TABLE telegram_streaming_previews (
+            -- These canonical IDs deliberately are not foreign keys. A
+            -- projection rebuild temporarily removes and restores their rows,
+            -- while a confirmed external Telegram effect must survive replay.
+            inbound_message_id TEXT PRIMARY KEY,
+            workshop_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            channel_binding_id TEXT NOT NULL,
+            external_message_id INTEGER NOT NULL CHECK (external_message_id > 0),
+            state TEXT NOT NULL DEFAULT 'confirmed_non_final'
+                CHECK (state = 'confirmed_non_final'),
+            confirmed_at TEXT NOT NULL,
+            UNIQUE (channel_binding_id, external_message_id)
+        )
+        """,
+        "CREATE INDEX telegram_streaming_previews_channel_idx "
+        "ON telegram_streaming_previews (channel_id, confirmed_at)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -464,6 +489,7 @@ _MIGRATIONS = (
     _BINDING_AWARE_DELIVERY_SCHEMA,
     _DELIVERY_BINDING_ORDER_SCHEMA,
     _DELIVERY_PURPOSE_SCHEMA,
+    _TELEGRAM_STREAMING_PREVIEW_SCHEMA,
 )
 
 

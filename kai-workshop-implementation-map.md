@@ -659,3 +659,35 @@ The first streaming-finalization prerequisite is now implemented without product
 Claims, expired-lease recovery, and per-binding ordering are purpose-scoped. A qualification row therefore cannot be claimed, recovered, or used as an ordering predecessor by a conversation worker, and the Telegram worker instance owns exactly one purpose. The installed qualification command is fixed to `qualification`; the production-unused atomic assistant-result service is fixed to `conversation_reply`. Neither accepts a purpose from an external caller.
 
 Migration, conflict, lane-isolation, recovery-isolation, and worker-exclusion tests pin this boundary. The runtime remains unregistered and normal Telegram delivery remains unchanged. The next bounded slice is canonical binding of a confirmed streaming preview to its direct channel and inbound message; it must remain production-unused and must not yet edit or send through the Workshop worker.
+
+### 21.5 Durable streaming-preview binding foundation
+
+The second streaming-finalization prerequisite is now implemented without a
+production caller. A confirmed Telegram streaming preview can be durably bound
+to one canonical human-authored inbound message in a direct channel. The input
+contract contains only the typed inbound message ID, the positive Telegram
+message ID returned by the already-confirmed send, and its confirmation time.
+It accepts no chat destination, channel ID, binding ID, transport, or external
+channel identity.
+
+The service resolves the direct channel and its unique Telegram binding inside
+the write transaction. Missing, non-direct, assistant-authored, or ambiguous
+targets fail closed. One inbound message cannot change preview identity, and
+one Telegram message cannot cross canonical inbound-message boundaries. The
+persisted state is explicitly `confirmed_non_final`, so a streaming snapshot is
+never mistaken for authoritative completion merely because its text happens to
+match the terminal response.
+
+The binding is operational external-effect state rather than a replayed
+conversation projection. It therefore survives process restart and canonical
+projection rebuild, while idempotent and concurrent retries produce only one
+record. Migration, destination-isolation, conflict, rollback, restart, and
+rebuild tests pin this boundary. No production handler calls it, and it does
+not send or edit Telegram.
+
+The next bounded slice is production-unused atomic assistant finalization. It
+must resolve any preview internally and build an immutable operation plan whose
+first operation edits that confirmed preview and whose remaining operations
+send continuation fragments. When no preview exists, every operation must be a
+send. It must still leave production routing and the runtime registration
+unchanged.
