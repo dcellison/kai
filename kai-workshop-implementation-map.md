@@ -579,13 +579,17 @@ This decision also keeps transport coverage bounded. Direct Telegram sends remai
 
 ### 20.1 Next bounded implementation milestone
 
-Add a production-unused Telegram delivery runtime owner around the existing worker. The owner should:
+The production-unused Telegram delivery runtime owner now wraps the existing worker. It:
 
-- create at most one worker task and expose an explicit ready state;
-- recover expired leases before reporting ready;
-- surface an unexpected worker exit or exception instead of silently leaving Kai healthy;
-- stop new polling during shutdown and await the worker's current serialized iteration without cancelling an in-flight external send;
-- make repeated or out-of-order start/stop calls deterministic;
-- remain uncalled by `main.py`, enqueue no production work, and preserve all direct Telegram behavior.
+- creates at most one worker task and exposes an explicit ready state;
+- recovers expired leases before reporting ready;
+- surfaces an unexpected worker exit or exception instead of silently leaving Kai healthy;
+- stops new polling during shutdown and awaits the worker's current serialized iteration without cancelling an in-flight external send;
+- makes repeated or out-of-order start/stop calls deterministic;
+- remains uncalled by `main.py`, enqueues no production work, and preserves all direct Telegram behavior.
 
-Tests should cover clean startup, recovery-before-ready ordering, duplicate start rejection, idle and active graceful shutdown, fault propagation, and the absence of any worker task when the owner is never explicitly started. Once that contract is complete, conduct a focused cutover review for one normal direct-chat text-reply path. GitHub notification routing, schedules, files, and voice remain separate later cutovers.
+Automated contracts cover clean startup, recovery-before-ready ordering, duplicate start rejection, idle and active graceful shutdown, fault propagation, and the absence of any worker task when the owner is never explicitly started. No production startup or routing code imports or starts the owner.
+
+### 20.2 Next bounded review
+
+Conduct a focused cutover review for one normal direct-chat text-reply path. The review must define how Kai's application lifecycle will supervise the owner and how one reply path will switch atomically from canonical result creation to durable delivery without double-sending. GitHub notification routing, schedules, files, and voice remain separate later cutovers.
