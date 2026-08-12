@@ -408,6 +408,7 @@ No entry may use an indefinite condition such as "keep for compatibility." A gen
 | Direct backend invocation from Telegram handlers | Transport-neutral command and run services | Telegram and the first Workshop client produce equivalent authorized runs and visible results | Remove handler-owned orchestration; leave authentication, parsing, and rendering in the Telegram adapter | Planned |
 | Direct Telegram delivery from handlers, schedules, and webhooks | Durable delivery outbox and Telegram delivery adapter | Delivery outcome events preserve binding identity; retry, crash recovery, ordering, private-chat and notification-group delivery tests pass; live delivery is verified | Register the outbox worker only in an explicit cutover; remove direct Bot API sends from domain paths and delete delivery fallback flags after installed verification | Active (production-unused durable request/lease/attempt/retry/recovery, binding-aware terminal outcomes, per-binding FIFO claims, immutable streaming edit/send plans, edit-capable finalization worker, and explicit runtime owner; installed direct-chat recovery and notification-group delivery passed, while production cutover is held on authority epochs, aggregate diagnostics, commit-outcome resolution, and lifecycle integration) |
 | Operator-invoked Workshop delivery qualification CLI | Installed evidence followed by the production delivery worker | A configured direct-chat reply is prepared without sending, survives a service restart, recovers an intentionally abandoned lease, reaches Telegram once through the exact selected delivery, and records a terminal binding-aware outcome; a configured notification group resolves through its outbound-only canonical channel, receives one atomically prepared qualification message through the exact selected delivery, and does not become an inbound conversation | Remove the qualification command and its explicit-claim-only surface after the production worker has equivalent installed restart/recovery evidence and direct delivery is retired | Active (the installed direct-chat recovery and notification-group delivery gates passed on 2026-08-12; retain until equivalent production-worker evidence exists, while the command remains unregistered and incapable of draining unrelated work) |
+| Conversation-delivery authority epochs | A single durable delivery authority after direct-send rollback is retired | Activation/deactivation, restart, historical-row isolation, exact-epoch worker ownership, aggregate diagnostics, and installed rollback/reactivation evidence pass; no supported rollback crosses the direct-send/outbox boundary | Remove epoch stamping, activation/deactivation state, exact-epoch claim filters, transitional readiness output, schema columns/tables where safely migratable, and their compatibility tests | Active (production-unused authority boundary; no production epoch activation, enqueue, worker registration, or route change) |
 | Schedule firing directly into the pool or Telegram | Durable Workshop run creation | Scheduled definitions and executions survive restart and expose run/attempt state without duplicate work | Remove schedule-specific execution path; retain schedules only as authenticated run triggers | Planned |
 | GitHub and generic webhook paths that route directly to Telegram or the pool | Canonical integration commands/events plus delivery/run services | Existing GitHub group notifications, generic callers, deduplication, and secret separation pass end-to-end tests | Remove direct routing while retaining verified webhook adapters and supported external contracts | Planned |
 | Per-chat settings, files, memory references, and project selection | Principal/channel/agent/project-workspace records and artifact metadata | Existing per-user isolation, context assembly, memory provenance, file delivery, and workspace access remain equivalent | Migrate namespaces and remove Telegram-derived ownership from domain storage; retire recorded compatibility `storage_path` values when an authoritative artifact store replaces local per-chat files | Active (artifact metadata foundation and photo/document/voice shadow) |
@@ -862,3 +863,30 @@ After this foundation, conduct a sixth explicit cutover review. That review
 must verify deterministic post-error commit resolution, the locked `sessions`
 adapters, startup and shutdown wiring, aggregate diagnostics, and an executable
 rollback procedure before authorizing one production handler path.
+
+### 22.3 Conversation-delivery authority-epoch foundation
+
+The production-unused authority boundary is now implemented. Schema version 14
+adds durable authority epochs and nullable epoch ownership on outbox rows.
+Existing rows remain unclassified rather than being silently adopted. A first
+activation fails closed while any matching unclassified conversation
+finalization exists; ordinary restarts reuse the same active epoch.
+
+Atomic streaming finalization resolves the active epoch inside its existing
+transaction and stamps both the request event and outbox row. Its caller cannot
+supply an epoch. The finalization worker must be constructed with one typed
+epoch and scopes claim, per-binding ordering, lease recovery, and settlement to
+that exact still-active epoch. A later epoch therefore cannot drain work from
+a prior authority period.
+
+Deactivation refuses pending, leased, or retry-wait work. It also requires an
+explicit acknowledgement when terminal failures exist, including failures with
+uncertain-fragment evidence, and retains that evidence after acknowledgement;
+reactivation creates a new epoch. `install-status` reports only aggregate epoch,
+classification, active-status, and uncertainty counts. It exposes no epoch,
+delivery, lease, worker, Telegram, message, or provider identifiers or content.
+
+The boundary remains uncalled by production startup and handlers. No epoch is
+activated during installation, no worker is registered, and direct Telegram
+delivery remains authoritative. The next bounded step is the sixth explicit
+cutover review defined above; production wiring is still not authorized.

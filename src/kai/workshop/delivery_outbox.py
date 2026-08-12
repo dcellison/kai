@@ -14,6 +14,7 @@ from kai.workshop.domain import (
     ChannelBindingId,
     ChannelId,
     DeliveryAttemptId,
+    DeliveryAuthorityEpochId,
     DeliveryId,
     EventEnvelope,
     EventId,
@@ -75,6 +76,7 @@ class DeliveryRequest:
     purpose: DeliveryPurpose
     occurred_at: datetime
     execution_contract: DeliveryExecutionContract = SEND_FRAGMENTS_CONTRACT
+    authority_epoch_id: DeliveryAuthorityEpochId | None = None
     max_attempts: int = 5
 
     def __post_init__(self) -> None:
@@ -86,6 +88,13 @@ class DeliveryRequest:
             raise ValueError("mode must be a lowercase identifier")
         _validate_purpose(self.purpose)
         _validate_execution_contract(self.execution_contract)
+        requires_epoch = (
+            self.purpose == CONVERSATION_REPLY_PURPOSE and self.execution_contract == STREAMING_FINALIZATION_CONTRACT
+        )
+        if requires_epoch and not isinstance(self.authority_epoch_id, DeliveryAuthorityEpochId):
+            raise ValueError("streaming conversation delivery requires a DeliveryAuthorityEpochId")
+        if not requires_epoch and self.authority_epoch_id is not None:
+            raise ValueError("authority_epoch_id is only valid for streaming conversation delivery")
         if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
             raise ValueError("occurred_at must be timezone-aware")
         if (
@@ -106,6 +115,7 @@ class DeliveryState:
     mode: str
     purpose: DeliveryPurpose
     execution_contract: DeliveryExecutionContract
+    authority_epoch_id: DeliveryAuthorityEpochId | None
     status: str
     max_attempts: int
     attempt_count: int
@@ -135,6 +145,7 @@ class DeliveryClaim:
     mode: str
     purpose: DeliveryPurpose
     execution_contract: DeliveryExecutionContract
+    authority_epoch_id: DeliveryAuthorityEpochId | None
     body: str
     lease_expires_at: datetime
 
@@ -191,6 +202,18 @@ def _validate_execution_contracts(contracts: tuple[DeliveryExecutionContract, ..
         _validate_execution_contract(contract)
 
 
+def _validate_authority_scope(
+    purposes: tuple[DeliveryPurpose, ...],
+    contracts: tuple[DeliveryExecutionContract, ...],
+    authority_epoch_id: DeliveryAuthorityEpochId | None,
+) -> None:
+    requires_epoch = CONVERSATION_REPLY_PURPOSE in purposes and STREAMING_FINALIZATION_CONTRACT in contracts
+    if requires_epoch and not isinstance(authority_epoch_id, DeliveryAuthorityEpochId):
+        raise ValueError("streaming conversation work requires an exact authority epoch")
+    if not requires_epoch and authority_epoch_id is not None:
+        raise ValueError("authority_epoch_id is only valid for streaming conversation work")
+
+
 def _delivery_purpose(value: object) -> DeliveryPurpose:
     purpose = str(value)
     _validate_purpose(purpose)
@@ -244,6 +267,16 @@ class WorkshopDeliveryOutbox:
 
         resolved = await self._resolve_target(request)
         workshop_id, channel_id, author_principal_id, transport = resolved
+        if request.authority_epoch_id is not None:
+            async with connection.execute(
+                "SELECT COUNT(*) FROM delivery_authority_epochs "
+                "WHERE id = ? AND lane = 'telegram_conversation_streaming_finalization' "
+                "AND status = 'active'",
+                (request.authority_epoch_id,),
+            ) as cursor:
+                authority_row = await cursor.fetchone()
+            if authority_row is None or int(authority_row[0]) != 1:
+                raise DeliveryRequestConflictError("Delivery authority epoch is not active")
         delivery_id = DeliveryId.derived(
             workshop_id,
             f"delivery:{request.message_id}:{request.channel_binding_id}:{request.mode}",
@@ -262,14 +295,15 @@ class WorkshopDeliveryOutbox:
                 or existing.max_attempts != request.max_attempts
                 or existing.purpose != request.purpose
                 or existing.execution_contract != request.execution_contract
+                or existing.authority_epoch_id != request.authority_epoch_id
             ):
                 raise DeliveryRequestConflictError("Delivery request identity has different semantics")
             return DeliveryRequestResult(delivery=existing, inserted=False)
 
         occurred_at = request.occurred_at.astimezone(UTC)
         streaming_finalization = request.execution_contract == STREAMING_FINALIZATION_CONTRACT
-        event_version = 3 if streaming_finalization else 2
-        event_identity_version = "v3" if streaming_finalization else "v2"
+        event_version = 4 if streaming_finalization else 2
+        event_identity_version = "v4" if streaming_finalization else "v2"
         payload: dict[str, object] = {
             "message_id": request.message_id,
             "channel_id": channel_id,
@@ -281,6 +315,7 @@ class WorkshopDeliveryOutbox:
         }
         if streaming_finalization:
             payload["execution_contract"] = request.execution_contract
+            payload["authority_epoch_id"] = request.authority_epoch_id
         event = EventEnvelope.create(
             event_id=EventId.derived(
                 workshop_id,
@@ -309,9 +344,9 @@ class WorkshopDeliveryOutbox:
         await connection.execute(
             "INSERT INTO delivery_outbox "
             "(id, workshop_id, channel_id, channel_binding_id, message_id, transport, mode, purpose, "
-            "execution_contract, "
+            "execution_contract, authority_epoch_id, "
             "status, max_attempts, attempt_count, available_at, requested_event_position, "
-            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, ?, ?, ?, ?)",
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, ?, ?, ?, ?)",
             (
                 delivery_id,
                 workshop_id,
@@ -322,6 +357,7 @@ class WorkshopDeliveryOutbox:
                 request.mode,
                 request.purpose,
                 request.execution_contract,
+                request.authority_epoch_id,
                 request.max_attempts,
                 timestamp,
                 appended.event.position,
@@ -342,10 +378,12 @@ class WorkshopDeliveryOutbox:
         transport: str | None = None,
         modes: tuple[str, ...] | None = None,
         delivery_id: DeliveryId | None = None,
+        authority_epoch_id: DeliveryAuthorityEpochId | None = None,
     ) -> DeliveryClaim | None:
         _validate_worker_id(worker_id)
         _validate_purposes(purposes)
         _validate_execution_contracts(execution_contracts)
+        _validate_authority_scope(purposes, execution_contracts, authority_epoch_id)
         if lease_duration <= timedelta(0) or lease_duration > _MAX_LEASE:
             raise ValueError("lease_duration must be positive and at most five minutes")
         if transport is not None and not _IDENTIFIER_PATTERN.fullmatch(transport):
@@ -368,6 +406,7 @@ class WorkshopDeliveryOutbox:
                 purposes=purposes,
                 execution_contracts=execution_contracts,
                 delivery_id=delivery_id,
+                authority_epoch_id=authority_epoch_id,
             )
             now_text = _format_timestamp(now)
             filters = [
@@ -378,6 +417,7 @@ class WorkshopDeliveryOutbox:
                 "SELECT 1 FROM delivery_outbox predecessor "
                 "WHERE predecessor.channel_binding_id = o.channel_binding_id "
                 "AND predecessor.purpose = o.purpose "
+                "AND predecessor.authority_epoch_id IS o.authority_epoch_id "
                 "AND predecessor.requested_event_position < o.requested_event_position "
                 "AND predecessor.status NOT IN ('succeeded', 'failed')"
                 ")",
@@ -389,6 +429,15 @@ class WorkshopDeliveryOutbox:
             contract_placeholders = ", ".join("?" for _ in execution_contracts)
             filters.append(f"o.execution_contract IN ({contract_placeholders})")
             parameters.extend(execution_contracts)
+            if authority_epoch_id is not None:
+                filters.append("o.authority_epoch_id = ?")
+                parameters.append(authority_epoch_id)
+                filters.append(
+                    "EXISTS (SELECT 1 FROM delivery_authority_epochs ae "
+                    "WHERE ae.id = o.authority_epoch_id "
+                    "AND ae.lane = 'telegram_conversation_streaming_finalization' "
+                    "AND ae.status = 'active')"
+                )
             if delivery_id is not None:
                 filters.append("o.id = ?")
                 parameters.append(delivery_id)
@@ -401,7 +450,7 @@ class WorkshopDeliveryOutbox:
                 parameters.extend(modes)
             async with connection.execute(
                 "SELECT o.id, o.workshop_id, o.channel_id, o.channel_binding_id, o.message_id, "
-                "o.transport, o.mode, o.purpose, o.execution_contract, o.attempt_count, "
+                "o.transport, o.mode, o.purpose, o.execution_contract, o.authority_epoch_id, o.attempt_count, "
                 "m.body, cb.external_channel_id "
                 "FROM delivery_outbox o "
                 "JOIN messages m ON m.id = o.message_id AND m.channel_id = o.channel_id "
@@ -417,7 +466,7 @@ class WorkshopDeliveryOutbox:
                 return None
 
             delivery_id = DeliveryId(str(row[0]))
-            attempt_number = int(row[9]) + 1
+            attempt_number = int(row[10]) + 1
             attempt_id = DeliveryAttemptId.new()
             expires_at = now + lease_duration
             expires_text = _format_timestamp(expires_at)
@@ -456,8 +505,9 @@ class WorkshopDeliveryOutbox:
                 mode=str(row[6]),
                 purpose=_delivery_purpose(row[7]),
                 execution_contract=_delivery_execution_contract(row[8]),
-                body=str(row[10]),
-                external_channel_id=str(row[11]),
+                authority_epoch_id=(DeliveryAuthorityEpochId(str(row[9])) if row[9] is not None else None),
+                body=str(row[11]),
+                external_channel_id=str(row[12]),
                 lease_expires_at=expires_at,
             )
         except Exception:
@@ -495,9 +545,11 @@ class WorkshopDeliveryOutbox:
         *,
         purposes: tuple[DeliveryPurpose, ...],
         execution_contracts: tuple[DeliveryExecutionContract, ...] = (SEND_FRAGMENTS_CONTRACT,),
+        authority_epoch_id: DeliveryAuthorityEpochId | None = None,
     ) -> DeliveryRecoveryResult:
         _validate_purposes(purposes)
         _validate_execution_contracts(execution_contracts)
+        _validate_authority_scope(purposes, execution_contracts, authority_epoch_id)
         connection = self._store.connection
         try:
             await connection.execute("BEGIN IMMEDIATE")
@@ -505,6 +557,7 @@ class WorkshopDeliveryOutbox:
                 self._now(),
                 purposes=purposes,
                 execution_contracts=execution_contracts,
+                authority_epoch_id=authority_epoch_id,
             )
             await connection.commit()
             return result
@@ -537,7 +590,8 @@ class WorkshopDeliveryOutbox:
             async with connection.execute(
                 "SELECT o.status, o.attempt_count, o.max_attempts, o.lease_id, "
                 "o.lease_expires_at, a.outcome, a.completed_at, a.error_code, "
-                "o.workshop_id, o.channel_id, o.channel_binding_id, o.message_id, o.transport, o.mode "
+                "o.workshop_id, o.channel_id, o.channel_binding_id, o.message_id, o.transport, o.mode, "
+                "o.authority_epoch_id "
                 "FROM delivery_outbox o JOIN delivery_attempts a "
                 "ON a.delivery_id = o.id AND a.id = ? WHERE o.id = ?",
                 (claim.attempt_id, claim.delivery_id),
@@ -545,6 +599,19 @@ class WorkshopDeliveryOutbox:
                 row = await cursor.fetchone()
             if row is None:
                 raise StaleDeliveryLeaseError("Delivery attempt does not exist")
+            persisted_epoch = DeliveryAuthorityEpochId(str(row[14])) if row[14] is not None else None
+            if persisted_epoch != claim.authority_epoch_id:
+                raise StaleDeliveryLeaseError("Delivery attempt does not belong to the claimed authority epoch")
+            if persisted_epoch is not None:
+                async with connection.execute(
+                    "SELECT COUNT(*) FROM delivery_authority_epochs "
+                    "WHERE id = ? AND lane = 'telegram_conversation_streaming_finalization' "
+                    "AND status = 'active'",
+                    (persisted_epoch,),
+                ) as cursor:
+                    active_epoch_row = await cursor.fetchone()
+                if active_epoch_row is None or int(active_epoch_row[0]) != 1:
+                    raise StaleDeliveryLeaseError("Delivery authority epoch is not active")
             if row[5] is not None:
                 if succeeded and row[5] == desired_outcome and row[0] == "succeeded":
                     if row[6] is None:
@@ -557,6 +624,7 @@ class WorkshopDeliveryOutbox:
                         message_id=MessageId(str(row[11])),
                         transport=str(row[12]),
                         mode=str(row[13]),
+                        authority_epoch_id=persisted_epoch,
                         attempt_number=int(row[1]),
                         status="succeeded",
                         error_code=None,
@@ -574,6 +642,7 @@ class WorkshopDeliveryOutbox:
                     purposes=(claim.purpose,),
                     execution_contracts=(claim.execution_contract,),
                     delivery_id=claim.delivery_id,
+                    authority_epoch_id=claim.authority_epoch_id,
                 )
                 await connection.commit()
                 raise StaleDeliveryLeaseError("Delivery attempt lease has expired")
@@ -646,6 +715,7 @@ class WorkshopDeliveryOutbox:
                     message_id=MessageId(str(row[11])),
                     transport=str(row[12]),
                     mode=str(row[13]),
+                    authority_epoch_id=persisted_epoch,
                     attempt_number=attempt_count,
                     status=status,
                     error_code=error_code,
@@ -665,6 +735,7 @@ class WorkshopDeliveryOutbox:
         purposes: tuple[DeliveryPurpose, ...],
         execution_contracts: tuple[DeliveryExecutionContract, ...],
         delivery_id: DeliveryId | None = None,
+        authority_epoch_id: DeliveryAuthorityEpochId | None = None,
     ) -> DeliveryRecoveryResult:
         connection = self._store.connection
         now_text = _format_timestamp(now)
@@ -672,14 +743,26 @@ class WorkshopDeliveryOutbox:
         contract_placeholders = ", ".join("?" for _ in execution_contracts)
         identity_filter = " AND id = ?" if delivery_id is not None else ""
         parameters: tuple[object, ...] = (now_text, *purposes, *execution_contracts)
+        authority_filter = " AND authority_epoch_id = ?" if authority_epoch_id is not None else ""
+        active_authority_filter = (
+            " AND EXISTS (SELECT 1 FROM delivery_authority_epochs ae "
+            "WHERE ae.id = delivery_outbox.authority_epoch_id "
+            "AND ae.lane = 'telegram_conversation_streaming_finalization' "
+            "AND ae.status = 'active')"
+            if authority_epoch_id is not None
+            else ""
+        )
+        if authority_epoch_id is not None:
+            parameters = (*parameters, authority_epoch_id)
         if delivery_id is not None:
             parameters = (*parameters, delivery_id)
         async with connection.execute(
             "SELECT id, lease_id, attempt_count, max_attempts, workshop_id, channel_id, "
-            "channel_binding_id, message_id, transport, mode FROM delivery_outbox "
+            "channel_binding_id, message_id, transport, mode, authority_epoch_id FROM delivery_outbox "
             f"WHERE status = 'leased' AND lease_expires_at <= ? "
             f"AND purpose IN ({purpose_placeholders}) "
-            f"AND execution_contract IN ({contract_placeholders}){identity_filter} "
+            f"AND execution_contract IN ({contract_placeholders}){authority_filter}"
+            f"{active_authority_filter}{identity_filter} "
             "ORDER BY requested_event_position",
             parameters,
         ) as cursor:
@@ -734,6 +817,7 @@ class WorkshopDeliveryOutbox:
                     message_id=MessageId(str(row[7])),
                     transport=str(row[8]),
                     mode=str(row[9]),
+                    authority_epoch_id=(DeliveryAuthorityEpochId(str(row[10])) if row[10] is not None else None),
                     attempt_number=int(row[2]),
                     status="failed",
                     error_code=error_code,
@@ -754,6 +838,7 @@ class WorkshopDeliveryOutbox:
         message_id: MessageId,
         transport: str,
         mode: str,
+        authority_epoch_id: DeliveryAuthorityEpochId | None,
         attempt_number: int,
         status: str,
         error_code: str | None,
@@ -771,21 +856,25 @@ class WorkshopDeliveryOutbox:
         }
         if error_code is not None:
             payload["error_code"] = error_code
+        if authority_epoch_id is not None:
+            payload["authority_epoch_id"] = authority_epoch_id
+        event_identity_version = "v3" if authority_epoch_id is not None else "v2"
+        event_version = 3 if authority_epoch_id is not None else 2
         event_type = (
             WorkshopEventType.DELIVERY_SUCCEEDED if status == "succeeded" else WorkshopEventType.DELIVERY_FAILED
         )
         event = EventEnvelope.create(
             event_id=EventId.derived(
                 workshop_id,
-                f"delivery-outcome-event:v2:{delivery_id}:{status}",
+                f"delivery-outcome-event:{event_identity_version}:{delivery_id}:{status}",
             ),
             event_type=event_type,
-            event_version=2,
+            event_version=event_version,
             workshop_id=workshop_id,
             aggregate_type="delivery",
             aggregate_id=delivery_id,
             occurred_at=occurred_at,
-            idempotency_key=f"workshop-delivery-outcome:v2:{delivery_id}:{status}",
+            idempotency_key=(f"workshop-delivery-outcome:{event_identity_version}:{delivery_id}:{status}"),
             payload=payload,
             metadata={"source": "delivery_outbox"},
         )
@@ -849,6 +938,11 @@ class WorkshopDeliveryOutbox:
             mode=str(row["mode"]),
             purpose=_delivery_purpose(row["purpose"]),
             execution_contract=_delivery_execution_contract(row["execution_contract"]),
+            authority_epoch_id=(
+                DeliveryAuthorityEpochId(str(row["authority_epoch_id"]))
+                if row["authority_epoch_id"] is not None
+                else None
+            ),
             status=str(row["status"]),
             max_attempts=int(row["max_attempts"]),
             attempt_count=int(row["attempt_count"]),

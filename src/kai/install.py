@@ -65,7 +65,11 @@ from kai.config import (
 from kai.named_access import replace_named_read_access
 from kai.protected_config import ProtectedConfigError, validate_protected_file_metadata
 from kai.user_isolation import validate_protected_user_isolation
-from kai.workshop.diagnostics import workshop_bootstrap_status, workshop_message_parity_status
+from kai.workshop.diagnostics import (
+    workshop_bootstrap_status,
+    workshop_delivery_authority_status,
+    workshop_message_parity_status,
+)
 
 # Config file written by `config`, read by `apply`.
 # Anchored to PROJECT_ROOT so it resolves correctly regardless of CWD.
@@ -6752,6 +6756,7 @@ def _cmd_status() -> None:
             expected_humans=expected_humans,
         )
     )
+    print(workshop_delivery_authority_status(Path(data_dir) / "kai.db"))
     print(workshop_message_parity_status(Path(data_dir) / "kai.db", Path(data_dir) / "history"))
 
     # Check workspace path traversal if install.conf has a service user

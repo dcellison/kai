@@ -71,6 +71,7 @@ def _claim(
         mode=mode,
         purpose=QUALIFICATION_PURPOSE,
         execution_contract=SEND_FRAGMENTS_CONTRACT,
+        authority_epoch_id=None,
         body=body,
         lease_expires_at=_NOW + timedelta(seconds=30),
     )

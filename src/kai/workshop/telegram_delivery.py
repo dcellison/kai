@@ -41,7 +41,7 @@ from kai.workshop.delivery_outbox import (
     DeliveryState,
     WorkshopDeliveryOutbox,
 )
-from kai.workshop.domain import DeliveryId
+from kai.workshop.domain import DeliveryAuthorityEpochId, DeliveryId
 
 _NUMERIC_CHAT_ID_PATTERN = re.compile(r"^-?[1-9][0-9]{0,19}$")
 _USERNAME_CHAT_ID_PATTERN = re.compile(r"^@[A-Za-z][A-Za-z0-9_]{4,31}$")
@@ -460,15 +460,19 @@ class WorkshopTelegramStreamingFinalizationWorker:
         adapter: WorkshopTelegramStreamingFinalizationAdapter,
         *,
         worker_id: str,
+        authority_epoch_id: DeliveryAuthorityEpochId,
         lease_duration: timedelta = timedelta(seconds=30),
         poll_interval: float = 1.0,
     ) -> None:
         if poll_interval <= 0 or poll_interval > 60:
             raise ValueError("poll_interval must be positive and at most 60 seconds")
+        if not isinstance(authority_epoch_id, DeliveryAuthorityEpochId):
+            raise ValueError("authority_epoch_id must be a DeliveryAuthorityEpochId")
         self._outbox = outbox
         self._fragments = fragments
         self._adapter = adapter
         self._worker_id = worker_id
+        self._authority_epoch_id = authority_epoch_id
         self._lease_duration = lease_duration
         self._poll_interval = poll_interval
 
@@ -480,6 +484,7 @@ class WorkshopTelegramStreamingFinalizationWorker:
             lease_duration=self._lease_duration,
             transport="telegram",
             modes=("text",),
+            authority_epoch_id=self._authority_epoch_id,
         )
         return await self._run_claim(claim)
 
@@ -495,6 +500,7 @@ class WorkshopTelegramStreamingFinalizationWorker:
             transport="telegram",
             modes=("text",),
             delivery_id=delivery_id,
+            authority_epoch_id=self._authority_epoch_id,
         )
         return await self._run_claim(claim)
 
@@ -502,6 +508,7 @@ class WorkshopTelegramStreamingFinalizationWorker:
         return await self._outbox.recover_expired_leases(
             purposes=(CONVERSATION_REPLY_PURPOSE,),
             execution_contracts=(STREAMING_FINALIZATION_CONTRACT,),
+            authority_epoch_id=self._authority_epoch_id,
         )
 
     async def _run_claim(self, claim: DeliveryClaim | None) -> TelegramWorkResult:

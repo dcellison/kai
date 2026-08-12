@@ -128,6 +128,10 @@ class DeliveryAttemptId(OpaqueId):
     prefix = "dla"
 
 
+class DeliveryAuthorityEpochId(OpaqueId):
+    prefix = "dae"
+
+
 class EventId(OpaqueId):
     prefix = "evt"
 
@@ -151,6 +155,7 @@ _ID_TYPES: dict[str, type[OpaqueId]] = {
         ArtifactId,
         DeliveryId,
         DeliveryAttemptId,
+        DeliveryAuthorityEpochId,
         EventId,
     )
 }

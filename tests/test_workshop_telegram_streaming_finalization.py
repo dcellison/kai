@@ -13,6 +13,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
 from kai.workshop.delivery_fragments import (
     EDIT_OPERATION,
     SEND_OPERATION,
@@ -32,6 +33,7 @@ from kai.workshop.domain import (
     ChannelBindingId,
     ChannelId,
     DeliveryAttemptId,
+    DeliveryAuthorityEpochId,
     DeliveryId,
     MessageId,
     WorkshopId,
@@ -83,6 +85,7 @@ def _claim(*, execution_contract=STREAMING_FINALIZATION_CONTRACT) -> DeliveryCla
         mode="text",
         purpose=CONVERSATION_REPLY_PURPOSE,
         execution_contract=execution_contract,
+        authority_epoch_id=DeliveryAuthorityEpochId.new(),
         body="Final answer",
         lease_expires_at=_NOW + timedelta(seconds=30),
     )
@@ -127,6 +130,7 @@ async def _open_with_inbound(path: Path) -> tuple[WorkshopEventStore, MessageId]
             occurred_at=_NOW,
         ),
     )
+    await WorkshopConversationDeliveryAuthority(store).activate()
     return store, MessageId(str(inbound.event.envelope.aggregate_id))
 
 
@@ -157,7 +161,7 @@ async def _prepare_finalization(
     return store, result.delivery.delivery.delivery_id
 
 
-def _worker(
+async def _worker(
     store: WorkshopEventStore,
     bot: AsyncMock,
     *,
@@ -165,11 +169,13 @@ def _worker(
     lease_duration: timedelta = timedelta(seconds=30),
 ) -> WorkshopTelegramStreamingFinalizationWorker:
     effective_clock = clock or _Clock(_NOW + timedelta(seconds=3))
+    authority_epoch = await WorkshopConversationDeliveryAuthority(store).active_epoch()
     return WorkshopTelegramStreamingFinalizationWorker(
         WorkshopDeliveryOutbox(store, clock=effective_clock),
         WorkshopDeliveryFragments(store, clock=effective_clock),
         WorkshopTelegramStreamingFinalizationAdapter(bot),
         worker_id="telegram-finalization-worker",
+        authority_epoch_id=authority_epoch.epoch_id,
         lease_duration=lease_duration,
         poll_interval=0.01,
     )
@@ -323,7 +329,7 @@ class TestTelegramStreamingFinalizationWorker:
         bot = AsyncMock()
         bot.edit_message_text.return_value = SimpleNamespace(message_id=7001)
         try:
-            result = await _worker(store, bot).run_delivery(delivery_id)
+            result = await (await _worker(store, bot)).run_delivery(delivery_id)
             persisted = await WorkshopDeliveryFragments(store).fragments(delivery_id)
 
             assert result.outcome == TelegramWorkOutcome.SUCCEEDED
@@ -342,7 +348,7 @@ class TestTelegramStreamingFinalizationWorker:
         bot.edit_message_text.return_value = SimpleNamespace(message_id=7001)
         bot.send_message.return_value = SimpleNamespace(message_id=8001)
         try:
-            result = await _worker(store, bot).run_once()
+            result = await (await _worker(store, bot)).run_once()
             persisted = await WorkshopDeliveryFragments(store).fragments(delivery_id)
 
             assert result.outcome == TelegramWorkOutcome.SUCCEEDED
@@ -366,7 +372,7 @@ class TestTelegramStreamingFinalizationWorker:
             SimpleNamespace(message_id=8002),
         ]
         try:
-            assert (await _worker(store, bot).run_once()).outcome == TelegramWorkOutcome.SUCCEEDED
+            assert (await (await _worker(store, bot)).run_once()).outcome == TelegramWorkOutcome.SUCCEEDED
             persisted = await WorkshopDeliveryFragments(store).fragments(delivery_id)
             assert [item.operation for item in persisted] == [SEND_OPERATION, SEND_OPERATION]
             assert [item.external_message_id for item in persisted] == ["8001", "8002"]
@@ -387,7 +393,7 @@ class TestTelegramStreamingFinalizationWorker:
         first_bot = AsyncMock()
         first_bot.edit_message_text.return_value = SimpleNamespace(message_id=7001)
         first_bot.send_message.side_effect = RetryAfter(timedelta(seconds=1))
-        first = await _worker(store, first_bot, clock=clock).run_once()
+        first = await (await _worker(store, first_bot, clock=clock)).run_once()
         assert first.outcome == TelegramWorkOutcome.RETRY_SCHEDULED
         assert [item.status for item in await WorkshopDeliveryFragments(store).fragments(delivery_id)] == [
             "sent",
@@ -400,7 +406,7 @@ class TestTelegramStreamingFinalizationWorker:
         second_bot = AsyncMock()
         second_bot.send_message.return_value = SimpleNamespace(message_id=8001)
         try:
-            second = await _worker(reopened, second_bot, clock=clock).run_delivery(delivery_id)
+            second = await (await _worker(reopened, second_bot, clock=clock)).run_delivery(delivery_id)
 
             assert second.outcome == TelegramWorkOutcome.SUCCEEDED
             assert second.attempt_number == 2
@@ -419,7 +425,7 @@ class TestTelegramStreamingFinalizationWorker:
             BadRequest("message to edit not found"),
             BadRequest("message to edit not found"),
         ]
-        worker = _worker(store, bot)
+        worker = await _worker(store, bot)
         try:
             result = await worker.run_once()
 
@@ -436,7 +442,7 @@ class TestTelegramStreamingFinalizationWorker:
         store, delivery_id = await _prepare_finalization(tmp_path / "kai.db")
         bot = AsyncMock()
         bot.edit_message_text.side_effect = TimedOut()
-        worker = _worker(store, bot)
+        worker = await _worker(store, bot)
         try:
             result = await worker.run_once()
 
@@ -457,7 +463,7 @@ class TestTelegramStreamingFinalizationWorker:
         bot = AsyncMock()
         bot.edit_message_text.return_value = SimpleNamespace(message_id=7001)
         bot.send_message.side_effect = TimedOut()
-        worker = _worker(store, bot)
+        worker = await _worker(store, bot)
         try:
             result = await worker.run_once()
             persisted = await WorkshopDeliveryFragments(store).fragments(delivery_id)
@@ -479,12 +485,14 @@ class TestTelegramStreamingFinalizationWorker:
         clock = _Clock(_NOW + timedelta(seconds=3))
         outbox = WorkshopDeliveryOutbox(store, clock=clock)
         fragments = WorkshopDeliveryFragments(store, clock=clock)
+        authority_epoch = await WorkshopConversationDeliveryAuthority(store).active_epoch()
         claim = await outbox.claim_next(
             "crashed-finalization-worker",
             purposes=(CONVERSATION_REPLY_PURPOSE,),
             execution_contracts=(STREAMING_FINALIZATION_CONTRACT,),
             lease_duration=timedelta(seconds=10),
             delivery_id=delivery_id,
+            authority_epoch_id=authority_epoch.epoch_id,
         )
         assert claim is not None
         started = await fragments.begin_next(claim)
@@ -498,6 +506,7 @@ class TestTelegramStreamingFinalizationWorker:
             recovered = await recovered_outbox.recover_expired_leases(
                 purposes=(CONVERSATION_REPLY_PURPOSE,),
                 execution_contracts=(STREAMING_FINALIZATION_CONTRACT,),
+                authority_epoch_id=authority_epoch.epoch_id,
             )
             state = await recovered_outbox.state(delivery_id)
 
@@ -538,7 +547,7 @@ class TestTelegramStreamingFinalizationWorker:
         )
         bot = AsyncMock()
         try:
-            assert (await _worker(store, bot).run_once()).outcome == TelegramWorkOutcome.IDLE
+            assert (await (await _worker(store, bot)).run_once()).outcome == TelegramWorkOutcome.IDLE
             assert (await WorkshopDeliveryOutbox(store).state(delivery.delivery.delivery_id)).status == "pending"
             bot.edit_message_text.assert_not_awaited()
             bot.send_message.assert_not_awaited()

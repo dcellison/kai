@@ -39,6 +39,11 @@ _PARITY_TABLES = {
     "channel_bindings",
     "workshop_memberships",
 }
+_DELIVERY_AUTHORITY_TABLES = {
+    "delivery_authority_epochs",
+    "delivery_outbox",
+    "delivery_fragments",
+}
 _TELEGRAM_SUBJECT_PATTERN = re.compile(r"^-?[0-9]+$")
 _SYNTHETIC_ASSISTANT_PATTERN = re.compile(
     r"\[(stopped by user|no response|error: .+)\]",
@@ -135,6 +140,116 @@ def workshop_bootstrap_status(db_path: Path, *, expected_humans: int | None) -> 
         f"Workshop bootstrap: {state}; workshops={workshop_count}, humans={human_count}, "
         f"Telegram bindings={telegram_binding_count}, channel memberships={channel_membership_count}, "
         f"agents={agent_count}; {expectation}"
+    )
+
+
+def workshop_delivery_authority_status(db_path: Path) -> str:
+    """Describe delivery-authority readiness using aggregate, non-secret state."""
+    prefix = "Workshop delivery authority:"
+    if not db_path.is_file():
+        return f"{prefix} pending; authority schema unavailable"
+
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if not tables >= _DELIVERY_AUTHORITY_TABLES:
+                return f"{prefix} pending; authority schema unavailable"
+
+            epoch_count = _scalar(connection, "SELECT COUNT(*) FROM delivery_authority_epochs")
+            active_rows = connection.execute(
+                "SELECT id FROM delivery_authority_epochs WHERE status = 'active'"
+            ).fetchall()
+            active_count = len(active_rows)
+            unclassified = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM delivery_outbox "
+                "WHERE purpose = 'conversation_reply' "
+                "AND execution_contract = 'streaming_finalization' "
+                "AND authority_epoch_id IS NULL",
+            )
+            active_epoch_id = str(active_rows[0][0]) if active_count == 1 else None
+            prior_parameters: tuple[object, ...] = ()
+            prior_filter = "authority_epoch_id IS NOT NULL"
+            if active_epoch_id is not None:
+                prior_filter += " AND authority_epoch_id != ?"
+                prior_parameters = (active_epoch_id,)
+            prior_nonterminal = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM delivery_outbox WHERE "
+                f"{prior_filter} AND status IN ('pending', 'leased', 'retry_wait')",
+                prior_parameters,
+            )
+            prior_failed = _scalar(
+                connection,
+                f"SELECT COUNT(*) FROM delivery_outbox WHERE {prior_filter} AND status = 'failed'",
+                prior_parameters,
+            )
+            prior_uncertain = _scalar(
+                connection,
+                "SELECT COUNT(DISTINCT o.id) FROM delivery_outbox o "
+                "JOIN delivery_fragments f ON f.delivery_id = o.id WHERE "
+                f"{prior_filter.replace('authority_epoch_id', 'o.authority_epoch_id')} "
+                "AND o.status = 'failed' AND f.status = 'uncertain'",
+                prior_parameters,
+            )
+            unacknowledged_epochs = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM delivery_authority_epochs ae "
+                "WHERE ae.status = 'deactivated' "
+                "AND ae.terminal_failures_acknowledged_at IS NULL "
+                "AND EXISTS (SELECT 1 FROM delivery_outbox o "
+                "WHERE o.authority_epoch_id = ae.id AND o.status = 'failed')",
+            )
+
+            counts = {
+                "pending": 0,
+                "leased": 0,
+                "retrying": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "uncertain": 0,
+            }
+            if active_epoch_id is not None:
+                rows = connection.execute(
+                    "SELECT o.status, EXISTS ("
+                    "SELECT 1 FROM delivery_fragments f "
+                    "WHERE f.delivery_id = o.id AND f.status = 'uncertain'"
+                    ") AS uncertain FROM delivery_outbox o WHERE o.authority_epoch_id = ?",
+                    (active_epoch_id,),
+                ).fetchall()
+                for status_value, uncertain_value in rows:
+                    status = str(status_value)
+                    if status == "failed" and int(uncertain_value):
+                        counts["uncertain"] += 1
+                    elif status == "retry_wait":
+                        counts["retrying"] += 1
+                    elif status in counts:
+                        counts[status] += 1
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+
+    if active_count > 1 or unclassified or prior_nonterminal or unacknowledged_epochs:
+        state = "NOT READY"
+    elif active_count == 1:
+        state = "active"
+    else:
+        state = "inactive"
+    return (
+        f"{prefix} {state}; epochs={epoch_count}, unclassified={unclassified}, "
+        f"prior nonterminal={prior_nonterminal}, prior failed={prior_failed}, "
+        f"prior uncertain={prior_uncertain}, unacknowledged epochs={unacknowledged_epochs}, "
+        f"active pending={counts['pending']}, "
+        f"leased={counts['leased']}, retrying={counts['retrying']}, "
+        f"succeeded={counts['succeeded']}, failed={counts['failed']}, "
+        f"uncertain={counts['uncertain']}"
     )
 
 

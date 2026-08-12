@@ -267,7 +267,7 @@ class CanonicalConversationProjection:
                     message_row = await cursor.fetchone()
                 if message_row is None:
                     raise ValueError("Workshop delivery message must belong to its channel")
-            elif envelope.event_version == 2:
+            elif envelope.event_version in {2, 3}:
                 channel_binding_id = _required_text(payload, "channel_binding_id")
                 async with connection.execute(
                     "SELECT 1 FROM messages m JOIN channel_bindings cb ON cb.channel_id = m.channel_id "

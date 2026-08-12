@@ -12,6 +12,7 @@ import aiosqlite
 import pytest
 
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
 from kai.workshop.delivery_fragments import EDIT_OPERATION, SEND_OPERATION, WorkshopDeliveryFragments
 from kai.workshop.delivery_outbox import (
     CONVERSATION_REPLY_PURPOSE,
@@ -62,7 +63,11 @@ class _Clock:
         self.now += delta
 
 
-async def _open_with_inbound(path: Path) -> tuple[WorkshopEventStore, MessageId]:
+async def _open_with_inbound(
+    path: Path,
+    *,
+    activate_authority: bool = True,
+) -> tuple[WorkshopEventStore, MessageId]:
     store = await WorkshopEventStore.open(path)
     await bootstrap_default_workshop(
         store,
@@ -81,6 +86,8 @@ async def _open_with_inbound(path: Path) -> tuple[WorkshopEventStore, MessageId]
         ),
     )
     assert isinstance(inbound.event.envelope.aggregate_id, MessageId)
+    if activate_authority:
+        await WorkshopConversationDeliveryAuthority(store).activate()
     return store, inbound.event.envelope.aggregate_id
 
 
@@ -291,6 +298,7 @@ class TestAtomicStreamingFinalization:
                     purpose=CONVERSATION_REPLY_PURPOSE,
                     occurred_at=_NOW + timedelta(seconds=2),
                     execution_contract=STREAMING_FINALIZATION_CONTRACT,
+                    authority_epoch_id=(await WorkshopConversationDeliveryAuthority(store).active_epoch()).epoch_id,
                 )
             )
 
@@ -340,6 +348,7 @@ class TestStreamingFinalizationWorkerIsolation:
                 _outbound(inbound_id),
             )
             outbox = WorkshopDeliveryOutbox(store, clock=clock)
+            authority_epoch = await WorkshopConversationDeliveryAuthority(store).active_epoch()
             assert (
                 await outbox.claim_next(
                     "send-only-worker",
@@ -355,6 +364,7 @@ class TestStreamingFinalizationWorkerIsolation:
                 execution_contracts=(STREAMING_FINALIZATION_CONTRACT,),
                 lease_duration=timedelta(seconds=10),
                 delivery_id=finalization.delivery.delivery.delivery_id,
+                authority_epoch_id=authority_epoch.epoch_id,
             )
             assert claim is not None
             clock.advance(timedelta(seconds=10))
@@ -369,6 +379,7 @@ class TestStreamingFinalizationWorkerIsolation:
             recovered = await outbox.recover_expired_leases(
                 purposes=(CONVERSATION_REPLY_PURPOSE,),
                 execution_contracts=(STREAMING_FINALIZATION_CONTRACT,),
+                authority_epoch_id=authority_epoch.epoch_id,
             )
             assert recovered.requeued == 1 and recovered.failed == 0
             assert (await outbox.state(claim.delivery_id)).status == "retry_wait"
@@ -388,7 +399,10 @@ class TestStreamingFinalizationMigration:
         with monkeypatch.context() as migration_context:
             migration_context.setattr(schema, "WORKSHOP_SCHEMA_VERSION", 12)
             migration_context.setattr(schema, "_MIGRATIONS", schema._MIGRATIONS[:12])
-            version_twelve, inbound_id = await _open_with_inbound(path)
+            version_twelve, inbound_id = await _open_with_inbound(
+                path,
+                activate_authority=False,
+            )
             outbound = await record_outbound_message(version_twelve, _outbound(inbound_id))
             message_id = MessageId(str(outbound.event.envelope.aggregate_id))
             async with version_twelve.connection.execute(
@@ -452,7 +466,7 @@ class TestStreamingFinalizationMigration:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 13
+            assert await upgraded.schema_version() == 14
             async with upgraded.connection.execute(
                 "SELECT execution_contract FROM delivery_outbox WHERE id = ?", (delivery_id,)
             ) as cursor:
@@ -462,5 +476,9 @@ class TestStreamingFinalizationMigration:
                 (delivery_id,),
             ) as cursor:
                 assert tuple(await cursor.fetchone()) == (SEND_OPERATION, None)
+            async with upgraded.connection.execute(
+                "SELECT authority_epoch_id FROM delivery_outbox WHERE id = ?", (delivery_id,)
+            ) as cursor:
+                assert (await cursor.fetchone())[0] is None
         finally:
             await upgraded.close()

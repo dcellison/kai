@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from kai.telegram_utils import chunk_text
+from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
 from kai.workshop.delivery_fragments import (
     EDIT_OPERATION,
     SEND_OPERATION,
@@ -336,6 +337,8 @@ async def record_outbound_message_with_streaming_finalization(
             message.body,
             preview_message_id=preview_message_id,
         )
+        authority_epoch = await WorkshopConversationDeliveryAuthority(store).active_epoch_in_transaction()
+        assert authority_epoch is not None
         message_result = await _existing_outbound(store, binding, message)
         if message_result is None:
             message_result = await store.append_in_transaction(_outbound_envelope(binding, message))
@@ -353,6 +356,7 @@ async def record_outbound_message_with_streaming_finalization(
                 purpose=CONVERSATION_REPLY_PURPOSE,
                 occurred_at=message.occurred_at,
                 execution_contract=STREAMING_FINALIZATION_CONTRACT,
+                authority_epoch_id=authority_epoch.epoch_id,
                 max_attempts=5,
             )
         )

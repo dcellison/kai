@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 13
+WORKSHOP_SCHEMA_VERSION = 14
 
 
 @dataclass(frozen=True, slots=True)
@@ -496,6 +496,39 @@ _STREAMING_FINALIZATION_SCHEMA = SchemaMigration(
     ),
 )
 
+_DELIVERY_AUTHORITY_EPOCH_SCHEMA = SchemaMigration(
+    version=14,
+    name="conversation_delivery_authority_epochs",
+    statements=(
+        """
+        CREATE TABLE delivery_authority_epochs (
+            id TEXT PRIMARY KEY,
+            lane TEXT NOT NULL CHECK (lane = 'telegram_conversation_streaming_finalization'),
+            status TEXT NOT NULL CHECK (status IN ('active', 'deactivated')),
+            activated_at TEXT NOT NULL,
+            deactivated_at TEXT,
+            terminal_failures_acknowledged_at TEXT,
+            CHECK (
+                (status = 'active' AND deactivated_at IS NULL)
+                OR (status = 'deactivated' AND deactivated_at IS NOT NULL)
+            ),
+            CHECK (
+                status = 'deactivated' OR terminal_failures_acknowledged_at IS NULL
+            )
+        )
+        """,
+        "CREATE UNIQUE INDEX delivery_authority_epochs_active_lane_idx "
+        "ON delivery_authority_epochs (lane) WHERE status = 'active'",
+        "ALTER TABLE delivery_outbox ADD COLUMN authority_epoch_id TEXT "
+        "REFERENCES delivery_authority_epochs(id) ON DELETE RESTRICT",
+        "CREATE INDEX delivery_outbox_authority_due_idx ON delivery_outbox "
+        "(authority_epoch_id, execution_contract, purpose, status, available_at, requested_event_position)",
+        "CREATE INDEX delivery_outbox_authority_binding_order_idx ON delivery_outbox "
+        "(authority_epoch_id, execution_contract, purpose, channel_binding_id, "
+        "requested_event_position, status)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -510,6 +543,7 @@ _MIGRATIONS = (
     _DELIVERY_PURPOSE_SCHEMA,
     _TELEGRAM_STREAMING_PREVIEW_SCHEMA,
     _STREAMING_FINALIZATION_SCHEMA,
+    _DELIVERY_AUTHORITY_EPOCH_SCHEMA,
 )
 
 
