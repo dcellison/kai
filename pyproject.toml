@@ -75,13 +75,15 @@ markers = [
     "integration: marks tests requiring optional dependencies (deselect with -m 'not integration')",
     "routing_test: codex routing-policy tests that opt out of the test-level same-user bypass",
 ]
-# Suite-wide filterwarnings stay empty so a future project-side leak
-# (sqlite connection, FutureWarning from in-tree code) is not silently
-# hidden by an ini-level filter. Third-party warnings that we cannot
-# fix at source get suppressed with `@pytest.mark.filterwarnings` at
-# the specific class or test that triggers them; that keeps the
-# suppression scoped to the known third-party code path and the
-# blast radius bounded.
+# Promote the recurring unawaited-AsyncMock leak to an error across the
+# entire suite. Python can surface that leak through coroutine finalization,
+# so the accompanying unraisable-exception category must also fail. These
+# rules hide nothing; known third-party warnings remain suppressed only with
+# narrowly scoped `@pytest.mark.filterwarnings` markers at their call sites.
+filterwarnings = [
+    "error:coroutine '.*AsyncMockMixin[.]_execute_mock_call' was never awaited:RuntimeWarning",
+    "error::pytest.PytestUnraisableExceptionWarning",
+]
 
 [tool.pyright]
 pythonVersion = "3.13"
