@@ -749,6 +749,13 @@ class TestCreateBotTransportMode:
         assert app.bot_data["workshop_streaming_finalizer"] is sessions.record_workshop_streaming_finalization
         assert isinstance(app.bot_data["workshop_conversation_run_service"], WorkshopConversationRunService)
 
+    def test_does_not_register_durable_run_lifecycle_before_cutover(self):
+        app = create_bot(_make_config())
+
+        # The durable lifecycle remains deliberately unregistered until the
+        # run-authority cutover gates in the Workshop map are satisfied.
+        assert "workshop_run_lifecycle" not in app.bot_data
+
 
 # ══════════════════════════════════════════════════════════════════════
 # Handler tests - mock Telegram Update/Context objects

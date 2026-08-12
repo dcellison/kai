@@ -80,7 +80,7 @@ The outer process is already a control plane in the practical sense: it authenti
 | Accepted inbound Telegram work | `telegram_update_queue` in [`sessions.py`](src/kai/sessions.py) | Telegram update ID | Strong Telegram-specific durability pattern; not yet a general command inbox. |
 | Transcript | Per-user/date JSONL in [`history.py`](src/kai/history.py) | Chat ID + timestamp | No stable message ID, channel ID, thread ID, edit lineage, delivery state, or transactional relation to SQLite. |
 | Harness session metadata | `sessions` table plus live backend instance | Chat ID | The stored session ID is used for statistics and clearing; process/session reconstruction still belongs to the live backend. |
-| Durable run lifecycle | Workshop event log and replayed `runs` projection | Run ID | Production-unused accepted/started/completed/failed/cancelled facts exist, but live execution does not create them and attempts are not yet modeled. |
+| Durable run lifecycle | Workshop event log and replayed `runs` projection | Run ID | Production-unused accepted/started/completed/failed/cancelled facts exist; the cutover review holds live activation until attempts, cancellation intent, result atomicity, and replay suppression exist. |
 | Active harness process | `SubprocessPool` in [`pool.py`](src/kai/pool.py) | Chat ID | One implicit agent process per conversation key; durable agent and run identities now exist but are not connected to process, attempt, lease, or worker ownership. |
 | User settings | Generic `settings` rows in [`sessions.py`](src/kai/sessions.py) | Namespaced strings containing chat ID | Flexible but not typed, versioned, or attached to transport-independent principals/channels. |
 | Scheduled jobs | `jobs` table and APScheduler registration | Integer job ID + chat ID | Job definitions survive restart, but executions are not durable runs with attempts and event history. |
@@ -411,7 +411,7 @@ No entry may use an indefinite condition such as "keep for compatibility." A gen
 | JSONL transcript writes and reads | Canonical message projection, with an explicit export facility if still useful | Canonical reads serve complete context and transcript views; migration/parity diagnostics report no unexplained divergence | Stop JSONL writes; remove production reads and dual-write recovery code; retain only a documented importer/exporter if required | Planned |
 | Telegram `chat_id` used as internal identity, namespace, and routing key | Durable principal, channel, agent, and binding IDs | Private chats, notification-only groups, duplicate updates, and restart routing all resolve correctly through bindings | Confine Telegram IDs to external identity, transport binding, and idempotency records; remove chat-shaped domain keys | Active (authoritative private text now enters execution by canonical message ID, but the compatibility resolver still derives the current pool key from the human principal's protected Telegram identity; settings, locks, history, files, memory, and excluded routes remain chat-keyed) |
 | `SubprocessPool` keyed by Telegram chat ID | Durable channel/agent session plus run and attempt orchestration | All five harnesses pass continuity, restart, cancellation, and isolation tests through durable identities | Remove chat-key compatibility lookup and move lifecycle ownership behind the orchestrator/runtime contract | Active (a canonical conversation-run service hides the private-text pool lookup behind a temporary compatibility resolution; the pool and all five harness processes remain keyed by that resolved integer) |
-| Direct backend invocation from Telegram handlers | Transport-neutral command and run services | Telegram and the first Workshop client produce equivalent authorized runs and visible results | Remove handler-owned orchestration; leave authentication, parsing, and rendering in the Telegram adapter | Active (authoritative private text invokes through the canonical conversation-run service using only its inbound `MessageId`; a transport-neutral durable run lifecycle now exists production-unused, but live execution does not yet record it; media, voice-enabled text, commands, schedules, integrations, and the future Workshop client remain unmigrated, and attempts do not yet exist) |
+| Direct backend invocation from Telegram handlers | Transport-neutral command and run services | Telegram and the first Workshop client produce equivalent authorized runs and visible results | Remove handler-owned orchestration; leave authentication, parsing, and rendering in the Telegram adapter | Active (authoritative private text invokes through the canonical conversation-run service using only its inbound `MessageId`; a transport-neutral durable run lifecycle exists production-unused; the run-authority review holds live lifecycle activation until execution attempts, cancellation intent, atomic terminal results, and terminal replay suppression exist) |
 | Direct Telegram delivery from handlers, schedules, and webhooks | Durable delivery outbox and Telegram delivery adapter | Delivery outcome events preserve binding identity; retry, crash recovery, ordering, private-chat and notification-group delivery tests pass; live delivery is verified | Migrate each remaining transport path separately; the private-text direct fallback is retired | Active (authenticated private-chat text with voice mode off uses atomic streaming finalization and a supervised exact-epoch worker and now fails closed rather than demoting to direct/shadow delivery; commands, media, voice, schedules, webhooks, files, and groups retain existing delivery) |
 | Operator-invoked Workshop delivery qualification CLI | Installed evidence followed by the production delivery worker | A configured direct-chat reply is prepared without sending, survives a service restart, recovers an intentionally abandoned lease, reaches Telegram once through the exact selected delivery, and records a terminal binding-aware outcome; a configured notification group resolves through its outbound-only canonical channel, receives one atomically prepared qualification message through the exact selected delivery, and does not become an inbound conversation | Remove the qualification command and its explicit-claim-only surface after the production worker has equivalent installed restart/recovery evidence and direct delivery is retired | Active (the installed direct-chat recovery and notification-group delivery gates passed on 2026-08-12; retain until equivalent production-worker evidence exists, while the command remains unregistered and incapable of draining unrelated work) |
 | Conversation-delivery authority epochs | A single durable delivery authority after direct-send rollback is retired | Activation/deactivation, restart, historical-row isolation, exact-epoch worker ownership, aggregate diagnostics, and installed rollback/reactivation evidence pass; no supported rollback crosses the direct-send/outbox boundary | Remove epoch stamping, activation/deactivation state, exact-epoch claim filters, transitional readiness output, schema columns/tables where safely migratable, and their compatibility tests | Active (production startup resumes or creates the exact epoch before ingress; installed private-text streaming, all-send, fragmentation, restart/no-replay, aggregate authority, and parity checks passed on 2026-08-12) |
@@ -1101,10 +1101,149 @@ This foundation is production-unused:
 - upgrading creates an empty `runs` table and advances the canonical projection
   version; existing conversations replay without synthesizing historical runs.
 
-The next bounded step is an explicit run-authority cutover review. It must
-decide the atomic boundary between inbound acceptance, run acceptance, backend
-start, terminal run state, canonical assistant output, and durable delivery;
-define what restart can truthfully recover when a local harness process is not
-durable; and specify cancellation semantics before the live private-text path
-may emit any run facts. Attempt and worker identity should remain a later slice
-unless that review proves they are required for truthful activation.
+The explicit run-authority cutover review is complete in section 27. It holds
+live activation and proves that attempt identity is required for truthful
+dispatch, crash recovery, and cancellation.
+
+## 27. First run-authority cutover review
+
+**Review date:** 2026-08-12
+
+**Scope:** Whether the production-unused durable run lifecycle is sufficient
+to emit live facts around the existing authenticated private-text conversation
+service and trusted-host backend processes.
+
+**Decision:** **Hold live lifecycle activation while adding a
+production-unused durable execution-attempt and cancellation-intent
+foundation.** The lifecycle vocabulary and projection are sound as durable
+facts, but the current handler cannot place those facts around a local coding
+agent without creating states that overclaim what Kai knows after a crash.
+
+The blocker is not transport routing or Telegram final delivery. The durable
+Telegram update queue and exact-epoch outbox already provide useful recovery
+boundaries. The blocker is the non-transactional boundary between SQLite and a
+backend process that may edit files, invoke tools, or affect remote systems
+before Kai observes its first stream event. No database transaction can make
+that external execution exactly once.
+
+### 27.1 Current authority trace
+
+For the live private-text path, authority currently crosses these boundaries:
+
+1. webhook mode persists the raw Telegram update before acknowledging it;
+2. the handler records the canonical inbound message idempotently;
+3. the conversation service resolves one canonical human, channel, and agent,
+   then privately resolves the current compatibility runtime key and model;
+4. the per-conversation lock serializes dispatch;
+5. `PreparedConversationRun.stream()` invokes the selected backend through the
+   trusted-host `SubprocessPool`;
+6. stable prefixes may create and edit a confirmed non-final Telegram preview;
+7. a successful terminal `StreamEvent` yields one in-memory `AgentResponse`;
+8. one transaction records the canonical assistant message, exact-epoch
+   delivery request, and immutable edit/send operation plan;
+9. the supervised outbox worker performs final Telegram delivery; and
+10. only after the handler returns does the compatibility Telegram queue mark
+    its update complete.
+
+Polling mode enters the same handler without the compatibility webhook queue.
+The canonical inbound message remains the transport-neutral idempotency fact
+once handler execution begins.
+
+### 27.2 Crash and replay findings
+
+| Boundary | Durable evidence after a crash | Safe automatic action |
+|---|---|---|
+| Before canonical inbound commit | No Workshop command was accepted | Let the ingress transport retry according to its own contract |
+| Inbound committed, run not accepted | Canonical message exists without a run | Deterministically repair acceptance; do not dispatch until acceptance commits |
+| Run accepted, no execution authority granted | Accepted run has no attempt that may have executed | A worker may grant a new attempt once, under the channel/agent serialization policy |
+| Attempt authority committed, before or during backend invocation | The backend may already have produced irreversible local or remote effects | Never automatically invoke the coding agent again; expire the owner and classify the attempt as interrupted for reconciliation |
+| Backend success observed, terminal result not committed | Effects and an in-memory response may have existed, but no durable result exists | Do not regenerate automatically; classify interruption unless the same live owner can still commit the captured result |
+| Canonical result, run completion, and delivery request committed | Durable terminal result and delivery authority exist | Suppress backend replay; let the outbox finish or resume delivery |
+| Delivery occurred, ingress receipt not completed | Terminal run and binding-aware delivery evidence exist | Suppress backend replay and acknowledge the duplicate/replayed ingress receipt |
+
+A lease can prove whether an owner is still entitled to act. Its expiry cannot
+prove that the backend never ran. For coding agents, at-least-once redispatch
+after the execution boundary is unsafe. The initial compatibility policy must
+therefore be **retry before dispatch, never automatically retry after dispatch**.
+A user may deliberately create a new run after inspecting an interrupted one.
+
+### 27.3 Required semantic corrections before activation
+
+The production-unused lifecycle can evolve safely before any historical live
+run facts exist. Activation requires these corrections:
+
+- **Atomic acceptance:** the authoritative private-text command must commit its
+  canonical inbound message and `run.accepted` fact as one idempotent command
+  transaction. Existing shadow adapters remain for excluded routes.
+- **Execution attempts:** every dispatch needs a typed attempt identity, one
+  current execution owner, a bounded lease, and a monotonic attempt sequence.
+  The attempt snapshots backend-neutral execution selection needed for audit
+  (agent, registered backend, provider when applicable, model, and execution
+  contract), but never credentials, executable paths, prompts, or output.
+- **Meaning of started:** `run.started` means Kai granted an attempt authority
+  at the may-have-executed boundary. It does not claim that the first token was
+  observed or that external effects are reversible.
+- **Durable cancellation intent:** a human cancellation request is a separate
+  fact from terminal cancellation. `run.cancelled` may be recorded only after
+  the live execution owner confirms shutdown. The human is the request actor;
+  the attached agent/execution authority is the terminal acknowledgement
+  actor. The current human-authored terminal cancellation contract must change
+  before activation. A crash with uncertain process outcome becomes bounded
+  `execution_interrupted` failure evidence rather than a false cancellation
+  acknowledgement.
+- **Atomic successful terminal state:** `run.completed` must identify the
+  canonical result message and commit in the same transaction as that message,
+  its exact-epoch delivery request, and immutable operation plan. A completed
+  run may never lack its durable visible result.
+- **Durable failure/cancellation outcome:** terminal failure or cancellation
+  and its bounded user-visible canonical outcome must commit before ingress is
+  acknowledged. Native backend errors remain outside canonical facts.
+- **Terminal replay suppression:** a replayed ingress receipt for a completed,
+  failed, or cancelled run must not call the backend. Accepted work may proceed
+  only through attempt authority; interrupted started work requires explicit
+  human reconciliation or a new run.
+- **Single terminal arbiter:** completion, failure, and confirmed cancellation
+  race through one transactional state transition so exactly one terminal fact
+  wins. A late `/stop` cannot rewrite a completed result.
+
+### 27.4 Cutover gates
+
+| Gate | Evidence | Result |
+|---|---|---|
+| Canonical target authorization | One human member and one attached agent resolve from the inbound `MessageId`; caller cannot select backend identity or pool key | Pass, production-used |
+| Durable lifecycle vocabulary | Deterministic acceptance and terminal facts replay to an exact run projection | Pass, production-unused |
+| Stable failure classification | Backend-native errors map conservatively to bounded backend-neutral categories | Pass as a building block |
+| Durable final delivery | Canonical result and exact-epoch streaming-finalization plan recover without duplicate final delivery | Pass, production-used |
+| Atomic inbound acceptance | Inbound message and run acceptance currently use separate service calls | Blocker |
+| Attempt authority and ownership | No attempt ID, owner, lease, or may-have-executed recovery state exists | Blocker |
+| Cancellation intent and acknowledgement | `/stop` uses a volatile event and immediate process kill; no durable request/acknowledgement race exists | Blocker |
+| Terminal result atomicity | Run completion is not part of the canonical result/finalization transaction | Blocker |
+| Terminal replay suppression | Replayed ingress has no run-state guard before backend invocation | Blocker |
+| Installed qualification | No live run facts should exist until all preceding blockers pass in automated review | Not yet applicable |
+
+### 27.5 Next bounded implementation milestone
+
+Add a production-unused durable **run execution-authority foundation**. It
+must:
+
+1. introduce typed attempt identity and a replayed attempt projection linked to
+   exactly one run;
+2. grant at most one active execution owner per run, with lease and monotonic
+   fencing semantics that prevent a stale owner from committing terminal state;
+3. distinguish accepted/pre-dispatch work from may-have-executed work and
+   forbid automatic redispatch of the latter after owner loss;
+4. record human cancellation intent separately from terminal cancellation and
+   define one transactional terminal-state arbiter;
+5. require successful completion to reference one canonical result `MessageId`
+   while leaving the later finalization integration production-unused;
+6. retain only registered backend/provider/model identifiers and bounded status
+   codes—never secrets, executable paths, raw errors, prompts, or output;
+7. provide deterministic idempotency, replay, lease-expiry, stale-owner,
+   completion/cancellation-race, and migration tests;
+8. remain unregistered in `main.py`, `bot.py`, `sessions.py`, the conversation
+   service, and every client endpoint.
+
+Do not add a generic background execution worker or wire Telegram in this
+slice. After the foundation passes, conduct a second run-authority review of
+the atomic inbound/acceptance adapter and terminal-result finalization
+integration before authorizing any live lifecycle facts.
