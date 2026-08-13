@@ -37,9 +37,7 @@ DeliveryPurpose = Literal["conversation_reply", "notification", "qualification"]
 CONVERSATION_REPLY_PURPOSE: DeliveryPurpose = "conversation_reply"
 NOTIFICATION_PURPOSE: DeliveryPurpose = "notification"
 QUALIFICATION_PURPOSE: DeliveryPurpose = "qualification"
-_DELIVERY_PURPOSES = frozenset(
-    {CONVERSATION_REPLY_PURPOSE, NOTIFICATION_PURPOSE, QUALIFICATION_PURPOSE}
-)
+_DELIVERY_PURPOSES = frozenset({CONVERSATION_REPLY_PURPOSE, NOTIFICATION_PURPOSE, QUALIFICATION_PURPOSE})
 
 DeliveryExecutionContract = Literal["send_fragments", "streaming_finalization"]
 SEND_FRAGMENTS_CONTRACT: DeliveryExecutionContract = "send_fragments"

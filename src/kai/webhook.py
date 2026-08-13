@@ -1186,8 +1186,7 @@ async def _process_github_event_for_user(
             recorded = await notification_service.record(notification)
             if recorded is not None:
                 log.info(
-                    "Recorded GitHub %s notification for Workshop channel delivery %s "
-                    "(user %d, inserted=%s)",
+                    "Recorded GitHub %s notification for Workshop channel delivery %s (user %d, inserted=%s)",
                     event_type,
                     recorded.delivery.delivery.delivery_id,
                     chat_id,

@@ -909,10 +909,8 @@ _NOTIFICATION_DELIVERY_PURPOSE_SCHEMA = SchemaMigration(
         "ALTER TABLE delivery_outbox_v19 RENAME TO delivery_outbox",
         "ALTER TABLE delivery_attempts_v19 RENAME TO delivery_attempts",
         "ALTER TABLE delivery_fragments_v19 RENAME TO delivery_fragments",
-        "CREATE INDEX delivery_outbox_due_idx "
-        "ON delivery_outbox (status, available_at, requested_event_position)",
-        "CREATE INDEX delivery_outbox_lease_expiry_idx "
-        "ON delivery_outbox (status, lease_expires_at)",
+        "CREATE INDEX delivery_outbox_due_idx ON delivery_outbox (status, available_at, requested_event_position)",
+        "CREATE INDEX delivery_outbox_lease_expiry_idx ON delivery_outbox (status, lease_expires_at)",
         "CREATE INDEX delivery_outbox_binding_order_idx "
         "ON delivery_outbox (channel_binding_id, requested_event_position, status)",
         "CREATE INDEX delivery_outbox_purpose_due_idx "
@@ -928,10 +926,8 @@ _NOTIFICATION_DELIVERY_PURPOSE_SCHEMA = SchemaMigration(
         "CREATE INDEX delivery_outbox_authority_binding_order_idx ON delivery_outbox "
         "(authority_epoch_id, execution_contract, purpose, channel_binding_id, "
         "requested_event_position, status)",
-        "CREATE INDEX delivery_attempts_delivery_idx "
-        "ON delivery_attempts (delivery_id, attempt_number)",
-        "CREATE INDEX delivery_fragments_status_idx "
-        "ON delivery_fragments (delivery_id, status, fragment_index)",
+        "CREATE INDEX delivery_attempts_delivery_idx ON delivery_attempts (delivery_id, attempt_number)",
+        "CREATE INDEX delivery_fragments_status_idx ON delivery_fragments (delivery_id, status, fragment_index)",
     ),
 )
 

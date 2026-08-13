@@ -2403,9 +2403,7 @@ class TestNotificationChatIdMutations:
             "workshop_private_text_execution": private_execution,
             "workshop_runtime_pool": MagicMock(),
             "workshop_principal_storage": _principal_storage_registry(),
-            "workshop_github_notifications": MagicMock(
-                spec=WorkshopTelegramNotificationService
-            ),
+            "workshop_github_notifications": MagicMock(spec=WorkshopTelegramNotificationService),
         }
 
         fake_runner = MagicMock()
@@ -2468,9 +2466,7 @@ class TestNotificationChatIdMutations:
             "workshop_private_text_execution": private_execution,
             "workshop_runtime_pool": MagicMock(),
             "workshop_principal_storage": _principal_storage_registry(),
-            "workshop_github_notifications": MagicMock(
-                spec=WorkshopTelegramNotificationService
-            ),
+            "workshop_github_notifications": MagicMock(spec=WorkshopTelegramNotificationService),
         }
 
         apps: list[web.Application] = []

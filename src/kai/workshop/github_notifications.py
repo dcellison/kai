@@ -165,9 +165,7 @@ class WorkshopGitHubNotificationRecorder:
                 or existing.envelope.payload != payload
                 or existing.envelope.metadata != metadata
             ):
-                raise IdempotencyConflictError(
-                    f"Event identity {idempotency_key!r} was reused with different content"
-                )
+                raise IdempotencyConflictError(f"Event identity {idempotency_key!r} was reused with different content")
 
             projection = CanonicalConversationProjection()
             await self._store.project_pending_in_transaction(projection)
@@ -182,9 +180,7 @@ class WorkshopGitHubNotificationRecorder:
                 )
             )
             if message_inserted != delivery.inserted:
-                raise GitHubNotificationError(
-                    "GitHub notification message and delivery do not share one prior state"
-                )
+                raise GitHubNotificationError("GitHub notification message and delivery do not share one prior state")
             await self._store.project_pending_in_transaction(projection)
             await connection.commit()
             return GitHubNotificationRecord(message_id=message_id, delivery=delivery)

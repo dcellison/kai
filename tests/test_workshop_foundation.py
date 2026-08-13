@@ -756,8 +756,7 @@ class TestWorkshopSchema:
             ) as cursor:
                 assert tuple(await cursor.fetchone()) == ("retry_scheduled", "timeout")
             async with upgraded.connection.execute(
-                "SELECT body, status, operation FROM delivery_fragments "
-                "WHERE delivery_id = ? AND fragment_index = 0",
+                "SELECT body, status, operation FROM delivery_fragments WHERE delivery_id = ? AND fragment_index = 0",
                 (delivery_id,),
             ) as cursor:
                 assert tuple(await cursor.fetchone()) == (
