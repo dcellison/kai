@@ -280,8 +280,7 @@ class TestDefaultWorkshopBootstrap:
                 aggregate_id=assignment_id,
                 occurred_at=datetime.now(UTC),
                 idempotency_key=(
-                    "workshop-bootstrap:v1:runtime-assignment:"
-                    + hashlib.sha256(b"telegram\x00101").hexdigest()
+                    "workshop-bootstrap:v1:runtime-assignment:" + hashlib.sha256(b"telegram\x00101").hexdigest()
                 ),
                 payload={
                     "channel_id": channel_id,

@@ -156,9 +156,7 @@ class TestCanonicalRunResolution:
         store = await WorkshopEventStore.open(tmp_path / "kai.db")
         try:
             inbound_id = await _canonical_inbound(store)
-            target = (
-                await resolve_canonical_conversation_run(store, inbound_id, profile_registry(101))
-            ).target
+            target = (await resolve_canonical_conversation_run(store, inbound_id, profile_registry(101))).target
             second_principal = PrincipalId.new()
             second_agent = AgentId.new()
             await store.connection.execute(

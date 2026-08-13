@@ -316,7 +316,10 @@ async def bootstrap_default_workshop(
                 "runtime-reassignment-v2",
                 f"{channel_token}:{human.runtime_profile_id}",
             )
-            if await store.event_by_idempotency_key(assignment_key) is not None or await store.event_by_idempotency_key(reassignment_key) is not None:
+            if (
+                await store.event_by_idempotency_key(assignment_key) is not None
+                or await store.event_by_idempotency_key(reassignment_key) is not None
+            ):
                 existing_events += 1
             elif await store.event_by_idempotency_key(previous_key) is not None:
                 await ensure(
