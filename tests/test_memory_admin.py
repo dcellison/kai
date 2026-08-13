@@ -9,11 +9,39 @@ which has its own coverage in tests/test_memory.py.
 
 from __future__ import annotations
 
+import sqlite3
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from kai import memory_admin
+
+
+def test_default_report_directory_uses_canonical_workshop_principal(tmp_path, monkeypatch):
+    db_path = tmp_path / "kai.db"
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "CREATE TABLE external_identities ("
+        "principal_id TEXT NOT NULL, provider TEXT NOT NULL, external_subject TEXT NOT NULL)"
+    )
+    principal_id = "prn_" + "c" * 32
+    connection.execute(
+        "INSERT INTO external_identities (principal_id, provider, external_subject) VALUES (?, ?, ?)",
+        (principal_id, "telegram", "42"),
+    )
+    connection.commit()
+    connection.close()
+    monkeypatch.setattr("kai.config.DATA_DIR", tmp_path / "data")
+
+    result = memory_admin._default_human_report_directory(
+        SimpleNamespace(session_db_path=db_path),
+        "42",
+        "reclassify",
+    )
+
+    assert result == tmp_path / "data" / "home" / principal_id / "docs" / "reclassify"
+
 
 # ── _build_parser: arg surface ───────────────────────────────────────
 

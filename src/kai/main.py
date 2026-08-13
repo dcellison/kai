@@ -377,7 +377,7 @@ def _start() -> None:
         # SubprocessPool. Each user's workspace is restored lazily on
         # their first message (in pool.send()). No startup restore needed.
 
-        # Personal MEMORY.md is now per-user under memory/<chat_id>/
+        # Personal MEMORY.md is now per-human under memory/<principal_id>/
         # and is bootstrapped lazily by the backend on first session
         # (backend.ensure_user_memory). No startup bootstrap is needed;
         # that call is intentionally gone. See issue #347.

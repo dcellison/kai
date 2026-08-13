@@ -6,6 +6,7 @@ import os
 import pwd
 import shutil
 import signal
+import sqlite3
 import stat
 import subprocess
 import time
@@ -39,6 +40,7 @@ from kai.install import (
     _collect_backends_from_yaml,
     _collect_os_users_from_yaml,
     _collect_user_memory_owners,
+    _copy_managed_home_tree,
     _copy_tree,
     _deployed_webhook_secret_migration_status,
     _file_checksum,
@@ -49,6 +51,7 @@ from kai.install import (
     _generate_systemd_unit,
     _generate_users_yaml,
     _migrate_identity_to_claude_md,
+    _migrate_managed_home_database_paths,
     _optional_file_checksum,
     _prompt_choice,
     _prompt_optional_choice,
@@ -5934,6 +5937,52 @@ class TestApplyMigratePerUserHome:
         monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
         return data_path
 
+    def test_atomic_copy_removes_partial_staging_tree(self, tmp_path, monkeypatch):
+        source = tmp_path / "legacy"
+        source.mkdir()
+        destination = tmp_path / ("prn_" + "a" * 32)
+
+        def fail_after_partial_copy(_source, temporary, *, symlinks):
+            assert symlinks is True
+            temporary.mkdir()
+            (temporary / "partial.txt").write_text("partial")
+            raise OSError("simulated copy failure")
+
+        monkeypatch.setattr("kai.install.shutil.copytree", fail_after_partial_copy)
+
+        with pytest.raises(OSError, match="simulated copy failure"):
+            _copy_managed_home_tree(source, destination)
+
+        assert not destination.exists()
+        assert not list(tmp_path.glob(f".{destination.name}.migrating-*"))
+
+    def test_database_path_migration_handles_missing_optional_tables(self, tmp_path):
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        db_path = data_path / "kai.db"
+        connection = sqlite3.connect(db_path)
+        connection.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        legacy_home = data_path / "home" / "42"
+        canonical_home = data_path / "home" / ("prn_" + "d" * 32)
+        connection.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?)",
+            ("workspace:42", str(legacy_home / "project")),
+        )
+        connection.commit()
+        connection.close()
+
+        _migrate_managed_home_database_paths(
+            data_path,
+            {42: (legacy_home, canonical_home)},
+            dry_run=False,
+        )
+
+        connection = sqlite3.connect(db_path)
+        assert connection.execute("SELECT value FROM settings WHERE key = 'workspace:42'").fetchone() == (
+            str(canonical_home / "project"),
+        )
+        connection.close()
+
     def test_no_override_creates_home_chat_id_dir(self, tmp_path, monkeypatch):
         """
         Case 1 (default): a user with no users.yaml home_workspace lands
@@ -6151,6 +6200,155 @@ class TestApplyMigratePerUserHome:
             "Override under symlinked DATA_DIR was not provisioned - "
             "is_relative_to comparison did not resolve data_path"
         )
+
+    async def test_copies_complete_home_and_rewrites_kai_database_paths(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        data_path = self._setup(tmp_path, monkeypatch)
+        users_yaml = tmp_path / "users.yaml"
+        self._write_users_yaml(
+            users_yaml,
+            "users:\n  - telegram_id: 7777\n    name: primary\n    role: admin\n",
+        )
+        legacy_home = data_path / "home" / "7777"
+        project = legacy_home / "project"
+        project.mkdir(parents=True)
+        (legacy_home / "AGENTS.md").write_text("# Operator identity\n")
+        executable = project / "run.sh"
+        executable.write_text("#!/bin/sh\n")
+        executable.chmod(0o755)
+        legacy_memory = data_path / "memory" / "7777" / "MEMORY.md"
+        legacy_memory.parent.mkdir(parents=True)
+        legacy_memory.write_text("operator memory")
+
+        store = await WorkshopEventStore.open(data_path / "kai.db")
+        await bootstrap_default_workshop(
+            store,
+            (
+                BootstrapHuman(
+                    "Primary",
+                    "admin",
+                    "telegram",
+                    "7777",
+                    "7777",
+                    profile_id(7777),
+                ),
+            ),
+        )
+        async with store.connection.execute(
+            "SELECT principal_id FROM external_identities WHERE provider = 'telegram' AND external_subject = '7777'"
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        principal_id = str(row[0])
+        await store.close()
+
+        connection = sqlite3.connect(data_path / "kai.db")
+        connection.executescript(
+            "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+            "CREATE TABLE IF NOT EXISTS allowed_workspaces ("
+            "chat_id INTEGER NOT NULL, path TEXT NOT NULL, PRIMARY KEY (chat_id, path));"
+            "CREATE TABLE IF NOT EXISTS workspace_history ("
+            "path TEXT NOT NULL, chat_id INTEGER NOT NULL, last_used_at TIMESTAMP, "
+            "PRIMARY KEY (path, chat_id));"
+            "CREATE TABLE IF NOT EXISTS memory_projects ("
+            "project_id TEXT PRIMARY KEY, display_name TEXT NOT NULL, "
+            "workspace_root TEXT NOT NULL UNIQUE, memory_enabled INTEGER NOT NULL, "
+            "default_scope_for_new_facts TEXT, created_by INTEGER NOT NULL, "
+            "created_at TIMESTAMP);"
+        )
+        legacy_project = str(project)
+        connection.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?)",
+            ("workspace:7777", legacy_project),
+        )
+        connection.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?)",
+            (f"ws_config:7777:{legacy_project}:model", "gpt-test"),
+        )
+        connection.execute(
+            "INSERT INTO allowed_workspaces (chat_id, path) VALUES (?, ?)",
+            (7777, legacy_project),
+        )
+        connection.execute(
+            "INSERT INTO workspace_history (path, chat_id, last_used_at) VALUES (?, ?, ?)",
+            (legacy_project, 7777, "2026-08-13 05:00:00"),
+        )
+        connection.execute(
+            "INSERT INTO memory_projects "
+            "(project_id, display_name, workspace_root, memory_enabled, "
+            "default_scope_for_new_facts, created_by, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("project", "Project", legacy_project, 1, None, 7777, "2026-08-13 05:00:00"),
+        )
+        connection.commit()
+        connection.close()
+
+        _apply_migrate(
+            data_path,
+            tmp_path / "install",
+            svc_uid=501,
+            svc_gid=20,
+            dry_run=True,
+            users_yaml_path=users_yaml,
+        )
+        canonical_home = data_path / "home" / principal_id
+        assert not canonical_home.exists()
+        connection = sqlite3.connect(data_path / "kai.db")
+        assert connection.execute("SELECT value FROM settings WHERE key = 'workspace:7777'").fetchone() == (
+            legacy_project,
+        )
+        connection.close()
+
+        _apply_migrate(
+            data_path,
+            tmp_path / "install",
+            svc_uid=501,
+            svc_gid=20,
+            dry_run=False,
+            users_yaml_path=users_yaml,
+        )
+
+        canonical_project = canonical_home / "project"
+        assert (canonical_home / "AGENTS.md").read_text() == "# Operator identity\n"
+        assert (canonical_project / "run.sh").stat().st_mode & 0o777 == 0o755
+        assert (legacy_home / "project" / "run.sh").is_file()
+        canonical_memory = data_path / "memory" / principal_id / "MEMORY.md"
+        assert canonical_memory.read_text() == "operator memory"
+        assert legacy_memory.read_text() == "operator memory"
+
+        connection = sqlite3.connect(data_path / "kai.db")
+        canonical_project_text = str(canonical_project)
+        assert connection.execute("SELECT value FROM settings WHERE key = 'workspace:7777'").fetchone() == (
+            canonical_project_text,
+        )
+        assert connection.execute(
+            "SELECT value FROM settings WHERE key = ?",
+            (f"ws_config:7777:{canonical_project_text}:model",),
+        ).fetchone() == ("gpt-test",)
+        assert connection.execute("SELECT path FROM allowed_workspaces WHERE chat_id = 7777").fetchone() == (
+            canonical_project_text,
+        )
+        assert connection.execute("SELECT path FROM workspace_history WHERE chat_id = 7777").fetchone() == (
+            canonical_project_text,
+        )
+        assert connection.execute(
+            "SELECT workspace_root FROM memory_projects WHERE project_id = 'project'"
+        ).fetchone() == (canonical_project_text,)
+        connection.close()
+
+        (canonical_home / "canonical-only.txt").write_text("new state")
+        _apply_migrate(
+            data_path,
+            tmp_path / "install",
+            svc_uid=501,
+            svc_gid=20,
+            dry_run=False,
+            users_yaml_path=users_yaml,
+        )
+        assert (canonical_home / "canonical-only.txt").read_text() == "new state"
 
 
 # ── Per-user PREFERENCES.md migration (#400) ─────────────────────────

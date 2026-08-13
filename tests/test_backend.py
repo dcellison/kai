@@ -1071,6 +1071,24 @@ class TestResolveHomeWorkspace:
         assert result == home
         ensure_home.assert_not_called()
 
+    def test_protected_install_uses_canonical_principal_home(self, tmp_path, monkeypatch):
+        config = self._config(
+            user_configs={42: UserConfig(telegram_id=42, name="real-user", os_user="alice")},
+            protected_install=True,
+        )
+        principal_id = "prn_" + "a" * 32
+        home = tmp_path / "home" / principal_id
+        home.mkdir(parents=True)
+        registry = MagicMock()
+        registry.for_runtime_config_id.return_value.principal_id = principal_id
+        monkeypatch.setattr("kai.backend._PRINCIPAL_STORAGE_REGISTRY", registry)
+
+        with patch("kai.backend.ensure_user_home") as ensure_home:
+            result = resolve_home_workspace(42, config, data_dir=tmp_path)
+
+        assert result == home
+        ensure_home.assert_not_called()
+
     def test_protected_install_requires_install_provisioning(self, tmp_path):
         config = self._config(
             user_configs={42: UserConfig(telegram_id=42, name="real-user", os_user="alice")},
@@ -1658,6 +1676,76 @@ class TestCanonicalPrincipalPreferences:
         canonical = data_dir / "preferences" / _PrincipalPreferenceNamespace.principal_id / "PREFERENCES.md"
         assert not canonical.exists()
         assert outside.read_text() == "outside preference"
+
+    def test_lazy_memory_bootstrap_copies_legacy_content(self, tmp_path, monkeypatch):
+        data_dir = tmp_path / "data"
+        legacy = data_dir / "memory" / "42" / "MEMORY.md"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text("durable personal memory")
+        monkeypatch.setattr(
+            "kai.backend._PRINCIPAL_STORAGE_REGISTRY",
+            _PrincipalPreferenceRegistry(),
+        )
+
+        ensure_user_memory(42, data_dir)
+
+        canonical = data_dir / "memory" / _PrincipalPreferenceNamespace.principal_id / "MEMORY.md"
+        assert canonical.read_text() == "durable personal memory"
+        assert legacy.read_text() == "durable personal memory"
+
+    def test_disabled_memory_context_prefers_canonical_principal(self, tmp_path, monkeypatch):
+        data_dir = tmp_path / "data"
+        canonical = data_dir / "memory" / _PrincipalPreferenceNamespace.principal_id / "MEMORY.md"
+        canonical.parent.mkdir(parents=True)
+        canonical.write_text("canonical memory")
+        legacy = data_dir / "memory" / "42" / "MEMORY.md"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text("legacy memory")
+        monkeypatch.setattr(
+            "kai.backend._PRINCIPAL_STORAGE_REGISTRY",
+            _PrincipalPreferenceRegistry(),
+        )
+
+        with patch("kai.backend.get_recent_history", return_value=""):
+            result = build_session_context(
+                workspace=tmp_path,
+                home_workspace=tmp_path,
+                api=ApiContext(webhook_port=8080, webhook_secret=None),
+                workspace_config=None,
+                chat_id=42,
+                data_dir=data_dir,
+                memory_enabled=False,
+            )
+
+        assert "canonical memory" in result
+        assert "legacy memory" not in result
+        assert str(canonical) in result
+
+    def test_managed_home_uses_canonical_principal_directory(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "kai.backend._PRINCIPAL_STORAGE_REGISTRY",
+            _PrincipalPreferenceRegistry(),
+        )
+
+        home = ensure_user_home(42, tmp_path, backend_name="codex")
+
+        assert home == tmp_path / "home" / _PrincipalPreferenceNamespace.principal_id
+        assert home.is_dir()
+        assert not (tmp_path / "home" / "42").exists()
+
+    def test_managed_home_keeps_first_install_legacy_fallback(self, tmp_path, monkeypatch):
+        legacy = tmp_path / "home" / "42"
+        legacy.mkdir(parents=True)
+        (legacy / "operator.txt").write_text("preserved")
+        monkeypatch.setattr(
+            "kai.backend._PRINCIPAL_STORAGE_REGISTRY",
+            _PrincipalPreferenceRegistry(),
+        )
+
+        home = ensure_user_home(42, tmp_path, backend_name="codex")
+
+        assert home == legacy
+        assert (home / "operator.txt").read_text() == "preserved"
 
 
 class TestPerUserMemoryIsolation:

@@ -1257,7 +1257,7 @@ def _cmd_config() -> None:
 
         if admin_os_user is not None:
             # No wizard prompt for home_workspace post-#353. The admin lands
-            # in DATA_DIR/home/<chat_id>/ like any other user; the per-user
+            # in DATA_DIR/home/<principal_id>/ like any other user; the per-human
             # default is private to them. An admin who wants a path outside
             # DATA_DIR can add `home_workspace` to users.yaml by hand.
             admin_home_workspace = None
@@ -3897,6 +3897,214 @@ def _canonical_principal_storage_names(data_path: Path) -> dict[str, str]:
     }
 
 
+def _rewrite_managed_home_path(value: str, legacy_home: Path, canonical_home: Path) -> str | None:
+    """Rewrite an exact managed-home prefix without resolving symlinks."""
+    try:
+        relative = Path(value).relative_to(legacy_home)
+    except ValueError:
+        return None
+    return str(canonical_home / relative)
+
+
+def _copy_managed_home_tree(source: Path, destination: Path) -> None:
+    """Copy one stopped-service home through a private atomic staging path."""
+    if destination.exists():
+        raise FileExistsError(destination)
+    temporary = Path(
+        tempfile.mkdtemp(
+            prefix=f".{destination.name}.migrating-",
+            dir=destination.parent,
+        )
+    )
+    temporary.rmdir()
+    try:
+        shutil.copytree(source, temporary, symlinks=True)
+        temporary.replace(destination)
+    except BaseException:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        raise
+
+
+def _migrate_managed_home_database_paths(
+    data_path: Path,
+    migrations: dict[int, tuple[Path, Path]],
+    *,
+    dry_run: bool,
+    validate_only: bool = False,
+) -> None:
+    """Move Kai-held workspace references to canonical managed homes."""
+    if not migrations:
+        return
+    db_path = data_path / "kai.db"
+    if db_path.is_symlink():
+        raise RuntimeError(f"Refusing symlinked database during managed-home migration: {db_path}")
+    if not db_path.is_file():
+        return
+
+    if dry_run or validate_only:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+    else:
+        connection = sqlite3.connect(db_path)
+    try:
+        tables = {
+            str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        }
+        original_settings = (
+            {str(key): str(value) for key, value in connection.execute("SELECT key, value FROM settings").fetchall()}
+            if "settings" in tables
+            else {}
+        )
+        migrated_settings = dict(original_settings)
+        for chat_id, (legacy_home, canonical_home) in migrations.items():
+            workspace_key = f"workspace:{chat_id}"
+            current_workspace = migrated_settings.get(workspace_key)
+            if current_workspace is not None:
+                rewritten = _rewrite_managed_home_path(current_workspace, legacy_home, canonical_home)
+                if rewritten is not None:
+                    migrated_settings[workspace_key] = rewritten
+
+            prefix = f"ws_config:{chat_id}:"
+            for key, value in tuple(migrated_settings.items()):
+                if not key.startswith(prefix):
+                    continue
+                path_and_field = key[len(prefix) :]
+                workspace_path, separator, field = path_and_field.rpartition(":")
+                if not separator or not field:
+                    continue
+                rewritten = _rewrite_managed_home_path(workspace_path, legacy_home, canonical_home)
+                if rewritten is None:
+                    continue
+                new_key = f"{prefix}{rewritten}:{field}"
+                existing = migrated_settings.get(new_key)
+                if existing is not None and new_key != key and existing != value:
+                    raise RuntimeError(f"Conflicting workspace settings during home migration: {new_key}")
+                del migrated_settings[key]
+                migrated_settings[new_key] = value
+
+        original_allowed = (
+            {
+                (int(chat_id), str(path))
+                for chat_id, path in connection.execute("SELECT chat_id, path FROM allowed_workspaces").fetchall()
+            }
+            if "allowed_workspaces" in tables
+            else set()
+        )
+        migrated_allowed: set[tuple[int, str]] = set()
+        for chat_id, path in original_allowed:
+            migration = migrations.get(chat_id)
+            rewritten = _rewrite_managed_home_path(path, *migration) if migration is not None else None
+            migrated_allowed.add((chat_id, rewritten if rewritten is not None else path))
+
+        original_history = (
+            [
+                (str(path), int(chat_id), last_used_at)
+                for path, chat_id, last_used_at in connection.execute(
+                    "SELECT path, chat_id, last_used_at FROM workspace_history"
+                ).fetchall()
+            ]
+            if "workspace_history" in tables
+            else []
+        )
+        migrated_history: dict[tuple[str, int], object] = {}
+        for path, chat_id, last_used_at in original_history:
+            migration = migrations.get(chat_id)
+            rewritten = _rewrite_managed_home_path(path, *migration) if migration is not None else None
+            key = (rewritten if rewritten is not None else path, chat_id)
+            prior = migrated_history.get(key)
+            if prior is None or (last_used_at is not None and str(last_used_at) > str(prior)):
+                migrated_history[key] = last_used_at
+
+        original_projects = (
+            [
+                (str(project_id), str(workspace_root), int(created_by))
+                for project_id, workspace_root, created_by in connection.execute(
+                    "SELECT project_id, workspace_root, created_by FROM memory_projects"
+                ).fetchall()
+            ]
+            if "memory_projects" in tables
+            else []
+        )
+        project_updates: dict[str, str] = {}
+        claimed_project_roots = {
+            workspace_root: project_id for project_id, workspace_root, _created_by in original_projects
+        }
+        for project_id, workspace_root, created_by in original_projects:
+            migration = migrations.get(created_by)
+            rewritten = _rewrite_managed_home_path(workspace_root, *migration) if migration is not None else None
+            if rewritten is None or rewritten == workspace_root:
+                continue
+            conflict = claimed_project_roots.get(rewritten)
+            if conflict is not None and conflict != project_id:
+                raise RuntimeError(f"Conflicting memory project root during home migration: {rewritten}")
+            project_updates[project_id] = rewritten
+
+        setting_deletes = set(original_settings) - set(migrated_settings)
+        setting_upserts = {
+            key: value for key, value in migrated_settings.items() if original_settings.get(key) != value
+        }
+        allowed_deletes = original_allowed - migrated_allowed
+        allowed_inserts = migrated_allowed - original_allowed
+        original_history_by_key = {(path, chat_id): last_used_at for path, chat_id, last_used_at in original_history}
+        history_deletes = set(original_history_by_key) - set(migrated_history)
+        history_upserts = {
+            key: value for key, value in migrated_history.items() if original_history_by_key.get(key) != value
+        }
+        change_count = (
+            len(setting_deletes)
+            + len(setting_upserts)
+            + len(allowed_deletes)
+            + len(allowed_inserts)
+            + len(history_deletes)
+            + len(history_upserts)
+            + len(project_updates)
+        )
+        if not change_count or validate_only:
+            return
+        if dry_run:
+            print(f"[DRY RUN] Would migrate Kai database paths for {len(migrations)} canonical managed home(s)")
+            return
+
+        connection.execute("BEGIN IMMEDIATE")
+        if "settings" in tables:
+            connection.executemany("DELETE FROM settings WHERE key = ?", [(key,) for key in sorted(setting_deletes)])
+            connection.executemany(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                sorted(setting_upserts.items()),
+            )
+        if "allowed_workspaces" in tables:
+            connection.executemany(
+                "DELETE FROM allowed_workspaces WHERE chat_id = ? AND path = ?",
+                sorted(allowed_deletes),
+            )
+            connection.executemany(
+                "INSERT OR IGNORE INTO allowed_workspaces (chat_id, path) VALUES (?, ?)",
+                sorted(allowed_inserts),
+            )
+        if "workspace_history" in tables:
+            connection.executemany(
+                "DELETE FROM workspace_history WHERE path = ? AND chat_id = ?",
+                sorted(history_deletes),
+            )
+            connection.executemany(
+                "INSERT OR REPLACE INTO workspace_history (path, chat_id, last_used_at) VALUES (?, ?, ?)",
+                [(path, chat_id, last_used_at) for (path, chat_id), last_used_at in sorted(history_upserts.items())],
+            )
+        if "memory_projects" in tables:
+            for project_id, workspace_root in project_updates.items():
+                connection.execute(
+                    "UPDATE memory_projects SET workspace_root = ? WHERE project_id = ?",
+                    (workspace_root, project_id),
+                )
+        connection.commit()
+        print(f"  Migrated Kai database paths for {len(migrations)} canonical managed home(s)")
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
 def _managed_identity_state(user_home: Path) -> tuple[Path, Path, str | None, str | None]:
     """Inspect and validate one managed user's canonical/compatibility files.
 
@@ -4054,7 +4262,7 @@ def _apply_migrate(
 
     # -- MEMORY.md migration --
     # One-time: land personal memory at the per-user path
-    # DATA_DIR/memory/<chat_id>/MEMORY.md. The "primary operator"
+    # DATA_DIR/memory/<principal_id>/MEMORY.md. The "primary operator"
     # (first entry in users.yaml, typically an admin) gets any legacy
     # content from DATA_DIR/memory/MEMORY.md (pre-#347 global location).
     # legacy_global is moved (not copied) so the DATA_DIR global path
@@ -4073,6 +4281,8 @@ def _apply_migrate(
     memory_root = data_path / "memory"
     legacy_global = memory_root / "MEMORY.md"
     template = PROJECT_ROOT / "templates" / ".claude" / "MEMORY.md"
+    if memory_root.is_symlink() or legacy_global.is_symlink():
+        raise RuntimeError(f"Refusing symlinked memory migration path under {memory_root}")
 
     # Resolve every os_user against the host's passwd database BEFORE
     # touching disk. If users.yaml names an OS user that does not exist
@@ -4117,65 +4327,58 @@ def _apply_migrate(
     primary_chat_id: int | None = memory_owners[0][0] if memory_owners else None
 
     if primary_chat_id is not None:
-        primary_dir = memory_root / str(primary_chat_id)
-        primary_dst = primary_dir / "MEMORY.md"
-
-        if not primary_dst.exists():
-            if dry_run:
-                if legacy_global.is_file():
-                    print(f"[DRY RUN] Would move {legacy_global} -> {primary_dst}")
-                elif template.is_file():
-                    print(f"[DRY RUN] Would seed {primary_dst} from {template}")
-                else:
-                    # Mirror the real branch's last-resort placeholder
-                    # below: when none of the source files exist (minimal
-                    # host, broken install tree), the real path writes
-                    # `# Memory\n` and prints "Created empty ...". Without
-                    # this `else` the dry-run prints nothing and the
-                    # operator sees a silent gap they cannot diagnose.
-                    print(f"[DRY RUN] Would create empty {primary_dst} (no template found)")
-            else:
-                primary_dir.mkdir(parents=True, exist_ok=True)
-                if legacy_global.is_file():
-                    # Move, not copy - the legacy global path must not
-                    # survive this migration, or a stale file will shadow
-                    # the per-user read once one user's subdir fills up.
-                    shutil.move(str(legacy_global), str(primary_dst))
-                    print(f"  Migrated MEMORY.md to {primary_dst}")
-                elif template.is_file():
-                    shutil.copy2(template, primary_dst)
-                    print(f"  Seeded {primary_dst} from memory template")
-                else:
-                    # Last-resort placeholder so the file is writable.
-                    primary_dst.write_text("# Memory\n")
-                    print(f"  Created empty {primary_dst}")
-
-        # Seed every other known user from the memory template. Skips
-        # the primary (handled above) and any user whose subdir already
-        # has a MEMORY.md (idempotent across reinstalls).
-        for chat_id, _os_user in memory_owners[1:]:
-            user_dir = memory_root / str(chat_id)
+        for index, (chat_id, _os_user) in enumerate(memory_owners):
+            if chat_id is None:
+                continue
+            legacy_name = str(chat_id)
+            canonical_name = canonical_principal_names.get(legacy_name, legacy_name)
+            user_dir = memory_root / canonical_name
             user_dst = user_dir / "MEMORY.md"
+            legacy_dir = memory_root / legacy_name
+            legacy_user_file = legacy_dir / "MEMORY.md"
+            if user_dir.is_symlink() or user_dst.is_symlink():
+                raise RuntimeError(f"Refusing symlinked canonical memory path: {user_dst}")
+            if legacy_user_file != user_dst and legacy_dir.is_symlink():
+                raise RuntimeError(f"Refusing symlinked legacy memory directory: {legacy_dir}")
+            if legacy_user_file != user_dst and legacy_user_file.is_symlink():
+                raise RuntimeError(f"Refusing symlinked legacy memory file: {legacy_user_file}")
             if user_dst.exists():
                 continue
+
+            source: Path | None = None
+            move_source = False
+            if legacy_user_file != user_dst and legacy_user_file.is_file():
+                source = legacy_user_file
+            elif index == 0 and legacy_global.is_file():
+                source = legacy_global
+                move_source = True
+            elif template.is_file():
+                source = template
+
             if dry_run:
-                # Match the real branch below: the template may not ship
-                # with the install tree, in which case the real path
-                # writes a placeholder. Printing "from memory template"
-                # unconditionally misleads operators on hosts where the
-                # template is missing.
-                if template.is_file():
-                    print(f"[DRY RUN] Would seed {user_dst} from memory template")
-                else:
+                if source is None:
                     print(f"[DRY RUN] Would create empty {user_dst} (no memory template)")
+                elif move_source:
+                    print(f"[DRY RUN] Would move {source} -> {user_dst}")
+                elif source == legacy_user_file:
+                    print(f"[DRY RUN] Would copy {source} -> {user_dst}")
+                else:
+                    print(f"[DRY RUN] Would seed {user_dst} from {source}")
                 continue
+
             user_dir.mkdir(parents=True, exist_ok=True)
-            if template.is_file():
-                shutil.copy2(template, user_dst)
-                print(f"  Seeded {user_dst} from memory template")
-            else:
+            if source is None:
                 user_dst.write_text("# Memory\n")
                 print(f"  Created empty {user_dst}")
+            elif move_source:
+                shutil.move(str(source), str(user_dst))
+                print(f"  Migrated MEMORY.md to {user_dst}")
+            else:
+                shutil.copy2(source, user_dst)
+                if source == legacy_user_file:
+                    print(f"  Copied memory {source} -> {user_dst}")
+                else:
+                    print(f"  Seeded {user_dst} from memory template")
 
     # -- Uploaded files migration --
     # One-time: copy user-uploaded files from the install tree
@@ -4247,7 +4450,7 @@ def _apply_migrate(
     #       Init_memory() creates qdrant/ and mem0_history.db at runtime
     #       in the main process (service user), so they must be writable
     #       by the service user.
-    #   (b) Per-user-owned: memory/<chat_id>/ subdirectories whose chat_id
+    #   (b) Per-user-owned: memory/<principal_id>/ subdirectories whose owner
     #       maps to a users.yaml entry with an explicit os_user. The
     #       inner Claude subprocess for that user runs via sudo -H -u
     #       <os_user>, so MEMORY.md ownership must match or writes fail
@@ -4278,7 +4481,7 @@ def _apply_migrate(
                     _set_private_user_tree_modes(entry)
                 else:
                     # qdrant/, mem0_history.db, extractor_cwd/, and any
-                    # memory/<chat_id>/ whose user has no os_user set.
+                    # personal-memory directories whose user has no os_user set.
                     _set_ownership(entry, svc_uid, svc_gid, recursive=True)
 
     # -- PREFERENCES.md per-user pre-creation --
@@ -4372,11 +4575,11 @@ def _apply_migrate(
     # entry we pre-create the directory the inner Claude subprocess
     # (sudo -H -u <os_user>) will write into on first message. Three
     # cases, all handled below:
-    #   1. No override: create DATA_DIR/home/<chat_id>/.
+    #   1. No override: create DATA_DIR/home/<principal_id>/.
     #   2. Override path under DATA_DIR (rare, but valid): create the
     #      override path itself, since it lives in our tree and
     #      resolve_home_workspace() will route the user there at
-    #      runtime. Creating DATA_DIR/home/<chat_id>/ instead would
+    #      runtime. Creating a separate canonical default instead would
     #      leave the actual runtime directory un-provisioned and the
     #      user's first write would fail.
     #   3. Override path outside DATA_DIR: skip entirely - the override
@@ -4387,6 +4590,33 @@ def _apply_migrate(
     # service-owned tier, matching the memory tier-(a) rule above.
     home_root = data_path / "home"
     home_overrides = _collect_user_home_overrides(users_yaml_path)
+    managed_home_migrations: dict[int, tuple[Path, Path]] = {}
+    for chat_id, _os_user in memory_owners:
+        if chat_id is None or chat_id in home_overrides:
+            continue
+        legacy_name = str(chat_id)
+        canonical_name = canonical_principal_names.get(legacy_name, legacy_name)
+        if canonical_name == legacy_name:
+            continue
+        legacy_home = home_root / legacy_name
+        canonical_home = home_root / canonical_name
+        if legacy_home.is_symlink() or canonical_home.is_symlink():
+            raise RuntimeError(f"Refusing symlinked managed-home migration: {legacy_home} -> {canonical_home}")
+        if legacy_home.exists() and not legacy_home.is_dir():
+            raise RuntimeError(f"Refusing non-directory legacy managed home: {legacy_home}")
+        if canonical_home.exists() and not canonical_home.is_dir():
+            raise RuntimeError(f"Refusing non-directory canonical managed home: {canonical_home}")
+        managed_home_migrations[chat_id] = (legacy_home, canonical_home)
+
+    # Validate every database rewrite before copying a workspace tree. The
+    # service is stopped during install, so the later copy and transaction see
+    # a stable source. Legacy homes remain untouched as rollback archives.
+    _migrate_managed_home_database_paths(
+        data_path,
+        managed_home_migrations,
+        dry_run=dry_run,
+        validate_only=not dry_run,
+    )
     # Defensive: `_apply_directories` already creates home_root with
     # the right ownership, but we cannot assume ordering (future
     # refactors could split these steps). A missing home_root here
@@ -4423,13 +4653,26 @@ def _apply_migrate(
             continue
         # Case 2: override under DATA_DIR - provision THAT path, since
         # resolve_home_workspace returns it verbatim at runtime. Case
-        # 1: no override - provision the per-user default slot.
-        user_dir = override if override is not None else home_root / str(chat_id)
+        # 1: no override - provision the canonical human default slot.
+        migration = managed_home_migrations.get(chat_id)
+        if override is not None:
+            user_dir = override
+        elif migration is not None:
+            legacy_home, canonical_home = migration
+            user_dir = canonical_home
+            if not canonical_home.exists() and legacy_home.is_dir():
+                if dry_run:
+                    print(f"[DRY RUN] Would copy managed home {legacy_home} -> {canonical_home}")
+                else:
+                    _copy_managed_home_tree(legacy_home, canonical_home)
+                    print(f"  Copied managed home {legacy_home} -> {canonical_home}")
+        else:
+            user_dir = home_root / str(chat_id)
         if user_dir.is_symlink():
             raise RuntimeError(f"Refusing symlinked managed user home: {user_dir}")
         if user_dir.exists() and not user_dir.is_dir():
             raise RuntimeError(f"Refusing non-directory managed user home: {user_dir}")
-        user_dir_exists = user_dir.exists()
+        user_dir_exists = user_dir.exists() or (dry_run and migration is not None and migration[0].is_dir())
         if dry_run:
             if str(chat_id) in per_user_ids:
                 uid, gid = per_user_ids[str(chat_id)]
@@ -4446,9 +4689,9 @@ def _apply_migrate(
         os.chmod(user_dir, _PRIVATE_USER_DIR_MODE)
         if str(chat_id) in per_user_ids:
             uid, gid = per_user_ids[str(chat_id)]
-            _set_ownership(user_dir, uid, gid, recursive=False)
+            _set_ownership(user_dir, uid, gid, recursive=migration is not None)
         else:
-            _set_ownership(user_dir, svc_uid, svc_gid, recursive=False)
+            _set_ownership(user_dir, svc_uid, svc_gid, recursive=migration is not None)
         if not user_dir_exists:
             print(f"  Created {user_dir}")
 
@@ -4471,8 +4714,18 @@ def _apply_migrate(
         override = home_overrides.get(chat_id)
         if override is not None and not override.is_relative_to(data_path_resolved):
             continue
-        user_home = override if override is not None else home_root / str(chat_id)
-        agents_path, claude_path, agents_content, claude_content = _managed_identity_state(user_home)
+        migration = None
+        if override is not None:
+            user_home = override
+        else:
+            migration = managed_home_migrations.get(chat_id)
+            user_home = migration[1] if migration is not None else home_root / str(chat_id)
+        inspection_home = user_home
+        if dry_run and migration is not None and not user_home.exists() and migration[0].is_dir():
+            inspection_home = migration[0]
+        _source_agents, _source_claude, agents_content, claude_content = _managed_identity_state(inspection_home)
+        agents_path = user_home / "AGENTS.md"
+        claude_path = user_home / ".claude" / "CLAUDE.md"
         managed_identities.append(
             (
                 chat_id,
@@ -4482,6 +4735,13 @@ def _apply_migrate(
                 agents_content,
                 claude_content,
             )
+        )
+
+    if not dry_run:
+        _migrate_managed_home_database_paths(
+            data_path,
+            managed_home_migrations,
+            dry_run=False,
         )
 
     for chat_id, backend_name, agents_path, claude_path, agents_content, claude_content in managed_identities:
@@ -5146,13 +5406,13 @@ def _apply_directories(
         (data_path / "history", svc_uid, svc_gid, _PRIVATE_USER_ROOT_MODE),
         (data_path / "memory", svc_uid, svc_gid, _PRIVATE_USER_ROOT_MODE),
         # Per-user preferences root (#400). Top-level dir is service-
-        # owned so the bot can lazily create new preferences/<chat_id>/
+        # owned so the bot can lazily create new preferences/<principal_id>/
         # subdirs at first message; per-user subdirs are pre-created
         # and chowned in _apply_migrate when the user has a distinct
         # os_user.
         (data_path / "preferences", svc_uid, svc_gid, _PRIVATE_USER_ROOT_MODE),
         # Per-user home root (#353). Top-level dir is service-owned so
-        # the bot can lazily create new home/<chat_id>/ subdirs at first
+        # the bot can lazily create new home/<principal_id>/ subdirs at first
         # message; per-user subdirs are pre-created and chowned in
         # _apply_migrate when the user has a distinct os_user.
         (data_path / "home", svc_uid, svc_gid, _PRIVATE_USER_ROOT_MODE),
@@ -5420,7 +5680,7 @@ def _migrate_recalled_memory_section(
     Args:
         identity_dst: The per-user AGENTS.md to append to. Path returned
             by the per-user seed loop's resolution of
-            `<DATA_DIR>/home/<chat_id>/AGENTS.md`.
+            `<DATA_DIR>/home/<principal_id>/AGENTS.md`.
         template_path: The tracked template
             (`templates/AGENTS.md`). Section text is extracted
             from here on every call so a future revision to the
@@ -5551,7 +5811,7 @@ def _retire_install_home_claude(install_path: Path, dry_run: bool) -> None:
 
     Both paths predate the per-user `home_workspace` migration in #353.
     Since #353 every session resolves identity from the per-user
-    `<DATA_DIR>/home/<chat_id>/AGENTS.md`; nothing in the
+    `<DATA_DIR>/home/<principal_id>/AGENTS.md`; nothing in the
     runtime reads either of the paths this helper deletes. Issue #447
     retires the install-tree scaffolding entirely. The per-user
     `AGENTS.md` is seeded by `_apply_migrate`'s home block (eager,

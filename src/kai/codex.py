@@ -63,6 +63,7 @@ from kai.backend import (
     build_foreign_workspace_reminder,
     build_session_context,
     ensure_user_context_files,
+    principal_storage_name,
     sanitize_agent_environment,
 )
 from kai.backend_registry import BackendRegistryError, backend_registry_is_authoritative, resolve_backend_command
@@ -188,10 +189,12 @@ def write_turn_image_file(
     # the filename.
     subtype = media_type.split("/", 1)[-1]
     suffix = f".{subtype}" if subtype.isalnum() else ".img"
-    principal = "unscoped" if chat_id is None else str(chat_id)
+    principal = "unscoped" if chat_id is None else principal_storage_name(chat_id)
     principal_dir = _TURN_IMAGE_DIR / principal
     path: Path | None = None
     try:
+        if _TURN_IMAGE_DIR.is_symlink() or principal_dir.is_symlink():
+            raise OSError(f"refusing symlinked Codex image staging path: {principal_dir}")
         _TURN_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
         _TURN_IMAGE_DIR.chmod(0o711)
         principal_dir.mkdir(parents=True, exist_ok=True)

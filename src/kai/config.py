@@ -2551,7 +2551,7 @@ def _load_user_configs(
                 if not home_workspace.is_dir():
                     # Null it out and let the runtime resolver
                     # (backend.resolve_home_workspace) fall through to
-                    # DATA_DIR/home/<chat_id>/. There is no longer a
+                    # DATA_DIR/home/<principal_id>/. There is no longer a
                     # shared "global default" directory - that was the
                     # multi-user privacy hazard #353 removed.
                     log.warning(

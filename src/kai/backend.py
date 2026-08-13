@@ -74,23 +74,71 @@ def configure_principal_storage_namespaces(
     _PRINCIPAL_STORAGE_REGISTRY = registry
 
 
+def principal_storage_search_directories(
+    chat_id: int,
+    *,
+    data_dir: Path,
+    namespace: str,
+) -> tuple[Path, ...]:
+    """Return canonical-first human storage directories for one runtime key."""
+    if namespace not in {"files", "home", "memory", "preferences"}:
+        raise ValueError(f"Unsupported principal storage namespace: {namespace}")
+    root = data_dir / namespace
+    canonical_name = principal_storage_name(chat_id)
+    canonical = root / canonical_name
+    legacy = root / str(chat_id)
+    return (canonical,) if canonical == legacy else (canonical, legacy)
+
+
+def principal_storage_name(chat_id: int) -> str:
+    """Resolve one runtime compatibility key to its canonical directory name."""
+    registry = _PRINCIPAL_STORAGE_REGISTRY
+    if registry is None:
+        return str(chat_id)
+    try:
+        namespace = registry.for_runtime_config_id(chat_id)
+    except Exception as exc:
+        raise PrincipalStorageResolutionError("Runtime configuration has no canonical storage principal") from exc
+    return str(namespace.principal_id)
+
+
 def preference_search_directories(
     chat_id: int,
     *,
     data_dir: Path,
 ) -> tuple[Path, ...]:
     """Return canonical-first preference directories for one runtime key."""
-    root = data_dir / "preferences"
-    registry = _PRINCIPAL_STORAGE_REGISTRY
-    if registry is None:
-        return (root / str(chat_id),)
-    try:
-        namespace = registry.for_runtime_config_id(chat_id)
-    except Exception as exc:
-        raise PrincipalStorageResolutionError("Runtime configuration has no canonical preference principal") from exc
-    canonical = root / str(namespace.principal_id)
-    legacy = root / str(chat_id)
-    return (canonical,) if canonical == legacy else (canonical, legacy)
+    return principal_storage_search_directories(
+        chat_id,
+        data_dir=data_dir,
+        namespace="preferences",
+    )
+
+
+def memory_search_directories(
+    chat_id: int,
+    *,
+    data_dir: Path,
+) -> tuple[Path, ...]:
+    """Return canonical-first personal-memory directories for one runtime key."""
+    return principal_storage_search_directories(
+        chat_id,
+        data_dir=data_dir,
+        namespace="memory",
+    )
+
+
+def home_search_directories(
+    chat_id: int,
+    *,
+    data_dir: Path,
+) -> tuple[Path, ...]:
+    """Return canonical-first managed-home directories for one runtime key."""
+    return principal_storage_search_directories(
+        chat_id,
+        data_dir=data_dir,
+        namespace="home",
+    )
 
 
 def _chmod_private_user_root(path: Path) -> None:
@@ -543,7 +591,7 @@ def build_session_context(
     # race and permission errors (same pattern as identity).
     #
     # Per-user scoping (#347): when chat_id is set, the file lives under
-    # memory/<chat_id>/MEMORY.md so each user has their own writable
+    # memory/<principal_id>/MEMORY.md so each human has their own writable
     # copy. The inner agent subprocess runs as that user's os_user
     # (via sudo -H -u), so ownership of the subdirectory is set to
     # match. A non-service user cannot write the legacy single-global
@@ -553,7 +601,17 @@ def build_session_context(
     # setups that never hit the multi-user pool path.
     if not memory_enabled:
         if chat_id is not None:
-            memory_path = data_dir / "memory" / str(chat_id) / "MEMORY.md"
+            memory_dirs = memory_search_directories(chat_id, data_dir=data_dir)
+            canonical_memory_path = memory_dirs[0] / "MEMORY.md"
+            memory_path = next(
+                (directory / "MEMORY.md" for directory in memory_dirs if (directory / "MEMORY.md").is_file()),
+                canonical_memory_path,
+            )
+            if defer_user_file_reads:
+                if len(memory_dirs) > 1 and not canonical_memory_path.parent.is_dir():
+                    memory_path = memory_dirs[1] / "MEMORY.md"
+                else:
+                    memory_path = canonical_memory_path
         else:
             memory_path = data_dir / "memory" / "MEMORY.md"
         if defer_user_file_reads and chat_id is not None:
@@ -705,7 +763,7 @@ def ensure_user_memory(chat_id: int | None, data_dir: Path) -> None:
 
     Idempotent and cheap: a stat, a possible mkdir, a possible copy2.
     Called on every send() path before build_session_context() so that
-    a user without a pre-created `memory/<chat_id>/` (single-user dev,
+    a user without a pre-created personal-memory directory (single-user dev,
     test runs, or any deployment where the inner agent runs as the
     same identity as the bot) still gets a writable memory surface on
     their first message.
@@ -714,7 +772,7 @@ def ensure_user_memory(chat_id: int | None, data_dir: Path) -> None:
 
     * Production multi-user (users.yaml entry has an explicit os_user
       different from the service user): the install step (install.py
-      `_apply_migrate`) pre-creates and chowns `memory/<chat_id>/` to
+      `_apply_migrate`) pre-creates and chowns `memory/<principal_id>/` to
       the user's os_user. mkdir here is then a no-op (the dir already
       exists), and the seed file is already in place. Good.
     * A user added to users.yaml AFTER install with a distinct os_user:
@@ -751,26 +809,46 @@ def ensure_user_memory(chat_id: int | None, data_dir: Path) -> None:
     if chat_id is None:
         user_memory_dir = memory_root
         user_memory_file = user_memory_dir / "MEMORY.md"
+        memory_dirs = (user_memory_dir,)
     else:
-        user_memory_dir = memory_root / str(chat_id)
+        try:
+            memory_dirs = memory_search_directories(chat_id, data_dir=data_dir)
+        except PrincipalStorageResolutionError:
+            log.exception("ensure_user_memory: could not resolve canonical principal")
+            return
+        user_memory_dir = memory_dirs[0]
         user_memory_file = user_memory_dir / "MEMORY.md"
 
     try:
+        if memory_root.is_symlink():
+            raise OSError(f"refusing symlinked memory root: {memory_root}")
+        if user_memory_dir.is_symlink():
+            raise OSError(f"refusing symlinked memory directory: {user_memory_dir}")
+        if user_memory_file.is_symlink():
+            raise OSError(f"refusing symlinked memory file: {user_memory_file}")
         memory_root.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_ROOT_MODE)
         _chmod_private_user_root(memory_root)
         user_memory_dir.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_DIR_MODE)
         if chat_id is not None:
             _chmod_private_user_dir(user_memory_dir)
         if not user_memory_file.exists():
-            # Seed from the template if one ships with the source tree.
-            template = PROJECT_ROOT / "templates" / ".claude" / "MEMORY.md"
-            if template.is_file():
-                shutil.copy2(template, user_memory_file)
+            legacy_memory_file = memory_dirs[1] / "MEMORY.md" if len(memory_dirs) > 1 else None
+            if legacy_memory_file is not None and legacy_memory_file.parent.is_symlink():
+                raise OSError(f"refusing symlinked legacy memory directory: {legacy_memory_file.parent}")
+            if legacy_memory_file is not None and legacy_memory_file.is_symlink():
+                raise OSError(f"refusing symlinked legacy memory file: {legacy_memory_file}")
+            if legacy_memory_file is not None and legacy_memory_file.is_file():
+                shutil.copy2(legacy_memory_file, user_memory_file)
             else:
-                # No template available (unusual - only happens when the
-                # install tree is incomplete). Create a minimal placeholder
-                # so the subprocess has a writable file to edit.
-                user_memory_file.write_text("# Memory\n")
+                # Seed from the template if one ships with the source tree.
+                template = PROJECT_ROOT / "templates" / ".claude" / "MEMORY.md"
+                if template.is_file():
+                    shutil.copy2(template, user_memory_file)
+                else:
+                    # No template available (unusual - only happens when the
+                    # install tree is incomplete). Create a minimal placeholder
+                    # so the subprocess has a writable file to edit.
+                    user_memory_file.write_text("# Memory\n")
         _chmod_private_user_file(user_memory_file)
     except OSError:
         log.warning(
@@ -951,7 +1029,7 @@ def ensure_user_home(chat_id: int | None, data_dir: Path, *, backend_name: str) 
     when users.yaml does not set an explicit home_workspace override.
     Idempotent and cheap: a stat and a possible mkdir. Used by development
     and single-user session initialization so a user without a pre-created
-    `home/<chat_id>/` still lands in a valid directory on first message.
+    `home/<principal_id>/` still lands in a valid directory on first message.
     Protected installs do not call this helper at runtime; their per-user
     directories are provisioned by ``make install`` under the target owner.
 
@@ -961,7 +1039,7 @@ def ensure_user_home(chat_id: int | None, data_dir: Path, *, backend_name: str) 
 
     * Production multi-user (users.yaml entry has an explicit os_user
       different from the service user): the install step (install.py
-      `_apply_migrate`) pre-creates and chowns `home/<chat_id>/` to the
+      `_apply_migrate`) pre-creates and chowns `home/<principal_id>/` to the
       user's os_user. mkdir here is then a no-op and the directory is
       already writable by the subprocess identity.
     * A user added to users.yaml AFTER install with a distinct os_user:
@@ -1000,12 +1078,24 @@ def ensure_user_home(chat_id: int | None, data_dir: Path, *, backend_name: str) 
     if chat_id is None:
         path = home_root / "anon"
     else:
-        path = home_root / str(chat_id)
+        home_dirs = home_search_directories(chat_id, data_dir=data_dir)
+        canonical_home = home_dirs[0]
+        # An unprotected first launch can bootstrap Workshop before the
+        # installer has copied an existing compatibility home. Keep using the
+        # existing home until the next install provisions the canonical tree.
+        if len(home_dirs) > 1 and not canonical_home.exists() and home_dirs[1].is_dir():
+            path = home_dirs[1]
+        else:
+            path = canonical_home
 
     # mkdir parents=True is load-bearing: on a brand-new install the
     # data_dir/home/ root may not exist yet (the installer creates it,
     # but dev paths and the tests go straight through lazy bootstrap).
     # exist_ok=True means this is safe to call on every session init.
+    if home_root.is_symlink():
+        raise RuntimeError(f"Refusing symlinked managed home root: {home_root}")
+    if path.is_symlink():
+        raise RuntimeError(f"Refusing symlinked managed user home: {path}")
     home_root.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_ROOT_MODE)
     _chmod_private_user_root(home_root)
     path.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_DIR_MODE)
@@ -1080,7 +1170,7 @@ def resolve_home_workspace(
     Resolution order:
     1. `user.home_workspace` from users.yaml when set (admin override,
        returned as-is with no second-guessing).
-    2. `<data_dir>/home/<chat_id>/`. Development and single-user runs lazily
+    2. `<data_dir>/home/<principal_id>/`. Development and single-user runs lazily
        create it via ensure_user_home(). Protected installs require it to have
        been provisioned by ``make install``. For notification-only chat_ids (a
        chat that received a routed notification but has no users.yaml entry of
@@ -1140,10 +1230,10 @@ def resolve_home_workspace(
     # user: doing so produces the wrong owner and defeats the private 0700
     # boundary. The installer is the authoritative provisioning step.
     if chat_id is not None and getattr(config, "protected_install", False) is True:
-        path = data_dir / "home" / str(chat_id)
+        path = home_search_directories(chat_id, data_dir=data_dir)[0]
         if not path.is_dir():
             raise RuntimeError(
-                f"Protected user home is not provisioned for chat_id {chat_id}: "
+                f"Protected user home is not provisioned for the canonical principal: "
                 f"{path}. Run `make install` to provision configured users."
             )
         return path

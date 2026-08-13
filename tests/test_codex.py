@@ -1342,6 +1342,40 @@ class TestWriteTurnImageFile:
             first.unlink()
             second.unlink()
 
+    def test_turn_image_directory_uses_canonical_workshop_principal(self):
+        registry = MagicMock()
+        registry.for_runtime_config_id.return_value.principal_id = "prn_" + "b" * 32
+        with patch("kai.backend._PRINCIPAL_STORAGE_REGISTRY", registry):
+            path = write_turn_image_file(
+                _anthropic_image_block(),
+                chat_id=111,
+                reader_user=None,
+            )
+
+        assert path is not None
+        try:
+            assert path.parent.name == "prn_" + "b" * 32
+            assert path.parent.name != "111"
+        finally:
+            path.unlink()
+
+    def test_turn_image_write_refuses_symlinked_staging_root(self, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        staging = tmp_path / "files" / "codex_turn_images"
+        staging.parent.mkdir()
+        staging.symlink_to(outside, target_is_directory=True)
+
+        with patch("kai.codex._TURN_IMAGE_DIR", staging):
+            path = write_turn_image_file(
+                _anthropic_image_block(),
+                chat_id=111,
+                reader_user=None,
+            )
+
+        assert path is None
+        assert not list(outside.iterdir())
+
     def test_macos_cross_user_file_gets_named_read_acl(self):
         completed = MagicMock(returncode=0, stderr="")
         with (

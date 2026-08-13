@@ -50,13 +50,43 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import sqlite3
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from kai.config import Config
 
 log = logging.getLogger(__name__)
+
+
+def _default_human_report_directory(config: Config, user_id: str, report_name: str) -> Path:
+    """Resolve admin artifacts under the canonical Workshop human home."""
+    from kai.config import DATA_DIR
+
+    db_path_value = getattr(config, "session_db_path", None)
+    if not isinstance(db_path_value, (str, Path)):
+        return DATA_DIR / "home" / user_id / "docs" / report_name
+    db_path = Path(db_path_value)
+    if db_path.is_symlink() or not db_path.is_file():
+        return DATA_DIR / "home" / user_id / "docs" / report_name
+    connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        tables = {
+            str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        }
+        if "external_identities" not in tables:
+            return DATA_DIR / "home" / user_id / "docs" / report_name
+        rows = connection.execute(
+            "SELECT principal_id FROM external_identities WHERE provider = 'telegram' AND external_subject = ?",
+            (user_id,),
+        ).fetchall()
+    finally:
+        connection.close()
+    if len(rows) != 1:
+        raise RuntimeError("Memory admin user has no unique canonical Workshop principal")
+    return DATA_DIR / "home" / str(rows[0][0]) / "docs" / report_name
 
 
 # ── Known source values ─────────────────────────────────────────────
@@ -439,12 +469,11 @@ def _cmd_reclassify(args: argparse.Namespace) -> int:
     if config is None:
         return 1
 
-    from pathlib import Path
-
     from kai import memory_reclassify
-    from kai.config import DATA_DIR
 
-    out_dir = Path(args.out_dir) if args.out_dir else DATA_DIR / "home" / args.user_id / "docs" / "reclassify"
+    out_dir = (
+        Path(args.out_dir) if args.out_dir else _default_human_report_directory(config, args.user_id, "reclassify")
+    )
 
     if not mutating:
         return asyncio.run(
@@ -587,11 +616,11 @@ def _cmd_backfill_provenance(args: argparse.Namespace) -> int:
     if config is None:
         return 1
 
-    from pathlib import Path
-
-    from kai.config import DATA_DIR
-
-    out_dir = Path(args.out_dir) if args.out_dir else DATA_DIR / "home" / args.user_id / "docs" / "backfill-provenance"
+    out_dir = (
+        Path(args.out_dir)
+        if args.out_dir
+        else _default_human_report_directory(config, args.user_id, "backfill-provenance")
+    )
 
     if not mutating:
         return asyncio.run(

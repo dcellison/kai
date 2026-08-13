@@ -230,7 +230,7 @@ class SubprocessPool:
         user = self._config.get_user_config(chat_id)
 
         # Resolve through the single backend.resolve_home_workspace
-        # helper: users.yaml override first, else DATA_DIR/home/<chat_id>/.
+        # helper: users.yaml override first, else DATA_DIR/home/<principal_id>/.
         # The old global home field on Config was removed by #353 because
         # it pointed every unconfigured user at a shared directory.
         workspace = resolve_home_workspace(chat_id, self._config)

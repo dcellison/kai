@@ -151,6 +151,18 @@ class WorkshopPrincipalStorageNamespace:
         """Return the prior configured-user directory during migration."""
         return data_dir / "files" / str(self._runtime_config_id)
 
+    def home_directory(self, data_dir: Path) -> Path:
+        """Return the transport-independent managed home directory."""
+        return data_dir / "home" / str(self.principal_id)
+
+    def memory_directory(self, data_dir: Path) -> Path:
+        """Return the transport-independent personal-memory directory."""
+        return data_dir / "memory" / str(self.principal_id)
+
+    def preferences_directory(self, data_dir: Path) -> Path:
+        """Return the transport-independent personal-preferences directory."""
+        return data_dir / "preferences" / str(self.principal_id)
+
 
 class WorkshopPrincipalStorageRegistry:
     """Resolve protected runtimes to canonical human-owned storage."""
