@@ -20,6 +20,8 @@ build/
 # Tool caches
 .pytest_cache/
 .ruff_cache/
+/workshop-client/node_modules/
+/workshop-client/coverage/
 
 # Runtime artifacts
 .kai-backup/

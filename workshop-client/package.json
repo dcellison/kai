@@ -1,0 +1,32 @@
+{
+  "name": "kai-workshop-client",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "vite build",
+    "check": "npm run typecheck && npm run test && npm run verify-generated",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "verify-generated": "npm run build && git diff --exit-code -- ../src/kai/workshop/static"
+  },
+  "dependencies": {
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "7.0.1",
+    "@testing-library/react": "16.3.2",
+    "@testing-library/user-event": "14.6.4",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "@vitejs/plugin-react": "6.0.5",
+    "jsdom": "29.1.1",
+    "typescript": "7.0.2",
+    "vite": "8.2.1",
+    "vitest": "4.1.10"
+  }
+}

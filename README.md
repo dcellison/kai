@@ -176,10 +176,12 @@ Most operational documentation lives in the wiki so it can grow without turning 
 
 ```bash
 make setup      # Install in editable mode with dev tools
+npm ci --prefix workshop-client # Install React client development dependencies
 make lint       # Run ruff
 make format     # Format with ruff
 make check      # Lint and format check
 make typecheck  # Run Pyright on the maintained typed baseline
+make client-check # Type-check/test React and verify its packaged assets
 make audit-deps # Report known vulnerabilities in installed dependencies
 make check-install-constraints # Dry-run install dependency resolution with constraints
 make module-sizes # Report large Python modules for decomposition planning

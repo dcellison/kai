@@ -2,7 +2,7 @@
 # where tools are installed globally (no .venv).
 BIN = .venv/bin/
 
-.PHONY: run lint format check typecheck audit-deps check-install-constraints module-sizes test setup config install install-status tts-model refresh-models
+.PHONY: run lint format check typecheck client-check audit-deps check-install-constraints module-sizes test setup config install install-status tts-model refresh-models
 
 run:
 	$(BIN)python -m kai
@@ -18,6 +18,9 @@ check: lint
 
 typecheck:
 	$(BIN)pyright --pythonpath "$$($(BIN)python -c 'import sys; print(sys.executable)')"
+
+client-check:
+	cd workshop-client && npm run check
 
 audit-deps:
 	$(BIN)pip-audit --local --skip-editable

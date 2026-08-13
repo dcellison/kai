@@ -34,13 +34,16 @@ cd kai
 python -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
+npm ci --prefix workshop-client
 
 # Verify everything works
-make check    # ruff lint + format check
-make test     # pytest
+make check          # ruff lint + format check
+make client-check   # React type check, tests, and generated assets
+make test           # pytest
 ```
 
-Requires **Python 3.13+**. See the
+Requires **Python 3.13+** and **Node.js 22+** for development. An installed
+Kai uses the committed prebuilt Workshop assets and does not require Node. See the
 [Getting Started](https://github.com/dcellison/kai/wiki/Getting-Started)
 wiki page for full setup instructions including `.env` configuration.
 
@@ -71,10 +74,10 @@ requests with required CI checks.
    untouched code, or tooling artifacts (`.idea/`, `.vscode/`, etc.)
    will get the PR sent back.
 
-4. **CI must pass.** The pipeline runs ruff (lint + format) and pytest.
+4. **CI must pass.** The pipeline checks Python and the Workshop React client.
    Check locally first:
    ```bash
-   make check && make test
+   make check && make client-check && make test
    ```
 
 5. **Expect an automated review.** Kai runs a PR Review Agent that

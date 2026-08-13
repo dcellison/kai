@@ -1,4 +1,4 @@
-"""Contracts for the static, read-only Workshop browser shell."""
+"""Serving contracts for the packaged, read-only Workshop React client."""
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -35,9 +35,9 @@ class TestWorkshopClientShell:
             assert response.headers["X-Content-Type-Options"] == "nosniff"
             assert response.headers["X-Frame-Options"] == "DENY"
             assert "Kai Workshop" in body
-            assert "Read-only preview" in body
-            assert '<form id="enrollment-form" method="post" action="/workshop/"' in body
-            assert '<script src="/workshop/app.js" defer></script>' in body
+            assert '<div id="root"></div>' in body
+            assert '<script type="module" crossorigin src="/workshop/app.js"></script>' in body
+            assert 'href="/workshop/app.css"' in body
             assert "<script>" not in body
             assert "style=" not in body
         finally:
@@ -71,17 +71,12 @@ class TestWorkshopClientShell:
 
             assert "sessionStorage" in script_body
             assert "localStorage" not in script_body
-            assert 'headers.set("Authorization"' in script_body
-            assert 'headers.set("Last-Event-ID"' in script_body
-            assert ".textContent =" in script_body
-            assert ".innerHTML" not in script_body
+            assert "Authorization" in script_body
+            assert "Last-Event-ID" in script_body
             assert "EventSource(" not in script_body
-            assert 'method: "POST"' in script_body
             assert "/v1/client/enrollment/redeem" in script_body
             assert "/timeline" in script_body
             assert "/events" in script_body
-            assert "correctChannel" in script_body
-            assert "forget-enrollment-session" in script_body
         finally:
             await client.close()
 

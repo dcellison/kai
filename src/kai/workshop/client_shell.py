@@ -1,4 +1,4 @@
-"""Static, read-only browser shell for the authenticated Workshop client API."""
+"""Packaged React client for the authenticated, read-only Workshop API."""
 
 from pathlib import Path
 
@@ -43,7 +43,7 @@ def _asset_response(body: bytes, content_type: str, *, document: bool = False) -
 
 
 def register_workshop_shell_routes(app: web.Application) -> None:
-    """Register a static shell; all collaboration data still comes from authenticated APIs."""
+    """Serve the prebuilt client; collaboration data still comes from authenticated APIs."""
     index = (_STATIC_ROOT / "index.html").read_bytes()
     stylesheet = (_STATIC_ROOT / "app.css").read_bytes()
     script = (_STATIC_ROOT / "app.js").read_bytes()

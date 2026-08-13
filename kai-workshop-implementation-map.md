@@ -421,7 +421,7 @@ No entry may use an indefinite condition such as "keep for compatibility." A gen
 | `users.yaml` values that represent mutable application state | Workshop administration and durable policy records | Workshop administration can safely inspect and change the relevant state, and bootstrap/recovery behavior is proven | Retain only protected installation/bootstrap policy; remove duplicated mutable state and precedence rules | Planned |
 | Backend-specific execution orchestration embedded in the control plane | Equal Harness Driver contracts and a Runtime Backend boundary | Capability and lifecycle tests cover Claude, Codex, Goose, OpenCode, and Pi without privileging one driver | Delete duplicated process orchestration only after the shared contracts carry the required evidence | Planned |
 | Trusted-host `local_process` execution and its executable-trust warnings | Isolated Workshop workers | Worker identity, filesystem grants, credentials, networking, artifacts, cancellation, upgrade, and recovery are verified for all five harnesses | Retire trusted-host mode or explicitly reclassify it as a supported development mode; remove production mitigations that it alone requires | Planned |
-| Preliminary static Workshop browser shell | React Workshop client at the same `/workshop/` route | The React client proves enrollment, tab-scoped session handling, canonical timeline history, authenticated resumable live updates, channel correction, session revocation, and equivalent security headers against the installed API | Replace the packaged `static/index.html`, `static/app.css`, and `static/app.js`; delete tests specific to the preliminary asset implementation while retaining transport-neutral API and browser-boundary contract tests; do not retain a second UI or compatibility route | Active until React client parity is installed and qualified |
+| Preliminary static Workshop browser shell | React Workshop client at the same `/workshop/` route | The React client proves enrollment, tab-scoped session handling, canonical timeline history, authenticated resumable live updates, channel correction, session revocation, and equivalent security headers against the installed API | Replace the packaged `static/index.html`, `static/app.css`, and `static/app.js`; delete tests specific to the preliminary asset implementation while retaining transport-neutral API and browser-boundary contract tests; do not retain a second UI or compatibility route | Replacement implemented; installed React parity qualification pending |
 | Temporary feature flags, legacy fallbacks, and compatibility diagnostics introduced during migration | The corresponding authoritative Workshop path | The owning ledger row has passed its removal gate and rollback no longer depends on the old path | Delete flags, fallback branches, stale status output, environment variables, fixtures, and tests that only preserve the retired path | Ongoing rule |
 | Superseded database tables and columns | Current Workshop schema and projections | Data migration is verified, no supported binary reads the old schema, and rollback/archive policy is explicit | Freeze writes, migrate or archive data, then remove obsolete schema in a dedicated migration | Planned |
 
@@ -1814,11 +1814,48 @@ referrer denial, cross-origin isolation headers, and no inline code. A plain
 HTML form fallback uses POST so an enrollment token cannot enter a URL if
 JavaScript is unavailable.
 
-This is not the final Workshop UI. The production client remains a React
-application, with Tauri packaging evaluated at the desktop boundary. React
-must replace these assets at the same `/workshop/` route after it proves parity
-for enrollment, tab-scoped credentials, history, reconnect, channel correction,
-and revocation. The preliminary shell and its implementation-specific tests
-must then be deleted; no second UI or compatibility route is permitted.
-Command submission remains a separate authorization milestone and will not be
-added to this preliminary client.
+This historical slice was replaced in source by the React client in section
+37. No second UI or compatibility route remains.
+
+## 37. React Workshop read client
+
+**Implementation date:** 2026-08-13
+
+The first production React client now replaces the preliminary assets at the
+same `/workshop/` route. It preserves the qualified enrollment, tab-scoped
+credential, canonical snapshot, resumable live stream, reconnect,
+resynchronization, channel-correction, and revocation behavior. React renders
+canonical message text without interpreting it as markup. Browser-boundary
+tests continue to pin no-store delivery, same-origin assets, strict security
+headers, and the absence of a client write route.
+
+The interface establishes the intended Workshop organization: a workspace
+rail, channel and agent navigation, the canonical conversation, and a context
+pane. Its initial fixed palette uses semantic Atom One Dark color tokens. The
+typography, spacing, fine dividers, and restrained surfaces take general visual
+inspiration from Phi, while the information architecture follows Workshop's
+own collaboration model. Participant labels come from canonical timeline data
+rather than install-specific names. This milestone does not implement runtime
+theme selection, command submission, threads, approvals, projects, or desktop
+packaging.
+
+Node is a development and CI dependency only. Vite emits committed, prebuilt
+assets that remain ordinary Python package data, so an installed Kai host does
+not need Node. CI type-checks and tests the source, rebuilds the client, and
+fails if the committed assets differ.
+
+### 37.1 Installed qualification
+
+After merge, install the packaged client and prove: enrollment with a
+disposable grant, complete existing history, one Telegram message and agent
+reply appearing live without refresh, one service restart followed by a
+resumed update without duplication, channel correction without re-enrollment,
+and device revocation returning the client to enrollment. Only then is the
+preliminary-shell ledger row retired.
+
+### 37.2 Next bounded milestone
+
+Add the first authorized command-submission path as a separate server and
+client milestone. It must create canonical inbound work through the existing
+Workshop execution authority; the browser must not invoke a backend, select a
+runtime command, or bypass the durable run and delivery lifecycle.
