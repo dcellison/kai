@@ -3837,14 +3837,11 @@ def _secure_history_directories(
     print(f"  Secured conversation history under {history_root}")
 
 
-def _canonical_storage_reader_users(
-    data_path: Path,
-    legacy_reader_users: dict[str, str],
-) -> dict[str, str]:
-    """Map canonical principal/channel directories to their agent OS reader."""
+def _canonical_storage_rows(data_path: Path) -> list[tuple[str, str, str]]:
+    """Read direct-channel, human-principal, and compatibility-key tuples."""
     db_path = data_path / "kai.db"
     if db_path.is_symlink() or not db_path.is_file():
-        return {}
+        return []
     try:
         connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
         try:
@@ -3859,7 +3856,7 @@ def _canonical_storage_reader_users(
                 "principals",
             }
             if not tables >= required:
-                return {}
+                return []
             rows = connection.execute(
                 "SELECT c.id, p.id, cb.external_channel_id "
                 "FROM channels c "
@@ -3873,15 +3870,31 @@ def _canonical_storage_reader_users(
     except sqlite3.Error:
         # Database integrity is checked separately by the migration path.
         # This compatibility lookup is optional for pre-Workshop databases.
-        return {}
+        return []
+    return [(str(channel), str(principal), str(legacy)) for channel, principal, legacy in rows]
+
+
+def _canonical_storage_reader_users(
+    data_path: Path,
+    legacy_reader_users: dict[str, str],
+) -> dict[str, str]:
+    """Map canonical principal/channel directories to their agent OS reader."""
     canonical: dict[str, str] = {}
-    for channel_id, principal_id, external_channel_id in rows:
-        reader = legacy_reader_users.get(str(external_channel_id))
+    for channel_id, principal_id, external_channel_id in _canonical_storage_rows(data_path):
+        reader = legacy_reader_users.get(external_channel_id)
         if reader is None:
             continue
-        canonical[str(channel_id)] = reader
-        canonical[str(principal_id)] = reader
+        canonical[channel_id] = reader
+        canonical[principal_id] = reader
     return canonical
+
+
+def _canonical_principal_storage_names(data_path: Path) -> dict[str, str]:
+    """Map legacy configured-user keys to canonical principal directory names."""
+    return {
+        external_channel_id: principal_id
+        for _channel_id, principal_id, external_channel_id in _canonical_storage_rows(data_path)
+    }
 
 
 def _managed_identity_state(user_home: Path) -> tuple[Path, Path, str | None, str | None]:
@@ -4088,8 +4101,13 @@ def _apply_migrate(
         reader_users[str(chat_id)] = os_user
     known_user_dir_names = {str(chat_id) for chat_id, _os_user in memory_owners if chat_id is not None}
     canonical_reader_users = _canonical_storage_reader_users(data_path, reader_users)
+    canonical_principal_names = _canonical_principal_storage_names(data_path)
     reader_users.update(canonical_reader_users)
-    known_user_dir_names.update(name for name in canonical_reader_users if name.startswith("prn_"))
+    known_user_dir_names.update(canonical_principal_names.values())
+    for legacy_name, principal_name in canonical_principal_names.items():
+        owner = per_user_ids.get(legacy_name)
+        if owner is not None:
+            per_user_ids[principal_name] = owner
 
     # Resolve the primary operator's chat_id (first yaml entry). When
     # users.yaml is absent or empty (first-ever install, single-user
@@ -4265,8 +4283,8 @@ def _apply_migrate(
 
     # -- PREFERENCES.md per-user pre-creation --
     # Mirror the MEMORY.md per-user pattern. For every users.yaml
-    # entry we pre-create DATA_DIR/preferences/<chat_id>/ and seed
-    # PREFERENCES.md from the example template if it does not exist.
+    # entry we pre-create DATA_DIR/preferences/<principal_id>/ and preserve
+    # the prior transport-keyed PREFERENCES.md when it exists.
     # Initial ownership is set by the ownership pass below, not here;
     # keeping the chown in a single block makes the os_user-change
     # idempotency case fall out naturally rather than requiring a
@@ -4279,12 +4297,24 @@ def _apply_migrate(
     for chat_id, _os_user in memory_owners:
         if chat_id is None:
             continue
-        pref_dir = preferences_tree / str(chat_id)
+        legacy_name = str(chat_id)
+        canonical_name = canonical_principal_names.get(legacy_name, legacy_name)
+        pref_dir = preferences_tree / canonical_name
         pref_dst = pref_dir / "PREFERENCES.md"
+        legacy_dir = preferences_tree / legacy_name
+        legacy_pref = legacy_dir / "PREFERENCES.md"
+        if pref_dir.is_symlink() or pref_dst.is_symlink():
+            raise RuntimeError(f"Refusing symlinked canonical preferences path: {pref_dst}")
+        if legacy_pref != pref_dst and legacy_dir.is_symlink():
+            raise RuntimeError(f"Refusing symlinked legacy preferences directory: {legacy_dir}")
+        if legacy_pref != pref_dst and legacy_pref.is_symlink():
+            raise RuntimeError(f"Refusing symlinked legacy preferences file: {legacy_pref}")
 
         if dry_run:
             if not pref_dst.exists():
-                if preferences_template.is_file():
+                if legacy_pref != pref_dst and legacy_pref.is_file():
+                    print(f"[DRY RUN] Would copy {legacy_pref} -> {pref_dst}")
+                elif preferences_template.is_file():
                     print(f"[DRY RUN] Would seed {pref_dst} from {preferences_template}")
                 else:
                     print(f"[DRY RUN] Would seed {pref_dst} with placeholder (template missing)")
@@ -4292,7 +4322,10 @@ def _apply_migrate(
 
         pref_dir.mkdir(parents=True, exist_ok=True)
         if not pref_dst.exists():
-            if preferences_template.is_file():
+            if legacy_pref != pref_dst and legacy_pref.is_file():
+                shutil.copy2(legacy_pref, pref_dst)
+                print(f"  Copied preferences {legacy_pref} -> {pref_dst}")
+            elif preferences_template.is_file():
                 shutil.copy2(preferences_template, pref_dst)
                 print(f"  Seeded {pref_dst} from preferences template")
             else:

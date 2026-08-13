@@ -77,6 +77,9 @@ from kai.install import (
     _webhook_secret_migration_status,
     cli,
 )
+from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+from kai.workshop.store import WorkshopEventStore
+from tests.workshop_profiles import profile_id
 
 
 @pytest.fixture(autouse=True)
@@ -6244,6 +6247,53 @@ class TestApplyMigratePerUserPreferences:
         )
 
         assert target.read_text() == "operator-customized rules"
+
+    async def test_copies_legacy_preferences_to_canonical_principal_without_deleting(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        data_path = self._setup(tmp_path, monkeypatch)
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - telegram_id: 7777\n    name: primary\n    role: admin\n")
+        legacy = data_path / "preferences" / "7777" / "PREFERENCES.md"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text("operator-customized rules")
+        store = await WorkshopEventStore.open(data_path / "kai.db")
+        await bootstrap_default_workshop(
+            store,
+            (
+                BootstrapHuman(
+                    "Primary",
+                    "admin",
+                    "telegram",
+                    "7777",
+                    "7777",
+                    profile_id(7777),
+                ),
+            ),
+        )
+        async with store.connection.execute(
+            "SELECT principal_id FROM external_identities WHERE provider = 'telegram' AND external_subject = '7777'"
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        principal_id = str(row[0])
+        await store.close()
+        monkeypatch.setattr("kai.install.os.chown", lambda *args: None)
+
+        _apply_migrate(
+            data_path,
+            tmp_path / "install",
+            svc_uid=501,
+            svc_gid=20,
+            dry_run=False,
+            users_yaml_path=users_yaml,
+        )
+
+        canonical = data_path / "preferences" / principal_id / "PREFERENCES.md"
+        assert canonical.read_text() == "operator-customized rules"
+        assert legacy.read_text() == "operator-customized rules"
 
     def test_template_missing_writes_placeholder(self, tmp_path, monkeypatch, capsys):
         """When the template is absent, write '# Preferences\\n' placeholder + warn."""

@@ -1557,6 +1557,109 @@ class TestEnsureUserPreferences:
         )
 
 
+class _PrincipalPreferenceNamespace:
+    principal_id = "prn_" + "a" * 32
+
+
+class _PrincipalPreferenceRegistry:
+    def for_runtime_config_id(self, runtime_config_id: int):
+        if runtime_config_id != 42:
+            raise LookupError("unknown runtime")
+        return _PrincipalPreferenceNamespace()
+
+
+class TestCanonicalPrincipalPreferences:
+    def test_deferred_context_uses_canonical_principal_path(self, tmp_path, monkeypatch):
+        data_dir = tmp_path / "data"
+        canonical = data_dir / "preferences" / _PrincipalPreferenceNamespace.principal_id
+        canonical.mkdir(parents=True)
+        monkeypatch.setattr(
+            "kai.backend._PRINCIPAL_STORAGE_REGISTRY",
+            _PrincipalPreferenceRegistry(),
+        )
+
+        with patch("kai.backend.get_recent_history", return_value=""):
+            result = build_session_context(
+                workspace=tmp_path,
+                home_workspace=tmp_path,
+                api=ApiContext(webhook_port=8080, webhook_secret=None),
+                workspace_config=None,
+                chat_id=42,
+                data_dir=data_dir,
+                defer_user_file_reads=True,
+            )
+
+        assert str(canonical / "PREFERENCES.md") in result
+        assert str(data_dir / "preferences" / "42" / "PREFERENCES.md") not in result
+
+    def test_deferred_context_falls_back_for_greenfield_first_install(self, tmp_path, monkeypatch):
+        data_dir = tmp_path / "data"
+        legacy = data_dir / "preferences" / "42"
+        legacy.mkdir(parents=True)
+        (legacy / "PREFERENCES.md").write_text("existing")
+        monkeypatch.setattr(
+            "kai.backend._PRINCIPAL_STORAGE_REGISTRY",
+            _PrincipalPreferenceRegistry(),
+        )
+
+        with patch("kai.backend.get_recent_history", return_value=""):
+            result = build_session_context(
+                workspace=tmp_path,
+                home_workspace=tmp_path,
+                api=ApiContext(webhook_port=8080, webhook_secret=None),
+                workspace_config=None,
+                chat_id=42,
+                data_dir=data_dir,
+                defer_user_file_reads=True,
+            )
+
+        assert str(legacy / "PREFERENCES.md") in result
+
+    def test_lazy_bootstrap_copies_legacy_content_without_deleting_it(self, tmp_path, monkeypatch):
+        data_dir = tmp_path / "data"
+        legacy = data_dir / "preferences" / "42" / "PREFERENCES.md"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text("custom preference")
+        monkeypatch.setattr(
+            "kai.backend._PRINCIPAL_STORAGE_REGISTRY",
+            _PrincipalPreferenceRegistry(),
+        )
+
+        ensure_user_preferences(42, data_dir)
+
+        canonical = data_dir / "preferences" / _PrincipalPreferenceNamespace.principal_id / "PREFERENCES.md"
+        assert canonical.read_text() == "custom preference"
+        assert legacy.read_text() == "custom preference"
+
+    def test_unknown_runtime_cannot_recreate_numeric_preference_directory(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "kai.backend._PRINCIPAL_STORAGE_REGISTRY",
+            _PrincipalPreferenceRegistry(),
+        )
+
+        ensure_user_preferences(99, tmp_path)
+
+        assert not (tmp_path / "preferences" / "99").exists()
+
+    def test_lazy_bootstrap_refuses_symlinked_legacy_file(self, tmp_path, monkeypatch):
+        data_dir = tmp_path / "data"
+        outside = tmp_path / "outside.md"
+        outside.write_text("outside preference")
+        legacy = data_dir / "preferences" / "42" / "PREFERENCES.md"
+        legacy.parent.mkdir(parents=True)
+        legacy.symlink_to(outside)
+        monkeypatch.setattr(
+            "kai.backend._PRINCIPAL_STORAGE_REGISTRY",
+            _PrincipalPreferenceRegistry(),
+        )
+
+        ensure_user_preferences(42, data_dir)
+
+        canonical = data_dir / "preferences" / _PrincipalPreferenceNamespace.principal_id / "PREFERENCES.md"
+        assert not canonical.exists()
+        assert outside.read_text() == "outside preference"
+
+
 class TestPerUserMemoryIsolation:
     """Writes to one user's MEMORY.md never appear in another user's context."""
 

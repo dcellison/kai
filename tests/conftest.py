@@ -161,7 +161,10 @@ def _isolate_backend_data_dir(tmp_path):
     their own patch / monkeypatch; the autouse fixture only sets
     the safe default.
     """
-    with patch("kai.backend.DATA_DIR", tmp_path):
+    with (
+        patch("kai.backend.DATA_DIR", tmp_path),
+        patch("kai.backend._PRINCIPAL_STORAGE_REGISTRY", None),
+    ):
         yield
 
 

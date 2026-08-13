@@ -23,6 +23,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 from kai.agent_failure import AgentFailureKind, classify_agent_failure
 from kai.config import (
@@ -43,6 +44,53 @@ _PRIVATE_USER_ROOT_MODE = 0o711
 _PRIVATE_USER_DIR_MODE = 0o700
 _PRIVATE_USER_FILE_MODE = 0o600
 _CLAUDE_IDENTITY_ADAPTER = "@../AGENTS.md\n"
+
+
+class _PrincipalStorageNamespace(Protocol):
+    principal_id: str
+
+
+@runtime_checkable
+class PrincipalStorageNamespaceResolver(Protocol):
+    """Narrow principal-storage boundary supplied by Workshop bootstrap."""
+
+    def for_runtime_config_id(self, runtime_config_id: int) -> _PrincipalStorageNamespace: ...
+
+
+class PrincipalStorageResolutionError(RuntimeError):
+    """A compatibility runtime key has no canonical human principal."""
+
+
+_PRINCIPAL_STORAGE_REGISTRY: PrincipalStorageNamespaceResolver | None = None
+
+
+def configure_principal_storage_namespaces(
+    registry: PrincipalStorageNamespaceResolver | None,
+) -> None:
+    """Install the canonical human-principal resolver for compatibility files."""
+    global _PRINCIPAL_STORAGE_REGISTRY
+    if registry is not None and not isinstance(registry, PrincipalStorageNamespaceResolver):
+        raise TypeError("registry must implement PrincipalStorageNamespaceResolver")
+    _PRINCIPAL_STORAGE_REGISTRY = registry
+
+
+def preference_search_directories(
+    chat_id: int,
+    *,
+    data_dir: Path,
+) -> tuple[Path, ...]:
+    """Return canonical-first preference directories for one runtime key."""
+    root = data_dir / "preferences"
+    registry = _PRINCIPAL_STORAGE_REGISTRY
+    if registry is None:
+        return (root / str(chat_id),)
+    try:
+        namespace = registry.for_runtime_config_id(chat_id)
+    except Exception as exc:
+        raise PrincipalStorageResolutionError("Runtime configuration has no canonical preference principal") from exc
+    canonical = root / str(namespace.principal_id)
+    legacy = root / str(chat_id)
+    return (canonical,) if canonical == legacy else (canonical, legacy)
 
 
 def _chmod_private_user_root(path: Path) -> None:
@@ -450,8 +498,20 @@ def build_session_context(
     # (one-shot CLI invocations) the block is omitted entirely; there
     # is no global-fallback PREFERENCES.md.
     if chat_id is not None:
-        pref_path = data_dir / "preferences" / str(chat_id) / "PREFERENCES.md"
+        preference_dirs = preference_search_directories(chat_id, data_dir=data_dir)
+        canonical_pref_path = preference_dirs[0] / "PREFERENCES.md"
+        pref_path = next(
+            (directory / "PREFERENCES.md" for directory in preference_dirs if (directory / "PREFERENCES.md").is_file()),
+            canonical_pref_path,
+        )
         if defer_user_file_reads:
+            # A first protected install predates Workshop bootstrap and can
+            # provision only the compatibility directory. Use it until the
+            # next install creates the canonical principal directory.
+            if len(preference_dirs) > 1 and not canonical_pref_path.parent.is_dir():
+                pref_path = preference_dirs[1] / "PREFERENCES.md"
+            else:
+                pref_path = canonical_pref_path
             parts.append(
                 f"[Your personal preferences are stored at {pref_path}. "
                 "Read this file before applying personal preference instructions.]"
@@ -726,11 +786,10 @@ def ensure_user_preferences(chat_id: int | None, data_dir: Path) -> None:
 
     Sibling to ensure_user_memory(). Same idempotency, same OSError
     swallow behavior, same multi-user ownership caveats - the install
-    step (install.py `_apply_migrate`) pre-creates `preferences/<chat_id>/`
-    for every entry in users.yaml and chowns it to that user's os_user
-    when one is set; lazy bootstrap is the runtime fallback for chat_ids
-    added between installs (a reinstall picks up the ownership in the
-    `-- PREFERENCES.md directory ownership --` pass).
+    step (install.py `_apply_migrate`) pre-creates the canonical
+    `preferences/<principal_id>/` directory and chowns it to that user's
+    os_user when one is set. The prior transport-keyed file remains a
+    read-only migration source.
 
     When chat_id is None we are on a one-shot CLI / test path: there
     is no per-user PREFERENCES.md to seed because the inject path
@@ -750,26 +809,41 @@ def ensure_user_preferences(chat_id: int | None, data_dir: Path) -> None:
         return
 
     preferences_root = data_dir / "preferences"
-    user_pref_dir = preferences_root / str(chat_id)
+    try:
+        preference_dirs = preference_search_directories(chat_id, data_dir=data_dir)
+    except PrincipalStorageResolutionError:
+        log.exception("ensure_user_preferences: could not resolve canonical principal")
+        return
+    user_pref_dir = preference_dirs[0]
     user_pref_file = user_pref_dir / "PREFERENCES.md"
 
     try:
+        if preferences_root.is_symlink():
+            raise OSError(f"refusing symlinked preferences root: {preferences_root}")
+        if user_pref_dir.is_symlink():
+            raise OSError(f"refusing symlinked preferences directory: {user_pref_dir}")
+        if user_pref_file.is_symlink():
+            raise OSError(f"refusing symlinked preferences file: {user_pref_file}")
         preferences_root.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_ROOT_MODE)
         _chmod_private_user_root(preferences_root)
         user_pref_dir.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_DIR_MODE)
         _chmod_private_user_dir(user_pref_dir)
         if not user_pref_file.exists():
-            # Seed from the template if one ships with the source tree.
-            template = PROJECT_ROOT / "templates" / ".claude" / "PREFERENCES.md"
-            if template.is_file():
-                shutil.copy2(template, user_pref_file)
+            legacy_pref_file = preference_dirs[1] / "PREFERENCES.md" if len(preference_dirs) > 1 else None
+            if legacy_pref_file is not None and legacy_pref_file.parent.is_symlink():
+                raise OSError(f"refusing symlinked legacy preferences directory: {legacy_pref_file.parent}")
+            if legacy_pref_file is not None and legacy_pref_file.is_symlink():
+                raise OSError(f"refusing symlinked legacy preferences file: {legacy_pref_file}")
+            # Preserve customized compatibility content when it is readable;
+            # the installer performs the authoritative protected-mode copy.
+            if legacy_pref_file is not None and legacy_pref_file.is_file():
+                shutil.copy2(legacy_pref_file, user_pref_file)
             else:
-                # No template available (unusual - only happens when
-                # the install tree is incomplete). Create a minimal
-                # placeholder so the subprocess has a writable file
-                # to edit. Matches ensure_user_memory's `# Memory\n`
-                # precedent for symmetry.
-                user_pref_file.write_text("# Preferences\n")
+                template = PROJECT_ROOT / "templates" / ".claude" / "PREFERENCES.md"
+                if template.is_file():
+                    shutil.copy2(template, user_pref_file)
+                else:
+                    user_pref_file.write_text("# Preferences\n")
         _chmod_private_user_file(user_pref_file)
     except OSError:
         log.warning(

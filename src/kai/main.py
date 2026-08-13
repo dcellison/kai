@@ -316,6 +316,9 @@ def _start() -> None:
             workshop_bootstrap.existing_events,
         )
         principal_storage = await sessions.load_workshop_principal_storage_registry(runtime_profiles)
+        from kai.backend import configure_principal_storage_namespaces
+
+        configure_principal_storage_namespaces(principal_storage)
         logging.info(
             "Workshop principal storage ready (namespaces=%d)",
             len(principal_storage.namespaces),
