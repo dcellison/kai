@@ -83,6 +83,7 @@ from kai.workshop.client_sessions import (
     WorkshopClientSessionManager,
 )
 from kai.workshop.client_shell import register_workshop_shell_routes
+from kai.workshop.compatibility_state import WorkshopCompatibilityStateWriter
 from kai.workshop.store import WorkshopEventStore
 
 log = logging.getLogger(__name__)
@@ -2590,10 +2591,16 @@ async def start(telegram_app, config) -> None:
     private_text_execution = telegram_app.bot_data.get("workshop_private_text_execution")
     if private_text_execution is None:
         raise RuntimeError("Workshop private-text execution service is unavailable")
+    workshop_runtime_pool = telegram_app.bot_data.get("workshop_runtime_pool")
+    if workshop_runtime_pool is None:
+        raise RuntimeError("Workshop runtime pool is unavailable")
     register_workshop_routes = await _register_workshop_client_api(
         _app,
         Path(config.session_db_path),
-        command_submitter=WorkshopClientCommandExecutor(private_text_execution, config),
+        command_submitter=WorkshopClientCommandExecutor(
+            private_text_execution,
+            WorkshopCompatibilityStateWriter(config, workshop_runtime_pool),
+        ),
     )
 
     _runner = web.AppRunner(_app, access_log=None)

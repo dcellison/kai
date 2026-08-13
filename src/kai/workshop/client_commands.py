@@ -4,10 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from kai import sessions
-from kai.config import Config
-from kai.conversation_compatibility import reader_user, schedule_memory_ingestion
-from kai.history import log_message
+from kai.workshop.compatibility_state import WorkshopCompatibilityStateWriter
 from kai.workshop.conversation_commands import (
     ClientConversationCommandAcceptance,
     ConversationCommandDisposition,
@@ -32,21 +29,18 @@ class WorkshopClientCommandExecutor:
     def __init__(
         self,
         execution: WorkshopPrivateTextExecutionService,
-        config: Config,
+        compatibility_state: WorkshopCompatibilityStateWriter,
     ) -> None:
         self._execution = execution
-        self._config = config
+        self._compatibility_state = compatibility_state
 
     async def submit(self, message: ClientInboundMessage) -> ClientCommandResult:
         accepted = await self._execution.accept_client(message)
-        runtime_config_id = self._execution.runtime_config_id(accepted.runtime_profile_id)
-        mapped_reader = reader_user(self._config, runtime_config_id)
+        compatibility_state = self._compatibility_state.for_profile(accepted.runtime_profile_id)
         user_log = (
-            log_message(
+            compatibility_state.append_history(
                 direction="user",
-                chat_id=runtime_config_id,
                 text=message.body,
-                reader_user=mapped_reader,
             )
             if accepted.command.disposition == ConversationCommandDisposition.NEWLY_ACCEPTED
             else None
@@ -54,21 +48,20 @@ class WorkshopClientCommandExecutor:
 
         result = await self._execution.execute(accepted.run.run_id)
         if result.terminal is not None:
-            assistant_log = log_message(
+            assistant_log = compatibility_state.append_history(
                 direction="assistant",
-                chat_id=runtime_config_id,
                 text=result.terminal.body,
-                reader_user=mapped_reader,
             )
             if result.session_id and result.selection is not None:
-                await sessions.save_session(runtime_config_id, result.session_id, result.selection.model)
+                await compatibility_state.save_session(
+                    result.session_id,
+                    result.selection.model,
+                )
             if result.disposition == CanonicalExecutionDisposition.COMPLETED and result.workspace is not None:
-                schedule_memory_ingestion(
+                compatibility_state.schedule_memory_ingestion(
                     prompt=message.body,
                     assistant_text=result.terminal.body,
-                    chat_id=runtime_config_id,
                     session_id=result.session_id,
-                    config=self._config,
                     workspace=result.workspace,
                     user_log=user_log,
                     assistant_log=assistant_log,

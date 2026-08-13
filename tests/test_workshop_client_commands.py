@@ -27,9 +27,7 @@ def _message() -> ClientInboundMessage:
     )
 
 
-async def test_completed_client_command_preserves_history_session_and_memory(
-    monkeypatch,
-):
+async def test_completed_client_command_preserves_history_session_and_memory():
     message = _message()
     run_id = RunId.new()
     accepted = SimpleNamespace(
@@ -50,53 +48,43 @@ async def test_completed_client_command_preserves_history_session_and_memory(
     execution = SimpleNamespace(
         accept_client=AsyncMock(return_value=accepted),
         execute=AsyncMock(return_value=execution_result),
-        runtime_config_id=Mock(return_value=101),
     )
-    config = SimpleNamespace(
-        get_user_config=lambda chat_id: SimpleNamespace(os_user="daniel") if chat_id == 101 else None
+    profile_state = SimpleNamespace(
+        append_history=Mock(side_effect=["user-log", "assistant-log"]),
+        save_session=AsyncMock(),
+        schedule_memory_ingestion=Mock(),
     )
-    log = Mock(side_effect=["user-log", "assistant-log"])
-    save_session = AsyncMock()
-    schedule = Mock()
-    monkeypatch.setattr("kai.workshop.client_commands.log_message", log)
-    monkeypatch.setattr("kai.workshop.client_commands.sessions.save_session", save_session)
-    monkeypatch.setattr("kai.workshop.client_commands.schedule_memory_ingestion", schedule)
+    compatibility_state = SimpleNamespace(for_profile=Mock(return_value=profile_state))
 
-    result = await WorkshopClientCommandExecutor(execution, config).submit(message)
+    result = await WorkshopClientCommandExecutor(execution, compatibility_state).submit(message)
 
     assert result.acceptance is accepted
     assert result.execution is execution_result
     execution.accept_client.assert_awaited_once_with(message)
     execution.execute.assert_awaited_once_with(run_id)
-    execution.runtime_config_id.assert_called_once_with(profile_id(101))
-    assert log.call_args_list == [
+    compatibility_state.for_profile.assert_called_once_with(profile_id(101))
+    assert profile_state.append_history.call_args_list == [
         call(
             direction="user",
-            chat_id=101,
             text="Hello from Workshop",
-            reader_user="daniel",
         ),
         call(
             direction="assistant",
-            chat_id=101,
             text="Completed through the protected lane",
-            reader_user="daniel",
         ),
     ]
-    save_session.assert_awaited_once_with(101, "session-1", "gpt-5.6-sol")
-    schedule.assert_called_once_with(
+    profile_state.save_session.assert_awaited_once_with("session-1", "gpt-5.6-sol")
+    profile_state.schedule_memory_ingestion.assert_called_once_with(
         prompt="Hello from Workshop",
         assistant_text="Completed through the protected lane",
-        chat_id=101,
         session_id="session-1",
-        config=config,
         workspace="/workspace/project",
         user_log="user-log",
         assistant_log="assistant-log",
     )
 
 
-async def test_terminal_replay_does_not_duplicate_compatibility_writes(monkeypatch):
+async def test_terminal_replay_does_not_duplicate_compatibility_writes():
     message = _message()
     run_id = RunId.new()
     accepted = SimpleNamespace(
@@ -106,7 +94,6 @@ async def test_terminal_replay_does_not_duplicate_compatibility_writes(monkeypat
     )
     execution = SimpleNamespace(
         accept_client=AsyncMock(return_value=accepted),
-        runtime_config_id=Mock(return_value=101),
         execute=AsyncMock(
             return_value=CanonicalExecutionResult(
                 CanonicalExecutionDisposition.TERMINAL_REPLAY,
@@ -114,16 +101,16 @@ async def test_terminal_replay_does_not_duplicate_compatibility_writes(monkeypat
             )
         ),
     )
-    config = SimpleNamespace(get_user_config=lambda _chat_id: None)
-    log = Mock()
-    save_session = AsyncMock()
-    schedule = Mock()
-    monkeypatch.setattr("kai.workshop.client_commands.log_message", log)
-    monkeypatch.setattr("kai.workshop.client_commands.sessions.save_session", save_session)
-    monkeypatch.setattr("kai.workshop.client_commands.schedule_memory_ingestion", schedule)
+    profile_state = SimpleNamespace(
+        append_history=Mock(),
+        save_session=AsyncMock(),
+        schedule_memory_ingestion=Mock(),
+    )
+    compatibility_state = SimpleNamespace(for_profile=Mock(return_value=profile_state))
 
-    await WorkshopClientCommandExecutor(execution, config).submit(message)
+    await WorkshopClientCommandExecutor(execution, compatibility_state).submit(message)
 
-    log.assert_not_called()
-    save_session.assert_not_awaited()
-    schedule.assert_not_called()
+    compatibility_state.for_profile.assert_called_once_with(profile_id(101))
+    profile_state.append_history.assert_not_called()
+    profile_state.save_session.assert_not_awaited()
+    profile_state.schedule_memory_ingestion.assert_not_called()

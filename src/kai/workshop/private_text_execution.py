@@ -10,7 +10,7 @@ from kai.workshop.conversation_commands import (
     ConversationCommandAcceptance,
     WorkshopConversationCommandService,
 )
-from kai.workshop.domain import RunId, RuntimeProfileId
+from kai.workshop.domain import RunId
 from kai.workshop.execution_coordinator import (
     CanonicalCancellationDisposition,
     CanonicalExecutionResult,
@@ -86,10 +86,6 @@ class WorkshopPrivateTextExecutionService:
     @property
     def ready(self) -> bool:
         return not self._closed and self._task is not None and not self._task.done()
-
-    def runtime_config_id(self, runtime_profile_id: str | RuntimeProfileId) -> int:
-        """Resolve compatibility state only through protected profile policy."""
-        return self._runtime_pool.compatibility_runtime_config_id(runtime_profile_id)
 
     async def accept(self, message: InboundMessage) -> ConversationCommandAcceptance:
         if self._closed:

@@ -2379,6 +2379,7 @@ class TestNotificationChatIdMutations:
         telegram_app.bot_data = {
             "pool": MagicMock(internal_api_auth=InternalAPIAuth({111: "secret"})),
             "workshop_private_text_execution": AsyncMock(),
+            "workshop_runtime_pool": MagicMock(),
         }
 
         fake_runner = MagicMock()
@@ -2435,6 +2436,7 @@ class TestNotificationChatIdMutations:
         telegram_app.bot_data = {
             "pool": MagicMock(internal_api_auth=InternalAPIAuth({111: "secret"})),
             "workshop_private_text_execution": AsyncMock(),
+            "workshop_runtime_pool": MagicMock(),
         }
 
         apps: list[web.Application] = []
