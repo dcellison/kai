@@ -548,11 +548,12 @@ def build_session_context(
     if chat_id is not None:
         preference_dirs = preference_search_directories(chat_id, data_dir=data_dir)
         canonical_pref_path = preference_dirs[0] / "PREFERENCES.md"
-        pref_path = next(
-            (directory / "PREFERENCES.md" for directory in preference_dirs if (directory / "PREFERENCES.md").is_file()),
-            canonical_pref_path,
-        )
         if defer_user_file_reads:
+            # Protected installs deliberately make each per-user directory
+            # unreadable to the outer service.  Do not probe files inside
+            # either namespace before handing the path to the user-owned
+            # backend process: Path.is_file() raises PermissionError rather
+            # than returning False when the directory is mode 0700.
             # A first protected install predates Workshop bootstrap and can
             # provision only the compatibility directory. Use it until the
             # next install creates the canonical principal directory.
@@ -565,6 +566,14 @@ def build_session_context(
                 "Read this file before applying personal preference instructions.]"
             )
         else:
+            pref_path = next(
+                (
+                    directory / "PREFERENCES.md"
+                    for directory in preference_dirs
+                    if (directory / "PREFERENCES.md").is_file()
+                ),
+                canonical_pref_path,
+            )
             try:
                 pref_text = pref_path.read_text().strip()
                 if pref_text:
@@ -603,15 +612,16 @@ def build_session_context(
         if chat_id is not None:
             memory_dirs = memory_search_directories(chat_id, data_dir=data_dir)
             canonical_memory_path = memory_dirs[0] / "MEMORY.md"
-            memory_path = next(
-                (directory / "MEMORY.md" for directory in memory_dirs if (directory / "MEMORY.md").is_file()),
-                canonical_memory_path,
-            )
             if defer_user_file_reads:
                 if len(memory_dirs) > 1 and not canonical_memory_path.parent.is_dir():
                     memory_path = memory_dirs[1] / "MEMORY.md"
                 else:
                     memory_path = canonical_memory_path
+            else:
+                memory_path = next(
+                    (directory / "MEMORY.md" for directory in memory_dirs if (directory / "MEMORY.md").is_file()),
+                    canonical_memory_path,
+                )
         else:
             memory_path = data_dir / "memory" / "MEMORY.md"
         if defer_user_file_reads and chat_id is not None:

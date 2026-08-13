@@ -1587,6 +1587,42 @@ class _PrincipalPreferenceRegistry:
 
 
 class TestCanonicalPrincipalPreferences:
+    def test_deferred_context_does_not_stat_private_context_files(self, tmp_path, monkeypatch):
+        data_dir = tmp_path / "data"
+        principal_id = _PrincipalPreferenceNamespace.principal_id
+        canonical_preferences = data_dir / "preferences" / principal_id
+        canonical_memory = data_dir / "memory" / principal_id
+        canonical_preferences.mkdir(parents=True)
+        canonical_memory.mkdir(parents=True)
+        monkeypatch.setattr(
+            "kai.backend._PRINCIPAL_STORAGE_REGISTRY",
+            _PrincipalPreferenceRegistry(),
+        )
+
+        original_is_file = Path.is_file
+
+        def reject_private_file_probe(path):
+            if path.name in {"PREFERENCES.md", "MEMORY.md"}:
+                raise PermissionError(f"private user file: {path}")
+            return original_is_file(path)
+
+        monkeypatch.setattr(Path, "is_file", reject_private_file_probe)
+
+        with patch("kai.backend.get_recent_history", return_value=""):
+            result = build_session_context(
+                workspace=tmp_path,
+                home_workspace=tmp_path,
+                api=ApiContext(webhook_port=8080, webhook_secret=None),
+                workspace_config=None,
+                chat_id=42,
+                data_dir=data_dir,
+                memory_enabled=False,
+                defer_user_file_reads=True,
+            )
+
+        assert str(canonical_preferences / "PREFERENCES.md") in result
+        assert str(canonical_memory / "MEMORY.md") in result
+
     def test_deferred_context_uses_canonical_principal_path(self, tmp_path, monkeypatch):
         data_dir = tmp_path / "data"
         canonical = data_dir / "preferences" / _PrincipalPreferenceNamespace.principal_id
