@@ -6,8 +6,9 @@ Provides functionality to:
 2. Retrieve recent messages for injection into new Claude sessions
 3. Serve as the "episodic memory" layer of Kai's three-layer memory system
 
-Log files are stored in per-user subdirectories under DATA_DIR/history/
-(e.g., DATA_DIR/history/<chat_id>/2026-02-11.jsonl). Each line is a JSON
+Log files are stored in per-channel subdirectories under DATA_DIR/history/
+(e.g., DATA_DIR/history/<channel_id>/2026-02-11.jsonl). During the Workshop
+transition, readers also consult the prior transport-keyed directory. Each line is a JSON
 object with fields:
     ts       — ISO 8601 timestamp
     dir      — "user" or "assistant"
@@ -27,7 +28,8 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from pathlib import Path
+from typing import Literal, Protocol, runtime_checkable
 
 from kai.config import DATA_DIR
 from kai.named_access import grant_named_read_access
@@ -39,6 +41,25 @@ log = logging.getLogger(__name__)
 # PROJECT_ROOT/history/. Intentionally NOT updated when workspace switches -
 # all conversation history stays in one canonical location.
 _LOG_DIR = DATA_DIR / "history"
+
+
+class _ChannelHistoryNamespace(Protocol):
+    channel_id: str
+    _legacy_chat_id: int
+
+
+@runtime_checkable
+class ChannelHistoryNamespaceResolver(Protocol):
+    """Narrow boundary supplied by Workshop after canonical bootstrap."""
+
+    def for_compatibility_chat_id(self, chat_id: int) -> _ChannelHistoryNamespace: ...
+
+
+class HistoryNamespaceResolutionError(RuntimeError):
+    """A compatibility key cannot resolve to canonical channel storage."""
+
+
+_CHANNEL_HISTORY_REGISTRY: ChannelHistoryNamespaceResolver | None = None
 
 # Limits for the recent-history summary injected at session start
 _MAX_RECENT_MESSAGES = 20
@@ -103,6 +124,78 @@ class LogEntry:
     sha256: str
 
 
+def configure_channel_history_namespaces(
+    registry: ChannelHistoryNamespaceResolver | None,
+) -> None:
+    """Install the canonical channel resolver used by compatibility history.
+
+    Production configures this once after Workshop bootstrap. Passing ``None``
+    is reserved for isolated tests and local compatibility tools; a running
+    protected service never falls back to creating transport-keyed trees.
+    """
+    global _CHANNEL_HISTORY_REGISTRY
+    if registry is not None and not isinstance(registry, ChannelHistoryNamespaceResolver):
+        raise TypeError("registry must implement ChannelHistoryNamespaceResolver")
+    _CHANNEL_HISTORY_REGISTRY = registry
+
+
+def history_search_directories(
+    chat_id: int,
+    *,
+    history_root: Path | None = None,
+) -> tuple[Path, ...]:
+    """Return canonical-first search paths for one compatibility chat key."""
+    root = _LOG_DIR if history_root is None else history_root
+    registry = _CHANNEL_HISTORY_REGISTRY
+    if registry is None:
+        return (root / str(chat_id),)
+    try:
+        namespace = registry.for_compatibility_chat_id(chat_id)
+    except Exception as exc:
+        raise HistoryNamespaceResolutionError("Compatibility chat ID has no canonical history namespace") from exc
+    canonical = root / str(namespace.channel_id)
+    legacy = root / str(namespace._legacy_chat_id)
+    return (canonical,) if canonical == legacy else (canonical, legacy)
+
+
+def _history_files_by_date(
+    chat_id: int,
+    *,
+    include_flat_legacy: bool,
+) -> list[tuple[str, list[Path]]]:
+    """Group canonical and compatibility JSONL files by date, newest first."""
+    grouped: dict[str, list[Path]] = {}
+    for directory in history_search_directories(chat_id):
+        if not directory.is_dir() or directory.is_symlink():
+            continue
+        for path in directory.glob("*.jsonl"):
+            if path.is_file() and not path.is_symlink():
+                grouped.setdefault(path.name, []).append(path)
+    if include_flat_legacy:
+        for path in _LOG_DIR.glob("*.jsonl"):
+            if path.is_file() and not path.is_symlink():
+                grouped.setdefault(path.name, []).append(path)
+    return [(name, sorted(paths)) for name, paths in sorted(grouped.items(), reverse=True)]
+
+
+def _read_history_day(chat_id: int, date: str) -> tuple[Literal["ok", "missing", "unreadable"], list[dict]]:
+    """Read and chronologically merge one day across canonical and legacy trees."""
+    paths = [directory / f"{date}.jsonl" for directory in history_search_directories(chat_id)]
+    existing = [path for path in paths if path.exists()]
+    if not existing:
+        return "missing", []
+    records: list[dict] = []
+    for path in existing:
+        if path.is_symlink() or not path.is_file():
+            return "unreadable", []
+        parsed = _read_jsonl_file(path)
+        if parsed is None:
+            return "unreadable", []
+        records.extend(parsed)
+    records.sort(key=lambda record: str(record.get("ts", "")))
+    return "ok", records
+
+
 def log_message(
     *,
     direction: str,
@@ -135,10 +228,14 @@ def log_message(
         reader_user: Optional mapped OS user allowed to search this user's
             otherwise service-private history.
     """
-    # Per-user subdirectory: DATA_DIR/history/<chat_id>/YYYY-MM-DD.jsonl
-    # Separates users on disk so grep/jq searches are naturally scoped
-    # and one user's history can be managed independently.
-    user_dir = _LOG_DIR / str(chat_id)
+    # Canonical per-channel directory. When the protected service has a
+    # namespace registry, failure to resolve is fatal to this write: silently
+    # recreating a numeric directory would reverse the migration boundary.
+    try:
+        user_dir = history_search_directories(chat_id)[0]
+    except HistoryNamespaceResolutionError:
+        log.exception("Failed to resolve canonical chat history namespace")
+        return None
     # Single `now` call so the ts written into the record and the date
     # baked into the filename can never drift across a midnight boundary
     # within one log_message invocation. The returned LogEntry carries
@@ -251,48 +348,49 @@ def get_recent_history(chat_id: int | None = None) -> str:
         return ""
 
     if chat_id is not None:
-        # Scan only this user's subdirectory for per-user isolation.
-        user_dir = _LOG_DIR / str(chat_id)
-        files = sorted(user_dir.glob("*.jsonl"), reverse=True) if user_dir.exists() else []
-        # Also include legacy flat files (pre-per-user migration) - the
-        # chat_id filter in the parsing loop handles mixed records correctly.
-        # These age out naturally as new writes go to per-user directories.
-        legacy = [f for f in _LOG_DIR.glob("*.jsonl") if f.is_file()]
-        files = sorted(set(files) | set(legacy), key=lambda p: p.name, reverse=True)
+        try:
+            file_groups = _history_files_by_date(chat_id, include_flat_legacy=True)
+        except HistoryNamespaceResolutionError:
+            log.exception("Failed to resolve canonical chat history namespace")
+            return ""
     else:
         # Scan all user directories (backward compat / admin view).
         # Sort by filename (date) not full path, so files from different
         # user directories on the same date interleave chronologically.
         files = sorted(_LOG_DIR.rglob("*.jsonl"), key=lambda p: p.name, reverse=True)
+        file_groups = [(path.name, [path]) for path in files]
 
-    if not files:
+    if not file_groups:
         return ""
 
     # Read files newest-first, collecting messages until we have enough.
     # We read entire files since individual files are small (one day of chat),
     # then take the last N from the combined pool.
     messages: list[dict] = []
-    for path in files:
+    for _date_name, paths in file_groups:
         file_messages: list[dict] = []
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except OSError:
-            log.exception("Failed to read history file %s", path)
-            continue
-        for line in raw.splitlines():
-            if line.strip():
-                try:
-                    record = json.loads(line)
-                    # Skip messages from other users when filtering.
-                    # Records without a chat_id field predate Phase 2
-                    # and are included for all users (see docstring note).
-                    record_chat_id = record.get("chat_id")
-                    if chat_id is not None and record_chat_id is not None and record_chat_id != chat_id:
-                        continue
-                    file_messages.append(record)
-                except json.JSONDecodeError:
-                    # Skip individual bad lines rather than discarding the whole file
-                    log.debug("Skipping malformed JSON line in %s: %s", path.name, line[:100])
+        for path in paths:
+            try:
+                raw = path.read_text(encoding="utf-8")
+            except OSError:
+                log.exception("Failed to read history file %s", path)
+                continue
+            for line in raw.splitlines():
+                if line.strip():
+                    try:
+                        record = json.loads(line)
+                        # Skip messages from other users when filtering.
+                        # Records without a chat_id field predate Phase 2
+                        # and are included for all users (see docstring note).
+                        record_chat_id = record.get("chat_id")
+                        if chat_id is not None and record_chat_id is not None and record_chat_id != chat_id:
+                            continue
+                        file_messages.append(record)
+                    except json.JSONDecodeError:
+                        # Skip individual bad lines rather than discarding the whole file
+                        log.debug("Skipping malformed JSON line in %s: %s", path.name, line[:100])
+
+        file_messages.sort(key=lambda record: str(record.get("ts", "")))
 
         # Prepend this file's messages (older days go before newer days)
         messages = file_messages + messages
@@ -390,17 +488,18 @@ def get_recent_pairs(chat_id: int, n: int) -> list[tuple[str, str]]:
     if not _LOG_DIR.exists():
         return []
 
-    # Per-user subdirectory; ignore legacy flat files entirely. The
+    # Canonical channel directory plus the prior transport-keyed directory;
+    # ignore legacy flat files entirely. The
     # classifier path's strictness on chat_id provenance means
     # admin-restored backups in user_dir are also filtered out below
     # (records without `chat_id` are dropped) so even a misplaced
     # legacy file in the wrong subdirectory cannot leak across users.
-    user_dir = _LOG_DIR / str(chat_id)
-    if not user_dir.exists():
+    try:
+        file_groups = _history_files_by_date(chat_id, include_flat_legacy=False)
+    except HistoryNamespaceResolutionError:
+        log.exception("Failed to resolve canonical chat history namespace")
         return []
-
-    files = sorted(user_dir.glob("*.jsonl"), reverse=True)  # newest first
-    if not files:
+    if not file_groups:
         return []
 
     # Collect filtered records, building oldest-first by prepending
@@ -416,46 +515,35 @@ def get_recent_pairs(chat_id: int, n: int) -> list[tuple[str, str]]:
     # stays cheap even on heavy users.
     records: list[dict] = []
     pairs: list[tuple[str, str]] = []
-    for path in files:
+    for _date_name, paths in file_groups:
         file_records: list[dict] = []
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except OSError:
-            log.exception("Failed to read history file %s", path)
-            continue
-        for line in raw.splitlines():
-            if not line.strip():
-                continue
+        for path in paths:
             try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                # Skip individual bad lines rather than discarding the
-                # whole file - matches the existing get_recent_history
-                # tolerance for partial corruption.
-                log.debug("Skipping malformed JSON line in %s", path.name)
+                raw = path.read_text(encoding="utf-8")
+            except OSError:
+                log.exception("Failed to read history file %s", path)
                 continue
-            # Drop records without a `chat_id` field (legacy pre-Phase-2).
-            # Greenfield divergence from get_recent_history: the
-            # classifier path needs strict provenance; legacy records
-            # have no way to confirm they belong to this chat.
-            if "chat_id" not in rec:
-                continue
-            # User partition: drop records belonging to other chats.
-            # Possible if a backup/restore mis-placed a file, or if a
-            # future operator action stages JSONL across chats.
-            if rec.get("chat_id") != chat_id:
-                continue
-            text = (rec.get("text") or "").strip()
-            if not text:
-                continue
-            direction = rec.get("dir")
-            # Synthetic-marker filter applies only to assistant records.
-            # A user message that quotes one of the marker shapes is
-            # legitimate prior context (the anchored regex shape catches
-            # only exact full-line matches; quoted prose is safe).
-            if direction == "assistant" and _SYNTHETIC_ASSISTANT_MARKERS.fullmatch(text):
-                continue
-            file_records.append({"dir": direction, "text": text})
+            for line in raw.splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    # Skip individual bad lines rather than discarding the
+                    # whole file - matches the existing get_recent_history
+                    # tolerance for partial corruption.
+                    log.debug("Skipping malformed JSON line in %s", path.name)
+                    continue
+                if "chat_id" not in rec or rec.get("chat_id") != chat_id:
+                    continue
+                text = (rec.get("text") or "").strip()
+                if not text:
+                    continue
+                direction = rec.get("dir")
+                if direction == "assistant" and _SYNTHETIC_ASSISTANT_MARKERS.fullmatch(text):
+                    continue
+                file_records.append({"dir": direction, "text": text, "ts": rec.get("ts", "")})
+        file_records.sort(key=lambda record: str(record.get("ts", "")))
         # Prepend so the running list stays oldest-first across files,
         # then re-pair. Pair count grows monotonically as we add
         # older records (newer pairs already exist; older records can
@@ -722,12 +810,15 @@ def fetch_transcript_context(
     user_text_sha256: str = provenance.user_text_sha256
     assistant_ts: str | None = provenance.assistant_ts
 
-    primary_path = _LOG_DIR / str(chat_id) / f"{date}.jsonl"
-    if not primary_path.exists():
+    try:
+        primary_status, primary_records = _read_history_day(chat_id, date)
+    except HistoryNamespaceResolutionError:
         _emit_drift_log(memory_id=memory_id, chat_id=chat_id, reason="file_missing")
         return TranscriptLookup(reason="file_missing", context=None)
-    primary_records = _read_jsonl_file(primary_path)
-    if primary_records is None:
+    if primary_status == "missing":
+        _emit_drift_log(memory_id=memory_id, chat_id=chat_id, reason="file_missing")
+        return TranscriptLookup(reason="file_missing", context=None)
+    if primary_status == "unreadable":
         _emit_drift_log(memory_id=memory_id, chat_id=chat_id, reason="unreadable")
         return TranscriptLookup(reason="unreadable", context=None)
 
@@ -753,9 +844,8 @@ def fetch_transcript_context(
         # (episode midnight cross) before giving up.
         assistant_index = _find_record_index(primary_records, ts=assistant_ts, direction="assistant")
         if assistant_index is None:
-            forward_path = _LOG_DIR / str(chat_id) / f"{_shift_date(date, 1)}.jsonl"
-            forward_records = _read_jsonl_file(forward_path) if forward_path.exists() else None
-            if forward_records is not None:
+            forward_status, forward_records = _read_history_day(chat_id, _shift_date(date, 1))
+            if forward_status == "ok":
                 forward_assistant_index = _find_record_index(forward_records, ts=assistant_ts, direction="assistant")
                 if forward_assistant_index is not None:
                     rec = forward_records[forward_assistant_index]
@@ -835,16 +925,14 @@ def _collect_before(
         if len(collected) >= before:
             break
     if len(collected) < before:
-        prev_path = _LOG_DIR / str(chat_id) / f"{_shift_date(date, -1)}.jsonl"
-        if prev_path.exists():
-            prev_records = _read_jsonl_file(prev_path)
-            if prev_records is not None:
-                for rec in reversed(prev_records):
-                    if _turn_is_synthetic(rec.get("text", "")):
-                        continue
-                    collected.append(_to_turn(rec))
-                    if len(collected) >= before:
-                        break
+        prev_status, prev_records = _read_history_day(chat_id, _shift_date(date, -1))
+        if prev_status == "ok":
+            for rec in reversed(prev_records):
+                if _turn_is_synthetic(rec.get("text", "")):
+                    continue
+                collected.append(_to_turn(rec))
+                if len(collected) >= before:
+                    break
     collected.reverse()
     return collected
 
@@ -893,23 +981,21 @@ def _collect_after(
         # any "after" turns following that assistant in the next file
         # itself, which is the same path the same-day branch would have
         # taken if the assistant lived locally.
-        next_path = _LOG_DIR / str(chat_id) / f"{_shift_date(date, 1)}.jsonl"
-        if next_path.exists():
-            next_records = _read_jsonl_file(next_path)
-            if next_records is not None:
-                # When the target_assistant lives in next_records, start
-                # after it; otherwise start at the beginning of the file.
-                start = 0
-                if target_assistant is not None:
-                    forward_assistant_index = _find_record_index(
-                        next_records, ts=target_assistant.ts, direction="assistant"
-                    )
-                    if forward_assistant_index is not None:
-                        start = forward_assistant_index + 1
-                for rec in next_records[start:]:
-                    if _turn_is_synthetic(rec.get("text", "")):
-                        continue
-                    collected.append(_to_turn(rec))
-                    if len(collected) >= after:
-                        break
+        next_status, next_records = _read_history_day(chat_id, _shift_date(date, 1))
+        if next_status == "ok":
+            # When the target_assistant lives in next_records, start
+            # after it; otherwise start at the beginning of the file.
+            start = 0
+            if target_assistant is not None:
+                forward_assistant_index = _find_record_index(
+                    next_records, ts=target_assistant.ts, direction="assistant"
+                )
+                if forward_assistant_index is not None:
+                    start = forward_assistant_index + 1
+            for rec in next_records[start:]:
+                if _turn_is_synthetic(rec.get("text", "")):
+                    continue
+                collected.append(_to_turn(rec))
+                if len(collected) >= after:
+                    break
     return collected

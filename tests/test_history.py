@@ -9,6 +9,11 @@ import pytest
 
 from kai import history
 from kai.history import get_recent_history, get_recent_pairs, log_message
+from kai.workshop.domain import ChannelId
+from kai.workshop.storage_namespaces import (
+    WorkshopChannelHistoryNamespace,
+    WorkshopChannelHistoryRegistry,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -1012,3 +1017,79 @@ class TestLogMessageMkdirFailure:
         monkeypatch.setattr(Path, "mkdir", boom)
         entry = log_message(direction="user", chat_id=99, text="x")
         assert entry is None
+
+
+class TestCanonicalChannelHistoryNamespace:
+    @staticmethod
+    def _registry() -> WorkshopChannelHistoryRegistry:
+        return WorkshopChannelHistoryRegistry(
+            (
+                WorkshopChannelHistoryNamespace(
+                    ChannelId("chn_" + "a" * 32),
+                    101,
+                ),
+            )
+        )
+
+    def test_new_writes_use_only_canonical_channel_directory(
+        self,
+        _log_dir,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(history, "_CHANNEL_HISTORY_REGISTRY", self._registry())
+
+        entry = log_message(direction="user", chat_id=101, text="canonical")
+
+        assert entry is not None
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
+        assert (_log_dir / ("chn_" + "a" * 32) / f"{today}.jsonl").is_file()
+        assert not (_log_dir / "101").exists()
+
+    def test_reads_merge_legacy_and_canonical_same_day_chronologically(
+        self,
+        _log_dir,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(history, "_CHANNEL_HISTORY_REGISTRY", self._registry())
+        legacy = _log_dir / "101" / "2026-08-13.jsonl"
+        canonical = _log_dir / ("chn_" + "a" * 32) / "2026-08-13.jsonl"
+        legacy.parent.mkdir(parents=True)
+        canonical.parent.mkdir(parents=True)
+        legacy.write_text(
+            json.dumps(
+                {
+                    "ts": "2026-08-13T09:00:00+00:00",
+                    "dir": "user",
+                    "chat_id": 101,
+                    "text": "before cutover",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        canonical.write_text(
+            json.dumps(
+                {
+                    "ts": "2026-08-13T09:01:00+00:00",
+                    "dir": "assistant",
+                    "chat_id": 101,
+                    "text": "after cutover",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        assert get_recent_pairs(101, 1) == [("before cutover", "after cutover")]
+        recent = get_recent_history(chat_id=101)
+        assert recent.index("before cutover") < recent.index("after cutover")
+
+    def test_unknown_chat_does_not_recreate_numeric_namespace(
+        self,
+        _log_dir,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(history, "_CHANNEL_HISTORY_REGISTRY", self._registry())
+
+        assert log_message(direction="user", chat_id=202, text="refuse") is None
+        assert not (_log_dir / "202").exists()

@@ -320,6 +320,14 @@ def _start() -> None:
             "Workshop principal storage ready (namespaces=%d)",
             len(principal_storage.namespaces),
         )
+        channel_history = await sessions.load_workshop_channel_history_registry(runtime_profiles)
+        from kai.history import configure_channel_history_namespaces
+
+        configure_channel_history_namespaces(channel_history)
+        logging.info(
+            "Workshop channel history ready (namespaces=%d)",
+            len(channel_history.namespaces),
+        )
 
         # Load user-registered memory projects into the detection
         # cache. Must follow init_db (the rows live in the session

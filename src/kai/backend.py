@@ -35,7 +35,7 @@ from kai.config import (
     get_user_backend_and_provider,
     validate_model_for_backend,
 )
-from kai.history import get_recent_history
+from kai.history import get_recent_history, history_search_directories
 
 log = logging.getLogger(__name__)
 
@@ -518,19 +518,33 @@ def build_session_context(
     if ws_prompt:
         parts.append(f"## Workspace Instructions\n\n{ws_prompt}")
 
-    # Always inject the per-user history directory path so the inner
-    # agent's grep/jq searches are naturally scoped to this user.
-    history_dir = str(data_dir / "history" / str(chat_id)) if chat_id is not None else str(data_dir / "history")
+    # Always inject the canonical per-channel history path so inner-agent
+    # grep/jq searches remain transport-independent. The old numeric tree is
+    # advertised only as a read-only archive while historical logs age out.
+    if chat_id is not None:
+        history_dirs = history_search_directories(
+            chat_id,
+            history_root=data_dir / "history",
+        )
+    else:
+        history_dirs = (data_dir / "history",)
+    history_dir = str(history_dirs[0])
+    history_archive_note = (
+        f" Earlier logs may remain in the read-only compatibility archive {history_dirs[1]}/."
+        if len(history_dirs) > 1
+        else ""
+    )
 
     # Inject recent conversation history for continuity.
     # Filter by chat_id so each user's session only sees their
     # own messages (Phase 2 per-user data isolation).
     recent = get_recent_history(chat_id=chat_id)
     if recent:
-        parts.append(f"[Recent conversations (search {history_dir}/ for full logs):]\n{recent}")
+        parts.append(f"[Recent conversations (search {history_dir}/ for full logs).{history_archive_note}]\n{recent}")
     else:
         parts.append(
-            f"[Chat history is stored in {history_dir}/ as daily JSONL files. Search with grep or jq when asked about past conversations.]"
+            f"[Chat history is stored in {history_dir}/ as daily JSONL files."
+            f"{history_archive_note} Search with grep or jq when asked about past conversations.]"
         )
 
     # Inject scheduling API info (always, so cron works from any workspace).

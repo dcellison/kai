@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from kai.workshop.domain import (
+    ChannelId,
     EventEnvelope,
     EventId,
     PrincipalId,
@@ -505,71 +506,91 @@ def _projection_mismatches(connection: sqlite3.Connection, replayed: _ReplayStat
     return len(actual), mismatches
 
 
-def _read_legacy_keys(history_root: Path, external_channel_id: str) -> tuple[list[tuple[str, str]], int, int]:
+def _read_legacy_keys(
+    history_root: Path,
+    external_channel_id: str,
+    channel_id: str,
+) -> tuple[list[tuple[str, str]], int, int]:
     if not _TELEGRAM_SUBJECT_PATTERN.fullmatch(external_channel_id):
+        return [], 0, 1
+    try:
+        canonical_channel_id = ChannelId(channel_id)
+    except (TypeError, ValueError):
         return [], 0, 1
     if history_root.is_symlink():
         return [], 0, 1
-    history_dir = history_root / external_channel_id
-    if history_dir.is_symlink():
-        return [], 0, 1
-    if not history_dir.is_dir():
-        return [], 0, 0
+    history_dirs = (
+        history_root / str(canonical_channel_id),
+        history_root / external_channel_id,
+    )
 
     keys: list[tuple[str, str]] = []
     pending_user_turn: bool | None = None
     malformed = 0
     unreadable = 0
-    for path in sorted(history_dir.glob("*.jsonl")):
-        if path.is_symlink():
+    records: list[dict] = []
+    for history_dir in history_dirs:
+        if history_dir.is_symlink():
             unreadable += 1
             continue
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except (OSError, UnicodeError):
+        if not history_dir.exists():
+            continue
+        if not history_dir.is_dir():
             unreadable += 1
             continue
-        for line in lines:
-            if not line.strip():
+        for path in sorted(history_dir.glob("*.jsonl")):
+            if path.is_symlink():
+                unreadable += 1
                 continue
             try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                malformed += 1
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except (OSError, UnicodeError):
+                unreadable += 1
                 continue
-            if not isinstance(record, dict):
-                malformed += 1
-                continue
-            direction = record.get("dir")
-            text = record.get("text")
-            chat_id = record.get("chat_id")
-            if direction not in {"user", "assistant"} or not isinstance(text, str):
-                continue
-            if str(chat_id) != external_channel_id:
-                continue
-            if direction == "user":
-                media = record.get("media")
-                is_shadowed_message = media is None or (
-                    isinstance(media, dict)
-                    and media.get("type") in {"photo", "document", "voice"}
-                    and media.get("workshop_message_shadowed") is True
-                )
-                # Only the most recent user record can own the next ordinary
-                # assistant record. Abandoned historical turns must not queue
-                # indefinitely and suppress otherwise valid later history.
-                pending_user_turn = is_shadowed_message
-                if is_shadowed_message:
-                    keys.append((direction, hashlib.sha256(text.encode("utf-8")).hexdigest()))
-                continue
-            if text.startswith(_SCHEDULED_ASSISTANT_PREFIXES):
-                continue
-            if pending_user_turn is None:
-                continue
-            shadowed_turn = pending_user_turn
-            pending_user_turn = None
-            if not shadowed_turn or _SYNTHETIC_ASSISTANT_PATTERN.fullmatch(text):
-                continue
-            keys.append((direction, hashlib.sha256(text.encode("utf-8")).hexdigest()))
+            for line in lines:
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    malformed += 1
+                    continue
+                if not isinstance(record, dict):
+                    malformed += 1
+                    continue
+                records.append(record)
+    records.sort(key=lambda record: str(record.get("ts", "")))
+    for record in records:
+        direction = record.get("dir")
+        text = record.get("text")
+        chat_id = record.get("chat_id")
+        if direction not in {"user", "assistant"} or not isinstance(text, str):
+            continue
+        if str(chat_id) != external_channel_id:
+            continue
+        if direction == "user":
+            media = record.get("media")
+            is_shadowed_message = media is None or (
+                isinstance(media, dict)
+                and media.get("type") in {"photo", "document", "voice"}
+                and media.get("workshop_message_shadowed") is True
+            )
+            # Only the most recent user record can own the next ordinary
+            # assistant record. Abandoned historical turns must not queue
+            # indefinitely and suppress otherwise valid later history.
+            pending_user_turn = is_shadowed_message
+            if is_shadowed_message:
+                keys.append((direction, hashlib.sha256(text.encode("utf-8")).hexdigest()))
+            continue
+        if text.startswith(_SCHEDULED_ASSISTANT_PREFIXES):
+            continue
+        if pending_user_turn is None:
+            continue
+        shadowed_turn = pending_user_turn
+        pending_user_turn = None
+        if not shadowed_turn or _SYNTHETIC_ASSISTANT_PATTERN.fullmatch(text):
+            continue
+        keys.append((direction, hashlib.sha256(text.encode("utf-8")).hexdigest()))
     return keys, malformed, unreadable
 
 
@@ -650,6 +671,7 @@ def _legacy_parity(
         legacy_keys, channel_malformed, channel_unreadable = _read_legacy_keys(
             history_root,
             bindings[channel_id],
+            channel_id,
         )
         malformed += channel_malformed
         unreadable += channel_unreadable

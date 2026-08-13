@@ -136,7 +136,10 @@ def _isolate_history_dir(tmp_path):
     to the real history directory, regardless of whether individual
     tests remember to patch log_message.
     """
-    with patch("kai.history._LOG_DIR", tmp_path):
+    with (
+        patch("kai.history._LOG_DIR", tmp_path),
+        patch("kai.history._CHANNEL_HISTORY_REGISTRY", None),
+    ):
         yield
 
 

@@ -65,7 +65,10 @@ from kai.workshop.outbound import (
     record_outbound_message_with_streaming_finalization,
 )
 from kai.workshop.schema import migrate_workshop_schema
-from kai.workshop.storage_namespaces import WorkshopPrincipalStorageRegistry
+from kai.workshop.storage_namespaces import (
+    WorkshopChannelHistoryRegistry,
+    WorkshopPrincipalStorageRegistry,
+)
 from kai.workshop.store import AppendResult, WorkshopEventStore
 from kai.workshop.streaming_preview import (
     ConfirmedTelegramStreamingPreview,
@@ -358,6 +361,20 @@ async def load_workshop_principal_storage_registry(
     async with _workshop_event_lock:
         store = WorkshopEventStore.from_initialized_connection(_get_db())
         return await WorkshopPrincipalStorageRegistry.from_store(
+            store,
+            runtime_profiles,
+        )
+
+
+async def load_workshop_channel_history_registry(
+    runtime_profiles: WorkshopRuntimeProfileRegistry,
+) -> WorkshopChannelHistoryRegistry:
+    """Resolve canonical channel histories on Kai's initialized database."""
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        store = WorkshopEventStore.from_initialized_connection(_get_db())
+        return await WorkshopChannelHistoryRegistry.from_store(
             store,
             runtime_profiles,
         )

@@ -29,6 +29,7 @@ import pwd
 import re
 import secrets
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -3836,6 +3837,53 @@ def _secure_history_directories(
     print(f"  Secured conversation history under {history_root}")
 
 
+def _canonical_storage_reader_users(
+    data_path: Path,
+    legacy_reader_users: dict[str, str],
+) -> dict[str, str]:
+    """Map canonical principal/channel directories to their agent OS reader."""
+    db_path = data_path / "kai.db"
+    if db_path.is_symlink() or not db_path.is_file():
+        return {}
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            required = {
+                "channels",
+                "channel_bindings",
+                "channel_memberships",
+                "principals",
+            }
+            if not tables >= required:
+                return {}
+            rows = connection.execute(
+                "SELECT c.id, p.id, cb.external_channel_id "
+                "FROM channels c "
+                "JOIN channel_bindings cb ON cb.channel_id = c.id AND cb.transport = 'telegram' "
+                "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.role = 'owner' "
+                "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
+                "WHERE c.kind = 'direct'"
+            ).fetchall()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        # Database integrity is checked separately by the migration path.
+        # This compatibility lookup is optional for pre-Workshop databases.
+        return {}
+    canonical: dict[str, str] = {}
+    for channel_id, principal_id, external_channel_id in rows:
+        reader = legacy_reader_users.get(str(external_channel_id))
+        if reader is None:
+            continue
+        canonical[str(channel_id)] = reader
+        canonical[str(principal_id)] = reader
+    return canonical
+
+
 def _managed_identity_state(user_home: Path) -> tuple[Path, Path, str | None, str | None]:
     """Inspect and validate one managed user's canonical/compatibility files.
 
@@ -4039,6 +4087,9 @@ def _apply_migrate(
         per_user_ids[str(chat_id)] = (pwd_entry.pw_uid, pwd_entry.pw_gid)
         reader_users[str(chat_id)] = os_user
     known_user_dir_names = {str(chat_id) for chat_id, _os_user in memory_owners if chat_id is not None}
+    canonical_reader_users = _canonical_storage_reader_users(data_path, reader_users)
+    reader_users.update(canonical_reader_users)
+    known_user_dir_names.update(name for name in canonical_reader_users if name.startswith("prn_"))
 
     # Resolve the primary operator's chat_id (first yaml entry). When
     # users.yaml is absent or empty (first-ever install, single-user

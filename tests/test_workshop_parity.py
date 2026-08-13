@@ -94,6 +94,35 @@ class TestWorkshopMessageParityStatus:
         assert "101" not in status
         assert "Private Operator Name" not in status
 
+    async def test_clean_status_reads_canonical_channel_history(self, tmp_path: Path):
+        db_path = tmp_path / "kai.db"
+        history_root = tmp_path / "history"
+        await _build_conversation(db_path)
+        store = await WorkshopEventStore.open(db_path)
+        try:
+            async with store.connection.execute(
+                "SELECT channel_id FROM channel_bindings WHERE transport = 'telegram' AND external_channel_id = '101'"
+            ) as cursor:
+                row = await cursor.fetchone()
+            assert row is not None
+            directory = history_root / str(row[0])
+            directory.mkdir(parents=True)
+            records = [
+                _record("user", "Secret question", seconds=0),
+                _record("assistant", "Secret answer", seconds=2),
+            ]
+            (directory / "2026-08-11.jsonl").write_text(
+                "\n".join(json.dumps(record) for record in records) + "\n",
+                encoding="utf-8",
+            )
+        finally:
+            await store.close()
+
+        status = workshop_message_parity_status(db_path, history_root)
+
+        assert "parity: clean" in status
+        assert "JSONL matched=2, JSONL missing=0, JSONL unmatched=0" in status
+
     async def test_outbound_only_notification_message_is_not_compared_to_direct_chat_jsonl(self, tmp_path: Path):
         db_path = tmp_path / "kai.db"
         history_root = tmp_path / "history"

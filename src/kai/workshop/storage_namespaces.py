@@ -5,13 +5,134 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from kai.workshop.domain import PrincipalId, RuntimeProfileId
+from kai.workshop.domain import ChannelId, PrincipalId, RuntimeProfileId
 from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
 from kai.workshop.store import WorkshopEventStore
 
 
 class WorkshopStorageNamespaceError(RuntimeError):
     """Protected runtime policy cannot resolve one canonical storage owner."""
+
+
+@dataclass(frozen=True, slots=True)
+class WorkshopChannelHistoryNamespace:
+    """One canonical channel's transitional transcript namespace."""
+
+    channel_id: ChannelId
+    _legacy_chat_id: int = field(repr=False)
+
+    def history_directory(self, data_dir: Path) -> Path:
+        """Return the transport-independent conversation-history directory."""
+        return data_dir / "history" / str(self.channel_id)
+
+    def legacy_history_directory(self, data_dir: Path) -> Path:
+        """Return the prior transport-keyed history directory during migration."""
+        return data_dir / "history" / str(self._legacy_chat_id)
+
+
+class WorkshopChannelHistoryRegistry:
+    """Resolve compatibility chat keys to canonical channel histories.
+
+    Telegram chat IDs remain adapter inputs while the compatibility runtime is
+    being retired. They are never used as new directory names once this
+    registry is configured. Runtime configuration IDs are also accepted as
+    aliases for direct-channel execution initiated by a non-Telegram client.
+    """
+
+    def __init__(
+        self,
+        namespaces: tuple[WorkshopChannelHistoryNamespace, ...],
+        *,
+        runtime_aliases: dict[int, ChannelId] | None = None,
+    ) -> None:
+        by_channel: dict[ChannelId, WorkshopChannelHistoryNamespace] = {}
+        by_compatibility_id: dict[int, WorkshopChannelHistoryNamespace] = {}
+        for namespace in namespaces:
+            if not isinstance(namespace, WorkshopChannelHistoryNamespace):
+                raise TypeError("namespaces must contain WorkshopChannelHistoryNamespace values")
+            if namespace.channel_id in by_channel:
+                raise WorkshopStorageNamespaceError("Duplicate channel history namespace")
+            existing = by_compatibility_id.get(namespace._legacy_chat_id)
+            if existing is not None and existing.channel_id != namespace.channel_id:
+                raise WorkshopStorageNamespaceError("Compatibility chat ID maps to multiple channels")
+            by_channel[namespace.channel_id] = namespace
+            by_compatibility_id[namespace._legacy_chat_id] = namespace
+        for compatibility_id, channel_id in (runtime_aliases or {}).items():
+            namespace = by_channel.get(channel_id)
+            if namespace is None:
+                raise WorkshopStorageNamespaceError("Runtime history alias references an unknown channel")
+            existing = by_compatibility_id.get(compatibility_id)
+            if existing is not None and existing.channel_id != channel_id:
+                raise WorkshopStorageNamespaceError("Compatibility chat ID maps to multiple channels")
+            by_compatibility_id[compatibility_id] = namespace
+        if not by_channel:
+            raise WorkshopStorageNamespaceError("At least one channel history namespace is required")
+        self._by_channel = by_channel
+        self._by_compatibility_id = by_compatibility_id
+
+    @classmethod
+    async def from_store(
+        cls,
+        store: WorkshopEventStore,
+        runtime_profiles: WorkshopRuntimeProfileRegistry,
+    ) -> WorkshopChannelHistoryRegistry:
+        """Resolve transport bindings and protected runtimes to channels."""
+        async with store.connection.execute(
+            "SELECT c.id, cb.external_channel_id "
+            "FROM channels c JOIN channel_bindings cb ON cb.channel_id = c.id "
+            "WHERE cb.transport = 'telegram' ORDER BY c.id"
+        ) as cursor:
+            binding_rows = list(await cursor.fetchall())
+
+        namespaces: list[WorkshopChannelHistoryNamespace] = []
+        for row in binding_rows:
+            try:
+                channel_id = ChannelId(str(row[0]))
+                legacy_chat_id = int(str(row[1]))
+            except (TypeError, ValueError) as exc:
+                raise WorkshopStorageNamespaceError(
+                    "Telegram channel history binding contains an invalid identifier"
+                ) from exc
+            if legacy_chat_id == 0:
+                raise WorkshopStorageNamespaceError("Telegram channel history binding cannot use chat ID zero")
+            namespaces.append(WorkshopChannelHistoryNamespace(channel_id, legacy_chat_id))
+
+        async with store.connection.execute(
+            "SELECT runtime_profile_id, channel_id FROM channel_agent_runtime_assignments ORDER BY runtime_profile_id"
+        ) as cursor:
+            assignment_rows = list(await cursor.fetchall())
+        channel_by_profile: dict[RuntimeProfileId, ChannelId] = {}
+        for row in assignment_rows:
+            try:
+                profile_id = RuntimeProfileId(str(row[0]))
+                channel_id = ChannelId(str(row[1]))
+            except (TypeError, ValueError) as exc:
+                raise WorkshopStorageNamespaceError(
+                    "Runtime history assignment contains an invalid opaque identifier"
+                ) from exc
+            if profile_id in channel_by_profile and channel_by_profile[profile_id] != channel_id:
+                raise WorkshopStorageNamespaceError("Runtime profile maps to multiple history channels")
+            channel_by_profile[profile_id] = channel_id
+
+        runtime_aliases: dict[int, ChannelId] = {}
+        for profile in runtime_profiles.profiles:
+            channel_id = channel_by_profile.get(profile.profile_id)
+            if channel_id is None:
+                raise WorkshopStorageNamespaceError("Protected runtime profile has no canonical history channel")
+            runtime_aliases[profile.runtime_config_id] = channel_id
+        return cls(tuple(namespaces), runtime_aliases=runtime_aliases)
+
+    @property
+    def namespaces(self) -> tuple[WorkshopChannelHistoryNamespace, ...]:
+        return tuple(sorted(self._by_channel.values(), key=lambda namespace: namespace.channel_id))
+
+    def for_compatibility_chat_id(self, chat_id: int) -> WorkshopChannelHistoryNamespace:
+        if isinstance(chat_id, bool) or not isinstance(chat_id, int) or chat_id == 0:
+            raise WorkshopStorageNamespaceError("Compatibility chat ID must be a non-zero integer")
+        namespace = self._by_compatibility_id.get(chat_id)
+        if namespace is None:
+            raise WorkshopStorageNamespaceError("Compatibility chat ID has no canonical history channel")
+        return namespace
 
 
 @dataclass(frozen=True, slots=True)
