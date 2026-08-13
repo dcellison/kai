@@ -52,6 +52,7 @@ async def _started_run(
                 transport="telegram",
                 external_subject="101",
                 external_channel_id="101",
+                runtime_subject="101",
             ),
         ),
     )
@@ -101,6 +102,7 @@ async def _started_client_run(
                 transport="telegram",
                 external_subject="101",
                 external_channel_id="101",
+                runtime_subject="101",
             ),
         ),
     )
@@ -134,6 +136,56 @@ async def _started_client_run(
     )
     started = await authority.start(granted.claim, occurred_at=_NOW + timedelta(seconds=3))
     await WorkshopConversationDeliveryAuthority(store).activate()
+    return store, authority, started.claim
+
+
+async def _started_workshop_only_client_run(
+    path: Path,
+) -> tuple[WorkshopEventStore, WorkshopRunExecutionAuthority, RunExecutionClaim]:
+    store = await WorkshopEventStore.open(path)
+    await bootstrap_default_workshop(
+        store,
+        (
+            BootstrapHuman(
+                display_name="Workshop Human",
+                role="admin",
+                transport="desktop",
+                external_subject="desktop-human",
+                external_channel_id="desktop-human",
+                runtime_subject="101",
+            ),
+        ),
+    )
+    async with store.connection.execute(
+        "SELECT e.principal_id, c.id FROM external_identities e "
+        "JOIN channel_memberships cm ON cm.principal_id = e.principal_id "
+        "JOIN channels c ON c.id = cm.channel_id AND c.kind = 'direct' "
+        "WHERE e.provider = 'kai' AND e.external_subject = '101'"
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    accepted = await WorkshopConversationCommandService(store).accept_client(
+        ClientInboundMessage(
+            principal_id=PrincipalId(str(row[0])),
+            channel_id=ChannelId(str(row[1])),
+            client_message_id="browser-command-1",
+            body="Perform one durable unit of work",
+            occurred_at=_NOW,
+        )
+    )
+    assert accepted.delivery is None
+    authority = WorkshopRunExecutionAuthority(
+        store,
+        selection_resolver=lambda _run: RunExecutionSelection("codex", "gpt-5.6-sol"),
+        registered_backend_ids=frozenset({"codex"}),
+    )
+    granted = await authority.grant(
+        accepted.run.run_id,
+        owner_id=RunExecutionOwnerId.new(),
+        occurred_at=_NOW + timedelta(seconds=2),
+        lease_expires_at=_NOW + timedelta(minutes=2),
+    )
+    started = await authority.start(granted.claim, occurred_at=_NOW + timedelta(seconds=3))
     return store, authority, started.claim
 
 
@@ -206,6 +258,34 @@ class TestAtomicTerminalTransactions:
             # The browser command's attributed echo precedes the assistant
             # finalization and both remain durable outbox work.
             assert await _terminal_rows(store) == (1, 2, 1)
+        finally:
+            await store.close()
+
+    async def test_workshop_only_success_commits_without_any_transport_work(
+        self,
+        tmp_path: Path,
+    ):
+        store, authority, claim = await _started_workshop_only_client_run(tmp_path / "kai.db")
+        try:
+            result = await WorkshopRunTerminalTransactionCoordinator(authority).complete(
+                claim,
+                body="WORKSHOP-ONLY-OK",
+                occurred_at=_NOW + timedelta(seconds=4),
+            )
+
+            assert result.outcome == TerminalOutcome.COMPLETED
+            assert result.execution.run.status == RunStatus.COMPLETED
+            assert result.finalization.delivery is None
+            assert result.finalization.plan is None
+            assert await _terminal_rows(store) == (1, 0, 0)
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM channel_bindings WHERE transport = 'telegram'"
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 0
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM external_identities WHERE provider = 'telegram'"
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 0
         finally:
             await store.close()
 

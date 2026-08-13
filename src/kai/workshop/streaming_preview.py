@@ -92,7 +92,8 @@ async def _resolve_telegram_target(
     inbound_message_id: MessageId,
     *,
     allow_workshop_client: bool,
-) -> ResolvedTelegramFinalizationTarget:
+    require_binding: bool,
+) -> ResolvedTelegramFinalizationTarget | None:
     async with store.connection.execute(
         "SELECT c.workshop_id, m.channel_id, c.kind, p.kind, m.reply_to_message_id, "
         "json_extract(e.metadata_json, '$.source'), "
@@ -137,6 +138,8 @@ async def _resolve_telegram_target(
         (str(row[8]), channel_id),
     ) as cursor:
         bindings = list(await cursor.fetchall())
+    if not bindings and not require_binding:
+        return None
     if len(bindings) != 1 or int(bindings[0][1]) != 1:
         raise StreamingPreviewBindingError("Canonical direct channel must have exactly one Telegram binding")
     return ResolvedTelegramFinalizationTarget(
@@ -155,7 +158,9 @@ async def resolve_telegram_streaming_target(
         store,
         inbound_message_id,
         allow_workshop_client=False,
+        require_binding=True,
     )
+    assert target is not None
     return ResolvedTelegramStreamingTarget(
         workshop_id=target.workshop_id,
         channel_id=target.channel_id,
@@ -166,12 +171,13 @@ async def resolve_telegram_streaming_target(
 async def resolve_telegram_finalization_target(
     store: WorkshopEventStore,
     inbound_message_id: MessageId,
-) -> ResolvedTelegramFinalizationTarget:
-    """Resolve Telegram final delivery for Telegram or Workshop ingress."""
+) -> ResolvedTelegramFinalizationTarget | None:
+    """Resolve optional Telegram final delivery for supported ingress."""
     return await _resolve_telegram_target(
         store,
         inbound_message_id,
         allow_workshop_client=True,
+        require_binding=False,
     )
 
 

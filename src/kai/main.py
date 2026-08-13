@@ -60,6 +60,7 @@ def _workshop_bootstrap_humans(config) -> tuple[BootstrapHuman, ...]:
             transport="telegram",
             external_subject=str(user.telegram_id),
             external_channel_id=str(user.telegram_id),
+            runtime_subject=str(user.telegram_id),
         )
         for user in sorted(config.user_configs.values(), key=lambda user: user.telegram_id)
     )

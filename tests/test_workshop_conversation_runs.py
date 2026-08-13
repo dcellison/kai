@@ -35,6 +35,7 @@ async def _canonical_inbound(store: WorkshopEventStore, telegram_id: int = 101) 
                 transport="telegram",
                 external_subject=str(telegram_id),
                 external_channel_id=str(telegram_id),
+                runtime_subject=str(telegram_id),
             ),
         ),
     )
@@ -91,6 +92,53 @@ class TestCanonicalRunResolution:
         finally:
             await store.close()
 
+    async def test_runtime_resolution_does_not_require_telegram_identity_or_binding(
+        self,
+        tmp_path: Path,
+    ):
+        store = await WorkshopEventStore.open(tmp_path / "kai.db")
+        try:
+            await bootstrap_default_workshop(
+                store,
+                (
+                    BootstrapHuman(
+                        display_name="Workshop-only Human",
+                        role="admin",
+                        transport="desktop",
+                        external_subject="desktop-human",
+                        external_channel_id="desktop-human",
+                        runtime_subject="202",
+                    ),
+                ),
+            )
+            inbound = await record_inbound_message(
+                store,
+                InboundMessage(
+                    transport="desktop",
+                    update_id="desktop-command-1",
+                    message_id="desktop-message-1",
+                    sender_subject="desktop-human",
+                    channel_subject="desktop-human",
+                    body="Run without Telegram",
+                    occurred_at=_NOW,
+                ),
+            )
+            inbound_id = MessageId(str(inbound.event.envelope.aggregate_id))
+
+            resolution = await resolve_canonical_conversation_run(store, inbound_id)
+
+            assert resolution._legacy_pool_key == 202
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM external_identities WHERE provider = 'telegram'"
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 0
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM channel_bindings WHERE transport = 'telegram'"
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 0
+        finally:
+            await store.close()
+
     async def test_rejects_missing_compatibility_identity(self, tmp_path: Path):
         store = await WorkshopEventStore.open(tmp_path / "kai.db")
         try:
@@ -98,7 +146,7 @@ class TestCanonicalRunResolution:
             await store.connection.execute("DELETE FROM external_identities")
             await store.connection.commit()
 
-            with pytest.raises(ConversationRunUnavailableError, match="exactly one Telegram"):
+            with pytest.raises(ConversationRunUnavailableError, match="exactly one Kai runtime"):
                 await resolve_canonical_conversation_run(store, inbound_id)
         finally:
             await store.close()

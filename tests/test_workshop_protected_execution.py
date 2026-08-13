@@ -34,6 +34,7 @@ async def _accepted_run(path: Path, home: Path):
                 transport="telegram",
                 external_subject="101",
                 external_channel_id="101",
+                runtime_subject="101",
             ),
         ),
     )

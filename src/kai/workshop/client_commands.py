@@ -39,12 +39,12 @@ class WorkshopClientCommandExecutor:
 
     async def submit(self, message: ClientInboundMessage) -> ClientCommandResult:
         accepted = await self._execution.accept_client(message)
-        chat_id = accepted.compatibility_chat_id
-        mapped_reader = reader_user(self._config, chat_id)
+        runtime_config_id = accepted.runtime_config_id
+        mapped_reader = reader_user(self._config, runtime_config_id)
         user_log = (
             log_message(
                 direction="user",
-                chat_id=chat_id,
+                chat_id=runtime_config_id,
                 text=message.body,
                 reader_user=mapped_reader,
             )
@@ -56,17 +56,17 @@ class WorkshopClientCommandExecutor:
         if result.terminal is not None:
             assistant_log = log_message(
                 direction="assistant",
-                chat_id=chat_id,
+                chat_id=runtime_config_id,
                 text=result.terminal.body,
                 reader_user=mapped_reader,
             )
             if result.session_id and result.selection is not None:
-                await sessions.save_session(chat_id, result.session_id, result.selection.model)
+                await sessions.save_session(runtime_config_id, result.session_id, result.selection.model)
             if result.disposition == CanonicalExecutionDisposition.COMPLETED and result.workspace is not None:
                 schedule_memory_ingestion(
                     prompt=message.body,
                     assistant_text=result.terminal.body,
-                    chat_id=chat_id,
+                    chat_id=runtime_config_id,
                     session_id=result.session_id,
                     config=self._config,
                     workspace=result.workspace,

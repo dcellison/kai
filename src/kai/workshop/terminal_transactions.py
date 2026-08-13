@@ -250,10 +250,12 @@ class WorkshopRunTerminalTransactionCoordinator:
 
             prior_states = {
                 finalization.message.inserted,
-                finalization.delivery.inserted,
-                finalization.plan.inserted,
                 execution.changed,
             }
+            if finalization.delivery is not None:
+                prior_states.add(finalization.delivery.inserted)
+            if finalization.plan is not None:
+                prior_states.add(finalization.plan.inserted)
             if len(prior_states) != 1:
                 raise TerminalTransactionStateConflictError(
                     "Canonical outcome, delivery plan, and run settlement did not share one prior state"

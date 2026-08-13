@@ -43,6 +43,7 @@ class TestBootstrapInput:
             ({"transport": "Telegram"}, "transport"),
             ({"external_subject": ""}, "external_subject"),
             ({"external_channel_id": ""}, "external_channel_id"),
+            ({"runtime_subject": ""}, "runtime_subject"),
         ],
     )
     def test_invalid_human_fails_before_database_changes(self, changes, match):
@@ -223,6 +224,37 @@ class TestDefaultWorkshopBootstrap:
         assert second.workshop_id == first.workshop_id
         assert second.agent_id == first.agent_id
         assert second_events == first_events
+
+    async def test_rerun_adds_one_protected_runtime_identity_without_replacing_transport_identity(
+        self,
+        store,
+    ):
+        original = _human(101, "Admin", role="admin")
+        first = await bootstrap_default_workshop(store, [original])
+        upgraded = await bootstrap_default_workshop(
+            store,
+            [
+                BootstrapHuman(
+                    display_name=original.display_name,
+                    role=original.role,
+                    transport=original.transport,
+                    external_subject=original.external_subject,
+                    external_channel_id=original.external_channel_id,
+                    runtime_subject="101",
+                )
+            ],
+        )
+
+        assert first.created_events == 12
+        assert upgraded.created_events == 1
+        assert upgraded.existing_events == 12
+        async with store.connection.execute(
+            "SELECT provider, external_subject FROM external_identities ORDER BY provider"
+        ) as cursor:
+            assert [tuple(row) for row in await cursor.fetchall()] == [
+                ("kai", "101"),
+                ("telegram", "101"),
+            ]
 
     async def test_input_order_does_not_change_event_or_projection_order(self, tmp_path: Path):
         first_store = await WorkshopEventStore.open(tmp_path / "first.db")

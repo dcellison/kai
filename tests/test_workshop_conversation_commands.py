@@ -70,6 +70,7 @@ async def _open_client_store(
                 transport="telegram",
                 external_subject="101",
                 external_channel_id="101",
+                runtime_subject="101",
             ),
         ),
     )
@@ -345,7 +346,8 @@ class TestAtomicClientConversationCommandAcceptance:
             assert accepted.command.message.inserted is True
             assert accepted.command.lifecycle.changed is True
             assert accepted.delivery.inserted is True
-            assert accepted.compatibility_chat_id == 101
+            assert accepted.runtime_config_id == 101
+            assert accepted.delivery is not None
             assert accepted.delivery.delivery.message_id == accepted.command.message.event.envelope.aggregate_id
             assert accepted.delivery.delivery.channel_id == channel_id
             assert accepted.delivery.delivery.mode == "workshop_client_text"
@@ -387,6 +389,8 @@ class TestAtomicClientConversationCommandAcceptance:
             assert retry.command.disposition == ConversationCommandDisposition.READY_REPLAY
             assert retry.command.message.inserted is False
             assert retry.command.lifecycle.changed is False
+            assert retry.delivery is not None
+            assert first.delivery is not None
             assert retry.delivery.inserted is False
             assert retry.command.message.event == first.command.message.event
             assert retry.command.lifecycle.event == first.command.lifecycle.event
@@ -399,5 +403,50 @@ class TestAtomicClientConversationCommandAcceptance:
                 "('message.created', 'run.accepted', 'delivery.requested')"
             ) as cursor:
                 assert int((await cursor.fetchone())[0]) == 3
+        finally:
+            await store.close()
+
+    async def test_workshop_only_channel_accepts_without_transport_delivery(
+        self,
+        tmp_path: Path,
+    ):
+        store = await WorkshopEventStore.open(tmp_path / "kai.db")
+        await bootstrap_default_workshop(
+            store,
+            (
+                BootstrapHuman(
+                    display_name="Workshop Human",
+                    role="admin",
+                    transport="desktop",
+                    external_subject="desktop-human",
+                    external_channel_id="desktop-human",
+                    runtime_subject="101",
+                ),
+            ),
+        )
+        async with store.connection.execute(
+            "SELECT e.principal_id, c.id FROM external_identities e "
+            "JOIN channel_memberships cm ON cm.principal_id = e.principal_id "
+            "JOIN channels c ON c.id = cm.channel_id AND c.kind = 'direct' "
+            "WHERE e.provider = 'kai' AND e.external_subject = '101'"
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        try:
+            accepted = await WorkshopConversationCommandService(store).accept_client(
+                _client_message(PrincipalId(str(row[0])), ChannelId(str(row[1])))
+            )
+
+            assert accepted.command.disposition == ConversationCommandDisposition.NEWLY_ACCEPTED
+            assert accepted.runtime_config_id == 101
+            assert accepted.delivery is None
+            async with store.connection.execute(
+                "SELECT event_type FROM event_log WHERE position >= ? ORDER BY position",
+                (accepted.command.message.event.position,),
+            ) as cursor:
+                assert [str(item[0]) for item in await cursor.fetchall()] == [
+                    "message.created",
+                    "run.accepted",
+                ]
         finally:
             await store.close()

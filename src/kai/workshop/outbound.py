@@ -107,8 +107,8 @@ class OutboundDeliveryResult:
 @dataclass(frozen=True, slots=True)
 class OutboundStreamingFinalizationResult:
     message: AppendResult
-    delivery: DeliveryRequestResult
-    plan: DeliveryFragmentPlanResult
+    delivery: DeliveryRequestResult | None
+    plan: DeliveryFragmentPlanResult | None
 
 
 async def _resolve_outbound(store: WorkshopEventStore, message_id: MessageId) -> _ResolvedOutbound:
@@ -339,7 +339,9 @@ async def record_outbound_message_with_streaming_finalization_in_transaction(
         store,
         message.in_reply_to_message_id,
     )
-    if streaming_target.workshop_id != binding.workshop_id or streaming_target.channel_id != binding.channel_id:
+    if streaming_target is not None and (
+        streaming_target.workshop_id != binding.workshop_id or streaming_target.channel_id != binding.channel_id
+    ):
         raise OutboundStreamingPreviewConflictError(
             "Telegram streaming target does not match the canonical agent reply target"
         )
@@ -351,15 +353,9 @@ async def record_outbound_message_with_streaming_finalization_in_transaction(
             channel_id=binding.channel_id,
             channel_binding_id=streaming_target.channel_binding_id,
         )
-        if streaming_target.preview_eligible
+        if streaming_target is not None and streaming_target.preview_eligible
         else None
     )
-    operations = _streaming_finalization_operations(
-        message.body,
-        preview_message_id=preview_message_id,
-    )
-    authority_epoch = await WorkshopConversationDeliveryAuthority(store).active_epoch_in_transaction()
-    assert authority_epoch is not None
     message_result = await _existing_outbound(store, binding, message)
     if message_result is None:
         message_result = await store.append_in_transaction(_outbound_envelope(binding, message))
@@ -369,28 +365,37 @@ async def record_outbound_message_with_streaming_finalization_in_transaction(
     message_id = message_result.event.envelope.aggregate_id
     if not isinstance(message_id, MessageId):
         raise RuntimeError("Canonical outbound event did not identify a message")
-    delivery_result = await WorkshopDeliveryOutbox(store).request_delivery_in_transaction(
-        DeliveryRequest(
-            message_id=message_id,
-            channel_binding_id=streaming_target.channel_binding_id,
-            mode="text",
-            purpose=CONVERSATION_REPLY_PURPOSE,
-            occurred_at=message.occurred_at,
-            execution_contract=STREAMING_FINALIZATION_CONTRACT,
-            authority_epoch_id=authority_epoch.epoch_id,
-            max_attempts=5,
+    delivery_result = None
+    plan_result = None
+    if streaming_target is not None:
+        operations = _streaming_finalization_operations(
+            message.body,
+            preview_message_id=preview_message_id,
         )
-    )
-    plan_result = await WorkshopDeliveryFragments(store).prepare_operations_in_transaction(
-        delivery_result.delivery.delivery_id,
-        operations,
-        occurred_at=message.occurred_at,
-    )
-    prior_states = {
-        message_result.inserted,
-        delivery_result.inserted,
-        plan_result.inserted,
-    }
+        authority_epoch = await WorkshopConversationDeliveryAuthority(store).active_epoch_in_transaction()
+        assert authority_epoch is not None
+        delivery_result = await WorkshopDeliveryOutbox(store).request_delivery_in_transaction(
+            DeliveryRequest(
+                message_id=message_id,
+                channel_binding_id=streaming_target.channel_binding_id,
+                mode="text",
+                purpose=CONVERSATION_REPLY_PURPOSE,
+                occurred_at=message.occurred_at,
+                execution_contract=STREAMING_FINALIZATION_CONTRACT,
+                authority_epoch_id=authority_epoch.epoch_id,
+                max_attempts=5,
+            )
+        )
+        plan_result = await WorkshopDeliveryFragments(store).prepare_operations_in_transaction(
+            delivery_result.delivery.delivery_id,
+            operations,
+            occurred_at=message.occurred_at,
+        )
+    prior_states = {message_result.inserted}
+    if delivery_result is not None:
+        prior_states.add(delivery_result.inserted)
+    if plan_result is not None:
+        prior_states.add(plan_result.inserted)
     if len(prior_states) != 1:
         raise OutboundDeliveryStateConflictError(
             "Canonical reply, delivery request, and operation plan did not share one prior state"

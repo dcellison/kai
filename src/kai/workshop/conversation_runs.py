@@ -13,7 +13,7 @@ from kai.workshop.domain import AgentId, ChannelId, MessageId, PrincipalId, Work
 from kai.workshop.store import WorkshopEventStore
 
 type AgentPrompt = str | list[dict[str, str]]
-_TELEGRAM_USER_ID_PATTERN = re.compile(r"^[1-9][0-9]*$")
+_RUNTIME_SUBJECT_PATTERN = re.compile(r"^[1-9][0-9]*$")
 
 
 class ConversationRunUnavailableError(LookupError):
@@ -90,20 +90,21 @@ async def resolve_canonical_conversation_run(
     """Resolve a canonical target plus the current private pool adapter key.
 
     The public run request contains only a canonical message ID. During the
-    migration, the resolved human's Telegram identity supplies the existing
-    pool/config key internally. A caller cannot provide or override that key.
+    migration, the resolved human's protected Kai runtime identity supplies
+    the existing pool/config key internally. A caller cannot provide or
+    override that key, and transport identities are not execution authority.
     """
     target = await resolve_canonical_conversation_target(store, inbound_message_id)
     async with store.connection.execute(
-        "SELECT external_subject FROM external_identities WHERE principal_id = ? AND provider = 'telegram'",
+        "SELECT external_subject FROM external_identities WHERE principal_id = ? AND provider = 'kai'",
         (target.requested_by_principal_id,),
     ) as cursor:
         identity_rows = list(await cursor.fetchall())
     if len(identity_rows) != 1:
-        raise ConversationRunUnavailableError("Canonical human requires exactly one Telegram compatibility identity")
+        raise ConversationRunUnavailableError("Canonical human requires exactly one Kai runtime identity")
     external_subject = str(identity_rows[0][0])
-    if not _TELEGRAM_USER_ID_PATTERN.fullmatch(external_subject):
-        raise ConversationRunUnavailableError("Telegram compatibility identity is not a positive user ID")
+    if not _RUNTIME_SUBJECT_PATTERN.fullmatch(external_subject):
+        raise ConversationRunUnavailableError("Kai runtime identity is not a positive configured-user ID")
 
     return CompatibilityConversationRunResolution(
         target=target,

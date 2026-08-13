@@ -32,7 +32,7 @@ async def test_completed_client_command_preserves_history_session_and_memory(
     message = _message()
     run_id = RunId.new()
     accepted = SimpleNamespace(
-        compatibility_chat_id=101,
+        runtime_config_id=101,
         command=SimpleNamespace(disposition=ConversationCommandDisposition.NEWLY_ACCEPTED),
         run=SimpleNamespace(run_id=run_id),
     )
@@ -97,7 +97,7 @@ async def test_terminal_replay_does_not_duplicate_compatibility_writes(monkeypat
     message = _message()
     run_id = RunId.new()
     accepted = SimpleNamespace(
-        compatibility_chat_id=101,
+        runtime_config_id=101,
         command=SimpleNamespace(disposition=ConversationCommandDisposition.TERMINAL_REPLAY),
         run=SimpleNamespace(run_id=run_id),
     )

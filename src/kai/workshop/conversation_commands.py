@@ -53,11 +53,11 @@ class ConversationCommandAcceptance:
 
 @dataclass(frozen=True, slots=True)
 class ClientConversationCommandAcceptance:
-    """Atomic client acceptance plus its durable Telegram bridge request."""
+    """Atomic client acceptance plus optional transport compatibility work."""
 
     command: ConversationCommandAcceptance
-    delivery: DeliveryRequestResult
-    compatibility_chat_id: int
+    delivery: DeliveryRequestResult | None
+    runtime_config_id: int
 
     @property
     def run(self) -> DurableRun:
@@ -111,7 +111,7 @@ class WorkshopConversationCommandService:
         self,
         message: ClientInboundMessage,
     ) -> ClientConversationCommandAcceptance:
-        """Accept one canonical browser command and Telegram echo atomically."""
+        """Accept one canonical browser command and optional Telegram echo."""
         if not isinstance(message, ClientInboundMessage):
             raise ValueError("message must be a ClientInboundMessage")
         connection = self._store.connection
@@ -125,21 +125,28 @@ class WorkshopConversationCommandService:
                 inbound_message_id,
                 occurred_at=inbound.event.envelope.occurred_at,
             )
-            binding_id, chat_id = await self._telegram_compatibility_target(
+            runtime_config_id = await self._runtime_config_id(message.principal_id)
+            binding_id = await self._optional_telegram_binding(
                 message.principal_id,
                 message.channel_id,
             )
-            delivery = await WorkshopDeliveryOutbox(self._store).request_delivery_in_transaction(
-                DeliveryRequest(
-                    message_id=inbound_message_id,
-                    channel_binding_id=binding_id,
-                    mode="workshop_client_text",
-                    purpose=CONVERSATION_REPLY_PURPOSE,
-                    occurred_at=inbound.event.envelope.occurred_at,
-                    max_attempts=5,
+            delivery = (
+                await WorkshopDeliveryOutbox(self._store).request_delivery_in_transaction(
+                    DeliveryRequest(
+                        message_id=inbound_message_id,
+                        channel_binding_id=binding_id,
+                        mode="workshop_client_text",
+                        purpose=CONVERSATION_REPLY_PURPOSE,
+                        occurred_at=inbound.event.envelope.occurred_at,
+                        max_attempts=5,
+                    )
                 )
+                if binding_id is not None
+                else None
             )
-            prior_states = {inbound.inserted, lifecycle.changed, delivery.inserted}
+            prior_states = {inbound.inserted, lifecycle.changed}
+            if delivery is not None:
+                prior_states.add(delivery.inserted)
             if len(prior_states) != 1:
                 raise ConversationCommandStateConflictError(
                     "Canonical inbound, run acceptance, and delivery request did not share one prior state"
@@ -153,37 +160,49 @@ class WorkshopConversationCommandService:
             return ClientConversationCommandAcceptance(
                 command=ConversationCommandAcceptance(inbound, lifecycle, disposition),
                 delivery=delivery,
-                compatibility_chat_id=chat_id,
+                runtime_config_id=runtime_config_id,
             )
         except Exception:
             await connection.rollback()
             raise
 
-    async def _telegram_compatibility_target(
+    async def _runtime_config_id(self, principal_id: PrincipalId) -> int:
+        async with self._store.connection.execute(
+            "SELECT external_subject FROM external_identities WHERE principal_id = ? AND provider = 'kai'",
+            (principal_id,),
+        ) as cursor:
+            rows = list(await cursor.fetchall())
+        if len(rows) != 1:
+            raise ConversationCommandStateConflictError("Client principal requires one Kai runtime identity")
+        try:
+            runtime_config_id = int(str(rows[0][0]))
+        except ValueError as exc:
+            raise ConversationCommandStateConflictError("Kai runtime identity is not numeric") from exc
+        if runtime_config_id <= 0:
+            raise ConversationCommandStateConflictError("Kai runtime identity is not a positive configured-user ID")
+        return runtime_config_id
+
+    async def _optional_telegram_binding(
         self,
         principal_id: PrincipalId,
         channel_id: ChannelId,
-    ) -> tuple[ChannelBindingId, int]:
+    ) -> ChannelBindingId | None:
         async with self._store.connection.execute(
-            "SELECT cb.id, cb.external_channel_id, ei.external_subject "
+            "SELECT cb.id, EXISTS (SELECT 1 FROM external_identities ei "
+            "WHERE ei.principal_id = ? AND ei.provider = 'telegram' "
+            "AND ei.external_subject = cb.external_channel_id) "
             "FROM channel_bindings cb "
-            "JOIN external_identities ei ON ei.principal_id = ? "
-            "AND ei.provider = 'telegram' "
             "WHERE cb.channel_id = ? AND cb.transport = 'telegram'",
             (principal_id, channel_id),
         ) as cursor:
             rows = list(await cursor.fetchall())
-        if len(rows) != 1 or str(rows[0][1]) != str(rows[0][2]):
+        if not rows:
+            return None
+        if len(rows) != 1 or int(rows[0][1]) != 1:
             raise ConversationCommandStateConflictError(
-                "Client command requires one matching direct Telegram compatibility binding"
+                "Client command has an ambiguous or mismatched Telegram binding"
             )
-        try:
-            chat_id = int(str(rows[0][2]))
-        except ValueError as exc:
-            raise ConversationCommandStateConflictError("Telegram compatibility identity is not numeric") from exc
-        if chat_id <= 0:
-            raise ConversationCommandStateConflictError("Telegram compatibility identity is not a positive user ID")
-        return ChannelBindingId(str(rows[0][0])), chat_id
+        return ChannelBindingId(str(rows[0][0]))
 
     async def _replay_disposition(self, run: DurableRun) -> ConversationCommandDisposition:
         if run.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:

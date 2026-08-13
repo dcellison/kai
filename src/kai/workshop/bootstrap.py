@@ -37,6 +37,7 @@ class BootstrapHuman:
     transport: str
     external_subject: str
     external_channel_id: str
+    runtime_subject: str | None = None
 
     def __post_init__(self) -> None:
         if not self.display_name.strip():
@@ -49,6 +50,8 @@ class BootstrapHuman:
             raise ValueError("external_subject must be non-empty")
         if not self.external_channel_id.strip():
             raise ValueError("external_channel_id must be non-empty")
+        if self.runtime_subject is not None and not self.runtime_subject.strip():
+            raise ValueError("runtime_subject must be non-empty when provided")
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,6 +252,22 @@ async def bootstrap_default_workshop(
                 "external_subject": human.external_subject,
             },
         )
+        if human.runtime_subject is not None:
+            runtime_token = _stable_token("kai", human.runtime_subject)
+            await ensure(
+                idempotency_key=_idempotency_key("external-identity", runtime_token),
+                event_type=WorkshopEventType.EXTERNAL_IDENTITY_BOUND,
+                aggregate_type="external_identity",
+                aggregate_id=ExternalIdentityId.derived(
+                    workshop_id,
+                    f"external-identity:{runtime_token}",
+                ),
+                payload={
+                    "principal_id": principal_id,
+                    "provider": "kai",
+                    "external_subject": human.runtime_subject,
+                },
+            )
         await ensure(
             idempotency_key=_idempotency_key("membership", token),
             event_type=WorkshopEventType.WORKSHOP_MEMBER_ADDED,
