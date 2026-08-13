@@ -1,6 +1,6 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
 import {
@@ -67,6 +67,10 @@ describe("Workshop React client", () => {
         });
       },
     );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it("enrolls, renders canonical history safely, and appends live messages", async () => {
@@ -144,15 +148,17 @@ describe("Workshop React client", () => {
     expect(sessionStorage.getItem("kai.workshop.read-session.v1")).toBeNull();
   });
 
-  it("submits from the composer and reuses the command identity on retry", async () => {
+  it("submits over LAN HTTP and reuses the command identity on retry", async () => {
     const user = userEvent.setup();
     sessionStorage.setItem(
       "kai.workshop.read-session.v1",
       JSON.stringify({ channelId, token: "existing-session" }),
     );
-    vi.spyOn(globalThis.crypto, "randomUUID").mockReturnValue(
-      "00000000-0000-4000-8000-000000000001",
-    );
+    const getRandomValues = vi.fn((array: Uint8Array): Uint8Array => {
+      array.fill(0x2a);
+      return array;
+    });
+    vi.stubGlobal("crypto", { getRandomValues });
     vi.mocked(submitCommand)
       .mockRejectedValueOnce(new Error("Backend temporarily unavailable."))
       .mockResolvedValueOnce({
@@ -175,12 +181,13 @@ describe("Workshop React client", () => {
     await waitFor(() => expect(submitCommand).toHaveBeenCalledTimes(2));
     expect(vi.mocked(submitCommand).mock.calls[0]).toEqual([
       { channelId, token: "existing-session" },
-      "00000000-0000-4000-8000-000000000001",
+      "browser-2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a",
       "Hello from Workshop",
     ]);
     expect(vi.mocked(submitCommand).mock.calls[1]).toEqual(
       vi.mocked(submitCommand).mock.calls[0],
     );
+    expect(getRandomValues).toHaveBeenCalledTimes(1);
     expect(screen.getByLabelText("Message Kai")).toHaveValue("");
   });
 });

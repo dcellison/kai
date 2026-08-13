@@ -278,6 +278,18 @@ function MessageItem({ message }: { message: TimelineMessage }): React.JSX.Eleme
   );
 }
 
+function createClientMessageId(): string {
+  if (typeof globalThis.crypto?.getRandomValues !== "function") {
+    throw new Error("This browser cannot create secure command identities.");
+  }
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  const token = Array.from(bytes, (value) =>
+    value.toString(16).padStart(2, "0"),
+  ).join("");
+  return `browser-${token}`;
+}
+
 function WorkshopView({
   channelId,
   connection,
@@ -308,11 +320,11 @@ function WorkshopView({
     if (!body || submitting) {
       return;
     }
-    const clientMessageId = pendingMessageId ?? crypto.randomUUID();
-    setPendingMessageId(clientMessageId);
     setSubmissionError(null);
     setSubmitting(true);
     try {
+      const clientMessageId = pendingMessageId ?? createClientMessageId();
+      setPendingMessageId(clientMessageId);
       await onSubmitCommand(clientMessageId, body);
       setDraft("");
       setPendingMessageId(null);
