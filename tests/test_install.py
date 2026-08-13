@@ -4731,6 +4731,33 @@ class TestApplyVenv:
         assert not (install / "build").exists()
         assert "Installed package into venv" in output
 
+    def test_reinstalls_on_packaged_static_asset_change(self, tmp_path, monkeypatch, capsys):
+        """A Workshop bundle change refreshes its copied site-packages resource."""
+        install = tmp_path / "opt" / "kai"
+        (install / "venv" / "bin").mkdir(parents=True)
+        (install / "venv" / "bin" / "python").touch(mode=0o755)
+        (install / "pyproject.toml").write_text("[project]\nname = 'kai'\n")
+        static = install / "src" / "kai" / "workshop" / "static"
+        static.mkdir(parents=True)
+        bundle = static / "app.js"
+        bundle.write_text("const version = 1;")
+        (install / ".pyproject.sha256").write_text(_file_checksum(install / "pyproject.toml") + "\n")
+        (install / ".src.sha256").write_text(_src_checksum(install / "src") + "\n")
+
+        bundle.write_text("const version = 2;")
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *a, **kw: subprocess.CompletedProcess(args=[], returncode=0),
+        )
+        monkeypatch.setattr("kai.install._set_ownership", lambda *a, **kw: None)
+
+        _apply_venv(install, is_update=True, dry_run=False)
+
+        output = capsys.readouterr().out
+        assert "source changed" in output
+        assert "Installed package into venv" in output
+
     def test_normalizes_source_metadata_created_by_pip(self, tmp_path, monkeypatch):
         """Packaging metadata created after the source copy cannot retain 0700."""
         install = tmp_path / "opt" / "kai"
@@ -5001,7 +5028,7 @@ class TestSrcChecksum:
     """Tests for _src_checksum(), the directory content hasher."""
 
     def test_empty_dir(self, tmp_path):
-        """Empty directory (no .py files) returns a hash (of zero inputs)."""
+        """Empty source directory returns a hash of zero inputs."""
         d = tmp_path / "src"
         d.mkdir()
         result = _src_checksum(d)
@@ -5045,19 +5072,36 @@ class TestSrcChecksum:
 
         assert h1 != h2
 
-    def test_ignores_non_py_files(self, tmp_path):
-        """Non-.py files do not affect the hash."""
+    def test_package_data_change_changes_hash(self, tmp_path):
+        """Changing packaged static data invalidates the non-editable venv."""
         d = tmp_path / "src"
         d.mkdir()
         (d / "a.py").write_text("hello")
         h1 = _src_checksum(d)
 
-        # Add non-Python files - hash should not change
-        (d / "readme.md").write_text("docs")
-        (d / "data.json").write_text("{}")
+        static = d / "kai" / "workshop" / "static"
+        static.mkdir(parents=True)
+        (static / "app.js").write_text("console.log('new client')")
         h2 = _src_checksum(d)
 
-        assert h1 == h2
+        assert h1 != h2
+
+    def test_ignores_generated_source_artifacts(self, tmp_path):
+        """Bytecode and packaging metadata cannot cause reinstall loops."""
+        d = tmp_path / "src"
+        package = d / "kai"
+        package.mkdir(parents=True)
+        (package / "a.py").write_text("hello")
+        h1 = _src_checksum(d)
+
+        cache = package / "__pycache__"
+        cache.mkdir()
+        (cache / "a.cpython-313.pyc").write_bytes(b"bytecode")
+        metadata = d / "kai.egg-info"
+        metadata.mkdir()
+        (metadata / "PKG-INFO").write_text("generated metadata")
+
+        assert _src_checksum(d) == h1
 
     def test_rename_changes_hash(self, tmp_path):
         """Renaming a file changes the hash (path is included in the digest)."""

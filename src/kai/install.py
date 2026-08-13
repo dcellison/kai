@@ -36,6 +36,7 @@ import tempfile
 import textwrap
 import time
 from collections.abc import Iterable
+from fnmatch import fnmatch
 from pathlib import Path
 
 import yaml
@@ -2395,21 +2396,27 @@ def _file_checksum(path: Path) -> str:
 
 def _src_checksum(src_dir: Path) -> str:
     """
-    Return a SHA-256 digest representing the contents of all .py files under src_dir.
+    Return a SHA-256 digest representing installable source under src_dir.
 
     Walks the directory tree in sorted order (for determinism), feeding each
-    file's relative path and content into a rolling hash. Returns an empty
-    string if the directory doesn't exist. Used alongside _file_checksum() on
-    pyproject.toml to detect source-only changes that require a pip reinstall.
+    non-generated file's relative path and content into a rolling hash. This
+    includes package data such as the Workshop HTML, CSS, and JavaScript;
+    excluding it would let the copied source advance while the non-editable
+    venv continued serving stale package resources. Returns an empty string if
+    the directory doesn't exist. Used alongside _file_checksum() on
+    pyproject.toml to detect source changes that require a pip reinstall.
     """
     if not src_dir.is_dir():
         return ""
     h = hashlib.sha256()
     # Sort for deterministic ordering across platforms and filesystems
-    for py_file in sorted(src_dir.rglob("*.py")):
+    for source_file in sorted(path for path in src_dir.rglob("*") if path.is_file()):
+        relative_path = source_file.relative_to(src_dir)
+        if any(fnmatch(part, pattern) for part in relative_path.parts for pattern in _SOURCE_EXCLUDES):
+            continue
         # Include the relative path so renames/moves change the hash
-        h.update(str(py_file.relative_to(src_dir)).encode())
-        h.update(py_file.read_bytes())
+        h.update(str(relative_path).encode())
+        h.update(source_file.read_bytes())
     return h.hexdigest()
 
 
