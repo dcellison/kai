@@ -17,6 +17,7 @@ from kai.workshop.bootstrap import (
 )
 from kai.workshop.domain import (
     ChannelBindingId,
+    ChannelId,
     EventEnvelope,
     MessageId,
     PrincipalId,
@@ -33,6 +34,7 @@ from kai.workshop.streaming_preview import (
     StreamingPreviewConflictError,
     StreamingPreviewTargetError,
     bind_confirmed_telegram_streaming_preview,
+    resolve_telegram_finalization_target,
 )
 
 _NOW = datetime(2026, 8, 12, 12, 0, tzinfo=UTC)
@@ -202,7 +204,7 @@ class TestTelegramStreamingPreviewBinding:
         finally:
             await store.close()
 
-    async def test_non_telegram_direct_message_is_not_a_preview_target(self, tmp_path: Path):
+    async def test_workshop_client_message_is_finalizable_but_not_a_preview_target(self, tmp_path: Path):
         store, inbound_id = await _open_with_inbound(tmp_path / "kai.db")
         try:
             async with store.connection.execute(
@@ -227,13 +229,20 @@ class TestTelegramStreamingPreviewBinding:
                         "author_principal_id": str(row[2]),
                         "body": "Canonical, but not Telegram inbound",
                     },
-                    metadata={"source": "workshop_client"},
+                    metadata={
+                        "source": "workshop_client",
+                        "client_message_id": "browser-command-1",
+                    },
                 )
             )
             await store.project_pending(CanonicalConversationProjection())
 
             with pytest.raises(StreamingPreviewTargetError, match="Telegram inbound"):
                 await bind_confirmed_telegram_streaming_preview(store, _preview(message_id))
+
+            target = await resolve_telegram_finalization_target(store, message_id)
+            assert target.channel_id == ChannelId(str(row[1]))
+            assert target.preview_eligible is False
         finally:
             await store.close()
 

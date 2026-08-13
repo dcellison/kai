@@ -35,7 +35,7 @@ from kai.workshop.domain import (
 )
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import AppendResult, IdempotencyConflictError, WorkshopEventStore
-from kai.workshop.streaming_preview import resolve_telegram_streaming_target
+from kai.workshop.streaming_preview import resolve_telegram_finalization_target
 
 _IDENTIFIER_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 
@@ -335,7 +335,7 @@ async def record_outbound_message_with_streaming_finalization_in_transaction(
             "record_outbound_message_with_streaming_finalization_in_transaction requires an active transaction"
         )
     binding = await _resolve_outbound(store, message.in_reply_to_message_id)
-    streaming_target = await resolve_telegram_streaming_target(
+    streaming_target = await resolve_telegram_finalization_target(
         store,
         message.in_reply_to_message_id,
     )
@@ -343,12 +343,16 @@ async def record_outbound_message_with_streaming_finalization_in_transaction(
         raise OutboundStreamingPreviewConflictError(
             "Telegram streaming target does not match the canonical agent reply target"
         )
-    preview_message_id = await _confirmed_preview_message_id(
-        store,
-        inbound_message_id=message.in_reply_to_message_id,
-        workshop_id=binding.workshop_id,
-        channel_id=binding.channel_id,
-        channel_binding_id=streaming_target.channel_binding_id,
+    preview_message_id = (
+        await _confirmed_preview_message_id(
+            store,
+            inbound_message_id=message.in_reply_to_message_id,
+            workshop_id=binding.workshop_id,
+            channel_id=binding.channel_id,
+            channel_binding_id=streaming_target.channel_binding_id,
+        )
+        if streaming_target.preview_eligible
+        else None
     )
     operations = _streaming_finalization_operations(
         message.body,

@@ -69,6 +69,16 @@ class ResolvedTelegramStreamingTarget:
     channel_binding_id: ChannelBindingId
 
 
+@dataclass(frozen=True, slots=True)
+class ResolvedTelegramFinalizationTarget:
+    """A direct Telegram delivery target plus preview eligibility."""
+
+    workshop_id: WorkshopId
+    channel_id: ChannelId
+    channel_binding_id: ChannelBindingId
+    preview_eligible: bool
+
+
 def _format_timestamp(value: datetime) -> str:
     return value.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
@@ -77,14 +87,17 @@ def _parse_timestamp(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
 
 
-async def resolve_telegram_streaming_target(
+async def _resolve_telegram_target(
     store: WorkshopEventStore,
     inbound_message_id: MessageId,
-) -> ResolvedTelegramStreamingTarget:
+    *,
+    allow_workshop_client: bool,
+) -> ResolvedTelegramFinalizationTarget:
     async with store.connection.execute(
         "SELECT c.workshop_id, m.channel_id, c.kind, p.kind, m.reply_to_message_id, "
         "json_extract(e.metadata_json, '$.source'), "
-        "json_extract(e.metadata_json, '$.transport_message_id'), p.id "
+        "json_extract(e.metadata_json, '$.transport_message_id'), "
+        "json_extract(e.metadata_json, '$.client_message_id'), p.id "
         "FROM messages m "
         "JOIN channels c ON c.id = m.channel_id "
         "JOIN principals p ON p.id = m.author_principal_id "
@@ -93,17 +106,25 @@ async def resolve_telegram_streaming_target(
         (inbound_message_id,),
     ) as cursor:
         row = await cursor.fetchone()
+    valid_telegram = row is not None and row[5] == "telegram" and isinstance(row[6], str) and bool(row[6])
+    valid_workshop_client = (
+        allow_workshop_client
+        and row is not None
+        and row[5] == "workshop_client"
+        and row[6] is None
+        and isinstance(row[7], str)
+        and bool(row[7])
+    )
     if (
         row is None
         or row[2] != "direct"
         or row[3] != "human"
         or row[4] is not None
-        or row[5] != "telegram"
-        or not isinstance(row[6], str)
-        or not row[6]
+        or not (valid_telegram or valid_workshop_client)
     ):
+        expected = "Telegram or Workshop client" if allow_workshop_client else "Telegram inbound"
         raise StreamingPreviewTargetError(
-            "Preview target must be an existing Telegram inbound message from a human in a direct channel"
+            f"Target must be an existing {expected} message from a human in a direct channel"
         )
 
     channel_id = ChannelId(str(row[1]))
@@ -113,15 +134,44 @@ async def resolve_telegram_streaming_target(
         "AND e.external_subject = b.external_channel_id) "
         "FROM channel_bindings b WHERE b.channel_id = ? "
         "AND b.transport = 'telegram' ORDER BY b.id",
-        (str(row[7]), channel_id),
+        (str(row[8]), channel_id),
     ) as cursor:
         bindings = list(await cursor.fetchall())
     if len(bindings) != 1 or int(bindings[0][1]) != 1:
         raise StreamingPreviewBindingError("Canonical direct channel must have exactly one Telegram binding")
-    return ResolvedTelegramStreamingTarget(
+    return ResolvedTelegramFinalizationTarget(
         workshop_id=WorkshopId(str(row[0])),
         channel_id=channel_id,
         channel_binding_id=ChannelBindingId(str(bindings[0][0])),
+        preview_eligible=valid_telegram,
+    )
+
+
+async def resolve_telegram_streaming_target(
+    store: WorkshopEventStore,
+    inbound_message_id: MessageId,
+) -> ResolvedTelegramStreamingTarget:
+    target = await _resolve_telegram_target(
+        store,
+        inbound_message_id,
+        allow_workshop_client=False,
+    )
+    return ResolvedTelegramStreamingTarget(
+        workshop_id=target.workshop_id,
+        channel_id=target.channel_id,
+        channel_binding_id=target.channel_binding_id,
+    )
+
+
+async def resolve_telegram_finalization_target(
+    store: WorkshopEventStore,
+    inbound_message_id: MessageId,
+) -> ResolvedTelegramFinalizationTarget:
+    """Resolve Telegram final delivery for Telegram or Workshop ingress."""
+    return await _resolve_telegram_target(
+        store,
+        inbound_message_id,
+        allow_workshop_client=True,
     )
 
 

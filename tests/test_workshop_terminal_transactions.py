@@ -9,9 +9,12 @@ import aiosqlite
 import pytest
 
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+from kai.workshop.conversation_commands import WorkshopConversationCommandService
 from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
-from kai.workshop.domain import MessageId, RunExecutionOwnerId
-from kai.workshop.inbound import InboundMessage, record_inbound_message
+from kai.workshop.delivery_fragments import SEND_OPERATION
+from kai.workshop.delivery_outbox import STREAMING_FINALIZATION_CONTRACT
+from kai.workshop.domain import ChannelId, MessageId, PrincipalId, RunExecutionOwnerId
+from kai.workshop.inbound import ClientInboundMessage, InboundMessage, record_inbound_message
 from kai.workshop.outbound import (
     OutboundMessage,
     record_outbound_message_with_streaming_finalization,
@@ -85,6 +88,55 @@ async def _started_run(
     return store, authority, started.claim
 
 
+async def _started_client_run(
+    path: Path,
+) -> tuple[WorkshopEventStore, WorkshopRunExecutionAuthority, RunExecutionClaim]:
+    store = await WorkshopEventStore.open(path)
+    await bootstrap_default_workshop(
+        store,
+        (
+            BootstrapHuman(
+                display_name="Workshop Human",
+                role="admin",
+                transport="telegram",
+                external_subject="101",
+                external_channel_id="101",
+            ),
+        ),
+    )
+    async with store.connection.execute(
+        "SELECT e.principal_id, cb.channel_id FROM external_identities e "
+        "JOIN channel_bindings cb ON cb.transport = e.provider "
+        "AND cb.external_channel_id = e.external_subject "
+        "WHERE e.provider = 'telegram' AND e.external_subject = '101'"
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    accepted = await WorkshopConversationCommandService(store).accept_client(
+        ClientInboundMessage(
+            principal_id=PrincipalId(str(row[0])),
+            channel_id=ChannelId(str(row[1])),
+            client_message_id="browser-command-1",
+            body="Perform one durable unit of work",
+            occurred_at=_NOW,
+        )
+    )
+    authority = WorkshopRunExecutionAuthority(
+        store,
+        selection_resolver=lambda _run: RunExecutionSelection("codex", "gpt-5.6-sol"),
+        registered_backend_ids=frozenset({"codex"}),
+    )
+    granted = await authority.grant(
+        accepted.run.run_id,
+        owner_id=RunExecutionOwnerId.new(),
+        occurred_at=_NOW + timedelta(seconds=2),
+        lease_expires_at=_NOW + timedelta(minutes=2),
+    )
+    started = await authority.start(granted.claim, occurred_at=_NOW + timedelta(seconds=3))
+    await WorkshopConversationDeliveryAuthority(store).activate()
+    return store, authority, started.claim
+
+
 async def _terminal_rows(store: WorkshopEventStore) -> tuple[int, int, int]:
     counts = []
     for table in ("messages", "delivery_outbox", "delivery_fragments"):
@@ -132,6 +184,28 @@ class TestAtomicTerminalTransactions:
                     "run_attempt.completed",
                     "run.completed",
                 ]
+        finally:
+            await store.close()
+
+    async def test_workshop_client_success_sends_without_telegram_preview(self, tmp_path: Path):
+        store, authority, claim = await _started_client_run(tmp_path / "kai.db")
+        try:
+            result = await WorkshopRunTerminalTransactionCoordinator(authority).complete(
+                claim,
+                body="WORKSHOP-COMMAND-OK",
+                occurred_at=_NOW + timedelta(seconds=4),
+            )
+
+            assert result.outcome == TerminalOutcome.COMPLETED
+            assert result.execution.run.status == RunStatus.COMPLETED
+            assert result.finalization.delivery.delivery.execution_contract == STREAMING_FINALIZATION_CONTRACT
+            assert [
+                (fragment.operation, fragment.target_external_message_id, fragment.body)
+                for fragment in result.finalization.plan.fragments
+            ] == [(SEND_OPERATION, None, "WORKSHOP-COMMAND-OK")]
+            # The browser command's attributed echo precedes the assistant
+            # finalization and both remain durable outbox work.
+            assert await _terminal_rows(store) == (1, 2, 1)
         finally:
             await store.close()
 
