@@ -671,6 +671,28 @@ function WorkshopView({
     }
   }, [channelId, messages]);
 
+  useLayoutEffect(() => {
+    const timeline = timelineRef.current;
+    if (
+      !timeline ||
+      !timelineInitializedRef.current ||
+      !timelineFollowRef.current
+    ) {
+      return;
+    }
+
+    // The activity card lives below the scrollable timeline. Adding or
+    // changing it reduces the timeline viewport, which moves the effective
+    // bottom even when no message was appended. Keep following only when the
+    // reader was already following; a deliberate historical position remains
+    // untouched.
+    timeline.scrollTop = timeline.scrollHeight;
+    storeTimelineViewport(channelId, {
+      follow: true,
+      scrollTop: timeline.scrollTop,
+    });
+  }, [activeRun, channelId]);
+
   const handleTimelineScroll = (): void => {
     const timeline = timelineRef.current;
     if (!timeline || !timelineInitializedRef.current) {

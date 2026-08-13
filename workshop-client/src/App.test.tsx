@@ -192,6 +192,7 @@ describe("Workshop React client", () => {
       scrollHeight: { configurable: true, get: () => scrollHeight },
       scrollTop: { configurable: true, value: 0, writable: true },
     });
+    await waitFor(() => expect(resolveTimeline).not.toBeNull());
     act(() => {
       resolveTimeline?.({ messages: [historyMessage], throughPosition: 25 });
     });
@@ -230,6 +231,34 @@ describe("Workshop React client", () => {
     expect(
       screen.queryByRole("button", { name: /new messages?/ }),
     ).toBeNull();
+
+    scrollHeight = 1300;
+    await user.type(screen.getByLabelText("Message Kai"), "Show activity");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    expect(await screen.findByLabelText("Agent run activity")).toBeVisible();
+    await waitFor(() => expect(timeline.scrollTop).toBe(1300));
+
+    timeline.scrollTop = 100;
+    fireEvent.scroll(timeline);
+    scrollHeight = 1400;
+    act(() =>
+      handlers?.onRunActivity(
+        {
+          eventPosition: 32,
+          occurredAt: "2026-08-13T09:00:03Z",
+          run: {
+            ...completedRun,
+            resultMessageId: null,
+            status: "started",
+            terminalAt: null,
+          },
+          transition: "run.started",
+        },
+        "32",
+      ),
+    );
+    expect(await screen.findByText("The agent is working on this request.")).toBeVisible();
+    expect(timeline.scrollTop).toBe(100);
   });
 
   it("returns to enrollment and clears the tab session after revocation", async () => {
