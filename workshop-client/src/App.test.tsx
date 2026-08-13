@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -124,6 +124,71 @@ describe("Workshop React client", () => {
 
     expect(await screen.findByText(liveMessage.body)).toBeVisible();
     expect(container.querySelector("img")).toBeNull();
+  });
+
+  it("opens at the latest message and preserves deliberate scroll position", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    let resolveTimeline: ((value: {
+      messages: TimelineMessage[];
+      throughPosition: number;
+    }) => void) | null = null;
+    vi.mocked(loadTimeline).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveTimeline = resolve;
+        }),
+    );
+    render(<App />);
+
+    const timeline = screen.getByLabelText("Conversation timeline");
+    let scrollHeight = 1000;
+    Object.defineProperties(timeline, {
+      clientHeight: { configurable: true, get: () => 300 },
+      scrollHeight: { configurable: true, get: () => scrollHeight },
+      scrollTop: { configurable: true, value: 0, writable: true },
+    });
+    act(() => {
+      resolveTimeline?.({ messages: [historyMessage], throughPosition: 25 });
+    });
+
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+    await waitFor(() => expect(timeline.scrollTop).toBe(1000));
+    timeline.scrollTop = 100;
+    fireEvent.scroll(timeline);
+
+    scrollHeight = 1100;
+    const firstNewMessage: TimelineMessage = {
+      ...historyMessage,
+      body: "First unread message",
+      eventPosition: 30,
+      messageId: "msg_00000000000000000000000000000030",
+    };
+    act(() => handlers?.onMessage(firstNewMessage, "30"));
+
+    expect(await screen.findByText("First unread message")).toBeVisible();
+    expect(timeline.scrollTop).toBe(100);
+    await user.click(screen.getByRole("button", { name: "1 new message" }));
+    expect(timeline.scrollTop).toBe(1100);
+    expect(screen.queryByRole("button", { name: "1 new message" })).toBeNull();
+
+    scrollHeight = 1200;
+    const secondNewMessage: TimelineMessage = {
+      ...historyMessage,
+      body: "Followed message",
+      eventPosition: 31,
+      messageId: "msg_00000000000000000000000000000031",
+    };
+    act(() => handlers?.onMessage(secondNewMessage, "31"));
+
+    expect(await screen.findByText("Followed message")).toBeVisible();
+    await waitFor(() => expect(timeline.scrollTop).toBe(1200));
+    expect(
+      screen.queryByRole("button", { name: /new messages?/ }),
+    ).toBeNull();
   });
 
   it("returns to enrollment and clears the tab session after revocation", async () => {

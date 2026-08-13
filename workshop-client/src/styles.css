@@ -745,6 +745,24 @@ button:disabled {
   background: var(--atom-bg);
 }
 
+.new-messages-button {
+  display: block;
+  margin: 0 auto 0.65rem;
+  border: 1px solid rgba(97, 175, 239, 0.5);
+  border-radius: 999px;
+  padding: 0.42rem 0.8rem;
+  background: var(--atom-surface-raised);
+  color: var(--atom-blue);
+  box-shadow: 0 0.4rem 1.2rem rgba(8, 10, 13, 0.28);
+  font: 700 0.68rem var(--sans);
+  cursor: pointer;
+}
+
+.new-messages-button:hover {
+  border-color: var(--atom-blue);
+  background: var(--atom-surface);
+}
+
 .composer-form {
   display: flex;
   align-items: flex-end;

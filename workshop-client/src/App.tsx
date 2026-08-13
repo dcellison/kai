@@ -1,4 +1,11 @@
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import {
+  FormEvent,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 
 import {
   AuthenticationError,
@@ -20,6 +27,7 @@ import { useWorkshopTimeline } from "./useWorkshopTimeline";
 
 const SESSION_KEY = "kai.workshop.read-session.v1";
 const ACTIVE_RUN_KEY = "kai.workshop.active-run.v1";
+const TIMELINE_FOLLOW_DISTANCE_PX = 96;
 
 function restoreSession(): WorkshopSession | null {
   try {
@@ -81,6 +89,13 @@ type ActiveWorkshopRun = WorkshopRun & { status: "accepted" | "started" };
 
 function isRunActive(run: WorkshopRun | null): run is ActiveWorkshopRun {
   return run?.status === "accepted" || run?.status === "started";
+}
+
+function isNearTimelineBottom(element: HTMLDivElement): boolean {
+  return (
+    element.scrollHeight - element.scrollTop - element.clientHeight <=
+    TIMELINE_FOLLOW_DISTANCE_PX
+  );
 }
 
 function formatTimestamp(value: string): string {
@@ -353,6 +368,12 @@ function WorkshopView({
   const [submitting, setSubmitting] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [activeRun, setActiveRun] = useState<WorkshopRun | null>(null);
+  const [unseenMessageCount, setUnseenMessageCount] = useState(0);
+  const timelineRef = useRef<HTMLDivElement | null>(null);
+  const timelineChannelRef = useRef(channelId);
+  const timelineInitializedRef = useRef(false);
+  const timelineFollowRef = useRef(true);
+  const latestMessagePositionRef = useRef(0);
   const agentName =
     messages.find((message) => message.authorKind === "agent")
       ?.authorDisplayName || "Agent";
@@ -414,6 +435,75 @@ function WorkshopView({
       window.clearTimeout(timer);
     };
   }, [activeRun, channelId, onLoadRun]);
+
+  useLayoutEffect(() => {
+    const timeline = timelineRef.current;
+    if (!timeline) {
+      return;
+    }
+    if (timelineChannelRef.current !== channelId) {
+      timelineChannelRef.current = channelId;
+      timelineInitializedRef.current = false;
+      timelineFollowRef.current = true;
+      latestMessagePositionRef.current = 0;
+      setUnseenMessageCount(0);
+    }
+
+    const latestPosition = messages.reduce(
+      (position, message) => Math.max(position, message.eventPosition),
+      0,
+    );
+    if (!timelineInitializedRef.current) {
+      if (messages.length === 0) {
+        return;
+      }
+      timeline.scrollTop = timeline.scrollHeight;
+      timelineInitializedRef.current = true;
+      timelineFollowRef.current = true;
+      latestMessagePositionRef.current = latestPosition;
+      setUnseenMessageCount(0);
+      return;
+    }
+
+    const addedMessages = messages.filter(
+      (message) => message.eventPosition > latestMessagePositionRef.current,
+    ).length;
+    latestMessagePositionRef.current = Math.max(
+      latestMessagePositionRef.current,
+      latestPosition,
+    );
+    if (addedMessages === 0) {
+      return;
+    }
+    if (timelineFollowRef.current) {
+      timeline.scrollTop = timeline.scrollHeight;
+      setUnseenMessageCount(0);
+    } else {
+      setUnseenMessageCount((count) => count + addedMessages);
+    }
+  }, [channelId, messages]);
+
+  const handleTimelineScroll = (): void => {
+    const timeline = timelineRef.current;
+    if (!timeline || !timelineInitializedRef.current) {
+      return;
+    }
+    const shouldFollow = isNearTimelineBottom(timeline);
+    timelineFollowRef.current = shouldFollow;
+    if (shouldFollow) {
+      setUnseenMessageCount(0);
+    }
+  };
+
+  const followLatestMessage = (): void => {
+    const timeline = timelineRef.current;
+    if (!timeline) {
+      return;
+    }
+    timelineFollowRef.current = true;
+    timeline.scrollTop = timeline.scrollHeight;
+    setUnseenMessageCount(0);
+  };
 
   const submit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
@@ -521,7 +611,12 @@ function WorkshopView({
           </div>
         </header>
 
-        <div className="timeline-wrap">
+        <div
+          ref={timelineRef}
+          className="timeline-wrap"
+          aria-label="Conversation timeline"
+          onScroll={handleTimelineScroll}
+        >
           <div className="channel-introduction">
             <span className="channel-symbol">#</span>
             <div>
@@ -546,6 +641,17 @@ function WorkshopView({
         </div>
 
         <footer className="composer-preview">
+          {unseenMessageCount > 0 && (
+            <button
+              className="new-messages-button"
+              type="button"
+              onClick={followLatestMessage}
+            >
+              {unseenMessageCount === 1
+                ? "1 new message"
+                : `${unseenMessageCount} new messages`}
+            </button>
+          )}
           <form className="composer-form" onSubmit={(event) => void submit(event)}>
             <textarea
               aria-label="Message Kai"
