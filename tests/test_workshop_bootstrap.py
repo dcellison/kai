@@ -43,7 +43,7 @@ class TestBootstrapInput:
             ({"transport": "Telegram"}, "transport"),
             ({"external_subject": ""}, "external_subject"),
             ({"external_channel_id": ""}, "external_channel_id"),
-            ({"runtime_subject": ""}, "runtime_subject"),
+            ({"runtime_profile_id": ""}, "runtime_profile_id"),
         ],
     )
     def test_invalid_human_fails_before_database_changes(self, changes, match):
@@ -225,7 +225,7 @@ class TestDefaultWorkshopBootstrap:
         assert second.agent_id == first.agent_id
         assert second_events == first_events
 
-    async def test_rerun_adds_one_protected_runtime_identity_without_replacing_transport_identity(
+    async def test_rerun_adds_one_runtime_assignment_without_replacing_transport_identity(
         self,
         store,
     ):
@@ -240,7 +240,7 @@ class TestDefaultWorkshopBootstrap:
                     transport=original.transport,
                     external_subject=original.external_subject,
                     external_channel_id=original.external_channel_id,
-                    runtime_subject="101",
+                    runtime_profile_id="101",
                 )
             ],
         )
@@ -251,10 +251,11 @@ class TestDefaultWorkshopBootstrap:
         async with store.connection.execute(
             "SELECT provider, external_subject FROM external_identities ORDER BY provider"
         ) as cursor:
-            assert [tuple(row) for row in await cursor.fetchall()] == [
-                ("kai", "101"),
-                ("telegram", "101"),
-            ]
+            assert [tuple(row) for row in await cursor.fetchall()] == [("telegram", "101")]
+        async with store.connection.execute(
+            "SELECT runtime_profile_id FROM channel_agent_runtime_assignments"
+        ) as cursor:
+            assert [str(row[0]) for row in await cursor.fetchall()] == ["101"]
 
     async def test_input_order_does_not_change_event_or_projection_order(self, tmp_path: Path):
         first_store = await WorkshopEventStore.open(tmp_path / "first.db")
@@ -371,7 +372,16 @@ class TestWorkshopBootstrapStatus:
         try:
             await bootstrap_default_workshop(
                 event_store,
-                [_human(101, "Secret Name", role="admin")],
+                [
+                    BootstrapHuman(
+                        "Secret Name",
+                        "admin",
+                        "telegram",
+                        "101",
+                        "101",
+                        runtime_profile_id="101",
+                    )
+                ],
             )
         finally:
             await event_store.close()
@@ -380,7 +390,7 @@ class TestWorkshopBootstrapStatus:
 
         assert status == (
             "Workshop bootstrap: initialized; workshops=1, humans=1, Telegram bindings=1, "
-            "channel memberships=2, agents=1; expected humans=1"
+            "channel memberships=2, agents=1, runtime assignments=1; expected humans=1"
         )
         assert "Secret Name" not in status
         assert "101" not in status

@@ -35,7 +35,7 @@ async def _canonical_inbound(store: WorkshopEventStore, telegram_id: int = 101) 
                 transport="telegram",
                 external_subject=str(telegram_id),
                 external_channel_id=str(telegram_id),
-                runtime_subject=str(telegram_id),
+                runtime_profile_id=str(telegram_id),
             ),
         ),
     )
@@ -107,7 +107,7 @@ class TestCanonicalRunResolution:
                         transport="desktop",
                         external_subject="desktop-human",
                         external_channel_id="desktop-human",
-                        runtime_subject="202",
+                        runtime_profile_id="202",
                     ),
                 ),
             )
@@ -139,14 +139,14 @@ class TestCanonicalRunResolution:
         finally:
             await store.close()
 
-    async def test_rejects_missing_compatibility_identity(self, tmp_path: Path):
+    async def test_rejects_missing_runtime_assignment(self, tmp_path: Path):
         store = await WorkshopEventStore.open(tmp_path / "kai.db")
         try:
             inbound_id = await _canonical_inbound(store)
-            await store.connection.execute("DELETE FROM external_identities")
+            await store.connection.execute("DELETE FROM channel_agent_runtime_assignments")
             await store.connection.commit()
 
-            with pytest.raises(ConversationRunUnavailableError, match="exactly one Kai runtime"):
+            with pytest.raises(ConversationRunUnavailableError, match="explicit runtime profile assignment"):
                 await resolve_canonical_conversation_run(store, inbound_id)
         finally:
             await store.close()

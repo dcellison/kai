@@ -70,7 +70,7 @@ async def _open_client_store(
                 transport="telegram",
                 external_subject="101",
                 external_channel_id="101",
-                runtime_subject="101",
+                runtime_profile_id="101",
             ),
         ),
     )
@@ -317,7 +317,7 @@ class TestConversationCommandReplay:
             checkpoint = await store.rebuild_projection(CanonicalConversationProjection())
             after = await WorkshopRunLifecycle(store).state(before.run.run_id)
 
-            assert checkpoint.version == 6
+            assert checkpoint.version == 7
             assert after == before.run
             async with store.connection.execute("SELECT body FROM messages") as cursor:
                 assert str((await cursor.fetchone())[0]) == _message().body
@@ -346,7 +346,7 @@ class TestAtomicClientConversationCommandAcceptance:
             assert accepted.command.message.inserted is True
             assert accepted.command.lifecycle.changed is True
             assert accepted.delivery.inserted is True
-            assert accepted.runtime_config_id == 101
+            assert accepted.runtime_profile_id == "101"
             assert accepted.delivery is not None
             assert accepted.delivery.delivery.message_id == accepted.command.message.event.envelope.aggregate_id
             assert accepted.delivery.delivery.channel_id == channel_id
@@ -420,15 +420,14 @@ class TestAtomicClientConversationCommandAcceptance:
                     transport="desktop",
                     external_subject="desktop-human",
                     external_channel_id="desktop-human",
-                    runtime_subject="101",
+                    runtime_profile_id="101",
                 ),
             ),
         )
         async with store.connection.execute(
-            "SELECT e.principal_id, c.id FROM external_identities e "
-            "JOIN channel_memberships cm ON cm.principal_id = e.principal_id "
+            "SELECT cm.principal_id, c.id FROM channel_memberships cm "
             "JOIN channels c ON c.id = cm.channel_id AND c.kind = 'direct' "
-            "WHERE e.provider = 'kai' AND e.external_subject = '101'"
+            "WHERE cm.role = 'owner'"
         ) as cursor:
             row = await cursor.fetchone()
         assert row is not None
@@ -438,7 +437,7 @@ class TestAtomicClientConversationCommandAcceptance:
             )
 
             assert accepted.command.disposition == ConversationCommandDisposition.NEWLY_ACCEPTED
-            assert accepted.runtime_config_id == 101
+            assert accepted.runtime_profile_id == "101"
             assert accepted.delivery is None
             async with store.connection.execute(
                 "SELECT event_type FROM event_log WHERE position >= ? ORDER BY position",

@@ -30,6 +30,7 @@ class WorkshopEventType(StrEnum):
     TRANSPORT_CHANNEL_BOUND = "transport.channel_bound"
     AGENT_CREATED = "agent.created"
     CHANNEL_AGENT_ATTACHED = "channel.agent_attached"
+    RUNTIME_PROFILE_ASSIGNED = "runtime_profile.assigned"
     MESSAGE_CREATED = "message.created"
     ARTIFACT_CREATED = "artifact.created"
     DELIVERY_REQUESTED = "delivery.requested"
@@ -126,6 +127,10 @@ class ChannelAgentId(OpaqueId):
     prefix = "cag"
 
 
+class RuntimeAssignmentId(OpaqueId):
+    prefix = "rta"
+
+
 class MessageId(OpaqueId):
     prefix = "msg"
 
@@ -177,6 +182,7 @@ _ID_TYPES: dict[str, type[OpaqueId]] = {
         ChannelBindingId,
         AgentId,
         ChannelAgentId,
+        RuntimeAssignmentId,
         MessageId,
         ArtifactId,
         DeliveryId,

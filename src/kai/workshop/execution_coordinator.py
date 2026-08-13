@@ -103,7 +103,7 @@ class WorkshopCanonicalExecutionCoordinator:
     """Own one canonical lane from accepted run through terminal settlement.
 
     The public execution input is only a canonical ``RunId``. Prompt, lane,
-    compatibility runtime identity, backend selection, owner, and delivery
+    protected runtime profile, backend selection, owner, and delivery
     authority are all derived behind this boundary.
     """
 

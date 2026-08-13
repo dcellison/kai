@@ -52,7 +52,7 @@ async def _started_run(
                 transport="telegram",
                 external_subject="101",
                 external_channel_id="101",
-                runtime_subject="101",
+                runtime_profile_id="101",
             ),
         ),
     )
@@ -102,7 +102,7 @@ async def _started_client_run(
                 transport="telegram",
                 external_subject="101",
                 external_channel_id="101",
-                runtime_subject="101",
+                runtime_profile_id="101",
             ),
         ),
     )
@@ -152,15 +152,14 @@ async def _started_workshop_only_client_run(
                 transport="desktop",
                 external_subject="desktop-human",
                 external_channel_id="desktop-human",
-                runtime_subject="101",
+                runtime_profile_id="101",
             ),
         ),
     )
     async with store.connection.execute(
-        "SELECT e.principal_id, c.id FROM external_identities e "
-        "JOIN channel_memberships cm ON cm.principal_id = e.principal_id "
+        "SELECT cm.principal_id, c.id FROM channel_memberships cm "
         "JOIN channels c ON c.id = cm.channel_id AND c.kind = 'direct' "
-        "WHERE e.provider = 'kai' AND e.external_subject = '101'"
+        "WHERE cm.role = 'owner'"
     ) as cursor:
         row = await cursor.fetchone()
     assert row is not None

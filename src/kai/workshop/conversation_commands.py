@@ -19,6 +19,10 @@ from kai.workshop.inbound import (
     record_inbound_message_in_transaction,
 )
 from kai.workshop.run_lifecycle import DurableRun, RunLifecycleResult, RunStatus, WorkshopRunLifecycle
+from kai.workshop.runtime_assignments import (
+    WorkshopRuntimeAssignmentError,
+    resolve_channel_runtime_profile,
+)
 from kai.workshop.store import AppendResult, WorkshopEventStore
 
 
@@ -57,7 +61,7 @@ class ClientConversationCommandAcceptance:
 
     command: ConversationCommandAcceptance
     delivery: DeliveryRequestResult | None
-    runtime_config_id: int
+    runtime_profile_id: str
 
     @property
     def run(self) -> DurableRun:
@@ -125,7 +129,13 @@ class WorkshopConversationCommandService:
                 inbound_message_id,
                 occurred_at=inbound.event.envelope.occurred_at,
             )
-            runtime_config_id = await self._runtime_config_id(message.principal_id)
+            try:
+                _, runtime_profile_id = await resolve_channel_runtime_profile(
+                    self._store,
+                    message.channel_id,
+                )
+            except WorkshopRuntimeAssignmentError as exc:
+                raise ConversationCommandStateConflictError(str(exc)) from exc
             binding_id = await self._optional_telegram_binding(
                 message.principal_id,
                 message.channel_id,
@@ -160,27 +170,11 @@ class WorkshopConversationCommandService:
             return ClientConversationCommandAcceptance(
                 command=ConversationCommandAcceptance(inbound, lifecycle, disposition),
                 delivery=delivery,
-                runtime_config_id=runtime_config_id,
+                runtime_profile_id=runtime_profile_id,
             )
         except Exception:
             await connection.rollback()
             raise
-
-    async def _runtime_config_id(self, principal_id: PrincipalId) -> int:
-        async with self._store.connection.execute(
-            "SELECT external_subject FROM external_identities WHERE principal_id = ? AND provider = 'kai'",
-            (principal_id,),
-        ) as cursor:
-            rows = list(await cursor.fetchall())
-        if len(rows) != 1:
-            raise ConversationCommandStateConflictError("Client principal requires one Kai runtime identity")
-        try:
-            runtime_config_id = int(str(rows[0][0]))
-        except ValueError as exc:
-            raise ConversationCommandStateConflictError("Kai runtime identity is not numeric") from exc
-        if runtime_config_id <= 0:
-            raise ConversationCommandStateConflictError("Kai runtime identity is not a positive configured-user ID")
-        return runtime_config_id
 
     async def _optional_telegram_binding(
         self,

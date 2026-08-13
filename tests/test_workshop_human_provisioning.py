@@ -114,7 +114,7 @@ class TestWorkshopHumanProvisioner:
             )
             with pytest.raises(
                 ConversationCommandStateConflictError,
-                match="requires one Kai runtime identity",
+                match="explicit runtime profile assignment",
             ):
                 await WorkshopConversationCommandService(store).accept_client(
                     ClientInboundMessage(

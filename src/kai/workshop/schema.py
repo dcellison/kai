@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 17
+WORKSHOP_SCHEMA_VERSION = 18
 
 
 @dataclass(frozen=True, slots=True)
@@ -719,6 +719,29 @@ _CLIENT_SECURITY_STATE_ISOLATION_SCHEMA = SchemaMigration(
     ),
 )
 
+_RUNTIME_ASSIGNMENT_SCHEMA = SchemaMigration(
+    version=18,
+    name="explicit_channel_agent_runtime_assignments",
+    statements=(
+        """
+        CREATE TABLE channel_agent_runtime_assignments (
+            id TEXT PRIMARY KEY,
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+            runtime_profile_id TEXT NOT NULL CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            created_at TEXT NOT NULL,
+            created_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            UNIQUE (channel_id, agent_id),
+            UNIQUE (runtime_profile_id)
+        )
+        """,
+        "CREATE INDEX channel_agent_runtime_profile_idx ON channel_agent_runtime_assignments (runtime_profile_id)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -737,6 +760,7 @@ _MIGRATIONS = (
     _DURABLE_RUN_LIFECYCLE_SCHEMA,
     _RUN_EXECUTION_AUTHORITY_SCHEMA,
     _CLIENT_SECURITY_STATE_ISOLATION_SCHEMA,
+    _RUNTIME_ASSIGNMENT_SCHEMA,
 )
 
 

@@ -27,6 +27,7 @@ _REQUIRED_TABLES = {
     "workshop_memberships",
     "agents",
     "channel_bindings",
+    "channel_agent_runtime_assignments",
     "channel_memberships",
     "projection_checkpoints",
 }
@@ -75,6 +76,7 @@ class _ReplayState:
     workshop_memberships: dict[str, tuple[str, str, str]]
     channel_bindings: dict[str, tuple[str, str, str]]
     channel_memberships: dict[str, tuple[str, str, str]]
+    runtime_assignments: dict[str, tuple[str, str, str]]
     messages: tuple[_ReplayMessage, ...]
 
 
@@ -117,6 +119,10 @@ def workshop_bootstrap_status(db_path: Path, *, expected_humans: int | None) -> 
                 ("telegram",),
             )
             channel_membership_count = _scalar(connection, "SELECT COUNT(*) FROM channel_memberships")
+            runtime_assignment_count = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_agent_runtime_assignments",
+            )
             projection_count = _scalar(
                 connection,
                 "SELECT COUNT(*) FROM projection_checkpoints WHERE name = ?",
@@ -129,7 +135,12 @@ def workshop_bootstrap_status(db_path: Path, *, expected_humans: int | None) -> 
 
     expected_memberships = 2 * (human_count if expected_humans is None else expected_humans)
     expected_state_present = (
-        expected_humans is None or (human_count >= expected_humans and telegram_binding_count >= expected_humans)
+        expected_humans is None
+        or (
+            human_count >= expected_humans
+            and telegram_binding_count >= expected_humans
+            and runtime_assignment_count >= expected_humans
+        )
     ) and channel_membership_count >= expected_memberships
     initialized = workshop_count >= 1 and agent_count >= 1 and projection_count == 1 and expected_state_present
     state = "initialized" if initialized else "pending"
@@ -139,7 +150,7 @@ def workshop_bootstrap_status(db_path: Path, *, expected_humans: int | None) -> 
     return (
         f"Workshop bootstrap: {state}; workshops={workshop_count}, humans={human_count}, "
         f"Telegram bindings={telegram_binding_count}, channel memberships={channel_membership_count}, "
-        f"agents={agent_count}; {expectation}"
+        f"agents={agent_count}, runtime assignments={runtime_assignment_count}; {expectation}"
     )
 
 
@@ -297,6 +308,7 @@ def _replay_state(connection: sqlite3.Connection) -> _ReplayState:
     workshop_memberships: dict[str, tuple[str, str, str]] = {}
     channel_bindings: dict[str, tuple[str, str, str]] = {}
     channel_memberships: dict[str, tuple[str, str, str]] = {}
+    runtime_assignments: dict[str, tuple[str, str, str]] = {}
     replayed: list[_ReplayMessage] = []
     for row in connection.execute("SELECT * FROM event_log ORDER BY position"):
         envelope = _event_from_row(row)
@@ -310,6 +322,7 @@ def _replay_state(connection: sqlite3.Connection) -> _ReplayState:
                 WorkshopEventType.WORKSHOP_MEMBER_ADDED,
                 WorkshopEventType.CHANNEL_MEMBER_ADDED,
                 WorkshopEventType.TRANSPORT_CHANNEL_BOUND,
+                WorkshopEventType.RUNTIME_PROFILE_ASSIGNED,
                 WorkshopEventType.MESSAGE_CREATED,
             }
             and envelope.event_version != 1
@@ -362,6 +375,17 @@ def _replay_state(connection: sqlite3.Connection) -> _ReplayState:
                 ),
             )
             continue
+        if envelope.event_type == WorkshopEventType.RUNTIME_PROFILE_ASSIGNED:
+            _insert_replayed_fact(
+                runtime_assignments,
+                aggregate_id,
+                (
+                    _required_payload_text(payload, "channel_id"),
+                    _required_payload_text(payload, "agent_id"),
+                    _required_payload_text(payload, "runtime_profile_id"),
+                ),
+            )
+            continue
         if envelope.event_type != WorkshopEventType.MESSAGE_CREATED:
             continue
 
@@ -394,6 +418,7 @@ def _replay_state(connection: sqlite3.Connection) -> _ReplayState:
         workshop_memberships=workshop_memberships,
         channel_bindings=channel_bindings,
         channel_memberships=channel_memberships,
+        runtime_assignments=runtime_assignments,
         messages=tuple(replayed),
     )
 
@@ -451,6 +476,12 @@ def _projection_mismatches(connection: sqlite3.Connection, replayed: _ReplayStat
         str(row[0]): (str(row[1]), str(row[2]), str(row[3]))
         for row in connection.execute("SELECT id, channel_id, principal_id, role FROM channel_memberships").fetchall()
     }
+    actual_runtime_assignments = {
+        str(row[0]): (str(row[1]), str(row[2]), str(row[3]))
+        for row in connection.execute(
+            "SELECT id, channel_id, agent_id, runtime_profile_id FROM channel_agent_runtime_assignments"
+        ).fetchall()
+    }
     mismatches = (
         _mapping_mismatches(expected, actual)
         + _mapping_mismatches(replayed.principal_kinds, actual_principal_kinds)
@@ -458,6 +489,7 @@ def _projection_mismatches(connection: sqlite3.Connection, replayed: _ReplayStat
         + _mapping_mismatches(replayed.workshop_memberships, actual_workshop_memberships)
         + _mapping_mismatches(replayed.channel_bindings, actual_bindings)
         + _mapping_mismatches(replayed.channel_memberships, actual_channel_memberships)
+        + _mapping_mismatches(replayed.runtime_assignments, actual_runtime_assignments)
     )
     return len(actual), mismatches
 

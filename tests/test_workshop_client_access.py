@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from aiohttp import web
@@ -175,6 +176,8 @@ class TestWorkshopClientAccessCLI:
             workshop_cli._parser().parse_args(["client-access", "revoke-device", "--telegram-user-id", "101"])
         with pytest.raises(SystemExit):
             workshop_cli._parser().parse_args(["client-access", "revoke-enrollment", "--telegram-user-id", "101"])
+        with pytest.raises(SystemExit):
+            workshop_cli._parser().parse_args(["client-access", "assign-runtime"])
 
     def test_opaque_identifiers_are_type_checked(self):
         with pytest.raises(WorkshopClientAccessError, match="Invalid device ID"):
@@ -273,6 +276,45 @@ class TestWorkshopClientAccessCLI:
         assert "Expires:" in output
         assert output.count("kai_ws_enroll_v1.") == 1
         assert "stores only its hash" in output
+
+    async def test_assign_runtime_command_reports_explicit_channel_agent_policy(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        capsys,
+    ):
+        store = await _store(tmp_path / "kai.db")
+        principal_id, channel_id = await _canonical_access_ids(store)
+        await store.close()
+        monkeypatch.setattr(workshop_cli, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(
+            workshop_cli,
+            "load_config",
+            lambda: SimpleNamespace(
+                user_configs={101: SimpleNamespace(telegram_id=101)},
+            ),
+        )
+        args = workshop_cli._parser().parse_args(
+            [
+                "client-access",
+                "assign-runtime",
+                "--principal-id",
+                principal_id,
+                "--channel-id",
+                channel_id,
+                "--runtime-profile-id",
+                "101",
+            ]
+        )
+
+        assert await workshop_cli._run(args) == 0
+        output = capsys.readouterr().out
+        assert f"Principal: {principal_id}" in output
+        assert f"Direct channel: {channel_id}" in output
+        assert "Agent: agt_" in output
+        assert "Runtime profile: 101" in output
+        assert "Status: assigned" in output
+        assert "not human or transport identity" in output
 
 
 class TestWorkshopClientProductionRegistration:

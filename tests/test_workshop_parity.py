@@ -48,6 +48,7 @@ async def _build_conversation(db_path: Path) -> None:
                     transport="telegram",
                     external_subject="101",
                     external_channel_id="101",
+                    runtime_profile_id="101",
                 ),
             ),
         )
@@ -285,6 +286,27 @@ class TestWorkshopMessageParityStatus:
         store = await WorkshopEventStore.open(db_path)
         try:
             await store.connection.execute("DELETE FROM channel_memberships WHERE role = 'owner'")
+            await store.connection.commit()
+        finally:
+            await store.close()
+
+        status = workshop_message_parity_status(db_path, history_root)
+
+        assert "parity: diverged" in status
+        assert "replay mismatches=1" in status
+        assert "Secret" not in status
+
+    async def test_runtime_assignment_projection_drift_is_reported(self, tmp_path: Path):
+        db_path = tmp_path / "kai.db"
+        history_root = tmp_path / "history"
+        await _build_conversation(db_path)
+        _write_history(
+            history_root,
+            [_record("user", "Secret question", seconds=0), _record("assistant", "Secret answer", seconds=2)],
+        )
+        store = await WorkshopEventStore.open(db_path)
+        try:
+            await store.connection.execute("DELETE FROM channel_agent_runtime_assignments")
             await store.connection.commit()
         finally:
             await store.close()

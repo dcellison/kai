@@ -64,7 +64,7 @@ async def _foundation(database: Path) -> None:
                     transport="telegram",
                     external_subject="101",
                     external_channel_id="101",
-                    runtime_subject="101",
+                    runtime_profile_id="101",
                 ),
             ),
         )

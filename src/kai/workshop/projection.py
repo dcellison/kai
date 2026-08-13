@@ -499,9 +499,8 @@ class CanonicalConversationProjection:
     """Rebuild the initial Workshop collaboration records from events."""
 
     name = "canonical_conversations"
-    # Run execution authority adds replayed attempt state and new run columns.
-    # Rebuild once so every installed projection shares the same v2 run rules.
-    version = 6
+    # Runtime-profile assignment becomes a replayed channel-agent policy.
+    version = 7
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -512,6 +511,7 @@ class CanonicalConversationProjection:
             "run_attempts",
             "runs",
             "messages",
+            "channel_agent_runtime_assignments",
             "channel_agents",
             "channel_bindings",
             "channel_memberships",
@@ -653,6 +653,20 @@ class CanonicalConversationProjection:
                     _required_text(payload, "channel_id"),
                     _required_text(payload, "agent_id"),
                     occurred_at,
+                ),
+            )
+        elif envelope.event_type == WorkshopEventType.RUNTIME_PROFILE_ASSIGNED:
+            await connection.execute(
+                "INSERT INTO channel_agent_runtime_assignments "
+                "(id, channel_id, agent_id, runtime_profile_id, created_at, created_event_position) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    envelope.aggregate_id,
+                    _required_text(payload, "channel_id"),
+                    _required_text(payload, "agent_id"),
+                    _required_text(payload, "runtime_profile_id"),
+                    occurred_at,
+                    event.position,
                 ),
             )
         elif envelope.event_type == WorkshopEventType.MESSAGE_CREATED:
