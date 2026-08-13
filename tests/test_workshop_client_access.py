@@ -16,7 +16,7 @@ from kai.workshop.client_sessions import (
     WorkshopClientEnrollmentManager,
     WorkshopClientSessionManager,
 )
-from kai.workshop.domain import DeviceId, EnrollmentGrantId
+from kai.workshop.domain import ChannelId, DeviceId, EnrollmentGrantId, PrincipalId
 from kai.workshop.store import WorkshopEventStore
 
 
@@ -32,11 +32,28 @@ async def _store(path: Path) -> WorkshopEventStore:
     return store
 
 
+async def _canonical_access_ids(
+    store: WorkshopEventStore,
+    external_subject: str = "101",
+) -> tuple[PrincipalId, ChannelId]:
+    async with store.connection.execute(
+        "SELECT e.principal_id, c.id FROM external_identities e "
+        "JOIN channel_memberships cm ON cm.principal_id = e.principal_id AND cm.role = 'owner' "
+        "JOIN channels c ON c.id = cm.channel_id AND c.kind = 'direct' "
+        "WHERE e.provider = 'telegram' AND e.external_subject = ?",
+        (external_subject,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    return PrincipalId(str(row[0])), ChannelId(str(row[1]))
+
+
 class TestWorkshopClientAccess:
     async def test_issue_resolves_server_selected_human_and_direct_channel(self, tmp_path: Path):
         store = await _store(tmp_path / "kai.db")
         try:
-            issued = await WorkshopClientAccess(store).issue_enrollment(101)
+            principal_id, channel_id = await _canonical_access_ids(store)
+            issued = await WorkshopClientAccess(store).issue_enrollment(principal_id, channel_id)
 
             assert issued.grant.token.startswith(f"kai_ws_enroll_v1.{issued.grant.grant_id}.")
             assert str(issued.channel_id).startswith("chn_")
@@ -51,11 +68,51 @@ class TestWorkshopClientAccess:
         finally:
             await store.close()
 
+    async def test_canonical_enrollment_needs_no_external_identity_or_transport_binding(
+        self,
+        tmp_path: Path,
+    ):
+        store = await _store(tmp_path / "kai.db")
+        try:
+            principal_id, channel_id = await _canonical_access_ids(store)
+            await store.connection.execute(
+                "DELETE FROM external_identities WHERE principal_id = ?",
+                (principal_id,),
+            )
+            await store.connection.execute(
+                "DELETE FROM channel_bindings WHERE channel_id = ?",
+                (channel_id,),
+            )
+            await store.connection.commit()
+
+            access = WorkshopClientAccess(store)
+            humans = await access.list_humans()
+            issued = await access.issue_enrollment(principal_id, channel_id)
+
+            assert any(human.principal_id == principal_id and channel_id in human.direct_channels for human in humans)
+            assert issued.grant.principal_id == principal_id
+            assert issued.channel_id == channel_id
+        finally:
+            await store.close()
+
+    async def test_canonical_enrollment_requires_owned_direct_channel(self, tmp_path: Path):
+        store = await _store(tmp_path / "kai.db")
+        try:
+            alice_id, _ = await _canonical_access_ids(store, "101")
+            _, bob_channel_id = await _canonical_access_ids(store, "202")
+
+            with pytest.raises(WorkshopClientAccessError, match="does not own"):
+                await WorkshopClientAccess(store).issue_enrollment(alice_id, bob_channel_id)
+            async with store.connection.execute("SELECT COUNT(*) FROM workshop_client_enrollment_grants") as cursor:
+                assert (await cursor.fetchone())[0] == 0
+        finally:
+            await store.close()
+
     async def test_unknown_telegram_identity_cannot_receive_a_grant(self, tmp_path: Path):
         store = await _store(tmp_path / "kai.db")
         try:
             with pytest.raises(WorkshopClientAccessError, match="exactly one canonical human"):
-                await WorkshopClientAccess(store).issue_enrollment(999)
+                await WorkshopClientAccess(store).issue_enrollment_for_telegram(999)
             async with store.connection.execute("SELECT COUNT(*) FROM workshop_client_enrollment_grants") as cursor:
                 assert (await cursor.fetchone())[0] == 0
         finally:
@@ -66,7 +123,7 @@ class TestWorkshopClientAccess:
         store = await _store(tmp_path / "kai.db")
         try:
             with pytest.raises(WorkshopClientAccessError, match="positive signed 64-bit"):
-                await WorkshopClientAccess(store).issue_enrollment(telegram_user_id)
+                await WorkshopClientAccess(store).issue_enrollment_for_telegram(telegram_user_id)
         finally:
             await store.close()
 
@@ -74,17 +131,21 @@ class TestWorkshopClientAccess:
         database = tmp_path / "kai.db"
         store = await _store(database)
         access = WorkshopClientAccess(store)
-        issued = await access.issue_enrollment(101)
+        principal_id, channel_id = await _canonical_access_ids(store)
+        issued = await access.issue_enrollment(principal_id, channel_id)
         redeemed = await WorkshopClientEnrollmentManager(store).redeem_grant(issued.grant.token, "Alice laptop")
         token = redeemed.session.token
-        await access.revoke_device(101, redeemed.device.device_id)
+        await access.revoke_device(principal_id, redeemed.device.device_id)
         await store.close()
 
         restarted = await WorkshopEventStore.open(database)
         try:
             assert await WorkshopClientSessionManager(restarted).authenticate_token(token) is None
             with pytest.raises(WorkshopClientAccessError, match="unavailable"):
-                await WorkshopClientAccess(restarted).revoke_device(101, redeemed.device.device_id)
+                await WorkshopClientAccess(restarted).revoke_device(
+                    principal_id,
+                    redeemed.device.device_id,
+                )
         finally:
             await restarted.close()
 
@@ -92,8 +153,9 @@ class TestWorkshopClientAccess:
         database = tmp_path / "kai.db"
         store = await _store(database)
         access = WorkshopClientAccess(store)
-        issued = await access.issue_enrollment(101)
-        await access.revoke_enrollment(101, issued.grant.grant_id)
+        principal_id, channel_id = await _canonical_access_ids(store)
+        issued = await access.issue_enrollment(principal_id, channel_id)
+        await access.revoke_enrollment(principal_id, issued.grant.grant_id)
         await store.close()
 
         restarted = await WorkshopEventStore.open(database)
@@ -118,9 +180,31 @@ class TestWorkshopClientAccessCLI:
             workshop_cli._device_id("101")
         with pytest.raises(WorkshopClientAccessError, match="Invalid enrollment grant ID"):
             workshop_cli._enrollment_grant_id("101")
+        with pytest.raises(WorkshopClientAccessError, match="Invalid principal ID"):
+            workshop_cli._principal_id("101")
+        with pytest.raises(WorkshopClientAccessError, match="Invalid channel ID"):
+            workshop_cli._channel_id("101")
 
         assert workshop_cli._device_id("dev_" + "a" * 32) == DeviceId("dev_" + "a" * 32)
         assert workshop_cli._enrollment_grant_id("enr_" + "b" * 32) == EnrollmentGrantId("enr_" + "b" * 32)
+
+    async def test_list_humans_prints_canonical_enrollment_coordinates(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        capsys,
+    ):
+        store = await _store(tmp_path / "kai.db")
+        principal_id, channel_id = await _canonical_access_ids(store)
+        await store.close()
+        monkeypatch.setattr(workshop_cli, "DATA_DIR", tmp_path)
+        args = workshop_cli._parser().parse_args(["client-access", "list-humans"])
+
+        assert await workshop_cli._run(args) == 0
+        output = capsys.readouterr().out
+        assert "Human: Alice" in output
+        assert f"Principal: {principal_id}" in output
+        assert f"Direct channel: {channel_id}" in output
 
     async def test_issue_command_prints_the_token_once_with_qualification_coordinates(
         self,
@@ -131,7 +215,19 @@ class TestWorkshopClientAccessCLI:
         store = await _store(tmp_path / "kai.db")
         await store.close()
         monkeypatch.setattr(workshop_cli, "DATA_DIR", tmp_path)
-        args = workshop_cli._parser().parse_args(["client-access", "issue-enrollment", "--telegram-user-id", "101"])
+        store = await WorkshopEventStore.open(tmp_path / "kai.db")
+        principal_id, channel_id = await _canonical_access_ids(store)
+        await store.close()
+        args = workshop_cli._parser().parse_args(
+            [
+                "client-access",
+                "issue-enrollment",
+                "--principal-id",
+                principal_id,
+                "--channel-id",
+                channel_id,
+            ]
+        )
 
         assert await workshop_cli._run(args) == 0
         output = capsys.readouterr().out
@@ -166,7 +262,11 @@ class TestWorkshopClientProductionRegistration:
 
             operator_store = await WorkshopEventStore.open(database)
             try:
-                issued = await WorkshopClientAccess(operator_store).issue_enrollment(101)
+                principal_id, channel_id = await _canonical_access_ids(operator_store)
+                issued = await WorkshopClientAccess(operator_store).issue_enrollment(
+                    principal_id,
+                    channel_id,
+                )
             finally:
                 await operator_store.close()
 

@@ -26,7 +26,7 @@ from kai.workshop.delivery_outbox import (
     WorkshopDeliveryOutbox,
 )
 from kai.workshop.delivery_qualification import DeliveryQualificationError, WorkshopDeliveryQualification
-from kai.workshop.domain import DeliveryId, DeviceId, EnrollmentGrantId
+from kai.workshop.domain import ChannelId, DeliveryId, DeviceId, EnrollmentGrantId, PrincipalId
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.telegram_delivery import (
     TelegramWorkOutcome,
@@ -85,22 +85,33 @@ def _parser() -> argparse.ArgumentParser:
         help="issue or revoke human Workshop client credentials",
     )
     client_actions = client_access.add_subparsers(dest="action", required=True)
+    client_actions.add_parser(
+        "list-humans",
+        help="list canonical humans and their direct channels",
+    )
     issue = client_actions.add_parser(
         "issue-enrollment",
-        help="issue one short-lived enrollment token for a configured Telegram human",
+        help="issue one short-lived enrollment token for a canonical human",
     )
-    issue.add_argument("--telegram-user-id", required=True, type=int)
+    issue_identity = issue.add_mutually_exclusive_group(required=True)
+    issue_identity.add_argument("--principal-id")
+    issue_identity.add_argument("--telegram-user-id", type=int)
+    issue.add_argument("--channel-id")
     revoke_device = client_actions.add_parser(
         "revoke-device",
         help="revoke one client device and all of its sessions",
     )
-    revoke_device.add_argument("--telegram-user-id", required=True, type=int)
+    revoke_device_identity = revoke_device.add_mutually_exclusive_group(required=True)
+    revoke_device_identity.add_argument("--principal-id")
+    revoke_device_identity.add_argument("--telegram-user-id", type=int)
     revoke_device.add_argument("--device-id", required=True)
     revoke_enrollment = client_actions.add_parser(
         "revoke-enrollment",
         help="revoke one unredeemed enrollment grant",
     )
-    revoke_enrollment.add_argument("--telegram-user-id", required=True, type=int)
+    revoke_enrollment_identity = revoke_enrollment.add_mutually_exclusive_group(required=True)
+    revoke_enrollment_identity.add_argument("--principal-id")
+    revoke_enrollment_identity.add_argument("--telegram-user-id", type=int)
     revoke_enrollment.add_argument("--grant-id", required=True)
     return parser
 
@@ -124,6 +135,20 @@ def _enrollment_grant_id(value: str) -> EnrollmentGrantId:
         return EnrollmentGrantId(value)
     except (TypeError, ValueError) as exc:
         raise WorkshopClientAccessError("Invalid enrollment grant ID") from exc
+
+
+def _principal_id(value: str) -> PrincipalId:
+    try:
+        return PrincipalId(value)
+    except (TypeError, ValueError) as exc:
+        raise WorkshopClientAccessError("Invalid principal ID") from exc
+
+
+def _channel_id(value: str) -> ChannelId:
+    try:
+        return ChannelId(value)
+    except (TypeError, ValueError) as exc:
+        raise WorkshopClientAccessError("Invalid channel ID") from exc
 
 
 def _print_state(state: DeliveryState) -> None:
@@ -154,8 +179,32 @@ async def _run(args: argparse.Namespace) -> int:
     try:
         if args.command == "client-access":
             access = WorkshopClientAccess(store)
+            if args.action == "list-humans":
+                humans = await access.list_humans()
+                if not humans:
+                    print("No canonical Workshop humans are available.")
+                    return 0
+                for human in humans:
+                    print(f"Human: {human.display_name}")
+                    print(f"Principal: {human.principal_id}")
+                    if human.direct_channels:
+                        for channel_id in human.direct_channels:
+                            print(f"Direct channel: {channel_id}")
+                    else:
+                        print("Direct channel: unavailable")
+                return 0
             if args.action == "issue-enrollment":
-                issued = await access.issue_enrollment(args.telegram_user_id)
+                if args.principal_id is not None:
+                    if args.channel_id is None:
+                        raise WorkshopClientAccessError("--channel-id is required with --principal-id")
+                    issued = await access.issue_enrollment(
+                        _principal_id(args.principal_id),
+                        _channel_id(args.channel_id),
+                    )
+                else:
+                    if args.channel_id is not None:
+                        raise WorkshopClientAccessError("--channel-id cannot be used with --telegram-user-id")
+                    issued = await access.issue_enrollment_for_telegram(args.telegram_user_id)
                 print(f"Enrollment: {issued.grant.grant_id}")
                 print(f"Channel: {issued.channel_id}")
                 print(f"Expires: {issued.grant.expires_at.isoformat()}")
@@ -164,12 +213,18 @@ async def _run(args: argparse.Namespace) -> int:
                 return 0
             if args.action == "revoke-device":
                 device_id = _device_id(args.device_id)
-                await access.revoke_device(args.telegram_user_id, device_id)
+                if args.principal_id is not None:
+                    await access.revoke_device(_principal_id(args.principal_id), device_id)
+                else:
+                    await access.revoke_device_for_telegram(args.telegram_user_id, device_id)
                 print(f"Device: {device_id}")
                 print("Status: revoked (all device sessions revoked)")
                 return 0
             grant_id = _enrollment_grant_id(args.grant_id)
-            await access.revoke_enrollment(args.telegram_user_id, grant_id)
+            if args.principal_id is not None:
+                await access.revoke_enrollment(_principal_id(args.principal_id), grant_id)
+            else:
+                await access.revoke_enrollment_for_telegram(args.telegram_user_id, grant_id)
             print(f"Enrollment: {grant_id}")
             print("Status: revoked")
             return 0
