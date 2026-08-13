@@ -24,6 +24,7 @@ from kai.workshop.run_execution_authority import (
 )
 from kai.workshop.run_lifecycle import RunStatus, WorkshopRunLifecycle
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
+from tests.workshop_profiles import profile_id
 
 _NOW = datetime(2026, 8, 12, 20, 0, tzinfo=UTC)
 
@@ -70,7 +71,7 @@ async def _open_client_store(
                 transport="telegram",
                 external_subject="101",
                 external_channel_id="101",
-                runtime_profile_id="101",
+                runtime_profile_id=profile_id(101),
             ),
         ),
     )
@@ -317,7 +318,7 @@ class TestConversationCommandReplay:
             checkpoint = await store.rebuild_projection(CanonicalConversationProjection())
             after = await WorkshopRunLifecycle(store).state(before.run.run_id)
 
-            assert checkpoint.version == 7
+            assert checkpoint.version == 8
             assert after == before.run
             async with store.connection.execute("SELECT body FROM messages") as cursor:
                 assert str((await cursor.fetchone())[0]) == _message().body
@@ -346,7 +347,7 @@ class TestAtomicClientConversationCommandAcceptance:
             assert accepted.command.message.inserted is True
             assert accepted.command.lifecycle.changed is True
             assert accepted.delivery.inserted is True
-            assert accepted.runtime_profile_id == "101"
+            assert accepted.runtime_profile_id == profile_id(101)
             assert accepted.delivery is not None
             assert accepted.delivery.delivery.message_id == accepted.command.message.event.envelope.aggregate_id
             assert accepted.delivery.delivery.channel_id == channel_id
@@ -420,7 +421,7 @@ class TestAtomicClientConversationCommandAcceptance:
                     transport="desktop",
                     external_subject="desktop-human",
                     external_channel_id="desktop-human",
-                    runtime_profile_id="101",
+                    runtime_profile_id=profile_id(101),
                 ),
             ),
         )
@@ -437,7 +438,7 @@ class TestAtomicClientConversationCommandAcceptance:
             )
 
             assert accepted.command.disposition == ConversationCommandDisposition.NEWLY_ACCEPTED
-            assert accepted.runtime_profile_id == "101"
+            assert accepted.runtime_profile_id == profile_id(101)
             assert accepted.delivery is None
             async with store.connection.execute(
                 "SELECT event_type FROM event_log WHERE position >= ? ORDER BY position",

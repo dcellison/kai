@@ -385,6 +385,18 @@ def _replay_state(connection: sqlite3.Connection) -> _ReplayState:
                 ),
             )
             continue
+        if envelope.event_type == WorkshopEventType.RUNTIME_PROFILE_REASSIGNED:
+            prior = runtime_assignments.get(aggregate_id)
+            channel_id = _required_payload_text(payload, "channel_id")
+            agent_id = _required_payload_text(payload, "agent_id")
+            if prior is None or prior[:2] != (channel_id, agent_id):
+                raise ValueError("Workshop runtime reassignment has no matching replayed assignment")
+            runtime_assignments[aggregate_id] = (
+                channel_id,
+                agent_id,
+                _required_payload_text(payload, "runtime_profile_id"),
+            )
+            continue
         if envelope.event_type != WorkshopEventType.MESSAGE_CREATED:
             continue
 

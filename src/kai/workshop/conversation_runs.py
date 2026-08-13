@@ -11,9 +11,9 @@ from kai.backend import StreamEvent
 from kai.workshop.domain import AgentId, ChannelId, MessageId, PrincipalId, WorkshopId
 from kai.workshop.runtime_assignments import (
     WorkshopRuntimeAssignmentError,
-    compatibility_user_id,
     resolve_channel_runtime_profile,
 )
+from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError, WorkshopRuntimeProfileRegistry
 from kai.workshop.store import WorkshopEventStore
 
 type AgentPrompt = str | list[dict[str, str]]
@@ -39,7 +39,7 @@ class CompatibilityConversationRunResolution:
     """Canonical target plus the private key required by the current pool."""
 
     target: CanonicalConversationRunTarget
-    _legacy_pool_key: int = field(repr=False, compare=False)
+    _runtime_config_id: int = field(repr=False, compare=False)
 
 
 class ConversationPool(Protocol):
@@ -89,6 +89,7 @@ async def resolve_canonical_conversation_target(
 async def resolve_canonical_conversation_run(
     store: WorkshopEventStore,
     inbound_message_id: MessageId,
+    runtime_profiles: WorkshopRuntimeProfileRegistry,
 ) -> CompatibilityConversationRunResolution:
     """Resolve a canonical target plus the current private pool adapter key.
 
@@ -105,13 +106,13 @@ async def resolve_canonical_conversation_run(
             target.channel_id,
             target.agent_id,
         )
-        legacy_pool_key = compatibility_user_id(runtime_profile_id)
-    except WorkshopRuntimeAssignmentError as exc:
+        runtime_config_id = runtime_profiles.resolve(runtime_profile_id).runtime_config_id
+    except (WorkshopRuntimeAssignmentError, WorkshopRuntimeProfileError) as exc:
         raise ConversationRunUnavailableError(str(exc)) from exc
 
     return CompatibilityConversationRunResolution(
         target=target,
-        _legacy_pool_key=legacy_pool_key,
+        _runtime_config_id=runtime_config_id,
     )
 
 
@@ -122,16 +123,16 @@ class PreparedConversationRun:
     target: CanonicalConversationRunTarget
     model: str
     _pool: ConversationPool = field(repr=False, compare=False)
-    _legacy_pool_key: int = field(repr=False, compare=False)
+    _runtime_config_id: int = field(repr=False, compare=False)
 
     async def stream(self, prompt: AgentPrompt) -> AsyncIterator[StreamEvent]:
         """Stream normalized harness events without exposing the pool key."""
-        async for event in self._pool.send(prompt, chat_id=self._legacy_pool_key):
+        async for event in self._pool.send(prompt, chat_id=self._runtime_config_id):
             yield event
 
     async def effective_workspace(self) -> Path:
         """Return the run's effective project workspace through the adapter."""
-        return await self._pool.get_effective_workspace(self._legacy_pool_key)
+        return await self._pool.get_effective_workspace(self._runtime_config_id)
 
 
 class WorkshopConversationRunService:
@@ -152,7 +153,7 @@ class WorkshopConversationRunService:
             raise ConversationRunUnavailableError("Run resolver returned a different inbound message")
         return PreparedConversationRun(
             target=target,
-            model=self._pool.get_model(resolution._legacy_pool_key),
+            model=self._pool.get_model(resolution._runtime_config_id),
             _pool=self._pool,
-            _legacy_pool_key=resolution._legacy_pool_key,
+            _runtime_config_id=resolution._runtime_config_id,
         )

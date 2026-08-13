@@ -13,6 +13,7 @@ from kai.workshop.conversation_runs import resolve_canonical_conversation_run
 from kai.workshop.domain import RunId
 from kai.workshop.run_execution_authority import RunExecutionSelection
 from kai.workshop.run_lifecycle import DurableRun, RunStatus, WorkshopRunLifecycle
+from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
 from kai.workshop.store import WorkshopEventStore
 
 type AgentPrompt = str | list[dict[str, str]]
@@ -52,6 +53,7 @@ class WorkshopProtectedExecutionPreparationService:
         pool: SubprocessPool,
         *,
         registered_backend_ids: frozenset[str],
+        runtime_profiles: WorkshopRuntimeProfileRegistry,
     ) -> None:
         if not registered_backend_ids:
             raise ValueError("registered_backend_ids must not be empty")
@@ -61,6 +63,7 @@ class WorkshopProtectedExecutionPreparationService:
         self._store = store
         self._pool = pool
         self._registered_backend_ids = registered_backend_ids
+        self._runtime_profiles = runtime_profiles
 
     async def prepare(self, run_id: RunId) -> PreparedWorkshopExecution:
         if not isinstance(run_id, RunId):
@@ -69,7 +72,11 @@ class WorkshopProtectedExecutionPreparationService:
         if run.status != RunStatus.ACCEPTED or run.cancellation_requested_at is not None:
             raise ProtectedExecutionPreparationError("Only an uncancelled accepted run can prepare execution")
 
-        resolution = await resolve_canonical_conversation_run(self._store, run.inbound_message_id)
+        resolution = await resolve_canonical_conversation_run(
+            self._store,
+            run.inbound_message_id,
+            self._runtime_profiles,
+        )
         target = resolution.target
         if (
             target.workshop_id != run.workshop_id
@@ -79,7 +86,7 @@ class WorkshopProtectedExecutionPreparationService:
         ):
             raise ProtectedExecutionPreparationError("Canonical run authority changed after acceptance")
 
-        runtime = await self._pool.prepare_execution(resolution._legacy_pool_key)
+        runtime = await self._pool.prepare_execution(resolution._runtime_config_id)
         prepared = runtime.selection
         if prepared.backend not in self._registered_backend_ids:
             raise ProtectedExecutionPreparationError("Effective backend is not present in the protected registry")

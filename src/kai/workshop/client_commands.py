@@ -18,7 +18,6 @@ from kai.workshop.execution_coordinator import (
 )
 from kai.workshop.inbound import ClientInboundMessage
 from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
-from kai.workshop.runtime_assignments import compatibility_user_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,7 +39,7 @@ class WorkshopClientCommandExecutor:
 
     async def submit(self, message: ClientInboundMessage) -> ClientCommandResult:
         accepted = await self._execution.accept_client(message)
-        runtime_config_id = compatibility_user_id(accepted.runtime_profile_id)
+        runtime_config_id = self._execution.runtime_config_id(accepted.runtime_profile_id)
         mapped_reader = reader_user(self._config, runtime_config_id)
         user_log = (
             log_message(

@@ -499,8 +499,8 @@ class CanonicalConversationProjection:
     """Rebuild the initial Workshop collaboration records from events."""
 
     name = "canonical_conversations"
-    # Runtime-profile assignment becomes a replayed channel-agent policy.
-    version = 7
+    # Runtime-profile assignments can migrate to stable protected profiles.
+    version = 8
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -669,6 +669,23 @@ class CanonicalConversationProjection:
                     event.position,
                 ),
             )
+        elif envelope.event_type == WorkshopEventType.RUNTIME_PROFILE_REASSIGNED:
+            channel_id = _required_text(payload, "channel_id")
+            agent_id = _required_text(payload, "agent_id")
+            cursor = await connection.execute(
+                "UPDATE channel_agent_runtime_assignments "
+                "SET runtime_profile_id = ?, created_event_position = ? "
+                "WHERE id = ? AND channel_id = ? AND agent_id = ?",
+                (
+                    _required_text(payload, "runtime_profile_id"),
+                    event.position,
+                    envelope.aggregate_id,
+                    channel_id,
+                    agent_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Workshop runtime reassignment has no matching channel-agent assignment")
         elif envelope.event_type == WorkshopEventType.MESSAGE_CREATED:
             reply_to = payload.get("reply_to_message_id")
             if reply_to is not None and not isinstance(reply_to, str):

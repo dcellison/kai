@@ -1905,3 +1905,30 @@ appears once in the bound Telegram chat, and the assistant response appears
 once in both clients. Retry and restart evidence must show no duplicate
 canonical messages, runs, echoes, finalizations, history entries, or memory
 ingestion, and `make install-status` must remain clean.
+
+## 39. Transport-neutral human and runtime authority
+
+**Implementation date:** 2026-08-13
+
+Workshop browser authority no longer requires a Telegram identity or binding.
+Operators can provision canonical humans and direct channels independently,
+issue enrollment to those principals, and optionally attach transport delivery
+later. Every executable channel-agent pair must also have exactly one explicit
+runtime-profile assignment; human identity, client enrollment, and transport
+bindings cannot select a backend process implicitly.
+
+Runtime-profile assignments now contain stable opaque `rtp_` identifiers. A
+process-local registry built only from protected operator configuration maps
+those identifiers to the configured backend/provider and OS execution user.
+Callers cannot submit the registry's private runtime-configuration key, and a
+structurally valid profile ID that is absent from protected policy fails
+closed. Existing numeric assignments are retained as historical events and
+superseded by a canonical `runtime_profile.reassigned` fact during bootstrap,
+so projection rebuilds reproduce the migration exactly.
+
+The current host runtime still uses the protected configured-user integer key
+behind this registry for subprocess pooling, settings, files, history, and
+memory compatibility. That key originates in the present `users.yaml` schema,
+whose primary record key is a Telegram user ID. It is no longer canonical
+Workshop assignment or caller authority, but retiring it from those storage
+namespaces is the next bounded migration seam.

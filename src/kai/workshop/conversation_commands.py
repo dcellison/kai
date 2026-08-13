@@ -11,7 +11,7 @@ from kai.workshop.delivery_outbox import (
     DeliveryRequestResult,
     WorkshopDeliveryOutbox,
 )
-from kai.workshop.domain import ChannelBindingId, ChannelId, MessageId, PrincipalId
+from kai.workshop.domain import ChannelBindingId, ChannelId, MessageId, PrincipalId, RuntimeProfileId
 from kai.workshop.inbound import (
     ClientInboundMessage,
     InboundMessage,
@@ -61,7 +61,7 @@ class ClientConversationCommandAcceptance:
 
     command: ConversationCommandAcceptance
     delivery: DeliveryRequestResult | None
-    runtime_profile_id: str
+    runtime_profile_id: RuntimeProfileId
 
     @property
     def run(self) -> DurableRun:

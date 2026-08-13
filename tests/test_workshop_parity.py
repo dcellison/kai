@@ -13,6 +13,7 @@ from kai.workshop.domain import MessageId
 from kai.workshop.inbound import InboundMessage, record_inbound_message
 from kai.workshop.outbound import OutboundMessage, record_outbound_message
 from kai.workshop.store import WorkshopEventStore
+from tests.workshop_profiles import profile_id
 
 _NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
 
@@ -48,7 +49,7 @@ async def _build_conversation(db_path: Path) -> None:
                     transport="telegram",
                     external_subject="101",
                     external_channel_id="101",
-                    runtime_profile_id="101",
+                    runtime_profile_id=profile_id(101),
                 ),
             ),
         )

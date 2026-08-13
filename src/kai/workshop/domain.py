@@ -31,6 +31,7 @@ class WorkshopEventType(StrEnum):
     AGENT_CREATED = "agent.created"
     CHANNEL_AGENT_ATTACHED = "channel.agent_attached"
     RUNTIME_PROFILE_ASSIGNED = "runtime_profile.assigned"
+    RUNTIME_PROFILE_REASSIGNED = "runtime_profile.reassigned"
     MESSAGE_CREATED = "message.created"
     ARTIFACT_CREATED = "artifact.created"
     DELIVERY_REQUESTED = "delivery.requested"
@@ -121,6 +122,10 @@ class ChannelBindingId(OpaqueId):
 
 class AgentId(OpaqueId):
     prefix = "agt"
+
+
+class RuntimeProfileId(OpaqueId):
+    prefix = "rtp"
 
 
 class ChannelAgentId(OpaqueId):

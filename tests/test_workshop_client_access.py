@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from kai import webhook, workshop_cli
+from kai.config import Config, UserConfig
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.client_access import WorkshopClientAccess, WorkshopClientAccessError
 from kai.workshop.client_sessions import (
@@ -20,6 +20,7 @@ from kai.workshop.client_sessions import (
 from kai.workshop.domain import ChannelId, DeviceId, EnrollmentGrantId, PrincipalId
 from kai.workshop.human_provisioning import WorkshopHumanProvisioningError
 from kai.workshop.store import WorkshopEventStore
+from tests.workshop_profiles import profile_id
 
 
 async def _store(path: Path) -> WorkshopEventStore:
@@ -290,8 +291,13 @@ class TestWorkshopClientAccessCLI:
         monkeypatch.setattr(
             workshop_cli,
             "load_config",
-            lambda: SimpleNamespace(
-                user_configs={101: SimpleNamespace(telegram_id=101)},
+            lambda: Config(
+                telegram_bot_token="test",
+                allowed_user_ids={101},
+                default_backend="codex",
+                default_provider="openai",
+                default_model="gpt-5.6-sol",
+                user_configs={101: UserConfig(telegram_id=101, name="Alice")},
             ),
         )
         args = workshop_cli._parser().parse_args(
@@ -303,7 +309,7 @@ class TestWorkshopClientAccessCLI:
                 "--channel-id",
                 channel_id,
                 "--runtime-profile-id",
-                "101",
+                profile_id(101),
             ]
         )
 
@@ -312,7 +318,7 @@ class TestWorkshopClientAccessCLI:
         assert f"Principal: {principal_id}" in output
         assert f"Direct channel: {channel_id}" in output
         assert "Agent: agt_" in output
-        assert "Runtime profile: 101" in output
+        assert f"Runtime profile: {profile_id(101)}" in output
         assert "Status: assigned" in output
         assert "not human or transport identity" in output
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -9,7 +11,10 @@ import pytest
 from kai import sessions
 from kai.workshop.bootstrap import BootstrapHuman, BootstrapNotificationChannel, bootstrap_default_workshop
 from kai.workshop.diagnostics import workshop_bootstrap_status
+from kai.workshop.domain import ChannelId, EventEnvelope, RuntimeAssignmentId, WorkshopEventType
+from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import WorkshopEventStore
+from tests.workshop_profiles import profile_id
 
 
 @pytest.fixture
@@ -240,7 +245,7 @@ class TestDefaultWorkshopBootstrap:
                     transport=original.transport,
                     external_subject=original.external_subject,
                     external_channel_id=original.external_channel_id,
-                    runtime_profile_id="101",
+                    runtime_profile_id=profile_id(101),
                 )
             ],
         )
@@ -255,7 +260,59 @@ class TestDefaultWorkshopBootstrap:
         async with store.connection.execute(
             "SELECT runtime_profile_id FROM channel_agent_runtime_assignments"
         ) as cursor:
-            assert [str(row[0]) for row in await cursor.fetchall()] == ["101"]
+            assert [str(row[0]) for row in await cursor.fetchall()] == [profile_id(101)]
+
+    async def test_existing_numeric_assignment_is_canonically_reassigned(self, store):
+        human = _human(101, "Admin", role="admin")
+        initial = await bootstrap_default_workshop(store, [human])
+        async with store.connection.execute("SELECT id FROM channels WHERE kind = 'direct'") as cursor:
+            channel_id = ChannelId(str((await cursor.fetchone())[0]))
+        assignment_id = RuntimeAssignmentId.derived(
+            channel_id,
+            f"runtime-profile:{initial.agent_id}",
+        )
+        await store.append(
+            EventEnvelope.create(
+                event_type=WorkshopEventType.RUNTIME_PROFILE_ASSIGNED,
+                event_version=1,
+                workshop_id=initial.workshop_id,
+                aggregate_type="runtime_assignment",
+                aggregate_id=assignment_id,
+                occurred_at=datetime.now(UTC),
+                idempotency_key=(
+                    "workshop-bootstrap:v1:runtime-assignment:"
+                    + hashlib.sha256(b"telegram\x00101").hexdigest()
+                ),
+                payload={
+                    "channel_id": channel_id,
+                    "agent_id": initial.agent_id,
+                    "runtime_profile_id": "101",
+                },
+                metadata={"source": "bootstrap"},
+            )
+        )
+        await store.rebuild_projection(CanonicalConversationProjection())
+
+        migrated = await bootstrap_default_workshop(
+            store,
+            [
+                BootstrapHuman(
+                    human.display_name,
+                    human.role,
+                    human.transport,
+                    human.external_subject,
+                    human.external_channel_id,
+                    profile_id(101),
+                )
+            ],
+        )
+
+        assert migrated.created_events == 1
+        assert (await store.read_events())[-1].envelope.event_type == WorkshopEventType.RUNTIME_PROFILE_REASSIGNED
+        async with store.connection.execute(
+            "SELECT runtime_profile_id FROM channel_agent_runtime_assignments"
+        ) as cursor:
+            assert str((await cursor.fetchone())[0]) == profile_id(101)
 
     async def test_input_order_does_not_change_event_or_projection_order(self, tmp_path: Path):
         first_store = await WorkshopEventStore.open(tmp_path / "first.db")
@@ -379,7 +436,7 @@ class TestWorkshopBootstrapStatus:
                         "telegram",
                         "101",
                         "101",
-                        runtime_profile_id="101",
+                        runtime_profile_id=profile_id(101),
                     )
                 ],
             )

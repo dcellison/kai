@@ -11,7 +11,7 @@ from kai.workshop.conversation_commands import (
     ConversationCommandAcceptance,
     WorkshopConversationCommandService,
 )
-from kai.workshop.domain import RunId
+from kai.workshop.domain import RunId, RuntimeProfileId
 from kai.workshop.execution_coordinator import (
     CanonicalCancellationDisposition,
     CanonicalExecutionResult,
@@ -20,6 +20,7 @@ from kai.workshop.execution_coordinator import (
 )
 from kai.workshop.inbound import ClientInboundMessage, InboundMessage
 from kai.workshop.protected_execution import WorkshopProtectedExecutionPreparationService
+from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
 from kai.workshop.store import WorkshopEventStore
 
 _RECOVERY_INTERVAL_SECONDS = 5.0
@@ -34,11 +35,13 @@ class WorkshopPrivateTextExecutionService:
         coordinator: WorkshopCanonicalExecutionCoordinator,
         command_service: WorkshopConversationCommandService,
         database_lock: asyncio.Lock,
+        runtime_profiles: WorkshopRuntimeProfileRegistry,
     ) -> None:
         self._store = store
         self._coordinator = coordinator
         self._command_service = command_service
         self._database_lock = database_lock
+        self._runtime_profiles = runtime_profiles
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._closed = False
@@ -50,6 +53,7 @@ class WorkshopPrivateTextExecutionService:
         pool: SubprocessPool,
         *,
         registered_backend_ids: frozenset[str],
+        runtime_profiles: WorkshopRuntimeProfileRegistry,
     ) -> WorkshopPrivateTextExecutionService:
         store = await WorkshopEventStore.open(database_path)
         database_lock = asyncio.Lock()
@@ -59,11 +63,18 @@ class WorkshopPrivateTextExecutionService:
                 store,
                 pool,
                 registered_backend_ids=registered_backend_ids,
+                runtime_profiles=runtime_profiles,
             ),
             registered_backend_ids=registered_backend_ids,
             database_lock=database_lock,
         )
-        service = cls(store, coordinator, WorkshopConversationCommandService(store), database_lock)
+        service = cls(
+            store,
+            coordinator,
+            WorkshopConversationCommandService(store),
+            database_lock,
+            runtime_profiles,
+        )
         try:
             await coordinator.recover_expired()
             service._task = asyncio.create_task(
@@ -78,6 +89,10 @@ class WorkshopPrivateTextExecutionService:
     @property
     def ready(self) -> bool:
         return not self._closed and self._task is not None and not self._task.done()
+
+    def runtime_config_id(self, runtime_profile_id: str | RuntimeProfileId) -> int:
+        """Resolve compatibility state only through protected profile policy."""
+        return self._runtime_profiles.resolve(runtime_profile_id).runtime_config_id
 
     async def accept(self, message: InboundMessage) -> ConversationCommandAcceptance:
         if self._closed:

@@ -48,10 +48,14 @@ from kai.bot import create_bot
 from kai.config import DATA_DIR, PROJECT_ROOT, _read_protected_file, load_config
 from kai.workshop.bootstrap import BootstrapHuman, BootstrapNotificationChannel
 from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
+from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
 from kai.workshop.telegram_delivery_runtime import WorkshopTelegramConversationDeliveryService
 
 
-def _workshop_bootstrap_humans(config) -> tuple[BootstrapHuman, ...]:
+def _workshop_bootstrap_humans(
+    config,
+    runtime_profiles: WorkshopRuntimeProfileRegistry,
+) -> tuple[BootstrapHuman, ...]:
     """Map authorized humans to their interactive direct-channel bindings."""
     return tuple(
         BootstrapHuman(
@@ -60,7 +64,7 @@ def _workshop_bootstrap_humans(config) -> tuple[BootstrapHuman, ...]:
             transport="telegram",
             external_subject=str(user.telegram_id),
             external_channel_id=str(user.telegram_id),
-            runtime_profile_id=str(user.telegram_id),
+            runtime_profile_id=runtime_profiles.for_config_id(user.telegram_id).profile_id,
         )
         for user in sorted(config.user_configs.values(), key=lambda user: user.telegram_id)
     )
@@ -298,8 +302,9 @@ def _start() -> None:
         # Notification groups are outbound-only channels: they share existing
         # principals but never create an inbound identity or alter live GitHub
         # routing through this migration.
+        runtime_profiles = WorkshopRuntimeProfileRegistry.from_config(config)
         workshop_bootstrap = await sessions.bootstrap_workshop_foundation(
-            _workshop_bootstrap_humans(config),
+            _workshop_bootstrap_humans(config, runtime_profiles),
             notification_channels=await _workshop_bootstrap_notification_channels(config),
         )
         logging.info(
@@ -434,6 +439,7 @@ def _start() -> None:
                 config.session_db_path,
                 app.bot_data["pool"],
                 registered_backend_ids=_workshop_registered_backend_ids(config),
+                runtime_profiles=runtime_profiles,
             )
             app.bot_data["workshop_private_text_execution"] = private_text_execution
             logging.info("Workshop private-text execution is ready")

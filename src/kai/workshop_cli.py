@@ -42,6 +42,7 @@ from kai.workshop.runtime_assignments import (
     WorkshopRuntimeAssignmentError,
     WorkshopRuntimeAssignmentService,
 )
+from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError, WorkshopRuntimeProfileRegistry
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.telegram_delivery import (
     TelegramWorkOutcome,
@@ -112,6 +113,10 @@ def _parser() -> argparse.ArgumentParser:
     provision.add_argument("--display-name", required=True)
     provision.add_argument("--role", required=True, choices=("admin", "member"))
     provision.add_argument("--workshop-id")
+    client_actions.add_parser(
+        "list-runtime-profiles",
+        help="list protected transport-neutral runtime profiles",
+    )
     assign_runtime = client_actions.add_parser(
         "assign-runtime",
         help="assign one protected runtime profile to a human's direct-channel agent",
@@ -247,13 +252,18 @@ async def _run(args: argparse.Namespace) -> int:
                 print("Transport access: not assigned")
                 print("Runtime access: not assigned")
                 return 0
+            if args.action == "list-runtime-profiles":
+                profiles = WorkshopRuntimeProfileRegistry.from_config(load_config()).profiles
+                for profile in profiles:
+                    print(f"Runtime profile: {profile.profile_id}")
+                    print(f"Configured user: {profile.display_name}")
+                    print(f"OS user: {profile.os_user or 'Kai service account'}")
+                    print(f"Backend: {profile.backend}")
+                    print(f"Provider: {profile.provider}")
+                return 0
             if args.action == "assign-runtime":
-                configured_profiles = {str(user.telegram_id) for user in load_config().user_configs.values()}
-                if args.runtime_profile_id not in configured_profiles:
-                    raise WorkshopRuntimeAssignmentError(
-                        "Runtime profile is not present in protected configured-user policy"
-                    )
-                assignment = await WorkshopRuntimeAssignmentService(store).assign(
+                profiles = WorkshopRuntimeProfileRegistry.from_config(load_config())
+                assignment = await WorkshopRuntimeAssignmentService(store, profiles).assign(
                     _principal_id(args.principal_id),
                     _channel_id(args.channel_id),
                     args.runtime_profile_id,
@@ -393,6 +403,8 @@ def cli(args: list[str]) -> None:
         raise SystemExit(f"Workshop human provisioning failed: {exc}") from exc
     except WorkshopRuntimeAssignmentError as exc:
         raise SystemExit(f"Workshop runtime assignment failed: {exc}") from exc
+    except WorkshopRuntimeProfileError as exc:
+        raise SystemExit(f"Workshop runtime profile failed: {exc}") from exc
     except (DeliveryQualificationError, DeliveryTargetNotFoundError) as exc:
         if parsed.command == "client-access":
             raise SystemExit(f"Workshop client access failed: {exc}") from exc

@@ -14,6 +14,7 @@ from kai.workshop.execution_coordinator import (
     CanonicalExecutionResult,
 )
 from kai.workshop.inbound import ClientInboundMessage
+from tests.workshop_profiles import profile_id
 
 
 def _message() -> ClientInboundMessage:
@@ -32,7 +33,7 @@ async def test_completed_client_command_preserves_history_session_and_memory(
     message = _message()
     run_id = RunId.new()
     accepted = SimpleNamespace(
-        runtime_profile_id="101",
+        runtime_profile_id=profile_id(101),
         command=SimpleNamespace(disposition=ConversationCommandDisposition.NEWLY_ACCEPTED),
         run=SimpleNamespace(run_id=run_id),
     )
@@ -49,6 +50,7 @@ async def test_completed_client_command_preserves_history_session_and_memory(
     execution = SimpleNamespace(
         accept_client=AsyncMock(return_value=accepted),
         execute=AsyncMock(return_value=execution_result),
+        runtime_config_id=Mock(return_value=101),
     )
     config = SimpleNamespace(
         get_user_config=lambda chat_id: SimpleNamespace(os_user="daniel") if chat_id == 101 else None
@@ -66,6 +68,7 @@ async def test_completed_client_command_preserves_history_session_and_memory(
     assert result.execution is execution_result
     execution.accept_client.assert_awaited_once_with(message)
     execution.execute.assert_awaited_once_with(run_id)
+    execution.runtime_config_id.assert_called_once_with(profile_id(101))
     assert log.call_args_list == [
         call(
             direction="user",
@@ -97,12 +100,13 @@ async def test_terminal_replay_does_not_duplicate_compatibility_writes(monkeypat
     message = _message()
     run_id = RunId.new()
     accepted = SimpleNamespace(
-        runtime_profile_id="101",
+        runtime_profile_id=profile_id(101),
         command=SimpleNamespace(disposition=ConversationCommandDisposition.TERMINAL_REPLAY),
         run=SimpleNamespace(run_id=run_id),
     )
     execution = SimpleNamespace(
         accept_client=AsyncMock(return_value=accepted),
+        runtime_config_id=Mock(return_value=101),
         execute=AsyncMock(
             return_value=CanonicalExecutionResult(
                 CanonicalExecutionDisposition.TERMINAL_REPLAY,

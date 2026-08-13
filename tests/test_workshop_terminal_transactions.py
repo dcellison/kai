@@ -35,6 +35,7 @@ from kai.workshop.terminal_transactions import (
     TerminalTransactionStateConflictError,
     WorkshopRunTerminalTransactionCoordinator,
 )
+from tests.workshop_profiles import profile_id
 
 _NOW = datetime(2026, 8, 12, 21, 0, tzinfo=UTC)
 
@@ -52,7 +53,7 @@ async def _started_run(
                 transport="telegram",
                 external_subject="101",
                 external_channel_id="101",
-                runtime_profile_id="101",
+                runtime_profile_id=profile_id(101),
             ),
         ),
     )
@@ -102,7 +103,7 @@ async def _started_client_run(
                 transport="telegram",
                 external_subject="101",
                 external_channel_id="101",
-                runtime_profile_id="101",
+                runtime_profile_id=profile_id(101),
             ),
         ),
     )
@@ -152,7 +153,7 @@ async def _started_workshop_only_client_run(
                 transport="desktop",
                 external_subject="desktop-human",
                 external_channel_id="desktop-human",
-                runtime_profile_id="101",
+                runtime_profile_id=profile_id(101),
             ),
         ),
     )

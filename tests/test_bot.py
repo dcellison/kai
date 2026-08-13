@@ -3786,7 +3786,7 @@ class TestHandleResponse:
             ),
             model="sonnet",
             _pool=pool,
-            _legacy_pool_key=12345,
+            _runtime_config_id=12345,
         )
 
     @pytest.mark.asyncio

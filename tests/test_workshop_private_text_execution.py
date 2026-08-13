@@ -19,6 +19,7 @@ from kai.workshop.inbound import InboundMessage
 from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
 from kai.workshop.run_lifecycle import RunStatus
 from kai.workshop.store import WorkshopEventStore
+from tests.workshop_profiles import profile_id, profile_registry
 
 _NOW = datetime(2026, 1, 1, 23, 0, tzinfo=UTC)
 
@@ -64,7 +65,7 @@ async def _foundation(database: Path) -> None:
                     transport="telegram",
                     external_subject="101",
                     external_channel_id="101",
-                    runtime_profile_id="101",
+                    runtime_profile_id=profile_id(101),
                 ),
             ),
         )
@@ -94,6 +95,7 @@ async def test_owner_accepts_executes_and_atomically_enqueues_terminal_reply(tmp
         database,
         pool,  # type: ignore[arg-type]
         registered_backend_ids=frozenset({"codex"}),
+        runtime_profiles=profile_registry(101),
     )
     observed: list[str] = []
     try:
@@ -136,6 +138,7 @@ async def test_owner_routes_stop_to_exact_active_runtime_and_terminal_cancellati
         database,
         pool,  # type: ignore[arg-type]
         registered_backend_ids=frozenset({"codex"}),
+        runtime_profiles=profile_registry(101),
     )
     try:
         accepted = await service.accept(_message())

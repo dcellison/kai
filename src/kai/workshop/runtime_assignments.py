@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -12,13 +11,13 @@ from kai.workshop.domain import (
     EventEnvelope,
     PrincipalId,
     RuntimeAssignmentId,
+    RuntimeProfileId,
     WorkshopEventType,
     WorkshopId,
 )
 from kai.workshop.projection import CanonicalConversationProjection
+from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError, WorkshopRuntimeProfileRegistry
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
-
-_RUNTIME_PROFILE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 class WorkshopRuntimeAssignmentError(RuntimeError):
@@ -32,16 +31,15 @@ class WorkshopRuntimeAssignment:
     principal_id: PrincipalId
     channel_id: ChannelId
     agent_id: AgentId
-    runtime_profile_id: str
+    runtime_profile_id: RuntimeProfileId
     created: bool
 
 
-def normalize_runtime_profile_id(value: object) -> str:
-    if not isinstance(value, str) or not _RUNTIME_PROFILE_PATTERN.fullmatch(value):
-        raise WorkshopRuntimeAssignmentError(
-            "Runtime profile ID must contain 1 through 128 bounded identifier characters"
-        )
-    return value
+def normalize_runtime_profile_id(value: object) -> RuntimeProfileId:
+    try:
+        return value if isinstance(value, RuntimeProfileId) else RuntimeProfileId(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise WorkshopRuntimeAssignmentError("Runtime profile ID must be an opaque rtp_ identifier") from exc
 
 
 def runtime_assignment_envelope(
@@ -50,7 +48,7 @@ def runtime_assignment_envelope(
     assignment_id: RuntimeAssignmentId,
     channel_id: ChannelId,
     agent_id: AgentId,
-    runtime_profile_id: str,
+    runtime_profile_id: str | RuntimeProfileId,
     occurred_at: datetime,
     idempotency_key: str,
     source: str,
@@ -76,7 +74,7 @@ async def resolve_channel_runtime_profile(
     store: WorkshopEventStore,
     channel_id: ChannelId,
     agent_id: AgentId | None = None,
-) -> tuple[AgentId, str]:
+) -> tuple[AgentId, RuntimeProfileId]:
     """Resolve exactly one explicit runtime assignment for a channel agent."""
     if not isinstance(channel_id, ChannelId):
         raise WorkshopRuntimeAssignmentError("channel_id must be a ChannelId")
@@ -102,37 +100,26 @@ async def resolve_channel_runtime_profile(
     return AgentId(str(rows[0][0])), normalize_runtime_profile_id(str(rows[0][1]))
 
 
-def compatibility_user_id(runtime_profile_id: str) -> int:
-    """Adapt a protected profile ID to the current integer-keyed runtime pool."""
-    normalized = normalize_runtime_profile_id(runtime_profile_id)
-    if not normalized.isascii() or not normalized.isdigit() or normalized.startswith("0"):
-        raise WorkshopRuntimeAssignmentError(
-            "Runtime profile is not compatible with the current integer-keyed host runtime"
-        )
-    value = int(normalized)
-    if value <= 0:
-        raise WorkshopRuntimeAssignmentError(
-            "Runtime profile is not compatible with the current integer-keyed host runtime"
-        )
-    return value
-
-
 class WorkshopRuntimeAssignmentService:
     """Grant a canonical channel agent one protected runtime profile."""
 
-    def __init__(self, store: WorkshopEventStore) -> None:
+    def __init__(self, store: WorkshopEventStore, profiles: WorkshopRuntimeProfileRegistry) -> None:
         self._store = store
+        self._profiles = profiles
 
     async def assign(
         self,
         principal_id: PrincipalId,
         channel_id: ChannelId,
-        runtime_profile_id: str,
+        runtime_profile_id: str | RuntimeProfileId,
     ) -> WorkshopRuntimeAssignment:
         if not isinstance(principal_id, PrincipalId) or not isinstance(channel_id, ChannelId):
             raise WorkshopRuntimeAssignmentError("Canonical principal and channel IDs are required")
         normalized_profile = normalize_runtime_profile_id(runtime_profile_id)
-        compatibility_user_id(normalized_profile)
+        try:
+            self._profiles.resolve(normalized_profile)
+        except WorkshopRuntimeProfileError as exc:
+            raise WorkshopRuntimeAssignmentError(str(exc)) from exc
         connection = self._store.connection
         try:
             await connection.execute("BEGIN IMMEDIATE")

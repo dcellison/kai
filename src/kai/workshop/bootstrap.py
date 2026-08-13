@@ -20,6 +20,7 @@ from kai.workshop.domain import (
     OpaqueId,
     PrincipalId,
     RuntimeAssignmentId,
+    RuntimeProfileId,
     WorkshopEventType,
     WorkshopId,
     WorkshopMembershipId,
@@ -38,7 +39,7 @@ class BootstrapHuman:
     transport: str
     external_subject: str
     external_channel_id: str
-    runtime_profile_id: str | None = None
+    runtime_profile_id: RuntimeProfileId | None = None
 
     def __post_init__(self) -> None:
         if not self.display_name.strip():
@@ -51,14 +52,8 @@ class BootstrapHuman:
             raise ValueError("external_subject must be non-empty")
         if not self.external_channel_id.strip():
             raise ValueError("external_channel_id must be non-empty")
-        if self.runtime_profile_id is not None and not self.runtime_profile_id.strip():
-            raise ValueError("runtime_profile_id must be non-empty when provided")
-        if self.runtime_profile_id is not None and (
-            not self.runtime_profile_id.isascii()
-            or not self.runtime_profile_id.isdigit()
-            or self.runtime_profile_id.startswith("0")
-        ):
-            raise ValueError("runtime_profile_id must identify a positive integer-keyed configured runtime")
+        if self.runtime_profile_id is not None and not isinstance(self.runtime_profile_id, RuntimeProfileId):
+            raise ValueError("runtime_profile_id must be an opaque RuntimeProfileId")
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,20 +309,39 @@ async def bootstrap_default_workshop(
             payload={"channel_id": channel_id, "agent_id": agent_id},
         )
         if human.runtime_profile_id is not None:
-            await ensure(
-                idempotency_key=_idempotency_key("runtime-assignment", channel_token),
-                event_type=WorkshopEventType.RUNTIME_PROFILE_ASSIGNED,
-                aggregate_type="runtime_assignment",
-                aggregate_id=RuntimeAssignmentId.derived(
-                    channel_id,
-                    f"runtime-profile:{agent_id}",
-                ),
-                payload={
-                    "channel_id": channel_id,
-                    "agent_id": agent_id,
-                    "runtime_profile_id": human.runtime_profile_id,
-                },
+            assignment_id = RuntimeAssignmentId.derived(channel_id, f"runtime-profile:{agent_id}")
+            previous_key = _idempotency_key("runtime-assignment", channel_token)
+            assignment_key = _idempotency_key("runtime-assignment-v2", channel_token)
+            reassignment_key = _idempotency_key(
+                "runtime-reassignment-v2",
+                f"{channel_token}:{human.runtime_profile_id}",
             )
+            if await store.event_by_idempotency_key(assignment_key) is not None or await store.event_by_idempotency_key(reassignment_key) is not None:
+                existing_events += 1
+            elif await store.event_by_idempotency_key(previous_key) is not None:
+                await ensure(
+                    idempotency_key=reassignment_key,
+                    event_type=WorkshopEventType.RUNTIME_PROFILE_REASSIGNED,
+                    aggregate_type="runtime_assignment",
+                    aggregate_id=assignment_id,
+                    payload={
+                        "channel_id": channel_id,
+                        "agent_id": agent_id,
+                        "runtime_profile_id": human.runtime_profile_id,
+                    },
+                )
+            else:
+                await ensure(
+                    idempotency_key=assignment_key,
+                    event_type=WorkshopEventType.RUNTIME_PROFILE_ASSIGNED,
+                    aggregate_type="runtime_assignment",
+                    aggregate_id=assignment_id,
+                    payload={
+                        "channel_id": channel_id,
+                        "agent_id": agent_id,
+                        "runtime_profile_id": human.runtime_profile_id,
+                    },
+                )
 
     for notification in ordered_notifications:
         channel_token = _stable_token(notification.transport, notification.external_channel_id)

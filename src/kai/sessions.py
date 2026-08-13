@@ -74,6 +74,7 @@ from kai.workshop.streaming_preview import (
 
 if TYPE_CHECKING:
     from kai.config import Config, WorkspaceConfig
+    from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
 
 log = logging.getLogger(__name__)
 
@@ -358,13 +359,14 @@ async def record_workshop_inbound_message(message: InboundMessage) -> AppendResu
 
 async def resolve_workshop_conversation_run(
     inbound_message_id: MessageId,
+    runtime_profiles: WorkshopRuntimeProfileRegistry,
 ) -> CompatibilityConversationRunResolution:
     """Resolve one canonical inbound message for transport-neutral execution."""
     if _workshop_event_lock is None:
         raise RuntimeError("Database not initialized - call init_db() first")
     async with _workshop_event_lock:
         store = WorkshopEventStore.from_initialized_connection(_get_db())
-        return await resolve_canonical_conversation_run(store, inbound_message_id)
+        return await resolve_canonical_conversation_run(store, inbound_message_id, runtime_profiles)
 
 
 async def record_workshop_inbound_artifact(

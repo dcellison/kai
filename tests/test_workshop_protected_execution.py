@@ -19,6 +19,7 @@ from kai.workshop.protected_execution import (
 )
 from kai.workshop.run_execution_authority import RunExecutionSelection, WorkshopRunExecutionAuthority
 from kai.workshop.store import WorkshopEventStore
+from tests.workshop_profiles import profile_id, profile_registry
 
 _NOW = datetime(2026, 8, 12, 21, 0, tzinfo=UTC)
 
@@ -34,7 +35,7 @@ async def _accepted_run(path: Path, home: Path):
                 transport="telegram",
                 external_subject="101",
                 external_channel_id="101",
-                runtime_profile_id="101",
+                runtime_profile_id=profile_id(101),
             ),
         ),
     )
@@ -69,14 +70,14 @@ async def _accepted_run(path: Path, home: Path):
             )
         },
     )
-    return store, accepted.run, SubprocessPool(config=config, services_info=[])
+    return store, accepted.run, SubprocessPool(config=config, services_info=[]), profile_registry(101)
 
 
 class TestProtectedExecutionPreparation:
     async def test_resolves_effective_registered_selection_and_hides_transport_key(self, tmp_path: Path):
         home = tmp_path / "home"
         home.mkdir()
-        store, run, pool = await _accepted_run(tmp_path / "kai.db", home)
+        store, run, pool, profiles = await _accepted_run(tmp_path / "kai.db", home)
         try:
             with (
                 patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
@@ -86,6 +87,7 @@ class TestProtectedExecutionPreparation:
                     store,
                     pool,
                     registered_backend_ids=frozenset({"claude"}),
+                    runtime_profiles=profiles,
                 ).prepare(run.run_id)
 
             assert prepared.run == run
@@ -102,7 +104,7 @@ class TestProtectedExecutionPreparation:
     async def test_unregistered_effective_backend_fails_closed(self, tmp_path: Path):
         home = tmp_path / "home"
         home.mkdir()
-        store, run, pool = await _accepted_run(tmp_path / "kai.db", home)
+        store, run, pool, profiles = await _accepted_run(tmp_path / "kai.db", home)
         try:
             with (
                 patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
@@ -113,6 +115,7 @@ class TestProtectedExecutionPreparation:
                     store,
                     pool,
                     registered_backend_ids=frozenset({"codex"}),
+                    runtime_profiles=profiles,
                 ).prepare(run.run_id)
         finally:
             await pool.shutdown()
@@ -121,7 +124,7 @@ class TestProtectedExecutionPreparation:
     async def test_cancellation_pending_run_never_prepares_a_runtime(self, tmp_path: Path):
         home = tmp_path / "home"
         home.mkdir()
-        store, run, pool = await _accepted_run(tmp_path / "kai.db", home)
+        store, run, pool, profiles = await _accepted_run(tmp_path / "kai.db", home)
         try:
             authority = WorkshopRunExecutionAuthority(
                 store,
@@ -141,6 +144,7 @@ class TestProtectedExecutionPreparation:
                     store,
                     pool,
                     registered_backend_ids=frozenset({"claude"}),
+                    runtime_profiles=profiles,
                 ).prepare(run.run_id)
             prepare.assert_not_awaited()
         finally:

@@ -21,13 +21,14 @@ from kai.workshop.human_provisioning import (
 )
 from kai.workshop.inbound import ClientInboundMessage
 from kai.workshop.store import WorkshopEventStore
+from tests.workshop_profiles import profile_id
 
 
 async def _store(path: Path) -> WorkshopEventStore:
     store = await WorkshopEventStore.open(path)
     await bootstrap_default_workshop(
         store,
-        (BootstrapHuman("Alice", "admin", "telegram", "101", "101", "101"),),
+        (BootstrapHuman("Alice", "admin", "telegram", "101", "101", profile_id(101)),),
     )
     return store
 

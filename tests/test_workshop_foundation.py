@@ -22,6 +22,7 @@ from kai.workshop.domain import (
     MessageId,
     PrincipalId,
     RuntimeAssignmentId,
+    RuntimeProfileId,
     WorkshopEventType,
     WorkshopId,
 )
@@ -73,6 +74,7 @@ class TestWorkshopIdentifiers:
             (DeliveryId, "msg_00000000000000000000000000000001"),
             (DeliveryAttemptId, "dlv_00000000000000000000000000000001"),
             (RuntimeAssignmentId, "cag_00000000000000000000000000000001"),
+            (RuntimeProfileId, "101"),
             (EventId, "evt_000000000000000000000000000000011"),
         ],
     )
@@ -94,6 +96,7 @@ class TestEventEnvelope:
             "agent.created",
             "channel.agent_attached",
             "runtime_profile.assigned",
+            "runtime_profile.reassigned",
             "message.created",
             "artifact.created",
             "delivery.requested",

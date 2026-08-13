@@ -17,17 +17,18 @@ from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.runtime_assignments import (
     WorkshopRuntimeAssignmentError,
     WorkshopRuntimeAssignmentService,
-    compatibility_user_id,
     resolve_channel_runtime_profile,
 )
+from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError
 from kai.workshop.store import WorkshopEventStore
+from tests.workshop_profiles import profile_id, profile_registry
 
 
 async def _store(path: Path) -> WorkshopEventStore:
     store = await WorkshopEventStore.open(path)
     await bootstrap_default_workshop(
         store,
-        (BootstrapHuman("Alice", "admin", "telegram", "101", "101", "101"),),
+        (BootstrapHuman("Alice", "admin", "telegram", "101", "101", profile_id(101)),),
     )
     return store
 
@@ -44,17 +45,18 @@ class TestRuntimeAssignmentPolicy:
                 "Charlie",
                 "member",
             )
-            service = WorkshopRuntimeAssignmentService(store)
+            profiles = profile_registry(101, 202)
+            service = WorkshopRuntimeAssignmentService(store, profiles)
 
             assigned = await service.assign(
                 human.principal_id,
                 human.channel_id,
-                "202",
+                profile_id(202),
             )
             retried = await service.assign(
                 human.principal_id,
                 human.channel_id,
-                "202",
+                profile_id(202),
             )
 
             assert assigned.created is True
@@ -62,9 +64,8 @@ class TestRuntimeAssignmentPolicy:
             assert retried.assignment_id == assigned.assignment_id
             assert await resolve_channel_runtime_profile(store, human.channel_id) == (
                 assigned.agent_id,
-                "202",
+                profile_id(202),
             )
-            assert compatibility_user_id("202") == 202
             async with store.connection.execute(
                 "SELECT COUNT(*) FROM external_identities WHERE principal_id = ?",
                 (human.principal_id,),
@@ -83,10 +84,11 @@ class TestRuntimeAssignmentPolicy:
             resolution = await resolve_canonical_conversation_run(
                 store,
                 MessageId(str(accepted.command.message.event.envelope.aggregate_id)),
+                profiles,
             )
 
-            assert accepted.runtime_profile_id == "202"
-            assert resolution._legacy_pool_key == 202
+            assert accepted.runtime_profile_id == profile_id(202)
+            assert resolution._runtime_config_id == 202
         finally:
             await store.close()
 
@@ -106,14 +108,14 @@ class TestRuntimeAssignmentPolicy:
                 "Dana",
                 "member",
             )
-            service = WorkshopRuntimeAssignmentService(store)
+            service = WorkshopRuntimeAssignmentService(store, profile_registry(101, 202))
 
             with pytest.raises(WorkshopRuntimeAssignmentError, match="must own"):
-                await service.assign(charlie.principal_id, dana.channel_id, "202")
+                await service.assign(charlie.principal_id, dana.channel_id, profile_id(202))
 
-            await service.assign(charlie.principal_id, charlie.channel_id, "202")
+            await service.assign(charlie.principal_id, charlie.channel_id, profile_id(202))
             with pytest.raises(WorkshopRuntimeAssignmentError, match="already assigned"):
-                await service.assign(dana.principal_id, dana.channel_id, "202")
+                await service.assign(dana.principal_id, dana.channel_id, profile_id(202))
         finally:
             await store.close()
 
@@ -125,20 +127,20 @@ class TestRuntimeAssignmentPolicy:
                 "Charlie",
                 "member",
             )
-            assigned = await WorkshopRuntimeAssignmentService(store).assign(
+            assigned = await WorkshopRuntimeAssignmentService(store, profile_registry(101, 202)).assign(
                 human.principal_id,
                 human.channel_id,
-                "202",
+                profile_id(202),
             )
             await store.connection.execute("DELETE FROM channel_agent_runtime_assignments")
             await store.connection.commit()
 
             checkpoint = await store.rebuild_projection(CanonicalConversationProjection())
 
-            assert checkpoint.version == 7
+            assert checkpoint.version == 8
             assert await resolve_channel_runtime_profile(store, human.channel_id) == (
                 assigned.agent_id,
-                "202",
+                profile_id(202),
             )
         finally:
             await store.close()
@@ -146,6 +148,12 @@ class TestRuntimeAssignmentPolicy:
 
 class TestRuntimeProfileCompatibilityBoundary:
     @pytest.mark.parametrize("value", ("profile-daniel", "0", "01"))
-    def test_current_host_runtime_rejects_non_integer_profile_keys(self, value: str):
-        with pytest.raises(WorkshopRuntimeAssignmentError, match="integer-keyed"):
-            compatibility_user_id(value)
+    def test_protected_registry_rejects_non_profile_ids(self, value: str):
+        with pytest.raises(WorkshopRuntimeProfileError, match="invalid"):
+            profile_registry(101).resolve(value)
+
+    def test_opaque_profile_does_not_encode_runtime_configuration_key(self):
+        profile = profile_registry(202).resolve(profile_id(202))
+
+        assert profile.profile_id != str(profile.runtime_config_id)
+        assert "202" not in profile.profile_id

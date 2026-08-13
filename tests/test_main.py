@@ -27,6 +27,7 @@ from kai.main import (
     _workshop_bootstrap_notification_channels,
     setup_logging,
 )
+from tests.workshop_profiles import profile_id, profile_registry
 
 
 class TestWorkshopBootstrapMapping:
@@ -42,12 +43,13 @@ class TestWorkshopBootstrapMapping:
             }
         )
 
-        humans = _workshop_bootstrap_humans(config)
+        humans = _workshop_bootstrap_humans(config, profile_registry(101))
 
         assert len(humans) == 1
         assert humans[0].external_subject == "101"
         assert humans[0].external_channel_id == "101"
         assert humans[0].role == "admin"
+        assert humans[0].runtime_profile_id == profile_id(101)
         assert "-999" not in repr(humans)
 
     async def test_effective_negative_destinations_become_deduplicated_notification_channels(self):
