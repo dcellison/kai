@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 from kai.workshop.domain import (
@@ -20,6 +20,7 @@ from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import AppendResult, WorkshopEventStore
 
 _TRANSPORT_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
+_CLIENT_MESSAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 class InboundBindingNotFoundError(LookupError):
@@ -45,6 +46,31 @@ class InboundMessage:
                 raise ValueError(f"{field_name} must be non-empty without surrounding whitespace")
         if not self.body:
             raise ValueError("body must be non-empty")
+        if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
+            raise ValueError("occurred_at must be timezone-aware")
+
+
+@dataclass(frozen=True, slots=True)
+class ClientInboundMessage:
+    """One browser command after session authentication and authorization."""
+
+    principal_id: PrincipalId
+    channel_id: ChannelId
+    client_message_id: str
+    body: str
+    occurred_at: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.principal_id, PrincipalId):
+            raise ValueError("principal_id must be a PrincipalId")
+        if not isinstance(self.channel_id, ChannelId):
+            raise ValueError("channel_id must be a ChannelId")
+        if not _CLIENT_MESSAGE_ID_PATTERN.fullmatch(self.client_message_id):
+            raise ValueError("client_message_id must be a bounded opaque identifier")
+        if not isinstance(self.body, str) or not self.body.strip():
+            raise ValueError("body must contain non-whitespace text")
+        if len(self.body) > 50_000:
+            raise ValueError("body must be at most 50000 characters")
         if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
             raise ValueError("occurred_at must be timezone-aware")
 
@@ -125,6 +151,57 @@ def _inbound_envelope(binding: _ResolvedInboundBinding, message: InboundMessage)
     )
 
 
+async def _resolve_client_binding(
+    store: WorkshopEventStore,
+    message: ClientInboundMessage,
+) -> _ResolvedInboundBinding:
+    async with store.connection.execute(
+        "SELECT c.workshop_id FROM channels c "
+        "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.principal_id = ? "
+        "JOIN workshop_memberships wm ON wm.workshop_id = c.workshop_id "
+        "AND wm.principal_id = cm.principal_id "
+        "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
+        "WHERE c.id = ?",
+        (message.principal_id, message.channel_id),
+    ) as cursor:
+        rows = list(await cursor.fetchall())
+    if len(rows) != 1:
+        raise InboundBindingNotFoundError("Client principal is not an authorized human channel member")
+    return _ResolvedInboundBinding(
+        workshop_id=WorkshopId(str(rows[0][0])),
+        principal_id=message.principal_id,
+        channel_id=message.channel_id,
+    )
+
+
+def _client_inbound_envelope(
+    binding: _ResolvedInboundBinding,
+    message: ClientInboundMessage,
+) -> EventEnvelope:
+    stable_name = f"client-message:{message.principal_id}:{message.channel_id}:{message.client_message_id}"
+    message_id = MessageId.derived(binding.workshop_id, stable_name)
+    return EventEnvelope.create(
+        event_id=EventId.derived(binding.workshop_id, f"client-message-event:{message_id}"),
+        event_type=WorkshopEventType.MESSAGE_CREATED,
+        event_version=1,
+        workshop_id=binding.workshop_id,
+        aggregate_type="message",
+        aggregate_id=message_id,
+        actor_principal_id=binding.principal_id,
+        occurred_at=message.occurred_at,
+        idempotency_key=f"workshop-client-message:v1:{message_id}",
+        payload={
+            "channel_id": binding.channel_id,
+            "author_principal_id": binding.principal_id,
+            "body": message.body,
+        },
+        metadata={
+            "source": "workshop_client",
+            "client_message_id": message.client_message_id,
+        },
+    )
+
+
 async def record_inbound_message_in_transaction(
     store: WorkshopEventStore,
     message: InboundMessage,
@@ -134,6 +211,28 @@ async def record_inbound_message_in_transaction(
         raise RuntimeError("record_inbound_message_in_transaction requires an active transaction")
     binding = await _resolve_binding(store, message)
     result = await store.append_in_transaction(_inbound_envelope(binding, message))
+    await store.project_pending_in_transaction(CanonicalConversationProjection())
+    return result
+
+
+async def record_client_inbound_message_in_transaction(
+    store: WorkshopEventStore,
+    message: ClientInboundMessage,
+) -> AppendResult:
+    """Append an authenticated client message inside a caller-owned transaction."""
+    if not store.connection.in_transaction:
+        raise RuntimeError("record_client_inbound_message_in_transaction requires an active transaction")
+    binding = await _resolve_client_binding(store, message)
+    envelope = _client_inbound_envelope(binding, message)
+    if envelope.idempotency_key is None:
+        raise RuntimeError("Client message envelope did not define an idempotency key")
+    existing = await store.event_by_idempotency_key(envelope.idempotency_key)
+    if existing is not None:
+        envelope = _client_inbound_envelope(
+            binding,
+            replace(message, occurred_at=existing.envelope.occurred_at),
+        )
+    result = await store.append_in_transaction(envelope)
     await store.project_pending_in_transaction(CanonicalConversationProjection())
     return result
 

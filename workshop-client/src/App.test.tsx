@@ -9,6 +9,7 @@ import {
   loadTimeline,
   redeemEnrollment,
   streamTimeline,
+  submitCommand,
 } from "./api";
 import type { TimelineMessage } from "./types";
 
@@ -19,6 +20,7 @@ vi.mock("./api", async (importOriginal) => {
     loadTimeline: vi.fn(),
     redeemEnrollment: vi.fn(),
     streamTimeline: vi.fn(),
+    submitCommand: vi.fn(),
   };
 });
 
@@ -47,6 +49,13 @@ describe("Workshop React client", () => {
     vi.mocked(loadTimeline).mockResolvedValue({
       messages: [historyMessage],
       throughPosition: 25,
+    });
+    vi.mocked(submitCommand).mockResolvedValue({
+      acceptance: "newly_accepted",
+      execution: "completed",
+      messageId: "msg_00000000000000000000000000000030",
+      runId: "run_00000000000000000000000000000030",
+      runStatus: "completed",
     });
     vi.mocked(streamTimeline).mockImplementation(
       async (_session, _position, streamHandlers, signal) => {
@@ -133,5 +142,45 @@ describe("Workshop React client", () => {
       expect(screen.getByLabelText("Enrollment token")).toBeVisible(),
     );
     expect(sessionStorage.getItem("kai.workshop.read-session.v1")).toBeNull();
+  });
+
+  it("submits from the composer and reuses the command identity on retry", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    vi.spyOn(globalThis.crypto, "randomUUID").mockReturnValue(
+      "00000000-0000-4000-8000-000000000001",
+    );
+    vi.mocked(submitCommand)
+      .mockRejectedValueOnce(new Error("Backend temporarily unavailable."))
+      .mockResolvedValueOnce({
+        acceptance: "ready_replay",
+        execution: "completed",
+        messageId: "msg_00000000000000000000000000000030",
+        runId: "run_00000000000000000000000000000030",
+        runStatus: "completed",
+      });
+    render(<App />);
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+
+    await user.type(screen.getByLabelText("Message Kai"), "Hello from Workshop");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Backend temporarily unavailable.",
+    );
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(submitCommand).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(submitCommand).mock.calls[0]).toEqual([
+      { channelId, token: "existing-session" },
+      "00000000-0000-4000-8000-000000000001",
+      "Hello from Workshop",
+    ]);
+    expect(vi.mocked(submitCommand).mock.calls[1]).toEqual(
+      vi.mocked(submitCommand).mock.calls[0],
+    );
+    expect(screen.getByLabelText("Message Kai")).toHaveValue("");
   });
 });

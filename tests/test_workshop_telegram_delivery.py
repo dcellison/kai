@@ -41,6 +41,7 @@ from kai.workshop.outbound import OutboundMessage, record_outbound_message
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.telegram_delivery import (
+    WORKSHOP_CLIENT_TEXT_MODE,
     TelegramDeliveryContractError,
     TelegramDeliveryFailure,
     TelegramWorkOutcome,
@@ -72,6 +73,7 @@ def _claim(
         purpose=QUALIFICATION_PURPOSE,
         execution_contract=SEND_FRAGMENTS_CONTRACT,
         authority_epoch_id=None,
+        author_display_name="Workshop Human",
         body=body,
         lease_expires_at=_NOW + timedelta(seconds=30),
     )
@@ -249,6 +251,23 @@ class TestWorkshopTelegramDeliveryAdapter:
             parse_mode=ParseMode.MARKDOWN,
         )
 
+    async def test_workshop_client_message_is_attributed_before_telegram_delivery(self):
+        bot = _successful_bot()
+        claim = _claim(mode=WORKSHOP_CLIENT_TEXT_MODE, body="Hello from the browser")
+
+        assert (
+            await WorkshopTelegramDeliveryAdapter(bot).deliver_fragment(
+                claim,
+                _fragment(claim, body="Workshop Human via Workshop:\nHello from the browser"),
+            )
+            == 1001
+        )
+
+        bot.send_message.assert_awaited_once_with(
+            chat_id=101,
+            text="Workshop Human via Workshop:\nHello from the browser",
+        )
+
     async def test_send_only_adapter_rejects_edit_operation_without_calling_telegram(self):
         bot = _successful_bot()
         claim = _claim()
@@ -361,6 +380,43 @@ class TestWorkshopTelegramDeliveryAdapter:
 
 
 class TestWorkshopTelegramDeliveryWorker:
+    async def test_client_mode_worker_delivers_attributed_human_echo(self, tmp_path: Path):
+        store, _, _ = await _open_with_outbound(tmp_path / "kai.db")
+        async with store.connection.execute(
+            "SELECT m.id, cb.id FROM messages m "
+            "JOIN channel_bindings cb ON cb.channel_id = m.channel_id "
+            "AND cb.transport = 'telegram' WHERE m.body = 'Hello'"
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        delivery_id = await _request(
+            store,
+            MessageId(str(row[0])),
+            ChannelBindingId(str(row[1])),
+            mode=WORKSHOP_CLIENT_TEXT_MODE,
+            purpose=CONVERSATION_REPLY_PURPOSE,
+        )
+        bot = _successful_bot()
+        worker = WorkshopTelegramDeliveryWorker(
+            WorkshopDeliveryOutbox(store),
+            WorkshopDeliveryFragments(store),
+            WorkshopTelegramDeliveryAdapter(bot),
+            worker_id="workshop-client-message-worker",
+            purpose=CONVERSATION_REPLY_PURPOSE,
+            modes=(WORKSHOP_CLIENT_TEXT_MODE,),
+        )
+        try:
+            result = await worker.run_once()
+
+            assert result.outcome == TelegramWorkOutcome.SUCCEEDED
+            assert result.delivery_id == delivery_id
+            bot.send_message.assert_awaited_once_with(
+                chat_id=101,
+                text="Authorized Human via Workshop:\nHello",
+            )
+        finally:
+            await store.close()
+
     async def test_qualification_worker_cannot_drain_conversation_work(self, tmp_path: Path):
         store, message_id, binding_id = await _open_with_outbound(tmp_path / "kai.db")
         delivery_id = await _request(

@@ -20,6 +20,14 @@ export interface TimelineSnapshot {
   throughPosition: number;
 }
 
+export interface CommandSubmissionResult {
+  acceptance: string;
+  execution: string;
+  messageId: string;
+  runId: string;
+  runStatus: string;
+}
+
 export type ConnectionTone = "connected" | "connecting" | "disconnected";
 
 export interface ConnectionState {

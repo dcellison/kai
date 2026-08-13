@@ -1,4 +1,4 @@
-"""Authenticated HTTP contracts for Workshop enrollment and read-only synchronization."""
+"""Authenticated HTTP contracts for Workshop enrollment and conversation access."""
 
 from __future__ import annotations
 
@@ -16,9 +16,13 @@ from typing import Protocol
 from aiohttp import web
 
 from kai.workshop.authorization import CanonicalChannelAuthorizer
+from kai.workshop.client_commands import ClientCommandResult
 from kai.workshop.client_sessions import EnrollmentGrantUnavailableError, WorkshopClientEnrollmentManager
+from kai.workshop.conversation_commands import ConversationCommandAcceptanceError
 from kai.workshop.domain import ChannelId, PrincipalId
-from kai.workshop.store import WorkshopEventStore
+from kai.workshop.execution_coordinator import CanonicalExecutionDisposition
+from kai.workshop.inbound import ClientInboundMessage, InboundBindingNotFoundError
+from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
 from kai.workshop.timeline import (
     TimelineAccessDeniedError,
     TimelineCursorError,
@@ -32,9 +36,11 @@ from kai.workshop.timeline import (
 _TIMELINE_PATH = "/v1/channels/{channel_id}/timeline"
 _TIMELINE_EVENTS_PATH = "/v1/channels/{channel_id}/events"
 _ENROLLMENT_REDEMPTION_PATH = "/v1/client/enrollment/redeem"
+_COMMAND_SUBMISSION_PATH = "/v1/channels/{channel_id}/commands"
 _ALLOWED_TIMELINE_QUERY_PARAMETERS = frozenset({"cursor", "limit"})
 _ALLOWED_EVENT_QUERY_PARAMETERS = frozenset({"after_position"})
 _ENROLLMENT_REQUEST_FIELDS = frozenset({"enrollment_token", "device_display_name"})
+_COMMAND_REQUEST_FIELDS = frozenset({"client_message_id", "body"})
 _DECIMAL_INTEGER = re.compile(r"^[0-9]+$")
 _EVENT_BATCH_SIZE = 100
 _SSE_RETRY_MILLISECONDS = 2000
@@ -44,6 +50,10 @@ class WorkshopClientAuthenticator(Protocol):
     """Resolve a human Workshop principal from a client request."""
 
     async def authenticate(self, request: web.Request) -> PrincipalId | None: ...
+
+
+class WorkshopClientCommandSubmitter(Protocol):
+    async def submit(self, message: ClientInboundMessage) -> ClientCommandResult: ...
 
 
 class WorkshopEnrollmentRateLimiter:
@@ -507,6 +517,95 @@ async def _handle_enrollment_redemption(
     )
 
 
+async def _handle_command_submission(
+    request: web.Request,
+    *,
+    store: WorkshopEventStore,
+    authenticator: WorkshopClientAuthenticator,
+    submitter: WorkshopClientCommandSubmitter,
+    request_lock: asyncio.Lock,
+) -> web.Response:
+    """Authenticate, authorize, accept, and execute one canonical command."""
+    async with request_lock:
+        principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(
+            status=401,
+            code="authentication_required",
+            message="Authentication required",
+        )
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    if request.content_type != "application/json":
+        return _error_response(
+            status=415,
+            code="unsupported_media_type",
+            message="Content-Type must be application/json",
+        )
+    try:
+        channel_id = ChannelId(request.match_info["channel_id"])
+        payload = await request.json()
+    except (UnicodeDecodeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid command request")
+    if not isinstance(payload, dict) or set(payload) != _COMMAND_REQUEST_FIELDS:
+        return _error_response(status=400, code="invalid_request", message="Invalid command request")
+    client_message_id = payload["client_message_id"]
+    body = payload["body"]
+    if not isinstance(client_message_id, str) or not isinstance(body, str):
+        return _error_response(status=400, code="invalid_request", message="Invalid command request")
+
+    async with request_lock:
+        authorized = await CanonicalChannelAuthorizer(store).can_submit_command(principal_id, channel_id)
+    if not authorized:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+
+    try:
+        command = ClientInboundMessage(
+            principal_id=principal_id,
+            channel_id=channel_id,
+            client_message_id=client_message_id,
+            body=body,
+            occurred_at=datetime.now(UTC),
+        )
+    except (TypeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid command request")
+
+    try:
+        result = await submitter.submit(command)
+    except IdempotencyConflictError:
+        return _error_response(
+            status=409,
+            code="idempotency_conflict",
+            message="Command identity conflicts with an existing request",
+        )
+    except (ConversationCommandAcceptanceError, InboundBindingNotFoundError):
+        return _error_response(
+            status=409,
+            code="command_state_conflict",
+            message="Command could not be accepted in the current channel state",
+        )
+
+    if result.execution.disposition == CanonicalExecutionDisposition.PREPARATION_DEFERRED:
+        response = _error_response(
+            status=503,
+            code="execution_deferred",
+            message="Kai could not safely prepare this request; retry the same command",
+        )
+        response.headers["Retry-After"] = "2"
+        return response
+    return _json_response(
+        {
+            "version": 1,
+            "message_id": str(result.acceptance.command.message.event.envelope.aggregate_id),
+            "run_id": str(result.acceptance.run.run_id),
+            "acceptance": result.acceptance.command.disposition.value,
+            "execution": result.execution.disposition.value,
+            "run_status": result.execution.run.status.value,
+        },
+        status=200,
+    )
+
+
 def register_workshop_read_routes(
     app: web.Application,
     *,
@@ -565,3 +664,25 @@ def register_workshop_enrollment_routes(
         )
 
     app.router.add_post(_ENROLLMENT_REDEMPTION_PATH, handle_enrollment_redemption)
+
+
+def register_workshop_command_routes(
+    app: web.Application,
+    *,
+    store: WorkshopEventStore,
+    authenticator: WorkshopClientAuthenticator,
+    submitter: WorkshopClientCommandSubmitter,
+    request_lock: asyncio.Lock,
+) -> None:
+    """Register the authenticated command boundary on a supplied application."""
+
+    async def handle_command_submission(request: web.Request) -> web.Response:
+        return await _handle_command_submission(
+            request,
+            store=store,
+            authenticator=authenticator,
+            submitter=submitter,
+            request_lock=request_lock,
+        )
+
+    app.router.add_post(_COMMAND_SUBMISSION_PATH, handle_command_submission)

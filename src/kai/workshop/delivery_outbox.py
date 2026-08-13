@@ -146,6 +146,7 @@ class DeliveryClaim:
     purpose: DeliveryPurpose
     execution_contract: DeliveryExecutionContract
     authority_epoch_id: DeliveryAuthorityEpochId | None
+    author_display_name: str
     body: str
     lease_expires_at: datetime
 
@@ -416,10 +417,15 @@ class WorkshopDeliveryOutbox:
                 "NOT EXISTS ("
                 "SELECT 1 FROM delivery_outbox predecessor "
                 "WHERE predecessor.channel_binding_id = o.channel_binding_id "
-                "AND predecessor.purpose = o.purpose "
-                "AND predecessor.authority_epoch_id IS o.authority_epoch_id "
                 "AND predecessor.requested_event_position < o.requested_event_position "
                 "AND predecessor.status NOT IN ('succeeded', 'failed')"
+                "AND ((predecessor.purpose = o.purpose "
+                "AND predecessor.authority_epoch_id IS o.authority_epoch_id) "
+                "OR (o.purpose = 'conversation_reply' "
+                "AND o.execution_contract = 'streaming_finalization' "
+                "AND predecessor.purpose = 'conversation_reply' "
+                "AND predecessor.execution_contract = 'send_fragments' "
+                "AND predecessor.mode = 'workshop_client_text'))"
                 ")",
             ]
             parameters: list[object] = [now_text]
@@ -451,9 +457,10 @@ class WorkshopDeliveryOutbox:
             async with connection.execute(
                 "SELECT o.id, o.workshop_id, o.channel_id, o.channel_binding_id, o.message_id, "
                 "o.transport, o.mode, o.purpose, o.execution_contract, o.authority_epoch_id, o.attempt_count, "
-                "m.body, cb.external_channel_id "
+                "m.body, cb.external_channel_id, p.display_name "
                 "FROM delivery_outbox o "
                 "JOIN messages m ON m.id = o.message_id AND m.channel_id = o.channel_id "
+                "JOIN principals p ON p.id = m.author_principal_id "
                 "JOIN channel_bindings cb ON cb.id = o.channel_binding_id "
                 "AND cb.channel_id = o.channel_id AND cb.transport = o.transport "
                 f"WHERE {' AND '.join(filters)} "
@@ -506,6 +513,7 @@ class WorkshopDeliveryOutbox:
                 purpose=_delivery_purpose(row[7]),
                 execution_contract=_delivery_execution_contract(row[8]),
                 authority_epoch_id=(DeliveryAuthorityEpochId(str(row[9])) if row[9] is not None else None),
+                author_display_name=str(row[13]),
                 body=str(row[11]),
                 external_channel_id=str(row[12]),
                 lease_expires_at=expires_at,

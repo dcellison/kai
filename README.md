@@ -104,10 +104,10 @@ make install-status
 Workshop remains loopback-only by default. To reach its browser client directly
 from a trusted private network, enter one private IPv4 interface address at the
 optional `Workshop LAN address` prompt. Kai then creates a second listener on
-the webhook port containing only the Workshop shell, enrollment, timeline, and
-event-stream routes; internal agent APIs and webhook ingress remain bound to
-loopback. This direct listener uses HTTP, so use a trusted LAN or put a trusted
-TLS terminator in front of it.
+the webhook port containing only the Workshop shell, enrollment, timeline,
+event-stream, and authenticated command-submission routes; internal agent APIs
+and webhook ingress remain bound to loopback. This direct listener uses HTTP,
+so use a trusted LAN or put a trusted TLS terminator in front of it.
 
 Protected mode requires every Telegram user to have a unique `os_user` that differs from the Kai service account; this keeps persistent agents from inheriting the daemon's protected-config capabilities. Single-user mode runs the agent as the operator account.
 

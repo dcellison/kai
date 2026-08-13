@@ -1,4 +1,5 @@
 import type {
+  CommandSubmissionResult,
   TimelineMessage,
   TimelineSnapshot,
   WorkshopSession,
@@ -127,6 +128,44 @@ export async function redeemEnrollment(
     throw new Error(safeErrorMessage(payload, "Enrollment failed."));
   }
   return payload.session.token;
+}
+
+export async function submitCommand(
+  session: WorkshopSession,
+  clientMessageId: string,
+  body: string,
+): Promise<CommandSubmissionResult> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/commands`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ body, client_message_id: clientMessageId }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Kai could not run this command."));
+  }
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    typeof payload.acceptance !== "string" ||
+    typeof payload.execution !== "string" ||
+    typeof payload.message_id !== "string" ||
+    typeof payload.run_id !== "string" ||
+    typeof payload.run_status !== "string"
+  ) {
+    throw new Error("Kai returned an unsupported command response.");
+  }
+  return {
+    acceptance: payload.acceptance,
+    execution: payload.execution,
+    messageId: payload.message_id,
+    runId: payload.run_id,
+    runStatus: payload.run_status,
+  };
 }
 
 export async function loadTimeline(

@@ -11,6 +11,7 @@ import aiosqlite
 import pytest
 
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
 from kai.workshop.delivery_outbox import (
     CONVERSATION_REPLY_PURPOSE,
     QUALIFICATION_PURPOSE,
@@ -535,6 +536,72 @@ class TestDeliveryOutcomes:
 
 
 class TestDeliveryOrdering:
+    async def test_streaming_reply_waits_for_prior_workshop_client_echo(
+        self,
+        tmp_path: Path,
+    ):
+        store, outbound_message_id, binding_id = await _open_with_outbound(tmp_path / "kai.db")
+        async with store.connection.execute("SELECT id FROM messages WHERE body = 'Hello'") as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        inbound_message_id = MessageId(str(row[0]))
+        outbox = WorkshopDeliveryOutbox(store)
+        try:
+            client_echo = await outbox.request_delivery(
+                DeliveryRequest(
+                    message_id=inbound_message_id,
+                    channel_binding_id=binding_id,
+                    mode="workshop_client_text",
+                    purpose=CONVERSATION_REPLY_PURPOSE,
+                    occurred_at=_NOW,
+                )
+            )
+            epoch = (await WorkshopConversationDeliveryAuthority(store).activate()).epoch
+            finalization = await outbox.request_delivery(
+                DeliveryRequest(
+                    message_id=outbound_message_id,
+                    channel_binding_id=binding_id,
+                    mode="text",
+                    purpose=CONVERSATION_REPLY_PURPOSE,
+                    occurred_at=_NOW,
+                    execution_contract=STREAMING_FINALIZATION_CONTRACT,
+                    authority_epoch_id=epoch.epoch_id,
+                )
+            )
+
+            assert (
+                await outbox.claim_next(
+                    "finalization-worker",
+                    purposes=(CONVERSATION_REPLY_PURPOSE,),
+                    execution_contracts=(STREAMING_FINALIZATION_CONTRACT,),
+                    authority_epoch_id=epoch.epoch_id,
+                )
+                is None
+            )
+            echo_claim = await outbox.claim_next(
+                "client-echo-worker",
+                purposes=(CONVERSATION_REPLY_PURPOSE,),
+                modes=("workshop_client_text",),
+            )
+            assert echo_claim is not None
+            assert echo_claim.delivery_id == client_echo.delivery.delivery_id
+            await outbox.mark_failed(
+                echo_claim,
+                retryable=False,
+                error_code="test_terminal_failure",
+            )
+
+            final_claim = await outbox.claim_next(
+                "finalization-worker",
+                purposes=(CONVERSATION_REPLY_PURPOSE,),
+                execution_contracts=(STREAMING_FINALIZATION_CONTRACT,),
+                authority_epoch_id=epoch.epoch_id,
+            )
+            assert final_claim is not None
+            assert final_claim.delivery_id == finalization.delivery.delivery_id
+        finally:
+            await store.close()
+
     async def test_purpose_lanes_do_not_claim_or_block_each_other(self, tmp_path: Path):
         store, first_message_id, binding_id = await _open_with_outbound(tmp_path / "kai.db")
         second_message_id = await _add_outbound(store, 1)

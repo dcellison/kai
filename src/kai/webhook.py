@@ -69,11 +69,14 @@ from kai.internal_api_auth import InternalAPIAuth, InternalAPIPrincipal, Interna
 from kai.job_types import CANONICAL_JOB_TYPES, normalize_job_type
 from kai.telegram_utils import chunk_text
 from kai.workshop.client_api import (
+    WorkshopClientCommandSubmitter,
     WorkshopEnrollmentRateLimiter,
     WorkshopEventStreamLimiter,
+    register_workshop_command_routes,
     register_workshop_enrollment_routes,
     register_workshop_read_routes,
 )
+from kai.workshop.client_commands import WorkshopClientCommandExecutor
 from kai.workshop.client_sessions import (
     WorkshopBearerSessionAuthenticator,
     WorkshopClientEnrollmentManager,
@@ -2434,6 +2437,8 @@ def _register_routes(app: web.Application, config: Config) -> None:
 async def _register_workshop_client_api(
     app: web.Application,
     database: Path,
+    *,
+    command_submitter: WorkshopClientCommandSubmitter | None = None,
 ) -> Callable[[web.Application], None]:
     """Open one client-state connection and return its route registrar.
 
@@ -2471,6 +2476,14 @@ async def _register_workshop_client_api(
                 request_lock=request_lock,
                 event_stream_limiter=event_stream_limiter,
             )
+            if command_submitter is not None:
+                register_workshop_command_routes(
+                    target,
+                    store=store,
+                    authenticator=authenticator,
+                    submitter=command_submitter,
+                    request_lock=request_lock,
+                )
             register_workshop_shell_routes(target)
 
         register(app)
@@ -2574,9 +2587,13 @@ async def start(telegram_app, config) -> None:
                     val,
                 )
     _register_routes(_app, config)
+    private_text_execution = telegram_app.bot_data.get("workshop_private_text_execution")
+    if private_text_execution is None:
+        raise RuntimeError("Workshop private-text execution service is unavailable")
     register_workshop_routes = await _register_workshop_client_api(
         _app,
         Path(config.session_db_path),
+        command_submitter=WorkshopClientCommandExecutor(private_text_execution, config),
     )
 
     _runner = web.AppRunner(_app, access_log=None)

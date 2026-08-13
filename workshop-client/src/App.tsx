@@ -1,6 +1,11 @@
 import { FormEvent, useCallback, useState } from "react";
 
-import { redeemEnrollment } from "./api";
+import {
+  AuthenticationError,
+  ChannelAccessError,
+  redeemEnrollment,
+  submitCommand,
+} from "./api";
 import type {
   ConnectionState,
   TimelineMessage,
@@ -110,7 +115,7 @@ function EnrollmentView({
       <header className="enrollment-brand">
         <span className="brand-mark">K</span>
         <span>Kai Workshop</span>
-        <span className="preview-badge">Read-only preview</span>
+        <span className="preview-badge">Workshop preview</span>
       </header>
 
       <section className="enrollment-layout">
@@ -278,18 +283,47 @@ function WorkshopView({
   connection,
   messages,
   onForget,
+  onSubmitCommand,
 }: {
   channelId: string;
   connection: ConnectionState;
   messages: TimelineMessage[];
   onForget: () => void;
+  onSubmitCommand: (clientMessageId: string, body: string) => Promise<void>;
 }): React.JSX.Element {
+  const [draft, setDraft] = useState("");
+  const [pendingMessageId, setPendingMessageId] = useState<string | null>(null);
+  const [submissionError, setSubmissionError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
   const agentName =
     messages.find((message) => message.authorKind === "agent")
       ?.authorDisplayName || "Agent";
   const humanName =
     messages.find((message) => message.authorKind === "human")
       ?.authorDisplayName || "You";
+
+  const submit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
+    event.preventDefault();
+    const body = draft.trim();
+    if (!body || submitting) {
+      return;
+    }
+    const clientMessageId = pendingMessageId ?? crypto.randomUUID();
+    setPendingMessageId(clientMessageId);
+    setSubmissionError(null);
+    setSubmitting(true);
+    try {
+      await onSubmitCommand(clientMessageId, body);
+      setDraft("");
+      setPendingMessageId(null);
+    } catch (caught) {
+      setSubmissionError(
+        caught instanceof Error ? caught.message : "Kai could not run this command.",
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  };
 
   return (
     <main className="workshop-app">
@@ -308,7 +342,7 @@ function WorkshopView({
             <p className="overline">Kai Workshop</p>
             <h1>Current Workshop</h1>
           </div>
-          <span className="read-only-chip">Read only</span>
+          <span className="read-only-chip">Connected</span>
         </header>
 
         <nav>
@@ -381,11 +415,29 @@ function WorkshopView({
         </div>
 
         <footer className="composer-preview">
-          <div>
-            <span className="composer-plus" aria-hidden="true">+</span>
-            <span>Command submission arrives after its authorization boundary.</span>
-          </div>
-          <span className="composer-mode">Read-only client</span>
+          <form className="composer-form" onSubmit={(event) => void submit(event)}>
+            <textarea
+              aria-label="Message Kai"
+              value={draft}
+              onChange={(event) => {
+                setDraft(event.target.value);
+                if (!submitting) {
+                  setPendingMessageId(null);
+                }
+              }}
+              maxLength={50000}
+              placeholder="Message Kai…"
+              rows={3}
+              disabled={submitting}
+            />
+            <button type="submit" disabled={submitting || !draft.trim()}>
+              {submitting ? "Running…" : "Send"}
+            </button>
+          </form>
+          {submissionError && (
+            <p className="composer-error" role="alert">{submissionError}</p>
+          )}
+          <span className="composer-mode">Canonical Workshop command</span>
         </footer>
       </section>
 
@@ -475,6 +527,22 @@ export default function App(): React.JSX.Element {
     setView("workshop");
   };
 
+  const runCommand = async (clientMessageId: string, body: string): Promise<void> => {
+    if (!session) {
+      throw new Error("Workshop session unavailable.");
+    }
+    try {
+      await submitCommand(session, clientMessageId, body);
+    } catch (caught) {
+      if (caught instanceof AuthenticationError) {
+        forgetSession(caught.message);
+      } else if (caught instanceof ChannelAccessError) {
+        correctChannel(caught.message);
+      }
+      throw caught;
+    }
+  };
+
   if (view === "enrollment") {
     return (
       <EnrollmentView
@@ -494,6 +562,7 @@ export default function App(): React.JSX.Element {
       connection={connection}
       messages={messages}
       onForget={() => forgetSession()}
+      onSubmitCommand={runCommand}
     />
   );
 }

@@ -4,6 +4,7 @@ import {
   EventStreamDecoder,
   loadTimeline,
   redeemEnrollment,
+  submitCommand,
   streamTimeline,
 } from "./api";
 import type { WorkshopSession } from "./types";
@@ -83,6 +84,39 @@ describe("Workshop client API", () => {
       "Bearer session-secret",
     );
     expect(secondRequest[0]).toContain("cursor=next-page");
+  });
+
+  it("submits only the opaque id and body under bearer authority", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      Response.json({
+        version: 1,
+        acceptance: "newly_accepted",
+        execution: "completed",
+        message_id: "msg_00000000000000000000000000000001",
+        run_id: "run_00000000000000000000000000000001",
+        run_status: "completed",
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      submitCommand(session, "browser-command-1", "Hello from Workshop"),
+    ).resolves.toEqual({
+      acceptance: "newly_accepted",
+      execution: "completed",
+      messageId: "msg_00000000000000000000000000000001",
+      runId: "run_00000000000000000000000000000001",
+      runStatus: "completed",
+    });
+    const [path, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(path).toBe(`/v1/channels/${channelId}/commands`);
+    expect(new Headers(options.headers).get("Authorization")).toBe(
+      "Bearer session-secret",
+    );
+    expect(JSON.parse(options.body as string)).toEqual({
+      body: "Hello from Workshop",
+      client_message_id: "browser-command-1",
+    });
   });
 
   it("decodes fragmented event-stream blocks", () => {

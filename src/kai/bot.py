@@ -75,6 +75,12 @@ from kai.config import (
     resolve_user_model,
     validate_model_for_backend,
 )
+from kai.conversation_compatibility import (
+    _pending_memory_tasks as _shared_pending_memory_tasks,
+)
+from kai.conversation_compatibility import (
+    schedule_memory_ingestion,
+)
 from kai.history import LogEntry, log_message
 from kai.locks import get_lock, get_stop_event
 from kai.pool import SubprocessPool
@@ -219,24 +225,8 @@ _QUEUED_MESSAGE_MARKER = (
 # backstop for interactions that run legitimately long with active output.
 _LOCK_ACQUIRE_TIMEOUT = 3600  # 1 hour
 
-
-# Strong references to in-flight memory-ingestion tasks.
-#
-# `asyncio.create_task` returns a Task that the runtime holds only by
-# WEAK reference. Without a strong reference somewhere, a heap-pressure
-# GC cycle can reap a still-running task; the failure mode is silent
-# because the task simply disappears and the exchange never makes it
-# into semantic memory. The set holds a strong reference until the
-# task completes; the done-callback `_pending_memory_tasks.discard`
-# registered at spawn keeps the set self-pruning so a long-running
-# deployment does not accumulate references without bound.
-#
-# Same pattern as `webhook.py`'s `_background_tasks` and
-# `memory_extraction.py`'s `_pending_episode_tasks`. Each module owns
-# its own set so the ownership boundary stays explicit; consolidating
-# into a single global set would obscure which subsystem is responsible
-# for a given task's lifetime.
-_pending_memory_tasks: set[asyncio.Task[None]] = set()
+# Backward-compatible diagnostic/test view of the shared ingestion task owner.
+_pending_memory_tasks = _shared_pending_memory_tasks
 
 
 async def _acquire_lock_or_kill(
@@ -4627,65 +4617,6 @@ async def _check_totp_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return False
 
 
-def _schedule_memory_ingestion(
-    *,
-    prompt: str | list,
-    assistant_text: str,
-    chat_id: int,
-    session_id: str | None,
-    config: Config,
-    workspace: str,
-    user_log: LogEntry | None,
-    assistant_log: LogEntry | None,
-) -> None:
-    """Preserve the existing fire-and-forget semantic-memory write path."""
-    from kai.memory import is_enabled as memory_is_enabled
-
-    if memory_is_enabled():
-
-        async def _ingest_memory() -> None:
-            try:
-                from kai import memory_extraction
-
-                if isinstance(prompt, str):
-                    user_text = prompt
-                else:
-                    user_text = next(
-                        (block["text"] for block in prompt if block.get("type") == "text"),
-                        "",
-                    )
-                if not user_text:
-                    return
-                user_config = config.get_user_config(chat_id)
-                effective_backend = (
-                    user_config.backend if user_config and user_config.backend else config.default_backend
-                )
-                if config.memory_extraction_enabled and effective_backend in ONESHOT_REASONER_BACKENDS:
-                    prior_pairs: list[tuple[str, str]] = []
-                    if config.episode_classifier_context_turns > 0:
-                        from kai.history import get_recent_pairs
-
-                        fetched = get_recent_pairs(chat_id, config.episode_classifier_context_turns + 1)
-                        prior_pairs = fetched[:-1]
-                    await memory_extraction.extract_and_store(
-                        user_text=user_text,
-                        assistant_text=assistant_text,
-                        user_id=str(chat_id),
-                        session_id=session_id,
-                        config=config,
-                        prior_pairs=prior_pairs,
-                        workspace=workspace,
-                        user_log=user_log,
-                        assistant_log=assistant_log,
-                    )
-            except Exception:
-                log.warning("Memory ingestion failed", exc_info=True)
-
-        task = asyncio.create_task(_ingest_memory())
-        _pending_memory_tasks.add(task)
-        task.add_done_callback(_pending_memory_tasks.discard)
-
-
 async def _handle_workshop_private_text(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -4761,7 +4692,7 @@ async def _handle_workshop_private_text(
         reader_user=_upload_reader_user(context, chat_id),
     )
     if result.disposition == CanonicalExecutionDisposition.COMPLETED and result.workspace is not None:
-        _schedule_memory_ingestion(
+        schedule_memory_ingestion(
             prompt=prompt,
             assistant_text=final_text,
             chat_id=chat_id,
@@ -4770,6 +4701,7 @@ async def _handle_workshop_private_text(
             workspace=result.workspace,
             user_log=user_log,
             assistant_log=assistant_log,
+            reasoner_backends=ONESHOT_REASONER_BACKENDS,
         )
 
 
@@ -5308,7 +5240,7 @@ async def _handle_response(
             ingest_workspace = str(await workshop_run.effective_workspace())
         else:
             ingest_workspace = str(await pool.get_effective_workspace(chat_id))
-        _schedule_memory_ingestion(
+        schedule_memory_ingestion(
             prompt=prompt,
             assistant_text=final_text,
             chat_id=chat_id,
@@ -5317,6 +5249,7 @@ async def _handle_response(
             workspace=ingest_workspace,
             user_log=user_log,
             assistant_log=assistant_log,
+            reasoner_backends=ONESHOT_REASONER_BACKENDS,
         )
 
     if workshop_delivery_committed:

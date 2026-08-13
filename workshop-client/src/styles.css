@@ -745,23 +745,52 @@ button:disabled {
   background: var(--atom-bg);
 }
 
-.composer-preview > div {
+.composer-form {
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   gap: 0.65rem;
-  min-height: 2.75rem;
-  border: 1px solid var(--line-strong);
-  border-radius: 0.4rem;
-  padding: 0.55rem 0.75rem;
-  background: var(--atom-bg-deep);
-  color: var(--atom-muted);
-  font-size: 0.76rem;
 }
 
-.composer-plus {
-  color: var(--atom-purple);
-  font-family: var(--mono);
-  font-size: 1.1rem;
+.composer-form textarea {
+  min-height: 3.4rem;
+  max-height: 12rem;
+  flex: 1;
+  resize: vertical;
+  border: 1px solid var(--line-strong);
+  border-radius: 0.4rem;
+  padding: 0.7rem 0.8rem;
+  background: var(--atom-bg-deep);
+  color: var(--atom-foreground);
+  font: 0.82rem/1.5 var(--sans);
+}
+
+.composer-form textarea:focus {
+  border-color: var(--atom-blue);
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(97, 175, 239, 0.12);
+}
+
+.composer-form button {
+  min-width: 5.5rem;
+  border: 1px solid rgba(97, 175, 239, 0.45);
+  border-radius: 0.4rem;
+  padding: 0.7rem 0.85rem;
+  background: rgba(97, 175, 239, 0.14);
+  color: var(--atom-blue);
+  font: 700 0.72rem var(--sans);
+  cursor: pointer;
+}
+
+.composer-form button:disabled,
+.composer-form textarea:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
+
+.composer-error {
+  margin: 0.5rem 0 0;
+  color: var(--atom-red);
+  font-size: 0.7rem;
 }
 
 .composer-mode {

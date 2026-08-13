@@ -361,25 +361,22 @@ class TestRecallReasonField:
 
 class TestExtractionCallSiteGating:
     """Switch-point-5 structural backstop (#434): every call site of
-    `memory_extraction.extract_and_store` in `src/kai/bot.py` must
+    `memory_extraction.extract_and_store` in the shared conversation
+    compatibility writer must
     sit inside an enclosing `if memory_is_enabled() ...:` guard.
 
     The behavioral pair in `test_bot.py::TestHandleResponse`
     exercises the gate with mocks; this test enforces it at the
     AST level so a refactor that adds a SECOND call site OUTSIDE
     the guard fails at CI rather than at runtime under disabled
-    mode. Today there is exactly one call site at
-    `bot.py`'s `_handle_response` post-response path; the test
-    asserts the gating property over every Call node, not just
-    "the one Call we know about."
+    mode. Today there is exactly one call site in
+    `schedule_memory_ingestion`; the test asserts the gating
+    property over every Call node, not just "the one Call we know
+    about."
 
-    Predicate shape note: the production guard is
-    `if memory_is_enabled() and chat_id is not None:`, whose
-    `If.test` is a `BoolOp(op=And(), values=[Call, Compare])`.
-    The Call to memory_is_enabled lives nested inside the
-    BoolOp's values, NOT as the direct `If.test`. The predicate
-    therefore walks `if_node.test` recursively via `ast.walk`
-    rather than comparing `if_node.test` to a Call directly.
+    The predicate walks `if_node.test` recursively via `ast.walk`
+    so the safety contract remains valid if the simple guard later
+    gains another condition.
     """
 
     @staticmethod
@@ -402,10 +399,7 @@ class TestExtractionCallSiteGating:
         expression tree, a `Call` to a name `memory_is_enabled`.
 
         Recursive-walk via `ast.walk(if_node.test)` so the
-        predicate matches the actual production shape
-        `BoolOp(And, [Call(memory_is_enabled), Compare(...)])` from
-        the `if memory_is_enabled() and chat_id is not None:`
-        guard. A direct-test predicate
+        predicate also matches a future compound guard. A direct-test predicate
         (`isinstance(if_node.test, ast.Call) and
         if_node.test.func.id == 'memory_is_enabled'`) would return
         False on this shape and silently miss the gate.
@@ -426,7 +420,7 @@ class TestExtractionCallSiteGating:
         )
 
     def test_every_extract_and_store_call_site_is_inside_is_enabled_guard(self) -> None:
-        """Walk `src/kai/bot.py`'s AST. For every `Call` whose `func`
+        """Walk the compatibility writer's AST. For every `Call` whose `func`
         is an `Attribute` with `attr == "extract_and_store"`, confirm
         that at least one ancestor `If` node has a test containing a
         `Call` to `memory_is_enabled`. Fail with the offending line
@@ -452,21 +446,21 @@ class TestExtractionCallSiteGating:
         polarity by asserting the correct `extract_and_store`
         call_count under each flag value.
         """
-        # Resolve the bot.py source path relative to the test file's
+        # Resolve the production source path relative to the test file's
         # location so the test runs cleanly under any working
         # directory (pytest cwd, IDE runner, CI). `Path(__file__)`
         # is `tests/test_eval_modeswitch.py`; two levels up is the
-        # repo root, then descend into `src/kai/bot.py`.
-        bot_py = Path(__file__).parent.parent / "src" / "kai" / "bot.py"
-        assert bot_py.exists(), f"expected bot.py at {bot_py}"
+        # repo root, then descend into the shared compatibility writer.
+        source_path = Path(__file__).parent.parent / "src" / "kai" / "conversation_compatibility.py"
+        assert source_path.exists(), f"expected compatibility writer at {source_path}"
 
-        tree = ast.parse(bot_py.read_text())
+        tree = ast.parse(source_path.read_text())
         self._attach_parents(tree)
 
         # `ast.walk(tree)` traverses every node, not just top-level
         # `Module.body`. The actual extract_and_store call site lives
-        # nested at `_handle_response > if memory_is_enabled() >
-        # async def _ingest_memory > await extract_and_store(...)`,
+        # nested at `schedule_memory_ingestion > if memory_is_enabled() >
+        # async def ingest_memory > await extract_and_store(...)`,
         # several layers below the module root, so the deep traversal
         # is required.
         call_sites: list[ast.Call] = []
@@ -484,9 +478,9 @@ class TestExtractionCallSiteGating:
         # vacuously, masking the absence of the production behavior
         # the test is meant to backstop.
         assert call_sites, (
-            "expected at least one `extract_and_store` call site in bot.py; "
-            "the production path lives in `_handle_response`'s post-response "
-            "ingestion block, gated by `if memory_is_enabled() and chat_id is not None:`"
+            "expected at least one `extract_and_store` call site in the compatibility "
+            "writer; the production path lives in `schedule_memory_ingestion`, gated "
+            "by `if memory_is_enabled():`"
         )
 
         ungated: list[int] = []

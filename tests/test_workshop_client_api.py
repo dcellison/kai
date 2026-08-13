@@ -7,15 +7,23 @@ import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
-from kai.workshop.client_api import WorkshopEventStreamLimiter, register_workshop_read_routes
-from kai.workshop.domain import ChannelId, PrincipalId
-from kai.workshop.inbound import InboundMessage, record_inbound_message
+from kai.workshop.client_api import (
+    WorkshopEventStreamLimiter,
+    register_workshop_command_routes,
+    register_workshop_read_routes,
+)
+from kai.workshop.conversation_commands import ConversationCommandDisposition
+from kai.workshop.domain import ChannelId, MessageId, PrincipalId, RunId
+from kai.workshop.execution_coordinator import CanonicalExecutionDisposition
+from kai.workshop.inbound import ClientInboundMessage, InboundMessage, record_inbound_message
+from kai.workshop.run_lifecycle import RunStatus
 from kai.workshop.store import WorkshopEventStore
 
 _NOW = datetime(2026, 8, 11, 14, 0, tzinfo=UTC)
@@ -33,6 +41,29 @@ class _Authenticator:
         if separator and scheme == "Bearer":
             return self.principals_by_token.get(token)
         return None
+
+
+@dataclass
+class _CommandSubmitter:
+    messages: list[ClientInboundMessage] = field(default_factory=list)
+
+    async def submit(self, message: ClientInboundMessage):
+        self.messages.append(message)
+        return SimpleNamespace(
+            acceptance=SimpleNamespace(
+                command=SimpleNamespace(
+                    message=SimpleNamespace(
+                        event=SimpleNamespace(envelope=SimpleNamespace(aggregate_id=MessageId.new()))
+                    ),
+                    disposition=ConversationCommandDisposition.NEWLY_ACCEPTED,
+                ),
+                run=SimpleNamespace(run_id=RunId.new()),
+            ),
+            execution=SimpleNamespace(
+                disposition=CanonicalExecutionDisposition.COMPLETED,
+                run=SimpleNamespace(status=RunStatus.COMPLETED),
+            ),
+        )
 
 
 async def _identity_for(store: WorkshopEventStore, subject: str) -> tuple[PrincipalId, ChannelId]:
@@ -103,6 +134,24 @@ async def _open_client(
     return client
 
 
+async def _open_command_client(
+    store: WorkshopEventStore,
+    authenticator: _Authenticator,
+    submitter: _CommandSubmitter,
+) -> TestClient:
+    app = web.Application()
+    register_workshop_command_routes(
+        app,
+        store=store,
+        authenticator=authenticator,
+        submitter=submitter,
+        request_lock=asyncio.Lock(),
+    )
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    return client
+
+
 async def _read_sse_event(response) -> dict[str, object]:
     event_name: str | None = None
     event_id: str | None = None
@@ -130,6 +179,115 @@ async def _read_sse_event(response) -> dict[str, object]:
             event_id = value
         elif field == "data":
             data_lines.append(value)
+
+
+class TestWorkshopCommandHTTPContract:
+    async def test_authenticated_member_submits_only_server_scoped_command_fields(
+        self,
+        tmp_path: Path,
+    ):
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        submitter = _CommandSubmitter()
+        client = await _open_command_client(
+            store,
+            _Authenticator({"alice-token": alice_id}),
+            submitter,
+        )
+        try:
+            response = await client.post(
+                f"/v1/channels/{alice_channel}/commands",
+                headers={"Authorization": "Bearer alice-token"},
+                json={
+                    "client_message_id": "browser-command-1",
+                    "body": "Hello from Workshop",
+                },
+            )
+            payload = await response.json()
+
+            assert response.status == 200
+            assert payload["version"] == 1
+            assert payload["acceptance"] == "newly_accepted"
+            assert payload["execution"] == "completed"
+            assert payload["run_status"] == "completed"
+            assert str(payload["message_id"]).startswith("msg_")
+            assert str(payload["run_id"]).startswith("run_")
+            assert len(submitter.messages) == 1
+            submitted = submitter.messages[0]
+            assert submitted.principal_id == alice_id
+            assert submitted.channel_id == alice_channel
+            assert submitted.client_message_id == "browser-command-1"
+            assert submitted.body == "Hello from Workshop"
+            assert submitted.occurred_at.tzinfo is not None
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_authentication_precedes_parsing_and_cross_channel_is_denied(
+        self,
+        tmp_path: Path,
+    ):
+        store, alice_id, alice_channel, _, bob_channel = await _open_store(tmp_path / "kai.db")
+        submitter = _CommandSubmitter()
+        client = await _open_command_client(
+            store,
+            _Authenticator({"alice-token": alice_id}),
+            submitter,
+        )
+        try:
+            unauthenticated = await client.post(
+                f"/v1/channels/{alice_channel}/commands",
+                data="not json",
+            )
+            denied = await client.post(
+                f"/v1/channels/{bob_channel}/commands",
+                headers={"Authorization": "Bearer alice-token"},
+                json={
+                    "client_message_id": "browser-command-1",
+                    "body": "Cross-channel command",
+                },
+            )
+
+            assert unauthenticated.status == 401
+            assert unauthenticated.headers["WWW-Authenticate"] == "Bearer"
+            assert denied.status == 403
+            assert submitter.messages == []
+        finally:
+            await client.close()
+            await store.close()
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"client_message_id": "browser-command-1"},
+            {"client_message_id": "browser-command-1", "body": "Hello", "model": "gpt"},
+            {"client_message_id": "bad id", "body": "Hello"},
+            {"client_message_id": "browser-command-1", "body": "   "},
+        ],
+    )
+    async def test_rejects_invalid_or_authority_expanding_input(
+        self,
+        tmp_path: Path,
+        payload: dict[str, str],
+    ):
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        submitter = _CommandSubmitter()
+        client = await _open_command_client(
+            store,
+            _Authenticator({"alice-token": alice_id}),
+            submitter,
+        )
+        try:
+            response = await client.post(
+                f"/v1/channels/{alice_channel}/commands",
+                headers={"Authorization": "Bearer alice-token"},
+                json=payload,
+            )
+
+            assert response.status == 400
+            assert submitter.messages == []
+        finally:
+            await client.close()
+            await store.close()
 
 
 class TestWorkshopTimelineHTTPContract:

@@ -48,6 +48,7 @@ _USERNAME_CHAT_ID_PATTERN = re.compile(r"^@[A-Za-z][A-Za-z0-9_]{4,31}$")
 _TELEGRAM_TEXT_LIMIT = 4096
 _MAX_TELEGRAM_FRAGMENTS = 1000
 _MAX_TELEGRAM_TEXT_SIZE = _TELEGRAM_TEXT_LIMIT * _MAX_TELEGRAM_FRAGMENTS
+WORKSHOP_CLIENT_TEXT_MODE = "workshop_client_text"
 
 
 class TelegramSentMessage(Protocol):
@@ -187,6 +188,17 @@ def _telegram_fragments(body: str) -> tuple[str, ...]:
     return fragments
 
 
+def _telegram_delivery_body(claim: DeliveryClaim) -> str:
+    if claim.mode == "text":
+        return claim.body
+    if claim.mode == WORKSHOP_CLIENT_TEXT_MODE:
+        display_name = claim.author_display_name.strip()
+        if not display_name or len(display_name) > 200:
+            raise TelegramDeliveryContractError("telegram_author_invalid")
+        return f"{display_name} via Workshop:\n{claim.body}"
+    raise TelegramDeliveryContractError("telegram_mode_unsupported")
+
+
 def _telegram_message_not_modified(error: BadRequest) -> bool:
     return "message is not modified" in str(error).lower()
 
@@ -220,7 +232,7 @@ class WorkshopTelegramDeliveryAdapter:
             raise ValueError("fragment must belong to the claimed delivery")
         if claim.transport != "telegram":
             raise TelegramDeliveryContractError("telegram_transport_mismatch")
-        if claim.mode != "text":
+        if claim.mode not in {"text", WORKSHOP_CLIENT_TEXT_MODE}:
             raise TelegramDeliveryContractError("telegram_mode_unsupported")
         if fragment.operation != "send" or fragment.target_external_message_id is not None:
             raise TelegramDeliveryContractError("telegram_operation_unsupported")
@@ -229,11 +241,14 @@ class WorkshopTelegramDeliveryAdapter:
 
         target = _telegram_target(claim.external_channel_id)
         try:
-            sent = await self._bot.send_message(
-                chat_id=target,
-                text=fragment.body,
-                parse_mode=ParseMode.MARKDOWN,
-            )
+            if claim.mode == WORKSHOP_CLIENT_TEXT_MODE:
+                sent = await self._bot.send_message(chat_id=target, text=fragment.body)
+            else:
+                sent = await self._bot.send_message(
+                    chat_id=target,
+                    text=fragment.body,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
         except BadRequest:
             # Match Kai's existing presentation behavior: Telegram Markdown
             # rejection is retried once as plain text. A second BadRequest is
@@ -330,6 +345,7 @@ class WorkshopTelegramDeliveryWorker:
         *,
         worker_id: str,
         purpose: DeliveryPurpose,
+        modes: tuple[str, ...] = ("text",),
         lease_duration: timedelta = timedelta(seconds=30),
         poll_interval: float = 1.0,
     ) -> None:
@@ -340,6 +356,9 @@ class WorkshopTelegramDeliveryWorker:
         self._adapter = adapter
         self._worker_id = worker_id
         self._purpose: DeliveryPurpose = purpose
+        if not modes or len(set(modes)) != len(modes):
+            raise ValueError("modes must contain unique values")
+        self._modes = modes
         self._lease_duration = lease_duration
         self._poll_interval = poll_interval
 
@@ -350,7 +369,7 @@ class WorkshopTelegramDeliveryWorker:
             execution_contracts=(SEND_FRAGMENTS_CONTRACT,),
             lease_duration=self._lease_duration,
             transport="telegram",
-            modes=("text",),
+            modes=self._modes,
         )
         return await self._run_claim(claim)
 
@@ -364,7 +383,7 @@ class WorkshopTelegramDeliveryWorker:
             execution_contracts=(SEND_FRAGMENTS_CONTRACT,),
             lease_duration=self._lease_duration,
             transport="telegram",
-            modes=("text",),
+            modes=self._modes,
             delivery_id=delivery_id,
         )
         return await self._run_claim(claim)
@@ -381,7 +400,7 @@ class WorkshopTelegramDeliveryWorker:
             return TelegramWorkResult(outcome=TelegramWorkOutcome.IDLE)
 
         try:
-            bodies = _telegram_fragments(claim.body)
+            bodies = _telegram_fragments(_telegram_delivery_body(claim))
             await self._fragments.prepare(claim, bodies)
         except TelegramDeliveryFailure as failure:
             return await self._settle_failure(claim, None, failure)

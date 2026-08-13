@@ -14,8 +14,9 @@ from kai.workshop.conversation_commands import (
     ConversationCommandStateConflictError,
     WorkshopConversationCommandService,
 )
-from kai.workshop.domain import AgentId, ChannelAgentId, PrincipalId, RunExecutionOwnerId
-from kai.workshop.inbound import InboundMessage, record_inbound_message
+from kai.workshop.delivery_outbox import CONVERSATION_REPLY_PURPOSE, SEND_FRAGMENTS_CONTRACT
+from kai.workshop.domain import AgentId, ChannelAgentId, ChannelId, PrincipalId, RunExecutionOwnerId
+from kai.workshop.inbound import ClientInboundMessage, InboundMessage, record_inbound_message
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.run_execution_authority import (
     RunExecutionSelection,
@@ -54,6 +55,49 @@ async def _open_store(path: Path) -> WorkshopEventStore:
         ),
     )
     return store
+
+
+async def _open_client_store(
+    path: Path,
+) -> tuple[WorkshopEventStore, PrincipalId, ChannelId]:
+    store = await WorkshopEventStore.open(path)
+    await bootstrap_default_workshop(
+        store,
+        (
+            BootstrapHuman(
+                display_name="Workshop Human",
+                role="admin",
+                transport="telegram",
+                external_subject="101",
+                external_channel_id="101",
+            ),
+        ),
+    )
+    async with store.connection.execute(
+        "SELECT e.principal_id, cb.channel_id FROM external_identities e "
+        "JOIN channel_bindings cb ON cb.transport = e.provider "
+        "AND cb.external_channel_id = e.external_subject "
+        "WHERE e.provider = 'telegram' AND e.external_subject = '101'"
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    return store, PrincipalId(str(row[0])), ChannelId(str(row[1]))
+
+
+def _client_message(
+    principal_id: PrincipalId,
+    channel_id: ChannelId,
+    *,
+    body: str = "Run this from Workshop",
+    occurred_at: datetime = _NOW,
+) -> ClientInboundMessage:
+    return ClientInboundMessage(
+        principal_id=principal_id,
+        channel_id=channel_id,
+        client_message_id="browser-command-1",
+        body=body,
+        occurred_at=occurred_at,
+    )
 
 
 def _authority(store: WorkshopEventStore) -> WorkshopRunExecutionAuthority:
@@ -284,3 +328,76 @@ class TestConversationCommandReplay:
         owner_source = (source_root / "workshop" / "private_text_execution.py").read_text(encoding="utf-8")
         assert "WorkshopConversationCommandService" in owner_source
         assert "WorkshopConversationCommandService" not in (source_root / "main.py").read_text(encoding="utf-8")
+
+
+class TestAtomicClientConversationCommandAcceptance:
+    async def test_accepts_message_run_and_telegram_echo_in_one_transaction(
+        self,
+        tmp_path: Path,
+    ):
+        store, principal_id, channel_id = await _open_client_store(tmp_path / "kai.db")
+        try:
+            accepted = await WorkshopConversationCommandService(store).accept_client(
+                _client_message(principal_id, channel_id)
+            )
+
+            assert accepted.command.disposition == ConversationCommandDisposition.NEWLY_ACCEPTED
+            assert accepted.command.message.inserted is True
+            assert accepted.command.lifecycle.changed is True
+            assert accepted.delivery.inserted is True
+            assert accepted.compatibility_chat_id == 101
+            assert accepted.delivery.delivery.message_id == accepted.command.message.event.envelope.aggregate_id
+            assert accepted.delivery.delivery.channel_id == channel_id
+            assert accepted.delivery.delivery.mode == "workshop_client_text"
+            assert accepted.delivery.delivery.purpose == CONVERSATION_REPLY_PURPOSE
+            assert accepted.delivery.delivery.execution_contract == SEND_FRAGMENTS_CONTRACT
+            assert accepted.delivery.delivery.authority_epoch_id is None
+            async with store.connection.execute(
+                "SELECT event_type FROM event_log WHERE position BETWEEN ? AND ? ORDER BY position",
+                (
+                    accepted.command.message.event.position,
+                    accepted.delivery.delivery.requested_event_position,
+                ),
+            ) as cursor:
+                assert [str(row[0]) for row in await cursor.fetchall()] == [
+                    "message.created",
+                    "run.accepted",
+                    "delivery.requested",
+                ]
+        finally:
+            await store.close()
+
+    async def test_exact_retry_reuses_all_three_facts_and_changed_body_conflicts(
+        self,
+        tmp_path: Path,
+    ):
+        store, principal_id, channel_id = await _open_client_store(tmp_path / "kai.db")
+        service = WorkshopConversationCommandService(store)
+        message = _client_message(principal_id, channel_id)
+        try:
+            first = await service.accept_client(message)
+            retry = await service.accept_client(
+                _client_message(
+                    principal_id,
+                    channel_id,
+                    occurred_at=_NOW + timedelta(minutes=5),
+                )
+            )
+
+            assert retry.command.disposition == ConversationCommandDisposition.READY_REPLAY
+            assert retry.command.message.inserted is False
+            assert retry.command.lifecycle.changed is False
+            assert retry.delivery.inserted is False
+            assert retry.command.message.event == first.command.message.event
+            assert retry.command.lifecycle.event == first.command.lifecycle.event
+            assert retry.delivery.delivery == first.delivery.delivery
+
+            with pytest.raises(IdempotencyConflictError):
+                await service.accept_client(_client_message(principal_id, channel_id, body="Changed command"))
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM event_log WHERE event_type IN "
+                "('message.created', 'run.accepted', 'delivery.requested')"
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 3
+        finally:
+            await store.close()

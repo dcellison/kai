@@ -6,7 +6,11 @@ import asyncio
 from pathlib import Path
 
 from kai.pool import SubprocessPool
-from kai.workshop.conversation_commands import ConversationCommandAcceptance, WorkshopConversationCommandService
+from kai.workshop.conversation_commands import (
+    ClientConversationCommandAcceptance,
+    ConversationCommandAcceptance,
+    WorkshopConversationCommandService,
+)
 from kai.workshop.domain import RunId
 from kai.workshop.execution_coordinator import (
     CanonicalCancellationDisposition,
@@ -14,7 +18,7 @@ from kai.workshop.execution_coordinator import (
     StreamObserver,
     WorkshopCanonicalExecutionCoordinator,
 )
-from kai.workshop.inbound import InboundMessage
+from kai.workshop.inbound import ClientInboundMessage, InboundMessage
 from kai.workshop.protected_execution import WorkshopProtectedExecutionPreparationService
 from kai.workshop.store import WorkshopEventStore
 
@@ -80,6 +84,15 @@ class WorkshopPrivateTextExecutionService:
             raise RuntimeError("Workshop private-text execution service is closed")
         async with self._database_lock:
             return await self._command_service.accept(message)
+
+    async def accept_client(
+        self,
+        message: ClientInboundMessage,
+    ) -> ClientConversationCommandAcceptance:
+        if self._closed:
+            raise RuntimeError("Workshop private-text execution service is closed")
+        async with self._database_lock:
+            return await self._command_service.accept_client(message)
 
     async def execute(
         self,

@@ -233,3 +233,30 @@ async def test_conversation_service_activates_once_and_reuses_epoch_after_restar
     await second_service.stop()
 
     assert second_epoch.epoch_id == first_epoch.epoch_id
+
+
+async def test_conversation_service_wait_fails_when_either_owned_worker_fails(
+    tmp_path: Path,
+):
+    final_store = await WorkshopEventStore.open(tmp_path / "final.db")
+    client_store = await WorkshopEventStore.open(tmp_path / "client.db")
+    final_worker = _ControlledWorker()
+    client_worker = _FaultingWorker()
+    final_runtime = WorkshopTelegramDeliveryRuntime(_ControlledRecovery(), final_worker)
+    client_runtime = WorkshopTelegramDeliveryRuntime(_ControlledRecovery(), client_worker)
+    await final_runtime.start()
+    await client_runtime.start()
+    service = WorkshopTelegramConversationDeliveryService(
+        final_store,
+        client_store,
+        final_runtime,
+        client_runtime,
+    )
+    await client_worker.started.wait()
+    client_worker.release.set()
+    try:
+        with pytest.raises(RuntimeError, match="delivery worker failed"):
+            await asyncio.wait_for(service.wait(), timeout=1.0)
+    finally:
+        with pytest.raises(RuntimeError, match="delivery worker failed"):
+            await service.stop()

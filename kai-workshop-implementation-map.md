@@ -411,7 +411,7 @@ No entry may use an indefinite condition such as "keep for compatibility." A gen
 | JSONL transcript writes and reads | Canonical message projection, with an explicit export facility if still useful | Canonical reads serve complete context and transcript views; migration/parity diagnostics report no unexplained divergence | Stop JSONL writes; remove production reads and dual-write recovery code; retain only a documented importer/exporter if required | Planned |
 | Telegram `chat_id` used as internal identity, namespace, and routing key | Durable principal, channel, agent, and binding IDs | Private chats, notification-only groups, duplicate updates, and restart routing all resolve correctly through bindings | Confine Telegram IDs to external identity, transport binding, and idempotency records; remove chat-shaped domain keys | Active (authoritative private text now enters execution by canonical message ID, but the compatibility resolver still derives the current pool key from the human principal's protected Telegram identity; settings, locks, history, files, memory, and excluded routes remain chat-keyed) |
 | `SubprocessPool` keyed by Telegram chat ID | Durable channel/agent session plus run and attempt orchestration | All five harnesses pass continuity, restart, cancellation, and isolation tests through durable identities | Remove chat-key compatibility lookup and move lifecycle ownership behind the orchestrator/runtime contract | Active (a canonical conversation-run service hides the private-text pool lookup behind a temporary compatibility resolution; the pool and all five harness processes remain keyed by that resolved integer) |
-| Direct backend invocation from Telegram handlers | Transport-neutral command and run services | Telegram and the first Workshop client produce equivalent authorized runs and visible results | Remove handler-owned orchestration; leave authentication, parsing, and rendering in the Telegram adapter | Active (authenticated private-chat text with voice mode off now accepts and executes by canonical `RunId`, with fenced attempts, durable cancellation, atomic terminal settlement, and replay suppression; media, voice modes, groups, schedules, and integrations retain their compatibility orchestration) |
+| Direct backend invocation from Telegram handlers | Transport-neutral command and run services | Telegram and the first Workshop client produce equivalent authorized runs and visible results | Remove handler-owned orchestration; leave authentication, parsing, and rendering in the Telegram adapter | Active (authenticated private-chat text and authenticated Workshop browser commands now accept and execute by canonical `RunId`, with fenced attempts, durable cancellation, atomic terminal settlement, and replay suppression; the first browser path temporarily resolves the existing direct-Telegram compatibility identity, while media, voice modes, groups, schedules, and integrations retain their compatibility orchestration) |
 | Direct Telegram delivery from handlers, schedules, and webhooks | Durable delivery outbox and Telegram delivery adapter | Delivery outcome events preserve binding identity; retry, crash recovery, ordering, private-chat and notification-group delivery tests pass; live delivery is verified | Migrate each remaining transport path separately; the private-text direct fallback is retired | Active (authenticated private-chat text with voice mode off uses atomic streaming finalization and a supervised exact-epoch worker and now fails closed rather than demoting to direct/shadow delivery; commands, media, voice, schedules, webhooks, files, and groups retain existing delivery) |
 | Operator-invoked Workshop delivery qualification CLI | Installed evidence followed by the production delivery worker | A configured direct-chat reply is prepared without sending, survives a service restart, recovers an intentionally abandoned lease, reaches Telegram once through the exact selected delivery, and records a terminal binding-aware outcome; a configured notification group resolves through its outbound-only canonical channel, receives one atomically prepared qualification message through the exact selected delivery, and does not become an inbound conversation | Remove the qualification command and its explicit-claim-only surface after the production worker has equivalent installed restart/recovery evidence and direct delivery is retired | Active (the installed direct-chat recovery and notification-group delivery gates passed on 2026-08-12; retain until equivalent production-worker evidence exists, while the command remains unregistered and incapable of draining unrelated work) |
 | Conversation-delivery authority epochs | A single durable delivery authority after direct-send rollback is retired | Activation/deactivation, restart, historical-row isolation, exact-epoch worker ownership, aggregate diagnostics, and installed rollback/reactivation evidence pass; no supported rollback crosses the direct-send/outbox boundary | Remove epoch stamping, activation/deactivation state, exact-epoch claim filters, transitional readiness output, schema columns/tables where safely migratable, and their compatibility tests | Active (production startup resumes or creates the exact epoch before ingress; installed private-text streaming, all-send, fragmentation, restart/no-replay, aggregate authority, and parity checks passed on 2026-08-12) |
@@ -421,7 +421,7 @@ No entry may use an indefinite condition such as "keep for compatibility." A gen
 | `users.yaml` values that represent mutable application state | Workshop administration and durable policy records | Workshop administration can safely inspect and change the relevant state, and bootstrap/recovery behavior is proven | Retain only protected installation/bootstrap policy; remove duplicated mutable state and precedence rules | Planned |
 | Backend-specific execution orchestration embedded in the control plane | Equal Harness Driver contracts and a Runtime Backend boundary | Capability and lifecycle tests cover Claude, Codex, Goose, OpenCode, and Pi without privileging one driver | Delete duplicated process orchestration only after the shared contracts carry the required evidence | Planned |
 | Trusted-host `local_process` execution and its executable-trust warnings | Isolated Workshop workers | Worker identity, filesystem grants, credentials, networking, artifacts, cancellation, upgrade, and recovery are verified for all five harnesses | Retire trusted-host mode or explicitly reclassify it as a supported development mode; remove production mitigations that it alone requires | Planned |
-| Preliminary static Workshop browser shell | React Workshop client at the same `/workshop/` route | The React client proves enrollment, tab-scoped session handling, canonical timeline history, authenticated resumable live updates, channel correction, session revocation, and equivalent security headers against the installed API | Replace the packaged `static/index.html`, `static/app.css`, and `static/app.js`; delete tests specific to the preliminary asset implementation while retaining transport-neutral API and browser-boundary contract tests; do not retain a second UI or compatibility route | Replacement implemented; installed React parity qualification pending |
+| Preliminary static Workshop browser shell | React Workshop client at the same `/workshop/` route | The React client proves enrollment, tab-scoped session handling, canonical timeline history, authenticated resumable live updates, channel correction, session revocation, and equivalent security headers against the installed API | Replace the packaged `static/index.html`, `static/app.css`, and `static/app.js`; delete tests specific to the preliminary asset implementation while retaining transport-neutral API and browser-boundary contract tests; do not retain a second UI or compatibility route | Replacement implemented and installed parity qualified; authenticated canonical command submission is now implemented for the first browser conversation path |
 | Temporary feature flags, legacy fallbacks, and compatibility diagnostics introduced during migration | The corresponding authoritative Workshop path | The owning ledger row has passed its removal gate and rollback no longer depends on the old path | Delete flags, fallback branches, stale status output, environment variables, fixtures, and tests that only preserve the retired path | Ongoing rule |
 | Superseded database tables and columns | Current Workshop schema and projections | Data migration is verified, no supported binary reads the old schema, and rollback/archive policy is explicit | Freeze writes, migrate or archive data, then remove obsolete schema in a dedicated migration | Planned |
 
@@ -1826,8 +1826,10 @@ same `/workshop/` route. It preserves the qualified enrollment, tab-scoped
 credential, canonical snapshot, resumable live stream, reconnect,
 resynchronization, channel-correction, and revocation behavior. React renders
 canonical message text without interpreting it as markup. Browser-boundary
-tests continue to pin no-store delivery, same-origin assets, strict security
-headers, and the absence of a client write route.
+tests continue to pin no-store delivery, same-origin assets, and strict
+security headers. At this read-client milestone, they also pinned the absence
+of a client write route; section 38 adds that route through the canonical
+execution boundary.
 
 The interface establishes the intended Workshop organization: a workspace
 rail, channel and agent navigation, the canonical conversation, and a context
@@ -1861,9 +1863,45 @@ resumed update without duplication, channel correction without re-enrollment,
 and device revocation returning the client to enrollment. Only then is the
 preliminary-shell ledger row retired.
 
-### 37.2 Next bounded milestone
+### 37.2 Subsequent bounded milestone
 
-Add the first authorized command-submission path as a separate server and
-client milestone. It must create canonical inbound work through the existing
-Workshop execution authority; the browser must not invoke a backend, select a
-runtime command, or bypass the durable run and delivery lifecycle.
+The authorized command-submission path specified here is implemented in
+section 38.
+
+## 38. First authorized Workshop command submission
+
+**Implementation date:** 2026-08-13
+
+The enrolled React client can submit one plain-text command to its selected
+canonical channel. The server authenticates the client session and authorizes
+the human principal's current workshop and channel membership. The request can
+name only an opaque client message ID and a bounded nonblank body; backend,
+model, executable, filesystem, runtime, principal, channel, and timestamp are
+all server authority.
+
+One transaction records the canonical human message, accepts its durable run,
+and prepares an attributed plain-text Telegram echo. Reusing the client ID
+with the same body is an idempotent retry even when the later HTTP request has
+a different timestamp; changing the body is a conflict. The protected run
+coordinator performs execution, compatibility history/session/memory writes
+are suppressed on terminal replay, and the supervised Telegram echo worker
+orders the human echo before the assistant finalization. The browser waits for
+the bounded execution result but renders both messages only from the canonical
+snapshot/event stream, preventing optimistic duplicates. A failed browser
+request retains the same client ID for exact retry.
+
+This remains an intentionally narrow bridge. The command and run are
+transport-neutral, but current backend context and compatibility storage still
+require exactly one protected direct-Telegram identity and binding for the
+human. Independent non-Telegram execution identity, asynchronous run views,
+browser cancellation, approvals, media, and broader channel kinds remain
+future milestones.
+
+### 38.1 Installed qualification
+
+After merge, install once and submit one browser command. Verify that the
+human message appears once in the Workshop timeline, its attributed echo
+appears once in the bound Telegram chat, and the assistant response appears
+once in both clients. Retry and restart evidence must show no duplicate
+canonical messages, runs, echoes, finalizations, history entries, or memory
+ingestion, and `make install-status` must remain clean.

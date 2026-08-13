@@ -1,4 +1,4 @@
-"""Serving contracts for the packaged, read-only Workshop React client."""
+"""Serving contracts for the packaged Workshop React client."""
 
 import re
 

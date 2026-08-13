@@ -2376,7 +2376,10 @@ class TestNotificationChatIdMutations:
 
         telegram_app = MagicMock()
         telegram_app.bot = AsyncMock()
-        telegram_app.bot_data = {"pool": MagicMock(internal_api_auth=InternalAPIAuth({111: "secret"}))}
+        telegram_app.bot_data = {
+            "pool": MagicMock(internal_api_auth=InternalAPIAuth({111: "secret"})),
+            "workshop_private_text_execution": AsyncMock(),
+        }
 
         fake_runner = MagicMock()
         fake_runner.setup = AsyncMock()
@@ -2429,7 +2432,10 @@ class TestNotificationChatIdMutations:
 
         telegram_app = MagicMock()
         telegram_app.bot = AsyncMock()
-        telegram_app.bot_data = {"pool": MagicMock(internal_api_auth=InternalAPIAuth({111: "secret"}))}
+        telegram_app.bot_data = {
+            "pool": MagicMock(internal_api_auth=InternalAPIAuth({111: "secret"})),
+            "workshop_private_text_execution": AsyncMock(),
+        }
 
         apps: list[web.Application] = []
         runners: list[MagicMock] = []
@@ -2465,6 +2471,7 @@ class TestNotificationChatIdMutations:
                 "/v1/client/enrollment/redeem",
                 "/v1/channels/{channel_id}/timeline",
                 "/v1/channels/{channel_id}/events",
+                "/v1/channels/{channel_id}/commands",
                 "/workshop",
                 "/workshop/",
                 "/workshop/app.css",
