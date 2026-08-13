@@ -313,6 +313,9 @@ describe("Workshop React client", () => {
     expect(
       await screen.findByText(`History for ${notificationChannelId}`),
     ).toBeVisible();
+    expect(screen.getByText("GitHub")).toBeVisible();
+    expect(screen.getByText("Durable notification feed")).toBeVisible();
+    expect(document.querySelector(".notification-row")).not.toBeNull();
     expect(screen.queryByLabelText("Message Kai")).toBeNull();
     expect(screen.getByText(/outbound-only/)).toBeVisible();
     expect(sessionStorage.getItem("kai.workshop.read-session.v1")).toContain(

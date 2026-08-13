@@ -1,4 +1,4 @@
-"""Production-unused durable delivery work for Kai Workshop."""
+"""Durable delivery work for Kai Workshop."""
 
 from __future__ import annotations
 
@@ -33,10 +33,13 @@ _MAX_MINIMUM_RETRY_DELAY = timedelta(days=1)
 _RETRY_BASE_SECONDS = 5
 _RETRY_MAX_SECONDS = 300
 
-DeliveryPurpose = Literal["conversation_reply", "qualification"]
+DeliveryPurpose = Literal["conversation_reply", "notification", "qualification"]
 CONVERSATION_REPLY_PURPOSE: DeliveryPurpose = "conversation_reply"
+NOTIFICATION_PURPOSE: DeliveryPurpose = "notification"
 QUALIFICATION_PURPOSE: DeliveryPurpose = "qualification"
-_DELIVERY_PURPOSES = frozenset({CONVERSATION_REPLY_PURPOSE, QUALIFICATION_PURPOSE})
+_DELIVERY_PURPOSES = frozenset(
+    {CONVERSATION_REPLY_PURPOSE, NOTIFICATION_PURPOSE, QUALIFICATION_PURPOSE}
+)
 
 DeliveryExecutionContract = Literal["send_fragments", "streaming_finalization"]
 SEND_FRAGMENTS_CONTRACT: DeliveryExecutionContract = "send_fragments"
@@ -181,7 +184,7 @@ def _validate_error_code(error_code: str) -> None:
 
 def _validate_purpose(purpose: str) -> None:
     if purpose not in _DELIVERY_PURPOSES:
-        raise ValueError("purpose must be conversation_reply or qualification")
+        raise ValueError("purpose must be conversation_reply, notification, or qualification")
 
 
 def _validate_purposes(purposes: tuple[DeliveryPurpose, ...]) -> None:

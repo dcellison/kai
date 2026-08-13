@@ -49,7 +49,10 @@ from kai.config import DATA_DIR, PROJECT_ROOT, _read_protected_file, load_config
 from kai.workshop.bootstrap import BootstrapHuman, BootstrapNotificationChannel
 from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
 from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
-from kai.workshop.telegram_delivery_runtime import WorkshopTelegramConversationDeliveryService
+from kai.workshop.telegram_delivery_runtime import (
+    WorkshopTelegramConversationDeliveryService,
+    WorkshopTelegramNotificationService,
+)
 
 
 def _workshop_bootstrap_humans(
@@ -349,6 +352,7 @@ def _start() -> None:
         )
         app.bot_data["workshop_principal_storage"] = principal_storage
         conversation_delivery: WorkshopTelegramConversationDeliveryService | None = None
+        notification_delivery: WorkshopTelegramNotificationService | None = None
         private_text_execution: WorkshopPrivateTextExecutionService | None = None
 
         # Determine the default user (admin or first user) for per-user
@@ -457,6 +461,13 @@ def _start() -> None:
             )
             logging.info("Workshop Telegram conversation delivery is ready")
 
+            notification_delivery = await WorkshopTelegramNotificationService.open_and_start(
+                config.session_db_path,
+                app.bot,
+            )
+            app.bot_data["workshop_github_notifications"] = notification_delivery
+            logging.info("Workshop Telegram notification delivery is ready")
+
             private_text_execution = await WorkshopPrivateTextExecutionService.open_and_start(
                 config.session_db_path,
                 app.bot_data["workshop_runtime_pool"],
@@ -539,6 +550,7 @@ def _start() -> None:
             # Kai process that can accept replies it cannot deliver.
             await asyncio.gather(
                 conversation_delivery.wait(),
+                notification_delivery.wait(),
                 private_text_execution.wait(),
             )
         finally:
@@ -554,6 +566,12 @@ def _start() -> None:
                     await private_text_execution.stop()
                 except Exception:
                     logging.exception("Workshop private-text execution stopped with an error")
+            if notification_delivery is not None:
+                app.bot_data.pop("workshop_github_notifications", None)
+                try:
+                    await notification_delivery.stop()
+                except Exception:
+                    logging.exception("Workshop Telegram notification delivery stopped with an error")
             if conversation_delivery is not None:
                 try:
                     await conversation_delivery.stop()

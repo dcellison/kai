@@ -25,6 +25,7 @@ from kai.webhook import (
     TELEGRAM_APP_KEY,
     TELEGRAM_BOT_KEY,
     TELEGRAM_WEBHOOK_SECRET_KEY,
+    WORKSHOP_GITHUB_NOTIFICATIONS_KEY,
     WORKSHOP_PRINCIPAL_STORAGE_KEY,
     UnauthorizedChatIdError,
     _handle_delete_job,
@@ -1119,6 +1120,50 @@ class TestGitHubWebhook:
         bot.send_message.assert_called_once()
         call_kwargs = bot.send_message.call_args
         assert call_kwargs.kwargs.get("parse_mode") == "Markdown" or call_kwargs[2] == "Markdown"
+
+    async def test_notification_group_records_canonical_delivery_without_direct_send(
+        self,
+        github_request,
+    ):
+        payload = _github_push_payload()
+        body = json.dumps(payload).encode()
+        github_request.read = AsyncMock(return_value=body)
+        github_request.headers = {
+            "X-Hub-Signature-256": _sign_body("test-secret", body),
+            "X-GitHub-Event": "push",
+            "X-GitHub-Delivery": "f8112a52-7129-11f1-8e31-acde48001122",
+        }
+        notification_service = MagicMock()
+        notification_service.record = AsyncMock(
+            return_value=MagicMock(
+                delivery=MagicMock(
+                    delivery=MagicMock(delivery_id="dlv_" + "1" * 32),
+                    inserted=True,
+                )
+            )
+        )
+        github_request.app[WORKSHOP_GITHUB_NOTIFICATIONS_KEY] = notification_service
+        settings = {
+            "repos": [],
+            "notify_chat_id": -100123,
+            "pr_review": False,
+            "issue_triage": False,
+        }
+
+        with patch(
+            "kai.webhook.sessions.resolve_github_settings",
+            new_callable=AsyncMock,
+            return_value=settings,
+        ):
+            response = await _handle_github(github_request)
+
+        assert response.status == 200
+        github_request.app[TELEGRAM_BOT_KEY].send_message.assert_not_called()
+        notification_service.record.assert_awaited_once()
+        notification = notification_service.record.await_args.args[0]
+        assert notification.delivery_id == github_request.headers["X-GitHub-Delivery"]
+        assert notification.telegram_chat_id == -100123
+        assert notification.repository == "testuser/repo"
 
     async def test_markdown_failure_falls_back_to_plain(self, github_request):
         """When Markdown parse fails, resends as stripped plain text."""

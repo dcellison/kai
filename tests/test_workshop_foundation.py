@@ -196,7 +196,7 @@ class TestWorkshopSchema:
         }
 
         assert expected <= await workshop_store.schema_tables()
-        assert await workshop_store.schema_version() == 18
+        assert await workshop_store.schema_version() == 19
         async with workshop_store.connection.execute("PRAGMA index_list(delivery_outbox)") as cursor:
             indexes = {str(row[1]) for row in await cursor.fetchall()}
         assert "delivery_outbox_binding_order_idx" in indexes
@@ -209,7 +209,7 @@ class TestWorkshopSchema:
         await first.close()
 
         second = await WorkshopEventStore.open(path)
-        assert await second.schema_version() == 18
+        assert await second.schema_version() == 19
         async with second.connection.execute(
             "SELECT COUNT(*) FROM workshop_schema_migrations WHERE version = 1"
         ) as cursor:
@@ -230,7 +230,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 18
+            assert await upgraded.schema_version() == 19
             assert {
                 "deliveries",
                 "channel_memberships",
@@ -264,6 +264,7 @@ class TestWorkshopSchema:
                     16,
                     17,
                     18,
+                    19,
                 ]
         finally:
             await upgraded.close()
@@ -286,7 +287,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 18
+            assert await upgraded.schema_version() == 19
             assert {
                 "channel_memberships",
                 "workshop_client_devices",
@@ -327,7 +328,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 18
+            assert await upgraded.schema_version() == 19
             assert {
                 "workshop_client_devices",
                 "workshop_client_enrollment_grants",
@@ -380,7 +381,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 18
+            assert await upgraded.schema_version() == 19
             assert "workshop_client_enrollment_grants" in await upgraded.schema_tables()
             assert "artifacts" in await upgraded.schema_tables()
             assert "delivery_outbox" in await upgraded.schema_tables()
@@ -424,7 +425,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 18
+            assert await upgraded.schema_version() == 19
             assert "artifacts" in await upgraded.schema_tables()
             assert "delivery_outbox" in await upgraded.schema_tables()
             async with upgraded.connection.execute(
@@ -468,7 +469,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 18
+            assert await upgraded.schema_version() == 19
             assert {"delivery_outbox", "delivery_attempts"} <= await upgraded.schema_tables()
             async with upgraded.connection.execute(
                 "SELECT display_name FROM principals WHERE id = ?",
@@ -512,7 +513,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 18
+            assert await upgraded.schema_version() == 19
             assert {"delivery_outbox", "delivery_attempts", "delivery_fragments"} <= await upgraded.schema_tables()
             async with upgraded.connection.execute(
                 "SELECT display_name FROM principals WHERE id = ?",
@@ -616,7 +617,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 18
+            assert await upgraded.schema_version() == 19
             async with upgraded.connection.execute(
                 "SELECT message_id, channel_binding_id, transport, mode, status FROM deliveries WHERE id = ?",
                 (delivery_id,),
@@ -711,7 +712,7 @@ class TestWorkshopSchema:
                 "(id, workshop_id, channel_id, channel_binding_id, message_id, transport, mode, "
                 "status, max_attempts, attempt_count, available_at, requested_event_position, "
                 "created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, 'telegram', 'text', 'pending', 3, 0, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, 'telegram', 'text', 'retry_wait', 3, 1, ?, ?, ?, ?)",
                 (
                     delivery_id,
                     workshop_id,
@@ -724,17 +725,48 @@ class TestWorkshopSchema:
                     timestamp,
                 ),
             )
+            attempt_id = "dat_existing_attempt"
+            await version_ten.connection.execute(
+                "INSERT INTO delivery_attempts "
+                "(id, delivery_id, attempt_number, worker_id, started_at, lease_expires_at, "
+                "completed_at, outcome, error_code) "
+                "VALUES (?, ?, 1, 'existing-worker', ?, ?, ?, 'retry_scheduled', 'timeout')",
+                (attempt_id, delivery_id, timestamp, timestamp, timestamp),
+            )
+            await version_ten.connection.execute(
+                "INSERT INTO delivery_fragments "
+                "(delivery_id, fragment_index, fragment_count, body, status, created_at, updated_at) "
+                "VALUES (?, 0, 1, 'Existing durable fragment', 'pending', ?, ?)",
+                (delivery_id, timestamp, timestamp),
+            )
             await version_ten.connection.commit()
             await version_ten.close()
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 18
+            assert await upgraded.schema_version() == 19
             async with upgraded.connection.execute(
                 "SELECT purpose, status, attempt_count FROM delivery_outbox WHERE id = ?",
                 (delivery_id,),
             ) as cursor:
-                assert tuple(await cursor.fetchone()) == ("qualification", "pending", 0)
+                assert tuple(await cursor.fetchone()) == ("qualification", "retry_wait", 1)
+            async with upgraded.connection.execute(
+                "SELECT outcome, error_code FROM delivery_attempts WHERE id = ?",
+                (attempt_id,),
+            ) as cursor:
+                assert tuple(await cursor.fetchone()) == ("retry_scheduled", "timeout")
+            async with upgraded.connection.execute(
+                "SELECT body, status, operation FROM delivery_fragments "
+                "WHERE delivery_id = ? AND fragment_index = 0",
+                (delivery_id,),
+            ) as cursor:
+                assert tuple(await cursor.fetchone()) == (
+                    "Existing durable fragment",
+                    "pending",
+                    "send",
+                )
+            async with upgraded.connection.execute("PRAGMA foreign_key_check") as cursor:
+                assert await cursor.fetchall() == []
         finally:
             await upgraded.close()
 

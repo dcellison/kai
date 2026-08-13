@@ -220,7 +220,7 @@ class TestDurableRunMigration:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 18
+            assert await upgraded.schema_version() == 19
             assert "runs" in await upgraded.schema_tables()
             assert "run_attempts" in await upgraded.schema_tables()
             async with upgraded.connection.execute("SELECT name FROM workshops") as cursor:

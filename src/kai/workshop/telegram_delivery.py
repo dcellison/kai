@@ -335,7 +335,7 @@ class WorkshopTelegramStreamingFinalizationAdapter:
 
 
 class WorkshopTelegramDeliveryWorker:
-    """Claim and settle Telegram text work without any production registration."""
+    """Claim and settle one explicitly assigned lane of Telegram text work."""
 
     def __init__(
         self,

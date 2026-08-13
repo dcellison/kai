@@ -696,6 +696,53 @@ button:disabled {
   background: linear-gradient(90deg, rgba(152, 195, 121, 0.035), transparent 70%);
 }
 
+.channel-introduction.notification .channel-symbol {
+  border-color: rgba(229, 192, 123, 0.34);
+  background: rgba(229, 192, 123, 0.08);
+  color: var(--atom-yellow);
+}
+
+.notification-feed {
+  display: grid;
+  gap: 0.75rem;
+  padding: 1rem 1.6rem 1.5rem;
+}
+
+.notification-row {
+  display: grid;
+  grid-template-columns: 2.5rem minmax(0, 1fr);
+  gap: 0.9rem;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--atom-yellow);
+  border-radius: 0.42rem;
+  padding: 1rem 1.1rem;
+  background: linear-gradient(
+    115deg,
+    rgba(229, 192, 123, 0.045),
+    rgba(44, 49, 60, 0.56) 55%,
+    rgba(44, 49, 60, 0.34)
+  );
+}
+
+.notification-source {
+  display: grid;
+  place-items: center;
+  width: 2.5rem;
+  height: 2.5rem;
+  border: 1px solid rgba(229, 192, 123, 0.34);
+  border-radius: 0.42rem;
+  background: rgba(229, 192, 123, 0.1);
+  color: var(--atom-yellow);
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  font-weight: 760;
+  letter-spacing: 0.04em;
+}
+
+.notification-row .message-meta strong {
+  color: var(--atom-yellow);
+}
+
 .message-avatar {
   display: grid;
   place-items: center;

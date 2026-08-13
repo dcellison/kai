@@ -56,7 +56,7 @@ import re
 import time
 from collections.abc import Callable
 from dataclasses import asdict
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from aiohttp import web
@@ -84,11 +84,13 @@ from kai.workshop.client_sessions import (
 )
 from kai.workshop.client_shell import register_workshop_shell_routes
 from kai.workshop.compatibility_state import WorkshopCompatibilityStateWriter
+from kai.workshop.github_notifications import GitHubNotification
 from kai.workshop.storage_namespaces import (
     WorkshopPrincipalStorageRegistry,
     WorkshopStorageNamespaceError,
 )
 from kai.workshop.store import WorkshopEventStore
+from kai.workshop.telegram_delivery_runtime import WorkshopTelegramNotificationService
 
 log = logging.getLogger(__name__)
 
@@ -128,6 +130,9 @@ WEBHOOK_PORT_KEY: web.AppKey[int] = web.AppKey("webhook_port", int)
 WORKSPACE_BASE_KEY: web.AppKey[str | None] = web.AppKey("workspace_base")
 WORKSHOP_PRINCIPAL_STORAGE_KEY: web.AppKey[WorkshopPrincipalStorageRegistry] = web.AppKey(
     "workshop_principal_storage", WorkshopPrincipalStorageRegistry
+)
+WORKSHOP_GITHUB_NOTIFICATIONS_KEY: web.AppKey[WorkshopTelegramNotificationService] = web.AppKey(
+    "workshop_github_notifications", WorkshopTelegramNotificationService
 )
 
 
@@ -1157,7 +1162,42 @@ async def _process_github_event_for_user(
     if not message:
         return
 
-    # Send to Telegram with Markdown, falling back to plain text on parse failure
+    # A configured Telegram notification group is also a canonical Workshop
+    # notification channel. Record the authenticated GitHub delivery once and
+    # let its durable outbox own both browser visibility and Telegram delivery.
+    github_delivery_id = request.headers.get("X-GitHub-Delivery", "")
+    notification_service = request.app.get(WORKSHOP_GITHUB_NOTIFICATIONS_KEY)
+    if target_chat_id < 0 and notification_service is not None and github_delivery_id:
+        try:
+            notification = GitHubNotification(
+                delivery_id=github_delivery_id,
+                event_type=event_type,
+                repository=repo_full_name,
+                telegram_chat_id=target_chat_id,
+                body=message,
+                occurred_at=datetime.now(UTC),
+            )
+        except ValueError:
+            log.warning(
+                "GitHub %s delivery has an unsupported identity; using compatibility delivery",
+                event_type,
+            )
+        else:
+            recorded = await notification_service.record(notification)
+            if recorded is not None:
+                log.info(
+                    "Recorded GitHub %s notification for Workshop channel delivery %s "
+                    "(user %d, inserted=%s)",
+                    event_type,
+                    recorded.delivery.delivery.delivery_id,
+                    chat_id,
+                    recorded.delivery.inserted,
+                )
+                return
+
+    # Destinations not represented by a canonical Workshop notification
+    # channel retain the compatibility route. This covers direct-chat installs
+    # and a newly changed /github notify target until the next bootstrap.
     try:
         await bot.send_message(target_chat_id, message, parse_mode="Markdown")
     except Exception:
@@ -2612,6 +2652,10 @@ async def start(telegram_app, config) -> None:
     if not isinstance(principal_storage, WorkshopPrincipalStorageRegistry):
         raise RuntimeError("Workshop principal storage registry is unavailable")
     _app[WORKSHOP_PRINCIPAL_STORAGE_KEY] = principal_storage
+    github_notifications = telegram_app.bot_data.get("workshop_github_notifications")
+    if not isinstance(github_notifications, WorkshopTelegramNotificationService):
+        raise RuntimeError("Workshop GitHub notification service is unavailable")
+    _app[WORKSHOP_GITHUB_NOTIFICATIONS_KEY] = github_notifications
     client_command_executor = WorkshopClientCommandExecutor(
         private_text_execution,
         WorkshopCompatibilityStateWriter(config, workshop_runtime_pool),

@@ -1988,23 +1988,22 @@ replace status polling with canonical lifecycle events and expose useful agent
 activity without coupling the browser to backend processes or compatibility
 storage.
 
-## Planned canonical notification feed activation
+## Canonical notification feed activation
 
 The authorized Workshop navigation now exposes outbound notification channels,
-but ordinary GitHub webhook notifications still use the compatibility path
-that formats an event and sends it directly to a Telegram destination. The
-notification link is therefore structurally live while normal GitHub events
-do not yet populate its canonical feed.
+and ordinary authenticated GitHub webhook notifications targeting a configured
+Telegram notification group now enter that canonical feed. One database
+transaction records the notification message and its durable Telegram outbox
+request. GitHub delivery identity plus destination binding supplies stable
+idempotency, so repeated delivery or multiple subscribed humans cannot create
+duplicate feed entries or Telegram sends. The existing direct-send route
+remains only as compatibility behavior for destinations that are not yet bound
+to a canonical Workshop notification channel.
 
-The activation milestone must make the canonical notification channel the
-owner of each notification. After subscription and destination authorization,
-one GitHub delivery should create one durable notification entry and one
-Workshop outbox request. The browser will receive the canonical entry through
-its live channel stream, while the Telegram adapter will deliver the same entry
-to the existing notification group. Idempotency must be derived from the
-GitHub delivery identity and destination channel so multiple subscribed humans
-cannot create duplicate feed entries or Telegram sends. Specialized issue
-triage should remain unchanged until it receives its own explicit migration.
+The browser receives each entry through its live channel stream, while the
+dedicated notification-purpose Telegram worker delivers the same entry to the
+existing group. Specialized issue triage remains unchanged until it receives
+its own explicit migration.
 
 Notification channels are feeds, not conversations. They must have no composer
 or agent execution authority. Their eventual presentation should use structured

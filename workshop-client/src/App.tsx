@@ -442,9 +442,31 @@ function ConnectionIndicator({
   );
 }
 
-function MessageItem({ message }: { message: TimelineMessage }): React.JSX.Element {
+function MessageItem({
+  message,
+  notification = false,
+}: {
+  message: TimelineMessage;
+  notification?: boolean;
+}): React.JSX.Element {
   const isAgent = message.authorKind === "agent";
   const displayName = message.authorDisplayName || "Unknown author";
+  if (notification) {
+    return (
+      <li className="notification-row">
+        <span className="notification-source" aria-hidden="true">GH</span>
+        <article>
+          <header className="message-meta">
+            <strong>GitHub</strong>
+            <time dateTime={message.createdAt}>
+              {formatTimestamp(message.createdAt)}
+            </time>
+          </header>
+          <MarkdownMessage body={message.body} />
+        </article>
+      </li>
+    );
+  }
   return (
     <li className={`message-row ${isAgent ? "agent" : "human"}`}>
       <span className="message-avatar" aria-hidden="true">
@@ -841,14 +863,18 @@ function WorkshopView({
           aria-label="Conversation timeline"
           onScroll={handleTimelineScroll}
         >
-          <div className="channel-introduction">
-            <span className="channel-symbol">#</span>
+          <div className={`channel-introduction ${channel.kind === "notification" ? "notification" : ""}`}>
+            <span className="channel-symbol">{channel.kind === "notification" ? "!" : "#"}</span>
             <div>
-              <p className="overline">Canonical conversation</p>
+              <p className="overline">
+                {channel.kind === "notification"
+                  ? "Durable notification feed"
+                  : "Canonical conversation"}
+              </p>
               <h3>Welcome to {channelName}</h3>
               <p>
                 {channel.kind === "notification"
-                  ? "This outbound channel records notifications delivered by Kai."
+                  ? "Authenticated GitHub activity appears here live and is delivered to every configured client."
                   : "Messages below come from Kai’s durable conversation history across every connected client."}
               </p>
             </div>
@@ -857,9 +883,16 @@ function WorkshopView({
           {messages.length === 0 ? (
             <p className="empty-timeline">No messages yet. New activity will appear here.</p>
           ) : (
-            <ol className="message-list" aria-live="polite">
+            <ol
+              className={`message-list ${channel.kind === "notification" ? "notification-feed" : ""}`}
+              aria-live="polite"
+            >
               {messages.map((message) => (
-                <MessageItem key={message.messageId} message={message} />
+                <MessageItem
+                  key={message.messageId}
+                  message={message}
+                  notification={channel.kind === "notification"}
+                />
               ))}
             </ol>
           )}

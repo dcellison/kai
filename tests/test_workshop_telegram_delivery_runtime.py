@@ -17,6 +17,7 @@ from kai.workshop.telegram_delivery_runtime import (
     TelegramDeliveryWorkerExitedError,
     WorkshopTelegramConversationDeliveryService,
     WorkshopTelegramDeliveryRuntime,
+    WorkshopTelegramNotificationService,
 )
 
 
@@ -233,6 +234,18 @@ async def test_conversation_service_activates_once_and_reuses_epoch_after_restar
     await second_service.stop()
 
     assert second_epoch.epoch_id == first_epoch.epoch_id
+
+
+async def test_notification_service_owns_a_dedicated_ready_worker(tmp_path: Path):
+    service = await WorkshopTelegramNotificationService.open_and_start(
+        tmp_path / "kai.db",
+        AsyncMock(),
+    )
+    try:
+        assert service.ready
+    finally:
+        await service.stop()
+    assert not service.ready
 
 
 async def test_conversation_service_wait_fails_when_either_owned_worker_fails(

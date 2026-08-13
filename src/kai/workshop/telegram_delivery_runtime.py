@@ -13,8 +13,14 @@ from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthorit
 from kai.workshop.delivery_fragments import WorkshopDeliveryFragments
 from kai.workshop.delivery_outbox import (
     CONVERSATION_REPLY_PURPOSE,
+    NOTIFICATION_PURPOSE,
     DeliveryRecoveryResult,
     WorkshopDeliveryOutbox,
+)
+from kai.workshop.github_notifications import (
+    GitHubNotification,
+    GitHubNotificationRecord,
+    WorkshopGitHubNotificationRecorder,
 )
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.telegram_delivery import (
@@ -316,3 +322,87 @@ class WorkshopTelegramConversationDeliveryService:
         for result in results:
             if isinstance(result, BaseException):
                 raise result
+
+
+class WorkshopTelegramNotificationService:
+    """Own canonical GitHub recording and its dedicated Telegram worker."""
+
+    def __init__(
+        self,
+        recorder_store: WorkshopEventStore,
+        worker_store: WorkshopEventStore,
+        recorder: WorkshopGitHubNotificationRecorder,
+        runtime: WorkshopTelegramDeliveryRuntime,
+    ) -> None:
+        self._recorder_store = recorder_store
+        self._worker_store = worker_store
+        self._recorder = recorder
+        self._runtime = runtime
+        self._closed = False
+
+    @classmethod
+    async def open_and_start(
+        cls,
+        database_path: Path,
+        bot: Bot,
+        *,
+        worker_id: str = "kai-telegram-notification",
+    ) -> WorkshopTelegramNotificationService:
+        recorder_store = await WorkshopEventStore.open(database_path)
+        worker_store: WorkshopEventStore | None = None
+        runtime: WorkshopTelegramDeliveryRuntime | None = None
+        try:
+            worker_store = await WorkshopEventStore.open(database_path)
+            worker = WorkshopTelegramDeliveryWorker(
+                WorkshopDeliveryOutbox(worker_store),
+                WorkshopDeliveryFragments(worker_store),
+                WorkshopTelegramDeliveryAdapter(cast(TelegramTextBot, bot)),
+                worker_id=worker_id,
+                purpose=NOTIFICATION_PURPOSE,
+                modes=("text",),
+            )
+            runtime = WorkshopTelegramDeliveryRuntime(worker, worker)
+            await runtime.start()
+        except BaseException:
+            if runtime is not None:
+                try:
+                    await runtime.stop()
+                except Exception:
+                    pass
+            if worker_store is not None:
+                await worker_store.close()
+            await recorder_store.close()
+            raise
+        assert worker_store is not None
+        assert runtime is not None
+        return cls(
+            recorder_store,
+            worker_store,
+            WorkshopGitHubNotificationRecorder(recorder_store),
+            runtime,
+        )
+
+    @property
+    def ready(self) -> bool:
+        return not self._closed and self._runtime.ready
+
+    async def record(
+        self,
+        notification: GitHubNotification,
+    ) -> GitHubNotificationRecord | None:
+        if self._closed:
+            raise RuntimeError("Workshop Telegram notification service is closed")
+        return await self._recorder.record(notification)
+
+    async def wait(self) -> None:
+        await self._runtime.wait()
+
+    async def stop(self) -> None:
+        if self._closed:
+            return
+        try:
+            await self._runtime.stop()
+        finally:
+            self._closed = True
+            await self._worker_store.close()
+            await self._recorder_store.close()

@@ -46,6 +46,7 @@ from kai.workshop.delivery_fragments import (
 )
 from kai.workshop.delivery_outbox import (
     CONVERSATION_REPLY_PURPOSE,
+    NOTIFICATION_PURPOSE,
     QUALIFICATION_PURPOSE,
     SEND_FRAGMENTS_CONTRACT,
     STREAMING_FINALIZATION_CONTRACT,
@@ -135,6 +136,7 @@ from kai.workshop.timeline import (
 __all__ = [
     "CONVERSATION_REPLY_PURPOSE",
     "EDIT_OPERATION",
+    "NOTIFICATION_PURPOSE",
     "QUALIFICATION_PURPOSE",
     "SEND_FRAGMENTS_CONTRACT",
     "SEND_OPERATION",
