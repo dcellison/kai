@@ -129,6 +129,7 @@ describe("Workshop React client", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     sessionStorage.clear();
+    localStorage.clear();
     handlers = null;
     failStream = null;
     vi.mocked(redeemEnrollment).mockResolvedValue("redeemed-session-token");
@@ -421,6 +422,46 @@ describe("Workshop React client", () => {
       ),
     ).toBeVisible();
     expect(screen.queryByText("Agents")).toBeNull();
+  });
+
+  it("collapses the navigation to labeled icons and restores its layout", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    render(<App />);
+
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+    const navigationPanel = screen.getByLabelText("Workshop navigation");
+    await user.click(screen.getByRole("button", { name: "Collapse navigation" }));
+
+    expect(navigationPanel).toHaveClass("collapsed");
+    expect(screen.getByRole("button", { name: "Kai" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Scott" })).toBeVisible();
+    expect(localStorage.getItem("kai.workshop.sidebar-layout.v1")).toContain(
+      '"collapsed":true',
+    );
+
+    await user.click(screen.getByRole("button", { name: "Expand navigation" }));
+    expect(navigationPanel).not.toHaveClass("collapsed");
+  });
+
+  it("resizes navigation with an accessible separator", async () => {
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    const { container } = render(<App />);
+
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+    const resizeHandle = screen.getByRole("separator", { name: "Resize navigation" });
+    fireEvent.keyDown(resizeHandle, { key: "ArrowRight" });
+
+    expect(container.querySelector(".workshop-app")).toHaveStyle(
+      "--channel-sidebar-width: 280px",
+    );
+    expect(resizeHandle).toHaveAttribute("aria-valuenow", "280");
   });
 
   it("submits over LAN HTTP and reuses the command identity on retry", async () => {

@@ -1,5 +1,8 @@
 import {
+  CSSProperties,
   FormEvent,
+  KeyboardEvent as ReactKeyboardEvent,
+  PointerEvent as ReactPointerEvent,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -35,7 +38,53 @@ const SESSION_KEY = "kai.workshop.read-session.v1";
 const ACTIVE_RUN_KEY = "kai.workshop.active-run.v1";
 const DRAFTS_KEY = "kai.workshop.drafts.v1";
 const VIEWPORTS_KEY = "kai.workshop.timeline-viewports.v1";
+const SIDEBAR_LAYOUT_KEY = "kai.workshop.sidebar-layout.v1";
 const TIMELINE_FOLLOW_DISTANCE_PX = 96;
+const DEFAULT_SIDEBAR_WIDTH_PX = 264;
+const MIN_SIDEBAR_WIDTH_PX = 176;
+const MAX_SIDEBAR_WIDTH_PX = 420;
+const COLLAPSED_SIDEBAR_WIDTH_PX = 56;
+
+interface StoredSidebarLayout {
+  collapsed: boolean;
+  width: number;
+}
+
+function clampSidebarWidth(width: number): number {
+  return Math.min(
+    MAX_SIDEBAR_WIDTH_PX,
+    Math.max(MIN_SIDEBAR_WIDTH_PX, width),
+  );
+}
+
+function restoreSidebarLayout(): StoredSidebarLayout {
+  try {
+    const stored: unknown = JSON.parse(
+      localStorage.getItem(SIDEBAR_LAYOUT_KEY) ?? "null",
+    );
+    if (
+      typeof stored === "object" &&
+      stored !== null &&
+      "collapsed" in stored &&
+      "width" in stored &&
+      typeof stored.collapsed === "boolean" &&
+      typeof stored.width === "number" &&
+      Number.isFinite(stored.width)
+    ) {
+      return {
+        collapsed: stored.collapsed,
+        width: clampSidebarWidth(stored.width),
+      };
+    }
+  } catch {
+    // Malformed layout state has no authority.
+  }
+  return { collapsed: false, width: DEFAULT_SIDEBAR_WIDTH_PX };
+}
+
+function storeSidebarLayout(layout: StoredSidebarLayout): void {
+  localStorage.setItem(SIDEBAR_LAYOUT_KEY, JSON.stringify(layout));
+}
 
 function restoreSession(): WorkshopSession | null {
   try {
@@ -583,13 +632,85 @@ function WorkshopView({
   const [activeRun, setActiveRun] = useState<WorkshopRun | null>(null);
   const [runClock, setRunClock] = useState(() => Date.now());
   const [unseenMessageCount, setUnseenMessageCount] = useState(0);
+  const [sidebarLayout, setSidebarLayout] = useState(restoreSidebarLayout);
+  const [resizingSidebar, setResizingSidebar] = useState(false);
   const timelineRef = useRef<HTMLDivElement | null>(null);
+  const sidebarRef = useRef<HTMLElement | null>(null);
+  const sidebarResizeStartRef = useRef({ pointerX: 0, width: 0 });
   const timelineChannelRef = useRef(channelId);
   const timelineInitializedRef = useRef(false);
   const timelineFollowRef = useRef(true);
   const latestMessagePositionRef = useRef(0);
   const latestRunActivityRef = useRef<WorkshopRunActivity | null>(runActivity);
   const humanName = navigation.principal.displayName || "You";
+
+  useEffect(() => {
+    storeSidebarLayout(sidebarLayout);
+  }, [sidebarLayout]);
+
+  useEffect(() => {
+    if (!resizingSidebar) {
+      return;
+    }
+    const finishResize = (): void => setResizingSidebar(false);
+    window.addEventListener("pointerup", finishResize, { once: true });
+    window.addEventListener("pointercancel", finishResize, { once: true });
+    return () => {
+      window.removeEventListener("pointerup", finishResize);
+      window.removeEventListener("pointercancel", finishResize);
+    };
+  }, [resizingSidebar]);
+
+  const beginSidebarResize = (
+    event: ReactPointerEvent<HTMLDivElement>,
+  ): void => {
+    if (sidebarLayout.collapsed) {
+      return;
+    }
+    event.currentTarget.setPointerCapture(event.pointerId);
+    sidebarResizeStartRef.current = {
+      pointerX: event.clientX,
+      width: sidebarLayout.width,
+    };
+    setResizingSidebar(true);
+  };
+
+  const resizeSidebar = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    if (!resizingSidebar) {
+      return;
+    }
+    const delta = event.clientX - sidebarResizeStartRef.current.pointerX;
+    setSidebarLayout((layout) => ({
+      ...layout,
+      width: clampSidebarWidth(sidebarResizeStartRef.current.width + delta),
+    }));
+  };
+
+  const resizeSidebarFromKeyboard = (
+    event: ReactKeyboardEvent<HTMLDivElement>,
+  ): void => {
+    const direction = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : 0;
+    if (direction === 0 && event.key !== "Home" && event.key !== "End") {
+      return;
+    }
+    event.preventDefault();
+    setSidebarLayout((layout) => ({
+      collapsed: false,
+      width:
+        event.key === "Home"
+          ? MIN_SIDEBAR_WIDTH_PX
+          : event.key === "End"
+            ? MAX_SIDEBAR_WIDTH_PX
+            : clampSidebarWidth(layout.width + direction * 16),
+    }));
+  };
+
+  const toggleSidebar = (): void => {
+    setSidebarLayout((layout) => ({
+      ...layout,
+      collapsed: !layout.collapsed,
+    }));
+  };
 
   useEffect(() => {
     const restoredRunId = restoreActiveRunId(channelId);
@@ -791,7 +912,16 @@ function WorkshopView({
   };
 
   return (
-    <main className="workshop-app">
+    <main
+      className={`workshop-app ${sidebarLayout.collapsed ? "sidebar-collapsed" : ""} ${resizingSidebar ? "sidebar-resizing" : ""}`}
+      style={{
+        "--channel-sidebar-width": `${
+          sidebarLayout.collapsed
+            ? COLLAPSED_SIDEBAR_WIDTH_PX
+            : sidebarLayout.width
+        }px`,
+      } as CSSProperties}
+    >
       <aside className="workspace-rail" aria-label="Workshop switcher">
         <span className="rail-brand">K</span>
         {navigation.workshops.map((availableWorkshop) => (
@@ -810,13 +940,29 @@ function WorkshopView({
         <span className="rail-status" title="Kai connected" aria-label="Kai connected" />
       </aside>
 
-      <aside className="channel-sidebar" aria-label="Workshop navigation">
+      <aside
+        ref={sidebarRef}
+        className={`channel-sidebar ${sidebarLayout.collapsed ? "collapsed" : ""}`}
+        aria-label="Workshop navigation"
+      >
         <header className="sidebar-header">
-          <div>
+          <div className="sidebar-title">
             <p className="overline">Kai Workshop</p>
             <h1>{workshop.name}</h1>
           </div>
-          <span className="read-only-chip">{workshop.role}</span>
+          <div className="sidebar-header-actions">
+            <span className="read-only-chip">{workshop.role}</span>
+            <button
+              className="sidebar-toggle"
+              type="button"
+              aria-label={sidebarLayout.collapsed ? "Expand navigation" : "Collapse navigation"}
+              aria-expanded={!sidebarLayout.collapsed}
+              title={sidebarLayout.collapsed ? "Expand navigation" : "Collapse navigation"}
+              onClick={toggleSidebar}
+            >
+              <span aria-hidden="true">{sidebarLayout.collapsed ? "›" : "‹"}</span>
+            </button>
+          </div>
         </header>
 
         <nav>
@@ -832,6 +978,7 @@ function WorkshopView({
                     className={`channel-link ${availableChannel.channelId === channelId ? "active" : ""}`}
                     type="button"
                     aria-label={channelDisplayName(availableChannel)}
+                    title={channelDisplayName(availableChannel)}
                     onClick={() => onSelectChannel(availableChannel.channelId)}
                     key={availableChannel.channelId}
                   >
@@ -857,6 +1004,7 @@ function WorkshopView({
                     className={`channel-link ${availableChannel.channelId === channelId ? "active" : ""}`}
                     type="button"
                     aria-label={channelDisplayName(availableChannel)}
+                    title={channelDisplayName(availableChannel)}
                     onClick={() => onSelectChannel(availableChannel.channelId)}
                     key={availableChannel.channelId}
                   >
@@ -882,6 +1030,7 @@ function WorkshopView({
                     className={`channel-link notification ${availableChannel.channelId === channelId ? "active" : ""}`}
                     type="button"
                     aria-label={channelDisplayName(availableChannel)}
+                    title={channelDisplayName(availableChannel)}
                     onClick={() => onSelectChannel(availableChannel.channelId)}
                     key={availableChannel.channelId}
                   >
@@ -899,7 +1048,7 @@ function WorkshopView({
             <>
               <p className="nav-heading">Agents</p>
               {channel.agents.map((agent) => (
-                <div className="agent-link" key={agent.agentId}>
+                <div className="agent-link" title={agent.name} key={agent.agentId}>
                   <span className="mini-avatar">
                     {agent.name.slice(0, 1).toUpperCase()}
                   </span>
@@ -913,7 +1062,7 @@ function WorkshopView({
           )}
         </nav>
 
-        <footer className="sidebar-footer">
+        <footer className="sidebar-footer" title={humanName}>
           <span className="mini-avatar human">
             {humanName.slice(0, 1).toUpperCase()}
           </span>
@@ -922,6 +1071,22 @@ function WorkshopView({
             <small>Human collaborator</small>
           </span>
         </footer>
+
+        {!sidebarLayout.collapsed && (
+          <div
+            className="sidebar-resize-handle"
+            role="separator"
+            aria-label="Resize navigation"
+            aria-orientation="vertical"
+            aria-valuemin={MIN_SIDEBAR_WIDTH_PX}
+            aria-valuemax={MAX_SIDEBAR_WIDTH_PX}
+            aria-valuenow={sidebarLayout.width}
+            tabIndex={0}
+            onKeyDown={resizeSidebarFromKeyboard}
+            onPointerDown={beginSidebarResize}
+            onPointerMove={resizeSidebar}
+          />
+        )}
       </aside>
 
       <section className="conversation-pane">
