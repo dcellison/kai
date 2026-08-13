@@ -29,6 +29,7 @@ import type {
 } from "./types";
 import { CHANNEL_PATTERN } from "./types";
 import { useWorkshopTimeline } from "./useWorkshopTimeline";
+import { MarkdownMessage } from "./MarkdownMessage";
 
 const SESSION_KEY = "kai.workshop.read-session.v1";
 const ACTIVE_RUN_KEY = "kai.workshop.active-run.v1";
@@ -456,7 +457,7 @@ function MessageItem({ message }: { message: TimelineMessage }): React.JSX.Eleme
             {formatTimestamp(message.createdAt)}
           </time>
         </header>
-        <p>{message.body}</p>
+        <MarkdownMessage body={message.body} />
       </article>
     </li>
   );
