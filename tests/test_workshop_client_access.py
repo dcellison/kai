@@ -17,6 +17,7 @@ from kai.workshop.client_sessions import (
     WorkshopClientSessionManager,
 )
 from kai.workshop.domain import ChannelId, DeviceId, EnrollmentGrantId, PrincipalId
+from kai.workshop.human_provisioning import WorkshopHumanProvisioningError
 from kai.workshop.store import WorkshopEventStore
 
 
@@ -184,6 +185,8 @@ class TestWorkshopClientAccessCLI:
             workshop_cli._principal_id("101")
         with pytest.raises(WorkshopClientAccessError, match="Invalid channel ID"):
             workshop_cli._channel_id("101")
+        with pytest.raises(WorkshopHumanProvisioningError, match="Invalid Workshop ID"):
+            workshop_cli._workshop_id("101")
 
         assert workshop_cli._device_id("dev_" + "a" * 32) == DeviceId("dev_" + "a" * 32)
         assert workshop_cli._enrollment_grant_id("enr_" + "b" * 32) == EnrollmentGrantId("enr_" + "b" * 32)
@@ -205,6 +208,40 @@ class TestWorkshopClientAccessCLI:
         assert "Human: Alice" in output
         assert f"Principal: {principal_id}" in output
         assert f"Direct channel: {channel_id}" in output
+
+    async def test_provision_command_reports_canonical_identity_without_implied_access(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        capsys,
+    ):
+        store = await _store(tmp_path / "kai.db")
+        await store.close()
+        monkeypatch.setattr(workshop_cli, "DATA_DIR", tmp_path)
+        args = workshop_cli._parser().parse_args(
+            [
+                "client-access",
+                "provision-human",
+                "--provisioning-key",
+                "charlie",
+                "--display-name",
+                "Charlie",
+                "--role",
+                "member",
+            ]
+        )
+
+        assert await workshop_cli._run(args) == 0
+        output = capsys.readouterr().out
+        assert "Human: Charlie" in output
+        assert "Principal: prn_" in output
+        assert "Workshop: wsp_" in output
+        assert "Direct channel: chn_" in output
+        assert "Role: member" in output
+        assert "Provisioning key: charlie" in output
+        assert "Status: created" in output
+        assert "Transport access: not assigned" in output
+        assert "Runtime access: not assigned" in output
 
     async def test_issue_command_prints_the_token_once_with_qualification_coordinates(
         self,

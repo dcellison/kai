@@ -26,7 +26,18 @@ from kai.workshop.delivery_outbox import (
     WorkshopDeliveryOutbox,
 )
 from kai.workshop.delivery_qualification import DeliveryQualificationError, WorkshopDeliveryQualification
-from kai.workshop.domain import ChannelId, DeliveryId, DeviceId, EnrollmentGrantId, PrincipalId
+from kai.workshop.domain import (
+    ChannelId,
+    DeliveryId,
+    DeviceId,
+    EnrollmentGrantId,
+    PrincipalId,
+    WorkshopId,
+)
+from kai.workshop.human_provisioning import (
+    WorkshopHumanProvisioner,
+    WorkshopHumanProvisioningError,
+)
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.telegram_delivery import (
     TelegramWorkOutcome,
@@ -89,6 +100,14 @@ def _parser() -> argparse.ArgumentParser:
         "list-humans",
         help="list canonical humans and their direct channels",
     )
+    provision = client_actions.add_parser(
+        "provision-human",
+        help="create a canonical human and direct channel without transport or runtime access",
+    )
+    provision.add_argument("--provisioning-key", required=True)
+    provision.add_argument("--display-name", required=True)
+    provision.add_argument("--role", required=True, choices=("admin", "member"))
+    provision.add_argument("--workshop-id")
     issue = client_actions.add_parser(
         "issue-enrollment",
         help="issue one short-lived enrollment token for a canonical human",
@@ -151,6 +170,13 @@ def _channel_id(value: str) -> ChannelId:
         raise WorkshopClientAccessError("Invalid channel ID") from exc
 
 
+def _workshop_id(value: str) -> WorkshopId:
+    try:
+        return WorkshopId(value)
+    except (TypeError, ValueError) as exc:
+        raise WorkshopHumanProvisioningError("Invalid Workshop ID") from exc
+
+
 def _print_state(state: DeliveryState) -> None:
     print(f"Delivery: {state.delivery_id}")
     print(f"Status: {state.status}")
@@ -192,6 +218,23 @@ async def _run(args: argparse.Namespace) -> int:
                             print(f"Direct channel: {channel_id}")
                     else:
                         print("Direct channel: unavailable")
+                return 0
+            if args.action == "provision-human":
+                human = await WorkshopHumanProvisioner(store).provision(
+                    args.provisioning_key,
+                    args.display_name,
+                    args.role,
+                    workshop_id=(_workshop_id(args.workshop_id) if args.workshop_id is not None else None),
+                )
+                print(f"Human: {human.display_name}")
+                print(f"Principal: {human.principal_id}")
+                print(f"Workshop: {human.workshop_id}")
+                print(f"Direct channel: {human.channel_id}")
+                print(f"Role: {human.role}")
+                print(f"Provisioning key: {human.provisioning_key}")
+                print(f"Status: {'created' if human.created else 'already provisioned'}")
+                print("Transport access: not assigned")
+                print("Runtime access: not assigned")
                 return 0
             if args.action == "issue-enrollment":
                 if args.principal_id is not None:
@@ -317,6 +360,8 @@ def cli(args: list[str]) -> None:
         raise SystemExit(f"Workshop delivery authority failed: {exc}") from exc
     except WorkshopClientAccessError as exc:
         raise SystemExit(f"Workshop client access failed: {exc}") from exc
+    except WorkshopHumanProvisioningError as exc:
+        raise SystemExit(f"Workshop human provisioning failed: {exc}") from exc
     except (DeliveryQualificationError, DeliveryTargetNotFoundError) as exc:
         if parsed.command == "client-access":
             raise SystemExit(f"Workshop client access failed: {exc}") from exc
