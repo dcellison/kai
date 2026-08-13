@@ -12,6 +12,7 @@ All paths are resolved relative to PROJECT_ROOT (the repository root), which is
 derived from this file's location in the source tree: src/kai/config.py -> project root.
 """
 
+import ipaddress
 import logging
 import os
 import pwd
@@ -37,6 +38,32 @@ from kai.user_isolation import validate_protected_user_isolation
 
 log = logging.getLogger(__name__)
 _legacy_registry_model_warning_emitted: set[tuple[str, str]] = set()
+
+
+def normalize_workshop_lan_host(value: str) -> str:
+    """Return one canonical private IPv4 address, or disable with empty input.
+
+    Workshop's optional direct listener is intentionally narrower than a
+    general bind-address setting.  Wildcard, loopback, public, multicast, and
+    IPv6 addresses are rejected so an operator cannot accidentally expose it
+    beyond the private IPv4 interface they selected.
+    """
+    candidate = value.strip()
+    if not candidate:
+        return ""
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        raise ValueError("must be an empty value or a private IPv4 address") from None
+    if (
+        not isinstance(address, ipaddress.IPv4Address)
+        or not address.is_private
+        or address.is_loopback
+        or address.is_unspecified
+        or address.is_multicast
+    ):
+        raise ValueError("must be a non-loopback private IPv4 address")
+    return str(address)
 
 
 # ── Module-level paths and constants ─────────────────────────────────
@@ -1436,6 +1463,10 @@ class Config:
 
     # Webhook server
     webhook_port: int = 8080
+    # Optional second HTTP listener containing only the authenticated Workshop
+    # client surface. Empty keeps Workshop reachable through the loopback
+    # listener (and any trusted TLS terminator) only.
+    workshop_lan_host: str = ""
     github_webhook_secret: str = ""
     generic_webhook_secret: str = ""
     # True when load_config() populated secrets from the protected
@@ -3084,6 +3115,12 @@ def load_config() -> Config:
     except ValueError:
         raise SystemExit("WEBHOOK_PORT must be an integer") from None
     try:
+        workshop_lan_host = normalize_workshop_lan_host(
+            os.environ.get("WORKSHOP_LAN_HOST", ""),
+        )
+    except ValueError as exc:
+        raise SystemExit(f"WORKSHOP_LAN_HOST {exc}") from None
+    try:
         file_retention_days = int(os.environ.get("FILE_RETENTION_DAYS", "0"))
     except ValueError:
         raise SystemExit("FILE_RETENTION_DAYS must be an integer") from None
@@ -3642,6 +3679,7 @@ def load_config() -> Config:
         codex_auth_mode=codex_auth_mode,
         codex_effort_level=codex_effort_level,
         webhook_port=webhook_port,
+        workshop_lan_host=workshop_lan_host,
         github_webhook_secret=github_webhook_secret,
         generic_webhook_secret=generic_webhook_secret,
         protected_install=bool(protected_env),

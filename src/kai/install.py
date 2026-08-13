@@ -60,6 +60,7 @@ from kai.config import (
     canonicalize_model_for_backend,
     get_default_model_for_backend,
     models_for_backend,
+    normalize_workshop_lan_host,
     validate_model_for_backend,
 )
 from kai.named_access import replace_named_read_access
@@ -1725,6 +1726,22 @@ def _cmd_config() -> None:
             break
         print("  Must be a valid port number (1-65535).")
 
+    while True:
+        workshop_lan_host_input = _prompt(
+            "Workshop LAN address (optional; client routes only)",
+            existing_env.get("WORKSHOP_LAN_HOST", ""),
+        )
+        try:
+            workshop_lan_host = normalize_workshop_lan_host(workshop_lan_host_input)
+            break
+        except ValueError as exc:
+            print(f"  Workshop LAN address {exc}.")
+    if workshop_lan_host:
+        print(
+            "  Warning: Workshop bearer sessions will use plain HTTP on this "
+            "trusted LAN address. Use a TLS terminator for untrusted networks."
+        )
+
     # Each external ingress has a dedicated credential. A legacy WEBHOOK_SECRET
     # from an older generated artifact is deliberately not carried forward.
     if had_legacy_webhook_secret:
@@ -2051,6 +2068,8 @@ def _cmd_config() -> None:
         "VOICE_ENABLED": str(voice_enabled).lower(),
         "TTS_ENABLED": str(tts_enabled).lower(),
     }
+    if workshop_lan_host:
+        env["WORKSHOP_LAN_HOST"] = workshop_lan_host
     # DEFAULT_BACKEND is the global default backend; users.yaml entries
     # can override it per user. The wizard writes the selected backend
     # explicitly; absence is not a backend-selection signal.
@@ -4976,6 +4995,8 @@ def _cmd_apply() -> None:
         print(f"  Data:    {data_dir}")
         print("  Secrets: /etc/kai/env")
         print(f"  User:    {service_user}")
+        if workshop_lan_host := env.get("WORKSHOP_LAN_HOST", "").strip():
+            print(f"  Workshop: http://{workshop_lan_host}:{env.get('WEBHOOK_PORT', '8080')}/workshop/")
         # Remind the user that install.conf contains secrets and can be
         # cleaned up. Don't auto-delete - the user may want to re-run
         # apply or adjust config.

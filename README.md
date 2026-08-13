@@ -101,6 +101,14 @@ make install-status
 
 `make install` invokes `sudo` internally and installs source, data, and secrets under separate protected system directories. It also generates the admin-owned `/etc/kai/backends.yaml` registry containing the discovered executable paths, allowed model surfaces, and selected default backend. Runtime configuration names backend identifiers; it cannot redirect a protected backend to an arbitrary executable. After a successful protected install, `install.conf` may be deleted because it can contain secrets; re-run `make config` before a later reconfiguration.
 
+Workshop remains loopback-only by default. To reach its browser client directly
+from a trusted private network, enter one private IPv4 interface address at the
+optional `Workshop LAN address` prompt. Kai then creates a second listener on
+the webhook port containing only the Workshop shell, enrollment, timeline, and
+event-stream routes; internal agent APIs and webhook ingress remain bound to
+loopback. This direct listener uses HTTP, so use a trusted LAN or put a trusted
+TLS terminator in front of it.
+
 Protected mode requires every Telegram user to have a unique `os_user` that differs from the Kai service account; this keeps persistent agents from inheriting the daemon's protected-config capabilities. Single-user mode runs the agent as the operator account.
 
 Kai-managed per-user identity has one editable source: `<DATA_DIR>/home/<chat_id>/AGENTS.md`. Codex, Goose, OpenCode, and Pi consume that file directly. Claude Code receives a generated `.claude/CLAUDE.md` adapter containing only `@../AGENTS.md`. On upgrade, `make install` migrates existing customized Claude identity content into `AGENTS.md`; if both files contain different customizations, installation stops without choosing or overwriting either one. Instruction files owned by individual project repositories remain independent.

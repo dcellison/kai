@@ -1844,6 +1844,14 @@ assets that remain ordinary Python package data, so an installed Kai host does
 not need Node. CI type-checks and tests the source, rebuilds the client, and
 fails if the committed assets differ.
 
+Direct trusted-LAN access is opt-in through one explicit private IPv4
+interface. The existing mixed webhook/internal API application remains bound
+to loopback. A separate application on the selected address registers only the
+Workshop shell, enrollment redemption, authenticated timeline, and event
+stream, while sharing the same locks and process-wide rate limits. The direct
+listener is HTTP and is not a replacement for the documented trusted TLS
+terminator boundary on an untrusted network.
+
 ### 37.1 Installed qualification
 
 After merge, install the packaged client and prove: enrollment with a

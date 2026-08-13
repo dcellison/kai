@@ -54,6 +54,7 @@ import json
 import logging
 import re
 import time
+from collections.abc import Callable
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -69,6 +70,7 @@ from kai.job_types import CANONICAL_JOB_TYPES, normalize_job_type
 from kai.telegram_utils import chunk_text
 from kai.workshop.client_api import (
     WorkshopEnrollmentRateLimiter,
+    WorkshopEventStreamLimiter,
     register_workshop_enrollment_routes,
     register_workshop_read_routes,
 )
@@ -125,6 +127,7 @@ class UnauthorizedChatIdError(Exception):
 # Module-level server state, managed by start() and stop()
 _app: web.Application | None = None
 _runner: web.AppRunner | None = None
+_workshop_lan_runner: web.AppRunner | None = None
 _workshop_client_store: WorkshopEventStore | None = None
 # Tracks whether we registered a Telegram webhook with the API, so stop()
 # knows whether to call delete_webhook(). Only True in webhook mode.
@@ -2428,8 +2431,19 @@ def _register_routes(app: web.Application, config: Config) -> None:
     app.router.add_delete("/api/memory/all", _handle_memory_delete_all)
 
 
-async def _register_workshop_client_api(app: web.Application, database: Path) -> None:
-    """Open one protected client-state connection and register its HTTP boundary."""
+async def _register_workshop_client_api(
+    app: web.Application,
+    database: Path,
+) -> Callable[[web.Application], None]:
+    """Open one client-state connection and return its route registrar.
+
+    The returned registrar deliberately contains only the Workshop browser
+    shell and authenticated client API.  It can therefore be applied to the
+    loopback application and, when explicitly configured, to a second
+    LAN-bound application without exposing webhook or internal-agent routes.
+    Shared locks and rate limiters keep both listeners inside one security
+    boundary rather than giving each listener an independent allowance.
+    """
     global _workshop_client_store
     if _workshop_client_store is not None:
         raise RuntimeError("Workshop client API store is already open")
@@ -2438,23 +2452,33 @@ async def _register_workshop_client_api(app: web.Application, database: Path) ->
     try:
         request_lock = asyncio.Lock()
         sessions_manager = WorkshopClientSessionManager(store)
-        register_workshop_enrollment_routes(
-            app,
-            enrollment_manager=WorkshopClientEnrollmentManager(store),
-            rate_limiter=WorkshopEnrollmentRateLimiter(),
-            request_lock=request_lock,
-        )
-        register_workshop_read_routes(
-            app,
-            store=store,
-            authenticator=WorkshopBearerSessionAuthenticator(sessions_manager),
-            request_lock=request_lock,
-        )
-        register_workshop_shell_routes(app)
+        enrollment_manager = WorkshopClientEnrollmentManager(store)
+        authenticator = WorkshopBearerSessionAuthenticator(sessions_manager)
+        enrollment_rate_limiter = WorkshopEnrollmentRateLimiter()
+        event_stream_limiter = WorkshopEventStreamLimiter()
+
+        def register(target: web.Application) -> None:
+            register_workshop_enrollment_routes(
+                target,
+                enrollment_manager=enrollment_manager,
+                rate_limiter=enrollment_rate_limiter,
+                request_lock=request_lock,
+            )
+            register_workshop_read_routes(
+                target,
+                store=store,
+                authenticator=authenticator,
+                request_lock=request_lock,
+                event_stream_limiter=event_stream_limiter,
+            )
+            register_workshop_shell_routes(target)
+
+        register(app)
     except Exception:
         await store.close()
         raise
     _workshop_client_store = store
+    return register
 
 
 async def start(telegram_app, config) -> None:
@@ -2473,7 +2497,7 @@ async def start(telegram_app, config) -> None:
         telegram_app: The python-telegram-bot Application instance.
         config: The application Config instance.
     """
-    global _app, _runner, _webhook_registered, _health_monitor_task
+    global _app, _runner, _workshop_lan_runner, _webhook_registered, _health_monitor_task
 
     _app = web.Application()
     _app[TELEGRAM_APP_KEY] = telegram_app
@@ -2550,15 +2574,36 @@ async def start(telegram_app, config) -> None:
                     val,
                 )
     _register_routes(_app, config)
-    await _register_workshop_client_api(_app, Path(config.session_db_path))
+    register_workshop_routes = await _register_workshop_client_api(
+        _app,
+        Path(config.session_db_path),
+    )
 
     _runner = web.AppRunner(_app, access_log=None)
     await _runner.setup()
-    # Bind to localhost only - all external access routes through Cloudflare Tunnel,
-    # so there's no reason to expose the server on the LAN.
+    # The mixed webhook/internal API application remains loopback-only.  A
+    # separately configured LAN listener below receives only Workshop client
+    # routes, so opting into browser access cannot expose /api or /webhook.
     site = web.TCPSite(_runner, "127.0.0.1", config.webhook_port)
     await site.start()
-    log.info("Webhook server listening on port %d", config.webhook_port)
+    log.info("Webhook server listening on 127.0.0.1:%d", config.webhook_port)
+
+    if config.workshop_lan_host:
+        workshop_lan_app = web.Application()
+        register_workshop_routes(workshop_lan_app)
+        _workshop_lan_runner = web.AppRunner(workshop_lan_app, access_log=None)
+        await _workshop_lan_runner.setup()
+        workshop_lan_site = web.TCPSite(
+            _workshop_lan_runner,
+            config.workshop_lan_host,
+            config.webhook_port,
+        )
+        await workshop_lan_site.start()
+        log.warning(
+            "Workshop client listening on trusted-LAN HTTP at http://%s:%d/workshop/",
+            config.workshop_lan_host,
+            config.webhook_port,
+        )
 
     # Register the webhook URL with Telegram's API if in webhook mode. This must
     # come after the server is listening so the endpoint is ready before Telegram
@@ -2625,7 +2670,8 @@ async def stop() -> None:
     if the network is down at shutdown time, Telegram will just overwrite the
     stale webhook on the next set_webhook call at startup.
     """
-    global _app, _runner, _webhook_registered, _health_monitor_task, _workshop_client_store
+    global _app, _runner, _workshop_lan_runner, _webhook_registered, _health_monitor_task
+    global _workshop_client_store
     # Cancel the webhook health monitor before tearing down the server
     if _health_monitor_task is not None:
         _health_monitor_task.cancel()
@@ -2647,10 +2693,14 @@ async def stop() -> None:
         _webhook_registered = False
     await _drain_background_tasks(_BACKGROUND_TASK_DRAIN_TIMEOUT)
     try:
+        if _workshop_lan_runner:
+            await _workshop_lan_runner.cleanup()
+            log.info("Workshop LAN client server stopped")
         if _runner:
             await _runner.cleanup()
             log.info("Webhook server stopped")
     finally:
+        _workshop_lan_runner = None
         _runner = None
         _app = None
         if _workshop_client_store is not None:

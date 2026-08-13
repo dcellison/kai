@@ -1440,6 +1440,7 @@ class TestCmdConfig:
                 "80",  # autocompact pct
                 "",  # claude effort level (take default "high")
                 "8080",  # port
+                "10.0.0.36",  # Workshop LAN address
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
                 "",  # allowed workspaces (empty)
@@ -1467,6 +1468,7 @@ class TestCmdConfig:
         assert conf["env"]["TELEGRAM_BOT_TOKEN"] == "fake-token"
         assert conf["env"]["GITHUB_WEBHOOK_SECRET"] == "test-secret"
         assert conf["env"]["GENERIC_WEBHOOK_SECRET"] != "test-secret"
+        assert conf["env"]["WORKSHOP_LAN_HOST"] == "10.0.0.36"
         assert "WEBHOOK_SECRET" not in conf["env"]
         # The context window setting was removed; the wizard never
         # emits the retired key.
@@ -1537,6 +1539,7 @@ class TestCmdConfig:
                 "80",  # autocompact pct
                 "",  # claude effort level (take default "high")
                 "8080",  # port
+                "",  # Workshop LAN address (disabled)
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
                 "",  # allowed workspaces (empty)
@@ -1618,6 +1621,7 @@ class TestCmdConfig:
                 "80",  # autocompact pct
                 "",  # claude effort level (take default "high")
                 "8080",  # port
+                "",  # Workshop LAN address (disabled)
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
                 "",  # allowed workspaces
@@ -1687,6 +1691,7 @@ class TestCmdConfig:
                 "80",
                 "",  # claude effort level (take default "high")
                 "8080",
+                "",  # Workshop LAN address (disabled)
                 "test-secret",
                 "~/Projects",
                 "",
@@ -1747,6 +1752,7 @@ class TestCmdConfig:
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
                 "8080",  # port
+                "",  # Workshop LAN address (disabled)
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
                 "",  # allowed workspaces (empty)
@@ -1880,6 +1886,7 @@ class TestCmdConfig:
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
                 "8080",  # port
+                "",  # Workshop LAN address (disabled)
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
                 "",  # allowed workspaces (empty)
@@ -2097,6 +2104,7 @@ class TestCmdConfig:
             "1800",  # idle eviction timeout seconds
             *claude_only_pre_webhook,  # autocompact + effort (claude only)
             "8080",  # port
+            "",  # Workshop LAN address (disabled)
             "test-secret",  # webhook secret
             "~/Projects",  # workspace base
             "",  # allowed workspaces
@@ -2534,6 +2542,7 @@ class TestCmdConfig:
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
                 "8080",  # port
+                "",  # Workshop LAN address (disabled)
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
                 "",  # allowed workspaces
@@ -2874,6 +2883,7 @@ class TestCmdConfig:
                 # autocompact + claude effort skipped on non-claude backend
                 "",  # codex reasoning effort (empty = codex default)
                 "8080",  # webhook port
+                "",  # Workshop LAN address (disabled)
                 "test-secret",  # webhook secret
                 "",  # workspace base
                 "",  # allowed workspaces
@@ -3399,6 +3409,7 @@ class TestCmdConfigDefaultModelDispatch:
             "80",  # autocompact pct
             "",  # effort level (default)
             "8080",  # webhook port
+            "",  # Workshop LAN address (disabled)
             "test-secret",  # webhook secret
             "~/Projects",  # workspace base (global default)
             "",  # allowed workspaces (global default, empty)
@@ -3440,6 +3451,7 @@ class TestCmdConfigDefaultModelDispatch:
             # No autocompact_pct / claude effort prompts (claude-only)
             "",  # codex reasoning effort (empty = codex default)
             "8080",  # webhook port
+            "",  # Workshop LAN address (disabled)
             "test-secret",  # webhook secret
             "~/Projects",  # workspace base (global default)
             "",  # allowed workspaces (global default, empty)
@@ -3474,6 +3486,7 @@ class TestCmdConfigDefaultModelDispatch:
             # (claude tunables and the codex effort prompt all skip
             # on goose)
             "8080",  # webhook port
+            "",  # Workshop LAN address (disabled)
             "test-secret",  # webhook secret
             "~/Projects",  # workspace base (global default)
             "",  # allowed workspaces (global default, empty)
@@ -8542,6 +8555,7 @@ class TestCmdConfigCanonicalUsersYaml:
             "80",
             "",  # effort level (default)
             "8080",
+            "",  # Workshop LAN address (disabled)
             "test-secret",
             "~/Projects",
             "",
@@ -9005,6 +9019,7 @@ class TestCmdConfigSingleUserMode:
             "80",  # autocompact
             "",  # effort level
             "8080",  # webhook port
+            "",  # Workshop LAN address (disabled)
             "test-secret",  # webhook secret
             "~/Projects",  # workspace_base
             "",  # allowed_workspaces
@@ -10499,6 +10514,7 @@ class TestOpenCodeConfigWizard:
             "0",  # max session age hours (0 = no limit)
             "1800",  # idle eviction timeout seconds
             "8080",  # webhook port
+            "",  # Workshop LAN address (disabled)
             "test-secret",  # webhook secret
             "",  # workspace base
             "",  # allowed workspaces

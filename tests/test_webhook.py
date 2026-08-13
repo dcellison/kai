@@ -2369,6 +2369,7 @@ class TestNotificationChatIdMutations:
         config.pr_review_cooldown = 0
         config.pr_review_timeout_s = 0
         config.webhook_port = 0
+        config.workshop_lan_host = ""
         config.workspace_base = None
         config.allowed_workspaces = []
         config.spec_dir = "specs"
@@ -2398,6 +2399,81 @@ class TestNotificationChatIdMutations:
         finally:
             wh._app = old_app
             wh._runner = old_runner
+
+    @pytest.mark.asyncio
+    async def test_start_lan_listener_exposes_only_workshop_client_routes(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Opt-in LAN access must not publish webhook or internal API routes."""
+        import kai.webhook as wh
+
+        admin = UserConfig(telegram_id=111, name="alice", role="admin")
+        config = MagicMock()
+        config.user_configs = {111: admin}
+        config.allowed_user_ids = {111}
+        config.get_admins.return_value = [admin]
+        config.telegram_webhook_url = None
+        config.telegram_webhook_secret = None
+        config.github_webhook_secret = None
+        config.generic_webhook_secret = None
+        config.pr_review_cooldown = 0
+        config.pr_review_timeout_s = 0
+        config.webhook_port = 8080
+        config.workshop_lan_host = "10.0.0.36"
+        config.workspace_base = None
+        config.allowed_workspaces = []
+        config.spec_dir = "specs"
+        config.session_db_path = tmp_path / "kai.db"
+
+        telegram_app = MagicMock()
+        telegram_app.bot = AsyncMock()
+        telegram_app.bot_data = {"pool": MagicMock(internal_api_auth=InternalAPIAuth({111: "secret"}))}
+
+        apps: list[web.Application] = []
+        runners: list[MagicMock] = []
+        sites: list[tuple[MagicMock, str, int]] = []
+
+        def fake_runner(app, *, access_log=None):
+            apps.append(app)
+            runner = MagicMock()
+            runner.setup = AsyncMock()
+            runner.cleanup = AsyncMock()
+            runners.append(runner)
+            return runner
+
+        def fake_site(runner, host, port):
+            sites.append((runner, host, port))
+            site = MagicMock()
+            site.start = AsyncMock()
+            return site
+
+        monkeypatch.setattr("kai.webhook.web.AppRunner", fake_runner)
+        monkeypatch.setattr("kai.webhook.web.TCPSite", fake_site)
+        monkeypatch.setattr("kai.webhook.sessions.get_setting", AsyncMock(return_value=None))
+
+        await wh.start(telegram_app, config)
+        try:
+            assert [(host, port) for _, host, port in sites] == [
+                ("127.0.0.1", 8080),
+                ("10.0.0.36", 8080),
+            ]
+            assert len(apps) == 2
+            lan_paths = {resource.canonical for resource in apps[1].router.resources()}
+            assert lan_paths == {
+                "/v1/client/enrollment/redeem",
+                "/v1/channels/{channel_id}/timeline",
+                "/v1/channels/{channel_id}/events",
+                "/workshop",
+                "/workshop/",
+                "/workshop/app.css",
+                "/workshop/app.js",
+            }
+            assert not any(path.startswith("/api/") for path in lan_paths)
+            assert not any(path.startswith("/webhook") for path in lan_paths)
+        finally:
+            await wh.stop()
 
     def test_add_notification_chat_id(self):
         """add_notification_chat_id adds a chat_id to the outbound registry."""

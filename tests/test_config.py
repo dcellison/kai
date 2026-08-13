@@ -42,6 +42,7 @@ _CONFIG_ENV_VARS = [
     "AGENT_IDLE_TIMEOUT",
     "CLAUDE_IDLE_TIMEOUT",  # backward compat (renamed to AGENT_IDLE_TIMEOUT)
     "WEBHOOK_PORT",
+    "WORKSHOP_LAN_HOST",
     "WEBHOOK_SECRET",
     "VOICE_ENABLED",
     "TTS_ENABLED",
@@ -223,6 +224,7 @@ class TestLoadConfigDefaults:
         assert config.default_timeout == 120
         assert config.agent_max_session_hours == 0
         assert config.webhook_port == 8080
+        assert config.workshop_lan_host == ""
         # Without TELEGRAM_WEBHOOK_URL, defaults to polling mode
         assert config.telegram_webhook_url is None
         assert config.telegram_webhook_secret is None
@@ -240,6 +242,11 @@ class TestLoadConfigDefaults:
         config = load_config()
         assert config.claude_autocompact_pct == 80
 
+    def test_private_workshop_lan_host_from_env(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("WORKSHOP_LAN_HOST", "10.0.0.36")
+        assert load_config().workshop_lan_host == "10.0.0.36"
+
     def test_retired_context_window_env_warns_but_loads(self, monkeypatch, caplog):
         """A lingering CLAUDE_MAX_CONTEXT_WINDOW (the setting was
         removed) does not block startup; load_config warns that the
@@ -256,6 +263,16 @@ class TestLoadConfigDefaults:
 
 
 class TestLoadConfigErrors:
+    @pytest.mark.parametrize(
+        "value",
+        ["0.0.0.0", "127.0.0.1", "8.8.8.8", "::", "not-an-address"],
+    )
+    def test_rejects_unsafe_workshop_lan_host(self, monkeypatch, value):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("WORKSHOP_LAN_HOST", value)
+        with pytest.raises(SystemExit, match="WORKSHOP_LAN_HOST"):
+            load_config()
+
     def test_missing_token(self):
         with pytest.raises(SystemExit, match="TELEGRAM_BOT_TOKEN"):
             load_config()
