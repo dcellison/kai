@@ -199,11 +199,12 @@ describe("Workshop client API", () => {
     vi.stubGlobal("fetch", fetchMock);
     const onConnected = vi.fn();
     const onMessage = vi.fn();
+    const onRunActivity = vi.fn();
 
     await streamTimeline(
       session,
       "30",
-      { onConnected, onMessage },
+      { onConnected, onMessage, onRunActivity },
       new AbortController().signal,
     );
 
@@ -216,5 +217,54 @@ describe("Workshop client API", () => {
     const headers = new Headers(request[1].headers);
     expect(headers.get("Authorization")).toBe("Bearer session-secret");
     expect(headers.get("Last-Event-ID")).toBe("30");
+  });
+
+  it("receives authoritative run lifecycle activity on the same stream", async () => {
+    const rawRun = {
+      ...run("started"),
+      started_at: "2026-08-13T09:00:01Z",
+    };
+    const event = [
+      "id: 32",
+      "event: run.lifecycle.changed",
+      `data: ${JSON.stringify({
+        version: 1,
+        channel_id: channelId,
+        event_position: 32,
+        occurred_at: "2026-08-13T09:00:01Z",
+        transition: "run.started",
+        run: rawRun,
+      })}`,
+      "",
+      "",
+    ].join("\n");
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(event));
+        controller.close();
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(stream, { status: 200 })),
+    );
+    const onRunActivity = vi.fn();
+
+    await streamTimeline(
+      session,
+      "31",
+      { onConnected: vi.fn(), onMessage: vi.fn(), onRunActivity },
+      new AbortController().signal,
+    );
+
+    expect(onRunActivity).toHaveBeenCalledWith(
+      {
+        eventPosition: 32,
+        occurredAt: "2026-08-13T09:00:01Z",
+        transition: "run.started",
+        run: expect.objectContaining({ status: "started" }),
+      },
+      "32",
+    );
   });
 });

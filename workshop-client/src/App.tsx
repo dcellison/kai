@@ -20,6 +20,7 @@ import type {
   ConnectionState,
   TimelineMessage,
   WorkshopRun,
+  WorkshopRunActivity,
   WorkshopSession,
 } from "./types";
 import { CHANNEL_PATTERN } from "./types";
@@ -107,6 +108,55 @@ function formatTimestamp(value: string): string {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(date);
+}
+
+function formatRunDuration(run: WorkshopRun, now: number): string {
+  const started = new Date(run.startedAt ?? run.acceptedAt).valueOf();
+  const ended = run.terminalAt ? new Date(run.terminalAt).valueOf() : now;
+  if (!Number.isFinite(started) || !Number.isFinite(ended)) {
+    return "Duration unavailable";
+  }
+  const totalSeconds = Math.max(0, Math.floor((ended - started) / 1000));
+  if (totalSeconds < 60) {
+    return `${totalSeconds}s`;
+  }
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}m ${seconds}s`;
+}
+
+function runStatusCopy(run: WorkshopRun): string {
+  if (run.status === "accepted") {
+    return run.cancellationRequestedAt
+      ? "Stopping when the agent reaches a safe boundary."
+      : "Queued for the configured agent.";
+  }
+  if (run.status === "started") {
+    return run.cancellationRequestedAt
+      ? "Stopping when the agent reaches a safe boundary."
+      : "The agent is working on this request.";
+  }
+  if (run.status === "completed") {
+    return "The agent completed this request.";
+  }
+  if (run.status === "cancelled") {
+    return "This request was cancelled.";
+  }
+  const actionableFailures: Record<string, string> = {
+    authentication_expired: "Sign in to the configured backend again, then retry.",
+    authentication_required: "Sign in to the configured backend, then retry.",
+    backend_crashed: "The agent process stopped unexpectedly. Retry this request.",
+    execution_interrupted: "Kai was interrupted while the agent was working. Retry this request.",
+    model_unavailable: "The configured model is unavailable. Choose an available model, then retry.",
+    no_response: "The agent ended without a response. Retry this request.",
+    provider_unavailable: "The provider is temporarily unavailable. Try again later.",
+    quota_exhausted: "The configured account has no usage allowance remaining.",
+    transient: "The provider failed temporarily. Try this request again.",
+  };
+  return (
+    (run.terminalCode && actionableFailures[run.terminalCode]) ||
+    "The agent could not complete this request. Retry it or ask the operator to inspect Kai."
+  );
 }
 
 function EnrollmentView({
@@ -346,6 +396,7 @@ function WorkshopView({
   channelId,
   connection,
   messages,
+  runActivity,
   onForget,
   onCancelRun,
   onLoadRun,
@@ -354,6 +405,7 @@ function WorkshopView({
   channelId: string;
   connection: ConnectionState;
   messages: TimelineMessage[];
+  runActivity: WorkshopRunActivity | null;
   onForget: () => void;
   onCancelRun: (runId: string) => Promise<WorkshopRun>;
   onLoadRun: (runId: string) => Promise<WorkshopRun>;
@@ -368,12 +420,14 @@ function WorkshopView({
   const [submitting, setSubmitting] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [activeRun, setActiveRun] = useState<WorkshopRun | null>(null);
+  const [runClock, setRunClock] = useState(() => Date.now());
   const [unseenMessageCount, setUnseenMessageCount] = useState(0);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const timelineChannelRef = useRef(channelId);
   const timelineInitializedRef = useRef(false);
   const timelineFollowRef = useRef(true);
   const latestMessagePositionRef = useRef(0);
+  const latestRunActivityRef = useRef<WorkshopRunActivity | null>(runActivity);
   const agentName =
     messages.find((message) => message.authorKind === "agent")
       ?.authorDisplayName || "Agent";
@@ -407,34 +461,31 @@ function WorkshopView({
   }, [channelId, onLoadRun]);
 
   useEffect(() => {
-    if (!isRunActive(activeRun)) {
-      if (activeRun) {
-        sessionStorage.removeItem(ACTIVE_RUN_KEY);
-      }
+    latestRunActivityRef.current = runActivity;
+    if (!runActivity) {
       return;
     }
-    storeActiveRun(channelId, activeRun.runId);
-    let cancelled = false;
-    const timer = window.setTimeout(() => {
-      void onLoadRun(activeRun.runId)
-        .then((run) => {
-          if (!cancelled) {
-            setActiveRun(run);
-          }
-        })
-        .catch((caught: unknown) => {
-          if (!cancelled) {
-            setSubmissionError(
-              caught instanceof Error ? caught.message : "Could not inspect the active run.",
-            );
-          }
-        });
-    }, 1000);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-  }, [activeRun, channelId, onLoadRun]);
+    setActiveRun(runActivity.run);
+  }, [runActivity]);
+
+  useEffect(() => {
+    if (isRunActive(activeRun)) {
+      storeActiveRun(channelId, activeRun.runId);
+      return;
+    }
+    if (activeRun) {
+      sessionStorage.removeItem(ACTIVE_RUN_KEY);
+    }
+  }, [activeRun, channelId]);
+
+  useEffect(() => {
+    if (!isRunActive(activeRun)) {
+      return;
+    }
+    setRunClock(Date.now());
+    const timer = window.setInterval(() => setRunClock(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [activeRun]);
 
   useLayoutEffect(() => {
     const timeline = timelineRef.current;
@@ -519,7 +570,10 @@ function WorkshopView({
       const result = await onSubmitCommand(clientMessageId, body);
       setDraft("");
       setPendingMessageId(null);
-      setActiveRun(result.run);
+      const streamed = latestRunActivityRef.current;
+      setActiveRun(
+        streamed?.run.runId === result.run.runId ? streamed.run : result.run,
+      );
     } catch (caught) {
       setSubmissionError(
         caught instanceof Error ? caught.message : "Kai could not run this command.",
@@ -652,6 +706,22 @@ function WorkshopView({
                 : `${unseenMessageCount} new messages`}
             </button>
           )}
+          {activeRun && (
+            <section
+              className={`run-activity ${activeRun.status}`}
+              aria-label="Agent run activity"
+              aria-live="polite"
+            >
+              <div>
+                <p className="run-activity-title">Agent run</p>
+                <p className="run-activity-copy">{runStatusCopy(activeRun)}</p>
+              </div>
+              <div className="run-activity-state">
+                <strong>{activeRun.status}</strong>
+                <span>{formatRunDuration(activeRun, runClock)}</span>
+              </div>
+            </section>
+          )}
           <form className="composer-form" onSubmit={(event) => void submit(event)}>
             <textarea
               aria-label="Message Kai"
@@ -686,11 +756,11 @@ function WorkshopView({
           {submissionError && (
             <p className="composer-error" role="alert">{submissionError}</p>
           )}
-          <span className="composer-mode" role="status">
-            {activeRun
-              ? `Workshop run: ${activeRun.status}`
-              : "Canonical Workshop command"}
-          </span>
+          {!activeRun && (
+            <span className="composer-mode" role="status">
+              Canonical Workshop command
+            </span>
+          )}
         </footer>
       </section>
 
@@ -754,7 +824,7 @@ export default function App(): React.JSX.Element {
     [forgetSession],
   );
 
-  const { connection, messages } = useWorkshopTimeline(
+  const { connection, messages, runActivity } = useWorkshopTimeline(
     session,
     view === "workshop",
     handleAuthenticationFailure,
@@ -855,6 +925,7 @@ export default function App(): React.JSX.Element {
       channelId={session?.channelId ?? ""}
       connection={connection}
       messages={messages}
+      runActivity={runActivity}
       onForget={() => forgetSession()}
       onCancelRun={stopRun}
       onLoadRun={inspectRun}

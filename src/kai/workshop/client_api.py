@@ -20,6 +20,12 @@ from kai.workshop.client_commands import (
     ClientCommandExecutorUnavailableError,
     ClientCommandSubmission,
 )
+from kai.workshop.client_events import (
+    ClientChannelEventBatch,
+    ClientRunLifecycleEvent,
+    ClientTimelineMessageEvent,
+    read_client_channel_events,
+)
 from kai.workshop.client_sessions import EnrollmentGrantUnavailableError, WorkshopClientEnrollmentManager
 from kai.workshop.conversation_commands import ConversationCommandAcceptanceError
 from kai.workshop.domain import ChannelId, PrincipalId, RunId
@@ -32,9 +38,7 @@ from kai.workshop.timeline import (
     TimelineCursorError,
     TimelineMessage,
     TimelineResumeError,
-    TimelineUpdateBatch,
     read_channel_timeline,
-    read_channel_timeline_updates,
 )
 
 _TIMELINE_PATH = "/v1/channels/{channel_id}/timeline"
@@ -322,6 +326,23 @@ def _serialize_timeline_event(message: TimelineMessage) -> bytes:
     return (f"id: {message.event_position}\nevent: timeline.message.created\ndata: {payload}\n\n").encode()
 
 
+def _serialize_run_lifecycle_event(activity: ClientRunLifecycleEvent) -> bytes:
+    payload = json.dumps(
+        {
+            "version": 1,
+            "channel_id": str(activity.run.channel_id),
+            "event_position": activity.event_position,
+            "transition": activity.transition.value,
+            "occurred_at": _format_timestamp(activity.occurred_at),
+            "run": _serialize_run(activity.run),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return (f"id: {activity.event_position}\nevent: run.lifecycle.changed\ndata: {payload}\n\n").encode()
+
+
 async def _authorized_update_batch(
     request: web.Request,
     *,
@@ -332,7 +353,7 @@ async def _authorized_update_batch(
     channel_id: ChannelId,
     after_position: int | None,
     reauthenticate: bool,
-) -> tuple[PrincipalId | None, TimelineUpdateBatch | None]:
+) -> tuple[PrincipalId | None, ClientChannelEventBatch | None]:
     async with request_lock:
         principal_id = expected_principal_id
         if reauthenticate:
@@ -342,7 +363,7 @@ async def _authorized_update_batch(
         if not isinstance(principal_id, PrincipalId):
             return None, None
         try:
-            batch = await read_channel_timeline_updates(
+            batch = await read_client_channel_events(
                 store,
                 principal_id=principal_id,
                 channel_id=channel_id,
@@ -378,7 +399,7 @@ async def _handle_channel_event_stream(
                 response.headers["WWW-Authenticate"] = "Bearer"
                 return response
             channel_id, after_position = _parse_event_stream_request(request)
-            initial_batch = await read_channel_timeline_updates(
+            initial_batch = await read_client_channel_events(
                 store,
                 principal_id=principal_id,
                 channel_id=channel_id,
@@ -424,11 +445,14 @@ async def _handle_channel_event_stream(
         last_authentication_check = last_heartbeat
         await response.write(f": connected\nretry: {_SSE_RETRY_MILLISECONDS}\n\n".encode())
         while True:
-            if batch.messages:
-                for message in batch.messages:
-                    await response.write(_serialize_timeline_event(message))
+            if batch.events:
+                for event in batch.events:
+                    if isinstance(event, ClientTimelineMessageEvent):
+                        await response.write(_serialize_timeline_event(event.message))
+                    else:
+                        await response.write(_serialize_run_lifecycle_event(event))
                 position = batch.next_position
-                batch = TimelineUpdateBatch((), position)
+                batch = ClientChannelEventBatch((), position)
                 last_heartbeat = time.monotonic()
                 continue
 

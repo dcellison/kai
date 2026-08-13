@@ -3,7 +3,9 @@ import type {
   TimelineMessage,
   TimelineSnapshot,
   WorkshopRun,
+  WorkshopRunActivity,
   WorkshopRunStatus,
+  WorkshopRunTransition,
   WorkshopSession,
 } from "./types";
 
@@ -22,6 +24,7 @@ interface StreamEvent {
 interface StreamHandlers {
   onConnected: () => void;
   onMessage: (message: TimelineMessage, eventId: string) => void;
+  onRunActivity: (activity: WorkshopRunActivity, eventId: string) => void;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -112,6 +115,15 @@ const RUN_STATUSES = new Set<WorkshopRunStatus>([
   "completed",
   "failed",
   "cancelled",
+]);
+
+const RUN_TRANSITIONS = new Set<WorkshopRunTransition>([
+  "run.accepted",
+  "run.started",
+  "run.cancellation_requested",
+  "run.completed",
+  "run.failed",
+  "run.cancelled",
 ]);
 
 function parseRun(value: unknown, channelId: string): WorkshopRun | null {
@@ -402,7 +414,6 @@ export async function streamTimeline(
     const events = eventDecoder.push(textDecoder.decode(value, { stream: true }));
     for (const event of events) {
       if (
-        event.eventName !== "timeline.message.created" ||
         !event.eventId ||
         !/^\d+$/.test(event.eventId)
       ) {
@@ -417,17 +428,40 @@ export async function streamTimeline(
       if (!isRecord(payload) || payload.version !== 1) {
         continue;
       }
-      const message = parseMessage(payload.message, session.channelId);
       const eventPosition = Number(event.eventId);
-      if (
-        !message ||
-        !Number.isSafeInteger(eventPosition) ||
-        message.eventPosition !== eventPosition ||
-        payload.channel_id !== session.channelId
-      ) {
+      if (!Number.isSafeInteger(eventPosition) || payload.channel_id !== session.channelId) {
         continue;
       }
-      handlers.onMessage(message, event.eventId);
+      if (event.eventName === "timeline.message.created") {
+        const message = parseMessage(payload.message, session.channelId);
+        if (!message || message.eventPosition !== eventPosition) {
+          continue;
+        }
+        handlers.onMessage(message, event.eventId);
+        continue;
+      }
+      if (event.eventName === "run.lifecycle.changed") {
+        const run = parseRun(payload.run, session.channelId);
+        const transition = payload.transition;
+        if (
+          !run ||
+          payload.event_position !== eventPosition ||
+          typeof payload.occurred_at !== "string" ||
+          typeof transition !== "string" ||
+          !RUN_TRANSITIONS.has(transition as WorkshopRunTransition)
+        ) {
+          continue;
+        }
+        handlers.onRunActivity(
+          {
+            eventPosition,
+            occurredAt: payload.occurred_at,
+            run,
+            transition: transition as WorkshopRunTransition,
+          },
+          event.eventId,
+        );
+      }
     }
   }
 }

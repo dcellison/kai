@@ -10,6 +10,7 @@ import {
 import type {
   ConnectionState,
   TimelineMessage,
+  WorkshopRunActivity,
   WorkshopSession,
 } from "./types";
 
@@ -49,8 +50,10 @@ export function useWorkshopTimeline(
 ): {
   connection: ConnectionState;
   messages: TimelineMessage[];
+  runActivity: WorkshopRunActivity | null;
 } {
   const [messages, setMessages] = useState<TimelineMessage[]>([]);
+  const [runActivity, setRunActivity] = useState<WorkshopRunActivity | null>(null);
   const [connection, setConnection] = useState<ConnectionState>({
     label: "Waiting",
     tone: "connecting",
@@ -59,12 +62,14 @@ export function useWorkshopTimeline(
   useEffect(() => {
     if (!active || !session) {
       setMessages([]);
+      setRunActivity(null);
       setConnection({ label: "Waiting", tone: "connecting" });
       return;
     }
 
     const controller = new AbortController();
     const { signal } = controller;
+    setRunActivity(null);
     let lastEventId = "0";
     let needsSnapshot = true;
     let knownMessageIds = new Set<string>();
@@ -101,6 +106,10 @@ export function useWorkshopTimeline(
                 }
                 knownMessageIds.add(message.messageId);
                 setMessages((current) => appendUnique(current, message));
+              },
+              onRunActivity: (activity, eventId) => {
+                lastEventId = eventId;
+                setRunActivity(activity);
               },
             },
             signal,
@@ -141,5 +150,5 @@ export function useWorkshopTimeline(
     session,
   ]);
 
-  return { connection, messages };
+  return { connection, messages, runActivity };
 }

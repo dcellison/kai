@@ -82,7 +82,8 @@ def _optional_timestamp(value: object) -> datetime | None:
     return None if value is None else _parse_timestamp(value)
 
 
-async def _load_run(store: WorkshopEventStore, run_id: RunId) -> DurableRun | None:
+async def load_durable_run(store: WorkshopEventStore, run_id: RunId) -> DurableRun | None:
+    """Load one projected durable run without granting any authorization."""
     async with store.connection.execute(
         "SELECT id, workshop_id, channel_id, requested_by_principal_id, agent_id, "
         "inbound_message_id, status, accepted_at, started_at, terminal_at, terminal_code, "
@@ -121,7 +122,7 @@ async def _load_run_by_inbound_message(
         (inbound_message_id,),
     ) as cursor:
         row = await cursor.fetchone()
-    return None if row is None else await _load_run(store, RunId(str(row[0])))
+    return None if row is None else await load_durable_run(store, RunId(str(row[0])))
 
 
 def _event_key(run_id: RunId, status: RunStatus) -> str:
@@ -178,7 +179,7 @@ class WorkshopRunLifecycle:
     async def state(self, run_id: RunId) -> DurableRun:
         if not isinstance(run_id, RunId):
             raise ValueError("run_id must be a RunId")
-        run = await _load_run(self._store, run_id)
+        run = await load_durable_run(self._store, run_id)
         if run is None:
             raise RunNotFoundError("Durable Workshop run was not found")
         return run
@@ -254,7 +255,7 @@ class WorkshopRunLifecycle:
         )
         appended = await self._store.append_in_transaction(event)
         await self._store.project_pending_in_transaction(projection)
-        run = await _load_run(self._store, run_id)
+        run = await load_durable_run(self._store, run_id)
         if run is None:
             raise RunLifecycleConflictError("Accepted run was not projected")
         return RunLifecycleResult(run=run, event=appended.event, changed=appended.inserted)

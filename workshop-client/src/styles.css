@@ -745,6 +745,82 @@ button:disabled {
   background: var(--atom-bg);
 }
 
+.run-activity {
+  border: 1px solid var(--line-strong);
+  border-left: 3px solid var(--atom-yellow);
+  background: var(--atom-bg-deep);
+  border-radius: 0.4rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  margin: 0 auto 0.7rem;
+  max-width: 52rem;
+  padding: 0.65rem 0.8rem;
+}
+
+.run-activity.started {
+  border-left-color: var(--atom-blue);
+}
+
+.run-activity.completed {
+  border-left-color: var(--atom-green);
+}
+
+.run-activity.failed,
+.run-activity.cancelled {
+  border-left-color: var(--atom-red);
+}
+
+.run-activity-title {
+  color: var(--atom-foreground-strong);
+  font-size: 0.72rem;
+  font-weight: 720;
+  margin: 0;
+}
+
+.run-activity-copy {
+  color: var(--atom-muted);
+  font-size: 0.68rem;
+  line-height: 1.45;
+  margin: 0.18rem 0 0;
+}
+
+.run-activity-state {
+  align-items: flex-end;
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.run-activity-state strong {
+  color: var(--atom-yellow);
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.run-activity.started .run-activity-state strong {
+  color: var(--atom-blue);
+}
+
+.run-activity.completed .run-activity-state strong {
+  color: var(--atom-green);
+}
+
+.run-activity.failed .run-activity-state strong,
+.run-activity.cancelled .run-activity-state strong {
+  color: var(--atom-red);
+}
+
+.run-activity-state span {
+  color: var(--atom-muted);
+  font-family: var(--mono);
+  font-size: 0.62rem;
+}
+
 .new-messages-button {
   display: block;
   margin: 0 auto 0.65rem;

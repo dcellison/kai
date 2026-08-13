@@ -19,7 +19,7 @@ from kai.workshop.domain import (
     WorkshopEventType,
 )
 from kai.workshop.projection import CanonicalConversationProjection
-from kai.workshop.run_lifecycle import DurableRun, RunNotFoundError, RunStatus, _load_run
+from kai.workshop.run_lifecycle import DurableRun, RunNotFoundError, RunStatus, load_durable_run
 from kai.workshop.store import StoredEvent, WorkshopEventStore
 
 _CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -291,7 +291,7 @@ class WorkshopRunExecutionAuthority:
             await connection.execute("BEGIN IMMEDIATE")
             projection = CanonicalConversationProjection()
             await self._store.project_pending_in_transaction(projection)
-            run = await _load_run(self._store, run_id)
+            run = await load_durable_run(self._store, run_id)
             if run is None:
                 raise RunNotFoundError("Durable Workshop run was not found")
             async with connection.execute(
@@ -440,7 +440,7 @@ class WorkshopRunExecutionAuthority:
             await connection.execute("BEGIN IMMEDIATE")
             projection = CanonicalConversationProjection()
             await self._store.project_pending_in_transaction(projection)
-            run = await _load_run(self._store, run_id)
+            run = await load_durable_run(self._store, run_id)
             if run is None:
                 raise RunNotFoundError("Durable Workshop run was not found")
             key = _run_key(run_id, "cancellation_requested")
@@ -496,7 +496,7 @@ class WorkshopRunExecutionAuthority:
             await connection.execute("BEGIN IMMEDIATE")
             projection = CanonicalConversationProjection()
             await self._store.project_pending_in_transaction(projection)
-            run = await _load_run(self._store, run_id)
+            run = await load_durable_run(self._store, run_id)
             if run is None:
                 raise RunNotFoundError("Durable Workshop run was not found")
 
@@ -1000,7 +1000,7 @@ class WorkshopRunExecutionAuthority:
         return run, attempt
 
     async def _require_run(self, run_id: RunId) -> DurableRun:
-        run = await _load_run(self._store, run_id)
+        run = await load_durable_run(self._store, run_id)
         if run is None:
             raise RunNotFoundError("Durable Workshop run was not found")
         return run

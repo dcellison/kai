@@ -19,11 +19,21 @@ from kai.workshop.client_api import (
     register_workshop_command_routes,
     register_workshop_read_routes,
 )
+from kai.workshop.client_events import (
+    ClientRunLifecycleEvent,
+    ClientTimelineMessageEvent,
+    read_client_channel_events,
+)
 from kai.workshop.conversation_commands import ConversationCommandDisposition
 from kai.workshop.domain import ChannelId, MessageId, PrincipalId, RunId
 from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.inbound import ClientInboundMessage, InboundMessage, record_inbound_message
-from kai.workshop.run_lifecycle import DurableRun, RunNotFoundError, RunStatus
+from kai.workshop.run_lifecycle import (
+    DurableRun,
+    RunNotFoundError,
+    RunStatus,
+    WorkshopRunLifecycle,
+)
 from kai.workshop.store import WorkshopEventStore
 
 _NOW = datetime(2026, 8, 11, 14, 0, tzinfo=UTC)
@@ -98,6 +108,11 @@ class _CommandSubmitter:
             cancellation_code="requested_by_human",
         )
         return CanonicalCancellationDisposition.REQUESTED
+
+
+class _AllowChannelRead:
+    async def can_read_channel(self, principal_id: PrincipalId, channel_id: ChannelId) -> bool:
+        return True
 
 
 async def _identity_for(store: WorkshopEventStore, subject: str) -> tuple[PrincipalId, ChannelId]:
@@ -562,6 +577,115 @@ class TestWorkshopTimelineHTTPContract:
 
 
 class TestWorkshopTimelineEventStreamHTTPContract:
+    async def test_run_activity_is_private_even_when_channel_read_is_allowed(self, tmp_path: Path):
+        store, alice_id, alice_channel, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        inbound = await record_inbound_message(
+            store,
+            InboundMessage(
+                "telegram",
+                "private-run-1",
+                "private-message-1",
+                "101",
+                "101",
+                "Private run state",
+                _NOW,
+            ),
+        )
+        message_id = inbound.event.envelope.aggregate_id
+        assert isinstance(message_id, MessageId)
+        accepted = await WorkshopRunLifecycle(store).accept(
+            message_id,
+            occurred_at=_NOW + timedelta(seconds=1),
+        )
+        try:
+            alice = await read_client_channel_events(
+                store,
+                principal_id=alice_id,
+                channel_id=alice_channel,
+                authorizer=_AllowChannelRead(),
+                after_position=0,
+            )
+            bob = await read_client_channel_events(
+                store,
+                principal_id=bob_id,
+                channel_id=alice_channel,
+                authorizer=_AllowChannelRead(),
+                after_position=0,
+            )
+            future_only = await read_client_channel_events(
+                store,
+                principal_id=alice_id,
+                channel_id=alice_channel,
+                authorizer=_AllowChannelRead(),
+                after_position=None,
+            )
+
+            assert any(isinstance(event, ClientRunLifecycleEvent) for event in alice.events)
+            assert not any(isinstance(event, ClientRunLifecycleEvent) for event in bob.events)
+            assert any(isinstance(event, ClientTimelineMessageEvent) for event in bob.events)
+            assert bob.next_position == inbound.event.position
+            assert accepted.event.position > bob.next_position
+            assert future_only.events == ()
+            assert future_only.next_position == accepted.event.position
+        finally:
+            await store.close()
+
+    async def test_replays_requester_run_lifecycle_as_versioned_sse(self, tmp_path: Path):
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        inbound = await record_inbound_message(
+            store,
+            InboundMessage(
+                "telegram",
+                "run-update-1",
+                "run-message-1",
+                "101",
+                "101",
+                "Perform one task",
+                _NOW,
+            ),
+        )
+        message_id = inbound.event.envelope.aggregate_id
+        assert isinstance(message_id, MessageId)
+        accepted = await WorkshopRunLifecycle(store).accept(
+            message_id,
+            occurred_at=_NOW + timedelta(seconds=1),
+        )
+        client = await _open_client(store, _Authenticator({"alice-token": alice_id}))
+        response = None
+        try:
+            response = await client.get(
+                f"/v1/channels/{alice_channel}/events",
+                params={"after_position": str(accepted.event.position - 1)},
+                headers={"Authorization": "Bearer alice-token"},
+            )
+            event = await _read_sse_event(response)
+
+            assert event["event"] == "run.lifecycle.changed"
+            assert event["id"] == str(accepted.event.position)
+            assert event["data"] == {
+                "version": 1,
+                "channel_id": alice_channel,
+                "event_position": accepted.event.position,
+                "transition": "run.accepted",
+                "occurred_at": "2026-08-11T14:00:01Z",
+                "run": {
+                    "run_id": accepted.run.run_id,
+                    "channel_id": alice_channel,
+                    "status": "accepted",
+                    "accepted_at": "2026-08-11T14:00:01Z",
+                    "started_at": None,
+                    "terminal_at": None,
+                    "terminal_code": None,
+                    "cancellation_requested_at": None,
+                    "result_message_id": None,
+                },
+            }
+        finally:
+            if response is not None:
+                response.close()
+            await client.close()
+            await store.close()
+
     async def test_replays_authorized_canonical_messages_as_versioned_sse(self, tmp_path: Path):
         store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
         await _record_messages(store, 2)

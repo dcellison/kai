@@ -305,13 +305,124 @@ describe("Workshop React client", () => {
     await user.type(screen.getByLabelText("Message Kai"), "Take your time");
     await user.click(screen.getByRole("button", { name: "Send" }));
 
-    expect(await screen.findByText("Workshop run: accepted")).toBeVisible();
+    expect(await screen.findByText("accepted")).toBeVisible();
     expect(screen.getByLabelText("Message Kai")).toHaveValue("");
     await user.click(screen.getByRole("button", { name: "Stop" }));
-    expect(await screen.findByText("Workshop run: cancelled")).toBeVisible();
+    expect(await screen.findByText("cancelled")).toBeVisible();
     expect(cancelRun).toHaveBeenCalledWith(
       { channelId, token: "existing-session" },
       acceptedRun.runId,
     );
+  });
+
+  it("updates run activity from the live stream without polling run state", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    const acceptedRun: WorkshopRun = {
+      ...completedRun,
+      resultMessageId: null,
+      startedAt: null,
+      status: "accepted",
+      terminalAt: null,
+    };
+    vi.mocked(submitCommand).mockResolvedValueOnce({
+      acceptance: "newly_accepted",
+      messageId: "msg_00000000000000000000000000000030",
+      run: acceptedRun,
+    });
+    render(<App />);
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+
+    await user.type(screen.getByLabelText("Message Kai"), "Inspect the event stream");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    expect(await screen.findByText("Queued for the configured agent.")).toBeVisible();
+
+    const startedRun: WorkshopRun = {
+      ...acceptedRun,
+      startedAt: "2026-08-13T09:00:01Z",
+      status: "started",
+    };
+    act(() =>
+      handlers?.onRunActivity(
+        {
+          eventPosition: 31,
+          occurredAt: "2026-08-13T09:00:01Z",
+          run: startedRun,
+          transition: "run.started",
+        },
+        "31",
+      ),
+    );
+    expect(await screen.findByText("The agent is working on this request.")).toBeVisible();
+
+    act(() =>
+      handlers?.onRunActivity(
+        {
+          eventPosition: 32,
+          occurredAt: "2026-08-13T09:00:02Z",
+          run: completedRun,
+          transition: "run.completed",
+        },
+        "32",
+      ),
+    );
+    expect(await screen.findByText("The agent completed this request.")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+    expect(loadRun).not.toHaveBeenCalled();
+  });
+
+  it("keeps a streamed terminal state when it arrives before command acceptance", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    const acceptedRun: WorkshopRun = {
+      ...completedRun,
+      resultMessageId: null,
+      startedAt: null,
+      status: "accepted",
+      terminalAt: null,
+    };
+    let resolveSubmission:
+      | ((result: Awaited<ReturnType<typeof submitCommand>>) => void)
+      | null = null;
+    vi.mocked(submitCommand).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveSubmission = resolve;
+        }),
+    );
+    render(<App />);
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+
+    await user.type(screen.getByLabelText("Message Kai"), "Finish very quickly");
+    const submitting = user.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(submitCommand).toHaveBeenCalledOnce());
+    act(() =>
+      handlers?.onRunActivity(
+        {
+          eventPosition: 32,
+          occurredAt: "2026-08-13T09:00:02Z",
+          run: completedRun,
+          transition: "run.completed",
+        },
+        "32",
+      ),
+    );
+    act(() =>
+      resolveSubmission?.({
+        acceptance: "newly_accepted",
+        messageId: "msg_00000000000000000000000000000030",
+        run: acceptedRun,
+      }),
+    );
+    await submitting;
+
+    expect(await screen.findByText("The agent completed this request.")).toBeVisible();
+    expect(screen.queryByText("Queued for the configured agent.")).toBeNull();
   });
 });

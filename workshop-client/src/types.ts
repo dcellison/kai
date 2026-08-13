@@ -45,6 +45,21 @@ export interface WorkshopRun {
   terminalCode: string | null;
 }
 
+export type WorkshopRunTransition =
+  | "run.accepted"
+  | "run.started"
+  | "run.cancellation_requested"
+  | "run.completed"
+  | "run.failed"
+  | "run.cancelled";
+
+export interface WorkshopRunActivity {
+  eventPosition: number;
+  occurredAt: string;
+  run: WorkshopRun;
+  transition: WorkshopRunTransition;
+}
+
 export type ConnectionTone = "connected" | "connecting" | "disconnected";
 
 export interface ConnectionState {
