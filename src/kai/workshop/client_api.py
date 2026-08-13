@@ -43,6 +43,7 @@ from kai.workshop.timeline import (
 
 _TIMELINE_PATH = "/v1/channels/{channel_id}/timeline"
 _TIMELINE_EVENTS_PATH = "/v1/channels/{channel_id}/events"
+_CLIENT_NAVIGATION_PATH = "/v1/client/navigation"
 _ENROLLMENT_REDEMPTION_PATH = "/v1/client/enrollment/redeem"
 _COMMAND_SUBMISSION_PATH = "/v1/channels/{channel_id}/commands"
 _RUN_STATE_PATH = "/v1/channels/{channel_id}/runs/{run_id}"
@@ -263,6 +264,122 @@ def _serialize_run(run: DurableRun) -> dict[str, object]:
         ),
         "result_message_id": str(run.result_message_id) if run.result_message_id is not None else None,
     }
+
+
+async def _handle_client_navigation(
+    request: web.Request,
+    *,
+    store: WorkshopEventStore,
+    authenticator: WorkshopClientAuthenticator,
+) -> web.Response:
+    """Return only the Workshops and channels explicitly visible to a human."""
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(
+            status=401,
+            code="authentication_required",
+            message="Authentication required",
+        )
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    if request.query or request.can_read_body:
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid navigation request",
+        )
+
+    async with store.connection.execute(
+        "SELECT display_name FROM principals WHERE id = ? AND kind = 'human'",
+        (principal_id,),
+    ) as cursor:
+        principal_row = await cursor.fetchone()
+    if principal_row is None:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+
+    async with store.connection.execute(
+        "SELECT w.id, w.name, wm.role FROM workshop_memberships wm "
+        "JOIN workshops w ON w.id = wm.workshop_id "
+        "WHERE wm.principal_id = ? ORDER BY lower(w.name), w.id",
+        (principal_id,),
+    ) as cursor:
+        workshop_rows = list(await cursor.fetchall())
+    async with store.connection.execute(
+        "SELECT c.workshop_id, c.id, c.kind, c.name, cm.role, a.id, a.name, "
+        "CASE WHEN cara.id IS NULL THEN 0 ELSE 1 END "
+        "FROM channel_memberships cm "
+        "JOIN channels c ON c.id = cm.channel_id "
+        "JOIN workshop_memberships wm ON wm.workshop_id = c.workshop_id "
+        "AND wm.principal_id = cm.principal_id "
+        "LEFT JOIN channel_agents ca ON ca.channel_id = c.id "
+        "LEFT JOIN agents a ON a.id = ca.agent_id AND a.workshop_id = c.workshop_id "
+        "LEFT JOIN channel_agent_runtime_assignments cara "
+        "ON cara.channel_id = c.id AND cara.agent_id = a.id "
+        "WHERE cm.principal_id = ? "
+        "ORDER BY c.workshop_id, "
+        "CASE c.kind WHEN 'direct' THEN 0 WHEN 'group' THEN 1 "
+        "WHEN 'notification' THEN 2 ELSE 3 END, lower(coalesce(c.name, '')), c.id, a.name, a.id",
+        (principal_id,),
+    ) as cursor:
+        channel_rows = list(await cursor.fetchall())
+
+    channels_by_workshop: dict[str, dict[str, dict[str, object]]] = {}
+    for row in channel_rows:
+        workshop_id = str(row[0])
+        channel_id = str(row[1])
+        workshop_channels = channels_by_workshop.setdefault(workshop_id, {})
+        channel = workshop_channels.setdefault(
+            channel_id,
+            {
+                "channel_id": channel_id,
+                "name": str(row[3]) if row[3] is not None else None,
+                "kind": str(row[2]),
+                "role": str(row[4]),
+                "agents": [],
+                "_runtime_assignments": [],
+            },
+        )
+        if row[5] is not None:
+            agents = channel["agents"]
+            assignments = channel["_runtime_assignments"]
+            if not isinstance(agents, list) or not isinstance(assignments, list):
+                raise RuntimeError("Workshop navigation channel assembly failed")
+            agents.append({"agent_id": str(row[5]), "name": str(row[6])})
+            assignments.append(bool(row[7]))
+
+    workshops: list[dict[str, object]] = []
+    for row in workshop_rows:
+        workshop_id = str(row[0])
+        visible_channels: list[dict[str, object]] = []
+        for channel in channels_by_workshop.get(workshop_id, {}).values():
+            assignments = channel.pop("_runtime_assignments")
+            agents = channel["agents"]
+            if not isinstance(assignments, list) or not isinstance(agents, list):
+                raise RuntimeError("Workshop navigation capability assembly failed")
+            channel["can_submit_commands"] = (
+                channel["kind"] in {"direct", "group"} and len(agents) == 1 and assignments == [True]
+            )
+            visible_channels.append(channel)
+        workshops.append(
+            {
+                "workshop_id": workshop_id,
+                "name": str(row[1]),
+                "role": str(row[2]),
+                "channels": visible_channels,
+            }
+        )
+
+    return _json_response(
+        {
+            "version": 1,
+            "principal": {
+                "principal_id": str(principal_id),
+                "display_name": str(principal_row[0]),
+            },
+            "workshops": workshops,
+        },
+        status=200,
+    )
 
 
 async def _handle_channel_timeline(
@@ -766,6 +883,14 @@ def register_workshop_read_routes(
                 authenticator=authenticator,
             )
 
+    async def handle_client_navigation(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_client_navigation(
+                request,
+                store=store,
+                authenticator=authenticator,
+            )
+
     async def handle_channel_event_stream(request: web.Request) -> web.StreamResponse:
         return await _handle_channel_event_stream(
             request,
@@ -778,6 +903,7 @@ def register_workshop_read_routes(
             stream_limiter=stream_limiter,
         )
 
+    app.router.add_get(_CLIENT_NAVIGATION_PATH, handle_client_navigation)
     app.router.add_get(_TIMELINE_PATH, handle_channel_timeline)
     app.router.add_get(_TIMELINE_EVENTS_PATH, handle_channel_event_stream)
 

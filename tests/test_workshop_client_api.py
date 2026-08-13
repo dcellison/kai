@@ -13,7 +13,11 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+from kai.workshop.bootstrap import (
+    BootstrapHuman,
+    BootstrapNotificationChannel,
+    bootstrap_default_workshop,
+)
 from kai.workshop.client_api import (
     WorkshopEventStreamLimiter,
     register_workshop_command_routes,
@@ -25,7 +29,7 @@ from kai.workshop.client_events import (
     read_client_channel_events,
 )
 from kai.workshop.conversation_commands import ConversationCommandDisposition
-from kai.workshop.domain import ChannelId, MessageId, PrincipalId, RunId
+from kai.workshop.domain import ChannelId, MessageId, PrincipalId, RunId, RuntimeProfileId
 from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.inbound import ClientInboundMessage, InboundMessage, record_inbound_message
 from kai.workshop.run_lifecycle import (
@@ -133,9 +137,24 @@ async def _open_store(path: Path) -> tuple[WorkshopEventStore, PrincipalId, Chan
     await bootstrap_default_workshop(
         store,
         (
-            BootstrapHuman("Alice", "admin", "telegram", "101", "101"),
-            BootstrapHuman("Bob", "member", "telegram", "202", "202"),
+            BootstrapHuman(
+                "Alice",
+                "admin",
+                "telegram",
+                "101",
+                "101",
+                RuntimeProfileId("rtp_11111111111111111111111111111111"),
+            ),
+            BootstrapHuman(
+                "Bob",
+                "member",
+                "telegram",
+                "202",
+                "202",
+                RuntimeProfileId("rtp_22222222222222222222222222222222"),
+            ),
         ),
+        notification_channels=(BootstrapNotificationChannel("telegram", "-100123", ("101", "202")),),
     )
     alice_id, alice_channel = await _identity_for(store, "101")
     bob_id, bob_channel = await _identity_for(store, "202")
@@ -230,6 +249,80 @@ async def _read_sse_event(response) -> dict[str, object]:
             data_lines.append(value)
 
 
+class TestWorkshopNavigationHTTPContract:
+    async def test_lists_only_explicit_memberships_and_marks_outbound_channels_read_only(
+        self,
+        tmp_path: Path,
+    ):
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        client = await _open_client(store, _Authenticator({"alice": alice_id}))
+        try:
+            response = await client.get(
+                "/v1/client/navigation",
+                headers={"Authorization": "Bearer alice"},
+            )
+
+            assert response.status == 200
+            payload = await response.json()
+            assert payload["principal"] == {
+                "principal_id": alice_id,
+                "display_name": "Alice",
+            }
+            assert len(payload["workshops"]) == 1
+            workshop = payload["workshops"][0]
+            assert workshop["name"] == "Kai Workshop"
+            assert workshop["role"] == "admin"
+            assert [channel["kind"] for channel in workshop["channels"]] == [
+                "direct",
+                "notification",
+            ]
+            direct, notification = workshop["channels"]
+            assert direct == {
+                "channel_id": alice_channel,
+                "name": "Direct",
+                "kind": "direct",
+                "role": "owner",
+                "agents": [
+                    {
+                        "agent_id": direct["agents"][0]["agent_id"],
+                        "name": "Kai",
+                    }
+                ],
+                "can_submit_commands": True,
+            }
+            assert notification["name"] == "Notifications"
+            assert notification["role"] == "participant"
+            assert notification["can_submit_commands"] is False
+
+            async with store.connection.execute(
+                "SELECT c.id FROM channels c JOIN channel_bindings cb ON cb.channel_id = c.id "
+                "WHERE cb.external_channel_id = '202'"
+            ) as cursor:
+                bob_channel = await cursor.fetchone()
+            assert bob_channel is not None
+            assert str(bob_channel[0]) not in {channel["channel_id"] for channel in workshop["channels"]}
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_authentication_precedes_navigation_validation(self, tmp_path: Path):
+        store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+        client = await _open_client(store, _Authenticator({"alice": alice_id}))
+        try:
+            unauthenticated = await client.get("/v1/client/navigation?unsupported=1")
+            malformed = await client.get(
+                "/v1/client/navigation?unsupported=1",
+                headers={"Authorization": "Bearer alice"},
+            )
+
+            assert unauthenticated.status == 401
+            assert malformed.status == 400
+            assert (await malformed.json())["error"]["code"] == "invalid_request"
+        finally:
+            await client.close()
+            await store.close()
+
+
 class TestWorkshopCommandHTTPContract:
     async def test_authenticated_member_submits_only_server_scoped_command_fields(
         self,
@@ -267,6 +360,38 @@ class TestWorkshopCommandHTTPContract:
             assert submitted.client_message_id == "browser-command-1"
             assert submitted.body == "Hello from Workshop"
             assert submitted.occurred_at.tzinfo is not None
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_notification_channel_rejects_command_submission(self, tmp_path: Path):
+        store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+        async with store.connection.execute(
+            "SELECT c.id FROM channels c JOIN channel_bindings cb ON cb.channel_id = c.id "
+            "WHERE c.kind = 'notification' AND cb.external_channel_id = '-100123'"
+        ) as cursor:
+            notification_row = await cursor.fetchone()
+        assert notification_row is not None
+        notification_channel = ChannelId(str(notification_row[0]))
+        submitter = _CommandSubmitter()
+        client = await _open_command_client(
+            store,
+            _Authenticator({"alice-token": alice_id}),
+            submitter,
+        )
+        try:
+            response = await client.post(
+                f"/v1/channels/{notification_channel}/commands",
+                headers={"Authorization": "Bearer alice-token"},
+                json={
+                    "client_message_id": "browser-command-1",
+                    "body": "Do not execute from the notification channel",
+                },
+            )
+
+            assert response.status == 403
+            assert await response.json() == {"error": {"code": "access_denied", "message": "Access denied"}}
+            assert submitter.messages == []
         finally:
             await client.close()
             await store.close()

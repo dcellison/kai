@@ -4,9 +4,16 @@ import type {
   TimelineSnapshot,
   WorkshopRun,
   WorkshopRunActivity,
+  WorkshopNavigation,
   WorkshopRunStatus,
   WorkshopRunTransition,
   WorkshopSession,
+} from "./types";
+import {
+  AGENT_PATTERN,
+  CHANNEL_PATTERN,
+  PRINCIPAL_PATTERN,
+  WORKSHOP_PATTERN,
 } from "./types";
 
 const MAX_TIMELINE_PAGES = 1000;
@@ -192,6 +199,91 @@ export async function redeemEnrollment(
     throw new Error(safeErrorMessage(payload, "Enrollment failed."));
   }
   return payload.session.token;
+}
+
+export async function loadNavigation(token: string): Promise<WorkshopNavigation> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    "/v1/client/navigation",
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(
+      safeErrorMessage(payload, "Could not load Workshop navigation."),
+    );
+  }
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    !isRecord(payload.principal) ||
+    typeof payload.principal.principal_id !== "string" ||
+    !PRINCIPAL_PATTERN.test(payload.principal.principal_id) ||
+    typeof payload.principal.display_name !== "string" ||
+    !Array.isArray(payload.workshops)
+  ) {
+    throw new Error("Kai returned unsupported Workshop navigation.");
+  }
+
+  const workshops = payload.workshops.map((rawWorkshop) => {
+    if (
+      !isRecord(rawWorkshop) ||
+      typeof rawWorkshop.workshop_id !== "string" ||
+      !WORKSHOP_PATTERN.test(rawWorkshop.workshop_id) ||
+      typeof rawWorkshop.name !== "string" ||
+      typeof rawWorkshop.role !== "string" ||
+      !Array.isArray(rawWorkshop.channels)
+    ) {
+      throw new Error("Kai returned unsupported Workshop navigation.");
+    }
+    const channels = rawWorkshop.channels.map((rawChannel) => {
+      if (
+        !isRecord(rawChannel) ||
+        typeof rawChannel.channel_id !== "string" ||
+        !CHANNEL_PATTERN.test(rawChannel.channel_id) ||
+        (rawChannel.name !== null && typeof rawChannel.name !== "string") ||
+        !["direct", "group", "notification"].includes(
+          String(rawChannel.kind),
+        ) ||
+        typeof rawChannel.role !== "string" ||
+        typeof rawChannel.can_submit_commands !== "boolean" ||
+        !Array.isArray(rawChannel.agents)
+      ) {
+        throw new Error("Kai returned unsupported Workshop navigation.");
+      }
+      const agents = rawChannel.agents.map((rawAgent) => {
+        if (
+          !isRecord(rawAgent) ||
+          typeof rawAgent.agent_id !== "string" ||
+          !AGENT_PATTERN.test(rawAgent.agent_id) ||
+          typeof rawAgent.name !== "string"
+        ) {
+          throw new Error("Kai returned unsupported Workshop navigation.");
+        }
+        return { agentId: rawAgent.agent_id, name: rawAgent.name };
+      });
+      return {
+        agents,
+        canSubmitCommands: rawChannel.can_submit_commands,
+        channelId: rawChannel.channel_id,
+        kind: rawChannel.kind as "direct" | "group" | "notification",
+        name: rawChannel.name,
+        role: rawChannel.role,
+      };
+    });
+    return {
+      channels,
+      name: rawWorkshop.name,
+      role: rawWorkshop.role,
+      workshopId: rawWorkshop.workshop_id,
+    };
+  });
+  return {
+    principal: {
+      displayName: payload.principal.display_name,
+      principalId: payload.principal.principal_id,
+    },
+    workshops,
+  };
 }
 
 export async function submitCommand(

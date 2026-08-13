@@ -401,6 +401,11 @@ button:disabled {
   color: var(--atom-blue);
 }
 
+.rail-item:hover:not(.active) {
+  border-color: var(--atom-muted);
+  color: var(--atom-foreground-strong);
+}
+
 .rail-spacer {
   flex: 1;
 }
@@ -494,6 +499,15 @@ button:disabled {
 .channel-link.active {
   background: rgba(97, 175, 239, 0.1);
   color: var(--atom-foreground-strong);
+}
+
+.channel-link:hover:not(.active) {
+  background: rgba(171, 178, 191, 0.06);
+  color: var(--atom-foreground-strong);
+}
+
+.channel-link.notification > span:first-child {
+  color: var(--atom-yellow);
 }
 
 .live-pip {
@@ -899,6 +913,27 @@ button:disabled {
   color: var(--atom-muted);
   font-size: 0.6rem;
   text-align: right;
+}
+
+.read-only-channel-notice {
+  margin: 0;
+  border: 1px solid rgba(229, 192, 123, 0.22);
+  border-radius: 0.35rem;
+  padding: 0.8rem 0.9rem;
+  background: rgba(229, 192, 123, 0.06);
+  color: var(--atom-yellow);
+  font-size: 0.72rem;
+  line-height: 1.5;
+}
+
+.loading-workshop {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  background: var(--atom-bg-deep);
+  color: var(--atom-muted);
+  font-size: 0.82rem;
+  letter-spacing: 0.04em;
 }
 
 .context-pane {

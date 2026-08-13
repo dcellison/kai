@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   EventStreamDecoder,
   cancelRun,
+  loadNavigation,
   loadRun,
   loadTimeline,
   redeemEnrollment,
@@ -100,6 +101,76 @@ describe("Workshop client API", () => {
       "Bearer session-secret",
     );
     expect(secondRequest[0]).toContain("cursor=next-page");
+  });
+
+  it("loads authority-backed Workshop and channel navigation", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      Response.json({
+        version: 1,
+        principal: {
+          principal_id: "prn_00000000000000000000000000000001",
+          display_name: "Daniel",
+        },
+        workshops: [
+          {
+            workshop_id: "wsp_00000000000000000000000000000001",
+            name: "Kai Workshop",
+            role: "admin",
+            channels: [
+              {
+                channel_id: channelId,
+                name: "Conversation",
+                kind: "direct",
+                role: "owner",
+                can_submit_commands: true,
+                agents: [
+                  {
+                    agent_id: "agt_00000000000000000000000000000001",
+                    name: "Kai",
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(loadNavigation("session-secret")).resolves.toEqual({
+      principal: {
+        displayName: "Daniel",
+        principalId: "prn_00000000000000000000000000000001",
+      },
+      workshops: [
+        {
+          channels: [
+            {
+              agents: [
+                {
+                  agentId: "agt_00000000000000000000000000000001",
+                  name: "Kai",
+                },
+              ],
+              canSubmitCommands: true,
+              channelId,
+              kind: "direct",
+              name: "Conversation",
+              role: "owner",
+            },
+          ],
+          name: "Kai Workshop",
+          role: "admin",
+          workshopId: "wsp_00000000000000000000000000000001",
+        },
+      ],
+    });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/v1/client/navigation");
+    expect(
+      new Headers((fetchMock.mock.calls[0]?.[1] as RequestInit).headers).get(
+        "Authorization",
+      ),
+    ).toBe("Bearer session-secret");
   });
 
   it("submits only the opaque id and body under bearer authority", async () => {

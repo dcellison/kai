@@ -2498,6 +2498,7 @@ class TestNotificationChatIdMutations:
             lan_paths = {resource.canonical for resource in apps[1].router.resources()}
             assert lan_paths == {
                 "/v1/client/enrollment/redeem",
+                "/v1/client/navigation",
                 "/v1/channels/{channel_id}/timeline",
                 "/v1/channels/{channel_id}/events",
                 "/v1/channels/{channel_id}/commands",

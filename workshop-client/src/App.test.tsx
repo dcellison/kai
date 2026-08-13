@@ -7,19 +7,25 @@ import {
   AuthenticationError,
   cancelRun,
   ChannelAccessError,
+  loadNavigation,
   loadRun,
   loadTimeline,
   redeemEnrollment,
   streamTimeline,
   submitCommand,
 } from "./api";
-import type { TimelineMessage, WorkshopRun } from "./types";
+import type {
+  TimelineMessage,
+  WorkshopNavigation,
+  WorkshopRun,
+} from "./types";
 
 vi.mock("./api", async (importOriginal) => {
   const original = await importOriginal<typeof import("./api")>();
   return {
     ...original,
     cancelRun: vi.fn(),
+    loadNavigation: vi.fn(),
     loadTimeline: vi.fn(),
     loadRun: vi.fn(),
     redeemEnrollment: vi.fn(),
@@ -29,6 +35,39 @@ vi.mock("./api", async (importOriginal) => {
 });
 
 const channelId = "chn_d3dfdfd7df9151ba8a1742b92403faa5";
+const notificationChannelId = "chn_11111111111111111111111111111111";
+const secondChannelId = "chn_22222222222222222222222222222222";
+const navigation: WorkshopNavigation = {
+  principal: {
+    displayName: "Daniel",
+    principalId: "prn_00000000000000000000000000000001",
+  },
+  workshops: [
+    {
+      channels: [
+        {
+          agents: [{ agentId: "agt_00000000000000000000000000000001", name: "Kai" }],
+          canSubmitCommands: true,
+          channelId,
+          kind: "direct",
+          name: "Conversation",
+          role: "owner",
+        },
+        {
+          agents: [{ agentId: "agt_00000000000000000000000000000001", name: "Kai" }],
+          canSubmitCommands: false,
+          channelId: notificationChannelId,
+          kind: "notification",
+          name: "GitHub notifications",
+          role: "participant",
+        },
+      ],
+      name: "Kai Workshop",
+      role: "admin",
+      workshopId: "wsp_00000000000000000000000000000001",
+    },
+  ],
+};
 const historyMessage: TimelineMessage = {
   authorDisplayName: "Kai",
   authorKind: "agent",
@@ -58,10 +97,12 @@ describe("Workshop React client", () => {
   let failStream: ((reason: Error) => void) | null;
 
   beforeEach(() => {
+    vi.clearAllMocks();
     sessionStorage.clear();
     handlers = null;
     failStream = null;
     vi.mocked(redeemEnrollment).mockResolvedValue("redeemed-session-token");
+    vi.mocked(loadNavigation).mockResolvedValue(navigation);
     vi.mocked(loadTimeline).mockResolvedValue({
       messages: [historyMessage],
       throughPosition: 25,
@@ -99,8 +140,7 @@ describe("Workshop React client", () => {
 
     expect(screen.getByRole("heading", { name: "People and agents, working in the same room." })).toBeVisible();
     await user.type(screen.getByLabelText("Enrollment token"), "one-time-token");
-    await user.type(screen.getByLabelText("Channel ID"), channelId);
-    await user.click(screen.getByRole("button", { name: "Open channel" }));
+    await user.click(screen.getByRole("button", { name: "Open Workshop" }));
 
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
     expect((await screen.findAllByText("Live")).length).toBeGreaterThanOrEqual(1);
@@ -108,6 +148,7 @@ describe("Workshop React client", () => {
       "one-time-token",
       "Workshop browser",
     );
+    expect(loadNavigation).toHaveBeenCalledWith("redeemed-session-token");
     expect(sessionStorage.getItem("kai.workshop.read-session.v1")).toContain(
       "redeemed-session-token",
     );
@@ -144,7 +185,7 @@ describe("Workshop React client", () => {
     );
     render(<App />);
 
-    const timeline = screen.getByLabelText("Conversation timeline");
+    const timeline = await screen.findByLabelText("Conversation timeline");
     let scrollHeight = 1000;
     Object.defineProperties(timeline, {
       clientHeight: { configurable: true, get: () => 300 },
@@ -206,8 +247,7 @@ describe("Workshop React client", () => {
     expect(screen.getByLabelText("Enrollment token")).toBeVisible();
   });
 
-  it("preserves an enrolled session while correcting channel access", async () => {
-    const user = userEvent.setup();
+  it("preserves an enrolled session while refreshing changed channel access", async () => {
     sessionStorage.setItem(
       "kai.workshop.read-session.v1",
       JSON.stringify({ channelId, token: "existing-session" }),
@@ -215,22 +255,74 @@ describe("Workshop React client", () => {
     vi.mocked(loadTimeline).mockRejectedValueOnce(
       new ChannelAccessError("Channel access changed."),
     );
+    vi.mocked(loadNavigation)
+      .mockResolvedValueOnce(navigation)
+      .mockResolvedValueOnce({
+        ...navigation,
+        workshops: [
+          {
+            ...navigation.workshops[0],
+            channels: [
+              {
+                ...navigation.workshops[0].channels[0],
+                channelId: secondChannelId,
+                name: "Replacement channel",
+              },
+            ],
+          },
+        ],
+      });
     render(<App />);
 
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Channel access changed.",
-    );
+    expect(
+      (await screen.findAllByRole("heading", { name: /Replacement channel/ })).length,
+    ).toBeGreaterThan(0);
     expect(screen.queryByLabelText("Enrollment token")).toBeNull();
-    expect(screen.getByLabelText("Channel ID")).toHaveValue(channelId);
     expect(sessionStorage.getItem("kai.workshop.read-session.v1")).toContain(
       "existing-session",
     );
-
-    await user.click(screen.getByRole("button", { name: "Forget session" }));
-    await waitFor(() =>
-      expect(screen.getByLabelText("Enrollment token")).toBeVisible(),
+    expect(sessionStorage.getItem("kai.workshop.read-session.v1")).toContain(
+      secondChannelId,
     );
-    expect(sessionStorage.getItem("kai.workshop.read-session.v1")).toBeNull();
+  });
+
+  it("switches authorized channels without re-enrollment and isolates drafts", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    vi.mocked(loadTimeline).mockImplementation(async (selectedSession) => ({
+      messages: [
+        {
+          ...historyMessage,
+          body: `History for ${selectedSession.channelId}`,
+          channelId: selectedSession.channelId,
+        },
+      ],
+      throughPosition: 25,
+    }));
+    render(<App />);
+
+    expect(await screen.findByText(`History for ${channelId}`)).toBeVisible();
+    await user.type(screen.getByLabelText("Message Kai"), "Keep this draft");
+    await user.click(
+      screen.getByRole("button", { name: /GitHub notifications/ }),
+    );
+
+    expect(
+      await screen.findByText(`History for ${notificationChannelId}`),
+    ).toBeVisible();
+    expect(screen.queryByLabelText("Message Kai")).toBeNull();
+    expect(screen.getByText(/outbound-only/)).toBeVisible();
+    expect(sessionStorage.getItem("kai.workshop.read-session.v1")).toContain(
+      notificationChannelId,
+    );
+
+    await user.click(screen.getByRole("button", { name: /Conversation/ }));
+    expect(await screen.findByText(`History for ${channelId}`)).toBeVisible();
+    expect(screen.getByLabelText("Message Kai")).toHaveValue("Keep this draft");
+    expect(redeemEnrollment).not.toHaveBeenCalled();
   });
 
   it("submits over LAN HTTP and reuses the command identity on retry", async () => {

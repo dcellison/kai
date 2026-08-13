@@ -11,6 +11,7 @@ import {
   AuthenticationError,
   cancelRun,
   ChannelAccessError,
+  loadNavigation,
   loadRun,
   redeemEnrollment,
   submitCommand,
@@ -21,13 +22,18 @@ import type {
   TimelineMessage,
   WorkshopRun,
   WorkshopRunActivity,
+  WorkshopChannelSummary,
+  WorkshopNavigation,
   WorkshopSession,
+  WorkshopSummary,
 } from "./types";
 import { CHANNEL_PATTERN } from "./types";
 import { useWorkshopTimeline } from "./useWorkshopTimeline";
 
 const SESSION_KEY = "kai.workshop.read-session.v1";
 const ACTIVE_RUN_KEY = "kai.workshop.active-run.v1";
+const DRAFTS_KEY = "kai.workshop.drafts.v1";
+const VIEWPORTS_KEY = "kai.workshop.timeline-viewports.v1";
 const TIMELINE_FOLLOW_DISTANCE_PX = 96;
 
 function restoreSession(): WorkshopSession | null {
@@ -59,6 +65,8 @@ function storeSession(session: WorkshopSession): void {
 function forgetStoredSession(): void {
   sessionStorage.removeItem(SESSION_KEY);
   sessionStorage.removeItem(ACTIVE_RUN_KEY);
+  sessionStorage.removeItem(DRAFTS_KEY);
+  sessionStorage.removeItem(VIEWPORTS_KEY);
 }
 
 function restoreActiveRunId(channelId: string): string | null {
@@ -67,23 +75,120 @@ function restoreActiveRunId(channelId: string): string | null {
     if (
       typeof stored === "object" &&
       stored !== null &&
-      "channelId" in stored &&
-      "runId" in stored &&
-      stored.channelId === channelId &&
-      typeof stored.runId === "string" &&
-      stored.runId.startsWith("run_")
+      channelId in stored &&
+      typeof (stored as Record<string, unknown>)[channelId] === "string" &&
+      String((stored as Record<string, unknown>)[channelId]).startsWith("run_")
     ) {
-      return stored.runId;
+      return String((stored as Record<string, unknown>)[channelId]);
     }
   } catch {
     // Malformed tab-local state has no authority.
   }
-  sessionStorage.removeItem(ACTIVE_RUN_KEY);
   return null;
 }
 
-function storeActiveRun(channelId: string, runId: string): void {
-  sessionStorage.setItem(ACTIVE_RUN_KEY, JSON.stringify({ channelId, runId }));
+function storeActiveRun(channelId: string, runId: string | null): void {
+  let stored: Record<string, string> = {};
+  try {
+    const value: unknown = JSON.parse(sessionStorage.getItem(ACTIVE_RUN_KEY) ?? "{}");
+    if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+      stored = Object.fromEntries(
+        Object.entries(value).filter((entry): entry is [string, string] =>
+          typeof entry[1] === "string" && entry[1].startsWith("run_"),
+        ),
+      );
+    }
+  } catch {
+    // Replace malformed tab-local state with the current channel state.
+  }
+  if (runId) {
+    stored[channelId] = runId;
+  } else {
+    delete stored[channelId];
+  }
+  sessionStorage.setItem(ACTIVE_RUN_KEY, JSON.stringify(stored));
+}
+
+function restoreDraft(channelId: string): string {
+  try {
+    const stored: unknown = JSON.parse(sessionStorage.getItem(DRAFTS_KEY) ?? "{}");
+    if (typeof stored === "object" && stored !== null && channelId in stored) {
+      const draft = (stored as Record<string, unknown>)[channelId];
+      return typeof draft === "string" && draft.length <= 50000 ? draft : "";
+    }
+  } catch {
+    // Malformed tab-local state has no authority.
+  }
+  return "";
+}
+
+function storeDraft(channelId: string, draft: string): void {
+  let stored: Record<string, string> = {};
+  try {
+    const value: unknown = JSON.parse(sessionStorage.getItem(DRAFTS_KEY) ?? "{}");
+    if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+      stored = Object.fromEntries(
+        Object.entries(value).filter((entry): entry is [string, string] =>
+          typeof entry[1] === "string" && entry[1].length <= 50000,
+        ),
+      );
+    }
+  } catch {
+    // Replace malformed tab-local state with the current channel draft.
+  }
+  if (draft) {
+    stored[channelId] = draft;
+  } else {
+    delete stored[channelId];
+  }
+  sessionStorage.setItem(DRAFTS_KEY, JSON.stringify(stored));
+}
+
+interface StoredTimelineViewport {
+  follow: boolean;
+  scrollTop: number;
+}
+
+function restoreTimelineViewport(channelId: string): StoredTimelineViewport | null {
+  try {
+    const stored: unknown = JSON.parse(sessionStorage.getItem(VIEWPORTS_KEY) ?? "{}");
+    const viewport =
+      typeof stored === "object" && stored !== null
+        ? (stored as Record<string, unknown>)[channelId]
+        : null;
+    if (
+      typeof viewport === "object" &&
+      viewport !== null &&
+      "follow" in viewport &&
+      "scrollTop" in viewport &&
+      typeof viewport.follow === "boolean" &&
+      typeof viewport.scrollTop === "number" &&
+      Number.isFinite(viewport.scrollTop) &&
+      viewport.scrollTop >= 0
+    ) {
+      return { follow: viewport.follow, scrollTop: viewport.scrollTop };
+    }
+  } catch {
+    // Malformed tab-local state has no authority.
+  }
+  return null;
+}
+
+function storeTimelineViewport(
+  channelId: string,
+  viewport: StoredTimelineViewport,
+): void {
+  let stored: Record<string, StoredTimelineViewport> = {};
+  try {
+    const value: unknown = JSON.parse(sessionStorage.getItem(VIEWPORTS_KEY) ?? "{}");
+    if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+      stored = value as Record<string, StoredTimelineViewport>;
+    }
+  } catch {
+    // Replace malformed tab-local state with the current channel viewport.
+  }
+  stored[channelId] = viewport;
+  sessionStorage.setItem(VIEWPORTS_KEY, JSON.stringify(stored));
 }
 
 type ActiveWorkshopRun = WorkshopRun & { status: "accepted" | "started" };
@@ -161,22 +266,18 @@ function runStatusCopy(run: WorkshopRun): string {
 
 function EnrollmentView({
   existingSession,
-  initialChannelId,
   notice,
   onForget,
   onOpen,
 }: {
   existingSession: boolean;
-  initialChannelId: string;
   notice: string | null;
   onForget: () => void;
   onOpen: (input: {
-    channelId: string;
     deviceDisplayName: string;
     enrollmentToken: string;
   }) => Promise<void>;
 }): React.JSX.Element {
-  const [channelId, setChannelId] = useState(initialChannelId);
   const [deviceDisplayName, setDeviceDisplayName] = useState("Workshop browser");
   const [enrollmentToken, setEnrollmentToken] = useState("");
   const [error, setError] = useState<string | null>(notice);
@@ -185,22 +286,16 @@ function EnrollmentView({
   const submit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
     setError(null);
-    const normalizedChannelId = channelId.trim();
-    if (!CHANNEL_PATTERN.test(normalizedChannelId)) {
-      setError("Enter the complete Workshop channel ID supplied by the operator.");
-      return;
-    }
     if (
       !existingSession &&
       (!deviceDisplayName.trim() || !enrollmentToken.trim())
     ) {
-      setError("Device name, channel ID, and enrollment token are required.");
+      setError("Device name and enrollment token are required.");
       return;
     }
     setBusy(true);
     try {
       await onOpen({
-        channelId: normalizedChannelId,
         deviceDisplayName: deviceDisplayName.trim(),
         enrollmentToken: enrollmentToken.trim(),
       });
@@ -265,8 +360,8 @@ function EnrollmentView({
 
           {existingSession ? (
             <p className="session-hint">
-              Enrollment is complete for this tab. Correct the channel ID, or
-              forget the session and enroll again.
+              Enrollment is complete for this tab. Retry Workshop discovery,
+              or forget the session and enroll again.
             </p>
           ) : (
             <p className="card-copy">
@@ -305,22 +400,9 @@ function EnrollmentView({
               </>
             )}
 
-            <label htmlFor="channel-id">Channel ID</label>
-            <input
-              id="channel-id"
-              name="channel-id"
-              value={channelId}
-              onChange={(event) => setChannelId(event.target.value)}
-              maxLength={64}
-              placeholder="chn_…"
-              autoComplete="off"
-              spellCheck={false}
-              required
-            />
-
             <div className="form-actions">
               <button className="primary-button" type="submit" disabled={busy}>
-                {busy ? "Opening…" : "Open channel"}
+                {busy ? "Opening…" : "Open Workshop"}
               </button>
               {existingSession && (
                 <button className="quiet-button" type="button" onClick={onForget}>
@@ -392,29 +474,63 @@ function createClientMessageId(): string {
   return `browser-${token}`;
 }
 
+function channelDisplayName(channel: WorkshopChannelSummary): string {
+  const name = channel.name?.trim();
+  if (name) {
+    return name;
+  }
+  if (channel.kind === "notification") {
+    return "Notifications";
+  }
+  if (channel.kind === "group") {
+    return "Group";
+  }
+  return "Conversation";
+}
+
+function workshopInitials(name: string): string {
+  const initials = name
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase())
+    .join("");
+  return initials || "WS";
+}
+
 function WorkshopView({
-  channelId,
+  channel,
   connection,
   messages,
+  navigation,
   runActivity,
+  workshop,
   onForget,
   onCancelRun,
   onLoadRun,
+  onSelectChannel,
+  onSelectWorkshop,
   onSubmitCommand,
 }: {
-  channelId: string;
+  channel: WorkshopChannelSummary;
   connection: ConnectionState;
   messages: TimelineMessage[];
+  navigation: WorkshopNavigation;
   runActivity: WorkshopRunActivity | null;
+  workshop: WorkshopSummary;
   onForget: () => void;
   onCancelRun: (runId: string) => Promise<WorkshopRun>;
   onLoadRun: (runId: string) => Promise<WorkshopRun>;
+  onSelectChannel: (channelId: string) => void;
+  onSelectWorkshop: (workshopId: string) => void;
   onSubmitCommand: (
     clientMessageId: string,
     body: string,
   ) => Promise<CommandSubmissionResult>;
 }): React.JSX.Element {
-  const [draft, setDraft] = useState("");
+  const channelId = channel.channelId;
+  const channelName = channelDisplayName(channel);
+  const [draft, setDraft] = useState(() => restoreDraft(channelId));
   const [pendingMessageId, setPendingMessageId] = useState<string | null>(null);
   const [submissionError, setSubmissionError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -428,12 +544,7 @@ function WorkshopView({
   const timelineFollowRef = useRef(true);
   const latestMessagePositionRef = useRef(0);
   const latestRunActivityRef = useRef<WorkshopRunActivity | null>(runActivity);
-  const agentName =
-    messages.find((message) => message.authorKind === "agent")
-      ?.authorDisplayName || "Agent";
-  const humanName =
-    messages.find((message) => message.authorKind === "human")
-      ?.authorDisplayName || "You";
+  const humanName = navigation.principal.displayName || "You";
 
   useEffect(() => {
     const restoredRunId = restoreActiveRunId(channelId);
@@ -449,7 +560,7 @@ function WorkshopView({
       })
       .catch((caught: unknown) => {
         if (!cancelled) {
-          sessionStorage.removeItem(ACTIVE_RUN_KEY);
+          storeActiveRun(channelId, null);
           setSubmissionError(
             caught instanceof Error ? caught.message : "Could not restore the active run.",
           );
@@ -474,7 +585,7 @@ function WorkshopView({
       return;
     }
     if (activeRun) {
-      sessionStorage.removeItem(ACTIVE_RUN_KEY);
+      storeActiveRun(channelId, null);
     }
   }, [activeRun, channelId]);
 
@@ -508,9 +619,12 @@ function WorkshopView({
       if (messages.length === 0) {
         return;
       }
-      timeline.scrollTop = timeline.scrollHeight;
+      const restoredViewport = restoreTimelineViewport(channelId);
+      timeline.scrollTop = restoredViewport?.follow === false
+        ? Math.min(restoredViewport.scrollTop, timeline.scrollHeight)
+        : timeline.scrollHeight;
       timelineInitializedRef.current = true;
-      timelineFollowRef.current = true;
+      timelineFollowRef.current = restoredViewport?.follow ?? true;
       latestMessagePositionRef.current = latestPosition;
       setUnseenMessageCount(0);
       return;
@@ -541,6 +655,10 @@ function WorkshopView({
     }
     const shouldFollow = isNearTimelineBottom(timeline);
     timelineFollowRef.current = shouldFollow;
+    storeTimelineViewport(channelId, {
+      follow: shouldFollow,
+      scrollTop: timeline.scrollTop,
+    });
     if (shouldFollow) {
       setUnseenMessageCount(0);
     }
@@ -553,6 +671,10 @@ function WorkshopView({
     }
     timelineFollowRef.current = true;
     timeline.scrollTop = timeline.scrollHeight;
+    storeTimelineViewport(channelId, {
+      follow: true,
+      scrollTop: timeline.scrollTop,
+    });
     setUnseenMessageCount(0);
   };
 
@@ -569,6 +691,7 @@ function WorkshopView({
       setPendingMessageId(clientMessageId);
       const result = await onSubmitCommand(clientMessageId, body);
       setDraft("");
+      storeDraft(channelId, "");
       setPendingMessageId(null);
       const streamed = latestRunActivityRef.current;
       setActiveRun(
@@ -604,9 +727,18 @@ function WorkshopView({
     <main className="workshop-app">
       <aside className="workspace-rail" aria-label="Workshop switcher">
         <span className="rail-brand">K</span>
-        <button className="rail-item active" type="button" aria-label="Current Workshop">
-          WS
-        </button>
+        {navigation.workshops.map((availableWorkshop) => (
+          <button
+            className={`rail-item ${availableWorkshop.workshopId === workshop.workshopId ? "active" : ""}`}
+            type="button"
+            aria-label={availableWorkshop.name}
+            title={availableWorkshop.name}
+            onClick={() => onSelectWorkshop(availableWorkshop.workshopId)}
+            key={availableWorkshop.workshopId}
+          >
+            {workshopInitials(availableWorkshop.name)}
+          </button>
+        ))}
         <span className="rail-spacer" />
         <span className="rail-status" title="Kai connected" aria-label="Kai connected" />
       </aside>
@@ -615,29 +747,66 @@ function WorkshopView({
         <header className="sidebar-header">
           <div>
             <p className="overline">Kai Workshop</p>
-            <h1>Current Workshop</h1>
+            <h1>{workshop.name}</h1>
           </div>
-          <span className="read-only-chip">Connected</span>
+          <span className="read-only-chip">{workshop.role}</span>
         </header>
 
         <nav>
           <p className="nav-heading">Channels</p>
-          <button className="channel-link active" type="button">
-            <span>#</span>
-            <span>conversation</span>
-            <span className="live-pip" aria-label="Live" />
-          </button>
+          {workshop.channels
+            .filter((availableChannel) => availableChannel.kind !== "notification")
+            .map((availableChannel) => (
+              <button
+                className={`channel-link ${availableChannel.channelId === channelId ? "active" : ""}`}
+                type="button"
+                onClick={() => onSelectChannel(availableChannel.channelId)}
+                key={availableChannel.channelId}
+              >
+                <span>#</span>
+                <span>{channelDisplayName(availableChannel)}</span>
+                {availableChannel.channelId === channelId && (
+                  <span className="live-pip" aria-label="Live" />
+                )}
+              </button>
+            ))}
+
+          {workshop.channels.some(
+            (availableChannel) => availableChannel.kind === "notification",
+          ) && (
+            <>
+              <p className="nav-heading">Notifications</p>
+              {workshop.channels
+                .filter((availableChannel) => availableChannel.kind === "notification")
+                .map((availableChannel) => (
+                  <button
+                    className={`channel-link notification ${availableChannel.channelId === channelId ? "active" : ""}`}
+                    type="button"
+                    onClick={() => onSelectChannel(availableChannel.channelId)}
+                    key={availableChannel.channelId}
+                  >
+                    <span>!</span>
+                    <span>{channelDisplayName(availableChannel)}</span>
+                    {availableChannel.channelId === channelId && (
+                      <span className="live-pip" aria-label="Live" />
+                    )}
+                  </button>
+                ))}
+            </>
+          )}
 
           <p className="nav-heading">Agents</p>
-          <button className="agent-link" type="button">
-            <span className="mini-avatar">
-              {agentName.slice(0, 1).toUpperCase()}
-            </span>
-            <span>
-              <strong>{agentName}</strong>
-              <small>coding agent</small>
-            </span>
-          </button>
+          {channel.agents.map((agent) => (
+            <div className="agent-link" key={agent.agentId}>
+              <span className="mini-avatar">
+                {agent.name.slice(0, 1).toUpperCase()}
+              </span>
+              <span>
+                <strong>{agent.name}</strong>
+                <small>coding agent</small>
+              </span>
+            </div>
+          ))}
         </nav>
 
         <footer className="sidebar-footer">
@@ -654,8 +823,8 @@ function WorkshopView({
       <section className="conversation-pane">
         <header className="conversation-header">
           <div>
-            <p className="breadcrumbs">Current Workshop / Channels</p>
-            <h2># conversation</h2>
+            <p className="breadcrumbs">{workshop.name} / {channel.kind === "notification" ? "Notifications" : "Channels"}</p>
+            <h2>{channel.kind === "notification" ? "!" : "#"} {channelName}</h2>
           </div>
           <div className="conversation-actions">
             <ConnectionIndicator connection={connection} />
@@ -675,10 +844,11 @@ function WorkshopView({
             <span className="channel-symbol">#</span>
             <div>
               <p className="overline">Canonical conversation</p>
-              <h3>Welcome to this channel</h3>
+              <h3>Welcome to {channelName}</h3>
               <p>
-                This channel is shared across Workshop and Telegram. Messages
-                below come from Kai’s durable conversation history.
+                {channel.kind === "notification"
+                  ? "This outbound channel records notifications delivered by Kai."
+                  : "Messages below come from Kai’s durable conversation history across every connected client."}
               </p>
             </div>
           </div>
@@ -722,41 +892,50 @@ function WorkshopView({
               </div>
             </section>
           )}
-          <form className="composer-form" onSubmit={(event) => void submit(event)}>
-            <textarea
-              aria-label="Message Kai"
-              value={draft}
-              onChange={(event) => {
-                setDraft(event.target.value);
-                if (!submitting) {
-                  setPendingMessageId(null);
-                }
-              }}
-              maxLength={50000}
-              placeholder="Message Kai…"
-              rows={3}
-            />
-            <button
-              type="submit"
-              disabled={submitting || isRunActive(activeRun) || !draft.trim()}
-            >
-              {submitting ? "Sending…" : "Send"}
-            </button>
-            {isRunActive(activeRun) && (
+          {channel.canSubmitCommands ? (
+            <form className="composer-form" onSubmit={(event) => void submit(event)}>
+              <textarea
+                aria-label="Message Kai"
+                value={draft}
+                onChange={(event) => {
+                  const nextDraft = event.target.value;
+                  setDraft(nextDraft);
+                  storeDraft(channelId, nextDraft);
+                  if (!submitting) {
+                    setPendingMessageId(null);
+                  }
+                }}
+                maxLength={50000}
+                placeholder="Message Kai…"
+                rows={3}
+              />
               <button
-                className="stop-button"
-                type="button"
-                disabled={stopping}
-                onClick={() => void stopRun()}
+                type="submit"
+                disabled={submitting || isRunActive(activeRun) || !draft.trim()}
               >
-                {stopping ? "Stopping…" : "Stop"}
+                {submitting ? "Sending…" : "Send"}
               </button>
-            )}
-          </form>
+              {isRunActive(activeRun) && (
+                <button
+                  className="stop-button"
+                  type="button"
+                  disabled={stopping}
+                  onClick={() => void stopRun()}
+                >
+                  {stopping ? "Stopping…" : "Stop"}
+                </button>
+              )}
+            </form>
+          ) : (
+            <p className="read-only-channel-notice">
+              This channel is outbound-only. Kai records delivery here, but it
+              does not accept conversation commands.
+            </p>
+          )}
           {submissionError && (
             <p className="composer-error" role="alert">{submissionError}</p>
           )}
-          {!activeRun && (
+          {!activeRun && channel.canSubmitCommands && (
             <span className="composer-mode" role="status">
               Canonical Workshop command
             </span>
@@ -767,7 +946,7 @@ function WorkshopView({
       <aside className="context-pane" aria-label="Channel context">
         <header>
           <p className="overline">Channel context</p>
-          <h2># conversation</h2>
+          <h2>{channel.kind === "notification" ? "!" : "#"} {channelName}</h2>
         </header>
 
         <section className="context-section">
@@ -784,8 +963,18 @@ function WorkshopView({
           <p>The channel—not a Telegram chat—is the collaboration boundary.</p>
         </section>
 
-        <section className="context-section future-section">
+        <section className="context-section">
           <span className="section-number">03</span>
+          <h3>Channel authority</h3>
+          <p>
+            {channel.canSubmitCommands
+              ? "You can read this channel and submit commands to its assigned agent."
+              : "You can read this outbound channel; command submission is disabled."}
+          </p>
+        </section>
+
+        <section className="context-section future-section">
+          <span className="section-number">04</span>
           <h3>Coming into view</h3>
           <ul>
             <li>Threads and run inspection</li>
@@ -798,10 +987,126 @@ function WorkshopView({
   );
 }
 
+function findNavigationChannel(
+  navigation: WorkshopNavigation,
+  channelId: string,
+): { channel: WorkshopChannelSummary; workshop: WorkshopSummary } | null {
+  for (const workshop of navigation.workshops) {
+    const channel = workshop.channels.find(
+      (availableChannel) => availableChannel.channelId === channelId,
+    );
+    if (channel) {
+      return { channel, workshop };
+    }
+  }
+  return null;
+}
+
+function preferredNavigationChannel(
+  navigation: WorkshopNavigation,
+  preferredChannelId: string | null,
+): { channel: WorkshopChannelSummary; workshop: WorkshopSummary } | null {
+  if (preferredChannelId) {
+    const preferred = findNavigationChannel(navigation, preferredChannelId);
+    if (preferred) {
+      return preferred;
+    }
+  }
+  for (const workshop of navigation.workshops) {
+    const channel = workshop.channels.find(
+      (availableChannel) => availableChannel.canSubmitCommands,
+    );
+    if (channel) {
+      return { channel, workshop };
+    }
+  }
+  for (const workshop of navigation.workshops) {
+    if (workshop.channels[0]) {
+      return { channel: workshop.channels[0], workshop };
+    }
+  }
+  return null;
+}
+
+function ActiveWorkshopClient({
+  navigation,
+  session,
+  onAuthenticationFailure,
+  onChannelAccessFailure,
+  onForget,
+  onSelectChannel,
+  onSelectWorkshop,
+}: {
+  navigation: WorkshopNavigation;
+  session: WorkshopSession;
+  onAuthenticationFailure: (message: string) => void;
+  onChannelAccessFailure: (message: string) => void;
+  onForget: () => void;
+  onSelectChannel: (channelId: string) => void;
+  onSelectWorkshop: (workshopId: string) => void;
+}): React.JSX.Element {
+  const selected = findNavigationChannel(navigation, session.channelId);
+  const { connection, messages, runActivity } = useWorkshopTimeline(
+    session,
+    selected !== null,
+    onAuthenticationFailure,
+    onChannelAccessFailure,
+  );
+  const withAccessHandling = useCallback(
+    async <Result,>(operation: () => Promise<Result>): Promise<Result> => {
+      try {
+        return await operation();
+      } catch (caught) {
+        if (caught instanceof AuthenticationError) {
+          onAuthenticationFailure(caught.message);
+        } else if (caught instanceof ChannelAccessError) {
+          onChannelAccessFailure(caught.message);
+        }
+        throw caught;
+      }
+    },
+    [onAuthenticationFailure, onChannelAccessFailure],
+  );
+  const loadSelectedRun = useCallback(
+    (runId: string) => withAccessHandling(() => loadRun(session, runId)),
+    [session, withAccessHandling],
+  );
+  const cancelSelectedRun = useCallback(
+    (runId: string) => withAccessHandling(() => cancelRun(session, runId)),
+    [session, withAccessHandling],
+  );
+  const submitSelectedCommand = useCallback(
+    (clientMessageId: string, body: string) =>
+      withAccessHandling(() => submitCommand(session, clientMessageId, body)),
+    [session, withAccessHandling],
+  );
+  if (!selected) {
+    return <main className="loading-workshop">Workshop access changed.</main>;
+  }
+
+  return (
+    <WorkshopView
+      channel={selected.channel}
+      connection={connection}
+      messages={messages}
+      navigation={navigation}
+      runActivity={runActivity}
+      workshop={selected.workshop}
+      onForget={onForget}
+      onCancelRun={cancelSelectedRun}
+      onLoadRun={loadSelectedRun}
+      onSelectChannel={onSelectChannel}
+      onSelectWorkshop={onSelectWorkshop}
+      onSubmitCommand={submitSelectedCommand}
+    />
+  );
+}
+
 export default function App(): React.JSX.Element {
   const [session, setSession] = useState<WorkshopSession | null>(() =>
     restoreSession(),
   );
+  const [navigation, setNavigation] = useState<WorkshopNavigation | null>(null);
   const [view, setView] = useState<"enrollment" | "workshop">(() =>
     sessionStorage.getItem(SESSION_KEY) ? "workshop" : "enrollment",
   );
@@ -810,11 +1115,7 @@ export default function App(): React.JSX.Element {
   const forgetSession = useCallback((message: string | null = null): void => {
     forgetStoredSession();
     setSession(null);
-    setNotice(message);
-    setView("enrollment");
-  }, []);
-
-  const correctChannel = useCallback((message: string): void => {
+    setNavigation(null);
     setNotice(message);
     setView("enrollment");
   }, []);
@@ -824,95 +1125,117 @@ export default function App(): React.JSX.Element {
     [forgetSession],
   );
 
-  const { connection, messages, runActivity } = useWorkshopTimeline(
-    session,
-    view === "workshop",
-    handleAuthenticationFailure,
-    correctChannel,
+  const adoptNavigation = useCallback(
+    (
+      token: string,
+      discovered: WorkshopNavigation,
+      preferredChannelId: string | null,
+    ): void => {
+      const selected = preferredNavigationChannel(discovered, preferredChannelId);
+      if (!selected) {
+        throw new Error("This Workshop account has no accessible channels.");
+      }
+      const nextSession = { channelId: selected.channel.channelId, token };
+      storeSession(nextSession);
+      setSession(nextSession);
+      setNavigation(discovered);
+      setNotice(null);
+      setView("workshop");
+    },
+    [],
   );
 
+  useEffect(() => {
+    if (view !== "workshop" || !session || navigation) {
+      return;
+    }
+    let cancelled = false;
+    void loadNavigation(session.token)
+      .then((discovered) => {
+        if (!cancelled) {
+          adoptNavigation(session.token, discovered, session.channelId);
+        }
+      })
+      .catch((caught: unknown) => {
+        if (cancelled) {
+          return;
+        }
+        if (caught instanceof AuthenticationError) {
+          forgetSession(caught.message);
+          return;
+        }
+        setNotice(
+          caught instanceof Error
+            ? caught.message
+            : "Could not load Workshop navigation.",
+        );
+        setView("enrollment");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [adoptNavigation, forgetSession, navigation, session, view]);
+
   const openChannel = async ({
-    channelId,
     deviceDisplayName,
     enrollmentToken,
   }: {
-    channelId: string;
     deviceDisplayName: string;
     enrollmentToken: string;
   }): Promise<void> => {
     const token =
       session?.token ??
       (await redeemEnrollment(enrollmentToken, deviceDisplayName));
-    const nextSession = { channelId, token };
-    storeSession(nextSession);
-    setSession(nextSession);
-    setNotice(null);
-    setView("workshop");
+    const discovered = await loadNavigation(token);
+    adoptNavigation(token, discovered, session?.channelId ?? null);
   };
 
-  const runCommand = async (
-    clientMessageId: string,
-    body: string,
-  ): Promise<CommandSubmissionResult> => {
+  const refreshChannelAccess = useCallback(async (message: string): Promise<void> => {
     if (!session) {
-      throw new Error("Workshop session unavailable.");
+      return;
     }
     try {
-      return await submitCommand(session, clientMessageId, body);
+      const discovered = await loadNavigation(session.token);
+      adoptNavigation(session.token, discovered, session.channelId);
     } catch (caught) {
       if (caught instanceof AuthenticationError) {
         forgetSession(caught.message);
-      } else if (caught instanceof ChannelAccessError) {
-        correctChannel(caught.message);
+        return;
       }
-      throw caught;
+      setNotice(
+        caught instanceof Error ? caught.message : message,
+      );
+      setNavigation(null);
+      setView("enrollment");
     }
+  }, [adoptNavigation, forgetSession, session]);
+
+  const selectChannel = (channelId: string): void => {
+    if (!session || !navigation || !findNavigationChannel(navigation, channelId)) {
+      return;
+    }
+    const nextSession = { ...session, channelId };
+    storeSession(nextSession);
+    setSession(nextSession);
   };
 
-  const inspectRun = useCallback(
-    async (runId: string): Promise<WorkshopRun> => {
-      if (!session) {
-        throw new Error("Workshop session unavailable.");
-      }
-      try {
-        return await loadRun(session, runId);
-      } catch (caught) {
-        if (caught instanceof AuthenticationError) {
-          forgetSession(caught.message);
-        } else if (caught instanceof ChannelAccessError) {
-          correctChannel(caught.message);
-        }
-        throw caught;
-      }
-    },
-    [correctChannel, forgetSession, session],
-  );
-
-  const stopRun = useCallback(
-    async (runId: string): Promise<WorkshopRun> => {
-      if (!session) {
-        throw new Error("Workshop session unavailable.");
-      }
-      try {
-        return await cancelRun(session, runId);
-      } catch (caught) {
-        if (caught instanceof AuthenticationError) {
-          forgetSession(caught.message);
-        } else if (caught instanceof ChannelAccessError) {
-          correctChannel(caught.message);
-        }
-        throw caught;
-      }
-    },
-    [correctChannel, forgetSession, session],
-  );
+  const selectWorkshop = (workshopId: string): void => {
+    const workshop = navigation?.workshops.find(
+      (availableWorkshop) => availableWorkshop.workshopId === workshopId,
+    );
+    const channel =
+      workshop?.channels.find((availableChannel) => availableChannel.canSubmitCommands) ??
+      workshop?.channels[0];
+    if (channel) {
+      selectChannel(channel.channelId);
+    }
+  };
 
   if (view === "enrollment") {
     return (
       <EnrollmentView
         key={`${session ? "correction" : "fresh"}:${notice ?? ""}`}
         existingSession={session !== null}
-        initialChannelId={session?.channelId ?? ""}
         notice={notice}
         onForget={() => forgetSession()}
         onOpen={openChannel}
@@ -920,16 +1243,20 @@ export default function App(): React.JSX.Element {
     );
   }
 
+  if (!session || !navigation) {
+    return <main className="loading-workshop">Opening Kai Workshop…</main>;
+  }
+
   return (
-    <WorkshopView
-      channelId={session?.channelId ?? ""}
-      connection={connection}
-      messages={messages}
-      runActivity={runActivity}
+    <ActiveWorkshopClient
+      key={session.channelId}
+      navigation={navigation}
+      session={session}
+      onAuthenticationFailure={handleAuthenticationFailure}
+      onChannelAccessFailure={(message) => void refreshChannelAccess(message)}
       onForget={() => forgetSession()}
-      onCancelRun={stopRun}
-      onLoadRun={inspectRun}
-      onSubmitCommand={runCommand}
+      onSelectChannel={selectChannel}
+      onSelectWorkshop={selectWorkshop}
     />
   );
 }

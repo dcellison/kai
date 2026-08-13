@@ -27,7 +27,7 @@ class CanonicalChannelAuthorizer:
             return await cursor.fetchone() is not None
 
     async def can_submit_command(self, principal_id: PrincipalId, channel_id: ChannelId) -> bool:
-        """Authorize command submission for an explicit human channel member."""
+        """Authorize a human in one executable conversational channel."""
         if not isinstance(principal_id, PrincipalId) or not isinstance(channel_id, ChannelId):
             return False
         async with self._store.connection.execute(
@@ -36,7 +36,12 @@ class CanonicalChannelAuthorizer:
             "JOIN channels c ON c.id = cm.channel_id "
             "JOIN workshop_memberships wm ON wm.principal_id = cm.principal_id "
             "AND wm.workshop_id = c.workshop_id "
-            "WHERE cm.principal_id = ? AND cm.channel_id = ? LIMIT 1",
+            "JOIN channel_agents ca ON ca.channel_id = c.id "
+            "JOIN channel_agent_runtime_assignments cara "
+            "ON cara.channel_id = ca.channel_id AND cara.agent_id = ca.agent_id "
+            "WHERE cm.principal_id = ? AND cm.channel_id = ? "
+            "AND c.kind IN ('direct', 'group') "
+            "GROUP BY c.id HAVING COUNT(ca.id) = 1 LIMIT 1",
             (principal_id, channel_id),
         ) as cursor:
             return await cursor.fetchone() is not None
