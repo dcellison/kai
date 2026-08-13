@@ -77,6 +77,7 @@ from kai.workshop.client_sessions import (
     WorkshopClientEnrollmentManager,
     WorkshopClientSessionManager,
 )
+from kai.workshop.client_shell import register_workshop_shell_routes
 from kai.workshop.store import WorkshopEventStore
 
 log = logging.getLogger(__name__)
@@ -2449,6 +2450,7 @@ async def _register_workshop_client_api(app: web.Application, database: Path) ->
             authenticator=WorkshopBearerSessionAuthenticator(sessions_manager),
             request_lock=request_lock,
         )
+        register_workshop_shell_routes(app)
     except Exception:
         await store.close()
         raise

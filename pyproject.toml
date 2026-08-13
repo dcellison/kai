@@ -42,6 +42,9 @@ totp = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"kai.workshop" = ["static/*.css", "static/*.html", "static/*.js"]
+
 [tool.ruff]
 target-version = "py313"
 line-length = 120

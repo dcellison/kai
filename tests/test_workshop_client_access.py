@@ -156,6 +156,10 @@ class TestWorkshopClientProductionRegistration:
             assert ("POST", "/v1/client/enrollment/redeem") in routes
             assert ("GET", "/v1/channels/{channel_id}/timeline") in routes
             assert ("GET", "/v1/channels/{channel_id}/events") in routes
+            assert ("GET", "/workshop") in routes
+            assert ("GET", "/workshop/") in routes
+            assert ("GET", "/workshop/app.css") in routes
+            assert ("GET", "/workshop/app.js") in routes
             assert ("POST", "/v1/channels/{channel_id}/timeline") not in routes
             assert ("POST", "/v1/channels/{channel_id}/events") not in routes
             assert ("POST", "/v1/client/enrollment") not in routes

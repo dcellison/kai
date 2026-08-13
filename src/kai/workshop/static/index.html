@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Kai Workshop</title>
+    <link rel="stylesheet" href="/workshop/app.css">
+    <script src="/workshop/app.js" defer></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="masthead">
+        <div>
+          <p class="eyebrow">Kai Workshop</p>
+          <h1>Shared work, unfolding live.</h1>
+        </div>
+        <span class="read-only">Read-only preview</span>
+      </header>
+
+      <section id="enrollment-panel" class="panel enrollment-panel">
+        <div class="panel-copy">
+          <h2>Open a Workshop channel</h2>
+          <p>
+            Use the short-lived enrollment token and channel ID supplied by
+            the Kai operator. This browser session stores the resulting
+            credential only until the tab session ends.
+          </p>
+        </div>
+        <form id="enrollment-form" method="post" action="/workshop/" novalidate>
+          <p id="enrolled-session-hint" class="session-hint" hidden>
+            Enrollment is complete for this tab. Correct the channel ID below,
+            or forget the session and enroll again.
+          </p>
+
+          <div id="credential-fields" class="form-fields">
+            <label for="device-name">Device name</label>
+            <input
+              id="device-name"
+              name="device-name"
+              type="text"
+              maxlength="100"
+              value="Workshop browser"
+              autocomplete="off"
+              required
+            >
+
+            <label for="enrollment-token">Enrollment token</label>
+            <input
+              id="enrollment-token"
+              name="enrollment-token"
+              type="password"
+              maxlength="512"
+              placeholder="kai_ws_enroll_v1.…"
+              autocomplete="off"
+              spellcheck="false"
+              required
+            >
+          </div>
+
+          <label for="channel-id">Channel ID</label>
+          <input
+            id="channel-id"
+            name="channel-id"
+            type="text"
+            maxlength="64"
+            placeholder="chn_…"
+            autocomplete="off"
+            spellcheck="false"
+            required
+          >
+
+          <div class="form-actions">
+            <button type="submit">Open channel</button>
+            <button
+              id="forget-enrollment-session"
+              class="secondary"
+              type="button"
+              hidden
+            >
+              Forget session
+            </button>
+          </div>
+          <p id="enrollment-error" class="error" role="alert" hidden></p>
+        </form>
+      </section>
+
+      <section id="timeline-panel" class="panel timeline-panel" hidden>
+        <div class="timeline-toolbar">
+          <div>
+            <p class="eyebrow">Canonical conversation</p>
+            <h2 id="channel-title">Workshop channel</h2>
+          </div>
+          <div class="toolbar-actions">
+            <p id="connection-status" class="status" role="status">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span id="connection-label">Loading history</span>
+            </p>
+            <button id="forget-session" class="secondary" type="button">
+              Forget session
+            </button>
+          </div>
+        </div>
+        <ol id="timeline" class="timeline" aria-live="polite"></ol>
+        <p id="empty-timeline" class="empty" hidden>
+          No messages yet. New canonical messages will appear here.
+        </p>
+      </section>
+    </main>
+
+    <template id="message-template">
+      <li class="message">
+        <div class="message-meta">
+          <strong class="message-author"></strong>
+          <time class="message-time"></time>
+        </div>
+        <p class="message-body"></p>
+      </li>
+    </template>
+  </body>
+</html>
