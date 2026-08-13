@@ -29,7 +29,14 @@ from kai.workshop.client_events import (
     read_client_channel_events,
 )
 from kai.workshop.conversation_commands import ConversationCommandDisposition
-from kai.workshop.domain import ChannelId, MessageId, PrincipalId, RunId, RuntimeProfileId
+from kai.workshop.domain import (
+    ChannelId,
+    ChannelMembershipId,
+    MessageId,
+    PrincipalId,
+    RunId,
+    RuntimeProfileId,
+)
 from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.inbound import ClientInboundMessage, InboundMessage, record_inbound_message
 from kai.workshop.run_lifecycle import (
@@ -288,6 +295,13 @@ class TestWorkshopNavigationHTTPContract:
                         "name": "Kai",
                     }
                 ],
+                "participants": [
+                    {
+                        "principal_id": direct["participants"][0]["principal_id"],
+                        "kind": "agent",
+                        "display_name": "Kai",
+                    }
+                ],
                 "can_submit_commands": True,
             }
             assert notification["name"] == "Notifications"
@@ -318,6 +332,50 @@ class TestWorkshopNavigationHTTPContract:
             assert unauthenticated.status == 401
             assert malformed.status == 400
             assert (await malformed.json())["error"]["code"] == "invalid_request"
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_direct_channel_participants_include_the_other_human(self, tmp_path: Path):
+        store, alice_id, _, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        async with store.connection.execute("SELECT id FROM workshops LIMIT 1") as cursor:
+            workshop_id = str((await cursor.fetchone())[0])
+        human_direct_channel = ChannelId.new()
+        await store.connection.execute(
+            "INSERT INTO channels (id, workshop_id, kind, name, created_at) VALUES (?, ?, ?, ?, ?)",
+            (human_direct_channel, workshop_id, "direct", "Direct", _NOW.isoformat()),
+        )
+        await store.connection.executemany(
+            "INSERT INTO channel_memberships (id, channel_id, principal_id, role, created_at) VALUES (?, ?, ?, ?, ?)",
+            (
+                (ChannelMembershipId.new(), human_direct_channel, alice_id, "owner", _NOW.isoformat()),
+                (ChannelMembershipId.new(), human_direct_channel, bob_id, "owner", _NOW.isoformat()),
+            ),
+        )
+        await store.connection.commit()
+        client = await _open_client(store, _Authenticator({"alice": alice_id}))
+        try:
+            response = await client.get(
+                "/v1/client/navigation",
+                headers={"Authorization": "Bearer alice"},
+            )
+
+            assert response.status == 200
+            payload = await response.json()
+            direct = next(
+                channel
+                for channel in payload["workshops"][0]["channels"]
+                if channel["channel_id"] == human_direct_channel
+            )
+            assert direct["participants"] == [
+                {
+                    "principal_id": bob_id,
+                    "kind": "human",
+                    "display_name": "Bob",
+                }
+            ]
+            assert direct["agents"] == []
+            assert direct["can_submit_commands"] is False
         finally:
             await client.close()
             await store.close()

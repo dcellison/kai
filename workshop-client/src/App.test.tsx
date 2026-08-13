@@ -37,6 +37,7 @@ vi.mock("./api", async (importOriginal) => {
 const channelId = "chn_d3dfdfd7df9151ba8a1742b92403faa5";
 const notificationChannelId = "chn_11111111111111111111111111111111";
 const secondChannelId = "chn_22222222222222222222222222222222";
+const humanDirectChannelId = "chn_33333333333333333333333333333333";
 const navigation: WorkshopNavigation = {
   principal: {
     displayName: "Daniel",
@@ -51,6 +52,13 @@ const navigation: WorkshopNavigation = {
           channelId,
           kind: "direct",
           name: "Conversation",
+          participants: [
+            {
+              displayName: "Kai",
+              kind: "agent",
+              principalId: "prn_00000000000000000000000000000002",
+            },
+          ],
           role: "owner",
         },
         {
@@ -59,7 +67,29 @@ const navigation: WorkshopNavigation = {
           channelId: notificationChannelId,
           kind: "notification",
           name: "GitHub notifications",
+          participants: [
+            {
+              displayName: "Kai",
+              kind: "agent",
+              principalId: "prn_00000000000000000000000000000002",
+            },
+          ],
           role: "participant",
+        },
+        {
+          agents: [],
+          canSubmitCommands: false,
+          channelId: humanDirectChannelId,
+          kind: "direct",
+          name: "Direct",
+          participants: [
+            {
+              displayName: "Scott",
+              kind: "human",
+              principalId: "prn_00000000000000000000000000000003",
+            },
+          ],
+          role: "owner",
         },
       ],
       name: "Kai Workshop",
@@ -295,6 +325,7 @@ describe("Workshop React client", () => {
               {
                 ...navigation.workshops[0].channels[0],
                 channelId: secondChannelId,
+                kind: "group",
                 name: "Replacement channel",
               },
             ],
@@ -351,10 +382,45 @@ describe("Workshop React client", () => {
       notificationChannelId,
     );
 
-    await user.click(screen.getByRole("button", { name: /Conversation/ }));
+    await user.click(screen.getByRole("button", { name: "Kai" }));
     expect(await screen.findByText(`History for ${channelId}`)).toBeVisible();
     expect(screen.getByLabelText("Message Kai")).toHaveValue("Keep this draft");
     expect(redeemEnrollment).not.toHaveBeenCalled();
+  });
+
+  it("groups direct messages and names agent and human conversations by participant", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    vi.mocked(loadTimeline).mockImplementation(async (selectedSession) => ({
+      messages: [
+        {
+          ...historyMessage,
+          channelId: selectedSession.channelId,
+        },
+      ],
+      throughPosition: 25,
+    }));
+    render(<App />);
+
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+    expect(screen.getByText("Direct messages")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Kai" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Scott" })).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "Scott" }));
+
+    expect(
+      (await screen.findAllByRole("heading", { name: "@ Scott" })).length,
+    ).toBeGreaterThan(0);
+    expect(
+      screen.getByText(
+        "Sending messages from Workshop is not available for this conversation yet.",
+      ),
+    ).toBeVisible();
+    expect(screen.queryByText("Agents")).toBeNull();
   });
 
   it("submits over LAN HTTP and reuses the command identity on retry", async () => {

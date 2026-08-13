@@ -498,6 +498,17 @@ function createClientMessageId(): string {
 }
 
 function channelDisplayName(channel: WorkshopChannelSummary): string {
+  if (channel.kind === "direct") {
+    const participantNames = channel.participants
+      .map((participant) => participant.displayName.trim())
+      .filter(Boolean);
+    if (participantNames.length > 0) {
+      return participantNames.join(", ");
+    }
+    if (channel.agents.length === 1 && channel.agents[0].name.trim()) {
+      return channel.agents[0].name.trim();
+    }
+  }
   const name = channel.name?.trim();
   if (name) {
     return name;
@@ -509,6 +520,16 @@ function channelDisplayName(channel: WorkshopChannelSummary): string {
     return "Group";
   }
   return "Conversation";
+}
+
+function channelSymbol(channel: WorkshopChannelSummary): string {
+  if (channel.kind === "notification") {
+    return "!";
+  }
+  if (channel.kind === "direct") {
+    return "@";
+  }
+  return "#";
 }
 
 function workshopInitials(name: string): string {
@@ -553,6 +574,7 @@ function WorkshopView({
 }): React.JSX.Element {
   const channelId = channel.channelId;
   const channelName = channelDisplayName(channel);
+  const symbol = channelSymbol(channel);
   const [draft, setDraft] = useState(() => restoreDraft(channelId));
   const [pendingMessageId, setPendingMessageId] = useState<string | null>(null);
   const [submissionError, setSubmissionError] = useState<string | null>(null);
@@ -798,23 +820,55 @@ function WorkshopView({
         </header>
 
         <nav>
-          <p className="nav-heading">Channels</p>
-          {workshop.channels
-            .filter((availableChannel) => availableChannel.kind !== "notification")
-            .map((availableChannel) => (
-              <button
-                className={`channel-link ${availableChannel.channelId === channelId ? "active" : ""}`}
-                type="button"
-                onClick={() => onSelectChannel(availableChannel.channelId)}
-                key={availableChannel.channelId}
-              >
-                <span>#</span>
-                <span>{channelDisplayName(availableChannel)}</span>
-                {availableChannel.channelId === channelId && (
-                  <span className="live-pip" aria-label="Live" />
-                )}
-              </button>
-            ))}
+          {workshop.channels.some(
+            (availableChannel) => availableChannel.kind === "direct",
+          ) && (
+            <>
+              <p className="nav-heading">Direct messages</p>
+              {workshop.channels
+                .filter((availableChannel) => availableChannel.kind === "direct")
+                .map((availableChannel) => (
+                  <button
+                    className={`channel-link ${availableChannel.channelId === channelId ? "active" : ""}`}
+                    type="button"
+                    aria-label={channelDisplayName(availableChannel)}
+                    onClick={() => onSelectChannel(availableChannel.channelId)}
+                    key={availableChannel.channelId}
+                  >
+                    <span>{channelSymbol(availableChannel)}</span>
+                    <span>{channelDisplayName(availableChannel)}</span>
+                    {availableChannel.channelId === channelId && (
+                      <span className="live-pip" aria-label="Live" />
+                    )}
+                  </button>
+                ))}
+            </>
+          )}
+
+          {workshop.channels.some(
+            (availableChannel) => availableChannel.kind === "group",
+          ) && (
+            <>
+              <p className="nav-heading">Channels</p>
+              {workshop.channels
+                .filter((availableChannel) => availableChannel.kind === "group")
+                .map((availableChannel) => (
+                  <button
+                    className={`channel-link ${availableChannel.channelId === channelId ? "active" : ""}`}
+                    type="button"
+                    aria-label={channelDisplayName(availableChannel)}
+                    onClick={() => onSelectChannel(availableChannel.channelId)}
+                    key={availableChannel.channelId}
+                  >
+                    <span>{channelSymbol(availableChannel)}</span>
+                    <span>{channelDisplayName(availableChannel)}</span>
+                    {availableChannel.channelId === channelId && (
+                      <span className="live-pip" aria-label="Live" />
+                    )}
+                  </button>
+                ))}
+            </>
+          )}
 
           {workshop.channels.some(
             (availableChannel) => availableChannel.kind === "notification",
@@ -827,6 +881,7 @@ function WorkshopView({
                   <button
                     className={`channel-link notification ${availableChannel.channelId === channelId ? "active" : ""}`}
                     type="button"
+                    aria-label={channelDisplayName(availableChannel)}
                     onClick={() => onSelectChannel(availableChannel.channelId)}
                     key={availableChannel.channelId}
                   >
@@ -840,18 +895,22 @@ function WorkshopView({
             </>
           )}
 
-          <p className="nav-heading">Agents</p>
-          {channel.agents.map((agent) => (
-            <div className="agent-link" key={agent.agentId}>
-              <span className="mini-avatar">
-                {agent.name.slice(0, 1).toUpperCase()}
-              </span>
-              <span>
-                <strong>{agent.name}</strong>
-                <small>coding agent</small>
-              </span>
-            </div>
-          ))}
+          {channel.agents.length > 0 && (
+            <>
+              <p className="nav-heading">Agents</p>
+              {channel.agents.map((agent) => (
+                <div className="agent-link" key={agent.agentId}>
+                  <span className="mini-avatar">
+                    {agent.name.slice(0, 1).toUpperCase()}
+                  </span>
+                  <span>
+                    <strong>{agent.name}</strong>
+                    <small>coding agent</small>
+                  </span>
+                </div>
+              ))}
+            </>
+          )}
         </nav>
 
         <footer className="sidebar-footer">
@@ -868,8 +927,14 @@ function WorkshopView({
       <section className="conversation-pane">
         <header className="conversation-header">
           <div>
-            <p className="breadcrumbs">{workshop.name} / {channel.kind === "notification" ? "Notifications" : "Channels"}</p>
-            <h2>{channel.kind === "notification" ? "!" : "#"} {channelName}</h2>
+            <p className="breadcrumbs">
+              {workshop.name} / {channel.kind === "notification"
+                ? "Notifications"
+                : channel.kind === "direct"
+                  ? "Direct messages"
+                  : "Channels"}
+            </p>
+            <h2>{symbol} {channelName}</h2>
           </div>
           <div className="conversation-actions">
             <ConnectionIndicator connection={connection} />
@@ -886,12 +951,14 @@ function WorkshopView({
           onScroll={handleTimelineScroll}
         >
           <div className={`channel-introduction ${channel.kind === "notification" ? "notification" : ""}`}>
-            <span className="channel-symbol">{channel.kind === "notification" ? "!" : "#"}</span>
+            <span className="channel-symbol">{symbol}</span>
             <div>
               <p className="overline">
                 {channel.kind === "notification"
                   ? "Durable notification feed"
-                  : "Canonical conversation"}
+                  : channel.kind === "direct"
+                    ? "Direct conversation"
+                    : "Canonical conversation"}
               </p>
               <h3>Welcome to {channelName}</h3>
               <p>
@@ -951,7 +1018,7 @@ function WorkshopView({
           {channel.canSubmitCommands ? (
             <form className="composer-form" onSubmit={(event) => void submit(event)}>
               <textarea
-                aria-label="Message Kai"
+                aria-label={`Message ${channelName}`}
                 value={draft}
                 onChange={(event) => {
                   const nextDraft = event.target.value;
@@ -962,7 +1029,7 @@ function WorkshopView({
                   }
                 }}
                 maxLength={50000}
-                placeholder="Message Kai…"
+                placeholder={`Message ${channelName}…`}
                 rows={3}
               />
               <button
@@ -984,8 +1051,9 @@ function WorkshopView({
             </form>
           ) : (
             <p className="read-only-channel-notice">
-              This channel is outbound-only. Kai records delivery here, but it
-              does not accept conversation commands.
+              {channel.kind === "notification"
+                ? "This channel is outbound-only. Kai records delivery here, but it does not accept conversation commands."
+                : "Sending messages from Workshop is not available for this conversation yet."}
             </p>
           )}
           {submissionError && (
@@ -1002,7 +1070,7 @@ function WorkshopView({
       <aside className="context-pane" aria-label="Channel context">
         <header>
           <p className="overline">Channel context</p>
-          <h2>{channel.kind === "notification" ? "!" : "#"} {channelName}</h2>
+          <h2>{symbol} {channelName}</h2>
         </header>
 
         <section className="context-section">

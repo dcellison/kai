@@ -322,6 +322,20 @@ async def _handle_client_navigation(
         (principal_id,),
     ) as cursor:
         channel_rows = list(await cursor.fetchall())
+    async with store.connection.execute(
+        "SELECT c.workshop_id, c.id, peer.id, peer.kind, peer.display_name "
+        "FROM channel_memberships own_cm "
+        "JOIN channels c ON c.id = own_cm.channel_id "
+        "JOIN workshop_memberships wm ON wm.workshop_id = c.workshop_id "
+        "AND wm.principal_id = own_cm.principal_id "
+        "JOIN channel_memberships peer_cm ON peer_cm.channel_id = c.id "
+        "AND peer_cm.principal_id != own_cm.principal_id "
+        "JOIN principals peer ON peer.id = peer_cm.principal_id "
+        "WHERE own_cm.principal_id = ? "
+        "ORDER BY c.workshop_id, c.id, lower(peer.display_name), peer.id",
+        (principal_id,),
+    ) as cursor:
+        participant_rows = list(await cursor.fetchall())
 
     channels_by_workshop: dict[str, dict[str, dict[str, object]]] = {}
     for row in channel_rows:
@@ -336,6 +350,7 @@ async def _handle_client_navigation(
                 "kind": str(row[2]),
                 "role": str(row[4]),
                 "agents": [],
+                "participants": [],
                 "_runtime_assignments": [],
             },
         )
@@ -346,6 +361,22 @@ async def _handle_client_navigation(
                 raise RuntimeError("Workshop navigation channel assembly failed")
             agents.append({"agent_id": str(row[5]), "name": str(row[6])})
             assignments.append(bool(row[7]))
+
+    for row in participant_rows:
+        workshop_channels = channels_by_workshop.get(str(row[0]))
+        channel = workshop_channels.get(str(row[1])) if workshop_channels is not None else None
+        if channel is None:
+            raise RuntimeError("Workshop navigation participant assembly failed")
+        participants = channel["participants"]
+        if not isinstance(participants, list):
+            raise RuntimeError("Workshop navigation participant assembly failed")
+        participants.append(
+            {
+                "principal_id": str(row[2]),
+                "kind": str(row[3]),
+                "display_name": str(row[4]),
+            }
+        )
 
     workshops: list[dict[str, object]] = []
     for row in workshop_rows:

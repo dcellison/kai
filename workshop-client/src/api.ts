@@ -246,7 +246,8 @@ export async function loadNavigation(token: string): Promise<WorkshopNavigation>
         ) ||
         typeof rawChannel.role !== "string" ||
         typeof rawChannel.can_submit_commands !== "boolean" ||
-        !Array.isArray(rawChannel.agents)
+        !Array.isArray(rawChannel.agents) ||
+        !Array.isArray(rawChannel.participants)
       ) {
         throw new Error("Kai returned unsupported Workshop navigation.");
       }
@@ -261,12 +262,29 @@ export async function loadNavigation(token: string): Promise<WorkshopNavigation>
         }
         return { agentId: rawAgent.agent_id, name: rawAgent.name };
       });
+      const participants = rawChannel.participants.map((rawParticipant) => {
+        if (
+          !isRecord(rawParticipant) ||
+          typeof rawParticipant.principal_id !== "string" ||
+          !PRINCIPAL_PATTERN.test(rawParticipant.principal_id) ||
+          typeof rawParticipant.kind !== "string" ||
+          typeof rawParticipant.display_name !== "string"
+        ) {
+          throw new Error("Kai returned unsupported Workshop navigation.");
+        }
+        return {
+          displayName: rawParticipant.display_name,
+          kind: rawParticipant.kind,
+          principalId: rawParticipant.principal_id,
+        };
+      });
       return {
         agents,
         canSubmitCommands: rawChannel.can_submit_commands,
         channelId: rawChannel.channel_id,
         kind: rawChannel.kind as "direct" | "group" | "notification",
         name: rawChannel.name,
+        participants,
         role: rawChannel.role,
       };
     });

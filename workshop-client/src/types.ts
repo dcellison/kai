@@ -13,6 +13,12 @@ export interface WorkshopAgentSummary {
   name: string;
 }
 
+export interface WorkshopParticipantSummary {
+  displayName: string;
+  kind: string;
+  principalId: string;
+}
+
 export type WorkshopChannelKind = "direct" | "group" | "notification";
 
 export interface WorkshopChannelSummary {
@@ -21,6 +27,7 @@ export interface WorkshopChannelSummary {
   channelId: string;
   kind: WorkshopChannelKind;
   name: string | null;
+  participants: WorkshopParticipantSummary[];
   role: string;
 }
 

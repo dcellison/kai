@@ -129,6 +129,13 @@ describe("Workshop client API", () => {
                     name: "Kai",
                   },
                 ],
+                participants: [
+                  {
+                    principal_id: "prn_00000000000000000000000000000002",
+                    kind: "agent",
+                    display_name: "Kai",
+                  },
+                ],
               },
             ],
           },
@@ -156,6 +163,13 @@ describe("Workshop client API", () => {
               channelId,
               kind: "direct",
               name: "Conversation",
+              participants: [
+                {
+                  displayName: "Kai",
+                  kind: "agent",
+                  principalId: "prn_00000000000000000000000000000002",
+                },
+              ],
               role: "owner",
             },
           ],
