@@ -349,6 +349,71 @@ class TestWorkshopMessageParityStatus:
         assert "parity: diverged" in status
         assert "JSONL matched=1, JSONL missing=1" in status
 
+    async def test_isolated_jsonl_gap_does_not_cascade_over_later_matches(self, tmp_path: Path):
+        db_path = tmp_path / "kai.db"
+        history_root = tmp_path / "history"
+        await _build_conversation(db_path)
+        store = await WorkshopEventStore.open(db_path)
+        try:
+            second_inbound = await record_inbound_message(
+                store,
+                InboundMessage(
+                    "telegram",
+                    "9002",
+                    "43",
+                    "101",
+                    "101",
+                    "Second question",
+                    _NOW + timedelta(seconds=4),
+                ),
+            )
+            await record_outbound_message(
+                store,
+                OutboundMessage(
+                    MessageId(str(second_inbound.event.envelope.aggregate_id)),
+                    "Second answer",
+                    _NOW + timedelta(seconds=6),
+                ),
+            )
+        finally:
+            await store.close()
+        _write_history(
+            history_root,
+            [
+                _record("user", "Secret question", seconds=0),
+                _record("user", "Second question", seconds=4),
+                _record("assistant", "Second answer", seconds=6),
+            ],
+        )
+
+        status = workshop_message_parity_status(db_path, history_root)
+
+        assert "parity: diverged" in status
+        assert "JSONL matched=3, JSONL missing=1, JSONL unmatched=0" in status
+
+    async def test_abandoned_unshadowed_media_does_not_poison_later_turns(self, tmp_path: Path):
+        db_path = tmp_path / "kai.db"
+        history_root = tmp_path / "history"
+        await _build_conversation(db_path)
+        _write_history(
+            history_root,
+            [
+                _record(
+                    "user",
+                    "Older unshadowed photo",
+                    seconds=-4,
+                    media={"type": "photo"},
+                ),
+                _record("user", "Secret question", seconds=0),
+                _record("assistant", "Secret answer", seconds=2),
+            ],
+        )
+
+        status = workshop_message_parity_status(db_path, history_root)
+
+        assert "parity: clean" in status
+        assert "JSONL matched=2, JSONL missing=0, JSONL unmatched=0" in status
+
     async def test_newer_unshadowed_jsonl_turn_is_reported(self, tmp_path: Path):
         db_path = tmp_path / "kai.db"
         history_root = tmp_path / "history"

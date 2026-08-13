@@ -6,7 +6,6 @@ import hashlib
 import json
 import re
 import sqlite3
-from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -506,7 +505,7 @@ def _read_legacy_keys(history_root: Path, external_channel_id: str) -> tuple[lis
         return [], 0, 0
 
     keys: list[tuple[str, str]] = []
-    pending_user_turns: deque[bool] = deque()
+    pending_user_turn: bool | None = None
     malformed = 0
     unreadable = 0
     for path in sorted(history_dir.glob("*.jsonl")):
@@ -543,15 +542,19 @@ def _read_legacy_keys(history_root: Path, external_channel_id: str) -> tuple[lis
                     and media.get("type") in {"photo", "document", "voice"}
                     and media.get("workshop_message_shadowed") is True
                 )
-                pending_user_turns.append(is_shadowed_message)
+                # Only the most recent user record can own the next ordinary
+                # assistant record. Abandoned historical turns must not queue
+                # indefinitely and suppress otherwise valid later history.
+                pending_user_turn = is_shadowed_message
                 if is_shadowed_message:
                     keys.append((direction, hashlib.sha256(text.encode("utf-8")).hexdigest()))
                 continue
             if text.startswith(_SCHEDULED_ASSISTANT_PREFIXES):
                 continue
-            if not pending_user_turns:
+            if pending_user_turn is None:
                 continue
-            shadowed_turn = pending_user_turns.popleft()
+            shadowed_turn = pending_user_turn
+            pending_user_turn = None
             if not shadowed_turn or _SYNTHETIC_ASSISTANT_PATTERN.fullmatch(text):
                 continue
             keys.append((direction, hashlib.sha256(text.encode("utf-8")).hexdigest()))
@@ -566,16 +569,15 @@ def _compare_legacy_suffix(
     if not canonical_keys:
         return 0, 0, 0
 
+    suffix_matches = _longest_common_subsequence_suffix_lengths(
+        canonical_keys[1:],
+        legacy_keys,
+    )
     candidates: list[tuple[int, int, int, int]] = []
     for start, legacy_key in enumerate(legacy_keys):
         if legacy_key != canonical_keys[0]:
             continue
-        canonical_index = 0
-        matched = 0
-        for candidate in legacy_keys[start:]:
-            if canonical_index < len(canonical_keys) and candidate == canonical_keys[canonical_index]:
-                canonical_index += 1
-                matched += 1
+        matched = 1 + suffix_matches[start + 1]
         missing = len(canonical_keys) - matched
         unmatched = len(legacy_keys) - start - matched
         candidates.append((matched, missing, unmatched, start))
@@ -586,6 +588,27 @@ def _compare_legacy_suffix(
         key=lambda result: (-result[0], result[1] + result[2], -result[3]),
     )
     return matched, missing, unmatched
+
+
+def _longest_common_subsequence_suffix_lengths(
+    canonical_keys: list[tuple[str, str]],
+    legacy_keys: list[tuple[str, str]],
+) -> list[int]:
+    """Return ordered-match counts for every legacy suffix in linear memory."""
+    following = [0] * (len(legacy_keys) + 1)
+    for canonical_key in reversed(canonical_keys):
+        current = [0] * (len(legacy_keys) + 1)
+        for legacy_index in range(len(legacy_keys) - 1, -1, -1):
+            legacy_key = legacy_keys[legacy_index]
+            if canonical_key == legacy_key:
+                current[legacy_index] = following[legacy_index + 1] + 1
+            else:
+                current[legacy_index] = max(
+                    following[legacy_index],
+                    current[legacy_index + 1],
+                )
+        following = current
+    return following
 
 
 def _legacy_parity(
