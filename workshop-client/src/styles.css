@@ -358,6 +358,7 @@ button:disabled {
 .workshop-app {
   display: grid;
   grid-template-columns: 4.25rem 16.5rem minmax(24rem, 1fr) 19rem;
+  grid-template-rows: minmax(0, 1fr);
   height: 100vh;
   overflow: hidden;
   background: var(--atom-bg);
@@ -368,6 +369,7 @@ button:disabled {
   flex-direction: column;
   align-items: center;
   gap: 0.9rem;
+  min-height: 0;
   padding: 0.85rem 0;
   border-right: 1px solid var(--line);
   background: var(--atom-bg-dark);
@@ -414,6 +416,7 @@ button:disabled {
 .channel-sidebar {
   display: grid;
   grid-template-rows: auto 1fr auto;
+  min-height: 0;
   min-width: 0;
   border-right: 1px solid var(--line);
   background: var(--atom-bg-deep);
@@ -445,6 +448,8 @@ button:disabled {
 }
 
 .channel-sidebar nav {
+  min-height: 0;
+  overflow-y: auto;
   padding: 1rem 0.65rem;
 }
 
@@ -549,7 +554,9 @@ button:disabled {
 .conversation-pane {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
+  min-height: 0;
   min-width: 0;
+  overflow: hidden;
   background: var(--atom-bg);
 }
 
@@ -767,6 +774,7 @@ button:disabled {
 
 .context-pane {
   min-width: 0;
+  min-height: 0;
   overflow-y: auto;
   border-left: 1px solid var(--line);
   background: var(--atom-bg-deep);

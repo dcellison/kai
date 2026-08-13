@@ -1,5 +1,7 @@
 """Serving contracts for the packaged, read-only Workshop React client."""
 
+import re
+
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -59,6 +61,7 @@ class TestWorkshopClientShell:
         try:
             stylesheet = await client.get("/workshop/app.css")
             script = await client.get("/workshop/app.js")
+            stylesheet_body = await stylesheet.text()
             script_body = await script.text()
 
             assert stylesheet.status == script.status == 200
@@ -77,6 +80,19 @@ class TestWorkshopClientShell:
             assert "/v1/client/enrollment/redeem" in script_body
             assert "/timeline" in script_body
             assert "/events" in script_body
+
+            # Every ancestor in the nested grid must be shrinkable; otherwise
+            # a long timeline expands the implicit row and is clipped by the
+            # viewport shell instead of scrolling within the conversation.
+            assert "grid-template-rows:minmax(0,1fr)" in stylesheet_body
+            conversation_rule = re.search(r"\.conversation-pane\{([^}]*)\}", stylesheet_body)
+            timeline_rule = re.search(r"\.timeline-wrap\{([^}]*)\}", stylesheet_body)
+            assert conversation_rule is not None
+            assert "min-height:0" in conversation_rule.group(1)
+            assert "overflow:hidden" in conversation_rule.group(1)
+            assert timeline_rule is not None
+            assert "min-height:0" in timeline_rule.group(1)
+            assert "overflow-y:auto" in timeline_rule.group(1)
         finally:
             await client.close()
 
