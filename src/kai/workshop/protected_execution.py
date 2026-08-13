@@ -8,12 +8,12 @@ from pathlib import Path
 
 from kai.backend import StreamEvent
 from kai.config import VALID_BACKENDS, validate_model_for_backend
-from kai.pool import PreparedBackendExecution, SubprocessPool
+from kai.pool import PreparedBackendExecution
 from kai.workshop.conversation_runs import resolve_canonical_conversation_run
 from kai.workshop.domain import RunId
 from kai.workshop.run_execution_authority import RunExecutionSelection
 from kai.workshop.run_lifecycle import DurableRun, RunStatus, WorkshopRunLifecycle
-from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
+from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.store import WorkshopEventStore
 
 type AgentPrompt = str | list[dict[str, str]]
@@ -50,10 +50,9 @@ class WorkshopProtectedExecutionPreparationService:
     def __init__(
         self,
         store: WorkshopEventStore,
-        pool: SubprocessPool,
+        pool: WorkshopRuntimePool,
         *,
         registered_backend_ids: frozenset[str],
-        runtime_profiles: WorkshopRuntimeProfileRegistry,
     ) -> None:
         if not registered_backend_ids:
             raise ValueError("registered_backend_ids must not be empty")
@@ -63,7 +62,6 @@ class WorkshopProtectedExecutionPreparationService:
         self._store = store
         self._pool = pool
         self._registered_backend_ids = registered_backend_ids
-        self._runtime_profiles = runtime_profiles
 
     async def prepare(self, run_id: RunId) -> PreparedWorkshopExecution:
         if not isinstance(run_id, RunId):
@@ -72,11 +70,7 @@ class WorkshopProtectedExecutionPreparationService:
         if run.status != RunStatus.ACCEPTED or run.cancellation_requested_at is not None:
             raise ProtectedExecutionPreparationError("Only an uncancelled accepted run can prepare execution")
 
-        resolution = await resolve_canonical_conversation_run(
-            self._store,
-            run.inbound_message_id,
-            self._runtime_profiles,
-        )
+        resolution = await resolve_canonical_conversation_run(self._store, run.inbound_message_id)
         target = resolution.target
         if (
             target.workshop_id != run.workshop_id
@@ -86,7 +80,7 @@ class WorkshopProtectedExecutionPreparationService:
         ):
             raise ProtectedExecutionPreparationError("Canonical run authority changed after acceptance")
 
-        runtime = await self._pool.prepare_execution(resolution._runtime_config_id)
+        runtime = await self._pool.prepare_execution(resolution.runtime_profile_id)
         prepared = runtime.selection
         if prepared.backend not in self._registered_backend_ids:
             raise ProtectedExecutionPreparationError("Effective backend is not present in the protected registry")

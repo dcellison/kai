@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from kai.pool import SubprocessPool
 from kai.workshop.conversation_commands import (
     ClientConversationCommandAcceptance,
     ConversationCommandAcceptance,
@@ -20,7 +19,7 @@ from kai.workshop.execution_coordinator import (
 )
 from kai.workshop.inbound import ClientInboundMessage, InboundMessage
 from kai.workshop.protected_execution import WorkshopProtectedExecutionPreparationService
-from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
+from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.store import WorkshopEventStore
 
 _RECOVERY_INTERVAL_SECONDS = 5.0
@@ -35,13 +34,13 @@ class WorkshopPrivateTextExecutionService:
         coordinator: WorkshopCanonicalExecutionCoordinator,
         command_service: WorkshopConversationCommandService,
         database_lock: asyncio.Lock,
-        runtime_profiles: WorkshopRuntimeProfileRegistry,
+        runtime_pool: WorkshopRuntimePool,
     ) -> None:
         self._store = store
         self._coordinator = coordinator
         self._command_service = command_service
         self._database_lock = database_lock
-        self._runtime_profiles = runtime_profiles
+        self._runtime_pool = runtime_pool
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._closed = False
@@ -50,10 +49,9 @@ class WorkshopPrivateTextExecutionService:
     async def open_and_start(
         cls,
         database_path: Path,
-        pool: SubprocessPool,
+        runtime_pool: WorkshopRuntimePool,
         *,
         registered_backend_ids: frozenset[str],
-        runtime_profiles: WorkshopRuntimeProfileRegistry,
     ) -> WorkshopPrivateTextExecutionService:
         store = await WorkshopEventStore.open(database_path)
         database_lock = asyncio.Lock()
@@ -61,9 +59,8 @@ class WorkshopPrivateTextExecutionService:
             store,
             WorkshopProtectedExecutionPreparationService(
                 store,
-                pool,
+                runtime_pool,
                 registered_backend_ids=registered_backend_ids,
-                runtime_profiles=runtime_profiles,
             ),
             registered_backend_ids=registered_backend_ids,
             database_lock=database_lock,
@@ -73,7 +70,7 @@ class WorkshopPrivateTextExecutionService:
             coordinator,
             WorkshopConversationCommandService(store),
             database_lock,
-            runtime_profiles,
+            runtime_pool,
         )
         try:
             await coordinator.recover_expired()
@@ -92,7 +89,7 @@ class WorkshopPrivateTextExecutionService:
 
     def runtime_config_id(self, runtime_profile_id: str | RuntimeProfileId) -> int:
         """Resolve compatibility state only through protected profile policy."""
-        return self._runtime_profiles.resolve(runtime_profile_id).runtime_config_id
+        return self._runtime_pool.compatibility_runtime_config_id(runtime_profile_id)
 
     async def accept(self, message: InboundMessage) -> ConversationCommandAcceptance:
         if self._closed:

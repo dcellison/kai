@@ -84,11 +84,10 @@ class TestRuntimeAssignmentPolicy:
             resolution = await resolve_canonical_conversation_run(
                 store,
                 MessageId(str(accepted.command.message.event.envelope.aggregate_id)),
-                profiles,
             )
 
             assert accepted.runtime_profile_id == profile_id(202)
-            assert resolution._runtime_config_id == 202
+            assert resolution.runtime_profile_id == profile_id(202)
         finally:
             await store.close()
 

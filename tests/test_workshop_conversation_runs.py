@@ -12,8 +12,8 @@ import pytest
 from kai.backend import AgentResponse, StreamEvent
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.conversation_runs import (
+    CanonicalConversationRunResolution,
     CanonicalConversationRunTarget,
-    CompatibilityConversationRunResolution,
     ConversationRunUnavailableError,
     WorkshopConversationRunService,
     resolve_canonical_conversation_run,
@@ -21,7 +21,7 @@ from kai.workshop.conversation_runs import (
 from kai.workshop.domain import AgentId, ChannelId, MessageId, PrincipalId, WorkshopId
 from kai.workshop.inbound import InboundMessage, record_inbound_message
 from kai.workshop.store import WorkshopEventStore
-from tests.workshop_profiles import profile_id, profile_registry
+from tests.workshop_profiles import profile_id
 
 _NOW = datetime(2026, 8, 12, 12, 0, tzinfo=UTC)
 
@@ -71,7 +71,7 @@ class TestCanonicalRunResolution:
         try:
             inbound_id = await _canonical_inbound(store, telegram_id=101)
 
-            resolution = await resolve_canonical_conversation_run(store, inbound_id, profile_registry(101))
+            resolution = await resolve_canonical_conversation_run(store, inbound_id)
             target = resolution.target
 
             assert target.inbound_message_id == inbound_id
@@ -79,7 +79,7 @@ class TestCanonicalRunResolution:
             assert isinstance(target.channel_id, ChannelId)
             assert isinstance(target.requested_by_principal_id, PrincipalId)
             assert isinstance(target.agent_id, AgentId)
-            assert resolution._runtime_config_id == 101
+            assert resolution.runtime_profile_id == profile_id(101)
         finally:
             await store.close()
 
@@ -89,7 +89,7 @@ class TestCanonicalRunResolution:
             await _canonical_inbound(store)
 
             with pytest.raises(ConversationRunUnavailableError, match="one human channel member"):
-                await resolve_canonical_conversation_run(store, MessageId.new(), profile_registry(101))
+                await resolve_canonical_conversation_run(store, MessageId.new())
         finally:
             await store.close()
 
@@ -126,9 +126,9 @@ class TestCanonicalRunResolution:
             )
             inbound_id = MessageId(str(inbound.event.envelope.aggregate_id))
 
-            resolution = await resolve_canonical_conversation_run(store, inbound_id, profile_registry(202))
+            resolution = await resolve_canonical_conversation_run(store, inbound_id)
 
-            assert resolution._runtime_config_id == 202
+            assert resolution.runtime_profile_id == profile_id(202)
             async with store.connection.execute(
                 "SELECT COUNT(*) FROM external_identities WHERE provider = 'telegram'"
             ) as cursor:
@@ -148,7 +148,7 @@ class TestCanonicalRunResolution:
             await store.connection.commit()
 
             with pytest.raises(ConversationRunUnavailableError, match="explicit runtime profile assignment"):
-                await resolve_canonical_conversation_run(store, inbound_id, profile_registry(101))
+                await resolve_canonical_conversation_run(store, inbound_id)
         finally:
             await store.close()
 
@@ -156,7 +156,7 @@ class TestCanonicalRunResolution:
         store = await WorkshopEventStore.open(tmp_path / "kai.db")
         try:
             inbound_id = await _canonical_inbound(store)
-            target = (await resolve_canonical_conversation_run(store, inbound_id, profile_registry(101))).target
+            target = (await resolve_canonical_conversation_run(store, inbound_id)).target
             second_principal = PrincipalId.new()
             second_agent = AgentId.new()
             await store.connection.execute(
@@ -174,7 +174,7 @@ class TestCanonicalRunResolution:
             await store.connection.commit()
 
             with pytest.raises(ConversationRunUnavailableError, match="one attached agent"):
-                await resolve_canonical_conversation_run(store, inbound_id, profile_registry(101))
+                await resolve_canonical_conversation_run(store, inbound_id)
         finally:
             await store.close()
 
@@ -182,7 +182,7 @@ class TestCanonicalRunResolution:
 class TestWorkshopConversationRunService:
     async def test_hides_compatibility_key_behind_canonical_request(self):
         inbound_id = MessageId.new()
-        target = CompatibilityConversationRunResolution(
+        target = CanonicalConversationRunResolution(
             target=CanonicalConversationRunTarget(
                 inbound_message_id=inbound_id,
                 workshop_id=WorkshopId.new(),
@@ -190,7 +190,7 @@ class TestWorkshopConversationRunService:
                 requested_by_principal_id=PrincipalId.new(),
                 agent_id=AgentId.new(),
             ),
-            _runtime_config_id=101,
+            runtime_profile_id=profile_id(101),
         )
         resolver = AsyncMock(return_value=target)
         pool = MagicMock()
@@ -204,9 +204,12 @@ class TestWorkshopConversationRunService:
         workspace = await prepared.effective_workspace()
 
         resolver.assert_awaited_once_with(inbound_id)
-        pool.get_model.assert_called_once_with(101)
-        pool.send.assert_called_once_with("hello", chat_id=101)
-        pool.get_effective_workspace.assert_awaited_once_with(101)
+        pool.get_model.assert_called_once_with(profile_id(101))
+        pool.send.assert_called_once_with(
+            "hello",
+            runtime_profile_id=profile_id(101),
+        )
+        pool.get_effective_workspace.assert_awaited_once_with(profile_id(101))
         assert prepared.target.inbound_message_id == inbound_id
         assert prepared.model == "gpt-5.6-sol"
         assert events[0].response is not None and events[0].response.text == "Done."
@@ -214,7 +217,7 @@ class TestWorkshopConversationRunService:
 
     async def test_rejects_resolver_substitution(self):
         requested_id = MessageId.new()
-        target = CompatibilityConversationRunResolution(
+        target = CanonicalConversationRunResolution(
             target=CanonicalConversationRunTarget(
                 inbound_message_id=MessageId.new(),
                 workshop_id=WorkshopId.new(),
@@ -222,7 +225,7 @@ class TestWorkshopConversationRunService:
                 requested_by_principal_id=PrincipalId.new(),
                 agent_id=AgentId.new(),
             ),
-            _runtime_config_id=101,
+            runtime_profile_id=profile_id(101),
         )
         pool = MagicMock()
         service = WorkshopConversationRunService(pool, AsyncMock(return_value=target))

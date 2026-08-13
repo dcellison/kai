@@ -8,12 +8,12 @@ from pathlib import Path
 from typing import Protocol
 
 from kai.backend import StreamEvent
-from kai.workshop.domain import AgentId, ChannelId, MessageId, PrincipalId, WorkshopId
+from kai.workshop.domain import AgentId, ChannelId, MessageId, PrincipalId, RuntimeProfileId, WorkshopId
 from kai.workshop.runtime_assignments import (
     WorkshopRuntimeAssignmentError,
     resolve_channel_runtime_profile,
 )
-from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError, WorkshopRuntimeProfileRegistry
+from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.store import WorkshopEventStore
 
 type AgentPrompt = str | list[dict[str, str]]
@@ -35,21 +35,29 @@ class CanonicalConversationRunTarget:
 
 
 @dataclass(frozen=True, slots=True)
-class CompatibilityConversationRunResolution:
-    """Canonical target plus the private key required by the current pool."""
+class CanonicalConversationRunResolution:
+    """Canonical target plus its explicitly assigned protected runtime."""
 
     target: CanonicalConversationRunTarget
-    _runtime_config_id: int = field(repr=False, compare=False)
+    runtime_profile_id: RuntimeProfileId
 
 
 class ConversationPool(Protocol):
-    """The narrow existing-pool surface hidden behind the run service."""
+    """The narrow profile-addressed runtime surface used by run preparation."""
 
-    def get_model(self, chat_id: int) -> str: ...
+    def get_model(self, runtime_profile_id: str | RuntimeProfileId) -> str: ...
 
-    def send(self, prompt: AgentPrompt, *, chat_id: int) -> AsyncIterator[StreamEvent]: ...
+    def send(
+        self,
+        prompt: AgentPrompt,
+        *,
+        runtime_profile_id: str | RuntimeProfileId,
+    ) -> AsyncIterator[StreamEvent]: ...
 
-    async def get_effective_workspace(self, chat_id: int) -> Path: ...
+    async def get_effective_workspace(
+        self,
+        runtime_profile_id: str | RuntimeProfileId,
+    ) -> Path: ...
 
 
 async def resolve_canonical_conversation_target(
@@ -89,15 +97,13 @@ async def resolve_canonical_conversation_target(
 async def resolve_canonical_conversation_run(
     store: WorkshopEventStore,
     inbound_message_id: MessageId,
-    runtime_profiles: WorkshopRuntimeProfileRegistry,
-) -> CompatibilityConversationRunResolution:
-    """Resolve a canonical target plus the current private pool adapter key.
+) -> CanonicalConversationRunResolution:
+    """Resolve a canonical target plus its assigned opaque runtime profile.
 
     The public run request contains only a canonical message ID. During the
-    migration, the channel-agent's protected runtime-profile assignment
-    supplies the existing pool/config key internally. A caller cannot provide
-    or override that key, and human or transport identities are not execution
-    authority.
+    migration, the channel-agent's protected runtime-profile assignment is the
+    only execution identity. Protected pool policy validates and resolves that
+    profile later; human or transport identities are not execution authority.
     """
     target = await resolve_canonical_conversation_target(store, inbound_message_id)
     try:
@@ -106,33 +112,35 @@ async def resolve_canonical_conversation_run(
             target.channel_id,
             target.agent_id,
         )
-        runtime_config_id = runtime_profiles.resolve(runtime_profile_id).runtime_config_id
-    except (WorkshopRuntimeAssignmentError, WorkshopRuntimeProfileError) as exc:
+    except WorkshopRuntimeAssignmentError as exc:
         raise ConversationRunUnavailableError(str(exc)) from exc
 
-    return CompatibilityConversationRunResolution(
+    return CanonicalConversationRunResolution(
         target=target,
-        _runtime_config_id=runtime_config_id,
+        runtime_profile_id=runtime_profile_id,
     )
 
 
 @dataclass(frozen=True, slots=True)
 class PreparedConversationRun:
-    """One canonical run prepared against the current compatibility runtime."""
+    """One canonical run prepared against a protected runtime profile."""
 
     target: CanonicalConversationRunTarget
     model: str
     _pool: ConversationPool = field(repr=False, compare=False)
-    _runtime_config_id: int = field(repr=False, compare=False)
+    _runtime_profile_id: RuntimeProfileId = field(repr=False, compare=False)
 
     async def stream(self, prompt: AgentPrompt) -> AsyncIterator[StreamEvent]:
         """Stream normalized harness events without exposing the pool key."""
-        async for event in self._pool.send(prompt, chat_id=self._runtime_config_id):
+        async for event in self._pool.send(
+            prompt,
+            runtime_profile_id=self._runtime_profile_id,
+        ):
             yield event
 
     async def effective_workspace(self) -> Path:
         """Return the run's effective project workspace through the adapter."""
-        return await self._pool.get_effective_workspace(self._runtime_config_id)
+        return await self._pool.get_effective_workspace(self._runtime_profile_id)
 
 
 class WorkshopConversationRunService:
@@ -140,8 +148,8 @@ class WorkshopConversationRunService:
 
     def __init__(
         self,
-        pool: ConversationPool,
-        resolver: Callable[[MessageId], Awaitable[CompatibilityConversationRunResolution]],
+        pool: WorkshopRuntimePool,
+        resolver: Callable[[MessageId], Awaitable[CanonicalConversationRunResolution]],
     ) -> None:
         self._pool = pool
         self._resolver = resolver
@@ -153,7 +161,7 @@ class WorkshopConversationRunService:
             raise ConversationRunUnavailableError("Run resolver returned a different inbound message")
         return PreparedConversationRun(
             target=target,
-            model=self._pool.get_model(resolution._runtime_config_id),
+            model=self._pool.get_model(resolution.runtime_profile_id),
             _pool=self._pool,
-            _runtime_config_id=resolution._runtime_config_id,
+            _runtime_profile_id=resolution.runtime_profile_id,
         )

@@ -99,6 +99,8 @@ from kai.workshop.execution_coordinator import (
 from kai.workshop.inbound import InboundMessage
 from kai.workshop.outbound import DeliveryObservation, OutboundMessage
 from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
+from kai.workshop.runtime_pool import WorkshopRuntimePool
+from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
 from kai.workshop.streaming_preview import ConfirmedTelegramStreamingPreview
 from kai.workspace_utils import is_workspace_allowed
 
@@ -5311,7 +5313,12 @@ async def _handle_response(
 # ── Application factory ─────────────────────────────────────────────
 
 
-def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
+def create_bot(
+    config: Config,
+    *,
+    runtime_profiles: WorkshopRuntimeProfileRegistry,
+    use_webhook: bool = True,
+) -> Application:
     """
     Build and configure the Telegram Application with all handlers.
 
@@ -5327,6 +5334,7 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
 
     Args:
         config: The application Config instance.
+        runtime_profiles: Protected runtime policy constructed by startup.
         use_webhook: If True, suppress the default Updater (updates arrive via
             webhook POST). If False, keep the Updater for long-polling mode.
 
@@ -5354,8 +5362,13 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
         services_info=services.get_available_services(),
     )
     app.bot_data["pool"] = pool
-    app.bot_data["workshop_conversation_run_service"] = WorkshopConversationRunService(
+    workshop_runtime_pool = WorkshopRuntimePool(
         pool,
+        runtime_profiles,
+    )
+    app.bot_data["workshop_runtime_pool"] = workshop_runtime_pool
+    app.bot_data["workshop_conversation_run_service"] = WorkshopConversationRunService(
+        workshop_runtime_pool,
         sessions.resolve_workshop_conversation_run,
     )
 

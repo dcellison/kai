@@ -18,6 +18,7 @@ from kai.workshop.execution_coordinator import (
 from kai.workshop.inbound import InboundMessage
 from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
 from kai.workshop.run_lifecycle import RunStatus
+from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.store import WorkshopEventStore
 from tests.workshop_profiles import profile_id, profile_registry
 
@@ -93,9 +94,8 @@ async def test_owner_accepts_executes_and_atomically_enqueues_terminal_reply(tmp
     pool = SimpleNamespace(prepare_execution=AsyncMock(return_value=runtime))
     service = await WorkshopPrivateTextExecutionService.open_and_start(
         database,
-        pool,  # type: ignore[arg-type]
+        WorkshopRuntimePool(pool, profile_registry(101)),  # type: ignore[arg-type]
         registered_backend_ids=frozenset({"codex"}),
-        runtime_profiles=profile_registry(101),
     )
     observed: list[str] = []
     try:
@@ -136,9 +136,8 @@ async def test_owner_routes_stop_to_exact_active_runtime_and_terminal_cancellati
     pool = SimpleNamespace(prepare_execution=AsyncMock(return_value=runtime))
     service = await WorkshopPrivateTextExecutionService.open_and_start(
         database,
-        pool,  # type: ignore[arg-type]
+        WorkshopRuntimePool(pool, profile_registry(101)),  # type: ignore[arg-type]
         registered_backend_ids=frozenset({"codex"}),
-        runtime_profiles=profile_registry(101),
     )
     try:
         accepted = await service.accept(_message())

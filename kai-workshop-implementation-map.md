@@ -1927,8 +1927,36 @@ superseded by a canonical `runtime_profile.reassigned` fact during bootstrap,
 so projection rebuilds reproduce the migration exactly.
 
 The current host runtime still uses the protected configured-user integer key
-behind this registry for subprocess pooling, settings, files, history, and
-memory compatibility. That key originates in the present `users.yaml` schema,
-whose primary record key is a Telegram user ID. It is no longer canonical
-Workshop assignment or caller authority, but retiring it from those storage
-namespaces is the next bounded migration seam.
+behind this registry for compatibility settings, files, history, memory, and
+the physical subprocess-pool implementation. That key originates in the
+present `users.yaml` schema, whose primary record key is a Telegram user ID. It
+is no longer canonical Workshop assignment or caller authority. A protected
+profile-addressed pool facade now owns the physical pool conversion; retiring
+the integer from the remaining compatibility storage namespaces is the next
+bounded migration seam.
+
+## 40. Profile-addressed Workshop runtime pool
+
+**Implementation date:** 2026-08-13
+
+Canonical run resolution now returns the channel-agent assignment's opaque
+`rtp_` identifier directly. It does not receive, derive, or expose the
+configured-user integer key. Both durable private-text execution and the
+older Telegram conversation-run bridge address backend preparation, model
+selection, streaming, and workspace resolution through a single
+`WorkshopRuntimePool` facade.
+
+The facade validates every profile against the protected registry before it
+touches the compatibility subprocess pool. It is the only pool boundary that
+converts a Workshop profile to the current configured-user key, so browser and
+Telegram turns for the same runtime profile reuse the same live backend rather
+than creating parallel processes. Unknown or retired profiles fail before any
+pool operation. Application construction must supply the already-built
+protected registry explicitly; the bot factory cannot invent runtime policy.
+
+The subprocess pool itself remains shared with the v2 Telegram compatibility
+application and therefore retains its integer-keyed implementation internally.
+Compatibility history, session, memory, settings, and file operations likewise
+still require that key. Those storage concerns remain behind the profile facade
+and should move one namespace at a time without changing the canonical
+Workshop identity model.

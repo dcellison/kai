@@ -325,7 +325,11 @@ def _start() -> None:
 
         load_db_registry(await sessions.get_memory_project_rows())
 
-        app = create_bot(config, use_webhook=use_webhook)
+        app = create_bot(
+            config,
+            use_webhook=use_webhook,
+            runtime_profiles=runtime_profiles,
+        )
         conversation_delivery: WorkshopTelegramConversationDeliveryService | None = None
         private_text_execution: WorkshopPrivateTextExecutionService | None = None
 
@@ -437,9 +441,8 @@ def _start() -> None:
 
             private_text_execution = await WorkshopPrivateTextExecutionService.open_and_start(
                 config.session_db_path,
-                app.bot_data["pool"],
+                app.bot_data["workshop_runtime_pool"],
                 registered_backend_ids=_workshop_registered_backend_ids(config),
-                runtime_profiles=runtime_profiles,
             )
             app.bot_data["workshop_private_text_execution"] = private_text_execution
             logging.info("Workshop private-text execution is ready")

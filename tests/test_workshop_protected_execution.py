@@ -18,6 +18,7 @@ from kai.workshop.protected_execution import (
     WorkshopProtectedExecutionPreparationService,
 )
 from kai.workshop.run_execution_authority import RunExecutionSelection, WorkshopRunExecutionAuthority
+from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.store import WorkshopEventStore
 from tests.workshop_profiles import profile_id, profile_registry
 
@@ -85,9 +86,8 @@ class TestProtectedExecutionPreparation:
             ):
                 prepared = await WorkshopProtectedExecutionPreparationService(
                     store,
-                    pool,
+                    WorkshopRuntimePool(pool, profiles),
                     registered_backend_ids=frozenset({"claude"}),
-                    runtime_profiles=profiles,
                 ).prepare(run.run_id)
 
             assert prepared.run == run
@@ -113,9 +113,8 @@ class TestProtectedExecutionPreparation:
             ):
                 await WorkshopProtectedExecutionPreparationService(
                     store,
-                    pool,
+                    WorkshopRuntimePool(pool, profiles),
                     registered_backend_ids=frozenset({"codex"}),
-                    runtime_profiles=profiles,
                 ).prepare(run.run_id)
         finally:
             await pool.shutdown()
@@ -142,9 +141,8 @@ class TestProtectedExecutionPreparation:
             ):
                 await WorkshopProtectedExecutionPreparationService(
                     store,
-                    pool,
+                    WorkshopRuntimePool(pool, profiles),
                     registered_backend_ids=frozenset({"claude"}),
-                    runtime_profiles=profiles,
                 ).prepare(run.run_id)
             prepare.assert_not_awaited()
         finally:
