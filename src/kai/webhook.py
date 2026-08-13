@@ -84,6 +84,10 @@ from kai.workshop.client_sessions import (
 )
 from kai.workshop.client_shell import register_workshop_shell_routes
 from kai.workshop.compatibility_state import WorkshopCompatibilityStateWriter
+from kai.workshop.storage_namespaces import (
+    WorkshopPrincipalStorageRegistry,
+    WorkshopStorageNamespaceError,
+)
 from kai.workshop.store import WorkshopEventStore
 
 log = logging.getLogger(__name__)
@@ -122,6 +126,9 @@ TELEGRAM_BOT_KEY: web.AppKey[Bot] = web.AppKey("telegram_bot", Bot)
 TELEGRAM_WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("telegram_webhook_secret", str)
 WEBHOOK_PORT_KEY: web.AppKey[int] = web.AppKey("webhook_port", int)
 WORKSPACE_BASE_KEY: web.AppKey[str | None] = web.AppKey("workspace_base")
+WORKSHOP_PRINCIPAL_STORAGE_KEY: web.AppKey[WorkshopPrincipalStorageRegistry] = web.AppKey(
+    "workshop_principal_storage", WorkshopPrincipalStorageRegistry
+)
 
 
 class UnauthorizedChatIdError(Exception):
@@ -1829,20 +1836,25 @@ async def _handle_send_file(request: web.Request, principal: InternalAPIPrincipa
         return web.json_response({"error": "No workspace configured"}, status=403)
     workspace = str(await pool.get_effective_workspace(chat_id))
     # Allow files from either the workspace or this authenticated principal's
-    # upload directory. Telegram uploads are stored under
-    # DATA_DIR/files/<chat_id>/; the legacy shared DATA_DIR/files/ root and
-    # sibling principals' directories are deliberately excluded. The scope is
-    # derived from the authenticated principal, never from a caller-selected
-    # request field.
+    # canonical upload directory. The prior configured-user directory remains
+    # readable during migration, but the legacy shared root and sibling
+    # principals' directories are excluded. Both scopes are resolved from the
+    # authenticated credential, never from caller-selected request fields.
     workspace_resolved = Path(workspace).resolve()
-    principal_files_resolved = (DATA_DIR / "files" / str(principal.chat_id)).resolve()
+    storage_registry = request.app.get(WORKSHOP_PRINCIPAL_STORAGE_KEY)
+    if storage_registry is None:
+        return web.json_response({"error": "Principal storage unavailable"}, status=403)
     try:
-        path.relative_to(workspace_resolved)
-    except ValueError:
-        try:
-            path.relative_to(principal_files_resolved)
-        except ValueError:
-            return web.json_response({"error": "Path outside allowed directories"}, status=403)
+        storage_namespace = storage_registry.for_runtime_config_id(principal.chat_id)
+    except WorkshopStorageNamespaceError:
+        return web.json_response({"error": "Principal storage unavailable"}, status=403)
+    allowed_roots = (
+        workspace_resolved,
+        storage_namespace.files_directory(DATA_DIR).resolve(),
+        storage_namespace.legacy_files_directory(DATA_DIR).resolve(),
+    )
+    if not any(path.is_relative_to(root) for root in allowed_roots):
+        return web.json_response({"error": "Path outside allowed directories"}, status=403)
 
     if not path.is_file():
         return web.json_response({"error": f"File not found: {file_path}"}, status=404)
@@ -2594,6 +2606,10 @@ async def start(telegram_app, config) -> None:
     workshop_runtime_pool = telegram_app.bot_data.get("workshop_runtime_pool")
     if workshop_runtime_pool is None:
         raise RuntimeError("Workshop runtime pool is unavailable")
+    principal_storage = telegram_app.bot_data.get("workshop_principal_storage")
+    if not isinstance(principal_storage, WorkshopPrincipalStorageRegistry):
+        raise RuntimeError("Workshop principal storage registry is unavailable")
+    _app[WORKSHOP_PRINCIPAL_STORAGE_KEY] = principal_storage
     register_workshop_routes = await _register_workshop_client_api(
         _app,
         Path(config.session_db_path),

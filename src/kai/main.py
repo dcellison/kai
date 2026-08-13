@@ -197,7 +197,8 @@ async def _file_cleanup_loop(retention_days: int) -> None:
             deleted = 0
             errors = 0
 
-            # Walk all files, including per-user subdirectories
+            # Walk all files, including canonical principal and legacy
+            # configured-user subdirectories.
             for path in files_dir.rglob("*"):
                 if not path.is_file():
                     continue
@@ -314,6 +315,11 @@ def _start() -> None:
             workshop_bootstrap.created_events,
             workshop_bootstrap.existing_events,
         )
+        principal_storage = await sessions.load_workshop_principal_storage_registry(runtime_profiles)
+        logging.info(
+            "Workshop principal storage ready (namespaces=%d)",
+            len(principal_storage.namespaces),
+        )
 
         # Load user-registered memory projects into the detection
         # cache. Must follow init_db (the rows live in the session
@@ -330,6 +336,7 @@ def _start() -> None:
             use_webhook=use_webhook,
             runtime_profiles=runtime_profiles,
         )
+        app.bot_data["workshop_principal_storage"] = principal_storage
         conversation_delivery: WorkshopTelegramConversationDeliveryService | None = None
         private_text_execution: WorkshopPrivateTextExecutionService | None = None
 

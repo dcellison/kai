@@ -91,7 +91,7 @@ from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
 from kai.workshop.artifacts import InboundArtifact
 from kai.workshop.conversation_commands import ConversationCommandDisposition
 from kai.workshop.conversation_runs import PreparedConversationRun, WorkshopConversationRunService
-from kai.workshop.domain import MessageId, RunId
+from kai.workshop.domain import MessageId, PrincipalId, RunId
 from kai.workshop.execution_coordinator import (
     CanonicalCancellationDisposition,
     CanonicalExecutionDisposition,
@@ -101,6 +101,10 @@ from kai.workshop.outbound import DeliveryObservation, OutboundMessage
 from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
+from kai.workshop.storage_namespaces import (
+    WorkshopPrincipalStorageRegistry,
+    WorkshopStorageNamespaceError,
+)
 from kai.workshop.streaming_preview import ConfirmedTelegramStreamingPreview
 from kai.workspace_utils import is_workspace_allowed
 
@@ -3531,7 +3535,7 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
     and TOTP middleware. The review runs inside the update handler (not a detached
     background task). On success the review text lands at
     ``/tmp/pr-<N>-review.md`` as the canonical artifact, a
-    timestamped copy is staged under the chat's file area via
+    timestamped copy is staged under the human actor's canonical file area via
     ``_save_upload()``, and the staged copy is uploaded to Telegram
     as a document attachment so phone-only use can read the full
     review. No GitHub comment is posted; the webhook cooldown map is
@@ -3539,10 +3543,10 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
     """
     assert update.message is not None
 
-    # `actor_id` drives every user-scoped lookup (config, effective
-    # repos, backend, provider, model override); `chat_id` drives
-    # chat-scoped state (workspace path, per-chat file staging, the
-    # reply target, document upload). In a notification group the two
+    # `actor_id` drives every human-scoped lookup (config, effective
+    # repos, backend, provider, model override, file ownership); `chat_id`
+    # drives conversation compatibility state and the reply target. In a
+    # notification group the two
     # differ: chat_id is the group's id and would silently miss the
     # authorized operator's user config if it were used for the
     # user-scoped reads, dropping the review onto global defaults.
@@ -3684,9 +3688,10 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(f"Review backend succeeded but writing {canonical} failed: {exc}")
         return
 
-    # Stage a timestamped copy under DATA_DIR/files/<chat_id>/ using
+    # Stage a timestamped copy under the canonical human principal's file
+    # namespace using
     # the existing upload-file naming convention so the staged
-    # artifact composes with the per-chat file area and never
+    # artifact composes with the principal-owned file area and never
     # overwrites a previous review's staged copy. Staging failure
     # is non-fatal: the canonical /tmp artifact still exists and
     # the reply will surface the staging gap explicitly.
@@ -3696,10 +3701,10 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
         staged = _save_upload(
             body.encode(),
             f"pr-{pr_number}-review.md",
-            user_id=chat_id,
+            principal_id=_upload_principal_id(context, actor_id),
             reader_user=claude_user,
         )
-    except OSError:
+    except (OSError, WorkshopStorageNamespaceError):
         staging_failed = True
         log.exception("Failed to stage review copy for %s#%d", repo, pr_number)
 
@@ -3853,10 +3858,21 @@ def _upload_reader_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str
     return user_config.os_user if user_config and user_config.os_user else None
 
 
+def _upload_principal_id(
+    context: ContextTypes.DEFAULT_TYPE,
+    runtime_config_id: int,
+) -> PrincipalId:
+    """Resolve upload ownership through canonical Workshop identity."""
+    registry = context.bot_data.get("workshop_principal_storage")
+    if not isinstance(registry, WorkshopPrincipalStorageRegistry):
+        raise WorkshopStorageNamespaceError("Workshop principal storage registry is unavailable")
+    return registry.for_runtime_config_id(runtime_config_id).principal_id
+
+
 def _save_upload(
     data: bytes,
     filename: str,
-    user_id: int | None = None,
+    principal_id: PrincipalId | None = None,
     *,
     reader_user: str | None = None,
 ) -> Path:
@@ -3868,8 +3884,9 @@ def _save_upload(
     spaces. Returns the absolute path to the saved file so Claude can
     reference it in subsequent commands.
 
-    When user_id is provided, files are saved to a per-user subdirectory
-    (DATA_DIR/files/{user_id}/) to prevent cross-user file access.
+    When principal_id is provided, files are saved to a canonical per-principal
+    subdirectory (DATA_DIR/files/{principal_id}/) to prevent cross-user file
+    access without deriving ownership from a transport identity.
     When None, uses the shared DATA_DIR/files/ directory (backward-
     compatible for single-user deployments).
 
@@ -3881,19 +3898,21 @@ def _save_upload(
     Args:
         data: Raw file bytes to write.
         filename: Original filename from Telegram (sanitized before use).
-        user_id: Optional Telegram user ID for per-user file isolation.
+        principal_id: Optional canonical human principal for file isolation.
         reader_user: Optional OS user that should receive read access.
 
     Returns:
         Absolute path to the saved file.
     """
-    if user_id is not None:
-        files_dir = DATA_DIR / "files" / str(user_id)
+    if principal_id is not None:
+        if not isinstance(principal_id, PrincipalId):
+            raise TypeError("principal_id must be a PrincipalId when provided")
+        files_dir = DATA_DIR / "files" / str(principal_id)
     else:
         files_dir = DATA_DIR / "files"
     files_dir.mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "files").chmod(_UPLOAD_ROOT_MODE)
-    if user_id is not None:
+    if principal_id is not None:
         files_dir.chmod(_UPLOAD_ROOT_MODE)
 
     # Timestamp prefix ensures unique names even if the same file is sent twice
@@ -3934,10 +3953,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not await _check_totp(update, context):
         return
 
+    actor_id = _user_id(update)
     chat_id = _chat_id(update)
     pool = _get_pool(context)
     model = pool.get_model(chat_id)
-    reader_user = _upload_reader_user(context, chat_id)
+    reader_user = _upload_reader_user(context, actor_id)
 
     # Download the largest available resolution (last in the list)
     photo = update.message.photo[-1]
@@ -3948,8 +3968,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     # Save to DATA_DIR/files/ so Claude can access the file via shell tools
     try:
-        saved = _save_upload(raw, f"photo_{photo.file_unique_id}.jpg", user_id=chat_id, reader_user=reader_user)
-    except OSError as exc:
+        saved = _save_upload(
+            raw,
+            f"photo_{photo.file_unique_id}.jpg",
+            principal_id=_upload_principal_id(context, actor_id),
+            reader_user=reader_user,
+        )
+    except (OSError, WorkshopStorageNamespaceError) as exc:
         log.exception("Failed to save uploaded photo for chat %d", chat_id)
         await update.message.reply_text(f"Couldn't save the upload for agent access: {exc}")
         return
@@ -4150,10 +4175,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     suffix = Path(file_name).suffix.lower()
     caption = update.message.caption or ""
 
+    actor_id = _user_id(update)
     chat_id = _chat_id(update)
     pool = _get_pool(context)
     model = pool.get_model(chat_id)
-    reader_user = _upload_reader_user(context, chat_id)
+    reader_user = _upload_reader_user(context, actor_id)
     artifact_media_type = _canonical_document_media_type(file_name, doc.mime_type)
 
     if suffix in _IMAGE_MEDIA_TYPES:
@@ -4166,8 +4192,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         # Save to DATA_DIR/files/ so Claude can access the file via shell tools
         try:
-            saved = _save_upload(raw, file_name, user_id=chat_id, reader_user=reader_user)
-        except OSError as exc:
+            saved = _save_upload(
+                raw,
+                file_name,
+                principal_id=_upload_principal_id(context, actor_id),
+                reader_user=reader_user,
+            )
+        except (OSError, WorkshopStorageNamespaceError) as exc:
             log.exception("Failed to save uploaded image document for chat %d", chat_id)
             await update.message.reply_text(f"Couldn't save the upload for agent access: {exc}")
             return
@@ -4192,8 +4223,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         # Save to DATA_DIR/files/ so Claude can access the file via shell tools
         try:
-            saved = _save_upload(raw, file_name, user_id=chat_id, reader_user=reader_user)
-        except OSError as exc:
+            saved = _save_upload(
+                raw,
+                file_name,
+                principal_id=_upload_principal_id(context, actor_id),
+                reader_user=reader_user,
+            )
+        except (OSError, WorkshopStorageNamespaceError) as exc:
             log.exception("Failed to save uploaded text document for chat %d", chat_id)
             await update.message.reply_text(f"Couldn't save the upload for agent access: {exc}")
             return
@@ -4210,8 +4246,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         file = await context.bot.get_file(doc.file_id)
         data = await file.download_as_bytearray()
         try:
-            saved = _save_upload(bytes(data), file_name, user_id=chat_id, reader_user=reader_user)
-        except OSError as exc:
+            saved = _save_upload(
+                bytes(data),
+                file_name,
+                principal_id=_upload_principal_id(context, actor_id),
+                reader_user=reader_user,
+            )
+        except (OSError, WorkshopStorageNamespaceError) as exc:
             log.exception("Failed to save uploaded document for chat %d", chat_id)
             await update.message.reply_text(f"Couldn't save the upload for agent access: {exc}")
             return
@@ -4319,8 +4360,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not await _check_totp(update, context):
         return
 
+    actor_id = _user_id(update)
     chat_id = _chat_id(update)
-    reader_user = _upload_reader_user(context, chat_id)
+    reader_user = _upload_reader_user(context, actor_id)
     pool = _get_pool(context)
     config: Config = context.bot_data["config"]
 
@@ -4414,10 +4456,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         try:
             # whisper-cpp uses a temporary copy that disappears after
             # transcription. Preserve the original Telegram Ogg/Opus bytes
-            # inside the existing per-user upload boundary so canonical
+            # inside the canonical principal-owned upload boundary so canonical
             # artifact provenance never points at an ephemeral path. This
             # path is not added to the backend prompt.
-            saved_voice = _save_upload(audio_data, "voice.oga", user_id=chat_id)
+            saved_voice = _save_upload(
+                audio_data,
+                "voice.oga",
+                principal_id=_upload_principal_id(context, actor_id),
+            )
             await artifact_recorder(
                 InboundArtifact(
                     message_id=workshop_inbound_message_id,

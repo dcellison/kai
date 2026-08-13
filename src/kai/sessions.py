@@ -65,6 +65,7 @@ from kai.workshop.outbound import (
     record_outbound_message_with_streaming_finalization,
 )
 from kai.workshop.schema import migrate_workshop_schema
+from kai.workshop.storage_namespaces import WorkshopPrincipalStorageRegistry
 from kai.workshop.store import AppendResult, WorkshopEventStore
 from kai.workshop.streaming_preview import (
     ConfirmedTelegramStreamingPreview,
@@ -74,6 +75,7 @@ from kai.workshop.streaming_preview import (
 
 if TYPE_CHECKING:
     from kai.config import Config, WorkspaceConfig
+    from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
 
 log = logging.getLogger(__name__)
 
@@ -344,6 +346,20 @@ async def bootstrap_workshop_foundation(
             store,
             humans,
             notification_channels=notification_channels,
+        )
+
+
+async def load_workshop_principal_storage_registry(
+    runtime_profiles: WorkshopRuntimeProfileRegistry,
+) -> WorkshopPrincipalStorageRegistry:
+    """Resolve canonical storage ownership on Kai's initialized database."""
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        store = WorkshopEventStore.from_initialized_connection(_get_db())
+        return await WorkshopPrincipalStorageRegistry.from_store(
+            store,
+            runtime_profiles,
         )
 
 

@@ -418,8 +418,8 @@ class TestBuildSessionContext:
         assert "Messaging API" in result
         assert "File API" in result
 
-    def test_file_api_docs_name_principal_upload_directory(self, tmp_path):
-        """File API guidance exposes only the current principal's upload path."""
+    def test_file_api_docs_avoid_transport_derived_directory(self, tmp_path):
+        """File guidance uses exact capabilities, not a Telegram-derived root."""
         workspace = tmp_path / "ws"
         workspace.mkdir()
         data_dir = tmp_path / "data"
@@ -436,7 +436,8 @@ class TestBuildSessionContext:
             )
 
         assert result is not None
-        assert f"principal-scoped incoming-file directory {data_dir}/files/123/" in result
+        assert "an exact incoming-file path previously supplied by Kai" in result
+        assert f"{data_dir}/files/123/" not in result
 
     def test_services_included(self, tmp_path):
         """External services block is injected when services are configured."""

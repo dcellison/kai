@@ -17,6 +17,7 @@ import pytest
 from kai import sessions
 from kai.bot import _clear_responding, _save_upload, _set_responding
 from kai.history import get_recent_history
+from kai.workshop.domain import PrincipalId
 
 # ── Settings namespacing ────────────────────────────────────────────
 
@@ -152,10 +153,11 @@ class TestHistoryFiltering:
 
 class TestFileStorage:
     def test_save_per_user(self, tmp_path, monkeypatch):
-        """File saved with user_id goes to per-user subdirectory."""
+        """File saved with a principal ID goes to its canonical subdirectory."""
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
-        saved = _save_upload(b"hello", "test.txt", user_id=123)
-        assert "/files/123/" in str(saved)
+        principal_id = PrincipalId("prn_" + "1" * 32)
+        saved = _save_upload(b"hello", "test.txt", principal_id=principal_id)
+        assert f"/files/{principal_id}/" in str(saved)
         assert saved.exists()
         assert saved.read_bytes() == b"hello"
 
@@ -169,11 +171,13 @@ class TestFileStorage:
     def test_per_user_files_isolated(self, tmp_path, monkeypatch):
         """User A's files are not in User B's directory."""
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
-        _save_upload(b"alice data", "a.txt", user_id=111)
-        _save_upload(b"bob data", "b.txt", user_id=222)
+        alice_id = PrincipalId("prn_" + "1" * 32)
+        bob_id = PrincipalId("prn_" + "2" * 32)
+        _save_upload(b"alice data", "a.txt", principal_id=alice_id)
+        _save_upload(b"bob data", "b.txt", principal_id=bob_id)
 
-        alice_files = list((tmp_path / "files" / "111").iterdir())
-        bob_files = list((tmp_path / "files" / "222").iterdir())
+        alice_files = list((tmp_path / "files" / alice_id).iterdir())
+        bob_files = list((tmp_path / "files" / bob_id).iterdir())
 
         assert len(alice_files) == 1
         assert len(bob_files) == 1

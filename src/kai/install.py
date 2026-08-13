@@ -4111,9 +4111,10 @@ def _apply_migrate(
     # -- Uploaded files migration --
     # One-time: copy user-uploaded files from the install tree
     # (home/files/, pre-DATA_DIR location) to DATA_DIR/files/.
-    # Walks the full directory tree to handle per-user subdirectories
-    # (files/{user_id}/). Existing files at the destination are not
-    # overwritten. Source files are preserved as backups.
+    # Walks the full directory tree to preserve both historical numeric
+    # subdirectories and canonical opaque-principal subdirectories. Existing
+    # files at the destination are not overwritten. Source files are preserved
+    # as backups.
     files_src = install_path / "home" / "files"
     files_dst = data_path / "files"
 

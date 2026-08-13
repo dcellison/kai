@@ -25,6 +25,7 @@ from kai.webhook import (
     TELEGRAM_APP_KEY,
     TELEGRAM_BOT_KEY,
     TELEGRAM_WEBHOOK_SECRET_KEY,
+    WORKSHOP_PRINCIPAL_STORAGE_KEY,
     UnauthorizedChatIdError,
     _handle_delete_job,
     _handle_generic,
@@ -44,6 +45,12 @@ from kai.webhook import (
     _resolve_chat_id,
     stop,
 )
+from kai.workshop.domain import PrincipalId
+from kai.workshop.storage_namespaces import (
+    WorkshopPrincipalStorageNamespace,
+    WorkshopPrincipalStorageRegistry,
+)
+from tests.workshop_profiles import profile_id
 
 
 def _make_internal_api_auth() -> InternalAPIAuth:
@@ -51,6 +58,23 @@ def _make_internal_api_auth() -> InternalAPIAuth:
     return InternalAPIAuth(
         {123: "test-secret", 456: "other-secret"},
         allowed_services_by_user={123: {"perplexity"}},
+    )
+
+
+def _principal_storage_registry() -> WorkshopPrincipalStorageRegistry:
+    return WorkshopPrincipalStorageRegistry(
+        (
+            WorkshopPrincipalStorageNamespace(
+                PrincipalId("prn_" + "1" * 32),
+                profile_id(123),
+                123,
+            ),
+            WorkshopPrincipalStorageNamespace(
+                PrincipalId("prn_" + "2" * 32),
+                profile_id(456),
+                456,
+            ),
+        )
     )
 
 
@@ -485,6 +509,7 @@ def send_file_request(tmp_path):
         TELEGRAM_BOT_KEY: AsyncMock(),
         CHAT_ID_KEY: 123,
         POOL_KEY: mock_pool,
+        WORKSHOP_PRINCIPAL_STORAGE_KEY: _principal_storage_registry(),
     }
     request.headers = {"X-Webhook-Secret": "test-secret"}
     return request
@@ -560,9 +585,10 @@ class TestSendFile:
         assert resp.status == 403
 
     async def test_authenticated_principal_can_send_own_uploaded_file(self, isolated_send_file_roots):
-        """The principal's DATA_DIR/files/<chat_id> directory is allowed."""
+        """The principal's canonical opaque upload directory is allowed."""
         request, _workspace, data_dir = isolated_send_file_roots
-        uploaded = data_dir / "files" / "123" / "report.txt"
+        namespace = request.app[WORKSHOP_PRINCIPAL_STORAGE_KEY].for_runtime_config_id(123)
+        uploaded = namespace.files_directory(data_dir) / "report.txt"
         uploaded.parent.mkdir(parents=True)
         uploaded.write_text("principal-owned")
         request.json = AsyncMock(return_value={"path": str(uploaded)})
@@ -575,7 +601,8 @@ class TestSendFile:
     async def test_file_scope_follows_authenticated_credential(self, isolated_send_file_roots):
         """A second credential receives its own scope, independent of app defaults."""
         request, _workspace, data_dir = isolated_send_file_roots
-        uploaded = data_dir / "files" / "456" / "report.txt"
+        namespace = request.app[WORKSHOP_PRINCIPAL_STORAGE_KEY].for_runtime_config_id(456)
+        uploaded = namespace.files_directory(data_dir) / "report.txt"
         uploaded.parent.mkdir(parents=True)
         uploaded.write_text("second principal")
         request.headers = {"X-Webhook-Secret": "other-secret"}
@@ -590,7 +617,8 @@ class TestSendFile:
     async def test_authenticated_principal_cannot_send_sibling_uploaded_file(self, isolated_send_file_roots):
         """A FILES_SEND credential cannot select another principal's upload."""
         request, _workspace, data_dir = isolated_send_file_roots
-        sibling_file = data_dir / "files" / "456" / "secret.txt"
+        namespace = request.app[WORKSHOP_PRINCIPAL_STORAGE_KEY].for_runtime_config_id(456)
+        sibling_file = namespace.files_directory(data_dir) / "secret.txt"
         sibling_file.parent.mkdir(parents=True)
         sibling_file.write_text("other principal")
         request.json = AsyncMock(return_value={"path": str(sibling_file)})
@@ -616,10 +644,11 @@ class TestSendFile:
     async def test_symlink_cannot_escape_principal_upload_directory(self, isolated_send_file_roots):
         """Resolving a symlink into a sibling principal's directory is denied."""
         request, _workspace, data_dir = isolated_send_file_roots
-        sibling_file = data_dir / "files" / "456" / "secret.txt"
+        registry = request.app[WORKSHOP_PRINCIPAL_STORAGE_KEY]
+        sibling_file = registry.for_runtime_config_id(456).files_directory(data_dir) / "secret.txt"
         sibling_file.parent.mkdir(parents=True)
         sibling_file.write_text("other principal")
-        link = data_dir / "files" / "123" / "link.txt"
+        link = registry.for_runtime_config_id(123).files_directory(data_dir) / "link.txt"
         link.parent.mkdir(parents=True)
         link.symlink_to(sibling_file)
         request.json = AsyncMock(return_value={"path": str(link)})
@@ -628,6 +657,22 @@ class TestSendFile:
 
         assert resp.status == 403
         request.app[TELEGRAM_BOT_KEY].send_document.assert_not_awaited()
+
+    async def test_authenticated_principal_can_send_pre_migration_uploaded_file(
+        self,
+        isolated_send_file_roots,
+    ):
+        """Existing numeric upload directories remain readable during migration."""
+        request, _workspace, data_dir = isolated_send_file_roots
+        legacy = data_dir / "files" / "123" / "legacy.txt"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text("pre-migration")
+        request.json = AsyncMock(return_value={"path": str(legacy)})
+
+        resp = await _handle_send_file(request)
+
+        assert resp.status == 200
+        request.app[TELEGRAM_BOT_KEY].send_document.assert_awaited_once()
 
     async def test_invalid_json_returns_400(self, send_file_request):
         """Returns 400 for malformed JSON body."""

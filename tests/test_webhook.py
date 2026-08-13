@@ -46,6 +46,25 @@ from kai.webhook import (
     add_notification_chat_id,
     remove_notification_chat_id,
 )
+from kai.workshop.domain import PrincipalId
+from kai.workshop.storage_namespaces import (
+    WorkshopPrincipalStorageNamespace,
+    WorkshopPrincipalStorageRegistry,
+)
+from tests.workshop_profiles import profile_id
+
+
+def _principal_storage_registry() -> WorkshopPrincipalStorageRegistry:
+    return WorkshopPrincipalStorageRegistry(
+        (
+            WorkshopPrincipalStorageNamespace(
+                PrincipalId("prn_" + "1" * 32),
+                profile_id(111),
+                111,
+            ),
+        )
+    )
+
 
 # ── _verify_github_signature ─────────────────────────────────────────
 
@@ -2380,6 +2399,7 @@ class TestNotificationChatIdMutations:
             "pool": MagicMock(internal_api_auth=InternalAPIAuth({111: "secret"})),
             "workshop_private_text_execution": AsyncMock(),
             "workshop_runtime_pool": MagicMock(),
+            "workshop_principal_storage": _principal_storage_registry(),
         }
 
         fake_runner = MagicMock()
@@ -2437,6 +2457,7 @@ class TestNotificationChatIdMutations:
             "pool": MagicMock(internal_api_auth=InternalAPIAuth({111: "secret"})),
             "workshop_private_text_execution": AsyncMock(),
             "workshop_runtime_pool": MagicMock(),
+            "workshop_principal_storage": _principal_storage_registry(),
         }
 
         apps: list[web.Application] = []

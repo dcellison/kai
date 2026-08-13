@@ -93,9 +93,13 @@ from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.inbound import InboundMessage
 from kai.workshop.outbound import DeliveryObservation, OutboundMessage
 from kai.workshop.runtime_pool import WorkshopRuntimePool
+from kai.workshop.storage_namespaces import (
+    WorkshopPrincipalStorageNamespace,
+    WorkshopPrincipalStorageRegistry,
+)
 from kai.workshop.streaming_preview import ConfirmedTelegramStreamingPreview
 from kai.workspace_utils import is_workspace_allowed
-from tests.workshop_profiles import profile_registry
+from tests.workshop_profiles import profile_id, profile_registry
 
 # ── _backend_name_for_instance ───────────────────────────────────────
 
@@ -467,8 +471,9 @@ class TestSaveUpload:
     def test_per_user_directory_is_traversal_only(self, tmp_path, monkeypatch):
         """Per-user upload dirs are not listable by sibling local users."""
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
-        result = _save_upload(b"x", "report.pdf", user_id=123)
-        assert result.parent == tmp_path / "files" / "123"
+        principal_id = PrincipalId("prn_" + "1" * 32)
+        result = _save_upload(b"x", "report.pdf", principal_id=principal_id)
+        assert result.parent == tmp_path / "files" / principal_id
         assert stat.S_IMODE((tmp_path / "files").stat().st_mode) == 0o711
         assert stat.S_IMODE(result.parent.stat().st_mode) == 0o711
         assert stat.S_IMODE(result.stat().st_mode) == 0o600
@@ -481,7 +486,12 @@ class TestSaveUpload:
             patch("kai.bot.sys.platform", "darwin"),
             patch("kai.bot.subprocess.run", return_value=completed) as run,
         ):
-            result = _save_upload(b"x", "report.pdf", user_id=123, reader_user="alice")
+            result = _save_upload(
+                b"x",
+                "report.pdf",
+                principal_id=PrincipalId("prn_" + "1" * 32),
+                reader_user="alice",
+            )
 
         command = run.call_args.args[0]
         assert command[:2] == ["/bin/chmod", "+a"]
@@ -497,9 +507,14 @@ class TestSaveUpload:
             patch("kai.bot.shutil.which", return_value=None),
             pytest.raises(OSError, match="setfacl is required"),
         ):
-            _save_upload(b"x", "report.pdf", user_id=123, reader_user="alice")
+            _save_upload(
+                b"x",
+                "report.pdf",
+                principal_id=PrincipalId("prn_" + "1" * 32),
+                reader_user="alice",
+            )
 
-        assert list((tmp_path / "files" / "123").glob("*")) == []
+        assert list((tmp_path / "files" / ("prn_" + "1" * 32)).glob("*")) == []
 
     def test_filename_contains_original_name(self, tmp_path, monkeypatch):
         """Saved filename preserves the original name after the timestamp."""
@@ -838,9 +853,28 @@ def _make_context(config=None, claude=None, pool=None, args=None, user_data=None
     # Accept either pool (Phase 3) or claude (legacy test compat) as the
     # mock subprocess manager. Pool is preferred for new tests.
     mock_pool = pool or claude or _make_mock_claude()
+    resolved_config = config or _make_config()
+    runtime_config_ids = {
+        runtime_config_id
+        for runtime_config_id in (
+            set(resolved_config.allowed_user_ids) | set(resolved_config.user_configs) | {1, 12345}
+        )
+        if isinstance(runtime_config_id, int) and runtime_config_id > 0
+    }
+    principal_storage = WorkshopPrincipalStorageRegistry(
+        tuple(
+            WorkshopPrincipalStorageNamespace(
+                PrincipalId(f"prn_{runtime_config_id:032x}"),
+                profile_id(runtime_config_id),
+                runtime_config_id,
+            )
+            for runtime_config_id in sorted(runtime_config_ids)
+        )
+    )
     ctx.bot_data = {
-        "config": config or _make_config(),
+        "config": resolved_config,
         "pool": mock_pool,
+        "workshop_principal_storage": principal_storage,
     }
     ctx.args = args or []
     ctx.user_data = user_data if user_data is not None else {}
@@ -2954,6 +2988,32 @@ class TestHandleMessage:
 
 class TestHandlePhoto:
     @pytest.mark.asyncio
+    async def test_group_upload_belongs_to_human_actor(self, tmp_path):
+        """A transport channel ID never becomes the file-storage owner."""
+        update = _make_update(chat_id=-100999, user_id=1)
+        photo = MagicMock(file_id="file123", file_unique_id="uniq123")
+        update.message.photo = [photo]
+        mock_file = MagicMock()
+        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"image-data"))
+        ctx = _make_context(config=_make_config(allowed_user_ids={1}))
+        ctx.bot.get_file = AsyncMock(return_value=mock_file)
+
+        with (
+            patch("kai.bot.DATA_DIR", tmp_path),
+            patch("kai.bot._handle_response", new_callable=AsyncMock),
+            patch("kai.bot.log_message"),
+            patch("kai.bot._set_responding"),
+            patch("kai.bot._clear_responding"),
+            patch("kai.bot.get_lock", return_value=_fake_lock()),
+        ):
+            await handle_photo(update, ctx)
+
+        namespace = ctx.bot_data["workshop_principal_storage"].for_runtime_config_id(1)
+        files = list(namespace.files_directory(tmp_path).iterdir())
+        assert len(files) == 1
+        assert not (tmp_path / "files" / "-100999").exists()
+
+    @pytest.mark.asyncio
     async def test_records_authenticated_photo_message_and_artifact(self, tmp_path):
         update = _make_update(chat_id=1, user_id=1)
         photo = MagicMock()
@@ -3489,7 +3549,11 @@ class TestHandleVoice:
                 occurred_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
             )
         )
-        save_upload.assert_called_once_with(b"audio-data", "voice.oga", user_id=1)
+        save_upload.assert_called_once_with(
+            b"audio-data",
+            "voice.oga",
+            principal_id=PrincipalId("prn_00000000000000000000000000000001"),
+        )
         artifact.assert_awaited_once_with(
             InboundArtifact(
                 message_id=inbound_id,
@@ -7543,7 +7607,7 @@ class TestHandleReviewCommand:
         assert "Repository: dcellison/kai" in body
 
     @pytest.mark.asyncio
-    async def test_stages_timestamped_copy_under_chat_files(self, tmp_path, monkeypatch):
+    async def test_stages_timestamped_copy_under_principal_files(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
         monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         update = _make_update(chat_id=12345)
@@ -7559,10 +7623,43 @@ class TestHandleReviewCommand:
         ):
             await handle_review_command(update, ctx)
 
-        staged_dir = tmp_path / "files" / "12345"
+        namespace = ctx.bot_data["workshop_principal_storage"].for_runtime_config_id(1)
+        staged_dir = namespace.files_directory(tmp_path)
         assert staged_dir.is_dir()
         staged = list(staged_dir.glob("*_pr-681-review.md"))
         assert len(staged) == 1, f"expected one timestamped staged copy, got {staged}"
+
+    @pytest.mark.asyncio
+    async def test_group_review_staging_belongs_to_human_actor(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """A notification-group chat ID never becomes a storage owner."""
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update(chat_id=-100999, user_id=1)
+        ctx = _make_context(
+            config=_review_command_config(),
+            args=["dcellison/kai", "681"],
+        )
+        ctx.bot.send_document = AsyncMock()
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(return_value=_review_result()),
+            ),
+        ):
+            await handle_review_command(update, ctx)
+
+        namespace = ctx.bot_data["workshop_principal_storage"].for_runtime_config_id(1)
+        staged = list(namespace.files_directory(tmp_path).glob("*_pr-681-review.md"))
+        assert len(staged) == 1
+        assert not (tmp_path / "files" / "-100999").exists()
+        ctx.bot.send_document.assert_awaited_once()
+        assert ctx.bot.send_document.await_args.args[0] == -100999
 
     @pytest.mark.asyncio
     async def test_uploads_staged_file_to_telegram(self, tmp_path, monkeypatch):
