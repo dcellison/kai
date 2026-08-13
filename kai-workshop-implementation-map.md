@@ -1960,3 +1960,30 @@ Compatibility history, session, memory, settings, and file operations likewise
 still require that key. Those storage concerns remain behind the profile facade
 and should move one namespace at a time without changing the canonical
 Workshop identity model.
+
+## 41. Asynchronous Workshop client runs
+
+**Implementation date:** 2026-08-13
+
+Browser command submission now ends when Kai has durably accepted the canonical
+message and run. It returns HTTP 202 with the typed run state instead of making
+the request own a potentially long backend execution. A process-level Workshop
+executor holds strong references to accepted browser tasks, reconciles accepted
+browser runs after startup, and leaves Telegram execution behavior unchanged.
+
+Authenticated, channel-scoped endpoints expose bounded canonical run status and
+cancellation. Both require the requesting principal to own the run in the named
+channel; unknown and cross-principal run IDs share one access-denied response.
+Cancellation before dispatch is an atomic durable terminal transition, while a
+dispatched run continues through the existing fenced runtime cancellation path.
+
+The React client keeps only the active run ID in tab-local session storage,
+polls canonical status, restores inspection after a reload, and offers an exact
+Stop control while the run is accepted or started. The draft clears as soon as
+durable acceptance succeeds, and timeline rendering remains exclusively driven
+by canonical messages rather than optimistic browser copies.
+
+The next coherent boundary is event-driven run progress and inspection. It can
+replace status polling with canonical lifecycle events and expose useful agent
+activity without coupling the browser to backend processes or compatibility
+storage.

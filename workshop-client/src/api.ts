@@ -2,6 +2,8 @@ import type {
   CommandSubmissionResult,
   TimelineMessage,
   TimelineSnapshot,
+  WorkshopRun,
+  WorkshopRunStatus,
   WorkshopSession,
 } from "./types";
 
@@ -104,6 +106,56 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
   };
 }
 
+const RUN_STATUSES = new Set<WorkshopRunStatus>([
+  "accepted",
+  "started",
+  "completed",
+  "failed",
+  "cancelled",
+]);
+
+function parseRun(value: unknown, channelId: string): WorkshopRun | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const {
+    accepted_at: acceptedAt,
+    cancellation_requested_at: cancellationRequestedAt,
+    channel_id: runChannelId,
+    result_message_id: resultMessageId,
+    run_id: runId,
+    started_at: startedAt,
+    status,
+    terminal_at: terminalAt,
+    terminal_code: terminalCode,
+  } = value;
+  if (
+    typeof acceptedAt !== "string" ||
+    (cancellationRequestedAt !== null && typeof cancellationRequestedAt !== "string") ||
+    runChannelId !== channelId ||
+    (resultMessageId !== null && typeof resultMessageId !== "string") ||
+    typeof runId !== "string" ||
+    (startedAt !== null && typeof startedAt !== "string") ||
+    typeof status !== "string" ||
+    !RUN_STATUSES.has(status as WorkshopRunStatus) ||
+    (terminalAt !== null && typeof terminalAt !== "string") ||
+    (terminalCode !== null && typeof terminalCode !== "string")
+  ) {
+    return null;
+  }
+  return {
+    acceptedAt,
+    cancellationRequestedAt,
+    channelId,
+    resultMessageId,
+    runId,
+    startedAt,
+    status: status as WorkshopRunStatus,
+    terminalAt,
+    terminalCode,
+  };
+}
+
 export async function redeemEnrollment(
   enrollmentToken: string,
   deviceDisplayName: string,
@@ -150,22 +202,62 @@ export async function submitCommand(
   }
   if (
     !isRecord(payload) ||
-    payload.version !== 1 ||
+    payload.version !== 2 ||
     typeof payload.acceptance !== "string" ||
-    typeof payload.execution !== "string" ||
     typeof payload.message_id !== "string" ||
     typeof payload.run_id !== "string" ||
-    typeof payload.run_status !== "string"
+    !isRecord(payload.run)
   ) {
+    throw new Error("Kai returned an unsupported command response.");
+  }
+  const run = parseRun(payload.run, session.channelId);
+  if (!run || run.runId !== payload.run_id) {
     throw new Error("Kai returned an unsupported command response.");
   }
   return {
     acceptance: payload.acceptance,
-    execution: payload.execution,
     messageId: payload.message_id,
-    runId: payload.run_id,
-    runStatus: payload.run_status,
+    run,
   };
+}
+
+export async function loadRun(
+  session: WorkshopSession,
+  runId: string,
+): Promise<WorkshopRun> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/runs/${encodeURIComponent(runId)}`,
+  );
+  const payload = await responsePayload(response);
+  const run = isRecord(payload) ? parseRun(payload.run, session.channelId) : null;
+  if (!response.ok || payload === null) {
+    throw new Error(safeErrorMessage(payload, "Could not inspect this run."));
+  }
+  if (!isRecord(payload) || payload.version !== 1 || !run || run.runId !== runId) {
+    throw new Error("Kai returned an unsupported run response.");
+  }
+  return run;
+}
+
+export async function cancelRun(
+  session: WorkshopSession,
+  runId: string,
+): Promise<WorkshopRun> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/runs/${encodeURIComponent(runId)}/cancel`,
+    { method: "POST" },
+  );
+  const payload = await responsePayload(response);
+  const run = isRecord(payload) ? parseRun(payload.run, session.channelId) : null;
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not stop this run."));
+  }
+  if (!isRecord(payload) || payload.version !== 1 || !run || run.runId !== runId) {
+    throw new Error("Kai returned an unsupported cancellation response.");
+  }
+  return run;
 }
 
 export async function loadTimeline(

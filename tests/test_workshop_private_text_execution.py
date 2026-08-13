@@ -11,12 +11,16 @@ from unittest.mock import AsyncMock
 from kai.backend import AgentResponse, StreamEvent
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
+from kai.workshop.domain import ChannelId, PrincipalId
 from kai.workshop.execution_coordinator import (
     CanonicalCancellationDisposition,
     CanonicalExecutionDisposition,
 )
-from kai.workshop.inbound import InboundMessage
-from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
+from kai.workshop.inbound import ClientInboundMessage, InboundMessage
+from kai.workshop.private_text_execution import (
+    RecoverableClientRun,
+    WorkshopPrivateTextExecutionService,
+)
 from kai.workshop.run_lifecycle import RunStatus
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.store import WorkshopEventStore
@@ -152,5 +156,52 @@ async def test_owner_routes_stop_to_exact_active_runtime_and_terminal_cancellati
         assert runtime.cancelled is True
         assert result.disposition == CanonicalExecutionDisposition.CANCELLED
         assert result.run.status == RunStatus.CANCELLED
+    finally:
+        await service.stop()
+
+
+async def test_owner_discovers_only_durably_accepted_workshop_client_runs(tmp_path: Path):
+    database = tmp_path / "kai.db"
+    await _foundation(database)
+    inspection = await WorkshopEventStore.open(database)
+    try:
+        async with inspection.connection.execute(
+            "SELECT p.id, c.id FROM principals p "
+            "JOIN external_identities ei ON ei.principal_id = p.id "
+            "JOIN channel_memberships cm ON cm.principal_id = p.id "
+            "JOIN channels c ON c.id = cm.channel_id AND c.kind = 'direct' "
+            "WHERE ei.provider = 'telegram' AND ei.external_subject = '101'"
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        principal_id = PrincipalId(str(row[0]))
+        channel_id = ChannelId(str(row[1]))
+    finally:
+        await inspection.close()
+
+    pool = SimpleNamespace(prepare_execution=AsyncMock())
+    service = await WorkshopPrivateTextExecutionService.open_and_start(
+        database,
+        WorkshopRuntimePool(pool, profile_registry(101)),  # type: ignore[arg-type]
+        registered_backend_ids=frozenset({"codex"}),
+    )
+    try:
+        accepted = await service.accept_client(
+            ClientInboundMessage(
+                principal_id=principal_id,
+                channel_id=channel_id,
+                client_message_id="recoverable-browser-command",
+                body="Resume this browser run after restart",
+                occurred_at=_NOW,
+            )
+        )
+
+        assert await service.recoverable_client_runs() == (
+            RecoverableClientRun(
+                accepted.run.run_id,
+                profile_id(101),
+                "Resume this browser run after restart",
+            ),
+        )
     finally:
         await service.stop()

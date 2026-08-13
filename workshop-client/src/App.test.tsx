@@ -5,19 +5,23 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import {
   AuthenticationError,
+  cancelRun,
   ChannelAccessError,
+  loadRun,
   loadTimeline,
   redeemEnrollment,
   streamTimeline,
   submitCommand,
 } from "./api";
-import type { TimelineMessage } from "./types";
+import type { TimelineMessage, WorkshopRun } from "./types";
 
 vi.mock("./api", async (importOriginal) => {
   const original = await importOriginal<typeof import("./api")>();
   return {
     ...original,
+    cancelRun: vi.fn(),
     loadTimeline: vi.fn(),
+    loadRun: vi.fn(),
     redeemEnrollment: vi.fn(),
     streamTimeline: vi.fn(),
     submitCommand: vi.fn(),
@@ -35,6 +39,18 @@ const historyMessage: TimelineMessage = {
   messageId: "msg_00000000000000000000000000000025",
 };
 
+const completedRun: WorkshopRun = {
+  acceptedAt: "2026-08-13T09:00:00Z",
+  cancellationRequestedAt: null,
+  channelId,
+  resultMessageId: "msg_00000000000000000000000000000031",
+  runId: "run_00000000000000000000000000000030",
+  startedAt: "2026-08-13T09:00:01Z",
+  status: "completed",
+  terminalAt: "2026-08-13T09:00:02Z",
+  terminalCode: null,
+};
+
 type StreamHandlers = Parameters<typeof streamTimeline>[2];
 
 describe("Workshop React client", () => {
@@ -50,12 +66,16 @@ describe("Workshop React client", () => {
       messages: [historyMessage],
       throughPosition: 25,
     });
+    vi.mocked(loadRun).mockResolvedValue(completedRun);
+    vi.mocked(cancelRun).mockResolvedValue({
+      ...completedRun,
+      status: "cancelled",
+      terminalCode: "requested_by_human",
+    });
     vi.mocked(submitCommand).mockResolvedValue({
       acceptance: "newly_accepted",
-      execution: "completed",
       messageId: "msg_00000000000000000000000000000030",
-      runId: "run_00000000000000000000000000000030",
-      runStatus: "completed",
+      run: completedRun,
     });
     vi.mocked(streamTimeline).mockImplementation(
       async (_session, _position, streamHandlers, signal) => {
@@ -163,10 +183,8 @@ describe("Workshop React client", () => {
       .mockRejectedValueOnce(new Error("Backend temporarily unavailable."))
       .mockResolvedValueOnce({
         acceptance: "ready_replay",
-        execution: "completed",
         messageId: "msg_00000000000000000000000000000030",
-        runId: "run_00000000000000000000000000000030",
-        runStatus: "completed",
+        run: completedRun,
       });
     render(<App />);
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
@@ -189,5 +207,46 @@ describe("Workshop React client", () => {
     );
     expect(getRandomValues).toHaveBeenCalledTimes(1);
     expect(screen.getByLabelText("Message Kai")).toHaveValue("");
+  });
+
+  it("accepts work asynchronously and exposes an exact run Stop control", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    const acceptedRun: WorkshopRun = {
+      ...completedRun,
+      resultMessageId: null,
+      startedAt: null,
+      status: "accepted",
+      terminalAt: null,
+    };
+    vi.mocked(submitCommand).mockResolvedValueOnce({
+      acceptance: "newly_accepted",
+      messageId: "msg_00000000000000000000000000000030",
+      run: acceptedRun,
+    });
+    vi.mocked(cancelRun).mockResolvedValueOnce({
+      ...acceptedRun,
+      cancellationRequestedAt: "2026-08-13T09:00:01Z",
+      status: "cancelled",
+      terminalAt: "2026-08-13T09:00:01Z",
+      terminalCode: "requested_by_human",
+    });
+    render(<App />);
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+
+    await user.type(screen.getByLabelText("Message Kai"), "Take your time");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText("Workshop run: accepted")).toBeVisible();
+    expect(screen.getByLabelText("Message Kai")).toHaveValue("");
+    await user.click(screen.getByRole("button", { name: "Stop" }));
+    expect(await screen.findByText("Workshop run: cancelled")).toBeVisible();
+    expect(cancelRun).toHaveBeenCalledWith(
+      { channelId, token: "existing-session" },
+      acceptedRun.runId,
+    );
   });
 });

@@ -257,6 +257,23 @@ class TestCanonicalExecutionCoordinator:
         finally:
             await store.close()
 
+    async def test_accepted_run_cancels_durably_before_backend_dispatch(self, tmp_path: Path):
+        store, run = await _accepted(tmp_path / "kai.db")
+        prepared = _Prepared(run)
+        preparation = _Preparation(prepared)
+        coordinator = _coordinator(store, preparation)
+        try:
+            cancellation = await coordinator.request_cancellation(run.run_id)
+            current = await WorkshopRunLifecycle(store).state(run.run_id)
+
+            assert cancellation == CanonicalCancellationDisposition.REQUESTED
+            assert current.status == RunStatus.CANCELLED
+            assert current.terminal_code == "requested_by_human"
+            assert preparation.calls == 0
+            assert await _terminal_bodies(store) == ["Canonical prompt 1"]
+        finally:
+            await store.close()
+
     async def test_expired_started_attempt_gets_visible_interruption_without_redispatch(self, tmp_path: Path):
         store, run = await _accepted(tmp_path / "kai.db")
         selection = RunExecutionSelection("codex", "gpt-5.6-sol")

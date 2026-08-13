@@ -1,20 +1,25 @@
-import { FormEvent, useCallback, useState } from "react";
+import { FormEvent, useCallback, useEffect, useState } from "react";
 
 import {
   AuthenticationError,
+  cancelRun,
   ChannelAccessError,
+  loadRun,
   redeemEnrollment,
   submitCommand,
 } from "./api";
 import type {
+  CommandSubmissionResult,
   ConnectionState,
   TimelineMessage,
+  WorkshopRun,
   WorkshopSession,
 } from "./types";
 import { CHANNEL_PATTERN } from "./types";
 import { useWorkshopTimeline } from "./useWorkshopTimeline";
 
 const SESSION_KEY = "kai.workshop.read-session.v1";
+const ACTIVE_RUN_KEY = "kai.workshop.active-run.v1";
 
 function restoreSession(): WorkshopSession | null {
   try {
@@ -44,6 +49,38 @@ function storeSession(session: WorkshopSession): void {
 
 function forgetStoredSession(): void {
   sessionStorage.removeItem(SESSION_KEY);
+  sessionStorage.removeItem(ACTIVE_RUN_KEY);
+}
+
+function restoreActiveRunId(channelId: string): string | null {
+  try {
+    const stored: unknown = JSON.parse(sessionStorage.getItem(ACTIVE_RUN_KEY) ?? "null");
+    if (
+      typeof stored === "object" &&
+      stored !== null &&
+      "channelId" in stored &&
+      "runId" in stored &&
+      stored.channelId === channelId &&
+      typeof stored.runId === "string" &&
+      stored.runId.startsWith("run_")
+    ) {
+      return stored.runId;
+    }
+  } catch {
+    // Malformed tab-local state has no authority.
+  }
+  sessionStorage.removeItem(ACTIVE_RUN_KEY);
+  return null;
+}
+
+function storeActiveRun(channelId: string, runId: string): void {
+  sessionStorage.setItem(ACTIVE_RUN_KEY, JSON.stringify({ channelId, runId }));
+}
+
+type ActiveWorkshopRun = WorkshopRun & { status: "accepted" | "started" };
+
+function isRunActive(run: WorkshopRun | null): run is ActiveWorkshopRun {
+  return run?.status === "accepted" || run?.status === "started";
 }
 
 function formatTimestamp(value: string): string {
@@ -295,18 +332,27 @@ function WorkshopView({
   connection,
   messages,
   onForget,
+  onCancelRun,
+  onLoadRun,
   onSubmitCommand,
 }: {
   channelId: string;
   connection: ConnectionState;
   messages: TimelineMessage[];
   onForget: () => void;
-  onSubmitCommand: (clientMessageId: string, body: string) => Promise<void>;
+  onCancelRun: (runId: string) => Promise<WorkshopRun>;
+  onLoadRun: (runId: string) => Promise<WorkshopRun>;
+  onSubmitCommand: (
+    clientMessageId: string,
+    body: string,
+  ) => Promise<CommandSubmissionResult>;
 }): React.JSX.Element {
   const [draft, setDraft] = useState("");
   const [pendingMessageId, setPendingMessageId] = useState<string | null>(null);
   const [submissionError, setSubmissionError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [stopping, setStopping] = useState(false);
+  const [activeRun, setActiveRun] = useState<WorkshopRun | null>(null);
   const agentName =
     messages.find((message) => message.authorKind === "agent")
       ?.authorDisplayName || "Agent";
@@ -314,10 +360,65 @@ function WorkshopView({
     messages.find((message) => message.authorKind === "human")
       ?.authorDisplayName || "You";
 
+  useEffect(() => {
+    const restoredRunId = restoreActiveRunId(channelId);
+    if (!restoredRunId) {
+      return;
+    }
+    let cancelled = false;
+    void onLoadRun(restoredRunId)
+      .then((run) => {
+        if (!cancelled) {
+          setActiveRun(run);
+        }
+      })
+      .catch((caught: unknown) => {
+        if (!cancelled) {
+          sessionStorage.removeItem(ACTIVE_RUN_KEY);
+          setSubmissionError(
+            caught instanceof Error ? caught.message : "Could not restore the active run.",
+          );
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [channelId, onLoadRun]);
+
+  useEffect(() => {
+    if (!isRunActive(activeRun)) {
+      if (activeRun) {
+        sessionStorage.removeItem(ACTIVE_RUN_KEY);
+      }
+      return;
+    }
+    storeActiveRun(channelId, activeRun.runId);
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void onLoadRun(activeRun.runId)
+        .then((run) => {
+          if (!cancelled) {
+            setActiveRun(run);
+          }
+        })
+        .catch((caught: unknown) => {
+          if (!cancelled) {
+            setSubmissionError(
+              caught instanceof Error ? caught.message : "Could not inspect the active run.",
+            );
+          }
+        });
+    }, 1000);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [activeRun, channelId, onLoadRun]);
+
   const submit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
     const body = draft.trim();
-    if (!body || submitting) {
+    if (!body || submitting || isRunActive(activeRun)) {
       return;
     }
     setSubmissionError(null);
@@ -325,15 +426,33 @@ function WorkshopView({
     try {
       const clientMessageId = pendingMessageId ?? createClientMessageId();
       setPendingMessageId(clientMessageId);
-      await onSubmitCommand(clientMessageId, body);
+      const result = await onSubmitCommand(clientMessageId, body);
       setDraft("");
       setPendingMessageId(null);
+      setActiveRun(result.run);
     } catch (caught) {
       setSubmissionError(
         caught instanceof Error ? caught.message : "Kai could not run this command.",
       );
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const stopRun = async (): Promise<void> => {
+    if (!activeRun || !isRunActive(activeRun) || stopping) {
+      return;
+    }
+    setSubmissionError(null);
+    setStopping(true);
+    try {
+      setActiveRun(await onCancelRun(activeRun.runId));
+    } catch (caught) {
+      setSubmissionError(
+        caught instanceof Error ? caught.message : "Could not stop this run.",
+      );
+    } finally {
+      setStopping(false);
     }
   };
 
@@ -440,16 +559,32 @@ function WorkshopView({
               maxLength={50000}
               placeholder="Message Kai…"
               rows={3}
-              disabled={submitting}
             />
-            <button type="submit" disabled={submitting || !draft.trim()}>
-              {submitting ? "Running…" : "Send"}
+            <button
+              type="submit"
+              disabled={submitting || isRunActive(activeRun) || !draft.trim()}
+            >
+              {submitting ? "Sending…" : "Send"}
             </button>
+            {isRunActive(activeRun) && (
+              <button
+                className="stop-button"
+                type="button"
+                disabled={stopping}
+                onClick={() => void stopRun()}
+              >
+                {stopping ? "Stopping…" : "Stop"}
+              </button>
+            )}
           </form>
           {submissionError && (
             <p className="composer-error" role="alert">{submissionError}</p>
           )}
-          <span className="composer-mode">Canonical Workshop command</span>
+          <span className="composer-mode" role="status">
+            {activeRun
+              ? `Workshop run: ${activeRun.status}`
+              : "Canonical Workshop command"}
+          </span>
         </footer>
       </section>
 
@@ -539,12 +674,15 @@ export default function App(): React.JSX.Element {
     setView("workshop");
   };
 
-  const runCommand = async (clientMessageId: string, body: string): Promise<void> => {
+  const runCommand = async (
+    clientMessageId: string,
+    body: string,
+  ): Promise<CommandSubmissionResult> => {
     if (!session) {
       throw new Error("Workshop session unavailable.");
     }
     try {
-      await submitCommand(session, clientMessageId, body);
+      return await submitCommand(session, clientMessageId, body);
     } catch (caught) {
       if (caught instanceof AuthenticationError) {
         forgetSession(caught.message);
@@ -554,6 +692,44 @@ export default function App(): React.JSX.Element {
       throw caught;
     }
   };
+
+  const inspectRun = useCallback(
+    async (runId: string): Promise<WorkshopRun> => {
+      if (!session) {
+        throw new Error("Workshop session unavailable.");
+      }
+      try {
+        return await loadRun(session, runId);
+      } catch (caught) {
+        if (caught instanceof AuthenticationError) {
+          forgetSession(caught.message);
+        } else if (caught instanceof ChannelAccessError) {
+          correctChannel(caught.message);
+        }
+        throw caught;
+      }
+    },
+    [correctChannel, forgetSession, session],
+  );
+
+  const stopRun = useCallback(
+    async (runId: string): Promise<WorkshopRun> => {
+      if (!session) {
+        throw new Error("Workshop session unavailable.");
+      }
+      try {
+        return await cancelRun(session, runId);
+      } catch (caught) {
+        if (caught instanceof AuthenticationError) {
+          forgetSession(caught.message);
+        } else if (caught instanceof ChannelAccessError) {
+          correctChannel(caught.message);
+        }
+        throw caught;
+      }
+    },
+    [correctChannel, forgetSession, session],
+  );
 
   if (view === "enrollment") {
     return (
@@ -574,6 +750,8 @@ export default function App(): React.JSX.Element {
       connection={connection}
       messages={messages}
       onForget={() => forgetSession()}
+      onCancelRun={stopRun}
+      onLoadRun={inspectRun}
       onSubmitCommand={runCommand}
     />
   );

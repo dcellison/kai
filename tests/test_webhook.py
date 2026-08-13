@@ -2393,17 +2393,20 @@ class TestNotificationChatIdMutations:
         config.allowed_workspaces = []
         config.spec_dir = "specs"
 
+        private_execution = MagicMock()
+        private_execution.recoverable_client_runs = AsyncMock(return_value=())
         telegram_app = MagicMock()
         telegram_app.bot = AsyncMock()
         telegram_app.bot_data = {
             "pool": MagicMock(internal_api_auth=InternalAPIAuth({111: "secret"})),
-            "workshop_private_text_execution": AsyncMock(),
+            "workshop_private_text_execution": private_execution,
             "workshop_runtime_pool": MagicMock(),
             "workshop_principal_storage": _principal_storage_registry(),
         }
 
         fake_runner = MagicMock()
         fake_runner.setup = AsyncMock()
+        fake_runner.cleanup = AsyncMock()
         fake_site = MagicMock()
         fake_site.start = AsyncMock()
 
@@ -2421,6 +2424,7 @@ class TestNotificationChatIdMutations:
             assert wh._app[ALLOWED_USER_IDS_KEY] == {111}
             assert wh._app[NOTIFICATION_CHAT_IDS_KEY] == {-100111, -100222}
         finally:
+            await wh.stop()
             wh._app = old_app
             wh._runner = old_runner
 
@@ -2451,11 +2455,13 @@ class TestNotificationChatIdMutations:
         config.spec_dir = "specs"
         config.session_db_path = tmp_path / "kai.db"
 
+        private_execution = MagicMock()
+        private_execution.recoverable_client_runs = AsyncMock(return_value=())
         telegram_app = MagicMock()
         telegram_app.bot = AsyncMock()
         telegram_app.bot_data = {
             "pool": MagicMock(internal_api_auth=InternalAPIAuth({111: "secret"})),
-            "workshop_private_text_execution": AsyncMock(),
+            "workshop_private_text_execution": private_execution,
             "workshop_runtime_pool": MagicMock(),
             "workshop_principal_storage": _principal_storage_registry(),
         }
@@ -2495,6 +2501,8 @@ class TestNotificationChatIdMutations:
                 "/v1/channels/{channel_id}/timeline",
                 "/v1/channels/{channel_id}/events",
                 "/v1/channels/{channel_id}/commands",
+                "/v1/channels/{channel_id}/runs/{run_id}",
+                "/v1/channels/{channel_id}/runs/{run_id}/cancel",
                 "/workshop",
                 "/workshop/",
                 "/workshop/app.css",

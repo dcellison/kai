@@ -169,11 +169,31 @@ class WorkshopCanonicalExecutionCoordinator:
                 active.cancellation_requested = True
         if active is None:
             run = await self._run(run_id)
-            return (
-                CanonicalCancellationDisposition.ALREADY_TERMINAL
-                if run.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}
-                else CanonicalCancellationDisposition.NOT_ACTIVE
-            )
+            if run.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
+                return CanonicalCancellationDisposition.ALREADY_TERMINAL
+            try:
+                async with self._database_lock:
+                    await self._probe_authority().cancel_before_dispatch(
+                        run_id,
+                        cancellation_code="requested_by_human",
+                        occurred_at=self._now(),
+                    )
+                return CanonicalCancellationDisposition.REQUESTED
+            except RunExecutionConflictError:
+                # Dispatch may have won the database race after the first map
+                # lookup.  Re-enter through the active attempt if it now owns
+                # the run; otherwise report the durable state conservatively.
+                async with self._map_lock:
+                    active = self._active.get(run_id)
+                    if active is not None:
+                        active.cancellation_requested = True
+                if active is None:
+                    run = await self._run(run_id)
+                    return (
+                        CanonicalCancellationDisposition.ALREADY_TERMINAL
+                        if run.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}
+                        else CanonicalCancellationDisposition.NOT_ACTIVE
+                    )
 
         await active.ready.wait()
         async with active.cancel_lock:

@@ -22,10 +22,27 @@ export interface TimelineSnapshot {
 
 export interface CommandSubmissionResult {
   acceptance: string;
-  execution: string;
   messageId: string;
+  run: WorkshopRun;
+}
+
+export type WorkshopRunStatus =
+  | "accepted"
+  | "started"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface WorkshopRun {
+  acceptedAt: string;
+  cancellationRequestedAt: string | null;
+  channelId: string;
+  resultMessageId: string | null;
   runId: string;
-  runStatus: string;
+  startedAt: string | null;
+  status: WorkshopRunStatus;
+  terminalAt: string | null;
+  terminalCode: string | null;
 }
 
 export type ConnectionTone = "connected" | "connecting" | "disconnected";

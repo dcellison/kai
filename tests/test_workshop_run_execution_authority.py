@@ -132,6 +132,24 @@ class TestRunExecutionGrant:
         finally:
             await store.close()
 
+    async def test_pre_dispatch_cancellation_is_atomic_and_blocks_grant(self, tmp_path: Path):
+        store, authority, inbound_id = await _open_authority(tmp_path / "kai.db")
+        try:
+            accepted = await _accepted(store, inbound_id)
+            cancelled = await authority.cancel_before_dispatch(
+                accepted.run.run_id,
+                cancellation_code="requested_by_human",
+                occurred_at=_NOW + timedelta(seconds=2),
+            )
+
+            assert cancelled.status == RunStatus.CANCELLED
+            assert cancelled.cancellation_code == "requested_by_human"
+            assert cancelled.terminal_code == "requested_by_human"
+            with pytest.raises(RunExecutionConflictError, match="uncancelled accepted"):
+                await _grant(authority, accepted.run.run_id, offset=3)
+        finally:
+            await store.close()
+
     async def test_unregistered_resolved_backend_fails_closed(self, tmp_path: Path):
         store, _, inbound_id = await _open_authority(tmp_path / "kai.db")
         try:

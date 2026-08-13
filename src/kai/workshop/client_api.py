@@ -16,12 +16,16 @@ from typing import Protocol
 from aiohttp import web
 
 from kai.workshop.authorization import CanonicalChannelAuthorizer
-from kai.workshop.client_commands import ClientCommandResult
+from kai.workshop.client_commands import (
+    ClientCommandExecutorUnavailableError,
+    ClientCommandSubmission,
+)
 from kai.workshop.client_sessions import EnrollmentGrantUnavailableError, WorkshopClientEnrollmentManager
 from kai.workshop.conversation_commands import ConversationCommandAcceptanceError
-from kai.workshop.domain import ChannelId, PrincipalId
-from kai.workshop.execution_coordinator import CanonicalExecutionDisposition
+from kai.workshop.domain import ChannelId, PrincipalId, RunId
+from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.inbound import ClientInboundMessage, InboundBindingNotFoundError
+from kai.workshop.run_lifecycle import DurableRun, RunNotFoundError, RunStatus
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
 from kai.workshop.timeline import (
     TimelineAccessDeniedError,
@@ -37,6 +41,8 @@ _TIMELINE_PATH = "/v1/channels/{channel_id}/timeline"
 _TIMELINE_EVENTS_PATH = "/v1/channels/{channel_id}/events"
 _ENROLLMENT_REDEMPTION_PATH = "/v1/client/enrollment/redeem"
 _COMMAND_SUBMISSION_PATH = "/v1/channels/{channel_id}/commands"
+_RUN_STATE_PATH = "/v1/channels/{channel_id}/runs/{run_id}"
+_RUN_CANCELLATION_PATH = "/v1/channels/{channel_id}/runs/{run_id}/cancel"
 _ALLOWED_TIMELINE_QUERY_PARAMETERS = frozenset({"cursor", "limit"})
 _ALLOWED_EVENT_QUERY_PARAMETERS = frozenset({"after_position"})
 _ENROLLMENT_REQUEST_FIELDS = frozenset({"enrollment_token", "device_display_name"})
@@ -53,7 +59,11 @@ class WorkshopClientAuthenticator(Protocol):
 
 
 class WorkshopClientCommandSubmitter(Protocol):
-    async def submit(self, message: ClientInboundMessage) -> ClientCommandResult: ...
+    async def submit(self, message: ClientInboundMessage) -> ClientCommandSubmission: ...
+
+    async def state(self, run_id: RunId) -> DurableRun: ...
+
+    async def cancel(self, run_id: RunId) -> CanonicalCancellationDisposition: ...
 
 
 class WorkshopEnrollmentRateLimiter:
@@ -232,6 +242,22 @@ def _serialize_message(message: TimelineMessage) -> dict[str, object]:
         "body": message.body,
         "event_position": message.event_position,
         "created_at": _format_timestamp(message.created_at),
+    }
+
+
+def _serialize_run(run: DurableRun) -> dict[str, object]:
+    return {
+        "run_id": str(run.run_id),
+        "channel_id": str(run.channel_id),
+        "status": run.status.value,
+        "accepted_at": _format_timestamp(run.accepted_at),
+        "started_at": _format_timestamp(run.started_at) if run.started_at is not None else None,
+        "terminal_at": _format_timestamp(run.terminal_at) if run.terminal_at is not None else None,
+        "terminal_code": run.terminal_code,
+        "cancellation_requested_at": (
+            _format_timestamp(run.cancellation_requested_at) if run.cancellation_requested_at is not None else None
+        ),
+        "result_message_id": str(run.result_message_id) if run.result_message_id is not None else None,
     }
 
 
@@ -525,7 +551,7 @@ async def _handle_command_submission(
     submitter: WorkshopClientCommandSubmitter,
     request_lock: asyncio.Lock,
 ) -> web.Response:
-    """Authenticate, authorize, accept, and execute one canonical command."""
+    """Authenticate, authorize, and durably enqueue one canonical command."""
     async with request_lock:
         principal_id = await authenticator.authenticate(request)
     if not isinstance(principal_id, PrincipalId):
@@ -584,25 +610,111 @@ async def _handle_command_submission(
             code="command_state_conflict",
             message="Command could not be accepted in the current channel state",
         )
-
-    if result.execution.disposition == CanonicalExecutionDisposition.PREPARATION_DEFERRED:
+    except ClientCommandExecutorUnavailableError:
         response = _error_response(
             status=503,
-            code="execution_deferred",
-            message="Kai could not safely prepare this request; retry the same command",
+            code="execution_unavailable",
+            message="Kai cannot accept Workshop commands right now",
         )
         response.headers["Retry-After"] = "2"
         return response
+
+    terminal = result.run.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}
     return _json_response(
         {
-            "version": 1,
+            "version": 2,
             "message_id": str(result.acceptance.command.message.event.envelope.aggregate_id),
             "run_id": str(result.acceptance.run.run_id),
             "acceptance": result.acceptance.command.disposition.value,
-            "execution": result.execution.disposition.value,
-            "run_status": result.execution.run.status.value,
+            "run": _serialize_run(result.run),
         },
-        status=200,
+        status=200 if terminal else 202,
+    )
+
+
+async def _authorized_run(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    submitter: WorkshopClientCommandSubmitter,
+    request_lock: asyncio.Lock,
+) -> tuple[PrincipalId, ChannelId, DurableRun] | web.Response:
+    async with request_lock:
+        principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(
+            status=401,
+            code="authentication_required",
+            message="Authentication required",
+        )
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    try:
+        channel_id = ChannelId(request.match_info["channel_id"])
+        run_id = RunId(request.match_info["run_id"])
+    except (TypeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid run request")
+    try:
+        run = await submitter.state(run_id)
+    except RunNotFoundError:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    if run.channel_id != channel_id or run.requested_by_principal_id != principal_id:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    return principal_id, channel_id, run
+
+
+async def _handle_run_state(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    submitter: WorkshopClientCommandSubmitter,
+    request_lock: asyncio.Lock,
+) -> web.Response:
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid run request")
+    authorized = await _authorized_run(
+        request,
+        authenticator=authenticator,
+        submitter=submitter,
+        request_lock=request_lock,
+    )
+    if isinstance(authorized, web.Response):
+        return authorized
+    return _json_response({"version": 1, "run": _serialize_run(authorized[2])}, status=200)
+
+
+async def _handle_run_cancellation(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    submitter: WorkshopClientCommandSubmitter,
+    request_lock: asyncio.Lock,
+) -> web.Response:
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid cancellation request")
+    authorized = await _authorized_run(
+        request,
+        authenticator=authenticator,
+        submitter=submitter,
+        request_lock=request_lock,
+    )
+    if isinstance(authorized, web.Response):
+        return authorized
+    _, _, run = authorized
+    disposition = await submitter.cancel(run.run_id)
+    current = await submitter.state(run.run_id)
+    return _json_response(
+        {
+            "version": 1,
+            "cancellation": disposition.value,
+            "run": _serialize_run(current),
+        },
+        status=(
+            202
+            if disposition == CanonicalCancellationDisposition.REQUESTED
+            and current.status not in {RunStatus.CANCELLED, RunStatus.COMPLETED, RunStatus.FAILED}
+            else 200
+        ),
     )
 
 
@@ -685,4 +797,22 @@ def register_workshop_command_routes(
             request_lock=request_lock,
         )
 
+    async def handle_run_state(request: web.Request) -> web.Response:
+        return await _handle_run_state(
+            request,
+            authenticator=authenticator,
+            submitter=submitter,
+            request_lock=request_lock,
+        )
+
+    async def handle_run_cancellation(request: web.Request) -> web.Response:
+        return await _handle_run_cancellation(
+            request,
+            authenticator=authenticator,
+            submitter=submitter,
+            request_lock=request_lock,
+        )
+
     app.router.add_post(_COMMAND_SUBMISSION_PATH, handle_command_submission)
+    app.router.add_get(_RUN_STATE_PATH, handle_run_state)
+    app.router.add_post(_RUN_CANCELLATION_PATH, handle_run_cancellation)

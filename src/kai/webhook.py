@@ -140,6 +140,7 @@ _app: web.Application | None = None
 _runner: web.AppRunner | None = None
 _workshop_lan_runner: web.AppRunner | None = None
 _workshop_client_store: WorkshopEventStore | None = None
+_workshop_client_command_executor: WorkshopClientCommandExecutor | None = None
 # Tracks whether we registered a Telegram webhook with the API, so stop()
 # knows whether to call delete_webhook(). Only True in webhook mode.
 _webhook_registered: bool = False
@@ -2524,6 +2525,7 @@ async def start(telegram_app, config) -> None:
         config: The application Config instance.
     """
     global _app, _runner, _workshop_lan_runner, _webhook_registered, _health_monitor_task
+    global _workshop_client_command_executor
 
     _app = web.Application()
     _app[TELEGRAM_APP_KEY] = telegram_app
@@ -2610,13 +2612,16 @@ async def start(telegram_app, config) -> None:
     if not isinstance(principal_storage, WorkshopPrincipalStorageRegistry):
         raise RuntimeError("Workshop principal storage registry is unavailable")
     _app[WORKSHOP_PRINCIPAL_STORAGE_KEY] = principal_storage
+    client_command_executor = WorkshopClientCommandExecutor(
+        private_text_execution,
+        WorkshopCompatibilityStateWriter(config, workshop_runtime_pool),
+    )
+    await client_command_executor.start()
+    _workshop_client_command_executor = client_command_executor
     register_workshop_routes = await _register_workshop_client_api(
         _app,
         Path(config.session_db_path),
-        command_submitter=WorkshopClientCommandExecutor(
-            private_text_execution,
-            WorkshopCompatibilityStateWriter(config, workshop_runtime_pool),
-        ),
+        command_submitter=client_command_executor,
     )
 
     _runner = web.AppRunner(_app, access_log=None)
@@ -2711,7 +2716,7 @@ async def stop() -> None:
     stale webhook on the next set_webhook call at startup.
     """
     global _app, _runner, _workshop_lan_runner, _webhook_registered, _health_monitor_task
-    global _workshop_client_store
+    global _workshop_client_store, _workshop_client_command_executor
     # Cancel the webhook health monitor before tearing down the server
     if _health_monitor_task is not None:
         _health_monitor_task.cancel()
@@ -2743,6 +2748,9 @@ async def stop() -> None:
         _workshop_lan_runner = None
         _runner = None
         _app = None
+        if _workshop_client_command_executor is not None:
+            await _workshop_client_command_executor.stop()
+            _workshop_client_command_executor = None
         if _workshop_client_store is not None:
             await _workshop_client_store.close()
             _workshop_client_store = None

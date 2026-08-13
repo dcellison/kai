@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   EventStreamDecoder,
+  cancelRun,
+  loadRun,
   loadTimeline,
   redeemEnrollment,
   submitCommand,
@@ -21,6 +23,20 @@ function message(position: number, body = `Message ${position}`): Record<string,
     created_at: "2026-08-13T09:00:00Z",
     event_position: position,
     message_id: `msg_${position.toString().padStart(32, "0")}`,
+  };
+}
+
+function run(status = "accepted"): Record<string, unknown> {
+  return {
+    accepted_at: "2026-08-13T09:00:00Z",
+    cancellation_requested_at: null,
+    channel_id: channelId,
+    result_message_id: null,
+    run_id: "run_00000000000000000000000000000001",
+    started_at: null,
+    status,
+    terminal_at: null,
+    terminal_code: null,
   };
 }
 
@@ -89,12 +105,11 @@ describe("Workshop client API", () => {
   it("submits only the opaque id and body under bearer authority", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       Response.json({
-        version: 1,
+        version: 2,
         acceptance: "newly_accepted",
-        execution: "completed",
         message_id: "msg_00000000000000000000000000000001",
         run_id: "run_00000000000000000000000000000001",
-        run_status: "completed",
+        run: run(),
       }),
     );
     vi.stubGlobal("fetch", fetchMock);
@@ -103,10 +118,18 @@ describe("Workshop client API", () => {
       submitCommand(session, "browser-command-1", "Hello from Workshop"),
     ).resolves.toEqual({
       acceptance: "newly_accepted",
-      execution: "completed",
       messageId: "msg_00000000000000000000000000000001",
-      runId: "run_00000000000000000000000000000001",
-      runStatus: "completed",
+      run: {
+        acceptedAt: "2026-08-13T09:00:00Z",
+        cancellationRequestedAt: null,
+        channelId,
+        resultMessageId: null,
+        runId: "run_00000000000000000000000000000001",
+        startedAt: null,
+        status: "accepted",
+        terminalAt: null,
+        terminalCode: null,
+      },
     });
     const [path, options] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(path).toBe(`/v1/channels/${channelId}/commands`);
@@ -117,6 +140,32 @@ describe("Workshop client API", () => {
       body: "Hello from Workshop",
       client_message_id: "browser-command-1",
     });
+  });
+
+  it("inspects and cancels a run through channel-scoped routes", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(Response.json({ version: 1, run: run("started") }))
+      .mockResolvedValueOnce(Response.json({ version: 1, run: run("cancelled") }));
+    vi.stubGlobal("fetch", fetchMock);
+    const runId = "run_00000000000000000000000000000001";
+
+    await expect(loadRun(session, runId)).resolves.toMatchObject({
+      runId,
+      status: "started",
+    });
+    await expect(cancelRun(session, runId)).resolves.toMatchObject({
+      runId,
+      status: "cancelled",
+    });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      `/v1/channels/${channelId}/runs/${runId}`,
+    );
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      `/v1/channels/${channelId}/runs/${runId}/cancel`,
+    );
+    expect((fetchMock.mock.calls[1]?.[1] as RequestInit).method).toBe("POST");
   });
 
   it("decodes fragmented event-stream blocks", () => {

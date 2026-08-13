@@ -787,6 +787,12 @@ button:disabled {
   opacity: 0.58;
 }
 
+.composer-form .stop-button {
+  border-color: rgba(224, 108, 117, 0.5);
+  background: rgba(224, 108, 117, 0.12);
+  color: var(--atom-red);
+}
+
 .composer-error {
   margin: 0.5rem 0 0;
   color: var(--atom-red);

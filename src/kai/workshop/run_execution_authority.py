@@ -474,6 +474,101 @@ class WorkshopRunExecutionAuthority:
             await connection.rollback()
             raise
 
+    async def cancel_before_dispatch(
+        self,
+        run_id: RunId,
+        *,
+        cancellation_code: str,
+        occurred_at: datetime,
+    ) -> DurableRun:
+        """Atomically cancel an accepted run that has no execution owner.
+
+        This is the durable cancellation path for work waiting on a canonical
+        execution lane.  Once an attempt exists, cancellation must instead be
+        acknowledged through that attempt's fenced authority.
+        """
+        if not isinstance(run_id, RunId):
+            raise ValueError("run_id must be a RunId")
+        cancellation_code = _require_code(cancellation_code, field_name="cancellation_code")
+        occurred_at = _timestamp(occurred_at, field_name="occurred_at")
+        connection = self._store.connection
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            projection = CanonicalConversationProjection()
+            await self._store.project_pending_in_transaction(projection)
+            run = await _load_run(self._store, run_id)
+            if run is None:
+                raise RunNotFoundError("Durable Workshop run was not found")
+
+            terminal_key = _run_key(run_id, "cancelled")
+            prior_terminal = await self._store.event_by_idempotency_key(terminal_key)
+            if prior_terminal is not None:
+                expected = {"cancellation_code": cancellation_code}
+                if (
+                    prior_terminal.envelope.event_type != WorkshopEventType.RUN_CANCELLED
+                    or prior_terminal.envelope.event_version != 1
+                    or prior_terminal.envelope.actor_principal_id != run.requested_by_principal_id
+                    or prior_terminal.envelope.payload != expected
+                ):
+                    raise RunExecutionConflictError("Pre-dispatch cancellation retry has conflicting facts")
+                await connection.commit()
+                return run
+
+            if run.status != RunStatus.ACCEPTED:
+                raise RunExecutionConflictError("Only an accepted run can cancel before dispatch")
+            async with connection.execute(
+                "SELECT COUNT(*) FROM run_attempts WHERE run_id = ? AND status IN ('granted', 'started')",
+                (run_id,),
+            ) as cursor:
+                active_row = await cursor.fetchone()
+            if active_row is None or int(active_row[0]) != 0:
+                raise RunExecutionConflictError("Run already has execution authority and cannot cancel before dispatch")
+
+            request_key = _run_key(run_id, "cancellation_requested")
+            prior_request = await self._store.event_by_idempotency_key(request_key)
+            if prior_request is None:
+                await self._store.append_in_transaction(
+                    EventEnvelope.create(
+                        event_id=EventId.derived(run_id, "cancellation-requested"),
+                        event_type=WorkshopEventType.RUN_CANCELLATION_REQUESTED,
+                        event_version=1,
+                        workshop_id=run.workshop_id,
+                        aggregate_type="run",
+                        aggregate_id=run_id,
+                        actor_principal_id=run.requested_by_principal_id,
+                        occurred_at=occurred_at,
+                        idempotency_key=request_key,
+                        payload={"cancellation_code": cancellation_code},
+                        metadata={"source": "workshop_run_execution_authority"},
+                    )
+                )
+                await self._store.project_pending_in_transaction(projection)
+            elif prior_request.envelope.payload != {"cancellation_code": cancellation_code}:
+                raise RunExecutionConflictError("Cancellation request retry has conflicting facts")
+
+            await self._store.append_in_transaction(
+                EventEnvelope.create(
+                    event_id=EventId.derived(run_id, "cancelled-before-dispatch"),
+                    event_type=WorkshopEventType.RUN_CANCELLED,
+                    event_version=1,
+                    workshop_id=run.workshop_id,
+                    aggregate_type="run",
+                    aggregate_id=run_id,
+                    actor_principal_id=run.requested_by_principal_id,
+                    occurred_at=occurred_at,
+                    idempotency_key=terminal_key,
+                    payload={"cancellation_code": cancellation_code},
+                    metadata={"source": "workshop_run_execution_authority"},
+                )
+            )
+            await self._store.project_pending_in_transaction(projection)
+            cancelled = await self._require_run(run_id)
+            await connection.commit()
+            return cancelled
+        except Exception:
+            await connection.rollback()
+            raise
+
     async def complete(
         self,
         claim: RunExecutionClaim,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,9 +21,9 @@ from kai.workshop.client_api import (
 )
 from kai.workshop.conversation_commands import ConversationCommandDisposition
 from kai.workshop.domain import ChannelId, MessageId, PrincipalId, RunId
-from kai.workshop.execution_coordinator import CanonicalExecutionDisposition
+from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.inbound import ClientInboundMessage, InboundMessage, record_inbound_message
-from kai.workshop.run_lifecycle import RunStatus
+from kai.workshop.run_lifecycle import DurableRun, RunNotFoundError, RunStatus
 from kai.workshop.store import WorkshopEventStore
 
 _NOW = datetime(2026, 8, 11, 14, 0, tzinfo=UTC)
@@ -46,24 +46,58 @@ class _Authenticator:
 @dataclass
 class _CommandSubmitter:
     messages: list[ClientInboundMessage] = field(default_factory=list)
+    runs: dict[RunId, DurableRun] = field(default_factory=dict)
 
     async def submit(self, message: ClientInboundMessage):
         self.messages.append(message)
+        message_id = MessageId.new()
+        run_id = RunId.new()
+        run = DurableRun(
+            run_id=run_id,
+            workshop_id=SimpleNamespace(),
+            channel_id=message.channel_id,
+            requested_by_principal_id=message.principal_id,
+            agent_id=SimpleNamespace(),
+            inbound_message_id=message_id,
+            status=RunStatus.ACCEPTED,
+            accepted_at=message.occurred_at,
+            started_at=None,
+            terminal_at=None,
+            terminal_code=None,
+            cancellation_requested_at=None,
+            cancellation_code=None,
+            result_message_id=None,
+            last_event_position=1,
+        )
+        self.runs[run_id] = run
         return SimpleNamespace(
             acceptance=SimpleNamespace(
                 command=SimpleNamespace(
-                    message=SimpleNamespace(
-                        event=SimpleNamespace(envelope=SimpleNamespace(aggregate_id=MessageId.new()))
-                    ),
+                    message=SimpleNamespace(event=SimpleNamespace(envelope=SimpleNamespace(aggregate_id=message_id))),
                     disposition=ConversationCommandDisposition.NEWLY_ACCEPTED,
                 ),
-                run=SimpleNamespace(run_id=RunId.new()),
+                run=run,
             ),
-            execution=SimpleNamespace(
-                disposition=CanonicalExecutionDisposition.COMPLETED,
-                run=SimpleNamespace(status=RunStatus.COMPLETED),
-            ),
+            run=run,
         )
+
+    async def state(self, run_id: RunId) -> DurableRun:
+        try:
+            return self.runs[run_id]
+        except KeyError as exc:
+            raise RunNotFoundError("missing") from exc
+
+    async def cancel(self, run_id: RunId) -> CanonicalCancellationDisposition:
+        run = await self.state(run_id)
+        self.runs[run_id] = replace(
+            run,
+            status=RunStatus.CANCELLED,
+            terminal_at=_NOW,
+            terminal_code="requested_by_human",
+            cancellation_requested_at=_NOW,
+            cancellation_code="requested_by_human",
+        )
+        return CanonicalCancellationDisposition.REQUESTED
 
 
 async def _identity_for(store: WorkshopEventStore, subject: str) -> tuple[PrincipalId, ChannelId]:
@@ -204,11 +238,11 @@ class TestWorkshopCommandHTTPContract:
             )
             payload = await response.json()
 
-            assert response.status == 200
-            assert payload["version"] == 1
+            assert response.status == 202
+            assert payload["version"] == 2
             assert payload["acceptance"] == "newly_accepted"
-            assert payload["execution"] == "completed"
-            assert payload["run_status"] == "completed"
+            assert payload["run"]["status"] == "accepted"
+            assert payload["run"]["channel_id"] == alice_channel
             assert str(payload["message_id"]).startswith("msg_")
             assert str(payload["run_id"]).startswith("run_")
             assert len(submitter.messages) == 1
@@ -218,6 +252,80 @@ class TestWorkshopCommandHTTPContract:
             assert submitted.client_message_id == "browser-command-1"
             assert submitted.body == "Hello from Workshop"
             assert submitted.occurred_at.tzinfo is not None
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_owner_can_inspect_and_cancel_accepted_run(self, tmp_path: Path):
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        submitter = _CommandSubmitter()
+        client = await _open_command_client(
+            store,
+            _Authenticator({"alice-token": alice_id}),
+            submitter,
+        )
+        try:
+            accepted = await client.post(
+                f"/v1/channels/{alice_channel}/commands",
+                headers={"Authorization": "Bearer alice-token"},
+                json={"client_message_id": "browser-command-1", "body": "Long task"},
+            )
+            run_id = (await accepted.json())["run_id"]
+
+            state = await client.get(
+                f"/v1/channels/{alice_channel}/runs/{run_id}",
+                headers={"Authorization": "Bearer alice-token"},
+            )
+            invalid = await client.post(
+                f"/v1/channels/{alice_channel}/runs/{run_id}/cancel",
+                headers={"Authorization": "Bearer alice-token"},
+                data="unexpected",
+            )
+            cancelled = await client.post(
+                f"/v1/channels/{alice_channel}/runs/{run_id}/cancel",
+                headers={"Authorization": "Bearer alice-token"},
+            )
+
+            assert state.status == 200
+            assert (await state.json())["run"]["status"] == "accepted"
+            assert invalid.status == 400
+            assert cancelled.status == 200
+            cancellation_payload = await cancelled.json()
+            assert cancellation_payload["cancellation"] == "requested"
+            assert cancellation_payload["run"]["status"] == "cancelled"
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_run_state_does_not_leak_across_principals_or_unknown_ids(self, tmp_path: Path):
+        store, alice_id, alice_channel, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        submitter = _CommandSubmitter()
+        client = await _open_command_client(
+            store,
+            _Authenticator({"alice-token": alice_id, "bob-token": bob_id}),
+            submitter,
+        )
+        try:
+            accepted = await client.post(
+                f"/v1/channels/{alice_channel}/commands",
+                headers={"Authorization": "Bearer alice-token"},
+                json={"client_message_id": "browser-command-1", "body": "Private work"},
+            )
+            run_id = (await accepted.json())["run_id"]
+            headers = {"Authorization": "Bearer bob-token"}
+
+            cross_principal = await client.get(
+                f"/v1/channels/{alice_channel}/runs/{run_id}",
+                headers=headers,
+            )
+            unknown = await client.get(
+                f"/v1/channels/{alice_channel}/runs/{RunId.new()}",
+                headers=headers,
+            )
+
+            assert cross_principal.status == 403
+            assert unknown.status == 403
+            assert await cross_principal.json() == await unknown.json()
         finally:
             await client.close()
             await store.close()
