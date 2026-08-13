@@ -129,7 +129,6 @@ describe("Workshop React client", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     sessionStorage.clear();
-    localStorage.clear();
     handlers = null;
     failStream = null;
     vi.mocked(redeemEnrollment).mockResolvedValue("redeemed-session-token");
@@ -439,7 +438,7 @@ describe("Workshop React client", () => {
     expect(navigationPanel).toHaveClass("collapsed");
     expect(screen.getByRole("button", { name: "Kai" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Scott" })).toBeVisible();
-    expect(localStorage.getItem("kai.workshop.sidebar-layout.v1")).toContain(
+    expect(sessionStorage.getItem("kai.workshop.sidebar-layout.v1")).toContain(
       '"collapsed":true',
     );
 

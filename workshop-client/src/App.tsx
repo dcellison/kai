@@ -60,7 +60,7 @@ function clampSidebarWidth(width: number): number {
 function restoreSidebarLayout(): StoredSidebarLayout {
   try {
     const stored: unknown = JSON.parse(
-      localStorage.getItem(SIDEBAR_LAYOUT_KEY) ?? "null",
+      sessionStorage.getItem(SIDEBAR_LAYOUT_KEY) ?? "null",
     );
     if (
       typeof stored === "object" &&
@@ -83,7 +83,7 @@ function restoreSidebarLayout(): StoredSidebarLayout {
 }
 
 function storeSidebarLayout(layout: StoredSidebarLayout): void {
-  localStorage.setItem(SIDEBAR_LAYOUT_KEY, JSON.stringify(layout));
+  sessionStorage.setItem(SIDEBAR_LAYOUT_KEY, JSON.stringify(layout));
 }
 
 function restoreSession(): WorkshopSession | null {
