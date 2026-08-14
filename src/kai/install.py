@@ -3578,6 +3578,15 @@ def _generate_sudoers(
         # `kill -<sig> <pid>` calls we use here. Same anchoring
         # rationale as the claude_bin fix in PR #455.
         kill_bin = "/bin/kill"
+        # CWD=* allows sudo's -D option on the pinned agent commands so
+        # the target OS user, rather than the Kai service user, enters a
+        # private protected workspace. Kai supplies only workspaces that
+        # passed protected runtime policy validation. This does not expand
+        # the practical authority of these rules: every allowed agent is
+        # already an arbitrary-code execution boundary for <target>, as
+        # documented immediately below. The config-read and kill rules do
+        # not receive CWD=*.
+        #
         # SETENV: allows the service user to pass env vars (e.g.,
         # KAI_WEBHOOK_SECRET, provider API keys) through sudo to the
         # agent binaries. Scoped to the agent rules; the kill rule
@@ -3611,11 +3620,11 @@ def _generate_sudoers(
             # delta is zero.
         """)
         for target in target_users:
-            rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {claude_bin_resolved}\n"
-            rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {codex_bin_resolved}\n"
-            rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {opencode_bin_resolved}\n"
-            rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {goose_bin_resolved}\n"
-            rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {pi_bin_resolved}\n"
+            rules += f"{service_user} ALL=({target}) CWD=* SETENV: NOPASSWD: {claude_bin_resolved}\n"
+            rules += f"{service_user} ALL=({target}) CWD=* SETENV: NOPASSWD: {codex_bin_resolved}\n"
+            rules += f"{service_user} ALL=({target}) CWD=* SETENV: NOPASSWD: {opencode_bin_resolved}\n"
+            rules += f"{service_user} ALL=({target}) CWD=* SETENV: NOPASSWD: {goose_bin_resolved}\n"
+            rules += f"{service_user} ALL=({target}) CWD=* SETENV: NOPASSWD: {pi_bin_resolved}\n"
             rules += f"{service_user} ALL=({target}) NOPASSWD: {kill_bin}\n"
 
     return rules

@@ -62,6 +62,7 @@ from kai.pi_rpc import (
     require_pi_rpc_response,
 )
 from kai.prompt_utils import make_boundary
+from kai.subprocess_identity import subprocess_spawn_cwd, wrap_command_for_target_user
 
 log = logging.getLogger(__name__)
 
@@ -424,10 +425,11 @@ def _wrap_cmd_for_user(
     target_user: str,
     backend: str,
     *,
+    working_directory: Path,
     preserve_vars: tuple[str, ...] | None = None,
 ) -> list[str]:
     """
-    Prefix `cmd` with `sudo -H -u <target> --preserve-env=<csv> --`.
+    Prefix `cmd` with a target-user sudo wrapper.
 
     `-H` rewrites HOME so the agent reads its config and OAuth state
     under the target user's home. The `--preserve-env=<csv>` clause
@@ -438,18 +440,18 @@ def _wrap_cmd_for_user(
     because the bot user's PATH is already in the subprocess env via
     the per-backend allow-list, and sudo resolves bare commands like
     `claude` / `codex` against that PATH before applying its sudoers
-    check (the sudoers rule pins the resolved absolute path).
+    check (the sudoers rule pins the resolved absolute path). ``-D``
+    enters the selected workspace after sudo assumes the target identity;
+    the Kai service user never needs traversal access to private managed
+    homes.
     """
     preserve = ",".join(preserve_vars if preserve_vars is not None else _preserved_auth_vars_for(backend))
-    wrapped = [
-        "sudo",
-        "-H",
-        "-u",
-        target_user,
-    ]
-    if preserve:
-        wrapped.append(f"--preserve-env={preserve}")
-    return [*wrapped, "--", *cmd]
+    return wrap_command_for_target_user(
+        cmd,
+        target_user=target_user,
+        working_directory=working_directory,
+        preserve_env=preserve.split(",") if preserve else (),
+    )
 
 
 def _os_user_log_field(effective_user: str | None) -> str:
@@ -612,7 +614,8 @@ class ClaudeOneShotReasoner:
                 DATA_DIR. Production callers leave this unset; the
                 reasoner uses `_EXTRACTOR_CWD` and ensures it exists
                 on first call.
-            os_user: Optional OS user to run claude as via `sudo -H -u`.
+            os_user: Optional OS user to run claude as via
+                `sudo -H -D <workspace> -u`.
                 When None or matching the bot process user (the
                 self-sudo-skip case, detected by `resolve_claude_user`),
                 claude spawns directly with no wrap, preserving the
@@ -691,7 +694,12 @@ class ClaudeOneShotReasoner:
         # user os_user keep working without configuration changes.
         effective_user = resolve_claude_user(self._os_user)
         if effective_user is not None:
-            cmd = _wrap_cmd_for_user(cmd, effective_user, "claude")
+            cmd = _wrap_cmd_for_user(
+                cmd,
+                effective_user,
+                "claude",
+                working_directory=self._cwd,
+            )
 
         # Allow-listed env: only forward vars from
         # _SUBPROCESS_ENV_ALLOWLIST that are present in the parent
@@ -709,7 +717,10 @@ class ClaudeOneShotReasoner:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=str(self._cwd),
+            cwd=subprocess_spawn_cwd(
+                self._cwd,
+                target_user=effective_user,
+            ),
             env=subprocess_env,
             # New session on the wrap path so kill -KILL -<pgid> hits
             # every target-user descendant; default semantics on the
@@ -1124,7 +1135,7 @@ class CodexOneShotReasoner:
                 `resolve_claude_user` collapses to the current process
                 user) spawns codex in-process as the bot user - the
                 self-sudo-skip path. A non-bot username wraps the
-                argv in `sudo -H -u <user>` for cross-user isolation.
+                argv in `sudo -H -D <workspace> -u <user>` for cross-user isolation.
                 Operators who want the cross-user separation set
                 `os_user` to a different OS account in users.yaml;
                 operators running kai under their own account leave
@@ -1258,7 +1269,7 @@ class CodexOneShotReasoner:
             schema_path.chmod(0o644)
             cmd.extend(["--output-schema", str(schema_path)])
 
-        # Wrap codex in `sudo -H -u <target>` with the auth preserve
+        # Wrap codex in `sudo -H -D <workspace> -u <target>` with the auth preserve
         # list when running cross-user. When `effective_user is None`
         # (same-user spawn: os_user unset OR matches the bot user),
         # the argv stays direct - codex runs in-process as the bot
@@ -1267,7 +1278,12 @@ class CodexOneShotReasoner:
         # the timeout-escalation branch below already gate on the
         # same predicate so the cross-user path stays unchanged.
         if effective_user is not None:
-            cmd = _wrap_cmd_for_user(cmd, effective_user, "codex")
+            cmd = _wrap_cmd_for_user(
+                cmd,
+                effective_user,
+                "codex",
+                working_directory=self._cwd,
+            )
 
         # Allow-listed env: only forward keys present in the parent
         # env. Defense-in-depth against a future regression that
@@ -1287,7 +1303,10 @@ class CodexOneShotReasoner:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=str(self._cwd),
+                cwd=subprocess_spawn_cwd(
+                    self._cwd,
+                    target_user=effective_user,
+                ),
                 env=subprocess_env,
                 start_new_session=bool(effective_user),
             )
@@ -1633,7 +1652,7 @@ class OpenCodeOneShotReasoner:
     Per-OS-user routing: mirrors claude and codex. When
     `os_user is None` or resolves to the bot user, opencode spawns
     directly. A non-bot target wraps the argv in
-    `sudo -H -u <user> --preserve-env=<csv>` carrying the auth vars
+    `sudo -H -D <workspace> -u <user> --preserve-env=<csv>` carrying the auth vars
     from `_preserved_auth_vars_for("opencode")`. The sudoers rule
     emitted by `install._generate_sudoers` for the opencode binary
     authorizes the passthrough; without that rule the wrap path
@@ -1661,7 +1680,7 @@ class OpenCodeOneShotReasoner:
                 process user) spawns opencode in-process as the bot
                 user; the self-sudo-skip path is identical to the
                 no-os_user case. A non-bot username wraps the argv
-                in `sudo -H -u <user>` with the opencode preserve
+                in `sudo -H -D <workspace> -u <user>` with the opencode preserve
                 list.
         """
         self._cwd = cwd if cwd is not None else _EXTRACTOR_CWD
@@ -1707,7 +1726,12 @@ class OpenCodeOneShotReasoner:
         # preserve list.
         effective_user = resolve_claude_user(self._os_user)
         if effective_user is not None:
-            cmd = _wrap_cmd_for_user(cmd, effective_user, "opencode")
+            cmd = _wrap_cmd_for_user(
+                cmd,
+                effective_user,
+                "opencode",
+                working_directory=self._cwd,
+            )
 
         # Allow-listed env: only forward keys present in the parent
         # env. Defense-in-depth against a future regression that tries
@@ -1735,7 +1759,10 @@ class OpenCodeOneShotReasoner:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=str(self._cwd),
+                cwd=subprocess_spawn_cwd(
+                    self._cwd,
+                    target_user=effective_user,
+                ),
                 env=subprocess_env,
                 # New session on the wrap path so a future
                 # `_kill_target_user_tree` on this reasoner has a pgid
@@ -2328,7 +2355,7 @@ class GooseOneShotReasoner:
                 other reasoners: None (or a value resolve_claude_user
                 collapses to the current process user) spawns goose
                 in-process; a non-bot username wraps the argv in
-                `sudo -H -u <user>`.
+                `sudo -H -D <workspace> -u <user>`.
             provider: Kai provider key for the `--provider` flag
                 (translated to goose's wire name at argv build).
                 Empty omits the flag so goose falls back to its own
@@ -2380,7 +2407,12 @@ class GooseOneShotReasoner:
         # preserve list.
         effective_user = resolve_claude_user(self._os_user)
         if effective_user is not None:
-            cmd = _wrap_cmd_for_user(cmd, effective_user, "goose")
+            cmd = _wrap_cmd_for_user(
+                cmd,
+                effective_user,
+                "goose",
+                working_directory=self._cwd,
+            )
 
         # Allow-listed env: only forward keys present in the parent
         # env. PATH is allow-listed so sudo can resolve the bare
@@ -2398,7 +2430,10 @@ class GooseOneShotReasoner:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=str(self._cwd),
+            cwd=subprocess_spawn_cwd(
+                self._cwd,
+                target_user=effective_user,
+            ),
             env=subprocess_env,
             start_new_session=bool(effective_user),
         )
@@ -2624,6 +2659,7 @@ class PiOneShotReasoner:
                 cmd,
                 effective_user,
                 "pi",
+                working_directory=self._cwd,
                 preserve_vars=_pi_provider_env_vars(self._provider),
             )
         env_allowlist = (*_PI_ENV_BASE_ALLOWLIST, *_pi_provider_env_vars(self._provider))
@@ -2640,7 +2676,10 @@ class PiOneShotReasoner:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=str(self._cwd),
+                cwd=subprocess_spawn_cwd(
+                    self._cwd,
+                    target_user=effective_user,
+                ),
                 env=subprocess_env,
                 limit=PI_RPC_STREAM_LIMIT,
                 start_new_session=bool(effective_user),

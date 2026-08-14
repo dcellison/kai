@@ -42,6 +42,7 @@ from kai.backend import (
 )
 from kai.backend_registry import BackendRegistryError, backend_registry_is_authoritative, resolve_backend_command
 from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude_user
+from kai.subprocess_identity import subprocess_spawn_cwd, wrap_command_for_target_user
 
 log = logging.getLogger(__name__)
 
@@ -279,16 +280,19 @@ class ClaudeCodeBackend(AgentBackend):
             # subprocess env below when autocompact_pct > 0; without
             # preservation, env_reset strips it and the per-user
             # claude never sees the configured threshold.
-            cmd = [
-                "sudo",
-                "-H",
-                "-u",
-                effective_claude_user,
-                "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR,"
-                "CLAUDE_CONFIG_DIR,ANTHROPIC_API_KEY,ANTHROPIC_BASE_URL,"
-                "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
-                "--",
-            ] + claude_cmd
+            cmd = wrap_command_for_target_user(
+                claude_cmd,
+                target_user=effective_claude_user,
+                working_directory=self.workspace,
+                preserve_env=(
+                    "KAI_WEBHOOK_SECRET",
+                    "TMPDIR",
+                    "CLAUDE_CONFIG_DIR",
+                    "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_BASE_URL",
+                    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
+                ),
+            )
         else:
             cmd = claude_cmd
 
@@ -353,7 +357,10 @@ class ClaudeCodeBackend(AgentBackend):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=str(self.workspace),
+            cwd=subprocess_spawn_cwd(
+                self.workspace,
+                target_user=effective_claude_user,
+            ),
             env=env,
             # A single stream-json line can inline the full text of a
             # large tool result. The asyncio.StreamReader default

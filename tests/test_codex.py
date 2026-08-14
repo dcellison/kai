@@ -1880,7 +1880,7 @@ class TestCodexUserSudoWrap:
     Verify the per-user OAuth isolation lever.
 
     When codex_user is set to a non-self user, the subprocess argv is
-    wrapped in `sudo -H -u <user> --preserve-env=<csv> --`
+    wrapped in `sudo -H -D <workspace> -u <user> --preserve-env=<csv> --`
     so codex runs as <codex_user> and reads
     ~<codex_user>/.codex/auth.json. This is what makes a multi-user
     install (e.g., users.yaml has os_user=daniel for one chat and
@@ -1914,6 +1914,7 @@ class TestCodexUserSudoWrap:
         argv = mock_exec.call_args[0]
         assert argv[0] == "sudo"
         assert "-H" in argv
+        assert argv[argv.index("-D") + 1] == "/tmp/test-workspace"
         i = argv.index("-u")
         assert argv[i + 1] == "ci-fake-user"
         # Exact preserve CSV: the webhook secret and TMPDIR anchor,
@@ -1926,6 +1927,7 @@ class TestCodexUserSudoWrap:
         separator_i = argv.index("--")
         assert argv[separator_i + 1].endswith("/codex") or argv[separator_i + 1] == "codex"
         assert argv[separator_i + 2] == "app-server"
+        assert mock_exec.call_args.kwargs["cwd"] is None
 
     @pytest.mark.asyncio
     async def test_tmpdir_anchored_per_os_user_in_cross_user_mode(self):

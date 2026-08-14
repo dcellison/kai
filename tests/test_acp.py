@@ -1791,14 +1791,15 @@ class TestOsUserRouting:
             await b._ensure_started()
 
         argv = list(captured["argv"])
-        assert argv[:4] == ["sudo", "-H", "-u", "other-user"]
+        assert argv[:6] == ["sudo", "-H", "-D", "/tmp/test-workspace", "-u", "other-user"]
         # Preserve-env CSV exact contract: the AcpBackend default
         # (webhook callback auth + per-os-user temp anchor). Backends
         # that need more override preserved_env_vars(); see the
         # hook-driven test below.
-        assert argv[4] == "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR"
-        assert argv[5] == "--"
-        assert argv[6] == "fake_acp_binary"
+        assert argv[6] == "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR"
+        assert argv[7] == "--"
+        assert argv[8] == "fake_acp_binary"
+        assert captured["cwd"] is None
         assert captured["start_new_session"] is True
         # _make_mock_proc pins pid=12345; PGID == PID for session
         # leaders, recorded at spawn time.
@@ -1828,7 +1829,7 @@ class TestOsUserRouting:
         ):
             await b._ensure_started()
 
-        assert captured["argv"][4] == "--preserve-env=ALPHA,BETA"
+        assert captured["argv"][6] == "--preserve-env=ALPHA,BETA"
 
     @pytest.mark.asyncio
     async def test_tmpdir_anchored_per_os_user_on_wrap(self):

@@ -1314,12 +1314,12 @@ class TestPreservedEnvVars:
             await g._ensure_started()
 
         argv = list(captured["argv"])
-        assert argv[:4] == ["sudo", "-H", "-u", "goose-user"]
-        assert argv[4] == (
+        assert argv[:6] == ["sudo", "-H", "-D", "/tmp/test-workspace", "-u", "goose-user"]
+        assert argv[6] == (
             "--preserve-env=GOOSE_MODEL,GOOSE_PROVIDER,CONTEXT_FILE_NAMES,ANTHROPIC_API_KEY,"
             "OPENAI_API_KEY,GOOGLE_API_KEY,OPENROUTER_API_KEY,DEEPSEEK_API_KEY,"
             "ANTHROPIC_HOST,OPENAI_HOST,OPENAI_BASE_PATH,OLLAMA_HOST,"
             "KAI_WEBHOOK_SECRET,TMPDIR"
         )
-        assert argv[5] == "--"
-        assert argv[6:] == ["goose", "acp", "--with-builtin", "developer"]
+        assert argv[7] == "--"
+        assert argv[8:] == ["goose", "acp", "--with-builtin", "developer"]

@@ -874,11 +874,11 @@ class TestPreservedEnvVars:
             await b._ensure_started()
 
         argv = list(captured["argv"])
-        assert argv[:4] == ["sudo", "-H", "-u", "oc-user"]
-        assert argv[4] == (
+        assert argv[:6] == ["sudo", "-H", "-D", "/tmp/test-workspace", "-u", "oc-user"]
+        assert argv[6] == (
             "--preserve-env=OPENCODE_CONFIG_CONTENT,OPENCODE_DISABLE_CLAUDE_CODE_PROMPT,ANTHROPIC_API_KEY,"
             "OPENAI_API_KEY,GOOGLE_API_KEY,OPENROUTER_API_KEY,DEEPSEEK_API_KEY,"
             "KAI_WEBHOOK_SECRET,TMPDIR"
         )
-        assert argv[5] == "--"
-        assert argv[6:] == ["opencode", "acp"]
+        assert argv[7] == "--"
+        assert argv[8:] == ["opencode", "acp"]

@@ -35,6 +35,7 @@ from kai.pi_rpc import (
     pi_rpc_text_delta,
     require_pi_rpc_response,
 )
+from kai.subprocess_identity import subprocess_spawn_cwd, wrap_command_for_target_user
 
 log = logging.getLogger(__name__)
 
@@ -231,16 +232,12 @@ class PiBackend(AgentBackend):
         argv = self._build_argv()
         env = self._build_env(effective_os_user)
         if effective_os_user:
-            preserve = ",".join(("KAI_WEBHOOK_SECRET", "TMPDIR", *_pi_provider_env_vars(self.provider)))
-            argv = [
-                "sudo",
-                "-H",
-                "-u",
-                effective_os_user,
-                f"--preserve-env={preserve}",
-                "--",
-                *argv,
-            ]
+            argv = wrap_command_for_target_user(
+                argv,
+                target_user=effective_os_user,
+                working_directory=self.workspace,
+                preserve_env=("KAI_WEBHOOK_SECRET", "TMPDIR", *_pi_provider_env_vars(self.provider)),
+            )
 
         log.info(
             "Starting persistent Pi RPC process (model=%s, user=%s)",
@@ -252,7 +249,10 @@ class PiBackend(AgentBackend):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=str(self.workspace),
+            cwd=subprocess_spawn_cwd(
+                self.workspace,
+                target_user=effective_os_user,
+            ),
             env=env,
             limit=PI_RPC_STREAM_LIMIT,
             start_new_session=bool(effective_os_user),

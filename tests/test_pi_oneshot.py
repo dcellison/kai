@@ -199,11 +199,12 @@ async def test_pi_oneshot_cross_user_wrap_preserves_only_pi_auth(tmp_path, monke
     process = FakeProcess([state_response(), prompt_response(), completed_message("ok"), {"type": "agent_settled"}])
     _, spawn = await run_with_process(tmp_path, monkeypatch, process, os_user="daniel")
     argv = spawn.await_args_list[0].args
-    assert argv[:4] == ("sudo", "-H", "-u", "daniel")
-    assert "ANTHROPIC_API_KEY" in argv[4]
-    assert "OPENAI_API_KEY" not in argv[4]
-    assert "GEMINI_API_KEY" not in argv[4]
-    assert "KAI_WEBHOOK_SECRET" not in argv[4]
+    assert argv[:6] == ("sudo", "-H", "-D", str(tmp_path), "-u", "daniel")
+    assert "ANTHROPIC_API_KEY" in argv[6]
+    assert "OPENAI_API_KEY" not in argv[6]
+    assert "GEMINI_API_KEY" not in argv[6]
+    assert "KAI_WEBHOOK_SECRET" not in argv[6]
+    assert spawn.await_args_list[0].kwargs["cwd"] is None
     assert spawn.await_args_list[0].kwargs["start_new_session"] is True
 
 
@@ -237,9 +238,10 @@ async def test_pi_subscription_wrap_needs_no_environment_credentials(tmp_path, m
     )
 
     argv = spawn.await_args_list[0].args
-    assert argv[:4] == ("sudo", "-H", "-u", "daniel")
-    assert argv[4:6] == ("--", "/opt/homebrew/bin/pi")
+    assert argv[:6] == ("sudo", "-H", "-D", str(tmp_path), "-u", "daniel")
+    assert argv[6:8] == ("--", "/opt/homebrew/bin/pi")
     assert not any(str(part).startswith("--preserve-env=") for part in argv)
+    assert spawn.await_args_list[0].kwargs["cwd"] is None
 
 
 @pytest.mark.asyncio

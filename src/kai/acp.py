@@ -59,6 +59,7 @@ from kai.backend import (
     sanitize_agent_environment,
 )
 from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude_user
+from kai.subprocess_identity import subprocess_spawn_cwd, wrap_command_for_target_user
 
 log = logging.getLogger(__name__)
 
@@ -654,7 +655,8 @@ class AcpBackend(AgentBackend):
         # explicit value.
         memory_enabled: bool = False,
         # Optional OS user to run the ACP subprocess as, via
-        # `sudo -H -u <user>`. None = run as the bot's process user.
+        # `sudo -H -D <workspace> -u <user>`. None = run as the bot's
+        # process user.
         # Same per-user isolation contract as claude_user / codex_user
         # on the sibling backends; resolved through resolve_claude_user
         # at spawn time so a value naming the bot's own user collapses
@@ -942,7 +944,7 @@ class AcpBackend(AgentBackend):
         2. session/new - creates a session with backend-specific params
 
         When `os_user` resolves to a non-bot user, the argv is wrapped
-        in `sudo -H -u <target> --preserve-env=<csv> --` so the agent
+        in `sudo -H -D <workspace> -u <target> --preserve-env=<csv> --` so the agent
         runs as that user (per-user OS isolation, same contract as the
         claude and codex backends). `-H` rewrites HOME so the agent
         reads its config and auth state under the target user's home;
@@ -990,16 +992,12 @@ class AcpBackend(AgentBackend):
             # authorizes --preserve-env; the rule pins the absolute
             # agent binary path, so sudo's PATH resolution of the
             # argv head must land on the same file the rule names.
-            preserve = ",".join(self.preserved_env_vars())
-            argv = [
-                "sudo",
-                "-H",
-                "-u",
-                effective_os_user,
-                f"--preserve-env={preserve}",
-                "--",
-                *argv,
-            ]
+            argv = wrap_command_for_target_user(
+                argv,
+                target_user=effective_os_user,
+                working_directory=self.workspace,
+                preserve_env=self.preserved_env_vars(),
+            )
 
         log.info(
             "Starting persistent %s ACP process (model=%s, user=%s)",
@@ -1013,7 +1011,10 @@ class AcpBackend(AgentBackend):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=str(self.workspace),
+            cwd=subprocess_spawn_cwd(
+                self.workspace,
+                target_user=effective_os_user,
+            ),
             env=env,
             # A single ACP notification line can carry a large payload
             # (a tool result echoed into a chunk, a long final

@@ -417,7 +417,7 @@ class TestGenerateSudoers:
         """
         monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
         result = _generate_sudoers("kai", os_users=["alice"])
-        assert "kai ALL=(alice) SETENV: NOPASSWD: /home/kai/.local/bin/claude" in result
+        assert "kai ALL=(alice) CWD=* SETENV: NOPASSWD: /home/kai/.local/bin/claude" in result
 
     def test_claude_bin_ignores_caller_path(self, monkeypatch):
         """
@@ -456,7 +456,7 @@ class TestGenerateSudoers:
 
         result = _generate_sudoers("kai", os_users=["alice"])
 
-        assert "kai ALL=(alice) SETENV: NOPASSWD: /opt/homebrew/bin/claude" in result
+        assert "kai ALL=(alice) CWD=* SETENV: NOPASSWD: /opt/homebrew/bin/claude" in result
         assert "/Users/kai/.local/bin/claude" not in result
 
     def test_claude_bin_arg_overrides_default(self, monkeypatch):
@@ -465,7 +465,7 @@ class TestGenerateSudoers:
         the backend registry."""
         monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
         result = _generate_sudoers("kai", os_users=["alice"], claude_bin="/opt/homebrew/bin/claude")
-        assert "kai ALL=(alice) SETENV: NOPASSWD: /opt/homebrew/bin/claude" in result
+        assert "kai ALL=(alice) CWD=* SETENV: NOPASSWD: /opt/homebrew/bin/claude" in result
         assert "/home/kai/.local/bin/claude" not in result
 
     # -- Issue #341: per-user rules from users.yaml -----------------------
@@ -482,16 +482,16 @@ class TestGenerateSudoers:
         monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
         result = _generate_sudoers("kai", os_users=["sellison"])
         assert result.count("SETENV: NOPASSWD: /home/kai/.local/bin/claude") == 1
-        assert "kai ALL=(sellison) SETENV: NOPASSWD: /home/kai/.local/bin/claude" in result
+        assert "kai ALL=(sellison) CWD=* SETENV: NOPASSWD: /home/kai/.local/bin/claude" in result
 
     def test_multiple_os_users_emit_one_rule_each(self, monkeypatch):
         """Acceptance (c): multiple distinct os_users → one rule each."""
         monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
         result = _generate_sudoers("kai", os_users=["sellison", "bob", "carol"])
         bin_path = "/home/kai/.local/bin/claude"
-        assert f"kai ALL=(sellison) SETENV: NOPASSWD: {bin_path}" in result
-        assert f"kai ALL=(bob) SETENV: NOPASSWD: {bin_path}" in result
-        assert f"kai ALL=(carol) SETENV: NOPASSWD: {bin_path}" in result
+        assert f"kai ALL=(sellison) CWD=* SETENV: NOPASSWD: {bin_path}" in result
+        assert f"kai ALL=(bob) CWD=* SETENV: NOPASSWD: {bin_path}" in result
+        assert f"kai ALL=(carol) CWD=* SETENV: NOPASSWD: {bin_path}" in result
         assert result.count(f"SETENV: NOPASSWD: {bin_path}") == 3
 
     def test_duplicate_os_users_deduped(self, monkeypatch):
@@ -505,8 +505,8 @@ class TestGenerateSudoers:
         # without the kill-rule or codex-rule noise inflating the
         # count.
         claude_bin = "/home/kai/.local/bin/claude"
-        assert result.count(f"kai ALL=(sellison) SETENV: NOPASSWD: {claude_bin}") == 1
-        assert result.count(f"kai ALL=(bob) SETENV: NOPASSWD: {claude_bin}") == 1
+        assert result.count(f"kai ALL=(sellison) CWD=* SETENV: NOPASSWD: {claude_bin}") == 1
+        assert result.count(f"kai ALL=(bob) CWD=* SETENV: NOPASSWD: {claude_bin}") == 1
 
     def test_os_user_matching_service_user_skipped(self, monkeypatch):
         """Acceptance (d): os_user == service_user → no rule (self-sudo path)."""
@@ -516,7 +516,7 @@ class TestGenerateSudoers:
         # resolve_claude_user() short-circuits the sudo wrapper at runtime.
         assert "kai ALL=(kai)" not in result
         bin_path = "/home/kai/.local/bin/claude"
-        assert f"kai ALL=(sellison) SETENV: NOPASSWD: {bin_path}" in result
+        assert f"kai ALL=(sellison) CWD=* SETENV: NOPASSWD: {bin_path}" in result
         assert result.count(f"SETENV: NOPASSWD: {bin_path}") == 1
 
     # -- Codex per-target rule (per-user OAuth isolation) ----------------
@@ -539,8 +539,8 @@ class TestGenerateSudoers:
         # Each target gets exactly one codex SETENV rule. The binary
         # path is not pinned in the assertion (shutil.which is
         # environment-dependent); match on the rule prefix instead.
-        assert "kai ALL=(alice) SETENV: NOPASSWD: " in result
-        assert "kai ALL=(bob) SETENV: NOPASSWD: " in result
+        assert "kai ALL=(alice) CWD=* SETENV: NOPASSWD: " in result
+        assert "kai ALL=(bob) CWD=* SETENV: NOPASSWD: " in result
         # Specifically: a line referencing "codex" appears under each target.
         alice_lines = [line for line in result.splitlines() if "(alice)" in line and "codex" in line]
         bob_lines = [line for line in result.splitlines() if "(bob)" in line and "codex" in line]
@@ -554,8 +554,8 @@ class TestGenerateSudoers:
             pi_bin="/opt/homebrew/bin/pi",
         )
 
-        assert "kai ALL=(alice) SETENV: NOPASSWD: /opt/homebrew/bin/pi" in result
-        assert "kai ALL=(bob) SETENV: NOPASSWD: /opt/homebrew/bin/pi" in result
+        assert "kai ALL=(alice) CWD=* SETENV: NOPASSWD: /opt/homebrew/bin/pi" in result
+        assert "kai ALL=(bob) CWD=* SETENV: NOPASSWD: /opt/homebrew/bin/pi" in result
 
     # -- Issue #456: per-target kill rule for cross-user signal escalation ----
 
@@ -595,10 +595,33 @@ class TestGenerateSudoers:
         kill_lines = [line for line in rule_lines if "kill" in line]
         assert len(kill_lines) == 1
         assert "SETENV" not in kill_lines[0]
+        assert "CWD=*" not in kill_lines[0]
         # The claude rule still has SETENV (unchanged by #456).
         claude_lines = [line for line in rule_lines if "claude" in line]
         assert len(claude_lines) == 1
         assert "SETENV" in claude_lines[0]
+        assert "CWD=*" in claude_lines[0]
+
+    def test_cwd_permission_is_scoped_to_agent_commands(self, monkeypatch):
+        """Only arbitrary-code agent rules may enter protected workspaces."""
+        monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
+        result = _generate_sudoers(
+            "kai",
+            os_users=["alice"],
+            claude_bin="/agents/claude",
+            codex_bin="/agents/codex",
+            opencode_bin="/agents/opencode",
+            goose_bin="/agents/goose",
+            pi_bin="/agents/pi",
+        )
+        rule_lines = [line for line in result.splitlines() if line.startswith("kai ALL=")]
+        agent_lines = [line for line in rule_lines if line.startswith("kai ALL=(alice)") and "kill" not in line]
+        assert len(agent_lines) == 5
+        assert all("CWD=* SETENV: NOPASSWD:" in line for line in agent_lines)
+        assert "kai ALL=(alice) NOPASSWD: /bin/kill" in rule_lines
+        config_lines = [line for line in rule_lines if " /etc/kai/" in line]
+        assert config_lines
+        assert all("CWD=*" not in line for line in config_lines)
 
     def test_kill_rule_path_is_hardcoded(self, monkeypatch):
         """
@@ -8832,7 +8855,7 @@ class TestApplyBackendRegistry:
 
         for backend in ("claude", "codex", "opencode", "goose", "pi"):
             command = registry["backends"][backend]["command"]
-            assert f"kai ALL=(alice) SETENV: NOPASSWD: {command}" in sudoers
+            assert f"kai ALL=(alice) CWD=* SETENV: NOPASSWD: {command}" in sudoers
 
     def test_dry_run_prints_registry_write(self, capsys, monkeypatch):
         monkeypatch.setattr(
@@ -11443,7 +11466,7 @@ class TestGenerateSudoersCodexBinArg:
             os_users=["daniel"],
             codex_bin="/Users/daniel/.npm-global/bin/codex",
         )
-        assert "kai ALL=(daniel) SETENV: NOPASSWD: /Users/daniel/.npm-global/bin/codex" in out
+        assert "kai ALL=(daniel) CWD=* SETENV: NOPASSWD: /Users/daniel/.npm-global/bin/codex" in out
         assert "/opt/homebrew/bin/codex" not in out
 
     def test_codex_bin_arg_none_prefers_common_absolute_path(self, monkeypatch):
@@ -11455,7 +11478,7 @@ class TestGenerateSudoersCodexBinArg:
             os_users=["daniel"],
             codex_bin=None,
         )
-        assert "kai ALL=(daniel) SETENV: NOPASSWD: /usr/local/bin/codex" in out
+        assert "kai ALL=(daniel) CWD=* SETENV: NOPASSWD: /usr/local/bin/codex" in out
         assert "/opt/homebrew/bin/codex" not in out
 
     def test_codex_bin_does_not_read_os_environ(self, monkeypatch):
@@ -11486,10 +11509,10 @@ class TestGenerateSudoersBackendPathArgs:
             goose_bin="/pins/goose",
         )
 
-        assert "kai ALL=(daniel) SETENV: NOPASSWD: /pins/claude" in out
-        assert "kai ALL=(daniel) SETENV: NOPASSWD: /pins/codex" in out
-        assert "kai ALL=(daniel) SETENV: NOPASSWD: /pins/opencode" in out
-        assert "kai ALL=(daniel) SETENV: NOPASSWD: /pins/goose" in out
+        assert "kai ALL=(daniel) CWD=* SETENV: NOPASSWD: /pins/claude" in out
+        assert "kai ALL=(daniel) CWD=* SETENV: NOPASSWD: /pins/codex" in out
+        assert "kai ALL=(daniel) CWD=* SETENV: NOPASSWD: /pins/opencode" in out
+        assert "kai ALL=(daniel) CWD=* SETENV: NOPASSWD: /pins/goose" in out
 
     def test_backend_path_args_do_not_read_os_environ(self, monkeypatch):
         monkeypatch.setenv("CLAUDE_BIN", "/env/claude")

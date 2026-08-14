@@ -68,6 +68,7 @@ from kai.backend import (
 )
 from kai.backend_registry import BackendRegistryError, backend_registry_is_authoritative, resolve_backend_command
 from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude_user
+from kai.subprocess_identity import subprocess_spawn_cwd, wrap_command_for_target_user
 
 log = logging.getLogger(__name__)
 
@@ -267,7 +268,8 @@ class CodexBackend(AgentBackend):
         services_info: list[dict] | None = None,
         workspace_config: WorkspaceConfig | None = None,
         provider: str = "openai",
-        # Optional OS user to run codex as via `sudo -H -u <user>`. When
+        # Optional OS user to run codex as via
+        # `sudo -H -D <workspace> -u <user>`. When
         # set, the codex subprocess runs as <codex_user> and reads its
         # auth token from ~<codex_user>/.codex/auth.json, NOT the kai
         # service user's home. This is the multi-user OAuth-isolation
@@ -489,14 +491,18 @@ class CodexBackend(AgentBackend):
             # CODEX_PROVIDER are deliberately NOT preserved: the
             # authoritative model selection rides the per-turn
             # protocol params, so the env mirrors are informational.
-            argv: list[str] = [
-                "sudo",
-                "-H",
-                "-u",
-                effective_codex_user,
-                "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR,CODEX_HOME,OPENAI_API_KEY,OPENAI_BASE_URL",
-                "--",
-            ] + codex_argv
+            argv = wrap_command_for_target_user(
+                codex_argv,
+                target_user=effective_codex_user,
+                working_directory=self.workspace,
+                preserve_env=(
+                    "KAI_WEBHOOK_SECRET",
+                    "TMPDIR",
+                    "CODEX_HOME",
+                    "OPENAI_API_KEY",
+                    "OPENAI_BASE_URL",
+                ),
+            )
         else:
             argv = codex_argv
 
@@ -512,7 +518,10 @@ class CodexBackend(AgentBackend):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=str(self.workspace),
+            cwd=subprocess_spawn_cwd(
+                self.workspace,
+                target_user=effective_codex_user,
+            ),
             env=env,
             # Cross-user mode: new session group so the sudo wrapper
             # is the session leader (PGID == PID). os.killpg later

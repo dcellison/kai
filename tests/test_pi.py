@@ -169,10 +169,11 @@ class TestPiStartup:
         await backend._ensure_started()
 
         argv = spawn.await_args.args
-        assert argv[:4] == ("sudo", "-H", "-u", "daniel")
-        assert argv[4].startswith("--preserve-env=")
-        assert "ANTHROPIC_API_KEY" in argv[4]
-        assert argv[5:7] == ("--", "/opt/homebrew/bin/pi")
+        assert argv[:6] == ("sudo", "-H", "-D", str(tmp_path), "-u", "daniel")
+        assert argv[6].startswith("--preserve-env=")
+        assert "ANTHROPIC_API_KEY" in argv[6]
+        assert argv[7:9] == ("--", "/opt/homebrew/bin/pi")
+        assert spawn.await_args.kwargs["cwd"] is None
         assert backend.session_id == "session-1"
         assert backend._supports_image_input is True
         assert transport.sent == [{"id": "kai-get_state-1", "type": "get_state"}]

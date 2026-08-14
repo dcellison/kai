@@ -144,7 +144,7 @@ class TestCommandConstruction:
 
     @pytest.mark.asyncio
     async def test_cmd_with_claude_user(self):
-        """With claude_user set, command is prefixed with 'sudo -H -u <user> --'."""
+        """With claude_user set, sudo enters the workspace as that user."""
         claude = _make_claude(claude_user="daniel")
 
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
@@ -158,16 +158,21 @@ class TestCommandConstruction:
 
             args = mock_exec.call_args
             cmd = args[0]
-            assert cmd[0] == "sudo"
-            assert cmd[1] == "-H"
-            assert cmd[2] == "-u"
-            assert cmd[3] == "daniel"
+            assert cmd[:6] == (
+                "sudo",
+                "-H",
+                "-D",
+                "/tmp/test-workspace",
+                "-u",
+                "daniel",
+            )
             assert (
-                cmd[4]
+                cmd[6]
                 == "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR,CLAUDE_CONFIG_DIR,ANTHROPIC_API_KEY,ANTHROPIC_BASE_URL,CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
             )
-            assert cmd[5] == "--"
-            assert cmd[6] == "claude"
+            assert cmd[7] == "--"
+            assert cmd[8] == "claude"
+            assert args.kwargs["cwd"] is None
 
     @pytest.mark.asyncio
     async def test_start_new_session_true_with_claude_user(self):
@@ -239,15 +244,20 @@ class TestCommandConstruction:
 
             args = mock_exec.call_args
             cmd = args[0]
-            assert cmd[0] == "sudo"
-            assert cmd[1] == "-H"
-            assert cmd[2] == "-u"
-            assert cmd[3] == "some_other_user"
+            assert cmd[:6] == (
+                "sudo",
+                "-H",
+                "-D",
+                "/tmp/test-workspace",
+                "-u",
+                "some_other_user",
+            )
             assert (
-                cmd[4]
+                cmd[6]
                 == "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR,CLAUDE_CONFIG_DIR,ANTHROPIC_API_KEY,ANTHROPIC_BASE_URL,CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
             )
-            assert cmd[5] == "--"
+            assert cmd[7] == "--"
+            assert args.kwargs["cwd"] is None
             assert args[1].get("start_new_session") is True
 
     @pytest.mark.asyncio
@@ -274,7 +284,8 @@ class TestCommandConstruction:
             # Should still wrap with sudo since we can't determine the user.
             assert cmd[0] == "sudo"
             assert cmd[1] == "-H"
-            assert cmd[3] == "container_user"
+            assert cmd[2:6] == ("-D", "/tmp/test-workspace", "-u", "container_user")
+            assert args.kwargs["cwd"] is None
             assert args[1].get("start_new_session") is True
 
     @pytest.mark.asyncio

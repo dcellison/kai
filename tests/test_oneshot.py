@@ -1469,15 +1469,13 @@ class TestRoutingArgvAndPreserveEnv:
         ):
             await reasoner.run(prompt="p", purpose="fact_extraction")
         cmd = mock_exec.call_args[0]
-        assert cmd[0] == "sudo"
-        assert cmd[1] == "-H"
-        assert cmd[2] == "-u"
-        assert cmd[3] == "other-user"
+        assert cmd[:6] == ("sudo", "-H", "-D", str(tmp_path), "-u", "other-user")
         # Preserve-env CSV exact contract: Claude auth vars only;
         # no HOME (covered by -H), no PATH (covered by allow-list).
-        assert cmd[4] == "--preserve-env=CLAUDE_CONFIG_DIR,ANTHROPIC_API_KEY,ANTHROPIC_BASE_URL"
-        assert cmd[5] == "--"
-        assert cmd[6] == "claude"
+        assert cmd[6] == "--preserve-env=CLAUDE_CONFIG_DIR,ANTHROPIC_API_KEY,ANTHROPIC_BASE_URL"
+        assert cmd[7] == "--"
+        assert cmd[8] == "claude"
+        assert mock_exec.call_args.kwargs["cwd"] is None
         assert mock_exec.call_args.kwargs["start_new_session"] is True
 
     @pytest.mark.asyncio
@@ -1513,16 +1511,17 @@ class TestRoutingArgvAndPreserveEnv:
         ):
             await reasoner.run(prompt="p", purpose="fact_extraction", json_schema={"type": "object"})
         cmd = mock_exec.call_args[0]
-        assert cmd[:4] == ("sudo", "-H", "-u", "other-user") or list(cmd[:4]) == ["sudo", "-H", "-u", "other-user"]
-        assert cmd[4] == "--preserve-env=CODEX_HOME,OPENAI_API_KEY,OPENAI_BASE_URL"
-        assert cmd[5] == "--"
+        assert cmd[:6] == ("sudo", "-H", "-D", str(tmp_path), "-u", "other-user")
+        assert cmd[6] == "--preserve-env=CODEX_HOME,OPENAI_API_KEY,OPENAI_BASE_URL"
+        assert cmd[7] == "--"
         # PATH and bare HOME deliberately not in the preserve list
         # (CODEX_HOME is intentional; the substring check splits on
         # the CSV so a future regression that adds bare HOME still
         # fails this assertion).
-        preserved = cmd[4].split("=", 1)[1].split(",")
+        preserved = cmd[6].split("=", 1)[1].split(",")
         assert "PATH" not in preserved
         assert "HOME" not in preserved
+        assert mock_exec.call_args.kwargs["cwd"] is None
         assert mock_exec.call_args.kwargs["start_new_session"] is True
 
 
@@ -3029,21 +3028,19 @@ class TestOpenCodeOneShotReasonerSudoWrap:
             await reasoner.run(prompt="hi", purpose="fact_extraction")
 
         cmd = mock_exec.call_args_list[0][0]
-        assert cmd[0] == "sudo"
-        assert cmd[1] == "-H"
-        assert cmd[2] == "-u"
-        assert cmd[3] == "some_other_user"
-        # preserve-env is the fifth element; the value carries every
+        assert cmd[:6] == ("sudo", "-H", "-D", str(tmp_path), "-u", "some_other_user")
+        # preserve-env follows the sudo identity options; the value carries every
         # _OPENCODE_PRESERVED_AUTH_VARS entry in a comma-separated CSV.
-        assert cmd[4].startswith("--preserve-env=")
-        csv = cmd[4][len("--preserve-env=") :]
+        assert cmd[6].startswith("--preserve-env=")
+        csv = cmd[6][len("--preserve-env=") :]
         preserved = set(csv.split(","))
         assert preserved == set(_OPENCODE_PRESERVED_AUTH_VARS)
         # `--` ends the sudo options; the wrapped argv (opencode acp)
         # follows.
-        assert cmd[5] == "--"
-        assert cmd[6] == "opencode"
-        assert cmd[7] == "acp"
+        assert cmd[7] == "--"
+        assert cmd[8] == "opencode"
+        assert cmd[9] == "acp"
+        assert mock_exec.call_args.kwargs["cwd"] is None
 
     @pytest.mark.asyncio
     async def test_sudo_wrap_uses_start_new_session_true(self, tmp_path):
@@ -3369,11 +3366,12 @@ class TestGooseRouting:
         ):
             await reasoner.run(prompt="p", purpose="fact_extraction", json_schema={"type": "object"})
         cmd = list(mock_exec.call_args[0])
-        assert cmd[:4] == ["sudo", "-H", "-u", "other-user"]
-        assert cmd[4] == (
+        assert cmd[:6] == ["sudo", "-H", "-D", str(tmp_path), "-u", "other-user"]
+        assert cmd[6] == (
             "--preserve-env=ANTHROPIC_API_KEY,OPENAI_API_KEY,GOOGLE_API_KEY,OPENROUTER_API_KEY,DEEPSEEK_API_KEY,"
             "ANTHROPIC_HOST,OPENAI_HOST,OPENAI_BASE_PATH,OLLAMA_HOST"
         )
-        assert cmd[5] == "--"
-        assert cmd[6] == "goose"
+        assert cmd[7] == "--"
+        assert cmd[8] == "goose"
+        assert mock_exec.call_args.kwargs["cwd"] is None
         assert mock_exec.call_args.kwargs["start_new_session"] is True
