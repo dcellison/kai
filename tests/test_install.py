@@ -10,6 +10,7 @@ import sqlite3
 import stat
 import subprocess
 import time
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -86,8 +87,12 @@ from kai.install import (
     _webhook_secret_migration_status,
     cli,
 )
-from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
-from kai.workshop.domain import RuntimeProfileId
+from kai.workshop.bootstrap import (
+    BootstrapHuman,
+    bootstrap_default_workshop,
+    bootstrap_human_principal_id,
+)
+from kai.workshop.domain import RuntimeProfileId, WorkshopId
 from kai.workshop.runtime_profiles import ProtectedRuntimeProfile, WorkshopRuntimeProfileRegistry
 from kai.workshop.store import WorkshopEventStore
 from tests.workshop_profiles import profile_id
@@ -12250,13 +12255,93 @@ class TestProtectedRuntimeStorageProvisioning:
                 users_yaml,
             )
 
+    @pytest.mark.asyncio
+    async def test_new_compatibility_user_uses_future_bootstrap_principal(self, tmp_path):
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        users_yaml = tmp_path / "users.yaml"
+        profile = self._profile("codex")
+        users_yaml.write_text(
+            f"users:\n  - telegram_id: {profile.runtime_config_id}\n    name: New Telegram human\n    role: member\n"
+        )
+        store = await WorkshopEventStore.open(data_path / "kai.db")
+        await bootstrap_default_workshop(
+            store,
+            (BootstrapHuman("Existing", "admin", "telegram", "1", "1", None),),
+        )
+        async with store.connection.execute("SELECT id FROM workshops") as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        workshop_id = WorkshopId(str(row[0]))
+        await store.close()
+
+        targets = _runtime_storage_targets(
+            data_path,
+            WorkshopRuntimeProfileRegistry((profile,)),
+            users_yaml,
+        )
+
+        assert targets[0].storage_name == str(
+            bootstrap_human_principal_id(
+                workshop_id,
+                "telegram",
+                str(profile.runtime_config_id),
+            )
+        )
+        assert targets[0].storage_name != str(profile.runtime_config_id)
+
+    def test_profiles_cannot_share_one_canonical_storage_owner(self, tmp_path, monkeypatch):
+        first = self._profile("codex")
+        second = replace(
+            first,
+            profile_id=RuntimeProfileId("rtp_" + "e" * 32),
+            runtime_config_id=123456789,
+        )
+        shared_principal = "prn_" + "a" * 32
+        monkeypatch.setattr(
+            "kai.install._runtime_profile_principal_names",
+            lambda _data_path: (
+                True,
+                None,
+                {
+                    str(first.profile_id): shared_principal,
+                    str(second.profile_id): shared_principal,
+                },
+            ),
+        )
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users: []\n")
+
+        with pytest.raises(RuntimeError, match="same canonical human storage owner"):
+            _runtime_storage_targets(
+                tmp_path / "data",
+                WorkshopRuntimeProfileRegistry((first, second)),
+                users_yaml,
+            )
+
+    def test_symlinked_database_never_uses_uninitialized_fallback(self, tmp_path):
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        real_db = tmp_path / "real.db"
+        real_db.touch()
+        (data_path / "kai.db").symlink_to(real_db)
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users: []\n")
+
+        with pytest.raises(RuntimeError, match="Refusing symlinked database"):
+            _runtime_storage_targets(
+                data_path,
+                WorkshopRuntimeProfileRegistry((self._profile("codex"),)),
+                users_yaml,
+            )
+
     def test_profile_only_missing_os_account_fails_before_provisioning(self, tmp_path, monkeypatch):
         users_yaml = tmp_path / "users.yaml"
         users_yaml.write_text("users: []\n")
         profile = self._profile("codex", os_user="missing-user")
         monkeypatch.setattr(
             "kai.install._runtime_profile_principal_names",
-            lambda _data_path: (True, {str(profile.profile_id): "prn_" + "a" * 32}),
+            lambda _data_path: (True, None, {str(profile.profile_id): "prn_" + "a" * 32}),
         )
         monkeypatch.setattr(
             "kai.install.pwd.getpwnam",
@@ -12278,7 +12363,7 @@ class TestProtectedRuntimeStorageProvisioning:
         profile = self._profile("codex")
         monkeypatch.setattr(
             "kai.install._runtime_profile_principal_names",
-            lambda _data_path: (True, {str(profile.profile_id): "prn_" + "a" * 32}),
+            lambda _data_path: (True, None, {str(profile.profile_id): "prn_" + "a" * 32}),
         )
         monkeypatch.setattr(
             "kai.install._canonical_principal_storage_names",
@@ -12412,6 +12497,23 @@ class TestProtectedRuntimeStorageProvisioning:
         assert status == ("Workshop runtime storage: complete; profiles=1, managed=1, operator-managed=0, incomplete=0")
         assert str(profile.profile_id) not in status
         assert str(profile.runtime_config_id) not in status
+
+        (home / "AGENTS.md").chmod(0o644)
+        incomplete_status = _runtime_storage_status(
+            data_path,
+            service_user,
+            policy,
+            backends,
+            users_yaml,
+        )
+
+        assert incomplete_status == (
+            "Workshop runtime storage: INCOMPLETE; profiles=1, managed=1, "
+            "operator-managed=0, incomplete=1; issues: home=0, identity=1, "
+            "memory=0, preferences=0, temp=0"
+        )
+        assert str(profile.profile_id) not in incomplete_status
+        assert str(profile.runtime_config_id) not in incomplete_status
 
     def test_profile_only_os_user_is_included_in_sudoers(self, tmp_path, monkeypatch):
         profile = self._profile("codex", os_user="browser-user")

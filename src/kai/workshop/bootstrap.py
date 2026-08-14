@@ -92,6 +92,16 @@ def _stable_token(*parts: str) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def bootstrap_human_principal_id(
+    workshop_id: WorkshopId,
+    transport: str,
+    external_subject: str,
+) -> PrincipalId:
+    """Derive the principal ID bootstrap will assign one external human."""
+    token = _stable_token(transport, external_subject)
+    return PrincipalId.derived(workshop_id, f"human:{token}")
+
+
 def _idempotency_key(kind: str, stable_token: str) -> str:
     return f"{_BOOTSTRAP_PREFIX}:{kind}:{stable_token}"
 
@@ -222,7 +232,11 @@ async def bootstrap_default_workshop(
     for human in ordered_humans:
         token = _stable_token(human.transport, human.external_subject)
         channel_token = _stable_token(human.transport, human.external_channel_id)
-        principal_id = PrincipalId.derived(workshop_id, f"human:{token}")
+        principal_id = bootstrap_human_principal_id(
+            workshop_id,
+            human.transport,
+            human.external_subject,
+        )
         external_identity_id = ExternalIdentityId.derived(workshop_id, f"external-identity:{token}")
         membership_id = WorkshopMembershipId.derived(workshop_id, f"membership:human:{token}")
         channel_id = ChannelId.derived(workshop_id, f"direct-channel:{channel_token}")
@@ -370,7 +384,11 @@ async def bootstrap_default_workshop(
         )
         for subject in sorted(notification.member_external_subjects):
             human_token = _stable_token(notification.transport, subject)
-            principal_id = PrincipalId.derived(workshop_id, f"human:{human_token}")
+            principal_id = bootstrap_human_principal_id(
+                workshop_id,
+                notification.transport,
+                subject,
+            )
             membership_id = ChannelMembershipId.derived(
                 workshop_id,
                 f"notification-channel-membership:{channel_token}:human:{human_token}",

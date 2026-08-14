@@ -71,11 +71,13 @@ from kai.config import (
 from kai.named_access import replace_named_read_access
 from kai.protected_config import ProtectedConfigError, validate_protected_file_metadata
 from kai.user_isolation import validate_protected_user_isolation
+from kai.workshop.bootstrap import bootstrap_human_principal_id
 from kai.workshop.diagnostics import (
     workshop_bootstrap_status,
     workshop_delivery_authority_status,
     workshop_message_parity_status,
 )
+from kai.workshop.domain import WorkshopId
 from kai.workshop.runtime_profiles import (
     WorkshopRuntimeProfileError,
     WorkshopRuntimeProfileRegistry,
@@ -4306,15 +4308,19 @@ class _RuntimeStorageTarget:
     home_workspace: Path | None
 
 
-def _runtime_profile_principal_names(data_path: Path) -> tuple[bool, dict[str, str]]:
+def _runtime_profile_principal_names(
+    data_path: Path,
+) -> tuple[bool, WorkshopId | None, dict[str, str]]:
     """Resolve protected runtime profiles to canonical direct-channel owners.
 
     The boolean distinguishes a database that predates Workshop assignments
     from an initialized database whose missing mappings must fail closed.
     """
     db_path = data_path / "kai.db"
-    if db_path.is_symlink() or not db_path.is_file():
-        return False, {}
+    if db_path.is_symlink():
+        raise RuntimeError(f"Refusing symlinked database during protected runtime storage preflight: {db_path}")
+    if not db_path.is_file():
+        return False, None, {}
     try:
         connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
         try:
@@ -4327,9 +4333,17 @@ def _runtime_profile_principal_names(data_path: Path) -> tuple[bool, dict[str, s
                 "channels",
                 "channel_memberships",
                 "principals",
+                "workshops",
             }
             if not tables >= required:
-                return False, {}
+                return False, None, {}
+            workshop_rows = connection.execute("SELECT id FROM workshops ORDER BY id").fetchall()
+            if len(workshop_rows) != 1:
+                raise RuntimeError("Initialized Workshop storage must contain exactly one Workshop")
+            try:
+                workshop_id = WorkshopId(str(workshop_rows[0][0]))
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("Initialized Workshop storage contains an invalid Workshop ID") from exc
             rows = connection.execute(
                 "SELECT ra.runtime_profile_id, cm.principal_id "
                 "FROM channel_agent_runtime_assignments ra "
@@ -4349,7 +4363,7 @@ def _runtime_profile_principal_names(data_path: Path) -> tuple[bool, dict[str, s
     ambiguous = sorted(profile_id for profile_id, principal_ids in owners.items() if len(principal_ids) != 1)
     if ambiguous:
         raise RuntimeError("Protected runtime storage ownership is ambiguous for profile(s): " + ", ".join(ambiguous))
-    return True, {profile_id: next(iter(principal_ids)) for profile_id, principal_ids in owners.items()}
+    return True, workshop_id, {profile_id: next(iter(principal_ids)) for profile_id, principal_ids in owners.items()}
 
 
 def _runtime_storage_targets(
@@ -4360,7 +4374,7 @@ def _runtime_storage_targets(
     """Build profile-authoritative provisioning targets before disk mutation."""
     compatibility_order = [chat_id for chat_id, _os_user in _collect_user_memory_owners(users_yaml_path)]
     compatibility_ids = set(compatibility_order)
-    assignments_initialized, principal_names = _runtime_profile_principal_names(data_path)
+    assignments_initialized, workshop_id, principal_names = _runtime_profile_principal_names(data_path)
     compatibility_principal_names = _canonical_principal_storage_names(data_path)
     by_config_id = {profile.runtime_config_id: profile for profile in runtime_profiles.profiles}
     policy_profile_ids = {str(profile.profile_id) for profile in runtime_profiles.profiles}
@@ -4387,14 +4401,27 @@ def _runtime_storage_targets(
                 f"Protected runtime profile {profile.profile_id} conflicts with its canonical compatibility owner"
             )
         if principal_name is None:
-            if assignments_initialized or runtime_config_id not in compatibility_ids:
+            if runtime_config_id not in compatibility_ids:
                 raise RuntimeError(
                     f"Protected runtime profile {profile.profile_id} must map to exactly one canonical human owner"
                 )
-            # A first installation has no Workshop projection yet. Migrated
-            # compatibility users keep their pre-bootstrap numeric slot until
-            # the next install can resolve the canonical principal.
-            principal_name = str(runtime_config_id)
+            if compatibility_principal is not None:
+                principal_name = compatibility_principal
+            elif assignments_initialized:
+                assert workshop_id is not None
+                principal_name = str(
+                    bootstrap_human_principal_id(
+                        workshop_id,
+                        "telegram",
+                        str(runtime_config_id),
+                    )
+                )
+            else:
+                # A first installation has no Workshop namespace from which
+                # to derive the future principal. The initial service start
+                # bootstraps it, and the next install migrates this empty
+                # compatibility slot to the canonical directory.
+                principal_name = str(runtime_config_id)
         if profile.os_user is not None:
             try:
                 pwd.getpwnam(profile.os_user)
@@ -4413,6 +4440,15 @@ def _runtime_storage_targets(
                 home_workspace=profile.home_workspace,
             )
         )
+    storage_owners: dict[str, str] = {}
+    for target in targets:
+        prior_profile = storage_owners.get(target.storage_name)
+        if prior_profile is not None:
+            raise RuntimeError(
+                "Protected runtime profiles resolve to the same canonical human storage owner: "
+                f"{prior_profile}, {target.profile_id}"
+            )
+        storage_owners[target.storage_name] = target.profile_id
     return tuple(targets)
 
 
@@ -7907,34 +7943,55 @@ def _runtime_storage_status(
     managed = 0
     operator_managed = 0
     incomplete = 0
+    issues = {"home": 0, "identity": 0, "memory": 0, "preferences": 0, "temp": 0}
     resolved_data_path = data_path.resolve()
+
+    def owned_private_directory(path: Path, owner: tuple[int, int]) -> bool:
+        try:
+            path_stat = path.stat()
+        except OSError:
+            return False
+        return (
+            path.is_dir()
+            and stat.S_IMODE(path_stat.st_mode) == _PRIVATE_USER_DIR_MODE
+            and (path_stat.st_uid, path_stat.st_gid) == owner
+        )
+
+    def owned_private_file(path: Path, owner: tuple[int, int]) -> bool:
+        try:
+            path_stat = path.stat()
+        except OSError:
+            return False
+        return (
+            path.is_file()
+            and stat.S_IMODE(path_stat.st_mode) == _PRIVATE_USER_FILE_MODE
+            and (path_stat.st_uid, path_stat.st_gid) == owner
+        )
+
     for target in targets:
         try:
             expected_entry = pwd.getpwnam(target.os_user) if target.os_user is not None else service_entry
             expected_owner = (expected_entry.pw_uid, expected_entry.pw_gid)
-            memory_dir = data_path / "memory" / target.storage_name
-            preferences_dir = data_path / "preferences" / target.storage_name
-            supporting_complete = all(
-                path.is_dir()
-                and stat.S_IMODE(path.stat().st_mode) == _PRIVATE_USER_DIR_MODE
-                and (path.stat().st_uid, path.stat().st_gid) == expected_owner
-                for path in (memory_dir, preferences_dir)
-            )
-            supporting_complete = (
-                supporting_complete
-                and (memory_dir / "MEMORY.md").is_file()
-                and (preferences_dir / "PREFERENCES.md").is_file()
-            )
-            if target.os_user is not None:
-                tmp_dir = data_path / "tmp" / target.os_user
-                supporting_complete = (
-                    supporting_complete
-                    and tmp_dir.is_dir()
-                    and stat.S_IMODE(tmp_dir.stat().st_mode) == _PRIVATE_USER_DIR_MODE
-                    and (tmp_dir.stat().st_uid, tmp_dir.stat().st_gid) == expected_owner
-                )
-        except (KeyError, OSError):
-            supporting_complete = False
+        except KeyError:
+            expected_owner = (-1, -1)
+
+        memory_dir = data_path / "memory" / target.storage_name
+        preferences_dir = data_path / "preferences" / target.storage_name
+        memory_complete = owned_private_directory(memory_dir, expected_owner) and owned_private_file(
+            memory_dir / "MEMORY.md",
+            expected_owner,
+        )
+        preferences_complete = owned_private_directory(
+            preferences_dir,
+            expected_owner,
+        ) and owned_private_file(
+            preferences_dir / "PREFERENCES.md",
+            expected_owner,
+        )
+        temp_complete = target.os_user is None or owned_private_directory(
+            data_path / "tmp" / target.os_user,
+            expected_owner,
+        )
 
         if target.home_workspace is None:
             home = data_path / "home" / target.storage_name
@@ -7944,39 +8001,47 @@ def _runtime_storage_status(
             installer_managed = home.is_relative_to(resolved_data_path)
         if not installer_managed:
             operator_managed += 1
-            if not home.is_dir() or not supporting_complete:
-                incomplete += 1
-            continue
-
-        managed += 1
-        try:
-            home_stat = home.stat()
+            home_complete = home.is_dir()
+            identity_complete = True
+        else:
+            managed += 1
+            home_complete = owned_private_directory(home, expected_owner)
             agents_path = home / "AGENTS.md"
             claude_path = home / ".claude" / "CLAUDE.md"
-            complete = (
-                supporting_complete
-                and home.is_dir()
-                and stat.S_IMODE(home_stat.st_mode) == _PRIVATE_USER_DIR_MODE
-                and (home_stat.st_uid, home_stat.st_gid) == expected_owner
-                and agents_path.is_file()
-                and stat.S_IMODE(agents_path.stat().st_mode) == _PRIVATE_USER_FILE_MODE
-                and (agents_path.stat().st_uid, agents_path.stat().st_gid) == expected_owner
-            )
+            identity_complete = owned_private_file(agents_path, expected_owner)
             if target.backend == "claude":
-                complete = complete and claude_path.is_file() and claude_path.read_text() == _CLAUDE_IDENTITY_ADAPTER
+                try:
+                    identity_complete = (
+                        identity_complete
+                        and owned_private_file(claude_path, expected_owner)
+                        and claude_path.read_text() == _CLAUDE_IDENTITY_ADAPTER
+                    )
+                except OSError:
+                    identity_complete = False
             else:
-                complete = complete and not claude_path.exists()
-        except (KeyError, OSError):
+                identity_complete = identity_complete and not claude_path.exists()
+
+        checks = {
+            "home": home_complete,
+            "identity": identity_complete,
+            "memory": memory_complete,
+            "preferences": preferences_complete,
+            "temp": temp_complete,
+        }
+        if not all(checks.values()):
             incomplete += 1
-            continue
-        if not complete:
-            incomplete += 1
+            for category, complete in checks.items():
+                issues[category] += int(not complete)
 
     state = "complete" if incomplete == 0 else "INCOMPLETE"
-    return (
+    result = (
         f"{prefix} {state}; profiles={len(targets)}, managed={managed}, "
         f"operator-managed={operator_managed}, incomplete={incomplete}"
     )
+    if incomplete:
+        issue_summary = ", ".join(f"{category}={count}" for category, count in issues.items())
+        result += f"; issues: {issue_summary}"
+    return result
 
 
 def _webhook_secret_migration_status(env: dict[str, str], *, source: str = "install.conf artifact") -> str:
