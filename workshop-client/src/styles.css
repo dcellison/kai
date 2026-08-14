@@ -169,8 +169,7 @@ button:disabled {
   font-size: 1.05rem;
 }
 
-.preview-badge,
-.read-only-chip {
+.preview-badge {
   border: 1px solid rgba(86, 182, 194, 0.35);
   border-radius: 999px;
   color: var(--atom-cyan);
@@ -462,11 +461,6 @@ button:disabled {
   outline: none;
 }
 
-.read-only-chip {
-  flex: none;
-  padding: 0.24rem 0.42rem;
-}
-
 .channel-sidebar nav {
   min-height: 0;
   overflow-y: auto;
@@ -586,7 +580,6 @@ button:disabled {
 }
 
 .channel-sidebar.collapsed .sidebar-title,
-.channel-sidebar.collapsed .read-only-chip,
 .channel-sidebar.collapsed .nav-heading,
 .channel-sidebar.collapsed .channel-link > span:nth-child(2),
 .channel-sidebar.collapsed .channel-link .live-pip,

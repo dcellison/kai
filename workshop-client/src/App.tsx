@@ -581,6 +581,16 @@ function channelSymbol(channel: WorkshopChannelSummary): string {
   return "#";
 }
 
+function workshopRoleLabel(role: string): string {
+  if (role === "admin") {
+    return "Workshop administrator";
+  }
+  if (role === "member") {
+    return "Workshop member";
+  }
+  return `Workshop ${role}`;
+}
+
 function WorkshopView({
   channel,
   connection,
@@ -631,6 +641,7 @@ function WorkshopView({
   const latestMessagePositionRef = useRef(0);
   const latestRunActivityRef = useRef<WorkshopRunActivity | null>(runActivity);
   const humanName = navigation.principal.displayName || "You";
+  const humanRole = workshopRoleLabel(workshop.role);
 
   useEffect(() => {
     storeSidebarLayout(sidebarLayout);
@@ -917,11 +928,9 @@ function WorkshopView({
       >
         <header className="sidebar-header">
           <div className="sidebar-title">
-            <p className="overline">Kai Workshop</p>
-            <h1>{workshop.name}</h1>
+            <h1>Kai Workshop</h1>
           </div>
           <div className="sidebar-header-actions">
-            <span className="read-only-chip">{workshop.role}</span>
             <button
               className="sidebar-toggle"
               type="button"
@@ -1032,13 +1041,13 @@ function WorkshopView({
           )}
         </nav>
 
-        <footer className="sidebar-footer" title={humanName}>
+        <footer className="sidebar-footer" title={`${humanName} — ${humanRole}`}>
           <span className="mini-avatar human">
             {humanName.slice(0, 1).toUpperCase()}
           </span>
           <span>
             <strong>{humanName}</strong>
-            <small>Human collaborator</small>
+            <small>{humanRole}</small>
           </span>
         </footer>
 

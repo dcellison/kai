@@ -174,7 +174,15 @@ describe("Workshop React client", () => {
 
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
     expect(screen.queryByLabelText("Workshop switcher")).toBeNull();
-    expect(screen.getByLabelText("Workshop navigation")).toBeVisible();
+    const navigationPanel = screen.getByLabelText("Workshop navigation");
+    expect(navigationPanel).toBeVisible();
+    expect(navigationPanel.querySelector(".sidebar-title")).toHaveTextContent(
+      /^Kai Workshop$/,
+    );
+    expect(navigationPanel.querySelector(".sidebar-header")).not.toHaveTextContent(
+      "admin",
+    );
+    expect(screen.getByText("Workshop administrator")).toBeVisible();
     expect((await screen.findAllByText("Live")).length).toBeGreaterThanOrEqual(1);
     expect(redeemEnrollment).toHaveBeenCalledWith(
       "one-time-token",
