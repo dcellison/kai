@@ -64,7 +64,15 @@ from telegram import Bot, Update
 from telegram.ext import Application
 
 from kai import cron, memory, review, services, sessions, triage
-from kai.config import DATA_DIR, IMAGE_EXTENSIONS, Config, ModelRole, UserConfig, resolve_user_model
+from kai.config import (
+    DATA_DIR,
+    IMAGE_EXTENSIONS,
+    Config,
+    ModelRole,
+    UserConfig,
+    get_user_backend_and_provider,
+    resolve_user_model,
+)
 from kai.internal_api_auth import InternalAPIAuth, InternalAPIPrincipal, InternalAPIScope
 from kai.job_types import CANONICAL_JOB_TYPES, normalize_job_type
 from kai.telegram_utils import chunk_text
@@ -970,37 +978,38 @@ async def _process_github_event_for_user(
     github_token = await sessions.get_setting(f"github_token:{chat_id}")
     protected_install = getattr(config, "protected_install", False) is True
 
-    # Resolve per-user os_user for subprocess isolation. None falls
-    # back to "run as the bot's own OS user" inside the agent backend.
     user_config = config.get_user_config(chat_id)
-    claude_user = user_config.os_user if user_config and user_config.os_user else None
     repo_full_name = payload.get("repository", {}).get("full_name", "")
     github_operations_authorized = bool(user_config and user_config.authorizes_github_repo(repo_full_name))
 
-    # Resolve per-user backend/provider for the review/triage agents.
-    # Same resolution logic as pool.py _create_instance: per-user
-    # config overrides global config.
-    if user_config and user_config.backend:
-        agent_backend = user_config.backend
+    # Review and triage subprocess identity follows protected runtime policy.
+    # Development callers without a protected pool retain compatibility config;
+    # a protected install never falls back when the pool boundary is absent.
+    pool = request.app.get(POOL_KEY)
+    if pool is not None:
+        claude_user = pool.get_os_user(chat_id)
+        agent_backend, provider = pool.get_backend_provider(chat_id)
+        pr_review_model_override = pool.get_role_model(chat_id, ModelRole.PR_REVIEW)
+        issue_triage_model_override = pool.get_role_model(chat_id, ModelRole.ISSUE_TRIAGE)
+    elif protected_install:
+        raise RuntimeError("Protected runtime pool is unavailable for GitHub agent execution")
     else:
-        agent_backend = config.default_backend
-
-    if user_config and user_config.provider:
-        provider = user_config.provider
-    else:
-        provider = config.default_provider
-
-    # Per-role model overrides for review and triage. `resolve_user_model`
-    # implements the full precedence chain: per-user `models:` from
-    # users.yaml > Config.default_models from DEFAULT_MODELS_JSON >
-    # MODEL_REGISTRY's (backend, provider, role) default. review.py /
-    # triage.py treat the empty string as "fall through to the registry
-    # default" via the model_override parameter; the resolver always
-    # returns a concrete model string, so the override path here is
-    # load-bearing only when the resolved value differs from the
-    # registry default (which is exactly when it should fire).
-    pr_review_model_override = resolve_user_model(ModelRole.PR_REVIEW, user_config, config)
-    issue_triage_model_override = resolve_user_model(ModelRole.ISSUE_TRIAGE, user_config, config)
+        claude_user = user_config.os_user if user_config and user_config.os_user else None
+        agent_backend, provider = get_user_backend_and_provider(user_config, config)
+        pr_review_model_override = resolve_user_model(
+            ModelRole.PR_REVIEW,
+            user_config,
+            config,
+            backend=agent_backend,
+            provider=provider,
+        )
+        issue_triage_model_override = resolve_user_model(
+            ModelRole.ISSUE_TRIAGE,
+            user_config,
+            config,
+            backend=agent_backend,
+            provider=provider,
+        )
 
     # ── PR review routing ────────────────────────────────────────
     # When PR review is enabled for this user, reviewable PR events

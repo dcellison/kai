@@ -60,7 +60,6 @@ from telegram.ext import (
 
 from kai import github_api, memory_command, review, services, sessions, webhook
 from kai.agent_failure import render_agent_failure
-from kai.backend import require_backend_name
 from kai.config import (
     DATA_DIR,
     ONESHOT_REASONER_BACKENDS,
@@ -69,10 +68,9 @@ from kai.config import (
     Config,
     ModelRole,
     WorkspaceConfig,
+    canonicalize_model_for_backend,
     get_effective_provider,
-    get_user_backend_and_provider,
     models_for_backend,
-    resolve_user_model,
     validate_model_for_backend,
 )
 from kai.conversation_compatibility import (
@@ -894,24 +892,15 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ── Model selection ──────────────────────────────────────────────────
 
 
-def _backend_name_for_instance(instance: object) -> str:
-    """Return a live instance's validated config-key backend name."""
-    return require_backend_name(instance)
-
-
 def _get_user_backend_provider(pool: SubprocessPool, chat_id: int, config: Config) -> tuple[str, str]:
     """Derive the effective (backend, provider) for a user without creating an instance.
 
-    Checks the running instance first; falls back to the canonical
-    get_user_backend_and_provider helper so read-only commands avoid
-    spawning a subprocess. The pair drives both the model-keyboard
-    listing and model validation, so they cannot drift.
+    Protected runtime policy owns the route when present. Compatibility
+    runtimes retain the existing live-instance/config cascade. The pair drives
+    both the model keyboard and model validation, so they cannot drift.
     """
-    instance = pool.get_if_exists(chat_id)
-    if instance:
-        return _backend_name_for_instance(instance), instance.provider
-    user_config = config.get_user_config(chat_id)
-    return get_user_backend_and_provider(user_config, config)
+    del config
+    return pool.get_backend_provider(chat_id)
 
 
 def _get_user_provider(pool: SubprocessPool, chat_id: int, config: Config) -> str:
@@ -1190,8 +1179,10 @@ async def _show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
     assert update.message is not None
     db_settings = await sessions.get_user_settings(chat_id)
     user_config = config.get_user_config(chat_id)
+    pool = _get_pool(context)
+    profile = pool.get_runtime_profile(chat_id)
 
-    def _resolve(db_key: str, yaml_val: object, global_val: object, fmt: object) -> tuple[str, str]:
+    def _resolve(db_key: str, baseline: object, baseline_source: str, fmt: object) -> tuple[str, str]:
         """Resolve effective value and source for a setting."""
         # Wrap fmt in try/except so a corrupt DB row doesn't crash the
         # display command. Matches the defensive parsing in _restore_workspace.
@@ -1199,24 +1190,41 @@ async def _show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
             try:
                 return fmt(db_settings[db_key]), "user override"  # type: ignore[operator]
             except (ValueError, TypeError):
-                pass  # fall through to yaml/global
-        if yaml_val is not None:
-            return fmt(yaml_val), "users.yaml"  # type: ignore[operator]
-        return fmt(global_val), "global default"  # type: ignore[operator]
+                pass  # fall through to protected/compatibility baseline
+        return fmt(baseline), baseline_source  # type: ignore[operator]
 
-    # Model
-    yaml_model = user_config.model if user_config else None
-    model, model_src = _resolve("model", yaml_model, config.default_model, str)
-
-    # Timeout
-    yaml_timeout = user_config.timeout if user_config else None
-    timeout, timeout_src = _resolve("timeout", yaml_timeout, config.default_timeout, lambda v: f"{int(v)}s")
+    if profile is not None:
+        baseline_model = profile.model
+        baseline_timeout = profile.timeout_seconds
+        model_baseline_source = timeout_baseline_source = "runtime policy"
+    else:
+        baseline_model = user_config.model if user_config and user_config.model else config.default_model
+        baseline_timeout = (
+            user_config.timeout if user_config and user_config.timeout is not None else config.default_timeout
+        )
+        model_baseline_source = "users.yaml" if user_config is not None and user_config.model else "global default"
+        timeout_baseline_source = (
+            "users.yaml" if user_config is not None and user_config.timeout is not None else "global default"
+        )
+    if profile is not None and (raw_model := db_settings.get("model", "").strip()):
+        candidate = canonicalize_model_for_backend(raw_model, profile.backend)
+        if validate_model_for_backend(candidate, profile.backend, profile.provider):
+            model, model_src = candidate, "user override"
+        else:
+            model, model_src = profile.model, "runtime policy"
+    else:
+        model, model_src = _resolve("model", baseline_model, model_baseline_source, str)
+    timeout, timeout_src = _resolve(
+        "timeout",
+        baseline_timeout,
+        timeout_baseline_source,
+        lambda value: f"{int(value)}s",
+    )
 
     # Provider info - always show so users know their configuration.
     # Uses the shared helper that checks the running instance first,
     # falling back to config cascade so new users see their provider
     # before any session starts.
-    pool = _get_pool(context)
     provider = _get_user_provider(pool, chat_id, config)
     provider_line = f"\n  Provider: {provider}"
 
@@ -1228,18 +1236,21 @@ async def _show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
 def _revert_instance_field(pool: SubprocessPool, chat_id: int, field: str, config: Config) -> None:
     """
     Write the resolved default value for a single field back onto the
-    live ClaudeCodeBackend instance.
+    live backend instance.
 
     Called before restart so that stale in-memory overrides don't
     persist after a DB entry is deleted. Resolution order mirrors
-    _create_instance(): users.yaml > global config.
+    _create_instance(): runtime policy > compatibility configuration.
     """
     instance = pool.get_if_exists(chat_id)
     if not instance:
         return
+    profile = pool.get_runtime_profile(chat_id)
     user = config.get_user_config(chat_id)
     if field == "model":
-        if user and user.model:
+        if profile is not None:
+            instance.model = profile.model
+        elif user and user.model:
             instance.model = user.model
         else:
             # Fall back to provider default, not necessarily config.default_model.
@@ -1262,7 +1273,13 @@ def _revert_instance_field(pool: SubprocessPool, chat_id: int, field: str, confi
                     fallback = config.default_model
                 instance.model = fallback
     elif field == "timeout":
-        instance.timeout_seconds = user.timeout if user and user.timeout is not None else config.default_timeout
+        instance.timeout_seconds = (
+            profile.timeout_seconds
+            if profile is not None
+            else user.timeout
+            if user and user.timeout is not None
+            else config.default_timeout
+        )
 
 
 async def _handle_settings_reset(
@@ -1839,7 +1856,7 @@ async def _handle_workspace_config(
 
     # /workspace config - show current settings
     if field is None:
-        await _show_workspace_config(update, workspace, config)
+        await _show_workspace_config(update, context, workspace, config)
         return
 
     # /workspace config reset [field]
@@ -1914,6 +1931,7 @@ async def _handle_workspace_config(
 
 async def _show_workspace_config(
     update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
     workspace: Path,
     config: Config,
 ) -> None:
@@ -1925,28 +1943,31 @@ async def _show_workspace_config(
 
     # Fetch user-level settings so the display reflects the full
     # precedence chain: workspace DB > workspaces.yaml > user DB >
-    # users.yaml > global default. Without these, fields that the user
+    # runtime policy > compatibility defaults. Without these, fields that the user
     # set via /settings or /model would show "global default" instead
     # of the actual effective value.
     user_settings = await sessions.get_user_settings(chat_id)
     user_config = config.get_user_config(chat_id)
+    profile = _get_pool(context).get_runtime_profile(chat_id)
 
     lines = [f"Config for {workspace.name}:"]
 
-    # Model: workspace DB > workspaces.yaml > user DB > users.yaml > global
+    # Model: workspace DB > workspaces.yaml > user DB > runtime/compatibility baseline
     if "model" in db_settings:
         model, model_src = db_settings["model"], "workspace override"
     elif yaml_config and yaml_config.model:
         model, model_src = yaml_config.model, "workspaces.yaml"
     elif "model" in user_settings:
         model, model_src = user_settings["model"], "user setting"
+    elif profile is not None:
+        model, model_src = profile.model, "runtime policy"
     elif user_config and user_config.model:
         model, model_src = user_config.model, "users.yaml"
     else:
         model, model_src = config.default_model, "global default"
     lines.append(f"  Model: {model} ({model_src})")
 
-    # Timeout: workspace DB > workspaces.yaml > user DB > users.yaml > global
+    # Timeout: workspace DB > workspaces.yaml > user DB > runtime/compatibility baseline
     try:
         if "timeout" in db_settings:
             timeout, timeout_src = int(db_settings["timeout"]), "workspace override"
@@ -1954,6 +1975,8 @@ async def _show_workspace_config(
             timeout, timeout_src = yaml_config.timeout, "workspaces.yaml"
         elif "timeout" in user_settings:
             timeout, timeout_src = int(user_settings["timeout"]), "user setting"
+        elif profile is not None:
+            timeout, timeout_src = profile.timeout_seconds, "runtime policy"
         elif user_config and user_config.timeout is not None:
             timeout, timeout_src = user_config.timeout, "users.yaml"
         else:
@@ -3610,15 +3633,12 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
-    # Per-user backend / provider / claude-user / model-override
-    # resolution. Use the shared `get_user_backend_and_provider`
-    # helper so a manual /review picks up exactly the same effective
-    # backend the rest of the bot uses for this user; hand-rolling
-    # the fallback would drift if config.py's resolution rules ever
-    # change.
-    claude_user = user_config.os_user if user_config and user_config.os_user else None
-    agent_backend, provider = get_user_backend_and_provider(user_config, config)
-    model_override = resolve_user_model(ModelRole.PR_REVIEW, user_config, config)
+    # Execution identity comes from the protected runtime profile. GitHub
+    # authorization and optional per-role model overrides remain operator
+    # policy on the human bootstrap record during this migration.
+    claude_user = pool.get_os_user(actor_id)
+    agent_backend, provider = pool.get_backend_provider(actor_id)
+    model_override = pool.get_role_model(actor_id, ModelRole.PR_REVIEW)
     github_token = await sessions.get_setting(f"github_token:{actor_id}")
     if getattr(config, "protected_install", False) is True and not github_token:
         await update.message.reply_text(
@@ -3846,10 +3866,8 @@ def _grant_upload_read_access(path: Path, reader_user: str) -> None:
 
 
 def _upload_reader_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str | None:
-    """Return the configured target OS user that must read uploaded files."""
-    config: Config = context.bot_data["config"]
-    user_config = config.get_user_config(chat_id)
-    return user_config.os_user if user_config and user_config.os_user else None
+    """Return the policy-selected OS user that must read uploaded files."""
+    return _get_pool(context).get_os_user(chat_id)
 
 
 def _upload_principal_id(
@@ -4744,6 +4762,7 @@ async def _handle_workshop_private_text(
             user_log=user_log,
             assistant_log=assistant_log,
             reasoner_backends=ONESHOT_REASONER_BACKENDS,
+            effective_backend=_get_pool(context).get_backend_provider(chat_id)[0],
         )
 
 
@@ -4943,7 +4962,7 @@ async def _handle_response(
         context: Telegram callback context.
         chat_id: The Telegram chat ID.
         prompt: Text string or list of content blocks to send to Claude.
-        claude: The ClaudeCodeBackend instance.
+        pool: The runtime pool used for this response.
         model: Current model name (for session tracking).
     """
     assert update.message is not None
@@ -4951,7 +4970,7 @@ async def _handle_response(
         raise ValueError("delivery_route must be a ResponseDeliveryRoute")
     # Check voice mode before starting
     config: Config = context.bot_data["config"]
-    reader_user = _upload_reader_user(context, chat_id)
+    reader_user = pool.get_os_user(chat_id)
     voice_mode = "off"
     if config.tts_enabled:
         voice_mode = await sessions.get_setting(f"voice_mode:{chat_id}") or "off"
@@ -5127,7 +5146,14 @@ async def _handle_response(
         # suspenders against a future change that re-introduces None,
         # so the literal "Error: None" string can't reappear via this
         # surface even on a regression.
-        error_text = render_agent_failure(final_response.failure_kind, final_response.error, config, chat_id)
+        backend, provider = pool.get_backend_provider(chat_id)
+        error_text = render_agent_failure(
+            final_response.failure_kind,
+            final_response.error,
+            config,
+            chat_id,
+            runtime_route=(backend, provider, pool.get_os_user(chat_id)),
+        )
         visible_error = error_text.removeprefix("Error: ")
         log_message(
             direction="assistant",

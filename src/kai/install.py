@@ -1219,42 +1219,6 @@ def _runtime_policy_apply_plan(
         raise ValueError(
             f"Protected runtime policy has no preserved profile for configured compatibility key(s): {rendered}"
         )
-    expected_profiles = WorkshopRuntimeProfileRegistry.from_yaml(
-        migrated_content,
-        backend_registry=registry_entries,
-    )
-    for expected in expected_profiles.profiles:
-        try:
-            actual = profiles.for_config_id(expected.runtime_config_id)
-        except WorkshopRuntimeProfileError as exc:
-            raise ValueError(
-                "Protected runtime policy lost a required compatibility profile during validation"
-            ) from exc
-        if (
-            actual.backend,
-            actual.provider,
-            actual.os_user,
-            actual.model,
-            actual.timeout_seconds,
-            frozenset(actual.allowed_services),
-            actual.home_workspace,
-            actual.workspace_base,
-            frozenset(actual.allowed_workspaces),
-        ) != (
-            expected.backend,
-            expected.provider,
-            expected.os_user,
-            expected.model,
-            expected.timeout_seconds,
-            frozenset(expected.allowed_services),
-            expected.home_workspace,
-            expected.workspace_base,
-            frozenset(expected.allowed_workspaces),
-        ):
-            raise ValueError(
-                f"Protected runtime profile {actual.profile_id} conflicts with users.yaml fields still required "
-                "for compatibility provisioning; update both protected documents together"
-            )
     return action, content, profiles
 
 

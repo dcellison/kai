@@ -18,10 +18,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kai.config import Config, UserConfig, WorkspaceConfig
+from kai.config import Config, ModelRole, UserConfig, WorkspaceConfig, get_model_for
 from kai.goose import GooseBackend
 from kai.internal_api_auth import InternalAPIScope
 from kai.pool import SubprocessPool
+from tests.workshop_profiles import profile_registry
 
 
 def _make_config(**overrides) -> Config:
@@ -586,6 +587,105 @@ class TestPerUserActions:
 
 
 class TestPropertyAccessors:
+    def test_protected_policy_owns_route_identity_and_model_without_starting_process(self):
+        config = _make_config(
+            default_backend="claude",
+            default_provider="anthropic",
+            default_model="sonnet",
+            user_configs={
+                111: UserConfig(
+                    telegram_id=111,
+                    name="Compatibility Daniel",
+                    os_user="compatibility-user",
+                    backend="claude",
+                    provider="anthropic",
+                    model="opus",
+                )
+            },
+        )
+        profiles = profile_registry(111)
+        pool = SubprocessPool(config=config, services_info=[], runtime_profiles=profiles)
+
+        assert pool.get_runtime_profile(111) == profiles.for_config_id(111)
+        assert pool.get_backend_provider(111) == ("codex", "openai")
+        assert pool.get_os_user(111) is None
+        assert pool.get_model(111) == "gpt-5.6-sol"
+        assert pool.get_if_exists(111) is None
+
+    def test_role_model_uses_protected_route_with_compatible_override(self):
+        config = _make_config(
+            user_configs={
+                111: UserConfig(
+                    telegram_id=111,
+                    name="Compatibility Daniel",
+                    backend="claude",
+                    provider="anthropic",
+                    models={"pr_review": "gpt-5.5"},
+                )
+            }
+        )
+        pool = SubprocessPool(
+            config=config,
+            services_info=[],
+            runtime_profiles=profile_registry(111),
+        )
+
+        assert pool.get_role_model(111, ModelRole.PR_REVIEW) == "gpt-5.5"
+        assert pool.get_if_exists(111) is None
+
+    def test_invalid_role_model_falls_back_within_protected_route(self, caplog):
+        config = _make_config(
+            user_configs={
+                111: UserConfig(
+                    telegram_id=111,
+                    name="Compatibility Daniel",
+                    backend="claude",
+                    provider="anthropic",
+                    models={"pr_review": "opus"},
+                )
+            }
+        )
+        pool = SubprocessPool(
+            config=config,
+            services_info=[],
+            runtime_profiles=profile_registry(111),
+        )
+
+        expected = get_model_for(ModelRole.PR_REVIEW, "codex", "openai")
+        assert pool.get_role_model(111, ModelRole.PR_REVIEW) == expected
+        assert "invalid for codex/openai" in caplog.text
+        assert pool.get_if_exists(111) is None
+
+    @pytest.mark.asyncio
+    async def test_protected_policy_is_effective_model_baseline(self):
+        pool = SubprocessPool(
+            config=_make_config(default_model="sonnet"),
+            services_info=[],
+            runtime_profiles=profile_registry(111),
+        )
+
+        with patch(
+            "kai.pool.sessions.get_user_settings",
+            new_callable=AsyncMock,
+            return_value={},
+        ):
+            assert await pool.get_effective_model(111) == "gpt-5.6-sol"
+
+    @pytest.mark.asyncio
+    async def test_invalid_model_override_cannot_escape_protected_route(self):
+        pool = SubprocessPool(
+            config=_make_config(default_model="sonnet"),
+            services_info=[],
+            runtime_profiles=profile_registry(111),
+        )
+
+        with patch(
+            "kai.pool.sessions.get_user_settings",
+            new_callable=AsyncMock,
+            return_value={"model": "opus"},
+        ):
+            assert await pool.get_effective_model(111) == "gpt-5.6-sol"
+
     def test_get_model_existing_instance(self):
         """get_model returns the instance's model when it exists."""
         pool = SubprocessPool(config=_make_config(), services_info=[])

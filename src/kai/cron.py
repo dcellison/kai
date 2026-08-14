@@ -50,8 +50,13 @@ _CONDITION_NOT_MET_PREFIX = (
 
 def _history_reader_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str | None:
     """Resolve the OS user allowed to search one scheduled chat's history."""
+    pool = context.bot_data.get("pool")
+    if pool is not None:
+        return pool.get_os_user(chat_id)
     config = context.bot_data.get("config")
     if config is None:
+        return None
+    if getattr(config, "protected_install", False) is True:
         return None
     user_config = config.get_user_config(chat_id)
     return user_config.os_user if user_config and user_config.os_user else None

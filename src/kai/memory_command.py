@@ -1901,8 +1901,12 @@ async def _send_dashboard(
     # sharpest. The per-user fall-through matches the extraction
     # gate's backend resolution in bot.py.
     config: Config = context.bot_data["config"]
-    user_config = config.get_user_config(chat_id)
-    effective_backend = user_config.backend if user_config and user_config.backend else config.default_backend
+    pool: SubprocessPool | None = context.bot_data.get("pool")
+    if pool is not None:
+        effective_backend = pool.get_backend_provider(chat_id)[0]
+    else:
+        user_config = config.get_user_config(chat_id)
+        effective_backend = user_config.backend if user_config and user_config.backend else config.default_backend
     if effective_backend not in ONESHOT_REASONER_BACKENDS:
         text += (
             f"\n\nNote: memory extraction is not available on the {effective_backend} "

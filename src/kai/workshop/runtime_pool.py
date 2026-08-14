@@ -8,7 +8,7 @@ from pathlib import Path
 from kai.backend import StreamEvent
 from kai.pool import PreparedBackendExecution, SubprocessPool
 from kai.workshop.domain import RuntimeProfileId
-from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
+from kai.workshop.runtime_profiles import ProtectedRuntimeProfile, WorkshopRuntimeProfileRegistry
 
 type AgentPrompt = str | list[dict[str, str]]
 
@@ -35,6 +35,13 @@ class WorkshopRuntimePool:
     ) -> int:
         """Return the private compatibility key for non-pool migrations."""
         return self._profiles.resolve(runtime_profile_id).runtime_config_id
+
+    def runtime_profile(
+        self,
+        runtime_profile_id: str | RuntimeProfileId,
+    ) -> ProtectedRuntimeProfile:
+        """Resolve the protected profile without exposing compatibility lookup."""
+        return self._profiles.resolve(runtime_profile_id)
 
     async def prepare_execution(
         self,

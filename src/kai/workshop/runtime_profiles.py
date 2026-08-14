@@ -407,53 +407,7 @@ class WorkshopRuntimeProfileRegistry:
         protected = bool(os.environ.get(INSTALL_DIR_ENV, "").strip())
         if not explicit and not protected:
             return cls.from_config(config)
-        registry = cls.from_yaml(_policy_text(policy_path), backend_registry=load_backend_registry())
-        registry._validate_compatibility_projection(config)
-        return registry
-
-    def _validate_compatibility_projection(self, config: Config) -> None:
-        """Fail closed while users.yaml still provisions existing OS identities.
-
-        Backend selection is owned by this registry. While users.yaml still
-        provisions the corresponding OS account and compatibility policy for
-        migrated profiles, duplicated execution fields must agree.
-        """
-        for runtime_config_id, user in config.user_configs.items():
-            profile = self.for_config_id(runtime_config_id)
-            backend, provider = get_user_backend_and_provider(user, config)
-            expected_model = _compatibility_model(user, config, backend=backend, provider=provider)
-            expected_timeout = user.timeout if user.timeout is not None else config.default_timeout
-            available_home = (
-                profile.home_workspace if profile.home_workspace and profile.home_workspace.is_dir() else None
-            )
-            available_base = (
-                profile.workspace_base if profile.workspace_base and profile.workspace_base.is_dir() else None
-            )
-            available_allowed = frozenset(path for path in profile.allowed_workspaces if path.is_dir())
-            if (
-                profile.backend,
-                profile.provider,
-                profile.os_user,
-                profile.model,
-                profile.timeout_seconds,
-                frozenset(profile.allowed_services),
-                available_home,
-                available_base,
-                available_allowed,
-            ) != (
-                backend,
-                provider,
-                user.os_user,
-                expected_model,
-                expected_timeout,
-                frozenset(user.allowed_services),
-                user.home_workspace,
-                user.workspace_base,
-                frozenset(user.allowed_workspaces),
-            ):
-                raise WorkshopRuntimeProfileError(
-                    f"Runtime profile {profile.profile_id} conflicts with the migrated users.yaml execution policy"
-                )
+        return cls.from_yaml(_policy_text(policy_path), backend_registry=load_backend_registry())
 
     @property
     def profiles(self) -> tuple[ProtectedRuntimeProfile, ...]:

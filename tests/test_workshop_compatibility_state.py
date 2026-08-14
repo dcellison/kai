@@ -13,7 +13,15 @@ async def test_profile_state_preserves_existing_storage_keys(monkeypatch):
             SimpleNamespace(os_user="daniel") if runtime_config_id == 101 else None
         )
     )
-    runtime_pool = SimpleNamespace(compatibility_runtime_config_id=Mock(return_value=101))
+    runtime_pool = SimpleNamespace(
+        runtime_profile=Mock(
+            return_value=SimpleNamespace(
+                runtime_config_id=101,
+                os_user="daniel",
+                backend="codex",
+            )
+        )
+    )
     log = Mock(side_effect=["user-log", "assistant-log"])
     save_session = AsyncMock()
     schedule = Mock()
@@ -40,7 +48,7 @@ async def test_profile_state_preserves_existing_storage_keys(monkeypatch):
         assistant_log=assistant_log,
     )
 
-    runtime_pool.compatibility_runtime_config_id.assert_called_once_with(profile_id(101))
+    runtime_pool.runtime_profile.assert_called_once_with(profile_id(101))
     assert log.call_args_list == [
         call(
             direction="user",
@@ -65,4 +73,5 @@ async def test_profile_state_preserves_existing_storage_keys(monkeypatch):
         workspace="/workspace/project",
         user_log="user-log",
         assistant_log="assistant-log",
+        effective_backend="codex",
     )

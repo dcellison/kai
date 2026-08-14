@@ -19,6 +19,7 @@ from telegram.error import Forbidden
 
 from kai.cron import (
     _ensure_utc,
+    _history_reader_user,
     _job_callback,
     _register_job,
     _register_new_jobs,
@@ -119,6 +120,31 @@ def _make_agent_mock(text="The response", success=True, error=None):
 
     mock_agent.send = fake_send
     return mock_agent
+
+
+class TestHistoryReaderUser:
+    def test_pool_identity_is_authoritative(self):
+        context = MagicMock()
+        pool = MagicMock()
+        pool.get_os_user.return_value = "policy-user"
+        config = MagicMock()
+        config.get_user_config.return_value = MagicMock(os_user="compatibility-user")
+        context.bot_data = {"pool": pool, "config": config}
+
+        assert _history_reader_user(context, 12345) == "policy-user"
+        pool.get_os_user.assert_called_once_with(12345)
+        config.get_user_config.assert_not_called()
+
+    def test_explicit_pool_none_does_not_fall_back_to_config(self):
+        context = MagicMock()
+        pool = MagicMock()
+        pool.get_os_user.return_value = None
+        config = MagicMock()
+        config.get_user_config.return_value = MagicMock(os_user="compatibility-user")
+        context.bot_data = {"pool": pool, "config": config}
+
+        assert _history_reader_user(context, 12345) is None
+        config.get_user_config.assert_not_called()
 
 
 # ── _ensure_utc ──────────────────────────────────────────────────────

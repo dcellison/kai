@@ -21,6 +21,7 @@ from kai.webhook import (
     GITHUB_WEBHOOK_SECRET_KEY,
     INTERNAL_API_AUTH_KEY,
     NOTIFICATION_CHAT_IDS_KEY,
+    POOL_KEY,
     PR_REVIEW_COOLDOWN_KEY,
     PR_REVIEW_TIMEOUT_S_KEY,
     SPEC_DIR_KEY,
@@ -432,6 +433,7 @@ def _default_github_token_lookup():
 def _build_test_app(
     cooldown: int = 300,
     config: object | None = None,
+    pool: object | None = None,
 ) -> web.Application:
     """Build a minimal aiohttp app with _handle_github wired up.
 
@@ -499,8 +501,27 @@ def _build_test_app(
         app[CONFIG_KEY] = mock_config
     else:
         app[CONFIG_KEY] = config
+    if pool is not None:
+        app[POOL_KEY] = pool
     app.router.add_post("/webhook/github", _handle_github)
     return app
+
+
+def _protected_pool(
+    *,
+    os_user: str | None = "policy-user",
+    backend: str = "codex",
+    provider: str = "openai",
+    pr_review_model: str = "gpt-5.5",
+    issue_triage_model: str = "gpt-5.5",
+) -> MagicMock:
+    pool = MagicMock()
+    pool.get_os_user.return_value = os_user
+    pool.get_backend_provider.return_value = (backend, provider)
+    pool.get_role_model.side_effect = lambda _runtime_config_id, role: (
+        pr_review_model if role.value == "pr_review" else issue_triage_model
+    )
+    return pool
 
 
 @pytest.fixture
@@ -2215,12 +2236,69 @@ class TestPerUserRouting:
             assert mock_review.call_args[1]["provider"] == "openai"
 
     @pytest.mark.asyncio
+    async def test_protected_review_uses_pool_execution_policy(
+        self,
+        _clear_cooldowns,
+        _mock_resolve_repo,
+    ):
+        """Webhook review cannot execute with divergent compatibility fields."""
+        base = self._make_user_config(111, repos=["owner/repo"])
+        user = dataclasses.replace(
+            base,
+            backend="claude",
+            provider="anthropic",
+            os_user="compatibility-user",
+            models={"pr_review": "opus"},
+        )
+        config = self._make_config_with_users([user])
+        config.protected_install = True
+        pool = _protected_pool(
+            os_user="policy-user",
+            backend="codex",
+            provider="openai",
+            pr_review_model="gpt-5.5",
+        )
+        app = _build_test_app(config=config, pool=pool)
+        payload = _make_pr_payload("opened")
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        with (
+            _mock_settings(pr_review=True, notify_chat_id=111),
+            patch(
+                "kai.webhook.sessions.get_setting",
+                new_callable=AsyncMock,
+                return_value="ghp_user",
+            ),
+            patch("kai.webhook.review.review_pr", new_callable=AsyncMock) as mock_review,
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "pull_request",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert resp.status == 200
+
+            await asyncio.sleep(0.01)
+            kwargs = mock_review.call_args.kwargs
+            assert kwargs["claude_user"] == "policy-user"
+            assert kwargs["agent_backend"] == "codex"
+            assert kwargs["provider"] == "openai"
+            assert kwargs["model_override"] == "gpt-5.5"
+            pool.get_os_user.assert_called_once_with(111)
+            pool.get_backend_provider.assert_called_once_with(111)
+
+    @pytest.mark.asyncio
     async def test_protected_review_requires_user_github_token(self, _clear_cooldowns, _mock_resolve_repo):
         """Protected installs do not fall back to the daemon gh identity for PR review."""
         user = self._make_user_config(111, repos=["owner/repo"])
         config = self._make_config_with_users([user])
         config.protected_install = True
-        app = _build_test_app(config=config)
+        app = _build_test_app(config=config, pool=_protected_pool())
         payload = _make_pr_payload("opened")
         body = json.dumps(payload).encode()
         sig = _sign_payload(payload)
@@ -2288,12 +2366,63 @@ class TestPerUserRouting:
             assert mock_triage.call_args[1]["allowed_triage_projects"] == ["Sprint 1"]
 
     @pytest.mark.asyncio
+    async def test_protected_triage_uses_pool_execution_policy(self, _clear_cooldowns):
+        """Webhook triage cannot execute with divergent compatibility fields."""
+        base = self._make_user_config(111, repos=["owner/repo"])
+        user = dataclasses.replace(
+            base,
+            backend="claude",
+            provider="anthropic",
+            os_user="compatibility-user",
+            models={"issue_triage": "opus"},
+        )
+        config = self._make_config_with_users([user])
+        config.protected_install = True
+        pool = _protected_pool(
+            os_user="policy-user",
+            backend="codex",
+            provider="openai",
+            issue_triage_model="gpt-5.4",
+        )
+        app = _build_test_app(config=config, pool=pool)
+        payload = _make_issue_payload("opened")
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        with (
+            _mock_settings(issue_triage=True, notify_chat_id=111),
+            patch(
+                "kai.webhook.sessions.get_setting",
+                new_callable=AsyncMock,
+                return_value="ghp_user",
+            ),
+            patch("kai.webhook.triage.triage_issue", new_callable=AsyncMock) as mock_triage,
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "issues",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert resp.status == 200
+
+            await asyncio.sleep(0.01)
+            kwargs = mock_triage.call_args.kwargs
+            assert kwargs["claude_user"] == "policy-user"
+            assert kwargs["agent_backend"] == "codex"
+            assert kwargs["provider"] == "openai"
+            assert kwargs["model_override"] == "gpt-5.4"
+
+    @pytest.mark.asyncio
     async def test_protected_triage_requires_user_github_token(self, _clear_cooldowns):
         """Protected installs do not fall back to the daemon gh identity for issue triage."""
         user = self._make_user_config(111, repos=["owner/repo"])
         config = self._make_config_with_users([user])
         config.protected_install = True
-        app = _build_test_app(config=config)
+        app = _build_test_app(config=config, pool=_protected_pool())
         payload = _make_issue_payload("opened")
         body = json.dumps(payload).encode()
         sig = _sign_payload(payload)

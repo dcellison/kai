@@ -83,7 +83,7 @@ pip install -e '.[dev]'
 make config
 ```
 
-`make config` runs without `sudo`. It discovers the supported backend CLIs installed on the machine, requires an explicit installation default when more than one is available, and writes `install.conf` as the configuration artifact for the selected deployment mode. It does not accept user-supplied backend executable paths. Model defaults come from Kai's backend/provider/role model registry; admin-set per-user model baselines belong in the `models:` map in `users.yaml`, while users can change their active conversational model with `/model`.
+`make config` runs without `sudo`. It discovers the supported backend CLIs installed on the machine, requires an explicit installation default when more than one is available, and writes `install.conf` as the configuration artifact for the selected deployment mode. It does not accept user-supplied backend executable paths. Model defaults come from Kai's backend/provider/role model registry. In protected installs, conversational model baselines belong to `runtime-profiles.yaml`; operator-set PR-review and issue-triage baselines remain in each human's `models:` map in `users.yaml`. Users can change their active conversational model with `/model`.
 
 For a `single_user` deployment, `make config` also writes the runtime files under the operator's account. Start Kai from the checkout:
 
@@ -100,6 +100,20 @@ make install-status
 ```
 
 `make install` invokes `sudo` internally and installs source, data, and secrets under separate protected system directories. It also generates the admin-owned `/etc/kai/backends.yaml` registry containing the discovered executable paths, allowed model surfaces, and selected default backend. Runtime configuration names backend identifiers; it cannot redirect a protected backend to an arbitrary executable. After a successful protected install, `install.conf` may be deleted because it can contain secrets; re-run `make config` before a later reconfiguration.
+
+On the first protected install, Kai seeds `/etc/kai/runtime-profiles.yaml`
+from the configured humans. After that file exists, it is the independent
+authority for each Workshop runtime's backend, provider, model baseline,
+timeout, OS execution user, service grants, and workspace policy. Later edits
+to duplicated execution fields in `users.yaml` do not replace or veto the
+protected profile. `users.yaml` remains the Telegram-human bootstrap and
+integration-policy input during the Workshop migration.
+
+Edit an installed runtime profile with `sudoedit`, validate it with
+`make install-status`, then run `make install` to reconcile OS-owned storage
+and restart Kai. The installer preserves explicit profile values and fails
+closed if a configured compatibility identity has lost its profile mapping or
+if the protected policy references an unavailable backend or invalid model.
 
 Workshop remains loopback-only by default. To reach its browser client directly
 from a trusted private network, enter one private IPv4 interface address at the
@@ -126,7 +140,7 @@ Kai has real local authority, so the security model is part of the product rathe
 - **Local execution:** Kai runs on your machine. Conversations do not pass through a Kai-hosted relay.
 - **Path confinement:** File exchange is constrained to allowed workspace and file-storage paths.
 - **Protected backend registry:** Protected installs resolve backend identifiers through admin-owned `/etc/kai/backends.yaml`; executable paths and allowed model surfaces are installation state, not user input.
-- **Service proxy:** Third-party API keys live in server-side config and are injected only for services explicitly allowed to that user in `users.yaml`; keys are never placed in conversation context.
+- **Service proxy:** Third-party API keys live in server-side config and are injected only for services explicitly allowed by the protected runtime profile (or compatibility configuration outside a protected install); keys are never placed in conversation context.
 - **GitHub operation boundary:** PR review and issue triage run only for repositories explicitly authorized to that user in admin-controlled `users.yaml`. Protected installs require the user's stored GitHub token, and notification subscriptions cannot grant operation access.
 - **Per-user isolation:** Users have separate history, files, workspaces, jobs, settings, and agent subprocesses.
 - **Principal-bound internal API:** Agent API credentials resolve to a fixed user and explicit scopes in the outer service; request data cannot select another principal.

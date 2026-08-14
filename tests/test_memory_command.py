@@ -2427,6 +2427,26 @@ class TestDashboardBackendNote:
         sent_text = upd.effective_chat.send_message.call_args.kwargs["text"]
         assert "memory extraction is not available on the goose backend" in sent_text
 
+    @pytest.mark.asyncio
+    async def test_protected_pool_route_drives_note(self, monkeypatch, update_factory, context_factory):
+        monkeypatch.setattr(memory_command, "ONESHOT_REASONER_BACKENDS", frozenset({"claude"}))
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        monkeypatch.setattr(
+            memory_command.memory,
+            "get_stats",
+            lambda *, user_id: _stats(extracted_count=3),
+        )
+        upd = update_factory()
+        ctx = context_factory(args=[])
+        pool = MagicMock()
+        pool.get_backend_provider.return_value = ("codex", "openai")
+        ctx.bot_data["pool"] = pool
+
+        await memory_command.handle_memory_command(upd, ctx)
+
+        sent_text = upd.effective_chat.send_message.call_args.kwargs["text"]
+        assert "memory extraction is not available on the codex backend" in sent_text
+
 
 # ── Cache TTL ──────────────────────────────────────────────────────
 

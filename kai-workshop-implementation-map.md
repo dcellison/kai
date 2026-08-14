@@ -419,7 +419,7 @@ No entry may use an indefinite condition such as "keep for compatibility." A gen
 | GitHub and generic webhook paths that route directly to Telegram or the pool | Canonical integration commands/events plus delivery/run services | Existing GitHub group notifications, generic callers, deduplication, and secret separation pass end-to-end tests | Remove direct routing while retaining verified webhook adapters and supported external contracts | Planned |
 | Per-chat settings, files, memory references, and project selection | Principal/channel/agent/project-workspace records and artifact metadata | Existing per-user isolation, context assembly, memory provenance, file delivery, and workspace access remain equivalent | Migrate namespaces and remove Telegram-derived ownership from domain storage; retire recorded compatibility `storage_path` values when an authoritative artifact store replaces local per-chat files | Active (new uploads and staged review artifacts use opaque human `PrincipalId` directories; numeric file directories remain read-compatible for existing uploads; settings, history, home, preferences, memory, and workspace compatibility state remain to migrate) |
 | `users.yaml` values that represent mutable application state | Workshop administration and durable policy records | Workshop administration can safely inspect and change the relevant state, and bootstrap/recovery behavior is proven | Retain only protected installation/bootstrap policy; remove duplicated mutable state and precedence rules | Planned |
-| One-time `users.yaml` projection into protected `runtime-profiles.yaml`, plus private integer `compatibility_runtime_config_id` values | Independently authored runtime profiles and profile-keyed runtime/state stores | Existing profile IDs and state continuity survive migration; a profile with no Telegram identity can be assigned and executed; installer/status diagnostics pass; all five backends remain equivalent | Remove the migration renderer and `from_config` development projection; remove `compatibility_runtime_config_id`, `for_config_id`, and integer conversion in `WorkshopRuntimePool` after pool and persistent state are profile-keyed | Active (#921; protected startup now loads the independent document, while pool/state execution still uses the explicitly named integer bridge) |
+| One-time `users.yaml` projection into protected `runtime-profiles.yaml`, plus private integer `compatibility_runtime_config_id` values | Independently authored runtime profiles and profile-keyed runtime/state stores | Existing profile IDs and state continuity survive migration; a profile with no Telegram identity can be assigned and executed; installer/status diagnostics pass; all five backends remain equivalent | Remove the migration renderer and `from_config` development projection; remove `compatibility_runtime_config_id`, `for_config_id`, and integer conversion in `WorkshopRuntimePool` after pool and persistent state are profile-keyed | Active (#921; protected fields are independently authoritative after their one-time seed and are no longer compared with `users.yaml`; the explicitly named integer pool/storage bridge and bootstrap-coverage check remain) |
 | Backend-specific execution orchestration embedded in the control plane | Equal Harness Driver contracts and a Runtime Backend boundary | Capability and lifecycle tests cover Claude, Codex, Goose, OpenCode, and Pi without privileging one driver | Delete duplicated process orchestration only after the shared contracts carry the required evidence | Planned |
 | Trusted-host `local_process` execution and its executable-trust warnings | Isolated Workshop workers | Worker identity, filesystem grants, credentials, networking, artifacts, cancellation, upgrade, and recovery are verified for all five harnesses | Retire trusted-host mode or explicitly reclassify it as a supported development mode; remove production mitigations that it alone requires | Planned |
 | Preliminary static Workshop browser shell | React Workshop client at the same `/workshop/` route | The React client proves enrollment, tab-scoped session handling, canonical timeline history, authenticated resumable live updates, channel correction, session revocation, and equivalent security headers against the installed API | Replace the packaged `static/index.html`, `static/app.css`, and `static/app.js`; delete tests specific to the preliminary asset implementation while retaining transport-neutral API and browser-boundary contract tests; do not retain a second UI or compatibility route | Replacement implemented and installed parity qualified; authenticated canonical command submission is now implemented for the first browser conversation path |
@@ -1988,6 +1988,38 @@ The next coherent boundary is event-driven run progress and inspection. It can
 replace status polling with canonical lifecycle events and expose useful agent
 activity without coupling the browser to backend processes or compatibility
 storage.
+
+## 42. Independent protected runtime-policy authority
+
+**Implementation date:** 2026-08-14
+
+An existing protected `/etc/kai/runtime-profiles.yaml` now owns its execution
+fields without a second authority in `users.yaml`. Installed startup and
+install reconciliation validate the protected document against the backend
+registry, but no longer reject an intentional difference in backend, provider,
+OS execution user, model baseline, timeout, service grants, or workspace
+policy. `users.yaml` supplies those values only for the one-time seed and for
+uninstalled compatibility operation.
+
+The temporary configured-user mapping remains explicit and fail-closed. During
+installation, every configured compatibility identity must still map to a
+preserved protected profile because the physical subprocess pool and some
+persistent namespaces remain integer-keyed. This coverage check does not copy
+or compare execution policy. Independently provisioned protected profiles may
+exist without a Telegram identity.
+
+Runtime-facing compatibility surfaces now resolve through the protected pool:
+model and timeout display/reset, model validation, backend-aware memory
+extraction messaging, upload-reader ownership, actionable authentication
+failures, and compatibility history/memory writes all use the selected profile
+rather than rereading duplicated fields. Tests exercise independent selection
+for Claude, Codex, Goose, OpenCode, and Pi and pin invalid user model overrides
+to the protected backend/provider boundary.
+
+The remaining Milestone 1 debt is the deliberately named integer bridge, not
+execution-policy precedence. Removing it requires profile-keyed subprocess and
+persistent-state namespaces; it does not require another round of field-by-
+field authority migration.
 
 ## Canonical notification feed activation
 

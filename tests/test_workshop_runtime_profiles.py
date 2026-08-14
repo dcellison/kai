@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 
 from kai.backend_registry import BackendRegistryEntry
 from kai.config import Config, UserConfig
@@ -223,7 +224,7 @@ def test_document_rejects_duplicate_resolved_allowed_workspace(tmp_path):
         )
 
 
-def test_unavailable_workspace_paths_remain_restrictive_and_do_not_create_false_drift(tmp_path):
+def test_unavailable_workspace_paths_remain_in_protected_policy(tmp_path):
     unavailable = (tmp_path / "later-mounted").resolve()
     profile_id = runtime_profile_id_for_config_id(101)
     registry = WorkshopRuntimeProfileRegistry.from_document(
@@ -249,45 +250,9 @@ def test_unavailable_workspace_paths_remain_restrictive_and_do_not_create_false_
     )
     unavailable_profile = registry.resolve(profile_id)
     assert unavailable_profile.workspace_base == unavailable
-    registry._validate_compatibility_projection(
-        Config(
-            telegram_bot_token="test",
-            allowed_user_ids={101},
-            default_backend="codex",
-            default_provider="openai",
-            default_model="gpt-5.6-sol",
-            user_configs={
-                101: UserConfig(
-                    telegram_id=101,
-                    name="Daniel",
-                    os_user="daniel",
-                    backend="codex",
-                )
-            },
-        )
-    )
 
     unavailable.mkdir()
-    registry._validate_compatibility_projection(
-        Config(
-            telegram_bot_token="test",
-            allowed_user_ids={101},
-            default_backend="codex",
-            default_provider="openai",
-            default_model="gpt-5.6-sol",
-            user_configs={
-                101: UserConfig(
-                    telegram_id=101,
-                    name="Daniel",
-                    os_user="daniel",
-                    backend="codex",
-                    home_workspace=unavailable,
-                    workspace_base=unavailable,
-                    allowed_workspaces=[unavailable],
-                )
-            },
-        )
-    )
+    assert registry.resolve(profile_id).allowed_workspaces == (unavailable,)
 
 
 def test_non_telegram_profile_derives_stable_private_compatibility_key():
@@ -640,7 +605,7 @@ runtime_profiles:
         registry.resolve(runtime_profile_id_for_config_id(101))
 
 
-def test_loaded_policy_fails_when_migrated_execution_fields_drift(tmp_path, monkeypatch):
+def test_loaded_policy_owns_execution_fields_independently_of_users_yaml(tmp_path, monkeypatch):
     profile_id = runtime_profile_id_for_config_id(101)
     policy = tmp_path / "runtime-profiles.yaml"
     policy.write_text(
@@ -663,11 +628,16 @@ runtime_profiles:
         lambda: {"claude": {}, "codex": {}},
     )
 
-    with pytest.raises(WorkshopRuntimeProfileError, match=r"conflicts with the migrated users\.yaml"):
-        WorkshopRuntimeProfileRegistry.load(_config(), path=policy)
+    profile = WorkshopRuntimeProfileRegistry.load(_config(), path=policy).resolve(profile_id)
+
+    assert (profile.backend, profile.provider, profile.os_user) == (
+        "claude",
+        "anthropic",
+        "daniel",
+    )
 
 
-def test_loaded_policy_fails_when_migrated_model_or_timeout_drifts(tmp_path, monkeypatch):
+def test_loaded_policy_owns_model_and_timeout_independently_of_users_yaml(tmp_path, monkeypatch):
     profile_id = runtime_profile_id_for_config_id(101)
     policy = tmp_path / "runtime-profiles.yaml"
     policy.write_text(
@@ -690,11 +660,13 @@ runtime_profiles:
         lambda: {"codex": {}, "claude": {}},
     )
 
-    with pytest.raises(WorkshopRuntimeProfileError, match=r"conflicts with the migrated users\.yaml"):
-        WorkshopRuntimeProfileRegistry.load(_config(), path=policy)
+    profile = WorkshopRuntimeProfileRegistry.load(_config(), path=policy).resolve(profile_id)
+
+    assert profile.model == "gpt-5.5"
+    assert profile.timeout_seconds == 999
 
 
-def test_loaded_policy_fails_when_migrated_service_scopes_drift(tmp_path, monkeypatch):
+def test_loaded_policy_owns_service_scopes_independently_of_users_yaml(tmp_path, monkeypatch):
     profile_id = runtime_profile_id_for_config_id(101)
     policy = tmp_path / "runtime-profiles.yaml"
     policy.write_text(
@@ -718,8 +690,61 @@ runtime_profiles:
         lambda: {"codex": {}, "claude": {}},
     )
 
-    with pytest.raises(WorkshopRuntimeProfileError, match=r"conflicts with the migrated users\.yaml"):
-        WorkshopRuntimeProfileRegistry.load(_config(), path=policy)
+    profile = WorkshopRuntimeProfileRegistry.load(_config(), path=policy).resolve(profile_id)
+
+    assert profile.allowed_services == ("perplexity",)
+
+
+@pytest.mark.parametrize(
+    ("backend", "provider", "model"),
+    (
+        ("claude", "anthropic", "sonnet"),
+        ("codex", "openai", "gpt-5.6-sol"),
+        ("goose", "openai", "gpt-5.5-pro"),
+        ("opencode", "anthropic", "anthropic/claude-sonnet-4-6"),
+        ("pi", "openai", "openai/gpt-5.6-sol:xhigh"),
+    ),
+)
+def test_every_backend_can_be_selected_only_by_protected_policy(
+    tmp_path,
+    monkeypatch,
+    backend,
+    provider,
+    model,
+):
+    profile_id = runtime_profile_id_for_config_id(101)
+    policy = tmp_path / "runtime-profiles.yaml"
+    policy.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "runtime_profiles": {
+                    str(profile_id): {
+                        "display_name": f"{backend} runtime",
+                        "compatibility_runtime_config_id": 101,
+                        "os_user": f"{backend}-operator",
+                        "backend": backend,
+                        "provider": provider,
+                        "model": model,
+                        "timeout_seconds": 321,
+                        "allowed_services": [],
+                        "allowed_workspaces": [],
+                    }
+                },
+            },
+            sort_keys=False,
+        )
+    )
+    monkeypatch.setattr(
+        "kai.workshop.runtime_profiles.load_backend_registry",
+        lambda: {backend: {}},
+    )
+
+    profile = WorkshopRuntimeProfileRegistry.load(_config(), path=policy).resolve(profile_id)
+
+    assert (profile.backend, profile.provider, profile.model) == (backend, provider, model)
+    assert profile.os_user == f"{backend}-operator"
+    assert profile.timeout_seconds == 321
 
 
 def test_loaded_policy_accepts_migrated_service_scope_reordering(tmp_path, monkeypatch):

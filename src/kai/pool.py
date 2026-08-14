@@ -8,9 +8,9 @@ Provides functionality to:
 4. Evict idle subprocesses to reclaim memory on resource-constrained machines
 5. Restore per-user saved workspaces on first interaction
 
-Each user gets their own backend instance with full conversation isolation,
-independent lifecycle, and OS-level enforcement via sudo -u when os_user is
-configured in users.yaml.
+Each runtime gets its own backend instance with full conversation isolation,
+independent lifecycle, and OS-level enforcement via sudo -u when an OS user is
+selected by protected runtime policy (or compatibility config outside it).
 """
 
 from __future__ import annotations
@@ -30,11 +30,14 @@ from kai.config import (
     OPEN_ENDED_PROVIDERS,
     VALID_BACKENDS,
     Config,
+    ModelRole,
     WorkspaceConfig,
     canonicalize_model_for_backend,
     get_default_model_for_backend,
     get_effective_provider,
+    get_model_for,
     get_user_backend_and_provider,
+    resolve_user_model,
     validate_model_for_backend,
 )
 from kai.goose import GooseBackend
@@ -43,7 +46,7 @@ from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError
 from kai.workspace_utils import is_workspace_allowed
 
 if TYPE_CHECKING:
-    from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
+    from kai.workshop.runtime_profiles import ProtectedRuntimeProfile, WorkshopRuntimeProfileRegistry
 
 log = logging.getLogger(__name__)
 
@@ -218,6 +221,58 @@ class SubprocessPool:
             if runtime_config_id >= 0:
                 raise
             return None
+
+    def get_runtime_profile(self, runtime_config_id: int) -> ProtectedRuntimeProfile | None:
+        """Return protected policy for one runtime, when that boundary applies."""
+        return self._protected_profile(runtime_config_id)
+
+    def get_backend_provider(self, runtime_config_id: int) -> tuple[str, str]:
+        """Resolve the active route without creating a backend process."""
+        profile = self._protected_profile(runtime_config_id)
+        if profile is not None:
+            return profile.backend, profile.provider
+        instance = self.get_if_exists(runtime_config_id)
+        if instance is not None:
+            return require_backend_name(instance), instance.provider
+        return get_user_backend_and_provider(
+            self._config.get_user_config(runtime_config_id),
+            self._config,
+        )
+
+    def get_os_user(self, runtime_config_id: int) -> str | None:
+        """Resolve the OS execution identity from protected policy when present."""
+        profile = self._protected_profile(runtime_config_id)
+        if profile is not None:
+            return profile.os_user
+        user = self._config.get_user_config(runtime_config_id)
+        return user.os_user if user is not None else None
+
+    def get_role_model(self, runtime_config_id: int, role: ModelRole) -> str:
+        """Resolve an operator role model against the policy-selected route."""
+        backend, provider = self.get_backend_provider(runtime_config_id)
+        model = canonicalize_model_for_backend(
+            resolve_user_model(
+                role,
+                self._config.get_user_config(runtime_config_id),
+                self._config,
+                backend=backend,
+                provider=provider,
+            ),
+            backend,
+        )
+        if validate_model_for_backend(model, backend, provider):
+            return model
+        fallback = get_model_for(role, backend, provider)
+        log.warning(
+            "Ignoring %s model %r for runtime %d because it is invalid for %s/%s; using %r",
+            role.value,
+            model,
+            runtime_config_id,
+            backend,
+            provider,
+            fallback,
+        )
+        return fallback
 
     def get_home_workspace(self, runtime_config_id: int) -> Path:
         """Resolve home through protected profile policy when available."""
@@ -656,8 +711,8 @@ class SubprocessPool:
         """Apply per-user DB-stored settings to a live instance.
 
         Covers the model and timeout overrides set via /settings or
-        /model. _create_instance() already applied the users.yaml
-        baselines, so this layer only handles the DB tier. Workspace
+        /model. _create_instance() already applied the protected policy or
+        compatibility baseline, so this layer only handles the DB tier. Workspace
         config takes precedence over user settings (more specific
         wins).
 
@@ -809,18 +864,19 @@ class SubprocessPool:
     # ── Per-user property accessors ─────────────────────────────────
 
     def get_model(self, chat_id: int) -> str:
-        """Get the active model for a user (or global default if no instance)."""
+        """Get the active model without bypassing protected runtime policy."""
         instance = self.get_if_exists(chat_id)
-        return instance.model if instance else self._config.default_model
+        if instance is not None:
+            return instance.model
+        profile = self._protected_profile(chat_id)
+        return profile.model if profile is not None else self._config.default_model
 
     async def get_effective_model(self, chat_id: int) -> str:
         """Get the effective model, checking persisted settings if no instance exists.
 
-        Unlike get_model() which returns the global default when no
-        subprocess instance exists (e.g., after a service restart before
-        the first message), this method resolves the model from the DB
-        using the same precedence chain as resolve_user_defaults():
-        user settings DB > users.yaml > global default.
+        Protected runtimes use the user settings DB over their protected
+        profile baseline. Compatibility runtimes retain the existing
+        users.yaml/global cascade through ``resolve_user_defaults``.
 
         Use this in command handlers that display the current model
         (like /models) where accuracy matters more than speed.
@@ -828,8 +884,18 @@ class SubprocessPool:
         instance = self.get_if_exists(chat_id)
         if instance:
             return instance.model
-        defaults = await sessions.resolve_user_defaults(chat_id, self._config)
-        return defaults["model"]
+        profile = self._protected_profile(chat_id)
+        if profile is None:
+            defaults = await sessions.resolve_user_defaults(chat_id, self._config)
+            return defaults["model"]
+        db_settings = await sessions.get_user_settings(chat_id)
+        raw_model = db_settings.get("model", "").strip()
+        if not raw_model:
+            return profile.model
+        model = canonicalize_model_for_backend(raw_model, profile.backend)
+        if validate_model_for_backend(model, profile.backend, profile.provider):
+            return model
+        return profile.model
 
     def set_model(self, chat_id: int, model: str) -> None:
         """Set the model for a user's subprocess."""

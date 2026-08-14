@@ -165,6 +165,8 @@ def render_agent_failure(
     error: str | None,
     config: Config,
     chat_id: int,
+    *,
+    runtime_route: tuple[str, str, str | None] | None = None,
 ) -> str:
     """Render a safe, actionable error for a failed backend turn.
 
@@ -179,9 +181,12 @@ def render_agent_failure(
         return f"Error: {detail}"
 
     user_config = config.get_user_config(chat_id)
-    backend, provider = get_user_backend_and_provider(user_config, config)
+    if runtime_route is None:
+        backend, provider = get_user_backend_and_provider(user_config, config)
+        os_user = user_config.os_user if user_config else None
+    else:
+        backend, provider, os_user = runtime_route
     route = _agent_route_display(backend, provider)
-    os_user = user_config.os_user if user_config else None
 
     if kind in {AgentFailureKind.AUTHENTICATION_EXPIRED, AgentFailureKind.AUTHENTICATION_REQUIRED}:
         state = "has expired" if kind is AgentFailureKind.AUTHENTICATION_EXPIRED else "is required"

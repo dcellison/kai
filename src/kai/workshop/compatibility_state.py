@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 from kai import sessions
 from kai.config import Config
-from kai.conversation_compatibility import reader_user, schedule_memory_ingestion
+from kai.conversation_compatibility import schedule_memory_ingestion
 from kai.history import LogEntry, log_message
 from kai.workshop.domain import RuntimeProfileId
 from kai.workshop.runtime_pool import WorkshopRuntimePool
@@ -24,6 +24,7 @@ class WorkshopProfileCompatibilityState:
     _runtime_config_id: int = field(repr=False)
     _config: Config = field(repr=False)
     _reader_user: str | None = field(repr=False)
+    _backend: str = field(repr=False)
 
     def append_history(self, *, direction: str, text: str) -> LogEntry | None:
         return log_message(
@@ -55,6 +56,7 @@ class WorkshopProfileCompatibilityState:
             workspace=workspace,
             user_log=user_log,
             assistant_log=assistant_log,
+            effective_backend=self._backend,
         )
 
 
@@ -73,9 +75,10 @@ class WorkshopCompatibilityStateWriter:
         self,
         runtime_profile_id: str | RuntimeProfileId,
     ) -> WorkshopProfileCompatibilityState:
-        runtime_config_id = self._runtime_pool.compatibility_runtime_config_id(runtime_profile_id)
+        profile = self._runtime_pool.runtime_profile(runtime_profile_id)
         return WorkshopProfileCompatibilityState(
-            runtime_config_id,
+            profile.runtime_config_id,
             self._config,
-            reader_user(self._config, runtime_config_id),
+            profile.os_user,
+            profile.backend,
         )

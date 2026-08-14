@@ -30,6 +30,7 @@ def schedule_memory_ingestion(
     user_log: LogEntry | None,
     assistant_log: LogEntry | None,
     reasoner_backends: frozenset[str] = ONESHOT_REASONER_BACKENDS,
+    effective_backend: str | None = None,
 ) -> None:
     """Preserve the existing fire-and-forget semantic-memory write path."""
     from kai.memory import is_enabled as memory_is_enabled
@@ -50,10 +51,10 @@ def schedule_memory_ingestion(
                 if not user_text:
                     return
                 user_config = config.get_user_config(chat_id)
-                effective_backend = (
+                backend = effective_backend or (
                     user_config.backend if user_config and user_config.backend else config.default_backend
                 )
-                if config.memory_extraction_enabled and effective_backend in reasoner_backends:
+                if config.memory_extraction_enabled and backend in reasoner_backends:
                     prior_pairs: list[tuple[str, str]] = []
                     if config.episode_classifier_context_turns > 0:
                         from kai.history import get_recent_pairs

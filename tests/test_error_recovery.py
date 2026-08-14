@@ -183,7 +183,13 @@ class TestErrorMessageLifecycle:
     internal `reply_text` call, so a future refactor of `_reply_safe`
     cannot silently void these tests."""
 
-    def _make_pool_text_then_error(self, error_text: str | None = "API connection lost"):
+    def _make_pool_text_then_error(
+        self,
+        error_text: str | None = "API connection lost",
+        *,
+        backend: str = "codex",
+        provider: str = "openai",
+    ):
         """Mock pool whose .send() yields a text event followed by a
         done StreamEvent with the given error string. The text event
         triggers live_msg creation in the streaming loop, so the
@@ -208,6 +214,8 @@ class TestErrorMessageLifecycle:
 
         pool = MagicMock()
         pool.send = MagicMock(side_effect=_fake_stream)
+        pool.get_os_user.return_value = "daniel"
+        pool.get_backend_provider.return_value = (backend, provider)
         return pool
 
     def _make_update_with_live_msg(self):
@@ -372,7 +380,9 @@ class TestErrorMessageLifecycle:
         update, _live_msg = self._make_update_with_live_msg()
         ctx = self._make_context(backend="claude", provider="anthropic")
         pool = self._make_pool_text_then_error(
-            "Failed to authenticate: OAuth session expired and could not be refreshed"
+            "Failed to authenticate: OAuth session expired and could not be refreshed",
+            backend="claude",
+            provider="anthropic",
         )
 
         with (

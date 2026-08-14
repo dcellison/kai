@@ -24,7 +24,6 @@ from kai.bot import (
     _QUEUED_MESSAGE_MARKER,
     ResponseDeliveryRoute,
     _acquire_lock_or_kill,
-    _backend_name_for_instance,
     _clear_responding,
     _do_switch_workspace,
     _edit_message_safe,
@@ -78,7 +77,15 @@ from kai.bot import (
     handle_workspace_callback,
     handle_workspaces,
 )
-from kai.config import PROVIDER_MODELS, Config, UserConfig, get_default_model_for_backend
+from kai.config import (
+    PROVIDER_MODELS,
+    Config,
+    ModelRole,
+    UserConfig,
+    get_default_model_for_backend,
+    get_user_backend_and_provider,
+    resolve_user_model,
+)
 from kai.review import CollectionWarning, PRReviewResult
 from kai.tts import DEFAULT_VOICE, VOICES
 from kai.workshop.artifacts import InboundArtifact
@@ -100,78 +107,6 @@ from kai.workshop.storage_namespaces import (
 from kai.workshop.streaming_preview import ConfirmedTelegramStreamingPreview
 from kai.workspace_utils import is_workspace_allowed
 from tests.workshop_profiles import profile_id, profile_registry
-
-# ── _backend_name_for_instance ───────────────────────────────────────
-
-
-class TestBackendNameForInstance:
-    """
-    Verify the bot-side runtime backend dispatch reads `backend_name`
-    off the instance rather than inspecting the concrete class name.
-
-    Real backends each set the attribute to their canonical identifier
-    (claude.py: "claude"; goose.py: "goose"; codex.py: "codex").
-    Missing or invalid identities are rejected so model validation
-    cannot silently use another backend's policy.
-    """
-
-    def test_claude_backend_returns_class_attribute(self):
-        """ClaudeCodeBackend.backend_name is "claude"."""
-        from kai.claude import ClaudeCodeBackend
-
-        instance = MagicMock(spec=ClaudeCodeBackend)
-        instance.backend_name = ClaudeCodeBackend.backend_name
-        assert _backend_name_for_instance(instance) == "claude"
-
-    def test_goose_backend_returns_goose(self):
-        """GooseBackend.backend_name is "goose"."""
-        from kai.goose import GooseBackend
-
-        instance = MagicMock(spec=GooseBackend)
-        instance.backend_name = GooseBackend.backend_name
-        assert _backend_name_for_instance(instance) == "goose"
-
-    def test_codex_backend_returns_codex(self):
-        """CodexBackend.backend_name is "codex"."""
-        from kai.codex import CodexBackend
-
-        instance = MagicMock(spec=CodexBackend)
-        instance.backend_name = CodexBackend.backend_name
-        assert _backend_name_for_instance(instance) == "codex"
-
-    def test_opencode_backend_returns_opencode(self):
-        """OpenCodeBackend.backend_name is "opencode"."""
-        from kai.opencode import OpenCodeBackend
-
-        instance = MagicMock(spec=OpenCodeBackend)
-        instance.backend_name = OpenCodeBackend.backend_name
-        assert _backend_name_for_instance(instance) == "opencode"
-
-    def test_falsy_backend_name_is_rejected(self):
-        """A stub with an empty backend identity fails closed."""
-        stub = MagicMock()
-        stub.backend_name = ""
-
-        with pytest.raises(RuntimeError, match="invalid backend_name"):
-            _backend_name_for_instance(stub)
-
-    def test_missing_backend_name_attribute_is_rejected(self):
-        """A stub without a backend identity fails closed."""
-
-        class _Stub:
-            pass
-
-        with pytest.raises(RuntimeError, match="invalid backend_name"):
-            _backend_name_for_instance(_Stub())
-
-    def test_unknown_backend_name_is_rejected(self):
-        """A non-canonical backend identity cannot reach model routing."""
-        stub = MagicMock()
-        stub.backend_name = "unknown"
-
-        with pytest.raises(RuntimeError, match="invalid backend_name"):
-            _backend_name_for_instance(stub)
-
 
 # ── _get_user_models warning suppression ─────────────────────────────
 
@@ -204,6 +139,7 @@ class TestGetUserModelsWarningSuppression:
         config.get_user_config = MagicMock(return_value=None)
         pool = MagicMock(spec=SubprocessPool)
         pool.get_if_exists = MagicMock(return_value=None)
+        pool.get_backend_provider = MagicMock(return_value=("opencode", ""))
 
         with caplog.at_level(logging.WARNING, logger="kai.bot"):
             result = _get_user_models(pool, 111, config)
@@ -225,6 +161,7 @@ class TestGetUserModelsWarningSuppression:
         config.get_user_config = MagicMock(return_value=None)
         pool = MagicMock(spec=SubprocessPool)
         pool.get_if_exists = MagicMock(return_value=None)
+        pool.get_backend_provider = MagicMock(return_value=("codex", ""))
 
         with caplog.at_level(logging.WARNING, logger="kai.bot"):
             _get_user_models(pool, 111, config)
@@ -830,6 +767,10 @@ def _make_mock_claude(model="sonnet", workspace=None, is_alive=True, provider="a
     pool.get_effective_workspace = AsyncMock(return_value=ws)
     pool.is_alive = MagicMock(return_value=is_alive)
     pool.get_session_id = MagicMock(return_value=None)
+    pool.get_runtime_profile = MagicMock(return_value=None)
+    pool.get_backend_provider = MagicMock(return_value=("claude", provider))
+    pool.get_os_user = MagicMock(return_value=None)
+    pool.get_role_model = MagicMock(return_value=model)
     pool.restart = AsyncMock()
     pool.change_workspace = AsyncMock()
     pool.force_kill = AsyncMock()
@@ -852,8 +793,24 @@ def _make_context(config=None, claude=None, pool=None, args=None, user_data=None
     ctx = MagicMock()
     # Accept either pool (Phase 3) or claude (legacy test compat) as the
     # mock subprocess manager. Pool is preferred for new tests.
+    created_pool = pool is None and claude is None
     mock_pool = pool or claude or _make_mock_claude()
     resolved_config = config or _make_config()
+    if created_pool:
+        mock_pool.get_backend_provider.side_effect = lambda runtime_config_id: get_user_backend_and_provider(
+            resolved_config.get_user_config(runtime_config_id),
+            resolved_config,
+        )
+        mock_pool.get_os_user.side_effect = lambda runtime_config_id: (
+            user.os_user if (user := resolved_config.get_user_config(runtime_config_id)) is not None else None
+        )
+        mock_pool.get_role_model.side_effect = lambda runtime_config_id, role: resolve_user_model(
+            role,
+            resolved_config.get_user_config(runtime_config_id),
+            resolved_config,
+            backend=mock_pool.get_backend_provider(runtime_config_id)[0],
+            provider=mock_pool.get_backend_provider(runtime_config_id)[1],
+        )
     if pool is None:
         mock_pool.get_home_workspace = MagicMock(
             side_effect=lambda runtime_config_id: resolve_home_workspace(
@@ -5886,6 +5843,25 @@ class TestHandleSettings:
         assert "global default" in reply
         assert "anthropic" in reply.lower()
 
+    @pytest.mark.asyncio
+    async def test_show_settings_ignores_invalid_protected_model_override(self):
+        """The display matches the model that protected execution will use."""
+        update = _make_update(text="/settings")
+        config = _make_config(protected_install=True)
+        pool = _make_mock_claude()
+        pool.get_runtime_profile.return_value = profile_registry(12345).for_config_id(12345)
+        pool.get_backend_provider.return_value = ("codex", "openai")
+        ctx = _make_context(config=config, pool=pool)
+        mock_sessions = self._mock_sessions({"model": "opus"})
+
+        with self._patches(mock_sessions):
+            await _show_settings(update, ctx, 12345, config)
+
+        reply = update.message.reply_text.call_args[0][0]
+        assert "gpt-5.6-sol (runtime policy)" in reply
+        assert "opus (user override)" not in reply
+        assert "openai" in reply.lower()
+
     # ── 2. Set model ───────────────────────────────────────────────
 
     @pytest.mark.asyncio
@@ -7869,6 +7845,57 @@ class TestHandleReviewCommand:
         # And the inferred repo is the operator's sole configured
         # repo, not empty.
         assert mock_generate.call_args.args == ("dcellison/kai", 681)
+
+    @pytest.mark.asyncio
+    async def test_protected_review_uses_pool_execution_policy(self, tmp_path, monkeypatch):
+        """Compatibility fields cannot select the protected review subprocess."""
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
+        update = _make_update(user_id=1)
+        config = _make_config(
+            protected_install=True,
+            allowed_user_ids={1},
+            user_configs={
+                1: UserConfig(
+                    telegram_id=1,
+                    name="operator",
+                    github_repos=["dcellison/kai"],
+                    backend="claude",
+                    provider="anthropic",
+                    os_user="compatibility-user",
+                    models={"pr_review": "opus"},
+                )
+            },
+        )
+        pool = _make_mock_claude()
+        pool.get_os_user.return_value = "policy-user"
+        pool.get_backend_provider.return_value = ("codex", "openai")
+        pool.get_role_model.return_value = "gpt-5.5"
+        ctx = _make_context(
+            config=config,
+            pool=pool,
+            args=["dcellison/kai", "681"],
+        )
+        ctx.bot.send_document = AsyncMock()
+
+        with (
+            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
+            patch("kai.bot.sessions.get_setting", new=AsyncMock(return_value="ghp_user")),
+            patch(
+                "kai.bot.review.generate_pr_review",
+                new=AsyncMock(return_value=_review_result()),
+            ) as mock_generate,
+        ):
+            await handle_review_command(update, ctx)
+
+        kwargs = mock_generate.call_args.kwargs
+        assert kwargs["claude_user"] == "policy-user"
+        assert kwargs["agent_backend"] == "codex"
+        assert kwargs["provider"] == "openai"
+        assert kwargs["model_override"] == "gpt-5.5"
+        pool.get_os_user.assert_called_once_with(1)
+        pool.get_backend_provider.assert_called_once_with(1)
+        pool.get_role_model.assert_called_once_with(1, ModelRole.PR_REVIEW)
 
     @pytest.mark.asyncio
     async def test_upload_failure_is_surfaced_in_reply(self, tmp_path, monkeypatch):

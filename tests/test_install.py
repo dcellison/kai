@@ -8690,7 +8690,11 @@ backends:
                 users_yaml,
             )
 
-    def test_existing_policy_accepts_migrated_service_scope_reordering(self, tmp_path, monkeypatch):
+    def test_existing_policy_remains_authoritative_when_users_yaml_execution_fields_drift(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
         users_yaml = tmp_path / "users.yaml"
         users_yaml.write_text(
             """users:
@@ -8712,13 +8716,14 @@ backends:
                     "version": 1,
                     "runtime_profiles": {
                         profile_id: {
-                            "display_name": "Daniel",
+                            "display_name": "Protected Daniel runtime",
                             "compatibility_runtime_config_id": 101,
-                            "backend": "codex",
-                            "provider": "openai",
-                            "model": "gpt-5.5",
-                            "timeout_seconds": 120,
-                            "allowed_services": ["weather", "perplexity"],
+                            "os_user": "protected-daniel",
+                            "backend": "claude",
+                            "provider": "anthropic",
+                            "model": "opus",
+                            "timeout_seconds": 999,
+                            "allowed_services": ["weather"],
                             "home_workspace": None,
                             "workspace_base": None,
                             "allowed_workspaces": [],
@@ -8731,7 +8736,10 @@ backends:
         monkeypatch.setattr("kai.install.RUNTIME_PROFILES_YAML", policy)
         monkeypatch.setattr(
             "kai.install._backend_registry_entries",
-            lambda *args: {"codex": {"allowed_models": ["gpt-5.5"]}},
+            lambda *args: {
+                "claude": {"allowed_models": ["opus"]},
+                "codex": {"allowed_models": ["gpt-5.5"]},
+            },
         )
 
         action, content, profiles = _runtime_policy_apply_plan(
@@ -8747,7 +8755,13 @@ backends:
 
         assert action == "preserve"
         assert content == policy.read_text()
-        assert profiles.resolve(profile_id).allowed_services == ("weather", "perplexity")
+        profile = profiles.resolve(profile_id)
+        assert profile.display_name == "Protected Daniel runtime"
+        assert profile.os_user == "protected-daniel"
+        assert (profile.backend, profile.provider) == ("claude", "anthropic")
+        assert profile.model == "opus"
+        assert profile.timeout_seconds == 999
+        assert profile.allowed_services == ("weather",)
 
 
 class TestApplyBackendRegistry:
