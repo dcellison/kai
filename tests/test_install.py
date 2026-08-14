@@ -63,6 +63,8 @@ from kai.install import (
     _retire_install_home_dir,
     _runtime_policy_apply_plan,
     _runtime_policy_status,
+    _runtime_storage_status,
+    _runtime_storage_targets,
     _secure_codex_turn_image_staging,
     _secure_history_directories,
     _secure_upload_directories,
@@ -85,6 +87,8 @@ from kai.install import (
     cli,
 )
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+from kai.workshop.domain import RuntimeProfileId
+from kai.workshop.runtime_profiles import ProtectedRuntimeProfile, WorkshopRuntimeProfileRegistry
 from kai.workshop.store import WorkshopEventStore
 from tests.workshop_profiles import profile_id
 
@@ -12126,3 +12130,351 @@ class TestWizardPerUserBackendsUseRegistry:
         env = self._run(monkeypatch, tmp_path, inputs)
 
         assert "OPENCODE_BIN" not in env
+
+
+class TestProtectedRuntimeStorageProvisioning:
+    @staticmethod
+    def _profile(backend: str, *, os_user: str | None = None) -> ProtectedRuntimeProfile:
+        provider = {
+            "claude": "anthropic",
+            "codex": "openai",
+            "goose": "openai",
+            "opencode": "openai",
+            "pi": "openai",
+        }[backend]
+        model = "sonnet" if backend == "claude" else "gpt-5.5"
+        return ProtectedRuntimeProfile(
+            profile_id=RuntimeProfileId("rtp_" + "f" * 32),
+            runtime_config_id=987654321,
+            display_name="Browser-only human",
+            os_user=os_user,
+            backend=backend,
+            provider=provider,
+            model=model,
+            timeout_seconds=120,
+            allowed_services=(),
+            home_workspace=None,
+            workspace_base=None,
+            allowed_workspaces=(),
+        )
+
+    @staticmethod
+    def _setup_project(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
+        project = tmp_path / "project"
+        templates = project / "templates"
+        (templates / ".claude").mkdir(parents=True)
+        (templates / "AGENTS.md").write_text("# Canonical identity\n")
+        (templates / ".claude" / "MEMORY.md").write_text("# Memory\n")
+        (templates / ".claude" / "PREFERENCES.md").write_text("# Preferences\n")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", project)
+        monkeypatch.setattr("kai.install.os.chown", lambda *_args: None)
+
+        data_path = tmp_path / "data"
+        for name in ("logs", "memory", "files", "history"):
+            (data_path / name).mkdir(parents=True, exist_ok=True)
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users: []\n")
+        return data_path, users_yaml
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("backend", ["claude", "codex", "goose", "opencode", "pi"])
+    async def test_profile_without_telegram_user_gets_canonical_managed_storage(
+        self,
+        backend,
+        tmp_path,
+        monkeypatch,
+    ):
+        data_path, users_yaml = self._setup_project(tmp_path, monkeypatch)
+        profile = self._profile(backend)
+        registry = WorkshopRuntimeProfileRegistry((profile,))
+        store = await WorkshopEventStore.open(data_path / "kai.db")
+        await bootstrap_default_workshop(
+            store,
+            (
+                BootstrapHuman(
+                    "Browser human",
+                    "admin",
+                    "workshop",
+                    "browser-human",
+                    "browser-direct",
+                    profile.profile_id,
+                ),
+            ),
+        )
+        await store.close()
+
+        targets = _runtime_storage_targets(data_path, registry, users_yaml)
+        assert len(targets) == 1
+        assert targets[0].storage_name.startswith("prn_")
+
+        _apply_migrate(
+            data_path,
+            tmp_path / "install",
+            svc_uid=os.getuid(),
+            svc_gid=os.getgid(),
+            dry_run=False,
+            users_yaml_path=users_yaml,
+            runtime_storage_targets=targets,
+        )
+
+        principal_name = targets[0].storage_name
+        home = data_path / "home" / principal_name
+        assert (home / "AGENTS.md").read_text() == "# Canonical identity\n"
+        assert (data_path / "memory" / principal_name / "MEMORY.md").is_file()
+        assert (data_path / "preferences" / principal_name / "PREFERENCES.md").is_file()
+        claude_adapter = home / ".claude" / "CLAUDE.md"
+        if backend == "claude":
+            assert claude_adapter.read_text() == "@../AGENTS.md\n"
+        else:
+            assert not claude_adapter.exists()
+        assert not (data_path / "home" / str(profile.runtime_config_id)).exists()
+
+    @pytest.mark.asyncio
+    async def test_initialized_assignments_fail_closed_for_unmapped_profile(self, tmp_path):
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users: []\n")
+        profile = self._profile("codex")
+        store = await WorkshopEventStore.open(data_path / "kai.db")
+        await bootstrap_default_workshop(
+            store,
+            (BootstrapHuman("Other", "admin", "workshop", "other", "other-direct", None),),
+        )
+        await store.close()
+
+        with pytest.raises(RuntimeError, match="exactly one canonical human owner"):
+            _runtime_storage_targets(
+                data_path,
+                WorkshopRuntimeProfileRegistry((profile,)),
+                users_yaml,
+            )
+
+    def test_profile_only_missing_os_account_fails_before_provisioning(self, tmp_path, monkeypatch):
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users: []\n")
+        profile = self._profile("codex", os_user="missing-user")
+        monkeypatch.setattr(
+            "kai.install._runtime_profile_principal_names",
+            lambda _data_path: (True, {str(profile.profile_id): "prn_" + "a" * 32}),
+        )
+        monkeypatch.setattr(
+            "kai.install.pwd.getpwnam",
+            lambda name: (_ for _ in ()).throw(KeyError(name)),
+        )
+
+        with pytest.raises(ValueError, match="does not exist on this host"):
+            _runtime_storage_targets(
+                tmp_path / "data",
+                WorkshopRuntimeProfileRegistry((profile,)),
+                users_yaml,
+            )
+
+        assert not (tmp_path / "data").exists()
+
+    def test_migrated_profile_conflicting_canonical_owner_fails_closed(self, tmp_path, monkeypatch):
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - telegram_id: 987654321\n    name: Existing human\n    role: admin\n")
+        profile = self._profile("codex")
+        monkeypatch.setattr(
+            "kai.install._runtime_profile_principal_names",
+            lambda _data_path: (True, {str(profile.profile_id): "prn_" + "a" * 32}),
+        )
+        monkeypatch.setattr(
+            "kai.install._canonical_principal_storage_names",
+            lambda _data_path: {str(profile.runtime_config_id): "prn_" + "b" * 32},
+        )
+
+        with pytest.raises(RuntimeError, match="conflicts with its canonical compatibility owner"):
+            _runtime_storage_targets(
+                tmp_path / "data",
+                WorkshopRuntimeProfileRegistry((profile,)),
+                users_yaml,
+            )
+
+    @pytest.mark.asyncio
+    async def test_profile_driven_dry_run_describes_canonical_home_without_writing(
+        self,
+        tmp_path,
+        monkeypatch,
+        capsys,
+    ):
+        data_path, users_yaml = self._setup_project(tmp_path, monkeypatch)
+        profile = self._profile("codex")
+        registry = WorkshopRuntimeProfileRegistry((profile,))
+        store = await WorkshopEventStore.open(data_path / "kai.db")
+        await bootstrap_default_workshop(
+            store,
+            (
+                BootstrapHuman(
+                    "Browser human",
+                    "admin",
+                    "workshop",
+                    "browser-human",
+                    "browser-direct",
+                    profile.profile_id,
+                ),
+            ),
+        )
+        await store.close()
+        targets = _runtime_storage_targets(data_path, registry, users_yaml)
+
+        _apply_migrate(
+            data_path,
+            tmp_path / "install",
+            svc_uid=os.getuid(),
+            svc_gid=os.getgid(),
+            dry_run=True,
+            users_yaml_path=users_yaml,
+            runtime_storage_targets=targets,
+        )
+
+        canonical_home = data_path / "home" / targets[0].storage_name
+        assert f"Would create {canonical_home}" in capsys.readouterr().out
+        assert not canonical_home.exists()
+        assert not (data_path / "memory" / targets[0].storage_name).exists()
+
+    @pytest.mark.asyncio
+    async def test_status_reports_profile_storage_coverage_without_identifiers(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        data_path, users_yaml = self._setup_project(tmp_path, monkeypatch)
+        profile = self._profile("codex")
+        store = await WorkshopEventStore.open(data_path / "kai.db")
+        await bootstrap_default_workshop(
+            store,
+            (
+                BootstrapHuman(
+                    "Browser human",
+                    "admin",
+                    "workshop",
+                    "browser-human",
+                    "browser-direct",
+                    profile.profile_id,
+                ),
+            ),
+        )
+        await store.close()
+        targets = _runtime_storage_targets(
+            data_path,
+            WorkshopRuntimeProfileRegistry((profile,)),
+            users_yaml,
+        )
+        _apply_migrate(
+            data_path,
+            tmp_path / "install",
+            svc_uid=os.getuid(),
+            svc_gid=os.getgid(),
+            dry_run=False,
+            users_yaml_path=users_yaml,
+            runtime_storage_targets=targets,
+        )
+
+        policy = tmp_path / "runtime-profiles.yaml"
+        policy.write_text(
+            yaml.safe_dump(
+                {
+                    "version": 1,
+                    "runtime_profiles": {
+                        str(profile.profile_id): {
+                            "display_name": profile.display_name,
+                            "compatibility_runtime_config_id": profile.runtime_config_id,
+                            "backend": profile.backend,
+                            "provider": profile.provider,
+                            "model": profile.model,
+                            "timeout_seconds": profile.timeout_seconds,
+                            "allowed_services": [],
+                            "home_workspace": None,
+                            "workspace_base": None,
+                            "allowed_workspaces": [],
+                        }
+                    },
+                }
+            )
+        )
+        backends = tmp_path / "backends.yaml"
+        backends.write_text("version: 1\nbackends:\n  codex: {}\n")
+        service_user = pwd.getpwuid(os.getuid()).pw_name
+        home = data_path / "home" / targets[0].storage_name
+        service_entry = MagicMock(pw_uid=home.stat().st_uid, pw_gid=home.stat().st_gid)
+        monkeypatch.setattr("kai.install.pwd.getpwnam", lambda _name: service_entry)
+
+        status = _runtime_storage_status(
+            data_path,
+            service_user,
+            policy,
+            backends,
+            users_yaml,
+        )
+
+        assert status == ("Workshop runtime storage: complete; profiles=1, managed=1, operator-managed=0, incomplete=0")
+        assert str(profile.profile_id) not in status
+        assert str(profile.runtime_config_id) not in status
+
+    def test_profile_only_os_user_is_included_in_sudoers(self, tmp_path, monkeypatch):
+        profile = self._profile("codex", os_user="browser-user")
+        registry = WorkshopRuntimeProfileRegistry((profile,))
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users: []\n")
+        observed_users: list[str] = []
+
+        def fake_generate_sudoers(_service_user, os_users, **_kwargs):
+            observed_users.extend(os_users)
+            return "# test sudoers\n"
+
+        monkeypatch.setattr("kai.install._generate_sudoers", fake_generate_sudoers)
+        monkeypatch.setattr(
+            "kai.install._backend_registry_entries",
+            lambda *_args, **_kwargs: {"codex": {"command": str(tmp_path / "codex")}},
+        )
+
+        _apply_sudoers(
+            "kai",
+            dry_run=True,
+            users_yaml_path=users_yaml,
+            agent_backend="codex",
+            runtime_profiles=registry,
+        )
+
+        assert observed_users == ["browser-user"]
+
+    def test_profile_only_goose_os_user_receives_config(self, tmp_path, monkeypatch):
+        import types
+
+        profile = self._profile("goose", os_user="browser-user")
+        registry = WorkshopRuntimeProfileRegistry((profile,))
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users: []\n")
+        install_path = tmp_path / "install"
+        (install_path / "config").mkdir(parents=True)
+        (install_path / "config" / "goose-config.yaml").write_text("extensions: {}\n")
+        service_home = tmp_path / "home" / "kai"
+        browser_home = tmp_path / "home" / "browser-user"
+        service_home.mkdir(parents=True)
+        browser_home.mkdir(parents=True)
+        monkeypatch.setattr("kai.install._user_home", lambda _name: str(service_home))
+        monkeypatch.setattr("kai.install.shutil.which", lambda _name: "/usr/local/bin/goose")
+        monkeypatch.setattr(
+            "kai.install.pwd.getpwnam",
+            lambda _name: types.SimpleNamespace(
+                pw_dir=str(browser_home),
+                pw_uid=os.getuid(),
+                pw_gid=os.getgid(),
+            ),
+        )
+        monkeypatch.setattr("kai.install._set_ownership", lambda *_args, **_kwargs: None)
+
+        _apply_goose_config(
+            "kai",
+            install_path,
+            os.getuid(),
+            os.getgid(),
+            dry_run=False,
+            users_yaml_path=users_yaml,
+            agent_backend="codex",
+            runtime_profiles=registry,
+        )
+
+        assert (browser_home / ".config" / "goose" / "config.yaml").is_file()
