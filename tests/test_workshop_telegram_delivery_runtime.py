@@ -215,18 +215,31 @@ async def test_recovery_failure_prevents_readiness_and_worker_creation():
     assert runtime.state == TelegramDeliveryRuntimeState.STOPPED
 
 
-async def test_conversation_service_activates_once_and_reuses_epoch_after_restart(tmp_path: Path):
+async def test_conversation_service_uses_core_epoch_after_restart(tmp_path: Path):
     database = tmp_path / "kai.db"
     bot = AsyncMock()
+    authority_store = await WorkshopEventStore.open(database)
+    try:
+        core_epoch = (await WorkshopConversationDeliveryAuthority(authority_store).activate()).epoch
+    finally:
+        await authority_store.close()
 
-    first_service = await WorkshopTelegramConversationDeliveryService.open_and_start(database, bot)
+    first_service = await WorkshopTelegramConversationDeliveryService.open_and_start(
+        database,
+        bot,
+        authority_epoch_id=core_epoch.epoch_id,
+    )
     assert first_service.ready
     observer = await WorkshopEventStore.open(database)
     first_epoch = await WorkshopConversationDeliveryAuthority(observer).active_epoch()
     await observer.close()
     await first_service.stop()
 
-    second_service = await WorkshopTelegramConversationDeliveryService.open_and_start(database, bot)
+    second_service = await WorkshopTelegramConversationDeliveryService.open_and_start(
+        database,
+        bot,
+        authority_epoch_id=core_epoch.epoch_id,
+    )
     assert second_service.ready
     observer = await WorkshopEventStore.open(database)
     second_epoch = await WorkshopConversationDeliveryAuthority(observer).active_epoch()
@@ -234,6 +247,24 @@ async def test_conversation_service_activates_once_and_reuses_epoch_after_restar
     await second_service.stop()
 
     assert second_epoch.epoch_id == first_epoch.epoch_id
+
+
+async def test_conversation_service_rejects_epoch_other_than_active_core_authority(tmp_path: Path):
+    from kai.workshop.domain import DeliveryAuthorityEpochId
+
+    database = tmp_path / "kai.db"
+    authority_store = await WorkshopEventStore.open(database)
+    try:
+        await WorkshopConversationDeliveryAuthority(authority_store).activate()
+    finally:
+        await authority_store.close()
+
+    with pytest.raises(RuntimeError, match="does not match core authority"):
+        await WorkshopTelegramConversationDeliveryService.open_and_start(
+            database,
+            AsyncMock(),
+            authority_epoch_id=DeliveryAuthorityEpochId.new(),
+        )
 
 
 async def test_notification_service_owns_a_dedicated_ready_worker(tmp_path: Path):

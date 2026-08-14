@@ -17,6 +17,7 @@ from kai.workshop.delivery_outbox import (
     DeliveryRecoveryResult,
     WorkshopDeliveryOutbox,
 )
+from kai.workshop.domain import DeliveryAuthorityEpochId
 from kai.workshop.github_notifications import (
     GitHubNotification,
     GitHubNotificationRecord,
@@ -221,7 +222,7 @@ class WorkshopTelegramDeliveryRuntime:
 
 
 class WorkshopTelegramConversationDeliveryService:
-    """Own the active authority epoch, dedicated store, and worker runtime."""
+    """Own dedicated Telegram stores and workers for one core-owned epoch."""
 
     def __init__(
         self,
@@ -242,15 +243,18 @@ class WorkshopTelegramConversationDeliveryService:
         database_path: Path,
         bot: Bot,
         *,
+        authority_epoch_id: DeliveryAuthorityEpochId,
         worker_id: str = "kai-telegram-conversation-finalization",
     ) -> WorkshopTelegramConversationDeliveryService:
-        """Activate authority and recover work before returning ready."""
+        """Validate core authority and recover Telegram work before ready."""
         store = await WorkshopEventStore.open(database_path)
         client_store: WorkshopEventStore | None = None
         client_runtime: WorkshopTelegramDeliveryRuntime | None = None
         try:
             client_store = await WorkshopEventStore.open(database_path)
-            epoch = (await WorkshopConversationDeliveryAuthority(store).activate()).epoch
+            epoch = await WorkshopConversationDeliveryAuthority(store).active_epoch()
+            if epoch.epoch_id != authority_epoch_id:
+                raise RuntimeError("Telegram delivery epoch does not match core authority")
             outbox = WorkshopDeliveryOutbox(store)
             fragments = WorkshopDeliveryFragments(store)
             client_worker = WorkshopTelegramDeliveryWorker(

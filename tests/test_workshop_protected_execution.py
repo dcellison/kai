@@ -152,8 +152,10 @@ class TestProtectedExecutionPreparation:
     def test_service_is_registered_only_through_private_text_runtime_owner(self):
         source_root = Path(__file__).parents[1] / "src" / "kai"
         main_source = (source_root / "main.py").read_text(encoding="utf-8")
+        host_source = (source_root / "application_host.py").read_text(encoding="utf-8")
         owner_source = (source_root / "workshop" / "private_text_execution.py").read_text(encoding="utf-8")
-        assert "WorkshopPrivateTextExecutionService.open_and_start" in main_source
+        assert "WorkshopPrivateTextExecutionService.open_and_start" in host_source
+        assert "WorkshopPrivateTextExecutionService.open_and_start" not in main_source
         assert "WorkshopProtectedExecutionPreparationService" in owner_source
         assert "WorkshopProtectedExecutionPreparationService" not in (source_root / "bot.py").read_text(
             encoding="utf-8"

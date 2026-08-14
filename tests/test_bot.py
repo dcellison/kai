@@ -13,6 +13,7 @@ import logging
 import stat
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
@@ -669,6 +670,39 @@ class TestIsWorkspaceAllowed:
 # ── create_bot transport mode ──────────────────────────────────────
 
 
+def _bot_core_services(config):
+    """Build unstarted typed core dependencies for Telegram factory tests."""
+    from kai import services
+    from kai.pool import SubprocessPool
+
+    profiles = profile_registry(1)
+    pool = SubprocessPool(
+        config=config,
+        services_info=services.get_available_services(),
+        runtime_profiles=profiles,
+    )
+    runtime_pool = WorkshopRuntimePool(pool, profiles)
+    principal_storage = WorkshopPrincipalStorageRegistry(
+        (
+            WorkshopPrincipalStorageNamespace(
+                PrincipalId("prn_" + "1" * 32),
+                profile_id(1),
+                1,
+            ),
+        )
+    )
+    return SimpleNamespace(
+        subprocess_pool=pool,
+        runtime_pool=runtime_pool,
+        conversation_runs=WorkshopConversationRunService(
+            runtime_pool,
+            sessions.resolve_workshop_conversation_run,
+        ),
+        private_text_execution=MagicMock(),
+        principal_storage=principal_storage,
+    )
+
+
 class TestCreateBotTransportMode:
     @pytest.fixture(autouse=True)
     def _init_services(self, tmp_path):
@@ -685,17 +719,18 @@ class TestCreateBotTransportMode:
     def test_webhook_mode_suppresses_updater(self):
         """In webhook mode, the Updater is suppressed (None)."""
         config = _make_config()
-        app = create_bot(config, use_webhook=True, runtime_profiles=profile_registry(1))
+        app = create_bot(config, use_webhook=True, core_services=_bot_core_services(config))
         assert app.updater is None
 
     def test_polling_mode_keeps_updater(self):
         """In polling mode, the Updater is present for start_polling()."""
         config = _make_config()
-        app = create_bot(config, use_webhook=False, runtime_profiles=profile_registry(1))
+        app = create_bot(config, use_webhook=False, core_services=_bot_core_services(config))
         assert app.updater is not None
 
     def test_installs_workshop_shadow_recorder(self):
-        app = create_bot(_make_config(), runtime_profiles=profile_registry(1))
+        config = _make_config()
+        app = create_bot(config, core_services=_bot_core_services(config))
 
         assert app.bot_data["workshop_inbound_recorder"] is sessions.record_workshop_inbound_message
         assert app.bot_data["workshop_artifact_recorder"] is sessions.record_workshop_inbound_artifact
@@ -707,7 +742,8 @@ class TestCreateBotTransportMode:
         assert isinstance(app.bot_data["workshop_conversation_run_service"], WorkshopConversationRunService)
 
     def test_does_not_register_durable_run_lifecycle_before_cutover(self):
-        app = create_bot(_make_config(), runtime_profiles=profile_registry(1))
+        config = _make_config()
+        app = create_bot(config, core_services=_bot_core_services(config))
 
         # The durable lifecycle remains deliberately unregistered until the
         # run-authority cutover gates in the Workshop map are satisfied.
@@ -6752,7 +6788,7 @@ class TestCommandMenu:
         from telegram.ext import CommandHandler as CH
 
         config = _make_config()
-        app = create_bot(config, runtime_profiles=profile_registry(1))
+        app = create_bot(config, core_services=_bot_core_services(config))
 
         # Collect all command names from registered CommandHandlers
         registered: set[str] = set()
@@ -6768,7 +6804,8 @@ class TestCommandMenu:
         """Every command except the narrow recovery set defaults to TOTP."""
         from telegram.ext import CommandHandler as CH
 
-        app = create_bot(_make_config(), runtime_profiles=profile_registry(1))
+        config = _make_config()
+        app = create_bot(config, core_services=_bot_core_services(config))
         callbacks: dict[str, object] = {}
         for group_handlers in app.handlers.values():
             for handler in group_handlers:
@@ -6787,7 +6824,8 @@ class TestCommandMenu:
         """Model, voice, workspace, and memory buttons cannot bypass TOTP."""
         from telegram.ext import CallbackQueryHandler as CQH
 
-        app = create_bot(_make_config(), runtime_profiles=profile_registry(1))
+        config = _make_config()
+        app = create_bot(config, core_services=_bot_core_services(config))
         callbacks = [
             handler.callback
             for group_handlers in app.handlers.values()

@@ -10,9 +10,11 @@ from unittest.mock import AsyncMock
 
 from kai import sessions
 from kai.workshop.bootstrap import BootstrapHuman
+from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
 from kai.workshop.domain import MessageId
 from kai.workshop.inbound import InboundMessage
 from kai.workshop.outbound import OutboundMessage
+from kai.workshop.store import WorkshopEventStore
 from kai.workshop.streaming_preview import ConfirmedTelegramStreamingPreview
 from kai.workshop.telegram_delivery_runtime import WorkshopTelegramConversationDeliveryService
 
@@ -41,7 +43,16 @@ async def test_shared_finalizer_and_dedicated_worker_finalize_one_preview_withou
 
         bot = AsyncMock()
         bot.edit_message_text.return_value = SimpleNamespace(message_id=7001)
-        service = await WorkshopTelegramConversationDeliveryService.open_and_start(database, bot)
+        authority_store = await WorkshopEventStore.open(database)
+        try:
+            epoch = (await WorkshopConversationDeliveryAuthority(authority_store).activate()).epoch
+        finally:
+            await authority_store.close()
+        service = await WorkshopTelegramConversationDeliveryService.open_and_start(
+            database,
+            bot,
+            authority_epoch_id=epoch.epoch_id,
+        )
         await sessions.record_workshop_streaming_preview(
             ConfirmedTelegramStreamingPreview(
                 inbound_message_id=inbound_id,

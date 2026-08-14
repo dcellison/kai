@@ -1,11 +1,12 @@
 """Route-registration tests for separated external and internal credentials."""
 
 import json
+from types import SimpleNamespace
 
 from aiohttp import web
 
 from kai.config import Config
-from kai.webhook import _handle_health, _register_routes
+from kai.webhook import CORE_HOST_KEY, _handle_health, _register_routes
 
 
 def _config(**overrides: object) -> Config:
@@ -69,6 +70,33 @@ def test_telegram_route_is_independent_of_other_webhooks() -> None:
 async def test_health_reports_non_sensitive_memory_mode(monkeypatch) -> None:
     monkeypatch.setattr("kai.webhook.memory.is_enabled", lambda: True)
 
-    response = await _handle_health(None)  # type: ignore[arg-type]
+    request = SimpleNamespace(app=web.Application())
+    response = await _handle_health(request)  # type: ignore[arg-type]
 
     assert json.loads(response.body) == {"status": "ok", "memory_enabled": True}
+
+
+async def test_health_reports_typed_core_component_readiness(monkeypatch) -> None:
+    monkeypatch.setattr("kai.webhook.memory.is_enabled", lambda: False)
+    app = web.Application()
+    app[CORE_HOST_KEY] = SimpleNamespace(
+        readiness=SimpleNamespace(
+            as_dict=lambda: {
+                "status": "ready",
+                "ready": True,
+                "components": {"runtime": True, "executor": True},
+            }
+        )
+    )
+
+    response = await _handle_health(SimpleNamespace(app=app))  # type: ignore[arg-type]
+
+    assert json.loads(response.body) == {
+        "status": "ok",
+        "memory_enabled": False,
+        "core": {
+            "status": "ready",
+            "ready": True,
+            "components": {"runtime": True, "executor": True},
+        },
+    }

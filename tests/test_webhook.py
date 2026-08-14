@@ -5,6 +5,7 @@ import dataclasses
 import hashlib
 import hmac
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -52,6 +53,7 @@ from kai.workshop.storage_namespaces import (
     WorkshopPrincipalStorageNamespace,
     WorkshopPrincipalStorageRegistry,
 )
+from kai.workshop.store import WorkshopEventStore
 from kai.workshop.telegram_delivery_runtime import WorkshopTelegramNotificationService
 from tests.workshop_profiles import profile_id
 
@@ -2527,13 +2529,14 @@ class TestNotificationChatIdMutations:
         private_execution.recoverable_client_runs = AsyncMock(return_value=())
         telegram_app = MagicMock()
         telegram_app.bot = AsyncMock()
-        telegram_app.bot_data = {
-            "pool": MagicMock(internal_api_auth=InternalAPIAuth({111: "secret"})),
-            "workshop_private_text_execution": private_execution,
-            "workshop_runtime_pool": MagicMock(),
-            "workshop_principal_storage": _principal_storage_registry(),
-            "workshop_github_notifications": MagicMock(spec=WorkshopTelegramNotificationService),
-        }
+        core_services = SimpleNamespace(
+            subprocess_pool=MagicMock(internal_api_auth=InternalAPIAuth({111: "secret"})),
+            principal_storage=_principal_storage_registry(),
+            client_store=MagicMock(),
+            client_commands=MagicMock(),
+        )
+        core_host = MagicMock()
+        github_notifications = MagicMock(spec=WorkshopTelegramNotificationService)
 
         fake_runner = MagicMock()
         fake_runner.setup = AsyncMock()
@@ -2550,7 +2553,13 @@ class TestNotificationChatIdMutations:
                 patch("kai.webhook.web.AppRunner", return_value=fake_runner),
                 patch("kai.webhook.web.TCPSite", return_value=fake_site),
             ):
-                await wh.start(telegram_app, config)
+                await wh.start(
+                    telegram_app,
+                    config,
+                    core_host=core_host,
+                    core_services=core_services,
+                    github_notifications=github_notifications,
+                )
 
             assert wh._app[ALLOWED_USER_IDS_KEY] == {111}
             assert wh._app[NOTIFICATION_CHAT_IDS_KEY] == {-100111, -100222}
@@ -2590,13 +2599,15 @@ class TestNotificationChatIdMutations:
         private_execution.recoverable_client_runs = AsyncMock(return_value=())
         telegram_app = MagicMock()
         telegram_app.bot = AsyncMock()
-        telegram_app.bot_data = {
-            "pool": MagicMock(internal_api_auth=InternalAPIAuth({111: "secret"})),
-            "workshop_private_text_execution": private_execution,
-            "workshop_runtime_pool": MagicMock(),
-            "workshop_principal_storage": _principal_storage_registry(),
-            "workshop_github_notifications": MagicMock(spec=WorkshopTelegramNotificationService),
-        }
+        core_store = await WorkshopEventStore.open(config.session_db_path)
+        core_services = SimpleNamespace(
+            subprocess_pool=MagicMock(internal_api_auth=InternalAPIAuth({111: "secret"})),
+            principal_storage=_principal_storage_registry(),
+            client_store=core_store,
+            client_commands=MagicMock(),
+        )
+        core_host = MagicMock()
+        github_notifications = MagicMock(spec=WorkshopTelegramNotificationService)
 
         apps: list[web.Application] = []
         runners: list[MagicMock] = []
@@ -2620,7 +2631,13 @@ class TestNotificationChatIdMutations:
         monkeypatch.setattr("kai.webhook.web.TCPSite", fake_site)
         monkeypatch.setattr("kai.webhook.sessions.get_setting", AsyncMock(return_value=None))
 
-        await wh.start(telegram_app, config)
+        await wh.start(
+            telegram_app,
+            config,
+            core_host=core_host,
+            core_services=core_services,
+            github_notifications=github_notifications,
+        )
         try:
             assert [(host, port) for _, host, port in sites] == [
                 ("127.0.0.1", 8080),
@@ -2645,6 +2662,7 @@ class TestNotificationChatIdMutations:
             assert not any(path.startswith("/webhook") for path in lan_paths)
         finally:
             await wh.stop()
+            await core_store.close()
 
     def test_add_notification_chat_id(self):
         """add_notification_chat_id adds a chat_id to the outbound registry."""

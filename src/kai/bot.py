@@ -58,8 +58,9 @@ from telegram.ext import (
     filters,
 )
 
-from kai import github_api, memory_command, review, services, sessions, webhook
+from kai import github_api, memory_command, review, sessions, webhook
 from kai.agent_failure import render_agent_failure
+from kai.application_host import KaiCoreServices
 from kai.config import (
     DATA_DIR,
     ONESHOT_REASONER_BACKENDS,
@@ -97,8 +98,6 @@ from kai.workshop.execution_coordinator import (
 from kai.workshop.inbound import InboundMessage
 from kai.workshop.outbound import DeliveryObservation, OutboundMessage
 from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
-from kai.workshop.runtime_pool import WorkshopRuntimePool
-from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
 from kai.workshop.storage_namespaces import (
     WorkshopPrincipalStorageRegistry,
     WorkshopStorageNamespaceError,
@@ -5382,7 +5381,7 @@ async def _handle_response(
 def create_bot(
     config: Config,
     *,
-    runtime_profiles: WorkshopRuntimeProfileRegistry,
+    core_services: KaiCoreServices,
     use_webhook: bool = True,
 ) -> Application:
     """
@@ -5400,7 +5399,7 @@ def create_bot(
 
     Args:
         config: The application Config instance.
-        runtime_profiles: Protected runtime policy constructed by startup.
+        core_services: Transport-neutral services constructed by the core host.
         use_webhook: If True, suppress the default Updater (updates arrive via
             webhook POST). If False, keep the Updater for long-polling mode.
 
@@ -5423,21 +5422,13 @@ def create_bot(
     app.bot_data["workshop_delivery_recorder"] = sessions.record_workshop_delivery_observation
     app.bot_data["workshop_streaming_preview_recorder"] = sessions.record_workshop_streaming_preview
     app.bot_data["workshop_streaming_finalizer"] = sessions.record_workshop_streaming_finalization
-    pool = SubprocessPool(
-        config=config,
-        services_info=services.get_available_services(),
-        runtime_profiles=runtime_profiles,
-    )
-    app.bot_data["pool"] = pool
-    workshop_runtime_pool = WorkshopRuntimePool(
-        pool,
-        runtime_profiles,
-    )
-    app.bot_data["workshop_runtime_pool"] = workshop_runtime_pool
-    app.bot_data["workshop_conversation_run_service"] = WorkshopConversationRunService(
-        workshop_runtime_pool,
-        sessions.resolve_workshop_conversation_run,
-    )
+    # Handlers still receive adapter-local mirrors while they migrate to typed
+    # services. Construction and lifecycle belong exclusively to the core host.
+    app.bot_data["pool"] = core_services.subprocess_pool
+    app.bot_data["workshop_runtime_pool"] = core_services.runtime_pool
+    app.bot_data["workshop_conversation_run_service"] = core_services.conversation_runs
+    app.bot_data["workshop_private_text_execution"] = core_services.private_text_execution
+    app.bot_data["workshop_principal_storage"] = core_services.principal_storage
 
     # Default every recognized command to sensitive. `/start` and `/help`
     # disclose no user state and remain available so an authorized operator can

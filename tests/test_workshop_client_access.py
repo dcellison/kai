@@ -327,11 +327,10 @@ class TestWorkshopClientProductionRegistration:
     async def test_runtime_wires_operator_grant_to_authenticated_timeline_read(self, tmp_path: Path):
         database = tmp_path / "kai.db"
         store = await _store(database)
-        await store.close()
         app = web.Application()
         client: TestClient | None = None
         try:
-            await webhook._register_workshop_client_api(app, database)
+            await webhook._register_workshop_client_api(app, store)
             routes = {(route.method, route.resource.canonical) for route in app.router.routes()}
 
             assert ("POST", "/v1/client/enrollment/redeem") in routes
@@ -381,4 +380,4 @@ class TestWorkshopClientProductionRegistration:
         finally:
             if client is not None:
                 await client.close()
-            await webhook.stop()
+            await store.close()

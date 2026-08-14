@@ -64,6 +64,7 @@ from telegram import Bot, Update
 from telegram.ext import Application
 
 from kai import cron, memory, review, services, sessions, triage
+from kai.application_host import KaiApplicationHost, KaiCoreServices
 from kai.config import (
     DATA_DIR,
     IMAGE_EXTENSIONS,
@@ -84,14 +85,12 @@ from kai.workshop.client_api import (
     register_workshop_enrollment_routes,
     register_workshop_read_routes,
 )
-from kai.workshop.client_commands import WorkshopClientCommandExecutor
 from kai.workshop.client_sessions import (
     WorkshopBearerSessionAuthenticator,
     WorkshopClientEnrollmentManager,
     WorkshopClientSessionManager,
 )
 from kai.workshop.client_shell import register_workshop_shell_routes
-from kai.workshop.compatibility_state import WorkshopCompatibilityStateWriter
 from kai.workshop.github_notifications import GitHubNotification
 from kai.workshop.storage_namespaces import (
     WorkshopPrincipalStorageRegistry,
@@ -123,6 +122,7 @@ ALLOWED_USER_IDS_KEY: web.AppKey[set[int]] = web.AppKey("allowed_user_ids", set)
 ALLOWED_WORKSPACES_KEY: web.AppKey[list[str]] = web.AppKey("allowed_workspaces", list)
 CHAT_ID_KEY: web.AppKey[int] = web.AppKey("chat_id", int)
 CONFIG_KEY: web.AppKey[Config] = web.AppKey("config", Config)
+CORE_HOST_KEY: web.AppKey[KaiApplicationHost] = web.AppKey("core_host", KaiApplicationHost)
 GENERIC_WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("generic_webhook_secret", str)
 GITHUB_WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("github_webhook_secret", str)
 INTERNAL_API_AUTH_KEY: web.AppKey[InternalAPIAuth] = web.AppKey("internal_api_auth", InternalAPIAuth)
@@ -152,8 +152,6 @@ class UnauthorizedChatIdError(Exception):
 _app: web.Application | None = None
 _runner: web.AppRunner | None = None
 _workshop_lan_runner: web.AppRunner | None = None
-_workshop_client_store: WorkshopEventStore | None = None
-_workshop_client_command_executor: WorkshopClientCommandExecutor | None = None
 # Tracks whether we registered a Telegram webhook with the API, so stop()
 # knows whether to call delete_webhook(). Only True in webhook mode.
 _webhook_registered: bool = False
@@ -715,8 +713,15 @@ def _verify_github_signature(secret: str, body: bytes, signature: str) -> bool:
 
 
 async def _handle_health(request: web.Request) -> web.Response:
-    """Return liveness plus the non-sensitive memory feature mode."""
-    return web.json_response({"status": "ok", "memory_enabled": memory.is_enabled()})
+    """Return liveness plus non-sensitive core component readiness."""
+    response: dict[str, object] = {
+        "status": "ok",
+        "memory_enabled": memory.is_enabled(),
+    }
+    host = request.app.get(CORE_HOST_KEY)
+    if host is not None:
+        response["core"] = host.readiness.as_dict()
+    return web.json_response(response)
 
 
 async def _handle_telegram_update(request: web.Request) -> web.Response:
@@ -2498,11 +2503,11 @@ def _register_routes(app: web.Application, config: Config) -> None:
 
 async def _register_workshop_client_api(
     app: web.Application,
-    database: Path,
+    store: WorkshopEventStore,
     *,
     command_submitter: WorkshopClientCommandSubmitter | None = None,
 ) -> Callable[[web.Application], None]:
-    """Open one client-state connection and return its route registrar.
+    """Register the client API against the core-owned canonical store.
 
     The returned registrar deliberately contains only the Workshop browser
     shell and authenticated client API.  It can therefore be applied to the
@@ -2511,52 +2516,49 @@ async def _register_workshop_client_api(
     Shared locks and rate limiters keep both listeners inside one security
     boundary rather than giving each listener an independent allowance.
     """
-    global _workshop_client_store
-    if _workshop_client_store is not None:
-        raise RuntimeError("Workshop client API store is already open")
+    request_lock = asyncio.Lock()
+    sessions_manager = WorkshopClientSessionManager(store)
+    enrollment_manager = WorkshopClientEnrollmentManager(store)
+    authenticator = WorkshopBearerSessionAuthenticator(sessions_manager)
+    enrollment_rate_limiter = WorkshopEnrollmentRateLimiter()
+    event_stream_limiter = WorkshopEventStreamLimiter()
 
-    store = await WorkshopEventStore.open(database)
-    try:
-        request_lock = asyncio.Lock()
-        sessions_manager = WorkshopClientSessionManager(store)
-        enrollment_manager = WorkshopClientEnrollmentManager(store)
-        authenticator = WorkshopBearerSessionAuthenticator(sessions_manager)
-        enrollment_rate_limiter = WorkshopEnrollmentRateLimiter()
-        event_stream_limiter = WorkshopEventStreamLimiter()
-
-        def register(target: web.Application) -> None:
-            register_workshop_enrollment_routes(
-                target,
-                enrollment_manager=enrollment_manager,
-                rate_limiter=enrollment_rate_limiter,
-                request_lock=request_lock,
-            )
-            register_workshop_read_routes(
+    def register(target: web.Application) -> None:
+        register_workshop_enrollment_routes(
+            target,
+            enrollment_manager=enrollment_manager,
+            rate_limiter=enrollment_rate_limiter,
+            request_lock=request_lock,
+        )
+        register_workshop_read_routes(
+            target,
+            store=store,
+            authenticator=authenticator,
+            request_lock=request_lock,
+            event_stream_limiter=event_stream_limiter,
+        )
+        if command_submitter is not None:
+            register_workshop_command_routes(
                 target,
                 store=store,
                 authenticator=authenticator,
+                submitter=command_submitter,
                 request_lock=request_lock,
-                event_stream_limiter=event_stream_limiter,
             )
-            if command_submitter is not None:
-                register_workshop_command_routes(
-                    target,
-                    store=store,
-                    authenticator=authenticator,
-                    submitter=command_submitter,
-                    request_lock=request_lock,
-                )
-            register_workshop_shell_routes(target)
+        register_workshop_shell_routes(target)
 
-        register(app)
-    except Exception:
-        await store.close()
-        raise
-    _workshop_client_store = store
+    register(app)
     return register
 
 
-async def start(telegram_app, config) -> None:
+async def start(
+    telegram_app: Application,
+    config: Config,
+    *,
+    core_host: KaiApplicationHost,
+    core_services: KaiCoreServices,
+    github_notifications: WorkshopTelegramNotificationService,
+) -> None:
     """
     Start the HTTP server and optionally register the Telegram webhook.
 
@@ -2571,15 +2573,18 @@ async def start(telegram_app, config) -> None:
     Args:
         telegram_app: The python-telegram-bot Application instance.
         config: The application Config instance.
+        core_host: Core lifecycle owner used for health/readiness reporting.
+        core_services: Typed core dependencies required by HTTP routes.
+        github_notifications: Telegram adapter for the configured notification feed.
     """
     global _app, _runner, _workshop_lan_runner, _webhook_registered, _health_monitor_task
-    global _workshop_client_command_executor
 
     _app = web.Application()
+    _app[CORE_HOST_KEY] = core_host
     _app[TELEGRAM_APP_KEY] = telegram_app
     _app[TELEGRAM_BOT_KEY] = telegram_app.bot
 
-    pool = telegram_app.bot_data.get("pool")
+    pool = core_services.subprocess_pool
     internal_api_auth = getattr(pool, "internal_api_auth", None)
     if not isinstance(internal_api_auth, InternalAPIAuth):
         raise RuntimeError("Subprocess pool did not provide an internal API credential store")
@@ -2650,30 +2655,12 @@ async def start(telegram_app, config) -> None:
                     val,
                 )
     _register_routes(_app, config)
-    private_text_execution = telegram_app.bot_data.get("workshop_private_text_execution")
-    if private_text_execution is None:
-        raise RuntimeError("Workshop private-text execution service is unavailable")
-    workshop_runtime_pool = telegram_app.bot_data.get("workshop_runtime_pool")
-    if workshop_runtime_pool is None:
-        raise RuntimeError("Workshop runtime pool is unavailable")
-    principal_storage = telegram_app.bot_data.get("workshop_principal_storage")
-    if not isinstance(principal_storage, WorkshopPrincipalStorageRegistry):
-        raise RuntimeError("Workshop principal storage registry is unavailable")
-    _app[WORKSHOP_PRINCIPAL_STORAGE_KEY] = principal_storage
-    github_notifications = telegram_app.bot_data.get("workshop_github_notifications")
-    if not isinstance(github_notifications, WorkshopTelegramNotificationService):
-        raise RuntimeError("Workshop GitHub notification service is unavailable")
+    _app[WORKSHOP_PRINCIPAL_STORAGE_KEY] = core_services.principal_storage
     _app[WORKSHOP_GITHUB_NOTIFICATIONS_KEY] = github_notifications
-    client_command_executor = WorkshopClientCommandExecutor(
-        private_text_execution,
-        WorkshopCompatibilityStateWriter(config, workshop_runtime_pool),
-    )
-    await client_command_executor.start()
-    _workshop_client_command_executor = client_command_executor
     register_workshop_routes = await _register_workshop_client_api(
         _app,
-        Path(config.session_db_path),
-        command_submitter=client_command_executor,
+        core_services.client_store,
+        command_submitter=core_services.client_commands,
     )
 
     _runner = web.AppRunner(_app, access_log=None)
@@ -2768,7 +2755,6 @@ async def stop() -> None:
     stale webhook on the next set_webhook call at startup.
     """
     global _app, _runner, _workshop_lan_runner, _webhook_registered, _health_monitor_task
-    global _workshop_client_store, _workshop_client_command_executor
     # Cancel the webhook health monitor before tearing down the server
     if _health_monitor_task is not None:
         _health_monitor_task.cancel()
@@ -2800,12 +2786,6 @@ async def stop() -> None:
         _workshop_lan_runner = None
         _runner = None
         _app = None
-        if _workshop_client_command_executor is not None:
-            await _workshop_client_command_executor.stop()
-            _workshop_client_command_executor = None
-        if _workshop_client_store is not None:
-            await _workshop_client_store.close()
-            _workshop_client_store = None
 
 
 def is_running() -> bool:

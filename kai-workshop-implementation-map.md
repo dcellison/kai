@@ -419,6 +419,7 @@ No entry may use an indefinite condition such as "keep for compatibility." A gen
 | GitHub and generic webhook paths that route directly to Telegram or the pool | Canonical integration commands/events plus delivery/run services | Existing GitHub group notifications, generic callers, deduplication, and secret separation pass end-to-end tests | Remove direct routing while retaining verified webhook adapters and supported external contracts | Planned |
 | Per-chat settings, files, memory references, and project selection | Principal/channel/agent/project-workspace records and artifact metadata | Existing per-user isolation, context assembly, memory provenance, file delivery, and workspace access remain equivalent | Migrate namespaces and remove Telegram-derived ownership from domain storage; retire recorded compatibility `storage_path` values when an authoritative artifact store replaces local per-chat files | Active (new uploads and staged review artifacts use opaque human `PrincipalId` directories; numeric file directories remain read-compatible for existing uploads; settings, history, home, preferences, memory, and workspace compatibility state remain to migrate) |
 | `users.yaml` values that represent mutable application state | Workshop administration and durable policy records | Workshop administration can safely inspect and change the relevant state, and bootstrap/recovery behavior is proven | Retain only protected installation/bootstrap policy; remove duplicated mutable state and precedence rules | Planned |
+| Core services mirrored into Telegram `bot_data` for compatibility handlers | Typed core host plus explicit adapter dependency injection | Core lifecycle tests run without Telegram; HTTP uses direct typed dependencies; each remaining Telegram handler family receives its required service without dictionary lookup; hybrid installed behavior passes | Remove `pool`, `workshop_runtime_pool`, `workshop_conversation_run_service`, `workshop_private_text_execution`, and `workshop_principal_storage` mirrors from `create_bot()` after handler injection is complete | Active (construction, startup, delivery-authority activation, supervision, browser-command executor, client store, readiness, and shutdown are core-owned; existing Telegram handlers temporarily retain adapter-local mirrors) |
 | One-time `users.yaml` projection into protected `runtime-profiles.yaml`, plus private integer `compatibility_runtime_config_id` values | Independently authored runtime profiles and profile-keyed runtime/state stores | Existing profile IDs and state continuity survive migration; a profile with no Telegram identity can be assigned and executed; installer/status diagnostics pass; all five backends remain equivalent | Remove the migration renderer and `from_config` development projection; remove `compatibility_runtime_config_id`, `for_config_id`, and integer conversion in `WorkshopRuntimePool` after pool and persistent state are profile-keyed | Active (#921; protected fields are independently authoritative after their one-time seed and are no longer compared with `users.yaml`; the explicitly named integer pool/storage bridge and bootstrap-coverage check remain) |
 | Backend-specific execution orchestration embedded in the control plane | Equal Harness Driver contracts and a Runtime Backend boundary | Capability and lifecycle tests cover Claude, Codex, Goose, OpenCode, and Pi without privileging one driver | Delete duplicated process orchestration only after the shared contracts carry the required evidence | Planned |
 | Trusted-host `local_process` execution and its executable-trust warnings | Isolated Workshop workers | Worker identity, filesystem grants, credentials, networking, artifacts, cancellation, upgrade, and recovery are verified for all five harnesses | Retire trusted-host mode or explicitly reclassify it as a supported development mode; remove production mitigations that it alone requires | Planned |
@@ -2020,6 +2021,36 @@ The remaining Milestone 1 debt is the deliberately named integer bridge, not
 execution-policy precedence. Removing it requires profile-keyed subprocess and
 persistent-state namespaces; it does not require another round of field-by-
 field authority migration.
+
+## 43. Transport-neutral core application host foundation
+
+**Implementation date:** 2026-08-14
+
+Kai now constructs and supervises the subprocess pool, protected runtime
+facade, canonical conversation-run service, durable private-text executor,
+Workshop browser command executor, and browser-facing event store through a
+typed `KaiApplicationHost`. The host imports no Telegram package and exposes a
+non-sensitive readiness snapshot for runtime, executor, client API, and store
+components. Its shutdown order drains browser commands before closing stores,
+execution recovery, and backend processes.
+
+The host also resumes or creates the durable conversation-delivery authority
+epoch before private-text recovery begins. Terminal recovery can therefore
+create correctly fenced delivery work even when the prior epoch was inactive.
+The Telegram conversation worker receives and validates that core-owned epoch;
+it no longer activates delivery authority as a transport startup side effect.
+
+The Telegram factory no longer constructs runtime or Workshop execution
+services. The mixed HTTP server receives its core dependencies explicitly and
+no longer discovers them through Telegram `bot_data`; it also no longer owns
+the browser executor or its canonical store. Telegram conversation and
+notification delivery workers remain adapter-owned, as intended.
+
+Existing Telegram handlers still receive temporary adapter-local service
+mirrors because their command and media orchestration has not yet moved behind
+typed feature services. The retirement ledger names those exact keys and their
+removal gate. This is a bounded compatibility surface, not a second lifecycle
+owner.
 
 ## Canonical notification feed activation
 
