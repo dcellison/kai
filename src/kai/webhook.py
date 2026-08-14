@@ -15,7 +15,8 @@ Provides functionality to:
 
 The server always runs on aiohttp alongside the Telegram bot in the same event
 loop, regardless of transport mode. In polling mode, Telegram updates arrive via
-the Updater in main.py; this server still handles everything else.
+the Updater owned by ``TelegramAdapter``; this server still handles everything
+else. ``HttpAdapter`` owns this module's listener lifecycle.
 
 Routes are organized into these groups:
     - /webhook/telegram     - Telegram updates (webhook mode only, secret_token auth)
@@ -2569,7 +2570,7 @@ async def start(
     config.telegram_webhook_url is set (webhook mode).
 
     In polling mode, the server still runs but Telegram updates arrive via
-    the Updater's long-polling loop in main.py instead.
+    the Updater's long-polling loop in ``TelegramAdapter`` instead.
 
     Args:
         telegram_app: The python-telegram-bot Application instance.
@@ -2746,7 +2747,7 @@ async def stop() -> None:
     """
     Deregister the Telegram webhook (if active) and stop the HTTP server.
 
-    Called during shutdown from main.py's finally block. In webhook mode,
+    Called during shutdown by ``HttpAdapter``. In webhook mode,
     deregisters the webhook with Telegram first (so Telegram stops sending
     updates to an endpoint that's about to disappear). In polling mode,
     skips the delete_webhook call since no webhook was registered.
@@ -2792,6 +2793,11 @@ async def stop() -> None:
 def is_running() -> bool:
     """True if the webhook server is currently running."""
     return _runner is not None
+
+
+def is_workshop_lan_running() -> bool:
+    """True if the dedicated Workshop LAN listener is currently running."""
+    return _workshop_lan_runner is not None
 
 
 def add_notification_chat_id(chat_id: int) -> None:

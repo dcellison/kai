@@ -113,19 +113,20 @@ class _FakeAdapterReadiness:
 
 
 class _FakeAdapter:
-    def __init__(self, events: list[str]) -> None:
+    def __init__(self, events: list[str], name: str = "adapter") -> None:
         self.events = events
+        self.name = name
         self.readiness = _FakeAdapterReadiness(ready=False)
 
     async def start(self) -> None:
-        self.events.append("adapter:start")
+        self.events.append(f"{self.name}:start")
         self.readiness = _FakeAdapterReadiness(ready=True)
 
     async def wait(self) -> None:
-        self.events.append("adapter:wait")
+        self.events.append(f"{self.name}:wait")
 
     async def stop(self) -> None:
-        self.events.append("adapter:stop")
+        self.events.append(f"{self.name}:stop")
         self.readiness = _FakeAdapterReadiness(ready=False)
 
 
@@ -227,6 +228,20 @@ async def test_core_host_rejects_empty_adapter_name(host_dependencies) -> None:
 
     assert "adapter:start" not in host_dependencies
     await host.stop()
+
+
+async def test_core_host_stops_adapters_in_reverse_attachment_order(
+    host_dependencies,
+) -> None:
+    host = _host()
+    await host.start()
+    await host.attach_adapter("telegram", _FakeAdapter(host_dependencies, "telegram"))
+    await host.attach_adapter("http", _FakeAdapter(host_dependencies, "http"))
+
+    await host.stop()
+
+    assert host_dependencies.index("http:stop") < host_dependencies.index("telegram:stop")
+    assert host_dependencies.index("telegram:stop") < host_dependencies.index("client:stop")
 
 
 def test_core_host_module_has_no_telegram_dependency() -> None:

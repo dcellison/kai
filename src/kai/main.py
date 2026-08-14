@@ -23,7 +23,7 @@ The startup sequence is:
     5. Restore previous workspace (if saved in settings table)
     6. Let the adapter initialize Telegram, register commands, and load jobs
     7. Start adapter-owned conversation and notification delivery workers
-    8. Start the webhook HTTP server (always runs for scheduling API, GitHub webhooks, etc.)
+    8. Attach the HTTP adapter for Workshop, integrations, and webhook ingress
     9. In webhook mode: register Telegram webhook with the API
        In polling mode: start the Updater's polling loop
     10. Check for interrupted-response flag file
@@ -40,10 +40,11 @@ from datetime import UTC, datetime, timedelta
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
-from kai import services, sessions, webhook
+from kai import services, sessions
 from kai.application_host import KaiApplicationHost
 from kai.backend_registry import load_backend_registry
 from kai.config import DATA_DIR, PROJECT_ROOT, _read_protected_file, load_config
+from kai.http_adapter import HttpAdapter
 from kai.telegram_adapter import TelegramAdapter
 from kai.workshop.bootstrap import BootstrapHuman, BootstrapNotificationChannel
 from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
@@ -406,16 +407,13 @@ def _start() -> None:
             )
             await core_host.attach_adapter("telegram", telegram_adapter)
 
-            # Start the HTTP server (always runs - serves scheduling API, GitHub
-            # webhooks, file exchange, and health check regardless of transport mode).
-            # In webhook mode, this also registers the Telegram webhook with the API.
-            await webhook.start(
-                telegram_adapter.application,
+            http_adapter = HttpAdapter(
                 config,
-                core_host=core_host,
-                core_services=core_services,
-                github_notifications=telegram_adapter.notification_delivery,
+                core_host,
+                core_services,
+                telegram_adapter,
             )
+            await core_host.attach_adapter("http", http_adapter)
             await telegram_adapter.activate_ingress()
             # Phase 3: per-user file confinement is handled at request
             # time via pool.get_effective_workspace(chat_id) in
@@ -470,15 +468,14 @@ def _start() -> None:
             await core_host.wait()
         finally:
             # Shutdown in reverse order of startup
-            await webhook.stop()
-            if cleanup_task is not None:
-                cleanup_task.cancel()
-                await asyncio.gather(cleanup_task, return_exceptions=True)
             if core_host is not None:
                 try:
                     await core_host.stop()
                 except Exception:
                     logging.exception("Kai core application host stopped with an error")
+            if cleanup_task is not None:
+                cleanup_task.cancel()
+                await asyncio.gather(cleanup_task, return_exceptions=True)
             await sessions.close_db()
 
     try:

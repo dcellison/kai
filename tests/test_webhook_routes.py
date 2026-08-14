@@ -88,11 +88,19 @@ async def test_health_reports_typed_core_component_readiness(monkeypatch) -> Non
             }
         ),
         adapter_readiness={
+            "http": {
+                "status": "ready",
+                "ready": True,
+                "components": {
+                    "loopback_listener": True,
+                    "workshop_lan_listener": True,
+                },
+            },
             "telegram": {
                 "status": "ready",
                 "ready": True,
                 "components": {"ingress": True, "conversation_delivery": True},
-            }
+            },
         },
     )
 
@@ -107,10 +115,18 @@ async def test_health_reports_typed_core_component_readiness(monkeypatch) -> Non
             "components": {"runtime": True, "executor": True},
         },
         "adapters": {
+            "http": {
+                "status": "ready",
+                "ready": True,
+                "components": {
+                    "loopback_listener": True,
+                    "workshop_lan_listener": True,
+                },
+            },
             "telegram": {
                 "status": "ready",
                 "ready": True,
                 "components": {"ingress": True, "conversation_delivery": True},
-            }
+            },
         },
     }
