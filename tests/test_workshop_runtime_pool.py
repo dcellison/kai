@@ -289,6 +289,83 @@ async def test_protected_workspace_policy_overrides_compatibility_config(tmp_pat
     assert compatibility_allowed not in allowed
 
 
+def test_unavailable_explicit_profile_home_fails_only_that_runtime(tmp_path, monkeypatch):
+    from kai.pool import SubprocessPool
+
+    missing_home = tmp_path / "unmounted-home"
+    monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
+    config = Config(
+        telegram_bot_token="test",
+        allowed_user_ids=set(),
+        default_backend="codex",
+        default_provider="openai",
+        default_model="gpt-5.6-sol",
+        protected_install=True,
+        user_configs={},
+    )
+    runtime_config_id = 987654321012347
+    profiles = WorkshopRuntimeProfileRegistry(
+        (
+            ProtectedRuntimeProfile(
+                profile_id=RuntimeProfileId("rtp_57575757575757575757575757575757"),
+                runtime_config_id=runtime_config_id,
+                display_name="Browser-only runtime",
+                os_user=None,
+                backend="codex",
+                provider="openai",
+                model="gpt-5.6-sol",
+                timeout_seconds=120,
+                allowed_services=(),
+                home_workspace=missing_home,
+                workspace_base=None,
+                allowed_workspaces=(),
+            ),
+        )
+    )
+    pool = SubprocessPool(config=config, services_info=[], runtime_profiles=profiles)
+
+    with pytest.raises(RuntimeError, match="Mount or create it, or update the protected runtime profile"):
+        pool.get(runtime_config_id)
+
+
+def test_profile_only_canonical_home_error_has_actionable_remediation(tmp_path, monkeypatch):
+    from kai.pool import SubprocessPool
+
+    monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
+    config = Config(
+        telegram_bot_token="test",
+        allowed_user_ids=set(),
+        default_backend="codex",
+        default_provider="openai",
+        default_model="gpt-5.6-sol",
+        protected_install=True,
+        user_configs={},
+    )
+    runtime_config_id = 987654321012348
+    profiles = WorkshopRuntimeProfileRegistry(
+        (
+            ProtectedRuntimeProfile(
+                profile_id=RuntimeProfileId("rtp_58585858585858585858585858585858"),
+                runtime_config_id=runtime_config_id,
+                display_name="Browser-only runtime",
+                os_user=None,
+                backend="codex",
+                provider="openai",
+                model="gpt-5.6-sol",
+                timeout_seconds=120,
+                allowed_services=(),
+                home_workspace=None,
+                workspace_base=None,
+                allowed_workspaces=(),
+            ),
+        )
+    )
+    pool = SubprocessPool(config=config, services_info=[], runtime_profiles=profiles)
+
+    with pytest.raises(RuntimeError, match="profile-only runtimes require an explicit home_workspace"):
+        pool.get(runtime_config_id)
+
+
 def test_unavailable_protected_service_is_denied_with_warning(tmp_path, monkeypatch, caplog):
     from kai.pool import SubprocessPool
 

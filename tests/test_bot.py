@@ -854,28 +854,29 @@ def _make_context(config=None, claude=None, pool=None, args=None, user_data=None
     # mock subprocess manager. Pool is preferred for new tests.
     mock_pool = pool or claude or _make_mock_claude()
     resolved_config = config or _make_config()
-    mock_pool.get_home_workspace = MagicMock(
-        side_effect=lambda runtime_config_id: resolve_home_workspace(
-            runtime_config_id,
-            resolved_config,
-        )
-    )
-    mock_pool.get_static_workspace_policy = MagicMock(
-        side_effect=lambda runtime_config_id: (
-            (
-                resolved_config.get_user_config(runtime_config_id).workspace_base,
-                tuple(resolved_config.get_user_config(runtime_config_id).allowed_workspaces),
-                False,
+    if pool is None:
+        mock_pool.get_home_workspace = MagicMock(
+            side_effect=lambda runtime_config_id: resolve_home_workspace(
+                runtime_config_id,
+                resolved_config,
             )
-            if resolved_config.get_user_config(runtime_config_id) is not None
-            else (None, (), False)
         )
-    )
+        mock_pool.get_static_workspace_policy = MagicMock(
+            side_effect=lambda runtime_config_id: (
+                (
+                    resolved_config.get_user_config(runtime_config_id).workspace_base,
+                    tuple(resolved_config.get_user_config(runtime_config_id).allowed_workspaces),
+                    False,
+                )
+                if resolved_config.get_user_config(runtime_config_id) is not None
+                else (None, (), False)
+            )
+        )
 
-    async def resolve_access(runtime_config_id):
-        return await sessions.resolve_workspace_access(runtime_config_id, resolved_config)
+        async def resolve_access(runtime_config_id):
+            return await sessions.resolve_workspace_access(runtime_config_id, resolved_config)
 
-    mock_pool.resolve_workspace_access = AsyncMock(side_effect=resolve_access)
+        mock_pool.resolve_workspace_access = AsyncMock(side_effect=resolve_access)
     runtime_config_ids = {
         runtime_config_id
         for runtime_config_id in (

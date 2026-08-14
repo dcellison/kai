@@ -964,15 +964,17 @@ def _migrated_service_scopes(entry: dict[object, object]) -> list[str]:
     return checked
 
 
-def _migrated_workspace_directory(value: object) -> str | None:
-    """Mirror users.yaml's effective optional workspace directory."""
+def _migrated_workspace_directory(value: object, *, field: str) -> str | None:
+    """Preserve one shape-valid workspace path through policy migration."""
     if value is None:
         return None
     rendered = str(value).strip()
     if not rendered:
         return None
-    path = Path(rendered).expanduser().resolve()
-    return str(path) if path.is_dir() else None
+    path = Path(rendered).expanduser()
+    if not path.is_absolute():
+        raise ValueError(f"users.yaml {field} must be an absolute path before runtime-policy migration")
+    return str(path.resolve())
 
 
 def _migrated_allowed_workspaces(entry: dict[object, object]) -> list[str]:
@@ -982,7 +984,7 @@ def _migrated_allowed_workspaces(entry: dict[object, object]) -> list[str]:
         return []
     checked: list[str] = []
     for raw_path in raw:
-        path = _migrated_workspace_directory(raw_path)
+        path = _migrated_workspace_directory(raw_path, field="allowed_workspaces entry")
         if path is not None and path not in checked:
             checked.append(path)
     return checked
@@ -1070,8 +1072,14 @@ def _build_migrated_runtime_profiles(
             "model": model,
             "timeout_seconds": timeout_seconds,
             "allowed_services": _migrated_service_scopes(entry),
-            "home_workspace": _migrated_workspace_directory(entry.get("home_workspace")),
-            "workspace_base": _migrated_workspace_directory(entry.get("workspace_base")),
+            "home_workspace": _migrated_workspace_directory(
+                entry.get("home_workspace"),
+                field="home_workspace",
+            ),
+            "workspace_base": _migrated_workspace_directory(
+                entry.get("workspace_base"),
+                field="workspace_base",
+            ),
             "allowed_workspaces": _migrated_allowed_workspaces(entry),
         }
         raw_os_user = entry.get("os_user")

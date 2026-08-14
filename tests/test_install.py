@@ -8304,6 +8304,66 @@ class TestIndependentRuntimePolicy:
         assert profile["workspace_base"] == str(base.resolve())
         assert profile["allowed_workspaces"] == [str(first.resolve()), str(second.resolve())]
 
+    def test_migration_preserves_unavailable_absolute_paths(self, tmp_path):
+        unavailable = (tmp_path / "later-mounted").resolve()
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text(
+            yaml.safe_dump(
+                {
+                    "users": [
+                        {
+                            "telegram_id": 101,
+                            "name": "Daniel",
+                            "role": "admin",
+                            "backend": "codex",
+                            "workspace_base": str(unavailable),
+                            "allowed_workspaces": [str(unavailable)],
+                        }
+                    ]
+                },
+                sort_keys=False,
+            )
+        )
+
+        rendered = _build_migrated_runtime_profiles(
+            users_yaml,
+            registry_entries={"codex": {"allowed_models": ["gpt-5.5"]}},
+            defaults=kai.install._RuntimePolicyDefaults(
+                backend="codex",
+                provider="openai",
+                model="gpt-5.5",
+                timeout_seconds=120,
+            ),
+        )
+
+        profile = next(iter(yaml.safe_load(rendered)["runtime_profiles"].values()))
+        assert profile["workspace_base"] == str(unavailable)
+        assert profile["allowed_workspaces"] == [str(unavailable)]
+
+    def test_migration_rejects_relative_workspace_paths(self, tmp_path):
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text(
+            """users:
+  - telegram_id: 101
+    name: Daniel
+    role: admin
+    backend: codex
+    workspace_base: relative/projects
+"""
+        )
+
+        with pytest.raises(ValueError, match="workspace_base must be an absolute path"):
+            _build_migrated_runtime_profiles(
+                users_yaml,
+                registry_entries={"codex": {"allowed_models": ["gpt-5.5"]}},
+                defaults=kai.install._RuntimePolicyDefaults(
+                    backend="codex",
+                    provider="openai",
+                    model="gpt-5.5",
+                    timeout_seconds=120,
+                ),
+            )
+
     def test_migration_preserves_existing_profile_ids_and_backend_choices(self, tmp_path, monkeypatch):
         users_yaml = tmp_path / "users.yaml"
         users_yaml.write_text(

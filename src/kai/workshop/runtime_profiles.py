@@ -141,7 +141,12 @@ def _workspace_directory(
     field: str,
     profile_id: RuntimeProfileId,
 ) -> Path | None:
-    """Validate one optional protected workspace directory."""
+    """Validate one optional protected workspace path.
+
+    Availability is deliberately a use-time concern. Retaining an absolute
+    path while its volume is unmounted keeps access restrictive and lets the
+    runtime recover when the path becomes available again.
+    """
     if value is None:
         return None
     if not isinstance(value, str) or not value.strip():
@@ -149,10 +154,7 @@ def _workspace_directory(
     path = Path(value.strip()).expanduser()
     if not path.is_absolute():
         raise WorkshopRuntimeProfileError(f"Runtime profile {profile_id}: {field} must be an absolute path")
-    resolved = path.resolve()
-    if not resolved.is_dir():
-        raise WorkshopRuntimeProfileError(f"Runtime profile {profile_id}: {field} is not an existing directory")
-    return resolved
+    return path.resolve()
 
 
 def _workspace_directories(value: object, *, profile_id: RuntimeProfileId) -> tuple[Path, ...]:
@@ -421,6 +423,13 @@ class WorkshopRuntimeProfileRegistry:
             backend, provider = get_user_backend_and_provider(user, config)
             expected_model = _compatibility_model(user, config, backend=backend, provider=provider)
             expected_timeout = user.timeout if user.timeout is not None else config.default_timeout
+            available_home = (
+                profile.home_workspace if profile.home_workspace and profile.home_workspace.is_dir() else None
+            )
+            available_base = (
+                profile.workspace_base if profile.workspace_base and profile.workspace_base.is_dir() else None
+            )
+            available_allowed = frozenset(path for path in profile.allowed_workspaces if path.is_dir())
             if (
                 profile.backend,
                 profile.provider,
@@ -428,9 +437,9 @@ class WorkshopRuntimeProfileRegistry:
                 profile.model,
                 profile.timeout_seconds,
                 frozenset(profile.allowed_services),
-                profile.home_workspace,
-                profile.workspace_base,
-                frozenset(profile.allowed_workspaces),
+                available_home,
+                available_base,
+                available_allowed,
             ) != (
                 backend,
                 provider,

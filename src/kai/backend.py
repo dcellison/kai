@@ -1250,8 +1250,9 @@ def resolve_home_workspace(
         path = home_search_directories(chat_id, data_dir=data_dir)[0]
         if not path.is_dir():
             raise RuntimeError(
-                f"Protected user home is not provisioned for the canonical principal: "
-                f"{path}. Run `make install` to provision configured users."
+                f"Protected runtime home is not provisioned for the canonical principal: {path}. "
+                "Run `make install` for configured users; profile-only runtimes require an explicit "
+                "home_workspace or an operator-provisioned canonical directory."
             )
         return path
 

@@ -223,6 +223,73 @@ def test_document_rejects_duplicate_resolved_allowed_workspace(tmp_path):
         )
 
 
+def test_unavailable_workspace_paths_remain_restrictive_and_do_not_create_false_drift(tmp_path):
+    unavailable = (tmp_path / "later-mounted").resolve()
+    profile_id = runtime_profile_id_for_config_id(101)
+    registry = WorkshopRuntimeProfileRegistry.from_document(
+        {
+            "version": 1,
+            "runtime_profiles": {
+                str(profile_id): {
+                    "display_name": "Daniel",
+                    "compatibility_runtime_config_id": 101,
+                    "os_user": "daniel",
+                    "backend": "codex",
+                    "provider": "openai",
+                    "model": "gpt-5.6-sol",
+                    "timeout_seconds": 120,
+                    "allowed_services": [],
+                    "home_workspace": str(unavailable),
+                    "workspace_base": str(unavailable),
+                    "allowed_workspaces": [str(unavailable)],
+                }
+            },
+        },
+        backend_registry={"codex": {}},
+    )
+    unavailable_profile = registry.resolve(profile_id)
+    assert unavailable_profile.workspace_base == unavailable
+    registry._validate_compatibility_projection(
+        Config(
+            telegram_bot_token="test",
+            allowed_user_ids={101},
+            default_backend="codex",
+            default_provider="openai",
+            default_model="gpt-5.6-sol",
+            user_configs={
+                101: UserConfig(
+                    telegram_id=101,
+                    name="Daniel",
+                    os_user="daniel",
+                    backend="codex",
+                )
+            },
+        )
+    )
+
+    unavailable.mkdir()
+    registry._validate_compatibility_projection(
+        Config(
+            telegram_bot_token="test",
+            allowed_user_ids={101},
+            default_backend="codex",
+            default_provider="openai",
+            default_model="gpt-5.6-sol",
+            user_configs={
+                101: UserConfig(
+                    telegram_id=101,
+                    name="Daniel",
+                    os_user="daniel",
+                    backend="codex",
+                    home_workspace=unavailable,
+                    workspace_base=unavailable,
+                    allowed_workspaces=[unavailable],
+                )
+            },
+        )
+    )
+
+
 def test_non_telegram_profile_derives_stable_private_compatibility_key():
     profile_id = RuntimeProfileId("rtp_11111111111111111111111111111111")
     first = WorkshopRuntimeProfileRegistry.from_document(

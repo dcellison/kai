@@ -224,6 +224,11 @@ class SubprocessPool:
         profile = self._protected_profile(runtime_config_id)
         if profile is not None:
             if profile.home_workspace is not None:
+                if not profile.home_workspace.is_dir():
+                    raise RuntimeError(
+                        f"Protected runtime {profile.profile_id} home workspace is unavailable: "
+                        f"{profile.home_workspace}. Mount or create it, or update the protected runtime profile."
+                    )
                 return profile.home_workspace
             return resolve_home_workspace(
                 runtime_config_id,
