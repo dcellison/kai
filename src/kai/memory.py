@@ -819,6 +819,30 @@ _config: Config | None = None
 # ── Helpers ─────────────────────────────────────────────────────────
 
 
+def _resolve_cached_embedding_model(model: str) -> tuple[str, bool]:
+    """Prefer an already-cached model snapshot without probing the Hub.
+
+    SentenceTransformer refreshes repository metadata when it receives a Hub
+    model ID, even when every required file is cached. Resolve a complete
+    local snapshot first and pass its filesystem path to Mem0 instead. A cache
+    miss deliberately preserves SentenceTransformer's existing first-run
+    download behavior.
+    """
+    local_path = Path(model).expanduser()
+    if local_path.exists():
+        return str(local_path.resolve()), True
+
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    repo_id = model if "/" in model else f"sentence-transformers/{model}"
+    try:
+        snapshot_path = snapshot_download(repo_id, local_files_only=True)
+    except LocalEntryNotFoundError:
+        return model, False
+    return str(Path(snapshot_path).resolve()), True
+
+
 def _mem0_config(config: Config) -> dict:
     """
     Build Mem0 configuration dict from Kai's config.
@@ -828,13 +852,17 @@ def _mem0_config(config: Config) -> dict:
     """
     qdrant_path = DATA_DIR / "memory" / "qdrant"
     qdrant_path.mkdir(parents=True, exist_ok=True)
+    embedding_model, local_only = _resolve_cached_embedding_model(config.memory_embedding_model)
+    model_kwargs: dict[str, object] = {"device": "cpu"}
+    if local_only:
+        model_kwargs["local_files_only"] = True
 
     return {
         "embedder": {
             "provider": "huggingface",
             "config": {
-                "model": config.memory_embedding_model,
-                "model_kwargs": {"device": "cpu"},
+                "model": embedding_model,
+                "model_kwargs": model_kwargs,
             },
         },
         "vector_store": {
@@ -1275,8 +1303,9 @@ def init_memory(config: Config) -> None:
     Haiku extraction via `add_structured`.
 
     Creates the Qdrant collection if it does not exist. Downloads the
-    embedding model on first run (~80MB, cached in ~/.cache/huggingface/
-    for subsequent runs).
+    embedding model on first run (~80MB, cached in ~/.cache/huggingface/).
+    Subsequent runs resolve that snapshot locally so model loading does not
+    contact Hugging Face merely to refresh repository metadata.
 
     Mem0 v2.0.0 unconditionally creates an LLM client at init time,
     even though we only use infer=False (no LLM extraction). To satisfy

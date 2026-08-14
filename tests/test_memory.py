@@ -16,8 +16,10 @@ import json
 import logging
 import os
 import re
+import sys
 from dataclasses import replace
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -192,6 +194,95 @@ def real_memory_instance(tmp_path_factory):
 
 
 # ── Unit tests (mocked Mem0, fast) ─────────────────────────────────
+
+
+class TestEmbeddingModelResolution:
+    """Cache-first model loading avoids recurring Hub metadata requests."""
+
+    @staticmethod
+    def _fake_hub(snapshot_download):
+        class LocalEntryNotFoundError(Exception):
+            pass
+
+        hub = ModuleType("huggingface_hub")
+        hub.snapshot_download = snapshot_download
+        errors = ModuleType("huggingface_hub.errors")
+        errors.LocalEntryNotFoundError = LocalEntryNotFoundError
+        return {
+            "huggingface_hub": hub,
+            "huggingface_hub.errors": errors,
+        }, LocalEntryNotFoundError
+
+    def test_existing_local_model_path_never_consults_hub(self, tmp_path):
+        from kai.memory import _resolve_cached_embedding_model
+
+        model_dir = tmp_path / "local-model"
+        model_dir.mkdir()
+        model, local_only = _resolve_cached_embedding_model(str(model_dir))
+
+        assert model == str(model_dir.resolve())
+        assert local_only is True
+
+    def test_cached_hub_snapshot_is_resolved_without_network(self, tmp_path):
+        from kai.memory import _resolve_cached_embedding_model
+
+        snapshot = tmp_path / "cached-snapshot"
+        snapshot.mkdir()
+        download = MagicMock(return_value=str(snapshot))
+        modules, _ = self._fake_hub(download)
+        with patch.dict(sys.modules, modules):
+            model, local_only = _resolve_cached_embedding_model("all-MiniLM-L6-v2")
+
+        assert model == str(snapshot.resolve())
+        assert local_only is True
+        download.assert_called_once_with(
+            "sentence-transformers/all-MiniLM-L6-v2",
+            local_files_only=True,
+        )
+
+    def test_cache_miss_preserves_first_run_download_behavior(self, tmp_path):
+        from kai.memory import _mem0_config, _resolve_cached_embedding_model
+
+        download = MagicMock()
+        modules, local_entry_not_found = self._fake_hub(download)
+        download.side_effect = local_entry_not_found("not cached")
+        with patch.dict(sys.modules, modules):
+            model, local_only = _resolve_cached_embedding_model("all-MiniLM-L6-v2")
+
+        assert model == "all-MiniLM-L6-v2"
+        assert local_only is False
+
+        with (
+            patch("kai.memory.DATA_DIR", tmp_path),
+            patch(
+                "kai.memory._resolve_cached_embedding_model",
+                return_value=(model, local_only),
+            ),
+        ):
+            config = _mem0_config(_make_config())
+
+        assert config["embedder"]["config"] == {
+            "model": "all-MiniLM-L6-v2",
+            "model_kwargs": {"device": "cpu"},
+        }
+
+    def test_cached_config_forces_sentence_transformers_local_only(self, tmp_path):
+        from kai.memory import _mem0_config
+
+        snapshot = tmp_path / "cached-snapshot"
+        with (
+            patch("kai.memory.DATA_DIR", tmp_path),
+            patch(
+                "kai.memory._resolve_cached_embedding_model",
+                return_value=(str(snapshot), True),
+            ),
+        ):
+            config = _mem0_config(_make_config())
+
+        assert config["embedder"]["config"] == {
+            "model": str(snapshot),
+            "model_kwargs": {"device": "cpu", "local_files_only": True},
+        }
 
 
 # Third-party warnings scoped to this class: qdrant-client's local
