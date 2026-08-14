@@ -71,6 +71,7 @@ Requirements:
 - A Telegram bot token from [BotFather](https://t.me/BotFather)
 - Your Telegram user ID from [userinfobot](https://t.me/userinfobot)
 - At least one supported agent backend installed and authenticated
+- Sudo 1.9.3+ for protected multi-user installs (`CWD`/`-D` support)
 
 Install Kai for local development:
 
