@@ -109,6 +109,8 @@ def _registry_model_ceiling(
 
 def _service_scopes(value: object, *, profile_id: RuntimeProfileId) -> tuple[str, ...]:
     """Validate one explicit ordered service-scope list."""
+    if value is None:
+        raise WorkshopRuntimeProfileError(f"Runtime profile {profile_id}: allowed_services is required")
     if not isinstance(value, list):
         raise WorkshopRuntimeProfileError(f"Runtime profile {profile_id}: allowed_services must be a list")
     checked: list[str] = []
@@ -368,14 +370,14 @@ class WorkshopRuntimeProfileRegistry:
                 profile.os_user,
                 profile.model,
                 profile.timeout_seconds,
-                profile.allowed_services,
+                frozenset(profile.allowed_services),
             ) != (
                 backend,
                 provider,
                 user.os_user,
                 expected_model,
                 expected_timeout,
-                tuple(user.allowed_services),
+                frozenset(user.allowed_services),
             ):
                 raise WorkshopRuntimeProfileError(
                     f"Runtime profile {profile.profile_id} conflicts with the migrated users.yaml execution policy"

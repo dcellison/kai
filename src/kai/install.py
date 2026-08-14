@@ -1190,14 +1190,14 @@ def _runtime_policy_apply_plan(
             actual.os_user,
             actual.model,
             actual.timeout_seconds,
-            actual.allowed_services,
+            frozenset(actual.allowed_services),
         ) != (
             expected.backend,
             expected.provider,
             expected.os_user,
             expected.model,
             expected.timeout_seconds,
-            expected.allowed_services,
+            frozenset(expected.allowed_services),
         ):
             raise ValueError(
                 f"Protected runtime profile {actual.profile_id} conflicts with users.yaml fields still required "

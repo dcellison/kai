@@ -8569,6 +8569,62 @@ backends:
                 users_yaml,
             )
 
+    def test_existing_policy_accepts_migrated_service_scope_reordering(self, tmp_path, monkeypatch):
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text(
+            """users:
+  - telegram_id: 101
+    name: Daniel
+    role: admin
+    backend: codex
+    model: gpt-5.5
+    allowed_services:
+      - perplexity
+      - weather
+"""
+        )
+        profile_id = str(kai.install.runtime_profile_id_for_config_id(101))
+        policy = tmp_path / "runtime-profiles.yaml"
+        policy.write_text(
+            yaml.safe_dump(
+                {
+                    "version": 1,
+                    "runtime_profiles": {
+                        profile_id: {
+                            "display_name": "Daniel",
+                            "compatibility_runtime_config_id": 101,
+                            "backend": "codex",
+                            "provider": "openai",
+                            "model": "gpt-5.5",
+                            "timeout_seconds": 120,
+                            "allowed_services": ["weather", "perplexity"],
+                        }
+                    },
+                },
+                sort_keys=False,
+            )
+        )
+        monkeypatch.setattr("kai.install.RUNTIME_PROFILES_YAML", policy)
+        monkeypatch.setattr(
+            "kai.install._backend_registry_entries",
+            lambda *args: {"codex": {"allowed_models": ["gpt-5.5"]}},
+        )
+
+        action, content, profiles = _runtime_policy_apply_plan(
+            "kai",
+            {
+                "DEFAULT_BACKEND": "codex",
+                "DEFAULT_PROVIDER": "openai",
+                "DEFAULT_MODEL": "gpt-5.5",
+                "DEFAULT_TIMEOUT": "120",
+            },
+            users_yaml,
+        )
+
+        assert action == "preserve"
+        assert content == policy.read_text()
+        assert profiles.resolve(profile_id).allowed_services == ("weather", "perplexity")
+
 
 class TestApplyBackendRegistry:
     def test_build_registry_uses_discovered_global_commands(self, monkeypatch):

@@ -328,7 +328,7 @@ def test_document_fails_closed_on_invalid_model_or_timeout(field, value, message
 @pytest.mark.parametrize(
     ("value", "message"),
     (
-        (None, "must be a list"),
+        (None, "is required"),
         ("perplexity", "must be a list"),
         ([1], "must be service names"),
         ([""], "is invalid"),
@@ -543,6 +543,46 @@ runtime_profiles:
 
     with pytest.raises(WorkshopRuntimeProfileError, match=r"conflicts with the migrated users\.yaml"):
         WorkshopRuntimeProfileRegistry.load(_config(), path=policy)
+
+
+def test_loaded_policy_accepts_migrated_service_scope_reordering(tmp_path, monkeypatch):
+    config = _config()
+    config.user_configs[101].allowed_services.extend(("perplexity", "weather"))
+    profile_id = runtime_profile_id_for_config_id(101)
+    policy = tmp_path / "runtime-profiles.yaml"
+    policy.write_text(
+        f"""version: 1
+runtime_profiles:
+  {profile_id}:
+    display_name: Daniel
+    compatibility_runtime_config_id: 101
+    os_user: daniel
+    backend: codex
+    provider: openai
+    model: gpt-5.6-sol
+    timeout_seconds: 120
+    allowed_services:
+      - weather
+      - perplexity
+  {runtime_profile_id_for_config_id(202)}:
+    display_name: Scott
+    compatibility_runtime_config_id: 202
+    os_user: sellison
+    backend: claude
+    provider: anthropic
+    model: sonnet
+    timeout_seconds: 120
+    allowed_services: []
+"""
+    )
+    monkeypatch.setattr(
+        "kai.workshop.runtime_profiles.load_backend_registry",
+        lambda: {"codex": {}, "claude": {}},
+    )
+
+    registry = WorkshopRuntimeProfileRegistry.load(config, path=policy)
+
+    assert registry.resolve(profile_id).allowed_services == ("weather", "perplexity")
 
 
 def test_uninstalled_development_without_policy_uses_compatibility_projection(monkeypatch):
