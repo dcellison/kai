@@ -154,13 +154,26 @@ class SubprocessPool:
             if runtime_profiles is not None
             else config.allowed_user_ids
         )
+        protected_profiles_by_config_id = (
+            {profile.runtime_config_id: profile for profile in runtime_profiles.profiles}
+            if runtime_profiles is not None
+            else {}
+        )
         for chat_id in runtime_config_ids:
             user = config.get_user_config(chat_id)
-            requested = frozenset(user.allowed_services if user else [])
+            protected_profile = protected_profiles_by_config_id.get(chat_id)
+            if protected_profile is not None:
+                requested = frozenset(protected_profile.allowed_services)
+            elif user is not None:
+                requested = frozenset(user.allowed_services)
+            else:
+                requested = frozenset()
             unavailable = requested - available_service_names
             if unavailable:
+                source = "protected runtime profile" if protected_profile is not None else "users.yaml user"
                 log.warning(
-                    "users.yaml: user %d has unavailable allowed_services: %s; denying them",
+                    "%s %d has unavailable allowed_services: %s; denying them",
+                    source,
                     chat_id,
                     ", ".join(sorted(unavailable)),
                 )

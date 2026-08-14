@@ -88,6 +88,7 @@ def test_registry_rejects_duplicate_configuration_authority():
         "openai",
         "gpt-5.6-sol",
         120,
+        (),
     )
 
     with pytest.raises(WorkshopRuntimeProfileError, match="Duplicate runtime profile ID"):
@@ -108,6 +109,7 @@ def test_document_preserves_migrated_profile_identity_and_compatibility_key():
                     "provider": "openai",
                     "model": "gpt-5.6-sol",
                     "timeout_seconds": 240,
+                    "allowed_services": ["perplexity", "weather"],
                 }
             },
         },
@@ -122,6 +124,7 @@ def test_document_preserves_migrated_profile_identity_and_compatibility_key():
     assert profile.provider == "openai"
     assert profile.model == "gpt-5.6-sol"
     assert profile.timeout_seconds == 240
+    assert profile.allowed_services == ("perplexity", "weather")
 
 
 def test_non_telegram_profile_derives_stable_private_compatibility_key():
@@ -136,6 +139,7 @@ def test_non_telegram_profile_derives_stable_private_compatibility_key():
                     "provider": "openai-codex",
                     "model": "openai-codex/gpt-5.5",
                     "timeout_seconds": 120,
+                    "allowed_services": [],
                 }
             },
         },
@@ -151,6 +155,7 @@ def test_non_telegram_profile_derives_stable_private_compatibility_key():
                     "provider": "openai-codex",
                     "model": "openai-codex/gpt-5.5",
                     "timeout_seconds": 120,
+                    "allowed_services": [],
                 }
             },
         },
@@ -185,6 +190,7 @@ def test_document_accepts_each_registered_backend_without_priority(backend, prov
                     "provider": provider,
                     "model": model,
                     "timeout_seconds": 120,
+                    "allowed_services": [],
                 }
             },
         },
@@ -208,6 +214,7 @@ def test_document_rejects_backend_absent_from_protected_registry():
                         "provider": "openai",
                         "model": "gpt-5.5",
                         "timeout_seconds": 120,
+                        "allowed_services": [],
                     }
                 },
             },
@@ -230,6 +237,7 @@ def test_document_rejects_provider_not_supported_by_backend(backend):
                         "provider": "not-a-provider",
                         "model": "sonnet",
                         "timeout_seconds": 120,
+                        "allowed_services": [],
                     }
                 },
             },
@@ -252,6 +260,7 @@ def test_single_provider_backend_defaults_only_when_provider_is_omitted(backend,
                     "backend": backend,
                     "model": "sonnet" if backend == "claude" else "gpt-5.5",
                     "timeout_seconds": 120,
+                    "allowed_services": [],
                 }
             },
         },
@@ -276,6 +285,7 @@ def test_document_rejects_invalid_os_user():
                         "provider": "openai",
                         "model": "gpt-5.5",
                         "timeout_seconds": 120,
+                        "allowed_services": [],
                     }
                 },
             },
@@ -301,11 +311,43 @@ def test_document_fails_closed_on_invalid_model_or_timeout(field, value, message
         "provider": "openai",
         "model": "gpt-5.5",
         "timeout_seconds": 120,
+        "allowed_services": [],
     }
     if value is None:
         profile.pop(field)
     else:
         profile[field] = value
+
+    with pytest.raises(WorkshopRuntimeProfileError, match=message):
+        WorkshopRuntimeProfileRegistry.from_document(
+            {"version": 1, "runtime_profiles": {str(profile_id): profile}},
+            backend_registry={"codex": {}},
+        )
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    (
+        (None, "must be a list"),
+        ("perplexity", "must be a list"),
+        ([1], "must be service names"),
+        ([""], "is invalid"),
+        (["*"], "is invalid"),
+        (["service/path"], "is invalid"),
+        (["perplexity", "perplexity"], "is duplicated"),
+    ),
+)
+def test_document_fails_closed_on_invalid_service_scopes(value, message):
+    profile_id = RuntimeProfileId("rtp_40404040404040404040404040404040")
+    profile = {
+        "display_name": "Protected runtime",
+        "backend": "codex",
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "timeout_seconds": 120,
+    }
+    if value is not None:
+        profile["allowed_services"] = value
 
     with pytest.raises(WorkshopRuntimeProfileError, match=message):
         WorkshopRuntimeProfileRegistry.from_document(
@@ -335,6 +377,7 @@ def test_document_enforces_loaded_backend_registry_model_ceiling():
                         "provider": "openai",
                         "model": "gpt-5.5",
                         "timeout_seconds": 120,
+                        "allowed_services": [],
                     }
                 },
             },
@@ -356,6 +399,7 @@ def test_document_rejects_unknown_backend_registry_entry_type():
                         "provider": "openai",
                         "model": "gpt-5.5",
                         "timeout_seconds": 120,
+                        "allowed_services": [],
                     }
                 },
             },
@@ -399,6 +443,7 @@ runtime_profiles:
     provider: openai-codex
     model: openai-codex/gpt-5.5
     timeout_seconds: 120
+    allowed_services: []
 """
     )
     monkeypatch.setattr(
@@ -435,6 +480,7 @@ runtime_profiles:
     provider: anthropic
     model: sonnet
     timeout_seconds: 120
+    allowed_services: []
 """
     )
     monkeypatch.setattr(
@@ -460,6 +506,34 @@ runtime_profiles:
     provider: openai
     model: gpt-5.5
     timeout_seconds: 999
+    allowed_services: []
+"""
+    )
+    monkeypatch.setattr(
+        "kai.workshop.runtime_profiles.load_backend_registry",
+        lambda: {"codex": {}, "claude": {}},
+    )
+
+    with pytest.raises(WorkshopRuntimeProfileError, match=r"conflicts with the migrated users\.yaml"):
+        WorkshopRuntimeProfileRegistry.load(_config(), path=policy)
+
+
+def test_loaded_policy_fails_when_migrated_service_scopes_drift(tmp_path, monkeypatch):
+    profile_id = runtime_profile_id_for_config_id(101)
+    policy = tmp_path / "runtime-profiles.yaml"
+    policy.write_text(
+        f"""version: 1
+runtime_profiles:
+  {profile_id}:
+    display_name: Daniel
+    compatibility_runtime_config_id: 101
+    os_user: daniel
+    backend: codex
+    provider: openai
+    model: gpt-5.6-sol
+    timeout_seconds: 120
+    allowed_services:
+      - perplexity
 """
     )
     monkeypatch.setattr(

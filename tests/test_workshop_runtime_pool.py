@@ -10,6 +10,7 @@ import pytest
 
 from kai.backend import AgentResponse, StreamEvent
 from kai.config import Config, UserConfig
+from kai.internal_api_auth import InternalAPIScope
 from kai.workshop.domain import RuntimeProfileId
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.runtime_profiles import (
@@ -97,6 +98,7 @@ def test_protected_profile_selects_backend_and_os_user_over_compatibility_config
                 provider="openai",
                 model="gpt-5.6-sol",
                 timeout_seconds=345,
+                allowed_services=(),
             ),
         )
     )
@@ -108,6 +110,59 @@ def test_protected_profile_selects_backend_and_os_user_over_compatibility_config
     assert instance.codex_user == "protected-user"
     assert instance.model == "gpt-5.6-sol"
     assert instance.timeout_seconds == 345
+
+
+def test_protected_profile_service_scopes_override_compatibility_config(tmp_path, monkeypatch):
+    from kai.pool import SubprocessPool
+
+    monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
+    services_info = [
+        {"name": "perplexity", "method": "POST", "description": "search"},
+        {"name": "weather", "method": "GET", "description": "weather"},
+    ]
+    config = Config(
+        telegram_bot_token="test",
+        allowed_user_ids={111},
+        default_backend="codex",
+        default_provider="openai",
+        default_model="gpt-5.6-sol",
+        user_configs={
+            111: UserConfig(
+                telegram_id=111,
+                name="Alice",
+                allowed_services=["weather"],
+            )
+        },
+    )
+    profiles = WorkshopRuntimeProfileRegistry(
+        (
+            ProtectedRuntimeProfile(
+                profile_id=RuntimeProfileId("rtp_15151515151515151515151515151515"),
+                runtime_config_id=111,
+                display_name="Protected coding runtime",
+                os_user=None,
+                backend="codex",
+                provider="openai",
+                model="gpt-5.6-sol",
+                timeout_seconds=120,
+                allowed_services=("perplexity",),
+            ),
+        )
+    )
+
+    pool = SubprocessPool(
+        config=config,
+        services_info=services_info,
+        runtime_profiles=profiles,
+    )
+    instance = pool.get(111)
+    principal = pool.internal_api_auth.authenticate(instance._api_context.webhook_secret)
+
+    assert instance._api_context.services_info == [services_info[0]]
+    assert principal is not None
+    assert principal.allows(InternalAPIScope.SERVICES_CALL)
+    assert principal.allows_service("perplexity")
+    assert not principal.allows_service("weather")
 
 
 def test_profile_without_telegram_user_receives_runtime_credential(tmp_path, monkeypatch):
@@ -133,6 +188,48 @@ def test_profile_without_telegram_user_receives_runtime_credential(tmp_path, mon
                 provider="openai",
                 model="gpt-5.6-sol",
                 timeout_seconds=120,
+                allowed_services=("perplexity",),
+            ),
+        )
+    )
+
+    services_info = [{"name": "perplexity", "method": "POST", "description": "search"}]
+    pool = SubprocessPool(config=config, services_info=services_info, runtime_profiles=profiles)
+    instance = pool.get(runtime_config_id)
+    principal = pool.internal_api_auth.authenticate(instance._api_context.webhook_secret)
+
+    assert instance.backend_name == "codex"
+    assert principal is not None
+    assert principal.chat_id == runtime_config_id
+    assert principal.allowed_services == frozenset({"perplexity"})
+    assert instance._api_context.services_info == services_info
+
+
+def test_unavailable_protected_service_is_denied_with_warning(tmp_path, monkeypatch, caplog):
+    from kai.pool import SubprocessPool
+
+    monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
+    config = Config(
+        telegram_bot_token="test",
+        allowed_user_ids=set(),
+        default_backend="codex",
+        default_provider="openai",
+        default_model="gpt-5.6-sol",
+        user_configs={},
+    )
+    runtime_config_id = 987654321012346
+    profiles = WorkshopRuntimeProfileRegistry(
+        (
+            ProtectedRuntimeProfile(
+                profile_id=RuntimeProfileId("rtp_25252525252525252525252525252525"),
+                runtime_config_id=runtime_config_id,
+                display_name="Browser-only runtime",
+                os_user=None,
+                backend="codex",
+                provider="openai",
+                model="gpt-5.6-sol",
+                timeout_seconds=120,
+                allowed_services=("missing",),
             ),
         )
     )
@@ -141,9 +238,11 @@ def test_profile_without_telegram_user_receives_runtime_credential(tmp_path, mon
     instance = pool.get(runtime_config_id)
     principal = pool.internal_api_auth.authenticate(instance._api_context.webhook_secret)
 
-    assert instance.backend_name == "codex"
     assert principal is not None
-    assert principal.chat_id == runtime_config_id
+    assert principal.allowed_services == frozenset()
+    assert instance._api_context.services_info == []
+    assert "protected runtime profile" in caplog.text
+    assert "unavailable allowed_services: missing; denying them" in caplog.text
 
 
 def test_negative_group_key_retains_legacy_compatibility_runtime(tmp_path, monkeypatch):
@@ -169,6 +268,7 @@ def test_negative_group_key_retains_legacy_compatibility_runtime(tmp_path, monke
                 provider="openai",
                 model="gpt-5.6-sol",
                 timeout_seconds=120,
+                allowed_services=(),
             ),
         )
     )
@@ -206,6 +306,7 @@ def test_positive_configuration_key_without_profile_fails_closed(tmp_path, monke
                 provider="openai",
                 model="gpt-5.6-sol",
                 timeout_seconds=120,
+                allowed_services=(),
             ),
         )
     )

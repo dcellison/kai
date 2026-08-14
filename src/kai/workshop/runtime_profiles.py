@@ -59,6 +59,7 @@ class ProtectedRuntimeProfile:
     provider: str
     model: str
     timeout_seconds: int
+    allowed_services: tuple[str, ...]
 
 
 def _compatibility_model(
@@ -104,6 +105,29 @@ def _registry_model_ceiling(
     raise WorkshopRuntimeProfileError(
         f"Runtime profile {profile_id}: backend registry entry for {backend!r} is invalid"
     )
+
+
+def _service_scopes(value: object, *, profile_id: RuntimeProfileId) -> tuple[str, ...]:
+    """Validate one explicit ordered service-scope list."""
+    if not isinstance(value, list):
+        raise WorkshopRuntimeProfileError(f"Runtime profile {profile_id}: allowed_services must be a list")
+    checked: list[str] = []
+    for raw_service in value:
+        if not isinstance(raw_service, str):
+            raise WorkshopRuntimeProfileError(
+                f"Runtime profile {profile_id}: allowed_services entries must be service names"
+            )
+        service = raw_service.strip()
+        if not service or service == "*" or "/" in service:
+            raise WorkshopRuntimeProfileError(
+                f"Runtime profile {profile_id}: allowed service {raw_service!r} is invalid"
+            )
+        if service in checked:
+            raise WorkshopRuntimeProfileError(
+                f"Runtime profile {profile_id}: allowed service {service!r} is duplicated"
+            )
+        checked.append(service)
+    return tuple(checked)
 
 
 def runtime_profile_id_for_config_id(runtime_config_id: int) -> RuntimeProfileId:
@@ -197,6 +221,7 @@ class WorkshopRuntimeProfileRegistry:
                     provider=provider,
                     model=_compatibility_model(user, config, backend=backend, provider=provider),
                     timeout_seconds=user.timeout if user.timeout is not None else config.default_timeout,
+                    allowed_services=tuple(user.allowed_services),
                 )
             )
         return cls(tuple(profiles))
@@ -286,6 +311,10 @@ class WorkshopRuntimeProfileRegistry:
                     provider=provider,
                     model=model,
                     timeout_seconds=raw_timeout,
+                    allowed_services=_service_scopes(
+                        raw_profile.get("allowed_services"),
+                        profile_id=profile_id,
+                    ),
                 )
             )
         return cls(tuple(profiles))
@@ -326,7 +355,7 @@ class WorkshopRuntimeProfileRegistry:
         Backend selection is owned by this registry. While users.yaml still
         provisions the corresponding OS account, models, workspaces, and
         service grants for migrated profiles, the duplicated backend/provider/
-        OS-user/model/timeout fields must agree.
+        OS-user/model/timeout/service-scope fields must agree.
         """
         for runtime_config_id, user in config.user_configs.items():
             profile = self.for_config_id(runtime_config_id)
@@ -339,7 +368,15 @@ class WorkshopRuntimeProfileRegistry:
                 profile.os_user,
                 profile.model,
                 profile.timeout_seconds,
-            ) != (backend, provider, user.os_user, expected_model, expected_timeout):
+                profile.allowed_services,
+            ) != (
+                backend,
+                provider,
+                user.os_user,
+                expected_model,
+                expected_timeout,
+                tuple(user.allowed_services),
+            ):
                 raise WorkshopRuntimeProfileError(
                     f"Runtime profile {profile.profile_id} conflicts with the migrated users.yaml execution policy"
                 )

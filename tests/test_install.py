@@ -8270,6 +8270,13 @@ class TestIndependentRuntimePolicy:
     role: admin
     os_user: daniel
     backend: codex
+    allowed_services:
+      - perplexity
+      - ""
+      - "*"
+      - invalid/path
+      - perplexity
+      - 7
   - telegram_id: 202
     name: Scott
     role: user
@@ -8307,12 +8314,14 @@ class TestIndependentRuntimePolicy:
             "provider": "openai",
             "model": "gpt-5.5",
             "timeout_seconds": 120,
+            "allowed_services": ["perplexity"],
             "os_user": "daniel",
         }
         assert document["runtime_profiles"][scott_id]["backend"] == "claude"
         assert document["runtime_profiles"][scott_id]["provider"] == "anthropic"
         assert document["runtime_profiles"][scott_id]["model"] == "sonnet"
         assert document["runtime_profiles"][scott_id]["timeout_seconds"] == 120
+        assert document["runtime_profiles"][scott_id]["allowed_services"] == []
 
     def test_migration_validates_against_registry_being_installed(self, tmp_path, monkeypatch):
         users_yaml = tmp_path / "users.yaml"
@@ -8373,6 +8382,7 @@ backends:
                             "provider": "openai",
                             "model": "gpt-5.5",
                             "timeout_seconds": 120,
+                            "allowed_services": [],
                         }
                     },
                 }
@@ -8457,6 +8467,8 @@ backends:
     backend: codex
     model: gpt-5.6-sol
     timeout: 345
+    allowed_services:
+      - perplexity
 """
         )
         profile_id = str(kai.install.runtime_profile_id_for_config_id(101))
@@ -8507,7 +8519,22 @@ backends:
         assert document["runtime_profiles"][profile_id]["display_name"] == "Operator display name"
         assert document["runtime_profiles"][profile_id]["model"] == "gpt-5.6-sol"
         assert document["runtime_profiles"][profile_id]["timeout_seconds"] == 345
+        assert document["runtime_profiles"][profile_id]["allowed_services"] == ["perplexity"]
         assert profiles.resolve(profile_id).runtime_config_id == 101
+
+        policy.write_text(content)
+        next_action, next_content, next_profiles = _runtime_policy_apply_plan(
+            "kai",
+            {
+                "DEFAULT_PROVIDER": "openai",
+                "DEFAULT_TIMEOUT": "120",
+            },
+            users_yaml,
+        )
+
+        assert next_action == "preserve"
+        assert next_content == content
+        assert next_profiles.resolve(profile_id).allowed_services == ("perplexity",)
 
     def test_existing_policy_must_cover_every_migrated_profile(self, tmp_path, monkeypatch):
         users_yaml = tmp_path / "users.yaml"

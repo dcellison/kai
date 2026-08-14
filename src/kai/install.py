@@ -948,6 +948,22 @@ def _install_registry_model_ceiling(
     return checked or None
 
 
+def _migrated_service_scopes(entry: dict[object, object]) -> list[str]:
+    """Mirror users.yaml's effective service allowlist during migration."""
+    raw = entry.get("allowed_services", [])
+    if not isinstance(raw, list):
+        return []
+    checked: list[str] = []
+    for raw_service in raw:
+        if not isinstance(raw_service, str):
+            continue
+        service = raw_service.strip()
+        if not service or service == "*" or "/" in service or service in checked:
+            continue
+        checked.append(service)
+    return checked
+
+
 def _build_migrated_runtime_profiles(
     users_yaml_path: Path,
     *,
@@ -1029,6 +1045,7 @@ def _build_migrated_runtime_profiles(
             "provider": provider,
             "model": model,
             "timeout_seconds": timeout_seconds,
+            "allowed_services": _migrated_service_scopes(entry),
         }
         raw_os_user = entry.get("os_user")
         if raw_os_user is not None and str(raw_os_user).strip():
@@ -1057,7 +1074,7 @@ def _upgrade_runtime_policy_content(
     migrated_content: str,
     defaults: _RuntimePolicyDefaults,
 ) -> tuple[str, bool]:
-    """Add model/timeout policy to documents that predate those keys.
+    """Add execution-policy fields to documents that predate them.
 
     The major document version remains 1 so older Kai code ignores the new
     keys during rollback. Existing values are never overwritten. Profiles
@@ -1107,6 +1124,9 @@ def _upgrade_runtime_policy_content(
             profile["timeout_seconds"] = (
                 expected["timeout_seconds"] if isinstance(expected, dict) else defaults.timeout_seconds
             )
+            changed = True
+        if "allowed_services" not in profile:
+            profile["allowed_services"] = expected["allowed_services"] if isinstance(expected, dict) else []
             changed = True
     if not changed:
         return content, False
@@ -1164,12 +1184,20 @@ def _runtime_policy_apply_plan(
             raise ValueError(
                 "Protected runtime policy lost a required compatibility profile during validation"
             ) from exc
-        if (actual.backend, actual.provider, actual.os_user, actual.model, actual.timeout_seconds) != (
+        if (
+            actual.backend,
+            actual.provider,
+            actual.os_user,
+            actual.model,
+            actual.timeout_seconds,
+            actual.allowed_services,
+        ) != (
             expected.backend,
             expected.provider,
             expected.os_user,
             expected.model,
             expected.timeout_seconds,
+            expected.allowed_services,
         ):
             raise ValueError(
                 f"Protected runtime profile {actual.profile_id} conflicts with users.yaml fields still required "
