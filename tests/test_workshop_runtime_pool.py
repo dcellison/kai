@@ -138,3 +138,68 @@ def test_profile_without_telegram_user_receives_runtime_credential(tmp_path, mon
     assert instance.backend_name == "codex"
     assert principal is not None
     assert principal.chat_id == runtime_config_id
+
+
+def test_negative_group_key_retains_legacy_compatibility_runtime(tmp_path, monkeypatch):
+    from kai.pool import SubprocessPool
+
+    monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
+    config = Config(
+        telegram_bot_token="test",
+        allowed_user_ids={111},
+        default_backend="codex",
+        default_provider="openai",
+        default_model="gpt-5.6-sol",
+        user_configs={111: UserConfig(telegram_id=111, name="Alice")},
+    )
+    profiles = WorkshopRuntimeProfileRegistry(
+        (
+            ProtectedRuntimeProfile(
+                profile_id=RuntimeProfileId("rtp_33333333333333333333333333333333"),
+                runtime_config_id=111,
+                display_name="Alice runtime",
+                os_user=None,
+                backend="codex",
+                provider="openai",
+            ),
+        )
+    )
+
+    pool = SubprocessPool(config=config, services_info=[], runtime_profiles=profiles)
+    instance = pool.get(-100999)
+
+    assert instance.backend_name == "codex"
+    principal = pool.internal_api_auth.authenticate(instance._api_context.webhook_secret)
+    assert principal is not None
+    assert principal.chat_id == -100999
+    assert principal.allowed_services == frozenset()
+
+
+def test_positive_configuration_key_without_profile_fails_closed(tmp_path, monkeypatch):
+    from kai.pool import SubprocessPool
+
+    monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
+    config = Config(
+        telegram_bot_token="test",
+        allowed_user_ids={111},
+        default_backend="codex",
+        default_provider="openai",
+        default_model="gpt-5.6-sol",
+        user_configs={111: UserConfig(telegram_id=111, name="Alice")},
+    )
+    profiles = WorkshopRuntimeProfileRegistry(
+        (
+            ProtectedRuntimeProfile(
+                profile_id=RuntimeProfileId("rtp_44444444444444444444444444444444"),
+                runtime_config_id=222,
+                display_name="Different runtime",
+                os_user=None,
+                backend="codex",
+                provider="openai",
+            ),
+        )
+    )
+    pool = SubprocessPool(config=config, services_info=[], runtime_profiles=profiles)
+
+    with pytest.raises(WorkshopRuntimeProfileError, match="no protected runtime profile"):
+        pool.get(111)

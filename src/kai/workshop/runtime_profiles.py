@@ -177,16 +177,15 @@ class WorkshopRuntimeProfileRegistry:
                     f"Runtime profile {profile_id}: backend {backend!r} is not present in the backend registry"
                 )
             provider = str(raw_profile.get("provider") or "").strip().lower()
-            if backend == "claude":
-                provider = "anthropic"
-            elif backend == "codex":
-                provider = "openai"
+            allowed_providers = BACKEND_PROVIDERS[backend]
+            if not provider and len(allowed_providers) == 1:
+                provider = allowed_providers[0]
             elif not provider:
                 raise WorkshopRuntimeProfileError(
                     f"Runtime profile {profile_id}: provider is required for backend {backend!r}"
                 )
-            if provider not in BACKEND_PROVIDERS[backend]:
-                allowed = ", ".join(BACKEND_PROVIDERS[backend])
+            if provider not in allowed_providers:
+                allowed = ", ".join(allowed_providers)
                 raise WorkshopRuntimeProfileError(
                     f"Runtime profile {profile_id}: provider {provider!r} is not valid for backend {backend!r}; "
                     f"expected one of: {allowed}"
@@ -234,7 +233,7 @@ class WorkshopRuntimeProfileRegistry:
         policy_path = path or runtime_profiles_path()
         explicit = path is not None or bool(os.environ.get(RUNTIME_PROFILES_YAML_ENV, "").strip())
         protected = bool(os.environ.get(INSTALL_DIR_ENV, "").strip())
-        if not policy_path.is_file() and not explicit and not protected:
+        if not explicit and not protected:
             return cls.from_config(config)
         registry = cls.from_yaml(_policy_text(policy_path), backend_registry=load_backend_registry())
         registry._validate_compatibility_projection(config)
@@ -243,11 +242,10 @@ class WorkshopRuntimeProfileRegistry:
     def _validate_compatibility_projection(self, config: Config) -> None:
         """Fail closed while users.yaml still provisions existing OS identities.
 
-        Backend selection is owned by this registry. During Milestone 1,
-        users.yaml still provisions the corresponding OS account, models,
-        workspaces, and service grants for migrated profiles, so the duplicated
-        backend/provider/OS-user fields must agree until those fields move into
-        the independent policy in the next cut.
+        Backend selection is owned by this registry. While users.yaml still
+        provisions the corresponding OS account, models, workspaces, and
+        service grants for migrated profiles, the duplicated backend/provider/
+        OS-user fields must agree.
         """
         for runtime_config_id, user in config.user_configs.items():
             profile = self.for_config_id(runtime_config_id)

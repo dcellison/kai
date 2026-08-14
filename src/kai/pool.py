@@ -39,6 +39,7 @@ from kai.config import (
 )
 from kai.goose import GooseBackend
 from kai.internal_api_auth import InternalAPIAuth
+from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError
 from kai.workspace_utils import is_workspace_allowed
 
 if TYPE_CHECKING:
@@ -239,9 +240,17 @@ class SubprocessPool:
         in _apply_user_db_settings() since they require async DB access.
         """
         user = self._config.get_user_config(chat_id)
-        protected_profile = (
-            self._runtime_profiles.for_config_id(chat_id) if self._runtime_profiles is not None else None
-        )
+        protected_profile = None
+        if self._runtime_profiles is not None:
+            try:
+                protected_profile = self._runtime_profiles.for_config_id(chat_id)
+            except WorkshopRuntimeProfileError:
+                # Interactive Telegram groups and group-owned scheduled jobs
+                # remain on their established negative-chat compatibility
+                # path until group orchestration crosses the canonical runtime
+                # boundary. Positive private/configuration keys fail closed.
+                if chat_id >= 0:
+                    raise
 
         # Resolve through the single backend.resolve_home_workspace
         # helper: users.yaml override first, else DATA_DIR/home/<principal_id>/.

@@ -1009,7 +1009,12 @@ def _runtime_policy_apply_plan(
         backend_registry=registry_entries,
     )
     for expected in expected_profiles.profiles:
-        actual = profiles.for_config_id(expected.runtime_config_id)
+        try:
+            actual = profiles.for_config_id(expected.runtime_config_id)
+        except WorkshopRuntimeProfileError as exc:
+            raise ValueError(
+                "Protected runtime policy lost a required compatibility profile during validation"
+            ) from exc
         if (actual.backend, actual.provider, actual.os_user) != (
             expected.backend,
             expected.provider,
@@ -1017,7 +1022,7 @@ def _runtime_policy_apply_plan(
         ):
             raise ValueError(
                 f"Protected runtime profile {actual.profile_id} conflicts with users.yaml fields still required "
-                "for compatibility provisioning; update both protected documents together during Milestone 1"
+                "for compatibility provisioning; update both protected documents together"
             )
     return action, content, profiles
 

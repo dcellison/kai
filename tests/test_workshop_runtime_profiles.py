@@ -196,7 +196,8 @@ def test_document_rejects_backend_absent_from_protected_registry():
         )
 
 
-def test_document_rejects_provider_not_supported_by_backend():
+@pytest.mark.parametrize("backend", ("claude", "codex", "goose"))
+def test_document_rejects_provider_not_supported_by_backend(backend):
     profile_id = RuntimeProfileId("rtp_34343434343434343434343434343434")
 
     with pytest.raises(WorkshopRuntimeProfileError, match=r"provider .* is not valid"):
@@ -206,13 +207,35 @@ def test_document_rejects_provider_not_supported_by_backend():
                 "runtime_profiles": {
                     str(profile_id): {
                         "display_name": "Invalid provider",
-                        "backend": "goose",
+                        "backend": backend,
                         "provider": "not-a-provider",
                     }
                 },
             },
-            backend_registry={"goose": object()},
+            backend_registry={backend: object()},
         )
+
+
+@pytest.mark.parametrize(
+    ("backend", "canonical_provider"),
+    (("claude", "anthropic"), ("codex", "openai")),
+)
+def test_single_provider_backend_defaults_only_when_provider_is_omitted(backend, canonical_provider):
+    profile_id = RuntimeProfileId("rtp_36363636363636363636363636363636")
+    registry = WorkshopRuntimeProfileRegistry.from_document(
+        {
+            "version": 1,
+            "runtime_profiles": {
+                str(profile_id): {
+                    "display_name": "Single-provider runtime",
+                    "backend": backend,
+                }
+            },
+        },
+        backend_registry={backend: object()},
+    )
+
+    assert registry.resolve(profile_id).provider == canonical_provider
 
 
 def test_document_rejects_invalid_os_user():
@@ -325,3 +348,25 @@ def test_uninstalled_development_without_policy_uses_compatibility_projection(mo
     registry = WorkshopRuntimeProfileRegistry.load(_config())
 
     assert registry.for_config_id(101).display_name == "Daniel"
+
+
+def test_uninstalled_development_ignores_existing_canonical_policy(monkeypatch):
+    monkeypatch.delenv("KAI_INSTALL_DIR", raising=False)
+    monkeypatch.delenv("KAI_RUNTIME_PROFILES_YAML", raising=False)
+    monkeypatch.setattr(
+        "kai.workshop.runtime_profiles._policy_text",
+        lambda _path: pytest.fail("development run must not read installed policy"),
+    )
+
+    registry = WorkshopRuntimeProfileRegistry.load(_config())
+
+    assert registry.for_config_id(101).display_name == "Daniel"
+
+
+def test_protected_startup_fails_closed_when_policy_is_unreadable(monkeypatch):
+    monkeypatch.setenv("KAI_INSTALL_DIR", "/opt/kai")
+    monkeypatch.delenv("KAI_RUNTIME_PROFILES_YAML", raising=False)
+    monkeypatch.setattr("kai.workshop.runtime_profiles._read_protected_file", lambda _path: None)
+
+    with pytest.raises(WorkshopRuntimeProfileError, match="missing or unreadable"):
+        WorkshopRuntimeProfileRegistry.load(_config())
