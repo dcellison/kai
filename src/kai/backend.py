@@ -1173,6 +1173,9 @@ def resolve_home_workspace(
     chat_id: int | None,
     config: Config,
     data_dir: Path | None = None,
+    *,
+    use_user_config: bool = True,
+    provisioned_runtime: bool = False,
 ) -> Path:
     """
     Return the user's home workspace path.
@@ -1192,6 +1195,10 @@ def resolve_home_workspace(
     Config directly - that field was removed by issue #353. The old
     global fallback (issue #353) was a multi-user privacy hazard
     (every user landed in a directory every other user could read).
+
+    A protected runtime profile can set ``provisioned_runtime`` to bypass the
+    notification-only compatibility check. This does not create a directory;
+    protected installs still require the installer to have provisioned it.
 
     Passing `config` (not just its admin home field) keeps the
     resolution decision local: the caller does not need to know whether
@@ -1213,7 +1220,7 @@ def resolve_home_workspace(
     # load_config) already filtered out bad paths, and a path that
     # became invalid post-load (unmounted drive, etc.) is the admin's
     # problem to fix, not ours to paper over.
-    user = config.get_user_config(chat_id) if chat_id is not None else None
+    user = config.get_user_config(chat_id) if chat_id is not None and use_user_config else None
     if user and user.home_workspace:
         return user.home_workspace
 
@@ -1232,7 +1239,7 @@ def resolve_home_workspace(
     # the path without bootstrapping leaves the downstream caller
     # to fail naturally on a missing directory, which is the right
     # behavior for a chat_id without an interactive session.
-    if _is_notification_only_chat_id(chat_id, config):
+    if not provisioned_runtime and _is_notification_only_chat_id(chat_id, config):
         return data_dir / "home" / str(chat_id)
 
     # A protected install has a separate service identity and backend OS

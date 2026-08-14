@@ -48,6 +48,7 @@ class TestRuntimeAssignmentPolicy:
                         "model": "gpt-5.5",
                         "timeout_seconds": 120,
                         "allowed_services": [],
+                        "allowed_workspaces": [],
                     }
                 },
             },

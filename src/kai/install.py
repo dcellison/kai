@@ -964,6 +964,30 @@ def _migrated_service_scopes(entry: dict[object, object]) -> list[str]:
     return checked
 
 
+def _migrated_workspace_directory(value: object) -> str | None:
+    """Mirror users.yaml's effective optional workspace directory."""
+    if value is None:
+        return None
+    rendered = str(value).strip()
+    if not rendered:
+        return None
+    path = Path(rendered).expanduser().resolve()
+    return str(path) if path.is_dir() else None
+
+
+def _migrated_allowed_workspaces(entry: dict[object, object]) -> list[str]:
+    """Mirror users.yaml's effective static workspace allowlist."""
+    raw = entry.get("allowed_workspaces", [])
+    if not isinstance(raw, list):
+        return []
+    checked: list[str] = []
+    for raw_path in raw:
+        path = _migrated_workspace_directory(raw_path)
+        if path is not None and path not in checked:
+            checked.append(path)
+    return checked
+
+
 def _build_migrated_runtime_profiles(
     users_yaml_path: Path,
     *,
@@ -1046,6 +1070,9 @@ def _build_migrated_runtime_profiles(
             "model": model,
             "timeout_seconds": timeout_seconds,
             "allowed_services": _migrated_service_scopes(entry),
+            "home_workspace": _migrated_workspace_directory(entry.get("home_workspace")),
+            "workspace_base": _migrated_workspace_directory(entry.get("workspace_base")),
+            "allowed_workspaces": _migrated_allowed_workspaces(entry),
         }
         raw_os_user = entry.get("os_user")
         if raw_os_user is not None and str(raw_os_user).strip():
@@ -1128,6 +1155,15 @@ def _upgrade_runtime_policy_content(
         if "allowed_services" not in profile:
             profile["allowed_services"] = expected["allowed_services"] if isinstance(expected, dict) else []
             changed = True
+        if "home_workspace" not in profile:
+            profile["home_workspace"] = expected["home_workspace"] if isinstance(expected, dict) else None
+            changed = True
+        if "workspace_base" not in profile:
+            profile["workspace_base"] = expected["workspace_base"] if isinstance(expected, dict) else None
+            changed = True
+        if "allowed_workspaces" not in profile:
+            profile["allowed_workspaces"] = expected["allowed_workspaces"] if isinstance(expected, dict) else []
+            changed = True
     if not changed:
         return content, False
     return yaml.safe_dump(document, sort_keys=False, default_flow_style=False), True
@@ -1191,6 +1227,9 @@ def _runtime_policy_apply_plan(
             actual.model,
             actual.timeout_seconds,
             frozenset(actual.allowed_services),
+            actual.home_workspace,
+            actual.workspace_base,
+            frozenset(actual.allowed_workspaces),
         ) != (
             expected.backend,
             expected.provider,
@@ -1198,6 +1237,9 @@ def _runtime_policy_apply_plan(
             expected.model,
             expected.timeout_seconds,
             frozenset(expected.allowed_services),
+            expected.home_workspace,
+            expected.workspace_base,
+            frozenset(expected.allowed_workspaces),
         ):
             raise ValueError(
                 f"Protected runtime profile {actual.profile_id} conflicts with users.yaml fields still required "

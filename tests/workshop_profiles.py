@@ -26,6 +26,9 @@ def profile_registry(*runtime_config_ids: int) -> WorkshopRuntimeProfileRegistry
                 model="gpt-5.6-sol",
                 timeout_seconds=120,
                 allowed_services=(),
+                home_workspace=None,
+                workspace_base=None,
+                allowed_workspaces=(),
             )
             for runtime_config_id in runtime_config_ids
         )

@@ -60,6 +60,9 @@ class ProtectedRuntimeProfile:
     model: str
     timeout_seconds: int
     allowed_services: tuple[str, ...]
+    home_workspace: Path | None
+    workspace_base: Path | None
+    allowed_workspaces: tuple[Path, ...]
 
 
 def _compatibility_model(
@@ -129,6 +132,44 @@ def _service_scopes(value: object, *, profile_id: RuntimeProfileId) -> tuple[str
                 f"Runtime profile {profile_id}: allowed service {service!r} is duplicated"
             )
         checked.append(service)
+    return tuple(checked)
+
+
+def _workspace_directory(
+    value: object,
+    *,
+    field: str,
+    profile_id: RuntimeProfileId,
+) -> Path | None:
+    """Validate one optional protected workspace directory."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise WorkshopRuntimeProfileError(f"Runtime profile {profile_id}: {field} must be a directory path or null")
+    path = Path(value.strip()).expanduser()
+    if not path.is_absolute():
+        raise WorkshopRuntimeProfileError(f"Runtime profile {profile_id}: {field} must be an absolute path")
+    resolved = path.resolve()
+    if not resolved.is_dir():
+        raise WorkshopRuntimeProfileError(f"Runtime profile {profile_id}: {field} is not an existing directory")
+    return resolved
+
+
+def _workspace_directories(value: object, *, profile_id: RuntimeProfileId) -> tuple[Path, ...]:
+    """Validate one explicit unique protected workspace allowlist."""
+    if not isinstance(value, list):
+        raise WorkshopRuntimeProfileError(f"Runtime profile {profile_id}: allowed_workspaces must be a list")
+    checked: list[Path] = []
+    for raw_path in value:
+        path = _workspace_directory(
+            raw_path,
+            field="allowed_workspaces entry",
+            profile_id=profile_id,
+        )
+        assert path is not None
+        if path in checked:
+            raise WorkshopRuntimeProfileError(f"Runtime profile {profile_id}: allowed workspace {path} is duplicated")
+        checked.append(path)
     return tuple(checked)
 
 
@@ -224,6 +265,9 @@ class WorkshopRuntimeProfileRegistry:
                     model=_compatibility_model(user, config, backend=backend, provider=provider),
                     timeout_seconds=user.timeout if user.timeout is not None else config.default_timeout,
                     allowed_services=tuple(user.allowed_services),
+                    home_workspace=user.home_workspace,
+                    workspace_base=user.workspace_base,
+                    allowed_workspaces=tuple(user.allowed_workspaces),
                 )
             )
         return cls(tuple(profiles))
@@ -317,6 +361,20 @@ class WorkshopRuntimeProfileRegistry:
                         raw_profile.get("allowed_services"),
                         profile_id=profile_id,
                     ),
+                    home_workspace=_workspace_directory(
+                        raw_profile.get("home_workspace"),
+                        field="home_workspace",
+                        profile_id=profile_id,
+                    ),
+                    workspace_base=_workspace_directory(
+                        raw_profile.get("workspace_base"),
+                        field="workspace_base",
+                        profile_id=profile_id,
+                    ),
+                    allowed_workspaces=_workspace_directories(
+                        raw_profile.get("allowed_workspaces"),
+                        profile_id=profile_id,
+                    ),
                 )
             )
         return cls(tuple(profiles))
@@ -355,9 +413,8 @@ class WorkshopRuntimeProfileRegistry:
         """Fail closed while users.yaml still provisions existing OS identities.
 
         Backend selection is owned by this registry. While users.yaml still
-        provisions the corresponding OS account, models, workspaces, and
-        service grants for migrated profiles, the duplicated backend/provider/
-        OS-user/model/timeout/service-scope fields must agree.
+        provisions the corresponding OS account and compatibility policy for
+        migrated profiles, duplicated execution fields must agree.
         """
         for runtime_config_id, user in config.user_configs.items():
             profile = self.for_config_id(runtime_config_id)
@@ -371,6 +428,9 @@ class WorkshopRuntimeProfileRegistry:
                 profile.model,
                 profile.timeout_seconds,
                 frozenset(profile.allowed_services),
+                profile.home_workspace,
+                profile.workspace_base,
+                frozenset(profile.allowed_workspaces),
             ) != (
                 backend,
                 provider,
@@ -378,6 +438,9 @@ class WorkshopRuntimeProfileRegistry:
                 expected_model,
                 expected_timeout,
                 frozenset(user.allowed_services),
+                user.home_workspace,
+                user.workspace_base,
+                frozenset(user.allowed_workspaces),
             ):
                 raise WorkshopRuntimeProfileError(
                     f"Runtime profile {profile.profile_id} conflicts with the migrated users.yaml execution policy"

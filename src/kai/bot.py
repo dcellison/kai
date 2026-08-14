@@ -60,7 +60,7 @@ from telegram.ext import (
 
 from kai import github_api, memory_command, review, services, sessions, webhook
 from kai.agent_failure import render_agent_failure
-from kai.backend import require_backend_name, resolve_home_workspace
+from kai.backend import require_backend_name
 from kai.config import (
     DATA_DIR,
     ONESHOT_REASONER_BACKENDS,
@@ -1690,10 +1690,7 @@ async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
     """
     pool = _get_pool(context)
     config: Config = context.bot_data["config"]
-    # "home" for this user is per-user post-#353. Same resolver pool.py
-    # uses, so the equality check below matches the directory the user
-    # would land in on `/workspace home` or session restart.
-    home = resolve_home_workspace(chat_id, config)
+    home = pool.get_home_workspace(chat_id)
 
     # Layer DB overrides (from /workspace config) on top of YAML baseline.
     yaml_config = config.get_workspace_config(path)
@@ -1722,10 +1719,7 @@ async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     """
     assert update.message is not None
     pool = _get_pool(context)
-    config: Config = context.bot_data["config"]
-    # Per-user resolution: this is what `/workspace home` would route to
-    # for THIS user, not a shared default.
-    home = resolve_home_workspace(_chat_id(update), config)
+    home = pool.get_home_workspace(_chat_id(update))
 
     if path == await pool.get_effective_workspace(_chat_id(update)):
         await update.message.reply_text("Already in that workspace.")
@@ -2138,15 +2132,13 @@ async def handle_workspaces(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     """Handle /workspaces - show an inline keyboard of recent workspaces."""
     assert update.message is not None
     chat_id = _chat_id(update)
-    config: Config = context.bot_data["config"]
-    # Resolve per-user workspace access (workspace_base + allowed list)
-    base, allowed = await sessions.resolve_workspace_access(chat_id, config)
-    history = await sessions.get_workspace_history(chat_id)
     pool = _get_pool(context)
+    base, allowed = await pool.resolve_workspace_access(chat_id)
+    history = await sessions.get_workspace_history(chat_id)
     current = str(await pool.get_effective_workspace(chat_id))
     # Per-user home for the listing's "Home" pin and the empty-state
     # short-circuit below.
-    home = str(resolve_home_workspace(chat_id, config))
+    home = str(pool.get_home_workspace(chat_id))
 
     if not history and not allowed and current == home:
         await update.message.reply_text("No workspace history yet.\nUse /workspace new <name> to create one.")
@@ -2177,10 +2169,10 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
     pool = _get_pool(context)
     # Per-user resolution: the "Home" keyboard button maps to THIS user's
     # home directory, not a shared one.
-    home = resolve_home_workspace(chat_id, config)
+    home = pool.get_home_workspace(chat_id)
 
     # Resolve per-user workspace access for this user
-    base, allowed = await sessions.resolve_workspace_access(chat_id, config)
+    base, allowed = await pool.resolve_workspace_access(chat_id)
 
     # Resolve target path from callback data
     if data == "home":
@@ -2269,7 +2261,7 @@ async def _handle_workspace_allow(
     """Handle /workspace allow <path> - add an allowed workspace."""
     assert update.message is not None
     chat_id = _chat_id(update)
-    config: Config = context.bot_data["config"]
+    pool = _get_pool(context)
 
     # Parse path from target string ("allow /path/to/dir")
     parts = target.split(None, 1)
@@ -2296,7 +2288,7 @@ async def _handle_workspace_allow(
         return
 
     # Check for redundancy: already under workspace_base?
-    base, allowed = await sessions.resolve_workspace_access(chat_id, config)
+    base, allowed = await pool.resolve_workspace_access(chat_id)
     if base:
         resolved_base = base.resolve()
         if str(resolved).startswith(str(resolved_base) + "/") or resolved == resolved_base:
@@ -2324,6 +2316,7 @@ async def _handle_workspace_deny(
     """Handle /workspace deny <path> - remove an allowed workspace."""
     assert update.message is not None
     chat_id = _chat_id(update)
+    pool = _get_pool(context)
 
     parts = target.split(None, 1)
     if len(parts) < 2:
@@ -2348,6 +2341,13 @@ async def _handle_workspace_deny(
     else:
         # Check if it's a global entry (can't be removed via Telegram)
         config: Config = context.bot_data["config"]
+        _base, static_paths, protected = pool.get_static_workspace_policy(chat_id)
+        if resolved in {path.resolve() for path in static_paths}:
+            source = "runtime profile" if protected else "users.yaml"
+            await update.message.reply_text(
+                f"That workspace is configured in the {source} and cannot be removed via Telegram."
+            )
+            return
         if resolved in [p.resolve() for p in config.allowed_workspaces]:
             await update.message.reply_text("That workspace is configured globally and cannot be removed via Telegram.")
         else:
@@ -2362,24 +2362,21 @@ async def _handle_workspace_allowed(
     assert update.message is not None
     chat_id = _chat_id(update)
     config: Config = context.bot_data["config"]
-    user_config = config.get_user_config(chat_id)
+    pool = _get_pool(context)
+    profile_base, static_paths, protected = pool.get_static_workspace_policy(chat_id)
 
-    # Resolve workspace_base: users.yaml > env
-    base = user_config.workspace_base if user_config and user_config.workspace_base else config.workspace_base
+    base = profile_base or config.workspace_base
 
     # Build allowed list with source attribution. Avoids calling
     # resolve_workspace_access() + get_allowed_workspaces() which
     # would query the DB twice. Only this handler needs attribution.
     db_paths = await sessions.get_allowed_workspaces(chat_id)
     db_path_set = {p.resolve() for p in db_paths}
-    # Per-user yaml allowed_workspaces tier (#460). Tracked
-    # separately from db_path_set so the source attribution
-    # below can distinguish "your yaml" from "your DB entries".
-    yaml_path_set: set[Path] = set()
-    if user_config and user_config.allowed_workspaces:
-        yaml_path_set = {p.resolve() for p in user_config.allowed_workspaces}
+    # Track the static runtime tier separately so source attribution can
+    # distinguish operator policy from mutable DB entries.
+    static_path_set = {p.resolve() for p in static_paths}
 
-    # Combined list: DB > yaml-per-user > global. Same order as
+    # Combined list: DB > runtime static > global. Same order as
     # resolve_workspace_access so this view matches what name
     # resolution actually traverses.
     seen: set[Path] = set()
@@ -2389,12 +2386,11 @@ async def _handle_workspace_allowed(
         if resolved not in seen:
             seen.add(resolved)
             allowed.append(resolved)
-    if user_config and user_config.allowed_workspaces:
-        for p in user_config.allowed_workspaces:
-            resolved = p.resolve()
-            if resolved not in seen:
-                seen.add(resolved)
-                allowed.append(resolved)
+    for p in static_paths:
+        resolved = p.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            allowed.append(resolved)
     for p in config.allowed_workspaces:
         resolved = p.resolve()
         if resolved not in seen:
@@ -2412,14 +2408,14 @@ async def _handle_workspace_allowed(
         lines.append("Allowed workspaces:")
         for p in allowed:
             # Source attribution priority matches the union order:
-            # DB beats yaml beats global. A path could in principle
+            # DB beats runtime policy beats global. A path could in principle
             # appear in multiple tiers (operator pinned via
             # /workspace allow AND listed in users.yaml); the most
             # specific tier wins the label.
             if p in db_path_set:
                 source = "you"
-            elif p in yaml_path_set:
-                source = "yaml"
+            elif p in static_path_set:
+                source = "profile" if protected else "yaml"
             else:
                 source = "global"
             lines.append(f"  {p} ({source})")
@@ -2434,7 +2430,7 @@ async def _handle_workspace_allowed(
     await update.message.reply_text("\n".join(lines))
 
 
-_NO_BASE_MSG = "No workspace base configured. Set workspace_base in users.yaml or WORKSPACE_BASE in .env."
+_NO_BASE_MSG = "No workspace base configured. Ask the operator to set a runtime workspace base or WORKSPACE_BASE."
 
 
 # Project ids are retrieval-time labels stored in memory rows, so
@@ -2670,12 +2666,10 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     chat_id = _chat_id(update)
     pool = _get_pool(context)
     config: Config = context.bot_data["config"]
-    # Per-user `/workspace home` destination. The user-visible fix for
-    # #353: prior to this, "home" was a shared directory.
-    home = resolve_home_workspace(chat_id, config)
+    home = pool.get_home_workspace(chat_id)
 
     # Resolve per-user workspace access (workspace_base + allowed list)
-    base, allowed = await sessions.resolve_workspace_access(chat_id, config)
+    base, allowed = await pool.resolve_workspace_access(chat_id)
 
     # No args: show current workspace
     if not context.args:

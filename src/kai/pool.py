@@ -208,6 +208,55 @@ class SubprocessPool:
         self._in_flight: set[int] = set()  # chat_ids with active send()
         self._eviction_task: asyncio.Task | None = None
 
+    def _protected_profile(self, runtime_config_id: int):
+        """Resolve protected policy while preserving the negative-group bridge."""
+        if self._runtime_profiles is None:
+            return None
+        try:
+            return self._runtime_profiles.for_config_id(runtime_config_id)
+        except WorkshopRuntimeProfileError:
+            if runtime_config_id >= 0:
+                raise
+            return None
+
+    def get_home_workspace(self, runtime_config_id: int) -> Path:
+        """Resolve home through protected profile policy when available."""
+        profile = self._protected_profile(runtime_config_id)
+        if profile is not None:
+            if profile.home_workspace is not None:
+                return profile.home_workspace
+            return resolve_home_workspace(
+                runtime_config_id,
+                self._config,
+                use_user_config=False,
+                provisioned_runtime=True,
+            )
+        return resolve_home_workspace(runtime_config_id, self._config)
+
+    def get_static_workspace_policy(
+        self,
+        runtime_config_id: int,
+    ) -> tuple[Path | None, tuple[Path, ...], bool]:
+        """Return per-runtime base/list policy and whether it is protected."""
+        profile = self._protected_profile(runtime_config_id)
+        if profile is not None:
+            return profile.workspace_base, profile.allowed_workspaces, True
+        user = self._config.get_user_config(runtime_config_id)
+        if user is None:
+            return None, (), False
+        return user.workspace_base, tuple(user.allowed_workspaces), False
+
+    async def resolve_workspace_access(self, runtime_config_id: int) -> tuple[Path | None, list[Path]]:
+        """Resolve mutable and static workspace access through runtime policy."""
+        base, allowed, protected = self.get_static_workspace_policy(runtime_config_id)
+        return await sessions.resolve_workspace_access(
+            runtime_config_id,
+            self._config,
+            use_user_config=not protected,
+            workspace_base=base,
+            static_allowed_workspaces=allowed if protected else (),
+        )
+
     @property
     def internal_api_auth(self) -> InternalAPIAuth:
         """Return the credential store shared with the loopback HTTP server."""
@@ -240,36 +289,22 @@ class SubprocessPool:
         """
         Create an AgentBackend for a specific user.
 
-        Backend selection: per-user backend (from users.yaml)
-        overrides the global config.default_backend. Both share the same
-        ABC interface; pool.py is backend-agnostic after this point.
+        Protected profiles own execution policy. Compatibility callers use
+        the existing UserConfig/global cascade.
 
-        Resolution order for each setting:
-        1. UserConfig from users.yaml (os_user, home_workspace, model,
-           timeout, backend, provider)
-        2. Global config defaults (from .env)
+        Protected profile fields take precedence over compatibility config.
 
         Per-user DB overrides (set via /settings or /model) are applied
         in _apply_user_db_settings() since they require async DB access.
         """
         user = self._config.get_user_config(chat_id)
-        protected_profile = None
-        if self._runtime_profiles is not None:
-            try:
-                protected_profile = self._runtime_profiles.for_config_id(chat_id)
-            except WorkshopRuntimeProfileError:
-                # Interactive Telegram groups and group-owned scheduled jobs
-                # remain on their established negative-chat compatibility
-                # path until group orchestration crosses the canonical runtime
-                # boundary. Positive private/configuration keys fail closed.
-                if chat_id >= 0:
-                    raise
+        protected_profile = self._protected_profile(chat_id)
 
         # Resolve through the single backend.resolve_home_workspace
         # helper: users.yaml override first, else DATA_DIR/home/<principal_id>/.
         # The old global home field on Config was removed by #353 because
         # it pointed every unconfigured user at a shared directory.
-        workspace = resolve_home_workspace(chat_id, self._config)
+        workspace = self.get_home_workspace(chat_id)
 
         ws_config = self._config.get_workspace_config(workspace)
 
@@ -351,7 +386,7 @@ class SubprocessPool:
         # non-home default. The redundant stat/mkdir inside
         # ensure_user_home is cheap (idempotent mkdir + chmod); the
         # clarity of two separate resolution calls is worth it.
-        home_ws = resolve_home_workspace(chat_id, self._config)
+        home_ws = self.get_home_workspace(chat_id)
 
         # os_user for sudo -u isolation. None = run as bot user.
         # Resolved here (rather than inside each branch) because all
@@ -562,8 +597,7 @@ class SubprocessPool:
         """Restore the saved workspace into a live instance.
 
         Reads `settings.workspace:<chat_id>`, validates path existence
-        and per-user workspace access (workspace_base from users.yaml,
-        allowed list from DB + global ALLOWED_WORKSPACES), and switches
+        and effective runtime workspace access, and switches
         the instance into the saved path when valid. Stale rows (path
         gone or no longer allowed) are deleted so an admin removing a
         path does not have users silently bypass the restriction.
@@ -589,7 +623,7 @@ class SubprocessPool:
                 )
                 await sessions.delete_setting(f"workspace:{chat_id}")
             else:
-                base, allowed = await sessions.resolve_workspace_access(chat_id, self._config)
+                base, allowed = await self.resolve_workspace_access(chat_id)
                 if not is_workspace_allowed(ws_path, base, allowed):
                     log.warning(
                         "Saved workspace for user %d is no longer allowed: %s",
@@ -611,7 +645,7 @@ class SubprocessPool:
         self._pending_workspace_restore.discard(chat_id)
         if effective is not None:
             return effective
-        return resolve_home_workspace(chat_id, self._config)
+        return self.get_home_workspace(chat_id)
 
     async def _apply_user_db_settings(self, chat_id: int, instance: AgentBackend) -> None:
         """Apply per-user DB-stored settings to a live instance.
@@ -838,10 +872,10 @@ class SubprocessPool:
         if not saved:
             if instance is not None:
                 self._pending_workspace_restore.discard(chat_id)
-            return resolve_home_workspace(chat_id, self._config)
+            return self.get_home_workspace(chat_id)
 
         ws_path = Path(saved)
-        base, allowed = await sessions.resolve_workspace_access(chat_id, self._config)
+        base, allowed = await self.resolve_workspace_access(chat_id)
         if not ws_path.is_dir() or not is_workspace_allowed(ws_path, base, allowed):
             log.warning(
                 "Saved workspace for user %d invalid; clearing: %s",
@@ -851,7 +885,7 @@ class SubprocessPool:
             await sessions.delete_setting(f"workspace:{chat_id}")
             if instance is not None:
                 self._pending_workspace_restore.discard(chat_id)
-            return resolve_home_workspace(chat_id, self._config)
+            return self.get_home_workspace(chat_id)
 
         # Only now do we materialize an instance. Avoiding instance
         # creation in the no-saved-row and stale-row branches keeps

@@ -99,6 +99,9 @@ def test_protected_profile_selects_backend_and_os_user_over_compatibility_config
                 model="gpt-5.6-sol",
                 timeout_seconds=345,
                 allowed_services=(),
+                home_workspace=None,
+                workspace_base=None,
+                allowed_workspaces=(),
             ),
         )
     )
@@ -146,6 +149,9 @@ def test_protected_profile_service_scopes_override_compatibility_config(tmp_path
                 model="gpt-5.6-sol",
                 timeout_seconds=120,
                 allowed_services=("perplexity",),
+                home_workspace=None,
+                workspace_base=None,
+                allowed_workspaces=(),
             ),
         )
     )
@@ -189,6 +195,9 @@ def test_profile_without_telegram_user_receives_runtime_credential(tmp_path, mon
                 model="gpt-5.6-sol",
                 timeout_seconds=120,
                 allowed_services=("perplexity",),
+                home_workspace=None,
+                workspace_base=None,
+                allowed_workspaces=(),
             ),
         )
     )
@@ -203,6 +212,81 @@ def test_profile_without_telegram_user_receives_runtime_credential(tmp_path, mon
     assert principal.chat_id == runtime_config_id
     assert principal.allowed_services == frozenset({"perplexity"})
     assert instance._api_context.services_info == services_info
+    assert instance.workspace == tmp_path / "home" / str(runtime_config_id)
+
+
+async def test_protected_workspace_policy_overrides_compatibility_config(tmp_path, monkeypatch):
+    from kai.pool import SubprocessPool
+
+    protected_home = tmp_path / "protected-home"
+    protected_base = tmp_path / "protected-base"
+    protected_allowed = tmp_path / "protected-allowed"
+    compatibility_home = tmp_path / "compatibility-home"
+    compatibility_base = tmp_path / "compatibility-base"
+    compatibility_allowed = tmp_path / "compatibility-allowed"
+    global_allowed = tmp_path / "global-allowed"
+    db_allowed = tmp_path / "db-allowed"
+    for path in (
+        protected_home,
+        protected_base,
+        protected_allowed,
+        compatibility_home,
+        compatibility_base,
+        compatibility_allowed,
+        global_allowed,
+        db_allowed,
+    ):
+        path.mkdir()
+    monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
+    config = Config(
+        telegram_bot_token="test",
+        allowed_user_ids={111},
+        default_backend="codex",
+        default_provider="openai",
+        default_model="gpt-5.6-sol",
+        allowed_workspaces=[global_allowed],
+        user_configs={
+            111: UserConfig(
+                telegram_id=111,
+                name="Alice",
+                home_workspace=compatibility_home,
+                workspace_base=compatibility_base,
+                allowed_workspaces=[compatibility_allowed],
+            )
+        },
+    )
+    profiles = WorkshopRuntimeProfileRegistry(
+        (
+            ProtectedRuntimeProfile(
+                profile_id=RuntimeProfileId("rtp_56565656565656565656565656565656"),
+                runtime_config_id=111,
+                display_name="Protected runtime",
+                os_user=None,
+                backend="codex",
+                provider="openai",
+                model="gpt-5.6-sol",
+                timeout_seconds=120,
+                allowed_services=(),
+                home_workspace=protected_home,
+                workspace_base=protected_base,
+                allowed_workspaces=(protected_allowed,),
+            ),
+        )
+    )
+    pool = SubprocessPool(config=config, services_info=[], runtime_profiles=profiles)
+    monkeypatch.setattr(
+        "kai.pool.sessions.get_allowed_workspaces",
+        AsyncMock(return_value=[db_allowed]),
+    )
+
+    instance = pool.get(111)
+    base, allowed = await pool.resolve_workspace_access(111)
+
+    assert instance.workspace == protected_home
+    assert instance.home_workspace == protected_home
+    assert base == protected_base
+    assert allowed == [db_allowed, protected_allowed, global_allowed]
+    assert compatibility_allowed not in allowed
 
 
 def test_unavailable_protected_service_is_denied_with_warning(tmp_path, monkeypatch, caplog):
@@ -230,6 +314,9 @@ def test_unavailable_protected_service_is_denied_with_warning(tmp_path, monkeypa
                 model="gpt-5.6-sol",
                 timeout_seconds=120,
                 allowed_services=("missing",),
+                home_workspace=None,
+                workspace_base=None,
+                allowed_workspaces=(),
             ),
         )
     )
@@ -269,6 +356,9 @@ def test_negative_group_key_retains_legacy_compatibility_runtime(tmp_path, monke
                 model="gpt-5.6-sol",
                 timeout_seconds=120,
                 allowed_services=(),
+                home_workspace=None,
+                workspace_base=None,
+                allowed_workspaces=(),
             ),
         )
     )
@@ -307,6 +397,9 @@ def test_positive_configuration_key_without_profile_fails_closed(tmp_path, monke
                 model="gpt-5.6-sol",
                 timeout_seconds=120,
                 allowed_services=(),
+                home_workspace=None,
+                workspace_base=None,
+                allowed_workspaces=(),
             ),
         )
     )
