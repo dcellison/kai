@@ -78,6 +78,7 @@ from kai.memory import (
     read_transcript_provenance,
 )
 from kai.memory_projects import ActiveMemoryProject, detect_active_memory_project, merged_registry
+from kai.telegram_context import get_core_services
 
 if TYPE_CHECKING:
     # Only used for type hints; importing at runtime would create a
@@ -536,7 +537,7 @@ async def _scope_inputs(
     """
     config: Config = context.bot_data["config"]
     registry = merged_registry(config.memory_projects)
-    pool: SubprocessPool | None = context.bot_data.get("pool")
+    pool: SubprocessPool | None = get_core_services(context).subprocess_pool
     if pool is None:
         return registry, None
     workspace = await pool.get_effective_workspace(chat_id)
@@ -1901,7 +1902,7 @@ async def _send_dashboard(
     # sharpest. The per-user fall-through matches the extraction
     # gate's backend resolution in bot.py.
     config: Config = context.bot_data["config"]
-    pool: SubprocessPool | None = context.bot_data.get("pool")
+    pool: SubprocessPool | None = get_core_services(context).subprocess_pool
     if pool is not None:
         effective_backend = pool.get_backend_provider(chat_id)[0]
     else:

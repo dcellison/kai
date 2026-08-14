@@ -26,6 +26,7 @@ from kai.bot import (
     handle_voice,
 )
 from kai.totp import TotpStateError
+from kai.workshop.domain import PrincipalId
 
 # ── Test helpers ──────────────────────────────────────────────────────────
 
@@ -433,6 +434,10 @@ async def test_photo_passes_with_valid_totp():
         # log_message MUST be patched to avoid writing test data (chat_id
         # 12345, MagicMock paths) to the real production history files.
         patch("kai.bot._get_pool"),
+        patch(
+            "kai.bot._upload_principal_id",
+            return_value=PrincipalId("prn_00000000000000000000000000000001"),
+        ),
         patch("kai.bot.log_message"),
         patch("kai.bot._notify_if_queued", new_callable=AsyncMock, return_value=False),
         patch("kai.bot._acquire_lock_or_kill", new_callable=AsyncMock, return_value=None),

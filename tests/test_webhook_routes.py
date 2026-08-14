@@ -86,7 +86,14 @@ async def test_health_reports_typed_core_component_readiness(monkeypatch) -> Non
                 "ready": True,
                 "components": {"runtime": True, "executor": True},
             }
-        )
+        ),
+        adapter_readiness={
+            "telegram": {
+                "status": "ready",
+                "ready": True,
+                "components": {"ingress": True, "conversation_delivery": True},
+            }
+        },
     )
 
     response = await _handle_health(SimpleNamespace(app=app))  # type: ignore[arg-type]
@@ -98,5 +105,12 @@ async def test_health_reports_typed_core_component_readiness(monkeypatch) -> Non
             "status": "ready",
             "ready": True,
             "components": {"runtime": True, "executor": True},
+        },
+        "adapters": {
+            "telegram": {
+                "status": "ready",
+                "ready": True,
+                "components": {"ingress": True, "conversation_delivery": True},
+            }
         },
     }

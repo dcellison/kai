@@ -19,10 +19,10 @@ The startup sequence is:
     1. Load config from .env
     2. Initialize SQLite database
     3. Start the transport-neutral runtime and Workshop execution host
-    4. Create the Telegram adapter application (with or without Updater)
+    4. Attach the explicit Telegram adapter to the core host
     5. Restore previous workspace (if saved in settings table)
-    6. Initialize the Telegram adapter and register slash commands
-    7. Load scheduled jobs from database into APScheduler
+    6. Let the adapter initialize Telegram, register commands, and load jobs
+    7. Start adapter-owned conversation and notification delivery workers
     8. Start the webhook HTTP server (always runs for scheduling API, GitHub webhooks, etc.)
     9. In webhook mode: register Telegram webhook with the API
        In polling mode: start the Updater's polling loop
@@ -30,7 +30,7 @@ The startup sequence is:
     11. Supervise required core and delivery workers until shutdown
 
 The shutdown sequence (in the finally block) reverses this order:
-    HTTP ingress -> Telegram ingress/delivery -> Telegram app -> core host -> database
+    HTTP ingress -> core-supervised adapters -> core services -> database
 """
 
 import asyncio
@@ -40,20 +40,13 @@ from datetime import UTC, datetime, timedelta
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
-from telegram import BotCommand
-from telegram.error import NetworkError
-
-from kai import cron, services, sessions, webhook
+from kai import services, sessions, webhook
 from kai.application_host import KaiApplicationHost
 from kai.backend_registry import load_backend_registry
-from kai.bot import create_bot
 from kai.config import DATA_DIR, PROJECT_ROOT, _read_protected_file, load_config
+from kai.telegram_adapter import TelegramAdapter
 from kai.workshop.bootstrap import BootstrapHuman, BootstrapNotificationChannel
 from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
-from kai.workshop.telegram_delivery_runtime import (
-    WorkshopTelegramConversationDeliveryService,
-    WorkshopTelegramNotificationService,
-)
 
 
 def _workshop_bootstrap_humans(
@@ -346,10 +339,9 @@ def _start() -> None:
 
         load_db_registry(await sessions.get_memory_project_rows())
 
-        conversation_delivery: WorkshopTelegramConversationDeliveryService | None = None
-        notification_delivery: WorkshopTelegramNotificationService | None = None
         core_host: KaiApplicationHost | None = None
-        app = None
+        telegram_adapter: TelegramAdapter | None = None
+        cleanup_task: asyncio.Task[None] | None = None
 
         # Determine the default user (admin or first user) for per-user
         # data migrations and workspace restoration. users.yaml is
@@ -407,89 +399,24 @@ def _start() -> None:
             core_services = await core_host.start()
             logging.info("Kai core application host is ready")
 
-            app = create_bot(
+            telegram_adapter = TelegramAdapter(
                 config,
+                core_services,
                 use_webhook=use_webhook,
-                core_services=core_services,
             )
-
-            # Retry initialization if the network isn't ready yet (e.g. after a
-            # power outage where DNS may take a while to come back).
-            for attempt in range(1, 13):
-                try:
-                    await app.initialize()
-                    break
-                except NetworkError:
-                    if attempt == 12:
-                        raise
-                    wait = min(30, 2**attempt)
-                    logging.warning(
-                        "Network not ready (attempt %d/12), retrying in %ds…",
-                        attempt,
-                        wait,
-                    )
-                    await asyncio.sleep(wait)
-
-            await app.start()
-
-            # Register slash command menu in Telegram's bot command list
-            await app.bot.set_my_commands(
-                [
-                    # Session
-                    BotCommand("stop", "Interrupt current response"),
-                    BotCommand("new", "Start a fresh session"),
-                    # Model
-                    BotCommand("models", "Choose a model"),
-                    BotCommand("model", "Switch model directly"),
-                    # Settings
-                    BotCommand("settings", "Show or change your settings"),
-                    # Memory
-                    BotCommand("memory", "Browse, search, and manage remembered facts"),
-                    # Workspace
-                    BotCommand("workspace", "Switch working directory"),
-                    BotCommand("workspaces", "List recent workspaces"),
-                    # GitHub
-                    BotCommand("github", "Show GitHub settings"),
-                    # Voice
-                    BotCommand("voice", "Toggle voice or set voice name"),
-                    BotCommand("voices", "Choose a voice"),
-                    # Info
-                    BotCommand("stats", "Show session info and cost"),
-                    BotCommand("job", "Manage scheduled jobs"),
-                    BotCommand("webhooks", "Show webhook server status"),
-                    BotCommand("help", "Show available commands"),
-                ]
-            )
-
-            # Reload scheduled jobs from the database into APScheduler
-            await cron.init_jobs(app)
-
-            # Validate the core-owned durable authority epoch and recover its
-            # Telegram conversation-finalization work on dedicated SQLite
-            # connections before webhook or polling ingress accepts updates.
-            conversation_delivery = await WorkshopTelegramConversationDeliveryService.open_and_start(
-                config.session_db_path,
-                app.bot,
-                authority_epoch_id=core_services.delivery_authority_epoch.epoch_id,
-            )
-            logging.info("Workshop Telegram conversation delivery is ready")
-
-            notification_delivery = await WorkshopTelegramNotificationService.open_and_start(
-                config.session_db_path,
-                app.bot,
-            )
-            logging.info("Workshop Telegram notification delivery is ready")
+            await core_host.attach_adapter("telegram", telegram_adapter)
 
             # Start the HTTP server (always runs - serves scheduling API, GitHub
             # webhooks, file exchange, and health check regardless of transport mode).
             # In webhook mode, this also registers the Telegram webhook with the API.
             await webhook.start(
-                app,
+                telegram_adapter.application,
                 config,
                 core_host=core_host,
                 core_services=core_services,
-                github_notifications=notification_delivery,
+                github_notifications=telegram_adapter.notification_delivery,
             )
+            await telegram_adapter.activate_ingress()
             # Phase 3: per-user file confinement is handled at request
             # time via pool.get_effective_workspace(chat_id) in
             # webhook.py. No global workspace sync needed at startup.
@@ -497,18 +424,6 @@ def _start() -> None:
             # Start periodic file cleanup if a retention policy is configured.
             if config.file_retention_days > 0:
                 cleanup_task = asyncio.create_task(_file_cleanup_loop(config.file_retention_days))
-                # Store reference to prevent GC; task self-cancels on loop shutdown
-                app.bot_data["cleanup_task"] = cleanup_task
-
-            # In polling mode, start the Updater's long-polling loop. PTB's
-            # start_polling() automatically calls delete_webhook() first, which
-            # cleans up any stale webhook from a previous webhook-mode run.
-            if not use_webhook:
-                assert app.updater is not None
-                await app.updater.start_polling(
-                    allowed_updates=["message", "callback_query"],
-                )
-                logging.info("Polling started")
 
             # Check for interrupted responses from a crash/restart.
             # Phase 2: check all files in the .responding directory (per-user
@@ -525,7 +440,7 @@ def _start() -> None:
                 flag.unlink(missing_ok=True)
                 try:
                     interrupted_chat_id = int(flag.name)
-                    await app.bot.send_message(
+                    await telegram_adapter.bot.send_message(
                         interrupted_chat_id,
                         "Sorry, my previous response was interrupted. Please resend your last message.",
                     )
@@ -542,7 +457,7 @@ def _start() -> None:
                     old_content = old_flag.read_text().strip()
                     old_flag.unlink(missing_ok=True)
                     old_chat_id = int(old_content)
-                    await app.bot.send_message(
+                    await telegram_adapter.bot.send_message(
                         old_chat_id,
                         "Sorry, my previous response was interrupted. Please resend your last message.",
                     )
@@ -552,36 +467,13 @@ def _start() -> None:
                     old_flag.unlink(missing_ok=True)
 
             logging.info("Kai is running. Press Ctrl+C to stop.")
-            # The delivery worker is part of service health. Unexpected worker
-            # exit reaches the top-level crash path instead of leaving a loaded
-            # Kai process that can accept replies it cannot deliver.
-            await asyncio.gather(
-                conversation_delivery.wait(),
-                notification_delivery.wait(),
-                core_host.wait(),
-            )
+            await core_host.wait()
         finally:
             # Shutdown in reverse order of startup
             await webhook.stop()
-            # Stop the polling Updater if it was running (no-op in webhook mode
-            # since the Updater was suppressed at build time)
-            if app is not None and not use_webhook and app.updater:
-                await app.updater.stop()
-            if notification_delivery is not None:
-                try:
-                    await notification_delivery.stop()
-                except Exception:
-                    logging.exception("Workshop Telegram notification delivery stopped with an error")
-            if conversation_delivery is not None:
-                try:
-                    await conversation_delivery.stop()
-                except Exception:
-                    # If wait() already exposed a worker failure, retain that
-                    # original exception while still completing shutdown.
-                    logging.exception("Workshop Telegram conversation delivery stopped with an error")
-            if app is not None:
-                await app.stop()
-                await app.shutdown()
+            if cleanup_task is not None:
+                cleanup_task.cancel()
+                await asyncio.gather(cleanup_task, return_exceptions=True)
             if core_host is not None:
                 try:
                     await core_host.stop()

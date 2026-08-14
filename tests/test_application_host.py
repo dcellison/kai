@@ -104,6 +104,31 @@ class _FakeClientCommands:
         self.ready = False
 
 
+class _FakeAdapterReadiness:
+    def __init__(self, *, ready: bool) -> None:
+        self.ready = ready
+
+    def as_dict(self) -> dict[str, object]:
+        return {"status": "ready" if self.ready else "starting", "ready": self.ready}
+
+
+class _FakeAdapter:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.readiness = _FakeAdapterReadiness(ready=False)
+
+    async def start(self) -> None:
+        self.events.append("adapter:start")
+        self.readiness = _FakeAdapterReadiness(ready=True)
+
+    async def wait(self) -> None:
+        self.events.append("adapter:wait")
+
+    async def stop(self) -> None:
+        self.events.append("adapter:stop")
+        self.readiness = _FakeAdapterReadiness(ready=False)
+
+
 @pytest.fixture
 def host_dependencies(monkeypatch):
     events: list[str] = []
@@ -171,6 +196,37 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
         "execution:stop",
         "pool:stop",
     ]
+
+
+async def test_core_host_starts_supervises_reports_and_stops_attached_adapter(
+    host_dependencies,
+) -> None:
+    host = _host()
+    await host.start()
+    adapter = _FakeAdapter(host_dependencies)
+
+    await host.attach_adapter("telegram", adapter)
+
+    assert host.adapter_readiness == {
+        "telegram": {"status": "ready", "ready": True},
+    }
+    await host.wait()
+    await host.stop()
+
+    assert "adapter:start" in host_dependencies
+    assert "adapter:wait" in host_dependencies
+    assert host_dependencies.index("adapter:stop") < host_dependencies.index("client:stop")
+
+
+async def test_core_host_rejects_empty_adapter_name(host_dependencies) -> None:
+    host = _host()
+    await host.start()
+
+    with pytest.raises(RuntimeError, match="name cannot be empty"):
+        await host.attach_adapter("", _FakeAdapter(host_dependencies))
+
+    assert "adapter:start" not in host_dependencies
+    await host.stop()
 
 
 def test_core_host_module_has_no_telegram_dependency() -> None:

@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -31,6 +32,7 @@ from kai import memory, memory_command
 from kai.config import MemoryProjectConfig
 from kai.memory import MemoryResult, MemoryStats
 from kai.memory_projects import ActiveMemoryProject
+from kai.telegram_context import KaiTelegramApplication
 
 # ── Fixture builders ────────────────────────────────────────────────
 
@@ -2148,6 +2150,9 @@ def context_factory(auth_config):
         ctx = MagicMock()
         ctx.bot_data = {"config": auth_config}
         ctx.args = args or []
+        application = MagicMock(spec=KaiTelegramApplication)
+        application.core_services = SimpleNamespace(subprocess_pool=None)
+        ctx.application = application
         return ctx
 
     return make
@@ -2440,7 +2445,7 @@ class TestDashboardBackendNote:
         ctx = context_factory(args=[])
         pool = MagicMock()
         pool.get_backend_provider.return_value = ("codex", "openai")
-        ctx.bot_data["pool"] = pool
+        ctx.application.core_services.subprocess_pool = pool
 
         await memory_command.handle_memory_command(upd, ctx)
 
@@ -3460,7 +3465,7 @@ class TestScopeInputs:
         ctx.bot_data["config"].memory_projects = {"kai": cfg}
         pool = MagicMock()
         pool.get_effective_workspace = AsyncMock(return_value=root)
-        ctx.bot_data["pool"] = pool
+        ctx.application.core_services.subprocess_pool = pool
         _registry, active = await memory_command._scope_inputs(ctx, 100)
         assert active is not None and active.project_id == "kai"
         pool.get_effective_workspace.assert_awaited_once_with(100)

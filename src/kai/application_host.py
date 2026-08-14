@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Protocol
 
 from kai import sessions
 from kai.config import Config
@@ -32,6 +34,25 @@ class KaiApplicationState(StrEnum):
     DRAINING = "draining"
     STOPPED = "stopped"
     FAILED = "failed"
+
+
+class KaiAdapterReadiness(Protocol):
+    """JSON-safe readiness contract for one external adapter."""
+
+    def as_dict(self) -> dict[str, object]: ...
+
+
+class KaiApplicationAdapter(Protocol):
+    """Lifecycle contract for one configured external adapter."""
+
+    @property
+    def readiness(self) -> KaiAdapterReadiness: ...
+
+    async def start(self) -> None: ...
+
+    async def wait(self) -> None: ...
+
+    async def stop(self) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +123,7 @@ class KaiApplicationHost:
         self._registered_backend_ids = registered_backend_ids
         self._state = KaiApplicationState.NEW
         self._services: KaiCoreServices | None = None
+        self._adapters: dict[str, KaiApplicationAdapter] = {}
 
     @property
     def services(self) -> KaiCoreServices:
@@ -120,6 +142,11 @@ class KaiApplicationHost:
             client_api=services is not None and services.client_commands.ready,
             store=services is not None,
         )
+
+    @property
+    def adapter_readiness(self) -> dict[str, object]:
+        """Return non-sensitive readiness reported by attached adapters."""
+        return {name: adapter.readiness.as_dict() for name, adapter in self._adapters.items()}
 
     async def start(self) -> KaiCoreServices:
         if self._state != KaiApplicationState.NEW:
@@ -184,9 +211,31 @@ class KaiApplicationHost:
                 await subprocess_pool.shutdown()
             raise
 
+    async def attach_adapter(self, name: str, adapter: KaiApplicationAdapter) -> None:
+        """Start and supervise an adapter after the core is ready."""
+        if self._state != KaiApplicationState.READY:
+            raise RuntimeError(f"Kai adapter cannot start while core is {self._state.value}")
+        if not name:
+            raise RuntimeError("Kai adapter name cannot be empty")
+        if name in self._adapters:
+            raise RuntimeError(f"Kai adapter {name!r} is already attached")
+        try:
+            await adapter.start()
+        except BaseException:
+            self._state = KaiApplicationState.FAILED
+            try:
+                await adapter.stop()
+            except Exception:
+                pass
+            raise
+        self._adapters[name] = adapter
+
     async def wait(self) -> None:
         """Expose failure of a required supervised core worker."""
-        await self.services.private_text_execution.wait()
+        await asyncio.gather(
+            self.services.private_text_execution.wait(),
+            *(adapter.wait() for adapter in self._adapters.values()),
+        )
 
     async def stop(self) -> None:
         if self._state in {KaiApplicationState.NEW, KaiApplicationState.STOPPED}:
@@ -199,6 +248,12 @@ class KaiApplicationHost:
             return
 
         errors: list[Exception] = []
+        for adapter in reversed(tuple(self._adapters.values())):
+            try:
+                await adapter.stop()
+            except Exception as exc:
+                errors.append(exc)
+        self._adapters.clear()
         for operation in (
             services.client_commands.stop,
             services.client_store.close,

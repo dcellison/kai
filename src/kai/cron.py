@@ -35,6 +35,7 @@ from kai import sessions
 from kai.history import log_message
 from kai.job_types import JOB_TYPE_AGENT, JOB_TYPE_REMINDER, normalize_job_type
 from kai.locks import get_lock
+from kai.telegram_context import get_core_services
 from kai.telegram_utils import chunk_text
 
 log = logging.getLogger(__name__)
@@ -50,16 +51,8 @@ _CONDITION_NOT_MET_PREFIX = (
 
 def _history_reader_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str | None:
     """Resolve the OS user allowed to search one scheduled chat's history."""
-    pool = context.bot_data.get("pool")
-    if pool is not None:
-        return pool.get_os_user(chat_id)
-    config = context.bot_data.get("config")
-    if config is None:
-        return None
-    if getattr(config, "protected_install", False) is True:
-        return None
-    user_config = config.get_user_config(chat_id)
-    return user_config.os_user if user_config and user_config.os_user else None
+    pool = get_core_services(context).subprocess_pool
+    return pool.get_os_user(chat_id) if pool is not None else None
 
 
 async def _send_chunked(bot: ExtBot, chat_id: int, text: str) -> None:
@@ -309,8 +302,8 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # ── Agent jobs: send prompt through the subprocess pool ──
-    pool = context.bot_data.get("pool")
-    if not pool:
+    pool = get_core_services(context).subprocess_pool
+    if pool is None:
         log.error("No subprocess pool available for job %d", job_id)
         return
 

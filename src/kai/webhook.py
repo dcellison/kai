@@ -721,6 +721,7 @@ async def _handle_health(request: web.Request) -> web.Response:
     host = request.app.get(CORE_HOST_KEY)
     if host is not None:
         response["core"] = host.readiness.as_dict()
+        response["adapters"] = host.adapter_readiness
     return web.json_response(response)
 
 

@@ -23,6 +23,7 @@ from kai import sessions
 from kai.backend import AgentResponse, StreamEvent, resolve_home_workspace
 from kai.bot import (
     _QUEUED_MESSAGE_MARKER,
+    KaiTelegramApplication,
     ResponseDeliveryRoute,
     _acquire_lock_or_kill,
     _clear_responding,
@@ -738,8 +739,17 @@ class TestCreateBotTransportMode:
         assert app.bot_data["workshop_delivery_recorder"] is sessions.record_workshop_delivery_observation
         assert app.bot_data["workshop_streaming_preview_recorder"] is sessions.record_workshop_streaming_preview
         assert app.bot_data["workshop_streaming_finalizer"] is sessions.record_workshop_streaming_finalization
-        assert isinstance(app.bot_data["workshop_runtime_pool"], WorkshopRuntimePool)
-        assert isinstance(app.bot_data["workshop_conversation_run_service"], WorkshopConversationRunService)
+        assert isinstance(app, KaiTelegramApplication)
+        assert isinstance(app.core_services.runtime_pool, WorkshopRuntimePool)
+        assert isinstance(app.core_services.conversation_runs, WorkshopConversationRunService)
+        for removed_key in (
+            "pool",
+            "workshop_runtime_pool",
+            "workshop_conversation_run_service",
+            "workshop_private_text_execution",
+            "workshop_principal_storage",
+        ):
+            assert removed_key not in app.bot_data
 
     def test_does_not_register_durable_run_lifecycle_before_cutover(self):
         config = _make_config()
@@ -889,9 +899,15 @@ def _make_context(config=None, claude=None, pool=None, args=None, user_data=None
     )
     ctx.bot_data = {
         "config": resolved_config,
-        "pool": mock_pool,
-        "workshop_principal_storage": principal_storage,
     }
+    application = MagicMock(spec=KaiTelegramApplication)
+    application.core_services = SimpleNamespace(
+        subprocess_pool=mock_pool,
+        private_text_execution=None,
+        conversation_runs=None,
+        principal_storage=principal_storage,
+    )
+    ctx.application = application
     ctx.args = args or []
     ctx.user_data = user_data if user_data is not None else {}
     ctx.bot.send_chat_action = AsyncMock()
@@ -1251,7 +1267,7 @@ class TestHandleStop:
         ctx = _make_context(claude=pool, config=_make_config(allowed_user_ids={1}))
         execution = MagicMock()
         execution.request_cancellation = AsyncMock(return_value=CanonicalCancellationDisposition.REQUESTED)
-        ctx.bot_data["workshop_private_text_execution"] = execution
+        ctx.application.core_services.private_text_execution = execution
 
         await handle_stop(update, ctx)
 
@@ -2861,7 +2877,7 @@ class TestHandleMessage:
         execution.accept.return_value.message.event.envelope.aggregate_id = inbound_id
         execution.accept.return_value.run.run_id = run_id
         execution.accept.return_value.disposition = ConversationCommandDisposition.NEWLY_ACCEPTED
-        ctx.bot_data["workshop_private_text_execution"] = execution
+        ctx.application.core_services.private_text_execution = execution
         with (
             patch("kai.bot.is_totp_configured", return_value=False),
             patch("kai.bot._handle_workshop_private_text", new_callable=AsyncMock) as response,
@@ -2913,7 +2929,7 @@ class TestHandleMessage:
         )
         execution.accept.return_value.run.run_id = RunId("run_00000000000000000000000000000001")
         execution.accept.return_value.disposition = ConversationCommandDisposition.TERMINAL_REPLAY
-        ctx.bot_data["workshop_private_text_execution"] = execution
+        ctx.application.core_services.private_text_execution = execution
 
         with (
             patch("kai.bot.is_totp_configured", return_value=False),
@@ -3024,7 +3040,7 @@ class TestHandlePhoto:
         ):
             await handle_photo(update, ctx)
 
-        namespace = ctx.bot_data["workshop_principal_storage"].for_runtime_config_id(1)
+        namespace = ctx.application.core_services.principal_storage.for_runtime_config_id(1)
         files = list(namespace.files_directory(tmp_path).iterdir())
         assert len(files) == 1
         assert not (tmp_path / "files" / "-100999").exists()
@@ -6837,27 +6853,10 @@ class TestCommandMenu:
         assert all(getattr(callback, "_kai_totp_sensitive", False) for callback in callbacks)
 
     def test_menu_matches_expected_set(self):
-        """The set_my_commands list in main.py matches EXPECTED_MENU_COMMANDS.
+        """The adapter-owned Telegram command menu matches the contract."""
+        from kai.telegram_adapter import _TELEGRAM_COMMANDS
 
-        Parses the actual source to extract BotCommand names from inside the
-        set_my_commands() call specifically, so the test breaks if someone
-        adds/removes a menu entry without updating the expected set.
-        """
-        import re
-
-        main_py = Path(__file__).parent.parent / "src" / "kai" / "main.py"
-        source = main_py.read_text()
-
-        # Scope to the set_my_commands(...) block so BotCommand references
-        # elsewhere in main.py (future defaults, comments, etc.) don't
-        # cause false positives.
-        match = re.search(
-            r"set_my_commands\(\s*\[(.+?)\]\s*\)",
-            source,
-            re.DOTALL,
-        )
-        assert match, "Could not find set_my_commands() call in main.py"
-        menu_commands = set(re.findall(r'BotCommand\("(\w+)"', match.group(1)))
+        menu_commands = {command.command for command in _TELEGRAM_COMMANDS}
 
         assert menu_commands == EXPECTED_MENU_COMMANDS, (
             f"Menu drift detected. "
@@ -7660,7 +7659,7 @@ class TestHandleReviewCommand:
         ):
             await handle_review_command(update, ctx)
 
-        namespace = ctx.bot_data["workshop_principal_storage"].for_runtime_config_id(1)
+        namespace = ctx.application.core_services.principal_storage.for_runtime_config_id(1)
         staged_dir = namespace.files_directory(tmp_path)
         assert staged_dir.is_dir()
         staged = list(staged_dir.glob("*_pr-681-review.md"))
@@ -7691,7 +7690,7 @@ class TestHandleReviewCommand:
         ):
             await handle_review_command(update, ctx)
 
-        namespace = ctx.bot_data["workshop_principal_storage"].for_runtime_config_id(1)
+        namespace = ctx.application.core_services.principal_storage.for_runtime_config_id(1)
         staged = list(namespace.files_directory(tmp_path).glob("*_pr-681-review.md"))
         assert len(staged) == 1
         assert not (tmp_path / "files" / "-100999").exists()

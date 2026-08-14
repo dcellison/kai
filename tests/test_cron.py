@@ -12,11 +12,13 @@ Covers:
 
 import json
 from datetime import UTC, datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from telegram.error import Forbidden
 
+from kai.bot import KaiTelegramApplication
 from kai.cron import (
     _ensure_utc,
     _history_reader_user,
@@ -81,6 +83,15 @@ def _make_job(
 def mock_context():
     """Build a mock Telegram callback context with job data for _job_callback."""
     ctx = AsyncMock()
+    application = MagicMock(spec=KaiTelegramApplication)
+
+    class CoreServices:
+        @property
+        def subprocess_pool(self):
+            return ctx.bot_data.get("pool")
+
+    application.core_services = CoreServices()
+    ctx.application = application
     ctx.bot = AsyncMock()
     ctx.bot.send_message = AsyncMock()
     ctx.bot.send_chat_action = AsyncMock()
@@ -130,6 +141,8 @@ class TestHistoryReaderUser:
         config = MagicMock()
         config.get_user_config.return_value = MagicMock(os_user="compatibility-user")
         context.bot_data = {"pool": pool, "config": config}
+        context.application = MagicMock(spec=KaiTelegramApplication)
+        context.application.core_services = SimpleNamespace(subprocess_pool=pool)
 
         assert _history_reader_user(context, 12345) == "policy-user"
         pool.get_os_user.assert_called_once_with(12345)
@@ -142,6 +155,8 @@ class TestHistoryReaderUser:
         config = MagicMock()
         config.get_user_config.return_value = MagicMock(os_user="compatibility-user")
         context.bot_data = {"pool": pool, "config": config}
+        context.application = MagicMock(spec=KaiTelegramApplication)
+        context.application.core_services = SimpleNamespace(subprocess_pool=pool)
 
         assert _history_reader_user(context, 12345) is None
         config.get_user_config.assert_not_called()
@@ -412,10 +427,9 @@ class TestJobCallbackReminder:
     @pytest.mark.asyncio()
     async def test_logs_message_to_history(self, mock_context):
         """Reminder delivery is recorded in message history."""
-        user_config = MagicMock(os_user="daniel")
-        config = MagicMock()
-        config.get_user_config.return_value = user_config
-        mock_context.bot_data["config"] = config
+        pool = MagicMock()
+        pool.get_os_user.return_value = "daniel"
+        mock_context.bot_data["pool"] = pool
         with patch("kai.cron.log_message") as mock_log:
             await _job_callback(mock_context)
         mock_log.assert_called_once()

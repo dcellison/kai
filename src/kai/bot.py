@@ -84,12 +84,13 @@ from kai.history import LogEntry, log_message
 from kai.locks import get_lock, get_stop_event
 from kai.pool import SubprocessPool
 from kai.sessions import WorkshopFinalizationCommitUncertainError
+from kai.telegram_context import KaiTelegramApplication, get_core_services
 from kai.telegram_utils import chunk_text
 from kai.transcribe import TranscriptionError, transcribe_voice
 from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
 from kai.workshop.artifacts import InboundArtifact
 from kai.workshop.conversation_commands import ConversationCommandDisposition
-from kai.workshop.conversation_runs import PreparedConversationRun, WorkshopConversationRunService
+from kai.workshop.conversation_runs import PreparedConversationRun
 from kai.workshop.domain import MessageId, PrincipalId, RunId
 from kai.workshop.execution_coordinator import (
     CanonicalCancellationDisposition,
@@ -97,16 +98,13 @@ from kai.workshop.execution_coordinator import (
 )
 from kai.workshop.inbound import InboundMessage
 from kai.workshop.outbound import DeliveryObservation, OutboundMessage
-from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
-from kai.workshop.storage_namespaces import (
-    WorkshopPrincipalStorageRegistry,
-    WorkshopStorageNamespaceError,
-)
+from kai.workshop.storage_namespaces import WorkshopStorageNamespaceError
 from kai.workshop.streaming_preview import ConfirmedTelegramStreamingPreview
 from kai.workspace_utils import is_workspace_allowed
 
 _UPLOAD_ROOT_MODE = 0o711
 _UPLOAD_FILE_MODE = 0o600
+
 
 # TOTP is optional for single-user development (requires pip install
 # -e '.[totp]'). A missing extra may disable the gate only when neither
@@ -844,8 +842,13 @@ async def _send_response(update: Update, text: str) -> None:
 
 
 def _get_pool(context: ContextTypes.DEFAULT_TYPE) -> "SubprocessPool":
-    """Retrieve the SubprocessPool from bot_data."""
-    return context.bot_data["pool"]
+    """Retrieve the core-owned pool through the typed adapter boundary."""
+    return _get_core_services(context).subprocess_pool
+
+
+def _get_core_services(context: ContextTypes.DEFAULT_TYPE) -> KaiCoreServices:
+    """Resolve core services without using Telegram's untyped bot_data map."""
+    return get_core_services(context)
 
 
 # ── Basic command handlers ───────────────────────────────────────────
@@ -1618,7 +1621,7 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """
     assert update.message is not None
     chat_id = _chat_id(update)
-    execution: WorkshopPrivateTextExecutionService | None = context.bot_data.get("workshop_private_text_execution")
+    execution = _get_core_services(context).private_text_execution
     if execution is not None and chat_id == _user_id(update):
         disposition = await execution.request_cancellation(
             telegram_user_id=_user_id(update),
@@ -3874,9 +3877,7 @@ def _upload_principal_id(
     runtime_config_id: int,
 ) -> PrincipalId:
     """Resolve upload ownership through canonical Workshop identity."""
-    registry = context.bot_data.get("workshop_principal_storage")
-    if not isinstance(registry, WorkshopPrincipalStorageRegistry):
-        raise WorkshopStorageNamespaceError("Workshop principal storage registry is unavailable")
+    registry = _get_core_services(context).principal_storage
     return registry.for_runtime_config_id(runtime_config_id).principal_id
 
 
@@ -4689,7 +4690,7 @@ async def _handle_workshop_private_text(
     """Render streaming previews while Workshop owns execution and final delivery."""
     assert update.message is not None
     source_message = update.message
-    execution: WorkshopPrivateTextExecutionService = context.bot_data["workshop_private_text_execution"]
+    execution = _get_core_services(context).private_text_execution
     config: Config = context.bot_data["config"]
     live_msg = None
     last_edit_time = 0.0
@@ -4802,9 +4803,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     workshop_run_id: RunId | None = None
     acceptance_disposition: ConversationCommandDisposition | None = None
     if private_text_activation:
-        execution: WorkshopPrivateTextExecutionService | None = context.bot_data.get("workshop_private_text_execution")
+        execution = _get_core_services(context).private_text_execution
         if execution is None:
-            log.error("Workshop private-text execution service is unavailable; refusing legacy backend fallback")
+            log.error("Workshop private-text execution service is unavailable")
             await _reply_safe(update.message, "Kai's durable execution service is unavailable. Please try again.")
             return
         try:
@@ -4886,7 +4887,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     workshop_run: PreparedConversationRun | None = None
     if chat_id == _user_id(update) and workshop_inbound_message_id is not None:
         delivery_route = ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT
-        run_service: WorkshopConversationRunService | None = context.bot_data.get("workshop_conversation_run_service")
+        run_service = _get_core_services(context).conversation_runs
         if run_service is not None:
             try:
                 workshop_run = await run_service.prepare(workshop_inbound_message_id)
@@ -5387,9 +5388,9 @@ def create_bot(
     """
     Build and configure the Telegram Application with all handlers.
 
-    Creates the python-telegram-bot Application, initializes the ClaudeCodeBackend
-    subprocess manager, stores both in bot_data, and registers all command,
-    callback, and message handlers.
+    Creates the python-telegram-bot Application, binds the typed core-service
+    boundary on the application object, and registers all command, callback,
+    and message handlers. Runtime services are never mirrored into bot_data.
 
     concurrent_updates=True is required so /stop can be processed while a
     message handler is blocked waiting on Claude's response.
@@ -5406,7 +5407,15 @@ def create_bot(
     Returns:
         A fully configured Telegram Application ready to be started.
     """
-    builder = Application.builder().token(config.telegram_bot_token).concurrent_updates(True)
+    builder = (
+        Application.builder()
+        .application_class(
+            KaiTelegramApplication,
+            kwargs={"core_services": core_services},
+        )
+        .token(config.telegram_bot_token)
+        .concurrent_updates(True)
+    )
 
     # PTB's ApplicationBuilder creates an Updater by default. In webhook mode,
     # updates arrive via HTTP POST so the Updater is dead weight - suppress it.
@@ -5422,13 +5431,6 @@ def create_bot(
     app.bot_data["workshop_delivery_recorder"] = sessions.record_workshop_delivery_observation
     app.bot_data["workshop_streaming_preview_recorder"] = sessions.record_workshop_streaming_preview
     app.bot_data["workshop_streaming_finalizer"] = sessions.record_workshop_streaming_finalization
-    # Handlers still receive adapter-local mirrors while they migrate to typed
-    # services. Construction and lifecycle belong exclusively to the core host.
-    app.bot_data["pool"] = core_services.subprocess_pool
-    app.bot_data["workshop_runtime_pool"] = core_services.runtime_pool
-    app.bot_data["workshop_conversation_run_service"] = core_services.conversation_runs
-    app.bot_data["workshop_private_text_execution"] = core_services.private_text_execution
-    app.bot_data["workshop_principal_storage"] = core_services.principal_storage
 
     # Default every recognized command to sensitive. `/start` and `/help`
     # disclose no user state and remain available so an authorized operator can
