@@ -115,11 +115,20 @@ class WorkshopChannelHistoryRegistry:
             channel_by_profile[profile_id] = channel_id
 
         runtime_aliases: dict[int, ChannelId] = {}
+        namespace_channels = {namespace.channel_id for namespace in namespaces}
         for profile in runtime_profiles.profiles:
             channel_id = channel_by_profile.get(profile.profile_id)
             if channel_id is None:
                 raise WorkshopStorageNamespaceError("Protected runtime profile has no canonical history channel")
             runtime_aliases[profile.runtime_config_id] = channel_id
+            if channel_id not in namespace_channels:
+                namespaces.append(
+                    WorkshopChannelHistoryNamespace(
+                        channel_id,
+                        profile.runtime_config_id,
+                    )
+                )
+                namespace_channels.add(channel_id)
         return cls(tuple(namespaces), runtime_aliases=runtime_aliases)
 
     @property

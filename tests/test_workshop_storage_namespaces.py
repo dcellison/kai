@@ -9,6 +9,8 @@ import pytest
 from kai.install import _canonical_storage_reader_users
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.domain import ChannelId, PrincipalId
+from kai.workshop.human_provisioning import WorkshopHumanProvisioner
+from kai.workshop.runtime_assignments import WorkshopRuntimeAssignmentService
 from kai.workshop.storage_namespaces import (
     WorkshopChannelHistoryNamespace,
     WorkshopChannelHistoryRegistry,
@@ -168,6 +170,41 @@ class TestWorkshopChannelHistoryRegistry:
             assert namespace.channel_id == expected_channel
             assert namespace.history_directory(tmp_path) == (tmp_path / "history" / str(expected_channel))
             assert namespace.legacy_history_directory(tmp_path) == (tmp_path / "history" / "101")
+        finally:
+            await store.close()
+
+    async def test_resolves_workshop_only_runtime_to_canonical_channel(
+        self,
+        tmp_path: Path,
+    ):
+        store = await _store(tmp_path / "kai.db")
+        profiles = profile_registry(101, 202, 303)
+        try:
+            human = await WorkshopHumanProvisioner(store).provision(
+                "workshop-only-human",
+                "Workshop-only human",
+                "member",
+            )
+            await WorkshopRuntimeAssignmentService(store, profiles).assign(
+                human.principal_id,
+                human.channel_id,
+                profile_id(303),
+            )
+
+            registry = await WorkshopChannelHistoryRegistry.from_store(
+                store,
+                profiles,
+            )
+            namespace = registry.for_compatibility_chat_id(303)
+
+            assert namespace.channel_id == human.channel_id
+            assert namespace.history_directory(tmp_path) == (tmp_path / "history" / str(human.channel_id))
+            assert namespace.legacy_history_directory(tmp_path) == (tmp_path / "history" / "303")
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM channel_bindings WHERE channel_id = ?",
+                (human.channel_id,),
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 0
         finally:
             await store.close()
 
