@@ -50,7 +50,7 @@ class TestRuntimeAssignmentPolicy:
                     }
                 },
             },
-            backend_registry={"codex": object()},
+            backend_registry={"codex": {}},
         )
         try:
             human = await WorkshopHumanProvisioner(store).provision(

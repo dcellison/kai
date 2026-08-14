@@ -101,10 +101,9 @@ def _registry_model_ceiling(
             )
         checked = tuple(item.strip() for item in raw if item.strip())
         return checked or None
-    # Focused tests may provide an opaque sentinel when only backend
-    # membership is under test. Production loaders use one of the two
-    # concrete forms above.
-    return None
+    raise WorkshopRuntimeProfileError(
+        f"Runtime profile {profile_id}: backend registry entry for {backend!r} is invalid"
+    )
 
 
 def runtime_profile_id_for_config_id(runtime_config_id: int) -> RuntimeProfileId:

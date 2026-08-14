@@ -111,7 +111,7 @@ def test_document_preserves_migrated_profile_identity_and_compatibility_key():
                 }
             },
         },
-        backend_registry={"codex": object()},
+        backend_registry={"codex": {}},
     )
 
     profile = registry.resolve(profile_id)
@@ -139,7 +139,7 @@ def test_non_telegram_profile_derives_stable_private_compatibility_key():
                 }
             },
         },
-        backend_registry={"pi": object()},
+        backend_registry={"pi": {}},
     )
     second = WorkshopRuntimeProfileRegistry.from_document(
         {
@@ -154,7 +154,7 @@ def test_non_telegram_profile_derives_stable_private_compatibility_key():
                 }
             },
         },
-        backend_registry={"pi": object()},
+        backend_registry={"pi": {}},
     )
 
     expected = compatibility_runtime_config_id_for_profile_id(profile_id)
@@ -188,7 +188,7 @@ def test_document_accepts_each_registered_backend_without_priority(backend, prov
                 }
             },
         },
-        backend_registry={backend: object()},
+        backend_registry={backend: {}},
     )
 
     assert registry.resolve(profile_id).backend == backend
@@ -211,7 +211,7 @@ def test_document_rejects_backend_absent_from_protected_registry():
                     }
                 },
             },
-            backend_registry={"pi": object()},
+            backend_registry={"pi": {}},
         )
 
 
@@ -233,7 +233,7 @@ def test_document_rejects_provider_not_supported_by_backend(backend):
                     }
                 },
             },
-            backend_registry={backend: object()},
+            backend_registry={backend: {}},
         )
 
 
@@ -255,7 +255,7 @@ def test_single_provider_backend_defaults_only_when_provider_is_omitted(backend,
                 }
             },
         },
-        backend_registry={backend: object()},
+        backend_registry={backend: {}},
     )
 
     assert registry.resolve(profile_id).provider == canonical_provider
@@ -279,7 +279,7 @@ def test_document_rejects_invalid_os_user():
                     }
                 },
             },
-            backend_registry={"codex": object()},
+            backend_registry={"codex": {}},
         )
 
 
@@ -310,7 +310,7 @@ def test_document_fails_closed_on_invalid_model_or_timeout(field, value, message
     with pytest.raises(WorkshopRuntimeProfileError, match=message):
         WorkshopRuntimeProfileRegistry.from_document(
             {"version": 1, "runtime_profiles": {str(profile_id): profile}},
-            backend_registry={"codex": object()},
+            backend_registry={"codex": {}},
         )
 
 
@@ -342,6 +342,27 @@ def test_document_enforces_loaded_backend_registry_model_ceiling():
         )
 
 
+def test_document_rejects_unknown_backend_registry_entry_type():
+    profile_id = RuntimeProfileId("rtp_39393939393939393939393939393939")
+
+    with pytest.raises(WorkshopRuntimeProfileError, match=r"registry entry.*invalid"):
+        WorkshopRuntimeProfileRegistry.from_document(
+            {
+                "version": 1,
+                "runtime_profiles": {
+                    str(profile_id): {
+                        "display_name": "Invalid registry entry",
+                        "backend": "codex",
+                        "provider": "openai",
+                        "model": "gpt-5.5",
+                        "timeout_seconds": 120,
+                    }
+                },
+            },
+            backend_registry={"codex": object()},
+        )
+
+
 @pytest.mark.parametrize(
     "document, message",
     (
@@ -363,7 +384,7 @@ def test_document_enforces_loaded_backend_registry_model_ceiling():
 )
 def test_document_fails_closed_on_incomplete_policy(document, message):
     with pytest.raises(WorkshopRuntimeProfileError, match=message):
-        WorkshopRuntimeProfileRegistry.from_document(document, backend_registry={"goose": object()})
+        WorkshopRuntimeProfileRegistry.from_document(document, backend_registry={"goose": {}})
 
 
 def test_explicit_policy_file_is_loaded_instead_of_config_projection(tmp_path, monkeypatch):
@@ -382,7 +403,7 @@ runtime_profiles:
     )
     monkeypatch.setattr(
         "kai.workshop.runtime_profiles.load_backend_registry",
-        lambda: {"pi": object()},
+        lambda: {"pi": {}},
     )
 
     config = Config(
@@ -418,7 +439,7 @@ runtime_profiles:
     )
     monkeypatch.setattr(
         "kai.workshop.runtime_profiles.load_backend_registry",
-        lambda: {"claude": object(), "codex": object()},
+        lambda: {"claude": {}, "codex": {}},
     )
 
     with pytest.raises(WorkshopRuntimeProfileError, match=r"conflicts with the migrated users\.yaml"):
@@ -443,7 +464,7 @@ runtime_profiles:
     )
     monkeypatch.setattr(
         "kai.workshop.runtime_profiles.load_backend_registry",
-        lambda: {"codex": object(), "claude": object()},
+        lambda: {"codex": {}, "claude": {}},
     )
 
     with pytest.raises(WorkshopRuntimeProfileError, match=r"conflicts with the migrated users\.yaml"):
