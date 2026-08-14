@@ -54,10 +54,9 @@ class HttpAdapterReadiness:
 class HttpAdapter:
     """Own HTTP listener startup, readiness, supervision, and shutdown.
 
-    The current mixed HTTP application still hosts Telegram webhook and
-    compatibility integration routes, so this Milestone 2 adapter receives the
-    already-started Telegram adapter explicitly. Making that dependency
-    optional is the configuration and route-separation cutover in Milestone 3.
+    Telegram-owned routes and dependencies are installed only when a started
+    Telegram adapter is supplied.  The loopback host and Workshop client can
+    therefore run without constructing any Telegram application.
     """
 
     def __init__(
@@ -65,7 +64,7 @@ class HttpAdapter:
         config: Config,
         core_host: KaiApplicationHost,
         core_services: KaiCoreServices,
-        telegram_adapter: TelegramAdapter,
+        telegram_adapter: TelegramAdapter | None,
     ) -> None:
         self._config = config
         self._core_host = core_host
@@ -89,11 +88,12 @@ class HttpAdapter:
         self._state = HttpAdapterState.STARTING
         try:
             await webhook.start(
-                self._telegram_adapter.application,
+                self._telegram_adapter.application if self._telegram_adapter else None,
                 self._config,
                 core_host=self._core_host,
                 core_services=self._core_services,
-                github_notifications=self._telegram_adapter.notification_delivery,
+                github_notifications=(self._telegram_adapter.notification_delivery if self._telegram_adapter else None),
+                workshop_enabled=self._config.workshop_enabled,
             )
         except BaseException:
             self._state = HttpAdapterState.FAILED

@@ -5407,13 +5407,16 @@ def create_bot(
     Returns:
         A fully configured Telegram Application ready to be started.
     """
+    token = config.telegram_bot_token
+    if not token:
+        raise RuntimeError("Telegram adapter cannot start without TELEGRAM_BOT_TOKEN")
     builder = (
         Application.builder()
         .application_class(
             KaiTelegramApplication,
             kwargs={"core_services": core_services},
         )
-        .token(config.telegram_bot_token)
+        .token(token)
         .concurrent_updates(True)
     )
 

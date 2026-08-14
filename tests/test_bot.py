@@ -729,6 +729,15 @@ class TestCreateBotTransportMode:
         app = create_bot(config, use_webhook=False, core_services=_bot_core_services(config))
         assert app.updater is not None
 
+    def test_rejects_construction_without_telegram_token(self):
+        config = _make_config(
+            telegram_bot_token=None,
+            enabled_adapters=frozenset({"workshop"}),
+        )
+
+        with pytest.raises(RuntimeError, match="cannot start without TELEGRAM_BOT_TOKEN"):
+            create_bot(config, core_services=_bot_core_services(config))
+
     def test_installs_workshop_shadow_recorder(self):
         config = _make_config()
         app = create_bot(config, core_services=_bot_core_services(config))

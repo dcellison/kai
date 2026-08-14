@@ -362,8 +362,13 @@ async def _run(args: argparse.Namespace) -> int:
             return 0
 
         config = load_config()
+        telegram_bot_token = config.telegram_bot_token
+        if not telegram_bot_token:
+            raise DeliveryQualificationError(
+                "Telegram delivery qualification requires the Telegram adapter and bot token"
+            )
         try:
-            async with Bot(config.telegram_bot_token) as bot:
+            async with Bot(telegram_bot_token) as bot:
                 worker = WorkshopTelegramDeliveryWorker(
                     WorkshopDeliveryOutbox(store),
                     WorkshopDeliveryFragments(store),

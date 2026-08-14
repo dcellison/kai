@@ -21,12 +21,15 @@ def http_dependencies(monkeypatch):
         core_host,
         core_services,
         github_notifications,
+        workshop_enabled,
     ) -> None:
-        assert application == "telegram-application"
+        assert application in {None, "telegram-application"}
         assert config.workshop_lan_host in {None, "10.0.0.36"}
         assert core_host == "core-host"
         assert core_services == "core-services"
-        assert github_notifications == "notification-delivery"
+        expected_notifications = "notification-delivery" if application is not None else None
+        assert github_notifications == expected_notifications
+        assert workshop_enabled is config.workshop_enabled
         events.append("http:start")
         state["loopback"] = True
         state["lan"] = True
@@ -51,12 +54,22 @@ def http_dependencies(monkeypatch):
     return events
 
 
-def _adapter(*, workshop_lan_host: str | None = "10.0.0.36") -> HttpAdapter:
-    config = SimpleNamespace(workshop_lan_host=workshop_lan_host)
-    telegram = SimpleNamespace(
-        application="telegram-application",
-        notification_delivery="notification-delivery",
+def _adapter(
+    *,
+    workshop_lan_host: str | None = "10.0.0.36",
+    telegram_enabled: bool = True,
+    workshop_enabled: bool = True,
+) -> HttpAdapter:
+    config = SimpleNamespace(
+        workshop_lan_host=workshop_lan_host,
+        workshop_enabled=workshop_enabled,
     )
+    telegram = None
+    if telegram_enabled:
+        telegram = SimpleNamespace(
+            application="telegram-application",
+            notification_delivery="notification-delivery",
+        )
     return HttpAdapter(  # type: ignore[arg-type]
         config,
         "core-host",  # type: ignore[arg-type]
@@ -100,6 +113,16 @@ async def test_http_adapter_reports_unconfigured_lan_listener_as_not_applicable(
 
     assert adapter.readiness.ready is True
     assert adapter.readiness.workshop_lan_listener is None
+    await adapter.stop()
+
+
+async def test_http_adapter_starts_without_telegram(http_dependencies) -> None:
+    adapter = _adapter(telegram_enabled=False)
+
+    await adapter.start()
+
+    assert adapter.readiness.ready is True
+    assert http_dependencies == ["http:start"]
     await adapter.stop()
 
 

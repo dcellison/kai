@@ -26,6 +26,7 @@ from kai.config import (
 
 # All env vars that load_config reads
 _CONFIG_ENV_VARS = [
+    "KAI_ENABLED_ADAPTERS",
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_WEBHOOK_URL",
     "TELEGRAM_WEBHOOK_SECRET",
@@ -235,6 +236,48 @@ class TestLoadConfigDefaults:
         assert config.claude_autocompact_pct == 0
         # Agent backend from explicit test config
         assert config.default_backend == "claude"
+        assert config.enabled_adapters == frozenset({"telegram", "workshop"})
+        assert config.telegram_enabled is True
+        assert config.workshop_enabled is True
+
+    def test_workshop_only_does_not_require_telegram_configuration(self, monkeypatch):
+        monkeypatch.setenv("KAI_ENABLED_ADAPTERS", "workshop")
+
+        config = load_config()
+
+        assert config.enabled_adapters == frozenset({"workshop"})
+        assert config.telegram_enabled is False
+        assert config.workshop_enabled is True
+        assert config.telegram_bot_token is None
+        assert config.user_configs == {}
+
+    def test_workshop_only_does_not_load_a_dormant_telegram_token(self, monkeypatch):
+        monkeypatch.setenv("KAI_ENABLED_ADAPTERS", "workshop")
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "stored-but-disabled")
+        monkeypatch.setenv("TELEGRAM_WEBHOOK_URL", "https://example.test/telegram")
+
+        config = load_config()
+
+        assert config.telegram_bot_token is None
+        assert config.telegram_webhook_url is None
+        assert config.telegram_webhook_secret is None
+
+    def test_workshop_only_rejects_a_present_malformed_users_file(self, monkeypatch):
+        monkeypatch.setenv("KAI_ENABLED_ADAPTERS", "workshop")
+        _patch_protected_users_yaml(monkeypatch, "users: invalid\n")
+
+        with pytest.raises(SystemExit, match=r"users\.yaml"):
+            load_config()
+
+    def test_telegram_only_does_not_enable_workshop(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("KAI_ENABLED_ADAPTERS", "telegram")
+
+        config = load_config()
+
+        assert config.enabled_adapters == frozenset({"telegram"})
+        assert config.telegram_enabled is True
+        assert config.workshop_enabled is False
 
     def test_autocompact_from_env(self, monkeypatch):
         _set_required(monkeypatch)
@@ -275,6 +318,26 @@ class TestLoadConfigErrors:
 
     def test_missing_token(self):
         with pytest.raises(SystemExit, match="TELEGRAM_BOT_TOKEN"):
+            load_config()
+
+    def test_rejects_unknown_client_adapter(self, monkeypatch):
+        monkeypatch.setenv("KAI_ENABLED_ADAPTERS", "workshop,carrier-pigeon")
+
+        with pytest.raises(SystemExit, match=r"unsupported adapter.*carrier-pigeon"):
+            load_config()
+
+    def test_rejects_explicit_empty_client_adapter_policy(self, monkeypatch):
+        monkeypatch.setenv("KAI_ENABLED_ADAPTERS", "")
+
+        with pytest.raises(SystemExit, match="must enable at least one client adapter"):
+            load_config()
+
+    def test_rejects_workshop_lan_listener_when_workshop_is_disabled(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("KAI_ENABLED_ADAPTERS", "telegram")
+        monkeypatch.setenv("WORKSHOP_LAN_HOST", "10.0.0.36")
+
+        with pytest.raises(SystemExit, match=r"WORKSHOP_LAN_HOST.*Workshop adapter.*enabled"):
             load_config()
 
     def test_missing_users_yaml(self, monkeypatch):
@@ -833,6 +896,23 @@ class TestDualModeLoading:
 
 
 class TestProtectedUserIsolation:
+    def test_workshop_only_protected_install_rejects_unreadable_users_yaml(self, monkeypatch):
+        monkeypatch.setenv("KAI_ENABLED_ADAPTERS", "workshop")
+
+        def protected_reader(path):
+            if path == "/etc/kai/env":
+                return "# protected install\n"
+            return None
+
+        monkeypatch.setattr("kai.config._read_protected_file", protected_reader)
+        monkeypatch.setattr(
+            "kai.config.validate_protected_file_metadata",
+            lambda path, **kwargs: path == "/etc/kai/users.yaml",
+        )
+
+        with pytest.raises(SystemExit, match=r"users\.yaml"):
+            load_config()
+
     def test_protected_install_requires_os_user(self, monkeypatch):
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake-token")
         _patch_protected_users_yaml(

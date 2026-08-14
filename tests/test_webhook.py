@@ -26,6 +26,7 @@ from kai.webhook import (
     PR_REVIEW_COOLDOWN_KEY,
     PR_REVIEW_TIMEOUT_S_KEY,
     SPEC_DIR_KEY,
+    TELEGRAM_APP_KEY,
     TELEGRAM_BOT_KEY,
     WEBHOOK_PORT_KEY,
     WORKSPACE_BASE_KEY,
@@ -2567,6 +2568,67 @@ class TestNotificationChatIdMutations:
             await wh.stop()
             wh._app = old_app
             wh._runner = old_runner
+
+    @pytest.mark.asyncio
+    async def test_start_workshop_only_constructs_no_telegram_surface(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        import kai.webhook as wh
+
+        config = MagicMock()
+        config.user_configs = {}
+        config.allowed_user_ids = set()
+        config.get_admins.return_value = []
+        config.telegram_webhook_url = None
+        config.telegram_webhook_secret = None
+        config.github_webhook_secret = "configured-but-telegram-owned"
+        config.generic_webhook_secret = "configured-but-telegram-owned"
+        config.pr_review_cooldown = 0
+        config.pr_review_timeout_s = 0
+        config.webhook_port = 8080
+        config.workshop_lan_host = ""
+        config.workspace_base = None
+        config.allowed_workspaces = []
+        config.spec_dir = "specs"
+        config.session_db_path = tmp_path / "kai.db"
+
+        store = await WorkshopEventStore.open(config.session_db_path)
+        core_services = SimpleNamespace(
+            subprocess_pool=MagicMock(internal_api_auth=InternalAPIAuth({111: "secret"})),
+            principal_storage=_principal_storage_registry(),
+            client_store=store,
+            client_commands=MagicMock(),
+        )
+        fake_runner = MagicMock()
+        fake_runner.setup = AsyncMock()
+        fake_runner.cleanup = AsyncMock()
+        fake_site = MagicMock()
+        fake_site.start = AsyncMock()
+
+        monkeypatch.setattr("kai.webhook.web.AppRunner", MagicMock(return_value=fake_runner))
+        monkeypatch.setattr("kai.webhook.web.TCPSite", MagicMock(return_value=fake_site))
+
+        await wh.start(
+            None,
+            config,
+            core_host=MagicMock(),
+            core_services=core_services,
+            github_notifications=None,
+            workshop_enabled=True,
+        )
+        try:
+            assert TELEGRAM_APP_KEY not in wh._app
+            assert TELEGRAM_BOT_KEY not in wh._app
+            paths = {resource.canonical for resource in wh._app.router.resources()}
+            assert "/workshop/" in paths
+            assert "/webhook/telegram" not in paths
+            assert "/webhook/github" not in paths
+            assert "/webhook" not in paths
+        finally:
+            await wh.stop()
+            await store.close()
 
     @pytest.mark.asyncio
     async def test_start_lan_listener_exposes_only_workshop_client_routes(

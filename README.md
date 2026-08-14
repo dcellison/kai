@@ -5,23 +5,23 @@
 [![License](https://img.shields.io/github/license/dcellison/kai)](LICENSE)
 [![Version](https://img.shields.io/github/v/tag/dcellison/kai?label=version)](https://github.com/dcellison/kai/releases)
 
-Kai is a local, Telegram-first personal engineering system: a persistent AI collaborator with repo-aware coding, memory, scheduling, PR review, and multi-backend operation.
+Kai is a local, multi-client personal engineering system: a persistent AI collaborator with repo-aware coding, memory, scheduling, PR review, and multi-backend operation.
 
-Run Kai on your own machine, reach it from Telegram, and give it real access to your local workspaces. Kai can inspect repositories, run shell commands, write code, review pull requests, triage issues, remember durable context, handle files, and run scheduled jobs while staying under your control. Your machine, your data, your rules.
+Run Kai on your own machine, reach it through the Workshop browser or Telegram, and give it real access to your local workspaces. Kai can inspect repositories, run shell commands, write code, review pull requests, triage issues, remember durable context, handle files, and run scheduled jobs while staying under your control. Your machine, your data, your rules.
 
 For full setup and operations guides, see the [Kai Wiki](https://github.com/dcellison/kai/wiki).
 
 ## Why Kai Exists
 
-Most AI coding tools are either interactive terminals or hosted chat surfaces. Kai is built for a different operating model: a long-running local service that keeps an agent available wherever Telegram works.
+Most AI coding tools are either interactive terminals or hosted chat surfaces. Kai is built for a different operating model: a long-running local service available through authenticated client adapters.
 
 - **Local-first authority:** Kai runs on hardware you control and works against your local filesystem, shell, git repos, and tools.
-- **Telegram as the control surface:** You can send messages, files, voice notes, GitHub events, and scheduling requests without opening a terminal.
+- **Multiple client surfaces:** Workshop provides the native browser experience; Telegram remains an optional mobile client with files, voice notes, commands, and notifications.
 - **Persistent agent sessions:** Each user gets a lazily-created subprocess with durable context and idle eviction.
 - **Memory across sessions:** Kai preserves identity, personal memory, and conversation history so useful context survives restarts and workspace switches.
 - **Background engineering workflows:** PR review, issue triage, webhooks, reminders, and condition-monitoring jobs run outside the active chat session.
 - **Multi-backend operation:** Each user can run through any installed supported backend, with an explicit installation default and optional per-user overrides.
-- **Multi-user isolation:** One Kai instance can serve multiple Telegram users with isolated history, files, settings, and optional OS-level process separation.
+- **Multi-user isolation:** One Kai instance can serve multiple Workshop humans and optional Telegram identities with isolated history, files, settings, and OS-level process separation.
 
 ## Core Capabilities
 
@@ -34,20 +34,19 @@ Most AI coding tools are either interactive terminals or hosted chat surfaces. K
 | GitHub automation | Reviews PRs, triages issues, routes notifications, and reacts to webhook events. |
 | File exchange | Accepts files from Telegram, exposes their local paths to the agent, and can send files back. |
 | Voice | Supports local voice transcription and optional text-to-speech responses. |
-| Multi-user operation | Isolates users by chat ID, workspace, files, history, jobs, settings, and optionally OS account. |
+| Multi-user operation | Isolates canonical principals, runtime profiles, workspaces, files, history, jobs, settings, and OS accounts. |
 
 ## How It Works
 
 ```text
-Telegram
-  -> Kai service
-    -> per-user agent backend
-      -> local workspace, shell, git, files, web, services
+Workshop browser --\
+                    -> Kai service -> per-user agent backend
+Telegram (optional)-/                    -> local workspace, shell, git, files, web, services
 ```
 
-Kai has two layers. The outer Python service handles Telegram, HTTP, scheduling, authentication, persistence, webhooks, file exchange, and per-user routing. The inner agent backend does the thinking and acting inside a local workspace. Backend subprocesses are created lazily per user and evicted after an idle timeout, so resource use follows active users rather than registered users.
+Kai has two layers. The outer Python service owns client adapters, HTTP, scheduling, authentication, persistence, webhooks, file exchange, and per-user routing. The inner agent backend does the thinking and acting inside a local workspace. Backend subprocesses are created lazily per user and evicted after an idle timeout, so resource use follows active users rather than registered users.
 
-This is not an API relay bot. The inner backend is a full coding-agent runtime with local tools and project context. Kai gives that runtime a durable home, a Telegram control surface, scheduled execution, event-driven inputs, memory, and a security model designed around the fact that it can take real action.
+This is not an API relay bot. The inner backend is a full coding-agent runtime with local tools and project context. Kai gives that runtime a durable home, authenticated client surfaces, scheduled execution, event-driven inputs, memory, and a security model designed around the fact that it can take real action.
 
 ## Backend Options
 
@@ -68,8 +67,7 @@ Kai does not require every supported backend to exist on every machine. Every ba
 Requirements:
 
 - Python 3.13+
-- A Telegram bot token from [BotFather](https://t.me/BotFather)
-- Your Telegram user ID from [userinfobot](https://t.me/userinfobot)
+- A Telegram bot token and Telegram user ID only if enabling the optional Telegram client
 - At least one supported agent backend installed and authenticated
 - Sudo 1.9.3+ for protected multi-user installs (`CWD`/`-D` support)
 
@@ -84,7 +82,17 @@ pip install -e '.[dev]'
 make config
 ```
 
-`make config` runs without `sudo`. It discovers the supported backend CLIs installed on the machine, requires an explicit installation default when more than one is available, and writes `install.conf` as the configuration artifact for the selected deployment mode. It does not accept user-supplied backend executable paths. Model defaults come from Kai's backend/provider/role model registry. In protected installs, conversational model baselines belong to `runtime-profiles.yaml`; operator-set PR-review and issue-triage baselines remain in each human's `models:` map in `users.yaml`. Users can change their active conversational model with `/model`.
+`make config` runs without `sudo`. It discovers the supported backend CLIs installed on the machine, requires an explicit installation default when more than one is available, and writes `install.conf` as the configuration artifact for the selected deployment and client modes. It does not accept user-supplied backend executable paths. Model defaults come from Kai's backend/provider/role model registry. In protected installs, conversational model baselines belong to `runtime-profiles.yaml`; operator-set PR-review and issue-triage baselines remain in each human's `models:` map in `users.yaml`. Users can change their active conversational model with `/model`.
+
+The client-mode choices are explicit and reversible:
+
+- `hybrid` enables Workshop and Telegram and is the upgrade-safe default;
+- `workshop-only` switches an existing protected installation with canonical humans and runtime profiles to the browser client without constructing a Telegram application, contacting Telegram, or retaining a bot token;
+- `telegram-only` runs Telegram without publishing Workshop client routes.
+
+Re-run `make config`, select a different client mode, and apply the installation to change modes. Existing configurations without an explicit client-mode setting remain hybrid. `make install-status` reports both the deployed policy and the current `install.conf` artifact without exposing the Telegram token.
+
+The initial Workshop-only qualification is deliberately an installed-mode switch, not a fresh-host bootstrap path. Fresh protected and single-user Workshop-only provisioning still needs a canonical administration flow for creating the first human and runtime assignment; the wizard refuses those incomplete combinations instead of generating a configuration that cannot start.
 
 For a `single_user` deployment, `make config` also writes the runtime files under the operator's account. Start Kai from the checkout:
 
@@ -124,9 +132,9 @@ event-stream, and authenticated command-submission routes; internal agent APIs
 and webhook ingress remain bound to loopback. This direct listener uses HTTP,
 so use a trusted LAN or put a trusted TLS terminator in front of it.
 
-Protected mode requires every Telegram user to have a unique `os_user` that differs from the Kai service account; this keeps persistent agents from inheriting the daemon's protected-config capabilities. Single-user mode runs the agent as the operator account.
+Protected mode requires every configured Telegram user to have a unique `os_user` that differs from the Kai service account; this keeps persistent agents from inheriting the daemon's protected-config capabilities. Single-user mode runs the agent as the operator account.
 
-Kai-managed per-user identity has one editable source: `<DATA_DIR>/home/<chat_id>/AGENTS.md`. Codex, Goose, OpenCode, and Pi consume that file directly. Claude Code receives a generated `.claude/CLAUDE.md` adapter containing only `@../AGENTS.md`. On upgrade, `make install` migrates existing customized Claude identity content into `AGENTS.md`; if both files contain different customizations, installation stops without choosing or overwriting either one. Instruction files owned by individual project repositories remain independent.
+Kai-managed per-user identity has one editable source: `<DATA_DIR>/home/<principal_id>/AGENTS.md`. Codex, Goose, OpenCode, and Pi consume that file directly. Claude Code receives a generated `.claude/CLAUDE.md` adapter containing only `@../AGENTS.md`. On upgrade, `make install` migrates existing customized Claude identity content into `AGENTS.md`; if both files contain different customizations, installation stops without choosing or overwriting either one. Instruction files owned by individual project repositories remain independent.
 
 Protected Linux installations that use Codex image input also require `setfacl` (normally provided by the distribution's `acl` package). Kai uses a read-only named ACL so an image can remain private to the service and its intended `os_user`; if ACL support is unavailable, that image is dropped with a user-visible notice instead of being made world-readable.
 

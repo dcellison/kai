@@ -23,6 +23,7 @@ from kai.config import UserConfig
 from kai.main import (
     _file_age,
     _file_cleanup_loop,
+    _warn_if_compatibility_jobs_are_dormant,
     _workshop_bootstrap_humans,
     _workshop_bootstrap_notification_channels,
     setup_logging,
@@ -71,6 +72,31 @@ class TestWorkshopBootstrapMapping:
         assert channels[0].transport == "telegram"
         assert channels[0].external_channel_id == "-999"
         assert channels[0].member_external_subjects == ("101", "202")
+
+
+class TestCompatibilityScheduleWarning:
+    async def test_warns_when_active_jobs_are_dormant_without_telegram(self, caplog):
+        config = SimpleNamespace(telegram_enabled=False)
+        with (
+            patch(
+                "kai.main.sessions.get_all_active_jobs",
+                new=AsyncMock(return_value=[{"id": 1}, {"id": 2}]),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            count = await _warn_if_compatibility_jobs_are_dormant(config)
+
+        assert count == 2
+        assert "2 active compatibility scheduled job(s) are dormant" in caplog.text
+
+    async def test_does_not_query_jobs_when_telegram_is_enabled(self):
+        config = SimpleNamespace(telegram_enabled=True)
+        query = AsyncMock()
+        with patch("kai.main.sessions.get_all_active_jobs", new=query):
+            count = await _warn_if_compatibility_jobs_are_dormant(config)
+
+        assert count == 0
+        query.assert_not_awaited()
 
 
 # ── setup_logging() ──────────────────────────────────────────────────

@@ -2465,42 +2465,56 @@ async def _webhook_health_loop(bot, webhook_url: str, webhook_secret: str, chat_
 # ── Lifecycle ────────────────────────────────────────────────────────
 
 
-def _register_routes(app: web.Application, config: Config) -> None:
-    """Register independently gated external routes and always-on internal APIs."""
+def _register_routes(
+    app: web.Application,
+    config: Config,
+    *,
+    telegram_enabled: bool = True,
+) -> None:
+    """Register gated adapter routes and transport-independent internal APIs."""
     app.router.add_get("/health", _handle_health)
 
-    if config.telegram_webhook_url:
+    if telegram_enabled and config.telegram_webhook_url:
         if not config.telegram_webhook_secret:
             raise RuntimeError("Telegram webhook mode requires a non-empty secret")
         app[TELEGRAM_WEBHOOK_SECRET_KEY] = config.telegram_webhook_secret
         app.router.add_post("/webhook/telegram", _handle_telegram_update)
 
-    if config.github_webhook_secret:
+    if telegram_enabled and config.github_webhook_secret:
         app[GITHUB_WEBHOOK_SECRET_KEY] = config.github_webhook_secret
         app.router.add_post("/webhook/github", _handle_github)
-    else:
+    elif telegram_enabled:
         log.warning("GITHUB_WEBHOOK_SECRET not set - GitHub webhook endpoint disabled")
+    elif config.github_webhook_secret:
+        log.info("GitHub webhook endpoint disabled because the Telegram adapter is disabled")
 
-    if config.generic_webhook_secret:
+    if telegram_enabled and config.generic_webhook_secret:
         app[GENERIC_WEBHOOK_SECRET_KEY] = config.generic_webhook_secret
         app.router.add_post("/webhook", _handle_generic)
-    else:
+    elif telegram_enabled:
         log.info("GENERIC_WEBHOOK_SECRET not set - generic webhook endpoint disabled")
+    elif config.generic_webhook_secret:
+        log.info("Generic webhook endpoint disabled because the Telegram adapter is disabled")
 
     # These routes authenticate through INTERNAL_API_AUTH_KEY. Their
     # availability must not be coupled to any public ingress configuration.
-    app.router.add_post("/api/schedule", _handle_schedule)
     app.router.add_get("/api/jobs", _handle_get_jobs)
     app.router.add_get("/api/jobs/{id}", _handle_get_job)
-    app.router.add_delete("/api/jobs/{id}", _handle_delete_job)
-    app.router.add_patch("/api/jobs/{id}", _handle_update_job)
     app.router.add_post("/api/services/{name}", _handle_service_call)
-    app.router.add_post("/api/send-message", _handle_send_message)
-    app.router.add_post("/api/send-file", _handle_send_file)
     app.router.add_post("/api/memory/add", _handle_memory_add)
     app.router.add_post("/api/memory/search", _handle_memory_search)
     app.router.add_get("/api/memory/stats", _handle_memory_stats)
     app.router.add_delete("/api/memory/all", _handle_memory_delete_all)
+    if telegram_enabled:
+        # These compatibility operations still use Telegram's scheduler or
+        # delivery surface. They are absent when the adapter is disabled and
+        # are not silently redirected. Later canonical scheduler, message,
+        # and artifact services will replace them.
+        app.router.add_post("/api/schedule", _handle_schedule)
+        app.router.add_delete("/api/jobs/{id}", _handle_delete_job)
+        app.router.add_patch("/api/jobs/{id}", _handle_update_job)
+        app.router.add_post("/api/send-message", _handle_send_message)
+        app.router.add_post("/api/send-file", _handle_send_file)
 
 
 async def _register_workshop_client_api(
@@ -2554,37 +2568,41 @@ async def _register_workshop_client_api(
 
 
 async def start(
-    telegram_app: Application,
+    telegram_app: Application | None,
     config: Config,
     *,
     core_host: KaiApplicationHost,
     core_services: KaiCoreServices,
-    github_notifications: WorkshopTelegramNotificationService,
+    github_notifications: WorkshopTelegramNotificationService | None,
+    workshop_enabled: bool = True,
 ) -> None:
     """
     Start the HTTP server and optionally register the Telegram webhook.
 
-    The HTTP server always starts regardless of transport mode - it serves the
-    scheduling API, GitHub webhooks, file exchange, and health check. The
-    Telegram webhook route and set_webhook API call are only added/made when
-    config.telegram_webhook_url is set (webhook mode).
+    The HTTP server always starts for health and transport-independent internal
+    APIs. Workshop client routes are independently enabled. Telegram webhook,
+    compatibility scheduling/delivery, and external integration routes are
+    registered only when a Telegram application is supplied.
 
     In polling mode, the server still runs but Telegram updates arrive via
     the Updater's long-polling loop in ``TelegramAdapter`` instead.
 
     Args:
-        telegram_app: The python-telegram-bot Application instance.
         config: The application Config instance.
         core_host: Core lifecycle owner used for health/readiness reporting.
         core_services: Typed core dependencies required by HTTP routes.
-        github_notifications: Telegram adapter for the configured notification feed.
+        telegram_app: Started Telegram application, or None when disabled.
+        github_notifications: Telegram notification service, or None when disabled.
+        workshop_enabled: Whether to publish Workshop client routes.
     """
     global _app, _runner, _workshop_lan_runner, _webhook_registered, _health_monitor_task
 
     _app = web.Application()
     _app[CORE_HOST_KEY] = core_host
-    _app[TELEGRAM_APP_KEY] = telegram_app
-    _app[TELEGRAM_BOT_KEY] = telegram_app.bot
+    telegram_enabled = telegram_app is not None
+    if telegram_enabled:
+        _app[TELEGRAM_APP_KEY] = telegram_app
+        _app[TELEGRAM_BOT_KEY] = telegram_app.bot
 
     pool = core_services.subprocess_pool
     internal_api_auth = getattr(pool, "internal_api_auth", None)
@@ -2595,19 +2613,20 @@ async def start(
     # Set the fallback destination for unattributed external webhook events.
     # Internal API calls never use this value for identity; their credential
     # resolves a principal before the handler runs.
-    admins = config.get_admins()
-    if admins:
-        _app[CHAT_ID_KEY] = admins[0].telegram_id
-    else:
-        fallback = next(iter(config.user_configs.values()))
-        log.warning(
-            "No admin users defined in users.yaml; using %s "
-            "(telegram_id: %d) as default webhook target. "
-            "External notifications may route unexpectedly.",
-            fallback.name,
-            fallback.telegram_id,
-        )
-        _app[CHAT_ID_KEY] = fallback.telegram_id
+    if telegram_enabled:
+        admins = config.get_admins()
+        if admins:
+            _app[CHAT_ID_KEY] = admins[0].telegram_id
+        else:
+            fallback = next(iter(config.user_configs.values()))
+            log.warning(
+                "No admin users defined in users.yaml; using %s "
+                "(telegram_id: %d) as default webhook target. "
+                "External notifications may route unexpectedly.",
+                fallback.name,
+                fallback.telegram_id,
+            )
+            _app[CHAT_ID_KEY] = fallback.telegram_id
 
     # Keep notification destinations separate from Config.allowed_user_ids,
     # which is the immutable-at-runtime source for Telegram inbound auth. The
@@ -2641,11 +2660,11 @@ async def start(
     # users.yaml and DB. This set is intentionally detached from Config's
     # inbound Telegram principals and is not consulted by internal API auth.
     for uc in config.user_configs.values():
-        if uc.github_notify_chat_id is not None:
+        if telegram_enabled and uc.github_notify_chat_id is not None:
             _app[NOTIFICATION_CHAT_IDS_KEY].add(uc.github_notify_chat_id)
     # Also add any DB-stored notify chat IDs (set via /github notify).
     # webhook.start() is already async so the await is fine.
-    for uid in config.user_configs:
+    for uid in config.user_configs if telegram_enabled else ():
         val = await sessions.get_setting(f"github_notify_chat:{uid}")
         if val:
             try:
@@ -2656,14 +2675,17 @@ async def start(
                     uid,
                     val,
                 )
-    _register_routes(_app, config)
+    _register_routes(_app, config, telegram_enabled=telegram_enabled)
     _app[WORKSHOP_PRINCIPAL_STORAGE_KEY] = core_services.principal_storage
-    _app[WORKSHOP_GITHUB_NOTIFICATIONS_KEY] = github_notifications
-    register_workshop_routes = await _register_workshop_client_api(
-        _app,
-        core_services.client_store,
-        command_submitter=core_services.client_commands,
-    )
+    if github_notifications is not None:
+        _app[WORKSHOP_GITHUB_NOTIFICATIONS_KEY] = github_notifications
+    register_workshop_routes: Callable[[web.Application], None] | None = None
+    if workshop_enabled:
+        register_workshop_routes = await _register_workshop_client_api(
+            _app,
+            core_services.client_store,
+            command_submitter=core_services.client_commands,
+        )
 
     _runner = web.AppRunner(_app, access_log=None)
     await _runner.setup()
@@ -2674,7 +2696,8 @@ async def start(
     await site.start()
     log.info("Webhook server listening on 127.0.0.1:%d", config.webhook_port)
 
-    if config.workshop_lan_host:
+    if workshop_enabled and config.workshop_lan_host:
+        assert register_workshop_routes is not None
         workshop_lan_app = web.Application()
         register_workshop_routes(workshop_lan_app)
         _workshop_lan_runner = web.AppRunner(workshop_lan_app, access_log=None)
@@ -2700,7 +2723,7 @@ async def start(
     # especially after a period of downtime when queued updates are flushing.
     # Without retries, a single timeout kills the whole startup and launchd
     # eventually gives up restarting.
-    if config.telegram_webhook_url:
+    if telegram_app is not None and config.telegram_webhook_url:
         requeued = await sessions.requeue_processing_telegram_updates()
         if requeued:
             log.info("Requeued %d unfinished Telegram update(s) from previous run", requeued)

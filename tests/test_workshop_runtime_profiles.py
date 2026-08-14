@@ -132,6 +132,55 @@ def test_document_preserves_migrated_profile_identity_and_compatibility_key():
     assert profile.allowed_services == ("perplexity", "weather")
 
 
+@pytest.mark.parametrize(
+    ("os_user", "message"),
+    (
+        (None, "missing required os_user"),
+        ("kai", "maps to service account"),
+        ("missing", "nonexistent OS account"),
+        ("service-alias", "resolves to service uid"),
+    ),
+)
+def test_protected_runtime_profiles_reject_unsafe_execution_accounts(os_user, message):
+    profile = ProtectedRuntimeProfile(
+        runtime_profile_id_for_config_id(101),
+        101,
+        "Daniel",
+        os_user,
+        "codex",
+        "openai",
+        "gpt-5.6-sol",
+        120,
+        (),
+        None,
+        None,
+        (),
+    )
+    registry = WorkshopRuntimeProfileRegistry((profile,))
+
+    def account_uid(name):
+        if name == "missing":
+            raise KeyError(name)
+        return 503 if name == "service-alias" else 501
+
+    with pytest.raises(WorkshopRuntimeProfileError, match=message):
+        registry.validate_protected_os_users(
+            "kai",
+            account_uid=account_uid,
+            service_uid=503,
+        )
+
+
+def test_protected_runtime_profiles_accept_non_service_execution_account():
+    registry = WorkshopRuntimeProfileRegistry.from_config(_config())
+
+    registry.validate_protected_os_users(
+        "kai",
+        account_uid=lambda name: {"daniel": 501, "sellison": 504}[name],
+        service_uid=503,
+    )
+
+
 def test_document_owns_resolved_workspace_policy(tmp_path):
     home = tmp_path / "home"
     base = tmp_path / "projects"
@@ -822,3 +871,33 @@ def test_protected_startup_fails_closed_when_policy_is_unreadable(monkeypatch):
 
     with pytest.raises(WorkshopRuntimeProfileError, match="missing or unreadable"):
         WorkshopRuntimeProfileRegistry.load(_config())
+
+
+def test_protected_startup_validates_runtime_profile_execution_account(tmp_path, monkeypatch):
+    policy = tmp_path / "runtime-profiles.yaml"
+    policy.write_text(
+        """version: 1
+runtime_profiles:
+  rtp_55555555555555555555555555555555:
+    display_name: Unsafe runtime
+    os_user: kai
+    backend: codex
+    provider: openai
+    model: gpt-5.6-sol
+    timeout_seconds: 120
+    allowed_services: []
+    allowed_workspaces: []
+"""
+    )
+    monkeypatch.setenv("KAI_INSTALL_DIR", "/opt/kai")
+    monkeypatch.setattr(
+        "kai.workshop.runtime_profiles.load_backend_registry",
+        lambda: {"codex": {}},
+    )
+    monkeypatch.setattr(
+        "kai.workshop.runtime_profiles.pwd.getpwuid",
+        lambda _uid: type("Account", (), {"pw_name": "kai"})(),
+    )
+
+    with pytest.raises(WorkshopRuntimeProfileError, match="maps to service account"):
+        WorkshopRuntimeProfileRegistry.load(_config(), path=policy)

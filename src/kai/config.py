@@ -88,6 +88,33 @@ DATA_DIR = Path(os.environ.get("KAI_DATA_DIR") or str(PROJECT_ROOT))
 # between load_config() and install.py.
 VALID_BACKENDS = {"claude", "goose", "codex", "opencode", "pi"}
 
+# External client adapters are explicit protected policy.  HTTP remains a
+# host-owned listener for health, internal APIs, and configured integrations;
+# these names control the human-facing client surfaces attached to that host.
+# Absence of KAI_ENABLED_ADAPTERS deliberately preserves the historic hybrid
+# deployment so upgrades do not silently disable Telegram.
+VALID_CLIENT_ADAPTERS: frozenset[str] = frozenset({"telegram", "workshop"})
+DEFAULT_CLIENT_ADAPTERS: frozenset[str] = VALID_CLIENT_ADAPTERS
+
+
+def parse_enabled_adapters(value: str | None) -> frozenset[str]:
+    """Parse explicit client-adapter policy, defaulting legacy installs to hybrid."""
+    if value is None:
+        return DEFAULT_CLIENT_ADAPTERS
+    if not value.strip():
+        raise ValueError("must enable at least one client adapter")
+    adapters = frozenset(part.strip().lower() for part in value.split(",") if part.strip())
+    if not adapters:
+        raise ValueError("must enable at least one client adapter")
+    unknown = sorted(adapters - VALID_CLIENT_ADAPTERS)
+    if unknown:
+        raise ValueError(
+            f"contains unsupported adapter(s): {', '.join(unknown)}; "
+            f"expected: {', '.join(sorted(VALID_CLIENT_ADAPTERS))}"
+        )
+    return adapters
+
+
 # Backends that ship a `OneShotReasoner` implementation in
 # `src/kai/oneshot.py`. Every site that gates on "does this backend
 # support one-shot agent dispatch" - memory extraction eligibility,
@@ -1384,14 +1411,16 @@ class Config:
     Optional fields have sensible defaults for single-user local deployment.
 
     Attributes:
-        telegram_bot_token: Bot token from @BotFather (required)
+        telegram_bot_token: Bot token from @BotFather. Required only when the
+            Telegram adapter is enabled.
         telegram_webhook_url: Public URL where Telegram pushes updates via webhook.
             When set, Kai runs in webhook mode (Telegram POSTs updates here).
             When None, Kai falls back to long-polling (Kai pulls updates from Telegram).
         telegram_webhook_secret: Secret token for validating incoming Telegram updates.
             Sent by Telegram as X-Telegram-Bot-Api-Secret-Token header on each update.
             Only used in webhook mode. Generated for the process when not explicitly set.
-        allowed_user_ids: Set of Telegram user IDs permitted to interact with the bot (required)
+        allowed_user_ids: Telegram user IDs permitted to interact with the bot;
+            empty when the Telegram adapter is disabled and no users file exists.
         default_model: Default model name, provider-dependent (e.g. sonnet, gpt-5.5-pro, gemini-2.5-pro)
         default_timeout: Seconds before an agent response is considered timed
             out, on every backend
@@ -1413,9 +1442,13 @@ class Config:
             without being under WORKSPACE_BASE. Non-existent paths are skipped at startup.
     """
 
-    # Required fields - no defaults, must be provided
-    telegram_bot_token: str
+    # Telegram credentials are optional for Workshop-only deployments.
+    telegram_bot_token: str | None
     allowed_user_ids: set[int]
+
+    # Explicit human-facing adapter policy. The default preserves the client
+    # surfaces used by installations created before this policy existed.
+    enabled_adapters: frozenset[str] = field(default_factory=lambda: DEFAULT_CLIENT_ADAPTERS)
 
     # Telegram transport mode: set telegram_webhook_url to use webhook mode,
     # leave as None to fall back to long-polling. The secret is only needed
@@ -1557,13 +1590,19 @@ class Config:
     # 0 = no cleanup (default). Cleanup runs once every 24 hours.
     file_retention_days: int = 0
 
-    # Per-user configuration from users.yaml, keyed by telegram_id.
-    # users.yaml is mandatory: _load_user_configs raises SystemExit
-    # if the file is missing, malformed, or has no valid entries, so
-    # this field is always a populated dict at runtime. The default
-    # factory is for tests that construct Config directly; production
-    # code goes through load_config.
+    # Telegram identity and compatibility policy from users.yaml, keyed by
+    # telegram_id. It is required and non-empty when Telegram is enabled. A
+    # Workshop-only runtime may have no users.yaml and instead use canonical
+    # humans plus protected runtime profiles.
     user_configs: dict[int, UserConfig] = field(default_factory=dict)
+
+    @property
+    def telegram_enabled(self) -> bool:
+        return "telegram" in self.enabled_adapters
+
+    @property
+    def workshop_enabled(self) -> bool:
+        return "workshop" in self.enabled_adapters
 
     # TOTP two-factor authentication timing (only relevant when TOTP is enabled)
     totp_session_minutes: int = 30
@@ -3035,10 +3074,21 @@ def load_config() -> Config:
     else:
         load_dotenv(PROJECT_ROOT / ".env")
 
-    # Validate required: Telegram bot token
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise SystemExit("TELEGRAM_BOT_TOKEN is required in .env")
+    try:
+        enabled_adapters = parse_enabled_adapters(os.environ.get("KAI_ENABLED_ADAPTERS"))
+    except ValueError as exc:
+        raise SystemExit(f"KAI_ENABLED_ADAPTERS {exc}") from None
+
+    # Telegram credentials are adapter configuration, not host credentials.
+    # Keeping a token in protected storage while the adapter is disabled must
+    # not construct a client or contact Telegram; the wizard normally removes
+    # it so Workshop-only qualification can also prove token absence.
+    telegram_enabled = "telegram" in enabled_adapters
+    workshop_enabled = "workshop" in enabled_adapters
+    stored_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip() or None
+    token = stored_token if telegram_enabled else None
+    if telegram_enabled and token is None:
+        raise SystemExit("TELEGRAM_BOT_TOKEN is required when the Telegram adapter is enabled")
 
     # Telegram transport mode: if TELEGRAM_WEBHOOK_URL is set, use webhook mode
     # (Telegram POSTs updates to this URL). If unset, fall back to long-polling
@@ -3047,7 +3097,7 @@ def load_config() -> Config:
     telegram_webhook_url: str | None = None
     telegram_webhook_secret: str | None = None
     raw_webhook_url = os.environ.get("TELEGRAM_WEBHOOK_URL", "").strip()
-    if raw_webhook_url:
+    if telegram_enabled and raw_webhook_url:
         telegram_webhook_url = raw_webhook_url
 
         # Webhook secret: validates incoming updates from Telegram. A fresh
@@ -3058,8 +3108,10 @@ def load_config() -> Config:
         if not telegram_webhook_secret:
             telegram_webhook_secret = secrets.token_urlsafe(32)
         log.info("Telegram transport: webhook (%s)", telegram_webhook_url)
-    else:
+    elif telegram_enabled:
         log.info("Telegram transport: polling (TELEGRAM_WEBHOOK_URL not set)")
+    else:
+        log.info("Telegram adapter disabled by KAI_ENABLED_ADAPTERS")
 
     # Validate optional: workspace base directory (must exist if provided)
     workspace_base = None
@@ -3142,6 +3194,8 @@ def load_config() -> Config:
         )
     except ValueError as exc:
         raise SystemExit(f"WORKSHOP_LAN_HOST {exc}") from None
+    if workshop_lan_host and not workshop_enabled:
+        raise SystemExit("WORKSHOP_LAN_HOST requires the Workshop adapter to be enabled")
     try:
         file_retention_days = int(os.environ.get("FILE_RETENTION_DAYS", "0"))
     except ValueError:
@@ -3445,13 +3499,10 @@ def load_config() -> Config:
     # workspaces the user is otherwise allowed to enter.
     memory_projects = _load_memory_project_configs()
 
-    # Per-user configuration. users.yaml is mandatory; the loader
-    # raises SystemExit on any failure with a path-naming message
-    # (and a one-line ALLOWED_USER_IDS migration hint when that env
-    # var is set on a missing-file install). The legacy env-var
-    # fallback is gone: a malformed users file used to silently
-    # degrade to ALLOWED_USER_IDS, which the wizard and the loader
-    # then disagreed about; fail-closed is the contract now.
+    # Telegram identity and compatibility configuration. users.yaml is
+    # mandatory while Telegram is enabled; a missing file is permitted in a
+    # Workshop-only runtime, while a present malformed file always fails
+    # closed. The legacy ALLOWED_USER_IDS authorization fallback is gone.
     #
     # The path resolves based on whether `/etc/kai/env` had readable
     # content at the top of this load_config call (protected install)
@@ -3460,8 +3511,18 @@ def load_config() -> Config:
     # explicit override for tests and ad-hoc development; the operator
     # path is always one of the two resolved defaults.
     users_yaml_path = _resolve_users_yaml_path(bool(protected_env))
-    user_configs = _load_user_configs(default_backend, default_provider, users_yaml_path)
-    if protected_env:
+    if telegram_enabled or protected_env:
+        user_configs = _load_user_configs(default_backend, default_provider, users_yaml_path)
+    else:
+        # Direct development can omit Telegram identities when the adapter is
+        # disabled. Protected installs retain their existing, real identity
+        # mappings during this installed qualification slice.
+        raw_users = _read_users_yaml(users_yaml_path)
+        if raw_users is None:
+            user_configs = {}
+        else:
+            user_configs = _load_user_configs(default_backend, default_provider, users_yaml_path)
+    if protected_env and user_configs:
         # A protected install gives the outer service account narrowly
         # scoped sudo access to root-owned Kai configuration.  A persistent
         # conversational agent running as that same account would inherit
@@ -3691,6 +3752,7 @@ def load_config() -> Config:
         telegram_webhook_url=telegram_webhook_url,
         telegram_webhook_secret=telegram_webhook_secret,
         allowed_user_ids=allowed_ids,
+        enabled_adapters=enabled_adapters,
         default_model=default_model,
         default_models=default_models,
         default_timeout=default_timeout,

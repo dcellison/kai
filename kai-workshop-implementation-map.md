@@ -2073,8 +2073,41 @@ Telegram components through the common adapter-readiness contract.
 The mixed HTTP application still contains Telegram webhook and compatibility
 integration routes, so the current `HttpAdapter` explicitly receives the
 already-started Telegram adapter. This is a visible transition boundary, not
-an implied core dependency: Milestone 3 will make that binding optional while
+an implied core dependency: Milestone 3 makes that binding optional while
 preserving the existing hybrid configuration.
+
+## 44. Explicit client-adapter deployment policy
+
+**Implementation date:** 2026-08-14
+
+Kai now records the enabled human-facing clients as explicit installation
+policy. `hybrid`, `workshop-only`, and `telegram-only` wizard choices become a
+validated `KAI_ENABLED_ADAPTERS` set. An older installation without the key
+continues in hybrid mode; the compatibility default can be removed after
+installed configurations have been regenerated.
+
+Workshop-only startup does not require a Telegram token, construct a Telegram
+application, attach a Telegram adapter, activate Telegram ingress, publish
+Telegram webhook routes, or start Telegram delivery workers. The HTTP adapter
+accepts no Telegram dependency and still publishes health, protected internal
+services, and authenticated Workshop client routes. Telegram-only startup
+keeps the HTTP health/internal surface but does not publish Workshop client or
+LAN routes. Hybrid remains behavior-compatible with the qualified installed
+system.
+
+This first qualification is a mode switch for an existing protected
+installation whose canonical humans, assignments, and runtime profiles have
+already been provisioned. The wizard rejects fresh-host and single-user
+Workshop-only bootstrap until canonical administration can create that initial
+authority without a transport identity.
+
+Routes whose implementation still owns Telegram scheduling or delivery are
+absent when Telegram is disabled rather than being silently redirected.
+Canonical scheduling and integration migration remains owned by the later
+epic milestones. Installed qualification must switch to Workshop-only with no
+stored bot token, prove browser enrollment, execution, activity,
+cancellation, restart continuity, health, and absence of Telegram contact,
+then restore hybrid mode and re-qualify both clients.
 
 ## Canonical notification feed activation
 

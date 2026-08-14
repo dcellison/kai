@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import os
+import pwd
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -407,7 +408,21 @@ class WorkshopRuntimeProfileRegistry:
         protected = bool(os.environ.get(INSTALL_DIR_ENV, "").strip())
         if not explicit and not protected:
             return cls.from_config(config)
-        return cls.from_yaml(_policy_text(policy_path), backend_registry=load_backend_registry())
+        registry = cls.from_yaml(_policy_text(policy_path), backend_registry=load_backend_registry())
+        if protected:
+            service_uid = os.geteuid()
+            try:
+                service_user = pwd.getpwuid(service_uid).pw_name
+            except KeyError:
+                raise WorkshopRuntimeProfileError(
+                    f"Protected installation could not resolve the Kai service account for effective uid {service_uid}"
+                ) from None
+            registry.validate_protected_os_users(
+                service_user,
+                account_uid=lambda name: pwd.getpwnam(name).pw_uid,
+                service_uid=service_uid,
+            )
+        return registry
 
     @property
     def profiles(self) -> tuple[ProtectedRuntimeProfile, ...]:
@@ -428,3 +443,37 @@ class WorkshopRuntimeProfileRegistry:
         if profile is None:
             raise WorkshopRuntimeProfileError("Configured user has no protected runtime profile")
         return profile
+
+    def validate_protected_os_users(
+        self,
+        service_user: str,
+        *,
+        account_uid: Callable[[str], int],
+        service_uid: int,
+    ) -> None:
+        """Keep protected backend processes off the privileged service account."""
+        errors: list[str] = []
+        normalized_service_user = service_user.strip()
+        for profile in self.profiles:
+            os_user = profile.os_user.strip() if profile.os_user else ""
+            label = f"runtime profile {profile.profile_id} ({profile.display_name!r})"
+            if not os_user:
+                errors.append(f"{label} is missing required os_user")
+                continue
+            if os_user == normalized_service_user:
+                errors.append(f"{label} maps to service account {normalized_service_user!r}")
+                continue
+            try:
+                uid = account_uid(os_user)
+            except KeyError:
+                errors.append(f"{label} maps to nonexistent OS account {os_user!r}")
+                continue
+            if uid == service_uid:
+                errors.append(f"{label} maps to OS account {os_user!r}, which resolves to service uid {service_uid}")
+        if errors:
+            detail = "\n  - ".join(errors)
+            raise WorkshopRuntimeProfileError(
+                "Protected runtime profiles must use existing non-service OS accounts:\n"
+                f"  - {detail}\n"
+                f"Assign every profile an OS account distinct from service account {normalized_service_user!r}."
+            )

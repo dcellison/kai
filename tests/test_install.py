@@ -21,6 +21,7 @@ import kai.install
 from kai.install import (
     _LAUNCHD_LABEL,
     ServiceStartError,
+    _adapter_policy_status,
     _apply_backend_registry,
     _apply_directories,
     _apply_goose_config,
@@ -45,7 +46,9 @@ from kai.install import (
     _collect_user_memory_owners,
     _copy_managed_home_tree,
     _copy_tree,
+    _deployed_adapter_policy_status,
     _deployed_webhook_secret_migration_status,
+    _dormant_compatibility_schedule_status,
     _file_checksum,
     _generate_env_file,
     _generate_launchd_plist,
@@ -1439,6 +1442,7 @@ class TestCmdConfig:
         inputs = iter(
             [
                 "protected",
+                "hybrid",
                 "/opt/kai",
                 "/var/lib/kai",
                 "kai",
@@ -1466,6 +1470,7 @@ class TestCmdConfig:
         inputs = iter(
             [
                 "protected",  # deployment mode
+                "hybrid",  # client mode
                 "/opt/kai",  # install dir
                 "/var/lib/kai",  # data dir
                 "kai",  # service user
@@ -1564,6 +1569,7 @@ class TestCmdConfig:
         inputs = iter(
             [
                 "protected",  # deployment mode
+                "hybrid",  # client mode
                 "/opt/kai",  # install dir
                 "/var/lib/kai",  # data dir
                 "kai",  # service user
@@ -1647,6 +1653,7 @@ class TestCmdConfig:
         inputs_basic = iter(
             [
                 "protected",  # deployment mode
+                "hybrid",  # client mode
                 "/opt/kai",  # install dir
                 "/var/lib/kai",  # data dir
                 "kai",  # service user
@@ -1716,6 +1723,7 @@ class TestCmdConfig:
         inputs_advanced = iter(
             [
                 "protected",
+                "hybrid",
                 "/opt/kai",
                 "/var/lib/kai",
                 "kai",
@@ -1778,6 +1786,7 @@ class TestCmdConfig:
         inputs = iter(
             [
                 "protected",  # deployment mode
+                "hybrid",  # client mode
                 "/opt/kai",  # install dir
                 "/var/lib/kai",  # data dir
                 "kai",  # service user
@@ -1913,6 +1922,7 @@ class TestCmdConfig:
         inputs = iter(
             [
                 "protected",  # deployment mode
+                "hybrid",  # client mode
                 "/opt/kai",  # install dir
                 "/var/lib/kai",  # data dir
                 "kai",  # service user
@@ -2071,6 +2081,7 @@ class TestCmdConfig:
         agent_backend: str = "claude",
         llm_provider: str = "anthropic",
         llm_api_key: str = "sk-ant-test-key",
+        client_mode: str = "hybrid",
     ) -> list[str]:
         """Default wizard inputs with swappable memory block, effort, and backend.
 
@@ -2128,17 +2139,31 @@ class TestCmdConfig:
                 effort,  # claude effort level ("" = default "high")
             ]
 
+        telegram_setup: list[str] = []
+        telegram_features: list[str] = []
+        if client_mode in {"hybrid", "telegram-only"}:
+            telegram_setup = [
+                "fake-token",  # bot token
+                "12345",  # admin Telegram ID
+                "admin",  # admin display name
+                "testuser",  # required protected os_user
+                "polling",  # transport
+            ]
+            telegram_features = [
+                "false",  # voice
+                "false",  # tts
+            ]
+
+        workshop_listener = [""] if client_mode in {"hybrid", "workshop-only"} else []
+
         return [
             "protected",  # deployment mode
+            client_mode,
             "/opt/kai",  # install dir
             "/var/lib/kai",  # data dir
             "kai",  # service user
             "darwin",  # platform
-            "fake-token",  # bot token
-            "12345",  # admin telegram ID
-            "admin",  # admin display name
-            "testuser",  # required protected os_user
-            "polling",  # transport
+            *telegram_setup,
             agent_backend,  # agent backend
             *backend_block,  # llm_provider + api_key (non-claude only)
             "sonnet",  # model
@@ -2148,17 +2173,139 @@ class TestCmdConfig:
             "1800",  # idle eviction timeout seconds
             *claude_only_pre_webhook,  # autocompact + effort (claude only)
             "8080",  # port
-            "",  # Workshop LAN address (disabled)
+            *workshop_listener,  # Workshop LAN address (disabled)
             "test-secret",  # webhook secret
             "~/Projects",  # workspace base
             "",  # allowed workspaces
             "300",  # pr review cooldown (global resource control)
             "900",  # pr review timeout
-            "false",  # voice
-            "false",  # tts
+            *telegram_features,
             *memory_block,
             "",  # perplexity key
         ]
+
+    @pytest.mark.parametrize(
+        ("client_mode", "expected_adapters", "telegram_configured"),
+        [
+            ("hybrid", "telegram,workshop", True),
+            ("workshop-only", "workshop", False),
+            ("telegram-only", "telegram", True),
+        ],
+    )
+    def test_client_modes_write_explicit_adapter_policy(
+        self,
+        tmp_path,
+        monkeypatch,
+        client_mode,
+        expected_adapters,
+        telegram_configured,
+    ):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._redirect_staging(monkeypatch, tmp_path)
+        if client_mode == "workshop-only":
+            self._simulate_existing_etc_users_yaml(
+                monkeypatch,
+                "users:\n  - telegram_id: 12345\n    name: admin\n    role: admin\n    os_user: testuser\n",
+            )
+            kai.install.RUNTIME_PROFILES_YAML.write_text("version: 1\nruntime_profiles:\n  existing: {}\n")
+
+        inputs = iter(self._base_inputs(["false"], client_mode=client_mode))
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        conf = json.loads((tmp_path / "install.conf").read_text())
+        env = conf["env"]
+        assert env["KAI_ENABLED_ADAPTERS"] == expected_adapters
+        assert ("TELEGRAM_BOT_TOKEN" in env) is telegram_configured
+        assert ("users_yaml_staging_path" in conf) is telegram_configured
+
+    def test_workshop_only_removes_token_but_preserves_dormant_telegram_preferences(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        conf_path = tmp_path / "install.conf"
+        conf_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "deployment_mode": "protected",
+                    "env": {
+                        "KAI_ENABLED_ADAPTERS": "telegram,workshop",
+                        "TELEGRAM_BOT_TOKEN": "must-not-survive",
+                        "TELEGRAM_TRANSPORT": "webhook",
+                        "TELEGRAM_WEBHOOK_URL": "https://example.test/telegram",
+                        "TELEGRAM_WEBHOOK_SECRET": "dormant-webhook-secret",
+                        "VOICE_ENABLED": "true",
+                        "TTS_ENABLED": "true",
+                        "DEFAULT_BACKEND": "claude",
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._redirect_staging(monkeypatch, tmp_path)
+        self._simulate_existing_etc_users_yaml(
+            monkeypatch,
+            "users:\n  - telegram_id: 12345\n    name: admin\n    role: admin\n    os_user: testuser\n",
+        )
+        kai.install.RUNTIME_PROFILES_YAML.write_text("version: 1\nruntime_profiles:\n  existing: {}\n")
+
+        inputs = iter(self._base_inputs(["false"], client_mode="workshop-only"))
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        env = json.loads(conf_path.read_text())["env"]
+        assert "TELEGRAM_BOT_TOKEN" not in env
+        assert env["TELEGRAM_TRANSPORT"] == "webhook"
+        assert env["TELEGRAM_WEBHOOK_URL"] == "https://example.test/telegram"
+        assert env["TELEGRAM_WEBHOOK_SECRET"] == "dormant-webhook-secret"
+        assert env["VOICE_ENABLED"] == "true"
+        assert env["TTS_ENABLED"] == "true"
+
+    def test_fresh_protected_workshop_only_fails_before_writing_config(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        conf_path = tmp_path / "install.conf"
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._redirect_staging(monkeypatch, tmp_path)
+        inputs = iter(
+            [
+                "protected",
+                "workshop-only",
+                "/opt/kai",
+                "/var/lib/kai",
+                "kai",
+                "darwin",
+            ]
+        )
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        with pytest.raises(SystemExit, match="requires an existing protected installation"):
+            _cmd_config()
+
+        assert not conf_path.exists()
+
+    def test_single_user_workshop_only_fails_before_writing_config(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        conf_path = tmp_path / "install.conf"
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._redirect_staging(monkeypatch, tmp_path)
+        monkeypatch.setattr("kai.install._read_protected_file", lambda _path: None)
+        inputs = iter(["single_user", "workshop-only"])
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        with pytest.raises(SystemExit, match="single-user bootstrap is not available"):
+            _cmd_config()
+
+        assert not conf_path.exists()
 
     def test_memory_disabled_omits_env_keys(self, tmp_path, monkeypatch):
         """MEMORY_ENABLED=false produces no MEMORY_* env entries."""
@@ -2568,6 +2715,7 @@ class TestCmdConfig:
         inputs = iter(
             [
                 "protected",  # deployment mode
+                "hybrid",  # client mode
                 "/opt/kai",  # install dir
                 "/var/lib/kai",  # data dir
                 "kai",  # service user
@@ -2908,6 +3056,7 @@ class TestCmdConfig:
         inputs = iter(
             [
                 "protected",  # deployment mode
+                "hybrid",  # client mode
                 "/opt/kai",  # install dir
                 "/var/lib/kai",  # data dir
                 "kai",  # service user
@@ -3438,6 +3587,7 @@ class TestCmdConfigDefaultModelDispatch:
         """
         return [
             "protected",  # deployment mode
+            "hybrid",  # client mode
             "/opt/kai",  # install dir
             "/var/lib/kai",  # data dir
             "kai",  # service user
@@ -3477,6 +3627,7 @@ class TestCmdConfigDefaultModelDispatch:
         """
         return [
             "protected",  # deployment mode
+            "hybrid",  # client mode
             "/opt/kai",  # install dir
             "/var/lib/kai",  # data dir
             "kai",  # service user
@@ -3512,6 +3663,7 @@ class TestCmdConfigDefaultModelDispatch:
         """Input chain for the users_yaml_exists=True + goose+openai path."""
         return [
             "protected",  # deployment mode
+            "hybrid",  # client mode
             "/opt/kai",  # install dir
             "/var/lib/kai",  # data dir
             "kai",  # service user
@@ -4569,6 +4721,67 @@ class TestCmdStatus:
             }
         )
         assert "legacy-secret" not in _webhook_secret_migration_status({"WEBHOOK_SECRET": "legacy-secret"})
+
+    @pytest.mark.parametrize(
+        ("env", "expected"),
+        [
+            ({}, "telegram,workshop; Telegram enabled, TOKEN MISSING; legacy hybrid default"),
+            (
+                {"KAI_ENABLED_ADAPTERS": "workshop"},
+                "workshop; Telegram disabled, no token configured",
+            ),
+            (
+                {"KAI_ENABLED_ADAPTERS": "telegram", "TELEGRAM_BOT_TOKEN": "secret-token"},
+                "telegram; Telegram enabled, token configured",
+            ),
+        ],
+    )
+    def test_adapter_policy_status_reports_mode_without_token(self, env, expected):
+        status = _adapter_policy_status(env, source="test")
+
+        assert expected in status
+        assert "secret-token" not in status
+
+    def test_deployed_adapter_status_never_exposes_token(self, tmp_path, monkeypatch):
+        env_path = tmp_path / "env"
+        env_path.write_text("KAI_ENABLED_ADAPTERS=workshop\nTELEGRAM_BOT_TOKEN=disabled-secret-token\n")
+        monkeypatch.setattr(
+            "kai.install.validate_protected_file_metadata",
+            lambda *args, **kwargs: True,
+        )
+
+        status = _deployed_adapter_policy_status(env_path)
+
+        assert "workshop; Telegram disabled, stored token ignored" in status
+        assert "disabled-secret-token" not in status
+
+    def test_status_reports_dormant_compatibility_jobs_without_telegram(self, tmp_path, monkeypatch):
+        env_path = tmp_path / "env"
+        env_path.write_text("KAI_ENABLED_ADAPTERS=workshop\n")
+        db_path = tmp_path / "kai.db"
+        connection = sqlite3.connect(db_path)
+        connection.execute("CREATE TABLE jobs (id INTEGER PRIMARY KEY, active INTEGER NOT NULL)")
+        connection.executemany("INSERT INTO jobs(active) VALUES (?)", [(1,), (1,), (0,)])
+        connection.commit()
+        connection.close()
+        monkeypatch.setattr(
+            "kai.install.validate_protected_file_metadata",
+            lambda *args, **kwargs: True,
+        )
+
+        status = _dormant_compatibility_schedule_status(db_path, env_path)
+
+        assert status == "Compatibility schedules: 2 active job(s) dormant; Telegram adapter disabled"
+
+    def test_status_omits_dormant_schedule_line_when_telegram_is_enabled(self, tmp_path, monkeypatch):
+        env_path = tmp_path / "env"
+        env_path.write_text("KAI_ENABLED_ADAPTERS=telegram,workshop\n")
+        monkeypatch.setattr(
+            "kai.install.validate_protected_file_metadata",
+            lambda *args, **kwargs: True,
+        )
+
+        assert _dormant_compatibility_schedule_status(tmp_path / "missing.db", env_path) is None
 
     def test_deployed_status_reports_named_secrets_without_values(self, tmp_path, monkeypatch):
         env_path = tmp_path / "env"
@@ -9362,6 +9575,7 @@ class TestCmdConfigCanonicalUsersYaml:
         """
         return [
             "protected",
+            "hybrid",
             "/opt/kai",
             "/var/lib/kai",
             "kai",
@@ -9831,6 +10045,7 @@ class TestCmdConfigSingleUserMode:
         """
         return [
             "single_user",  # deployment mode
+            "hybrid",  # client mode
             # install_dir / data_dir / service_user / platform are skipped
             "fake-token",  # bot token
             "12345",  # admin telegram id
@@ -9940,7 +10155,7 @@ class TestCmdConfigSingleUserMode:
         # Only the deployment_mode prompt is reached before the refusal
         # fires; the rest of the chain is unused but kept here so the
         # test does not depend on prompt-count specifics.
-        inputs = iter(["single_user"] + ["x"] * 50)
+        inputs = iter(["single_user", "hybrid"] + ["x"] * 50)
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
         with pytest.raises(SystemExit, match="single_user mode was selected"):
             _cmd_config()
@@ -11324,6 +11539,7 @@ class TestOpenCodeConfigWizard:
         """
         return [
             "protected",  # deployment mode
+            "hybrid",  # client mode
             "/opt/kai",  # install dir
             "/var/lib/kai",  # data dir
             "kai",  # service user

@@ -67,6 +67,35 @@ def test_telegram_route_is_independent_of_other_webhooks() -> None:
     assert ("POST", "/webhook") not in routes
 
 
+def test_workshop_only_omits_telegram_owned_routes() -> None:
+    app = web.Application()
+
+    _register_routes(
+        app,
+        _config(
+            telegram_webhook_url="https://example.com/webhook/telegram",
+            telegram_webhook_secret="telegram-secret",
+            github_webhook_secret="github-secret",
+            generic_webhook_secret="generic-secret",
+        ),
+        telegram_enabled=False,
+    )
+
+    routes = _routes(app)
+    assert ("GET", "/health") in routes
+    assert ("GET", "/api/jobs") in routes
+    assert ("POST", "/api/services/{name}") in routes
+    assert ("GET", "/api/memory/stats") in routes
+    assert ("POST", "/webhook/telegram") not in routes
+    assert ("POST", "/webhook/github") not in routes
+    assert ("POST", "/webhook") not in routes
+    assert ("POST", "/api/schedule") not in routes
+    assert ("DELETE", "/api/jobs/{id}") not in routes
+    assert ("PATCH", "/api/jobs/{id}") not in routes
+    assert ("POST", "/api/send-message") not in routes
+    assert ("POST", "/api/send-file") not in routes
+
+
 async def test_health_reports_non_sensitive_memory_mode(monkeypatch) -> None:
     monkeypatch.setattr("kai.webhook.memory.is_enabled", lambda: True)
 

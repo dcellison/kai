@@ -65,6 +65,7 @@ from kai.config import (
     get_effective_provider,
     models_for_backend,
     normalize_workshop_lan_host,
+    parse_enabled_adapters,
     validate_model_for_backend,
     validate_model_for_backend_policy,
 )
@@ -1424,6 +1425,37 @@ def _cmd_config() -> None:
     )
     print()
 
+    # -- Client mode --
+    # Existing configurations without KAI_ENABLED_ADAPTERS are hybrid by
+    # definition.  Persisting the selected mode makes adapter construction an
+    # explicit protected policy decision rather than an inference from whether
+    # a token happens to be present.
+    try:
+        existing_adapters = parse_enabled_adapters(existing_env.get("KAI_ENABLED_ADAPTERS"))
+    except ValueError as exc:
+        raise SystemExit(f"install.conf KAI_ENABLED_ADAPTERS {exc}") from None
+    existing_client_mode = {
+        frozenset({"telegram", "workshop"}): "hybrid",
+        frozenset({"workshop"}): "workshop-only",
+        frozenset({"telegram"}): "telegram-only",
+    }[existing_adapters]
+    print("-- Client mode --")
+    client_mode = _prompt_choice(
+        "Enabled clients",
+        ["hybrid", "workshop-only", "telegram-only"],
+        existing_client_mode,
+    )
+    telegram_enabled = client_mode in {"hybrid", "telegram-only"}
+    workshop_enabled = client_mode in {"hybrid", "workshop-only"}
+    enabled_adapters = {
+        "hybrid": "telegram,workshop",
+        "workshop-only": "workshop",
+        "telegram-only": "telegram",
+    }[client_mode]
+    if not telegram_enabled:
+        print("  Telegram is disabled; the bot token will be omitted from the generated configuration.")
+    print()
+
     # Migration safety: if the operator picks single_user but a
     # readable `/etc/kai/env` exists from a previous protected install,
     # the runtime predicate in `config._resolve_users_yaml_path` will
@@ -1493,12 +1525,14 @@ def _cmd_config() -> None:
         platform = detected_platform
 
     # -- Telegram --
-    print("-- Telegram --")
-    bot_token = _prompt(
-        "Telegram bot token",
-        existing_env.get("TELEGRAM_BOT_TOKEN", ""),
-        required=True,
-    )
+    bot_token = ""
+    if telegram_enabled:
+        print("-- Telegram --")
+        bot_token = _prompt(
+            "Telegram bot token",
+            existing_env.get("TELEGRAM_BOT_TOKEN", ""),
+            required=True,
+        )
 
     # -- User setup --
     # `/etc/kai/users.yaml` is the only canonical source for the wizard.
@@ -1527,6 +1561,19 @@ def _cmd_config() -> None:
     else:
         users_yaml_path = _xdg_users_yaml_path()
     users_yaml_exists = users_yaml_path.exists()
+    if not telegram_enabled:
+        if deployment_mode == "single_user":
+            raise SystemExit(
+                "Workshop-only single-user bootstrap is not available yet. "
+                "Use a protected installation with existing canonical runtime policy, "
+                "or keep Telegram enabled for single-user setup."
+            )
+        if not users_yaml_exists or not RUNTIME_PROFILES_YAML.is_file():
+            raise SystemExit(
+                "Workshop-only mode currently requires an existing protected installation "
+                "with users.yaml and runtime-profiles.yaml. Start from the qualified hybrid "
+                "installation path before switching modes."
+            )
     stray_note = (
         f"  Note: {stray_project_users_yaml} is no longer used. Move it to {users_yaml_path} or remove it."
         if stray_project_users_yaml.exists()
@@ -1536,9 +1583,9 @@ def _cmd_config() -> None:
     # do: a first-time install (the admin prompts below run) or a stray
     # leftover to warn about. When the canonical users.yaml already
     # exists the wizard leaves it untouched, so it prints no bare header.
-    if not users_yaml_exists or stray_note:
+    if telegram_enabled and (not users_yaml_exists or stray_note):
         print("-- User setup --")
-    if stray_note:
+    if telegram_enabled and stray_note:
         print(stray_note)
 
     # Admin os_user captured by the advanced-mode prompt block below.
@@ -1568,7 +1615,7 @@ def _cmd_config() -> None:
 
     # First-time install only: collect the admin identity and stage a
     # users.yaml. An existing canonical file is left untouched.
-    if not users_yaml_exists:
+    if telegram_enabled and not users_yaml_exists:
         while True:
             admin_telegram_id = _prompt(
                 "Admin Telegram ID",
@@ -1655,7 +1702,7 @@ def _cmd_config() -> None:
             os.chmod(users_yaml_path, 0o600)
         print(f"  Generated {users_yaml_path}")
 
-    if deployment_mode == "protected":
+    if deployment_mode == "protected" and telegram_enabled:
         try:
             _validate_protected_users_yaml(
                 users_yaml_path,
@@ -1669,7 +1716,7 @@ def _cmd_config() -> None:
     # gated on the same condition as its header. On a re-run with an
     # existing users.yaml the section is silent, so this would otherwise
     # be an orphaned blank line before the transport prompt.
-    if not users_yaml_exists or stray_note:
+    if telegram_enabled and (not users_yaml_exists or stray_note):
         print()
 
     protected_yaml_staging_paths = _stage_optional_protected_yaml_configs(deployment_mode)
@@ -1678,15 +1725,17 @@ def _cmd_config() -> None:
         print(f"Staged protected YAML config for install: {staged_names}")
         print()
 
-    transport = _prompt_choice(
-        "Telegram transport",
-        ["polling", "webhook"],
-        existing_env.get("TELEGRAM_TRANSPORT", "polling"),
-    )
+    transport = existing_env.get("TELEGRAM_TRANSPORT", "polling")
+    if telegram_enabled:
+        transport = _prompt_choice(
+            "Telegram transport",
+            ["polling", "webhook"],
+            existing_env.get("TELEGRAM_TRANSPORT", "polling"),
+        )
 
-    webhook_url = ""
-    tg_webhook_secret = ""
-    if transport == "webhook":
+    webhook_url = existing_env.get("TELEGRAM_WEBHOOK_URL", "")
+    tg_webhook_secret = existing_env.get("TELEGRAM_WEBHOOK_SECRET", "")
+    if telegram_enabled and transport == "webhook":
         webhook_url = _prompt(
             "Telegram webhook URL",
             existing_env.get("TELEGRAM_WEBHOOK_URL", ""),
@@ -1696,7 +1745,8 @@ def _cmd_config() -> None:
             "Telegram webhook secret",
             existing_env.get("TELEGRAM_WEBHOOK_SECRET", ""),
         )
-    print()
+    if telegram_enabled:
+        print()
 
     # -- Default backend --
     print("-- Default backend --")
@@ -2090,16 +2140,18 @@ def _cmd_config() -> None:
             break
         print("  Must be a valid port number (1-65535).")
 
-    while True:
-        workshop_lan_host_input = _prompt(
-            "Workshop LAN address (optional; client routes only)",
-            existing_env.get("WORKSHOP_LAN_HOST", ""),
-        )
-        try:
-            workshop_lan_host = normalize_workshop_lan_host(workshop_lan_host_input)
-            break
-        except ValueError as exc:
-            print(f"  Workshop LAN address {exc}.")
+    workshop_lan_host = ""
+    if workshop_enabled:
+        while True:
+            workshop_lan_host_input = _prompt(
+                "Workshop LAN address (optional; client routes only)",
+                existing_env.get("WORKSHOP_LAN_HOST", ""),
+            )
+            try:
+                workshop_lan_host = normalize_workshop_lan_host(workshop_lan_host_input)
+                break
+            except ValueError as exc:
+                print(f"  Workshop LAN address {exc}.")
     if workshop_lan_host:
         print(
             "  Warning: Workshop bearer sessions will use plain HTTP on this "
@@ -2187,14 +2239,17 @@ def _cmd_config() -> None:
 
     # -- Optional features --
     print("-- Optional features --")
-    voice_enabled = _prompt_bool(
-        "Voice transcription",
-        existing_env.get("VOICE_ENABLED", "false").lower() in ("1", "true", "yes"),
-    )
-    tts_enabled = _prompt_bool(
-        "Text-to-speech",
-        existing_env.get("TTS_ENABLED", "false").lower() in ("1", "true", "yes"),
-    )
+    voice_enabled = existing_env.get("VOICE_ENABLED", "false").lower() in ("1", "true", "yes")
+    tts_enabled = existing_env.get("TTS_ENABLED", "false").lower() in ("1", "true", "yes")
+    if telegram_enabled:
+        voice_enabled = _prompt_bool(
+            "Voice transcription",
+            existing_env.get("VOICE_ENABLED", "false").lower() in ("1", "true", "yes"),
+        )
+        tts_enabled = _prompt_bool(
+            "Text-to-speech",
+            existing_env.get("TTS_ENABLED", "false").lower() in ("1", "true", "yes"),
+        )
 
     # Per-user OS isolation lives in users.yaml `os_user` (admin-set
     # baseline) and is no longer mirrored to a global env var. The
@@ -2425,13 +2480,15 @@ def _cmd_config() -> None:
     # Build the env dict (only include non-empty values).
     # Truly global vars are always written regardless of users.yaml.
     env: dict[str, str] = {
-        "TELEGRAM_BOT_TOKEN": bot_token,
+        "KAI_ENABLED_ADAPTERS": enabled_adapters,
         "WEBHOOK_PORT": port,
         "GITHUB_WEBHOOK_SECRET": github_webhook_secret,
         "GENERIC_WEBHOOK_SECRET": generic_webhook_secret,
         "VOICE_ENABLED": str(voice_enabled).lower(),
         "TTS_ENABLED": str(tts_enabled).lower(),
     }
+    if telegram_enabled:
+        env["TELEGRAM_BOT_TOKEN"] = bot_token
     if workshop_lan_host:
         env["WORKSHOP_LAN_HOST"] = workshop_lan_host
     # DEFAULT_BACKEND is the global default backend; users.yaml entries
@@ -5668,7 +5725,12 @@ def _cmd_apply() -> None:
             env,
             effective_users_yaml,
         )
-    except ValueError as exc:
+        runtime_policy.validate_protected_os_users(
+            service_user,
+            account_uid=lambda name: pwd.getpwnam(name).pw_uid,
+            service_uid=svc_uid,
+        )
+    except (ValueError, WorkshopRuntimeProfileError) as exc:
         raise SystemExit(
             f"Protected runtime policy preflight failed; no installation changes were made:\n{exc}"
         ) from exc
@@ -7810,6 +7872,17 @@ def _cmd_status() -> None:
     print(_check_path(RUNTIME_PROFILES_YAML, "Runtime profiles"))
     print(_check_path(Path("/etc/sudoers.d/kai"), "Sudoers"))
     print(_check_service_status(platform))
+    print(_deployed_adapter_policy_status(_DEPLOYED_ENV_FILE))
+    schedule_status = _dormant_compatibility_schedule_status(
+        Path(data_dir) / "kai.db",
+        _DEPLOYED_ENV_FILE,
+    )
+    if schedule_status is not None:
+        print(schedule_status)
+    if conf_env is None:
+        print("Client adapters (install.conf artifact): unavailable")
+    else:
+        print(_adapter_policy_status(conf_env, source="install.conf artifact"))
     print(_deployed_webhook_secret_migration_status(_DEPLOYED_ENV_FILE))
     if conf_env is None:
         print("Webhook secret migration (install.conf artifact): unavailable")
@@ -8026,6 +8099,82 @@ def _webhook_secret_migration_status(env: dict[str, str], *, source: str = "inst
         return f"{prefix} named GitHub/generic secrets configured; unsupported WEBHOOK_SECRET absent"
     missing = [key for key in ("GITHUB_WEBHOOK_SECRET", "GENERIC_WEBHOOK_SECRET") if not env.get(key, "").strip()]
     return f"{prefix} unsupported WEBHOOK_SECRET absent; missing named secret(s): {', '.join(missing)}"
+
+
+def _adapter_policy_status(env: dict[str, str], *, source: str) -> str:
+    """Report configured client adapters without exposing token content."""
+    raw = env.get("KAI_ENABLED_ADAPTERS")
+    try:
+        adapters = parse_enabled_adapters(raw)
+    except ValueError as exc:
+        return f"Client adapters ({source}): INVALID ({exc})"
+    names = ",".join(sorted(adapters))
+    telegram_enabled = "telegram" in adapters
+    token_present = bool(env.get("TELEGRAM_BOT_TOKEN", "").strip())
+    if telegram_enabled:
+        token_state = "token configured" if token_present else "TOKEN MISSING"
+    else:
+        token_state = "no token configured" if not token_present else "stored token ignored"
+    legacy = "; legacy hybrid default" if raw is None or not raw.strip() else ""
+    return (
+        f"Client adapters ({source}): {names}; Telegram "
+        f"{'enabled' if telegram_enabled else 'disabled'}, {token_state}{legacy}"
+    )
+
+
+def _deployed_adapter_policy_status(env_path: Path) -> str:
+    """Inspect deployed adapter names and token presence, never token content."""
+    source = f"deployed {env_path}"
+    try:
+        configured = _read_deployed_adapter_configuration(env_path)
+    except FileNotFoundError:
+        return f"Client adapters ({source}): deployed environment file not found"
+    except ProtectedConfigError as exc:
+        return f"Client adapters ({source}): NOT VERIFIED ({exc})"
+    except PermissionError:
+        return f"Client adapters ({source}): NOT VERIFIED (permission denied; run `make install-status`)"
+    except (OSError, UnicodeError) as exc:
+        return f"Client adapters ({source}): NOT VERIFIED (could not read deployed environment: {exc})"
+    return _adapter_policy_status(configured, source=source)
+
+
+def _read_deployed_adapter_configuration(env_path: Path) -> dict[str, str]:
+    """Read only adapter policy and token presence from protected environment."""
+    validate_protected_file_metadata(env_path, max_mode=0o600, require_root_owner=True)
+    configured: dict[str, str] = {}
+    with env_path.open(encoding="utf-8") as env_file:
+        for line in env_file:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            key, separator, raw_value = stripped.partition("=")
+            key = key.strip()
+            if not separator or key not in {"KAI_ENABLED_ADAPTERS", "TELEGRAM_BOT_TOKEN"}:
+                continue
+            value = raw_value.strip().strip("\"'")
+            configured[key] = value if key == "KAI_ENABLED_ADAPTERS" else ("configured" if value else "")
+    return configured
+
+
+def _dormant_compatibility_schedule_status(db_path: Path, env_path: Path) -> str | None:
+    """Report active Telegram-owned jobs that cannot fire without the adapter."""
+    try:
+        configured = _read_deployed_adapter_configuration(env_path)
+        adapters = parse_enabled_adapters(configured.get("KAI_ENABLED_ADAPTERS"))
+    except (FileNotFoundError, OSError, UnicodeError, ProtectedConfigError, ValueError):
+        return None
+    if "telegram" in adapters or not db_path.is_file():
+        return None
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            row = connection.execute("SELECT COUNT(*) FROM jobs WHERE active = 1").fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        return f"Compatibility schedules: NOT VERIFIED ({exc})"
+    count = int(row[0]) if row else 0
+    return f"Compatibility schedules: {count} active job(s) dormant; Telegram adapter disabled"
 
 
 def _deployed_webhook_secret_migration_status(env_path: Path) -> str:

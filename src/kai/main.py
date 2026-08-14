@@ -6,12 +6,12 @@ Provides functionality to:
 2. Load configuration and validate environment
 3. Initialize the database, transport-neutral core, adapters, jobs, and HTTP server
 4. Restore workspace from previous session
-5. Start the Telegram transport (webhook or polling, depending on config)
+5. Start the optional Telegram transport when configured
 6. Notify the user if a previous response was interrupted by a crash
 7. Run the event loop until shutdown (Ctrl+C or SIGTERM)
 8. Clean up all resources in the correct order on exit
 
-Telegram transport mode is determined by TELEGRAM_WEBHOOK_URL in .env:
+When Telegram is enabled, transport mode is determined by TELEGRAM_WEBHOOK_URL:
     - Set: webhook mode (Telegram POSTs updates to Kai's HTTP server)
     - Unset: polling mode (Kai pulls updates from Telegram's servers)
 
@@ -19,10 +19,10 @@ The startup sequence is:
     1. Load config from .env
     2. Initialize SQLite database
     3. Start the transport-neutral runtime and Workshop execution host
-    4. Attach the explicit Telegram adapter to the core host
+    4. Attach the explicit Telegram adapter when enabled
     5. Restore previous workspace (if saved in settings table)
-    6. Let the adapter initialize Telegram, register commands, and load jobs
-    7. Start adapter-owned conversation and notification delivery workers
+    6. Let an enabled adapter initialize Telegram, register commands, and load jobs
+    7. Start enabled adapter-owned conversation and notification delivery workers
     8. Attach the HTTP adapter for Workshop, integrations, and webhook ingress
     9. In webhook mode: register Telegram webhook with the API
        In polling mode: start the Updater's polling loop
@@ -48,6 +48,20 @@ from kai.http_adapter import HttpAdapter
 from kai.telegram_adapter import TelegramAdapter
 from kai.workshop.bootstrap import BootstrapHuman, BootstrapNotificationChannel
 from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
+
+
+async def _warn_if_compatibility_jobs_are_dormant(config) -> int:
+    """Warn when disabling Telegram also pauses its compatibility scheduler."""
+    if config.telegram_enabled:
+        return 0
+    active_jobs = await sessions.get_all_active_jobs()
+    count = len(active_jobs)
+    if count:
+        logging.warning(
+            "Telegram adapter is disabled; %d active compatibility scheduled job(s) are dormant",
+            count,
+        )
+    return count
 
 
 def _workshop_bootstrap_humans(
@@ -292,10 +306,11 @@ def _start() -> None:
         restores previous state, and blocks until shutdown. The finally
         block ensures all resources are cleaned up in reverse order.
         """
-        # Derive transport mode from config: webhook if URL is set, polling otherwise
-        use_webhook = config.telegram_webhook_url is not None
+        # Derive Telegram transport only when that optional adapter is enabled.
+        use_webhook = config.telegram_enabled and config.telegram_webhook_url is not None
 
         await sessions.init_db(config.session_db_path)
+        await _warn_if_compatibility_jobs_are_dormant(config)
 
         # Seed the non-authoritative Workshop identity/channel projection.
         # Notification groups are outbound-only channels: they share existing
@@ -344,15 +359,16 @@ def _start() -> None:
         telegram_adapter: TelegramAdapter | None = None
         cleanup_task: asyncio.Task[None] | None = None
 
-        # Determine the default user (admin or first user) for per-user
-        # data migrations and workspace restoration. users.yaml is
-        # mandatory so user_configs is always non-empty; the admin
-        # branch is preferred, otherwise the first entry wins.
+        # Determine the default compatibility user (admin or first user) for
+        # legacy per-user migrations. Workshop-only installations may have no
+        # users.yaml entries, in which case these migrations are unnecessary.
         admins = config.get_admins()
         if admins:
             default_chat_id: int | None = admins[0].telegram_id
-        else:
+        elif config.user_configs:
             default_chat_id = next(iter(config.user_configs))
+        else:
+            default_chat_id = None
 
         # One-time migration: rename global "workspace" setting to
         # "workspace:{chat_id}" for per-user namespacing (Phase 2).
@@ -400,12 +416,13 @@ def _start() -> None:
             core_services = await core_host.start()
             logging.info("Kai core application host is ready")
 
-            telegram_adapter = TelegramAdapter(
-                config,
-                core_services,
-                use_webhook=use_webhook,
-            )
-            await core_host.attach_adapter("telegram", telegram_adapter)
+            if config.telegram_enabled:
+                telegram_adapter = TelegramAdapter(
+                    config,
+                    core_services,
+                    use_webhook=use_webhook,
+                )
+                await core_host.attach_adapter("telegram", telegram_adapter)
 
             http_adapter = HttpAdapter(
                 config,
@@ -414,7 +431,8 @@ def _start() -> None:
                 telegram_adapter,
             )
             await core_host.attach_adapter("http", http_adapter)
-            await telegram_adapter.activate_ingress()
+            if telegram_adapter is not None:
+                await telegram_adapter.activate_ingress()
             # Phase 3: per-user file confinement is handled at request
             # time via pool.get_effective_workspace(chat_id) in
             # webhook.py. No global workspace sync needed at startup.
@@ -427,30 +445,30 @@ def _start() -> None:
             # Phase 2: check all files in the .responding directory (per-user
             # flags) instead of the old single .responding_to file.
             responding_dir = DATA_DIR / ".responding"
-            try:
-                flags = list(responding_dir.iterdir()) if responding_dir.is_dir() else []
-            except OSError:
-                flags = []
-            for flag in flags:
-                # Always unlink the flag first: prevents double-notify on
-                # restart if send fails, and cleans up malformed files
-                # (e.g., OS temp files) that would otherwise persist forever.
-                flag.unlink(missing_ok=True)
+            if telegram_adapter is not None:
                 try:
-                    interrupted_chat_id = int(flag.name)
-                    await telegram_adapter.bot.send_message(
-                        interrupted_chat_id,
-                        "Sorry, my previous response was interrupted. Please resend your last message.",
-                    )
-                    logging.info("Notified chat %d of interrupted response", interrupted_chat_id)
-                except Exception:
-                    logging.exception("Failed to process interrupted-response flag: %s", flag.name)
+                    flags = list(responding_dir.iterdir()) if responding_dir.is_dir() else []
+                except OSError:
+                    flags = []
+                for flag in flags:
+                    # Always unlink the flag first: prevents double-notify on
+                    # restart if send fails, and cleans up malformed files.
+                    flag.unlink(missing_ok=True)
+                    try:
+                        interrupted_chat_id = int(flag.name)
+                        await telegram_adapter.bot.send_message(
+                            interrupted_chat_id,
+                            "Sorry, my previous response was interrupted. Please resend your last message.",
+                        )
+                        logging.info("Notified chat %d of interrupted response", interrupted_chat_id)
+                    except Exception:
+                        logging.exception("Failed to process interrupted-response flag: %s", flag.name)
 
             # Clean up old single-file flag if it exists (one-time migration).
             # Unlink unconditionally (same pattern as the new-style flags)
             # so malformed content doesn't persist across restarts.
             old_flag = DATA_DIR / ".responding_to"
-            if old_flag.exists():
+            if old_flag.exists() and telegram_adapter is not None:
                 try:
                     old_content = old_flag.read_text().strip()
                     old_flag.unlink(missing_ok=True)
