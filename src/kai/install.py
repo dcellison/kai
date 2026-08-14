@@ -73,6 +73,11 @@ from kai.workshop.diagnostics import (
     workshop_delivery_authority_status,
     workshop_message_parity_status,
 )
+from kai.workshop.runtime_profiles import (
+    WorkshopRuntimeProfileError,
+    WorkshopRuntimeProfileRegistry,
+    runtime_profile_id_for_config_id,
+)
 
 # Config file written by `config`, read by `apply`.
 # Anchored to PROJECT_ROOT so it resolves correctly regardless of CWD.
@@ -86,6 +91,7 @@ INSTALL_CONF = PROJECT_ROOT / "install.conf"
 # real runtime config.
 USERS_YAML = Path("/etc/kai/users.yaml")
 BACKENDS_YAML = Path("/etc/kai/backends.yaml")
+RUNTIME_PROFILES_YAML = Path("/etc/kai/runtime-profiles.yaml")
 _DEPLOYED_ENV_FILE = Path("/etc/kai/env")
 
 # Default installation paths
@@ -868,6 +874,8 @@ def _protected_user_assignments(users_yaml_path: Path) -> list[tuple[int, str, s
         if not isinstance(entry, dict):
             continue
         raw_id = entry.get("telegram_id")
+        if not isinstance(raw_id, (int, str)):
+            continue
         try:
             if isinstance(raw_id, bool):
                 raise ValueError
@@ -889,6 +897,155 @@ def _protected_user_assignments(users_yaml_path: Path) -> list[tuple[int, str, s
             raise ValueError(f"Invalid os_user {os_user!r} in {users_yaml_path}: must match {_OS_USER_RE.pattern}")
         assignments.append((telegram_id, name, os_user))
     return assignments
+
+
+def _build_migrated_runtime_profiles(
+    users_yaml_path: Path,
+    env: dict[str, str],
+    *,
+    service_user: str,
+) -> str:
+    """Render the deterministic first protected runtime-policy document.
+
+    Existing configured humans retain the exact opaque profile IDs and
+    integer compatibility keys already persisted by Workshop. This is a
+    one-time migration source only: once installed, runtime-profiles.yaml is
+    protected operator policy and is never regenerated from users.yaml.
+    """
+    raw = _read_users_yaml_text(users_yaml_path)
+    if raw is None:
+        raise ValueError(f"Protected users.yaml is missing or unreadable: {users_yaml_path}")
+    try:
+        document = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Protected users.yaml is malformed: {users_yaml_path}: {exc}") from exc
+    entries = document.get("users") if isinstance(document, dict) else None
+    if not isinstance(entries, list):
+        raise ValueError(f"Protected users.yaml must contain a 'users' list: {users_yaml_path}")
+
+    default_backend = _resolve_install_default_backend(env, _discover_backend_commands(service_user))
+    default_provider = str(env.get("DEFAULT_PROVIDER") or "").strip().lower()
+    profiles: dict[str, dict[str, object]] = {}
+    seen: set[int] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        raw_id = entry.get("telegram_id")
+        if isinstance(raw_id, bool) or not isinstance(raw_id, (int, str)):
+            continue
+        try:
+            runtime_config_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        display_name = str(entry.get("name") or "").strip()
+        role = str(entry.get("role", "user")).strip().lower()
+        if runtime_config_id <= 0 or not display_name or role not in _VALID_ROLES or runtime_config_id in seen:
+            continue
+        seen.add(runtime_config_id)
+        backend = str(entry.get("backend") or default_backend).strip().lower()
+        provider = str(entry.get("provider") or default_provider).strip().lower()
+        if backend == "claude":
+            provider = "anthropic"
+        elif backend == "codex":
+            provider = "openai"
+        profile_id = runtime_profile_id_for_config_id(runtime_config_id)
+        profile: dict[str, object] = {
+            "display_name": display_name,
+            "compatibility_runtime_config_id": runtime_config_id,
+            "backend": backend,
+            "provider": provider,
+        }
+        raw_os_user = entry.get("os_user")
+        if raw_os_user is not None and str(raw_os_user).strip():
+            profile["os_user"] = str(raw_os_user).strip()
+        profiles[str(profile_id)] = profile
+    return yaml.safe_dump(
+        {"version": 1, "runtime_profiles": profiles},
+        sort_keys=False,
+        default_flow_style=False,
+    )
+
+
+def _runtime_policy_apply_plan(
+    service_user: str,
+    env: dict[str, str],
+    users_yaml_path: Path,
+) -> tuple[str, str, WorkshopRuntimeProfileRegistry]:
+    """Validate existing policy or prepare the one-time migration before apply."""
+    registry_entries = _backend_registry_entries(service_user, env, users_yaml_path)
+    migrated_content = _build_migrated_runtime_profiles(
+        users_yaml_path,
+        env,
+        service_user=service_user,
+    )
+    if RUNTIME_PROFILES_YAML.is_file():
+        try:
+            content = RUNTIME_PROFILES_YAML.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ValueError(f"Could not read protected runtime policy {RUNTIME_PROFILES_YAML}: {exc}") from exc
+        action = "preserve"
+    else:
+        content = migrated_content
+        action = "initialize"
+    try:
+        profiles = WorkshopRuntimeProfileRegistry.from_yaml(
+            content,
+            backend_registry=registry_entries,
+        )
+    except WorkshopRuntimeProfileError as exc:
+        raise ValueError(f"Protected runtime policy is invalid: {exc}") from exc
+    missing = [
+        runtime_config_id
+        for runtime_config_id, _name, _os_user in _protected_user_assignments(users_yaml_path)
+        if not _runtime_policy_has_config_id(profiles, runtime_config_id)
+    ]
+    if missing:
+        rendered = ", ".join(str(item) for item in missing)
+        raise ValueError(
+            f"Protected runtime policy has no preserved profile for configured compatibility key(s): {rendered}"
+        )
+    expected_profiles = WorkshopRuntimeProfileRegistry.from_yaml(
+        migrated_content,
+        backend_registry=registry_entries,
+    )
+    for expected in expected_profiles.profiles:
+        actual = profiles.for_config_id(expected.runtime_config_id)
+        if (actual.backend, actual.provider, actual.os_user) != (
+            expected.backend,
+            expected.provider,
+            expected.os_user,
+        ):
+            raise ValueError(
+                f"Protected runtime profile {actual.profile_id} conflicts with users.yaml fields still required "
+                "for compatibility provisioning; update both protected documents together during Milestone 1"
+            )
+    return action, content, profiles
+
+
+def _runtime_policy_has_config_id(
+    profiles: WorkshopRuntimeProfileRegistry,
+    runtime_config_id: int,
+) -> bool:
+    try:
+        profiles.for_config_id(runtime_config_id)
+    except WorkshopRuntimeProfileError:
+        return False
+    return True
+
+
+def _apply_runtime_policy(action: str, content: str, dry_run: bool) -> None:
+    """Install or secure the already-validated protected runtime policy."""
+    if dry_run:
+        verb = "initialize" if action == "initialize" else "secure existing"
+        print(f"[DRY RUN] Would {verb}: {RUNTIME_PROFILES_YAML} (mode 0600, root-owned)")
+        return
+    if action == "initialize":
+        RUNTIME_PROFILES_YAML.write_text(content, encoding="utf-8")
+        print(f"  Initialized {RUNTIME_PROFILES_YAML}")
+    os.chmod(RUNTIME_PROFILES_YAML, 0o600)
+    os.chown(RUNTIME_PROFILES_YAML, 0, 0)
+    if action == "preserve":
+        print(f"  Secured existing {RUNTIME_PROFILES_YAML} (mode 0600, root-owned)")
 
 
 def _validate_protected_users_yaml(
@@ -3164,6 +3321,7 @@ def _generate_sudoers(
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/workspaces.yaml
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/memory-projects.yaml
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/backends.yaml
+        {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/runtime-profiles.yaml
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/totp.secret
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/totp.attempts
         {service_user} ALL=(root) NOPASSWD: {tee_path} /etc/kai/totp.attempts
@@ -5101,6 +5259,20 @@ def _cmd_apply() -> None:
         valid_list = ", ".join(valid_models) or "(no curated list)"
         raise SystemExit(f"{msg} {remedy} Valid models: {valid_list}")
 
+    # Resolve and validate the protected runtime-policy transition before
+    # stopping a healthy service. Existing policy is preserved verbatim;
+    # absence produces the deterministic one-time users.yaml migration.
+    try:
+        runtime_policy_action, runtime_policy_content, _runtime_policy = _runtime_policy_apply_plan(
+            service_user,
+            env,
+            effective_users_yaml,
+        )
+    except ValueError as exc:
+        raise SystemExit(
+            f"Protected runtime policy preflight failed; no installation changes were made:\n{exc}"
+        ) from exc
+
     dry_run = os.environ.get("DRY_RUN", "").strip() in ("1", "true", "yes")
     if dry_run:
         print("[DRY RUN] No changes will be made.\n")
@@ -5221,6 +5393,9 @@ def _cmd_apply() -> None:
 
         # -- Step 6: Deploy installed backend registry --
         _apply_backend_registry(service_user, env, dry_run, users_yaml_path=effective_users_yaml)
+
+        # -- Step 6b: Deploy independent protected runtime policy --
+        _apply_runtime_policy(runtime_policy_action, runtime_policy_content, dry_run)
 
         # -- Step 7: Deploy Goose config (if any goose-backed user) --
         # The function gates itself: global DEFAULT_BACKEND=goose or a
@@ -7177,6 +7352,7 @@ def _cmd_status() -> None:
     print(_check_path(Path(data_dir), "Data"))
     print(_check_path(_DEPLOYED_ENV_FILE, "Secrets"))
     print(_check_path(Path("/etc/kai/services.yaml"), "Services"))
+    print(_check_path(RUNTIME_PROFILES_YAML, "Runtime profiles"))
     print(_check_path(Path("/etc/sudoers.d/kai"), "Sudoers"))
     print(_check_service_status(platform))
     print(_deployed_webhook_secret_migration_status(_DEPLOYED_ENV_FILE))
@@ -7184,6 +7360,8 @@ def _cmd_status() -> None:
         print("Webhook secret migration (install.conf artifact): unavailable")
     else:
         print(_webhook_secret_migration_status(conf_env, source="install.conf artifact"))
+
+    print(_runtime_policy_status(RUNTIME_PROFILES_YAML, BACKENDS_YAML))
 
     expected_humans: int | None = None
     if os.geteuid() == 0:
@@ -7227,6 +7405,26 @@ def _cmd_status() -> None:
                 version = line.split("=")[1].strip().strip('"').strip("'")
                 print(f"Version: {version}")
                 break
+
+
+def _runtime_policy_status(policy_path: Path, backend_registry_path: Path) -> str:
+    """Return a non-secret diagnostic for the protected runtime policy."""
+    prefix = "Workshop runtime policy:"
+    if not policy_path.is_file():
+        return f"{prefix} missing"
+    try:
+        content = policy_path.read_text(encoding="utf-8")
+        backend_document = yaml.safe_load(backend_registry_path.read_text(encoding="utf-8"))
+        raw_backends = backend_document.get("backends") if isinstance(backend_document, dict) else None
+        backend_ids = raw_backends if isinstance(raw_backends, dict) else {}
+        profiles = WorkshopRuntimeProfileRegistry.from_yaml(
+            content,
+            backend_registry=backend_ids,
+        )
+    except (OSError, yaml.YAMLError, WorkshopRuntimeProfileError) as exc:
+        return f"{prefix} INVALID ({type(exc).__name__})"
+    backends = ",".join(sorted({profile.backend for profile in profiles.profiles}))
+    return f"{prefix} initialized; profiles={len(profiles.profiles)}, backends={backends}"
 
 
 def _webhook_secret_migration_status(env: dict[str, str], *, source: str = "install.conf artifact") -> str:

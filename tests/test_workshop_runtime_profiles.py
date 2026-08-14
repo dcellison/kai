@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from kai.config import Config, UserConfig
@@ -10,6 +12,7 @@ from kai.workshop.runtime_profiles import (
     ProtectedRuntimeProfile,
     WorkshopRuntimeProfileError,
     WorkshopRuntimeProfileRegistry,
+    compatibility_runtime_config_id_for_profile_id,
     runtime_profile_id_for_config_id,
 )
 
@@ -82,3 +85,243 @@ def test_registry_rejects_duplicate_configuration_authority():
 
     with pytest.raises(WorkshopRuntimeProfileError, match="Duplicate runtime profile ID"):
         WorkshopRuntimeProfileRegistry((profile, profile))
+
+
+def test_document_preserves_migrated_profile_identity_and_compatibility_key():
+    profile_id = runtime_profile_id_for_config_id(101)
+    registry = WorkshopRuntimeProfileRegistry.from_document(
+        {
+            "version": 1,
+            "runtime_profiles": {
+                str(profile_id): {
+                    "display_name": "Daniel coding",
+                    "compatibility_runtime_config_id": 101,
+                    "os_user": "daniel",
+                    "backend": "codex",
+                    "provider": "openai",
+                }
+            },
+        },
+        backend_registry={"codex": object()},
+    )
+
+    profile = registry.resolve(profile_id)
+    assert profile.profile_id == profile_id
+    assert profile.runtime_config_id == 101
+    assert profile.os_user == "daniel"
+    assert profile.backend == "codex"
+    assert profile.provider == "openai"
+
+
+def test_non_telegram_profile_derives_stable_private_compatibility_key():
+    profile_id = RuntimeProfileId("rtp_11111111111111111111111111111111")
+    first = WorkshopRuntimeProfileRegistry.from_document(
+        {
+            "version": 1,
+            "runtime_profiles": {
+                str(profile_id): {
+                    "display_name": "Browser-only coding",
+                    "backend": "pi",
+                    "provider": "openai-codex",
+                }
+            },
+        },
+        backend_registry={"pi": object()},
+    )
+    second = WorkshopRuntimeProfileRegistry.from_document(
+        {
+            "version": 1,
+            "runtime_profiles": {
+                str(profile_id): {
+                    "display_name": "Browser-only coding",
+                    "backend": "pi",
+                    "provider": "openai-codex",
+                }
+            },
+        },
+        backend_registry={"pi": object()},
+    )
+
+    expected = compatibility_runtime_config_id_for_profile_id(profile_id)
+    assert first.resolve(profile_id).runtime_config_id == expected
+    assert second.resolve(profile_id).runtime_config_id == expected
+    assert expected > 0
+
+
+@pytest.mark.parametrize(
+    ("backend", "provider"),
+    (
+        ("claude", "anthropic"),
+        ("codex", "openai"),
+        ("goose", "openai"),
+        ("opencode", "anthropic"),
+        ("pi", "openai-codex"),
+    ),
+)
+def test_document_accepts_each_registered_backend_without_priority(backend, provider):
+    profile_id = RuntimeProfileId("rtp_22222222222222222222222222222222")
+    registry = WorkshopRuntimeProfileRegistry.from_document(
+        {
+            "version": 1,
+            "runtime_profiles": {
+                str(profile_id): {
+                    "display_name": f"{backend} runtime",
+                    "backend": backend,
+                    "provider": provider,
+                }
+            },
+        },
+        backend_registry={backend: object()},
+    )
+
+    assert registry.resolve(profile_id).backend == backend
+
+
+def test_document_rejects_backend_absent_from_protected_registry():
+    profile_id = RuntimeProfileId("rtp_33333333333333333333333333333333")
+
+    with pytest.raises(WorkshopRuntimeProfileError, match="not present in the backend registry"):
+        WorkshopRuntimeProfileRegistry.from_document(
+            {
+                "version": 1,
+                "runtime_profiles": {
+                    str(profile_id): {
+                        "display_name": "Unavailable runtime",
+                        "backend": "codex",
+                        "provider": "openai",
+                    }
+                },
+            },
+            backend_registry={"pi": object()},
+        )
+
+
+def test_document_rejects_provider_not_supported_by_backend():
+    profile_id = RuntimeProfileId("rtp_34343434343434343434343434343434")
+
+    with pytest.raises(WorkshopRuntimeProfileError, match=r"provider .* is not valid"):
+        WorkshopRuntimeProfileRegistry.from_document(
+            {
+                "version": 1,
+                "runtime_profiles": {
+                    str(profile_id): {
+                        "display_name": "Invalid provider",
+                        "backend": "goose",
+                        "provider": "not-a-provider",
+                    }
+                },
+            },
+            backend_registry={"goose": object()},
+        )
+
+
+def test_document_rejects_invalid_os_user():
+    profile_id = RuntimeProfileId("rtp_35353535353535353535353535353535")
+
+    with pytest.raises(WorkshopRuntimeProfileError, match="os_user is invalid"):
+        WorkshopRuntimeProfileRegistry.from_document(
+            {
+                "version": 1,
+                "runtime_profiles": {
+                    str(profile_id): {
+                        "display_name": "Invalid OS user",
+                        "os_user": "../../root",
+                        "backend": "codex",
+                        "provider": "openai",
+                    }
+                },
+            },
+            backend_registry={"codex": object()},
+        )
+
+
+@pytest.mark.parametrize(
+    "document, message",
+    (
+        ({}, "version"),
+        ({"version": 1, "runtime_profiles": {}}, "non-empty"),
+        (
+            {
+                "version": 1,
+                "runtime_profiles": {
+                    "rtp_44444444444444444444444444444444": {
+                        "display_name": "No provider",
+                        "backend": "goose",
+                    }
+                },
+            },
+            "provider is required",
+        ),
+    ),
+)
+def test_document_fails_closed_on_incomplete_policy(document, message):
+    with pytest.raises(WorkshopRuntimeProfileError, match=message):
+        WorkshopRuntimeProfileRegistry.from_document(document, backend_registry={"goose": object()})
+
+
+def test_explicit_policy_file_is_loaded_instead_of_config_projection(tmp_path, monkeypatch):
+    profile_id = RuntimeProfileId("rtp_55555555555555555555555555555555")
+    policy = tmp_path / "runtime-profiles.yaml"
+    policy.write_text(
+        """version: 1
+runtime_profiles:
+  rtp_55555555555555555555555555555555:
+    display_name: Browser runtime
+    backend: pi
+    provider: openai-codex
+"""
+    )
+    monkeypatch.setattr(
+        "kai.workshop.runtime_profiles.load_backend_registry",
+        lambda: {"pi": object()},
+    )
+
+    config = Config(
+        telegram_bot_token="test",
+        allowed_user_ids=set(),
+        default_backend="codex",
+        default_provider="openai",
+        default_model="gpt-5.6-sol",
+        user_configs={},
+    )
+    registry = WorkshopRuntimeProfileRegistry.load(config, path=policy)
+
+    assert registry.resolve(profile_id).display_name == "Browser runtime"
+    with pytest.raises(WorkshopRuntimeProfileError, match="protected operator policy"):
+        registry.resolve(runtime_profile_id_for_config_id(101))
+
+
+def test_loaded_policy_fails_when_migrated_execution_fields_drift(tmp_path, monkeypatch):
+    profile_id = runtime_profile_id_for_config_id(101)
+    policy = tmp_path / "runtime-profiles.yaml"
+    policy.write_text(
+        f"""version: 1
+runtime_profiles:
+  {profile_id}:
+    display_name: Daniel
+    compatibility_runtime_config_id: 101
+    os_user: daniel
+    backend: claude
+    provider: anthropic
+"""
+    )
+    monkeypatch.setattr(
+        "kai.workshop.runtime_profiles.load_backend_registry",
+        lambda: {"claude": object(), "codex": object()},
+    )
+
+    with pytest.raises(WorkshopRuntimeProfileError, match=r"conflicts with the migrated users\.yaml"):
+        WorkshopRuntimeProfileRegistry.load(_config(), path=policy)
+
+
+def test_uninstalled_development_without_policy_uses_compatibility_projection(monkeypatch):
+    monkeypatch.delenv("KAI_INSTALL_DIR", raising=False)
+    monkeypatch.delenv("KAI_RUNTIME_PROFILES_YAML", raising=False)
+    monkeypatch.setattr(
+        "kai.workshop.runtime_profiles.runtime_profiles_path",
+        lambda: Path("/definitely/not/a/runtime-policy.yaml"),
+    )
+
+    registry = WorkshopRuntimeProfileRegistry.load(_config())
+
+    assert registry.for_config_id(101).display_name == "Daniel"

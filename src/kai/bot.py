@@ -5406,6 +5406,7 @@ def create_bot(
     pool = SubprocessPool(
         config=config,
         services_info=services.get_available_services(),
+        runtime_profiles=runtime_profiles,
     )
     app.bot_data["pool"] = pool
     workshop_runtime_pool = WorkshopRuntimePool(

@@ -21,6 +21,7 @@ import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from kai import sessions
 from kai.backend import AgentBackend, StreamEvent, require_backend_name, resolve_home_workspace
@@ -39,6 +40,9 @@ from kai.config import (
 from kai.goose import GooseBackend
 from kai.internal_api_auth import InternalAPIAuth
 from kai.workspace_utils import is_workspace_allowed
+
+if TYPE_CHECKING:
+    from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
 
 log = logging.getLogger(__name__)
 
@@ -135,14 +139,21 @@ class SubprocessPool:
         *,
         config: Config,
         services_info: list[dict],
+        runtime_profiles: WorkshopRuntimeProfileRegistry | None = None,
     ):
         self._config = config
+        self._runtime_profiles = runtime_profiles
         available_service_names = {
             service["name"] for service in services_info if isinstance(service.get("name"), str) and service["name"]
         }
         allowed_services_by_user: dict[int, frozenset[str]] = {}
         self._services_info_by_user: dict[int, list[dict]] = {}
-        for chat_id in config.allowed_user_ids:
+        runtime_config_ids = (
+            {profile.runtime_config_id for profile in runtime_profiles.profiles}
+            if runtime_profiles is not None
+            else config.allowed_user_ids
+        )
+        for chat_id in runtime_config_ids:
             user = config.get_user_config(chat_id)
             requested = frozenset(user.allowed_services if user else [])
             unavailable = requested - available_service_names
@@ -166,7 +177,7 @@ class SubprocessPool:
         # it creates every persistent backend; webhook.start() receives this
         # same object through bot_data so credential resolution cannot drift.
         self._internal_api_auth = InternalAPIAuth.for_users(
-            config.allowed_user_ids,
+            runtime_config_ids,
             allowed_services_by_user=allowed_services_by_user,
         )
         self._pool: dict[int, AgentBackend] = {}
@@ -228,6 +239,9 @@ class SubprocessPool:
         in _apply_user_db_settings() since they require async DB access.
         """
         user = self._config.get_user_config(chat_id)
+        protected_profile = (
+            self._runtime_profiles.for_config_id(chat_id) if self._runtime_profiles is not None else None
+        )
 
         # Resolve through the single backend.resolve_home_workspace
         # helper: users.yaml override first, else DATA_DIR/home/<principal_id>/.
@@ -244,7 +258,11 @@ class SubprocessPool:
         # cascade bot.py and the install-time validator use. Without
         # this, a per-user backend differing from the global backend can
         # inherit an incompatible global model.
-        backend, effective_provider = get_user_backend_and_provider(user, self._config)
+        if protected_profile is not None:
+            backend = protected_profile.backend
+            effective_provider = protected_profile.provider
+        else:
+            backend, effective_provider = get_user_backend_and_provider(user, self._config)
         if backend not in VALID_BACKENDS:
             raise RuntimeError(f"Cannot create backend instance for unsupported backend {backend!r}")
         # get_effective_provider hardcodes the backend->provider rule for
@@ -311,7 +329,7 @@ class SubprocessPool:
         # opencode auth.json via `opencode auth login` run as that
         # user); the `sudo -H` wrap each backend applies is what
         # points the subprocess at the right home.
-        os_user = user.os_user if user else None
+        os_user = protected_profile.os_user if protected_profile is not None else user.os_user if user else None
 
         # Backend selection is explicit. No branch may substitute a
         # different backend for a missing or unknown identifier.

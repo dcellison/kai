@@ -306,7 +306,7 @@ def _start() -> None:
         # Notification groups are outbound-only channels: they share existing
         # principals but never create an inbound identity or alter live GitHub
         # routing through this migration.
-        runtime_profiles = WorkshopRuntimeProfileRegistry.from_config(config)
+        runtime_profiles = WorkshopRuntimeProfileRegistry.load(config)
         workshop_bootstrap = await sessions.bootstrap_workshop_foundation(
             _workshop_bootstrap_humans(config, runtime_profiles),
             notification_channels=await _workshop_bootstrap_notification_channels(config),

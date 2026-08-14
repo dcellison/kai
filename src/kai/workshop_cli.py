@@ -253,16 +253,16 @@ async def _run(args: argparse.Namespace) -> int:
                 print("Runtime access: not assigned")
                 return 0
             if args.action == "list-runtime-profiles":
-                profiles = WorkshopRuntimeProfileRegistry.from_config(load_config()).profiles
+                profiles = WorkshopRuntimeProfileRegistry.load(load_config()).profiles
                 for profile in profiles:
                     print(f"Runtime profile: {profile.profile_id}")
-                    print(f"Configured user: {profile.display_name}")
+                    print(f"Runtime name: {profile.display_name}")
                     print(f"OS user: {profile.os_user or 'Kai service account'}")
                     print(f"Backend: {profile.backend}")
                     print(f"Provider: {profile.provider}")
                 return 0
             if args.action == "assign-runtime":
-                profiles = WorkshopRuntimeProfileRegistry.from_config(load_config())
+                profiles = WorkshopRuntimeProfileRegistry.load(load_config())
                 assignment = await WorkshopRuntimeAssignmentService(store, profiles).assign(
                     _principal_id(args.principal_id),
                     _channel_id(args.channel_id),

@@ -9,9 +9,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kai.backend import AgentResponse, StreamEvent
+from kai.config import Config, UserConfig
 from kai.workshop.domain import RuntimeProfileId
 from kai.workshop.runtime_pool import WorkshopRuntimePool
-from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError
+from kai.workshop.runtime_profiles import (
+    ProtectedRuntimeProfile,
+    WorkshopRuntimeProfileError,
+    WorkshopRuntimeProfileRegistry,
+)
 from tests.workshop_profiles import profile_id, profile_registry
 
 
@@ -62,3 +67,74 @@ def test_profile_facade_does_not_expose_transport_named_methods():
 
     assert not hasattr(profiles, "chat_id")
     assert not hasattr(profiles, "telegram_user_id")
+
+
+def test_protected_profile_selects_backend_and_os_user_over_compatibility_config():
+    from kai.pool import SubprocessPool
+
+    config = Config(
+        telegram_bot_token="test",
+        allowed_user_ids={111},
+        default_backend="claude",
+        default_model="sonnet",
+        user_configs={
+            111: UserConfig(
+                telegram_id=111,
+                name="Alice",
+                backend="claude",
+                os_user="legacy-user",
+            )
+        },
+    )
+    profiles = WorkshopRuntimeProfileRegistry(
+        (
+            ProtectedRuntimeProfile(
+                profile_id=RuntimeProfileId("rtp_11111111111111111111111111111111"),
+                runtime_config_id=111,
+                display_name="Protected coding runtime",
+                os_user="protected-user",
+                backend="codex",
+                provider="openai",
+            ),
+        )
+    )
+
+    pool = SubprocessPool(config=config, services_info=[], runtime_profiles=profiles)
+    instance = pool.get(111)
+
+    assert instance.backend_name == "codex"
+    assert instance.codex_user == "protected-user"
+
+
+def test_profile_without_telegram_user_receives_runtime_credential(tmp_path, monkeypatch):
+    from kai.pool import SubprocessPool
+
+    runtime_config_id = 987654321012345
+    monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
+    config = Config(
+        telegram_bot_token="test",
+        allowed_user_ids=set(),
+        default_backend="claude",
+        default_model="sonnet",
+        user_configs={},
+    )
+    profiles = WorkshopRuntimeProfileRegistry(
+        (
+            ProtectedRuntimeProfile(
+                profile_id=RuntimeProfileId("rtp_22222222222222222222222222222222"),
+                runtime_config_id=runtime_config_id,
+                display_name="Browser-only runtime",
+                os_user=None,
+                backend="codex",
+                provider="openai",
+            ),
+        )
+    )
+
+    pool = SubprocessPool(config=config, services_info=[], runtime_profiles=profiles)
+    instance = pool.get(runtime_config_id)
+    principal = pool.internal_api_auth.authenticate(instance._api_context.webhook_secret)
+
+    assert instance.backend_name == "codex"
+    assert principal is not None
+    assert principal.chat_id == runtime_config_id

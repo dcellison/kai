@@ -10,7 +10,7 @@ import pytest
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.conversation_commands import WorkshopConversationCommandService
 from kai.workshop.conversation_runs import resolve_canonical_conversation_run
-from kai.workshop.domain import MessageId
+from kai.workshop.domain import MessageId, RuntimeProfileId
 from kai.workshop.human_provisioning import WorkshopHumanProvisioner
 from kai.workshop.inbound import ClientInboundMessage
 from kai.workshop.projection import CanonicalConversationProjection
@@ -19,7 +19,7 @@ from kai.workshop.runtime_assignments import (
     WorkshopRuntimeAssignmentService,
     resolve_channel_runtime_profile,
 )
-from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError
+from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError, WorkshopRuntimeProfileRegistry
 from kai.workshop.store import WorkshopEventStore
 from tests.workshop_profiles import profile_id, profile_registry
 
@@ -34,6 +34,44 @@ async def _store(path: Path) -> WorkshopEventStore:
 
 
 class TestRuntimeAssignmentPolicy:
+    async def test_non_telegram_policy_profile_can_be_assigned_to_browser_only_human(self, tmp_path: Path):
+        store = await _store(tmp_path / "kai.db")
+        runtime_profile_id = RuntimeProfileId("rtp_99999999999999999999999999999999")
+        profiles = WorkshopRuntimeProfileRegistry.from_document(
+            {
+                "version": 1,
+                "runtime_profiles": {
+                    str(runtime_profile_id): {
+                        "display_name": "Browser coding",
+                        "backend": "codex",
+                        "provider": "openai",
+                    }
+                },
+            },
+            backend_registry={"codex": object()},
+        )
+        try:
+            human = await WorkshopHumanProvisioner(store).provision(
+                "browser-human",
+                "Browser human",
+                "member",
+            )
+
+            assigned = await WorkshopRuntimeAssignmentService(store, profiles).assign(
+                human.principal_id,
+                human.channel_id,
+                runtime_profile_id,
+            )
+
+            assert assigned.runtime_profile_id == runtime_profile_id
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM external_identities WHERE principal_id = ?",
+                (human.principal_id,),
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 0
+        finally:
+            await store.close()
+
     async def test_provisioned_human_gains_runtime_only_after_explicit_assignment(
         self,
         tmp_path: Path,

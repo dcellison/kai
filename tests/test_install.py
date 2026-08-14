@@ -25,12 +25,14 @@ from kai.install import (
     _apply_goose_config,
     _apply_migrate,
     _apply_models,
+    _apply_runtime_policy,
     _apply_secrets,
     _apply_service,
     _apply_source,
     _apply_sudoers,
     _apply_venv,
     _backend_command_trust_issues,
+    _build_migrated_runtime_profiles,
     _check_path,
     _check_service_status,
     _check_traversal,
@@ -59,6 +61,8 @@ from kai.install import (
     _resolve_codex_bin_prompt_default,
     _retire_install_home_claude,
     _retire_install_home_dir,
+    _runtime_policy_apply_plan,
+    _runtime_policy_status,
     _secure_codex_turn_image_staging,
     _secure_history_directories,
     _secure_upload_directories,
@@ -96,6 +100,7 @@ def _isolate_installed_backend_discovery(monkeypatch, tmp_path):
     missing/discovered backend behavior override this fixture locally.
     """
     monkeypatch.setattr("kai.install.BACKENDS_YAML", tmp_path / "absent-backends.yaml")
+    monkeypatch.setattr("kai.install.RUNTIME_PROFILES_YAML", tmp_path / "absent-runtime-profiles.yaml")
     monkeypatch.setattr("kai.install._DEPLOYED_ENV_FILE", tmp_path / "absent-env")
     monkeypatch.setattr(
         "kai.install._discover_backend_commands",
@@ -371,6 +376,7 @@ class TestGenerateSudoers:
         assert f"{cat_path} /etc/kai/services.yaml" in result
         assert f"{cat_path} /etc/kai/users.yaml" in result
         assert f"{cat_path} /etc/kai/workspaces.yaml" in result
+        assert f"{cat_path} /etc/kai/runtime-profiles.yaml" in result
         assert f"{cat_path} /etc/kai/memory-projects.yaml" in result
         assert f"{cat_path} /etc/kai/backends.yaml" in result
         assert f"{cat_path} /etc/kai/totp.secret" in result
@@ -3809,6 +3815,7 @@ class TestCmdApplyDefaultModelGate:
             "_apply_models",
             "_apply_secrets",
             "_apply_backend_registry",
+            "_apply_runtime_policy",
             "_apply_goose_config",
             "_apply_sudoers",
             "_apply_migrate",
@@ -8253,6 +8260,154 @@ class TestApplySecretsDryRun:
         assert f"{project / 'services.yaml'} -> /etc/kai/services.yaml" not in output
 
 
+class TestIndependentRuntimePolicy:
+    def test_migration_preserves_existing_profile_ids_and_backend_choices(self, tmp_path, monkeypatch):
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text(
+            """users:
+  - telegram_id: 101
+    name: Daniel
+    role: admin
+    os_user: daniel
+    backend: codex
+  - telegram_id: 202
+    name: Scott
+    role: user
+    os_user: sellison
+    backend: claude
+"""
+        )
+        monkeypatch.setattr(
+            "kai.install._discover_backend_commands",
+            lambda _service_user: {"codex": "/usr/local/bin/codex", "claude": "/usr/local/bin/claude"},
+        )
+
+        rendered = _build_migrated_runtime_profiles(
+            users_yaml,
+            {"DEFAULT_BACKEND": "codex", "DEFAULT_PROVIDER": "openai"},
+            service_user="kai",
+        )
+        document = yaml.safe_load(rendered)
+
+        daniel_id = str(kai.install.runtime_profile_id_for_config_id(101))
+        scott_id = str(kai.install.runtime_profile_id_for_config_id(202))
+        assert document["version"] == 1
+        assert document["runtime_profiles"][daniel_id] == {
+            "display_name": "Daniel",
+            "compatibility_runtime_config_id": 101,
+            "backend": "codex",
+            "provider": "openai",
+            "os_user": "daniel",
+        }
+        assert document["runtime_profiles"][scott_id]["backend"] == "claude"
+        assert document["runtime_profiles"][scott_id]["provider"] == "anthropic"
+
+    def test_status_reports_only_profile_count_and_backend_ids(self, tmp_path):
+        profile_id = str(kai.install.runtime_profile_id_for_config_id(101))
+        policy = tmp_path / "runtime-profiles.yaml"
+        policy.write_text(
+            yaml.safe_dump(
+                {
+                    "version": 1,
+                    "runtime_profiles": {
+                        profile_id: {
+                            "display_name": "Secret display name",
+                            "compatibility_runtime_config_id": 101,
+                            "backend": "codex",
+                            "provider": "openai",
+                        }
+                    },
+                }
+            )
+        )
+        backends = tmp_path / "backends.yaml"
+        backends.write_text("version: 1\nbackends:\n  codex: {}\n")
+
+        status = _runtime_policy_status(policy, backends)
+
+        assert status == "Workshop runtime policy: initialized; profiles=1, backends=codex"
+        assert "Secret display name" not in status
+        assert "101" not in status
+
+    def test_status_fails_closed_when_policy_references_unregistered_backend(self, tmp_path):
+        profile_id = str(kai.install.runtime_profile_id_for_config_id(101))
+        policy = tmp_path / "runtime-profiles.yaml"
+        policy.write_text(
+            yaml.safe_dump(
+                {
+                    "version": 1,
+                    "runtime_profiles": {
+                        profile_id: {
+                            "display_name": "Daniel",
+                            "compatibility_runtime_config_id": 101,
+                            "backend": "codex",
+                            "provider": "openai",
+                        }
+                    },
+                }
+            )
+        )
+        backends = tmp_path / "backends.yaml"
+        backends.write_text("version: 1\nbackends:\n  pi: {}\n")
+
+        assert _runtime_policy_status(policy, backends).startswith("Workshop runtime policy: INVALID")
+
+    def test_apply_initializes_root_private_policy(self, tmp_path, monkeypatch):
+        policy = tmp_path / "runtime-profiles.yaml"
+        monkeypatch.setattr("kai.install.RUNTIME_PROFILES_YAML", policy)
+        chowned: list[tuple[Path, int, int]] = []
+        monkeypatch.setattr("kai.install.os.chown", lambda path, uid, gid: chowned.append((path, uid, gid)))
+
+        _apply_runtime_policy("initialize", "version: 1\nruntime_profiles: {}\n", dry_run=False)
+
+        assert policy.read_text() == "version: 1\nruntime_profiles: {}\n"
+        assert stat.S_IMODE(policy.stat().st_mode) == 0o600
+        assert chowned == [(policy, 0, 0)]
+
+    def test_apply_preserves_existing_policy_content(self, tmp_path, monkeypatch):
+        policy = tmp_path / "runtime-profiles.yaml"
+        policy.write_text("operator-authored\n")
+        monkeypatch.setattr("kai.install.RUNTIME_PROFILES_YAML", policy)
+        monkeypatch.setattr("kai.install.os.chown", lambda *args: None)
+
+        _apply_runtime_policy("preserve", "replacement-must-not-land\n", dry_run=False)
+
+        assert policy.read_text() == "operator-authored\n"
+
+    def test_existing_policy_must_cover_every_migrated_profile(self, tmp_path, monkeypatch):
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - telegram_id: 101\n    name: Daniel\n    role: admin\n")
+        policy = tmp_path / "runtime-profiles.yaml"
+        other_id = str(kai.install.runtime_profile_id_for_config_id(202))
+        policy.write_text(
+            yaml.safe_dump(
+                {
+                    "version": 1,
+                    "runtime_profiles": {
+                        other_id: {
+                            "display_name": "Other",
+                            "compatibility_runtime_config_id": 202,
+                            "backend": "codex",
+                            "provider": "openai",
+                        }
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr("kai.install.RUNTIME_PROFILES_YAML", policy)
+        monkeypatch.setattr(
+            "kai.install._backend_registry_entries",
+            lambda *args: {"codex": {}},
+        )
+
+        with pytest.raises(ValueError, match="no preserved profile"):
+            _runtime_policy_apply_plan(
+                "kai",
+                {"DEFAULT_BACKEND": "codex", "DEFAULT_PROVIDER": "openai"},
+                users_yaml,
+            )
+
+
 class TestApplyBackendRegistry:
     def test_build_registry_uses_discovered_global_commands(self, monkeypatch):
         monkeypatch.setattr(
@@ -9049,6 +9204,7 @@ class TestCmdApplyStagingHandoff:
         monkeypatch.setattr("kai.install._apply_models", lambda *a, **kw: None)
         monkeypatch.setattr("kai.install._apply_secrets", _fake_apply_secrets)
         monkeypatch.setattr("kai.install._apply_backend_registry", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.install._apply_runtime_policy", lambda *a, **kw: None)
         monkeypatch.setattr("kai.install._apply_sudoers", lambda *a, **kw: None)
         monkeypatch.setattr("kai.install._apply_migrate", lambda *a, **kw: None)
         monkeypatch.setattr("kai.install._apply_service", lambda *a, **kw: None)
@@ -9545,6 +9701,7 @@ class TestCmdApplySingleUserRefuses:
         monkeypatch.setattr("kai.install._apply_models", lambda *a, **kw: None)
         monkeypatch.setattr("kai.install._apply_secrets", lambda *a, **kw: None)
         monkeypatch.setattr("kai.install._apply_backend_registry", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.install._apply_runtime_policy", lambda *a, **kw: None)
         monkeypatch.setattr("kai.install._apply_sudoers", lambda *a, **kw: None)
         monkeypatch.setattr("kai.install._apply_migrate", lambda *a, **kw: None)
         monkeypatch.setattr("kai.install._apply_service", lambda *a, **kw: None)

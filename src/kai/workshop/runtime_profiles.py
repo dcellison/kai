@@ -1,14 +1,28 @@
-"""Protected, transport-neutral Workshop runtime-profile registry."""
+"""Protected, transport-neutral Workshop runtime-profile policy."""
 
 from __future__ import annotations
 
 import hashlib
+import os
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
-from kai.config import Config, get_user_backend_and_provider
+import yaml
+
+from kai.backend_registry import BackendRegistryEntry, load_backend_registry
+from kai.config import BACKEND_PROVIDERS, VALID_BACKENDS, Config, _read_protected_file, get_user_backend_and_provider
 from kai.workshop.domain import RuntimeProfileId
 
 _PROFILE_DERIVATION_DOMAIN = b"kai-workshop-runtime-profile:v1\0"
+_COMPATIBILITY_KEY_DERIVATION_DOMAIN = b"kai-workshop-runtime-compatibility-key:v1\0"
+
+DEFAULT_RUNTIME_PROFILES_YAML = Path("/etc/kai/runtime-profiles.yaml")
+RUNTIME_PROFILES_YAML_ENV = "KAI_RUNTIME_PROFILES_YAML"
+INSTALL_DIR_ENV = "KAI_INSTALL_DIR"
+_OS_USER_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 
 
 class WorkshopRuntimeProfileError(RuntimeError):
@@ -21,8 +35,9 @@ class ProtectedRuntimeProfile:
 
     ``runtime_config_id`` is deliberately private compatibility state. The
     current host runtime still stores settings, files, memory, and subprocess
-    instances under the configured-user integer key. Canonical Workshop
-    assignments and callers see only ``profile_id``.
+    instances under an integer key. It is not a transport identity and new
+    profiles derive it from the opaque profile ID. Canonical Workshop callers
+    see only ``profile_id``.
     """
 
     profile_id: RuntimeProfileId
@@ -34,11 +49,52 @@ class ProtectedRuntimeProfile:
 
 
 def runtime_profile_id_for_config_id(runtime_config_id: int) -> RuntimeProfileId:
-    """Derive a stable opaque profile ID from protected configured-user state."""
+    """Derive the preserved profile ID for one migrated configured user."""
     if isinstance(runtime_config_id, bool) or not isinstance(runtime_config_id, int) or runtime_config_id <= 0:
         raise WorkshopRuntimeProfileError("Runtime configuration ID must be a positive integer")
     digest = hashlib.sha256(_PROFILE_DERIVATION_DOMAIN + str(runtime_config_id).encode("ascii")).hexdigest()[:32]
     return RuntimeProfileId(f"rtp_{digest}")
+
+
+def compatibility_runtime_config_id_for_profile_id(profile_id: RuntimeProfileId) -> int:
+    """Derive non-transport compatibility storage for a new profile.
+
+    The high bit remains clear so the result fits SQLite's signed INTEGER.
+    Existing migrated profiles carry their former positive key explicitly;
+    newly authored profiles need no Telegram-shaped value.
+    """
+    digest = hashlib.sha256(_COMPATIBILITY_KEY_DERIVATION_DOMAIN + str(profile_id).encode("ascii")).digest()
+    return int.from_bytes(digest[:8], "big") & ((1 << 63) - 1) or 1
+
+
+def runtime_profiles_path() -> Path:
+    """Return the configured protected runtime-policy path."""
+    override = os.environ.get(RUNTIME_PROFILES_YAML_ENV, "").strip()
+    return Path(override) if override else DEFAULT_RUNTIME_PROFILES_YAML
+
+
+def _positive_compatibility_key(value: object, *, profile_id: RuntimeProfileId) -> int:
+    if value is None:
+        return compatibility_runtime_config_id_for_profile_id(profile_id)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise WorkshopRuntimeProfileError(
+            f"Runtime profile {profile_id}: compatibility_runtime_config_id must be a positive integer"
+        )
+    return value
+
+
+def _policy_text(path: Path) -> str:
+    """Read an explicit/dev file directly or the canonical protected file via sudo."""
+    canonical = path == DEFAULT_RUNTIME_PROFILES_YAML and not os.environ.get(RUNTIME_PROFILES_YAML_ENV, "").strip()
+    if canonical:
+        content = _read_protected_file(str(path))
+        if content is None:
+            raise WorkshopRuntimeProfileError(f"Protected runtime policy {path} is missing or unreadable")
+        return content
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise WorkshopRuntimeProfileError(f"Could not read runtime policy {path}: {exc}") from exc
 
 
 class WorkshopRuntimeProfileRegistry:
@@ -53,7 +109,7 @@ class WorkshopRuntimeProfileRegistry:
             if profile.profile_id in by_id:
                 raise WorkshopRuntimeProfileError("Duplicate runtime profile ID")
             if profile.runtime_config_id in by_config_id:
-                raise WorkshopRuntimeProfileError("Duplicate runtime configuration ID")
+                raise WorkshopRuntimeProfileError("Duplicate runtime compatibility configuration ID")
             by_id[profile.profile_id] = profile
             by_config_id[profile.runtime_config_id] = profile
         if not by_id:
@@ -63,6 +119,11 @@ class WorkshopRuntimeProfileRegistry:
 
     @classmethod
     def from_config(cls, config: Config) -> WorkshopRuntimeProfileRegistry:
+        """Build the development-only compatibility projection.
+
+        Protected startup uses :meth:`load`; this constructor remains useful
+        for direct/dev runs and focused tests with no installed policy file.
+        """
         profiles: list[ProtectedRuntimeProfile] = []
         for runtime_config_id, user in sorted(config.user_configs.items()):
             if user.telegram_id != runtime_config_id:
@@ -79,6 +140,122 @@ class WorkshopRuntimeProfileRegistry:
                 )
             )
         return cls(tuple(profiles))
+
+    @classmethod
+    def from_document(
+        cls,
+        document: object,
+        *,
+        backend_registry: Mapping[str, BackendRegistryEntry | object] | None = None,
+    ) -> WorkshopRuntimeProfileRegistry:
+        """Parse and validate one versioned runtime-policy document."""
+        if not isinstance(document, dict):
+            raise WorkshopRuntimeProfileError("Runtime policy must be a YAML mapping")
+        if document.get("version") != 1:
+            raise WorkshopRuntimeProfileError("Runtime policy version must be 1")
+        raw_profiles = document.get("runtime_profiles")
+        if not isinstance(raw_profiles, dict) or not raw_profiles:
+            raise WorkshopRuntimeProfileError("Runtime policy must contain a non-empty runtime_profiles mapping")
+
+        installed = backend_registry
+        profiles: list[ProtectedRuntimeProfile] = []
+        for raw_profile_id, raw_profile in raw_profiles.items():
+            try:
+                profile_id = RuntimeProfileId(str(raw_profile_id))
+            except (TypeError, ValueError) as exc:
+                raise WorkshopRuntimeProfileError(f"Invalid runtime profile ID {raw_profile_id!r}") from exc
+            if not isinstance(raw_profile, dict):
+                raise WorkshopRuntimeProfileError(f"Runtime profile {profile_id} must be a mapping")
+            display_name = str(raw_profile.get("display_name") or "").strip()
+            if not display_name:
+                raise WorkshopRuntimeProfileError(f"Runtime profile {profile_id}: display_name is required")
+            backend = str(raw_profile.get("backend") or "").strip().lower()
+            if backend not in VALID_BACKENDS:
+                raise WorkshopRuntimeProfileError(f"Runtime profile {profile_id}: unsupported backend {backend!r}")
+            if installed is not None and backend not in installed:
+                raise WorkshopRuntimeProfileError(
+                    f"Runtime profile {profile_id}: backend {backend!r} is not present in the backend registry"
+                )
+            provider = str(raw_profile.get("provider") or "").strip().lower()
+            if backend == "claude":
+                provider = "anthropic"
+            elif backend == "codex":
+                provider = "openai"
+            elif not provider:
+                raise WorkshopRuntimeProfileError(
+                    f"Runtime profile {profile_id}: provider is required for backend {backend!r}"
+                )
+            if provider not in BACKEND_PROVIDERS[backend]:
+                allowed = ", ".join(BACKEND_PROVIDERS[backend])
+                raise WorkshopRuntimeProfileError(
+                    f"Runtime profile {profile_id}: provider {provider!r} is not valid for backend {backend!r}; "
+                    f"expected one of: {allowed}"
+                )
+            raw_os_user = raw_profile.get("os_user")
+            os_user = None if raw_os_user is None else str(raw_os_user).strip() or None
+            if os_user is not None and _OS_USER_RE.fullmatch(os_user) is None:
+                raise WorkshopRuntimeProfileError(f"Runtime profile {profile_id}: os_user is invalid")
+            profiles.append(
+                ProtectedRuntimeProfile(
+                    profile_id=profile_id,
+                    runtime_config_id=_positive_compatibility_key(
+                        raw_profile.get("compatibility_runtime_config_id"),
+                        profile_id=profile_id,
+                    ),
+                    display_name=display_name,
+                    os_user=os_user,
+                    backend=backend,
+                    provider=provider,
+                )
+            )
+        return cls(tuple(profiles))
+
+    @classmethod
+    def from_yaml(
+        cls,
+        content: str,
+        *,
+        backend_registry: Mapping[str, BackendRegistryEntry | object] | None = None,
+    ) -> WorkshopRuntimeProfileRegistry:
+        try:
+            document: Any = yaml.safe_load(content)
+        except yaml.YAMLError as exc:
+            raise WorkshopRuntimeProfileError(f"Runtime policy is not valid YAML: {exc}") from exc
+        return cls.from_document(document, backend_registry=backend_registry)
+
+    @classmethod
+    def load(
+        cls,
+        config: Config,
+        *,
+        path: Path | None = None,
+    ) -> WorkshopRuntimeProfileRegistry:
+        """Load installed policy, failing closed when protected policy is absent."""
+        policy_path = path or runtime_profiles_path()
+        explicit = path is not None or bool(os.environ.get(RUNTIME_PROFILES_YAML_ENV, "").strip())
+        protected = bool(os.environ.get(INSTALL_DIR_ENV, "").strip())
+        if not policy_path.is_file() and not explicit and not protected:
+            return cls.from_config(config)
+        registry = cls.from_yaml(_policy_text(policy_path), backend_registry=load_backend_registry())
+        registry._validate_compatibility_projection(config)
+        return registry
+
+    def _validate_compatibility_projection(self, config: Config) -> None:
+        """Fail closed while users.yaml still provisions existing OS identities.
+
+        Backend selection is owned by this registry. During Milestone 1,
+        users.yaml still provisions the corresponding OS account, models,
+        workspaces, and service grants for migrated profiles, so the duplicated
+        backend/provider/OS-user fields must agree until those fields move into
+        the independent policy in the next cut.
+        """
+        for runtime_config_id, user in config.user_configs.items():
+            profile = self.for_config_id(runtime_config_id)
+            backend, provider = get_user_backend_and_provider(user, config)
+            if (profile.backend, profile.provider, profile.os_user) != (backend, provider, user.os_user):
+                raise WorkshopRuntimeProfileError(
+                    f"Runtime profile {profile.profile_id} conflicts with the migrated users.yaml execution policy"
+                )
 
     @property
     def profiles(self) -> tuple[ProtectedRuntimeProfile, ...]:
