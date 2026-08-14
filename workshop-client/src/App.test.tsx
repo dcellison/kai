@@ -179,6 +179,9 @@ describe("Workshop React client", () => {
     expect(navigationPanel.querySelector(".sidebar-title")).toHaveTextContent(
       /^Kai Workshop$/,
     );
+    expect(
+      navigationPanel.querySelector(".sidebar-title .overline"),
+    ).toBeVisible();
     expect(navigationPanel.querySelector(".sidebar-header")).not.toHaveTextContent(
       "admin",
     );

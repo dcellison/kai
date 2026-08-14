@@ -387,12 +387,9 @@ button:disabled {
   border-bottom: 1px solid var(--line);
 }
 
-.sidebar-header h1 {
+.sidebar-title .overline {
   overflow: hidden;
   margin: 0;
-  color: var(--atom-foreground-strong);
-  font-size: 0.87rem;
-  font-weight: 680;
   text-overflow: ellipsis;
   white-space: nowrap;
 }

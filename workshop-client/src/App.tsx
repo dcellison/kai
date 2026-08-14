@@ -928,7 +928,7 @@ function WorkshopView({
       >
         <header className="sidebar-header">
           <div className="sidebar-title">
-            <h1>Kai Workshop</h1>
+            <p className="overline">Kai Workshop</p>
           </div>
           <div className="sidebar-header-actions">
             <button
