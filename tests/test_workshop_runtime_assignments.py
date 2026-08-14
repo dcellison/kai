@@ -45,6 +45,8 @@ class TestRuntimeAssignmentPolicy:
                         "display_name": "Browser coding",
                         "backend": "codex",
                         "provider": "openai",
+                        "model": "gpt-5.5",
+                        "timeout_seconds": 120,
                     }
                 },
             },

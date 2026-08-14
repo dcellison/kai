@@ -95,6 +95,8 @@ def test_protected_profile_selects_backend_and_os_user_over_compatibility_config
                 os_user="protected-user",
                 backend="codex",
                 provider="openai",
+                model="gpt-5.6-sol",
+                timeout_seconds=345,
             ),
         )
     )
@@ -104,6 +106,8 @@ def test_protected_profile_selects_backend_and_os_user_over_compatibility_config
 
     assert instance.backend_name == "codex"
     assert instance.codex_user == "protected-user"
+    assert instance.model == "gpt-5.6-sol"
+    assert instance.timeout_seconds == 345
 
 
 def test_profile_without_telegram_user_receives_runtime_credential(tmp_path, monkeypatch):
@@ -127,6 +131,8 @@ def test_profile_without_telegram_user_receives_runtime_credential(tmp_path, mon
                 os_user=None,
                 backend="codex",
                 provider="openai",
+                model="gpt-5.6-sol",
+                timeout_seconds=120,
             ),
         )
     )
@@ -161,6 +167,8 @@ def test_negative_group_key_retains_legacy_compatibility_runtime(tmp_path, monke
                 os_user=None,
                 backend="codex",
                 provider="openai",
+                model="gpt-5.6-sol",
+                timeout_seconds=120,
             ),
         )
     )
@@ -196,6 +204,8 @@ def test_positive_configuration_key_without_profile_fails_closed(tmp_path, monke
                 os_user=None,
                 backend="codex",
                 provider="openai",
+                model="gpt-5.6-sol",
+                timeout_seconds=120,
             ),
         )
     )

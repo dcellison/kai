@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from kai.backend_registry import BackendRegistryEntry
 from kai.config import Config, UserConfig
 from kai.workshop.domain import RuntimeProfileId
 from kai.workshop.runtime_profiles import (
@@ -55,9 +56,13 @@ def test_registry_exposes_opaque_stable_profiles_with_protected_policy():
     assert daniel.os_user == "daniel"
     assert daniel.backend == "codex"
     assert daniel.provider == "openai"
+    assert daniel.model == "gpt-5.6-sol"
+    assert daniel.timeout_seconds == 120
     assert scott.os_user == "sellison"
     assert scott.backend == "claude"
     assert scott.provider == "anthropic"
+    assert scott.model == "sonnet"
+    assert scott.timeout_seconds == 120
 
 
 @pytest.mark.parametrize("value", (0, -1, True, "101"))
@@ -81,6 +86,8 @@ def test_registry_rejects_duplicate_configuration_authority():
         "daniel",
         "codex",
         "openai",
+        "gpt-5.6-sol",
+        120,
     )
 
     with pytest.raises(WorkshopRuntimeProfileError, match="Duplicate runtime profile ID"):
@@ -99,6 +106,8 @@ def test_document_preserves_migrated_profile_identity_and_compatibility_key():
                     "os_user": "daniel",
                     "backend": "codex",
                     "provider": "openai",
+                    "model": "gpt-5.6-sol",
+                    "timeout_seconds": 240,
                 }
             },
         },
@@ -111,6 +120,8 @@ def test_document_preserves_migrated_profile_identity_and_compatibility_key():
     assert profile.os_user == "daniel"
     assert profile.backend == "codex"
     assert profile.provider == "openai"
+    assert profile.model == "gpt-5.6-sol"
+    assert profile.timeout_seconds == 240
 
 
 def test_non_telegram_profile_derives_stable_private_compatibility_key():
@@ -123,6 +134,8 @@ def test_non_telegram_profile_derives_stable_private_compatibility_key():
                     "display_name": "Browser-only coding",
                     "backend": "pi",
                     "provider": "openai-codex",
+                    "model": "openai-codex/gpt-5.5",
+                    "timeout_seconds": 120,
                 }
             },
         },
@@ -136,6 +149,8 @@ def test_non_telegram_profile_derives_stable_private_compatibility_key():
                     "display_name": "Browser-only coding",
                     "backend": "pi",
                     "provider": "openai-codex",
+                    "model": "openai-codex/gpt-5.5",
+                    "timeout_seconds": 120,
                 }
             },
         },
@@ -149,16 +164,16 @@ def test_non_telegram_profile_derives_stable_private_compatibility_key():
 
 
 @pytest.mark.parametrize(
-    ("backend", "provider"),
+    ("backend", "provider", "model"),
     (
-        ("claude", "anthropic"),
-        ("codex", "openai"),
-        ("goose", "openai"),
-        ("opencode", "anthropic"),
-        ("pi", "openai-codex"),
+        ("claude", "anthropic", "sonnet"),
+        ("codex", "openai", "gpt-5.5"),
+        ("goose", "openai", "gpt-5.5-pro"),
+        ("opencode", "anthropic", "anthropic/claude-sonnet-4-6"),
+        ("pi", "openai-codex", "openai-codex/gpt-5.5"),
     ),
 )
-def test_document_accepts_each_registered_backend_without_priority(backend, provider):
+def test_document_accepts_each_registered_backend_without_priority(backend, provider, model):
     profile_id = RuntimeProfileId("rtp_22222222222222222222222222222222")
     registry = WorkshopRuntimeProfileRegistry.from_document(
         {
@@ -168,6 +183,8 @@ def test_document_accepts_each_registered_backend_without_priority(backend, prov
                     "display_name": f"{backend} runtime",
                     "backend": backend,
                     "provider": provider,
+                    "model": model,
+                    "timeout_seconds": 120,
                 }
             },
         },
@@ -189,6 +206,8 @@ def test_document_rejects_backend_absent_from_protected_registry():
                         "display_name": "Unavailable runtime",
                         "backend": "codex",
                         "provider": "openai",
+                        "model": "gpt-5.5",
+                        "timeout_seconds": 120,
                     }
                 },
             },
@@ -209,6 +228,8 @@ def test_document_rejects_provider_not_supported_by_backend(backend):
                         "display_name": "Invalid provider",
                         "backend": backend,
                         "provider": "not-a-provider",
+                        "model": "sonnet",
+                        "timeout_seconds": 120,
                     }
                 },
             },
@@ -229,6 +250,8 @@ def test_single_provider_backend_defaults_only_when_provider_is_omitted(backend,
                 str(profile_id): {
                     "display_name": "Single-provider runtime",
                     "backend": backend,
+                    "model": "sonnet" if backend == "claude" else "gpt-5.5",
+                    "timeout_seconds": 120,
                 }
             },
         },
@@ -251,10 +274,71 @@ def test_document_rejects_invalid_os_user():
                         "os_user": "../../root",
                         "backend": "codex",
                         "provider": "openai",
+                        "model": "gpt-5.5",
+                        "timeout_seconds": 120,
                     }
                 },
             },
             backend_registry={"codex": object()},
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("model", None, "model is required"),
+        ("model", "not-a-codex-model", "not valid"),
+        ("timeout_seconds", None, "positive integer"),
+        ("timeout_seconds", 0, "positive integer"),
+        ("timeout_seconds", True, "positive integer"),
+    ),
+)
+def test_document_fails_closed_on_invalid_model_or_timeout(field, value, message):
+    profile_id = RuntimeProfileId("rtp_37373737373737373737373737373737")
+    profile = {
+        "display_name": "Protected runtime",
+        "backend": "codex",
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "timeout_seconds": 120,
+    }
+    if value is None:
+        profile.pop(field)
+    else:
+        profile[field] = value
+
+    with pytest.raises(WorkshopRuntimeProfileError, match=message):
+        WorkshopRuntimeProfileRegistry.from_document(
+            {"version": 1, "runtime_profiles": {str(profile_id): profile}},
+            backend_registry={"codex": object()},
+        )
+
+
+def test_document_enforces_loaded_backend_registry_model_ceiling():
+    profile_id = RuntimeProfileId("rtp_38383838383838383838383838383838")
+    backend = BackendRegistryEntry(
+        id="codex",
+        driver="codex",
+        runtime="local_process",
+        command="/usr/local/bin/codex",
+        allowed_models=("gpt-5.4",),
+    )
+
+    with pytest.raises(WorkshopRuntimeProfileError, match="not valid"):
+        WorkshopRuntimeProfileRegistry.from_document(
+            {
+                "version": 1,
+                "runtime_profiles": {
+                    str(profile_id): {
+                        "display_name": "Disallowed model",
+                        "backend": "codex",
+                        "provider": "openai",
+                        "model": "gpt-5.5",
+                        "timeout_seconds": 120,
+                    }
+                },
+            },
+            backend_registry={"codex": backend},
         )
 
 
@@ -292,6 +376,8 @@ runtime_profiles:
     display_name: Browser runtime
     backend: pi
     provider: openai-codex
+    model: openai-codex/gpt-5.5
+    timeout_seconds: 120
 """
     )
     monkeypatch.setattr(
@@ -326,11 +412,38 @@ runtime_profiles:
     os_user: daniel
     backend: claude
     provider: anthropic
+    model: sonnet
+    timeout_seconds: 120
 """
     )
     monkeypatch.setattr(
         "kai.workshop.runtime_profiles.load_backend_registry",
         lambda: {"claude": object(), "codex": object()},
+    )
+
+    with pytest.raises(WorkshopRuntimeProfileError, match=r"conflicts with the migrated users\.yaml"):
+        WorkshopRuntimeProfileRegistry.load(_config(), path=policy)
+
+
+def test_loaded_policy_fails_when_migrated_model_or_timeout_drifts(tmp_path, monkeypatch):
+    profile_id = runtime_profile_id_for_config_id(101)
+    policy = tmp_path / "runtime-profiles.yaml"
+    policy.write_text(
+        f"""version: 1
+runtime_profiles:
+  {profile_id}:
+    display_name: Daniel
+    compatibility_runtime_config_id: 101
+    os_user: daniel
+    backend: codex
+    provider: openai
+    model: gpt-5.5
+    timeout_seconds: 999
+"""
+    )
+    monkeypatch.setattr(
+        "kai.workshop.runtime_profiles.load_backend_registry",
+        lambda: {"codex": object(), "claude": object()},
     )
 
     with pytest.raises(WorkshopRuntimeProfileError, match=r"conflicts with the migrated users\.yaml"):

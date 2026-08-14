@@ -61,6 +61,7 @@ from kai.config import (
     _resolve_renamed_key,
     canonicalize_model_for_backend,
     get_default_model_for_backend,
+    get_effective_provider,
     models_for_backend,
     normalize_workshop_lan_host,
     validate_model_for_backend,
@@ -924,7 +925,15 @@ def _build_migrated_runtime_profiles(
         raise ValueError(f"Protected users.yaml must contain a 'users' list: {users_yaml_path}")
 
     default_backend = _resolve_install_default_backend(env, _discover_backend_commands(service_user))
-    default_provider = str(env.get("DEFAULT_PROVIDER") or "").strip().lower()
+    default_provider = get_effective_provider(
+        default_backend,
+        str(env.get("DEFAULT_PROVIDER") or "").strip().lower(),
+    )
+    default_model = canonicalize_model_for_backend(
+        str(env.get("DEFAULT_MODEL") or "").strip() or get_default_model_for_backend(default_backend, default_provider),
+        default_backend,
+    )
+    default_timeout = _runtime_policy_default_timeout(env)
     profiles: dict[str, dict[str, object]] = {}
     seen: set[int] = set()
     for entry in entries:
@@ -948,12 +957,35 @@ def _build_migrated_runtime_profiles(
             provider = "anthropic"
         elif backend == "codex":
             provider = "openai"
+        raw_model = entry.get("model")
+        model = ""
+        if raw_model is not None:
+            model = canonicalize_model_for_backend(str(raw_model).strip().lower(), backend)
+            if not validate_model_for_backend(model, backend, provider):
+                model = ""
+        if not model:
+            model = (
+                default_model
+                if backend == default_backend and provider == default_provider
+                else get_default_model_for_backend(backend, provider)
+            )
+        raw_timeout = entry.get("timeout")
+        try:
+            if isinstance(raw_timeout, bool):
+                raise ValueError
+            timeout_seconds = int(raw_timeout) if raw_timeout is not None else default_timeout
+            if timeout_seconds <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            timeout_seconds = default_timeout
         profile_id = runtime_profile_id_for_config_id(runtime_config_id)
         profile: dict[str, object] = {
             "display_name": display_name,
             "compatibility_runtime_config_id": runtime_config_id,
             "backend": backend,
             "provider": provider,
+            "model": model,
+            "timeout_seconds": timeout_seconds,
         }
         raw_os_user = entry.get("os_user")
         if raw_os_user is not None and str(raw_os_user).strip():
@@ -964,6 +996,86 @@ def _build_migrated_runtime_profiles(
         sort_keys=False,
         default_flow_style=False,
     )
+
+
+def _runtime_policy_default_timeout(env: dict[str, str]) -> int:
+    raw = str(env.get("DEFAULT_TIMEOUT") or env.get("AGENT_TIMEOUT_SECONDS") or "120").strip()
+    try:
+        value = int(raw)
+        if value <= 0:
+            raise ValueError
+    except (TypeError, ValueError) as exc:
+        raise ValueError("DEFAULT_TIMEOUT must be a positive integer before runtime-policy migration") from exc
+    return value
+
+
+def _upgrade_runtime_policy_content(
+    content: str,
+    migrated_content: str,
+    env: dict[str, str],
+) -> tuple[str, bool]:
+    """Add model/timeout policy to the pre-#923 format without new authority.
+
+    The major document version remains 1 so older Kai code ignores the new
+    keys during rollback. Existing values are never overwritten. Profiles
+    migrated from users.yaml receive the exact pre-cutover effective values;
+    independently authored profiles receive deterministic backend defaults.
+    """
+    try:
+        document = yaml.safe_load(content)
+        migrated = yaml.safe_load(migrated_content)
+    except yaml.YAMLError:
+        return content, False
+    if not isinstance(document, dict) or not isinstance(document.get("runtime_profiles"), dict):
+        return content, False
+    migrated_profiles = migrated.get("runtime_profiles") if isinstance(migrated, dict) else None
+    if not isinstance(migrated_profiles, dict):
+        return content, False
+    expected_by_config_id = {
+        profile.get("compatibility_runtime_config_id"): profile
+        for profile in migrated_profiles.values()
+        if isinstance(profile, dict)
+    }
+    default_backend = str(env.get("DEFAULT_BACKEND") or "").strip().lower()
+    default_provider = get_effective_provider(
+        default_backend,
+        str(env.get("DEFAULT_PROVIDER") or "").strip().lower(),
+    )
+    default_model = canonicalize_model_for_backend(
+        str(env.get("DEFAULT_MODEL") or "").strip() or get_default_model_for_backend(default_backend, default_provider),
+        default_backend,
+    )
+    default_timeout = _runtime_policy_default_timeout(env)
+    changed = False
+    for profile in document["runtime_profiles"].values():
+        if not isinstance(profile, dict):
+            continue
+        expected = expected_by_config_id.get(profile.get("compatibility_runtime_config_id"))
+        if "model" not in profile:
+            if isinstance(expected, dict):
+                profile["model"] = expected["model"]
+            else:
+                backend = str(profile.get("backend") or "").strip().lower()
+                provider = str(profile.get("provider") or "").strip().lower()
+                try:
+                    profile["model"] = (
+                        default_model
+                        if backend == default_backend and provider == default_provider
+                        else get_default_model_for_backend(backend, provider)
+                    )
+                except LookupError:
+                    # Leave malformed independently-authored profiles alone;
+                    # the canonical parser below will report the invalid
+                    # backend/provider rather than hiding it with a migration
+                    # lookup failure.
+                    continue
+            changed = True
+        if "timeout_seconds" not in profile:
+            profile["timeout_seconds"] = expected["timeout_seconds"] if isinstance(expected, dict) else default_timeout
+            changed = True
+    if not changed:
+        return content, False
+    return yaml.safe_dump(document, sort_keys=False, default_flow_style=False), True
 
 
 def _runtime_policy_apply_plan(
@@ -983,7 +1095,8 @@ def _runtime_policy_apply_plan(
             content = RUNTIME_PROFILES_YAML.read_text(encoding="utf-8")
         except OSError as exc:
             raise ValueError(f"Could not read protected runtime policy {RUNTIME_PROFILES_YAML}: {exc}") from exc
-        action = "preserve"
+        content, upgraded = _upgrade_runtime_policy_content(content, migrated_content, env)
+        action = "upgrade" if upgraded else "preserve"
     else:
         content = migrated_content
         action = "initialize"
@@ -1015,10 +1128,12 @@ def _runtime_policy_apply_plan(
             raise ValueError(
                 "Protected runtime policy lost a required compatibility profile during validation"
             ) from exc
-        if (actual.backend, actual.provider, actual.os_user) != (
+        if (actual.backend, actual.provider, actual.os_user, actual.model, actual.timeout_seconds) != (
             expected.backend,
             expected.provider,
             expected.os_user,
+            expected.model,
+            expected.timeout_seconds,
         ):
             raise ValueError(
                 f"Protected runtime profile {actual.profile_id} conflicts with users.yaml fields still required "
@@ -1041,12 +1156,17 @@ def _runtime_policy_has_config_id(
 def _apply_runtime_policy(action: str, content: str, dry_run: bool) -> None:
     """Install or secure the already-validated protected runtime policy."""
     if dry_run:
-        verb = "initialize" if action == "initialize" else "secure existing"
+        verb = {
+            "initialize": "initialize",
+            "upgrade": "upgrade existing",
+            "preserve": "secure existing",
+        }[action]
         print(f"[DRY RUN] Would {verb}: {RUNTIME_PROFILES_YAML} (mode 0600, root-owned)")
         return
-    if action == "initialize":
+    if action in {"initialize", "upgrade"}:
         RUNTIME_PROFILES_YAML.write_text(content, encoding="utf-8")
-        print(f"  Initialized {RUNTIME_PROFILES_YAML}")
+        verb = "Initialized" if action == "initialize" else "Upgraded"
+        print(f"  {verb} {RUNTIME_PROFILES_YAML}")
     os.chmod(RUNTIME_PROFILES_YAML, 0o600)
     os.chown(RUNTIME_PROFILES_YAML, 0, 0)
     if action == "preserve":
@@ -5265,8 +5385,9 @@ def _cmd_apply() -> None:
         raise SystemExit(f"{msg} {remedy} Valid models: {valid_list}")
 
     # Resolve and validate the protected runtime-policy transition before
-    # stopping a healthy service. Existing policy is preserved verbatim;
-    # absence produces the deterministic one-time users.yaml migration.
+    # stopping a healthy service. Existing policy is preserved except for
+    # backward-compatible schema enrichment; absence produces the
+    # deterministic one-time users.yaml migration.
     try:
         runtime_policy_action, runtime_policy_content, _runtime_policy = _runtime_policy_apply_plan(
             service_user,

@@ -13,7 +13,18 @@ from typing import Any
 import yaml
 
 from kai.backend_registry import BackendRegistryEntry, load_backend_registry
-from kai.config import BACKEND_PROVIDERS, VALID_BACKENDS, Config, _read_protected_file, get_user_backend_and_provider
+from kai.config import (
+    BACKEND_PROVIDERS,
+    VALID_BACKENDS,
+    Config,
+    UserConfig,
+    _read_protected_file,
+    canonicalize_model_for_backend,
+    get_default_model_for_backend,
+    get_effective_provider,
+    get_user_backend_and_provider,
+    validate_model_for_backend_policy,
+)
 from kai.workshop.domain import RuntimeProfileId
 
 _PROFILE_DERIVATION_DOMAIN = b"kai-workshop-runtime-profile:v1\0"
@@ -46,6 +57,54 @@ class ProtectedRuntimeProfile:
     os_user: str | None
     backend: str
     provider: str
+    model: str
+    timeout_seconds: int
+
+
+def _compatibility_model(
+    user: UserConfig | None,
+    config: Config,
+    *,
+    backend: str,
+    provider: str,
+) -> str:
+    """Mirror the conversational pool's pre-cutover model cascade."""
+    global_provider = get_effective_provider(config.default_backend, config.default_provider)
+    if user is not None and user.model:
+        model = user.model
+    elif backend == config.default_backend and provider == global_provider:
+        model = config.default_model
+    else:
+        model = get_default_model_for_backend(backend, provider)
+    return canonicalize_model_for_backend(model, backend)
+
+
+def _registry_model_ceiling(
+    backend: str,
+    installed: Mapping[str, BackendRegistryEntry | object] | None,
+    *,
+    profile_id: RuntimeProfileId,
+) -> tuple[str, ...] | None:
+    """Read one already-loaded backend entry's optional model ceiling."""
+    if installed is None:
+        return None
+    entry = installed[backend]
+    if isinstance(entry, BackendRegistryEntry):
+        return entry.allowed_models or None
+    if isinstance(entry, Mapping):
+        raw = entry.get("allowed_models")
+        if raw is None:
+            return None
+        if not isinstance(raw, list) or any(not isinstance(item, str) for item in raw):
+            raise WorkshopRuntimeProfileError(
+                f"Runtime profile {profile_id}: backend registry allowed_models is invalid"
+            )
+        checked = tuple(item.strip() for item in raw if item.strip())
+        return checked or None
+    # Focused tests may provide an opaque sentinel when only backend
+    # membership is under test. Production loaders use one of the two
+    # concrete forms above.
+    return None
 
 
 def runtime_profile_id_for_config_id(runtime_config_id: int) -> RuntimeProfileId:
@@ -137,6 +196,8 @@ class WorkshopRuntimeProfileRegistry:
                     os_user=user.os_user,
                     backend=backend,
                     provider=provider,
+                    model=_compatibility_model(user, config, backend=backend, provider=provider),
+                    timeout_seconds=user.timeout if user.timeout is not None else config.default_timeout,
                 )
             )
         return cls(tuple(profiles))
@@ -190,6 +251,25 @@ class WorkshopRuntimeProfileRegistry:
                     f"Runtime profile {profile_id}: provider {provider!r} is not valid for backend {backend!r}; "
                     f"expected one of: {allowed}"
                 )
+            model = canonicalize_model_for_backend(str(raw_profile.get("model") or "").strip(), backend)
+            if not model:
+                raise WorkshopRuntimeProfileError(f"Runtime profile {profile_id}: model is required")
+            allowed_models = _registry_model_ceiling(backend, installed, profile_id=profile_id)
+            if not validate_model_for_backend_policy(
+                model,
+                backend,
+                provider,
+                allowed_models=allowed_models,
+            ):
+                raise WorkshopRuntimeProfileError(
+                    f"Runtime profile {profile_id}: model {model!r} is not valid for "
+                    f"backend {backend!r} and provider {provider!r}"
+                )
+            raw_timeout = raw_profile.get("timeout_seconds")
+            if isinstance(raw_timeout, bool) or not isinstance(raw_timeout, int) or raw_timeout <= 0:
+                raise WorkshopRuntimeProfileError(
+                    f"Runtime profile {profile_id}: timeout_seconds must be a positive integer"
+                )
             raw_os_user = raw_profile.get("os_user")
             os_user = None if raw_os_user is None else str(raw_os_user).strip() or None
             if os_user is not None and _OS_USER_RE.fullmatch(os_user) is None:
@@ -205,6 +285,8 @@ class WorkshopRuntimeProfileRegistry:
                     os_user=os_user,
                     backend=backend,
                     provider=provider,
+                    model=model,
+                    timeout_seconds=raw_timeout,
                 )
             )
         return cls(tuple(profiles))
@@ -245,12 +327,20 @@ class WorkshopRuntimeProfileRegistry:
         Backend selection is owned by this registry. While users.yaml still
         provisions the corresponding OS account, models, workspaces, and
         service grants for migrated profiles, the duplicated backend/provider/
-        OS-user fields must agree.
+        OS-user/model/timeout fields must agree.
         """
         for runtime_config_id, user in config.user_configs.items():
             profile = self.for_config_id(runtime_config_id)
             backend, provider = get_user_backend_and_provider(user, config)
-            if (profile.backend, profile.provider, profile.os_user) != (backend, provider, user.os_user):
+            expected_model = _compatibility_model(user, config, backend=backend, provider=provider)
+            expected_timeout = user.timeout if user.timeout is not None else config.default_timeout
+            if (
+                profile.backend,
+                profile.provider,
+                profile.os_user,
+                profile.model,
+                profile.timeout_seconds,
+            ) != (backend, provider, user.os_user, expected_model, expected_timeout):
                 raise WorkshopRuntimeProfileError(
                     f"Runtime profile {profile.profile_id} conflicts with the migrated users.yaml execution policy"
                 )

@@ -280,28 +280,34 @@ class SubprocessPool:
         # the backend; no codex-specific patch needed here.
         global_provider = get_effective_provider(self._config.default_backend, self._config.default_provider)
 
-        # Per-user model. When the user's effective backend differs
-        # from the global one, the global default_model may not be
-        # valid; fall back to the per-backend default instead.
-        if user and user.model:
-            model = user.model
-        elif backend == self._config.default_backend and effective_provider == global_provider:
-            model = self._config.default_model
-            # Catch the case where the global backend itself is an open-ended
-            # provider and DEFAULT_MODEL is a backend-specific value
-            # that may be invalid for the open-ended provider.
-            # Startup validation passes because open-ended providers accept
-            # any model string, but the provider API will reject it.
-            if effective_provider in OPEN_ENDED_PROVIDERS:
-                log.warning(
-                    "No model configured for open-ended provider '%s' (chat %d); "
-                    "using global default '%s' which may not be valid for this provider",
-                    effective_provider,
-                    chat_id,
-                    model,
-                )
+        # Protected Workshop policy owns the effective conversational model.
+        # The compatibility cascade remains only for Telegram groups and
+        # uninstalled/dev runs that do not resolve a protected profile.
+        if protected_profile is not None:
+            model = protected_profile.model
         else:
-            model = get_default_model_for_backend(backend, effective_provider)
+            # Per-user model. When the user's effective backend differs
+            # from the global one, the global default_model may not be
+            # valid; fall back to the per-backend default instead.
+            if user and user.model:
+                model = user.model
+            elif backend == self._config.default_backend and effective_provider == global_provider:
+                model = self._config.default_model
+                # Catch the case where the global backend itself is an open-ended
+                # provider and DEFAULT_MODEL is a backend-specific value
+                # that may be invalid for the open-ended provider.
+                # Startup validation passes because open-ended providers accept
+                # any model string, but the provider API will reject it.
+                if effective_provider in OPEN_ENDED_PROVIDERS:
+                    log.warning(
+                        "No model configured for open-ended provider '%s' (chat %d); "
+                        "using global default '%s' which may not be valid for this provider",
+                        effective_provider,
+                        chat_id,
+                        model,
+                    )
+            else:
+                model = get_default_model_for_backend(backend, effective_provider)
 
         # Canonicalize retired backend-specific spellings after the
         # complete precedence cascade and before constructing a backend.
@@ -310,7 +316,12 @@ class SubprocessPool:
         # family shorthand.
         model = canonicalize_model_for_backend(model, backend)
 
-        timeout = user.timeout if user and user.timeout is not None else self._config.default_timeout
+        if protected_profile is not None:
+            timeout = protected_profile.timeout_seconds
+        elif user and user.timeout is not None:
+            timeout = user.timeout
+        else:
+            timeout = self._config.default_timeout
         # home_ws is what the backend treats as "home" for the foreign-
         # workspace reminder. Same resolution as the workspace above so
         # the two cannot drift; pre-#353 this took a different path that

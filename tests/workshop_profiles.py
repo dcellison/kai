@@ -23,6 +23,8 @@ def profile_registry(*runtime_config_ids: int) -> WorkshopRuntimeProfileRegistry
                 os_user=None,
                 backend="codex",
                 provider="openai",
+                model="gpt-5.6-sol",
+                timeout_seconds=120,
             )
             for runtime_config_id in runtime_config_ids
         )

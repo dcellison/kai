@@ -866,6 +866,39 @@ def _model_allowed_by_registry(model: str, backend: str, allowed_models: tuple[s
     return False
 
 
+def validate_model_for_backend_policy(
+    model: str,
+    backend: str,
+    eff_provider: str,
+    *,
+    allowed_models: tuple[str, ...] | None = None,
+) -> bool:
+    """Validate a model against backend rules and an explicit ceiling.
+
+    ``None`` means that no registry-level ceiling applies. An empty tuple
+    means that an authoritative registry failed closed and therefore permits
+    no model. Keeping this pure lets protected policy validation use the
+    already-loaded backend registry instead of consulting ambient process
+    state a second time.
+    """
+    if backend == "codex":
+        base_allowed = model in CODEX_MODELS
+    elif backend == "opencode":
+        base_allowed = is_opencode_model_shape(model)
+    elif backend == "pi":
+        base_allowed = is_pi_model_shape(model, eff_provider)
+    elif (backend == "claude" or (backend == "goose" and eff_provider == "anthropic")) and model.startswith("claude-"):
+        base_allowed = True
+    else:
+        base_allowed = validate_model_for_provider(model, eff_provider)
+
+    if not base_allowed:
+        return False
+    if allowed_models is None:
+        return True
+    return _model_allowed_by_registry(model, backend, allowed_models)
+
+
 def validate_model_for_backend(model: str, backend: str, eff_provider: str) -> bool:
     """Check if a model is valid for the active backend.
 
@@ -901,24 +934,13 @@ def validate_model_for_backend(model: str, backend: str, eff_provider: str) -> b
     codebase routes through this function so backends share no
     fallback path.
     """
-    if backend == "codex":
-        base_allowed = model in CODEX_MODELS
-    elif backend == "opencode":
-        base_allowed = is_opencode_model_shape(model)
-    elif backend == "pi":
-        base_allowed = is_pi_model_shape(model, eff_provider)
-    elif (backend == "claude" or (backend == "goose" and eff_provider == "anthropic")) and model.startswith("claude-"):
-        base_allowed = True
-    else:
-        base_allowed = validate_model_for_provider(model, eff_provider)
-
-    if not base_allowed:
-        return False
-
     registry_allowed = _backend_registry_allowed_models(backend)
-    if registry_allowed is None:
-        return True
-    return _model_allowed_by_registry(model, backend, registry_allowed)
+    return validate_model_for_backend_policy(
+        model,
+        backend,
+        eff_provider,
+        allowed_models=registry_allowed,
+    )
 
 
 # (context, matched legacy key) pairs that have already emitted a
