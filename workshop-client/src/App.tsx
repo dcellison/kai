@@ -581,16 +581,6 @@ function channelSymbol(channel: WorkshopChannelSummary): string {
   return "#";
 }
 
-function workshopInitials(name: string): string {
-  const initials = name
-    .split(/\s+/)
-    .filter(Boolean)
-    .slice(0, 2)
-    .map((part) => part[0]?.toUpperCase())
-    .join("");
-  return initials || "WS";
-}
-
 function WorkshopView({
   channel,
   connection,
@@ -602,7 +592,6 @@ function WorkshopView({
   onCancelRun,
   onLoadRun,
   onSelectChannel,
-  onSelectWorkshop,
   onSubmitCommand,
 }: {
   channel: WorkshopChannelSummary;
@@ -615,7 +604,6 @@ function WorkshopView({
   onCancelRun: (runId: string) => Promise<WorkshopRun>;
   onLoadRun: (runId: string) => Promise<WorkshopRun>;
   onSelectChannel: (channelId: string) => void;
-  onSelectWorkshop: (workshopId: string) => void;
   onSubmitCommand: (
     clientMessageId: string,
     body: string,
@@ -922,24 +910,6 @@ function WorkshopView({
         }px`,
       } as CSSProperties}
     >
-      <aside className="workspace-rail" aria-label="Workshop switcher">
-        <span className="rail-brand">K</span>
-        {navigation.workshops.map((availableWorkshop) => (
-          <button
-            className={`rail-item ${availableWorkshop.workshopId === workshop.workshopId ? "active" : ""}`}
-            type="button"
-            aria-label={availableWorkshop.name}
-            title={availableWorkshop.name}
-            onClick={() => onSelectWorkshop(availableWorkshop.workshopId)}
-            key={availableWorkshop.workshopId}
-          >
-            {workshopInitials(availableWorkshop.name)}
-          </button>
-        ))}
-        <span className="rail-spacer" />
-        <span className="rail-status" title="Kai connected" aria-label="Kai connected" />
-      </aside>
-
       <aside
         ref={sidebarRef}
         className={`channel-sidebar ${sidebarLayout.collapsed ? "collapsed" : ""}`}
@@ -1324,7 +1294,6 @@ function ActiveWorkshopClient({
   onChannelAccessFailure,
   onForget,
   onSelectChannel,
-  onSelectWorkshop,
 }: {
   navigation: WorkshopNavigation;
   session: WorkshopSession;
@@ -1332,7 +1301,6 @@ function ActiveWorkshopClient({
   onChannelAccessFailure: (message: string) => void;
   onForget: () => void;
   onSelectChannel: (channelId: string) => void;
-  onSelectWorkshop: (workshopId: string) => void;
 }): React.JSX.Element {
   const selected = findNavigationChannel(navigation, session.channelId);
   const { connection, messages, runActivity } = useWorkshopTimeline(
@@ -1385,7 +1353,6 @@ function ActiveWorkshopClient({
       onCancelRun={cancelSelectedRun}
       onLoadRun={loadSelectedRun}
       onSelectChannel={onSelectChannel}
-      onSelectWorkshop={onSelectWorkshop}
       onSubmitCommand={submitSelectedCommand}
     />
   );
@@ -1508,18 +1475,6 @@ export default function App(): React.JSX.Element {
     setSession(nextSession);
   };
 
-  const selectWorkshop = (workshopId: string): void => {
-    const workshop = navigation?.workshops.find(
-      (availableWorkshop) => availableWorkshop.workshopId === workshopId,
-    );
-    const channel =
-      workshop?.channels.find((availableChannel) => availableChannel.canSubmitCommands) ??
-      workshop?.channels[0];
-    if (channel) {
-      selectChannel(channel.channelId);
-    }
-  };
-
   if (view === "enrollment") {
     return (
       <EnrollmentView
@@ -1545,7 +1500,6 @@ export default function App(): React.JSX.Element {
       onChannelAccessFailure={(message) => void refreshChannelAccess(message)}
       onForget={() => forgetSession()}
       onSelectChannel={selectChannel}
-      onSelectWorkshop={selectWorkshop}
     />
   );
 }

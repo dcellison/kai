@@ -173,6 +173,8 @@ describe("Workshop React client", () => {
     await user.click(screen.getByRole("button", { name: "Open Workshop" }));
 
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+    expect(screen.queryByLabelText("Workshop switcher")).toBeNull();
+    expect(screen.getByLabelText("Workshop navigation")).toBeVisible();
     expect((await screen.findAllByText("Live")).length).toBeGreaterThanOrEqual(1);
     expect(redeemEnrollment).toHaveBeenCalledWith(
       "one-time-token",

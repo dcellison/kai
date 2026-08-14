@@ -74,8 +74,7 @@ button:disabled {
   text-transform: uppercase;
 }
 
-.brand-mark,
-.rail-brand {
+.brand-mark {
   display: inline-grid;
   place-items: center;
   background: var(--atom-blue);
@@ -357,65 +356,11 @@ button:disabled {
 
 .workshop-app {
   display: grid;
-  grid-template-columns: 4.25rem var(--channel-sidebar-width, 16.5rem) minmax(24rem, 1fr) 19rem;
+  grid-template-columns: var(--channel-sidebar-width, 16.5rem) minmax(24rem, 1fr) 19rem;
   grid-template-rows: minmax(0, 1fr);
   height: 100vh;
   overflow: hidden;
   background: var(--atom-bg);
-}
-
-.workspace-rail {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 0.9rem;
-  min-height: 0;
-  padding: 0.85rem 0;
-  border-right: 1px solid var(--line);
-  background: var(--atom-bg-dark);
-}
-
-.rail-brand,
-.rail-item {
-  width: 2.65rem;
-  height: 2.65rem;
-  border-radius: 0.55rem;
-}
-
-.rail-brand {
-  font-size: 1.25rem;
-}
-
-.rail-item {
-  border: 1px solid var(--line-strong);
-  background: var(--atom-surface);
-  color: var(--atom-foreground);
-  font-size: 0.68rem;
-  font-weight: 750;
-  cursor: pointer;
-}
-
-.rail-item.active {
-  border-color: rgba(97, 175, 239, 0.65);
-  box-shadow: inset 3px 0 var(--atom-blue);
-  color: var(--atom-blue);
-}
-
-.rail-item:hover:not(.active) {
-  border-color: var(--atom-muted);
-  color: var(--atom-foreground-strong);
-}
-
-.rail-spacer {
-  flex: 1;
-}
-
-.rail-status {
-  width: 0.62rem;
-  height: 0.62rem;
-  border-radius: 50%;
-  background: var(--atom-green);
-  box-shadow: 0 0 0 4px rgba(152, 195, 121, 0.1);
 }
 
 .channel-sidebar {
@@ -1326,7 +1271,7 @@ button:disabled {
 
 @media (max-width: 1120px) {
   .workshop-app {
-    grid-template-columns: 4.25rem var(--channel-sidebar-width, 15rem) minmax(24rem, 1fr);
+    grid-template-columns: var(--channel-sidebar-width, 15rem) minmax(24rem, 1fr);
   }
 
   .context-pane {
@@ -1350,7 +1295,7 @@ button:disabled {
   }
 
   .workshop-app {
-    grid-template-columns: 4rem minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .channel-sidebar {
@@ -1382,10 +1327,6 @@ button:disabled {
 
   .workshop-app {
     grid-template-columns: 1fr;
-  }
-
-  .workspace-rail {
-    display: none;
   }
 
   .conversation-header {
