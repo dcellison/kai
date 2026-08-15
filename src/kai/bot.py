@@ -202,7 +202,7 @@ async def _notify_if_queued(update: Update, chat_id: int) -> bool:
     context-switch marker for a task that already finished. Both are
     harmless and not worth fixing.
     """
-    if get_lock(chat_id).locked():
+    if get_lock(sessions.execution_lane_key(chat_id)).locked():
         assert update.message is not None
         await _reply_safe(
             update.message,
@@ -247,7 +247,7 @@ async def _acquire_lock_or_kill(
     releases the same object that was acquired (avoids issues if get_lock
     is called again and returns a different instance).
     """
-    lock = get_lock(chat_id)
+    lock = get_lock(sessions.execution_lane_key(chat_id))
     try:
         await asyncio.wait_for(lock.acquire(), timeout=_LOCK_ACQUIRE_TIMEOUT)
         return lock
@@ -1637,7 +1637,7 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
     pool = _get_pool(context)
-    stop_event = get_stop_event(chat_id)
+    stop_event = get_stop_event(sessions.execution_lane_key(chat_id))
     stop_event.set()
     await pool.force_kill(chat_id)
     await update.message.reply_text("Stopping...")
@@ -3382,7 +3382,7 @@ async def _handle_github_toggle(
         return
 
     value = args[0].lower() == "on"
-    await sessions.set_setting(f"{field}:{chat_id}", "true" if value else "false")
+    await sessions.set_github_toggle(chat_id, field, value)
     state = "enabled" if value else "disabled"
     await update.message.reply_text(f"{label} {state}.")
 
@@ -5036,7 +5036,7 @@ async def _handle_response(
 
     try:
         # Reset the stop event (in case /stop was sent between messages)
-        stop_event = get_stop_event(chat_id)
+        stop_event = get_stop_event(sessions.execution_lane_key(chat_id))
         stop_event.clear()
 
         # Stream events from Claude. Pass chat_id so the inner Claude

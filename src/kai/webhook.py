@@ -866,7 +866,13 @@ async def _get_subscribed_users(config: Config, repo_full_name: str) -> list[Use
 
         if repo_lower in effective:
             explicitly_subscribed.append(uc)
-        elif uc.role == "admin" and not effective:
+        elif (
+            await sessions.github_admin_wildcard(
+                uc.telegram_id,
+                legacy_admin=uc.role == "admin",
+            )
+            and not effective
+        ):
             # Admin with no effective repos = wildcard (receives all events).
             admin_wildcards.append(uc)
 

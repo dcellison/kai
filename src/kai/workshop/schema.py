@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 22
+WORKSHOP_SCHEMA_VERSION = 23
 
 
 @dataclass(frozen=True, slots=True)
@@ -1073,6 +1073,66 @@ _CANONICAL_MEMORY_AUTHORITY_SCHEMA = SchemaMigration(
     ),
 )
 
+_CANONICAL_OPERATIONAL_STATE_SCHEMA = SchemaMigration(
+    version=23,
+    name="canonical_operational_state_authority",
+    statements=(
+        # Jobs remain in the compatibility scheduler table until the
+        # scheduler-service cutover, but ownership is canonical and immutable.
+        # The legacy chat_id is then only a private execution/delivery alias.
+        """
+        CREATE TABLE workshop_job_owners (
+            job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+            principal_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            runtime_profile_id TEXT NOT NULL CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+        """,
+        "CREATE INDEX workshop_job_owners_principal_idx ON workshop_job_owners (principal_id, job_id)",
+        "CREATE INDEX workshop_job_owners_lane_idx ON workshop_job_owners (channel_id, agent_id, job_id)",
+        # GitHub subscription policy belongs to a human principal. Operator
+        # baselines are synchronized from protected configuration at startup;
+        # interactive additions, removals, and toggle overrides remain here.
+        """
+        CREATE TABLE principal_github_subscriptions (
+            principal_id TEXT PRIMARY KEY,
+            baseline_repos_json TEXT NOT NULL,
+            added_repos_json TEXT NOT NULL,
+            removed_repos_json TEXT NOT NULL,
+            pr_review_enabled INTEGER NOT NULL CHECK (pr_review_enabled IN (0, 1)),
+            issue_triage_enabled INTEGER NOT NULL CHECK (issue_triage_enabled IN (0, 1)),
+            pr_review_source TEXT NOT NULL CHECK (
+                pr_review_source IN ('default', 'operator', 'user')
+            ),
+            issue_triage_source TEXT NOT NULL CHECK (
+                issue_triage_source IN ('default', 'operator', 'user')
+            ),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+        """,
+        """
+        CREATE TABLE workshop_operational_state_migrations (
+            runtime_profile_id TEXT PRIMARY KEY CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            runtime_config_id INTEGER NOT NULL UNIQUE CHECK (runtime_config_id > 0),
+            principal_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            jobs_count INTEGER NOT NULL CHECK (jobs_count >= 0),
+            github_subscription_count INTEGER NOT NULL CHECK (
+                github_subscription_count IN (0, 1)
+            ),
+            migrated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+        """,
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -1096,6 +1156,7 @@ _MIGRATIONS = (
     _CANONICAL_RUNTIME_SESSION_SCHEMA,
     _CANONICAL_EXECUTION_STATE_SCHEMA,
     _CANONICAL_MEMORY_AUTHORITY_SCHEMA,
+    _CANONICAL_OPERATIONAL_STATE_SCHEMA,
 )
 
 

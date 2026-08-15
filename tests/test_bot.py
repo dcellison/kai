@@ -6306,7 +6306,7 @@ class TestHandleGitHub:
         config = _make_config()
         ctx = _make_context(config=config, args=["token", "ghp_secret"])
         mock_sessions = AsyncMock()
-        mock_sessions.set_setting = AsyncMock()
+        mock_sessions.set_github_toggle = AsyncMock()
 
         with patch("kai.bot.sessions", mock_sessions):
             await handle_github(update, ctx)
@@ -6412,7 +6412,7 @@ class TestHandleGitHub:
         with patch("kai.bot.sessions", mock_sessions):
             await handle_github(update, ctx)
 
-        mock_sessions.set_setting.assert_called_once_with("pr_review:12345", "true")
+        mock_sessions.set_github_toggle.assert_called_once_with(12345, "pr_review", True)
         reply = update.message.reply_text.call_args[0][0]
         assert "enabled" in reply.lower()
 
@@ -6425,12 +6425,12 @@ class TestHandleGitHub:
         config = _make_config()
         ctx = _make_context(config=config, args=["reviews", "off"])
         mock_sessions = AsyncMock()
-        mock_sessions.set_setting = AsyncMock()
+        mock_sessions.set_github_toggle = AsyncMock()
 
         with patch("kai.bot.sessions", mock_sessions):
             await handle_github(update, ctx)
 
-        mock_sessions.set_setting.assert_called_once_with("pr_review:12345", "false")
+        mock_sessions.set_github_toggle.assert_called_once_with(12345, "pr_review", False)
         reply = update.message.reply_text.call_args[0][0]
         assert "disabled" in reply.lower()
 
@@ -6443,12 +6443,12 @@ class TestHandleGitHub:
         config = _make_config()
         ctx = _make_context(config=config, args=["triage", "on"])
         mock_sessions = AsyncMock()
-        mock_sessions.set_setting = AsyncMock()
+        mock_sessions.set_github_toggle = AsyncMock()
 
         with patch("kai.bot.sessions", mock_sessions):
             await handle_github(update, ctx)
 
-        mock_sessions.set_setting.assert_called_once_with("issue_triage:12345", "true")
+        mock_sessions.set_github_toggle.assert_called_once_with(12345, "issue_triage", True)
         reply = update.message.reply_text.call_args[0][0]
         assert "enabled" in reply.lower()
 
