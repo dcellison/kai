@@ -678,7 +678,7 @@ class SubprocessPool:
         Returns the effective workspace path (saved when valid,
         otherwise the user's home workspace).
         """
-        saved = await sessions.get_setting(f"workspace:{chat_id}")
+        saved = await sessions.get_active_workspace(chat_id)
         effective: Path | None = None
         if saved:
             ws_path = Path(saved)
@@ -688,7 +688,7 @@ class SubprocessPool:
                     chat_id,
                     saved,
                 )
-                await sessions.delete_setting(f"workspace:{chat_id}")
+                await sessions.delete_active_workspace(chat_id)
             else:
                 base, allowed = await self.resolve_workspace_access(chat_id)
                 if not is_workspace_allowed(ws_path, base, allowed):
@@ -697,7 +697,7 @@ class SubprocessPool:
                         chat_id,
                         saved,
                     )
-                    await sessions.delete_setting(f"workspace:{chat_id}")
+                    await sessions.delete_active_workspace(chat_id)
                 else:
                     # Layer DB overrides on top of YAML baseline so the
                     # user's per-workspace config (set via /workspace
@@ -946,7 +946,7 @@ class SubprocessPool:
         if instance is not None and chat_id not in self._pending_workspace_restore:
             return instance.workspace
 
-        saved = await sessions.get_setting(f"workspace:{chat_id}")
+        saved = await sessions.get_active_workspace(chat_id)
         if not saved:
             if instance is not None:
                 self._pending_workspace_restore.discard(chat_id)
@@ -960,7 +960,7 @@ class SubprocessPool:
                 chat_id,
                 saved,
             )
-            await sessions.delete_setting(f"workspace:{chat_id}")
+            await sessions.delete_active_workspace(chat_id)
             if instance is not None:
                 self._pending_workspace_restore.discard(chat_id)
             return self.get_home_workspace(chat_id)

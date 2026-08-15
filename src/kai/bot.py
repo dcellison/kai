@@ -1721,9 +1721,9 @@ async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
     await _end_session(chat_id)
 
     if path == home:
-        await sessions.delete_setting(f"workspace:{chat_id}")
+        await sessions.delete_active_workspace(chat_id)
     else:
-        await sessions.set_setting(f"workspace:{chat_id}", str(path))
+        await sessions.set_active_workspace(chat_id, str(path))
         await sessions.upsert_workspace_history(str(path), chat_id)
 
     return ws_config
