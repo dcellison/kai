@@ -36,6 +36,10 @@ class _Runtime:
         self.wait = wait
         self.validated = False
         self.cancelled = False
+        self.canonical_histories: list[str] = []
+
+    def stage_canonical_history(self, history: str) -> None:
+        self.canonical_histories.append(history)
 
     def validate_current(self) -> None:
         self.validated = True
@@ -116,6 +120,7 @@ async def test_owner_accepts_executes_and_atomically_enqueues_terminal_reply(tmp
         assert result.workspace == str(tmp_path)
         assert observed == ["Stable preview."]
         assert runtime.validated is True
+        assert runtime.canonical_histories == [""]
         pool.prepare_execution.assert_awaited_once_with(101)
     finally:
         await service.stop()

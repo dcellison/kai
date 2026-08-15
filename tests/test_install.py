@@ -4617,6 +4617,7 @@ class TestCmdStatus:
         assert "Installation Status" in output
         assert "Workshop bootstrap:" in output
         assert "Workshop delivery authority:" in output
+        assert "Workshop conversation continuity:" in output
         assert "Workshop message parity:" in output
 
     def test_reports_unsupported_webhook_secret(self, tmp_path, monkeypatch, capsys):

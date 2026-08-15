@@ -45,6 +45,13 @@ _DELIVERY_AUTHORITY_TABLES = {
     "delivery_outbox",
     "delivery_fragments",
 }
+_RUNTIME_SESSION_TABLES = {
+    "channel_agent_runtime_assignments",
+    "channel_agent_runtime_sessions",
+    "messages",
+    "runs",
+    "workshop_continuity_cutover",
+}
 _TELEGRAM_SUBJECT_PATTERN = re.compile(r"^-?[0-9]+$")
 _SYNTHETIC_ASSISTANT_PATTERN = re.compile(
     r"\[(stopped by user|no response|error: .+)\]",
@@ -261,6 +268,75 @@ def workshop_delivery_authority_status(db_path: Path) -> str:
         f"leased={counts['leased']}, retrying={counts['retrying']}, "
         f"succeeded={counts['succeeded']}, failed={counts['failed']}, "
         f"uncertain={counts['uncertain']}"
+    )
+
+
+def workshop_runtime_session_status(db_path: Path) -> str:
+    """Describe canonical restart-context and runtime-session coverage."""
+    prefix = "Workshop conversation continuity:"
+    if not db_path.is_file():
+        return f"{prefix} pending; canonical runtime-session schema unavailable"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if not tables >= _RUNTIME_SESSION_TABLES:
+                return f"{prefix} pending; canonical runtime-session schema unavailable"
+            cutover_row = connection.execute(
+                "SELECT event_position FROM workshop_continuity_cutover WHERE singleton = 1"
+            ).fetchone()
+            if cutover_row is None:
+                return f"{prefix} pending; canonical runtime-session migration unavailable"
+            cutover = int(cutover_row[0])
+            successful_lanes = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM (SELECT DISTINCT r.channel_id, r.agent_id FROM runs r "
+                "JOIN messages m ON m.id = r.result_message_id "
+                "WHERE r.status = 'completed' AND m.created_event_position > ?)",
+                (cutover,),
+            )
+            sessions = _scalar(connection, "SELECT COUNT(*) FROM channel_agent_runtime_sessions")
+            provider_sessions = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_agent_runtime_sessions WHERE provider_session_id IS NOT NULL",
+            )
+            missing = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM (SELECT DISTINCT r.channel_id, r.agent_id FROM runs r "
+                "JOIN messages m ON m.id = r.result_message_id "
+                "WHERE r.status = 'completed' AND m.created_event_position > ?) lanes "
+                "WHERE NOT EXISTS ("
+                "SELECT 1 FROM channel_agent_runtime_sessions s "
+                "WHERE s.channel_id = lanes.channel_id AND s.agent_id = lanes.agent_id)",
+                (cutover,),
+            )
+            stale = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_agent_runtime_sessions s WHERE "
+                "NOT EXISTS (SELECT 1 FROM channel_agent_runtime_assignments a "
+                "WHERE a.channel_id = s.channel_id AND a.agent_id = s.agent_id "
+                "AND a.runtime_profile_id = s.runtime_profile_id) OR "
+                "s.context_through_event_position < COALESCE(("
+                "SELECT MAX(m.created_event_position) FROM runs r "
+                "JOIN messages m ON m.id = r.result_message_id "
+                "WHERE r.channel_id = s.channel_id AND r.agent_id = s.agent_id "
+                "AND r.status = 'completed' AND m.created_event_position > ?), 0)",
+                (cutover,),
+            )
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    state = "active" if missing == 0 and stale == 0 else "INCOMPLETE"
+    return (
+        f"{prefix} {state}; successful lanes={successful_lanes}, sessions={sessions}, "
+        f"provider sessions={provider_sessions}, missing={missing}, stale={stale}; "
+        "cold-start context=canonical timeline"
     )
 
 

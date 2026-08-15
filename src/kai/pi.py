@@ -359,6 +359,7 @@ class PiBackend(AgentBackend):
                 backend_name=self.backend_name,
                 memory_enabled=self.memory_enabled,
                 defer_user_file_reads=self.defer_user_file_reads,
+                canonical_history=self.consume_canonical_history(),
             )
         reminder = build_foreign_workspace_reminder(self.workspace, self.home_workspace) or ""
 

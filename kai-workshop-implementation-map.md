@@ -408,7 +408,7 @@ No entry may use an indefinite condition such as "keep for compatibility." A gen
 | Transitional mechanism | Replacement authority | Required evidence and removal gate | Retirement work | State |
 |---|---|---|---|---|
 | Authenticated plain-text/photo/document/voice and successful assistant-result canonical shadow writes beside current history, plus non-authoritative Telegram delivery observations | Workshop event store, message/artifact projections, and durable delivery outbox | Deterministic replay, duplicate-ingress/result tests, restart tests, full media-ingress coverage, delivery parity diagnostics, and sustained parity with current history and Telegram outcomes | Remove the `workshop_inbound_recorder`, `workshop_artifact_recorder`, `workshop_outbound_recorder`, and `workshop_delivery_recorder` bot-data adapters and their fail-open handler branches; remove the transitional `workshop_message_shadowed` JSONL marker; remove `workshop_message_parity_status` and its install-status output after canonical reads and outbox delivery become authoritative; make canonical command/event transactions and the delivery outbox the sole write and delivery paths | Active (private text finalization is authoritative in the outbox; inbound/media artifacts, remaining assistant results and delivery observations, JSONL history, and parity diagnostics remain transitional) |
-| JSONL transcript writes and reads | Canonical message projection, with an explicit export facility if still useful | Canonical reads serve complete context and transcript views; migration/parity diagnostics report no unexplained divergence | Stop JSONL writes; remove production reads and dual-write recovery code; retain only a documented importer/exporter if required | Planned |
+| JSONL transcript writes and reads | Canonical message projection, with an explicit export facility if still useful | All five harnesses rebuild restart context from canonical messages; excluded media, command, group, schedule, and integration lanes have crossed the canonical execution boundary; canonical history search replaces the compatibility full-log pointer; migration/parity diagnostics report no unexplained divergence | Stop JSONL writes; remove compatibility-route reads, dual-write recovery code, the split fresh-process bootstrap source, and JSONL-only full-history instructions; retain only a documented importer/exporter if required | Active (canonical private-text runs use a bounded canonical timeline window and durable channel-agent continuity after the schema-v20 cutover; JSONL remains the context source for excluded compatibility routes and remains a transitional write/archive surface) |
 | Telegram `chat_id` used as internal identity, namespace, and routing key | Durable principal, channel, agent, and binding IDs | Private chats, notification-only groups, duplicate updates, and restart routing all resolve correctly through bindings | Confine Telegram IDs to external identity, transport binding, and idempotency records; remove chat-shaped domain keys | Active (authoritative private text now enters execution by canonical message ID, but the compatibility resolver still derives the current pool key from the human principal's protected Telegram identity; settings, locks, history, files, memory, and excluded routes remain chat-keyed) |
 | `SubprocessPool` keyed by Telegram chat ID | Durable channel/agent session plus run and attempt orchestration | All five harnesses pass continuity, restart, cancellation, and isolation tests through durable identities | Remove chat-key compatibility lookup and move lifecycle ownership behind the orchestrator/runtime contract | Active (a canonical conversation-run service hides the private-text pool lookup behind a temporary compatibility resolution; the pool and all five harness processes remain keyed by that resolved integer) |
 | Direct backend invocation from Telegram handlers | Transport-neutral command and run services | Telegram and the first Workshop client produce equivalent authorized runs and visible results | Remove handler-owned orchestration; leave authentication, parsing, and rendering in the Telegram adapter | Active (authenticated private-chat text and authenticated Workshop browser commands now accept and execute by canonical `RunId`, with fenced attempts, durable cancellation, atomic terminal settlement, and replay suppression; the first browser path temporarily resolves the existing direct-Telegram compatibility identity, while media, voice modes, groups, schedules, and integrations retain their compatibility orchestration) |
@@ -2108,6 +2108,39 @@ epic milestones. Installed qualification must switch to Workshop-only with no
 stored bot token, prove browser enrollment, execution, activity,
 cancellation, restart continuity, health, and absence of Telegram contact,
 then restore hybrid mode and re-qualify both clients.
+
+## 45. Canonical conversation-continuity authority
+
+**Implementation date:** 2026-08-15
+
+Canonical private-text runs now rebuild fresh backend context from the
+Workshop message timeline rather than reading the transitional JSONL
+transcript. The bounded window contains at most 50 messages, 24,000 rendered
+characters, and 6,000 characters from any one message, and ends strictly
+before the inbound message being executed. The same shared staging contract
+feeds Claude, Codex, Goose, OpenCode, and Pi only when a fresh harness session
+is created; an unused staged window is discarded after the exact dispatch.
+
+Schema version 20 records an event-log cutover boundary and durable
+channel-agent runtime-session facts. Successful completion normally advances
+the runtime profile, backend/provider/model selection, workspace, provider
+session ID, last run/result, and canonical context boundary in the same
+transaction as the answer and fenced run settlement. Those facts are
+continuity bookkeeping, not authority over an answer already produced: an
+in-flight runtime reassignment, conflicting replay, or backward boundary
+skips the continuity advance while still committing the canonical answer,
+delivery plan, and completed run. Aggregate install diagnostics expose the
+resulting missing or stale continuity row for operator repair.
+
+This is a scoped authority cutover, not complete JSONL retirement. Fresh
+processes still serve both canonical private text and excluded compatibility
+routes, so the first compatibility turn may bootstrap from JSONL while the
+first canonical turn bootstraps from the Workshop timeline. Compatibility
+routes still write and read JSONL, and their full-history pointer remains
+available; canonical private text currently has only the bounded timeline
+window. Retiring the split source requires canonical execution for the
+remaining media, commands, groups, schedules, and integrations, plus a
+canonical history-search/export facility for older context.
 
 ## Canonical notification feed activation
 

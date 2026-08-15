@@ -10,7 +10,7 @@ from kai.backend import StreamEvent
 from kai.config import VALID_BACKENDS, validate_model_for_backend
 from kai.pool import PreparedBackendExecution
 from kai.workshop.conversation_runs import resolve_canonical_conversation_run
-from kai.workshop.domain import RunId
+from kai.workshop.domain import RunId, RuntimeProfileId
 from kai.workshop.run_execution_authority import RunExecutionSelection
 from kai.workshop.run_lifecycle import DurableRun, RunStatus, WorkshopRunLifecycle
 from kai.workshop.runtime_pool import WorkshopRuntimePool
@@ -26,6 +26,7 @@ class ProtectedExecutionPreparationError(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class PreparedWorkshopExecution:
     run: DurableRun
+    runtime_profile_id: RuntimeProfileId
     selection: RunExecutionSelection
     workspace: Path
     _runtime: PreparedBackendExecution = field(repr=False, compare=False)
@@ -34,6 +35,9 @@ class PreparedWorkshopExecution:
         """Dispatch once through the exact runtime bound during preparation."""
         async for event in self._runtime.stream(prompt):
             yield event
+
+    def stage_canonical_history(self, history: str) -> None:
+        self._runtime.stage_canonical_history(history)
 
     def validate_current(self) -> None:
         """Verify the exact runtime immediately before the started boundary."""
@@ -93,6 +97,7 @@ class WorkshopProtectedExecutionPreparationService:
         )
         return PreparedWorkshopExecution(
             run=run,
+            runtime_profile_id=resolution.runtime_profile_id,
             selection=selection,
             workspace=runtime.workspace,
             _runtime=runtime,

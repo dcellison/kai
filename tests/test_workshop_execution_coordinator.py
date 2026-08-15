@@ -12,22 +12,26 @@ from kai.backend import AgentResponse, StreamEvent
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.conversation_commands import WorkshopConversationCommandService
 from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
-from kai.workshop.domain import RunExecutionOwnerId
+from kai.workshop.diagnostics import workshop_runtime_session_status
+from kai.workshop.domain import RunExecutionOwnerId, RuntimeProfileId
 from kai.workshop.execution_coordinator import (
     CanonicalCancellationDisposition,
     CanonicalExecutionDisposition,
     WorkshopCanonicalExecutionCoordinator,
 )
 from kai.workshop.inbound import InboundMessage
+from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.run_execution_authority import (
     RunAttemptStatus,
     RunExecutionSelection,
     WorkshopRunExecutionAuthority,
 )
 from kai.workshop.run_lifecycle import RunStatus, WorkshopRunLifecycle
+from kai.workshop.runtime_sessions import load_runtime_session
 from kai.workshop.store import WorkshopEventStore
 
 _NOW = datetime(2026, 8, 12, 22, 0, tzinfo=UTC)
+_RUNTIME_PROFILE_ID = RuntimeProfileId.new()
 
 
 class _Prepared:
@@ -40,6 +44,7 @@ class _Prepared:
         on_stream: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.run = run
+        self.runtime_profile_id = _RUNTIME_PROFILE_ID
         self.selection = RunExecutionSelection("codex", "gpt-5.6-sol")
         self.workspace = Path("/private/tmp/kai-workshop-test-workspace")
         self.response = response or AgentResponse(success=True, text="Canonical answer")
@@ -49,6 +54,10 @@ class _Prepared:
         self.validated = False
         self.cancelled = False
         self.reject_validation = False
+        self.canonical_histories: list[str] = []
+
+    def stage_canonical_history(self, history: str) -> None:
+        self.canonical_histories.append(history)
 
     def validate_current(self) -> None:
         self.validated = True
@@ -93,6 +102,7 @@ async def _accepted(path: Path, *, suffix: str = "1"):
                 transport="telegram",
                 external_subject="101",
                 external_channel_id="101",
+                runtime_profile_id=_RUNTIME_PROFILE_ID,
             ),
         ),
     )
@@ -143,6 +153,71 @@ class TestCanonicalExecutionCoordinator:
             assert prepared.validated is True
             assert prepared.prompts == ["Canonical prompt 1"]
             assert await _terminal_bodies(store) == ["Canonical prompt 1", "Canonical answer"]
+            session = await load_runtime_session(store, run.channel_id, run.agent_id)
+            assert session is not None
+            assert session.last_run_id == run.run_id
+            assert session.runtime_profile_id == _RUNTIME_PROFILE_ID
+            await store.rebuild_projection(CanonicalConversationProjection())
+            assert await load_runtime_session(store, run.channel_id, run.agent_id) == session
+            assert workshop_runtime_session_status(tmp_path / "kai.db").startswith(
+                "Workshop conversation continuity: active; successful lanes=1, sessions=1"
+            )
+        finally:
+            await store.close()
+
+    async def test_cold_restart_bootstraps_only_prior_canonical_timeline(self, tmp_path: Path):
+        store, first_run = await _accepted(tmp_path / "kai.db")
+        first = _Prepared(first_run)
+        try:
+            first_result = await _coordinator(store, _Preparation(first)).execute(first_run.run_id)
+            assert first_result.disposition == CanonicalExecutionDisposition.COMPLETED
+            assert first.canonical_histories == [""]
+
+            second_acceptance = await WorkshopConversationCommandService(store).accept(
+                InboundMessage(
+                    transport="telegram",
+                    update_id="command-2",
+                    message_id="message-2",
+                    sender_subject="101",
+                    channel_subject="101",
+                    body="Canonical prompt 2",
+                    occurred_at=_NOW,
+                )
+            )
+            second_run = second_acceptance.run
+            second = _Prepared(
+                second_run,
+                response=AgentResponse(
+                    success=True,
+                    text="Second canonical answer",
+                    session_id="provider-session-2",
+                ),
+            )
+            second_result = await _coordinator(store, _Preparation(second)).execute(second_run.run_id)
+
+            assert second_result.disposition == CanonicalExecutionDisposition.COMPLETED
+            assert len(second.canonical_histories) == 1
+            history = second.canonical_histories[0]
+            assert "Workshop Human:\nCanonical prompt 1" in history
+            assert "Kai:\nCanonical answer" in history
+            assert "Canonical prompt 2" not in history
+            session = await load_runtime_session(store, second_run.channel_id, second_run.agent_id)
+            assert session is not None
+            assert session.last_run_id == second_run.run_id
+            assert session.provider_session_id == "provider-session-2"
+            assert session.last_result_message_id == second_result.run.result_message_id
+        finally:
+            await store.close()
+
+    async def test_live_runtime_receives_restart_context_without_prompt_duplication(self, tmp_path: Path):
+        store, run = await _accepted(tmp_path / "kai.db")
+        prepared = _Prepared(run)
+        try:
+            result = await _coordinator(store, _Preparation(prepared)).execute(run.run_id)
+
+            assert result.disposition == CanonicalExecutionDisposition.COMPLETED
+            assert prepared.canonical_histories == [""]
+            assert prepared.prompts == ["Canonical prompt 1"]
         finally:
             await store.close()
 
