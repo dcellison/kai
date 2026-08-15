@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 20
+WORKSHOP_SCHEMA_VERSION = 21
 
 
 @dataclass(frozen=True, slots=True)
@@ -976,6 +976,81 @@ _CANONICAL_RUNTIME_SESSION_SCHEMA = SchemaMigration(
     ),
 )
 
+_CANONICAL_EXECUTION_STATE_SCHEMA = SchemaMigration(
+    version=21,
+    name="canonical_execution_state",
+    statements=(
+        # Canonical IDs deliberately are not foreign keys in these mutable
+        # state tables. Collaboration tables are replayable projections;
+        # execution settings and workspace policy must survive their rebuild.
+        """
+        CREATE TABLE channel_agent_execution_settings (
+            channel_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            runtime_profile_id TEXT NOT NULL CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            field TEXT NOT NULL CHECK (field IN ('model', 'timeout', 'workspace')),
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            PRIMARY KEY (channel_id, agent_id, field)
+        )
+        """,
+        "CREATE INDEX channel_agent_execution_settings_profile_idx "
+        "ON channel_agent_execution_settings (runtime_profile_id)",
+        """
+        CREATE TABLE channel_agent_workspace_settings (
+            channel_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            runtime_profile_id TEXT NOT NULL CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            workspace_path TEXT NOT NULL CHECK (length(trim(workspace_path)) > 0),
+            field TEXT NOT NULL CHECK (field IN ('model', 'timeout', 'env', 'prompt')),
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            PRIMARY KEY (channel_id, agent_id, workspace_path, field)
+        )
+        """,
+        "CREATE INDEX channel_agent_workspace_settings_profile_idx "
+        "ON channel_agent_workspace_settings (runtime_profile_id)",
+        """
+        CREATE TABLE principal_workspace_history (
+            principal_id TEXT NOT NULL,
+            path TEXT NOT NULL CHECK (length(trim(path)) > 0),
+            last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (principal_id, path)
+        )
+        """,
+        "CREATE INDEX principal_workspace_history_recency_idx "
+        "ON principal_workspace_history (principal_id, last_used_at DESC)",
+        """
+        CREATE TABLE principal_workspace_grants (
+            principal_id TEXT NOT NULL,
+            path TEXT NOT NULL CHECK (length(trim(path)) > 0),
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            PRIMARY KEY (principal_id, path)
+        )
+        """,
+        """
+        CREATE TABLE workshop_execution_state_migrations (
+            runtime_profile_id TEXT PRIMARY KEY CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            runtime_config_id INTEGER NOT NULL UNIQUE CHECK (runtime_config_id > 0),
+            principal_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            settings_count INTEGER NOT NULL CHECK (settings_count >= 0),
+            workspace_settings_count INTEGER NOT NULL CHECK (workspace_settings_count >= 0),
+            history_count INTEGER NOT NULL CHECK (history_count >= 0),
+            grants_count INTEGER NOT NULL CHECK (grants_count >= 0),
+            migrated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+        """,
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -997,6 +1072,7 @@ _MIGRATIONS = (
     _RUNTIME_ASSIGNMENT_SCHEMA,
     _NOTIFICATION_DELIVERY_PURPOSE_SCHEMA,
     _CANONICAL_RUNTIME_SESSION_SCHEMA,
+    _CANONICAL_EXECUTION_STATE_SCHEMA,
 )
 
 

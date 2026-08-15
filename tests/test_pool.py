@@ -328,7 +328,7 @@ class TestPerUserBackendRouting:
         # Simulate DB override with a model from a different provider
         db_settings = {"model": "opus"}
         with (
-            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
+            patch("kai.pool.sessions.get_active_workspace", new_callable=AsyncMock, return_value=None),
             patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value=db_settings),
             patch.object(instance, "restart", new_callable=AsyncMock),
         ):
@@ -734,10 +734,10 @@ class TestPropertyAccessors:
         """
         monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
 
-        async def _no_setting(key: str) -> str | None:
+        async def _no_setting(chat_id: int) -> str | None:
             return None
 
-        monkeypatch.setattr("kai.pool.sessions.get_setting", _no_setting)
+        monkeypatch.setattr("kai.pool.sessions.get_active_workspace", _no_setting)
         pool = SubprocessPool(config=_make_config(), services_info=[])
         assert await pool.get_effective_workspace(999) == tmp_path / "home" / "999"
 
@@ -822,7 +822,7 @@ class TestWorkspaceRestoration:
         instance = pool.get(111)
 
         with (
-            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=str(ws)),
+            patch("kai.pool.sessions.get_active_workspace", new_callable=AsyncMock, return_value=str(ws)),
             # resolve_workspace_access returns permissive (None, []) so the
             # workspace passes _is_workspace_allowed.
             patch("kai.pool.sessions.resolve_workspace_access", new_callable=AsyncMock, return_value=(None, [])),
@@ -851,7 +851,7 @@ class TestPreparedExecution:
         pool = SubprocessPool(config=_make_config(), services_info=[])
         instance = pool.get(111)
         with (
-            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
+            patch("kai.pool.sessions.get_active_workspace", new_callable=AsyncMock, return_value=None),
             patch(
                 "kai.pool.sessions.get_user_settings",
                 new_callable=AsyncMock,
@@ -888,7 +888,7 @@ class TestPreparedExecution:
     async def test_prepared_execution_rejects_runtime_drift_before_dispatch(self):
         pool = SubprocessPool(config=_make_config(), services_info=[])
         with (
-            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
+            patch("kai.pool.sessions.get_active_workspace", new_callable=AsyncMock, return_value=None),
             patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value={}),
         ):
             prepared = await pool.prepare_execution(111)
@@ -906,7 +906,7 @@ class TestPreparedExecution:
     async def test_prepared_cancellation_stops_only_the_exact_current_runtime(self):
         pool = SubprocessPool(config=_make_config(), services_info=[])
         with (
-            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
+            patch("kai.pool.sessions.get_active_workspace", new_callable=AsyncMock, return_value=None),
             patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value={}),
         ):
             prepared = await pool.prepare_execution(111)
@@ -926,7 +926,7 @@ class TestPreparedExecution:
     async def test_prepared_cancellation_preserves_replacement_created_during_shutdown(self):
         pool = SubprocessPool(config=_make_config(), services_info=[])
         with (
-            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
+            patch("kai.pool.sessions.get_active_workspace", new_callable=AsyncMock, return_value=None),
             patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value={}),
         ):
             prepared = await pool.prepare_execution(111)
@@ -1046,15 +1046,15 @@ class TestPreparedExecution:
 
         with (
             patch(
-                "kai.pool.sessions.get_setting",
+                "kai.pool.sessions.get_active_workspace",
                 new_callable=AsyncMock,
                 return_value="/nonexistent/path",
             ),
-            patch("kai.pool.sessions.delete_setting", new_callable=AsyncMock) as mock_delete,
+            patch("kai.pool.sessions.delete_active_workspace", new_callable=AsyncMock) as mock_delete,
         ):
             # The restore should detect the path doesn't exist and delete
             await pool._attempt_workspace_restore(111, pool.get(111))
-            mock_delete.assert_called_once_with("workspace:111")
+            mock_delete.assert_awaited_once_with(111)
 
     @pytest.mark.asyncio
     async def test_restore_workspace_in_user_allowed_list(self, tmp_path):
@@ -1065,7 +1065,7 @@ class TestPreparedExecution:
         instance = pool.get(111)
 
         with (
-            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=str(ws)),
+            patch("kai.pool.sessions.get_active_workspace", new_callable=AsyncMock, return_value=str(ws)),
             # Per-user resolve returns the workspace in the allowed list
             patch(
                 "kai.pool.sessions.resolve_workspace_access",
@@ -1089,17 +1089,17 @@ class TestPreparedExecution:
         pool.get(111)
 
         with (
-            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=str(ws)),
+            patch("kai.pool.sessions.get_active_workspace", new_callable=AsyncMock, return_value=str(ws)),
             # Per-user resolve returns base that doesn't cover the workspace
             patch(
                 "kai.pool.sessions.resolve_workspace_access",
                 new_callable=AsyncMock,
                 return_value=(other_base, []),
             ),
-            patch("kai.pool.sessions.delete_setting", new_callable=AsyncMock) as mock_delete,
+            patch("kai.pool.sessions.delete_active_workspace", new_callable=AsyncMock) as mock_delete,
         ):
             await pool._attempt_workspace_restore(111, pool.get(111))
-            mock_delete.assert_called_once_with("workspace:111")
+            mock_delete.assert_awaited_once_with(111)
 
     @pytest.mark.asyncio
     async def test_rejected_workspace_model_does_not_block_db_model(self, tmp_path):
@@ -1171,7 +1171,7 @@ class TestPreparedExecution:
         instance = pool.get(111)
 
         with (
-            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=str(ws)),
+            patch("kai.pool.sessions.get_active_workspace", new_callable=AsyncMock, return_value=str(ws)),
             # Per-user resolve returns a base that covers the workspace
             patch(
                 "kai.pool.sessions.resolve_workspace_access",
@@ -1570,7 +1570,7 @@ class TestGetEffectiveWorkspace:
         """Cold state, no saved row -> home; no instance materialized."""
         monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
         pool = SubprocessPool(config=_make_config(), services_info=[])
-        with patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None):
+        with patch("kai.pool.sessions.get_active_workspace", new_callable=AsyncMock, return_value=None):
             result = await pool.get_effective_workspace(999)
         assert result == tmp_path / "home" / "999"
         assert 999 not in pool._pool
@@ -1583,7 +1583,7 @@ class TestGetEffectiveWorkspace:
         ws.mkdir()
         pool = SubprocessPool(config=_make_config(), services_info=[])
         with (
-            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=str(ws)),
+            patch("kai.pool.sessions.get_active_workspace", new_callable=AsyncMock, return_value=str(ws)),
             patch(
                 "kai.pool.sessions.resolve_workspace_access",
                 new_callable=AsyncMock,
@@ -1611,17 +1611,19 @@ class TestGetEffectiveWorkspace:
         monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
         pool = SubprocessPool(config=_make_config(), services_info=[])
         with (
-            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=str(tmp_path / "gone")),
+            patch(
+                "kai.pool.sessions.get_active_workspace", new_callable=AsyncMock, return_value=str(tmp_path / "gone")
+            ),
             patch(
                 "kai.pool.sessions.resolve_workspace_access",
                 new_callable=AsyncMock,
                 return_value=(None, []),
             ),
-            patch("kai.pool.sessions.delete_setting", new_callable=AsyncMock) as mock_delete,
+            patch("kai.pool.sessions.delete_active_workspace", new_callable=AsyncMock) as mock_delete,
         ):
             result = await pool.get_effective_workspace(999)
         assert result == tmp_path / "home" / "999"
-        mock_delete.assert_awaited_once_with("workspace:999")
+        mock_delete.assert_awaited_once_with(999)
         assert 999 not in pool._pool
 
     @pytest.mark.asyncio
@@ -1634,17 +1636,17 @@ class TestGetEffectiveWorkspace:
         other_base.mkdir()
         pool = SubprocessPool(config=_make_config(), services_info=[])
         with (
-            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=str(ws)),
+            patch("kai.pool.sessions.get_active_workspace", new_callable=AsyncMock, return_value=str(ws)),
             patch(
                 "kai.pool.sessions.resolve_workspace_access",
                 new_callable=AsyncMock,
                 return_value=(other_base, []),
             ),
-            patch("kai.pool.sessions.delete_setting", new_callable=AsyncMock) as mock_delete,
+            patch("kai.pool.sessions.delete_active_workspace", new_callable=AsyncMock) as mock_delete,
         ):
             result = await pool.get_effective_workspace(999)
         assert result == tmp_path / "home" / "999"
-        mock_delete.assert_awaited_once_with("workspace:999")
+        mock_delete.assert_awaited_once_with(999)
         assert 999 not in pool._pool
 
     @pytest.mark.asyncio
@@ -1656,7 +1658,7 @@ class TestGetEffectiveWorkspace:
         # Simulate a previous resolver/send having finalized the
         # workspace half.
         pool._pending_workspace_restore.discard(111)
-        with patch("kai.pool.sessions.get_setting", new_callable=AsyncMock) as mock_setting:
+        with patch("kai.pool.sessions.get_active_workspace", new_callable=AsyncMock) as mock_setting:
             result = await pool.get_effective_workspace(111)
         assert result == instance.workspace
         mock_setting.assert_not_called()
@@ -1672,7 +1674,7 @@ class TestGetEffectiveWorkspace:
         assert 111 in pool._pending_workspace_restore
         assert 111 in pool._pending_settings_restore
         with (
-            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=str(ws)),
+            patch("kai.pool.sessions.get_active_workspace", new_callable=AsyncMock, return_value=str(ws)),
             patch(
                 "kai.pool.sessions.resolve_workspace_access",
                 new_callable=AsyncMock,
@@ -1698,7 +1700,7 @@ class TestGetEffectiveWorkspace:
         pool.get(111)
         with (
             patch(
-                "kai.pool.sessions.get_setting",
+                "kai.pool.sessions.get_active_workspace",
                 new_callable=AsyncMock,
                 return_value=str(tmp_path / "gone"),
             ),
@@ -1707,11 +1709,11 @@ class TestGetEffectiveWorkspace:
                 new_callable=AsyncMock,
                 return_value=(None, []),
             ),
-            patch("kai.pool.sessions.delete_setting", new_callable=AsyncMock) as mock_delete,
+            patch("kai.pool.sessions.delete_active_workspace", new_callable=AsyncMock) as mock_delete,
         ):
             result = await pool.get_effective_workspace(111)
         assert result == tmp_path / "home" / "111"
-        mock_delete.assert_awaited_once_with("workspace:111")
+        mock_delete.assert_awaited_once_with(111)
         assert 111 not in pool._pending_workspace_restore
         assert 111 in pool._pending_settings_restore
 
@@ -1726,17 +1728,17 @@ class TestGetEffectiveWorkspace:
         pool = SubprocessPool(config=_make_config(), services_info=[])
         pool.get(111)
         with (
-            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=str(ws)),
+            patch("kai.pool.sessions.get_active_workspace", new_callable=AsyncMock, return_value=str(ws)),
             patch(
                 "kai.pool.sessions.resolve_workspace_access",
                 new_callable=AsyncMock,
                 return_value=(other_base, []),
             ),
-            patch("kai.pool.sessions.delete_setting", new_callable=AsyncMock) as mock_delete,
+            patch("kai.pool.sessions.delete_active_workspace", new_callable=AsyncMock) as mock_delete,
         ):
             result = await pool.get_effective_workspace(111)
         assert result == tmp_path / "home" / "111"
-        mock_delete.assert_awaited_once_with("workspace:111")
+        mock_delete.assert_awaited_once_with(111)
         assert 111 not in pool._pending_workspace_restore
         assert 111 in pool._pending_settings_restore
 
@@ -1746,7 +1748,7 @@ class TestGetEffectiveWorkspace:
         monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
         pool = SubprocessPool(config=_make_config(), services_info=[])
         pool.get(111)
-        with patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None):
+        with patch("kai.pool.sessions.get_active_workspace", new_callable=AsyncMock, return_value=None):
             result = await pool.get_effective_workspace(111)
         assert result == tmp_path / "home" / "111"
         assert 111 not in pool._pending_workspace_restore
@@ -1778,7 +1780,7 @@ class TestSendAppliesSettingsAfterResolverCall:
         pool = SubprocessPool(config=config, services_info=[])
 
         with (
-            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=str(ws)),
+            patch("kai.pool.sessions.get_active_workspace", new_callable=AsyncMock, return_value=str(ws)),
             patch(
                 "kai.pool.sessions.resolve_workspace_access",
                 new_callable=AsyncMock,
@@ -1828,7 +1830,7 @@ class TestSendAppliesSettingsAfterResolverCall:
         pool = SubprocessPool(config=_make_config(), services_info=[])
 
         with (
-            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=str(ws)),
+            patch("kai.pool.sessions.get_active_workspace", new_callable=AsyncMock, return_value=str(ws)),
             patch(
                 "kai.pool.sessions.resolve_workspace_access",
                 new_callable=AsyncMock,

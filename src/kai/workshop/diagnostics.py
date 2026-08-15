@@ -52,6 +52,14 @@ _RUNTIME_SESSION_TABLES = {
     "runs",
     "workshop_continuity_cutover",
 }
+_EXECUTION_STATE_TABLES = {
+    "channel_agent_execution_settings",
+    "channel_agent_runtime_assignments",
+    "channel_agent_workspace_settings",
+    "principal_workspace_grants",
+    "principal_workspace_history",
+    "workshop_execution_state_migrations",
+}
 _TELEGRAM_SUBJECT_PATTERN = re.compile(r"^-?[0-9]+$")
 _SYNTHETIC_ASSISTANT_PATTERN = re.compile(
     r"\[(stopped by user|no response|error: .+)\]",
@@ -337,6 +345,97 @@ def workshop_runtime_session_status(db_path: Path) -> str:
         f"{prefix} {state}; successful lanes={successful_lanes}, sessions={sessions}, "
         f"provider sessions={provider_sessions}, missing={missing}, stale={stale}; "
         "cold-start context=canonical timeline"
+    )
+
+
+def workshop_execution_state_status(db_path: Path) -> str:
+    """Describe canonical mutable execution-state authority and backfill."""
+    prefix = "Workshop execution state:"
+    if not db_path.is_file():
+        return f"{prefix} pending; canonical execution-state schema unavailable"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if not tables >= _EXECUTION_STATE_TABLES:
+                return f"{prefix} pending; canonical execution-state schema unavailable"
+            profiles = _scalar(connection, "SELECT COUNT(*) FROM channel_agent_runtime_assignments")
+            migrated = _scalar(connection, "SELECT COUNT(*) FROM workshop_execution_state_migrations")
+            missing = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_agent_runtime_assignments a WHERE NOT EXISTS ("
+                "SELECT 1 FROM workshop_execution_state_migrations m "
+                "WHERE m.runtime_profile_id = a.runtime_profile_id AND m.channel_id = a.channel_id "
+                "AND m.agent_id = a.agent_id)",
+            )
+            stale = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM workshop_execution_state_migrations m WHERE NOT EXISTS ("
+                "SELECT 1 FROM channel_agent_runtime_assignments a "
+                "JOIN channels c ON c.id = a.channel_id AND c.kind = 'direct' "
+                "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.role = 'owner' "
+                "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
+                "WHERE a.runtime_profile_id = m.runtime_profile_id "
+                "AND a.channel_id = m.channel_id AND a.agent_id = m.agent_id "
+                "AND cm.principal_id = m.principal_id)",
+            )
+            settings = _scalar(connection, "SELECT COUNT(*) FROM channel_agent_execution_settings")
+            workspace_settings = _scalar(connection, "SELECT COUNT(*) FROM channel_agent_workspace_settings")
+            history = _scalar(connection, "SELECT COUNT(*) FROM principal_workspace_history")
+            grants = _scalar(connection, "SELECT COUNT(*) FROM principal_workspace_grants")
+            orphaned = _scalar(
+                connection,
+                "SELECT (SELECT COUNT(*) FROM channel_agent_execution_settings s WHERE NOT EXISTS ("
+                "SELECT 1 FROM channel_agent_runtime_assignments a WHERE a.channel_id = s.channel_id "
+                "AND a.agent_id = s.agent_id AND a.runtime_profile_id = s.runtime_profile_id)) + "
+                "(SELECT COUNT(*) FROM channel_agent_workspace_settings s WHERE NOT EXISTS ("
+                "SELECT 1 FROM channel_agent_runtime_assignments a WHERE a.channel_id = s.channel_id "
+                "AND a.agent_id = s.agent_id AND a.runtime_profile_id = s.runtime_profile_id))",
+            )
+            mapped_config_ids = {
+                int(row[0])
+                for row in connection.execute(
+                    "SELECT runtime_config_id FROM workshop_execution_state_migrations"
+                ).fetchall()
+            }
+            unclassified = 0
+            for (raw_key,) in connection.execute("SELECT key FROM settings"):
+                key = str(raw_key)
+                runtime_text: str | None = None
+                field, separator, suffix = key.partition(":")
+                if separator and field in {"model", "timeout", "workspace"}:
+                    runtime_text = suffix
+                elif key.startswith("ws_config:"):
+                    runtime_text = key[len("ws_config:") :].partition(":")[0]
+                if runtime_text and runtime_text.isdigit() and int(runtime_text) > 0:
+                    unclassified += int(int(runtime_text) not in mapped_config_ids)
+            unclassified += sum(
+                int(int(row[0]) not in mapped_config_ids)
+                for row in connection.execute("SELECT DISTINCT chat_id FROM workspace_history WHERE chat_id > 0")
+            )
+            unclassified += sum(
+                int(int(row[0]) not in mapped_config_ids)
+                for row in connection.execute("SELECT DISTINCT chat_id FROM allowed_workspaces WHERE chat_id > 0")
+            )
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    state = (
+        "active"
+        if profiles > 0 and missing == 0 and stale == 0 and orphaned == 0 and unclassified == 0
+        else "INCOMPLETE"
+    )
+    return (
+        f"{prefix} {state}; profiles={profiles}, migrated={migrated}, "
+        f"missing={missing}, stale={stale}, orphaned={orphaned}, unclassified={unclassified}, settings={settings}, "
+        f"workspace settings={workspace_settings}, history={history}, grants={grants}; "
+        "protected legacy reads=disabled, rollback dual writes=active"
     )
 
 

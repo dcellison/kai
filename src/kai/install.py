@@ -76,6 +76,7 @@ from kai.workshop.bootstrap import bootstrap_human_principal_id
 from kai.workshop.diagnostics import (
     workshop_bootstrap_status,
     workshop_delivery_authority_status,
+    workshop_execution_state_status,
     workshop_message_parity_status,
     workshop_runtime_session_status,
 )
@@ -7915,6 +7916,7 @@ def _cmd_status() -> None:
     )
     print(workshop_delivery_authority_status(Path(data_dir) / "kai.db"))
     print(workshop_runtime_session_status(Path(data_dir) / "kai.db"))
+    print(workshop_execution_state_status(Path(data_dir) / "kai.db"))
     print(workshop_message_parity_status(Path(data_dir) / "kai.db", Path(data_dir) / "history"))
 
     # Check workspace path traversal if install.conf has a service user

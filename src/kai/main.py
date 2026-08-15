@@ -382,6 +382,19 @@ def _start() -> None:
         if default_chat_id is not None:
             await sessions.backfill_workspace_history(default_chat_id)
 
+        execution_state, execution_migration = await sessions.initialize_workshop_execution_state(runtime_profiles)
+        logging.info(
+            "Workshop canonical execution state ready "
+            "(profiles=%d, newly_migrated=%d, settings=%d, workspace_settings=%d, "
+            "history=%d, grants=%d)",
+            len(execution_state.namespaces),
+            execution_migration.newly_migrated,
+            execution_migration.settings,
+            execution_migration.workspace_settings,
+            execution_migration.history,
+            execution_migration.grants,
+        )
+
         # Phase 3: per-user workspace restoration is deferred to the
         # SubprocessPool. Each user's workspace is restored lazily on
         # their first message (in pool.send()). No startup restore needed.

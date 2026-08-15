@@ -1944,7 +1944,7 @@ class TestHandleWorkspace:
         with (
             _mock_resolve(),
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
-            patch("kai.bot.sessions.delete_setting", new_callable=AsyncMock),
+            patch("kai.bot.sessions.delete_active_workspace", new_callable=AsyncMock),
             patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
         ):
             await handle_workspace(update, ctx)
@@ -1980,7 +1980,7 @@ class TestHandleWorkspace:
         with (
             _mock_resolve(),
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
-            patch("kai.bot.sessions.delete_setting", new_callable=AsyncMock),
+            patch("kai.bot.sessions.delete_active_workspace", new_callable=AsyncMock),
             patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
         ):
             await handle_workspace(update, ctx)
@@ -2059,7 +2059,7 @@ class TestHandleWorkspace:
             _mock_resolve(base=tmp_path),
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=mock_proc),
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
-            patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
+            patch("kai.bot.sessions.set_active_workspace", new_callable=AsyncMock),
             patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
             patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
         ):
@@ -2082,7 +2082,7 @@ class TestHandleWorkspace:
             _mock_resolve(base=tmp_path),
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=mock_proc),
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
-            patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
+            patch("kai.bot.sessions.set_active_workspace", new_callable=AsyncMock),
             patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
             patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
         ):
@@ -2106,7 +2106,7 @@ class TestHandleWorkspace:
         with (
             _mock_resolve(base=tmp_path),
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
-            patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
+            patch("kai.bot.sessions.set_active_workspace", new_callable=AsyncMock),
             patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
             patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
         ):
@@ -2136,7 +2136,7 @@ class TestHandleWorkspace:
         with (
             _mock_resolve(base=tmp_path),
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
-            patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
+            patch("kai.bot.sessions.set_active_workspace", new_callable=AsyncMock),
             patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
             patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
         ):
@@ -2155,7 +2155,7 @@ class TestHandleWorkspace:
         with (
             _mock_resolve(allowed=[project]),
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
-            patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
+            patch("kai.bot.sessions.set_active_workspace", new_callable=AsyncMock),
             patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
             patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
         ):
@@ -2267,7 +2267,7 @@ class TestHandleWorkspaceCallback:
         with (
             _mock_resolve(),
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
-            patch("kai.bot.sessions.delete_setting", new_callable=AsyncMock),
+            patch("kai.bot.sessions.delete_active_workspace", new_callable=AsyncMock),
             patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
         ):
             await handle_workspace_callback(update, ctx)
@@ -2287,7 +2287,7 @@ class TestHandleWorkspaceCallback:
         with (
             _mock_resolve(allowed=[project]),
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
-            patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
+            patch("kai.bot.sessions.set_active_workspace", new_callable=AsyncMock),
             patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
             patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
         ):
@@ -2336,7 +2336,7 @@ class TestHandleWorkspaceCallback:
             _mock_resolve(),
             patch("kai.bot.sessions.get_workspace_history", new_callable=AsyncMock, return_value=history),
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
-            patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
+            patch("kai.bot.sessions.set_active_workspace", new_callable=AsyncMock),
             patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
             patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
         ):
@@ -2724,7 +2724,7 @@ class TestWorkspaceSubcommandRouting:
         with (
             _mock_resolve(allowed=[project]),
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
-            patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
+            patch("kai.bot.sessions.set_active_workspace", new_callable=AsyncMock),
             patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
             patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
         ):
