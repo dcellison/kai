@@ -132,14 +132,23 @@ async def reconcile_legacy_execution_state(
             ) as cursor:
                 migrated = await cursor.fetchone()
                 if migrated is not None:
-                    if tuple(migrated) != (
+                    migrated_owner = (
+                        int(migrated["runtime_config_id"]),
+                        str(migrated["principal_id"]),
+                        str(migrated["channel_id"]),
+                        str(migrated["agent_id"]),
+                    )
+                    current_owner = (
                         namespace.runtime_config_id,
-                        namespace.principal_id,
-                        namespace.channel_id,
-                        namespace.agent_id,
-                    ):
+                        str(namespace.principal_id),
+                        str(namespace.channel_id),
+                        str(namespace.agent_id),
+                    )
+                    if migrated_owner != current_owner:
                         raise WorkshopExecutionStateError(
-                            "Canonical execution-state migration conflicts with current protected ownership"
+                            "Canonical execution-state migration conflicts with current protected ownership "
+                            f"for runtime profile {namespace.runtime_profile_id}; restore its recorded "
+                            "canonical assignment or restore the database from backup"
                         )
                     continue
 

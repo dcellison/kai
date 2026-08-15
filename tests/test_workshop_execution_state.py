@@ -145,7 +145,13 @@ class TestCanonicalExecutionStateMigration:
         )
         await sessions._get_db().commit()
 
-        with pytest.raises(WorkshopExecutionStateError, match="conflicts with current protected ownership"):
+        with pytest.raises(
+            WorkshopExecutionStateError,
+            match=(
+                r"conflicts with current protected ownership for runtime profile rtp_.*; "
+                r"restore its recorded canonical assignment or restore the database from backup"
+            ),
+        ):
             await sessions.initialize_workshop_execution_state(profile_registry(101))
 
 
@@ -181,6 +187,23 @@ class TestCanonicalExecutionStateWrites:
         assert await sessions.get_workspace_config_settings(101, "/projects/alice") == {}
         assert await sessions.get_workspace_history(101) == []
         assert await sessions.get_allowed_workspaces(101) == []
+
+    async def test_workspace_config_delete_preserves_colon_prefixed_workspace_in_both_stores(
+        self,
+        database: Path,
+    ):
+        await _initialize(database, 101)
+        shorter = "/projects/alice"
+        colon_prefixed = "/projects/alice:archive"
+        await sessions.set_workspace_config_setting(101, shorter, "model", "gpt-5.5")
+        await sessions.set_workspace_config_setting(101, colon_prefixed, "model", "gpt-5.6-sol")
+
+        await sessions.delete_all_workspace_config(101, shorter)
+
+        assert await sessions.get_workspace_config_settings(101, shorter) == {}
+        assert await sessions.get_workspace_config_settings(101, colon_prefixed) == {"model": "gpt-5.6-sol"}
+        assert await sessions.get_setting("ws_config:101:/projects/alice:model") is None
+        assert await sessions.get_setting("ws_config:101:/projects/alice:archive:model") == "gpt-5.6-sol"
 
     async def test_unmapped_development_callers_retain_legacy_behavior(self, database: Path):
         await _initialize(database, 101)

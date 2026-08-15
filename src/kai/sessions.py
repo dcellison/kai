@@ -1073,18 +1073,16 @@ async def delete_workspace_config_setting(chat_id: int, workspace_path: str, fie
 
 async def delete_all_workspace_config(chat_id: int, workspace_path: str) -> None:
     """Remove all config overrides for this user's workspace."""
-    # Use SUBSTR for exact prefix matching instead of LIKE, which
-    # treats underscores in filesystem paths as single-char wildcards.
-    prefix = f"ws_config:{chat_id}:{workspace_path}:"
     namespace = _execution_state_namespace(chat_id)
     if namespace is not None:
         await _get_db().execute(
             "DELETE FROM channel_agent_workspace_settings WHERE channel_id = ? AND agent_id = ? AND workspace_path = ?",
             (namespace.channel_id, namespace.agent_id, workspace_path),
         )
+    keys = tuple(f"ws_config:{chat_id}:{workspace_path}:{field}" for field in ("model", "timeout", "env", "prompt"))
     await _get_db().execute(
-        "DELETE FROM settings WHERE SUBSTR(key, 1, ?) = ?",
-        (len(prefix), prefix),
+        "DELETE FROM settings WHERE key IN (?, ?, ?, ?)",
+        keys,
     )
     await _get_db().commit()
 
