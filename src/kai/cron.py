@@ -307,7 +307,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
         log.error("No subprocess pool available for job %d", job_id)
         return
 
-    async with get_lock(chat_id):
+    async with get_lock(sessions.execution_lane_key(chat_id)):
         # Show typing indicator while the selected backend processes the prompt
         try:
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)

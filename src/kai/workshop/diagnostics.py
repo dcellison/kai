@@ -68,6 +68,14 @@ _MEMORY_AUTHORITY_TABLES = {
     "workshop_execution_state_migrations",
     "workshop_memory_authority_migrations",
 }
+_OPERATIONAL_STATE_TABLES = {
+    "channel_agent_runtime_assignments",
+    "jobs",
+    "principal_github_subscriptions",
+    "workshop_execution_state_migrations",
+    "workshop_job_owners",
+    "workshop_operational_state_migrations",
+}
 _TELEGRAM_SUBJECT_PATTERN = re.compile(r"^-?[0-9]+$")
 _SYNTHETIC_ASSISTANT_PATTERN = re.compile(
     r"\[(stopped by user|no response|error: .+)\]",
@@ -512,6 +520,93 @@ def workshop_memory_authority_status(db_path: Path, *, memory_enabled: bool | No
         f"{prefix} {state}; profiles={profiles}, migrated={migrated}, missing={missing}, "
         f"stale={stale}, moved={moved}, stamped={stamped}, migration rows={total}; "
         "protected legacy reads=disabled"
+    )
+
+
+def workshop_operational_state_status(db_path: Path) -> str:
+    """Describe canonical job ownership and GitHub subscription authority."""
+    prefix = "Workshop operational state:"
+    if not db_path.is_file():
+        return f"{prefix} pending; canonical operational-state schema unavailable"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if not tables >= _OPERATIONAL_STATE_TABLES:
+                return f"{prefix} pending; canonical operational-state schema unavailable"
+            profiles = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_agent_runtime_assignments",
+            )
+            migrated = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM workshop_operational_state_migrations",
+            )
+            missing = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_agent_runtime_assignments a WHERE NOT EXISTS ("
+                "SELECT 1 FROM workshop_operational_state_migrations m "
+                "WHERE m.runtime_profile_id = a.runtime_profile_id "
+                "AND m.channel_id = a.channel_id AND m.agent_id = a.agent_id)",
+            )
+            stale = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM workshop_operational_state_migrations m WHERE NOT EXISTS ("
+                "SELECT 1 FROM channel_agent_runtime_assignments a "
+                "WHERE a.runtime_profile_id = m.runtime_profile_id "
+                "AND a.channel_id = m.channel_id AND a.agent_id = m.agent_id)",
+            )
+            jobs = _scalar(connection, "SELECT COUNT(*) FROM workshop_job_owners")
+            unowned_jobs = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM jobs j JOIN workshop_execution_state_migrations e "
+                "ON e.runtime_config_id = j.chat_id LEFT JOIN workshop_job_owners o "
+                "ON o.job_id = j.id WHERE o.job_id IS NULL",
+            )
+            conflicting_jobs = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM jobs j JOIN workshop_execution_state_migrations e "
+                "ON e.runtime_config_id = j.chat_id JOIN workshop_job_owners o ON o.job_id = j.id "
+                "WHERE o.principal_id != e.principal_id OR o.channel_id != e.channel_id "
+                "OR o.agent_id != e.agent_id OR o.runtime_profile_id != e.runtime_profile_id",
+            )
+            github_subscriptions = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM principal_github_subscriptions",
+            )
+            missing_subscriptions = _scalar(
+                connection,
+                "SELECT COUNT(DISTINCT m.principal_id) "
+                "FROM workshop_operational_state_migrations m WHERE NOT EXISTS ("
+                "SELECT 1 FROM principal_github_subscriptions g "
+                "WHERE g.principal_id = m.principal_id)",
+            )
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    state = (
+        "active"
+        if profiles > 0
+        and migrated == profiles
+        and missing == 0
+        and stale == 0
+        and unowned_jobs == 0
+        and conflicting_jobs == 0
+        and missing_subscriptions == 0
+        else "INCOMPLETE"
+    )
+    return (
+        f"{prefix} {state}; profiles={profiles}, migrated={migrated}, "
+        f"missing={missing}, stale={stale}, jobs={jobs}, unowned jobs={unowned_jobs}, "
+        f"conflicting jobs={conflicting_jobs}, GitHub principals={github_subscriptions}, "
+        f"missing subscriptions={missing_subscriptions}; protected legacy ownership "
+        "reads=disabled, rollback dual writes=active"
     )
 
 

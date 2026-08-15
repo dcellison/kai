@@ -310,7 +310,6 @@ def _start() -> None:
         use_webhook = config.telegram_enabled and config.telegram_webhook_url is not None
 
         await sessions.init_db(config.session_db_path)
-        await _warn_if_compatibility_jobs_are_dormant(config)
 
         # Seed the non-authoritative Workshop identity/channel projection.
         # Notification groups are outbound-only channels: they share existing
@@ -394,6 +393,19 @@ def _start() -> None:
             execution_migration.history,
             execution_migration.grants,
         )
+        operational_migration = await sessions.initialize_workshop_operational_state(
+            execution_state,
+            config,
+        )
+        logging.info(
+            "Workshop canonical operational state ready "
+            "(profiles=%d, newly_migrated=%d, jobs=%d, github_subscriptions=%d)",
+            operational_migration.profiles,
+            operational_migration.newly_migrated,
+            operational_migration.jobs,
+            operational_migration.github_subscriptions,
+        )
+        await _warn_if_compatibility_jobs_are_dormant(config)
 
         # Phase 3: per-user workspace restoration is deferred to the
         # SubprocessPool. Each user's workspace is restored lazily on

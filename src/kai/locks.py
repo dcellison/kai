@@ -1,12 +1,14 @@
 """
-Per-chat concurrency primitives for serializing message handling.
+Per-lane concurrency primitives for serializing agent execution.
 
 Provides functionality to:
-1. Allocate per-chat asyncio locks so only one message is processed at a time
-2. Allocate per-chat stop events so /stop can interrupt in-flight responses
+1. Allocate per-lane asyncio locks so only one message is processed at a time
+2. Allocate per-lane stop events so cancellation can interrupt in-flight responses
 3. Bound memory usage by evicting the oldest entries when limits are reached
 
-Both lock and stop-event pools are bounded dicts keyed by chat_id. The eviction
+Both lock and stop-event pools are bounded dicts keyed by a canonical execution
+lane. Compatibility callers may still use an integer until their canonical
+assignment is loaded. The eviction
 limit (_MAX_LOCKS) is generous for a single-user bot but prevents unbounded
 growth if the bot were ever exposed to multiple chats.
 """
@@ -17,28 +19,30 @@ import asyncio
 # When exceeded, the oldest (least-recently-inserted) entry is evicted.
 _MAX_LOCKS = 64
 
-# chat_id → asyncio.Lock: ensures only one Claude interaction per chat at a time
-_chat_locks: dict[int, asyncio.Lock] = {}
+ExecutionLaneKey = int | str
 
-# chat_id → asyncio.Event: set when the user sends /stop to cancel a response
-_stop_events: dict[int, asyncio.Event] = {}
+# lane → asyncio.Lock: ensures only one agent interaction per lane at a time
+_chat_locks: dict[ExecutionLaneKey, asyncio.Lock] = {}
+
+# lane → asyncio.Event: set when the user requests response cancellation
+_stop_events: dict[ExecutionLaneKey, asyncio.Event] = {}
 
 
-def get_lock(chat_id: int) -> asyncio.Lock:
+def get_lock(lane: ExecutionLaneKey) -> asyncio.Lock:
     """
-    Get or create an asyncio lock for this chat.
+    Get or create an asyncio lock for this execution lane.
 
-    Used to serialize message handling — while Claude is processing one message,
-    subsequent messages for the same chat wait on this lock rather than spawning
-    concurrent Claude interactions.
+    Used to serialize message handling while an agent is processing one message.
+    Subsequent messages for the same lane wait instead of spawning concurrent
+    interactions.
 
     Args:
-        chat_id: Telegram chat ID to get the lock for.
+        lane: Canonical channel-agent lane, or a compatibility key before cutover.
 
     Returns:
-        An asyncio.Lock unique to this chat_id (created on first access).
+        An asyncio.Lock unique to this execution lane (created on first access).
     """
-    lock = _chat_locks.get(chat_id)
+    lock = _chat_locks.get(lane)
     if lock is not None:
         return lock
     # Evict oldest entry if at capacity, but skip any lock that is currently
@@ -50,25 +54,25 @@ def get_lock(chat_id: int) -> asyncio.Lock:
                 del _chat_locks[candidate]
                 break
     lock = asyncio.Lock()
-    _chat_locks[chat_id] = lock
+    _chat_locks[lane] = lock
     return lock
 
 
-def get_stop_event(chat_id: int) -> asyncio.Event:
+def get_stop_event(lane: ExecutionLaneKey) -> asyncio.Event:
     """
-    Get or create a stop event for this chat.
+    Get or create a stop event for this execution lane.
 
-    The /stop command sets this event, and the streaming loop in
-    _handle_response() checks it between stream chunks. When set,
-    the response is aborted and the Claude process is killed.
+    Cancellation sets this event, and the compatibility streaming loop checks it
+    between stream chunks. When set, the response is aborted and its agent
+    process is killed.
 
     Args:
-        chat_id: Telegram chat ID to get the stop event for.
+        lane: Canonical channel-agent lane, or a compatibility key before cutover.
 
     Returns:
-        An asyncio.Event unique to this chat_id. Set = stop requested.
+        An asyncio.Event unique to this execution lane. Set = stop requested.
     """
-    event = _stop_events.get(chat_id)
+    event = _stop_events.get(lane)
     if event is not None:
         return event
     # Evict oldest entry if at capacity, but skip any event that is currently
@@ -80,5 +84,5 @@ def get_stop_event(chat_id: int) -> asyncio.Event:
                 del _stop_events[candidate]
                 break
     event = asyncio.Event()
-    _stop_events[chat_id] = event
+    _stop_events[lane] = event
     return event

@@ -66,6 +66,10 @@ from kai.workshop.memory_authority import (
     WorkshopMemoryAuthorityMigration,
     reconcile_workshop_memory_authority,
 )
+from kai.workshop.operational_state import (
+    WorkshopOperationalStateMigration,
+    reconcile_workshop_operational_state,
+)
 from kai.workshop.outbound import (
     DeliveryObservation,
     OutboundMessage,
@@ -416,10 +420,29 @@ async def initialize_workshop_memory_authority(
         return await reconcile_workshop_memory_authority(_get_db(), registry)
 
 
+async def initialize_workshop_operational_state(
+    registry: WorkshopExecutionStateRegistry,
+    config: Config,
+) -> WorkshopOperationalStateMigration:
+    """Backfill and verify canonical job and GitHub subscription ownership."""
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        return await reconcile_workshop_operational_state(_get_db(), registry, config)
+
+
 def _execution_state_namespace(chat_id: int) -> WorkshopExecutionStateNamespace | None:
     if _workshop_execution_state is None:
         return None
     return _workshop_execution_state.maybe_for_runtime_config_id(chat_id)
+
+
+def execution_lane_key(chat_id: int) -> int | str:
+    """Return the canonical execution-lane key for a protected runtime alias."""
+    namespace = _execution_state_namespace(chat_id)
+    if namespace is None:
+        return chat_id
+    return f"{namespace.channel_id}:{namespace.agent_id}"
 
 
 async def record_workshop_inbound_message(message: InboundMessage) -> AppendResult:
@@ -789,65 +812,140 @@ async def create_job(
     Returns:
         The auto-generated integer job ID.
     """
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
     canonical_job_type = normalize_job_type(job_type)
-    cursor = await _get_db().execute(
-        """INSERT INTO jobs (chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, notify_on_check)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            chat_id,
-            name,
-            canonical_job_type,
-            prompt,
-            schedule_type,
-            schedule_data,
-            int(auto_remove),
-            int(notify_on_check),
-        ),
+    namespace = _execution_state_namespace(chat_id)
+    async with _workshop_event_lock:
+        try:
+            await _get_db().execute("BEGIN IMMEDIATE")
+            cursor = await _get_db().execute(
+                """INSERT INTO jobs (chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, notify_on_check)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    chat_id,
+                    name,
+                    canonical_job_type,
+                    prompt,
+                    schedule_type,
+                    schedule_data,
+                    int(auto_remove),
+                    int(notify_on_check),
+                ),
+            )
+            if cursor.lastrowid is None:
+                raise RuntimeError("INSERT did not return a row ID")
+            if namespace is not None:
+                await _get_db().execute(
+                    "INSERT INTO workshop_job_owners ("
+                    "job_id, principal_id, channel_id, agent_id, runtime_profile_id"
+                    ") VALUES (?, ?, ?, ?, ?)",
+                    (
+                        cursor.lastrowid,
+                        namespace.principal_id,
+                        namespace.channel_id,
+                        namespace.agent_id,
+                        namespace.runtime_profile_id,
+                    ),
+                )
+            await _get_db().commit()
+        except Exception:
+            await _get_db().rollback()
+            raise
+        return cursor.lastrowid
+
+
+_JOB_OWNER_COLUMNS = (
+    "o.principal_id AS owner_principal_id, o.channel_id AS owner_channel_id, "
+    "o.agent_id AS owner_agent_id, o.runtime_profile_id AS owner_runtime_profile_id"
+)
+
+
+def _verified_job(row: aiosqlite.Row) -> dict:
+    """Validate protected canonical ownership and return the compatibility row."""
+    namespace = _execution_state_namespace(int(row["chat_id"]))
+    owner = (
+        row["owner_principal_id"],
+        row["owner_channel_id"],
+        row["owner_agent_id"],
+        row["owner_runtime_profile_id"],
     )
-    await _get_db().commit()
-    # RuntimeError instead of assert so this guard survives python -O.
-    # SQLite always sets lastrowid on INSERT, but guard against None defensively.
-    if cursor.lastrowid is None:
-        raise RuntimeError("INSERT did not return a row ID")
-    return cursor.lastrowid
+    if namespace is not None:
+        expected = (
+            namespace.principal_id,
+            namespace.channel_id,
+            namespace.agent_id,
+            namespace.runtime_profile_id,
+        )
+        if owner != expected:
+            raise RuntimeError(f"Protected scheduled job {row['id']} has missing or conflicting canonical ownership")
+    elif any(value is not None for value in owner):
+        raise RuntimeError(f"Canonically owned scheduled job {row['id']} has no current protected runtime alias")
+    result = {
+        key: row[key]
+        for key in row.keys()  # noqa: SIM118 - sqlite Row iteration yields values
+        if not key.startswith("owner_")
+    }
+    result["auto_remove"] = bool(result["auto_remove"])
+    result["notify_on_check"] = bool(result["notify_on_check"])
+    return result
 
 
 async def get_jobs(chat_id: int) -> list[dict]:
     """Get all active jobs for a specific chat. Used by /jobs command."""
-    async with _get_db().execute(
-        "SELECT id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, notify_on_check, created_at FROM jobs WHERE chat_id = ? AND active = 1",
-        (chat_id,),
-    ) as cursor:
+    namespace = _execution_state_namespace(chat_id)
+    if namespace is None:
+        sql = (
+            "SELECT j.id, j.chat_id, j.name, j.job_type, j.prompt, j.schedule_type, "
+            "j.schedule_data, j.auto_remove, j.notify_on_check, j.created_at, "
+            f"{_JOB_OWNER_COLUMNS} FROM jobs j LEFT JOIN workshop_job_owners o "
+            "ON o.job_id = j.id WHERE j.chat_id = ? AND j.active = 1"
+        )
+        params: tuple[object, ...] = (chat_id,)
+    else:
+        sql = (
+            "SELECT j.id, j.chat_id, j.name, j.job_type, j.prompt, j.schedule_type, "
+            "j.schedule_data, j.auto_remove, j.notify_on_check, j.created_at, "
+            f"{_JOB_OWNER_COLUMNS} FROM jobs j JOIN workshop_job_owners o "
+            "ON o.job_id = j.id WHERE o.principal_id = ? AND o.channel_id = ? "
+            "AND o.agent_id = ? AND o.runtime_profile_id = ? AND j.active = 1"
+        )
+        params = (
+            namespace.principal_id,
+            namespace.channel_id,
+            namespace.agent_id,
+            namespace.runtime_profile_id,
+        )
+    async with _get_db().execute(sql, params) as cursor:
         rows = await cursor.fetchall()
-        # SQLite stores booleans as integers; convert back to bool
-        return [
-            {**dict(r), "auto_remove": bool(r["auto_remove"]), "notify_on_check": bool(r["notify_on_check"])}
-            for r in rows
-        ]
+        return [_verified_job(row) for row in rows]
 
 
 async def get_job_by_id(job_id: int) -> dict | None:
     """Get a single job by ID, or None if not found. Used by cron.register_job_by_id()."""
     async with _get_db().execute(
-        "SELECT id, chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, notify_on_check FROM jobs WHERE id = ?",
+        "SELECT j.id, j.chat_id, j.name, j.job_type, j.prompt, j.schedule_type, "
+        "j.schedule_data, j.auto_remove, j.notify_on_check, "
+        f"{_JOB_OWNER_COLUMNS} FROM jobs j LEFT JOIN workshop_job_owners o "
+        "ON o.job_id = j.id WHERE j.id = ?",
         (job_id,),
     ) as cursor:
         row = await cursor.fetchone()
         if not row:
             return None
-        return {**dict(row), "auto_remove": bool(row["auto_remove"]), "notify_on_check": bool(row["notify_on_check"])}
+        return _verified_job(row)
 
 
 async def get_all_active_jobs() -> list[dict]:
     """Get all active jobs across all chats. Used at startup to register with APScheduler."""
     async with _get_db().execute(
-        "SELECT id, chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, notify_on_check FROM jobs WHERE active = 1"
+        "SELECT j.id, j.chat_id, j.name, j.job_type, j.prompt, j.schedule_type, "
+        "j.schedule_data, j.auto_remove, j.notify_on_check, "
+        f"{_JOB_OWNER_COLUMNS} FROM jobs j LEFT JOIN workshop_job_owners o "
+        "ON o.job_id = j.id WHERE j.active = 1"
     ) as cursor:
         rows = await cursor.fetchall()
-        return [
-            {**dict(r), "auto_remove": bool(r["auto_remove"]), "notify_on_check": bool(r["notify_on_check"])}
-            for r in rows
-        ]
+        return [_verified_job(row) for row in rows]
 
 
 async def delete_job(job_id: int, chat_id: int | None = None) -> bool:
@@ -856,10 +954,26 @@ async def delete_job(job_id: int, chat_id: int | None = None) -> bool:
     not found (or not owned by chat_id when provided).
     """
     if chat_id is not None:
-        cursor = await _get_db().execute(
-            "DELETE FROM jobs WHERE id = ? AND chat_id = ?",
-            (job_id, chat_id),
-        )
+        namespace = _execution_state_namespace(chat_id)
+        if namespace is None:
+            cursor = await _get_db().execute(
+                "DELETE FROM jobs WHERE id = ? AND chat_id = ?",
+                (job_id, chat_id),
+            )
+        else:
+            cursor = await _get_db().execute(
+                "DELETE FROM jobs WHERE id = ? AND EXISTS ("
+                "SELECT 1 FROM workshop_job_owners o WHERE o.job_id = jobs.id "
+                "AND o.principal_id = ? AND o.channel_id = ? AND o.agent_id = ? "
+                "AND o.runtime_profile_id = ?)",
+                (
+                    job_id,
+                    namespace.principal_id,
+                    namespace.channel_id,
+                    namespace.agent_id,
+                    namespace.runtime_profile_id,
+                ),
+            )
     else:
         cursor = await _get_db().execute("DELETE FROM jobs WHERE id = ?", (job_id,))
     await _get_db().commit()
@@ -879,10 +993,26 @@ async def deactivate_job(job_id: int, chat_id: int | None = None) -> bool:
     owned by chat_id.
     """
     if chat_id is not None:
-        cursor = await _get_db().execute(
-            "UPDATE jobs SET active = 0 WHERE id = ? AND chat_id = ?",
-            (job_id, chat_id),
-        )
+        namespace = _execution_state_namespace(chat_id)
+        if namespace is None:
+            cursor = await _get_db().execute(
+                "UPDATE jobs SET active = 0 WHERE id = ? AND chat_id = ?",
+                (job_id, chat_id),
+            )
+        else:
+            cursor = await _get_db().execute(
+                "UPDATE jobs SET active = 0 WHERE id = ? AND EXISTS ("
+                "SELECT 1 FROM workshop_job_owners o WHERE o.job_id = jobs.id "
+                "AND o.principal_id = ? AND o.channel_id = ? AND o.agent_id = ? "
+                "AND o.runtime_profile_id = ?)",
+                (
+                    job_id,
+                    namespace.principal_id,
+                    namespace.channel_id,
+                    namespace.agent_id,
+                    namespace.runtime_profile_id,
+                ),
+            )
     else:
         cursor = await _get_db().execute("UPDATE jobs SET active = 0 WHERE id = ?", (job_id,))
     await _get_db().commit()
@@ -952,8 +1082,24 @@ async def update_job(
     values.append(job_id)
     where = "WHERE id = ? AND active = 1"
     if chat_id is not None:
-        where += " AND chat_id = ?"
-        values.append(chat_id)
+        namespace = _execution_state_namespace(chat_id)
+        if namespace is None:
+            where += " AND chat_id = ?"
+            values.append(chat_id)
+        else:
+            where += (
+                " AND EXISTS (SELECT 1 FROM workshop_job_owners o WHERE o.job_id = jobs.id "
+                "AND o.principal_id = ? AND o.channel_id = ? AND o.agent_id = ? "
+                "AND o.runtime_profile_id = ?)"
+            )
+            values.extend(
+                (
+                    namespace.principal_id,
+                    namespace.channel_id,
+                    namespace.agent_id,
+                    namespace.runtime_profile_id,
+                )
+            )
     sql = f"UPDATE jobs SET {', '.join(updates)} {where}"
     cursor = await _get_db().execute(sql, values)
     await _get_db().commit()
@@ -1726,15 +1872,22 @@ async def get_github_added_repos(chat_id: int) -> list[str]:
     Values are stored as a JSON array of lowercase strings in the
     settings table under the key "github_repos_added:{chat_id}".
     """
-    val = await get_setting(f"github_repos_added:{chat_id}")
+    canonical = await _canonical_github_subscription(chat_id)
+    val = (
+        str(canonical["added_repos_json"])
+        if canonical is not None
+        else await get_setting(f"github_repos_added:{chat_id}")
+    )
     if val is None:
         return []
     try:
         repos = json.loads(val)
-        if not isinstance(repos, list):
+        if not isinstance(repos, list) or any(not isinstance(repo, str) for repo in repos):
             raise ValueError("expected list")
         return repos
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError) as exc:
+        if canonical is not None:
+            raise RuntimeError("Canonical GitHub added repository policy is corrupt") from exc
         log.warning("Corrupt github_repos_added for chat %d: %r", chat_id, val)
         return []
 
@@ -1745,29 +1898,124 @@ async def get_github_removed_repos(chat_id: int) -> list[str]:
     Values are stored as a JSON array of lowercase strings in the
     settings table under the key "github_repos_removed:{chat_id}".
     """
-    val = await get_setting(f"github_repos_removed:{chat_id}")
+    canonical = await _canonical_github_subscription(chat_id)
+    val = (
+        str(canonical["removed_repos_json"])
+        if canonical is not None
+        else await get_setting(f"github_repos_removed:{chat_id}")
+    )
     if val is None:
         return []
     try:
         repos = json.loads(val)
-        if not isinstance(repos, list):
+        if not isinstance(repos, list) or any(not isinstance(repo, str) for repo in repos):
             raise ValueError("expected list")
         return repos
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError) as exc:
+        if canonical is not None:
+            raise RuntimeError("Canonical GitHub removed repository policy is corrupt") from exc
         log.warning("Corrupt github_repos_removed for chat %d: %r", chat_id, val)
         return []
 
 
 async def set_github_added_repos(chat_id: int, repos: list[str]) -> None:
     """Persist the user's added-repos list. Stores lowercase."""
-    normalized = [r.lower() for r in repos]
-    await set_setting(f"github_repos_added:{chat_id}", json.dumps(normalized))
+    await _set_github_repos(chat_id, "added_repos_json", "github_repos_added", repos)
 
 
 async def set_github_removed_repos(chat_id: int, repos: list[str]) -> None:
     """Persist the user's removed-repos list. Stores lowercase."""
-    normalized = [r.lower() for r in repos]
-    await set_setting(f"github_repos_removed:{chat_id}", json.dumps(normalized))
+    await _set_github_repos(chat_id, "removed_repos_json", "github_repos_removed", repos)
+
+
+async def _canonical_github_subscription(chat_id: int) -> aiosqlite.Row | None:
+    namespace = _execution_state_namespace(chat_id)
+    if namespace is None:
+        return None
+    async with _get_db().execute(
+        "SELECT baseline_repos_json, added_repos_json, removed_repos_json, "
+        "pr_review_enabled, issue_triage_enabled, pr_review_source, "
+        "issue_triage_source FROM principal_github_subscriptions "
+        "WHERE principal_id = ?",
+        (namespace.principal_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is None:
+        raise RuntimeError("Protected GitHub subscription policy is missing its canonical principal owner")
+    return row
+
+
+async def _set_github_repos(
+    chat_id: int,
+    canonical_column: str,
+    legacy_key: str,
+    repos: list[str],
+) -> None:
+    normalized = sorted({repo.strip().lower() for repo in repos if repo.strip()})
+    encoded = json.dumps(normalized, separators=(",", ":"))
+    namespace = _execution_state_namespace(chat_id)
+    if namespace is None:
+        await set_setting(f"{legacy_key}:{chat_id}", encoded)
+        return
+    if canonical_column not in {"added_repos_json", "removed_repos_json"}:
+        raise ValueError("Unsupported canonical GitHub repository column")
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        try:
+            await _get_db().execute("BEGIN IMMEDIATE")
+            cursor = await _get_db().execute(
+                f"UPDATE principal_github_subscriptions SET {canonical_column} = ?, "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE principal_id = ?",
+                (encoded, namespace.principal_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Canonical GitHub subscription update found no unique owner")
+            await _get_db().execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (f"{legacy_key}:{chat_id}", encoded),
+            )
+            await _get_db().commit()
+        except Exception:
+            await _get_db().rollback()
+            raise
+
+
+async def set_github_toggle(chat_id: int, field: str, enabled: bool) -> None:
+    """Persist one GitHub policy toggle under its canonical principal owner."""
+    columns = {
+        "pr_review": ("pr_review_enabled", "pr_review_source"),
+        "issue_triage": ("issue_triage_enabled", "issue_triage_source"),
+    }
+    if field not in columns:
+        raise ValueError("Unsupported GitHub toggle")
+    namespace = _execution_state_namespace(chat_id)
+    encoded = "true" if enabled else "false"
+    if namespace is None:
+        await set_setting(f"{field}:{chat_id}", encoded)
+        return
+    value_column, source_column = columns[field]
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        try:
+            await _get_db().execute("BEGIN IMMEDIATE")
+            cursor = await _get_db().execute(
+                f"UPDATE principal_github_subscriptions SET {value_column} = ?, "
+                f"{source_column} = 'user', updated_at = "
+                "strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE principal_id = ?",
+                (int(enabled), namespace.principal_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Canonical GitHub subscription update found no unique owner")
+            await _get_db().execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (f"{field}:{chat_id}", encoded),
+            )
+            await _get_db().commit()
+        except Exception:
+            await _get_db().rollback()
+            raise
 
 
 async def get_effective_repos(chat_id: int, yaml_repos: list[str]) -> list[str]:
@@ -1779,6 +2027,15 @@ async def get_effective_repos(chat_id: int, yaml_repos: list[str]) -> list[str]:
     both resolve_github_settings() and webhook._get_subscribed_users()
     call this function.
     """
+    canonical = await _canonical_github_subscription(chat_id)
+    if canonical is not None:
+        try:
+            baseline = json.loads(str(canonical["baseline_repos_json"]))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Canonical GitHub baseline is corrupt") from exc
+        if not isinstance(baseline, list) or any(not isinstance(repo, str) for repo in baseline):
+            raise RuntimeError("Canonical GitHub baseline is corrupt")
+        yaml_repos = baseline
     added = await get_github_added_repos(chat_id)
     removed = await get_github_removed_repos(chat_id)
     # Lowercase everything defensively. added/removed are stored
@@ -1787,6 +2044,23 @@ async def get_effective_repos(chat_id: int, yaml_repos: list[str]) -> list[str]:
     return sorted(
         (set(r.lower() for r in yaml_repos) | set(r.lower() for r in added)) - set(r.lower() for r in removed)
     )
+
+
+async def github_admin_wildcard(chat_id: int, *, legacy_admin: bool) -> bool:
+    """Return wildcard policy from the protected human's current Workshop role."""
+    namespace = _execution_state_namespace(chat_id)
+    if namespace is None:
+        return legacy_admin
+    async with _get_db().execute(
+        "SELECT wm.role FROM channels c "
+        "JOIN workshop_memberships wm ON wm.workshop_id = c.workshop_id "
+        "AND wm.principal_id = ? WHERE c.id = ?",
+        (namespace.principal_id, namespace.channel_id),
+    ) as cursor:
+        rows = tuple(await cursor.fetchall())
+    if len(rows) != 1:
+        raise RuntimeError("Protected GitHub subscriber has no unique current Workshop role")
+    return str(rows[0][0]) == "admin"
 
 
 async def get_github_db_settings(chat_id: int) -> dict[str, str]:
@@ -1802,13 +2076,24 @@ async def get_github_db_settings(chat_id: int) -> dict[str, str]:
     "github_repos_added", "github_repos_removed".
     """
     result: dict[str, str] = {}
-    for key in (
-        "pr_review",
-        "issue_triage",
-        "github_notify_chat",
-        "github_repos_added",
-        "github_repos_removed",
-    ):
+    canonical = await _canonical_github_subscription(chat_id)
+    if canonical is not None:
+        if canonical["pr_review_source"] == "user":
+            result["pr_review"] = "true" if canonical["pr_review_enabled"] else "false"
+        if canonical["issue_triage_source"] == "user":
+            result["issue_triage"] = "true" if canonical["issue_triage_enabled"] else "false"
+        result["github_repos_added"] = str(canonical["added_repos_json"])
+        result["github_repos_removed"] = str(canonical["removed_repos_json"])
+        keys = ("github_notify_chat",)
+    else:
+        keys = (
+            "pr_review",
+            "issue_triage",
+            "github_notify_chat",
+            "github_repos_added",
+            "github_repos_removed",
+        )
+    for key in keys:
         val = await get_setting(f"{key}:{chat_id}")
         if val is not None:
             result[key] = val
@@ -1863,8 +2148,12 @@ async def resolve_github_settings(chat_id: int, config: Config) -> GitHubSetting
             # the user's own DM (telegram_id == chat_id for private chats).
             notify = chat_id
 
-    # PR review: DB > yaml > False
-    if "pr_review" in db:
+    canonical = await _canonical_github_subscription(chat_id)
+
+    # PR review: canonical protected policy, otherwise DB > yaml > False.
+    if canonical is not None:
+        pr_review = bool(canonical["pr_review_enabled"])
+    elif "pr_review" in db:
         pr_review = isinstance(db["pr_review"], str) and db["pr_review"].lower() == "true"
     elif user_config and user_config.pr_review is not None:
         pr_review = user_config.pr_review
@@ -1872,7 +2161,9 @@ async def resolve_github_settings(chat_id: int, config: Config) -> GitHubSetting
         pr_review = False
 
     # Issue triage: DB > yaml > False
-    if "issue_triage" in db:
+    if canonical is not None:
+        issue_triage = bool(canonical["issue_triage_enabled"])
+    elif "issue_triage" in db:
         issue_triage = isinstance(db["issue_triage"], str) and db["issue_triage"].lower() == "true"
     elif user_config and user_config.issue_triage is not None:
         issue_triage = user_config.issue_triage
