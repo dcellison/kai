@@ -44,6 +44,7 @@ class WorkshopExecutionStateRegistry:
     def __init__(self, namespaces: tuple[WorkshopExecutionStateNamespace, ...]) -> None:
         by_config_id: dict[int, WorkshopExecutionStateNamespace] = {}
         by_profile: dict[RuntimeProfileId, WorkshopExecutionStateNamespace] = {}
+        by_principal: dict[PrincipalId, WorkshopExecutionStateNamespace | None] = {}
         for namespace in namespaces:
             if not isinstance(namespace, WorkshopExecutionStateNamespace):
                 raise TypeError("namespaces must contain WorkshopExecutionStateNamespace values")
@@ -53,10 +54,18 @@ class WorkshopExecutionStateRegistry:
                 raise WorkshopExecutionStateError("Duplicate runtime profile execution-state owner")
             by_config_id[namespace.runtime_config_id] = namespace
             by_profile[namespace.runtime_profile_id] = namespace
+            # A human may eventually have more than one runtime profile.  A
+            # principal-id lookup is therefore available only while it is
+            # unambiguous; exact protected-runtime lookups remain authoritative.
+            if namespace.principal_id in by_principal:
+                by_principal[namespace.principal_id] = None
+            else:
+                by_principal[namespace.principal_id] = namespace
         if not by_config_id:
             raise WorkshopExecutionStateError("At least one execution-state namespace is required")
         self._by_config_id = by_config_id
         self._by_profile = by_profile
+        self._by_principal = by_principal
 
     @classmethod
     async def from_store(
@@ -113,6 +122,13 @@ class WorkshopExecutionStateRegistry:
         if isinstance(runtime_config_id, bool) or not isinstance(runtime_config_id, int):
             return None
         return self._by_config_id.get(runtime_config_id)
+
+    def maybe_for_principal_id(self, principal_id: str) -> WorkshopExecutionStateNamespace | None:
+        try:
+            canonical_id = PrincipalId(principal_id)
+        except (TypeError, ValueError):
+            return None
+        return self._by_principal.get(canonical_id)
 
 
 async def reconcile_legacy_execution_state(

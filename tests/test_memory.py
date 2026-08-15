@@ -3800,6 +3800,76 @@ class TestMemoryIntegration:
         remaining = mem_mod.get_all(user_id=user_id)
         assert len(remaining) == 0
 
+    def test_canonical_namespace_migration_preserves_real_mem0_memory(self, real_memory_instance):
+        """Re-key a deployed-shape row without changing its identity or meaning."""
+        import kai.memory as mem_mod
+        from kai.workshop.domain import AgentId, ChannelId, PrincipalId, RuntimeProfileId
+        from kai.workshop.execution_state import (
+            WorkshopExecutionStateNamespace,
+            WorkshopExecutionStateRegistry,
+        )
+
+        namespace = WorkshopExecutionStateNamespace(
+            principal_id=PrincipalId.new(),
+            channel_id=ChannelId.new(),
+            agent_id=AgentId.new(),
+            runtime_profile_id=RuntimeProfileId.new(),
+            runtime_config_id=8675309,
+        )
+        legacy_user_id = str(namespace.runtime_config_id)
+        canonical_user_id = str(namespace.principal_id)
+        mem_mod._memory = real_memory_instance
+        mem_mod._config = _make_config()
+        real_memory_instance.delete_all(user_id=legacy_user_id)
+        real_memory_instance.delete_all(user_id=canonical_user_id)
+
+        expected_metadata = {
+            "source": "extracted",
+            "scope": "project",
+            "project_id": "kai",
+            "tags": ["architecture", "memory"],
+            "speaker": "user",
+            "confidence": 1.0,
+            "session_id": "legacy-transcript-locator",
+        }
+        memory_id = mem_mod.add_structured(
+            "Daniel considers semantic memory an important part of Kai.",
+            user_id=legacy_user_id,
+            memory_type="fact",
+            metadata=expected_metadata,
+        )
+        assert memory_id is not None
+        before = mem_mod._get_all_raw(user_id=legacy_user_id)
+        assert len(before) == 1
+        recall_query = "What part of Kai is important to Daniel?"
+        before_recall = mem_mod.search(recall_query, user_id=legacy_user_id)
+        before_hit = next(item for item in before_recall if item.id == memory_id)
+
+        try:
+            migrated = mem_mod.migrate_memory_namespace(namespace)
+
+            assert migrated == mem_mod.CanonicalMemoryMigrationResult(moved=1, stamped=0, total=1)
+            assert mem_mod._get_all_raw(user_id=legacy_user_id) == []
+            canonical_rows = mem_mod._get_all_raw(user_id=canonical_user_id)
+            assert len(canonical_rows) == 1
+            row = canonical_rows[0]
+            assert row.id == memory_id
+            assert row.text == "Daniel considers semantic memory an important part of Kai."
+            assert row.created_at == before[0].created_at
+            assert row.updated_at == before[0].updated_at
+            assert {key: row.metadata[key] for key in expected_metadata} == expected_metadata
+            assert row.metadata["type"] == "fact"
+
+            mem_mod.configure_memory_authority(WorkshopExecutionStateRegistry((namespace,)))
+            assert [item.id for item in mem_mod.get_all(user_id=legacy_user_id)] == [memory_id]
+            recalled = mem_mod.search(recall_query, user_id=legacy_user_id)
+            after_hit = next(item for item in recalled if item.id == memory_id)
+            assert after_hit.score == pytest.approx(before_hit.score)
+        finally:
+            mem_mod.configure_memory_authority(None)
+            real_memory_instance.delete_all(user_id=legacy_user_id)
+            real_memory_instance.delete_all(user_id=canonical_user_id)
+
     async def test_format_context_integration(self, real_memory_instance):
         """format_context returns formatted, budget-capped output.
 

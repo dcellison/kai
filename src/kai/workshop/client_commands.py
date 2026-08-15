@@ -6,13 +6,14 @@ import asyncio
 import logging
 from dataclasses import dataclass
 
+from kai.conversation_compatibility import CanonicalMemoryProvenance
 from kai.history import LogEntry
 from kai.workshop.compatibility_state import WorkshopCompatibilityStateWriter
 from kai.workshop.conversation_commands import (
     ClientConversationCommandAcceptance,
     ConversationCommandDisposition,
 )
-from kai.workshop.domain import RunId, RuntimeProfileId
+from kai.workshop.domain import MessageId, RunId, RuntimeProfileId
 from kai.workshop.execution_coordinator import (
     CanonicalCancellationDisposition,
     CanonicalExecutionDisposition,
@@ -44,6 +45,7 @@ class ClientCommandSubmission:
 class _ClientRunContext:
     run_id: RunId
     runtime_profile_id: RuntimeProfileId
+    inbound_message_id: MessageId
     body: str
     user_log: LogEntry | None = None
 
@@ -95,10 +97,14 @@ class WorkshopClientCommandExecutor:
             ConversationCommandDisposition.NEWLY_ACCEPTED,
             ConversationCommandDisposition.READY_REPLAY,
         }:
+            inbound_message_id = accepted.command.message.event.envelope.aggregate_id
+            if not isinstance(inbound_message_id, MessageId):
+                raise RuntimeError("Workshop client command did not identify a canonical message")
             await self._schedule(
                 _ClientRunContext(
                     accepted.run.run_id,
                     accepted.runtime_profile_id,
+                    inbound_message_id,
                     message.body,
                     user_log,
                 )
@@ -160,6 +166,9 @@ class WorkshopClientCommandExecutor:
                     result.selection.model,
                 )
             if result.disposition == CanonicalExecutionDisposition.COMPLETED and result.workspace is not None:
+                result_message_id = result.terminal.finalization.message.event.envelope.aggregate_id
+                if not isinstance(result_message_id, MessageId):
+                    raise RuntimeError("Workshop execution did not identify a canonical result message")
                 compatibility_state.schedule_memory_ingestion(
                     prompt=context.body,
                     assistant_text=result.terminal.body,
@@ -167,6 +176,11 @@ class WorkshopClientCommandExecutor:
                     workspace=result.workspace,
                     user_log=context.user_log,
                     assistant_log=assistant_log,
+                    canonical_provenance=CanonicalMemoryProvenance(
+                        run_id=context.run_id,
+                        source_message_id=context.inbound_message_id,
+                        result_message_id=result_message_id,
+                    ),
                 )
         except Exception:
             log.exception("Workshop client run task failed for %s", context.run_id)
@@ -199,5 +213,6 @@ class WorkshopClientCommandExecutor:
         return _ClientRunContext(
             run.run_id,
             run.runtime_profile_id,
+            run.inbound_message_id,
             run.body,
         )

@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 from kai import sessions
 from kai.config import Config
-from kai.conversation_compatibility import schedule_memory_ingestion
+from kai.conversation_compatibility import CanonicalMemoryProvenance, schedule_memory_ingestion
 from kai.history import LogEntry, log_message
 from kai.workshop.domain import RuntimeProfileId
 from kai.workshop.runtime_pool import WorkshopRuntimePool
@@ -16,9 +16,11 @@ from kai.workshop.runtime_pool import WorkshopRuntimePool
 class WorkshopProfileCompatibilityState:
     """Write existing state for one protected runtime profile.
 
-    The integer key is deliberately private to this adapter. Existing JSONL,
-    session, and semantic-memory namespaces remain unchanged while canonical
-    Workshop callers address the state only through a runtime profile.
+    The integer key is deliberately private to this adapter. JSONL and
+    remaining compatibility calls retain it; the semantic-memory boundary
+    resolves it to the canonical principal and rejects legacy-owner reads.
+    Canonical Workshop callers address this state only through a runtime
+    profile.
     """
 
     _runtime_config_id: int = field(repr=False)
@@ -46,6 +48,7 @@ class WorkshopProfileCompatibilityState:
         workspace: str,
         user_log: LogEntry | None,
         assistant_log: LogEntry | None,
+        canonical_provenance: CanonicalMemoryProvenance,
     ) -> None:
         schedule_memory_ingestion(
             prompt=prompt,
@@ -56,6 +59,7 @@ class WorkshopProfileCompatibilityState:
             workspace=workspace,
             user_log=user_log,
             assistant_log=assistant_log,
+            canonical_provenance=canonical_provenance,
             effective_backend=self._backend,
         )
 

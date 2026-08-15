@@ -4,13 +4,33 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 
 from kai.config import ONESHOT_REASONER_BACKENDS, Config
 from kai.history import LogEntry
+from kai.workshop.domain import MessageId, RunId
 
 log = logging.getLogger(__name__)
 
 _pending_memory_tasks: set[asyncio.Task[None]] = set()
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalMemoryProvenance:
+    """Canonical messages and run consumed by one memory extraction."""
+
+    run_id: RunId
+    source_message_id: MessageId
+    result_message_id: MessageId
+
+    def metadata(self) -> dict[str, object]:
+        from kai import memory
+
+        return {
+            memory.WORKSHOP_RUN_ID_KEY: str(self.run_id),
+            memory.WORKSHOP_SOURCE_MESSAGE_ID_KEY: str(self.source_message_id),
+            memory.WORKSHOP_RESULT_MESSAGE_ID_KEY: str(self.result_message_id),
+        }
 
 
 def reader_user(config: Config, chat_id: int) -> str | None:
@@ -29,6 +49,7 @@ def schedule_memory_ingestion(
     workspace: str,
     user_log: LogEntry | None,
     assistant_log: LogEntry | None,
+    canonical_provenance: CanonicalMemoryProvenance | None = None,
     reasoner_backends: frozenset[str] = ONESHOT_REASONER_BACKENDS,
     effective_backend: str | None = None,
 ) -> None:
@@ -71,6 +92,9 @@ def schedule_memory_ingestion(
                         workspace=workspace,
                         user_log=user_log,
                         assistant_log=assistant_log,
+                        canonical_provenance=(
+                            canonical_provenance.metadata() if canonical_provenance is not None else None
+                        ),
                     )
             except Exception:
                 log.warning("Memory ingestion failed", exc_info=True)

@@ -62,6 +62,10 @@ from kai.workshop.execution_state import (
     reconcile_legacy_execution_state,
 )
 from kai.workshop.inbound import InboundMessage, record_inbound_message
+from kai.workshop.memory_authority import (
+    WorkshopMemoryAuthorityMigration,
+    reconcile_workshop_memory_authority,
+)
 from kai.workshop.outbound import (
     DeliveryObservation,
     OutboundMessage,
@@ -400,6 +404,16 @@ async def initialize_workshop_execution_state(
         migration = await reconcile_legacy_execution_state(_get_db(), registry)
         _workshop_execution_state = registry
         return registry, migration
+
+
+async def initialize_workshop_memory_authority(
+    registry: WorkshopExecutionStateRegistry,
+) -> WorkshopMemoryAuthorityMigration:
+    """Re-key protected semantic memory under the canonical event-store lock."""
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        return await reconcile_workshop_memory_authority(_get_db(), registry)
 
 
 def _execution_state_namespace(chat_id: int) -> WorkshopExecutionStateNamespace | None:

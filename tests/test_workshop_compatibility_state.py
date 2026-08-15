@@ -3,7 +3,9 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
 
+from kai.conversation_compatibility import CanonicalMemoryProvenance
 from kai.workshop.compatibility_state import WorkshopCompatibilityStateWriter
+from kai.workshop.domain import MessageId, RunId
 from tests.workshop_profiles import profile_id
 
 
@@ -38,6 +40,7 @@ async def test_profile_state_preserves_existing_storage_keys(monkeypatch):
     state = WorkshopCompatibilityStateWriter(config, runtime_pool).for_profile(profile_id(101))
     user_log = state.append_history(direction="user", text="Hello")
     assistant_log = state.append_history(direction="assistant", text="Hi")
+    provenance = CanonicalMemoryProvenance(RunId.new(), MessageId.new(), MessageId.new())
     await state.save_session("session-1", "gpt-5.6-sol")
     state.schedule_memory_ingestion(
         prompt="Hello",
@@ -46,6 +49,7 @@ async def test_profile_state_preserves_existing_storage_keys(monkeypatch):
         workspace="/workspace/project",
         user_log=user_log,
         assistant_log=assistant_log,
+        canonical_provenance=provenance,
     )
 
     runtime_pool.runtime_profile.assert_called_once_with(profile_id(101))
@@ -73,5 +77,6 @@ async def test_profile_state_preserves_existing_storage_keys(monkeypatch):
         workspace="/workspace/project",
         user_log="user-log",
         assistant_log="assistant-log",
+        canonical_provenance=provenance,
         effective_backend="codex",
     )

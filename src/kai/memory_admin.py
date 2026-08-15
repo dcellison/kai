@@ -125,7 +125,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     purge.add_argument(
         "user_id",
-        help="Telegram chat id (as a string) whose rows to purge.",
+        help="Memory owner key; protected runtime IDs resolve to their canonical principal.",
     )
     purge.add_argument(
         "--source",
@@ -159,7 +159,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     rec.add_argument(
         "user_id",
-        help="Telegram chat id (as a string) whose rows to reclassify.",
+        help="Memory owner key; protected runtime IDs resolve to their canonical principal.",
     )
     # Classification flags default to None (not their documented
     # defaults) so the mutating-mode rejection below can tell "flag
@@ -234,7 +234,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     bp.add_argument(
         "user_id",
-        help="Telegram chat id (as a string) whose rows to backfill.",
+        help="Memory owner key; protected runtime IDs resolve to their canonical principal.",
     )
     # Scoring flags default to None so the mutating-mode rejection
     # below can tell "flag explicitly passed" from "default in effect";
@@ -339,10 +339,10 @@ def _initialize_memory() -> Config | None:
     """
     try:
         from kai.config import load_config
-        from kai.memory import init_memory, is_enabled
+        from kai.memory import init_offline_memory, is_enabled
 
         config = load_config()
-        init_memory(config)
+        init_offline_memory(config)
         if not is_enabled():
             # is_enabled returns False when MEMORY_ENABLED=false or when
             # init_memory hit a recoverable problem (dimension mismatch,
@@ -356,7 +356,11 @@ def _initialize_memory() -> Config | None:
             return None
         return config
     except Exception as e:
-        print(f"memory admin: init failed: {e}", file=sys.stderr)
+        print(
+            f"memory admin: init failed: {e}. If canonical memory receipts are incomplete, "
+            "start Kai once with memory enabled so the protected migration can finish.",
+            file=sys.stderr,
+        )
         return None
 
 

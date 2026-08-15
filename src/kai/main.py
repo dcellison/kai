@@ -412,11 +412,24 @@ def _start() -> None:
         # spec §320 / epic #306; Haiku extraction (Phase 2) is gated
         # separately via MEMORY_EXTRACTION_ENABLED.
         try:
-            from kai.memory import init_memory
+            from kai.memory import configure_memory_authority, init_memory, is_enabled
 
+            configure_memory_authority(execution_state)
             init_memory(config)
         except Exception:
             logging.warning("Could not initialize semantic memory", exc_info=True)
+        else:
+            if is_enabled():
+                memory_migration = await sessions.initialize_workshop_memory_authority(execution_state)
+                logging.info(
+                    "Workshop canonical memory authority ready "
+                    "(profiles=%d, newly_migrated=%d, moved=%d, stamped=%d, total=%d)",
+                    memory_migration.profiles,
+                    memory_migration.newly_migrated,
+                    memory_migration.moved,
+                    memory_migration.stamped,
+                    memory_migration.total,
+                )
 
         try:
             core_host = KaiApplicationHost(
@@ -507,6 +520,9 @@ def _start() -> None:
             if cleanup_task is not None:
                 cleanup_task.cancel()
                 await asyncio.gather(cleanup_task, return_exceptions=True)
+            from kai.memory import configure_memory_authority
+
+            configure_memory_authority(None)
             await sessions.close_db()
 
     try:

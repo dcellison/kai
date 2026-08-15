@@ -2410,6 +2410,7 @@ async def _generate_episode(
     active_project: ActiveMemoryProject | None = None,
     user_log: LogEntry | None = None,
     assistant_log: LogEntry | None = None,
+    canonical_provenance: dict[str, object] | None = None,
 ) -> None:
     """
     Stage-2 task body: generate one episode record and store it.
@@ -2547,6 +2548,8 @@ async def _generate_episode(
                         "speaker": "episode_summary",
                         "confidence": 1.0,
                     }
+                    if canonical_provenance is not None:
+                        extra.update(canonical_provenance)
                     if "lessons" in episode:
                         extra["lessons"] = episode["lessons"]
                     # Write-scope routing, same consumption shape as
@@ -2780,6 +2783,7 @@ def _store_facts(
     active_project: ActiveMemoryProject | None = None,
     user_log: LogEntry | None = None,
     assistant_log: LogEntry | None = None,
+    canonical_provenance: dict[str, object] | None = None,
 ) -> tuple[int, int, int]:
     """
     Persist validated facts via memory.add_structured, branching on intent.
@@ -2882,6 +2886,8 @@ def _store_facts(
             "session_id": session_id or "",
             "prompt_version": _EXTRACTION_PROMPT_VERSION,
         }
+        if canonical_provenance is not None:
+            extra.update(canonical_provenance)
         # confirmation_quote is only present on confirmed_action facts
         # by the time _validate_facts has run.
         if "confirmation_quote" in fact:
@@ -3087,6 +3093,7 @@ async def extract_and_store(
     workspace: str | None = None,
     user_log: LogEntry | None = None,
     assistant_log: LogEntry | None = None,
+    canonical_provenance: dict[str, object] | None = None,
 ) -> int:
     """
     Run Haiku extraction on an exchange and store the resulting facts.
@@ -3135,6 +3142,12 @@ async def extract_and_store(
     stamped and the row matches today's metadata shape byte for byte.
     The legacy-row UI fallback handles the absent case across every
     consumer surface.
+
+    `canonical_provenance`, when supplied by a production Workshop run,
+    identifies the canonical run plus its inbound and result messages. It is
+    copied to every fact and episode produced from this exchange. JSONL
+    locators remain supplemental migration/archive provenance and never
+    determine protected memory ownership.
     """
     if config is None:
         from kai.config import load_config
@@ -3336,6 +3349,7 @@ async def extract_and_store(
                         active_project=active_project,
                         user_log=user_log,
                         assistant_log=assistant_log,
+                        canonical_provenance=canonical_provenance,
                     ),
                 )
             else:
@@ -3376,6 +3390,7 @@ async def extract_and_store(
                         active_project=active_project,
                         user_log=user_log,
                         assistant_log=assistant_log,
+                        canonical_provenance=canonical_provenance,
                     ),
                     name=f"episode-{user_id}",
                 )

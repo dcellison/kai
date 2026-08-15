@@ -634,10 +634,10 @@ def _initialize_memory_or_exit() -> Config | None:
     """
     try:
         from kai.config import load_config
-        from kai.memory import init_memory, is_enabled
+        from kai.memory import init_offline_memory, is_enabled
 
         config = load_config()
-        init_memory(config)
+        init_offline_memory(config)
         if not is_enabled():
             print(
                 "gen_collision_probes: memory is not enabled. "

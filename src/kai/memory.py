@@ -28,11 +28,21 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from kai.config import DATA_DIR, Config
 
 log = logging.getLogger(__name__)
+
+WORKSHOP_MEMORY_PROVENANCE_VERSION_KEY = "workshop_memory_provenance_version"
+WORKSHOP_PRINCIPAL_ID_KEY = "workshop_principal_id"
+WORKSHOP_CHANNEL_ID_KEY = "workshop_channel_id"
+WORKSHOP_AGENT_ID_KEY = "workshop_agent_id"
+WORKSHOP_RUNTIME_PROFILE_ID_KEY = "workshop_runtime_profile_id"
+WORKSHOP_SOURCE_MESSAGE_ID_KEY = "workshop_source_message_id"
+WORKSHOP_RESULT_MESSAGE_ID_KEY = "workshop_result_message_id"
+WORKSHOP_RUN_ID_KEY = "workshop_run_id"
+_WORKSHOP_MEMORY_PROVENANCE_VERSION = 1
 
 # ── Data classes ────────────────────────────────────────────────────
 
@@ -816,6 +826,137 @@ _memory: object | None = None
 _config: Config | None = None
 
 
+class _CanonicalMemoryNamespace(Protocol):
+    @property
+    def principal_id(self) -> object: ...
+
+    @property
+    def channel_id(self) -> object: ...
+
+    @property
+    def agent_id(self) -> object: ...
+
+    @property
+    def runtime_profile_id(self) -> object: ...
+
+    @property
+    def runtime_config_id(self) -> int: ...
+
+
+class CanonicalMemoryNamespaceResolver(Protocol):
+    """Resolve protected compatibility IDs to canonical memory owners."""
+
+    def maybe_for_runtime_config_id(self, runtime_config_id: int) -> _CanonicalMemoryNamespace | None: ...
+
+    def maybe_for_principal_id(self, principal_id: str) -> _CanonicalMemoryNamespace | None: ...
+
+
+class CanonicalMemoryAuthorityError(RuntimeError):
+    """Semantic memory cannot be attributed to one canonical owner."""
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalMemoryMigrationResult:
+    """Result of re-keying one protected semantic-memory namespace."""
+
+    moved: int
+    stamped: int
+    total: int
+
+
+_MEMORY_AUTHORITY_REGISTRY: CanonicalMemoryNamespaceResolver | None = None
+
+
+def configure_memory_authority(
+    registry: CanonicalMemoryNamespaceResolver | None,
+) -> None:
+    """Install the protected canonical-owner resolver used at Mem0 boundaries."""
+    global _MEMORY_AUTHORITY_REGISTRY
+    _MEMORY_AUTHORITY_REGISTRY = registry
+
+
+def _canonical_memory_owner(
+    user_id: str,
+) -> tuple[str, _CanonicalMemoryNamespace | None]:
+    registry = _MEMORY_AUTHORITY_REGISTRY
+    if registry is None:
+        return user_id, None
+    canonical = registry.maybe_for_principal_id(user_id)
+    if canonical is not None:
+        return str(canonical.principal_id), canonical
+    try:
+        runtime_config_id = int(user_id)
+    except (TypeError, ValueError):
+        return user_id, None
+    if runtime_config_id <= 0 or str(runtime_config_id) != user_id:
+        return user_id, None
+    namespace = registry.maybe_for_runtime_config_id(runtime_config_id)
+    if namespace is None:
+        return user_id, None
+    return str(namespace.principal_id), namespace
+
+
+def canonical_memory_user_id(user_id: str) -> str:
+    """Return the canonical semantic-memory namespace for a protected caller."""
+    return _canonical_memory_owner(user_id)[0]
+
+
+def _owner_metadata(namespace: _CanonicalMemoryNamespace) -> dict[str, object]:
+    return {
+        WORKSHOP_MEMORY_PROVENANCE_VERSION_KEY: _WORKSHOP_MEMORY_PROVENANCE_VERSION,
+        WORKSHOP_PRINCIPAL_ID_KEY: str(namespace.principal_id),
+        WORKSHOP_CHANNEL_ID_KEY: str(namespace.channel_id),
+        WORKSHOP_AGENT_ID_KEY: str(namespace.agent_id),
+        WORKSHOP_RUNTIME_PROFILE_ID_KEY: str(namespace.runtime_profile_id),
+    }
+
+
+def _metadata_for_owner(
+    metadata: dict[str, Any] | None,
+    namespace: _CanonicalMemoryNamespace | None,
+) -> dict[str, Any]:
+    merged = dict(metadata) if metadata else {}
+    if namespace is not None:
+        expected = _owner_metadata(namespace)
+        for key, value in expected.items():
+            existing = merged.get(key)
+            if existing is not None and existing != value:
+                raise CanonicalMemoryAuthorityError(
+                    "Semantic-memory provenance conflicts with the protected canonical owner"
+                )
+            merged[key] = value
+    return merged
+
+
+def _memory_result_has_owner(
+    result: MemoryResult,
+    namespace: _CanonicalMemoryNamespace | None,
+) -> bool:
+    if namespace is None:
+        return True
+    expected = _owner_metadata(namespace)
+    return all(result.metadata.get(key) == value for key, value in expected.items())
+
+
+def _memory_owner_state(
+    result: MemoryResult,
+    namespace: _CanonicalMemoryNamespace,
+    sibling_namespaces: tuple[_CanonicalMemoryNamespace, ...],
+) -> str:
+    """Classify canonical payload provenance for one principal namespace."""
+    owner_keys = tuple(_owner_metadata(namespace))
+    present = tuple(key for key in owner_keys if key in result.metadata)
+    if not present:
+        return "unowned"
+    if len(present) != len(owner_keys):
+        return "conflict"
+    if _memory_result_has_owner(result, namespace):
+        return "exact"
+    if any(_memory_result_has_owner(result, sibling) for sibling in sibling_namespaces):
+        return "sibling"
+    return "conflict"
+
+
 # ── Helpers ─────────────────────────────────────────────────────────
 
 
@@ -1289,6 +1430,21 @@ def _emit_recall_log(payload: dict[str, object]) -> None:
 # ── Public API ──────────────────────────────────────────────────────
 
 
+def init_offline_memory(config: Config) -> None:
+    """Initialize Mem0 with receipt-backed canonical aliases for offline tools.
+
+    The daemon installs its live execution-state registry before calling
+    ``init_memory``. Administrative and evaluation processes instead recover
+    the same protected mapping from the canonical SQLite receipts. Keeping
+    that sequence here prevents a numeric protected ID from silently querying
+    the now-empty legacy namespace.
+    """
+    from kai.workshop.memory_authority import memory_authority_registry_from_database
+
+    configure_memory_authority(memory_authority_registry_from_database(Path(config.session_db_path)))
+    init_memory(config)
+
+
 def init_memory(config: Config) -> None:
     """
     Initialize the Mem0 memory instance with Qdrant embedded storage.
@@ -1589,7 +1745,8 @@ def search(query: str, *, user_id: str, limit: int | None = None) -> list[Memory
 
     Args:
         query: Search text (typically the user's message).
-        user_id: Telegram chat_id as string, for user isolation.
+        user_id: Semantic-memory owner key. Protected runtime IDs resolve to
+            their canonical Workshop principal.
         limit: Max results. Defaults to config.memory_search_limit.
 
     Returns:
@@ -1600,16 +1757,17 @@ def search(query: str, *, user_id: str, limit: int | None = None) -> list[Memory
         return []
 
     effective_limit = limit if limit is not None else _config.memory_search_limit
+    storage_user_id, namespace = _canonical_memory_owner(user_id)
 
     try:
         result = _memory.search(
             query,
-            filters={"user_id": user_id},
+            filters={"user_id": storage_user_id},
             top_k=effective_limit,
         )
         # Mem0 v2.0.0 wraps results in {"results": [...]}
         raw_results = result.get("results", []) if isinstance(result, dict) else result
-        return [_wrap_result(r) for r in raw_results]
+        return [wrapped for raw in raw_results if _memory_result_has_owner((wrapped := _wrap_result(raw)), namespace)]
     except Exception:
         log.warning("Memory search failed", exc_info=True)
         return []
@@ -2517,7 +2675,8 @@ def count_by_source(user_id: str, source: str) -> int:
     and a warning is logged so the operator can investigate.
 
     Args:
-        user_id: Telegram chat_id as string.
+        user_id: Semantic-memory owner key. Protected runtime IDs resolve to
+            their canonical Workshop principal.
         source: Source tag to count, matched against
             `metadata.source`. Empty string counts legacy rows
             (missing or empty source) using the same convention
@@ -2534,8 +2693,9 @@ def count_by_source(user_id: str, source: str) -> int:
     # Single fetch: top_k bounds the result; no looping. See docstring
     # for why a paged loop is unsafe here even though it works in
     # delete_by_source.
+    storage_user_id, namespace = _canonical_memory_owner(user_id)
     result = _memory.get_all(
-        filters={"user_id": user_id},
+        filters={"user_id": storage_user_id},
         top_k=_DELETE_PAGE_SIZE,
     )
     rows = result.get("results", []) if isinstance(result, dict) else result or []
@@ -2546,6 +2706,10 @@ def count_by_source(user_id: str, source: str) -> int:
     # payload (mem0/memory/main.py:1118-1120).
     count = 0
     for row in rows:
+        if namespace is not None and (
+            not isinstance(row, dict) or not _memory_result_has_owner(_wrap_result(row), namespace)
+        ):
+            continue
         row_source = row.get("metadata", {}).get("source") if isinstance(row, dict) else None
         if source == "":
             if row_source is None or row_source == "":
@@ -2621,6 +2785,7 @@ async def delete_by_source(user_id: str, source: str) -> int:
         return 0
 
     loop = asyncio.get_running_loop()
+    storage_user_id, namespace = _canonical_memory_owner(user_id)
     count = 0
     completed_pages = 0
     while True:
@@ -2629,7 +2794,7 @@ async def delete_by_source(user_id: str, source: str) -> int:
         result = await loop.run_in_executor(
             None,
             lambda: _memory.get_all(
-                filters={"user_id": user_id},
+                filters={"user_id": storage_user_id},
                 top_k=_DELETE_PAGE_SIZE,
             ),
         )
@@ -2643,6 +2808,10 @@ async def delete_by_source(user_id: str, source: str) -> int:
         # branch below treats as a match.
         matches: list[dict] = []
         for row in rows:
+            if namespace is not None and (
+                not isinstance(row, dict) or not _memory_result_has_owner(_wrap_result(row), namespace)
+            ):
+                continue
             row_source = row.get("metadata", {}).get("source") if isinstance(row, dict) else None
             if source == "":
                 if row_source is None or row_source == "":
@@ -2726,7 +2895,8 @@ def add_structured(
 
     Args:
         content: The memory text to store. Must be non-empty after stripping.
-        user_id: Telegram chat_id as a string. Mem0 isolates memories per user.
+        user_id: Semantic-memory owner key. Protected runtime IDs resolve to
+            their canonical Workshop principal.
         memory_type: Free-form type tag. Current callers use "fact" or
             "preference". Future callers may use "episode" or "self_assessment".
             Stored in metadata["type"]; no validation is performed so future
@@ -2753,9 +2923,11 @@ def add_structured(
     if not content.strip():
         return None
 
+    storage_user_id, namespace = _canonical_memory_owner(user_id)
+
     # Build the metadata dict. Caller-provided metadata comes first so
     # the reserved keys (type, tags) can override caller values.
-    final_metadata: dict = dict(metadata) if metadata else {}
+    final_metadata: dict = _metadata_for_owner(metadata, namespace)
     final_metadata["type"] = memory_type
     if tags is not None:
         final_metadata["tags"] = tags
@@ -2765,7 +2937,7 @@ def add_structured(
         # This is the entire point of the Track 2 primitive.
         raw = _memory.add(
             content,
-            user_id=user_id,
+            user_id=storage_user_id,
             infer=False,
             metadata=final_metadata,
         )
@@ -2794,7 +2966,8 @@ def get_all(*, user_id: str, limit: int | None = 1000) -> list[MemoryResult]:
     command surface (spec 310), and the per-source delete primitive.
 
     Args:
-        user_id: Telegram chat_id as a string.
+        user_id: Semantic-memory owner key. Protected runtime IDs resolve to
+            their canonical Workshop principal.
         limit: Maximum rows to fetch (passed to Mem0 as top_k). Defaults
             to 1000 to preserve the legacy bounded-memory behavior of
             this function for non-/memory callers (e.g. delete_by_source
@@ -2817,13 +2990,105 @@ def get_all(*, user_id: str, limit: int | None = 1000) -> list[MemoryResult]:
     # 1000. Aligned with the spec §7.2.1 guidance ("100000").
     effective_top_k = 100_000 if limit is None else limit
 
+    storage_user_id, namespace = _canonical_memory_owner(user_id)
     try:
-        result = _memory.get_all(filters={"user_id": user_id}, top_k=effective_top_k)
+        result = _memory.get_all(filters={"user_id": storage_user_id}, top_k=effective_top_k)
         raw_results = result.get("results", []) if isinstance(result, dict) else result
-        return [_wrap_result(r) for r in raw_results]
+        return [wrapped for raw in raw_results if _memory_result_has_owner((wrapped := _wrap_result(raw)), namespace)]
     except Exception:
         log.warning("Memory get_all failed", exc_info=True)
         return []
+
+
+def _get_all_raw(*, user_id: str) -> list[MemoryResult]:
+    """Read one exact Mem0 namespace without applying canonical aliases."""
+    if _memory is None:
+        return []
+    result = _memory.get_all(filters={"user_id": user_id}, top_k=100_000)
+    raw_results = result.get("results", []) if isinstance(result, dict) else result
+    return [_wrap_result(row) for row in raw_results]
+
+
+def _patch_memory_payload(*, memory_id: str, payload: dict[str, object]) -> None:
+    """Add migration-only payload fields without editing semantic content.
+
+    Mem0's public ``update`` API re-embeds unchanged text, advances
+    ``updated_at``, records a semantic-edit history row, and refreshes entity
+    links.  Canonical ownership migration is not a semantic edit, so use the
+    pinned Mem0 2.x vector-store payload operation in this one isolated
+    boundary.  Qdrant ``set_payload`` merges these fields while retaining the
+    stored vector and every existing payload field.
+    """
+    if _memory is None:
+        raise CanonicalMemoryAuthorityError("Semantic memory is not initialized")
+    vector_store = getattr(_memory, "vector_store", None)
+    update = getattr(vector_store, "update", None)
+    if not callable(update):
+        raise CanonicalMemoryAuthorityError(
+            "Semantic-memory provider does not support payload-only ownership migration"
+        )
+    update(vector_id=memory_id, payload=payload)
+
+
+def migrate_memory_namespace(
+    namespace: _CanonicalMemoryNamespace,
+    *,
+    sibling_namespaces: tuple[_CanonicalMemoryNamespace, ...] = (),
+) -> CanonicalMemoryMigrationResult:
+    """Re-key one legacy Mem0 namespace to its canonical principal in place.
+
+    Memory IDs, vectors, text, timestamps, scope metadata, and transcript
+    locators are preserved. A payload-only update changes the top-level
+    ``user_id`` while adding canonical provenance. The operation is
+    idempotent: a restart after a partial move scans both the old and new
+    namespaces and finishes the remaining rows.
+    """
+    if _memory is None:
+        raise CanonicalMemoryAuthorityError("Semantic memory is not initialized")
+    legacy_user_id = str(namespace.runtime_config_id)
+    canonical_user_id = str(namespace.principal_id)
+    legacy_rows = _get_all_raw(user_id=legacy_user_id)
+    canonical_rows = _get_all_raw(user_id=canonical_user_id)
+    stamped = 0
+    exact_before = 0
+    allow_unowned_canonical = not sibling_namespaces
+
+    for row in canonical_rows:
+        state = _memory_owner_state(row, namespace, sibling_namespaces)
+        if state == "exact":
+            exact_before += 1
+        elif state == "unowned" and allow_unowned_canonical:
+            _patch_memory_payload(memory_id=row.id, payload=_owner_metadata(namespace))
+            stamped += 1
+        elif state != "sibling":
+            raise CanonicalMemoryAuthorityError(
+                "Canonical semantic-memory namespace contains ambiguous or conflicting provenance; "
+                "restore the memory and database backups or assign each legacy namespace to a distinct principal"
+            )
+
+    for row in legacy_rows:
+        _metadata_for_owner(row.metadata, namespace)
+        _patch_memory_payload(
+            memory_id=row.id,
+            payload={"user_id": canonical_user_id, **_owner_metadata(namespace)},
+        )
+
+    remaining = _get_all_raw(user_id=legacy_user_id)
+    if remaining:
+        raise CanonicalMemoryAuthorityError("Legacy semantic-memory rows remain after canonical namespace migration")
+    authoritative = _get_all_raw(user_id=canonical_user_id)
+    states = [_memory_owner_state(row, namespace, sibling_namespaces) for row in authoritative]
+    if any(state not in {"exact", "sibling"} for state in states):
+        raise CanonicalMemoryAuthorityError("Canonical semantic-memory namespace contains unowned or conflicting rows")
+    exact_total = sum(state == "exact" for state in states)
+    expected_total = len(legacy_rows) + exact_before + stamped
+    if exact_total != expected_total:
+        raise CanonicalMemoryAuthorityError("Canonical semantic-memory row count changed during namespace migration")
+    return CanonicalMemoryMigrationResult(
+        moved=len(legacy_rows),
+        stamped=stamped,
+        total=exact_total,
+    )
 
 
 def get_by_tag(*, user_id: str, tag: str) -> list[MemoryResult]:
@@ -3005,11 +3270,12 @@ def get_by_id(*, user_id: str, memory_id: str) -> MemoryResult | None:
     # back onto the result dict). metadata is a dict of any leftover
     # payload keys and may be absent entirely if the row carried no
     # extra payload, so use .get with a default rather than indexing.
-    if row.get("user_id") != user_id:
+    storage_user_id, namespace = _canonical_memory_owner(user_id)
+    if row.get("user_id") != storage_user_id:
         log.warning(
             "get_by_id: ownership mismatch (memory_id=%s, requested_user=%s)",
             memory_id,
-            user_id,
+            storage_user_id,
         )
         return None
     if (row.get("metadata") or {}).get("source") not in USER_VISIBLE_SOURCES:
@@ -3020,7 +3286,8 @@ def get_by_id(*, user_id: str, memory_id: str) -> MemoryResult | None:
         # not an anomaly.
         return None
 
-    return _wrap_result(row)
+    result = _wrap_result(row)
+    return result if _memory_result_has_owner(result, namespace) else None
 
 
 def delete_by_id(*, user_id: str, memory_id: str) -> bool:
@@ -3111,8 +3378,13 @@ def update_metadata(*, user_id: str, memory_id: str, data: str, metadata: dict[s
     if get_by_id(user_id=user_id, memory_id=memory_id) is None:
         return False
 
+    _, namespace = _canonical_memory_owner(user_id)
     try:
-        _memory.update(memory_id=memory_id, data=data, metadata=metadata)
+        _memory.update(
+            memory_id=memory_id,
+            data=data,
+            metadata=_metadata_for_owner(metadata, namespace),
+        )
     except Exception:
         log.warning("update_metadata: update failed for %s", memory_id, exc_info=True)
         return False
@@ -3129,8 +3401,9 @@ def delete_all(*, user_id: str) -> None:
     if _memory is None:
         return
 
+    storage_user_id, _ = _canonical_memory_owner(user_id)
     try:
-        _memory.delete_all(user_id=user_id)
+        _memory.delete_all(user_id=storage_user_id)
     except Exception:
         log.warning("Memory delete_all failed", exc_info=True)
 
