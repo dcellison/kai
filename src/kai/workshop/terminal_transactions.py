@@ -21,6 +21,12 @@ from kai.workshop.run_execution_authority import (
     WorkshopRunExecutionAuthority,
 )
 from kai.workshop.run_lifecycle import WorkshopRunLifecycle
+from kai.workshop.runtime_sessions import (
+    RuntimeSessionSettlement,
+    RuntimeSessionSettlementResult,
+    RuntimeSessionStateConflictError,
+    settle_runtime_session_in_transaction,
+)
 
 
 class TerminalTransactionError(RuntimeError):
@@ -97,6 +103,7 @@ class TerminalTransactionResult:
     finalization: OutboundStreamingFinalizationResult
     execution: RunExecutionResult
     changed: bool
+    runtime_session: RuntimeSessionSettlementResult | None = None
 
 
 class WorkshopRunTerminalTransactionCoordinator:
@@ -120,6 +127,7 @@ class WorkshopRunTerminalTransactionCoordinator:
         *,
         body: str,
         occurred_at: datetime,
+        runtime_session: RuntimeSessionSettlement | None = None,
     ) -> TerminalTransactionResult:
         return await self._resolve_possible_commit(
             lambda: self._settle_once(
@@ -127,6 +135,7 @@ class WorkshopRunTerminalTransactionCoordinator:
                 outcome=TerminalOutcome.COMPLETED,
                 body=body,
                 occurred_at=occurred_at,
+                runtime_session=runtime_session,
             )
         )
 
@@ -205,6 +214,7 @@ class WorkshopRunTerminalTransactionCoordinator:
         occurred_at: datetime,
         failure_code: TerminalFailureCode | None = None,
         expired_interruption: bool = False,
+        runtime_session: RuntimeSessionSettlement | None = None,
     ) -> TerminalTransactionResult:
         if not isinstance(claim, RunExecutionClaim):
             raise ValueError("claim must be a RunExecutionClaim")
@@ -248,6 +258,29 @@ class WorkshopRunTerminalTransactionCoordinator:
                     occurred_at=occurred_at,
                 )
 
+            runtime_session_result = None
+            if outcome == TerminalOutcome.COMPLETED and runtime_session is not None:
+                await connection.execute("SAVEPOINT runtime_session_settlement")
+                try:
+                    runtime_session_result = await settle_runtime_session_in_transaction(
+                        self._store,
+                        runtime_session,
+                        result_message_id=message_id,
+                        context_through_event_position=finalization.message.event.position,
+                        occurred_at=occurred_at,
+                    )
+                except RuntimeSessionStateConflictError:
+                    # The answer, delivery plan, and fenced run settlement are
+                    # primary facts. An operator reassignment or stale
+                    # continuity row must not discard an answer the backend
+                    # has already produced. Missing/stale continuity remains
+                    # visible through the installed diagnostic.
+                    await connection.execute("ROLLBACK TO SAVEPOINT runtime_session_settlement")
+                    await connection.execute("RELEASE SAVEPOINT runtime_session_settlement")
+                    runtime_session_result = None
+                else:
+                    await connection.execute("RELEASE SAVEPOINT runtime_session_settlement")
+
             prior_states = {
                 finalization.message.inserted,
                 execution.changed,
@@ -256,6 +289,8 @@ class WorkshopRunTerminalTransactionCoordinator:
                 prior_states.add(finalization.delivery.inserted)
             if finalization.plan is not None:
                 prior_states.add(finalization.plan.inserted)
+            if runtime_session_result is not None:
+                prior_states.add(runtime_session_result.changed)
             if len(prior_states) != 1:
                 raise TerminalTransactionStateConflictError(
                     "Canonical outcome, delivery plan, and run settlement did not share one prior state"
@@ -271,6 +306,7 @@ class WorkshopRunTerminalTransactionCoordinator:
                 finalization=finalization,
                 execution=execution,
                 changed=changed,
+                runtime_session=runtime_session_result,
             )
         except Exception:
             await connection.rollback()

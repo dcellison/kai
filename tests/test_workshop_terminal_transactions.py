@@ -27,6 +27,7 @@ from kai.workshop.run_execution_authority import (
     WorkshopRunExecutionAuthority,
 )
 from kai.workshop.run_lifecycle import RunStatus, WorkshopRunLifecycle
+from kai.workshop.runtime_sessions import RuntimeSessionSettlement, load_runtime_session
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
 from kai.workshop.terminal_transactions import (
     TerminalFailureCode,
@@ -236,6 +237,86 @@ class TestAtomicTerminalTransactions:
                     "run_attempt.completed",
                     "run.completed",
                 ]
+        finally:
+            await store.close()
+
+    async def test_runtime_reassignment_does_not_discard_completed_answer(self, tmp_path: Path):
+        store, authority, claim = await _started_run(tmp_path / "kai.db")
+        run = await WorkshopRunLifecycle(store).state(claim.run_id)
+        original_profile = profile_id(101)
+        try:
+            await store.connection.execute(
+                "UPDATE channel_agent_runtime_assignments SET runtime_profile_id = ? "
+                "WHERE channel_id = ? AND agent_id = ?",
+                (profile_id(202), run.channel_id, run.agent_id),
+            )
+            await store.connection.commit()
+
+            result = await WorkshopRunTerminalTransactionCoordinator(authority).complete(
+                claim,
+                body="Answer survives reassignment",
+                occurred_at=_NOW + timedelta(seconds=4),
+                runtime_session=RuntimeSessionSettlement(
+                    channel_id=run.channel_id,
+                    agent_id=run.agent_id,
+                    runtime_profile_id=original_profile,
+                    selection=RunExecutionSelection("codex", "gpt-5.6-sol"),
+                    workspace="/private/tmp/kai-workshop-test-workspace",
+                    provider_session_id="provider-session-before-reassignment",
+                    run_id=run.run_id,
+                ),
+            )
+
+            assert result.outcome == TerminalOutcome.COMPLETED
+            assert result.execution.run.status == RunStatus.COMPLETED
+            assert result.runtime_session is None
+            assert await load_runtime_session(store, run.channel_id, run.agent_id) is None
+            assert await _terminal_rows(store) == (1, 1, 1)
+        finally:
+            await store.close()
+
+    async def test_conflicting_runtime_session_replay_does_not_veto_result_replay(self, tmp_path: Path):
+        store, authority, claim = await _started_run(tmp_path / "kai.db")
+        run = await WorkshopRunLifecycle(store).state(claim.run_id)
+        settlement = RuntimeSessionSettlement(
+            channel_id=run.channel_id,
+            agent_id=run.agent_id,
+            runtime_profile_id=profile_id(101),
+            selection=RunExecutionSelection("codex", "gpt-5.6-sol"),
+            workspace="/private/tmp/kai-workshop-test-workspace",
+            provider_session_id="provider-session-original",
+            run_id=run.run_id,
+        )
+        coordinator = WorkshopRunTerminalTransactionCoordinator(authority)
+        try:
+            completed = await coordinator.complete(
+                claim,
+                body="Canonical result",
+                occurred_at=_NOW + timedelta(seconds=4),
+                runtime_session=settlement,
+            )
+            replay = await coordinator.complete(
+                claim,
+                body="Canonical result",
+                occurred_at=_NOW + timedelta(seconds=30),
+                runtime_session=RuntimeSessionSettlement(
+                    channel_id=run.channel_id,
+                    agent_id=run.agent_id,
+                    runtime_profile_id=profile_id(101),
+                    selection=RunExecutionSelection("codex", "gpt-5.6-sol"),
+                    workspace="/private/tmp/kai-workshop-test-workspace",
+                    provider_session_id="provider-session-conflict",
+                    run_id=run.run_id,
+                ),
+            )
+
+            assert completed.runtime_session is not None
+            assert replay.changed is False
+            assert replay.runtime_session is None
+            session = await load_runtime_session(store, run.channel_id, run.agent_id)
+            assert session is not None
+            assert session.provider_session_id == "provider-session-original"
+            assert await _terminal_rows(store) == (1, 1, 1)
         finally:
             await store.close()
 

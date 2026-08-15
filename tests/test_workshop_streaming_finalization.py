@@ -466,7 +466,7 @@ class TestStreamingFinalizationMigration:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 19
+            assert await upgraded.schema_version() == 20
             async with upgraded.connection.execute(
                 "SELECT execution_contract FROM delivery_outbox WHERE id = ?", (delivery_id,)
             ) as cursor:

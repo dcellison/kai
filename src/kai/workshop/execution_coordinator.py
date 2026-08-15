@@ -11,6 +11,7 @@ from typing import Protocol
 
 from kai.agent_failure import AgentFailureKind
 from kai.backend import AgentResponse, StreamEvent
+from kai.workshop.conversation_context import assemble_canonical_conversation_context
 from kai.workshop.domain import AgentId, ChannelId, RunExecutionOwnerId, RunId
 from kai.workshop.protected_execution import PreparedWorkshopExecution
 from kai.workshop.run_execution_authority import (
@@ -21,6 +22,7 @@ from kai.workshop.run_execution_authority import (
     WorkshopRunExecutionAuthority,
 )
 from kai.workshop.run_lifecycle import DurableRun, RunStatus, WorkshopRunLifecycle
+from kai.workshop.runtime_sessions import RuntimeSessionSettlement
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.terminal_transactions import (
     TerminalFailureCode,
@@ -293,6 +295,15 @@ class WorkshopCanonicalExecutionCoordinator:
                         active.claim,
                         body=response.text,
                         occurred_at=self._now(),
+                        runtime_session=RuntimeSessionSettlement(
+                            channel_id=prepared.run.channel_id,
+                            agent_id=prepared.run.agent_id,
+                            runtime_profile_id=prepared.runtime_profile_id,
+                            selection=prepared.selection,
+                            workspace=str(prepared.workspace),
+                            provider_session_id=response.session_id,
+                            run_id=prepared.run.run_id,
+                        ),
                     )
                     disposition = CanonicalExecutionDisposition.COMPLETED
                 else:
@@ -386,6 +397,9 @@ class WorkshopCanonicalExecutionCoordinator:
         stream_observer: StreamObserver | None,
     ) -> AgentResponse | None:
         prompt = await self._prompt(prepared.run)
+        async with self._database_lock:
+            context = await assemble_canonical_conversation_context(self._store, prepared.run)
+        prepared.stage_canonical_history(context.text)
         response: AgentResponse | None = None
         async for event in prepared.stream(prompt):
             if event.done:

@@ -95,6 +95,11 @@ class PreparedBackendExecution:
     def workspace(self) -> Path:
         return self._fingerprint.workspace
 
+    def stage_canonical_history(self, history: str) -> None:
+        """Stage restart context on this exact protected runtime."""
+        self._pool._validate_prepared(self)
+        self._instance.stage_canonical_history(history)
+
     def validate_current(self) -> None:
         """Fail before dispatch if the protected runtime selection drifted."""
         self._pool._validate_prepared(self)
@@ -606,6 +611,7 @@ class SubprocessPool:
             async for event in instance.send(prompt, chat_id=chat_id):
                 yield event
         finally:
+            instance.discard_canonical_history()
             self._in_flight.discard(chat_id)
             self._last_activity[chat_id] = time.monotonic()
 
@@ -624,6 +630,7 @@ class SubprocessPool:
             async for event in instance.send(prompt, chat_id=chat_id):
                 yield event
         finally:
+            instance.discard_canonical_history()
             self._in_flight.discard(chat_id)
             self._last_activity[chat_id] = time.monotonic()
 

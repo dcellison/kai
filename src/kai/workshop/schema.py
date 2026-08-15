@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 19
+WORKSHOP_SCHEMA_VERSION = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -931,6 +931,51 @@ _NOTIFICATION_DELIVERY_PURPOSE_SCHEMA = SchemaMigration(
     ),
 )
 
+_CANONICAL_RUNTIME_SESSION_SCHEMA = SchemaMigration(
+    version=20,
+    name="canonical_channel_agent_runtime_sessions",
+    statements=(
+        "CREATE UNIQUE INDEX channel_agent_runtime_assignment_tuple_idx "
+        "ON channel_agent_runtime_assignments (channel_id, agent_id, runtime_profile_id)",
+        """
+        CREATE TABLE workshop_continuity_cutover (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            event_position INTEGER NOT NULL CHECK (event_position >= 0)
+        )
+        """,
+        "INSERT INTO workshop_continuity_cutover (singleton, event_position) "
+        "SELECT 1, COALESCE(MAX(position), 0) FROM event_log",
+        """
+        CREATE TABLE channel_agent_runtime_sessions (
+            channel_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            runtime_profile_id TEXT NOT NULL CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            backend TEXT NOT NULL CHECK (length(trim(backend)) > 0),
+            provider TEXT,
+            model TEXT NOT NULL CHECK (length(trim(model)) > 0),
+            workspace TEXT NOT NULL CHECK (length(trim(workspace)) > 0),
+            provider_session_id TEXT,
+            -- These canonical IDs deliberately are not foreign keys. The
+            -- referenced collaboration tables are replayable projections;
+            -- mutable continuity state must survive their reset/rebuild.
+            last_run_id TEXT NOT NULL,
+            last_result_message_id TEXT NOT NULL,
+            context_through_event_position INTEGER NOT NULL CHECK (
+                context_through_event_position > 0
+            ),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (channel_id, agent_id)
+        )
+        """,
+        "CREATE INDEX channel_agent_runtime_sessions_profile_idx "
+        "ON channel_agent_runtime_sessions (runtime_profile_id)",
+        "CREATE INDEX channel_agent_runtime_sessions_run_idx ON channel_agent_runtime_sessions (last_run_id)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -951,6 +996,7 @@ _MIGRATIONS = (
     _CLIENT_SECURITY_STATE_ISOLATION_SCHEMA,
     _RUNTIME_ASSIGNMENT_SCHEMA,
     _NOTIFICATION_DELIVERY_PURPOSE_SCHEMA,
+    _CANONICAL_RUNTIME_SESSION_SCHEMA,
 )
 
 

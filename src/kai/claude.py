@@ -774,6 +774,7 @@ class ClaudeCodeBackend(AgentBackend):
                 backend_name=self.backend_name,
                 memory_enabled=self.memory_enabled,
                 defer_user_file_reads=self.defer_user_file_reads,
+                canonical_history=self.consume_canonical_history(),
             )
 
         # Foreign-workspace reminder is built fresh per turn (its

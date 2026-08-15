@@ -1943,6 +1943,27 @@ class TestExtractTextQuery:
         assert extract_text_query(prompt) == "real text"
 
 
+def test_build_session_context_prefers_canonical_history(monkeypatch, tmp_path):
+    from kai.backend import ApiContext, build_session_context
+
+    def reject_jsonl(*_args, **_kwargs):
+        raise AssertionError("JSONL compatibility history must not be read")
+
+    monkeypatch.setattr("kai.backend.get_recent_history", reject_jsonl)
+    result = build_session_context(
+        workspace=tmp_path,
+        home_workspace=tmp_path,
+        api=ApiContext(webhook_port=0, webhook_secret=""),
+        workspace_config=None,
+        chat_id=123,
+        data_dir=tmp_path,
+        canonical_history="Human:\nEarlier question\n\nKai:\nEarlier answer",
+    )
+
+    assert "Recent canonical conversation context" in result
+    assert "Earlier question" in result
+
+
 def _patch_scoped_recall(monkeypatch, *, rendered_context: str = "", recall_payload: dict | None = None):
     """Patch `format_scoped_context_with_recall_payload` to return a
     canned ScopedRecallResult. Most TestAssembleTurnContext tests want
