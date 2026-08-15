@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from kai import sessions
 from kai.config import Config
 from kai.conversation_compatibility import CanonicalMemoryProvenance, schedule_memory_ingestion
-from kai.history import LogEntry, log_message
 from kai.workshop.domain import RuntimeProfileId
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 
@@ -16,25 +15,20 @@ from kai.workshop.runtime_pool import WorkshopRuntimePool
 class WorkshopProfileCompatibilityState:
     """Write existing state for one protected runtime profile.
 
-    The integer key is deliberately private to this adapter. JSONL and
-    remaining compatibility calls retain it; the semantic-memory boundary
-    resolves it to the canonical principal and rejects legacy-owner reads.
-    Canonical Workshop callers address this state only through a runtime
-    profile.
+    The integer key is deliberately private to this adapter. Remaining
+    compatibility calls retain it; the semantic-memory boundary resolves it
+    to the canonical principal and rejects legacy-owner reads. Canonical
+    Workshop callers address this state only through a runtime profile.
     """
 
     _runtime_config_id: int = field(repr=False)
     _config: Config = field(repr=False)
-    _reader_user: str | None = field(repr=False)
     _backend: str = field(repr=False)
 
-    def append_history(self, *, direction: str, text: str) -> LogEntry | None:
-        return log_message(
-            direction=direction,
-            chat_id=self._runtime_config_id,
-            text=text,
-            reader_user=self._reader_user,
-        )
+    @property
+    def memory_context_turns(self) -> int:
+        """Return the configured canonical episode-context window."""
+        return self._config.episode_classifier_context_turns
 
     async def save_session(self, session_id: str, model: str) -> None:
         await sessions.save_session(self._runtime_config_id, session_id, model)
@@ -46,9 +40,8 @@ class WorkshopProfileCompatibilityState:
         assistant_text: str,
         session_id: str | None,
         workspace: str,
-        user_log: LogEntry | None,
-        assistant_log: LogEntry | None,
         canonical_provenance: CanonicalMemoryProvenance,
+        canonical_prior_pairs: tuple[tuple[str, str], ...],
     ) -> None:
         schedule_memory_ingestion(
             prompt=prompt,
@@ -57,9 +50,10 @@ class WorkshopProfileCompatibilityState:
             session_id=session_id,
             config=self._config,
             workspace=workspace,
-            user_log=user_log,
-            assistant_log=assistant_log,
+            user_log=None,
+            assistant_log=None,
             canonical_provenance=canonical_provenance,
+            canonical_prior_pairs=canonical_prior_pairs,
             effective_backend=self._backend,
         )
 
@@ -83,6 +77,5 @@ class WorkshopCompatibilityStateWriter:
         return WorkshopProfileCompatibilityState(
             profile.runtime_config_id,
             self._config,
-            profile.os_user,
             profile.backend,
         )

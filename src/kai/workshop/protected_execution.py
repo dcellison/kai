@@ -29,6 +29,7 @@ class PreparedWorkshopExecution:
     runtime_profile_id: RuntimeProfileId
     selection: RunExecutionSelection
     workspace: Path
+    history_reader_user: str | None
     _runtime: PreparedBackendExecution = field(repr=False, compare=False)
 
     async def stream(self, prompt: AgentPrompt) -> AsyncIterator[StreamEvent]:
@@ -100,5 +101,6 @@ class WorkshopProtectedExecutionPreparationService:
             runtime_profile_id=resolution.runtime_profile_id,
             selection=selection,
             workspace=runtime.workspace,
+            history_reader_user=self._pool.runtime_profile(resolution.runtime_profile_id).os_user,
             _runtime=runtime,
         )

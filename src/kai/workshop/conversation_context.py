@@ -11,6 +11,7 @@ from kai.workshop.store import WorkshopEventStore
 _MAX_CONTEXT_MESSAGES = 50
 _MAX_CONTEXT_CHARACTERS = 24_000
 _MAX_MESSAGE_CHARACTERS = 6_000
+_MIN_PRIOR_PAIR_SCAN_MESSAGES = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,3 +64,53 @@ async def assemble_canonical_conversation_context(
     text = "\n\n".join(_render(name, kind, body) for name, kind, body, _ in selected)
     through = selected[-1][3] if selected else 0
     return CanonicalConversationContext(text, len(selected), through)
+
+
+async def assemble_canonical_prior_pairs(
+    store: WorkshopEventStore,
+    run: DurableRun,
+    *,
+    limit: int,
+) -> tuple[tuple[str, str], ...]:
+    """Return completed human/agent pairs before this run's inbound message.
+
+    This is the canonical counterpart to the compatibility JSONL episode
+    window.  The current exchange is excluded by event position, so callers
+    do not need the old ``+1`` fetch followed by dropping the newest pair.
+    """
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+        raise ValueError("limit must be a non-negative integer")
+    if limit == 0:
+        return ()
+    async with store.connection.execute(
+        "SELECT created_event_position FROM messages WHERE id = ? AND channel_id = ?",
+        (run.inbound_message_id, run.channel_id),
+    ) as cursor:
+        inbound = await cursor.fetchone()
+    if inbound is None:
+        raise RuntimeError("Canonical inbound message no longer exists")
+
+    scan_limit = max(_MIN_PRIOR_PAIR_SCAN_MESSAGES, limit * 4)
+    async with store.connection.execute(
+        "SELECT p.kind, m.body FROM messages m "
+        "JOIN principals p ON p.id = m.author_principal_id "
+        "WHERE m.channel_id = ? AND m.created_event_position < ? "
+        "AND p.kind IN ('human', 'agent') "
+        "ORDER BY m.created_event_position DESC LIMIT ?",
+        (run.channel_id, int(inbound[0]), scan_limit),
+    ) as cursor:
+        rows = list(await cursor.fetchall())
+
+    pending_human: str | None = None
+    pairs: list[tuple[str, str]] = []
+    for row in reversed(rows):
+        kind = str(row[0])
+        body = str(row[1]).strip()
+        if not body:
+            continue
+        if kind == "human":
+            pending_human = body
+        elif pending_human is not None:
+            pairs.append((pending_human, body))
+            pending_human = None
+    return tuple(pairs[-limit:])

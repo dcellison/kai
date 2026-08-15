@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -120,7 +121,11 @@ async def test_owner_accepts_executes_and_atomically_enqueues_terminal_reply(tmp
         assert result.workspace == str(tmp_path)
         assert observed == ["Stable preview."]
         assert runtime.validated is True
-        assert runtime.canonical_histories == [""]
+        transcript = tmp_path / "history" / str(accepted.run.channel_id) / "canonical-transcript.ndjson"
+        assert len(runtime.canonical_histories) == 1
+        assert str(transcript) in runtime.canonical_histories[0]
+        records = [json.loads(line) for line in transcript.read_text().splitlines()]
+        assert [record["body"] for record in records] == ["Canonical prompt 1"]
         pool.prepare_execution.assert_awaited_once_with(101)
     finally:
         await service.stop()

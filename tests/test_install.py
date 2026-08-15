@@ -4618,6 +4618,7 @@ class TestCmdStatus:
         assert "Workshop bootstrap:" in output
         assert "Workshop delivery authority:" in output
         assert "Workshop conversation continuity:" in output
+        assert "Workshop transcript authority:" in output
         assert "Workshop memory authority:" in output
         assert "Workshop operational state:" in output
         assert "Workshop message parity:" in output

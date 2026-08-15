@@ -2107,6 +2107,8 @@ _SOURCE_FAILURE_MESSAGES: dict[str, str] = {
     "ts_not_found": "The original message was not found in the history file.",
     "hash_mismatch": "Content drift detected: the original message no longer matches its fingerprint.",
     "chat_mismatch": "This memory's source pointer does not match this chat; refusing to dereference.",
+    "canonical_missing": "The canonical source messages are no longer available.",
+    "principal_mismatch": "This memory's source pointer does not match its canonical owner.",
     "legacy": "This memory predates source tracking.",
 }
 
@@ -2187,7 +2189,12 @@ async def _send_source_view(
     # chat would otherwise let this UI dereference an unrelated
     # chat's JSONL. The helper returns chat_mismatch before any
     # filesystem read on disagreement.
-    lookup = fetch_transcript_context(provenance, memory_id=memory_id, expected_chat_id=chat_id)
+    lookup = fetch_transcript_context(
+        provenance,
+        memory_id=memory_id,
+        expected_chat_id=chat_id,
+        expected_principal_id=memory.canonical_memory_user_id(str(chat_id)),
+    )
     text, kb = _build_source_view(fact, lookup)
     cache = _get_cache(chat_id)
     return_to = cache.return_to if cache is not None else None

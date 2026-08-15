@@ -429,17 +429,14 @@ class TranscriptProvenance:
     """
     Read-time interpretation of a row's `source_*` metadata.
 
-    `present` is the contract every consumer keys on: when False, the
-    row predates provenance (or extraction skipped stamping due to a
-    `log_message` write failure), and the originating turns cannot be
-    recovered. When True, every required field is populated and the
-    transcript helper has a definite lookup target.
+    ``present`` is the contract every consumer keys on. New Workshop rows
+    carry canonical principal/channel/run/source/result identities and are
+    resolved from SQLite. Older rows may carry the compatibility JSONL
+    locator. A row with neither complete shape is treated as legacy.
 
     Attributes:
-        present: True iff `chat_id`, `date`, `user_ts`, and
-            `user_text_sha256` are all populated. A row with three of
-            four required fields is malformed; the resolver flags it
-            not-present rather than guessing.
+        present: True iff either the canonical or compatibility locator is
+            complete. Partial locators are never guessed.
         chat_id: Telegram chat id whose JSONL holds the source turns.
             Redundant with Mem0's row-level `user_id` so the locator
             survives a future move off Mem0 without round-tripping
@@ -460,6 +457,11 @@ class TranscriptProvenance:
             populate this whenever the user and assistant turns fall
             on different UTC dates; fact rows carry the assistant date
             implicitly via `assistant_ts`.
+        canonical_present: True iff all five canonical identity fields are
+            populated. Canonical provenance takes precedence over JSONL.
+        principal_id, channel_id, run_id: protected Workshop ownership and
+            execution identities.
+        source_message_id, result_message_id: exact canonical exchange.
     """
 
     present: bool
@@ -469,18 +471,22 @@ class TranscriptProvenance:
     user_text_sha256: str | None
     assistant_ts: str | None
     date_end: str | None
+    canonical_present: bool
+    principal_id: str | None
+    channel_id: str | None
+    run_id: str | None
+    source_message_id: str | None
+    result_message_id: str | None
 
 
 def read_transcript_provenance(metadata: dict[str, Any] | None) -> TranscriptProvenance:
     """
     Interpret a row's `source_*` metadata into a TranscriptProvenance.
 
-    Required fields are `source_chat_id`, `source_date`, `source_user_ts`,
-    and `source_user_text_sha256`. A row missing ANY of those is treated
-    as not-present; the resolver does not guess at a half-populated
-    locator. `source_assistant_ts` and `source_date_end` are optional;
-    their absence on a present row is meaningful (no assistant turn /
-    same-day window) and does not flip the present flag.
+    Complete canonical provenance takes precedence. Otherwise the required
+    compatibility fields are ``source_chat_id``, ``source_date``,
+    ``source_user_ts``, and ``source_user_text_sha256``. The resolver never
+    guesses at either half-populated shape.
 
     The resolver does not validate timestamp formats beyond presence;
     the transcript helper performs that check at lookup time and fails
@@ -502,14 +508,29 @@ def read_transcript_provenance(metadata: dict[str, Any] | None) -> TranscriptPro
     )
     assistant_ts = md.get(SOURCE_ASSISTANT_TS_KEY)
     date_end = md.get(SOURCE_DATE_END_KEY)
+    canonical_values = (
+        md.get(WORKSHOP_PRINCIPAL_ID_KEY),
+        md.get(WORKSHOP_CHANNEL_ID_KEY),
+        md.get(WORKSHOP_RUN_ID_KEY),
+        md.get(WORKSHOP_SOURCE_MESSAGE_ID_KEY),
+        md.get(WORKSHOP_RESULT_MESSAGE_ID_KEY),
+    )
+    canonical_present = all(isinstance(value, str) and bool(value) for value in canonical_values)
+    principal_id, channel_id, run_id, source_message_id, result_message_id = canonical_values
     return TranscriptProvenance(
-        present=required_present,
+        present=required_present or canonical_present,
         chat_id=chat_id if isinstance(chat_id, int) else None,
         date=date if isinstance(date, str) and date else None,
         user_ts=user_ts if isinstance(user_ts, str) and user_ts else None,
         user_text_sha256=user_text_sha256 if isinstance(user_text_sha256, str) and user_text_sha256 else None,
         assistant_ts=assistant_ts if isinstance(assistant_ts, str) and assistant_ts else None,
         date_end=date_end if isinstance(date_end, str) and date_end else None,
+        canonical_present=canonical_present,
+        principal_id=principal_id if isinstance(principal_id, str) and principal_id else None,
+        channel_id=channel_id if isinstance(channel_id, str) and channel_id else None,
+        run_id=run_id if isinstance(run_id, str) and run_id else None,
+        source_message_id=(source_message_id if isinstance(source_message_id, str) and source_message_id else None),
+        result_message_id=(result_message_id if isinstance(result_message_id, str) and result_message_id else None),
     )
 
 

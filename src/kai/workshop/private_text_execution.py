@@ -11,6 +11,7 @@ from kai.workshop.conversation_commands import (
     ConversationCommandAcceptance,
     WorkshopConversationCommandService,
 )
+from kai.workshop.conversation_context import assemble_canonical_prior_pairs
 from kai.workshop.domain import MessageId, RunId, RuntimeProfileId
 from kai.workshop.execution_coordinator import (
     CanonicalCancellationDisposition,
@@ -76,6 +77,7 @@ class WorkshopPrivateTextExecutionService:
             ),
             registered_backend_ids=registered_backend_ids,
             database_lock=database_lock,
+            transcript_export_root=database_path.parent / "history",
         )
         service = cls(
             store,
@@ -130,6 +132,19 @@ class WorkshopPrivateTextExecutionService:
             raise RuntimeError("Workshop private-text execution service is closed")
         async with self._database_lock:
             return await WorkshopRunLifecycle(self._store).state(run_id)
+
+    async def prior_conversation_pairs(
+        self,
+        run_id: RunId,
+        *,
+        limit: int,
+    ) -> tuple[tuple[str, str], ...]:
+        """Return canonical prior exchanges for memory episode extraction."""
+        if self._closed:
+            raise RuntimeError("Workshop private-text execution service is closed")
+        async with self._database_lock:
+            run = await WorkshopRunLifecycle(self._store).state(run_id)
+            return await assemble_canonical_prior_pairs(self._store, run, limit=limit)
 
     async def recoverable_client_runs(self) -> tuple[RecoverableClientRun, ...]:
         """Find browser runs that are durably accepted and safe to dispatch."""

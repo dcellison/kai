@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, call
+from unittest.mock import AsyncMock, Mock
 
 from kai.conversation_compatibility import CanonicalMemoryProvenance
 from kai.workshop.client_commands import WorkshopClientCommandExecutor
@@ -70,9 +70,10 @@ async def test_submission_returns_before_execution_and_preserves_compatibility_s
         run_state=AsyncMock(return_value=run),
         recoverable_client_runs=AsyncMock(return_value=()),
         request_run_cancellation=AsyncMock(),
+        prior_conversation_pairs=AsyncMock(return_value=(("Earlier", "Answer"),)),
     )
     profile_state = SimpleNamespace(
-        append_history=Mock(side_effect=["user-log", "assistant-log"]),
+        memory_context_turns=2,
         save_session=AsyncMock(),
         schedule_memory_ingestion=Mock(),
     )
@@ -92,23 +93,19 @@ async def test_submission_returns_before_execution_and_preserves_compatibility_s
         release.set()
         await executor.stop()
 
-    assert profile_state.append_history.call_args_list == [
-        call(direction="user", text="Hello from Workshop"),
-        call(direction="assistant", text="Completed through the protected lane"),
-    ]
+    execution.prior_conversation_pairs.assert_awaited_once_with(run_id, limit=2)
     profile_state.save_session.assert_awaited_once_with("session-1", "gpt-5.6-sol")
     profile_state.schedule_memory_ingestion.assert_called_once_with(
         prompt="Hello from Workshop",
         assistant_text="Completed through the protected lane",
         session_id="session-1",
         workspace="/workspace/project",
-        user_log="user-log",
-        assistant_log="assistant-log",
         canonical_provenance=CanonicalMemoryProvenance(
             run_id=run_id,
             source_message_id=inbound_message_id,
             result_message_id=result_message_id,
         ),
+        canonical_prior_pairs=(("Earlier", "Answer"),),
     )
 
 
@@ -129,7 +126,6 @@ async def test_terminal_replay_does_not_schedule_or_duplicate_compatibility_writ
         request_run_cancellation=AsyncMock(),
     )
     profile_state = SimpleNamespace(
-        append_history=Mock(),
         save_session=AsyncMock(),
         schedule_memory_ingestion=Mock(),
     )

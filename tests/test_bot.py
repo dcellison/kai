@@ -2890,7 +2890,7 @@ class TestHandleMessage:
         with (
             patch("kai.bot.is_totp_configured", return_value=False),
             patch("kai.bot._handle_workshop_private_text", new_callable=AsyncMock) as response,
-            patch("kai.bot.log_message"),
+            patch("kai.bot.log_message") as history,
             patch("kai.bot._set_responding") as set_responding,
             patch("kai.bot._clear_responding") as clear_responding,
             patch("kai.bot.get_lock", return_value=_fake_lock()) as get_lock,
@@ -2914,6 +2914,7 @@ class TestHandleMessage:
         get_lock.assert_not_called()
         set_responding.assert_not_called()
         clear_responding.assert_not_called()
+        history.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_private_text_without_durable_service_fails_closed(self):
@@ -2928,7 +2929,7 @@ class TestHandleMessage:
         assert "durable execution service is unavailable" in update.message.reply_text.await_args.args[0]
 
     @pytest.mark.asyncio
-    async def test_private_text_terminal_replay_does_not_duplicate_jsonl_user_history(self):
+    async def test_private_text_never_writes_jsonl_history(self):
         update = _make_update(text="same durable update", chat_id=1, user_id=1)
         ctx = _make_context(config=_make_config(allowed_user_ids={1}))
         execution = MagicMock()
@@ -2948,7 +2949,7 @@ class TestHandleMessage:
             await handle_message(update, ctx)
 
         execute.assert_awaited_once()
-        assert execute.await_args.kwargs["user_log"] is None
+        assert "user_log" not in execute.await_args.kwargs
         history.assert_not_called()
 
     @pytest.mark.asyncio

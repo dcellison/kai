@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from pathlib import Path
 from typing import Protocol
 
 from kai.agent_failure import AgentFailureKind
@@ -29,6 +31,12 @@ from kai.workshop.terminal_transactions import (
     TerminalTransactionResult,
     WorkshopRunTerminalTransactionCoordinator,
 )
+from kai.workshop.transcript_export import (
+    build_canonical_transcript_export,
+    write_canonical_transcript_snapshot,
+)
+
+log = logging.getLogger(__name__)
 
 
 class ProtectedPreparation(Protocol):
@@ -118,6 +126,7 @@ class WorkshopCanonicalExecutionCoordinator:
         clock: Callable[[], datetime] | None = None,
         lease_duration: timedelta = timedelta(minutes=5),
         database_lock: asyncio.Lock | None = None,
+        transcript_export_root: Path | None = None,
     ) -> None:
         if not registered_backend_ids:
             raise ValueError("registered_backend_ids must not be empty")
@@ -132,6 +141,7 @@ class WorkshopCanonicalExecutionCoordinator:
         self._active: dict[RunId, _ActiveExecution] = {}
         self._map_lock = asyncio.Lock()
         self._database_lock = database_lock or asyncio.Lock()
+        self._transcript_export_root = transcript_export_root
 
     async def execute(
         self,
@@ -397,9 +407,40 @@ class WorkshopCanonicalExecutionCoordinator:
         stream_observer: StreamObserver | None,
     ) -> AgentResponse | None:
         prompt = await self._prompt(prepared.run)
+        transcript_export_root = self._transcript_export_root
+        transcript_path: Path | None = None
         async with self._database_lock:
             context = await assemble_canonical_conversation_context(self._store, prepared.run)
-        prepared.stage_canonical_history(context.text)
+            transcript = (
+                await build_canonical_transcript_export(self._store, prepared.run.channel_id)
+                if transcript_export_root is not None
+                else None
+            )
+            if transcript is not None and transcript_export_root is not None:
+                try:
+                    # Serialize build and replace with canonical DB work so an
+                    # older concurrent run cannot overwrite a newer snapshot.
+                    transcript_path = await asyncio.to_thread(
+                        write_canonical_transcript_snapshot,
+                        transcript,
+                        transcript_export_root,
+                        reader_user=getattr(prepared, "history_reader_user", None),
+                    )
+                except Exception:
+                    log.warning(
+                        "Could not refresh canonical transcript export for channel %s",
+                        prepared.run.channel_id,
+                        exc_info=True,
+                    )
+        canonical_history = context.text
+        if transcript_path is not None:
+            export_note = (
+                "[Full canonical conversation export (derived, read-only projection): "
+                f"{transcript_path}. Search it with grep or jq when older conversation "
+                "history is relevant. SQLite remains authoritative.]"
+            )
+            canonical_history = f"{canonical_history}\n\n{export_note}" if canonical_history else export_note
+        prepared.stage_canonical_history(canonical_history)
         response: AgentResponse | None = None
         async for event in prepared.stream(prompt):
             if event.done:

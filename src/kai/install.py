@@ -81,6 +81,7 @@ from kai.workshop.diagnostics import (
     workshop_message_parity_status,
     workshop_operational_state_status,
     workshop_runtime_session_status,
+    workshop_transcript_authority_status,
 )
 from kai.workshop.domain import WorkshopId
 from kai.workshop.runtime_profiles import (
@@ -7918,6 +7919,7 @@ def _cmd_status() -> None:
     )
     print(workshop_delivery_authority_status(Path(data_dir) / "kai.db"))
     print(workshop_runtime_session_status(Path(data_dir) / "kai.db"))
+    print(workshop_transcript_authority_status(Path(data_dir) / "kai.db"))
     print(workshop_execution_state_status(Path(data_dir) / "kai.db"))
     print(workshop_operational_state_status(Path(data_dir) / "kai.db"))
     print(

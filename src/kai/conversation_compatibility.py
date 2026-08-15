@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from kai.config import ONESHOT_REASONER_BACKENDS, Config
 from kai.history import LogEntry
-from kai.workshop.domain import MessageId, RunId
+
+if TYPE_CHECKING:
+    from kai.workshop.domain import MessageId, RunId
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +53,7 @@ def schedule_memory_ingestion(
     user_log: LogEntry | None,
     assistant_log: LogEntry | None,
     canonical_provenance: CanonicalMemoryProvenance | None = None,
+    canonical_prior_pairs: tuple[tuple[str, str], ...] | None = None,
     reasoner_backends: frozenset[str] = ONESHOT_REASONER_BACKENDS,
     effective_backend: str | None = None,
 ) -> None:
@@ -78,10 +82,17 @@ def schedule_memory_ingestion(
                 if config.memory_extraction_enabled and backend in reasoner_backends:
                     prior_pairs: list[tuple[str, str]] = []
                     if config.episode_classifier_context_turns > 0:
-                        from kai.history import get_recent_pairs
+                        if canonical_provenance is not None:
+                            # Canonical private text must never consult the
+                            # compatibility JSONL transcript. Its caller
+                            # supplies pairs strictly before the current
+                            # inbound message from the Workshop timeline.
+                            prior_pairs = list(canonical_prior_pairs or ())
+                        else:
+                            from kai.history import get_recent_pairs
 
-                        fetched = get_recent_pairs(chat_id, config.episode_classifier_context_turns + 1)
-                        prior_pairs = fetched[:-1]
+                            fetched = get_recent_pairs(chat_id, config.episode_classifier_context_turns + 1)
+                            prior_pairs = fetched[:-1]
                     await memory_extraction.extract_and_store(
                         user_text=user_text,
                         assistant_text=assistant_text,

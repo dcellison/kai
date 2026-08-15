@@ -52,6 +52,11 @@ _RUNTIME_SESSION_TABLES = {
     "runs",
     "workshop_continuity_cutover",
 }
+_TRANSCRIPT_AUTHORITY_TABLES = {
+    "channel_agent_runtime_assignments",
+    "messages",
+    "runs",
+}
 _EXECUTION_STATE_TABLES = {
     "channel_agent_execution_settings",
     "channel_agent_runtime_assignments",
@@ -452,6 +457,40 @@ def workshop_execution_state_status(db_path: Path) -> str:
         f"missing={missing}, stale={stale}, orphaned={orphaned}, unclassified={unclassified}, settings={settings}, "
         f"workspace settings={workspace_settings}, history={history}, grants={grants}; "
         "protected legacy reads=disabled, rollback dual writes=active"
+    )
+
+
+def workshop_transcript_authority_status(db_path: Path) -> str:
+    """Describe the protected private-text transcript cutover."""
+    prefix = "Workshop transcript authority:"
+    if not db_path.is_file():
+        return f"{prefix} pending; canonical transcript schema unavailable"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if not tables >= _TRANSCRIPT_AUTHORITY_TABLES:
+                return f"{prefix} pending; canonical transcript schema unavailable"
+            channels = _scalar(
+                connection,
+                "SELECT COUNT(DISTINCT channel_id) FROM channel_agent_runtime_assignments",
+            )
+            messages = _scalar(connection, "SELECT COUNT(*) FROM messages")
+            completed_runs = _scalar(connection, "SELECT COUNT(*) FROM runs WHERE status = 'completed'")
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    state = "active" if channels > 0 else "INCOMPLETE"
+    return (
+        f"{prefix} {state}; channels={channels}, canonical messages={messages}, "
+        f"completed runs={completed_runs}; protected JSONL reads=disabled, writes=disabled; "
+        "canonical export=v1, compatibility archive=retained for excluded routes"
     )
 
 

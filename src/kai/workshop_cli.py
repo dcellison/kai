@@ -49,6 +49,10 @@ from kai.workshop.telegram_delivery import (
     WorkshopTelegramDeliveryAdapter,
     WorkshopTelegramDeliveryWorker,
 )
+from kai.workshop.transcript_export import (
+    CanonicalTranscriptExportError,
+    build_canonical_transcript_export,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -148,6 +152,17 @@ def _parser() -> argparse.ArgumentParser:
     revoke_enrollment_identity.add_argument("--principal-id")
     revoke_enrollment_identity.add_argument("--telegram-user-id", type=int)
     revoke_enrollment.add_argument("--grant-id", required=True)
+
+    transcript = commands.add_parser(
+        "transcript",
+        help="export canonical Workshop conversation history",
+    )
+    transcript_actions = transcript.add_subparsers(dest="action", required=True)
+    export = transcript_actions.add_parser(
+        "export",
+        help="write one canonical channel transcript as JSONL to standard output",
+    )
+    export.add_argument("--channel-id", required=True)
     return parser
 
 
@@ -186,6 +201,13 @@ def _channel_id(value: str) -> ChannelId:
         raise WorkshopClientAccessError("Invalid channel ID") from exc
 
 
+def _transcript_channel_id(value: str) -> ChannelId:
+    try:
+        return ChannelId(value)
+    except (TypeError, ValueError) as exc:
+        raise CanonicalTranscriptExportError("Invalid channel ID") from exc
+
+
 def _workshop_id(value: str) -> WorkshopId:
     try:
         return WorkshopId(value)
@@ -219,6 +241,14 @@ def _qualification_database(data_dir: Path) -> Path:
 async def _run(args: argparse.Namespace) -> int:
     store = await WorkshopEventStore.open(_qualification_database(DATA_DIR))
     try:
+        if args.command == "transcript":
+            export = await build_canonical_transcript_export(
+                store,
+                _transcript_channel_id(args.channel_id),
+            )
+            print(export.jsonl(), end="")
+            return 0
+
         if args.command == "client-access":
             access = WorkshopClientAccess(store)
             if args.action == "list-humans":
@@ -410,6 +440,8 @@ def cli(args: list[str]) -> None:
         raise SystemExit(f"Workshop runtime assignment failed: {exc}") from exc
     except WorkshopRuntimeProfileError as exc:
         raise SystemExit(f"Workshop runtime profile failed: {exc}") from exc
+    except CanonicalTranscriptExportError as exc:
+        raise SystemExit(f"Workshop transcript export failed: {exc}") from exc
     except (DeliveryQualificationError, DeliveryTargetNotFoundError) as exc:
         if parsed.command == "client-access":
             raise SystemExit(f"Workshop client access failed: {exc}") from exc
