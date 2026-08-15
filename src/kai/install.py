@@ -77,6 +77,7 @@ from kai.workshop.diagnostics import (
     workshop_bootstrap_status,
     workshop_delivery_authority_status,
     workshop_execution_state_status,
+    workshop_memory_authority_status,
     workshop_message_parity_status,
     workshop_runtime_session_status,
 )
@@ -7917,6 +7918,12 @@ def _cmd_status() -> None:
     print(workshop_delivery_authority_status(Path(data_dir) / "kai.db"))
     print(workshop_runtime_session_status(Path(data_dir) / "kai.db"))
     print(workshop_execution_state_status(Path(data_dir) / "kai.db"))
+    print(
+        workshop_memory_authority_status(
+            Path(data_dir) / "kai.db",
+            memory_enabled=_read_deployed_memory_enabled(_DEPLOYED_ENV_FILE),
+        )
+    )
     print(workshop_message_parity_status(Path(data_dir) / "kai.db", Path(data_dir) / "history"))
 
     # Check workspace path traversal if install.conf has a service user
@@ -8158,6 +8165,23 @@ def _read_deployed_adapter_configuration(env_path: Path) -> dict[str, str]:
             value = raw_value.strip().strip("\"'")
             configured[key] = value if key == "KAI_ENABLED_ADAPTERS" else ("configured" if value else "")
     return configured
+
+
+def _read_deployed_memory_enabled(env_path: Path) -> bool | None:
+    """Read the deployed memory toggle without retaining any other value."""
+    try:
+        validate_protected_file_metadata(env_path, max_mode=0o600, require_root_owner=True)
+        with env_path.open(encoding="utf-8") as env_file:
+            for line in env_file:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                key, separator, raw_value = stripped.partition("=")
+                if separator and key.strip() == "MEMORY_ENABLED":
+                    return raw_value.strip().strip("\"'").lower() in {"1", "true", "yes"}
+        return False
+    except (FileNotFoundError, OSError, UnicodeError, ProtectedConfigError):
+        return None
 
 
 def _dormant_compatibility_schedule_status(db_path: Path, env_path: Path) -> str | None:

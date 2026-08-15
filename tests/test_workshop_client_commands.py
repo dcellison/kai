@@ -7,9 +7,10 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
 
+from kai.conversation_compatibility import CanonicalMemoryProvenance
 from kai.workshop.client_commands import WorkshopClientCommandExecutor
 from kai.workshop.conversation_commands import ConversationCommandDisposition
-from kai.workshop.domain import ChannelId, PrincipalId, RunId
+from kai.workshop.domain import ChannelId, MessageId, PrincipalId, RunId
 from kai.workshop.execution_coordinator import (
     CanonicalExecutionDisposition,
     CanonicalExecutionResult,
@@ -32,14 +33,24 @@ def _message() -> ClientInboundMessage:
 async def test_submission_returns_before_execution_and_preserves_compatibility_state():
     message = _message()
     run_id = RunId.new()
+    inbound_message_id = MessageId.new()
+    result_message_id = MessageId.new()
     run = SimpleNamespace(run_id=run_id, status="accepted")
     accepted = SimpleNamespace(
         runtime_profile_id=profile_id(101),
-        command=SimpleNamespace(disposition=ConversationCommandDisposition.NEWLY_ACCEPTED),
+        command=SimpleNamespace(
+            disposition=ConversationCommandDisposition.NEWLY_ACCEPTED,
+            message=SimpleNamespace(event=SimpleNamespace(envelope=SimpleNamespace(aggregate_id=inbound_message_id))),
+        ),
         run=run,
     )
     release = asyncio.Event()
-    terminal = SimpleNamespace(body="Completed through the protected lane")
+    terminal = SimpleNamespace(
+        body="Completed through the protected lane",
+        finalization=SimpleNamespace(
+            message=SimpleNamespace(event=SimpleNamespace(envelope=SimpleNamespace(aggregate_id=result_message_id)))
+        ),
+    )
     execution_result = CanonicalExecutionResult(
         CanonicalExecutionDisposition.COMPLETED,
         SimpleNamespace(status="completed"),
@@ -93,6 +104,11 @@ async def test_submission_returns_before_execution_and_preserves_compatibility_s
         workspace="/workspace/project",
         user_log="user-log",
         assistant_log="assistant-log",
+        canonical_provenance=CanonicalMemoryProvenance(
+            run_id=run_id,
+            source_message_id=inbound_message_id,
+            result_message_id=result_message_id,
+        ),
     )
 
 
@@ -143,6 +159,7 @@ async def test_start_reconciles_durably_accepted_browser_run():
                 RecoverableClientRun(
                     run_id,
                     profile_id(101),
+                    MessageId.new(),
                     "Recovered browser prompt",
                 ),
             )

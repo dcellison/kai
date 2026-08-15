@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 21
+WORKSHOP_SCHEMA_VERSION = 22
 
 
 @dataclass(frozen=True, slots=True)
@@ -1051,6 +1051,28 @@ _CANONICAL_EXECUTION_STATE_SCHEMA = SchemaMigration(
     ),
 )
 
+_CANONICAL_MEMORY_AUTHORITY_SCHEMA = SchemaMigration(
+    version=22,
+    name="canonical_memory_authority",
+    statements=(
+        """
+        CREATE TABLE workshop_memory_authority_migrations (
+            runtime_profile_id TEXT PRIMARY KEY CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            runtime_config_id INTEGER NOT NULL UNIQUE CHECK (runtime_config_id > 0),
+            principal_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            moved_count INTEGER NOT NULL CHECK (moved_count >= 0),
+            stamped_count INTEGER NOT NULL CHECK (stamped_count >= 0),
+            total_count INTEGER NOT NULL CHECK (total_count >= 0),
+            migrated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+        """,
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -1073,6 +1095,7 @@ _MIGRATIONS = (
     _NOTIFICATION_DELIVERY_PURPOSE_SCHEMA,
     _CANONICAL_RUNTIME_SESSION_SCHEMA,
     _CANONICAL_EXECUTION_STATE_SCHEMA,
+    _CANONICAL_MEMORY_AUTHORITY_SCHEMA,
 )
 
 

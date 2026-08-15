@@ -1532,10 +1532,10 @@ def _initialize_memory() -> bool:
     """
     try:
         from kai.config import load_config
-        from kai.memory import init_memory, is_enabled
+        from kai.memory import init_offline_memory, is_enabled
 
         config = load_config()
-        init_memory(config)
+        init_offline_memory(config)
         if not is_enabled():
             print(
                 "eval: memory is not enabled. Set MEMORY_ENABLED=true and verify the store is readable.",

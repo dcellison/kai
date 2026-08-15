@@ -11,7 +11,7 @@ from kai.workshop.conversation_commands import (
     ConversationCommandAcceptance,
     WorkshopConversationCommandService,
 )
-from kai.workshop.domain import RunId, RuntimeProfileId
+from kai.workshop.domain import MessageId, RunId, RuntimeProfileId
 from kai.workshop.execution_coordinator import (
     CanonicalCancellationDisposition,
     CanonicalExecutionResult,
@@ -33,6 +33,7 @@ class RecoverableClientRun:
 
     run_id: RunId
     runtime_profile_id: RuntimeProfileId
+    inbound_message_id: MessageId
     body: str
 
 
@@ -137,7 +138,7 @@ class WorkshopPrivateTextExecutionService:
         async with (
             self._database_lock,
             self._store.connection.execute(
-                "SELECT r.id, ra.runtime_profile_id, m.body "
+                "SELECT r.id, ra.runtime_profile_id, r.inbound_message_id, m.body "
                 "FROM runs r "
                 "JOIN messages m ON m.id = r.inbound_message_id "
                 "JOIN event_log e ON e.position = m.created_event_position "
@@ -155,7 +156,8 @@ class WorkshopPrivateTextExecutionService:
             RecoverableClientRun(
                 RunId(str(row[0])),
                 RuntimeProfileId(str(row[1])),
-                str(row[2]),
+                MessageId(str(row[2])),
+                str(row[3]),
             )
             for row in rows
         )

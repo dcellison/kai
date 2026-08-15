@@ -1218,10 +1218,10 @@ def _initialize_memory_local() -> MemoryInitResult:
     """
     try:
         from kai.config import load_config
-        from kai.memory import init_memory, is_enabled
+        from kai.memory import init_offline_memory, is_enabled
 
         config = load_config()
-        init_memory(config)
+        init_offline_memory(config)
         if not is_enabled():
             return MemoryInitResult(MemoryAvailability.DISABLED, None)
         return MemoryInitResult(MemoryAvailability.ENABLED, None)

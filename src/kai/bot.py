@@ -75,10 +75,11 @@ from kai.config import (
     validate_model_for_backend,
 )
 from kai.conversation_compatibility import (
-    _pending_memory_tasks as _shared_pending_memory_tasks,
+    CanonicalMemoryProvenance,
+    schedule_memory_ingestion,
 )
 from kai.conversation_compatibility import (
-    schedule_memory_ingestion,
+    _pending_memory_tasks as _shared_pending_memory_tasks,
 )
 from kai.history import LogEntry, log_message
 from kai.locks import get_lock, get_stop_event
@@ -4752,6 +4753,9 @@ async def _handle_workshop_private_text(
         reader_user=_upload_reader_user(context, chat_id),
     )
     if result.disposition == CanonicalExecutionDisposition.COMPLETED and result.workspace is not None:
+        result_message_id = result.terminal.finalization.message.event.envelope.aggregate_id
+        if not isinstance(result_message_id, MessageId):
+            raise RuntimeError("Workshop execution returned a non-message result aggregate")
         schedule_memory_ingestion(
             prompt=prompt,
             assistant_text=final_text,
@@ -4761,6 +4765,11 @@ async def _handle_workshop_private_text(
             workspace=result.workspace,
             user_log=user_log,
             assistant_log=assistant_log,
+            canonical_provenance=CanonicalMemoryProvenance(
+                run_id=run_id,
+                source_message_id=inbound_message_id,
+                result_message_id=result_message_id,
+            ),
             reasoner_backends=ONESHOT_REASONER_BACKENDS,
             effective_backend=_get_pool(context).get_backend_provider(chat_id)[0],
         )

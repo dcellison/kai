@@ -60,6 +60,14 @@ _EXECUTION_STATE_TABLES = {
     "principal_workspace_history",
     "workshop_execution_state_migrations",
 }
+_MEMORY_AUTHORITY_TABLES = {
+    "channel_agent_runtime_assignments",
+    "channel_memberships",
+    "channels",
+    "principals",
+    "workshop_execution_state_migrations",
+    "workshop_memory_authority_migrations",
+}
 _TELEGRAM_SUBJECT_PATTERN = re.compile(r"^-?[0-9]+$")
 _SYNTHETIC_ASSISTANT_PATTERN = re.compile(
     r"\[(stopped by user|no response|error: .+)\]",
@@ -436,6 +444,74 @@ def workshop_execution_state_status(db_path: Path) -> str:
         f"missing={missing}, stale={stale}, orphaned={orphaned}, unclassified={unclassified}, settings={settings}, "
         f"workspace settings={workspace_settings}, history={history}, grants={grants}; "
         "protected legacy reads=disabled, rollback dual writes=active"
+    )
+
+
+def workshop_memory_authority_status(db_path: Path, *, memory_enabled: bool | None) -> str:
+    """Describe canonical semantic-memory ownership without reading memory content."""
+    prefix = "Workshop memory authority:"
+    if memory_enabled is False:
+        return f"{prefix} disabled by policy"
+    if not db_path.is_file():
+        return f"{prefix} pending; canonical memory schema unavailable"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if not tables >= _MEMORY_AUTHORITY_TABLES:
+                return f"{prefix} pending; canonical memory schema unavailable"
+            profiles = _scalar(connection, "SELECT COUNT(*) FROM channel_agent_runtime_assignments")
+            migrated = _scalar(connection, "SELECT COUNT(*) FROM workshop_memory_authority_migrations")
+            missing = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_agent_runtime_assignments a "
+                "JOIN channels c ON c.id = a.channel_id AND c.kind = 'direct' "
+                "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.role = 'owner' "
+                "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
+                "JOIN workshop_execution_state_migrations e "
+                "ON e.runtime_profile_id = a.runtime_profile_id AND e.channel_id = a.channel_id "
+                "AND e.agent_id = a.agent_id AND e.principal_id = cm.principal_id "
+                "WHERE NOT EXISTS (SELECT 1 FROM workshop_memory_authority_migrations m "
+                "WHERE m.runtime_profile_id = a.runtime_profile_id "
+                "AND m.runtime_config_id = e.runtime_config_id AND m.channel_id = a.channel_id "
+                "AND m.agent_id = a.agent_id AND m.principal_id = cm.principal_id)",
+            )
+            stale = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM workshop_memory_authority_migrations m WHERE NOT EXISTS ("
+                "SELECT 1 FROM channel_agent_runtime_assignments a "
+                "JOIN channels c ON c.id = a.channel_id AND c.kind = 'direct' "
+                "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.role = 'owner' "
+                "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
+                "JOIN workshop_execution_state_migrations e "
+                "ON e.runtime_profile_id = a.runtime_profile_id "
+                "AND e.runtime_config_id = m.runtime_config_id "
+                "WHERE a.runtime_profile_id = m.runtime_profile_id "
+                "AND a.channel_id = m.channel_id AND a.agent_id = m.agent_id "
+                "AND cm.principal_id = m.principal_id)",
+            )
+            counts = connection.execute(
+                "SELECT COALESCE(SUM(moved_count), 0), COALESCE(SUM(stamped_count), 0), "
+                "COALESCE(SUM(total_count), 0) FROM workshop_memory_authority_migrations"
+            ).fetchone()
+            moved, stamped, total = (int(value) for value in counts) if counts is not None else (0, 0, 0)
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    if memory_enabled is None:
+        state = "NOT VERIFIED"
+    else:
+        state = "active" if profiles > 0 and missing == 0 and stale == 0 and migrated == profiles else "INCOMPLETE"
+    return (
+        f"{prefix} {state}; profiles={profiles}, migrated={migrated}, missing={missing}, "
+        f"stale={stale}, moved={moved}, stamped={stamped}, migration rows={total}; "
+        "protected legacy reads=disabled"
     )
 
 

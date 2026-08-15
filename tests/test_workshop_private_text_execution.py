@@ -205,6 +205,7 @@ async def test_owner_discovers_only_durably_accepted_workshop_client_runs(tmp_pa
             RecoverableClientRun(
                 accepted.run.run_id,
                 profile_id(101),
+                accepted.command.message.event.envelope.aggregate_id,
                 "Resume this browser run after restart",
             ),
         )
