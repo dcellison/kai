@@ -36,7 +36,7 @@ models/
 install.conf
 
 # Claude Code local config
-/CLAUDE.md
+.claude/
 
 # OS / IDE
 .DS_Store
