@@ -636,6 +636,7 @@ function WorkshopView({
   const [sidebarLayout, setSidebarLayout] = useState(restoreSidebarLayout);
   const [resizingSidebar, setResizingSidebar] = useState(false);
   const timelineRef = useRef<HTMLDivElement | null>(null);
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const sidebarRef = useRef<HTMLElement | null>(null);
   const sidebarResizeStartRef = useRef({ pointerX: 0, width: 0 });
   const timelineChannelRef = useRef(channelId);
@@ -649,6 +650,23 @@ function WorkshopView({
   useEffect(() => {
     storeSidebarLayout(sidebarLayout);
   }, [sidebarLayout]);
+
+  // The composer rests at a single line and grows with its content, so the
+  // whole draft (including a restored per-channel draft) stays visible up to
+  // the stylesheet's max-height cap, past which the textarea scrolls.
+  useLayoutEffect(() => {
+    const composer = composerRef.current;
+    if (!composer) {
+      return;
+    }
+    // scrollHeight never reports less than the current height, so the
+    // textarea collapses to auto first; otherwise deleting lines would
+    // leave it stuck at its tallest size. scrollHeight excludes borders,
+    // which the border-box height must include.
+    const borderHeight = composer.offsetHeight - composer.clientHeight;
+    composer.style.height = "auto";
+    composer.style.height = `${composer.scrollHeight + borderHeight}px`;
+  }, [draft, channelId]);
 
   useEffect(() => {
     if (!resizingSidebar) {
@@ -1182,6 +1200,7 @@ function WorkshopView({
           {channel.canSubmitCommands ? (
             <form className="composer-form" onSubmit={(event) => void submit(event)}>
               <textarea
+                ref={composerRef}
                 aria-label={`Message ${channelName}`}
                 value={draft}
                 onChange={(event) => {
@@ -1216,7 +1235,7 @@ function WorkshopView({
                 }}
                 maxLength={50000}
                 placeholder={`Message ${channelName}…`}
-                rows={3}
+                rows={1}
               />
               <button
                 type="submit"
