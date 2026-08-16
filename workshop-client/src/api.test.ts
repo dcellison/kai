@@ -289,7 +289,7 @@ describe("Workshop client API", () => {
     await streamTimeline(
       session,
       "30",
-      { onConnected, onMessage, onRunActivity },
+      { onConnected, onMessage, onRunActivity, onRunPreview: vi.fn() },
       new AbortController().signal,
     );
 
@@ -302,6 +302,75 @@ describe("Workshop client API", () => {
     const headers = new Headers(request[1].headers);
     expect(headers.get("Authorization")).toBe("Bearer session-secret");
     expect(headers.get("Last-Event-ID")).toBe("30");
+  });
+
+  it("parses run preview frames without an id and rejects malformed or foreign ones", async () => {
+    const preview = (payload: Record<string, unknown>): string =>
+      ["event: run.preview.updated", `data: ${JSON.stringify(payload)}`, "", ""].join("\n");
+    const rawMessage = message(33, "Canonical answer");
+    const frames = [
+      // Valid: no id line, current channel.
+      preview({
+        version: 1,
+        channel_id: channelId,
+        run_id: "run_00000000000000000000000000000030",
+        sequence: 2,
+        text: "First sentence.",
+      }),
+      // Malformed: text missing.
+      preview({
+        version: 1,
+        channel_id: channelId,
+        run_id: "run_00000000000000000000000000000030",
+        sequence: 3,
+      }),
+      // Foreign channel: must never reach the handler.
+      preview({
+        version: 1,
+        channel_id: "chn_99999999999999999999999999999999",
+        run_id: "run_00000000000000000000000000000031",
+        sequence: 4,
+        text: "Private to another channel.",
+      }),
+      // A durable event after the previews proves the resume path is intact.
+      [
+        "id: 33",
+        "event: timeline.message.created",
+        `data: ${JSON.stringify({ version: 1, channel_id: channelId, message: rawMessage })}`,
+        "",
+        "",
+      ].join("\n"),
+    ].join("");
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(frames));
+        controller.close();
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(stream, { status: 200 })),
+    );
+    const onRunPreview = vi.fn();
+    const onMessage = vi.fn();
+
+    await streamTimeline(
+      session,
+      "32",
+      { onConnected: vi.fn(), onMessage, onRunActivity: vi.fn(), onRunPreview },
+      new AbortController().signal,
+    );
+
+    expect(onRunPreview).toHaveBeenCalledOnce();
+    expect(onRunPreview).toHaveBeenCalledWith({
+      runId: "run_00000000000000000000000000000030",
+      sequence: 2,
+      text: "First sentence.",
+    });
+    expect(onMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ body: "Canonical answer", eventPosition: 33 }),
+      "33",
+    );
   });
 
   it("receives authoritative run lifecycle activity on the same stream", async () => {
@@ -338,7 +407,7 @@ describe("Workshop client API", () => {
     await streamTimeline(
       session,
       "31",
-      { onConnected: vi.fn(), onMessage: vi.fn(), onRunActivity },
+      { onConnected: vi.fn(), onMessage: vi.fn(), onRunActivity, onRunPreview: vi.fn() },
       new AbortController().signal,
     );
 

@@ -92,8 +92,9 @@ class _FakeStore:
 class _FakeClientCommands:
     ready = False
 
-    def __init__(self, _execution, _compatibility) -> None:
+    def __init__(self, _execution, _compatibility, *, run_previews=None) -> None:
         self.events = _FakeExecutionFactory.events
+        self.run_previews = run_previews
 
     async def start(self) -> None:
         self.events.append("client:start")

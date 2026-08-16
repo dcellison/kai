@@ -836,6 +836,29 @@ button:disabled {
   white-space: nowrap;
 }
 
+/* Streaming preview bubble: visually a normal agent message, with a
+   pulsing label instead of a timestamp while text is still arriving. */
+.run-preview-label {
+  color: var(--atom-muted);
+  font-size: 0.63rem;
+  white-space: nowrap;
+  animation: run-preview-pulse 1.4s ease-in-out infinite;
+}
+
+.run-preview-label::after {
+  content: "...";
+}
+
+@keyframes run-preview-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
 .markdown-message {
   margin: 0;
   color: var(--atom-foreground);

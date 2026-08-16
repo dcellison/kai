@@ -60,7 +60,8 @@ async def test_submission_returns_before_execution_and_preserves_compatibility_s
         selection=SimpleNamespace(model="gpt-5.6-sol"),
     )
 
-    async def execute(_run_id):
+    async def execute(_run_id, *, stream_observer=None):
+        del stream_observer
         await release.wait()
         return execution_result
 
@@ -86,7 +87,7 @@ async def test_submission_returns_before_execution_and_preserves_compatibility_s
         assert submission.acceptance is accepted
         assert submission.run is run
         assert not release.is_set()
-        execution.execute.assert_awaited_once_with(run_id)
+        execution.execute.assert_awaited_once_with(run_id, stream_observer=None)
 
     finally:
         release.set()
@@ -172,4 +173,4 @@ async def test_start_reconciles_durably_accepted_browser_run():
     await asyncio.sleep(0)
     await executor.stop()
 
-    execution.execute.assert_awaited_once_with(run_id)
+    execution.execute.assert_awaited_once_with(run_id, stream_observer=None)
