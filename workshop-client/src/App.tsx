@@ -1196,10 +1196,15 @@ function WorkshopView({
                   // Enter sends the draft; Shift+Enter inserts a newline. An
                   // Enter that confirms an IME composition must never send,
                   // so composing keystrokes are left to the editor untouched.
+                  // WebKit delivers the composition-confirming Enter after
+                  // compositionend with isComposing already false; it is
+                  // recognizable only by the legacy 229 keyCode, so that
+                  // value bails as well.
                   if (
                     event.key !== "Enter" ||
                     event.shiftKey ||
-                    event.nativeEvent.isComposing
+                    event.nativeEvent.isComposing ||
+                    event.nativeEvent.keyCode === 229
                   ) {
                     return;
                   }

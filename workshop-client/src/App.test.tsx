@@ -587,6 +587,13 @@ describe("Workshop React client", () => {
     expect(composer).toHaveValue("first line\nsecond line");
     expect(submitCommand).not.toHaveBeenCalled();
 
+    // Enter during an IME composition, and the WebKit variant that reports
+    // the composition-confirming Enter with the legacy 229 keyCode after
+    // composition has ended, must not send the draft.
+    fireEvent.keyDown(composer, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(composer, { key: "Enter", keyCode: 229 });
+    expect(submitCommand).not.toHaveBeenCalled();
+
     // A bare Enter sends the full multi-line draft and clears the composer.
     await user.keyboard("{Enter}");
     await waitFor(() => expect(submitCommand).toHaveBeenCalledTimes(1));
