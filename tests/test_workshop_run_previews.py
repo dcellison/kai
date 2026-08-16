@@ -57,6 +57,26 @@ class TestRunPreviewRegistry:
         assert live is not None and live.run_id == live_run
         assert registry.channel_preview(stale_channel) is None
 
+    def test_sequence_never_restarts_after_expiry_or_clear(self):
+        clock = SimpleNamespace(now=0.0)
+        registry = WorkshopRunPreviewRegistry(clock=lambda: clock.now)
+        run_id = RunId.new()
+        channel_id = ChannelId.new()
+
+        registry.publish(run_id, channel_id, "Before the quiet period.")
+        before = registry.channel_preview(channel_id)
+        # A long silent tool call outlives the TTL; the entry expires while
+        # the run is still alive, then publishing resumes.
+        clock.now = 700.0
+        assert registry.channel_preview(channel_id) is None
+        registry.publish(run_id, channel_id, "After the quiet period.")
+        after = registry.channel_preview(channel_id)
+
+        # A reader keeping a per-run high-water mark must never see the
+        # resumed preview sort below the pre-expiry one.
+        assert before is not None and after is not None
+        assert after.sequence > before.sequence
+
     def test_newest_preview_wins_within_a_channel(self):
         clock = SimpleNamespace(now=0.0)
         registry = WorkshopRunPreviewRegistry(clock=lambda: clock.now)

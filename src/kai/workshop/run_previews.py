@@ -46,17 +46,24 @@ class WorkshopRunPreviewRegistry:
     def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
         self._clock = clock
         self._previews: dict[RunId, RunPreview] = {}
+        # Registry-global monotonic sequence. A per-run counter would restart
+        # at 1 whenever an entry is re-created after TTL expiry, and readers
+        # that keep a per-run high-water mark would then discard every later
+        # update; a process-global counter can never hand out a lower
+        # sequence than one already delivered from this process.
+        self._sequence = 0
 
     def publish(self, run_id: RunId, channel_id: ChannelId, text: str) -> None:
         """Record `text` as the run's newest preview if it changed."""
         current = self._previews.get(run_id)
         if current is not None and current.text == text:
             return
+        self._sequence += 1
         self._previews[run_id] = RunPreview(
             run_id=run_id,
             channel_id=channel_id,
             text=text,
-            sequence=(current.sequence + 1) if current is not None else 1,
+            sequence=self._sequence,
             updated_at=self._clock(),
         )
 

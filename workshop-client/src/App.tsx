@@ -1131,6 +1131,9 @@ function WorkshopView({
                 />
               ))}
               {runPreview && channel.kind !== "notification" && (
+                /* The preview payload carries no author; direct channels
+                   have a single agent today, so the first agent's name is
+                   the correct attribution until previews learn authorship. */
                 <li className="message-row agent run-preview">
                   <span className="message-avatar" aria-hidden="true">
                     {(channel.agents[0]?.name ?? "Agent").slice(0, 1).toUpperCase()}

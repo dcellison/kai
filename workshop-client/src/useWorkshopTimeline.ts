@@ -15,8 +15,6 @@ import type {
   WorkshopSession,
 } from "./types";
 
-const TERMINAL_RUN_STATUSES = new Set(["completed", "failed", "cancelled"]);
-
 const RECONNECT_DELAY_MS = 2000;
 
 function waitForRetry(signal: AbortSignal): Promise<void> {
@@ -102,6 +100,12 @@ export function useWorkshopTimeline(
           }
 
           setConnection({ label: "Connecting", tone: "connecting" });
+          // Previews are ephemeral per-process server state. After a server
+          // restart the registry's sequence numbering starts over, so the
+          // high-water mark held here would silently discard every preview
+          // from the new process. Each connection attempt starts clean; the
+          // stream re-sends the current preview immediately on connect.
+          setRunPreview(null);
           await streamTimeline(
             session,
             lastEventId,
@@ -124,7 +128,7 @@ export function useWorkshopTimeline(
               },
               onRunActivity: (activity, eventId) => {
                 lastEventId = eventId;
-                if (TERMINAL_RUN_STATUSES.has(activity.run.status)) {
+                if (activity.run.terminalAt !== null) {
                   terminalRunIds.add(activity.run.runId);
                   setRunPreview((current) =>
                     current && current.runId === activity.run.runId ? null : current,

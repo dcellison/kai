@@ -50,6 +50,7 @@ from kai.webhook import (
     remove_notification_chat_id,
 )
 from kai.workshop.domain import PrincipalId
+from kai.workshop.run_previews import WorkshopRunPreviewRegistry
 from kai.workshop.storage_namespaces import (
     WorkshopPrincipalStorageNamespace,
     WorkshopPrincipalStorageRegistry,
@@ -2535,7 +2536,7 @@ class TestNotificationChatIdMutations:
             principal_storage=_principal_storage_registry(),
             client_store=MagicMock(),
             client_commands=MagicMock(),
-            run_previews=None,
+            run_previews=WorkshopRunPreviewRegistry(),
         )
         core_host = MagicMock()
         github_notifications = MagicMock(spec=WorkshopTelegramNotificationService)
@@ -2601,7 +2602,7 @@ class TestNotificationChatIdMutations:
             principal_storage=_principal_storage_registry(),
             client_store=store,
             client_commands=MagicMock(),
-            run_previews=None,
+            run_previews=WorkshopRunPreviewRegistry(),
         )
         fake_runner = MagicMock()
         fake_runner.setup = AsyncMock()
@@ -2669,7 +2670,7 @@ class TestNotificationChatIdMutations:
             principal_storage=_principal_storage_registry(),
             client_store=core_store,
             client_commands=MagicMock(),
-            run_previews=None,
+            run_previews=WorkshopRunPreviewRegistry(),
         )
         core_host = MagicMock()
         github_notifications = MagicMock(spec=WorkshopTelegramNotificationService)
