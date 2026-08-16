@@ -210,6 +210,55 @@ describe("Workshop React client", () => {
     expect(container.querySelector("img")).toBeNull();
   });
 
+  it("streams a growing run preview and replaces it with the canonical answer", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.type(screen.getByLabelText("Enrollment token"), "one-time-token");
+    await user.click(screen.getByRole("button", { name: "Open Workshop" }));
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+
+    act(() =>
+      handlers?.onRunPreview({
+        runId: "run_00000000000000000000000000000030",
+        sequence: 1,
+        text: "First sentence.",
+      }),
+    );
+    expect(await screen.findByText("First sentence.")).toBeVisible();
+    expect(screen.getByText("writing")).toBeVisible();
+
+    act(() =>
+      handlers?.onRunPreview({
+        runId: "run_00000000000000000000000000000030",
+        sequence: 2,
+        text: "First sentence. Second sentence.",
+      }),
+    );
+    expect(await screen.findByText("First sentence. Second sentence.")).toBeVisible();
+
+    // A stale lower-sequence event must not roll the bubble backwards.
+    act(() =>
+      handlers?.onRunPreview({
+        runId: "run_00000000000000000000000000000030",
+        sequence: 1,
+        text: "First sentence.",
+      }),
+    );
+    expect(screen.getByText("First sentence. Second sentence.")).toBeVisible();
+
+    const canonicalAnswer: TimelineMessage = {
+      ...historyMessage,
+      body: "First sentence. Second sentence. Final answer.",
+      eventPosition: 31,
+      messageId: "msg_00000000000000000000000000000031",
+    };
+    act(() => handlers?.onMessage(canonicalAnswer, "31"));
+
+    expect(await screen.findByText(canonicalAnswer.body)).toBeVisible();
+    expect(screen.queryByText("writing")).toBeNull();
+    expect(screen.queryByText("First sentence. Second sentence.")).toBeNull();
+  });
+
   it("opens at the latest message and preserves deliberate scroll position", async () => {
     const user = userEvent.setup();
     sessionStorage.setItem(

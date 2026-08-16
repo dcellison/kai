@@ -289,7 +289,7 @@ describe("Workshop client API", () => {
     await streamTimeline(
       session,
       "30",
-      { onConnected, onMessage, onRunActivity },
+      { onConnected, onMessage, onRunActivity, onRunPreview: vi.fn() },
       new AbortController().signal,
     );
 
@@ -338,7 +338,7 @@ describe("Workshop client API", () => {
     await streamTimeline(
       session,
       "31",
-      { onConnected: vi.fn(), onMessage: vi.fn(), onRunActivity },
+      { onConnected: vi.fn(), onMessage: vi.fn(), onRunActivity, onRunPreview: vi.fn() },
       new AbortController().signal,
     );
 

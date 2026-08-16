@@ -19,6 +19,7 @@ from kai.workshop.delivery_authority import (
     WorkshopConversationDeliveryAuthority,
 )
 from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
+from kai.workshop.run_previews import WorkshopRunPreviewRegistry
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
 from kai.workshop.storage_namespaces import WorkshopPrincipalStorageRegistry
@@ -97,6 +98,7 @@ class KaiCoreServices:
     client_store: WorkshopEventStore
     principal_storage: WorkshopPrincipalStorageRegistry
     delivery_authority_epoch: DeliveryAuthorityEpoch
+    run_previews: WorkshopRunPreviewRegistry
 
 
 class KaiApplicationHost:
@@ -180,9 +182,11 @@ class KaiApplicationHost:
                 runtime_pool,
                 registered_backend_ids=self._registered_backend_ids,
             )
+            run_previews = WorkshopRunPreviewRegistry()
             client_commands = WorkshopClientCommandExecutor(
                 private_execution,
                 WorkshopCompatibilityStateWriter(self._config, runtime_pool),
+                run_previews=run_previews,
             )
             await client_commands.start()
 
@@ -196,6 +200,7 @@ class KaiApplicationHost:
                 client_store=client_store,
                 principal_storage=self._principal_storage,
                 delivery_authority_epoch=delivery_authority_epoch,
+                run_previews=run_previews,
             )
             self._state = KaiApplicationState.READY
             return self._services

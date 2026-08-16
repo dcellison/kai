@@ -25,6 +25,7 @@ import type {
   TimelineMessage,
   WorkshopRun,
   WorkshopRunActivity,
+  WorkshopRunPreview,
   WorkshopChannelSummary,
   WorkshopNavigation,
   WorkshopSession,
@@ -597,6 +598,7 @@ function WorkshopView({
   messages,
   navigation,
   runActivity,
+  runPreview,
   workshop,
   onForget,
   onCancelRun,
@@ -609,6 +611,7 @@ function WorkshopView({
   messages: TimelineMessage[];
   navigation: WorkshopNavigation;
   runActivity: WorkshopRunActivity | null;
+  runPreview: WorkshopRunPreview | null;
   workshop: WorkshopSummary;
   onForget: () => void;
   onCancelRun: (runId: string) => Promise<WorkshopRun>;
@@ -833,7 +836,7 @@ function WorkshopView({
       follow: true,
       scrollTop: timeline.scrollTop,
     });
-  }, [activeRun, channelId]);
+  }, [activeRun, channelId, runPreview]);
 
   const handleTimelineScroll = (): void => {
     const timeline = timelineRef.current;
@@ -1127,6 +1130,20 @@ function WorkshopView({
                   notification={channel.kind === "notification"}
                 />
               ))}
+              {runPreview && channel.kind !== "notification" && (
+                <li className="message-row agent run-preview">
+                  <span className="message-avatar" aria-hidden="true">
+                    {(channel.agents[0]?.name ?? "Agent").slice(0, 1).toUpperCase()}
+                  </span>
+                  <article>
+                    <header className="message-meta">
+                      <strong>{channel.agents[0]?.name ?? "Agent"}</strong>
+                      <span className="run-preview-label">writing</span>
+                    </header>
+                    <MarkdownMessage body={runPreview.text} />
+                  </article>
+                </li>
+              )}
             </ol>
           )}
         </div>
@@ -1312,7 +1329,7 @@ function ActiveWorkshopClient({
   onSelectChannel: (channelId: string) => void;
 }): React.JSX.Element {
   const selected = findNavigationChannel(navigation, session.channelId);
-  const { connection, messages, runActivity } = useWorkshopTimeline(
+  const { connection, messages, runActivity, runPreview } = useWorkshopTimeline(
     session,
     selected !== null,
     onAuthenticationFailure,
@@ -1357,6 +1374,7 @@ function ActiveWorkshopClient({
       messages={messages}
       navigation={navigation}
       runActivity={runActivity}
+      runPreview={runPreview}
       workshop={selected.workshop}
       onForget={onForget}
       onCancelRun={cancelSelectedRun}

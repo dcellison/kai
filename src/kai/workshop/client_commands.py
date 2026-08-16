@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from kai.conversation_compatibility import CanonicalMemoryProvenance
 from kai.history import LogEntry
+from kai.streaming_text import stream_publishable_prefix
 from kai.workshop.compatibility_state import WorkshopCompatibilityStateWriter
 from kai.workshop.conversation_commands import (
     ClientConversationCommandAcceptance,
@@ -24,6 +25,7 @@ from kai.workshop.private_text_execution import (
     WorkshopPrivateTextExecutionService,
 )
 from kai.workshop.run_lifecycle import DurableRun
+from kai.workshop.run_previews import WorkshopRunPreviewRegistry
 
 log = logging.getLogger(__name__)
 _RECONCILE_INTERVAL_SECONDS = 5.0
@@ -57,9 +59,12 @@ class WorkshopClientCommandExecutor:
         self,
         execution: WorkshopPrivateTextExecutionService,
         compatibility_state: WorkshopCompatibilityStateWriter,
+        *,
+        run_previews: WorkshopRunPreviewRegistry | None = None,
     ) -> None:
         self._execution = execution
         self._compatibility_state = compatibility_state
+        self._run_previews = run_previews
         self._tasks: dict[RunId, asyncio.Task[None]] = {}
         self._task_lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
@@ -152,7 +157,10 @@ class WorkshopClientCommandExecutor:
     async def _execute(self, context: _ClientRunContext) -> None:
         task = asyncio.current_task()
         try:
-            result = await self._execution.execute(context.run_id)
+            result = await self._execution.execute(
+                context.run_id,
+                stream_observer=await self._preview_observer(context.run_id),
+            )
             if result.terminal is None:
                 return
             compatibility_state = self._compatibility_state.for_profile(context.runtime_profile_id)
@@ -185,9 +193,31 @@ class WorkshopClientCommandExecutor:
         except Exception:
             log.exception("Workshop client run task failed for %s", context.run_id)
         finally:
+            if self._run_previews is not None:
+                self._run_previews.clear(context.run_id)
             async with self._task_lock:
                 if self._tasks.get(context.run_id) is task:
                     del self._tasks[context.run_id]
+
+    async def _preview_observer(self, run_id: RunId):
+        """Build a stream observer that publishes stable partial text."""
+        previews = self._run_previews
+        if previews is None:
+            return None
+        channel_id = (await self._execution.run_state(run_id)).channel_id
+        last_published: str | None = None
+
+        async def observe(event) -> None:
+            nonlocal last_published
+            if not event.text_so_far:
+                return
+            publishable = stream_publishable_prefix(event.text_so_far)
+            if publishable is None or publishable == last_published:
+                return
+            last_published = publishable
+            previews.publish(run_id, channel_id, publishable)
+
+        return observe
 
     async def _reconcile(self) -> None:
         for recoverable in await self._execution.recoverable_client_runs():

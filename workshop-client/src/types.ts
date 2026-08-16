@@ -94,6 +94,12 @@ export type WorkshopRunTransition =
   | "run.failed"
   | "run.cancelled";
 
+export interface WorkshopRunPreview {
+  runId: string;
+  sequence: number;
+  text: string;
+}
+
 export interface WorkshopRunActivity {
   eventPosition: number;
   occurredAt: string;

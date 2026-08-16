@@ -11,8 +11,11 @@ import type {
   ConnectionState,
   TimelineMessage,
   WorkshopRunActivity,
+  WorkshopRunPreview,
   WorkshopSession,
 } from "./types";
+
+const TERMINAL_RUN_STATUSES = new Set(["completed", "failed", "cancelled"]);
 
 const RECONNECT_DELAY_MS = 2000;
 
@@ -51,9 +54,11 @@ export function useWorkshopTimeline(
   connection: ConnectionState;
   messages: TimelineMessage[];
   runActivity: WorkshopRunActivity | null;
+  runPreview: WorkshopRunPreview | null;
 } {
   const [messages, setMessages] = useState<TimelineMessage[]>([]);
   const [runActivity, setRunActivity] = useState<WorkshopRunActivity | null>(null);
+  const [runPreview, setRunPreview] = useState<WorkshopRunPreview | null>(null);
   const [connection, setConnection] = useState<ConnectionState>({
     label: "Waiting",
     tone: "connecting",
@@ -63,6 +68,7 @@ export function useWorkshopTimeline(
     if (!active || !session) {
       setMessages([]);
       setRunActivity(null);
+      setRunPreview(null);
       setConnection({ label: "Waiting", tone: "connecting" });
       return;
     }
@@ -70,6 +76,10 @@ export function useWorkshopTimeline(
     const controller = new AbortController();
     const { signal } = controller;
     setRunActivity(null);
+    setRunPreview(null);
+    // Runs already seen terminal on this connection. A preview event that
+    // races the terminal batch must never resurrect a finished bubble.
+    const terminalRunIds = new Set<string>();
     let lastEventId = "0";
     let needsSnapshot = true;
     let knownMessageIds = new Set<string>();
@@ -105,11 +115,34 @@ export function useWorkshopTimeline(
                   return;
                 }
                 knownMessageIds.add(message.messageId);
+                // The canonical assistant message replaces any streaming
+                // preview; SQLite remains authoritative.
+                if (message.authorKind === "agent") {
+                  setRunPreview(null);
+                }
                 setMessages((current) => appendUnique(current, message));
               },
               onRunActivity: (activity, eventId) => {
                 lastEventId = eventId;
+                if (TERMINAL_RUN_STATUSES.has(activity.run.status)) {
+                  terminalRunIds.add(activity.run.runId);
+                  setRunPreview((current) =>
+                    current && current.runId === activity.run.runId ? null : current,
+                  );
+                }
                 setRunActivity(activity);
+              },
+              onRunPreview: (preview) => {
+                if (terminalRunIds.has(preview.runId)) {
+                  return;
+                }
+                setRunPreview((current) =>
+                  current &&
+                  current.runId === preview.runId &&
+                  current.sequence >= preview.sequence
+                    ? current
+                    : preview,
+                );
               },
             },
             signal,
@@ -150,5 +183,5 @@ export function useWorkshopTimeline(
     session,
   ]);
 
-  return { connection, messages, runActivity };
+  return { connection, messages, runActivity, runPreview };
 }

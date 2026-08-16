@@ -45,6 +45,7 @@ from kai.workshop.run_lifecycle import (
     RunStatus,
     WorkshopRunLifecycle,
 )
+from kai.workshop.run_previews import WorkshopRunPreviewRegistry
 from kai.workshop.store import WorkshopEventStore
 
 _NOW = datetime(2026, 8, 11, 14, 0, tzinfo=UTC)
@@ -192,6 +193,7 @@ async def _open_client(
     event_heartbeat_interval: float = 0.05,
     event_authentication_recheck_interval: float = 0.01,
     event_stream_limiter: WorkshopEventStreamLimiter | None = None,
+    run_previews: WorkshopRunPreviewRegistry | None = None,
 ) -> TestClient:
     app = web.Application()
     register_workshop_read_routes(
@@ -203,6 +205,7 @@ async def _open_client(
         event_heartbeat_interval=event_heartbeat_interval,
         event_authentication_recheck_interval=event_authentication_recheck_interval,
         event_stream_limiter=event_stream_limiter,
+        run_previews=run_previews,
     )
     client = TestClient(TestServer(app))
     await client.start_server()
@@ -1130,5 +1133,84 @@ class TestWorkshopTimelineEventStreamHTTPContract:
             assert response.status == status
             assert (await response.json())["error"]["code"] == error
         finally:
+            await client.close()
+            await store.close()
+
+
+class TestWorkshopRunPreviewEventStream:
+    async def test_preview_events_carry_no_id_and_advance_by_sequence(self, tmp_path: Path):
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        previews = WorkshopRunPreviewRegistry()
+        run_id = RunId.new()
+        previews.publish(run_id, ChannelId(alice_channel), "First sentence.")
+        client = await _open_client(
+            store,
+            _Authenticator({"alice-token": alice_id}),
+            run_previews=previews,
+        )
+        response = None
+        try:
+            response = await client.get(
+                f"/v1/channels/{alice_channel}/events",
+                headers={"Authorization": "Bearer alice-token"},
+            )
+            event = await _read_sse_event(response)
+            while event["event"] != "run.preview.updated":
+                event = await _read_sse_event(response)
+
+            assert event["id"] is None
+            assert event["data"] == {
+                "version": 1,
+                "channel_id": alice_channel,
+                "run_id": str(run_id),
+                "sequence": 1,
+                "text": "First sentence.",
+            }
+
+            previews.publish(run_id, ChannelId(alice_channel), "First sentence. Second sentence.")
+            event = await _read_sse_event(response)
+            while event["event"] != "run.preview.updated":
+                event = await _read_sse_event(response)
+
+            # An unchanged preview is never re-sent, so the very next preview
+            # event on the wire is the sequence-2 update.
+            assert event["id"] is None
+            assert event["data"]["sequence"] == 2
+            assert event["data"]["text"] == "First sentence. Second sentence."
+        finally:
+            if response is not None:
+                response.close()
+            await client.close()
+            await store.close()
+
+    async def test_preview_events_are_scoped_to_their_channel(self, tmp_path: Path):
+        store, _, alice_channel, bob_id, bob_channel = await _open_store(tmp_path / "kai.db")
+        previews = WorkshopRunPreviewRegistry()
+        previews.publish(RunId.new(), ChannelId(alice_channel), "Private to the other channel.")
+        client = await _open_client(
+            store,
+            _Authenticator({"bob-token": bob_id}),
+            run_previews=previews,
+        )
+        response = None
+        try:
+            response = await client.get(
+                f"/v1/channels/{bob_channel}/events",
+                headers={"Authorization": "Bearer bob-token"},
+            )
+            bob_run = RunId.new()
+            previews.publish(bob_run, ChannelId(bob_channel), "Visible in this channel.")
+            event = await _read_sse_event(response)
+            while event["event"] != "run.preview.updated":
+                event = await _read_sse_event(response)
+
+            # The other channel's earlier preview was live for the whole
+            # connection; the first preview this stream ever sees must be the
+            # one published for its own channel.
+            assert event["data"]["run_id"] == str(bob_run)
+            assert event["data"]["channel_id"] == bob_channel
+        finally:
+            if response is not None:
+                response.close()
             await client.close()
             await store.close()

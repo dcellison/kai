@@ -32,6 +32,7 @@ from kai.workshop.domain import ChannelId, PrincipalId, RunId
 from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.inbound import ClientInboundMessage, InboundBindingNotFoundError
 from kai.workshop.run_lifecycle import DurableRun, RunNotFoundError, RunStatus
+from kai.workshop.run_previews import RunPreview, WorkshopRunPreviewRegistry
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
 from kai.workshop.timeline import (
     TimelineAccessDeniedError,
@@ -491,6 +492,28 @@ def _serialize_run_lifecycle_event(activity: ClientRunLifecycleEvent) -> bytes:
     return (f"id: {activity.event_position}\nevent: run.lifecycle.changed\ndata: {payload}\n\n").encode()
 
 
+def _serialize_run_preview_event(preview: RunPreview) -> bytes:
+    """Render one ephemeral preview event.
+
+    Deliberately carries no SSE `id:` line: the client's Last-Event-ID
+    resume cursor must remain a durable store position, and previews are
+    advisory display state that never participates in resume.
+    """
+    payload = json.dumps(
+        {
+            "version": 1,
+            "channel_id": str(preview.channel_id),
+            "run_id": str(preview.run_id),
+            "sequence": preview.sequence,
+            "text": preview.text,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return (f"event: run.preview.updated\ndata: {payload}\n\n").encode()
+
+
 async def _authorized_update_batch(
     request: web.Request,
     *,
@@ -534,6 +557,7 @@ async def _handle_channel_event_stream(
     heartbeat_interval: float,
     authentication_recheck_interval: float,
     stream_limiter: WorkshopEventStreamLimiter,
+    run_previews: WorkshopRunPreviewRegistry | None = None,
 ) -> web.StreamResponse:
     try:
         async with request_lock:
@@ -591,8 +615,19 @@ async def _handle_channel_event_stream(
         batch = initial_batch
         last_heartbeat = time.monotonic()
         last_authentication_check = last_heartbeat
+        # (run_id, sequence) of the preview most recently written to this
+        # connection, so an unchanged preview is not re-sent every poll.
+        last_preview_sent: tuple[str, int] | None = None
         await response.write(f": connected\nretry: {_SSE_RETRY_MILLISECONDS}\n\n".encode())
         while True:
+            if run_previews is not None:
+                preview = run_previews.channel_preview(channel_id)
+                if preview is not None:
+                    preview_key = (str(preview.run_id), preview.sequence)
+                    if preview_key != last_preview_sent:
+                        await response.write(_serialize_run_preview_event(preview))
+                        last_preview_sent = preview_key
+                        last_heartbeat = time.monotonic()
             if batch.events:
                 for event in batch.events:
                     if isinstance(event, ClientTimelineMessageEvent):
@@ -900,6 +935,7 @@ def register_workshop_read_routes(
     event_heartbeat_interval: float = 15.0,
     event_authentication_recheck_interval: float = 15.0,
     event_stream_limiter: WorkshopEventStreamLimiter | None = None,
+    run_previews: WorkshopRunPreviewRegistry | None = None,
 ) -> None:
     """Register the read-only contract on an explicitly supplied application."""
     if event_poll_interval <= 0 or event_heartbeat_interval <= 0 or event_authentication_recheck_interval <= 0:
@@ -932,6 +968,7 @@ def register_workshop_read_routes(
             heartbeat_interval=event_heartbeat_interval,
             authentication_recheck_interval=event_authentication_recheck_interval,
             stream_limiter=stream_limiter,
+            run_previews=run_previews,
         )
 
     app.router.add_get(_CLIENT_NAVIGATION_PATH, handle_client_navigation)

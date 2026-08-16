@@ -2535,6 +2535,7 @@ class TestNotificationChatIdMutations:
             principal_storage=_principal_storage_registry(),
             client_store=MagicMock(),
             client_commands=MagicMock(),
+            run_previews=None,
         )
         core_host = MagicMock()
         github_notifications = MagicMock(spec=WorkshopTelegramNotificationService)
@@ -2600,6 +2601,7 @@ class TestNotificationChatIdMutations:
             principal_storage=_principal_storage_registry(),
             client_store=store,
             client_commands=MagicMock(),
+            run_previews=None,
         )
         fake_runner = MagicMock()
         fake_runner.setup = AsyncMock()
@@ -2667,6 +2669,7 @@ class TestNotificationChatIdMutations:
             principal_storage=_principal_storage_registry(),
             client_store=core_store,
             client_commands=MagicMock(),
+            run_previews=None,
         )
         core_host = MagicMock()
         github_notifications = MagicMock(spec=WorkshopTelegramNotificationService)

@@ -4,6 +4,7 @@ import type {
   TimelineSnapshot,
   WorkshopRun,
   WorkshopRunActivity,
+  WorkshopRunPreview,
   WorkshopNavigation,
   WorkshopRunStatus,
   WorkshopRunTransition,
@@ -32,6 +33,7 @@ interface StreamHandlers {
   onConnected: () => void;
   onMessage: (message: TimelineMessage, eventId: string) => void;
   onRunActivity: (activity: WorkshopRunActivity, eventId: string) => void;
+  onRunPreview: (preview: WorkshopRunPreview) => void;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -523,6 +525,34 @@ export async function streamTimeline(
     }
     const events = eventDecoder.push(textDecoder.decode(value, { stream: true }));
     for (const event of events) {
+      if (event.eventName === "run.preview.updated") {
+        // Previews are ephemeral display state and deliberately carry no
+        // SSE id, so they are handled before the resume-cursor guard and
+        // never advance Last-Event-ID.
+        let previewPayload: unknown;
+        try {
+          previewPayload = JSON.parse(event.data);
+        } catch {
+          continue;
+        }
+        if (
+          !isRecord(previewPayload) ||
+          previewPayload.version !== 1 ||
+          previewPayload.channel_id !== session.channelId ||
+          typeof previewPayload.run_id !== "string" ||
+          typeof previewPayload.text !== "string" ||
+          typeof previewPayload.sequence !== "number" ||
+          !Number.isSafeInteger(previewPayload.sequence)
+        ) {
+          continue;
+        }
+        handlers.onRunPreview({
+          runId: previewPayload.run_id,
+          sequence: previewPayload.sequence,
+          text: previewPayload.text,
+        });
+        continue;
+      }
       if (
         !event.eventId ||
         !/^\d+$/.test(event.eventId)
