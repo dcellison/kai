@@ -1192,6 +1192,23 @@ function WorkshopView({
                     setPendingMessageId(null);
                   }
                 }}
+                onKeyDown={(event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+                  // Enter sends the draft; Shift+Enter inserts a newline. An
+                  // Enter that confirms an IME composition must never send,
+                  // so composing keystrokes are left to the editor untouched.
+                  if (
+                    event.key !== "Enter" ||
+                    event.shiftKey ||
+                    event.nativeEvent.isComposing
+                  ) {
+                    return;
+                  }
+                  event.preventDefault();
+                  // Submitting the surrounding form keeps every send on the
+                  // submit() path, so its guards (empty draft, in-flight
+                  // command, active run) apply to keyboard sends as well.
+                  event.currentTarget.form?.requestSubmit();
+                }}
                 maxLength={50000}
                 placeholder={`Message ${channelName}…`}
                 rows={3}

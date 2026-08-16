@@ -566,6 +566,36 @@ describe("Workshop React client", () => {
     expect(screen.getByLabelText("Message Kai")).toHaveValue("");
   });
 
+  it("sends the draft on Enter and keeps Shift+Enter as a newline", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    render(<App />);
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+
+    // Enter on an empty composer must not submit; the send path rejects
+    // blank drafts regardless of how submission is triggered.
+    const composer = screen.getByLabelText("Message Kai");
+    await user.click(composer);
+    await user.keyboard("{Enter}");
+    expect(submitCommand).not.toHaveBeenCalled();
+
+    // Shift+Enter stays a plain newline inside the draft.
+    await user.type(composer, "first line{Shift>}{Enter}{/Shift}second line");
+    expect(composer).toHaveValue("first line\nsecond line");
+    expect(submitCommand).not.toHaveBeenCalled();
+
+    // A bare Enter sends the full multi-line draft and clears the composer.
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(submitCommand).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(submitCommand).mock.calls[0]?.[2]).toBe(
+      "first line\nsecond line",
+    );
+    expect(composer).toHaveValue("");
+  });
+
   it("accepts work asynchronously and exposes an exact run Stop control", async () => {
     const user = userEvent.setup();
     sessionStorage.setItem(
