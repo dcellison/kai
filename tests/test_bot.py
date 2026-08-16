@@ -1305,14 +1305,22 @@ class TestHandleStats:
         stats = {
             "session_id": "abcd1234efgh",
             "model": "sonnet",
-            "created_at": "2026-01-01",
-            "last_used_at": "2026-01-02",
+            "created_at": "2026-01-01 12:00:00",
+            "last_used_at": "2026-01-02 15:30:45",
         }
         with patch("kai.bot.sessions.get_stats", new_callable=AsyncMock, return_value=stats):
             await handle_stats(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "abcd1234" in reply
         assert "sonnet" in reply
+        # Stored values are UTC; the reply must show them converted to the
+        # host zone with a zone label. Expected values are computed with an
+        # independent conversion so the assertion holds in any host zone,
+        # including across the EST/EDT boundary.
+        expected_started = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        expected_last_used = datetime(2026, 1, 2, 15, 30, 45, tzinfo=UTC).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        assert f"Started: {expected_started}" in reply
+        assert f"Last used: {expected_last_used}" in reply
 
 
 # ── handle_jobs ──────────────────────────────────────────────────────

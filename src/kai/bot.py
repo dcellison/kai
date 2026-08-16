@@ -1461,6 +1461,19 @@ async def handle_voice_callback(update: Update, context: ContextTypes.DEFAULT_TY
 # ── Info and management commands ─────────────────────────────────────
 
 
+def _stats_local_time(utc_timestamp: str) -> str:
+    """Render a stored UTC session timestamp in the host's local zone.
+
+    The sessions table stores SQLite CURRENT_TIMESTAMP values, which are
+    always UTC at second precision with no zone marker. Readers compare
+    /stats output against their local wall clock, so the value is
+    converted to the host zone and labeled with the zone name. Storage
+    stays UTC; only rendering changes.
+    """
+    parsed = datetime.strptime(utc_timestamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+    return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
 @_require_auth
 async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /stats: show session info, model, and process status."""
@@ -1475,8 +1488,8 @@ async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(
         f"Session: {stats['session_id'][:8]}...\n"
         f"Model: {stats['model']}\n"
-        f"Started: {stats['created_at']}\n"
-        f"Last used: {stats['last_used_at']}\n"
+        f"Started: {_stats_local_time(stats['created_at'])}\n"
+        f"Last used: {_stats_local_time(stats['last_used_at'])}\n"
         f"Process alive: {alive}"
     )
 
