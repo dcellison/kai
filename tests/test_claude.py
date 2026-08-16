@@ -91,6 +91,16 @@ def _assistant_event(text: str) -> bytes:
     )
 
 
+def _stream_delta_event(delta: dict) -> bytes:
+    """Build a stream_event line carrying one content-block delta."""
+    return _json_line(
+        {
+            "type": "stream_event",
+            "event": {"type": "content_block_delta", "index": 1, "delta": delta},
+        }
+    )
+
+
 def _result_event(
     text: str = "Final",
     is_error: bool = False,
@@ -594,6 +604,23 @@ class TestCommandConstruction:
             assert "--effort" in cmd
             idx = cmd.index("--effort")
             assert cmd[idx + 1] == "xhigh"
+
+    @pytest.mark.asyncio
+    async def test_partial_messages_flag_in_cmd(self):
+        """Token-level stream_event chunks require the CLI opt-in flag;
+        without it the backend regresses to per-message streaming."""
+        claude = _make_claude()
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
+            mock_exec.return_value = mock_proc
+
+            await claude._ensure_started()
+
+            assert "--include-partial-messages" in mock_exec.call_args[0]
 
 
 # ── Process signal handling ──────────────────────────────────────────
@@ -1294,6 +1321,128 @@ class TestSendLockedBasic:
         assert "First" in last_text
         assert "Second" in last_text
         assert "\n\n" in last_text
+
+    @pytest.mark.asyncio
+    async def test_text_deltas_stream_before_the_complete_message(self, monkeypatch):
+        """Token deltas yield growing text; the complete message that
+        repeats them does not double the text, and the final response
+        is byte-identical to the non-delta path."""
+        monkeypatch.setattr("kai.claude._PARTIAL_YIELD_MIN_GROWTH", 1)
+        proc = _make_mock_proc(
+            [
+                _system_event(),
+                _stream_delta_event({"type": "text_delta", "text": "Hel"}),
+                _stream_delta_event({"type": "text_delta", "text": "lo."}),
+                _assistant_event("Hello."),
+                _result_event("Hello."),
+                b"",
+            ]
+        )
+        claude = _make_claude()
+        claude._proc = proc
+        claude._fresh_session = False
+
+        events = await _collect_events(claude)
+
+        text_events = [e.text_so_far for e in events if not e.done]
+        assert text_events == ["Hel", "Hello.", "Hello."]
+        assert events[-1].response is not None
+        assert events[-1].response.text == "Hello."
+
+    @pytest.mark.asyncio
+    async def test_text_deltas_after_a_prior_message_get_the_separator(self, monkeypatch):
+        """Deltas of a later block render behind the accumulated text with
+        the same separator rule complete messages use."""
+        monkeypatch.setattr("kai.claude._PARTIAL_YIELD_MIN_GROWTH", 1)
+        proc = _make_mock_proc(
+            [
+                _system_event(),
+                _assistant_event("First."),
+                _stream_delta_event({"type": "text_delta", "text": "Second"}),
+                _result_event(),
+                b"",
+            ]
+        )
+        claude = _make_claude()
+        claude._proc = proc
+        claude._fresh_session = False
+
+        events = await _collect_events(claude)
+
+        text_events = [e.text_so_far for e in events if not e.done]
+        assert text_events[-1] == "First.\n\nSecond"
+
+    @pytest.mark.asyncio
+    async def test_small_deltas_coalesce_until_the_growth_threshold(self):
+        """Token-sized deltas below the growth threshold do not yield;
+        crossing it yields once, and the complete message still flushes
+        the exact final text."""
+        proc = _make_mock_proc(
+            [
+                _system_event(),
+                _stream_delta_event({"type": "text_delta", "text": "Tiny. "}),
+                _stream_delta_event({"type": "text_delta", "text": "Also tiny. "}),
+                _stream_delta_event({"type": "text_delta", "text": "x" * 100}),
+                _assistant_event("Tiny. Also tiny. " + "x" * 100),
+                _result_event(),
+                b"",
+            ]
+        )
+        claude = _make_claude()
+        claude._proc = proc
+        claude._fresh_session = False
+
+        events = await _collect_events(claude)
+
+        text_events = [e.text_so_far for e in events if not e.done]
+        assert text_events == [
+            "Tiny. Also tiny. " + "x" * 100,
+            "Tiny. Also tiny. " + "x" * 100,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_malformed_stream_events_yield_nothing(self):
+        """Protocol drift in stream_event shapes is ignored, not fatal."""
+        proc = _make_mock_proc(
+            [
+                _system_event(),
+                _json_line({"type": "stream_event"}),
+                _json_line({"type": "stream_event", "event": "not-a-dict"}),
+                _json_line({"type": "stream_event", "event": {"type": "content_block_delta", "delta": "nope"}}),
+                _stream_delta_event({"type": "text_delta", "text": ""}),
+                _stream_delta_event({"type": "text_delta"}),
+                _result_event(),
+                b"",
+            ]
+        )
+        claude = _make_claude()
+        claude._proc = proc
+        claude._fresh_session = False
+
+        events = await _collect_events(claude)
+
+        assert [e for e in events if not e.done] == []
+        assert events[-1].done is True
+
+    @pytest.mark.asyncio
+    async def test_non_text_deltas_yield_nothing(self):
+        """Thinking and signature deltas never surface as preview text."""
+        proc = _make_mock_proc(
+            [
+                _system_event(),
+                _stream_delta_event({"type": "thinking_delta", "thinking": "Hmm"}),
+                _stream_delta_event({"type": "signature_delta", "signature": "abc"}),
+                _result_event(),
+                b"",
+            ]
+        )
+        claude = _make_claude()
+        claude._proc = proc
+        claude._fresh_session = False
+
+        events = await _collect_events(claude)
+
+        assert [e for e in events if not e.done] == []
 
     @pytest.mark.asyncio
     async def test_non_text_content_blocks_ignored(self):

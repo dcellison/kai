@@ -12,9 +12,10 @@ as shared functions usable by any backend.
 
 The stream-json protocol:
     Input:  {"type": "user", "message": {"role": "user", "content": [...]}}
-    Output: {"type": "system", ...}      - session metadata
-            {"type": "assistant", ...}   - partial text (streaming)
-            {"type": "result", ...}      - final response with session info
+    Output: {"type": "system", ...}       - session metadata
+            {"type": "stream_event", ...} - token-level content block deltas
+            {"type": "assistant", ...}    - one completed assistant message
+            {"type": "result", ...}       - final response with session info
 """
 
 import asyncio
@@ -45,6 +46,15 @@ from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude
 from kai.subprocess_identity import subprocess_spawn_cwd, wrap_command_for_target_user
 
 log = logging.getLogger(__name__)
+
+# Minimum partial-text growth, in characters, before a delta yields an
+# intermediate StreamEvent. Stream observers run a full-text
+# publishable-prefix scan per yield, so unbatched per-token yields would
+# make total gate work quadratic in response length. At typical
+# generation speed this batches to roughly one yield per second, which
+# matches both transports' preview cadence (2s Telegram edit throttle,
+# 1s Workshop event-stream poll).
+_PARTIAL_YIELD_MIN_GROWTH = 100
 
 
 def _resolve_default_claude_bin() -> str:
@@ -233,6 +243,12 @@ class ClaudeCodeBackend(AgentBackend):
             "--output-format",
             "stream-json",
             "--verbose",
+            # Emit token-level stream_event chunks between complete
+            # assistant messages so live previews grow while a long text
+            # block is still being generated. Verified against `claude
+            # --help`: only valid with --print and stream-json output,
+            # which is exactly this invocation.
+            "--include-partial-messages",
             "--model",
             self.model,
             # Effort level controls how many reasoning tokens Claude spends
@@ -827,6 +843,15 @@ class ClaudeCodeBackend(AgentBackend):
             return
 
         accumulated_text = ""
+        # Text-delta chunks of the content block currently being generated.
+        # Complete assistant message events remain the source of truth for
+        # `accumulated_text` and the final response; this buffer only feeds
+        # intermediate text_so_far yields and is reset whenever a complete
+        # assistant message arrives, because that message repeats the text
+        # its deltas already delivered.
+        partial_text = ""
+        # Length of partial_text at its last yield, for delta coalescing.
+        partial_yielded_length = 0
         # Idle-activity timeout for the interaction. Resets every time the
         # process emits a line of output. If the process goes silent for
         # this long, it is likely dead or wedged. The per-readline timeout
@@ -971,6 +996,8 @@ class ClaudeCodeBackend(AgentBackend):
                     return
 
                 elif etype == "assistant" and "message" in event:
+                    partial_text = ""
+                    partial_yielded_length = 0
                     msg_data = event["message"]
                     if isinstance(msg_data, dict) and "content" in msg_data:
                         for block in msg_data["content"]:
@@ -980,6 +1007,30 @@ class ClaudeCodeBackend(AgentBackend):
                                     accumulated_text += "\n\n"
                                 accumulated_text += new_text
                                 yield StreamEvent(text_so_far=accumulated_text)
+
+                elif etype == "stream_event":
+                    inner = event.get("event")
+                    delta = inner.get("delta") if isinstance(inner, dict) else None
+                    # Only text deltas feed the preview; thinking and
+                    # signature deltas of other block types are invisible.
+                    if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                        chunk = delta.get("text", "")
+                        if chunk:
+                            partial_text += chunk
+                            # Coalesce token-sized deltas: every stream
+                            # observer runs a full-text publishable-prefix
+                            # scan per yield, so per-token yields would make
+                            # total gate work quadratic in response length.
+                            # The prefix gate only advances at sentence-like
+                            # boundaries anyway, so batching costs no
+                            # visible granularity; the complete assistant
+                            # message below still flushes the exact text.
+                            if len(partial_text) - partial_yielded_length >= _PARTIAL_YIELD_MIN_GROWTH:
+                                partial_yielded_length = len(partial_text)
+                                preview = accumulated_text
+                                if preview and not preview.endswith("\n"):
+                                    preview += "\n\n"
+                                yield StreamEvent(text_so_far=preview + partial_text)
 
         except Exception as e:
             log.exception("Unexpected error reading Claude stream")
