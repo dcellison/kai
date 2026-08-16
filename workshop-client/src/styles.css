@@ -1144,10 +1144,12 @@ button:disabled {
 }
 
 .composer-form textarea {
-  min-height: 3.4rem;
+  /* Height is driven by the auto-grow effect in App.tsx: one line at rest,
+     expanding with the draft until this cap, after which it scrolls. */
   max-height: 12rem;
+  overflow-y: auto;
   flex: 1;
-  resize: vertical;
+  resize: none;
   border: 1px solid var(--line-strong);
   border-radius: 0.4rem;
   padding: 0.7rem 0.8rem;
@@ -1164,6 +1166,9 @@ button:disabled {
 
 .composer-form button {
   min-width: 5.5rem;
+  /* One line of textarea text plus its block padding and borders, so the
+     buttons match the resting single-line composer height exactly. */
+  min-height: calc(0.82rem * 1.5 + 1.4rem + 2px);
   border: 1px solid rgba(97, 175, 239, 0.45);
   border-radius: 0.4rem;
   padding: 0.7rem 0.85rem;
