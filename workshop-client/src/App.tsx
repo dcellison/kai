@@ -844,17 +844,19 @@ function WorkshopView({
       return;
     }
 
-    // The activity card lives below the scrollable timeline. Adding or
-    // changing it reduces the timeline viewport, which moves the effective
-    // bottom even when no message was appended. Keep following only when the
-    // reader was already following; a deliberate historical position remains
-    // untouched.
+    // The activity card and the composer live below the scrollable timeline.
+    // Adding or changing the card, or the composer growing with the draft,
+    // reduces the timeline viewport, which moves the effective bottom even
+    // when no message was appended. Keep following only when the reader was
+    // already following; a deliberate historical position remains untouched.
+    // The composer's auto-grow layout effect is declared earlier in this
+    // component, so the textarea has its new size before this measurement.
     timeline.scrollTop = timeline.scrollHeight;
     storeTimelineViewport(channelId, {
       follow: true,
       scrollTop: timeline.scrollTop,
     });
-  }, [activeRun, channelId, runPreview]);
+  }, [activeRun, channelId, draft, runPreview]);
 
   const handleTimelineScroll = (): void => {
     const timeline = timelineRef.current;
