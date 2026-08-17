@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -12,16 +13,21 @@ from typing import Any
 
 from kai.acp import _kill_target_user_tree, _kill_target_user_tree_sync
 from kai.backend import (
+    TRACE_DETAIL_MAX_CHARS,
+    TRACE_SUMMARY_MAX_CHARS,
     AgentBackend,
     AgentResponse,
     ApiContext,
     StreamEvent,
+    TraceEntry,
     apply_workspace_model,
     assemble_turn_context,
     build_foreign_workspace_reminder,
     build_session_context,
     ensure_user_context_files,
     sanitize_agent_environment,
+    scrub_trace_text,
+    trace_secret_values,
 )
 from kai.backend_registry import resolve_backend_command
 from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude_user
@@ -108,6 +114,23 @@ def _assistant_message_text(message: Any) -> str | None:
     return "".join(parts)
 
 
+def _tool_result_text(result: Any) -> str | None:
+    """
+    Join the text content blocks of a pi tool result, or None when the
+    shape carries no identifiable content list (the per-tool `details`
+    object is not surfaced; the text blocks are the human-readable
+    output).
+    """
+    if not isinstance(result, Mapping):
+        return None
+    content = result.get("content")
+    if not isinstance(content, list):
+        return None
+    return "\n".join(
+        part.get("text", "") for part in content if isinstance(part, Mapping) and part.get("type") == "text"
+    )
+
+
 def _assistant_message_error(message: Any) -> str | None:
     """Extract a terminal model error from a completed assistant message."""
 
@@ -176,6 +199,10 @@ class PiBackend(AgentBackend):
         self._fresh_session = True
         self._stderr_task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
+        # Secret values scrubbed from trace text. Snapshotted from the
+        # fully built subprocess environment at spawn so constructor-only
+        # credentials (the per-principal webhook secret) are covered.
+        self._trace_secrets: tuple[str, ...] = ()
 
     @property
     def is_alive(self) -> bool:
@@ -231,6 +258,7 @@ class PiBackend(AgentBackend):
         effective_os_user = resolve_claude_user(self.os_user)
         argv = self._build_argv()
         env = self._build_env(effective_os_user)
+        self._trace_secrets = trace_secret_values(env)
         if effective_os_user:
             argv = wrap_command_for_target_user(
                 argv,
@@ -485,6 +513,17 @@ class PiBackend(AgentBackend):
                     message.get("toolName"),
                     message.get("toolCallId"),
                 )
+                # tool_execution_update streams accumulated partial
+                # output; the card shows call then result, so progress
+                # churn stays invisible, same as the ACP lanes.
+                if message_type == "tool_execution_start":
+                    trace = self._tool_start_trace(message)
+                    if trace is not None:
+                        yield StreamEvent(text_so_far="", trace=trace)
+                elif message_type == "tool_execution_end":
+                    trace = self._tool_end_trace(message)
+                    if trace is not None:
+                        yield StreamEvent(text_so_far="", trace=trace)
                 continue
 
             if pi_rpc_is_settled(message):
@@ -497,6 +536,67 @@ class PiBackend(AgentBackend):
 
             if message_type == "extension_ui_request":
                 raise PiRpcProtocolError("Pi requested extension UI despite extensions being disabled")
+
+    def _tool_start_trace(self, message: Mapping) -> TraceEntry | None:
+        """
+        Build a tool_call TraceEntry from a tool_execution_start event.
+
+        toolName feeds the summary and the args object the detail; a
+        payload whose args cannot be identified carries the raw event
+        JSON as detail instead, so no information is lost. Returns None
+        with a debug log on a malformed event; trace emission must never
+        break the text stream.
+        """
+        try:
+            tool_call_id = message["toolCallId"]
+            tool_name = message["toolName"]
+            if not isinstance(tool_call_id, str) or not isinstance(tool_name, str):
+                raise TypeError("unexpected tool event field type")
+            args = message.get("args")
+            if isinstance(args, Mapping):
+                detail = json.dumps(args, ensure_ascii=False)
+            else:
+                detail = json.dumps(dict(message), ensure_ascii=False)
+            return TraceEntry(
+                kind="tool_call",
+                tool_use_id=tool_call_id,
+                summary=scrub_trace_text(tool_name, self._trace_secrets, TRACE_SUMMARY_MAX_CHARS),
+                detail=scrub_trace_text(detail, self._trace_secrets, TRACE_DETAIL_MAX_CHARS),
+                tool_name=tool_name,
+            )
+        except Exception:
+            log.debug("Skipping malformed tool_execution_start for trace", exc_info=True)
+            return None
+
+    def _tool_end_trace(self, message: Mapping) -> TraceEntry | None:
+        """
+        Build a tool_result TraceEntry from a tool_execution_end event.
+
+        tool_use_id carries the toolCallId, the same value the tool_call
+        trace carried, so client call/result pairing works unchanged.
+        The result's text content blocks feed the detail; a result whose
+        content cannot be identified carries the raw event JSON instead.
+        Returns None with a debug log on a malformed event; trace
+        emission must never break the text stream.
+        """
+        try:
+            tool_call_id = message["toolCallId"]
+            tool_name = message["toolName"]
+            if not isinstance(tool_call_id, str) or not isinstance(tool_name, str):
+                raise TypeError("unexpected tool event field type")
+            detail = _tool_result_text(message.get("result"))
+            if detail is None:
+                detail = json.dumps(dict(message), ensure_ascii=False)
+            return TraceEntry(
+                kind="tool_result",
+                tool_use_id=tool_call_id,
+                summary=scrub_trace_text(tool_name, self._trace_secrets, TRACE_SUMMARY_MAX_CHARS),
+                detail=scrub_trace_text(detail, self._trace_secrets, TRACE_DETAIL_MAX_CHARS),
+                is_error=bool(message.get("isError", False)),
+            )
+        except Exception:
+            log.debug("Skipping malformed tool_execution_end for trace", exc_info=True)
+            return None
 
     def _final_event(self, text: str, started_at: float, *, error: str | None) -> StreamEvent:
         response = AgentResponse(
