@@ -2796,3 +2796,31 @@ class TestTraceEmission:
 
         assert [e for e in events if e.trace is not None] == []
         assert events[-1].done is True
+
+    @pytest.mark.asyncio
+    async def test_file_change_without_diff_text_is_not_marked_diff(self):
+        """is_diff reflects diff text being present, not merely a
+        non-empty changes list; declined status maps to is_error."""
+        changes = [{"path": "src/a.py", "kind": "delete", "diff": ""}]
+        c = _make_codex()
+        c._proc = _make_mock_proc(
+            [
+                _item_notification(
+                    "item/started", {"id": "fc-2", "type": "fileChange", "changes": changes, "status": "inProgress"}
+                ),
+                _item_notification(
+                    "item/completed", {"id": "fc-2", "type": "fileChange", "changes": changes, "status": "declined"}
+                ),
+                _turn_completed("completed"),
+            ]
+        )
+        c._session_id = "test-session"
+        c._fresh_session = False
+        c._next_id = 3
+
+        events = await _collect_events(c)
+
+        call, result = [e.trace for e in events if e.trace is not None]
+        assert call.is_diff is False
+        assert call.summary == "fileChange: src/a.py"
+        assert result.is_error is True

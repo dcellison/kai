@@ -1131,19 +1131,21 @@ class CodexBackend(AgentBackend):
                 #   - turn/started NOTIFICATION: opted out via
                 #     initialize.capabilities so it never arrives.
                 #   - item/started: full ThreadItem with type and id.
-                #     We only care about agentMessage items for the
-                #     conversational stream; other item types (reasoning,
-                #     commandExecution, fileChange, etc.) are logged at
-                #     DEBUG. We capture the agentMessage item id so
-                #     subsequent deltas can be tied back to the right
-                #     stream.
+                #     agentMessage items feed the conversational stream;
+                #     other item types are logged at DEBUG and traced
+                #     as tool_call entries (reasoning excepted, which
+                #     stays invisible). We capture the agentMessage item
+                #     id so subsequent deltas can be tied back to the
+                #     right stream.
                 #   - item/agentMessage/delta: streaming text chunks.
                 #     Concatenate `delta` per itemId. Codex emits text
                 #     in roughly token-sized chunks.
                 #   - item/completed: authoritative final state of the
                 #     item. For agentMessage this carries the full
                 #     accumulated `text`; we trust this over our own
-                #     concatenation in case any delta was missed.
+                #     concatenation in case any delta was missed. Other
+                #     item types are logged at DEBUG and traced as
+                #     tool_result entries (reasoning excepted).
                 #   - turn/completed: terminal event. Carries turn
                 #     status (`completed` / `interrupted` / `failed`)
                 #     and an optional error payload on failure. This
@@ -1354,7 +1356,7 @@ class CodexBackend(AgentBackend):
             elif item_type == "fileChange" and isinstance(item.get("changes"), list):
                 summary = f"fileChange: {_file_change_paths(item['changes'])}"
                 detail = _file_change_detail(item["changes"])
-                is_diff = bool(detail)
+                is_diff = any(change.get("diff") for change in item["changes"] if isinstance(change, dict))
             else:
                 summary = item_type
                 detail = json.dumps(item, ensure_ascii=False)
@@ -1402,6 +1404,12 @@ class CodexBackend(AgentBackend):
                 tool_use_id=item_id,
                 summary=scrub_trace_text(summary, self._trace_secrets, TRACE_SUMMARY_MAX_CHARS),
                 detail=scrub_trace_text(detail, self._trace_secrets, TRACE_DETAIL_MAX_CHARS),
+                # The item's terminal status enum is the protocol's own
+                # failure signal. exitCode deliberately does not feed
+                # is_error: a command that ran to completion with a
+                # nonzero exit is not an execution failure at this layer,
+                # and the schema does not promise nonzero exit implies
+                # status "failed".
                 is_error=item.get("status") in ("failed", "declined"),
             )
         except Exception:
