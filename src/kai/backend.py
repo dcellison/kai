@@ -23,7 +23,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 from kai.agent_failure import AgentFailureKind, classify_agent_failure
 from kai.config import (
@@ -313,12 +313,13 @@ class TraceEntry:
         summary: One-line human-readable description, scrubbed and capped.
         detail: Fuller payload (tool input / result text), scrubbed and capped.
         tool_name: Name of the invoked tool (tool_call only).
-        is_diff: True when detail carries an edit-shaped payload the client
-            may render as a diff (tool_call only).
+        is_diff: True when detail carries an edit-shaped payload (old/new
+            string pairs or diff content) the client may render as a diff
+            (tool_call only).
         is_error: True when the tool reported failure (tool_result only).
     """
 
-    kind: str
+    kind: Literal["tool_call", "tool_result"]
     tool_use_id: str
     summary: str
     detail: str
@@ -355,8 +356,17 @@ def trace_secret_values(env: Mapping[str, str]) -> tuple[str, ...]:
 
 
 def scrub_trace_text(text: str, secrets: tuple[str, ...], max_chars: int) -> str:
-    """Replace known secret values with [redacted], then cap the length."""
-    for secret in secrets:
+    """
+    Replace known secret values with [redacted], then cap the length.
+
+    Secrets are replaced longest-first so a snapshot value that is a
+    substring of another cannot mangle the longer occurrence and leak
+    its suffix. Matching is exact on the raw value: a secret containing
+    characters that a caller transformed before scrubbing (JSON string
+    escaping, whitespace collapsing) is not caught. Accepted limitation;
+    realistic env credentials are single URL-safe tokens.
+    """
+    for secret in sorted(secrets, key=len, reverse=True):
         text = text.replace(secret, "[redacted]")
     if len(text) > max_chars:
         text = text[:max_chars] + _TRACE_TRUNCATION_MARKER

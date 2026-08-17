@@ -1070,9 +1070,10 @@ class ClaudeCodeBackend(AgentBackend):
         Build a tool_call TraceEntry from an assistant tool_use block.
 
         The summary is one line: Bash shows its command, Edit/Write the
-        target file path, any other tool just its name. Returns None with
-        a debug log on a malformed block; trace emission must never break
-        the text stream.
+        target file path, other tools their name plus a compact list of
+        their input keys, and a tool with no input just its name. Returns
+        None with a debug log on a malformed block; trace emission must
+        never break the text stream.
         """
         try:
             tool_use_id = block["id"]
@@ -1085,6 +1086,8 @@ class ClaudeCodeBackend(AgentBackend):
                 summary = f"Bash: {' '.join(tool_input['command'].split())}"
             elif tool_name in ("Edit", "Write") and isinstance(tool_input.get("file_path"), str):
                 summary = f"{tool_name}: {tool_input['file_path']}"
+            elif tool_input:
+                summary = f"{tool_name}: {', '.join(sorted(tool_input))}"
             return TraceEntry(
                 kind="tool_call",
                 tool_use_id=tool_use_id,
@@ -1095,7 +1098,10 @@ class ClaudeCodeBackend(AgentBackend):
                     TRACE_DETAIL_MAX_CHARS,
                 ),
                 tool_name=tool_name,
-                is_diff=tool_name == "Edit",
+                # Content-based rather than name-based so any edit-shaped
+                # tool is rendered rich, and the flag keeps the same
+                # meaning across backend emitters.
+                is_diff="old_string" in tool_input and "new_string" in tool_input,
             )
         except Exception:
             log.debug("Skipping malformed tool_use block", exc_info=True)

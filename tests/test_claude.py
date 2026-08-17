@@ -4031,9 +4031,20 @@ class TestTraceEmission:
                     [
                         {"type": "text", "text": "Looking."},
                         {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls\n-la"}},
-                        {"type": "tool_use", "id": "toolu_2", "name": "Edit", "input": {"file_path": "/w/a.py"}},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_2",
+                            "name": "Edit",
+                            "input": {"file_path": "/w/a.py", "old_string": "x", "new_string": "y"},
+                        },
                         {"type": "tool_use", "id": "toolu_3", "name": "Write", "input": {"file_path": "/w/b.py"}},
-                        {"type": "tool_use", "id": "toolu_4", "name": "Mystery", "input": {}},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_4",
+                            "name": "Read",
+                            "input": {"file_path": "/w/c.py", "limit": 5},
+                        },
+                        {"type": "tool_use", "id": "toolu_5", "name": "Mystery", "input": {}},
                     ]
                 ),
                 _assistant_event("Done."),
@@ -4052,10 +4063,11 @@ class TestTraceEmission:
             "Bash: ls -la",
             "Edit: /w/a.py",
             "Write: /w/b.py",
+            "Read: file_path, limit",
             "Mystery",
         ]
-        assert [t.kind for t in traces] == ["tool_call"] * 4
-        assert [t.is_diff for t in traces] == [False, True, False, False]
+        assert [t.kind for t in traces] == ["tool_call"] * 5
+        assert [t.is_diff for t in traces] == [False, True, False, False, False]
         assert traces[0].tool_name == "Bash"
         assert json.loads(traces[0].detail) == {"command": "ls\n-la"}
         text_events = [e.text_so_far for e in events if not e.done and e.trace is None]
@@ -4279,3 +4291,30 @@ class TestTraceEmission:
 
         assert [e for e in events if e.trace is not None] == []
         assert events[-1].done is True
+
+    @pytest.mark.asyncio
+    async def test_overlapping_secrets_are_scrubbed_longest_first(self):
+        """A snapshot value that is a prefix of another cannot mangle the
+        longer occurrence and leak its suffix."""
+        short_secret = "abc12345"
+        long_secret = "abc12345xyz99999"
+        proc = _make_mock_proc(
+            [
+                _system_event(),
+                _user_tool_result_event(
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": f"value: {long_secret}"}
+                ),
+                _result_event(),
+                b"",
+            ]
+        )
+        claude = _make_claude()
+        claude._proc = proc
+        claude._fresh_session = False
+        claude._trace_secrets = (short_secret, long_secret)
+
+        events = await _collect_events(claude)
+
+        (result,) = [e.trace for e in events if e.trace is not None]
+        assert result.detail == "value: [redacted]"
+        assert "xyz99999" not in result.detail
