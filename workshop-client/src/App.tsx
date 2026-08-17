@@ -1046,7 +1046,7 @@ function WorkshopView({
 
   return (
     <main
-      className={`workshop-app ${sidebarLayout.collapsed ? "sidebar-collapsed" : ""} ${resizingSidebar || resizingContext ? "sidebar-resizing" : ""}`}
+      className={`workshop-app ${sidebarLayout.collapsed ? "sidebar-collapsed" : ""} ${resizingSidebar || resizingContext ? "pane-resizing" : ""}`}
       style={{
         "--channel-sidebar-width": `${
           sidebarLayout.collapsed
@@ -1401,54 +1401,54 @@ function WorkshopView({
           onPointerMove={resizeContext}
         />
         <div className="context-scroll">
-        <header>
-          <p className="overline">Channel context</p>
-          <h2>{symbol} {channelName}</h2>
-        </header>
+          <header>
+            <p className="overline">Channel context</p>
+            <h2>{symbol} {channelName}</h2>
+          </header>
 
-        <section className="context-section">
-          <span className="section-number">01</span>
-          <h3>Connection</h3>
-          <ConnectionIndicator connection={connection} />
-          <p>History and new messages are synchronized directly with Kai.</p>
-        </section>
+          <section className="context-section">
+            <span className="section-number">01</span>
+            <h3>Connection</h3>
+            <ConnectionIndicator connection={connection} />
+            <p>History and new messages are synchronized directly with Kai.</p>
+          </section>
 
-        <section className="context-section">
-          <span className="section-number">02</span>
-          <h3>Canonical identity</h3>
-          <code title={channelId}>{channelId}</code>
-          <p>The channel—not a Telegram chat—is the collaboration boundary.</p>
-        </section>
+          <section className="context-section">
+            <span className="section-number">02</span>
+            <h3>Canonical identity</h3>
+            <code title={channelId}>{channelId}</code>
+            <p>The channel—not a Telegram chat—is the collaboration boundary.</p>
+          </section>
 
-        <section className="context-section">
-          <span className="section-number">03</span>
-          <h3>Channel authority</h3>
-          <p>
-            {channel.canSubmitCommands
-              ? "You can read this channel and submit commands to its assigned agent."
-              : "You can read this outbound channel; command submission is disabled."}
-          </p>
-        </section>
+          <section className="context-section">
+            <span className="section-number">03</span>
+            <h3>Channel authority</h3>
+            <p>
+              {channel.canSubmitCommands
+                ? "You can read this channel and submit commands to its assigned agent."
+                : "You can read this outbound channel; command submission is disabled."}
+            </p>
+          </section>
 
-        <section className="context-section trace-section">
-          <span className="section-number">04</span>
-          <h3>Run inspector</h3>
-          <RunTraceCard
-            entries={traceEntries}
-            failed={traceFailed}
-            loaded={traceLoaded}
-            runId={inspectedRunId}
-          />
-        </section>
+          <section className="context-section trace-section">
+            <span className="section-number">04</span>
+            <h3>Run inspector</h3>
+            <RunTraceCard
+              entries={traceEntries}
+              failed={traceFailed}
+              loaded={traceLoaded}
+              runId={inspectedRunId}
+            />
+          </section>
 
-        <section className="context-section future-section">
-          <span className="section-number">05</span>
-          <h3>Coming into view</h3>
-          <ul>
-            <li>Threads</li>
-            <li>Projects and shared artifacts</li>
-          </ul>
-        </section>
+          <section className="context-section future-section">
+            <span className="section-number">05</span>
+            <h3>Coming into view</h3>
+            <ul>
+              <li>Threads</li>
+              <li>Projects and shared artifacts</li>
+            </ul>
+          </section>
         </div>
       </aside>
     </main>

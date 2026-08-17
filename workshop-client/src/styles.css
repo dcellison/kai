@@ -355,7 +355,16 @@ button:disabled {
 
 .workshop-app {
   display: grid;
-  grid-template-columns: var(--channel-sidebar-width, 16.5rem) minmax(24rem, 1fr) var(--context-pane-width, 19rem);
+  grid-template-columns:
+    var(--channel-sidebar-width, 16.5rem)
+    minmax(24rem, 1fr)
+    /* The pane never exceeds what the viewport leaves after the sidebar
+       and the timeline's minimum, so a wide stored width cannot push the
+       grid past the window and silently clip the pane's right edge. */
+    min(
+      var(--context-pane-width, 19rem),
+      calc(100vw - var(--channel-sidebar-width, 16.5rem) - 24rem)
+    );
   grid-template-rows: minmax(0, 1fr);
   height: 100vh;
   overflow: hidden;
@@ -372,7 +381,7 @@ button:disabled {
   background: var(--atom-bg-deep);
 }
 
-.sidebar-resizing {
+.pane-resizing {
   cursor: col-resize;
   user-select: none;
 }
@@ -1264,6 +1273,10 @@ button:disabled {
 .context-resize-handle:focus-visible::after {
   width: 2px;
   background: var(--atom-blue);
+}
+
+.context-resize-handle:focus-visible {
+  outline: none;
 }
 
 .context-scroll > header {
