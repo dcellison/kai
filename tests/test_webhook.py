@@ -2719,6 +2719,7 @@ class TestNotificationChatIdMutations:
                 "/v1/channels/{channel_id}/commands",
                 "/v1/channels/{channel_id}/runs/{run_id}",
                 "/v1/channels/{channel_id}/runs/{run_id}/cancel",
+                "/v1/channels/{channel_id}/runs/{run_id}/trace",
                 "/workshop",
                 "/workshop/",
                 "/workshop/app.css",
