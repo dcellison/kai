@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from kai.agent_failure import AgentFailureKind
-from kai.backend import AgentResponse, StreamEvent
+from kai.backend import AgentResponse, StreamEvent, TraceEntry
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.conversation_commands import WorkshopConversationCommandService
 from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
@@ -245,6 +245,39 @@ class TestCanonicalExecutionCoordinator:
 
             assert result.disposition == CanonicalExecutionDisposition.COMPLETED
             assert [event.text_so_far for event in observed] == ["Stable preview."]
+        finally:
+            await store.close()
+
+    async def test_trace_bearing_events_persist_to_run_traces(self, tmp_path: Path):
+        store, run = await _accepted(tmp_path / "kai.db")
+        prepared = _Prepared(run)
+        original_stream = prepared.stream
+
+        async def stream_with_trace(prompt: str) -> AsyncIterator[StreamEvent]:
+            yield StreamEvent(
+                text_so_far="",
+                trace=TraceEntry(
+                    kind="tool_call",
+                    tool_use_id="toolu_1",
+                    summary="Bash: ls",
+                    detail="{}",
+                    tool_name="Bash",
+                ),
+            )
+            async for event in original_stream(prompt):
+                yield event
+
+        prepared.stream = stream_with_trace  # type: ignore[method-assign]
+        try:
+            result = await _coordinator(store, _Preparation(prepared)).execute(run.run_id)
+
+            assert result.disposition == CanonicalExecutionDisposition.COMPLETED
+            async with store.connection.execute(
+                "SELECT seq, kind, summary FROM run_traces WHERE run_id = ?",
+                (run.run_id,),
+            ) as cursor:
+                rows = list(await cursor.fetchall())
+            assert [tuple(row) for row in rows] == [(1, "tool_call", "Bash: ls")]
         finally:
             await store.close()
 

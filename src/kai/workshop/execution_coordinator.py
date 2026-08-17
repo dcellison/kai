@@ -22,6 +22,7 @@ from kai.workshop.run_execution_authority import (
     WorkshopRunExecutionAuthority,
 )
 from kai.workshop.run_lifecycle import DurableRun, RunStatus, WorkshopRunLifecycle
+from kai.workshop.run_traces import WorkshopRunTraceStore
 from kai.workshop.runtime_sessions import RuntimeSessionSettlement
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.terminal_transactions import (
@@ -132,6 +133,7 @@ class WorkshopCanonicalExecutionCoordinator:
         self._active: dict[RunId, _ActiveExecution] = {}
         self._map_lock = asyncio.Lock()
         self._database_lock = database_lock or asyncio.Lock()
+        self._trace_store = WorkshopRunTraceStore(store)
 
     async def execute(
         self,
@@ -392,6 +394,7 @@ class WorkshopCanonicalExecutionCoordinator:
 
     async def _consume(
         self,
+        active: _ActiveExecution,
         prepared: PreparedWorkshopExecution,
         *,
         stream_observer: StreamObserver | None,
@@ -405,6 +408,13 @@ class WorkshopCanonicalExecutionCoordinator:
             if event.done:
                 response = event.response
                 break
+            if event.trace is not None and active.claim is not None:
+                # Persisted under the current fenced claim so a
+                # superseded attempt cannot write; staleness raises
+                # and aborts the doomed attempt, the same posture the
+                # lease-renewal task takes.
+                async with self._database_lock:
+                    await self._trace_store.append(active.claim, event.trace, occurred_at=self._now())
             if stream_observer is not None:
                 await stream_observer(event)
         return response
@@ -418,7 +428,7 @@ class WorkshopCanonicalExecutionCoordinator:
     ) -> AgentResponse | None:
         renewal = asyncio.create_task(self._renew_while_running(active))
         try:
-            return await self._consume(prepared, stream_observer=stream_observer)
+            return await self._consume(active, prepared, stream_observer=stream_observer)
         finally:
             active.renewal_stop.set()
             await renewal
