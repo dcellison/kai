@@ -1,3 +1,4 @@
+import { memo } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -23,7 +24,16 @@ const MARKDOWN_COMPONENTS: Components = {
   ),
 };
 
-export function MarkdownMessage({ body }: { body: string }): React.JSX.Element {
+// Memoized on the single string prop, so a re-render of the enclosing
+// view (every keystroke and resize pointermove re-renders the whole
+// WorkshopView) never re-runs the remark parse for unchanged messages;
+// that parse, multiplied by the timeline length, is the dominant render
+// cost of the app.
+export const MarkdownMessage = memo(function MarkdownMessage({
+  body,
+}: {
+  body: string;
+}): React.JSX.Element {
   return (
     <div className="markdown-message">
       {/* Without rehype-raw, embedded HTML is rendered as inert source text. */}
@@ -35,4 +45,4 @@ export function MarkdownMessage({ body }: { body: string }): React.JSX.Element {
       </ReactMarkdown>
     </div>
   );
-}
+});
