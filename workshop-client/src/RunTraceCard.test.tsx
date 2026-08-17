@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 
@@ -96,6 +96,110 @@ describe("RunTraceCard", () => {
     expect(removed).toHaveLength(1);
     expect(added[0].textContent).toContain("+ a = 2");
     expect(removed[0].textContent).toContain("- a = 1");
+    // Every diff line, tinted or not, is a block-level trace-line inside
+    // the single width-carrying trace-lines wrapper, so the add/del
+    // backgrounds span the full scrolled row.
+    expect(container.querySelectorAll(".trace-lines")).toHaveLength(1);
+    expect(container.querySelectorAll(".trace-line")).toHaveLength(3);
+  });
+
+  it("pretty-prints JSON details and copies the rendered text", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <RunTraceCard
+        failed={false}
+        loaded
+        runId="run_1"
+        entries={[
+          entry({
+            seq: 1,
+            kind: "tool_call",
+            toolName: "Bash",
+            toolUseId: "t1",
+            summary: "Bash: ls",
+            detail: '{"command":"ls","cwd":"/w"}',
+          }),
+        ]}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: /Bash: ls/ }));
+    const pretty = '{\n  "command": "ls",\n  "cwd": "/w"\n}';
+    expect(container.querySelector(".trace-detail")?.textContent).toBe(pretty);
+
+    const copyButton = screen.getByRole("button", { name: "Copy call detail" });
+    expect(copyButton.textContent).not.toBe("✓");
+    await user.click(copyButton);
+    // Success feedback is both the checkmark glyph and the accessible name.
+    expect(copyButton.textContent).toBe("✓");
+    expect(copyButton).toHaveAccessibleName("Copied");
+    await expect(window.navigator.clipboard.readText()).resolves.toBe(pretty);
+  });
+
+  it("renders a detail that fails to parse as JSON exactly as stored", async () => {
+    const user = userEvent.setup();
+    // Source-side truncation can cut a payload mid-JSON; it must render raw.
+    const truncated = '{"command":"ls","cwd":"/w';
+    const { container } = render(
+      <RunTraceCard
+        failed={false}
+        loaded
+        runId="run_1"
+        entries={[
+          entry({
+            seq: 1,
+            kind: "tool_call",
+            toolName: "Bash",
+            toolUseId: "t1",
+            summary: "Bash: ls",
+            detail: truncated,
+          }),
+        ]}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: /Bash: ls/ }));
+    expect(container.querySelector(".trace-detail")?.textContent).toBe(truncated);
+  });
+
+  it("omits the copy button when the clipboard API is unavailable", () => {
+    // userEvent.setup() installs a clipboard stub on the shared jsdom
+    // navigator, so this test forces the property absent and clicks via
+    // fireEvent; calling setup() here would put the stub right back.
+    const original = Object.getOwnPropertyDescriptor(window.navigator, "clipboard");
+    Object.defineProperty(window.navigator, "clipboard", {
+      configurable: true,
+      value: undefined,
+    });
+    try {
+      render(
+        <RunTraceCard
+          failed={false}
+          loaded
+          runId="run_1"
+          entries={[
+            entry({
+              seq: 1,
+              kind: "tool_call",
+              toolName: "Bash",
+              toolUseId: "t1",
+              summary: "Bash: ls",
+              detail: '{"command":"ls"}',
+            }),
+          ]}
+        />,
+      );
+      fireEvent.click(screen.getByRole("button", { name: /Bash: ls/ }));
+      // The detail block itself still renders; only the button is gone.
+      expect(document.querySelector(".trace-detail")).not.toBeNull();
+      expect(screen.queryByRole("button", { name: /Copy (call|result) detail/ })).toBeNull();
+    } finally {
+      if (original) {
+        Object.defineProperty(window.navigator, "clipboard", original);
+      } else {
+        Reflect.deleteProperty(window.navigator, "clipboard");
+      }
+    }
   });
 
   it("shows honest empty states and the truncation marker as its own row", () => {
