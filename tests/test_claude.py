@@ -4001,3 +4001,281 @@ class TestWorkspaceConfig:
 
             call_kwargs = mock_exec.call_args.kwargs
             assert call_kwargs["env"]["SHARED"] == "from_inline"
+
+
+# ── Trace emission ───────────────────────────────────────────────────
+
+
+def _assistant_content_event(content: list) -> bytes:
+    """Build an assistant event JSON line with arbitrary content blocks."""
+    return _json_line({"type": "assistant", "message": {"content": content}})
+
+
+def _user_tool_result_event(*blocks: dict) -> bytes:
+    """Build a user event JSON line carrying the given content blocks."""
+    return _json_line({"type": "user", "message": {"content": list(blocks)}})
+
+
+class TestTraceEmission:
+    """_send_locked emits TraceEntry-bearing events for tool activity."""
+
+    @pytest.mark.asyncio
+    async def test_tool_use_yields_tool_call_and_text_is_unchanged(self):
+        """tool_use blocks yield tool_call traces with composed one-line
+        summaries while text accumulation stays byte-identical to the
+        trace-free path."""
+        proc = _make_mock_proc(
+            [
+                _system_event(),
+                _assistant_content_event(
+                    [
+                        {"type": "text", "text": "Looking."},
+                        {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls\n-la"}},
+                        {"type": "tool_use", "id": "toolu_2", "name": "Edit", "input": {"file_path": "/w/a.py"}},
+                        {"type": "tool_use", "id": "toolu_3", "name": "Write", "input": {"file_path": "/w/b.py"}},
+                        {"type": "tool_use", "id": "toolu_4", "name": "Mystery", "input": {}},
+                    ]
+                ),
+                _assistant_event("Done."),
+                _result_event("ignored"),
+                b"",
+            ]
+        )
+        claude = _make_claude()
+        claude._proc = proc
+        claude._fresh_session = False
+
+        events = await _collect_events(claude)
+
+        traces = [e.trace for e in events if e.trace is not None]
+        assert [t.summary for t in traces] == [
+            "Bash: ls -la",
+            "Edit: /w/a.py",
+            "Write: /w/b.py",
+            "Mystery",
+        ]
+        assert [t.kind for t in traces] == ["tool_call"] * 4
+        assert [t.is_diff for t in traces] == [False, True, False, False]
+        assert traces[0].tool_name == "Bash"
+        assert json.loads(traces[0].detail) == {"command": "ls\n-la"}
+        text_events = [e.text_so_far for e in events if not e.done and e.trace is None]
+        assert text_events == ["Looking.", "Looking.\n\nDone."]
+        assert events[-1].response is not None
+        assert events[-1].response.text == "Looking.\n\nDone."
+
+    @pytest.mark.asyncio
+    async def test_trace_events_carry_no_text_and_are_not_done(self):
+        """Every trace-bearing event has empty text and done=False; the
+        observers' empty-text guard is what keeps traces invisible to
+        text consumers."""
+        proc = _make_mock_proc(
+            [
+                _system_event(),
+                _assistant_content_event(
+                    [
+                        {"type": "text", "text": "Hi."},
+                        {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "pwd"}},
+                    ]
+                ),
+                _user_tool_result_event({"type": "tool_result", "tool_use_id": "toolu_1", "content": "/w"}),
+                _result_event(),
+                b"",
+            ]
+        )
+        claude = _make_claude()
+        claude._proc = proc
+        claude._fresh_session = False
+
+        events = await _collect_events(claude)
+
+        trace_events = [e for e in events if e.trace is not None]
+        assert len(trace_events) == 2
+        for event in trace_events:
+            assert event.text_so_far == ""
+            assert event.done is False
+
+    @pytest.mark.asyncio
+    async def test_tool_result_pairs_with_its_call_by_tool_use_id(self):
+        """tool_result traces carry the tool_use_id of their call, string
+        and block-list content shapes both surface, and is_error passes
+        through."""
+        proc = _make_mock_proc(
+            [
+                _system_event(),
+                _assistant_content_event(
+                    [{"type": "tool_use", "id": "toolu_9", "name": "Bash", "input": {"command": "pwd"}}]
+                ),
+                _user_tool_result_event(
+                    {"type": "tool_result", "tool_use_id": "toolu_9", "content": "line one\nline two"},
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_a",
+                        "content": [{"type": "text", "text": "boom"}],
+                        "is_error": True,
+                    },
+                ),
+                _result_event(),
+                b"",
+            ]
+        )
+        claude = _make_claude()
+        claude._proc = proc
+        claude._fresh_session = False
+
+        events = await _collect_events(claude)
+
+        call, first, second = [e.trace for e in events if e.trace is not None]
+        assert call.kind == "tool_call"
+        assert first.kind == "tool_result"
+        assert first.tool_use_id == call.tool_use_id == "toolu_9"
+        assert first.summary == "line one"
+        assert first.detail == "line one\nline two"
+        assert first.is_error is False
+        assert second.tool_use_id == "toolu_a"
+        assert second.detail == "boom"
+        assert second.is_error is True
+
+    @pytest.mark.asyncio
+    async def test_planted_secret_is_redacted_in_summary_and_detail(self):
+        """A value from the scrub snapshot never appears in trace text."""
+        secret = "planted-secret-value-123"
+        proc = _make_mock_proc(
+            [
+                _system_event(),
+                _assistant_content_event(
+                    [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "Bash",
+                            "input": {"command": f"curl -H 'X-Auth: {secret}'"},
+                        }
+                    ]
+                ),
+                _user_tool_result_event(
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": f"token was {secret}"}
+                ),
+                _result_event(),
+                b"",
+            ]
+        )
+        claude = _make_claude()
+        claude._proc = proc
+        claude._fresh_session = False
+        claude._trace_secrets = (secret,)
+
+        events = await _collect_events(claude)
+
+        call, result = [e.trace for e in events if e.trace is not None]
+        for trace in (call, result):
+            assert secret not in trace.summary
+            assert secret not in trace.detail
+        assert "[redacted]" in call.summary
+        assert "[redacted]" in call.detail
+        assert result.summary == "token was [redacted]"
+
+    @pytest.mark.asyncio
+    async def test_trace_secrets_snapshot_from_spawned_child_env(self, monkeypatch):
+        """The scrub set is snapshotted from the fully built child
+        environment at spawn, so it covers both parent-env secrets and
+        the webhook secret that exists only as a constructor argument."""
+        monkeypatch.setattr("kai.claude._resolve_default_claude_bin", lambda: "claude")
+        monkeypatch.setenv("KAITEST_PLANTED_SECRET", "parent-env-secret-1")
+        claude = _make_claude(webhook_secret="webhook-secret-value")
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
+            mock_exec.return_value = mock_proc
+
+            await claude._ensure_started()
+
+        assert "parent-env-secret-1" in claude._trace_secrets
+        assert "webhook-secret-value" in claude._trace_secrets
+
+    @pytest.mark.asyncio
+    async def test_truncation_appends_an_explicit_marker(self):
+        """summary caps at 200 chars and detail at 4096, each with the
+        truncation marker."""
+        proc = _make_mock_proc(
+            [
+                _system_event(),
+                _assistant_content_event(
+                    [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "z" * 300}}]
+                ),
+                _user_tool_result_event({"type": "tool_result", "tool_use_id": "toolu_1", "content": "y" * 5000}),
+                _result_event(),
+                b"",
+            ]
+        )
+        claude = _make_claude()
+        claude._proc = proc
+        claude._fresh_session = False
+
+        events = await _collect_events(claude)
+
+        call, result = [e.trace for e in events if e.trace is not None]
+        assert call.summary == ("Bash: " + "z" * 300)[:200] + " [truncated]"
+        assert result.detail == "y" * 4096 + " [truncated]"
+        assert result.summary == "y" * 200 + " [truncated]"
+
+    @pytest.mark.asyncio
+    async def test_scrub_runs_before_truncation(self):
+        """A secret straddling the detail cap boundary is redacted whole;
+        truncation can never leave a survivable secret prefix."""
+        secret = "hunter2secret999"
+        proc = _make_mock_proc(
+            [
+                _system_event(),
+                _user_tool_result_event(
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "x" * 4090 + secret}
+                ),
+                _result_event(),
+                b"",
+            ]
+        )
+        claude = _make_claude()
+        claude._proc = proc
+        claude._fresh_session = False
+        claude._trace_secrets = (secret,)
+
+        events = await _collect_events(claude)
+
+        (result,) = [e.trace for e in events if e.trace is not None]
+        assert secret not in result.detail
+        assert "hunter" not in result.detail
+        assert result.detail.endswith(" [truncated]")
+
+    @pytest.mark.asyncio
+    async def test_malformed_tool_blocks_are_skipped_without_raising(self):
+        """Protocol drift in tool_use / tool_result shapes yields no trace
+        and never breaks the stream."""
+        proc = _make_mock_proc(
+            [
+                _system_event(),
+                _assistant_content_event(
+                    [
+                        {"type": "tool_use"},
+                        {"type": "tool_use", "id": 5, "name": "Bash", "input": {}},
+                        {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": "not-a-dict"},
+                    ]
+                ),
+                _user_tool_result_event(
+                    {"type": "tool_result"},
+                    {"type": "tool_result", "tool_use_id": 7},
+                ),
+                _json_line({"type": "user", "message": {"content": "plain string"}}),
+                _result_event(),
+                b"",
+            ]
+        )
+        claude = _make_claude()
+        claude._proc = proc
+        claude._fresh_session = False
+
+        events = await _collect_events(claude)
+
+        assert [e for e in events if e.trace is not None] == []
+        assert events[-1].done is True

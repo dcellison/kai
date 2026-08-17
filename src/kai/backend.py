@@ -20,7 +20,7 @@ import shutil
 import tempfile
 import time
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -294,6 +294,75 @@ class AgentResponse:
             self.failure_kind = classify_agent_failure(self.error)
 
 
+@dataclass(frozen=True)
+class TraceEntry:
+    """
+    One backend-neutral trace record of agent tool activity.
+
+    Attached to a StreamEvent by backend emitters so run observers can
+    surface what the agent is doing between text chunks. Two kinds:
+
+    - "tool_call": the agent invoked a tool. tool_name and is_diff are
+      meaningful; is_error is always False.
+    - "tool_result": the tool finished. is_error is meaningful; tool_name
+      and is_diff keep their defaults.
+
+    Attributes:
+        kind: "tool_call" or "tool_result".
+        tool_use_id: Backend-issued id pairing a result with its call.
+        summary: One-line human-readable description, scrubbed and capped.
+        detail: Fuller payload (tool input / result text), scrubbed and capped.
+        tool_name: Name of the invoked tool (tool_call only).
+        is_diff: True when detail carries an edit-shaped payload the client
+            may render as a diff (tool_call only).
+        is_error: True when the tool reported failure (tool_result only).
+    """
+
+    kind: str
+    tool_use_id: str
+    summary: str
+    detail: str
+    tool_name: str = ""
+    is_diff: bool = False
+    is_error: bool = False
+
+
+# Caps applied by scrub_trace_text. Scrubbing always runs before the cap
+# so truncation can never bisect a secret into a survivable prefix.
+TRACE_SUMMARY_MAX_CHARS = 200
+TRACE_DETAIL_MAX_CHARS = 4096
+_TRACE_TRUNCATION_MARKER = " [truncated]"
+_TRACE_SECRET_NAME_SUFFIXES = ("_SECRET", "_TOKEN", "_KEY", "_PASSWORD")
+# Values shorter than this are too likely to occur as ordinary text
+# (e.g. TERM=xterm under a hypothetical *_KEY name) to scrub safely.
+_TRACE_SECRET_MIN_LENGTH = 8
+
+
+def trace_secret_values(env: Mapping[str, str]) -> tuple[str, ...]:
+    """
+    Snapshot the secret values to scrub from trace text.
+
+    Backends call this on the fully built subprocess environment at spawn
+    time (not the parent process environment at construction), so
+    credentials that exist only as constructor arguments, like the
+    per-principal webhook secret, are always covered.
+    """
+    return tuple(
+        value
+        for name, value in env.items()
+        if name.endswith(_TRACE_SECRET_NAME_SUFFIXES) and len(value) >= _TRACE_SECRET_MIN_LENGTH
+    )
+
+
+def scrub_trace_text(text: str, secrets: tuple[str, ...], max_chars: int) -> str:
+    """Replace known secret values with [redacted], then cap the length."""
+    for secret in secrets:
+        text = text.replace(secret, "[redacted]")
+    if len(text) > max_chars:
+        text = text[:max_chars] + _TRACE_TRUNCATION_MARKER
+    return text
+
+
 @dataclass
 class StreamEvent:
     """
@@ -306,11 +375,16 @@ class StreamEvent:
         text_so_far: Accumulated response text up to this point.
         done: True if this is the final event (response complete or error).
         response: The complete AgentResponse, set only when done=True.
+        trace: Tool activity record. A trace-bearing event always carries
+            text_so_far="" and done=False; every stream observer drops
+            empty-text events, which is what keeps traces invisible to
+            text consumers.
     """
 
     text_so_far: str
     done: bool = False
     response: AgentResponse | None = None
+    trace: TraceEntry | None = None
 
 
 # ── API context ─────────────────────────────────────────────────────
