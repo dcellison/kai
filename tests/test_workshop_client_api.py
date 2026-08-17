@@ -1383,6 +1383,14 @@ class TestWorkshopRunTraceEventStream:
         assert isinstance(message_id, MessageId)
         accepted = await WorkshopRunLifecycle(store).accept(message_id, occurred_at=_NOW + timedelta(seconds=1))
         run_id = str(accepted.run.run_id)
+        # The doorbell targets the channel's started run: appends only
+        # happen between start and settlement, so a queued accepted run
+        # must never mask the executing one.
+        await store.connection.execute(
+            "UPDATE runs SET status = 'started', started_at = ? WHERE id = ?",
+            ((_NOW + timedelta(seconds=2)).isoformat(), run_id),
+        )
+        await store.connection.commit()
         await _insert_trace_rows(store, run_id, 3)
         client = await _open_client(store, _Authenticator({"alice-token": alice_id}))
         response = None

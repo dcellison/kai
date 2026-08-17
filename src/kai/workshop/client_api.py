@@ -541,17 +541,19 @@ def _serialize_run_trace_event(run_id: str, channel_id: str, seq: int) -> bytes:
 
 
 async def _latest_channel_trace(store: WorkshopEventStore, channel_id: ChannelId) -> tuple[str, int] | None:
-    """Return (run_id, seq) of the channel's newest run's trace tip.
+    """Return (run_id, seq) of the channel's appending run's trace tip.
 
-    Two indexed lookups (the channel's most recently accepted run, then
-    that run's MAX(seq) via the primary key) rather than a reverse scan
-    of run_traces, whose cost would grow with every other channel's
-    trace history. Only the channel's newest run can be appending; a
-    newer run with no rows yet reports None, which the doorbell dedup
-    treats as nothing to signal.
+    Two indexed lookups (the channel's started run, then that run's
+    MAX(seq) via the primary key) rather than a reverse scan of
+    run_traces, whose cost would grow with every other channel's trace
+    history. The coordinator appends strictly between start and
+    settlement, so only a started run can be appending; a queued
+    accepted run never masks the executing one. Rows landing just
+    before settlement can miss a final doorbell, which the terminal
+    run-lifecycle event covers with the card's final refresh.
     """
     async with store.connection.execute(
-        "SELECT id FROM runs WHERE channel_id = ? ORDER BY accepted_at DESC, id DESC LIMIT 1",
+        "SELECT id FROM runs WHERE channel_id = ? AND status = 'started' ORDER BY accepted_at DESC, id DESC LIMIT 1",
         (str(channel_id),),
     ) as cursor:
         run_row = await cursor.fetchone()
