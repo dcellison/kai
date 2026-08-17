@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -440,3 +441,140 @@ class TestPiLifecycle:
         await backend.shutdown()
 
         kill.assert_awaited_once()
+
+
+class TestTraceEmission:
+    """_read_turn emits TraceEntry-bearing events for tool execution."""
+
+    @pytest.mark.asyncio
+    async def test_start_and_end_pair_by_tool_call_id(self, tmp_path, monkeypatch):
+        """tool_execution_start yields tool_call and tool_execution_end
+        tool_result sharing the toolCallId; intermediate updates yield
+        nothing; text accumulation across tool events stays
+        byte-identical; trace events carry empty text and done=False."""
+        backend = make_backend(tmp_path)
+        backend._proc = FakeProcess()
+        backend._session_id = "session-1"
+        backend._fresh_session = False
+        backend._transport = FakeTransport(
+            [
+                {"id": "kai-prompt-1", "type": "response", "command": "prompt", "success": True},
+                {"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "delta": "Looking."}},
+                {
+                    "type": "tool_execution_start",
+                    "toolCallId": "tool-1",
+                    "toolName": "bash",
+                    "args": {"command": "ls -la"},
+                },
+                {
+                    "type": "tool_execution_update",
+                    "toolCallId": "tool-1",
+                    "toolName": "bash",
+                    "args": {"command": "ls -la"},
+                    "partialResult": {"content": [{"type": "text", "text": "partial"}]},
+                },
+                {
+                    "type": "tool_execution_end",
+                    "toolCallId": "tool-1",
+                    "toolName": "bash",
+                    "result": {"content": [{"type": "text", "text": "total 48\nREADME.md"}]},
+                    "isError": False,
+                },
+                {"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "delta": " Done."}},
+                {"type": "agent_settled"},
+            ]
+        )
+        monkeypatch.setattr(backend, "_ensure_started", AsyncMock())
+
+        events = await collect(backend)
+
+        trace_events = [e for e in events if e.trace is not None]
+        for event in trace_events:
+            assert event.text_so_far == ""
+            assert event.done is False
+        call, result = [e.trace for e in trace_events]
+        assert call.kind == "tool_call"
+        assert call.summary == "bash"
+        assert call.tool_name == "bash"
+        assert call.detail == '{"command": "ls -la"}'
+        assert result.kind == "tool_result"
+        assert result.tool_use_id == call.tool_use_id == "tool-1"
+        assert result.summary == "bash"
+        assert result.detail == "total 48\nREADME.md"
+        assert result.is_error is False
+        text_events = [e.text_so_far for e in events if not e.done and e.trace is None]
+        assert text_events == ["Looking.", "Looking. Done."]
+        assert events[-1].response is not None
+        assert events[-1].response.text == "Looking. Done."
+
+    @pytest.mark.asyncio
+    async def test_unidentifiable_payload_falls_back_to_raw_event_json(self, tmp_path, monkeypatch):
+        """A start without an args object and an end whose result has no
+        content list carry the raw event payload as detail, not a drop;
+        isError still passes through."""
+        backend = make_backend(tmp_path)
+        backend._proc = FakeProcess()
+        backend._session_id = "session-1"
+        backend._fresh_session = False
+        start = {"type": "tool_execution_start", "toolCallId": "tool-2", "toolName": "mystery"}
+        end = {
+            "type": "tool_execution_end",
+            "toolCallId": "tool-2",
+            "toolName": "mystery",
+            "result": "not-an-object",
+            "isError": True,
+        }
+        backend._transport = FakeTransport(
+            [
+                {"id": "kai-prompt-1", "type": "response", "command": "prompt", "success": True},
+                start,
+                end,
+                {"type": "agent_settled"},
+            ]
+        )
+        monkeypatch.setattr(backend, "_ensure_started", AsyncMock())
+
+        events = await collect(backend)
+
+        call, result = [e.trace for e in events if e.trace is not None]
+        assert json.loads(call.detail) == start
+        assert json.loads(result.detail) == end
+        assert result.is_error is True
+
+    @pytest.mark.asyncio
+    async def test_planted_secret_redacted(self, tmp_path, monkeypatch):
+        """A snapshot secret value never appears in trace text."""
+        secret = "planted-secret-value-123"
+        backend = make_backend(tmp_path)
+        backend._proc = FakeProcess()
+        backend._session_id = "session-1"
+        backend._fresh_session = False
+        backend._trace_secrets = (secret,)
+        backend._transport = FakeTransport(
+            [
+                {"id": "kai-prompt-1", "type": "response", "command": "prompt", "success": True},
+                {
+                    "type": "tool_execution_start",
+                    "toolCallId": "tool-3",
+                    "toolName": "bash",
+                    "args": {"command": f"curl -H 'X-Auth: {secret}'"},
+                },
+                {
+                    "type": "tool_execution_end",
+                    "toolCallId": "tool-3",
+                    "toolName": "bash",
+                    "result": {"content": [{"type": "text", "text": f"token was {secret}"}]},
+                    "isError": False,
+                },
+                {"type": "agent_settled"},
+            ]
+        )
+        monkeypatch.setattr(backend, "_ensure_started", AsyncMock())
+
+        events = await collect(backend)
+
+        call, result = [e.trace for e in events if e.trace is not None]
+        for trace in (call, result):
+            assert secret not in trace.detail
+        assert "[redacted]" in call.detail
+        assert result.detail == "token was [redacted]"
