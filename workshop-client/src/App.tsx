@@ -92,6 +92,42 @@ function storeSidebarLayout(layout: StoredSidebarLayout): void {
   sessionStorage.setItem(SIDEBAR_LAYOUT_KEY, JSON.stringify(layout));
 }
 
+const CONTEXT_LAYOUT_KEY = "kai.workshop.context-layout.v1";
+const DEFAULT_CONTEXT_WIDTH_PX = 304;
+const MIN_CONTEXT_WIDTH_PX = 240;
+const MAX_CONTEXT_WIDTH_PX = 560;
+
+function clampContextWidth(width: number): number {
+  return Math.min(
+    MAX_CONTEXT_WIDTH_PX,
+    Math.max(MIN_CONTEXT_WIDTH_PX, width),
+  );
+}
+
+function restoreContextWidth(): number {
+  try {
+    const stored: unknown = JSON.parse(
+      sessionStorage.getItem(CONTEXT_LAYOUT_KEY) ?? "null",
+    );
+    if (
+      typeof stored === "object" &&
+      stored !== null &&
+      "width" in stored &&
+      typeof stored.width === "number" &&
+      Number.isFinite(stored.width)
+    ) {
+      return clampContextWidth(stored.width);
+    }
+  } catch {
+    // Malformed layout state has no authority.
+  }
+  return DEFAULT_CONTEXT_WIDTH_PX;
+}
+
+function storeContextWidth(width: number): void {
+  sessionStorage.setItem(CONTEXT_LAYOUT_KEY, JSON.stringify({ width }));
+}
+
 function restoreSession(): WorkshopSession | null {
   try {
     const stored: unknown = JSON.parse(sessionStorage.getItem(SESSION_KEY) ?? "null");
@@ -644,10 +680,13 @@ function WorkshopView({
   const [unseenMessageCount, setUnseenMessageCount] = useState(0);
   const [sidebarLayout, setSidebarLayout] = useState(restoreSidebarLayout);
   const [resizingSidebar, setResizingSidebar] = useState(false);
+  const [contextWidth, setContextWidth] = useState(restoreContextWidth);
+  const [resizingContext, setResizingContext] = useState(false);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const sidebarRef = useRef<HTMLElement | null>(null);
   const sidebarResizeStartRef = useRef({ pointerX: 0, width: 0 });
+  const contextResizeStartRef = useRef({ pointerX: 0, width: 0 });
   const timelineChannelRef = useRef(channelId);
   const timelineInitializedRef = useRef(false);
   const timelineFollowRef = useRef(true);
@@ -668,6 +707,10 @@ function WorkshopView({
   useEffect(() => {
     storeSidebarLayout(sidebarLayout);
   }, [sidebarLayout]);
+
+  useEffect(() => {
+    storeContextWidth(contextWidth);
+  }, [contextWidth]);
 
   // The composer rests at a single line and grows with its content, so the
   // whole draft (including a restored per-channel draft) stays visible up to
@@ -698,6 +741,19 @@ function WorkshopView({
       window.removeEventListener("pointercancel", finishResize);
     };
   }, [resizingSidebar]);
+
+  useEffect(() => {
+    if (!resizingContext) {
+      return;
+    }
+    const finishResize = (): void => setResizingContext(false);
+    window.addEventListener("pointerup", finishResize, { once: true });
+    window.addEventListener("pointercancel", finishResize, { once: true });
+    return () => {
+      window.removeEventListener("pointerup", finishResize);
+      window.removeEventListener("pointercancel", finishResize);
+    };
+  }, [resizingContext]);
 
   const beginSidebarResize = (
     event: ReactPointerEvent<HTMLDivElement>,
@@ -748,6 +804,43 @@ function WorkshopView({
       ...layout,
       collapsed: !layout.collapsed,
     }));
+  };
+
+  const beginContextResize = (
+    event: ReactPointerEvent<HTMLDivElement>,
+  ): void => {
+    event.currentTarget.setPointerCapture(event.pointerId);
+    contextResizeStartRef.current = {
+      pointerX: event.clientX,
+      width: contextWidth,
+    };
+    setResizingContext(true);
+  };
+
+  const resizeContext = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    if (!resizingContext) {
+      return;
+    }
+    // The pane sits on the right, so dragging the separator left widens it.
+    const delta = contextResizeStartRef.current.pointerX - event.clientX;
+    setContextWidth(clampContextWidth(contextResizeStartRef.current.width + delta));
+  };
+
+  const resizeContextFromKeyboard = (
+    event: ReactKeyboardEvent<HTMLDivElement>,
+  ): void => {
+    const direction = event.key === "ArrowLeft" ? 1 : event.key === "ArrowRight" ? -1 : 0;
+    if (direction === 0 && event.key !== "Home" && event.key !== "End") {
+      return;
+    }
+    event.preventDefault();
+    setContextWidth((width) =>
+      event.key === "Home"
+        ? MIN_CONTEXT_WIDTH_PX
+        : event.key === "End"
+          ? MAX_CONTEXT_WIDTH_PX
+          : clampContextWidth(width + direction * 16),
+    );
   };
 
   useEffect(() => {
@@ -953,13 +1046,14 @@ function WorkshopView({
 
   return (
     <main
-      className={`workshop-app ${sidebarLayout.collapsed ? "sidebar-collapsed" : ""} ${resizingSidebar ? "sidebar-resizing" : ""}`}
+      className={`workshop-app ${sidebarLayout.collapsed ? "sidebar-collapsed" : ""} ${resizingSidebar || resizingContext ? "sidebar-resizing" : ""}`}
       style={{
         "--channel-sidebar-width": `${
           sidebarLayout.collapsed
             ? COLLAPSED_SIDEBAR_WIDTH_PX
             : sidebarLayout.width
         }px`,
+        "--context-pane-width": `${contextWidth}px`,
       } as CSSProperties}
     >
       <aside
@@ -1293,6 +1387,20 @@ function WorkshopView({
       </section>
 
       <aside className="context-pane" aria-label="Channel context">
+        <div
+          className="context-resize-handle"
+          role="separator"
+          aria-label="Resize channel context"
+          aria-orientation="vertical"
+          aria-valuemin={MIN_CONTEXT_WIDTH_PX}
+          aria-valuemax={MAX_CONTEXT_WIDTH_PX}
+          aria-valuenow={contextWidth}
+          tabIndex={0}
+          onKeyDown={resizeContextFromKeyboard}
+          onPointerDown={beginContextResize}
+          onPointerMove={resizeContext}
+        />
+        <div className="context-scroll">
         <header>
           <p className="overline">Channel context</p>
           <h2>{symbol} {channelName}</h2>
@@ -1341,6 +1449,7 @@ function WorkshopView({
             <li>Projects and shared artifacts</li>
           </ul>
         </section>
+        </div>
       </aside>
     </main>
   );

@@ -355,7 +355,7 @@ button:disabled {
 
 .workshop-app {
   display: grid;
-  grid-template-columns: var(--channel-sidebar-width, 16.5rem) minmax(24rem, 1fr) 19rem;
+  grid-template-columns: var(--channel-sidebar-width, 16.5rem) minmax(24rem, 1fr) var(--context-pane-width, 19rem);
   grid-template-rows: minmax(0, 1fr);
   height: 100vh;
   overflow: hidden;
@@ -1226,14 +1226,47 @@ button:disabled {
 }
 
 .context-pane {
+  position: relative;
   min-width: 0;
   min-height: 0;
-  overflow-y: auto;
+  overflow: hidden;
   border-left: 1px solid var(--line);
   background: var(--atom-bg-deep);
 }
 
-.context-pane > header {
+.context-scroll {
+  height: 100%;
+  overflow-y: auto;
+}
+
+.context-resize-handle {
+  position: absolute;
+  z-index: 4;
+  top: 0;
+  left: -0.3rem;
+  bottom: 0;
+  width: 0.6rem;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.context-resize-handle::after {
+  position: absolute;
+  top: 0;
+  left: 0.25rem;
+  bottom: 0;
+  width: 1px;
+  background: transparent;
+  content: "";
+}
+
+.context-resize-handle:hover::after,
+.context-resize-handle:focus-visible::after {
+  width: 2px;
+  background: var(--atom-blue);
+}
+
+.context-scroll > header {
   min-height: 4.55rem;
   padding: 0.8rem 1rem;
   border-bottom: 1px solid var(--line);
