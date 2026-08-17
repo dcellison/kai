@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 
 import type { WorkshopRunTraceEntry } from "./types";
 
@@ -65,7 +65,10 @@ function DetailBlock({ entry }: { entry: WorkshopRunTraceEntry }): React.JSX.Ele
   );
 }
 
-export function RunTraceCard({
+// Memoized because the enclosing view re-renders on every keystroke and
+// resize pointermove while the card's props (entries array identity and
+// scalars) only change when trace pages land or the inspected run moves.
+export const RunTraceCard = memo(function RunTraceCard({
   entries,
   failed,
   loaded,
@@ -177,4 +180,4 @@ export function RunTraceCard({
       </ol>
     </div>
   );
-}
+});
