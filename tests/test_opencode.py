@@ -27,6 +27,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from kai.backend import StreamEvent
 from kai.opencode import OpenCodeBackend
 
 
@@ -882,3 +883,176 @@ class TestPreservedEnvVars:
         )
         assert argv[7] == "--"
         assert argv[8:] == ["opencode", "acp"]
+
+
+# ── Trace emission through the shared ACP mapper ─────────────────────
+
+
+def _session_update_line(update: dict, session_id: str = "ses_test01") -> bytes:
+    """Build a session/update notification carrying the given update."""
+    return _json_line(
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": session_id, "update": update},
+        }
+    )
+
+
+def _completion_result(prompt_id: int = 3) -> bytes:
+    """Build a completion result (end_turn) for a given prompt id."""
+    return _json_line(
+        {
+            "jsonrpc": "2.0",
+            "id": prompt_id,
+            "result": {"stopReason": "end_turn"},
+        }
+    )
+
+
+async def _collect_events(b: OpenCodeBackend, prompt: str | list = "test") -> list[StreamEvent]:
+    """Send a prompt and collect all yielded StreamEvents."""
+    events = []
+    async for event in b._send_locked(prompt):
+        events.append(event)
+    return events
+
+
+class TestTraceEmission:
+    """The opencode lane emits TraceEntry events via the shared ACP mapper."""
+
+    @pytest.mark.asyncio
+    async def test_call_and_terminal_result_pair_by_tool_call_id(self):
+        """tool_call yields tool_call and a terminal tool_call_update
+        tool_result sharing the toolCallId; non-terminal progress
+        updates yield nothing."""
+        b = _make_opencode()
+        b._proc = _make_mock_proc(
+            [
+                _session_update_line(
+                    {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tc-1",
+                        "title": "Read kai.py",
+                        "kind": "read",
+                        "status": "pending",
+                    }
+                ),
+                _session_update_line(
+                    {"sessionUpdate": "tool_call_update", "toolCallId": "tc-1", "status": "in_progress"}
+                ),
+                _session_update_line(
+                    {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "tc-1",
+                        "status": "completed",
+                        "content": [{"type": "content", "content": {"type": "text", "text": "line one\nline two"}}],
+                    }
+                ),
+                _completion_result(prompt_id=3),
+            ]
+        )
+        b._session_id = "test-session"
+        b._fresh_session = False
+        b._next_id = 3
+
+        events = await _collect_events(b)
+
+        trace_events = [e for e in events if e.trace is not None]
+        for event in trace_events:
+            assert event.text_so_far == ""
+            assert event.done is False
+        call, result = [e.trace for e in trace_events]
+        assert call.kind == "tool_call"
+        assert call.summary == "Read kai.py"
+        assert call.tool_name == "read"
+        assert result.kind == "tool_result"
+        assert result.tool_use_id == call.tool_use_id == "tc-1"
+        assert result.summary == "line one"
+        assert result.is_error is False
+
+    @pytest.mark.asyncio
+    async def test_diff_content_sets_is_diff(self):
+        """ACP diff content blocks render line-prefixed old/new text and
+        set is_diff on the call."""
+        b = _make_opencode()
+        b._proc = _make_mock_proc(
+            [
+                _session_update_line(
+                    {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tc-2",
+                        "title": "Edit config.py",
+                        "kind": "edit",
+                        "content": [{"type": "diff", "path": "/w/config.py", "oldText": "a = 1", "newText": "a = 2"}],
+                    }
+                ),
+                _completion_result(prompt_id=3),
+            ]
+        )
+        b._session_id = "test-session"
+        b._fresh_session = False
+        b._next_id = 3
+
+        events = await _collect_events(b)
+
+        (call,) = [e.trace for e in events if e.trace is not None]
+        assert call.is_diff is True
+        assert call.detail == "/w/config.py\n- a = 1\n+ a = 2"
+
+    @pytest.mark.asyncio
+    async def test_unrecognized_update_shape_traced_with_raw_payload(self):
+        """Unknown session-update vocabulary degrades to a type-named
+        trace carrying the raw payload; housekeeping stays invisible."""
+        b = _make_opencode()
+        b._proc = _make_mock_proc(
+            [
+                _session_update_line({"sessionUpdate": "usage_update", "tokens": 5}),
+                _session_update_line({"sessionUpdate": "plan", "entries": []}),
+                _session_update_line({"sessionUpdate": "current_mode_update", "currentModeId": "code"}),
+                _session_update_line({"sessionUpdate": "plan_update", "steps": ["a"]}),
+                _completion_result(prompt_id=3),
+            ]
+        )
+        b._session_id = "test-session"
+        b._fresh_session = False
+        b._next_id = 3
+
+        events = await _collect_events(b)
+
+        (trace,) = [e.trace for e in events if e.trace is not None]
+        assert trace.kind == "tool_call"
+        assert trace.tool_name == "plan_update"
+        assert json.loads(trace.detail) == {"sessionUpdate": "plan_update", "steps": ["a"]}
+
+    @pytest.mark.asyncio
+    async def test_planted_secret_redacted(self):
+        """A snapshot secret value never appears in trace text."""
+        secret = "planted-secret-value-123"
+        b = _make_opencode()
+        b._proc = _make_mock_proc(
+            [
+                _session_update_line(
+                    {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tc-3",
+                        "title": f"curl -H 'X-Auth: {secret}'",
+                        "kind": "execute",
+                        "content": [{"type": "content", "content": {"type": "text", "text": f"token was {secret}"}}],
+                    }
+                ),
+                _completion_result(prompt_id=3),
+            ]
+        )
+        b._session_id = "test-session"
+        b._fresh_session = False
+        b._next_id = 3
+        b._trace_secrets = (secret,)
+
+        events = await _collect_events(b)
+
+        (call,) = [e.trace for e in events if e.trace is not None]
+        assert secret not in call.summary
+        assert secret not in call.detail
+        assert "[redacted]" in call.summary
+        assert call.detail == "token was [redacted]"

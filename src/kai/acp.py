@@ -47,16 +47,21 @@ from pathlib import Path
 
 import kai
 from kai.backend import (
+    TRACE_DETAIL_MAX_CHARS,
+    TRACE_SUMMARY_MAX_CHARS,
     AgentBackend,
     AgentResponse,
     ApiContext,
     StreamEvent,
+    TraceEntry,
     apply_workspace_model,
     assemble_turn_context,
     build_foreign_workspace_reminder,
     build_session_context,
     ensure_user_context_files,
     sanitize_agent_environment,
+    scrub_trace_text,
+    trace_secret_values,
 )
 from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude_user
 from kai.subprocess_identity import subprocess_spawn_cwd, wrap_command_for_target_user
@@ -613,6 +618,59 @@ def _signal_target_user_pid_sync(
 # ── ACP base backend ──────────────────────────────────────────────
 
 
+# Session-update discriminators that never produce a trace entry: the
+# text lane (surfaced by extract_text_delta), thinking (invisible in
+# every backend lane, mirroring the claude and codex emitters), the
+# user's own prompt echo, and the housekeeping shapes with no tool
+# semantics. All are ACP v1 spec vocabulary except usage_update, an
+# observed OpenCode extension. The unknown-vocabulary fallback in
+# _session_update_trace is reserved for shapes outside this known set.
+_UNTRACED_SESSION_UPDATES = (
+    "agent_message_chunk",
+    "agent_thought_chunk",
+    "user_message_chunk",
+    "plan",
+    "available_commands_update",
+    "current_mode_update",
+    "config_options_update",
+    "usage_update",
+)
+
+
+def _tool_call_content_text(content: object) -> tuple[str, bool]:
+    """
+    Render ACP ToolCallContent blocks to detail text; flag diff blocks.
+
+    A diff block renders as its file path followed by the old text with
+    a `- ` prefix and the new text with a `+ ` prefix per line, so the
+    client's line-prefix diff rendering works on it. A content block
+    contributes its inner text. Terminal blocks carry no text.
+    """
+    if not isinstance(content, list):
+        return "", False
+    parts: list[str] = []
+    is_diff = False
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "diff":
+            is_diff = True
+            lines = [str(block.get("path", ""))]
+            old_text = block.get("oldText")
+            if isinstance(old_text, str) and old_text:
+                lines.extend(f"- {line}" for line in old_text.splitlines())
+            new_text = block.get("newText")
+            if isinstance(new_text, str) and new_text:
+                lines.extend(f"+ {line}" for line in new_text.splitlines())
+            parts.append("\n".join(lines))
+        elif block_type == "content":
+            inner = block.get("content")
+            if isinstance(inner, dict) and inner.get("type") == "text":
+                parts.append(inner.get("text", ""))
+    return "\n".join(parts), is_diff
+
+
 class AcpBackend(AgentBackend):
     """
     AgentBackend implementation for the ACP JSON-RPC 2.0 wire shape.
@@ -738,6 +796,10 @@ class AcpBackend(AgentBackend):
         # unambiguous across restarts.
         self._next_id: int = 1
         self._lock = asyncio.Lock()  # Serializes all message sends
+        # Secret values scrubbed from trace text. Snapshotted from the
+        # fully built subprocess environment at spawn so constructor-only
+        # credentials (the per-principal webhook secret) are covered.
+        self._trace_secrets: tuple[str, ...] = ()
         # True until the first send() finishes; first-message context
         # (AGENTS.md / PREFERENCES.md / session_context) is injected
         # exactly once per session.
@@ -838,6 +900,91 @@ class AcpBackend(AgentBackend):
         but Kai should not surface.
         """
         raise NotImplementedError
+
+    def _session_update_trace(self, update: dict) -> TraceEntry | None:
+        """
+        Build a TraceEntry from a non-text ACP session update, shared by
+        every ACP lane.
+
+        tool_call updates yield kind tool_call (title feeds the summary,
+        the ACP kind the tool name, content the detail, with is_diff for
+        diff blocks); tool_call_update with terminal status yields kind
+        tool_result keyed by the same toolCallId. Non-terminal progress
+        states yield None: the card shows call then result, and status
+        churn is noise at this granularity. Unknown vocabulary degrades
+        to a trace named by the ACP kind or the literal update type with
+        the raw update payload as detail, not dropped. Returns None with
+        a debug log on a malformed update; trace emission must never
+        break the text stream.
+        """
+        try:
+            update_type = update.get("sessionUpdate")
+            if not isinstance(update_type, str) or update_type in _UNTRACED_SESSION_UPDATES:
+                return None
+            if update_type == "tool_call_update":
+                status = update.get("status")
+                if status not in ("completed", "failed"):
+                    return None
+                tool_call_id = update["toolCallId"]
+                if not isinstance(tool_call_id, str):
+                    raise TypeError("unexpected toolCallId type")
+                detail, _ = _tool_call_content_text(update.get("content"))
+                title = update.get("title")
+                if isinstance(title, str) and title:
+                    summary = title
+                elif detail.strip():
+                    summary = detail.strip().split("\n", 1)[0]
+                else:
+                    summary = "(no output)"
+                return TraceEntry(
+                    kind="tool_result",
+                    tool_use_id=tool_call_id,
+                    summary=scrub_trace_text(summary, self._trace_secrets, TRACE_SUMMARY_MAX_CHARS),
+                    # A recognized result with no content blocks keeps an
+                    # empty detail, matching the codex emitter's no-output
+                    # results; the raw-payload fallback is for shapes that
+                    # would otherwise lose information.
+                    detail=scrub_trace_text(detail, self._trace_secrets, TRACE_DETAIL_MAX_CHARS),
+                    is_error=status == "failed",
+                )
+            if update_type == "tool_call":
+                tool_call_id = update["toolCallId"]
+                if not isinstance(tool_call_id, str):
+                    raise TypeError("unexpected toolCallId type")
+                acp_kind = update.get("kind")
+                tool_name = acp_kind if isinstance(acp_kind, str) else ""
+                detail, is_diff = _tool_call_content_text(update.get("content"))
+                title = update.get("title")
+                summary = title if isinstance(title, str) and title else (tool_name or update_type)
+                return TraceEntry(
+                    kind="tool_call",
+                    tool_use_id=tool_call_id,
+                    summary=scrub_trace_text(summary, self._trace_secrets, TRACE_SUMMARY_MAX_CHARS),
+                    detail=scrub_trace_text(
+                        detail or json.dumps(update, ensure_ascii=False),
+                        self._trace_secrets,
+                        TRACE_DETAIL_MAX_CHARS,
+                    ),
+                    tool_name=tool_name,
+                    is_diff=is_diff,
+                )
+            name = update.get("kind") if isinstance(update.get("kind"), str) else update_type
+            tool_call_id = update.get("toolCallId")
+            return TraceEntry(
+                kind="tool_call",
+                tool_use_id=tool_call_id if isinstance(tool_call_id, str) else "",
+                summary=scrub_trace_text(name, self._trace_secrets, TRACE_SUMMARY_MAX_CHARS),
+                detail=scrub_trace_text(
+                    json.dumps(update, ensure_ascii=False),
+                    self._trace_secrets,
+                    TRACE_DETAIL_MAX_CHARS,
+                ),
+                tool_name=name,
+                is_diff=False,
+            )
+        except Exception:
+            log.debug("Skipping malformed session update for trace", exc_info=True)
+            return None
 
     def is_completion(self, msg: dict, prompt_id: int) -> bool:
         """
@@ -1005,6 +1152,8 @@ class AcpBackend(AgentBackend):
             self.model,
             effective_os_user or "(same as bot)",
         )
+
+        self._trace_secrets = trace_secret_values(env)
 
         self._proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -1438,6 +1587,10 @@ class AcpBackend(AgentBackend):
                         accumulated = self.combine_text_chunks(accumulated, text)
                         got_model_text = True
                         yield StreamEvent(text_so_far=accumulated)
+                    elif msg.get("method") == "session/update":
+                        trace = self._session_update_trace(msg.get("params", {}).get("update", {}))
+                        if trace is not None:
+                            yield StreamEvent(text_so_far="", trace=trace)
                     continue
 
                 # Server-initiated JSON-RPC request (has BOTH method AND
