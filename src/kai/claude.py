@@ -1088,20 +1088,35 @@ class ClaudeCodeBackend(AgentBackend):
                 summary = f"{tool_name}: {tool_input['file_path']}"
             elif tool_input:
                 summary = f"{tool_name}: {', '.join(sorted(tool_input))}"
+            # Content-based rather than name-based so any edit-shaped
+            # tool is rendered rich, and the flag keeps the same
+            # meaning across backend emitters.
+            is_diff = "old_string" in tool_input and "new_string" in tool_input
+            if is_diff:
+                # Diff-shaped inputs compose the file path with line-
+                # prefixed old/new text (the ACP mapper's composition)
+                # so the client's line-prefix diff coloring works on
+                # them; a raw JSON dump would render as a flat blob.
+                lines = []
+                file_path = tool_input.get("file_path")
+                if isinstance(file_path, str):
+                    lines.append(file_path)
+                old_string = tool_input.get("old_string")
+                if isinstance(old_string, str) and old_string:
+                    lines.extend(f"- {line}" for line in old_string.splitlines())
+                new_string = tool_input.get("new_string")
+                if isinstance(new_string, str) and new_string:
+                    lines.extend(f"+ {line}" for line in new_string.splitlines())
+                detail = "\n".join(lines)
+            else:
+                detail = json.dumps(tool_input, ensure_ascii=False)
             return TraceEntry(
                 kind="tool_call",
                 tool_use_id=tool_use_id,
                 summary=scrub_trace_text(summary, self._trace_secrets, TRACE_SUMMARY_MAX_CHARS),
-                detail=scrub_trace_text(
-                    json.dumps(tool_input, ensure_ascii=False),
-                    self._trace_secrets,
-                    TRACE_DETAIL_MAX_CHARS,
-                ),
+                detail=scrub_trace_text(detail, self._trace_secrets, TRACE_DETAIL_MAX_CHARS),
                 tool_name=tool_name,
-                # Content-based rather than name-based so any edit-shaped
-                # tool is rendered rich, and the flag keeps the same
-                # meaning across backend emitters.
-                is_diff="old_string" in tool_input and "new_string" in tool_input,
+                is_diff=is_diff,
             )
         except Exception:
             log.debug("Skipping malformed tool_use block", exc_info=True)
