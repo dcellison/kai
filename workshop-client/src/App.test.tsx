@@ -647,6 +647,28 @@ describe("Workshop React client", () => {
     expect(resizeHandle).toHaveAttribute("aria-valuenow", "280");
   });
 
+  it("resizes the context pane with an accessible separator", async () => {
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    const { container } = render(<App />);
+
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+    const resizeHandle = screen.getByRole("separator", { name: "Resize channel context" });
+    // The pane sits on the right, so ArrowLeft moves the separator left
+    // and widens it.
+    fireEvent.keyDown(resizeHandle, { key: "ArrowLeft" });
+
+    expect(container.querySelector(".workshop-app")).toHaveStyle(
+      "--context-pane-width: 320px",
+    );
+    expect(resizeHandle).toHaveAttribute("aria-valuenow", "320");
+    expect(
+      JSON.parse(sessionStorage.getItem("kai.workshop.context-layout.v1") ?? "null"),
+    ).toEqual({ width: 320 });
+  });
+
   it("submits over LAN HTTP and reuses the command identity on retry", async () => {
     const user = userEvent.setup();
     sessionStorage.setItem(
