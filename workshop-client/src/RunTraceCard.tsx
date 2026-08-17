@@ -67,10 +67,12 @@ function DetailBlock({ entry }: { entry: WorkshopRunTraceEntry }): React.JSX.Ele
 
 export function RunTraceCard({
   entries,
+  failed,
   loaded,
   runId,
 }: {
   entries: WorkshopRunTraceEntry[];
+  failed: boolean;
   loaded: boolean;
   runId: string | null;
 }): React.JSX.Element {
@@ -98,6 +100,9 @@ export function RunTraceCard({
 
   if (!runId) {
     return <p className="trace-empty">No runs yet in this channel.</p>;
+  }
+  if (failed && entries.length === 0) {
+    return <p className="trace-empty">Trace unavailable for this run.</p>;
   }
   if (loaded && entries.length === 0) {
     return <p className="trace-empty">No steps recorded for this run.</p>;
@@ -143,7 +148,12 @@ export function RunTraceCard({
           const errored = row.result?.isError ?? primary.isError;
           return (
             <li key={row.key} className={`trace-row${errored ? " trace-error" : ""}`}>
-              <button type="button" className="trace-step" onClick={() => toggle(row)}>
+              <button
+                type="button"
+                className="trace-step"
+                aria-expanded={expanded}
+                onClick={() => toggle(row)}
+              >
                 <span className="trace-icon" aria-hidden="true">
                   {row.call ? "⚙" : "↩"}
                 </span>

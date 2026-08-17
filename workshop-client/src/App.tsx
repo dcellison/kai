@@ -659,11 +659,11 @@ function WorkshopView({
   // the most recently settled run (activeRun keeps its terminal value
   // and is seeded from replayed lifecycle events on mount).
   const inspectedRunId = activeRun?.runId ?? null;
-  const { entries: traceEntries, loaded: traceLoaded } = useRunTrace(
-    inspectedRunId,
-    runTrace,
-    onLoadRunTrace,
-  );
+  const {
+    entries: traceEntries,
+    failed: traceFailed,
+    loaded: traceLoaded,
+  } = useRunTrace(inspectedRunId, runTrace, onLoadRunTrace);
 
   useEffect(() => {
     storeSidebarLayout(sidebarLayout);
@@ -1325,7 +1325,12 @@ function WorkshopView({
         <section className="context-section trace-section">
           <span className="section-number">04</span>
           <h3>Run inspector</h3>
-          <RunTraceCard entries={traceEntries} loaded={traceLoaded} runId={inspectedRunId} />
+          <RunTraceCard
+            entries={traceEntries}
+            failed={traceFailed}
+            loaded={traceLoaded}
+            runId={inspectedRunId}
+          />
         </section>
 
         <section className="context-section future-section">

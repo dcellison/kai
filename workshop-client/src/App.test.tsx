@@ -269,6 +269,69 @@ describe("Workshop React client", () => {
     expect(vi.mocked(loadRunTrace)).toHaveBeenCalledTimes(2);
   });
 
+  it("does not duplicate rows when a doorbell races the initial drain", async () => {
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    const page = {
+      entries: [
+        {
+          createdAt: "2026-08-13T09:00:00+00:00",
+          detail: "",
+          isDiff: false,
+          isError: false,
+          kind: "tool_call" as const,
+          seq: 1,
+          summary: "step 1",
+          toolName: "Bash",
+          toolUseId: "toolu_1",
+        },
+      ],
+      hasMore: false,
+    };
+    let resolveInitial: ((value: typeof page) => void) | null = null;
+    vi.mocked(loadRunTrace)
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveInitial = resolve;
+          }),
+      )
+      .mockResolvedValueOnce(page);
+    render(<App />);
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+
+    const startedRun: WorkshopRun = {
+      ...completedRun,
+      resultMessageId: null,
+      status: "started",
+      terminalAt: null,
+    };
+    act(() =>
+      handlers?.onRunActivity(
+        {
+          eventPosition: 30,
+          occurredAt: "2026-08-13T09:00:01Z",
+          run: startedRun,
+          transition: "run.started",
+        },
+        "30",
+      ),
+    );
+    await waitFor(() => expect(loadRunTrace).toHaveBeenCalledTimes(1));
+
+    // The stale doorbell every fresh connection receives lands while the
+    // initial drain's fetch is still in flight; both drains resolve with
+    // the same page.
+    act(() => handlers?.onRunTrace({ runId: startedRun.runId, seq: 1 }));
+    await waitFor(() => expect(loadRunTrace).toHaveBeenCalledTimes(2));
+    act(() => resolveInitial?.(page));
+
+    expect(await screen.findByText("step 1")).toBeVisible();
+    expect(screen.getAllByText("step 1")).toHaveLength(1);
+  });
+
   it("streams a growing run preview and replaces it with the canonical answer", async () => {
     const user = userEvent.setup();
     render(<App />);

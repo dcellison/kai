@@ -25,6 +25,7 @@ describe("RunTraceCard", () => {
     const user = userEvent.setup();
     render(
       <RunTraceCard
+        failed={false}
         loaded
         runId="run_1"
         entries={[
@@ -72,6 +73,7 @@ describe("RunTraceCard", () => {
   it("renders diff rows expanded by default with line-prefix classes", () => {
     const { container } = render(
       <RunTraceCard
+        failed={false}
         loaded
         runId="run_1"
         entries={[
@@ -97,14 +99,18 @@ describe("RunTraceCard", () => {
   });
 
   it("shows honest empty states and the truncation marker as its own row", () => {
-    const { rerender } = render(<RunTraceCard loaded runId="run_1" entries={[]} />);
+    const { rerender } = render(<RunTraceCard failed={false} loaded runId="run_1" entries={[]} />);
     expect(screen.getByText("No steps recorded for this run.")).toBeVisible();
 
-    rerender(<RunTraceCard loaded runId={null} entries={[]} />);
+    rerender(<RunTraceCard failed={false} loaded runId={null} entries={[]} />);
     expect(screen.getByText("No runs yet in this channel.")).toBeVisible();
+
+    rerender(<RunTraceCard failed loaded={false} runId="run_1" entries={[]} />);
+    expect(screen.getByText("Trace unavailable for this run.")).toBeVisible();
 
     rerender(
       <RunTraceCard
+        failed={false}
         loaded
         runId="run_1"
         entries={[entry({ seq: 1, kind: "truncated", summary: "trace truncated at 500 steps" })]}
