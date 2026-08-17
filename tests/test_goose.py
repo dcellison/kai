@@ -109,7 +109,7 @@ def _agent_thought_chunk(text: str, session_id: str = "20260406_01") -> bytes:
 
 
 def _tool_call_event(session_id: str = "20260406_01") -> bytes:
-    """Build a session/update notification with tool_call (should be skipped)."""
+    """Build a session/update notification with tool_call."""
     return _json_line(
         {
             "jsonrpc": "2.0",
@@ -527,8 +527,9 @@ class TestStreamParsing:
         assert events[1].done is True
 
     @pytest.mark.asyncio
-    async def test_tool_call_events_skipped(self):
-        """tool_call events are silently skipped."""
+    async def test_tool_call_events_yield_trace_not_text(self):
+        """tool_call events surface as empty-text trace events and never
+        reach the accumulated text."""
         g = _make_goose()
         g._proc = _make_mock_proc(
             [
@@ -543,8 +544,13 @@ class TestStreamParsing:
 
         events = await _collect_events(g)
 
-        assert len(events) == 2
-        assert events[0].text_so_far == "done"
+        assert len(events) == 3
+        assert events[0].trace is not None
+        assert events[0].text_so_far == ""
+        assert events[0].done is False
+        assert events[1].text_so_far == "done"
+        assert events[2].response is not None
+        assert events[2].response.text == "done"
 
     @pytest.mark.asyncio
     async def test_non_json_lines_skipped(self):
@@ -1323,3 +1329,163 @@ class TestPreservedEnvVars:
         )
         assert argv[7] == "--"
         assert argv[8:] == ["goose", "acp", "--with-builtin", "developer"]
+
+
+# ── Trace emission through the shared ACP mapper ─────────────────────
+
+
+def _session_update_line(update: dict, session_id: str = "20260406_01") -> bytes:
+    """Build a session/update notification carrying the given update."""
+    return _json_line(
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": session_id, "update": update},
+        }
+    )
+
+
+class TestTraceEmission:
+    """The goose lane emits TraceEntry events via the shared ACP mapper."""
+
+    @pytest.mark.asyncio
+    async def test_call_and_terminal_result_pair_by_tool_call_id(self):
+        """tool_call yields tool_call and a terminal tool_call_update
+        tool_result sharing the toolCallId; non-terminal progress
+        updates yield nothing."""
+        g = _make_goose()
+        g._proc = _make_mock_proc(
+            [
+                _session_update_line(
+                    {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tc-1",
+                        "title": "Read kai.py",
+                        "kind": "read",
+                        "status": "pending",
+                    }
+                ),
+                _session_update_line(
+                    {"sessionUpdate": "tool_call_update", "toolCallId": "tc-1", "status": "in_progress"}
+                ),
+                _session_update_line(
+                    {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "tc-1",
+                        "status": "completed",
+                        "content": [{"type": "content", "content": {"type": "text", "text": "line one\nline two"}}],
+                    }
+                ),
+                _session_update_line({"sessionUpdate": "tool_call_update", "toolCallId": "tc-1", "status": "failed"}),
+                _completion_result(prompt_id=3),
+            ]
+        )
+        g._session_id = "test-session"
+        g._fresh_session = False
+        g._next_id = 3
+
+        events = await _collect_events(g)
+
+        trace_events = [e for e in events if e.trace is not None]
+        for event in trace_events:
+            assert event.text_so_far == ""
+            assert event.done is False
+        call, result, failed = [e.trace for e in trace_events]
+        assert call.kind == "tool_call"
+        assert call.summary == "Read kai.py"
+        assert call.tool_name == "read"
+        assert result.kind == "tool_result"
+        assert result.tool_use_id == call.tool_use_id == "tc-1"
+        assert result.summary == "line one"
+        assert result.detail == "line one\nline two"
+        assert result.is_error is False
+        assert failed.is_error is True
+
+    @pytest.mark.asyncio
+    async def test_diff_content_sets_is_diff(self):
+        """ACP diff content blocks render line-prefixed old/new text and
+        set is_diff on the call."""
+        g = _make_goose()
+        g._proc = _make_mock_proc(
+            [
+                _session_update_line(
+                    {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tc-2",
+                        "title": "Edit config.py",
+                        "kind": "edit",
+                        "content": [
+                            {"type": "diff", "path": "/w/config.py", "oldText": "a = 1", "newText": "a = 2\nb = 3"}
+                        ],
+                    }
+                ),
+                _completion_result(prompt_id=3),
+            ]
+        )
+        g._session_id = "test-session"
+        g._fresh_session = False
+        g._next_id = 3
+
+        events = await _collect_events(g)
+
+        (call,) = [e.trace for e in events if e.trace is not None]
+        assert call.is_diff is True
+        assert call.detail == "/w/config.py\n- a = 1\n+ a = 2\n+ b = 3"
+
+    @pytest.mark.asyncio
+    async def test_unrecognized_update_shape_traced_with_raw_payload(self):
+        """Unknown session-update vocabulary degrades to a type-named
+        trace carrying the raw payload, not a drop; thoughts and
+        housekeeping stay invisible."""
+        g = _make_goose()
+        g._proc = _make_mock_proc(
+            [
+                _agent_thought_chunk("thinking"),
+                _session_update_line({"sessionUpdate": "usage_update", "tokens": 5}),
+                _session_update_line({"sessionUpdate": "plan_update", "steps": ["a", "b"]}),
+                _completion_result(prompt_id=3),
+            ]
+        )
+        g._session_id = "test-session"
+        g._fresh_session = False
+        g._next_id = 3
+
+        events = await _collect_events(g)
+
+        (trace,) = [e.trace for e in events if e.trace is not None]
+        assert trace.kind == "tool_call"
+        assert trace.summary == "plan_update"
+        assert trace.tool_name == "plan_update"
+        assert json.loads(trace.detail) == {"sessionUpdate": "plan_update", "steps": ["a", "b"]}
+
+    @pytest.mark.asyncio
+    async def test_planted_secret_redacted(self):
+        """A snapshot secret value never appears in trace text."""
+        secret = "planted-secret-value-123"
+        g = _make_goose()
+        g._proc = _make_mock_proc(
+            [
+                _session_update_line(
+                    {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tc-3",
+                        "title": f"curl -H 'X-Auth: {secret}'",
+                        "kind": "execute",
+                        "content": [{"type": "content", "content": {"type": "text", "text": f"token was {secret}"}}],
+                    }
+                ),
+                _completion_result(prompt_id=3),
+            ]
+        )
+        g._session_id = "test-session"
+        g._fresh_session = False
+        g._next_id = 3
+        g._trace_secrets = (secret,)
+
+        events = await _collect_events(g)
+
+        (call,) = [e.trace for e in events if e.trace is not None]
+        assert secret not in call.summary
+        assert secret not in call.detail
+        assert "[redacted]" in call.summary
+        assert call.detail == "token was [redacted]"
