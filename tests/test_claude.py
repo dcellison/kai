@@ -4318,3 +4318,80 @@ class TestTraceEmission:
         (result,) = [e.trace for e in events if e.trace is not None]
         assert result.detail == "value: [redacted]"
         assert "xyz99999" not in result.detail
+
+    @pytest.mark.asyncio
+    async def test_edit_detail_renders_as_line_prefixed_diff(self):
+        """Diff-shaped inputs compose the file path with prefixed old/new
+        lines for the client's line-prefix diff coloring; other inputs
+        keep the JSON detail byte-identical."""
+        proc = _make_mock_proc(
+            [
+                _system_event(),
+                _assistant_content_event(
+                    [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "Edit",
+                            "input": {"file_path": "/w/a.py", "old_string": "a = 1", "new_string": "a = 2\nb = 3"},
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_2",
+                            "name": "Write",
+                            "input": {"file_path": "/w/b.py", "content": "x = 1"},
+                        },
+                    ]
+                ),
+                _result_event(),
+                b"",
+            ]
+        )
+        claude = _make_claude()
+        claude._proc = proc
+        claude._fresh_session = False
+
+        events = await _collect_events(claude)
+
+        edit, write = [e.trace for e in events if e.trace is not None]
+        assert edit.is_diff is True
+        assert edit.detail == "/w/a.py\n- a = 1\n+ a = 2\n+ b = 3"
+        assert write.is_diff is False
+        assert json.loads(write.detail) == {"file_path": "/w/b.py", "content": "x = 1"}
+
+    @pytest.mark.asyncio
+    async def test_secret_in_edit_text_is_redacted(self):
+        """A snapshot secret in old/new text never survives into the
+        composed diff detail."""
+        secret = "planted-secret-value-123"
+        proc = _make_mock_proc(
+            [
+                _system_event(),
+                _assistant_content_event(
+                    [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "Edit",
+                            "input": {
+                                "file_path": "/w/.env",
+                                "old_string": f"TOKEN={secret}",
+                                "new_string": "TOKEN=rotated",
+                            },
+                        }
+                    ]
+                ),
+                _result_event(),
+                b"",
+            ]
+        )
+        claude = _make_claude()
+        claude._proc = proc
+        claude._fresh_session = False
+        claude._trace_secrets = (secret,)
+
+        events = await _collect_events(claude)
+
+        (edit,) = [e.trace for e in events if e.trace is not None]
+        assert secret not in edit.detail
+        assert edit.detail == "/w/.env\n- TOKEN=[redacted]\n+ TOKEN=rotated"
