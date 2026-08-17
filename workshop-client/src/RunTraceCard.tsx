@@ -50,6 +50,28 @@ function formatDetail(detail: string): string {
   }
 }
 
+// Fallback for insecure contexts (plain HTTP on the trusted LAN), where
+// the async clipboard API does not exist: automate the selection-copy the
+// user could already do by hand, via a scratch textarea and the deprecated
+// but still-functional execCommand.
+function legacyCopy(text: string): boolean {
+  const scratch = document.createElement("textarea");
+  scratch.value = text;
+  // Fixed position and zero opacity keep the scratch element from
+  // scrolling the page or flashing while it briefly holds the selection.
+  scratch.style.position = "fixed";
+  scratch.style.opacity = "0";
+  document.body.appendChild(scratch);
+  scratch.select();
+  try {
+    return document.execCommand("copy");
+  } catch {
+    return false;
+  } finally {
+    scratch.remove();
+  }
+}
+
 function DetailBlock({ entry }: { entry: WorkshopRunTraceEntry }): React.JSX.Element | null {
   const [copied, setCopied] = useState(false);
   const copyTimerRef = useRef<number | null>(null);
@@ -73,23 +95,29 @@ function DetailBlock({ entry }: { entry: WorkshopRunTraceEntry }): React.JSX.Ele
   // redacted and truncated at the source.
   const text = entry.isDiff ? entry.detail : formatDetail(entry.detail);
 
-  // The async clipboard API only exists in secure contexts (localhost
-  // qualifies); render no button at all rather than one that always fails.
-  const clipboard = typeof navigator === "undefined" ? undefined : navigator.clipboard;
-  const copy = (): void => {
-    void clipboard?.writeText(text).then(
-      () => {
-        setCopied(true);
-        if (copyTimerRef.current !== null) {
-          window.clearTimeout(copyTimerRef.current);
-        }
-        copyTimerRef.current = window.setTimeout(() => setCopied(false), 1500);
-      },
-      () => {
+  // The async clipboard API only exists in secure contexts; elsewhere the
+  // legacy path does the same job, so the button always renders.
+  const copy = (event: React.MouseEvent<HTMLButtonElement>): void => {
+    const button = event.currentTarget;
+    const markCopied = (): void => {
+      setCopied(true);
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+      copyTimerRef.current = window.setTimeout(() => setCopied(false), 1500);
+    };
+    const clipboard = typeof navigator === "undefined" ? undefined : navigator.clipboard;
+    if (clipboard) {
+      void clipboard.writeText(text).then(markCopied, () => {
         // A rejected write (permission revoked, window unfocused) leaves
         // the button in its idle state; there is no error surface here.
-      },
-    );
+      });
+    } else if (legacyCopy(text)) {
+      // The scratch textarea took the focus during the copy; hand it back
+      // so keyboard flow and the :focus-visible reveal are undisturbed.
+      button.focus();
+      markCopied();
+    }
   };
 
   return (
@@ -123,22 +151,20 @@ function DetailBlock({ entry }: { entry: WorkshopRunTraceEntry }): React.JSX.Ele
       ) : (
         <pre className="trace-detail">{text}</pre>
       )}
-      {clipboard && (
-        <button
-          type="button"
-          className="trace-copy"
-          aria-label={
-            copied
-              ? "Copied"
-              : entry.kind === "tool_call"
-                ? "Copy call detail"
-                : "Copy result detail"
-          }
-          onClick={copy}
-        >
-          {copied ? "✓" : "⧉"}
-        </button>
-      )}
+      <button
+        type="button"
+        className="trace-copy"
+        aria-label={
+          copied
+            ? "Copied"
+            : entry.kind === "tool_call"
+              ? "Copy call detail"
+              : "Copy result detail"
+        }
+        onClick={copy}
+      >
+        {copied ? "✓" : "⧉"}
+      </button>
     </div>
   );
 }
