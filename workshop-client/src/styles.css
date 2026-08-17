@@ -1501,8 +1501,13 @@ button:disabled {
   padding: 0 0.1rem 0.5rem;
 }
 
-.trace-detail {
+.trace-detail-wrap {
+  position: relative;
   margin: 0.25rem 0 0;
+}
+
+.trace-detail {
+  margin: 0;
   max-height: 12rem;
   overflow: auto;
   border-left: 2px solid var(--line-strong);
@@ -1513,12 +1518,41 @@ button:disabled {
   white-space: pre;
 }
 
+/* Diff lines are block-level so the tint spans the row; max-content keeps
+   the background under text that scrolls past the container width. */
+.trace-line {
+  display: block;
+  width: max-content;
+  min-width: 100%;
+}
+
 .trace-diff-add {
   color: var(--atom-green);
+  background: rgba(152, 195, 121, 0.14);
 }
 
 .trace-diff-del {
   color: var(--atom-red);
+  background: rgba(224, 108, 117, 0.14);
+}
+
+.trace-copy {
+  position: absolute;
+  top: 0.35rem;
+  right: 0.35rem;
+  border: 1px solid var(--line-strong);
+  border-radius: 0.3rem;
+  padding: 0.05rem 0.3rem;
+  background: var(--atom-bg-deep);
+  color: var(--atom-muted);
+  font: 0.68rem/1.4 var(--mono);
+  cursor: pointer;
+  opacity: 0;
+}
+
+.trace-detail-wrap:hover .trace-copy,
+.trace-copy:focus {
+  opacity: 1;
 }
 
 .trace-truncated {

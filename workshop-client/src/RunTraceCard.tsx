@@ -37,31 +37,92 @@ function buildRows(entries: WorkshopRunTraceEntry[]): TraceRow[] {
   return rows;
 }
 
+// Display-only transform: a non-diff detail that parses as JSON is
+// re-serialized with two-space indentation. Falling back to the raw text
+// on parse failure is load-bearing, not just defensive: the backend
+// truncates details at the source, so a payload can arrive cut mid-JSON
+// and must still render as stored.
+function formatDetail(detail: string): string {
+  try {
+    return JSON.stringify(JSON.parse(detail), null, 2);
+  } catch {
+    return detail;
+  }
+}
+
 function DetailBlock({ entry }: { entry: WorkshopRunTraceEntry }): React.JSX.Element | null {
+  const [copied, setCopied] = useState(false);
+  const copyTimerRef = useRef<number | null>(null);
+
+  // Cancel a pending checkmark reset if the block unmounts (row collapsed,
+  // run switched) before the swap-back fires.
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+    };
+  }, []);
+
   if (!entry.detail) {
     return null;
   }
-  if (!entry.isDiff) {
-    return <pre className="trace-detail">{entry.detail}</pre>;
-  }
+
+  // The copy button copies exactly what is rendered: the formatted JSON
+  // when formatting applied, the raw detail otherwise. Both are already
+  // redacted and truncated at the source.
+  const text = entry.isDiff ? entry.detail : formatDetail(entry.detail);
+
+  // The async clipboard API only exists in secure contexts (localhost
+  // qualifies); render no button at all rather than one that always fails.
+  const clipboard = typeof navigator === "undefined" ? undefined : navigator.clipboard;
+  const copy = (): void => {
+    void clipboard?.writeText(text).then(
+      () => {
+        setCopied(true);
+        if (copyTimerRef.current !== null) {
+          window.clearTimeout(copyTimerRef.current);
+        }
+        copyTimerRef.current = window.setTimeout(() => setCopied(false), 1500);
+      },
+      () => {
+        // A rejected write (permission revoked, window unfocused) leaves
+        // the button in its idle state; there is no error surface here.
+      },
+    );
+  };
+
   return (
-    <pre className="trace-detail">
-      {entry.detail.split("\n").map((line, index) => (
-        <span
-          key={index}
-          className={
-            line.startsWith("+")
-              ? "trace-diff-add"
-              : line.startsWith("-")
-                ? "trace-diff-del"
-                : undefined
-          }
-        >
-          {line}
-          {"\n"}
-        </span>
-      ))}
-    </pre>
+    <div className="trace-detail-wrap">
+      {entry.isDiff ? (
+        <pre className="trace-detail">
+          {entry.detail.split("\n").map((line, index) => (
+            <span
+              key={index}
+              className={
+                line.startsWith("+")
+                  ? "trace-line trace-diff-add"
+                  : line.startsWith("-")
+                    ? "trace-line trace-diff-del"
+                    : "trace-line"
+              }
+            >
+              {/* Block-level lines supply their own breaks, so the newline
+                  separators are dropped; an empty line keeps an explicit
+                  one so it still occupies a row. */}
+              {line === "" ? "\n" : line}
+            </span>
+          ))}
+        </pre>
+      ) : (
+        <pre className="trace-detail">{text}</pre>
+      )}
+      {clipboard && (
+        <button type="button" className="trace-copy" aria-label="Copy detail" onClick={copy}>
+          {copied ? "✓" : "⧉"}
+        </button>
+      )}
+    </div>
   );
 }
 
