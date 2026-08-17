@@ -12,6 +12,7 @@ import type {
   TimelineMessage,
   WorkshopRunActivity,
   WorkshopRunPreview,
+  WorkshopRunTraceSignal,
   WorkshopSession,
 } from "./types";
 
@@ -53,10 +54,12 @@ export function useWorkshopTimeline(
   messages: TimelineMessage[];
   runActivity: WorkshopRunActivity | null;
   runPreview: WorkshopRunPreview | null;
+  runTrace: WorkshopRunTraceSignal | null;
 } {
   const [messages, setMessages] = useState<TimelineMessage[]>([]);
   const [runActivity, setRunActivity] = useState<WorkshopRunActivity | null>(null);
   const [runPreview, setRunPreview] = useState<WorkshopRunPreview | null>(null);
+  const [runTrace, setRunTrace] = useState<WorkshopRunTraceSignal | null>(null);
   const [connection, setConnection] = useState<ConnectionState>({
     label: "Waiting",
     tone: "connecting",
@@ -67,6 +70,7 @@ export function useWorkshopTimeline(
       setMessages([]);
       setRunActivity(null);
       setRunPreview(null);
+      setRunTrace(null);
       setConnection({ label: "Waiting", tone: "connecting" });
       return;
     }
@@ -75,6 +79,7 @@ export function useWorkshopTimeline(
     const { signal } = controller;
     setRunActivity(null);
     setRunPreview(null);
+    setRunTrace(null);
     // Runs already seen terminal on this connection. A preview event that
     // races the terminal batch must never resurrect a finished bubble.
     const terminalRunIds = new Set<string>();
@@ -148,6 +153,16 @@ export function useWorkshopTimeline(
                     : preview,
                 );
               },
+              // Unlike previews, traces are durable, so a doorbell for a
+              // terminal run is meaningful; the card decides whether it
+              // is following that run.
+              onRunTrace: (trace) => {
+                setRunTrace((current) =>
+                  current && current.runId === trace.runId && current.seq >= trace.seq
+                    ? current
+                    : trace,
+                );
+              },
             },
             signal,
           );
@@ -187,5 +202,5 @@ export function useWorkshopTimeline(
     session,
   ]);
 
-  return { connection, messages, runActivity, runPreview };
+  return { connection, messages, runActivity, runPreview, runTrace };
 }

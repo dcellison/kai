@@ -7,6 +7,10 @@ import type {
   WorkshopRunPreview,
   WorkshopNavigation,
   WorkshopRunStatus,
+  WorkshopRunTraceEntry,
+  WorkshopRunTraceKind,
+  WorkshopRunTracePage,
+  WorkshopRunTraceSignal,
   WorkshopRunTransition,
   WorkshopSession,
 } from "./types";
@@ -34,6 +38,7 @@ interface StreamHandlers {
   onMessage: (message: TimelineMessage, eventId: string) => void;
   onRunActivity: (activity: WorkshopRunActivity, eventId: string) => void;
   onRunPreview: (preview: WorkshopRunPreview) => void;
+  onRunTrace: (signal: WorkshopRunTraceSignal) => void;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -364,6 +369,72 @@ export async function loadRun(
   return run;
 }
 
+const TRACE_KINDS = new Set<WorkshopRunTraceKind>(["tool_call", "tool_result", "truncated"]);
+
+function parseTraceEntry(value: unknown): WorkshopRunTraceEntry | null {
+  if (
+    !isRecord(value) ||
+    typeof value.seq !== "number" ||
+    !Number.isSafeInteger(value.seq) ||
+    typeof value.kind !== "string" ||
+    !TRACE_KINDS.has(value.kind as WorkshopRunTraceKind) ||
+    typeof value.summary !== "string" ||
+    typeof value.detail !== "string" ||
+    typeof value.is_diff !== "boolean" ||
+    typeof value.is_error !== "boolean" ||
+    typeof value.created_at !== "string" ||
+    (value.tool_name !== null && typeof value.tool_name !== "string") ||
+    (value.tool_use_id !== null && typeof value.tool_use_id !== "string")
+  ) {
+    return null;
+  }
+  return {
+    createdAt: value.created_at,
+    detail: value.detail,
+    isDiff: value.is_diff,
+    isError: value.is_error,
+    kind: value.kind as WorkshopRunTraceKind,
+    seq: value.seq,
+    summary: value.summary,
+    toolName: value.tool_name,
+    toolUseId: value.tool_use_id,
+  };
+}
+
+export async function loadRunTrace(
+  session: WorkshopSession,
+  runId: string,
+  afterSeq: number,
+): Promise<WorkshopRunTracePage> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/runs/${encodeURIComponent(runId)}/trace` +
+      `?after_seq=${encodeURIComponent(String(afterSeq))}`,
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load this run's trace."));
+  }
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    payload.run_id !== runId ||
+    !Array.isArray(payload.entries) ||
+    typeof payload.has_more !== "boolean"
+  ) {
+    throw new Error("Kai returned an unsupported trace response.");
+  }
+  const entries: WorkshopRunTraceEntry[] = [];
+  for (const value of payload.entries) {
+    const entry = parseTraceEntry(value);
+    if (!entry) {
+      throw new Error("Kai returned an unsupported trace response.");
+    }
+    entries.push(entry);
+  }
+  return { entries, hasMore: payload.has_more };
+}
+
 export async function cancelRun(
   session: WorkshopSession,
   runId: string,
@@ -550,6 +621,32 @@ export async function streamTimeline(
           runId: previewPayload.run_id,
           sequence: previewPayload.sequence,
           text: previewPayload.text,
+        });
+        continue;
+      }
+      if (event.eventName === "run.trace.updated") {
+        // Trace doorbells deliberately carry no SSE id, so they are
+        // handled before the resume-cursor guard and never advance
+        // Last-Event-ID; the trace endpoint is the source of truth.
+        let tracePayload: unknown;
+        try {
+          tracePayload = JSON.parse(event.data);
+        } catch {
+          continue;
+        }
+        if (
+          !isRecord(tracePayload) ||
+          tracePayload.version !== 1 ||
+          tracePayload.channel_id !== session.channelId ||
+          typeof tracePayload.run_id !== "string" ||
+          typeof tracePayload.seq !== "number" ||
+          !Number.isSafeInteger(tracePayload.seq)
+        ) {
+          continue;
+        }
+        handlers.onRunTrace({
+          runId: tracePayload.run_id,
+          seq: tracePayload.seq,
         });
         continue;
       }

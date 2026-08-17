@@ -1374,3 +1374,109 @@ button:disabled {
     transition-duration: 0.01ms !important;
   }
 }
+
+.trace-card {
+  max-height: 22rem;
+  overflow-y: auto;
+}
+
+.trace-empty {
+  margin: 0.75rem 0 0;
+  color: var(--atom-muted);
+  font-size: 0.72rem;
+  line-height: 1.58;
+}
+
+.trace-steps {
+  margin: 0.5rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.trace-row {
+  border-bottom: 1px solid var(--line);
+}
+
+.trace-step {
+  display: flex;
+  align-items: baseline;
+  gap: 0.45rem;
+  width: 100%;
+  border: none;
+  padding: 0.4rem 0.1rem;
+  background: none;
+  color: var(--atom-foreground);
+  font: 0.68rem/1.5 var(--mono);
+  text-align: left;
+  cursor: pointer;
+}
+
+.trace-error .trace-step {
+  color: var(--atom-red);
+}
+
+.trace-icon {
+  flex: none;
+  color: var(--atom-muted);
+}
+
+.trace-tool {
+  flex: none;
+  color: var(--atom-purple);
+}
+
+.trace-error .trace-tool {
+  color: var(--atom-red);
+}
+
+.trace-summary {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trace-chip {
+  flex: none;
+  border: 1px solid rgba(152, 195, 121, 0.5);
+  border-radius: 0.4rem;
+  padding: 0 0.35rem;
+  color: var(--atom-green);
+  font-size: 0.6rem;
+}
+
+.trace-chip-error {
+  border-color: rgba(224, 108, 117, 0.5);
+  color: var(--atom-red);
+}
+
+.trace-expansion {
+  padding: 0 0.1rem 0.5rem;
+}
+
+.trace-detail {
+  margin: 0.25rem 0 0;
+  max-height: 12rem;
+  overflow: auto;
+  border-left: 2px solid var(--line-strong);
+  padding: 0.35rem 0.55rem;
+  background: var(--atom-bg-deep);
+  color: var(--atom-foreground);
+  font: 0.65rem/1.5 var(--mono);
+  white-space: pre;
+}
+
+.trace-diff-add {
+  color: var(--atom-green);
+}
+
+.trace-diff-del {
+  color: var(--atom-red);
+}
+
+.trace-truncated {
+  padding: 0.4rem 0.1rem;
+  color: var(--atom-yellow);
+  font: 0.68rem/1.5 var(--mono);
+}

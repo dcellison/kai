@@ -113,3 +113,27 @@ export interface ConnectionState {
   label: string;
   tone: ConnectionTone;
 }
+
+export type WorkshopRunTraceKind = "tool_call" | "tool_result" | "truncated";
+
+export interface WorkshopRunTraceEntry {
+  createdAt: string;
+  detail: string;
+  isDiff: boolean;
+  isError: boolean;
+  kind: WorkshopRunTraceKind;
+  seq: number;
+  summary: string;
+  toolName: string | null;
+  toolUseId: string | null;
+}
+
+export interface WorkshopRunTracePage {
+  entries: WorkshopRunTraceEntry[];
+  hasMore: boolean;
+}
+
+export interface WorkshopRunTraceSignal {
+  runId: string;
+  seq: number;
+}
