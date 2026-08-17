@@ -96,8 +96,10 @@ describe("RunTraceCard", () => {
     expect(removed).toHaveLength(1);
     expect(added[0].textContent).toContain("+ a = 2");
     expect(removed[0].textContent).toContain("- a = 1");
-    // Every diff line, tinted or not, is a block-level trace-line so the
-    // add/del backgrounds span the full row.
+    // Every diff line, tinted or not, is a block-level trace-line inside
+    // the single width-carrying trace-lines wrapper, so the add/del
+    // backgrounds span the full scrolled row.
+    expect(container.querySelectorAll(".trace-lines")).toHaveLength(1);
     expect(container.querySelectorAll(".trace-line")).toHaveLength(3);
   });
 
@@ -125,10 +127,12 @@ describe("RunTraceCard", () => {
     const pretty = '{\n  "command": "ls",\n  "cwd": "/w"\n}';
     expect(container.querySelector(".trace-detail")?.textContent).toBe(pretty);
 
-    const copyButton = screen.getByRole("button", { name: "Copy detail" });
+    const copyButton = screen.getByRole("button", { name: "Copy call detail" });
     expect(copyButton.textContent).not.toBe("✓");
     await user.click(copyButton);
+    // Success feedback is both the checkmark glyph and the accessible name.
     expect(copyButton.textContent).toBe("✓");
+    expect(copyButton).toHaveAccessibleName("Copied");
     await expect(window.navigator.clipboard.readText()).resolves.toBe(pretty);
   });
 
@@ -188,7 +192,7 @@ describe("RunTraceCard", () => {
       fireEvent.click(screen.getByRole("button", { name: /Bash: ls/ }));
       // The detail block itself still renders; only the button is gone.
       expect(document.querySelector(".trace-detail")).not.toBeNull();
-      expect(screen.queryByRole("button", { name: "Copy detail" })).toBeNull();
+      expect(screen.queryByRole("button", { name: /Copy (call|result) detail/ })).toBeNull();
     } finally {
       if (original) {
         Object.defineProperty(window.navigator, "clipboard", original);

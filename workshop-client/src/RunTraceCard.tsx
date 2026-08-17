@@ -96,29 +96,46 @@ function DetailBlock({ entry }: { entry: WorkshopRunTraceEntry }): React.JSX.Ele
     <div className="trace-detail-wrap">
       {entry.isDiff ? (
         <pre className="trace-detail">
-          {entry.detail.split("\n").map((line, index) => (
-            <span
-              key={index}
-              className={
-                line.startsWith("+")
-                  ? "trace-line trace-diff-add"
-                  : line.startsWith("-")
-                    ? "trace-line trace-diff-del"
-                    : "trace-line"
-              }
-            >
-              {/* Block-level lines supply their own breaks, so the newline
-                  separators are dropped; an empty line keeps an explicit
-                  one so it still occupies a row. */}
-              {line === "" ? "\n" : line}
-            </span>
-          ))}
+          {/* The trace-lines wrapper, not each line, carries the max-content
+              sizing: sizing lines individually would let short lines' tints
+              stop at the container's client width while a longer sibling
+              forces horizontal scroll past them. */}
+          <span className="trace-lines">
+            {entry.detail.split("\n").map((line, index) => (
+              <span
+                key={index}
+                className={
+                  line.startsWith("+")
+                    ? "trace-line trace-diff-add"
+                    : line.startsWith("-")
+                      ? "trace-line trace-diff-del"
+                      : "trace-line"
+                }
+              >
+                {/* Block-level lines supply their own breaks, so the newline
+                    separators are dropped; an empty line keeps an explicit
+                    one so it still occupies a row. */}
+                {line === "" ? "\n" : line}
+              </span>
+            ))}
+          </span>
         </pre>
       ) : (
         <pre className="trace-detail">{text}</pre>
       )}
       {clipboard && (
-        <button type="button" className="trace-copy" aria-label="Copy detail" onClick={copy}>
+        <button
+          type="button"
+          className="trace-copy"
+          aria-label={
+            copied
+              ? "Copied"
+              : entry.kind === "tool_call"
+                ? "Copy call detail"
+                : "Copy result detail"
+          }
+          onClick={copy}
+        >
           {copied ? "✓" : "⧉"}
         </button>
       )}

@@ -1518,12 +1518,16 @@ button:disabled {
   white-space: pre;
 }
 
-/* Diff lines are block-level so the tint spans the row; max-content keeps
-   the background under text that scrolls past the container width. */
-.trace-line {
+/* One block sized to the widest line, so every diff tint spans the full
+   scrolled row rather than stopping at the container's client width. */
+.trace-lines {
   display: block;
   width: max-content;
   min-width: 100%;
+}
+
+.trace-line {
+  display: block;
 }
 
 .trace-diff-add {
@@ -1551,8 +1555,16 @@ button:disabled {
 }
 
 .trace-detail-wrap:hover .trace-copy,
-.trace-copy:focus {
+.trace-copy:focus-visible {
   opacity: 1;
+}
+
+/* No hover means no reveal gesture; keep the button visible rather than
+   leaving an invisible tappable target. */
+@media (hover: none) {
+  .trace-copy {
+    opacity: 1;
+  }
 }
 
 .trace-truncated {
