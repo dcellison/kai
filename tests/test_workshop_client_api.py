@@ -1214,3 +1214,203 @@ class TestWorkshopRunPreviewEventStream:
                 response.close()
             await client.close()
             await store.close()
+
+
+# ── Run trace endpoint and doorbell ─────────────────────────────────
+
+
+async def _insert_trace_rows(store: WorkshopEventStore, run_id: str, count: int, *, start: int = 1) -> None:
+    for seq in range(start, start + count):
+        await store.connection.execute(
+            "INSERT INTO run_traces (run_id, seq, kind, tool_name, tool_use_id, "
+            "summary, detail, is_diff, is_error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                seq,
+                "tool_call",
+                "Bash",
+                f"toolu_{seq}",
+                f"summary {seq}",
+                f"detail {seq}",
+                0,
+                0,
+                "2026-08-11T14:00:00+00:00",
+            ),
+        )
+    await store.connection.commit()
+
+
+class TestWorkshopRunTraceHTTPContract:
+    async def test_trace_access_is_denied_across_principals(self, tmp_path: Path):
+        store, alice_id, alice_channel, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        submitter = _CommandSubmitter()
+        client = await _open_command_client(
+            store,
+            _Authenticator({"alice-token": alice_id, "bob-token": bob_id}),
+            submitter,
+        )
+        try:
+            accepted = await client.post(
+                f"/v1/channels/{alice_channel}/commands",
+                headers={"Authorization": "Bearer alice-token"},
+                json={"client_message_id": "browser-command-1", "body": "Private work"},
+            )
+            run_id = (await accepted.json())["run_id"]
+            await _insert_trace_rows(store, run_id, 1)
+
+            denied = await client.get(
+                f"/v1/channels/{alice_channel}/runs/{run_id}/trace",
+                headers={"Authorization": "Bearer bob-token"},
+            )
+            allowed = await client.get(
+                f"/v1/channels/{alice_channel}/runs/{run_id}/trace",
+                headers={"Authorization": "Bearer alice-token"},
+            )
+
+            assert denied.status == 403
+            assert allowed.status == 200
+            payload = await allowed.json()
+            assert payload["run_id"] == run_id
+            assert payload["channel_id"] == alice_channel
+            assert [entry["seq"] for entry in payload["entries"]] == [1]
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_after_seq_paging_returns_disjoint_ordered_slices(self, tmp_path: Path):
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        submitter = _CommandSubmitter()
+        client = await _open_command_client(store, _Authenticator({"alice-token": alice_id}), submitter)
+        try:
+            accepted = await client.post(
+                f"/v1/channels/{alice_channel}/commands",
+                headers={"Authorization": "Bearer alice-token"},
+                json={"client_message_id": "browser-command-1", "body": "Long task"},
+            )
+            run_id = (await accepted.json())["run_id"]
+            await _insert_trace_rows(store, run_id, 201)
+            headers = {"Authorization": "Bearer alice-token"}
+
+            first = await client.get(f"/v1/channels/{alice_channel}/runs/{run_id}/trace", headers=headers)
+            first_payload = await first.json()
+            second = await client.get(
+                f"/v1/channels/{alice_channel}/runs/{run_id}/trace",
+                params={"after_seq": str(first_payload["entries"][-1]["seq"])},
+                headers=headers,
+            )
+            second_payload = await second.json()
+
+            assert first.status == 200
+            assert [entry["seq"] for entry in first_payload["entries"]] == list(range(1, 201))
+            assert first_payload["has_more"] is True
+            assert second.status == 200
+            assert [entry["seq"] for entry in second_payload["entries"]] == [201]
+            assert second_payload["has_more"] is False
+            assert second_payload["entries"][0]["summary"] == "summary 201"
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_truncation_marker_row_serves_as_stored(self, tmp_path: Path):
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        submitter = _CommandSubmitter()
+        client = await _open_command_client(store, _Authenticator({"alice-token": alice_id}), submitter)
+        try:
+            accepted = await client.post(
+                f"/v1/channels/{alice_channel}/commands",
+                headers={"Authorization": "Bearer alice-token"},
+                json={"client_message_id": "browser-command-1", "body": "Long task"},
+            )
+            run_id = (await accepted.json())["run_id"]
+            await _insert_trace_rows(store, run_id, 1)
+            await store.connection.execute(
+                "INSERT INTO run_traces (run_id, seq, kind, tool_name, tool_use_id, "
+                "summary, detail, is_diff, is_error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    2,
+                    "truncated",
+                    None,
+                    None,
+                    "trace truncated at 500 steps",
+                    "",
+                    0,
+                    0,
+                    "2026-08-11T14:00:01+00:00",
+                ),
+            )
+            await store.connection.commit()
+
+            response = await client.get(
+                f"/v1/channels/{alice_channel}/runs/{run_id}/trace",
+                headers={"Authorization": "Bearer alice-token"},
+            )
+
+            assert response.status == 200
+            marker = (await response.json())["entries"][1]
+            assert marker == {
+                "seq": 2,
+                "kind": "truncated",
+                "tool_name": None,
+                "tool_use_id": None,
+                "summary": "trace truncated at 500 steps",
+                "detail": "",
+                "is_diff": False,
+                "is_error": False,
+                "created_at": "2026-08-11T14:00:01+00:00",
+            }
+        finally:
+            await client.close()
+            await store.close()
+
+
+class TestWorkshopRunTraceEventStream:
+    async def test_trace_doorbell_carries_no_id_and_advances_by_seq(self, tmp_path: Path):
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        inbound = await record_inbound_message(
+            store,
+            InboundMessage(
+                "telegram",
+                "trace-update-1",
+                "trace-message-1",
+                "101",
+                "101",
+                "Perform one task",
+                _NOW,
+            ),
+        )
+        message_id = inbound.event.envelope.aggregate_id
+        assert isinstance(message_id, MessageId)
+        accepted = await WorkshopRunLifecycle(store).accept(message_id, occurred_at=_NOW + timedelta(seconds=1))
+        run_id = str(accepted.run.run_id)
+        await _insert_trace_rows(store, run_id, 3)
+        client = await _open_client(store, _Authenticator({"alice-token": alice_id}))
+        response = None
+        try:
+            response = await client.get(
+                f"/v1/channels/{alice_channel}/events",
+                headers={"Authorization": "Bearer alice-token"},
+            )
+            event = await _read_sse_event(response)
+            while event["event"] != "run.trace.updated":
+                event = await _read_sse_event(response)
+
+            assert event["id"] is None
+            assert event["data"] == {
+                "version": 1,
+                "channel_id": alice_channel,
+                "run_id": run_id,
+                "seq": 3,
+            }
+
+            await _insert_trace_rows(store, run_id, 1, start=4)
+            event = await _read_sse_event(response)
+            while event["event"] != "run.trace.updated":
+                event = await _read_sse_event(response)
+            assert event["id"] is None
+            assert event["data"]["seq"] == 4
+        finally:
+            if response is not None:
+                response.close()
+            await client.close()
+            await store.close()

@@ -48,6 +48,7 @@ _CLIENT_NAVIGATION_PATH = "/v1/client/navigation"
 _ENROLLMENT_REDEMPTION_PATH = "/v1/client/enrollment/redeem"
 _COMMAND_SUBMISSION_PATH = "/v1/channels/{channel_id}/commands"
 _RUN_STATE_PATH = "/v1/channels/{channel_id}/runs/{run_id}"
+_RUN_TRACE_PATH = "/v1/channels/{channel_id}/runs/{run_id}/trace"
 _RUN_CANCELLATION_PATH = "/v1/channels/{channel_id}/runs/{run_id}/cancel"
 _ALLOWED_TIMELINE_QUERY_PARAMETERS = frozenset({"cursor", "limit"})
 _ALLOWED_EVENT_QUERY_PARAMETERS = frozenset({"after_position"})
@@ -56,6 +57,9 @@ _COMMAND_REQUEST_FIELDS = frozenset({"client_message_id", "body"})
 _DECIMAL_INTEGER = re.compile(r"^[0-9]+$")
 _EVENT_BATCH_SIZE = 100
 _SSE_RETRY_MILLISECONDS = 2000
+# Trace entries served per /trace response; the client pages with
+# after_seq until has_more is false.
+_TRACE_PAGE_SIZE = 200
 
 
 class WorkshopClientAuthenticator(Protocol):
@@ -514,6 +518,44 @@ def _serialize_run_preview_event(preview: RunPreview) -> bytes:
     return (f"event: run.preview.updated\ndata: {payload}\n\n").encode()
 
 
+def _serialize_run_trace_event(run_id: str, channel_id: str, seq: int) -> bytes:
+    """Render one trace doorbell event.
+
+    Deliberately carries no SSE `id:` line, for exactly the reason the
+    preview event omits it: the client's Last-Event-ID resume cursor
+    must remain a durable store position, and a missed doorbell costs
+    nothing because the trace endpoint is the source of truth.
+    """
+    payload = json.dumps(
+        {
+            "version": 1,
+            "channel_id": channel_id,
+            "run_id": run_id,
+            "seq": seq,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return (f"event: run.trace.updated\ndata: {payload}\n\n").encode()
+
+
+async def _latest_channel_trace(store: WorkshopEventStore, channel_id: ChannelId) -> tuple[str, int] | None:
+    """Return (run_id, seq) of the channel's newest trace row.
+
+    Newest by insertion order: only the channel's active run appends
+    rows, so the last inserted row is the one whose seq advances.
+    """
+    async with store.connection.execute(
+        "SELECT run_traces.run_id, run_traces.seq FROM run_traces "
+        "JOIN runs ON runs.id = run_traces.run_id "
+        "WHERE runs.channel_id = ? ORDER BY run_traces.rowid DESC LIMIT 1",
+        (str(channel_id),),
+    ) as cursor:
+        row = await cursor.fetchone()
+    return None if row is None else (str(row[0]), int(row[1]))
+
+
 async def _authorized_update_batch(
     request: web.Request,
     *,
@@ -618,6 +660,10 @@ async def _handle_channel_event_stream(
         # (run_id, sequence) of the preview most recently written to this
         # connection, so an unchanged preview is not re-sent every poll.
         last_preview_sent: tuple[str, int] | None = None
+        # (run_id, seq) of the trace doorbell most recently written, so
+        # the signal fires at most once per poll interval per run and
+        # only when the durable trace actually advanced.
+        last_trace_sent: tuple[str, int] | None = None
         await response.write(f": connected\nretry: {_SSE_RETRY_MILLISECONDS}\n\n".encode())
         while True:
             if run_previews is not None:
@@ -628,6 +674,12 @@ async def _handle_channel_event_stream(
                         await response.write(_serialize_run_preview_event(preview))
                         last_preview_sent = preview_key
                         last_heartbeat = time.monotonic()
+            async with request_lock:
+                trace_key = await _latest_channel_trace(store, channel_id)
+            if trace_key is not None and trace_key != last_trace_sent:
+                await response.write(_serialize_run_trace_event(trace_key[0], str(channel_id), trace_key[1]))
+                last_trace_sent = trace_key
+                last_heartbeat = time.monotonic()
             if batch.events:
                 for event in batch.events:
                     if isinstance(event, ClientTimelineMessageEvent):
@@ -890,6 +942,76 @@ async def _handle_run_state(
     return _json_response({"version": 1, "run": _serialize_run(authorized[2])}, status=200)
 
 
+async def _handle_run_trace(
+    request: web.Request,
+    *,
+    store: WorkshopEventStore,
+    authenticator: WorkshopClientAuthenticator,
+    submitter: WorkshopClientCommandSubmitter,
+    request_lock: asyncio.Lock,
+) -> web.Response:
+    """Serve one page of a run's durable trace rows, as stored.
+
+    Rows are served raw: the kind vocabulary is the table's (tool_call,
+    tool_result, and the synthetic truncated marker), which deliberately
+    never grows the shared TraceEntry emitter type.
+    """
+    if not set(request.query) <= {"after_seq"}:
+        return _error_response(status=400, code="invalid_request", message="Invalid trace request")
+    after_seq = 0
+    raw_after_seq = _single_query_value(request, "after_seq")
+    if raw_after_seq is not None:
+        try:
+            after_seq = int(raw_after_seq)
+        except ValueError:
+            return _error_response(status=400, code="invalid_request", message="Invalid trace request")
+        if after_seq < 0:
+            return _error_response(status=400, code="invalid_request", message="Invalid trace request")
+    authorized = await _authorized_run(
+        request,
+        authenticator=authenticator,
+        submitter=submitter,
+        request_lock=request_lock,
+    )
+    if isinstance(authorized, web.Response):
+        return authorized
+    _, channel_id, run = authorized
+    async with (
+        request_lock,
+        store.connection.execute(
+            "SELECT seq, kind, tool_name, tool_use_id, summary, detail, is_diff, is_error, created_at "
+            "FROM run_traces WHERE run_id = ? AND seq > ? ORDER BY seq LIMIT ?",
+            (run.run_id, after_seq, _TRACE_PAGE_SIZE + 1),
+        ) as cursor,
+    ):
+        rows = list(await cursor.fetchall())
+    has_more = len(rows) > _TRACE_PAGE_SIZE
+    entries = [
+        {
+            "seq": int(row[0]),
+            "kind": str(row[1]),
+            "tool_name": None if row[2] is None else str(row[2]),
+            "tool_use_id": None if row[3] is None else str(row[3]),
+            "summary": str(row[4]),
+            "detail": str(row[5]),
+            "is_diff": bool(row[6]),
+            "is_error": bool(row[7]),
+            "created_at": str(row[8]),
+        }
+        for row in rows[:_TRACE_PAGE_SIZE]
+    ]
+    return _json_response(
+        {
+            "version": 1,
+            "channel_id": str(channel_id),
+            "run_id": str(run.run_id),
+            "entries": entries,
+            "has_more": has_more,
+        },
+        status=200,
+    )
+
+
 async def _handle_run_cancellation(
     request: web.Request,
     *,
@@ -1023,6 +1145,15 @@ def register_workshop_command_routes(
             request_lock=request_lock,
         )
 
+    async def handle_run_trace(request: web.Request) -> web.Response:
+        return await _handle_run_trace(
+            request,
+            store=store,
+            authenticator=authenticator,
+            submitter=submitter,
+            request_lock=request_lock,
+        )
+
     async def handle_run_cancellation(request: web.Request) -> web.Response:
         return await _handle_run_cancellation(
             request,
@@ -1033,4 +1164,5 @@ def register_workshop_command_routes(
 
     app.router.add_post(_COMMAND_SUBMISSION_PATH, handle_command_submission)
     app.router.add_get(_RUN_STATE_PATH, handle_run_state)
+    app.router.add_get(_RUN_TRACE_PATH, handle_run_trace)
     app.router.add_post(_RUN_CANCELLATION_PATH, handle_run_cancellation)
