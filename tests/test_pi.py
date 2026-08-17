@@ -578,3 +578,33 @@ class TestTraceEmission:
             assert secret not in trace.detail
         assert "[redacted]" in call.detail
         assert result.detail == "token was [redacted]"
+
+    @pytest.mark.asyncio
+    async def test_recognized_empty_result_keeps_empty_detail(self, tmp_path, monkeypatch):
+        """A result whose content list is present but carries no text is
+        recognized, not a fallback case: detail stays empty rather than
+        becoming raw event JSON."""
+        backend = make_backend(tmp_path)
+        backend._proc = FakeProcess()
+        backend._session_id = "session-1"
+        backend._fresh_session = False
+        backend._transport = FakeTransport(
+            [
+                {"id": "kai-prompt-1", "type": "response", "command": "prompt", "success": True},
+                {
+                    "type": "tool_execution_end",
+                    "toolCallId": "tool-4",
+                    "toolName": "bash",
+                    "result": {"content": []},
+                    "isError": False,
+                },
+                {"type": "agent_settled"},
+            ]
+        )
+        monkeypatch.setattr(backend, "_ensure_started", AsyncMock())
+
+        events = await collect(backend)
+
+        (result,) = [e.trace for e in events if e.trace is not None]
+        assert result.detail == ""
+        assert result.summary == "bash"
