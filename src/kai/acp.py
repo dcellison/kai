@@ -620,12 +620,19 @@ def _signal_target_user_pid_sync(
 
 # Session-update discriminators that never produce a trace entry: the
 # text lane (surfaced by extract_text_delta), thinking (invisible in
-# every backend lane, mirroring the claude and codex emitters), and the
-# housekeeping shapes with no tool semantics.
+# every backend lane, mirroring the claude and codex emitters), the
+# user's own prompt echo, and the housekeeping shapes with no tool
+# semantics. All are ACP v1 spec vocabulary except usage_update, an
+# observed OpenCode extension. The unknown-vocabulary fallback in
+# _session_update_trace is reserved for shapes outside this known set.
 _UNTRACED_SESSION_UPDATES = (
     "agent_message_chunk",
     "agent_thought_chunk",
+    "user_message_chunk",
+    "plan",
     "available_commands_update",
+    "current_mode_update",
+    "config_options_update",
     "usage_update",
 )
 
@@ -933,11 +940,11 @@ class AcpBackend(AgentBackend):
                     kind="tool_result",
                     tool_use_id=tool_call_id,
                     summary=scrub_trace_text(summary, self._trace_secrets, TRACE_SUMMARY_MAX_CHARS),
-                    detail=scrub_trace_text(
-                        detail or json.dumps(update, ensure_ascii=False),
-                        self._trace_secrets,
-                        TRACE_DETAIL_MAX_CHARS,
-                    ),
+                    # A recognized result with no content blocks keeps an
+                    # empty detail, matching the codex emitter's no-output
+                    # results; the raw-payload fallback is for shapes that
+                    # would otherwise lose information.
+                    detail=scrub_trace_text(detail, self._trace_secrets, TRACE_DETAIL_MAX_CHARS),
                     is_error=status == "failed",
                 )
             if update_type == "tool_call":

@@ -1376,7 +1376,7 @@ class TestTraceEmission:
                         "content": [{"type": "content", "content": {"type": "text", "text": "line one\nline two"}}],
                     }
                 ),
-                _session_update_line({"sessionUpdate": "tool_call_update", "toolCallId": "tc-1", "status": "failed"}),
+                _session_update_line({"sessionUpdate": "tool_call_update", "toolCallId": "tc-9", "status": "failed"}),
                 _completion_result(prompt_id=3),
             ]
         )
@@ -1399,7 +1399,10 @@ class TestTraceEmission:
         assert result.summary == "line one"
         assert result.detail == "line one\nline two"
         assert result.is_error is False
+        assert failed.tool_use_id == "tc-9"
         assert failed.is_error is True
+        assert failed.summary == "(no output)"
+        assert failed.detail == ""
 
     @pytest.mark.asyncio
     async def test_diff_content_sets_is_diff(self):
@@ -1442,6 +1445,8 @@ class TestTraceEmission:
             [
                 _agent_thought_chunk("thinking"),
                 _session_update_line({"sessionUpdate": "usage_update", "tokens": 5}),
+                _session_update_line({"sessionUpdate": "plan", "entries": []}),
+                _session_update_line({"sessionUpdate": "current_mode_update", "currentModeId": "code"}),
                 _session_update_line({"sessionUpdate": "plan_update", "steps": ["a", "b"]}),
                 _completion_result(prompt_id=3),
             ]

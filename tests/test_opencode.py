@@ -1008,6 +1008,8 @@ class TestTraceEmission:
         b._proc = _make_mock_proc(
             [
                 _session_update_line({"sessionUpdate": "usage_update", "tokens": 5}),
+                _session_update_line({"sessionUpdate": "plan", "entries": []}),
+                _session_update_line({"sessionUpdate": "current_mode_update", "currentModeId": "code"}),
                 _session_update_line({"sessionUpdate": "plan_update", "steps": ["a"]}),
                 _completion_result(prompt_id=3),
             ]
