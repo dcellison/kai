@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { RunTraceCard } from "./RunTraceCard";
 import type { WorkshopRunTraceEntry } from "./types";
@@ -162,7 +162,7 @@ describe("RunTraceCard", () => {
     expect(container.querySelector(".trace-detail")?.textContent).toBe(truncated);
   });
 
-  it("omits the copy button when the clipboard API is unavailable", () => {
+  it("copies via the legacy execCommand path when the clipboard API is unavailable", () => {
     // userEvent.setup() installs a clipboard stub on the shared jsdom
     // navigator, so this test forces the property absent and clicks via
     // fireEvent; calling setup() here would put the stub right back.
@@ -171,6 +171,14 @@ describe("RunTraceCard", () => {
       configurable: true,
       value: undefined,
     });
+    // execCommand copies the live selection, so the stub captures what
+    // the scratch textarea holds at call time.
+    let copiedValue: string | null = null;
+    const exec = vi.fn(() => {
+      copiedValue = document.querySelector("textarea")?.value ?? null;
+      return true;
+    });
+    Object.defineProperty(document, "execCommand", { configurable: true, value: exec });
     try {
       render(
         <RunTraceCard
@@ -190,15 +198,20 @@ describe("RunTraceCard", () => {
         />,
       );
       fireEvent.click(screen.getByRole("button", { name: /Bash: ls/ }));
-      // The detail block itself still renders; only the button is gone.
-      expect(document.querySelector(".trace-detail")).not.toBeNull();
-      expect(screen.queryByRole("button", { name: /Copy (call|result) detail/ })).toBeNull();
+      const copyButton = screen.getByRole("button", { name: "Copy call detail" });
+      fireEvent.click(copyButton);
+      expect(exec).toHaveBeenCalledWith("copy");
+      expect(copiedValue).toBe('{\n  "command": "ls"\n}');
+      expect(copyButton).toHaveAccessibleName("Copied");
+      // The scratch textarea is removed once the copy completes.
+      expect(document.querySelector("textarea")).toBeNull();
     } finally {
       if (original) {
         Object.defineProperty(window.navigator, "clipboard", original);
       } else {
         Reflect.deleteProperty(window.navigator, "clipboard");
       }
+      Reflect.deleteProperty(document, "execCommand");
     }
   });
 
