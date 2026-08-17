@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 23
+WORKSHOP_SCHEMA_VERSION = 24
 
 
 @dataclass(frozen=True, slots=True)
@@ -1133,6 +1133,33 @@ _CANONICAL_OPERATIONAL_STATE_SCHEMA = SchemaMigration(
     ),
 )
 
+_RUN_TRACE_SCHEMA = SchemaMigration(
+    version=24,
+    name="durable_run_traces",
+    statements=(
+        """
+        CREATE TABLE run_traces (
+            -- run_id deliberately is not a foreign key, matching
+            -- telegram_streaming_previews: rows are pruned with their
+            -- run row by run pruning, not by cascade, and there is no
+            -- separate TTL. seq is dense per run, assigned at
+            -- persistence time under the write transaction.
+            run_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            tool_name TEXT,
+            tool_use_id TEXT,
+            summary TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            is_diff INTEGER NOT NULL DEFAULT 0,
+            is_error INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (run_id, seq)
+        )
+        """,
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -1157,6 +1184,7 @@ _MIGRATIONS = (
     _CANONICAL_EXECUTION_STATE_SCHEMA,
     _CANONICAL_MEMORY_AUTHORITY_SCHEMA,
     _CANONICAL_OPERATIONAL_STATE_SCHEMA,
+    _RUN_TRACE_SCHEMA,
 )
 
 
