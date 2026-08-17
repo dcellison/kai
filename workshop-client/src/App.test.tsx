@@ -9,6 +9,7 @@ import {
   ChannelAccessError,
   loadNavigation,
   loadRun,
+  loadRunTrace,
   loadTimeline,
   redeemEnrollment,
   streamTimeline,
@@ -28,6 +29,7 @@ vi.mock("./api", async (importOriginal) => {
     loadNavigation: vi.fn(),
     loadTimeline: vi.fn(),
     loadRun: vi.fn(),
+    loadRunTrace: vi.fn(),
     redeemEnrollment: vi.fn(),
     streamTimeline: vi.fn(),
     submitCommand: vi.fn(),
@@ -138,6 +140,7 @@ describe("Workshop React client", () => {
       throughPosition: 25,
     });
     vi.mocked(loadRun).mockResolvedValue(completedRun);
+    vi.mocked(loadRunTrace).mockResolvedValue({ entries: [], hasMore: false });
     vi.mocked(cancelRun).mockResolvedValue({
       ...completedRun,
       status: "cancelled",
@@ -208,6 +211,125 @@ describe("Workshop React client", () => {
 
     expect(await screen.findByText(liveMessage.body)).toBeVisible();
     expect(container.querySelector("img")).toBeNull();
+  });
+
+  it("fetches the run trace incrementally on trace doorbells", async () => {
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    const traceEntry = (seq: number) => ({
+      createdAt: "2026-08-13T09:00:00+00:00",
+      detail: "",
+      isDiff: false,
+      isError: false,
+      kind: "tool_call" as const,
+      seq,
+      summary: `step ${seq}`,
+      toolName: "Bash",
+      toolUseId: `toolu_${seq}`,
+    });
+    vi.mocked(loadRunTrace)
+      .mockResolvedValueOnce({ entries: [traceEntry(1), traceEntry(2)], hasMore: false })
+      .mockResolvedValueOnce({ entries: [traceEntry(3)], hasMore: false });
+    render(<App />);
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+
+    const startedRun: WorkshopRun = {
+      ...completedRun,
+      resultMessageId: null,
+      status: "started",
+      terminalAt: null,
+    };
+    act(() =>
+      handlers?.onRunActivity(
+        {
+          eventPosition: 30,
+          occurredAt: "2026-08-13T09:00:01Z",
+          run: startedRun,
+          transition: "run.started",
+        },
+        "30",
+      ),
+    );
+
+    expect(await screen.findByText("step 2")).toBeVisible();
+
+    act(() => handlers?.onRunTrace({ runId: startedRun.runId, seq: 3 }));
+    expect(await screen.findByText("step 3")).toBeVisible();
+    expect(
+      vi.mocked(loadRunTrace).mock.calls.map((call) => [call[1], call[2]]),
+    ).toEqual([
+      [startedRun.runId, 0],
+      [startedRun.runId, 2],
+    ]);
+
+    // A doorbell at or below the held position fetches nothing more.
+    act(() => handlers?.onRunTrace({ runId: startedRun.runId, seq: 3 }));
+    expect(vi.mocked(loadRunTrace)).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not duplicate rows when a doorbell races the initial drain", async () => {
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    const page = {
+      entries: [
+        {
+          createdAt: "2026-08-13T09:00:00+00:00",
+          detail: "",
+          isDiff: false,
+          isError: false,
+          kind: "tool_call" as const,
+          seq: 1,
+          summary: "step 1",
+          toolName: "Bash",
+          toolUseId: "toolu_1",
+        },
+      ],
+      hasMore: false,
+    };
+    let resolveInitial: ((value: typeof page) => void) | null = null;
+    vi.mocked(loadRunTrace)
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveInitial = resolve;
+          }),
+      )
+      .mockResolvedValueOnce(page);
+    render(<App />);
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+
+    const startedRun: WorkshopRun = {
+      ...completedRun,
+      resultMessageId: null,
+      status: "started",
+      terminalAt: null,
+    };
+    act(() =>
+      handlers?.onRunActivity(
+        {
+          eventPosition: 30,
+          occurredAt: "2026-08-13T09:00:01Z",
+          run: startedRun,
+          transition: "run.started",
+        },
+        "30",
+      ),
+    );
+    await waitFor(() => expect(loadRunTrace).toHaveBeenCalledTimes(1));
+
+    // The stale doorbell every fresh connection receives lands while the
+    // initial drain's fetch is still in flight; both drains resolve with
+    // the same page.
+    act(() => handlers?.onRunTrace({ runId: startedRun.runId, seq: 1 }));
+    await waitFor(() => expect(loadRunTrace).toHaveBeenCalledTimes(2));
+    act(() => resolveInitial?.(page));
+
+    expect(await screen.findByText("step 1")).toBeVisible();
+    expect(screen.getAllByText("step 1")).toHaveLength(1);
   });
 
   it("streams a growing run preview and replaces it with the canonical answer", async () => {

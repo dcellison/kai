@@ -16,6 +16,7 @@ import {
   ChannelAccessError,
   loadNavigation,
   loadRun,
+  loadRunTrace,
   redeemEnrollment,
   submitCommand,
 } from "./api";
@@ -26,12 +27,16 @@ import type {
   WorkshopRun,
   WorkshopRunActivity,
   WorkshopRunPreview,
+  WorkshopRunTracePage,
+  WorkshopRunTraceSignal,
   WorkshopChannelSummary,
   WorkshopNavigation,
   WorkshopSession,
   WorkshopSummary,
 } from "./types";
 import { CHANNEL_PATTERN } from "./types";
+import { RunTraceCard } from "./RunTraceCard";
+import { useRunTrace } from "./useRunTrace";
 import { useWorkshopTimeline } from "./useWorkshopTimeline";
 import { MarkdownMessage } from "./MarkdownMessage";
 
@@ -599,10 +604,12 @@ function WorkshopView({
   navigation,
   runActivity,
   runPreview,
+  runTrace,
   workshop,
   onForget,
   onCancelRun,
   onLoadRun,
+  onLoadRunTrace,
   onSelectChannel,
   onSubmitCommand,
 }: {
@@ -612,10 +619,12 @@ function WorkshopView({
   navigation: WorkshopNavigation;
   runActivity: WorkshopRunActivity | null;
   runPreview: WorkshopRunPreview | null;
+  runTrace: WorkshopRunTraceSignal | null;
   workshop: WorkshopSummary;
   onForget: () => void;
   onCancelRun: (runId: string) => Promise<WorkshopRun>;
   onLoadRun: (runId: string) => Promise<WorkshopRun>;
+  onLoadRunTrace: (runId: string, afterSeq: number) => Promise<WorkshopRunTracePage>;
   onSelectChannel: (channelId: string) => void;
   onSubmitCommand: (
     clientMessageId: string,
@@ -646,6 +655,15 @@ function WorkshopView({
   const latestRunActivityRef = useRef<WorkshopRunActivity | null>(runActivity);
   const humanName = navigation.principal.displayName || "You";
   const humanRole = workshopRoleLabel(workshop.role);
+  // The inspected run: the channel's active run when one exists, else
+  // the most recently settled run (activeRun keeps its terminal value
+  // and is seeded from replayed lifecycle events on mount).
+  const inspectedRunId = activeRun?.runId ?? null;
+  const {
+    entries: traceEntries,
+    failed: traceFailed,
+    loaded: traceLoaded,
+  } = useRunTrace(inspectedRunId, runTrace, onLoadRunTrace);
 
   useEffect(() => {
     storeSidebarLayout(sidebarLayout);
@@ -1304,12 +1322,22 @@ function WorkshopView({
           </p>
         </section>
 
-        <section className="context-section future-section">
+        <section className="context-section trace-section">
           <span className="section-number">04</span>
+          <h3>Run inspector</h3>
+          <RunTraceCard
+            entries={traceEntries}
+            failed={traceFailed}
+            loaded={traceLoaded}
+            runId={inspectedRunId}
+          />
+        </section>
+
+        <section className="context-section future-section">
+          <span className="section-number">05</span>
           <h3>Coming into view</h3>
           <ul>
-            <li>Threads and run inspection</li>
-            <li>Agent activity and approvals</li>
+            <li>Threads</li>
             <li>Projects and shared artifacts</li>
           </ul>
         </section>
@@ -1375,7 +1403,7 @@ function ActiveWorkshopClient({
   onSelectChannel: (channelId: string) => void;
 }): React.JSX.Element {
   const selected = findNavigationChannel(navigation, session.channelId);
-  const { connection, messages, runActivity, runPreview } = useWorkshopTimeline(
+  const { connection, messages, runActivity, runPreview, runTrace } = useWorkshopTimeline(
     session,
     selected !== null,
     onAuthenticationFailure,
@@ -1400,6 +1428,11 @@ function ActiveWorkshopClient({
     (runId: string) => withAccessHandling(() => loadRun(session, runId)),
     [session, withAccessHandling],
   );
+  const loadSelectedRunTrace = useCallback(
+    (runId: string, afterSeq: number) =>
+      withAccessHandling(() => loadRunTrace(session, runId, afterSeq)),
+    [session, withAccessHandling],
+  );
   const cancelSelectedRun = useCallback(
     (runId: string) => withAccessHandling(() => cancelRun(session, runId)),
     [session, withAccessHandling],
@@ -1421,10 +1454,12 @@ function ActiveWorkshopClient({
       navigation={navigation}
       runActivity={runActivity}
       runPreview={runPreview}
+      runTrace={runTrace}
       workshop={selected.workshop}
       onForget={onForget}
       onCancelRun={cancelSelectedRun}
       onLoadRun={loadSelectedRun}
+      onLoadRunTrace={loadSelectedRunTrace}
       onSelectChannel={onSelectChannel}
       onSubmitCommand={submitSelectedCommand}
     />
