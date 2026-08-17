@@ -1414,3 +1414,25 @@ class TestWorkshopRunTraceEventStream:
                 response.close()
             await client.close()
             await store.close()
+
+    async def test_invalid_trace_queries_return_bounded_errors(self, tmp_path: Path):
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        submitter = _CommandSubmitter()
+        client = await _open_command_client(store, _Authenticator({"alice-token": alice_id}), submitter)
+        try:
+            accepted = await client.post(
+                f"/v1/channels/{alice_channel}/commands",
+                headers={"Authorization": "Bearer alice-token"},
+                json={"client_message_id": "browser-command-1", "body": "Long task"},
+            )
+            run_id = (await accepted.json())["run_id"]
+            headers = {"Authorization": "Bearer alice-token"}
+            path = f"/v1/channels/{alice_channel}/runs/{run_id}/trace"
+
+            for query in ("after_seq=abc", "after_seq=-1", "after_seq=+5", "unknown=1", "after_seq=1&after_seq=2"):
+                response = await client.get(f"{path}?{query}", headers=headers)
+                assert response.status == 400, query
+                assert (await response.json())["error"]["code"] == "invalid_request", query
+        finally:
+            await client.close()
+            await store.close()

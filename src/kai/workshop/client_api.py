@@ -541,19 +541,31 @@ def _serialize_run_trace_event(run_id: str, channel_id: str, seq: int) -> bytes:
 
 
 async def _latest_channel_trace(store: WorkshopEventStore, channel_id: ChannelId) -> tuple[str, int] | None:
-    """Return (run_id, seq) of the channel's newest trace row.
+    """Return (run_id, seq) of the channel's newest run's trace tip.
 
-    Newest by insertion order: only the channel's active run appends
-    rows, so the last inserted row is the one whose seq advances.
+    Two indexed lookups (the channel's most recently accepted run, then
+    that run's MAX(seq) via the primary key) rather than a reverse scan
+    of run_traces, whose cost would grow with every other channel's
+    trace history. Only the channel's newest run can be appending; a
+    newer run with no rows yet reports None, which the doorbell dedup
+    treats as nothing to signal.
     """
     async with store.connection.execute(
-        "SELECT run_traces.run_id, run_traces.seq FROM run_traces "
-        "JOIN runs ON runs.id = run_traces.run_id "
-        "WHERE runs.channel_id = ? ORDER BY run_traces.rowid DESC LIMIT 1",
+        "SELECT id FROM runs WHERE channel_id = ? ORDER BY accepted_at DESC, id DESC LIMIT 1",
         (str(channel_id),),
     ) as cursor:
-        row = await cursor.fetchone()
-    return None if row is None else (str(row[0]), int(row[1]))
+        run_row = await cursor.fetchone()
+    if run_row is None:
+        return None
+    run_id = str(run_row[0])
+    async with store.connection.execute(
+        "SELECT MAX(seq) FROM run_traces WHERE run_id = ?",
+        (run_id,),
+    ) as cursor:
+        seq_row = await cursor.fetchone()
+    if seq_row is None or seq_row[0] is None:
+        return None
+    return run_id, int(seq_row[0])
 
 
 async def _authorized_update_batch(
@@ -959,14 +971,14 @@ async def _handle_run_trace(
     if not set(request.query) <= {"after_seq"}:
         return _error_response(status=400, code="invalid_request", message="Invalid trace request")
     after_seq = 0
-    raw_after_seq = _single_query_value(request, "after_seq")
+    try:
+        raw_after_seq = _single_query_value(request, "after_seq")
+    except ValueError:
+        return _error_response(status=400, code="invalid_request", message="Invalid trace request")
     if raw_after_seq is not None:
-        try:
-            after_seq = int(raw_after_seq)
-        except ValueError:
+        if not _DECIMAL_INTEGER.fullmatch(raw_after_seq):
             return _error_response(status=400, code="invalid_request", message="Invalid trace request")
-        if after_seq < 0:
-            return _error_response(status=400, code="invalid_request", message="Invalid trace request")
+        after_seq = int(raw_after_seq)
     authorized = await _authorized_run(
         request,
         authenticator=authenticator,
