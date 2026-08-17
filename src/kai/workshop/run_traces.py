@@ -45,7 +45,7 @@ class WorkshopRunTraceStore:
         trace: TraceEntry,
         *,
         occurred_at: datetime,
-    ) -> None:
+    ) -> bool:
         """Append one trace row for the claim's run.
 
         The claim must still match the run's active fenced attempt; the
@@ -54,6 +54,11 @@ class WorkshopRunTraceStore:
         attempt raises StaleRunExecutionAuthorityError and writes
         nothing. seq is dense per run and assigned here, under the write
         transaction.
+
+        Returns True when the entry was appended; False once the run's
+        cap is reached (the marker row is written on the first overflow,
+        further calls write nothing), so the caller can stop paying a
+        write transaction per event for the rest of the run.
         """
         connection = self._store.connection
         try:
@@ -95,15 +100,18 @@ class WorkshopRunTraceStore:
                         ),
                     )
                 await connection.commit()
-                return
+                return False
             await connection.execute(
                 _INSERT_TRACE,
                 (
                     claim.run_id,
                     next_seq,
                     trace.kind,
-                    trace.tool_name,
-                    trace.tool_use_id,
+                    # Absent optional fields store as NULL, never "";
+                    # one representation keeps readers from having to
+                    # treat the two as synonyms.
+                    trace.tool_name or None,
+                    trace.tool_use_id or None,
                     trace.summary,
                     trace.detail,
                     int(trace.is_diff),
@@ -112,6 +120,7 @@ class WorkshopRunTraceStore:
                 ),
             )
             await connection.commit()
+            return True
         except Exception:
             await connection.rollback()
             raise

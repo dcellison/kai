@@ -164,10 +164,16 @@ class TestRunTracePersistence:
             claim = await _granted_claim(store, authority, inbound_id)
             traces = WorkshopRunTraceStore(store)
             for index in range(1, _TRACE_MAX_ENTRIES + 1):
-                await traces.append(claim, _trace(index), occurred_at=_NOW + timedelta(seconds=3))
+                assert await traces.append(claim, _trace(index), occurred_at=_NOW + timedelta(seconds=3)) is True
 
-            await traces.append(claim, _trace(_TRACE_MAX_ENTRIES + 1), occurred_at=_NOW + timedelta(seconds=4))
-            await traces.append(claim, _trace(_TRACE_MAX_ENTRIES + 2), occurred_at=_NOW + timedelta(seconds=5))
+            overflow = await traces.append(
+                claim, _trace(_TRACE_MAX_ENTRIES + 1), occurred_at=_NOW + timedelta(seconds=4)
+            )
+            after_marker = await traces.append(
+                claim, _trace(_TRACE_MAX_ENTRIES + 2), occurred_at=_NOW + timedelta(seconds=5)
+            )
+            assert overflow is False
+            assert after_marker is False
 
             rows = await _rows(store, claim.run_id)
             assert len(rows) == _TRACE_MAX_ENTRIES + 1

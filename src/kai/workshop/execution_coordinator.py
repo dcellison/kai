@@ -404,17 +404,23 @@ class WorkshopCanonicalExecutionCoordinator:
             context = await assemble_canonical_conversation_context(self._store, prepared.run)
         prepared.stage_canonical_history(context.text)
         response: AgentResponse | None = None
+        traces_truncated = False
         async for event in prepared.stream(prompt):
             if event.done:
                 response = event.response
                 break
-            if event.trace is not None and active.claim is not None:
+            if event.trace is not None and not traces_truncated:
                 # Persisted under the current fenced claim so a
                 # superseded attempt cannot write; staleness raises
                 # and aborts the doomed attempt, the same posture the
-                # lease-renewal task takes.
+                # lease-renewal task takes. Once the run's cap is
+                # reached, later trace events skip the write
+                # transaction entirely.
+                assert active.claim is not None
                 async with self._database_lock:
-                    await self._trace_store.append(active.claim, event.trace, occurred_at=self._now())
+                    appended = await self._trace_store.append(active.claim, event.trace, occurred_at=self._now())
+                if not appended:
+                    traces_truncated = True
             if stream_observer is not None:
                 await stream_observer(event)
         return response
