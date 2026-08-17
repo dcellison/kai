@@ -2598,3 +2598,201 @@ class TestSessionAgeRecycling:
         # _kill fires at least once for the recycle (and again from
         # the streaming loop's EOF handler, which is expected).
         assert mock_kill.await_count >= 1
+
+
+# ── Trace emission ───────────────────────────────────────────────────
+
+
+def _item_notification(method: str, item: dict) -> bytes:
+    """Build an item/started or item/completed notification line."""
+    return _json_line({"jsonrpc": "2.0", "method": method, "params": {"item": item}})
+
+
+class TestTraceEmission:
+    """_send_locked emits TraceEntry-bearing events for non-text items."""
+
+    @pytest.mark.asyncio
+    async def test_command_execution_pairs_call_and_result_by_item_id(self):
+        """item/started yields tool_call and item/completed tool_result,
+        sharing the item id in tool_use_id; failed status maps to
+        is_error; trace events carry empty text and done=False."""
+        c = _make_codex()
+        c._proc = _make_mock_proc(
+            [
+                _item_notification(
+                    "item/started",
+                    {"id": "cmd-1", "type": "commandExecution", "command": "git\ndiff --stat", "status": "inProgress"},
+                ),
+                _item_notification(
+                    "item/completed",
+                    {
+                        "id": "cmd-1",
+                        "type": "commandExecution",
+                        "command": "git\ndiff --stat",
+                        "aggregatedOutput": "output line\nmore output",
+                        "exitCode": 0,
+                        "status": "completed",
+                    },
+                ),
+                _item_notification(
+                    "item/started",
+                    {"id": "cmd-2", "type": "commandExecution", "command": "false", "status": "inProgress"},
+                ),
+                _item_notification(
+                    "item/completed",
+                    {"id": "cmd-2", "type": "commandExecution", "command": "false", "status": "failed"},
+                ),
+                _turn_completed("completed"),
+            ]
+        )
+        c._session_id = "test-session"
+        c._fresh_session = False
+        c._next_id = 3
+
+        events = await _collect_events(c)
+
+        trace_events = [e for e in events if e.trace is not None]
+        for event in trace_events:
+            assert event.text_so_far == ""
+            assert event.done is False
+        call_1, result_1, call_2, result_2 = [e.trace for e in trace_events]
+        assert call_1.kind == "tool_call"
+        assert call_1.summary == "commandExecution: git diff --stat"
+        assert call_1.detail == "git\ndiff --stat"
+        assert call_1.tool_name == "commandExecution"
+        assert result_1.kind == "tool_result"
+        assert result_1.tool_use_id == call_1.tool_use_id == "cmd-1"
+        assert result_1.summary == "output line"
+        assert result_1.detail == "output line\nmore output"
+        assert result_1.is_error is False
+        assert call_2.tool_use_id == result_2.tool_use_id == "cmd-2"
+        assert result_2.summary == "(no output)"
+        assert result_2.is_error is True
+
+    @pytest.mark.asyncio
+    async def test_file_change_diff_content_sets_is_diff(self):
+        """fileChange traces list the changed paths and carry the diffs
+        as detail, with is_diff set on the call."""
+        changes = [
+            {"path": "src/a.py", "kind": "update", "diff": "+new\n-old"},
+            {"path": "src/b.py", "kind": "add", "diff": "+line"},
+        ]
+        c = _make_codex()
+        c._proc = _make_mock_proc(
+            [
+                _item_notification(
+                    "item/started", {"id": "fc-1", "type": "fileChange", "changes": changes, "status": "inProgress"}
+                ),
+                _item_notification(
+                    "item/completed", {"id": "fc-1", "type": "fileChange", "changes": changes, "status": "completed"}
+                ),
+                _turn_completed("completed"),
+            ]
+        )
+        c._session_id = "test-session"
+        c._fresh_session = False
+        c._next_id = 3
+
+        events = await _collect_events(c)
+
+        call, result = [e.trace for e in events if e.trace is not None]
+        assert call.kind == "tool_call"
+        assert call.summary == "fileChange: src/a.py, src/b.py"
+        assert call.is_diff is True
+        assert call.detail == "src/a.py\n+new\n-old\nsrc/b.py\n+line"
+        assert result.kind == "tool_result"
+        assert result.tool_use_id == call.tool_use_id == "fc-1"
+        assert result.is_error is False
+
+    @pytest.mark.asyncio
+    async def test_unknown_item_type_is_traced_not_dropped(self):
+        """New codex vocabulary degrades gracefully to a type-named
+        trace; reasoning items stay invisible."""
+        c = _make_codex()
+        c._proc = _make_mock_proc(
+            [
+                _item_notification("item/started", {"id": "r-1", "type": "reasoning"}),
+                _item_notification("item/started", {"id": "ws-1", "type": "webSearch", "query": "kai bot"}),
+                _item_notification("item/completed", {"id": "ws-1", "type": "webSearch", "query": "kai bot"}),
+                _item_notification("item/completed", {"id": "r-1", "type": "reasoning"}),
+                _turn_completed("completed"),
+            ]
+        )
+        c._session_id = "test-session"
+        c._fresh_session = False
+        c._next_id = 3
+
+        events = await _collect_events(c)
+
+        call, result = [e.trace for e in events if e.trace is not None]
+        assert call.kind == "tool_call"
+        assert call.tool_use_id == "ws-1"
+        assert call.summary == "webSearch"
+        assert call.tool_name == "webSearch"
+        assert "kai bot" in call.detail
+        assert result.kind == "tool_result"
+        assert result.tool_use_id == "ws-1"
+
+    @pytest.mark.asyncio
+    async def test_planted_secret_redacted_in_command_output(self):
+        """A snapshot secret value never appears in trace text."""
+        secret = "planted-secret-value-123"
+        c = _make_codex()
+        c._proc = _make_mock_proc(
+            [
+                _item_notification(
+                    "item/started",
+                    {
+                        "id": "cmd-1",
+                        "type": "commandExecution",
+                        "command": f"curl -H 'X-Auth: {secret}'",
+                        "status": "inProgress",
+                    },
+                ),
+                _item_notification(
+                    "item/completed",
+                    {
+                        "id": "cmd-1",
+                        "type": "commandExecution",
+                        "command": f"curl -H 'X-Auth: {secret}'",
+                        "aggregatedOutput": f"token was {secret}",
+                        "status": "completed",
+                    },
+                ),
+                _turn_completed("completed"),
+            ]
+        )
+        c._session_id = "test-session"
+        c._fresh_session = False
+        c._next_id = 3
+        c._trace_secrets = (secret,)
+
+        events = await _collect_events(c)
+
+        call, result = [e.trace for e in events if e.trace is not None]
+        for trace in (call, result):
+            assert secret not in trace.summary
+            assert secret not in trace.detail
+        assert "[redacted]" in call.summary
+        assert result.summary == "token was [redacted]"
+
+    @pytest.mark.asyncio
+    async def test_malformed_items_are_skipped_without_raising(self):
+        """Items without a usable id yield no trace and never break the
+        stream."""
+        c = _make_codex()
+        c._proc = _make_mock_proc(
+            [
+                _item_notification("item/started", {"type": "commandExecution", "command": "pwd"}),
+                _item_notification("item/completed", {"id": 7, "type": "commandExecution"}),
+                _turn_completed("completed"),
+            ]
+        )
+        c._session_id = "test-session"
+        c._fresh_session = False
+        c._next_id = 3
+
+        events = await _collect_events(c)
+
+        assert [e for e in events if e.trace is not None] == []
+        assert events[-1].done is True

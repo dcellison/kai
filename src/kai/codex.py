@@ -54,10 +54,13 @@ from pathlib import Path
 import kai
 from kai.acp import _signal_target_user_pid, _signal_target_user_pid_sync
 from kai.backend import (
+    TRACE_DETAIL_MAX_CHARS,
+    TRACE_SUMMARY_MAX_CHARS,
     AgentBackend,
     AgentResponse,
     ApiContext,
     StreamEvent,
+    TraceEntry,
     apply_workspace_model,
     assemble_turn_context,
     build_foreign_workspace_reminder,
@@ -65,6 +68,8 @@ from kai.backend import (
     ensure_user_context_files,
     principal_storage_name,
     sanitize_agent_environment,
+    scrub_trace_text,
+    trace_secret_values,
 )
 from kai.backend_registry import BackendRegistryError, backend_registry_is_authoritative, resolve_backend_command
 from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude_user
@@ -107,6 +112,23 @@ def _resolve_default_codex_bin() -> str:
             return candidate
     discovered = shutil.which("codex")
     return discovered or "codex"
+
+
+def _file_change_paths(changes: list) -> str:
+    """One-line comma-joined path list of a fileChange item's changes."""
+    return ", ".join(change.get("path", "") for change in changes if isinstance(change, dict))
+
+
+def _file_change_detail(changes: list) -> str:
+    """
+    Concatenated per-file diffs of a fileChange item.
+
+    Each change's path precedes its diff so the client's line-prefix
+    diff rendering keeps file context in multi-file changes.
+    """
+    return "\n".join(
+        f"{change.get('path', '')}\n{change.get('diff', '')}" for change in changes if isinstance(change, dict)
+    )
 
 
 def _grant_turn_image_read_access(path: Path, reader_user: str) -> None:
@@ -355,6 +377,10 @@ class CodexBackend(AgentBackend):
         self._lock = asyncio.Lock()  # Serializes all message sends
         self._fresh_session: bool = True  # True until the first message is sent
         self._stderr_task: asyncio.Task | None = None  # Background stderr drain
+        # Secret values scrubbed from trace text. Snapshotted from the
+        # fully built subprocess environment at spawn so constructor-only
+        # credentials (the per-principal webhook secret) are covered.
+        self._trace_secrets: tuple[str, ...] = ()
 
         # Cross-user teardown apparatus (#456-equivalent for codex).
         # When effective_codex_user is set in _ensure_started, the
@@ -512,6 +538,8 @@ class CodexBackend(AgentBackend):
             self.provider,
             effective_codex_user or "(same as bot)",
         )
+
+        self._trace_secrets = trace_secret_values(env)
 
         self._proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -1137,6 +1165,15 @@ class CodexBackend(AgentBackend):
                         current_item_phase = phase if phase in ("commentary", "final_answer") else None
                     else:
                         log.debug("Codex: item/started type=%s id=%s", item.get("type"), item.get("id"))
+                        # Non-text items become tool_call traces; unknown
+                        # item types are traced under their type name so
+                        # new codex vocabulary degrades gracefully.
+                        # reasoning stays invisible, mirroring the claude
+                        # emitter's treatment of thinking.
+                        if item.get("type") != "reasoning":
+                            trace = self._item_call_trace(item)
+                            if trace is not None:
+                                yield StreamEvent(text_so_far="", trace=trace)
 
                 elif method == "item/agentMessage/delta":
                     params = msg.get("params", {})
@@ -1176,6 +1213,10 @@ class CodexBackend(AgentBackend):
                             yield StreamEvent(text_so_far=_visible_text())
                     else:
                         log.debug("Codex: item/completed type=%s", item.get("type"))
+                        if item.get("type") != "reasoning":
+                            trace = self._item_result_trace(item)
+                            if trace is not None:
+                                yield StreamEvent(text_so_far="", trace=trace)
 
                 elif method == "turn/completed":
                     turn = msg.get("params", {}).get("turn", {})
@@ -1290,6 +1331,82 @@ class CodexBackend(AgentBackend):
             _unlink_turn_images(turn_image_paths)
 
     # ── Kill / restart / shutdown ──────────────────────────────────
+
+    def _item_call_trace(self, item: dict) -> TraceEntry | None:
+        """
+        Build a tool_call TraceEntry from a non-text item/started item.
+
+        The summary is one line: commandExecution shows its command,
+        fileChange its changed path(s), any other item type its type
+        name with the full item as detail. Returns None with a debug log
+        on a malformed item; trace emission must never break the text
+        stream.
+        """
+        try:
+            item_id = item["id"]
+            item_type = item["type"]
+            if not isinstance(item_id, str) or not isinstance(item_type, str):
+                raise TypeError("unexpected item field type")
+            is_diff = False
+            if item_type == "commandExecution" and isinstance(item.get("command"), str):
+                summary = f"commandExecution: {' '.join(item['command'].split())}"
+                detail = item["command"]
+            elif item_type == "fileChange" and isinstance(item.get("changes"), list):
+                summary = f"fileChange: {_file_change_paths(item['changes'])}"
+                detail = _file_change_detail(item["changes"])
+                is_diff = bool(detail)
+            else:
+                summary = item_type
+                detail = json.dumps(item, ensure_ascii=False)
+            return TraceEntry(
+                kind="tool_call",
+                tool_use_id=item_id,
+                summary=scrub_trace_text(summary, self._trace_secrets, TRACE_SUMMARY_MAX_CHARS),
+                detail=scrub_trace_text(detail, self._trace_secrets, TRACE_DETAIL_MAX_CHARS),
+                tool_name=item_type,
+                is_diff=is_diff,
+            )
+        except Exception:
+            log.debug("Skipping malformed item for tool_call trace", exc_info=True)
+            return None
+
+    def _item_result_trace(self, item: dict) -> TraceEntry | None:
+        """
+        Build a tool_result TraceEntry from a non-text item/completed item.
+
+        tool_use_id carries the item id, the same value the tool_call
+        trace carried, so client call/result pairing works unchanged.
+        is_error reflects the item's terminal status (failed or declined).
+        Returns None with a debug log on a malformed item; trace emission
+        must never break the text stream.
+        """
+        try:
+            item_id = item["id"]
+            item_type = item["type"]
+            if not isinstance(item_id, str) or not isinstance(item_type, str):
+                raise TypeError("unexpected item field type")
+            if item_type == "commandExecution":
+                output = item.get("aggregatedOutput")
+                text = output if isinstance(output, str) else ""
+                stripped = text.strip()
+                summary = stripped.split("\n", 1)[0] if stripped else "(no output)"
+                detail = text
+            elif item_type == "fileChange" and isinstance(item.get("changes"), list):
+                summary = f"fileChange: {_file_change_paths(item['changes'])}"
+                detail = _file_change_detail(item["changes"])
+            else:
+                summary = item_type
+                detail = json.dumps(item, ensure_ascii=False)
+            return TraceEntry(
+                kind="tool_result",
+                tool_use_id=item_id,
+                summary=scrub_trace_text(summary, self._trace_secrets, TRACE_SUMMARY_MAX_CHARS),
+                detail=scrub_trace_text(detail, self._trace_secrets, TRACE_DETAIL_MAX_CHARS),
+                is_error=item.get("status") in ("failed", "declined"),
+            )
+        except Exception:
+            log.debug("Skipping malformed item for tool_result trace", exc_info=True)
+            return None
 
     def _lookup_inner_codex_pids(self) -> list[int]:
         """
