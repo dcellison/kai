@@ -30,16 +30,21 @@ from pathlib import Path
 
 from kai.acp import _signal_target_user_pid, _signal_target_user_pid_sync
 from kai.backend import (
+    TRACE_DETAIL_MAX_CHARS,
+    TRACE_SUMMARY_MAX_CHARS,
     AgentBackend,
     AgentResponse,
     ApiContext,
     StreamEvent,
+    TraceEntry,
     apply_workspace_model,
     assemble_turn_context,
     build_foreign_workspace_reminder,
     build_session_context,
     ensure_user_context_files,
     sanitize_agent_environment,
+    scrub_trace_text,
+    trace_secret_values,
 )
 from kai.backend_registry import BackendRegistryError, backend_registry_is_authoritative, resolve_backend_command
 from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude_user
@@ -194,6 +199,10 @@ class ClaudeCodeBackend(AgentBackend):
         self._fresh_session = True  # True until the first message is sent
         self._stderr_task: asyncio.Task | None = None  # Background stderr drain
         self._session_started_at: float | None = None  # time.monotonic() at process start
+        # Secret values scrubbed from trace text. Snapshotted from the
+        # fully built subprocess environment at spawn so constructor-only
+        # credentials (the per-principal webhook secret) are covered.
+        self._trace_secrets: tuple[str, ...] = ()
 
     @property
     def is_alive(self) -> bool:
@@ -367,6 +376,8 @@ class ClaudeCodeBackend(AgentBackend):
         # /tmp; no cross-user collision is possible there.
         if effective_claude_user:
             env["TMPDIR"] = str(DATA_DIR / "tmp" / effective_claude_user)
+
+        self._trace_secrets = trace_secret_values(env)
 
         self._proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -1007,6 +1018,19 @@ class ClaudeCodeBackend(AgentBackend):
                                     accumulated_text += "\n\n"
                                 accumulated_text += new_text
                                 yield StreamEvent(text_so_far=accumulated_text)
+                            elif block.get("type") == "tool_use":
+                                trace = self._tool_call_trace(block)
+                                if trace is not None:
+                                    yield StreamEvent(text_so_far="", trace=trace)
+
+                elif etype == "user" and "message" in event:
+                    msg_data = event["message"]
+                    if isinstance(msg_data, dict) and isinstance(msg_data.get("content"), list):
+                        for block in msg_data["content"]:
+                            if isinstance(block, dict) and block.get("type") == "tool_result":
+                                trace = self._tool_result_trace(block)
+                                if trace is not None:
+                                    yield StreamEvent(text_so_far="", trace=trace)
 
                 elif etype == "stream_event":
                     inner = event.get("event")
@@ -1040,6 +1064,83 @@ class ClaudeCodeBackend(AgentBackend):
                 done=True,
                 response=AgentResponse(success=False, text=accumulated_text, error=str(e)),
             )
+
+    def _tool_call_trace(self, block: dict) -> TraceEntry | None:
+        """
+        Build a tool_call TraceEntry from an assistant tool_use block.
+
+        The summary is one line: Bash shows its command, Edit/Write the
+        target file path, other tools their name plus a compact list of
+        their input keys, and a tool with no input just its name. Returns
+        None with a debug log on a malformed block; trace emission must
+        never break the text stream.
+        """
+        try:
+            tool_use_id = block["id"]
+            tool_name = block["name"]
+            tool_input = block.get("input", {})
+            if not isinstance(tool_use_id, str) or not isinstance(tool_name, str) or not isinstance(tool_input, dict):
+                raise TypeError("unexpected tool_use field type")
+            summary = tool_name
+            if tool_name == "Bash" and isinstance(tool_input.get("command"), str):
+                summary = f"Bash: {' '.join(tool_input['command'].split())}"
+            elif tool_name in ("Edit", "Write") and isinstance(tool_input.get("file_path"), str):
+                summary = f"{tool_name}: {tool_input['file_path']}"
+            elif tool_input:
+                summary = f"{tool_name}: {', '.join(sorted(tool_input))}"
+            return TraceEntry(
+                kind="tool_call",
+                tool_use_id=tool_use_id,
+                summary=scrub_trace_text(summary, self._trace_secrets, TRACE_SUMMARY_MAX_CHARS),
+                detail=scrub_trace_text(
+                    json.dumps(tool_input, ensure_ascii=False),
+                    self._trace_secrets,
+                    TRACE_DETAIL_MAX_CHARS,
+                ),
+                tool_name=tool_name,
+                # Content-based rather than name-based so any edit-shaped
+                # tool is rendered rich, and the flag keeps the same
+                # meaning across backend emitters.
+                is_diff="old_string" in tool_input and "new_string" in tool_input,
+            )
+        except Exception:
+            log.debug("Skipping malformed tool_use block", exc_info=True)
+            return None
+
+    def _tool_result_trace(self, block: dict) -> TraceEntry | None:
+        """
+        Build a tool_result TraceEntry from a user-message tool_result block.
+
+        The CLI emits result content either as a plain string or as a list
+        of typed blocks, of which only text blocks carry human-readable
+        output. Returns None with a debug log on a malformed block; trace
+        emission must never break the text stream.
+        """
+        try:
+            tool_use_id = block["tool_use_id"]
+            if not isinstance(tool_use_id, str):
+                raise TypeError("unexpected tool_use_id type")
+            content = block.get("content", "")
+            if isinstance(content, list):
+                text = "\n".join(
+                    part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text"
+                )
+            elif isinstance(content, str):
+                text = content
+            else:
+                text = ""
+            stripped = text.strip()
+            summary = stripped.split("\n", 1)[0] if stripped else "(no output)"
+            return TraceEntry(
+                kind="tool_result",
+                tool_use_id=tool_use_id,
+                summary=scrub_trace_text(summary, self._trace_secrets, TRACE_SUMMARY_MAX_CHARS),
+                detail=scrub_trace_text(text, self._trace_secrets, TRACE_DETAIL_MAX_CHARS),
+                is_error=bool(block.get("is_error", False)),
+            )
+        except Exception:
+            log.debug("Skipping malformed tool_result block", exc_info=True)
+            return None
 
     def force_kill(self) -> None:
         """
