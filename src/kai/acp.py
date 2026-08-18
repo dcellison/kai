@@ -1065,21 +1065,30 @@ class AcpBackend(AgentBackend):
         """
         return None
 
-    async def _send_server_response(self, request_id: int, result: dict) -> None:
+    async def _send_server_response(
+        self,
+        proc: asyncio.subprocess.Process,
+        request_id: int,
+        result: dict,
+    ) -> None:
         """
         Write a JSON-RPC response back to the subprocess for a
         server-initiated request.
 
         Distinct from `_write_rpc` (which sends a new request and
         consumes a fresh `_next_id`); this writes a response using the
-        id the SERVER sent us. Helper kept out of the read loop so the
-        ordering and error handling stay clear.
+        id the SERVER sent us. Takes the caller's process reference
+        rather than re-reading self._proc: a teardown that nulls the
+        attribute mid-turn then surfaces as an OSError from the dead
+        pipe, which the calling branch handles, instead of an assert
+        failure here. Helper kept out of the read loop so the ordering
+        and error handling stay clear.
         """
-        assert self._proc is not None and self._proc.stdin is not None
+        assert proc.stdin is not None
         payload = {"jsonrpc": "2.0", "id": request_id, "result": result}
         line = (json.dumps(payload) + "\n").encode()
-        self._proc.stdin.write(line)
-        await self._proc.stdin.drain()
+        proc.stdin.write(line)
+        await proc.stdin.drain()
 
     # ── Lifecycle properties ──────────────────────────────────────────
 
@@ -1651,7 +1660,7 @@ class AcpBackend(AgentBackend):
                     result = self.handle_server_request(msg)
                     if result is not None:
                         try:
-                            await self._send_server_response(server_id, result)
+                            await self._send_server_response(proc, server_id, result)
                         except OSError as e:
                             log.error(
                                 "Failed to write server-request response to %s: %s",
@@ -1676,7 +1685,7 @@ class AcpBackend(AgentBackend):
                     # subprocess persists across turns). See
                     # drain_late_text for the mechanism.
                     accumulated = await drain_late_text(
-                        proc=self._proc,
+                        proc=proc,
                         accumulated=accumulated,
                         extract_delta=self.extract_text_delta,
                         combine=self.combine_text_chunks,

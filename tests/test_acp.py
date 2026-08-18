@@ -608,6 +608,87 @@ class TestSendStream:
         assert events[-1].response.success is True
 
     @pytest.mark.asyncio
+    async def test_shutdown_mid_stream_still_reports_a_completed_turn(self):
+        """
+        The killed process's buffer can hold the turn's own completion
+        response. The completion branch's late-text drain must read
+        through the local reference, so a turn that genuinely finished
+        as the teardown landed reports success instead of failing on a
+        nulled self._proc.
+        """
+        b = _make_fake()
+        proc = _make_mock_proc([])
+        release = asyncio.Event()
+        lines = [_completion_result(prompt_id=3)]
+
+        async def readline() -> bytes:
+            await release.wait()
+            return lines.pop(0) if lines else b""
+
+        proc.stdout.readline = readline
+        b._proc = proc
+        b._session_id = "sess-1"
+        b._fresh_session = False
+        b._next_id = 3
+
+        task = asyncio.create_task(_collect_events(b, prompt="hi"))
+        await asyncio.sleep(0.01)
+        await b.shutdown()
+        release.set()
+        events = await task
+
+        assert events[-1].done is True
+        assert events[-1].response.success is True
+
+    @pytest.mark.asyncio
+    async def test_shutdown_mid_stream_survives_a_buffered_server_request(self):
+        """
+        The killed process's buffer can hold a server-initiated request
+        (an OpenCode permission ask). The response write must go through
+        the local reference: against a dead pipe it surfaces as the
+        OSError the branch already handles, never an assert failure on
+        a nulled self._proc, and the loop continues to the completion.
+        """
+
+        class _AutoApprove(_FakeAcp):
+            def handle_server_request(self, msg):
+                if msg.get("method") == "session/request_permission":
+                    return {"outcome": {"outcome": "selected", "optionId": "always"}}
+                return None
+
+        b = _AutoApprove(model="x", workspace=Path("/tmp/ws"))
+        proc = _make_mock_proc([])
+        release = asyncio.Event()
+        server_request = _json_line(
+            {
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "session/request_permission",
+                "params": {},
+            }
+        )
+        lines = [server_request, _completion_result(prompt_id=3)]
+
+        async def readline() -> bytes:
+            await release.wait()
+            return lines.pop(0) if lines else b""
+
+        proc.stdout.readline = readline
+        b._proc = proc
+        b._session_id = "sess-1"
+        b._fresh_session = False
+        b._next_id = 3
+
+        task = asyncio.create_task(_collect_events(b, prompt="hi"))
+        await asyncio.sleep(0.01)
+        await b.shutdown()
+        release.set()
+        events = await task
+
+        assert events[-1].done is True
+        assert events[-1].response.success is True
+
+    @pytest.mark.asyncio
     async def test_turn_deadline_ends_a_turn_that_keeps_trickling_output(self):
         """
         The idle guard resets on any output, so a turn that trickles
