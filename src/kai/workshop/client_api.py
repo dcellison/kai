@@ -50,7 +50,7 @@ _COMMAND_SUBMISSION_PATH = "/v1/channels/{channel_id}/commands"
 _RUN_STATE_PATH = "/v1/channels/{channel_id}/runs/{run_id}"
 _RUN_TRACE_PATH = "/v1/channels/{channel_id}/runs/{run_id}/trace"
 _RUN_CANCELLATION_PATH = "/v1/channels/{channel_id}/runs/{run_id}/cancel"
-_ALLOWED_TIMELINE_QUERY_PARAMETERS = frozenset({"cursor", "limit"})
+_ALLOWED_TIMELINE_QUERY_PARAMETERS = frozenset({"cursor", "limit", "tail"})
 _ALLOWED_EVENT_QUERY_PARAMETERS = frozenset({"after_position"})
 _ENROLLMENT_REQUEST_FIELDS = frozenset({"enrollment_token", "device_display_name"})
 _COMMAND_REQUEST_FIELDS = frozenset({"client_message_id", "body"})
@@ -205,7 +205,7 @@ def _single_query_value(request: web.Request, name: str) -> str | None:
     return values[0] if values else None
 
 
-def _parse_timeline_request(request: web.Request) -> tuple[ChannelId, str | None, int]:
+def _parse_timeline_request(request: web.Request) -> tuple[ChannelId, str | None, int, bool]:
     if not set(request.query).issubset(_ALLOWED_TIMELINE_QUERY_PARAMETERS):
         raise ValueError("Unsupported query parameter")
 
@@ -218,7 +218,18 @@ def _parse_timeline_request(request: web.Request) -> tuple[ChannelId, str | None
         raise ValueError("Invalid limit")
     else:
         limit = int(limit_value)
-    return channel_id, cursor, limit
+    tail_value = _single_query_value(request, "tail")
+    if tail_value is None:
+        tail = False
+    elif tail_value != "1":
+        raise ValueError("Invalid tail flag")
+    else:
+        tail = True
+    # A cursor already encodes its direction; combining the two would make
+    # the request ambiguous, so it is rejected rather than resolved.
+    if tail and cursor is not None:
+        raise ValueError("tail requests must not carry a cursor")
+    return channel_id, cursor, limit, tail
 
 
 def _parse_event_stream_request(request: web.Request) -> tuple[ChannelId, int | None]:
@@ -435,7 +446,7 @@ async def _handle_channel_timeline(
         return response
 
     try:
-        channel_id, cursor, limit = _parse_timeline_request(request)
+        channel_id, cursor, limit, tail = _parse_timeline_request(request)
         page = await read_channel_timeline(
             store,
             principal_id=principal_id,
@@ -443,6 +454,7 @@ async def _handle_channel_timeline(
             authorizer=CanonicalChannelAuthorizer(store),
             cursor=cursor,
             limit=limit,
+            tail=tail,
         )
     except TimelineAccessDeniedError:
         return _error_response(status=403, code="access_denied", message="Access denied")
@@ -459,6 +471,7 @@ async def _handle_channel_timeline(
             "channel_id": str(channel_id),
             "messages": [_serialize_message(message) for message in page.messages],
             "next_cursor": page.next_cursor,
+            "previous_cursor": page.previous_cursor,
             "through_position": page.through_position,
         },
         status=200,

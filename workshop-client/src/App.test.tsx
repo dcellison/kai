@@ -7,6 +7,7 @@ import {
   AuthenticationError,
   cancelRun,
   ChannelAccessError,
+  loadEarlierTimeline,
   loadNavigation,
   loadRun,
   loadRunTrace,
@@ -17,6 +18,7 @@ import {
 } from "./api";
 import type {
   TimelineMessage,
+  TimelineSnapshot,
   WorkshopNavigation,
   WorkshopRun,
 } from "./types";
@@ -26,6 +28,7 @@ vi.mock("./api", async (importOriginal) => {
   return {
     ...original,
     cancelRun: vi.fn(),
+    loadEarlierTimeline: vi.fn(),
     loadNavigation: vi.fn(),
     loadTimeline: vi.fn(),
     loadRun: vi.fn(),
@@ -138,6 +141,7 @@ describe("Workshop React client", () => {
     vi.mocked(loadTimeline).mockResolvedValue({
       messages: [historyMessage],
       throughPosition: 25,
+      previousCursor: null,
     });
     vi.mocked(loadRun).mockResolvedValue(completedRun);
     vi.mocked(loadRunTrace).mockResolvedValue({ entries: [], hasMore: false });
@@ -381,6 +385,73 @@ describe("Workshop React client", () => {
     expect(screen.queryByText("First sentence. Second sentence.")).toBeNull();
   });
 
+  it("loads earlier history on demand and preserves the reader's position", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    vi.mocked(loadTimeline).mockResolvedValue({
+      messages: [historyMessage],
+      throughPosition: 25,
+      previousCursor: "earlier-page",
+    });
+    let resolveEarlier: ((value: TimelineSnapshot) => void) | null = null;
+    vi.mocked(loadEarlierTimeline).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveEarlier = resolve;
+        }),
+    );
+    render(<App />);
+
+    const timeline = await screen.findByLabelText("Conversation timeline");
+    let scrollHeight = 1000;
+    Object.defineProperties(timeline, {
+      clientHeight: { configurable: true, get: () => 300 },
+      scrollHeight: { configurable: true, get: () => scrollHeight },
+      scrollTop: { configurable: true, value: 0, writable: true },
+    });
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+
+    // The reader has scrolled near the top, where the control lives.
+    timeline.scrollTop = 40;
+    fireEvent.scroll(timeline);
+    await user.click(screen.getByRole("button", { name: "Load earlier messages" }));
+    expect(vi.mocked(loadEarlierTimeline)).toHaveBeenCalledWith(
+      { channelId, token: "existing-session" },
+      "earlier-page",
+      25,
+      expect.anything(),
+    );
+
+    // The prepended page grows the content above the viewport by 600px;
+    // the viewport must shift by exactly that amount to stay put.
+    scrollHeight = 1600;
+    const earlierMessage: TimelineMessage = {
+      ...historyMessage,
+      body: "Older history.",
+      eventPosition: 5,
+      messageId: "msg_00000000000000000000000000000005",
+    };
+    act(() => {
+      resolveEarlier?.({
+        messages: [earlierMessage],
+        throughPosition: 25,
+        previousCursor: null,
+      });
+    });
+
+    expect(await screen.findByText("Older history.")).toBeVisible();
+    const bodies = screen.getAllByRole("listitem").map((item) => item.textContent ?? "");
+    expect(bodies.findIndex((text) => text.includes("Older history."))).toBeLessThan(
+      bodies.findIndex((text) => text.includes("Canonical history is ready.")),
+    );
+    await waitFor(() => expect(timeline.scrollTop).toBe(640));
+    // The final page reached the start of the channel; the control goes away.
+    expect(screen.queryByRole("button", { name: "Load earlier messages" })).toBeNull();
+  });
+
   it("opens at the latest message and preserves deliberate scroll position", async () => {
     const user = userEvent.setup();
     sessionStorage.setItem(
@@ -390,6 +461,7 @@ describe("Workshop React client", () => {
     let resolveTimeline: ((value: {
       messages: TimelineMessage[];
       throughPosition: number;
+      previousCursor: string | null;
     }) => void) | null = null;
     vi.mocked(loadTimeline).mockImplementationOnce(
       () =>
@@ -408,7 +480,7 @@ describe("Workshop React client", () => {
     });
     await waitFor(() => expect(resolveTimeline).not.toBeNull());
     act(() => {
-      resolveTimeline?.({ messages: [historyMessage], throughPosition: 25 });
+      resolveTimeline?.({ messages: [historyMessage], throughPosition: 25, previousCursor: null });
     });
 
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
@@ -545,6 +617,7 @@ describe("Workshop React client", () => {
         },
       ],
       throughPosition: 25,
+      previousCursor: null,
     }));
     render(<App />);
 
@@ -586,6 +659,7 @@ describe("Workshop React client", () => {
         },
       ],
       throughPosition: 25,
+      previousCursor: null,
     }));
     render(<App />);
 

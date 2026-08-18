@@ -55,11 +55,17 @@ class TimelineMessage:
 
 @dataclass(frozen=True, slots=True)
 class TimelinePage:
-    """A stable page from a bounded snapshot of one channel timeline."""
+    """A stable page from a bounded snapshot of one channel timeline.
+
+    Exactly one pagination direction is populated: forward pages carry
+    next_cursor, tail-first pages carry previous_cursor. Both are None on
+    a page that exhausted its direction.
+    """
 
     messages: tuple[TimelineMessage, ...]
     next_cursor: str | None
     through_position: int
+    previous_cursor: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,21 +83,47 @@ class _CursorState:
     through_position: int
 
 
+@dataclass(frozen=True, slots=True)
+class _TailCursorState:
+    channel_id: ChannelId
+    before_position: int
+    through_position: int
+
+
+def _encode_payload(payload: dict[str, object]) -> str:
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+    return f"{_CURSOR_PREFIX}{encoded}"
+
+
 def _encode_cursor(state: _CursorState) -> str:
-    payload = json.dumps(
+    return _encode_payload(
         {
             "after_position": state.after_position,
             "channel_id": state.channel_id,
             "through_position": state.through_position,
-        },
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    encoded = base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
-    return f"{_CURSOR_PREFIX}{encoded}"
+        }
+    )
 
 
-def _decode_cursor(cursor: str) -> _CursorState:
+def _encode_tail_cursor(state: _TailCursorState) -> str:
+    return _encode_payload(
+        {
+            "before_position": state.before_position,
+            "channel_id": state.channel_id,
+            "through_position": state.through_position,
+        }
+    )
+
+
+def _cursor_position(payload: dict[str, object], key: str) -> int:
+    value = payload[key]
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TimelineCursorError("Invalid timeline cursor")
+    return value
+
+
+def _decode_cursor(cursor: str) -> _CursorState | _TailCursorState:
     if not isinstance(cursor, str) or not cursor.startswith(_CURSOR_PREFIX) or len(cursor) > _MAX_CURSOR_LENGTH:
         raise TimelineCursorError("Invalid timeline cursor")
     encoded = cursor.removeprefix(_CURSOR_PREFIX)
@@ -103,29 +135,33 @@ def _decode_cursor(cursor: str) -> _CursorState:
         payload = json.loads(raw.decode("utf-8"))
     except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise TimelineCursorError("Invalid timeline cursor") from exc
-    if not isinstance(payload, dict) or set(payload) != {
-        "after_position",
-        "channel_id",
-        "through_position",
-    }:
+    # The key set is the direction marker: forward cursors carry
+    # after_position, tail cursors before_position. Anything else fails
+    # closed as malformed.
+    if not isinstance(payload, dict):
         raise TimelineCursorError("Invalid timeline cursor")
-    after_position = payload["after_position"]
-    through_position = payload["through_position"]
-    if (
-        not isinstance(after_position, int)
-        or isinstance(after_position, bool)
-        or not isinstance(through_position, int)
-        or isinstance(through_position, bool)
-        or after_position < 0
-        or through_position < after_position
-        or through_position > _MAX_SQLITE_INTEGER
-    ):
+    keys = set(payload)
+    if keys == {"after_position", "channel_id", "through_position"}:
+        boundary_key = "after_position"
+    elif keys == {"before_position", "channel_id", "through_position"}:
+        boundary_key = "before_position"
+    else:
+        raise TimelineCursorError("Invalid timeline cursor")
+    boundary = _cursor_position(payload, boundary_key)
+    through_position = _cursor_position(payload, "through_position")
+    if boundary < 0 or through_position < boundary or through_position > _MAX_SQLITE_INTEGER:
         raise TimelineCursorError("Invalid timeline cursor")
     try:
         channel_id = ChannelId(payload["channel_id"])
     except (TypeError, ValueError) as exc:
         raise TimelineCursorError("Invalid timeline cursor") from exc
-    return _CursorState(channel_id, after_position, through_position)
+    if boundary_key == "after_position":
+        return _CursorState(channel_id, boundary, through_position)
+    # A tail cursor's boundary is the position of a message already
+    # returned, so zero can never be legitimate: positions start at one.
+    if boundary == 0:
+        raise TimelineCursorError("Invalid timeline cursor")
+    return _TailCursorState(channel_id, boundary, through_position)
 
 
 def _parse_timestamp(value: str) -> datetime:
@@ -192,29 +228,12 @@ def _messages_from_rows(rows: list[aiosqlite.Row]) -> tuple[TimelineMessage, ...
     )
 
 
-async def read_channel_timeline(
+async def _read_forward_page(
     store: WorkshopEventStore,
-    *,
-    principal_id: PrincipalId,
     channel_id: ChannelId,
-    authorizer: ChannelTimelineAuthorizer,
-    cursor: str | None = None,
-    limit: int = 50,
+    state: _CursorState,
+    limit: int,
 ) -> TimelinePage:
-    """Read an authorized, stable snapshot page from one canonical channel."""
-    _validate_request(principal_id, channel_id, limit)
-    await _authorize(authorizer, principal_id, channel_id)
-
-    if not await _channel_exists(store, channel_id):
-        raise TimelineAccessDeniedError("Timeline access denied")
-
-    if cursor is None:
-        state = _CursorState(channel_id, 0, await _latest_message_position(store, channel_id))
-    else:
-        state = _decode_cursor(cursor)
-        if state.channel_id != channel_id:
-            raise TimelineCursorError("Timeline cursor belongs to another channel")
-
     async with store.connection.execute(
         "SELECT m.id, m.channel_id, m.author_principal_id, p.kind, p.display_name, "
         "m.reply_to_message_id, m.body, m.created_event_position, m.created_at "
@@ -238,6 +257,90 @@ async def read_channel_timeline(
             )
         )
     return TimelinePage(messages, next_cursor, state.through_position)
+
+
+async def _read_tail_page(
+    store: WorkshopEventStore,
+    channel_id: ChannelId,
+    state: _TailCursorState,
+    limit: int,
+) -> TimelinePage:
+    # The strict upper bound alone keeps the page inside the snapshot:
+    # decoded cursors guarantee before_position <= through_position, and
+    # the synthetic initial state uses through_position + 1 so the bound
+    # itself is included. Rows come back newest-first to take the page
+    # nearest the boundary, then flip to ascending so every page reads
+    # in event order.
+    async with store.connection.execute(
+        "SELECT m.id, m.channel_id, m.author_principal_id, p.kind, p.display_name, "
+        "m.reply_to_message_id, m.body, m.created_event_position, m.created_at "
+        "FROM messages m JOIN principals p ON p.id = m.author_principal_id "
+        "WHERE m.channel_id = ? AND m.created_event_position < ? "
+        "ORDER BY m.created_event_position DESC LIMIT ?",
+        (channel_id, state.before_position, limit + 1),
+    ) as query_cursor:
+        rows = list(await query_cursor.fetchall())
+
+    has_more = len(rows) > limit
+    page_rows = list(reversed(rows[:limit]))
+    messages = _messages_from_rows(page_rows)
+    previous_cursor = None
+    if has_more:
+        previous_cursor = _encode_tail_cursor(
+            _TailCursorState(
+                channel_id=channel_id,
+                before_position=messages[0].event_position,
+                through_position=state.through_position,
+            )
+        )
+    return TimelinePage(messages, None, state.through_position, previous_cursor)
+
+
+async def read_channel_timeline(
+    store: WorkshopEventStore,
+    *,
+    principal_id: PrincipalId,
+    channel_id: ChannelId,
+    authorizer: ChannelTimelineAuthorizer,
+    cursor: str | None = None,
+    limit: int = 50,
+    tail: bool = False,
+) -> TimelinePage:
+    """Read an authorized, stable snapshot page from one canonical channel.
+
+    Without a cursor, ``tail=False`` starts a forward walk from the start
+    of the snapshot and ``tail=True`` returns the newest page, whose
+    previous_cursor walks earlier history under the same snapshot bound.
+    A cursor carries its own direction, so ``tail`` must stay False when
+    one is supplied.
+    """
+    _validate_request(principal_id, channel_id, limit)
+    if tail and cursor is not None:
+        raise ValueError("tail requests must not carry a cursor")
+    await _authorize(authorizer, principal_id, channel_id)
+
+    if not await _channel_exists(store, channel_id):
+        raise TimelineAccessDeniedError("Timeline access denied")
+
+    if cursor is not None:
+        state = _decode_cursor(cursor)
+        if state.channel_id != channel_id:
+            raise TimelineCursorError("Timeline cursor belongs to another channel")
+        if isinstance(state, _TailCursorState):
+            return await _read_tail_page(store, channel_id, state, limit)
+        return await _read_forward_page(store, channel_id, state, limit)
+
+    through_position = await _latest_message_position(store, channel_id)
+    if tail:
+        # The initial tail page has no boundary message yet; one past the
+        # snapshot bound makes the strict inequality include the bound.
+        return await _read_tail_page(
+            store,
+            channel_id,
+            _TailCursorState(channel_id, through_position + 1, through_position),
+            limit,
+        )
+    return await _read_forward_page(store, channel_id, _CursorState(channel_id, 0, through_position), limit)
 
 
 async def read_channel_timeline_updates(

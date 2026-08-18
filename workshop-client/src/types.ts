@@ -59,6 +59,9 @@ export interface TimelineMessage {
 export interface TimelineSnapshot {
   messages: TimelineMessage[];
   throughPosition: number;
+  // Walks history older than this page; null when the page reaches the
+  // start of the channel.
+  previousCursor: string | null;
 }
 
 export interface CommandSubmissionResult {

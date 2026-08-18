@@ -1046,6 +1046,36 @@ button:disabled {
   text-align: center;
 }
 
+.timeline-earlier {
+  padding: 0.5rem 1.25rem 0;
+  text-align: center;
+}
+
+.timeline-earlier-button {
+  border: 1px solid var(--line-strong);
+  border-radius: 0.4rem;
+  padding: 0.25rem 0.8rem;
+  background: var(--atom-bg-deep);
+  color: var(--atom-muted);
+  font-size: 0.72rem;
+  cursor: pointer;
+}
+
+.timeline-earlier-button:hover:enabled {
+  color: var(--atom-foreground);
+}
+
+.timeline-earlier-button:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.timeline-earlier-error {
+  margin: 0.4rem 0 0;
+  color: var(--atom-red);
+  font-size: 0.72rem;
+}
+
 .composer-preview {
   padding: 0.85rem 1.25rem 1rem;
   border-top: 1px solid var(--line);

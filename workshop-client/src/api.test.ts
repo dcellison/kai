@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   EventStreamDecoder,
   cancelRun,
+  loadEarlierTimeline,
   loadNavigation,
   loadRun,
   loadTimeline,
@@ -67,40 +68,78 @@ describe("Workshop client API", () => {
     });
   });
 
-  it("loads every page from one stable canonical snapshot", async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        Response.json({
-          version: 1,
-          channel_id: channelId,
-          messages: [message(10)],
-          next_cursor: "next-page",
-          through_position: 20,
-        }),
-      )
-      .mockResolvedValueOnce(
-        Response.json({
-          version: 1,
-          channel_id: channelId,
-          messages: [message(20)],
-          next_cursor: null,
-          through_position: 20,
-        }),
-      );
+  it("loads only the newest window with a single tail request", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      Response.json({
+        version: 1,
+        channel_id: channelId,
+        messages: [message(10), message(20)],
+        next_cursor: null,
+        previous_cursor: "earlier-page",
+        through_position: 20,
+      }),
+    );
     vi.stubGlobal("fetch", fetchMock);
 
     const snapshot = await loadTimeline(session, new AbortController().signal);
 
     expect(snapshot.throughPosition).toBe(20);
+    expect(snapshot.previousCursor).toBe("earlier-page");
     expect(snapshot.messages.map((item) => item.eventPosition)).toEqual([10, 20]);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    const firstRequest = fetchMock.mock.calls[0] as [string, RequestInit];
-    const secondRequest = fetchMock.mock.calls[1] as [string, RequestInit];
-    expect(new Headers(firstRequest[1].headers).get("Authorization")).toBe(
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [path, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(path).toContain("tail=1");
+    expect(path).toContain("limit=100");
+    expect(new Headers(options.headers).get("Authorization")).toBe(
       "Bearer session-secret",
     );
-    expect(secondRequest[0]).toContain("cursor=next-page");
+  });
+
+  it("loads an earlier page from the same snapshot via its cursor", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      Response.json({
+        version: 1,
+        channel_id: channelId,
+        messages: [message(5)],
+        next_cursor: null,
+        previous_cursor: null,
+        through_position: 20,
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const page = await loadEarlierTimeline(
+      session,
+      "earlier-page",
+      20,
+      new AbortController().signal,
+    );
+
+    expect(page.messages.map((item) => item.eventPosition)).toEqual([5]);
+    expect(page.previousCursor).toBeNull();
+    const [path] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(path).toContain("cursor=earlier-page");
+    expect(path).not.toContain("tail=");
+  });
+
+  it("rejects an earlier page whose snapshot bound does not match", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json({
+          version: 1,
+          channel_id: channelId,
+          messages: [message(5)],
+          next_cursor: null,
+          previous_cursor: null,
+          through_position: 21,
+        }),
+      ),
+    );
+
+    await expect(
+      loadEarlierTimeline(session, "earlier-page", 20, new AbortController().signal),
+    ).rejects.toThrow("The timeline snapshot changed while it was loading.");
   });
 
   it("loads authority-backed Workshop and channel navigation", async () => {
