@@ -199,6 +199,15 @@ class PiBackend(AgentBackend):
         self._fresh_session = True
         self._stderr_task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
+        # Serializes _kill (shutdown delegates to it). Teardown paths
+        # await between reading process state and using it; two
+        # teardowns interleaving across those awaits would let the
+        # second read attributes the first already nulled. Always
+        # acquired after _lock when both are held, never before it.
+        # The sync force_kill stays outside this gate: it cannot be
+        # interleaved mid-function, and nothing it nulls is re-read
+        # unguarded by a gated body afterwards.
+        self._teardown_lock = asyncio.Lock()
         # Secret values scrubbed from trace text. Snapshotted from the
         # fully built subprocess environment at spawn so constructor-only
         # credentials (the per-principal webhook secret) are covered.
@@ -627,27 +636,28 @@ class PiBackend(AgentBackend):
             self._stderr_task = None
 
     async def _kill(self) -> None:
-        if self._proc is not None:
-            if self._effective_os_user is not None and self._pgid is not None:
-                await _kill_target_user_tree(
-                    target_user=self._effective_os_user,
-                    pgid=self._pgid,
-                    purpose="chat",
-                    backend=self.backend_name,
-                )
-                self._pgid = None
-            self.force_kill()
-            try:
-                await asyncio.wait_for(self._proc.wait(), timeout=5)
-            except TimeoutError:
-                pass
-        self._proc = None
-        self._transport = None
-        self._session_id = None
-        self._effective_os_user = None
-        self._pgid = None
-        self._session_started_at = None
-        self._supports_image_input = False
+        async with self._teardown_lock:
+            if self._proc is not None:
+                if self._effective_os_user is not None and self._pgid is not None:
+                    await _kill_target_user_tree(
+                        target_user=self._effective_os_user,
+                        pgid=self._pgid,
+                        purpose="chat",
+                        backend=self.backend_name,
+                    )
+                    self._pgid = None
+                self.force_kill()
+                try:
+                    await asyncio.wait_for(self._proc.wait(), timeout=5)
+                except TimeoutError:
+                    pass
+            self._proc = None
+            self._transport = None
+            self._session_id = None
+            self._effective_os_user = None
+            self._pgid = None
+            self._session_started_at = None
+            self._supports_image_input = False
 
     async def restart(self) -> None:
         await self._kill()

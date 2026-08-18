@@ -2321,6 +2321,58 @@ class TestCodexCrossUserTeardown:
         # The wrapper reap also uses the snapshot, not the nulled attribute.
         mock_killpg.assert_called_once_with(12345, signal.SIGKILL)
 
+    @staticmethod
+    def _teardown_race_backend() -> CodexBackend:
+        """Cross-user backend primed so a teardown reaches the escalation."""
+        c = _make_codex(codex_user="ci-fake-user")
+        proc = MagicMock()
+        proc.pid = 12345
+        proc.wait = AsyncMock(return_value=0)
+        c._proc = proc
+        c._pgid = 12345
+        c._effective_codex_user = "ci-fake-user"
+        c._inner_codex_pids = [67890]
+        c._stderr_task = None
+        return c
+
+    @pytest.mark.asyncio
+    async def test_concurrent_kills_are_serialized(self):
+        """
+        Two _kill tasks racing across the escalation await: the loser
+        must wait at the teardown gate, re-check _proc under it, and
+        return instead of reading attributes the winner nulled.
+        """
+        c = self._teardown_race_backend()
+
+        async def escalate(sig):
+            # A real suspension, so the competing teardown interleaves
+            # here exactly the way concurrent teardown does in production.
+            await asyncio.sleep(0.01)
+
+        with patch.object(c, "_async_send_signal_for_close", side_effect=escalate):
+            await asyncio.gather(c._kill(), c._kill())
+
+        assert c._proc is None
+        assert c._effective_codex_user is None
+
+    @pytest.mark.asyncio
+    async def test_kill_racing_shutdown_is_serialized(self):
+        """Same interleaving with shutdown as the losing teardown."""
+        c = self._teardown_race_backend()
+        escalations = []
+
+        async def escalate(sig):
+            escalations.append(int(sig))
+            await asyncio.sleep(0.01)
+
+        with patch.object(c, "_async_send_signal_for_close", side_effect=escalate):
+            await asyncio.gather(c._kill(), c.shutdown())
+
+        assert c._proc is None
+        # The losing shutdown found _proc already cleared under the
+        # gate, so only the winning _kill signalled anything.
+        assert escalations == [int(signal.SIGKILL)]
+
 
 class TestSudoKillEsrchDemotion:
     """

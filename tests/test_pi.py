@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -441,6 +442,35 @@ class TestPiLifecycle:
         await backend.shutdown()
 
         kill.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_kill_racing_shutdown_is_serialized(self, tmp_path, monkeypatch):
+        """
+        Two teardowns racing across the escalation await: the loser
+        must wait at the teardown gate, re-check _proc under it, and
+        return instead of reading attributes the winner nulled.
+        """
+        backend = make_backend(tmp_path)
+        proc = MagicMock()
+        proc.wait = AsyncMock(return_value=0)
+        proc.kill = MagicMock()
+        backend._proc = proc
+        backend._pgid = 4242
+        backend._effective_os_user = "other-user"
+        backend._stderr_task = None
+
+        async def tree_kill(**kwargs):
+            # A real suspension, so the competing teardown interleaves
+            # here exactly the way concurrent teardown does in production.
+            await asyncio.sleep(0.01)
+
+        monkeypatch.setattr("kai.pi._kill_target_user_tree", tree_kill)
+        monkeypatch.setattr("kai.pi._kill_target_user_tree_sync", MagicMock())
+
+        await asyncio.gather(backend._kill(), backend.shutdown())
+
+        assert backend._proc is None
+        assert backend._effective_os_user is None
 
 
 class TestTraceEmission:
