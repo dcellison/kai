@@ -75,11 +75,10 @@ from kai.config import (
     validate_model_for_backend,
 )
 from kai.conversation_compatibility import (
-    CanonicalMemoryProvenance,
-    schedule_memory_ingestion,
+    _pending_memory_tasks as _shared_pending_memory_tasks,
 )
 from kai.conversation_compatibility import (
-    _pending_memory_tasks as _shared_pending_memory_tasks,
+    schedule_memory_ingestion,
 )
 from kai.history import LogEntry, log_message
 from kai.locks import get_lock, get_stop_event
@@ -93,7 +92,7 @@ from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
 from kai.workshop.artifacts import InboundArtifact
 from kai.workshop.conversation_commands import ConversationCommandDisposition
 from kai.workshop.conversation_runs import PreparedConversationRun
-from kai.workshop.domain import MessageId, PrincipalId, RunId
+from kai.workshop.domain import CanonicalMemoryProvenance, MessageId, PrincipalId, RunId
 from kai.workshop.execution_coordinator import (
     CanonicalCancellationDisposition,
     CanonicalExecutionDisposition,

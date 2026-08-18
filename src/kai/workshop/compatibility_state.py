@@ -6,9 +6,9 @@ from dataclasses import dataclass, field
 
 from kai import sessions
 from kai.config import Config
-from kai.conversation_compatibility import CanonicalMemoryProvenance, schedule_memory_ingestion
+from kai.conversation_compatibility import schedule_memory_ingestion
 from kai.history import LogEntry, log_message
-from kai.workshop.domain import RuntimeProfileId
+from kai.workshop.domain import CanonicalMemoryProvenance, RuntimeProfileId
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 
 

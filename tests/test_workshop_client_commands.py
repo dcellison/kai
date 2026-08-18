@@ -7,10 +7,9 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
 
-from kai.conversation_compatibility import CanonicalMemoryProvenance
 from kai.workshop.client_commands import WorkshopClientCommandExecutor
 from kai.workshop.conversation_commands import ConversationCommandDisposition
-from kai.workshop.domain import ChannelId, MessageId, PrincipalId, RunId
+from kai.workshop.domain import CanonicalMemoryProvenance, ChannelId, MessageId, PrincipalId, RunId
 from kai.workshop.execution_coordinator import (
     CanonicalExecutionDisposition,
     CanonicalExecutionResult,

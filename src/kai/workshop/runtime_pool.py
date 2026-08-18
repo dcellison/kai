@@ -4,11 +4,17 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from kai.backend import StreamEvent
-from kai.pool import PreparedBackendExecution, SubprocessPool
 from kai.workshop.domain import RuntimeProfileId
 from kai.workshop.runtime_profiles import ProtectedRuntimeProfile, WorkshopRuntimeProfileRegistry
+
+# Type-only: kai.pool imports kai.sessions, which imports this package, so
+# a runtime import here would close an import cycle. The pool arrives as a
+# constructor argument; only its type names are needed at module scope.
+if TYPE_CHECKING:
+    from kai.pool import PreparedBackendExecution, SubprocessPool
 
 type AgentPrompt = str | list[dict[str, str]]
 

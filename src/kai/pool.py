@@ -42,7 +42,6 @@ from kai.config import (
 )
 from kai.goose import GooseBackend
 from kai.internal_api_auth import InternalAPIAuth
-from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError
 from kai.workspace_utils import is_workspace_allowed
 
 if TYPE_CHECKING:
@@ -218,6 +217,12 @@ class SubprocessPool:
 
     def _protected_profile(self, runtime_config_id: int):
         """Resolve protected policy while preserving the negative-group bridge."""
+        # Imported at call time: kai.workshop's package initialization
+        # reaches back into this module through kai.sessions, so a
+        # module-level import of any workshop submodule from here is
+        # circular for some first-import orders.
+        from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError
+
         if self._runtime_profiles is None:
             return None
         try:

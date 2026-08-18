@@ -333,3 +333,30 @@ class EventEnvelope:
         }
         encoded = json.dumps(content, allow_nan=False, separators=(",", ":"), sort_keys=True)
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalMemoryProvenance:
+    """Canonical messages and run consumed by one memory extraction.
+
+    Lives here, beside its field types, so that both Workshop modules and
+    top-level ingress code can share it without either importing the
+    other: this module has no kai imports, which keeps it reachable from
+    anywhere.
+    """
+
+    run_id: RunId
+    source_message_id: MessageId
+    result_message_id: MessageId
+
+    def metadata(self) -> dict[str, object]:
+        # Imported at call time: a module-level kai.memory import would
+        # give this leaf module an import-time dependency on the wider
+        # application stack.
+        from kai import memory
+
+        return {
+            memory.WORKSHOP_RUN_ID_KEY: str(self.run_id),
+            memory.WORKSHOP_SOURCE_MESSAGE_ID_KEY: str(self.source_message_id),
+            memory.WORKSHOP_RESULT_MESSAGE_ID_KEY: str(self.result_message_id),
+        }
