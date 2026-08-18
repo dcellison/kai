@@ -482,6 +482,12 @@ class PiBackend(AgentBackend):
         started_at: float,
     ) -> AsyncIterator[StreamEvent]:
         assert self._transport is not None
+        # Local reference: a /stop-shaped teardown nulls self._transport
+        # mid-turn, and this loop must keep reading the dead process's
+        # buffered records to their end (surfaced as PiRpcEOFError into
+        # the standard failure path) instead of crashing on a None
+        # re-read.
+        transport = self._transport
         accepted = False
         streamed = ""
         completed_messages: list[str] = []
@@ -502,7 +508,7 @@ class PiBackend(AgentBackend):
                     self.turn_deadline_seconds,
                 )
                 raise PiRpcTimeoutError("Pi turn exceeded its deadline")
-            message = await self._transport.receive(timeout_seconds=self.timeout_seconds)
+            message = await transport.receive(timeout_seconds=self.timeout_seconds)
             message_type = message.get("type")
 
             if message_type == "response":

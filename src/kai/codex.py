@@ -971,6 +971,12 @@ class CodexBackend(AgentBackend):
         assert self._proc is not None
         assert self._proc.stdin is not None
         assert self._proc.stdout is not None
+        # Local reference for the streaming loop below: a /stop-shaped
+        # teardown nulls self._proc mid-turn, and the loop must keep
+        # draining the killed process's buffered stdout to its EOF
+        # (ending the turn through the EOF path) instead of crashing
+        # on a None re-read.
+        proc = self._proc
 
         try:
             turn_params: dict = {
@@ -1120,7 +1126,7 @@ class CodexBackend(AgentBackend):
 
                 try:
                     line = await asyncio.wait_for(
-                        self._proc.stdout.readline(),
+                        proc.stdout.readline(),
                         timeout=self.timeout_seconds * 3,
                     )
                 except TimeoutError:

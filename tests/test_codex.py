@@ -603,6 +603,45 @@ class TestStreamParsing:
     """Verify _send_locked() correctly parses streaming responses."""
 
     @pytest.mark.asyncio
+    async def test_shutdown_mid_stream_drains_to_eof_without_crashing(self):
+        """
+        A /stop-shaped teardown nulls self._proc while the send loop is
+        suspended mid-stream. The loop must drain the killed process's
+        buffered output to EOF and end the turn through the standard
+        EOF path rather than crash re-reading the nulled attribute.
+        """
+        c = _make_codex()
+        proc = _make_mock_proc([])
+        release = asyncio.Event()
+        lines = [_agent_message_delta("buffered"), b""]
+
+        async def readline():
+            await release.wait()
+            return lines.pop(0) if lines else b""
+
+        proc.stdout.readline = readline
+        c._proc = proc
+        c._session_id = "test-session"
+        c._fresh_session = False
+        c._next_id = 3
+
+        task = asyncio.create_task(_collect_events(c))
+        # Let the send loop reach its readline and suspend on it.
+        await asyncio.sleep(0.01)
+        await c.shutdown()
+        assert c._proc is None
+        release.set()
+        events = await task
+
+        # The clean EOF ending, not the catch-all handler swallowing an
+        # AttributeError from a nulled self._proc re-read: visible text
+        # arrived, so the EOF branch reports success with no error.
+        assert events[-1].done is True
+        assert "buffered" in events[-1].text_so_far
+        assert events[-1].response.success is True
+        assert events[-1].response.error is None
+
+    @pytest.mark.asyncio
     async def test_turn_deadline_ends_a_turn_that_keeps_trickling_output(self):
         """
         The idle guard resets on any output, so a turn that trickles
