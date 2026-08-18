@@ -683,6 +683,12 @@ function WorkshopView({
   const [activeRun, setActiveRun] = useState<WorkshopRun | null>(null);
   const [runClock, setRunClock] = useState(() => Date.now());
   const [unseenMessageCount, setUnseenMessageCount] = useState(0);
+  // Render-state mirror of timelineFollowRef's negation. The ref is
+  // deliberately render-free for scroll-frequency updates; the
+  // jump-to-latest button needs a re-render when follow disengages, so
+  // this state is set alongside every follow-ref write. Same-value
+  // setState is a React no-op, keeping the per-scroll cost nil.
+  const [awayFromBottom, setAwayFromBottom] = useState(false);
   const [sidebarLayout, setSidebarLayout] = useState(restoreSidebarLayout);
   const [resizingSidebar, setResizingSidebar] = useState(false);
   const [contextWidth, setContextWidth] = useState(restoreContextWidth);
@@ -917,6 +923,7 @@ function WorkshopView({
       earliestMessagePositionRef.current = 0;
       earlierAnchorRef.current = null;
       setUnseenMessageCount(0);
+      setAwayFromBottom(false);
     }
 
     const latestPosition = messages.reduce(
@@ -935,6 +942,12 @@ function WorkshopView({
         : timeline.scrollHeight;
       timelineInitializedRef.current = true;
       timelineFollowRef.current = restoredViewport?.follow ?? true;
+      // Derived from the clamped position, not the stored flag: the
+      // restored window is the latest page only, so a position saved
+      // with earlier pages loaded can clamp to (or land near) the
+      // bottom, where a jump-to-latest button over a fully visible
+      // timeline would be noise.
+      setAwayFromBottom(!isNearTimelineBottom(timeline));
       latestMessagePositionRef.current = latestPosition;
       earliestMessagePositionRef.current = earliestPosition;
       setUnseenMessageCount(0);
@@ -1005,6 +1018,7 @@ function WorkshopView({
     }
     const shouldFollow = isNearTimelineBottom(timeline);
     timelineFollowRef.current = shouldFollow;
+    setAwayFromBottom(!shouldFollow);
     storeTimelineViewport(channelId, {
       follow: shouldFollow,
       scrollTop: timeline.scrollTop,
@@ -1026,6 +1040,7 @@ function WorkshopView({
       scrollTop: timeline.scrollTop,
     });
     setUnseenMessageCount(0);
+    setAwayFromBottom(false);
   };
 
   const handleLoadEarlier = (): void => {
@@ -1346,15 +1361,20 @@ function WorkshopView({
         </div>
 
         <footer className="composer-preview">
-          {unseenMessageCount > 0 && (
+          {(awayFromBottom || unseenMessageCount > 0) && (
             <button
               className="new-messages-button"
               type="button"
               onClick={followLatestMessage}
+              aria-label={
+                unseenMessageCount > 0 ? undefined : "Jump to latest messages"
+              }
             >
-              {unseenMessageCount === 1
-                ? "1 new message"
-                : `${unseenMessageCount} new messages`}
+              {unseenMessageCount === 0
+                ? "Jump to latest"
+                : unseenMessageCount === 1
+                  ? "1 new message"
+                  : `${unseenMessageCount} new messages`}
             </button>
           )}
           {activeRun && (

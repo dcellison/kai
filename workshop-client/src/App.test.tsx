@@ -547,6 +547,150 @@ describe("Workshop React client", () => {
     expect(timeline.scrollTop).toBe(100);
   });
 
+  it("offers jump-to-latest while reading history with no new arrivals", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    let resolveTimeline: ((value: TimelineSnapshot) => void) | null = null;
+    vi.mocked(loadTimeline).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveTimeline = resolve;
+        }),
+    );
+    render(<App />);
+
+    const timeline = await screen.findByLabelText("Conversation timeline");
+    let scrollHeight = 1000;
+    Object.defineProperties(timeline, {
+      clientHeight: { configurable: true, get: () => 300 },
+      scrollHeight: { configurable: true, get: () => scrollHeight },
+      scrollTop: { configurable: true, value: 0, writable: true },
+    });
+    await waitFor(() => expect(resolveTimeline).not.toBeNull());
+    act(() => {
+      resolveTimeline?.({ messages: [historyMessage], throughPosition: 25, previousCursor: null });
+    });
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+    await waitFor(() => expect(timeline.scrollTop).toBe(1000));
+
+    // At the bottom: no button of either form.
+    expect(screen.queryByRole("button", { name: /Jump to latest|new message/ })).toBeNull();
+
+    // Within the follow distance (96px of the bottom): still none.
+    timeline.scrollTop = 650;
+    fireEvent.scroll(timeline);
+    expect(screen.queryByRole("button", { name: /Jump to latest|new message/ })).toBeNull();
+
+    // Past the follow distance: the neutral button appears with no
+    // new messages required.
+    timeline.scrollTop = 100;
+    fireEvent.scroll(timeline);
+    const jumpButton = screen.getByRole("button", { name: "Jump to latest messages" });
+    expect(jumpButton).toHaveTextContent("Jump to latest");
+
+    // A live arrival while away: the count label takes precedence.
+    scrollHeight = 1100;
+    const arrival: TimelineMessage = {
+      ...historyMessage,
+      body: "Arrived while reading back",
+      eventPosition: 30,
+      messageId: "msg_00000000000000000000000000000030",
+    };
+    act(() => handlers?.onMessage(arrival, "30"));
+    expect(await screen.findByRole("button", { name: "1 new message" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Jump to latest messages" })).toBeNull();
+
+    // Clicking returns to the bottom, persists follow, and hides the
+    // button entirely.
+    await user.click(screen.getByRole("button", { name: "1 new message" }));
+    expect(timeline.scrollTop).toBe(1100);
+    expect(screen.queryByRole("button", { name: /Jump to latest|new message/ })).toBeNull();
+    const viewports: unknown = JSON.parse(
+      sessionStorage.getItem("kai.workshop.timeline-viewports.v1") ?? "{}",
+    );
+    expect((viewports as Record<string, { follow: boolean }>)[channelId]?.follow).toBe(true);
+  });
+
+  it("shows jump-to-latest on mount for a restored away-from-bottom viewport", async () => {
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    sessionStorage.setItem(
+      "kai.workshop.timeline-viewports.v1",
+      JSON.stringify({ [channelId]: { follow: false, scrollTop: 100 } }),
+    );
+    let resolveTimeline: ((value: TimelineSnapshot) => void) | null = null;
+    vi.mocked(loadTimeline).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveTimeline = resolve;
+        }),
+    );
+    render(<App />);
+
+    const timeline = await screen.findByLabelText("Conversation timeline");
+    Object.defineProperties(timeline, {
+      clientHeight: { configurable: true, get: () => 300 },
+      scrollHeight: { configurable: true, get: () => 1000 },
+      scrollTop: { configurable: true, value: 0, writable: true },
+    });
+    await waitFor(() => expect(resolveTimeline).not.toBeNull());
+    act(() => {
+      resolveTimeline?.({ messages: [historyMessage], throughPosition: 25, previousCursor: null });
+    });
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+
+    // The restored deliberate position is honored, and the button is
+    // there from the start rather than waiting for a scroll event.
+    await waitFor(() => expect(timeline.scrollTop).toBe(100));
+    expect(
+      await screen.findByRole("button", { name: "Jump to latest messages" }),
+    ).toBeVisible();
+  });
+
+  it("hides jump-to-latest when a restored viewport lands at the bottom", async () => {
+    // A viewport persisted with earlier pages loaded can restore into
+    // a latest-page window too short to put the position away from the
+    // bottom; the button must derive from the clamped geometry, not
+    // the stored follow flag.
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    sessionStorage.setItem(
+      "kai.workshop.timeline-viewports.v1",
+      JSON.stringify({ [channelId]: { follow: false, scrollTop: 900 } }),
+    );
+    let resolveTimeline: ((value: TimelineSnapshot) => void) | null = null;
+    vi.mocked(loadTimeline).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveTimeline = resolve;
+        }),
+    );
+    render(<App />);
+
+    const timeline = await screen.findByLabelText("Conversation timeline");
+    Object.defineProperties(timeline, {
+      clientHeight: { configurable: true, get: () => 300 },
+      scrollHeight: { configurable: true, get: () => 250 },
+      scrollTop: { configurable: true, value: 0, writable: true },
+    });
+    await waitFor(() => expect(resolveTimeline).not.toBeNull());
+    act(() => {
+      resolveTimeline?.({ messages: [historyMessage], throughPosition: 25, previousCursor: null });
+    });
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+
+    expect(
+      screen.queryByRole("button", { name: "Jump to latest messages" }),
+    ).toBeNull();
+  });
+
   it("returns to enrollment and clears the tab session after revocation", async () => {
     sessionStorage.setItem(
       "kai.workshop.read-session.v1",
