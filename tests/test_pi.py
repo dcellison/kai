@@ -275,6 +275,54 @@ class TestPiTurns:
         assert backend._transport.sent[0]["images"] == [{"type": "image", "data": "YWJj", "mimeType": "image/png"}]
 
     @pytest.mark.asyncio
+    async def test_shutdown_mid_stream_ends_through_the_error_path(self, tmp_path, monkeypatch):
+        """
+        A /stop-shaped teardown nulls self._transport while the turn
+        loop is suspended mid-stream. The loop must keep reading the
+        dead process's remaining records and end the turn through the
+        standard error path rather than crash re-reading the nulled
+        attribute.
+        """
+        backend = make_backend(tmp_path)
+        backend._proc = FakeProcess()
+        backend._session_id = "session-1"
+        backend._fresh_session = False
+        release = asyncio.Event()
+
+        class BlockingTransport(FakeTransport):
+            async def receive(self, *, timeout_seconds=None):
+                if self.records:
+                    value = self.records.pop(0)
+                    if value == "block":
+                        await release.wait()
+                        return {
+                            "type": "message_update",
+                            "assistantMessageEvent": {"type": "text_delta", "delta": "buffered"},
+                        }
+                    return value
+                raise PiRpcEOFError("stream exhausted")
+
+        backend._transport = BlockingTransport(
+            [
+                {"id": "kai-prompt-1", "type": "response", "command": "prompt", "success": True},
+                "block",
+            ]
+        )
+        monkeypatch.setattr(backend, "_ensure_started", AsyncMock())
+
+        task = asyncio.create_task(collect(backend))
+        # Let the turn loop reach its receive and suspend on it.
+        await asyncio.sleep(0.01)
+        await backend.shutdown()
+        assert backend._transport is None
+        release.set()
+        events = await task
+
+        assert events[-1].done is True
+        assert events[-1].response.success is False
+        assert "buffered" in events[-1].text_so_far
+
+    @pytest.mark.asyncio
     async def test_turn_deadline_ends_a_turn_that_keeps_trickling_output(self, tmp_path, monkeypatch):
         """
         The per-receive timeout resets on any record, so a turn that
