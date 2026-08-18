@@ -22,6 +22,10 @@ Scope (spec §16 + Phase 4 of spec 320):
   `source_*` keys onto surviving rows with pre-images dumped first;
   `--rollback` restores rows whose source block has not drifted.
   The pass logic lives in `src/kai/memory_provenance_backfill.py`.
+- `purge-sandbox`: delete every eval-residue identity (user_id prefix
+  `sandbox-`) from the collection. Censuses owners collection-wide,
+  prints the plan, and verifies by re-census that no sandbox rows
+  survive and real principals' counts are unchanged.
 
 Commands that modify the store require an explicit `--yes` flag. When
 `--yes` is absent, the command prints the action it WOULD take and
@@ -31,11 +35,11 @@ ops scripts and cron invocations should either set `--yes` upfront or
 fail fast on missing authorization, rather than blocking on stdin.
 
 The broader `delete_all(user_id=...)` primitive exists in
-`src/kai/memory.py` and is documented in spec §16. It is intentionally
-NOT exposed here: Phase 4 is scoped to legacy cleanup, and a
-per-source purge is sufficient for the advertised use case
-(`--source ""` to drop rows from pre-Phase-1 installations). If a
-future incident requires the nuclear option, add it as a separate
+`src/kai/memory.py`. The only exposure here is the constrained one
+inside `purge-sandbox`: identities are discovered by census, gated on
+the `sandbox-` prefix, and verified by re-census afterwards. An
+unconstrained wipe of an arbitrary user_id remains intentionally NOT
+exposed; if a future incident requires that, add it as a separate
 `nuke` subcommand with its own review.
 
 This module should NOT import `kai.bot`, `kai.pool`, or other

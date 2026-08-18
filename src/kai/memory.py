@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1492,6 +1493,33 @@ def init_memory(config: Config, *, store_dir: Path | None = None) -> None:
         Exception: Propagated to caller (main.py catches and logs).
     """
     global _memory, _config
+
+    # Store isolation self-check. Callers passing store_dir (the eval
+    # harnesses) redirect MEM0_DIR into that tree so mem0's
+    # auto-created migrations store lands there too, but mem0 captures
+    # MEM0_DIR into module constants at first import. The redirect is
+    # therefore only effective while mem0's import stays lazy (it
+    # happens below, inside this function). If a future refactor pulls
+    # mem0 into an earlier import graph, the migrations store would
+    # silently land at the captured path instead, where it can
+    # contend with the live daemon's lock on the same embedded store.
+    # Fail loud on the actual invariant (captured home == current
+    # env) rather than on mere prior import, so an early import with
+    # a correctly-set env stays valid. Plain `if/raise`, not assert:
+    # asserts vanish under python -O.
+    if store_dir is not None and "mem0" in sys.modules:
+        from mem0.memory.setup import mem0_dir as _captured_mem0_dir
+
+        if str(_captured_mem0_dir) != os.environ.get("MEM0_DIR", ""):
+            raise RuntimeError(
+                "init_memory(store_dir=...) requires mem0's home to match "
+                f"MEM0_DIR, but mem0 already captured {_captured_mem0_dir!r} "
+                f"at import time while MEM0_DIR is now "
+                f"{os.environ.get('MEM0_DIR', '')!r}. Set MEM0_DIR before "
+                "the first mem0 import (the eval harnesses set it before "
+                "calling init_memory, which normally performs the first "
+                "import lazily)."
+            )
 
     # Structured startup log describing the configured memory state.
     # Emitted exactly once per init regardless of whether memory is

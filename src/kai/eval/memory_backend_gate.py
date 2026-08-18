@@ -2056,6 +2056,12 @@ async def _run_cli(args: argparse.Namespace) -> int:
     # dedicated store directory, never the production collection, and
     # MEM0_DIR is redirected before init_memory lazily imports mem0.
     eval_store = DATA_DIR / "eval_memory"
+    # Owner-only: sandbox facts derive from real conversation windows,
+    # so the eval store must not be more readable than the production
+    # store it is isolated from. chmod as well as mkdir so a tree
+    # created by an older run is healed rather than trusted.
+    eval_store.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(eval_store, 0o700)
     os.environ["MEM0_DIR"] = str(eval_store / "mem0")
     memory.init_memory(memory_init_config, store_dir=eval_store)
     runs: dict[str, BackendRun] = {}

@@ -6294,3 +6294,45 @@ class TestCountPointsByOwner:
         fake = SimpleNamespace(vector_store=SimpleNamespace(client=object(), collection_name="x"))
         with patch("kai.memory._memory", fake), pytest.raises(RuntimeError):
             count_points_by_owner()
+
+
+# ── store_dir mem0-home invariant guard ──────────────────────────────
+
+
+class TestStoreDirMem0HomeGuard:
+    """init_memory(store_dir=...) must fail loud when mem0 was already
+    imported with a home that does not match the current MEM0_DIR: the
+    redirect the eval harnesses rely on is only effective while mem0's
+    import stays lazy, and a silent no-op would drop the migrations
+    store outside the isolated tree (where it can contend with the
+    live daemon's lock)."""
+
+    def test_stale_captured_home_raises(self, tmp_path, monkeypatch):
+        from kai.memory import init_memory
+
+        setup_mod = ModuleType("mem0.memory.setup")
+        setup_mod.mem0_dir = "/frozen/at/import/time"  # type: ignore[attr-defined]
+        fakes = {
+            "mem0": ModuleType("mem0"),
+            "mem0.memory": ModuleType("mem0.memory"),
+            "mem0.memory.setup": setup_mod,
+        }
+        monkeypatch.setenv("MEM0_DIR", str(tmp_path / "eval" / "mem0"))
+        with patch.dict(sys.modules, fakes), pytest.raises(RuntimeError, match="already captured"):
+            init_memory(_make_config(), store_dir=tmp_path / "eval")
+
+    def test_no_store_dir_skips_the_guard(self, monkeypatch):
+        """Production init (no store_dir) must not consult the guard at
+        all: the daemon sets its own MEM0_DIR at service level and a
+        mismatch there is not this invariant's business."""
+        from kai.memory import init_memory
+
+        setup_mod = ModuleType("mem0.memory.setup")
+        setup_mod.mem0_dir = "/frozen/at/import/time"  # type: ignore[attr-defined]
+        monkeypatch.setenv("MEM0_DIR", "/somewhere/else")
+        # memory_enabled=False makes init a no-op immediately after
+        # the guard region, so reaching the return proves the guard
+        # did not fire.
+        config = replace(_make_config(), memory_enabled=False)
+        with patch.dict(sys.modules, {"mem0.memory.setup": setup_mod}):
+            init_memory(config)
