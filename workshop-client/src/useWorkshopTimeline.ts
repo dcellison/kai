@@ -117,22 +117,25 @@ export function useWorkshopTimeline(
     setEarlier({ available: true, loading: true, error: null });
     void loadEarlierTimeline(context.session, cursor, context.throughPosition, context.signal).then(
       (page) => {
-        earlierLoadingRef.current = false;
         // A snapshot reload (channel switch, resynchronization) between
         // request and response makes this page part of a window that no
-        // longer exists; drop it rather than splice stale history in.
+        // longer exists; drop it before touching ANY state, the loading
+        // guard included. Each snapshot resets the guard for its own
+        // generation, and a stale settlement resetting it here would let
+        // a duplicate in-flight fetch slip past.
         if (context.signal.aborted || generationRef.current !== context.generation) {
           return;
         }
+        earlierLoadingRef.current = false;
         earlierCursorRef.current = page.previousCursor;
         setMessages((current) => prependUnique(current, page.messages));
         setEarlier({ available: page.previousCursor !== null, loading: false, error: null });
       },
       (caught: unknown) => {
-        earlierLoadingRef.current = false;
         if (context.signal.aborted || generationRef.current !== context.generation) {
           return;
         }
+        earlierLoadingRef.current = false;
         setEarlier({
           available: true,
           loading: false,
