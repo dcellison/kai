@@ -3,9 +3,8 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
 
-from kai.conversation_compatibility import CanonicalMemoryProvenance
 from kai.workshop.compatibility_state import WorkshopCompatibilityStateWriter
-from kai.workshop.domain import MessageId, RunId
+from kai.workshop.domain import CanonicalMemoryProvenance, MessageId, RunId
 from tests.workshop_profiles import profile_id
 
 

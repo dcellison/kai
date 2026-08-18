@@ -6,7 +6,6 @@ import asyncio
 import logging
 from dataclasses import dataclass
 
-from kai.conversation_compatibility import CanonicalMemoryProvenance
 from kai.history import LogEntry
 from kai.streaming_text import stream_publishable_prefix
 from kai.workshop.compatibility_state import WorkshopCompatibilityStateWriter
@@ -14,7 +13,7 @@ from kai.workshop.conversation_commands import (
     ClientConversationCommandAcceptance,
     ConversationCommandDisposition,
 )
-from kai.workshop.domain import MessageId, RunId, RuntimeProfileId
+from kai.workshop.domain import CanonicalMemoryProvenance, MessageId, RunId, RuntimeProfileId
 from kai.workshop.execution_coordinator import (
     CanonicalCancellationDisposition,
     CanonicalExecutionDisposition,

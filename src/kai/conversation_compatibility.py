@@ -4,33 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from kai.config import ONESHOT_REASONER_BACKENDS, Config
 from kai.history import LogEntry
-from kai.workshop.domain import MessageId, RunId
+
+# Type-only: Workshop modules import this module at runtime, so a runtime
+# import of anything under kai.workshop from here would be circular.
+if TYPE_CHECKING:
+    from kai.workshop.domain import CanonicalMemoryProvenance
 
 log = logging.getLogger(__name__)
 
 _pending_memory_tasks: set[asyncio.Task[None]] = set()
-
-
-@dataclass(frozen=True, slots=True)
-class CanonicalMemoryProvenance:
-    """Canonical messages and run consumed by one memory extraction."""
-
-    run_id: RunId
-    source_message_id: MessageId
-    result_message_id: MessageId
-
-    def metadata(self) -> dict[str, object]:
-        from kai import memory
-
-        return {
-            memory.WORKSHOP_RUN_ID_KEY: str(self.run_id),
-            memory.WORKSHOP_SOURCE_MESSAGE_ID_KEY: str(self.source_message_id),
-            memory.WORKSHOP_RESULT_MESSAGE_ID_KEY: str(self.result_message_id),
-        }
 
 
 def reader_user(config: Config, chat_id: int) -> str | None:

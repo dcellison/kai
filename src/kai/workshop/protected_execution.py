@@ -5,16 +5,22 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from kai.backend import StreamEvent
 from kai.config import VALID_BACKENDS, validate_model_for_backend
-from kai.pool import PreparedBackendExecution
 from kai.workshop.conversation_runs import resolve_canonical_conversation_run
 from kai.workshop.domain import RunId, RuntimeProfileId
 from kai.workshop.run_execution_authority import RunExecutionSelection
 from kai.workshop.run_lifecycle import DurableRun, RunStatus, WorkshopRunLifecycle
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.store import WorkshopEventStore
+
+# Type-only: kai.pool imports kai.sessions, which imports this package, so
+# a runtime import here would close an import cycle. The prepared execution
+# arrives from the runtime pool; only its type name is needed here.
+if TYPE_CHECKING:
+    from kai.pool import PreparedBackendExecution
 
 type AgentPrompt = str | list[dict[str, str]]
 
