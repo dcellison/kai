@@ -796,6 +796,12 @@ class AcpBackend(AgentBackend):
         # unambiguous across restarts.
         self._next_id: int = 1
         self._lock = asyncio.Lock()  # Serializes all message sends
+        # Serializes _kill/shutdown. Teardown paths await between
+        # reading process state and using it; two teardowns
+        # interleaving across those awaits would let the second read
+        # attributes the first already nulled. Always acquired after
+        # _lock when both are held, never before it.
+        self._teardown_lock = asyncio.Lock()
         # Secret values scrubbed from trace text. Snapshotted from the
         # fully built subprocess environment at spawn so constructor-only
         # credentials (the per-principal webhook secret) are covered.
@@ -1722,27 +1728,28 @@ class AcpBackend(AgentBackend):
         force_kill() call below does not repeat the escalation
         synchronously.
         """
-        if self._proc:
-            if self._effective_os_user is not None and self._pgid is not None:
-                await _kill_target_user_tree(
-                    target_user=self._effective_os_user,
-                    pgid=self._pgid,
-                    purpose="chat",
-                    backend=self.backend_name,
-                )
+        async with self._teardown_lock:
+            if self._proc:
+                if self._effective_os_user is not None and self._pgid is not None:
+                    await _kill_target_user_tree(
+                        target_user=self._effective_os_user,
+                        pgid=self._pgid,
+                        purpose="chat",
+                        backend=self.backend_name,
+                    )
+                    self._pgid = None
+                self.force_kill()
+                try:
+                    await asyncio.wait_for(self._proc.wait(), timeout=5)
+                except TimeoutError:
+                    pass
+                # force_kill() already cancelled _stderr_task and set it to
+                # None, so no additional cleanup needed here.
+                self._proc = None
+                self._session_id = None
                 self._pgid = None
-            self.force_kill()
-            try:
-                await asyncio.wait_for(self._proc.wait(), timeout=5)
-            except TimeoutError:
-                pass
-            # force_kill() already cancelled _stderr_task and set it to
-            # None, so no additional cleanup needed here.
-            self._proc = None
-            self._session_id = None
-            self._pgid = None
-            self._effective_os_user = None
-            self._session_started_at = None
+                self._effective_os_user = None
+                self._session_started_at = None
 
     async def restart(self) -> None:
         """
@@ -1797,35 +1804,36 @@ class AcpBackend(AgentBackend):
         force_kill() reaps the wrapper (with _pgid nulled so
         force_kill skips its own sync escalation).
         """
-        if self._proc:
-            try:
-                self._proc.terminate()
-            except OSError:
-                # Process already exited between the _proc check and
-                # terminate(). Fall through to cleanup below.
-                pass
-            else:
+        async with self._teardown_lock:
+            if self._proc:
                 try:
-                    await asyncio.wait_for(self._proc.wait(), timeout=5)
-                except TimeoutError:
-                    if self._effective_os_user is not None and self._pgid is not None:
-                        await _kill_target_user_tree(
-                            target_user=self._effective_os_user,
-                            pgid=self._pgid,
-                            purpose="chat",
-                            backend=self.backend_name,
-                        )
-                        self._pgid = None
-                    self.force_kill()
+                    self._proc.terminate()
+                except OSError:
+                    # Process already exited between the _proc check and
+                    # terminate(). Fall through to cleanup below.
+                    pass
+                else:
                     try:
                         await asyncio.wait_for(self._proc.wait(), timeout=5)
                     except TimeoutError:
-                        log.warning("%s: process did not exit after SIGKILL", self.backend_label)
-        if self._stderr_task:
-            self._stderr_task.cancel()
-            self._stderr_task = None
-        self._proc = None
-        self._session_id = None
-        self._pgid = None
-        self._effective_os_user = None
-        self._session_started_at = None
+                        if self._effective_os_user is not None and self._pgid is not None:
+                            await _kill_target_user_tree(
+                                target_user=self._effective_os_user,
+                                pgid=self._pgid,
+                                purpose="chat",
+                                backend=self.backend_name,
+                            )
+                            self._pgid = None
+                        self.force_kill()
+                        try:
+                            await asyncio.wait_for(self._proc.wait(), timeout=5)
+                        except TimeoutError:
+                            log.warning("%s: process did not exit after SIGKILL", self.backend_label)
+            if self._stderr_task:
+                self._stderr_task.cancel()
+                self._stderr_task = None
+            self._proc = None
+            self._session_id = None
+            self._pgid = None
+            self._effective_os_user = None
+            self._session_started_at = None

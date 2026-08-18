@@ -195,6 +195,12 @@ class ClaudeCodeBackend(AgentBackend):
         self._inner_claude_pid: int | None = None  # Cross-user mode: PID of the claude grandchild under sudo (#456)
         self._effective_claude_user: str | None = None  # Cross-user mode: the resolved sudo target (#456)
         self._lock = asyncio.Lock()  # Serializes all message sends
+        # Serializes _kill/shutdown. Teardown paths await between
+        # reading process state and using it; two teardowns
+        # interleaving across those awaits would let the second read
+        # attributes the first already nulled. Always acquired after
+        # _lock when both are held, never before it.
+        self._teardown_lock = asyncio.Lock()
         self._session_id: str | None = None
         self._fresh_session = True  # True until the first message is sent
         self._stderr_task: asyncio.Task | None = None  # Background stderr drain
@@ -1337,86 +1343,87 @@ class ClaudeCodeBackend(AgentBackend):
         because _stderr_task is only created alongside _proc in _ensure_started().
         If _proc is None, there is no stderr task to cancel.
         """
-        if self._proc:
-            # Save pgid before clearing - the EOF handler in _send_locked()
-            # may call _kill() again after we clear self._pgid, but we need
-            # to ensure the process group gets signaled at least once more
-            # after the wait completes (belt-and-suspenders for the race
-            # where sudo dies but claude survives the initial SIGKILL).
-            saved_pgid = self._pgid
+        async with self._teardown_lock:
+            if self._proc:
+                # Save pgid before clearing - the EOF handler in _send_locked()
+                # may call _kill() again after we clear self._pgid, but we need
+                # to ensure the process group gets signaled at least once more
+                # after the wait completes (belt-and-suspenders for the race
+                # where sudo dies but claude survives the initial SIGKILL).
+                saved_pgid = self._pgid
 
-            # Prime the inner-claude-PID cache BEFORE any signal goes
-            # out. Once the killpg below reaps the sudo wrapper,
-            # pgrep -P <dead_sudo_pid> returns nothing and we lose
-            # the only handle on the orphaned grandchild. The cache
-            # survives the per-signal escalation + killpg sequence
-            # so the final-cleanup sudo-kill below can still reach
-            # the inner claude. See issue #456. Only attempt when
-            # we actually have a sudo target to escalate to; without
-            # _effective_claude_user the lookup result is useless.
-            #
-            # Async pgrep variant so the event loop is not blocked
-            # waiting for the lookup. See #459.
-            saved_user = self._effective_claude_user
-            if saved_user is not None and self._inner_claude_pid is None:
-                self._inner_claude_pid = await self._async_lookup_inner_claude_pid()
-            saved_inner_pid = self._inner_claude_pid
+                # Prime the inner-claude-PID cache BEFORE any signal goes
+                # out. Once the killpg below reaps the sudo wrapper,
+                # pgrep -P <dead_sudo_pid> returns nothing and we lose
+                # the only handle on the orphaned grandchild. The cache
+                # survives the per-signal escalation + killpg sequence
+                # so the final-cleanup sudo-kill below can still reach
+                # the inner claude. See issue #456. Only attempt when
+                # we actually have a sudo target to escalate to; without
+                # _effective_claude_user the lookup result is useless.
+                #
+                # Async pgrep variant so the event loop is not blocked
+                # waiting for the lookup. See #459.
+                saved_user = self._effective_claude_user
+                if saved_user is not None and self._inner_claude_pid is None:
+                    self._inner_claude_pid = await self._async_lookup_inner_claude_pid()
+                saved_inner_pid = self._inner_claude_pid
 
-            # Cross-user escalation (#456) + wrapper killpg / single-
-            # user direct signal. Routed through the async helper so
-            # the event loop stays responsive while sudo + kill
-            # complete. See #459.
-            await self._async_send_signal_for_close(signal.SIGKILL)
+                # Cross-user escalation (#456) + wrapper killpg / single-
+                # user direct signal. Routed through the async helper so
+                # the event loop stays responsive while sudo + kill
+                # complete. See #459.
+                await self._async_send_signal_for_close(signal.SIGKILL)
 
-            try:
-                await asyncio.wait_for(self._proc.wait(), timeout=5)
-            except TimeoutError:
-                pass
-
-            # Cancel the stderr drain BEFORE clearing self._proc.
-            # _drain_stderr's while-loop checks self._proc on each iteration;
-            # if we clear proc first, the drain task could observe None in a
-            # state that was never intended to be visible to it. Cancelling
-            # the task first ensures it stops reading before its dependencies
-            # are destroyed.
-            if self._stderr_task:
-                self._stderr_task.cancel()
-                self._stderr_task = None
-
-            self._proc = None
-            self._pgid = None
-            self._inner_claude_pid = None
-            self._effective_claude_user = None
-            self._session_id = None
-            self._session_started_at = None
-
-            # Final cleanup: signal the saved process group one more time.
-            # If claude was reparented to init during the wait, this catches
-            # it. If everything is already dead, killpg raises OSError which
-            # we ignore. Only applies to claude_user mode (pgid is None
-            # otherwise).
-            if saved_pgid is not None:
                 try:
-                    os.killpg(saved_pgid, signal.SIGKILL)
-                except OSError:
+                    await asyncio.wait_for(self._proc.wait(), timeout=5)
+                except TimeoutError:
                     pass
 
-            # Final cross-user cleanup: even after the killpg above,
-            # the inner claude grandchild may still be alive because
-            # the service user cannot signal a target-user process
-            # (#456). Escalate via sudo to kill the captured PID
-            # directly. Skipped silently when:
-            # - single-user mode (no saved_user / saved_inner_pid),
-            # - pgrep failed to find a child PID at any point
-            #   (sudo never forked, or sudo died with no child),
-            # - the inner claude is already dead (sudo kill returns
-            #   ESRCH; the shared helper classifies that benign race
-            #   at DEBUG).
-            #
-            # Async sudo-kill so the event loop is not blocked on the
-            # 5s ceiling. See #459.
-            if saved_user is not None and saved_inner_pid is not None:
-                await self._async_sudo_kill(saved_user, saved_inner_pid, int(signal.SIGKILL))
+                # Cancel the stderr drain BEFORE clearing self._proc.
+                # _drain_stderr's while-loop checks self._proc on each iteration;
+                # if we clear proc first, the drain task could observe None in a
+                # state that was never intended to be visible to it. Cancelling
+                # the task first ensures it stops reading before its dependencies
+                # are destroyed.
+                if self._stderr_task:
+                    self._stderr_task.cancel()
+                    self._stderr_task = None
+
+                self._proc = None
+                self._pgid = None
+                self._inner_claude_pid = None
+                self._effective_claude_user = None
+                self._session_id = None
+                self._session_started_at = None
+
+                # Final cleanup: signal the saved process group one more time.
+                # If claude was reparented to init during the wait, this catches
+                # it. If everything is already dead, killpg raises OSError which
+                # we ignore. Only applies to claude_user mode (pgid is None
+                # otherwise).
+                if saved_pgid is not None:
+                    try:
+                        os.killpg(saved_pgid, signal.SIGKILL)
+                    except OSError:
+                        pass
+
+                # Final cross-user cleanup: even after the killpg above,
+                # the inner claude grandchild may still be alive because
+                # the service user cannot signal a target-user process
+                # (#456). Escalate via sudo to kill the captured PID
+                # directly. Skipped silently when:
+                # - single-user mode (no saved_user / saved_inner_pid),
+                # - pgrep failed to find a child PID at any point
+                #   (sudo never forked, or sudo died with no child),
+                # - the inner claude is already dead (sudo kill returns
+                #   ESRCH; the shared helper classifies that benign race
+                #   at DEBUG).
+                #
+                # Async sudo-kill so the event loop is not blocked on the
+                # 5s ceiling. See #459.
+                if saved_user is not None and saved_inner_pid is not None:
+                    await self._async_sudo_kill(saved_user, saved_inner_pid, int(signal.SIGKILL))
 
     async def shutdown(self) -> None:
         """
@@ -1441,11 +1448,14 @@ class ClaudeCodeBackend(AgentBackend):
         # start a concurrent stdout read during _save_prompt().
         # If a stream is in flight, this blocks until it finishes.
         # Note: _kill() (called from _send_locked error paths) does
-        # NOT acquire _lock, so there is no deadlock risk.
+        # NOT acquire _lock, so there is no deadlock risk. The
+        # teardown gate nests INSIDE _lock here, matching the
+        # _lock-then-_teardown_lock order of the _send_locked error
+        # paths that call _kill while holding _lock.
         saved_pgid = None
         saved_inner_pid: int | None = None
         saved_user: str | None = None
-        async with self._lock:
+        async with self._lock, self._teardown_lock:
             if self._proc:
                 try:
                     await self._save_prompt()

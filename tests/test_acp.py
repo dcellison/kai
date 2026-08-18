@@ -1902,6 +1902,29 @@ class TestCrossUserKillEscalation:
         b._stderr_task = None
         return b, proc
 
+    @pytest.mark.asyncio
+    async def test_concurrent_kills_are_serialized(self):
+        """
+        Two _kill tasks racing across the group-kill await: the loser
+        must wait at the teardown gate, re-check _proc under it, and
+        return instead of reading attributes the winner nulled.
+        """
+        b, _proc = self._wrapped_backend()
+
+        async def tree_kill(**kwargs):
+            # A real suspension, so the competing teardown interleaves
+            # here exactly the way concurrent teardown does in production.
+            await asyncio.sleep(0.01)
+
+        with (
+            patch("kai.acp._kill_target_user_tree", side_effect=tree_kill),
+            patch("kai.acp._kill_target_user_tree_sync"),
+        ):
+            await asyncio.gather(b._kill(), b._kill())
+
+        assert b._proc is None
+        assert b._effective_os_user is None
+
     def test_force_kill_escalates_sync_then_kills_wrapper(self):
         """force_kill (sync, the pool's last resort) runs the sync
         group-kill variant before SIGKILLing the wrapper, and nulls

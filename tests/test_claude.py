@@ -2571,6 +2571,61 @@ class TestKill:
         # The wrapper reap also uses the snapshot, not the nulled attribute.
         mock_killpg.assert_called_once_with(12345, signal.SIGKILL)
 
+    @staticmethod
+    def _teardown_race_backend() -> ClaudeCodeBackend:
+        """Cross-user backend primed so a teardown reaches the escalation."""
+        claude = _make_claude(claude_user="daniel")
+        proc = MagicMock()
+        proc.wait = AsyncMock(return_value=0)
+        claude._proc = proc
+        claude._pgid = 12345
+        claude._effective_claude_user = "daniel"
+        claude._inner_claude_pid = 99999
+        claude._stderr_task = None
+        return claude
+
+    @pytest.mark.asyncio
+    async def test_concurrent_kills_are_serialized(self):
+        """
+        Two _kill tasks racing across the escalation await: the loser
+        must wait at the teardown gate, re-check _proc under it, and
+        return instead of reading attributes the winner nulled.
+        """
+        claude = self._teardown_race_backend()
+
+        async def escalate(sig):
+            # A real suspension, so the competing teardown interleaves
+            # here exactly the way concurrent teardown does in production.
+            await asyncio.sleep(0.01)
+
+        with (
+            patch.object(claude, "_async_send_signal_for_close", side_effect=escalate),
+            patch.object(claude, "_async_sudo_kill", new=AsyncMock()),
+            patch("os.killpg"),
+        ):
+            await asyncio.gather(claude._kill(), claude._kill())
+
+        assert claude._proc is None
+        assert claude._effective_claude_user is None
+
+    @pytest.mark.asyncio
+    async def test_kill_racing_shutdown_is_serialized(self):
+        """Same interleaving with shutdown as the losing teardown."""
+        claude = self._teardown_race_backend()
+
+        async def escalate(sig):
+            await asyncio.sleep(0.01)
+
+        with (
+            patch.object(claude, "_async_send_signal_for_close", side_effect=escalate),
+            patch.object(claude, "_async_sudo_kill", new=AsyncMock()),
+            patch.object(claude, "_save_prompt", new=AsyncMock()),
+            patch("os.killpg"),
+        ):
+            await asyncio.gather(claude._kill(), claude.shutdown())
+
+        assert claude._proc is None
+
     @pytest.mark.asyncio
     async def test_kill_skips_sudo_when_inner_pid_unknown(self):
         """

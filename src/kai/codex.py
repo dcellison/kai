@@ -384,6 +384,12 @@ class CodexBackend(AgentBackend):
         self._session_started_at: float | None = None
         self._next_id: int = 1  # Monotonically increasing JSON-RPC request ID
         self._lock = asyncio.Lock()  # Serializes all message sends
+        # Serializes _kill/shutdown. Teardown paths await between
+        # reading process state and using it; two teardowns
+        # interleaving across those awaits would let the second read
+        # attributes the first already nulled. Always acquired after
+        # _lock when both are held, never before it.
+        self._teardown_lock = asyncio.Lock()
         self._fresh_session: bool = True  # True until the first message is sent
         self._stderr_task: asyncio.Task | None = None  # Background stderr drain
         # Secret values scrubbed from trace text. Snapshotted from the
@@ -1732,23 +1738,25 @@ class CodexBackend(AgentBackend):
         Sends SIGKILL via the async escalation path (so cross-user
         installs do not orphan the codex grandchild), waits up to 5
         seconds for exit, then nulls all process references.
-        Idempotent.
+        Idempotent: a teardown that loses the lock race re-checks
+        _proc under the lock and returns without re-killing.
         """
-        if self._proc:
-            await self._async_send_signal_for_close(signal.SIGKILL)
-            if self._stderr_task:
-                self._stderr_task.cancel()
-                self._stderr_task = None
-            try:
-                await asyncio.wait_for(self._proc.wait(), timeout=5)
-            except TimeoutError:
-                pass
-            self._proc = None
-            self._session_id = None
-            self._pgid = None
-            self._inner_codex_pids = []
-            self._effective_codex_user = None
-            self._session_started_at = None
+        async with self._teardown_lock:
+            if self._proc:
+                await self._async_send_signal_for_close(signal.SIGKILL)
+                if self._stderr_task:
+                    self._stderr_task.cancel()
+                    self._stderr_task = None
+                try:
+                    await asyncio.wait_for(self._proc.wait(), timeout=5)
+                except TimeoutError:
+                    pass
+                self._proc = None
+                self._session_id = None
+                self._pgid = None
+                self._inner_codex_pids = []
+                self._effective_codex_user = None
+                self._session_started_at = None
 
     async def restart(self) -> None:
         """
@@ -1798,22 +1806,23 @@ class CodexBackend(AgentBackend):
         Falls back to SIGKILL (also through the escalation path) if
         the process doesn't terminate in time.
         """
-        if self._proc:
-            await self._async_send_signal_for_close(signal.SIGTERM)
-            try:
-                await asyncio.wait_for(self._proc.wait(), timeout=5)
-            except TimeoutError:
-                await self._async_send_signal_for_close(signal.SIGKILL)
+        async with self._teardown_lock:
+            if self._proc:
+                await self._async_send_signal_for_close(signal.SIGTERM)
                 try:
                     await asyncio.wait_for(self._proc.wait(), timeout=5)
                 except TimeoutError:
-                    log.warning("CodexBackend: process did not exit after SIGKILL")
-        if self._stderr_task:
-            self._stderr_task.cancel()
-            self._stderr_task = None
-        self._proc = None
-        self._session_id = None
-        self._pgid = None
-        self._inner_codex_pids = []
-        self._effective_codex_user = None
-        self._session_started_at = None
+                    await self._async_send_signal_for_close(signal.SIGKILL)
+                    try:
+                        await asyncio.wait_for(self._proc.wait(), timeout=5)
+                    except TimeoutError:
+                        log.warning("CodexBackend: process did not exit after SIGKILL")
+            if self._stderr_task:
+                self._stderr_task.cancel()
+                self._stderr_task = None
+            self._proc = None
+            self._session_id = None
+            self._pgid = None
+            self._inner_codex_pids = []
+            self._effective_codex_user = None
+            self._session_started_at = None
