@@ -52,6 +52,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -533,7 +534,20 @@ async def _async_main(argv: list[str] | None = None) -> int:
     # consolidation log. Placed AFTER argument validation so a bad
     # `--context-turns` does not trigger the first-run Mem0 embedding-
     # model download (~80MB) only to exit immediately.
-    init_memory(config)
+    #
+    # The store is isolated from the production collection: replay
+    # writes accumulate under sandbox user_ids, and those must never
+    # share a collection with real principals (they distort write
+    # metrics and RAM footprint even though owner filtering keeps
+    # recall correct). The dedicated directory persists across runs
+    # (the accumulating-sandbox design needs that), and MEM0_DIR is
+    # redirected so mem0's auto-created migrations store lands in the
+    # same tree instead of ~/.mem0/ or the production store. MEM0_DIR
+    # is read at mem0 import time, which happens lazily inside
+    # init_memory, so setting it here is early enough.
+    eval_store = DATA_DIR / "eval_memory"
+    os.environ["MEM0_DIR"] = str(eval_store / "mem0")
+    init_memory(config, store_dir=eval_store)
 
     file_paths = _iter_history_files(history_dir, args.start_date, args.end_date)
     if not file_paths:

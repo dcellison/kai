@@ -14,6 +14,7 @@ because it can contain conversation fragments.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -1003,6 +1004,11 @@ class TestCLIInitializesMemory:
         before the first run_backend invocation."""
         from unittest.mock import patch
 
+        # The CLI overwrites MEM0_DIR as part of store isolation;
+        # registering it with monkeypatch first makes pytest restore
+        # the pre-test value at teardown.
+        monkeypatch.setenv("MEM0_DIR", "pre-test-value")
+
         # Build a minimum-valid probe fixture so the preflight passes.
         path = tmp_path / "probes.jsonl"
         rows = []
@@ -1042,9 +1048,11 @@ class TestCLIInitializesMemory:
         _write_jsonl(path, rows)
 
         call_order: list[str] = []
+        init_store_dirs: list = []
 
-        def _fake_init(_config):
+        def _fake_init(_config, *, store_dir=None):
             call_order.append("init_memory")
+            init_store_dirs.append(store_dir)
 
         async def _fake_run_backend(**kwargs):
             call_order.append("run_backend")
@@ -1085,6 +1093,12 @@ class TestCLIInitializesMemory:
         assert rc == 0
         assert "init_memory" in call_order
         assert call_order.index("init_memory") < call_order.index("run_backend")
+        # store_dir pins the eval-isolation guardrail: the gate's
+        # sandbox arms must never open the production collection.
+        from kai.config import DATA_DIR
+
+        assert init_store_dirs == [DATA_DIR / "eval_memory"]
+        assert os.environ["MEM0_DIR"] == str(DATA_DIR / "eval_memory" / "mem0")
 
 
 # ── --os-user override threading ────────────────────────────────────
@@ -1156,6 +1170,7 @@ class TestOsUserOverride:
         )()
 
     def test_codex_without_os_user_proceeds(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MEM0_DIR", "pre-test-value")
         """Issue #522: codex same-user spawn is supported. Running
         the gate with `--backends codex` and no `--os-user` reaches
         `run_backend` with `os_user_override=None`; no preflight
@@ -1184,7 +1199,7 @@ class TestOsUserOverride:
             )
 
         with (
-            patch("kai.eval.memory_backend_gate.memory.init_memory", lambda _c: None),
+            patch("kai.eval.memory_backend_gate.memory.init_memory", lambda _c, store_dir=None: None),
             patch("kai.eval.memory_backend_gate.load_config", return_value=_BASE_CONFIG),
             patch("kai.eval.memory_backend_gate.run_backend", _fake_run_backend),
         ):
@@ -1193,6 +1208,7 @@ class TestOsUserOverride:
         assert captured == [None, None]
 
     def test_claude_only_does_not_require_os_user(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MEM0_DIR", "pre-test-value")
         """Single-arm claude run with no `--os-user` proceeds the
         same way it always has."""
         import asyncio
@@ -1216,7 +1232,7 @@ class TestOsUserOverride:
             )
 
         with (
-            patch("kai.eval.memory_backend_gate.memory.init_memory", lambda _c: None),
+            patch("kai.eval.memory_backend_gate.memory.init_memory", lambda _c, store_dir=None: None),
             patch("kai.eval.memory_backend_gate.load_config", return_value=_BASE_CONFIG),
             patch("kai.eval.memory_backend_gate.run_backend", _fake_run_backend),
         ):
@@ -1224,6 +1240,7 @@ class TestOsUserOverride:
         assert rc == 0
 
     def test_os_user_flows_into_run_backend(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MEM0_DIR", "pre-test-value")
         """When `--os-user` is supplied, the value is threaded into
         `run_backend(..., os_user_override=...)` for both arms."""
         import asyncio
@@ -1250,7 +1267,7 @@ class TestOsUserOverride:
             )
 
         with (
-            patch("kai.eval.memory_backend_gate.memory.init_memory", lambda _c: None),
+            patch("kai.eval.memory_backend_gate.memory.init_memory", lambda _c, store_dir=None: None),
             patch("kai.eval.memory_backend_gate.load_config", return_value=_BASE_CONFIG),
             patch("kai.eval.memory_backend_gate.run_backend", _fake_run_backend),
         ):

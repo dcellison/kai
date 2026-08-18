@@ -984,14 +984,24 @@ def _resolve_cached_embedding_model(model: str) -> tuple[str, bool]:
     return str(Path(snapshot_path).resolve()), True
 
 
-def _mem0_config(config: Config) -> dict:
+def _mem0_config(config: Config, store_dir: Path | None = None) -> dict:
     """
     Build Mem0 configuration dict from Kai's config.
 
     Creates the Qdrant storage directory if it does not exist. Uses
     local embedded Qdrant (no server needed) with HuggingFace embeddings.
+
+    Args:
+        config: Application config with memory settings.
+        store_dir: Root directory for the Qdrant tree and the Mem0
+            history DB. None means the production store
+            (DATA_DIR/memory). Eval harnesses pass an isolated
+            directory so sandbox writes can never land in the
+            production collection.
     """
-    qdrant_path = DATA_DIR / "memory" / "qdrant"
+    if store_dir is None:
+        store_dir = DATA_DIR / "memory"
+    qdrant_path = store_dir / "qdrant"
     qdrant_path.mkdir(parents=True, exist_ok=True)
     embedding_model, local_only = _resolve_cached_embedding_model(config.memory_embedding_model)
     model_kwargs: dict[str, object] = {"device": "cpu"}
@@ -1017,10 +1027,11 @@ def _mem0_config(config: Config) -> dict:
                 "path": str(qdrant_path),
             },
         },
-        # Keep Mem0's history DB inside DATA_DIR, not ~/.mem0/.
-        # In production DATA_DIR is /var/lib/kai/, so without this
-        # override the history DB would land in the wrong location.
-        "history_db_path": str(DATA_DIR / "memory" / "mem0_history.db"),
+        # Keep Mem0's history DB inside the store dir, not ~/.mem0/.
+        # In production the store dir is /var/lib/kai/memory/, so
+        # without this override the history DB would land in the
+        # wrong location.
+        "history_db_path": str(store_dir / "mem0_history.db"),
     }
 
 
@@ -1445,7 +1456,7 @@ def init_offline_memory(config: Config) -> None:
     init_memory(config)
 
 
-def init_memory(config: Config) -> None:
+def init_memory(config: Config, *, store_dir: Path | None = None) -> None:
     """
     Initialize the Mem0 memory instance with Qdrant embedded storage.
 
@@ -1472,6 +1483,10 @@ def init_memory(config: Config) -> None:
 
     Args:
         config: Application config with memory settings.
+        store_dir: Root directory for the store, passed through to
+            `_mem0_config`. None means the production store
+            (DATA_DIR/memory); eval harnesses pass an isolated
+            directory.
 
     Raises:
         Exception: Propagated to caller (main.py catches and logs).
@@ -1635,7 +1650,7 @@ def init_memory(config: Config) -> None:
     # (~300MB RAM, several seconds) when memory is disabled.
     from mem0 import Memory
 
-    mem0_cfg = _mem0_config(config)
+    mem0_cfg = _mem0_config(config, store_dir)
     m = Memory.from_config(mem0_cfg)
 
     # Validate that the embedding model's output dimensions match the
@@ -1661,7 +1676,7 @@ def init_memory(config: Config) -> None:
         "Memory system ready (model=%s, dims=%d, storage=%s)",
         config.memory_embedding_model,
         actual_dims,
-        DATA_DIR / "memory" / "qdrant",
+        mem0_cfg["vector_store"]["config"]["path"],
     )
 
 
@@ -3028,6 +3043,50 @@ def _patch_memory_payload(*, memory_id: str, payload: dict[str, object]) -> None
             "Semantic-memory provider does not support payload-only ownership migration"
         )
     update(vector_id=memory_id, payload=payload)
+
+
+def count_points_by_owner() -> dict[str, int]:
+    """Count stored points per top-level `user_id` across the whole collection.
+
+    Mem0's `get_all` requires a `user_id` filter, so a collection-wide
+    owner census has no public-API path. Like `_patch_memory_payload`
+    above, this reaches through Mem0's `vector_store` in one isolated
+    boundary: a Qdrant scroll fetching only the `user_id` payload key
+    (no vectors, no other payload). Read-only.
+
+    Used by the `purge-sandbox` admin command to discover eval residue
+    identities and to verify real principals' counts are untouched by
+    the purge.
+
+    Raises RuntimeError when memory is not initialized or the provider
+    does not expose a Qdrant-style scroll: the sole caller is an
+    operator CLI where a loud failure beats an empty census that reads
+    as "nothing to purge".
+    """
+    if _memory is None:
+        raise RuntimeError("Semantic memory is not initialized")
+    vector_store = getattr(_memory, "vector_store", None)
+    client = getattr(vector_store, "client", None)
+    scroll = getattr(client, "scroll", None)
+    if not callable(scroll):
+        raise RuntimeError("Semantic-memory provider does not support an owner census")
+
+    counts: dict[str, int] = {}
+    offset = None
+    while True:
+        points, offset = scroll(
+            collection_name=vector_store.collection_name,
+            limit=1000,
+            offset=offset,
+            with_payload=["user_id"],
+            with_vectors=False,
+        )
+        for point in points:
+            uid = (point.payload or {}).get("user_id", "")
+            counts[uid] = counts.get(uid, 0) + 1
+        if offset is None:
+            break
+    return counts
 
 
 def migrate_memory_namespace(

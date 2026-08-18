@@ -19,7 +19,7 @@ import re
 import sys
 from dataclasses import replace
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -283,6 +283,42 @@ class TestEmbeddingModelResolution:
             "model": str(snapshot),
             "model_kwargs": {"device": "cpu", "local_files_only": True},
         }
+
+    def test_default_store_dir_is_production_memory_tree(self, tmp_path):
+        from kai.memory import _mem0_config
+
+        with (
+            patch("kai.memory.DATA_DIR", tmp_path),
+            patch(
+                "kai.memory._resolve_cached_embedding_model",
+                return_value=("m", False),
+            ),
+        ):
+            config = _mem0_config(_make_config())
+
+        assert config["vector_store"]["config"]["path"] == str(tmp_path / "memory" / "qdrant")
+        assert config["history_db_path"] == str(tmp_path / "memory" / "mem0_history.db")
+
+    def test_store_dir_override_relocates_qdrant_and_history(self, tmp_path):
+        """The eval-isolation override must move BOTH stores: an
+        override that relocated the vectors but left the history DB on
+        the production path would silently keep polluting the
+        production write metrics the override exists to protect."""
+        from kai.memory import _mem0_config
+
+        override = tmp_path / "eval_memory"
+        with (
+            patch("kai.memory.DATA_DIR", tmp_path),
+            patch(
+                "kai.memory._resolve_cached_embedding_model",
+                return_value=("m", False),
+            ),
+        ):
+            config = _mem0_config(_make_config(), store_dir=override)
+
+        assert config["vector_store"]["config"]["path"] == str(override / "qdrant")
+        assert config["history_db_path"] == str(override / "mem0_history.db")
+        assert (override / "qdrant").is_dir()
 
 
 # Third-party warnings scoped to this class: qdrant-client's local
@@ -6194,3 +6230,67 @@ class TestEmbedTexts:
         # Order matters: callers (centroid computation) rely on
         # vectors lining up with the input texts by index.
         assert mock_mem.embedding_model.embed.call_count == 3
+
+
+# ── count_points_by_owner ────────────────────────────────────────────
+
+
+class TestCountPointsByOwner:
+    """Collection-wide owner census used by the purge-sandbox admin
+    command. Reaches through Mem0's vector_store to a Qdrant scroll,
+    so the fake mirrors that surface: client.scroll returning
+    (points, next_offset) pages."""
+
+    @staticmethod
+    def _fake_memory(pages):
+        """Build a fake Mem0 whose client.scroll serves the given pages."""
+        calls = {"offsets": []}
+
+        def scroll(*, collection_name, limit, offset, with_payload, with_vectors):
+            calls["offsets"].append(offset)
+            points, next_offset = pages[len(calls["offsets"]) - 1]
+            return points, next_offset
+
+        client = SimpleNamespace(scroll=scroll)
+        vector_store = SimpleNamespace(client=client, collection_name="kai_memory")
+        return SimpleNamespace(vector_store=vector_store), calls
+
+    def test_counts_owners_across_pages(self):
+        from kai.memory import count_points_by_owner
+
+        p = lambda uid: SimpleNamespace(payload={"user_id": uid})  # noqa: E731
+        fake, calls = self._fake_memory(
+            [
+                ([p("prn_a"), p("sandbox-1"), p("prn_a")], "cursor"),
+                ([p("sandbox-1"), p("prn_b")], None),
+            ]
+        )
+        with patch("kai.memory._memory", fake):
+            counts = count_points_by_owner()
+
+        assert counts == {"prn_a": 2, "sandbox-1": 2, "prn_b": 1}
+        # Pagination contract: first call starts at None, second call
+        # resumes from the returned cursor.
+        assert calls["offsets"] == [None, "cursor"]
+
+    def test_missing_payload_counts_as_empty_owner(self):
+        from kai.memory import count_points_by_owner
+
+        fake, _ = self._fake_memory([([SimpleNamespace(payload=None)], None)])
+        with patch("kai.memory._memory", fake):
+            assert count_points_by_owner() == {"": 1}
+
+    def test_raises_when_memory_uninitialized(self):
+        from kai.memory import count_points_by_owner
+
+        with patch("kai.memory._memory", None), pytest.raises(RuntimeError):
+            count_points_by_owner()
+
+    def test_raises_when_provider_has_no_scroll(self):
+        """A provider without a Qdrant-style scroll must fail loud, not
+        return an empty census that reads as 'nothing to purge'."""
+        from kai.memory import count_points_by_owner
+
+        fake = SimpleNamespace(vector_store=SimpleNamespace(client=object(), collection_name="x"))
+        with patch("kai.memory._memory", fake), pytest.raises(RuntimeError):
+            count_points_by_owner()

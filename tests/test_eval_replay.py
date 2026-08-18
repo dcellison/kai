@@ -20,6 +20,7 @@ PII posture: tests use synthetic JSONL fixtures generated inside
 from __future__ import annotations
 
 import json
+import os
 from datetime import date
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -375,7 +376,11 @@ class TestInitMemory:
     `outcome=dropped_backend`."""
 
     @pytest.mark.asyncio
-    async def test_async_main_initializes_memory(self, tmp_path):
+    async def test_async_main_initializes_memory(self, tmp_path, monkeypatch):
+        # The command overwrites MEM0_DIR in the process env as part of
+        # store isolation; registering the var with monkeypatch first
+        # makes pytest restore the pre-test value at teardown.
+        monkeypatch.setenv("MEM0_DIR", "pre-test-value")
         # Create a history file with one valid pair so the replay walks
         # but does not block on missing files.
         history_dir = tmp_path / "history" / str(_CHAT_ID)
@@ -412,7 +417,13 @@ class TestInitMemory:
             )
 
         assert rc == 0
-        init_mock.assert_called_once_with(config_mock)
+        # store_dir pins the eval-isolation guardrail: replay must
+        # never open the production collection; before isolation
+        # existed, eval runs left sandbox points in the real store.
+        from kai.config import DATA_DIR
+
+        init_mock.assert_called_once_with(config_mock, store_dir=DATA_DIR / "eval_memory")
+        assert os.environ["MEM0_DIR"] == str(DATA_DIR / "eval_memory" / "mem0")
 
 
 # ── --log-file structured-log capture ───────────────────────────────
@@ -443,13 +454,14 @@ class TestLogFileCapture:
         return history_dir
 
     @pytest.mark.asyncio
-    async def test_log_file_flag_captures_intent_log_lines(self, tmp_path):
+    async def test_log_file_flag_captures_intent_log_lines(self, tmp_path, monkeypatch):
         """End-to-end: an INFO-level `memory.consolidate.intent` line
         emitted via the production `_emit_intent_log` helper must
         appear in the file the operator named. The replay loop is
         short-circuited (no real extraction) and we directly emit a
         synthetic intent log from inside the patched extract path so
         the test is fast and deterministic."""
+        monkeypatch.setenv("MEM0_DIR", "pre-test-value")
         history_dir = self._make_history(tmp_path)
         log_path = tmp_path / "replay-with-logs.log"
 
@@ -516,13 +528,14 @@ class TestLogFileCapture:
         return len(logging.getLogger().handlers)
 
     @pytest.mark.asyncio
-    async def test_log_file_default_attaches_no_handler(self, tmp_path):
+    async def test_log_file_default_attaches_no_handler(self, tmp_path, monkeypatch):
         """Regression guard: without `--log-file` the replay must NOT
         attach a handler to the root logger. The previous behavior
         (no logging) was a bug, but the FIX must be explicit (the
         flag), not silent. A future refactor that auto-enables logging
         could leak handlers across test runs or surprise an operator
         whose terminal session was previously quiet."""
+        monkeypatch.setenv("MEM0_DIR", "pre-test-value")
         history_dir = self._make_history(tmp_path)
         before = self._root_handler_count()
 

@@ -36,6 +36,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -45,7 +46,15 @@ from pathlib import Path
 from typing import Any
 
 from kai import memory, memory_extraction
-from kai.config import ONESHOT_REASONER_BACKENDS, Config, ModelRole, _resolve_eval_provider, get_model_for, load_config
+from kai.config import (
+    DATA_DIR,
+    ONESHOT_REASONER_BACKENDS,
+    Config,
+    ModelRole,
+    _resolve_eval_provider,
+    get_model_for,
+    load_config,
+)
 from kai.eval.extraction import _window_to_extractor_args
 from kai.eval.replay import _SANDBOX_USER_ID_PREFIX
 
@@ -2043,7 +2052,12 @@ async def _run_cli(args: argparse.Namespace) -> int:
         memory_enabled=True,
         memory_extraction_enabled=True,
     )
-    memory.init_memory(memory_init_config)
+    # Same isolation as the replay harness: sandbox arms write to a
+    # dedicated store directory, never the production collection, and
+    # MEM0_DIR is redirected before init_memory lazily imports mem0.
+    eval_store = DATA_DIR / "eval_memory"
+    os.environ["MEM0_DIR"] = str(eval_store / "mem0")
+    memory.init_memory(memory_init_config, store_dir=eval_store)
     runs: dict[str, BackendRun] = {}
     metrics_by_backend: dict[str, BackendMetrics] = {}
     for backend in args.backends:

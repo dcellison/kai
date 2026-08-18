@@ -138,6 +138,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Confirm deletion. Without this flag the command prints the planned action and exits with status 2.",
     )
 
+    ps = sub.add_parser(
+        "purge-sandbox",
+        help="Delete every eval-residue identity (user_id prefix 'sandbox-') from the store",
+        description=(
+            "Enumerate every owner identity in the collection whose "
+            "user_id starts with 'sandbox-' (the eval-harness naming "
+            "convention shared by the replay and backend-gate tools) "
+            "and delete all of their rows. Real principals are listed "
+            "in the plan and re-counted afterwards so the run verifies "
+            "they were untouched."
+        ),
+    )
+    ps.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm deletion. Without this flag the command prints the planned deletions and exits with status 2.",
+    )
+
     # Lazy import: the choices list is the only config dependency at
     # parser-build time. Importing it here (not at module top) keeps
     # `import kai.memory_admin` itself free of kai.config, preserving
@@ -419,6 +437,72 @@ def _cmd_purge(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_purge_sandbox(args: argparse.Namespace) -> int:
+    """Execute the `purge-sandbox` subcommand. Returns a process exit code.
+
+    Deletion goes through the existing `delete_all` primitive per
+    identity. That primitive swallows provider exceptions by design
+    (it serves the bot's forget-all path), so success is verified by
+    re-running the owner census afterwards rather than by trusting
+    the calls: any surviving sandbox row, or any change to a real
+    principal's count, fails the run with exit 1.
+    """
+    if not _initialize_memory():
+        return 1
+
+    from kai.memory import count_points_by_owner, delete_all
+
+    try:
+        before = count_points_by_owner()
+    except Exception as e:
+        print(f"memory admin: owner census failed: {e}", file=sys.stderr)
+        return 1
+
+    sandbox = {uid: n for uid, n in sorted(before.items()) if uid.startswith("sandbox-")}
+    real = {uid: n for uid, n in sorted(before.items()) if not uid.startswith("sandbox-")}
+
+    if not sandbox:
+        print("memory admin: no sandbox-prefixed identities in the store; nothing to purge.")
+        return 0
+
+    print(f"memory admin: {sum(sandbox.values())} row(s) across {len(sandbox)} sandbox identit(ies):")
+    for uid, n in sandbox.items():
+        print(f"  {uid}: {n}")
+    print(f"memory admin: {len(real)} real principal(s) will be left untouched:")
+    for uid, n in real.items():
+        print(f"  {uid}: {n}")
+
+    if not args.yes:
+        # Dry-run path; exit 2 mirrors `purge` (distinct from success
+        # and error so automation can tell them apart).
+        print("memory admin: re-run with --yes to execute.")
+        return 2
+
+    for uid in sandbox:
+        delete_all(user_id=uid)
+
+    try:
+        after = count_points_by_owner()
+    except Exception as e:
+        print(f"memory admin: post-purge census failed: {e}", file=sys.stderr)
+        return 1
+
+    leftover = {uid: n for uid, n in sorted(after.items()) if uid.startswith("sandbox-")}
+    real_after = {uid: n for uid, n in sorted(after.items()) if not uid.startswith("sandbox-")}
+    if leftover:
+        print(f"memory admin: purge incomplete; sandbox rows remain: {leftover}", file=sys.stderr)
+        return 1
+    if real_after != real:
+        print(
+            f"memory admin: real principal counts changed during the purge: before={real} after={real_after}",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"memory admin: deleted {sum(sandbox.values())} row(s); real principal counts unchanged.")
+    return 0
+
+
 def _cmd_reclassify(args: argparse.Namespace) -> int:
     """Execute the `reclassify-scope` subcommand. Returns an exit code.
 
@@ -697,6 +781,8 @@ def cli(argv: list[str]) -> None:
 
     if args.command == "purge":
         sys.exit(_cmd_purge(args))
+    if args.command == "purge-sandbox":
+        sys.exit(_cmd_purge_sandbox(args))
     if args.command == "reclassify-scope":
         sys.exit(_cmd_reclassify(args))
     if args.command == "backfill-provenance":
