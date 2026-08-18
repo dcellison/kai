@@ -1218,6 +1218,53 @@ class TestSendLockedBasic:
         monkeypatch.setattr(ClaudeCodeBackend, "_kill", AsyncMock())
 
     @pytest.mark.asyncio
+    async def test_turn_deadline_ends_a_turn_that_keeps_trickling_output(self):
+        """
+        The idle guard resets on any output, so a turn that trickles
+        assistant events without ever completing is bounded only by
+        the turn deadline; when it fires, the turn ends with a failed
+        response preserving the accumulated text.
+        """
+        claude = _make_claude(turn_deadline_seconds=1)
+        proc = _make_mock_proc([])
+
+        async def trickle():
+            # Frequent-enough output that the idle guard never fires.
+            await asyncio.sleep(0.4)
+            return _assistant_event("still going")
+
+        proc.stdout.readline = AsyncMock(side_effect=trickle)
+        claude._proc = proc
+        claude._fresh_session = False
+
+        events = await _collect_events(claude)
+
+        assert events[-1].done is True
+        assert events[-1].response.success is False
+        assert events[-1].response.error == "Claude turn exceeded its deadline"
+        assert "still going" in events[-1].text_so_far
+
+    @pytest.mark.asyncio
+    async def test_turn_completing_within_deadline_is_untouched(self):
+        """A normal turn under the deadline ends by completion, not the backstop."""
+        claude = _make_claude(turn_deadline_seconds=5)
+        proc = _make_mock_proc(
+            [
+                _system_event(),
+                _assistant_event("Hello"),
+                _result_event("Hello"),
+                b"",
+            ]
+        )
+        claude._proc = proc
+        claude._fresh_session = False
+
+        events = await _collect_events(claude)
+
+        assert events[-1].done is True
+        assert events[-1].response.success is True
+
+    @pytest.mark.asyncio
     async def test_writes_json_to_stdin(self):
         """Sends a JSON-formatted message to the process stdin."""
         proc = _make_mock_proc([_system_event(), _result_event(), b""])
@@ -1594,25 +1641,30 @@ class TestSendLockedErrors:
         """
         claude = _make_claude(timeout_seconds=1)  # idle limit = 5s
 
-        # Control time progression in kai.claude without affecting asyncio.
-        # The streaming loop calls time.monotonic() in a fixed pattern:
-        #   1. Init: last_activity = time.monotonic()
-        #   2. Idle check (iter 1): time.monotonic() - last_activity
-        #   3. Reset after readline 1: last_activity = time.monotonic()
-        #   4. Idle check (iter 2): time.monotonic() - last_activity
-        #   5. Reset after readline 2: last_activity = time.monotonic()
-        #   6. Idle check (iter 3): time.monotonic() - last_activity <- jump here
-        # Calls 1-5 return small values; call 6+ returns 100.0 so the
-        # idle check sees (100.0 - 0.5) > 5s and fires.
+        # Control time progression in kai.claude without affecting
+        # asyncio. Keyed off readline progress rather than a scripted
+        # call count so the pattern survives extra monotonic() calls in
+        # the loop (the turn-deadline check is one): while the first
+        # two reads are being produced the clock creeps in tiny steps,
+        # and once both are out it jumps to 100.0. The next idle check
+        # then sees a gap far past the 5s limit and fires, while the
+        # turn-deadline check stays quiet (100.0 elapsed is far under
+        # the 3600s default).
         mono_call = [0]
+        readline_count = [0]
+        post_read_calls = [0]
 
         def fake_monotonic():
+            if readline_count[0] >= 2:
+                post_read_calls[0] += 1
+                # The first monotonic() call after the second read is
+                # the last_activity reset; it must stay small or the
+                # idle gap this test manufactures would be erased
+                # before the next idle check could see it.
+                if post_read_calls[0] > 1:
+                    return 100.0
             mono_call[0] += 1
-            if mono_call[0] <= 5:
-                return mono_call[0] * 0.1
-            return 100.0
-
-        readline_count = [0]
+            return mono_call[0] * 0.1
 
         async def readline_with_output():
             readline_count[0] += 1
