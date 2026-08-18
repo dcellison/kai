@@ -1292,7 +1292,11 @@ button:disabled {
 .context-resize-handle::after {
   position: absolute;
   top: 0;
-  left: 0.25rem;
+  /* The handle starts 0.3rem outside the pane, and the pane clips at its
+     edge (overflow: hidden), so the indicator must begin exactly at the
+     pane boundary to show its full width; any less and the clipped sliver
+     renders it thinner than the sidebar's. */
+  left: 0.3rem;
   bottom: 0;
   width: 1px;
   background: transparent;
