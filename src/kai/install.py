@@ -3645,7 +3645,13 @@ def _generate_principal_memory_reader(data_dir: str) -> str:
             finally:
                 os.close(root_fd)
             try:
-                fd = os.open("MEMORY.md", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+                # O_NONBLOCK so a planted FIFO opens instantly (and is
+                # then rejected by the S_ISREG check) instead of
+                # blocking this root process forever; regular files
+                # are unaffected by the flag.
+                fd = os.open(
+                    "MEMORY.md", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd
+                )
             except OSError:
                 return 1
             finally:

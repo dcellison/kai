@@ -438,6 +438,9 @@ class TestGeneratePrincipalMemoryReader:
         assert "st_nlink != 1" in script
         assert "info.st_uid == 0" in script
         assert "stat.S_ISREG" in script
+        # The file open is non-blocking so a planted FIFO cannot hang
+        # the root process; S_ISREG then rejects it.
+        assert "os.O_NONBLOCK" in script
         # The memory root is a repr'd literal; no env consultation.
         assert "MEMORY_ROOT = '/var/lib/kai/memory'" in script
         assert "environ" not in script
@@ -516,6 +519,16 @@ class TestPrincipalMemoryReaderExecution:
     def test_missing_memory_md_exits_nonzero(self, tmp_path):
         (tmp_path / "memory" / "prn_empty").mkdir(parents=True)
         assert self._run(tmp_path, "prn_empty")[0] == 1
+
+    def test_fifo_memory_md_is_refused_without_blocking(self, tmp_path):
+        """A planted FIFO must be rejected, not block the root helper
+        forever waiting for a writer. O_NONBLOCK makes the open return
+        immediately; S_ISREG then refuses it."""
+        principal = tmp_path / "memory" / "prn_fifo"
+        principal.mkdir(parents=True)
+        os.mkfifo(principal / "MEMORY.md")
+        code, out = self._run(tmp_path, "prn_fifo")
+        assert (code, out) == (1, b"")
 
     def test_nopasswd(self):
         result = _generate_sudoers("kai")
