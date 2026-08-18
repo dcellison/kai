@@ -161,6 +161,17 @@ _EXTRACTION_PROMPT_VERSION: str = "12"
 # project write-scope judgment for the scoped-memory routing path).
 _EPISODE_PROMPT_VERSION: str = "2"
 
+# Consecutive stage-1 subprocess failures across all users in this
+# process, and the streak length at which one ERROR-level alarm fires
+# (at the crossing only; reset on the next completed run). Observed
+# provider-side failure bursts are sustained conditions lasting hours,
+# during which every affected turn's facts are permanently lost; the
+# per-failure WARNING is too quiet to distinguish a burst from a
+# one-off. Three is past any plausible one-off but early enough to
+# catch a burst within minutes of active conversation.
+_FAILURE_STREAK_ALARM_THRESHOLD = 3
+_consecutive_subprocess_failures = 0
+
 # Memory `type` values this module writes. Track 1 writes "exchange"
 # from memory.py; Track 2 writes "fact" from here. Any other type value
 # in add_structured() metadata produced by this module is a bug.
@@ -2131,6 +2142,8 @@ async def _run_extractor(
     API-key-only auth path - only `--bare` does, and its absence is
     asserted by a regression test (§13.3).
     """
+    global _consecutive_subprocess_failures
+
     # Provider subprocess mechanics (argv, env allow-list, neutral
     # cwd, timeout, kill+await on miss) live in `kai.oneshot`'s
     # ClaudeOneShotReasoner. The reasoner raises typed exceptions on
@@ -2169,11 +2182,29 @@ async def _run_extractor(
         )
         return ExtractionResult(facts=[], has_episode=False)
     except OneShotSubprocessError as e:
+        # stderr head AND stdout tail: codex `exec --json` reports its
+        # failure cause in error / turn.failed events streamed to
+        # stdout (stderr carries only the stdin banner), and the cause
+        # events arrive last, so the tail is the informative end.
         log.warning(
-            "Memory extraction subprocess exited %d: %s",
+            "Memory extraction subprocess exited %d: stderr=%s stdout_tail=%s",
             e.returncode,
             e.stderr[:500].decode("utf-8", errors="replace"),
+            e.stdout[-500:].decode("utf-8", errors="replace"),
         )
+        _consecutive_subprocess_failures += 1
+        if _consecutive_subprocess_failures == _FAILURE_STREAK_ALARM_THRESHOLD:
+            # One loud line per streak, at the crossing only. Observed
+            # failure bursts are sustained provider-side conditions
+            # lasting hours (runs of 7 to 9 consecutive failures), so
+            # a per-failure WARNING scrolls past while facts are lost
+            # every turn; the ERROR is the operator's signal to look.
+            log.error(
+                "Memory extraction has failed %d consecutive times; every affected "
+                "turn's facts are being lost. See the stderr/stdout capture on the "
+                "preceding warnings for the provider's failure detail.",
+                _consecutive_subprocess_failures,
+            )
         return ExtractionResult(facts=[], has_episode=False)
     except OneShotError:
         # OneShotOutputError or any future OneShotError subclass the
@@ -2185,6 +2216,11 @@ async def _run_extractor(
         # subprocess-error path.
         log.warning("Memory extraction reasoner error", exc_info=True)
         return ExtractionResult(facts=[], has_episode=False)
+
+    # The subprocess ran to completion, so any failure streak is over;
+    # the next streak should alarm again at its own threshold crossing.
+    _consecutive_subprocess_failures = 0
+
     try:
         parsed = json.loads(result.text)
     except json.JSONDecodeError:

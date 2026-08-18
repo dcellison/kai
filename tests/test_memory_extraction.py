@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -4996,3 +4997,92 @@ class TestProvenanceStamping:
         _store_facts(facts, user_id="100", session_id="s", config=_cfg())
         md = captured["metadata"]
         assert not any(k.startswith("source_") for k in md if k != "source")
+
+
+# ── Stage-1 failure capture, streak alarm ───────────────────────────
+
+
+class TestSubprocessFailureCaptureAlarm:
+    """Stage 1's OneShotSubprocessError handler must log the stdout
+    tail (codex exec --json reports its failure cause there, not on
+    stderr) and must escalate to one ERROR-level line when consecutive
+    failures cross the streak threshold, since observed bursts are
+    sustained conditions during which every turn's facts are lost."""
+
+    @staticmethod
+    def _failing_reasoner(stdout: bytes = b"", stderr: bytes = b"banner"):
+        from kai.oneshot import OneShotSubprocessError
+
+        class _Failing:
+            async def run(self, **kwargs):
+                raise OneShotSubprocessError(returncode=1, stderr=stderr, stdout=stdout)
+
+        return _Failing()
+
+    @staticmethod
+    def _succeeding_reasoner():
+        class _Result:
+            text = '{"facts": [], "has_episode": false}'
+
+        class _Succeeding:
+            async def run(self, **kwargs):
+                return _Result()
+
+        return _Succeeding()
+
+    async def _run(self, reasoner):
+        with patch("kai.memory_extraction._build_memory_reasoner", return_value=reasoner):
+            return await memory_extraction._run_extractor(
+                payload_text="payload",
+                config=_cfg(),
+                candidate_ids=set(),
+                candidate_metadata={},
+                user_id="u1",
+                effective_backend="codex",
+                effective_provider="openai",
+            )
+
+    @pytest.mark.asyncio
+    async def test_warning_includes_stdout_tail(self, caplog, monkeypatch):
+        monkeypatch.setattr(memory_extraction, "_consecutive_subprocess_failures", 0)
+        stdout = b'{"type":"turn.failed","error":{"message":"usage limit reached"}}'
+
+        with caplog.at_level(logging.WARNING, logger="kai.memory_extraction"):
+            await self._run(self._failing_reasoner(stdout=stdout))
+
+        [warning] = [
+            r for r in caplog.records if "subprocess exited" in r.message or "subprocess exited" in r.getMessage()
+        ]
+        rendered = warning.getMessage()
+        assert "usage limit reached" in rendered
+        assert "banner" in rendered
+
+    @pytest.mark.asyncio
+    async def test_alarm_fires_at_threshold_crossing_only(self, caplog, monkeypatch):
+        monkeypatch.setattr(memory_extraction, "_consecutive_subprocess_failures", 0)
+
+        with caplog.at_level(logging.WARNING, logger="kai.memory_extraction"):
+            for _ in range(memory_extraction._FAILURE_STREAK_ALARM_THRESHOLD + 1):
+                await self._run(self._failing_reasoner())
+
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        # Exactly one ERROR: at the crossing, not before and not again
+        # on the fourth failure of the same streak.
+        assert len(errors) == 1
+        assert "consecutive" in errors[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_completed_run_resets_the_streak(self, caplog, monkeypatch):
+        monkeypatch.setattr(memory_extraction, "_consecutive_subprocess_failures", 0)
+
+        with caplog.at_level(logging.WARNING, logger="kai.memory_extraction"):
+            await self._run(self._failing_reasoner())
+            await self._run(self._failing_reasoner())
+            await self._run(self._succeeding_reasoner())
+            await self._run(self._failing_reasoner())
+            await self._run(self._failing_reasoner())
+
+        # Two failures, reset, two failures: threshold (3) never
+        # crossed, so no ERROR anywhere.
+        assert [r for r in caplog.records if r.levelno == logging.ERROR] == []
+        assert memory_extraction._consecutive_subprocess_failures == 2

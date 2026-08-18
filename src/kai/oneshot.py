@@ -279,6 +279,15 @@ class OneShotSubprocessError(OneShotError):
 
     returncode: int
     stderr: bytes
+    # Captured stdout, for backends whose CLIs report failure detail
+    # there rather than on stderr: codex `exec --json` streams its
+    # error and turn.failed events to stdout as JSONL while stderr
+    # carries only the "Reading prompt from stdin..." banner, so a
+    # stderr-only capture logs the banner and discards the cause.
+    # Defaulted so raise sites with no captured output stay valid.
+    # Deliberately absent from __str__: stage 2's failure-reason
+    # string shape (`exit_N: <stderr snippet>`) is pinned by tests.
+    stdout: bytes = b""
 
     def __str__(self) -> str:
         # The dataclass-generated __init__ never populates
@@ -770,7 +779,7 @@ class ClaudeOneShotReasoner:
                 returncode,
                 os_user_field,
             )
-            raise OneShotSubprocessError(returncode=returncode, stderr=stderr)
+            raise OneShotSubprocessError(returncode=returncode, stderr=stderr, stdout=stdout)
 
         log.info(
             "oneshot_reasoner purpose=%s backend=claude model=%s duration_ms=%d outcome=success returncode=0 os_user=%s",
@@ -1353,7 +1362,7 @@ class CodexOneShotReasoner:
                     returncode,
                     os_user_field,
                 )
-                raise OneShotSubprocessError(returncode=returncode, stderr=stderr)
+                raise OneShotSubprocessError(returncode=returncode, stderr=stderr, stdout=stdout)
 
             stdout_text = stdout.decode("utf-8", errors="replace")
             # Structured-output callers want only the LAST completed
@@ -2477,7 +2486,7 @@ class GooseOneShotReasoner:
                 returncode,
                 os_user_field,
             )
-            raise OneShotSubprocessError(returncode=returncode, stderr=stderr)
+            raise OneShotSubprocessError(returncode=returncode, stderr=stderr, stdout=stdout)
 
         response_text = stdout.decode("utf-8", errors="replace").strip()
         raw_metadata = {
