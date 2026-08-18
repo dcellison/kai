@@ -285,8 +285,11 @@ class OneShotSubprocessError(OneShotError):
     # carries only the "Reading prompt from stdin..." banner, so a
     # stderr-only capture logs the banner and discards the cause.
     # Defaulted so raise sites with no captured output stay valid.
-    # Deliberately absent from __str__: stage 2's failure-reason
-    # string shape (`exit_N: <stderr snippet>`) is pinned by tests.
+    # Deliberately absent from __str__: that rendering's shape is
+    # pinned by its own tests and embedded verbatim by callers that
+    # fold str(e) into their error messages, and a stdout tail there
+    # would bloat every such message. Callers that want the stdout
+    # detail (the stage-1 extraction warning) read the field directly.
     stdout: bytes = b""
 
     def __str__(self) -> str:

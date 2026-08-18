@@ -169,6 +169,14 @@ _EPISODE_PROMPT_VERSION: str = "2"
 # per-failure WARNING is too quiet to distinguish a burst from a
 # one-off. Three is past any plausible one-off but early enough to
 # catch a burst within minutes of active conversation.
+#
+# Scope is nonzero-exit failures ONLY, by measurement: timeouts do
+# not increment (zero timeout outcomes across the entire telemetry
+# window under the 300-second production budget, and the alarm text
+# points at stderr/stdout captures that timeout entries do not have),
+# and a completed-but-unparseable run resets (the provider was up and
+# answered; output quality is a different failure with its own
+# warnings). Widen only if a burst of either shape is ever observed.
 _FAILURE_STREAK_ALARM_THRESHOLD = 3
 _consecutive_subprocess_failures = 0
 
