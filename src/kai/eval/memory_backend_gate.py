@@ -36,6 +36,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -45,7 +46,15 @@ from pathlib import Path
 from typing import Any
 
 from kai import memory, memory_extraction
-from kai.config import ONESHOT_REASONER_BACKENDS, Config, ModelRole, _resolve_eval_provider, get_model_for, load_config
+from kai.config import (
+    DATA_DIR,
+    ONESHOT_REASONER_BACKENDS,
+    Config,
+    ModelRole,
+    _resolve_eval_provider,
+    get_model_for,
+    load_config,
+)
 from kai.eval.extraction import _window_to_extractor_args
 from kai.eval.replay import _SANDBOX_USER_ID_PREFIX
 
@@ -2043,7 +2052,18 @@ async def _run_cli(args: argparse.Namespace) -> int:
         memory_enabled=True,
         memory_extraction_enabled=True,
     )
-    memory.init_memory(memory_init_config)
+    # Same isolation as the replay harness: sandbox arms write to a
+    # dedicated store directory, never the production collection, and
+    # MEM0_DIR is redirected before init_memory lazily imports mem0.
+    eval_store = DATA_DIR / "eval_memory"
+    # Owner-only: sandbox facts derive from real conversation windows,
+    # so the eval store must not be more readable than the production
+    # store it is isolated from. chmod as well as mkdir so a tree
+    # created by an older run is healed rather than trusted.
+    eval_store.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(eval_store, 0o700)
+    os.environ["MEM0_DIR"] = str(eval_store / "mem0")
+    memory.init_memory(memory_init_config, store_dir=eval_store)
     runs: dict[str, BackendRun] = {}
     metrics_by_backend: dict[str, BackendMetrics] = {}
     for backend in args.backends:

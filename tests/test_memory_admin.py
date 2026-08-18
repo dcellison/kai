@@ -481,3 +481,111 @@ class TestReclassifyGates:
         assert kwargs["threshold"] == 0.8
         assert kwargs["sample"] == 10
         assert kwargs["backend"] is None
+
+
+# ── purge-sandbox ────────────────────────────────────────────────────
+
+
+class TestPurgeSandbox:
+    """The eval-residue purge: census -> delete per sandbox identity ->
+    re-census verification. delete_all swallows provider errors by
+    design, so the command's success signal is the after-census, and
+    these tests pin that contract."""
+
+    @staticmethod
+    def _args(yes: bool):
+        parser = memory_admin._build_parser()
+        return parser.parse_args(["purge-sandbox", "--yes"] if yes else ["purge-sandbox"])
+
+    def test_dry_run_lists_plan_and_exits_2(self, capsys):
+        census = {"prn_a": 500, "sandbox-464": 300, "sandbox-465": 74}
+        delete_mock = MagicMock()
+        with (
+            patch.object(memory_admin, "_initialize_memory", return_value=True),
+            patch("kai.memory.count_points_by_owner", return_value=census),
+            patch("kai.memory.delete_all", delete_mock),
+        ):
+            code = memory_admin._cmd_purge_sandbox(self._args(yes=False))
+        assert code == 2
+        delete_mock.assert_not_called()
+        out = capsys.readouterr().out
+        assert "sandbox-464: 300" in out
+        assert "prn_a: 500" in out
+        assert "--yes" in out
+
+    def test_yes_deletes_each_identity_and_verifies(self, capsys):
+        before = {"prn_a": 500, "sandbox-464": 300, "sandbox-465": 74}
+        after = {"prn_a": 500}
+        delete_mock = MagicMock()
+        with (
+            patch.object(memory_admin, "_initialize_memory", return_value=True),
+            patch("kai.memory.count_points_by_owner", side_effect=[before, after]),
+            patch("kai.memory.delete_all", delete_mock),
+        ):
+            code = memory_admin._cmd_purge_sandbox(self._args(yes=True))
+        assert code == 0
+        assert {c.kwargs["user_id"] for c in delete_mock.call_args_list} == {
+            "sandbox-464",
+            "sandbox-465",
+        }
+        out = capsys.readouterr().out
+        assert "deleted 374 row(s)" in out
+        assert "unchanged" in out
+
+    def test_surviving_sandbox_rows_fail_the_run(self, capsys):
+        before = {"prn_a": 500, "sandbox-464": 300}
+        after = {"prn_a": 500, "sandbox-464": 12}
+        with (
+            patch.object(memory_admin, "_initialize_memory", return_value=True),
+            patch("kai.memory.count_points_by_owner", side_effect=[before, after]),
+            patch("kai.memory.delete_all", MagicMock()),
+        ):
+            code = memory_admin._cmd_purge_sandbox(self._args(yes=True))
+        assert code == 1
+        assert "sandbox rows remain" in capsys.readouterr().err
+
+    def test_changed_real_principal_counts_fail_the_run(self, capsys):
+        before = {"prn_a": 500, "sandbox-464": 300}
+        after = {"prn_a": 499}
+        with (
+            patch.object(memory_admin, "_initialize_memory", return_value=True),
+            patch("kai.memory.count_points_by_owner", side_effect=[before, after]),
+            patch("kai.memory.delete_all", MagicMock()),
+        ):
+            code = memory_admin._cmd_purge_sandbox(self._args(yes=True))
+        assert code == 1
+        assert "real principal counts changed" in capsys.readouterr().err
+
+    def test_no_sandbox_identities_is_a_clean_noop(self, capsys):
+        delete_mock = MagicMock()
+        with (
+            patch.object(memory_admin, "_initialize_memory", return_value=True),
+            patch("kai.memory.count_points_by_owner", return_value={"prn_a": 5}),
+            patch("kai.memory.delete_all", delete_mock),
+        ):
+            code = memory_admin._cmd_purge_sandbox(self._args(yes=True))
+        assert code == 0
+        delete_mock.assert_not_called()
+        assert "nothing to purge" in capsys.readouterr().out
+
+    def test_init_failure_exits_1(self):
+        with patch.object(memory_admin, "_initialize_memory", return_value=None):
+            assert memory_admin._cmd_purge_sandbox(self._args(yes=True)) == 1
+
+    def test_census_failure_exits_1(self, capsys):
+        with (
+            patch.object(memory_admin, "_initialize_memory", return_value=True),
+            patch("kai.memory.count_points_by_owner", side_effect=RuntimeError("no scroll")),
+        ):
+            code = memory_admin._cmd_purge_sandbox(self._args(yes=True))
+        assert code == 1
+        assert "census failed" in capsys.readouterr().err
+
+    def test_cli_dispatches_purge_sandbox(self):
+        with (
+            patch.object(memory_admin, "_cmd_purge_sandbox", return_value=0) as cmd,
+            pytest.raises(SystemExit) as exc,
+        ):
+            memory_admin.cli(["purge-sandbox"])
+        assert exc.value.code == 0
+        cmd.assert_called_once()
