@@ -53,6 +53,7 @@ from kai.install import (
     _generate_env_file,
     _generate_launchd_plist,
     _generate_launcher_script,
+    _generate_principal_memory_reader,
     _generate_sudoers,
     _generate_systemd_unit,
     _generate_users_yaml,
@@ -399,6 +400,38 @@ class TestGenerateSudoers:
         result = _generate_sudoers("kai")
         tee_path = shutil.which("tee") or "/usr/bin/tee"
         assert f"{tee_path} /etc/kai/totp.attempts" in result
+
+    def test_contains_principal_memory_reader_rule(self):
+        """The nightly backup's privileged MEMORY.md read targets the
+        fixed validating helper, never a cat wildcard (which would let
+        traversal in the matched argument read arbitrary files)."""
+        result = _generate_sudoers("kai")
+        assert "kai ALL=(root) NOPASSWD: /etc/kai/read-principal-memory *" in result
+        cat_path = shutil.which("cat") or "/bin/cat"
+        assert f"{cat_path} /var/lib" not in result
+
+
+class TestGeneratePrincipalMemoryReader:
+    """The helper script is the confinement boundary for the sudoers
+    grant: it must validate its argument before touching the
+    filesystem, and the data directory must be baked in (not read from
+    env, which sudo would let the caller influence)."""
+
+    def test_script_shape(self):
+        script = _generate_principal_memory_reader("/var/lib/kai")
+        assert script.startswith("#!/bin/sh\n")
+        # Argument count and character-class validation both present.
+        assert '[ "$#" -eq 1 ] || exit 64' in script
+        assert "*[!A-Za-z0-9_-]*" in script
+        # The read path is a literal prefix around the validated name;
+        # no env expansion anywhere in the path.
+        assert '/bin/cat "/var/lib/kai/memory/$1/MEMORY.md"' in script
+        assert "$DATA_DIR" not in script
+        assert "Managed by 'python -m kai install apply'" in script
+
+    def test_data_dir_is_baked_in(self):
+        script = _generate_principal_memory_reader("/srv/kai-data")
+        assert '"/srv/kai-data/memory/$1/MEMORY.md"' in script
 
     def test_nopasswd(self):
         result = _generate_sudoers("kai")

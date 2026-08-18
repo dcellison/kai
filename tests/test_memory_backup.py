@@ -22,6 +22,7 @@ import sqlite3
 import stat
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -184,6 +185,7 @@ class TestFailure:
     def test_unreadable_directory_warns_but_snapshot_succeeds(self, tmp_path, caplog, monkeypatch):
         """Foreign-owned 0700 principal dirs are reported loudly, not silently skipped."""
         monkeypatch.setattr("kai.memory_backup._previous_unreadable", None)
+        monkeypatch.setattr("kai.memory_backup._privileged_read_principal_memory", lambda name: None)
         memory_dir, conn = _make_memory_tree(tmp_path)
         conn.close()
         locked = memory_dir / "prn_locked"
@@ -205,6 +207,7 @@ class TestFailure:
     def test_unchanged_unreadable_set_demotes_to_info(self, tmp_path, caplog, monkeypatch):
         """A repeat of the same unreadable set logs INFO, not nightly WARNING furniture."""
         monkeypatch.setattr("kai.memory_backup._previous_unreadable", None)
+        monkeypatch.setattr("kai.memory_backup._privileged_read_principal_memory", lambda name: None)
         memory_dir, conn = _make_memory_tree(tmp_path)
         conn.close()
         locked = memory_dir / "prn_locked"
@@ -222,3 +225,110 @@ class TestFailure:
         assert first is not None and second is not None
         unreadable_records = [r for r in caplog.records if "prn_locked" in r.message or "skipped" in r.message]
         assert [r.levelno for r in unreadable_records] == [logging.WARNING, logging.INFO]
+
+
+# ── Privileged MEMORY.md salvage ─────────────────────────────────────
+
+
+class TestPrivilegedSalvage:
+    """Foreign-owned per-principal directories get a salvage attempt
+    through the root-owned sudo reader before landing in the warning.
+    The reader itself is stubbed here; its subprocess mechanics have
+    their own tests below."""
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+    def test_captured_memory_md_lands_in_snapshot(self, tmp_path, caplog, monkeypatch):
+        monkeypatch.setattr("kai.memory_backup._previous_unreadable", None)
+        calls: list[str] = []
+
+        def fake_reader(name):
+            calls.append(name)
+            return b"# salvaged facts\n"
+
+        monkeypatch.setattr("kai.memory_backup._privileged_read_principal_memory", fake_reader)
+        memory_dir, conn = _make_memory_tree(tmp_path)
+        conn.close()
+        locked = memory_dir / "prn_locked"
+        locked.mkdir()
+        os.chmod(locked, 0o000)
+
+        try:
+            with caplog.at_level(logging.INFO, logger="kai.memory_backup"):
+                snapshot = run_memory_backup(memory_dir, tmp_path / "backups" / "memory", NOW)
+        finally:
+            os.chmod(locked, 0o700)
+
+        assert snapshot is not None
+        assert calls == ["prn_locked"]
+        salvaged = snapshot / "prn_locked" / "MEMORY.md"
+        assert salvaged.read_bytes() == b"# salvaged facts\n"
+        assert stat.S_IMODE(salvaged.stat().st_mode) == 0o600
+        assert stat.S_IMODE(salvaged.parent.stat().st_mode) == 0o700
+        # Covered directory: no unreadable warning, one capture INFO.
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING and "unreadable" in r.message]
+        assert any("captured 1 foreign-owned MEMORY.md" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+    def test_nested_unreadable_directory_is_not_attempted(self, tmp_path, caplog, monkeypatch):
+        """Only direct children of the memory root are per-principal
+        stores; a deeper unreadable directory stays in the warning and
+        never reaches the reader."""
+        monkeypatch.setattr("kai.memory_backup._previous_unreadable", None)
+        calls: list[str] = []
+
+        def fake_reader(name):
+            calls.append(name)
+            return b"never used"
+
+        monkeypatch.setattr("kai.memory_backup._privileged_read_principal_memory", fake_reader)
+        memory_dir, conn = _make_memory_tree(tmp_path)
+        conn.close()
+        nested = memory_dir / "qdrant" / "locked_nested"
+        nested.mkdir()
+        os.chmod(nested, 0o000)
+
+        try:
+            with caplog.at_level(logging.WARNING, logger="kai.memory_backup"):
+                snapshot = run_memory_backup(memory_dir, tmp_path / "backups" / "memory", NOW)
+        finally:
+            os.chmod(nested, 0o700)
+
+        assert snapshot is not None
+        assert calls == []
+        assert any("unreadable" in r.message and "locked_nested" in r.getMessage() for r in caplog.records)
+
+
+class TestPrivilegedReader:
+    """Subprocess mechanics of _privileged_read_principal_memory: the
+    exact sudo -n command shape, and None on every unavailable path."""
+
+    def test_success_returns_stdout(self, monkeypatch):
+        from kai.memory_backup import _privileged_read_principal_memory
+
+        captured = {}
+
+        def fake_run(cmd, capture_output, timeout):
+            captured["cmd"] = cmd
+            return SimpleNamespace(returncode=0, stdout=b"# facts\n")
+
+        monkeypatch.setattr("kai.memory_backup.subprocess.run", fake_run)
+        assert _privileged_read_principal_memory("prn_abc") == b"# facts\n"
+        assert captured["cmd"] == ["sudo", "-n", "/etc/kai/read-principal-memory", "prn_abc"]
+
+    def test_nonzero_exit_returns_none(self, monkeypatch):
+        from kai.memory_backup import _privileged_read_principal_memory
+
+        monkeypatch.setattr(
+            "kai.memory_backup.subprocess.run",
+            lambda cmd, capture_output, timeout: SimpleNamespace(returncode=1, stdout=b""),
+        )
+        assert _privileged_read_principal_memory("prn_abc") is None
+
+    def test_oserror_returns_none(self, monkeypatch):
+        from kai.memory_backup import _privileged_read_principal_memory
+
+        def fake_run(cmd, capture_output, timeout):
+            raise OSError("sudo not found")
+
+        monkeypatch.setattr("kai.memory_backup.subprocess.run", fake_run)
+        assert _privileged_read_principal_memory("prn_abc") is None

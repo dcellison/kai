@@ -104,6 +104,14 @@ BACKENDS_YAML = Path("/etc/kai/backends.yaml")
 RUNTIME_PROFILES_YAML = Path("/etc/kai/runtime-profiles.yaml")
 _DEPLOYED_ENV_FILE = Path("/etc/kai/env")
 
+# Root-owned helper the nightly memory backup invokes via sudo to read
+# per-principal MEMORY.md files the service user cannot read directly
+# (protected installs keep those directories 0700 per-owner). The
+# script validates its single argument, so the sudoers grant cannot be
+# steered outside DATA_DIR/memory/<name>/MEMORY.md. memory_backup.py
+# hardcodes the same path; keep them in sync.
+PRINCIPAL_MEMORY_READER = Path("/etc/kai/read-principal-memory")
+
 # Default installation paths
 _DEFAULT_INSTALL_DIR = "/opt/kai"
 _DEFAULT_DATA_DIR = "/var/lib/kai"
@@ -3573,6 +3581,41 @@ def _collect_user_home_overrides(users_yaml_path: str | Path) -> dict[int, Path]
     return result
 
 
+def _generate_principal_memory_reader(data_dir: str) -> str:
+    """
+    Generate the root-owned helper that reads one per-principal MEMORY.md.
+
+    The nightly memory backup runs as the service user and cannot read
+    protected installs' per-principal directories (0700, owned by each
+    inner agent's OS user). Rather than a sudoers `cat` wildcard, which
+    would let path traversal in the matched argument read arbitrary
+    files as root, the grant targets this fixed script, and the script
+    itself confines the read: exactly one argument, flat-name
+    characters only, and a hardcoded path template around it. The data
+    directory is baked in at generation time so the runtime cannot
+    steer the prefix via environment.
+
+    Args:
+        data_dir: Absolute data directory (e.g., /var/lib/kai).
+
+    Returns:
+        The shell script content.
+    """
+    return textwrap.dedent(f"""\
+        #!/bin/sh
+        # Kai - read one per-principal MEMORY.md for the nightly memory backup.
+        # Managed by 'python -m kai install apply'. Do not edit manually.
+        # Confinement: single flat directory-name argument; anything else
+        # (extra args, slashes, dots, empty) exits without reading.
+        set -eu
+        [ "$#" -eq 1 ] || exit 64
+        case "$1" in
+          ''|*[!A-Za-z0-9_-]*) exit 64 ;;
+        esac
+        exec /bin/cat "{data_dir}/memory/$1/MEMORY.md"
+    """)
+
+
 def _generate_sudoers(
     service_user: str,
     os_users: Iterable[str] = (),
@@ -3629,6 +3672,7 @@ def _generate_sudoers(
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/totp.secret
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/totp.attempts
         {service_user} ALL=(root) NOPASSWD: {tee_path} /etc/kai/totp.attempts
+        {service_user} ALL=(root) NOPASSWD: {PRINCIPAL_MEMORY_READER} *
     """)
 
     # Yaml-derived os_users only. Drop self-sudo entries: pool.py uses
@@ -5937,6 +5981,7 @@ def _cmd_apply() -> None:
         _apply_sudoers(
             service_user,
             dry_run,
+            data_dir=data_dir,
             agent_backend=agent_backend,
             runtime_profiles=runtime_policy,
         )
@@ -7554,6 +7599,7 @@ def _apply_sudoers(
     service_user: str,
     dry_run: bool,
     users_yaml_path: str | Path | None = None,
+    data_dir: str | None = None,
     claude_bin: str | None = None,
     codex_bin: str | None = None,
     opencode_bin: str | None = None,
@@ -7578,6 +7624,10 @@ def _apply_sudoers(
     `runtime_profiles` scopes protected per-profile identities and backend
     checks. `agent_backend` and users.yaml retain compatibility coverage for
     the global/default runtime path.
+
+    `data_dir` additionally installs the principal-memory reader helper
+    the new sudoers rule targets; None (direct/dev callers) skips the
+    helper and leaves the rule pointing at whatever is already there.
     """
     # None resolves to the module-level USERS_YAML at call time rather
     # than in the signature: a def-time default would bake the
@@ -7671,9 +7721,28 @@ def _apply_sudoers(
                 )
 
     if dry_run:
+        if data_dir is not None:
+            print(f"[DRY RUN] Would write: {PRINCIPAL_MEMORY_READER} (mode 0755)")
         print(f"[DRY RUN] Would write: {sudoers_path} (mode 0440)")
         print("[DRY RUN] Would validate with visudo -cf")
         return
+
+    # Install the reader helper BEFORE the sudoers rules that target
+    # it, so the grant never points at a path an attacker could race
+    # to create first. Same mkstemp-then-move shape as the sudoers
+    # write below, for the same symlink-attack reason.
+    if data_dir is not None:
+        fd, tmp_name = tempfile.mkstemp(prefix="kai-memreader-", suffix=".tmp")
+        try:
+            os.write(fd, _generate_principal_memory_reader(data_dir).encode())
+            os.close(fd)
+            shutil.move(tmp_name, str(PRINCIPAL_MEMORY_READER))
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+        os.chmod(PRINCIPAL_MEMORY_READER, 0o755)
+        os.chown(PRINCIPAL_MEMORY_READER, 0, 0)
+        print(f"  Wrote {PRINCIPAL_MEMORY_READER}")
 
     # Write to a secure temp file first, validate, then move into place.
     # Uses mkstemp (random name, restrictive permissions) instead of a
