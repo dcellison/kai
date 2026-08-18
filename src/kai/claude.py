@@ -574,12 +574,17 @@ class ClaudeCodeBackend(AgentBackend):
         by public-API contract).
         """
         if self._pgid is not None:
-            if self._effective_claude_user is not None:
+            # Snapshot under the guard: a concurrent _kill/shutdown nulls
+            # _effective_claude_user, and the pgrep await below yields to
+            # it, so re-reading the attribute afterwards can hand the
+            # sudo argv a None.
+            target_user = self._effective_claude_user
+            if target_user is not None:
                 if self._inner_claude_pid is None:
                     self._inner_claude_pid = await self._async_lookup_inner_claude_pid()
                 if self._inner_claude_pid is not None:
                     await self._async_sudo_kill(
-                        self._effective_claude_user,
+                        target_user,
                         self._inner_claude_pid,
                         int(sig),
                     )

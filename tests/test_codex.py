@@ -2226,6 +2226,41 @@ class TestCodexCrossUserTeardown:
         # plural cache would silently retain stale PIDs.
         assert c._inner_codex_pids == []
 
+    @pytest.mark.asyncio
+    async def test_escalation_survives_concurrent_teardown_nulling_user(self):
+        """
+        The sudo target is snapshotted before the pgrep await: a
+        concurrent _kill/shutdown nulls _effective_codex_user while
+        that await yields, and the escalation must still address the
+        user it was guarded on rather than passing None into the sudo
+        argv.
+        """
+        c = _make_codex(codex_user="ci-fake-user")
+        c._proc = MagicMock()
+        c._pgid = 12345
+        c._effective_codex_user = "ci-fake-user"
+        # Empty cache so the async pgrep lookup (the yield point) runs.
+        c._inner_codex_pids = []
+
+        async def lookup_and_null():
+            c._effective_codex_user = None
+            return [67890]
+
+        sudo_proc = MagicMock()
+        sudo_proc.returncode = 0
+        sudo_proc.communicate = AsyncMock(return_value=(b"", b""))
+
+        with (
+            patch.object(c, "_async_lookup_inner_codex_pids", side_effect=lookup_and_null),
+            patch("kai.codex.asyncio.create_subprocess_exec", AsyncMock(return_value=sudo_proc)) as mock_exec,
+            patch("kai.codex.os.killpg"),
+        ):
+            await c._async_send_signal_for_close(signal.SIGKILL)
+
+        sudo_argv = mock_exec.call_args[0]
+        assert sudo_argv[:5] == ("sudo", "-n", "-u", "ci-fake-user", "/bin/kill")
+        assert sudo_argv[6] == "67890"
+
 
 class TestSudoKillEsrchDemotion:
     """

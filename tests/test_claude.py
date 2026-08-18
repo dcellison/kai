@@ -2537,6 +2537,35 @@ class TestKill:
             assert args[2] == int(signal.SIGKILL)
 
     @pytest.mark.asyncio
+    async def test_escalation_survives_concurrent_teardown_nulling_user(self):
+        """
+        The sudo target is snapshotted before the pgrep await: a
+        concurrent _kill/shutdown nulls _effective_claude_user while
+        that await yields, and the escalation must still address the
+        user it was guarded on rather than passing None into the sudo
+        argv.
+        """
+        claude = _make_claude(claude_user="daniel")
+        claude._proc = MagicMock()
+        claude._pgid = 12345
+        claude._effective_claude_user = "daniel"
+        claude._inner_claude_pid = None
+
+        async def lookup_and_null():
+            claude._effective_claude_user = None
+            return 99999
+
+        mock_sudo_kill = AsyncMock()
+        with (
+            patch.object(claude, "_async_lookup_inner_claude_pid", side_effect=lookup_and_null),
+            patch.object(claude, "_async_sudo_kill", new=mock_sudo_kill),
+            patch("os.killpg"),
+        ):
+            await claude._async_send_signal_for_close(signal.SIGKILL)
+
+        mock_sudo_kill.assert_awaited_once_with("daniel", 99999, int(signal.SIGKILL))
+
+    @pytest.mark.asyncio
     async def test_kill_skips_sudo_when_inner_pid_unknown(self):
         """
         If _async_lookup_inner_claude_pid never returns a PID (sudo
