@@ -181,8 +181,9 @@ class TestFailure:
         assert list(backup_root.iterdir()) == []
 
     @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
-    def test_unreadable_directory_warns_but_snapshot_succeeds(self, tmp_path, caplog):
+    def test_unreadable_directory_warns_but_snapshot_succeeds(self, tmp_path, caplog, monkeypatch):
         """Foreign-owned 0700 principal dirs are reported loudly, not silently skipped."""
+        monkeypatch.setattr("kai.memory_backup._previous_unreadable", None)
         memory_dir, conn = _make_memory_tree(tmp_path)
         conn.close()
         locked = memory_dir / "prn_locked"
@@ -199,3 +200,25 @@ class TestFailure:
         assert snapshot is not None
         assert not (snapshot / "prn_locked" / "MEMORY.md").exists()
         assert any("unreadable" in r.message and "prn_locked" in r.message for r in caplog.records)
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+    def test_unchanged_unreadable_set_demotes_to_info(self, tmp_path, caplog, monkeypatch):
+        """A repeat of the same unreadable set logs INFO, not nightly WARNING furniture."""
+        monkeypatch.setattr("kai.memory_backup._previous_unreadable", None)
+        memory_dir, conn = _make_memory_tree(tmp_path)
+        conn.close()
+        locked = memory_dir / "prn_locked"
+        locked.mkdir()
+        os.chmod(locked, 0o000)
+
+        try:
+            with caplog.at_level(logging.INFO, logger="kai.memory_backup"):
+                # Two runs spaced past the freshness floor, same unreadable set.
+                first = run_memory_backup(memory_dir, tmp_path / "backups" / "memory", NOW)
+                second = run_memory_backup(memory_dir, tmp_path / "backups" / "memory", NOW + MIN_SNAPSHOT_AGE * 2)
+        finally:
+            os.chmod(locked, 0o700)
+
+        assert first is not None and second is not None
+        unreadable_records = [r for r in caplog.records if "prn_locked" in r.message or "skipped" in r.message]
+        assert [r.levelno for r in unreadable_records] == [logging.WARNING, logging.INFO]

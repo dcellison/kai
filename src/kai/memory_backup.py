@@ -80,6 +80,11 @@ _SQLITE_SIDECAR_ENDINGS = ("-wal", "-shm", "-journal")
 
 # ── Snapshot ─────────────────────────────────────────────────────────
 
+# The unreadable-directory set reported by the previous run in this
+# process, used to demote the repeat warning below. None means no run
+# has happened yet since startup.
+_previous_unreadable: frozenset[str] | None = None
+
 
 def _is_sqlite_sidecar(name: str) -> bool:
     """Check if a filename is a SQLite WAL/SHM/journal sidecar."""
@@ -94,9 +99,10 @@ def _backup_sqlite(source: Path, target: Path) -> None:
     mutate the live store. backup() with default arguments copies the
     whole database in one pass under a read lock, yielding a
     transactionally consistent target even if the daemon commits
-    writes concurrently.
+    writes concurrently. as_uri() percent-encodes the path, so names
+    containing URI metacharacters cannot misparse as query components.
     """
-    src_conn = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    src_conn = sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)
     try:
         dst_conn = sqlite3.connect(target)
         try:
@@ -144,13 +150,28 @@ def _snapshot_tree(memory_dir: Path, snapshot_dir: Path) -> None:
                 shutil.copy2(src, dst)
             os.chmod(dst, 0o600)
 
+    # WARNING only when the unreadable set changes (or on the first run
+    # after startup), INFO otherwise. In a multi-user deployment the
+    # foreign-owned principal dirs are unreadable every night; a warning
+    # that always fires trains the operator to skim past backup
+    # warnings, which this log line most needs taken seriously.
+    global _previous_unreadable
+    current = frozenset(unreadable)
     if unreadable:
-        log.warning(
-            "Memory backup: %d unreadable director%s not captured in the snapshot (owned by another user): %s",
-            len(unreadable),
-            "y" if len(unreadable) == 1 else "ies",
-            ", ".join(unreadable),
-        )
+        if current != _previous_unreadable:
+            log.warning(
+                "Memory backup: %d unreadable director%s not captured in the snapshot (owned by another user): %s",
+                len(unreadable),
+                "y" if len(unreadable) == 1 else "ies",
+                ", ".join(sorted(unreadable)),
+            )
+        else:
+            log.info(
+                "Memory backup: %d unreadable director%s skipped (unchanged since last run)",
+                len(unreadable),
+                "y" if len(unreadable) == 1 else "ies",
+            )
+    _previous_unreadable = current
 
 
 def _latest_snapshot_time(backup_root: Path) -> datetime | None:
