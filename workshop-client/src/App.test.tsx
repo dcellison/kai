@@ -652,6 +652,45 @@ describe("Workshop React client", () => {
     ).toBeVisible();
   });
 
+  it("hides jump-to-latest when a restored viewport lands at the bottom", async () => {
+    // A viewport persisted with earlier pages loaded can restore into
+    // a latest-page window too short to put the position away from the
+    // bottom; the button must derive from the clamped geometry, not
+    // the stored follow flag.
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    sessionStorage.setItem(
+      "kai.workshop.timeline-viewports.v1",
+      JSON.stringify({ [channelId]: { follow: false, scrollTop: 900 } }),
+    );
+    let resolveTimeline: ((value: TimelineSnapshot) => void) | null = null;
+    vi.mocked(loadTimeline).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveTimeline = resolve;
+        }),
+    );
+    render(<App />);
+
+    const timeline = await screen.findByLabelText("Conversation timeline");
+    Object.defineProperties(timeline, {
+      clientHeight: { configurable: true, get: () => 300 },
+      scrollHeight: { configurable: true, get: () => 250 },
+      scrollTop: { configurable: true, value: 0, writable: true },
+    });
+    await waitFor(() => expect(resolveTimeline).not.toBeNull());
+    act(() => {
+      resolveTimeline?.({ messages: [historyMessage], throughPosition: 25, previousCursor: null });
+    });
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+
+    expect(
+      screen.queryByRole("button", { name: "Jump to latest messages" }),
+    ).toBeNull();
+  });
+
   it("returns to enrollment and clears the tab session after revocation", async () => {
     sessionStorage.setItem(
       "kai.workshop.read-session.v1",

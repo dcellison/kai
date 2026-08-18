@@ -942,7 +942,12 @@ function WorkshopView({
         : timeline.scrollHeight;
       timelineInitializedRef.current = true;
       timelineFollowRef.current = restoredViewport?.follow ?? true;
-      setAwayFromBottom(restoredViewport?.follow === false);
+      // Derived from the clamped position, not the stored flag: the
+      // restored window is the latest page only, so a position saved
+      // with earlier pages loaded can clamp to (or land near) the
+      // bottom, where a jump-to-latest button over a fully visible
+      // timeline would be noise.
+      setAwayFromBottom(!isNearTimelineBottom(timeline));
       latestMessagePositionRef.current = latestPosition;
       earliestMessagePositionRef.current = earliestPosition;
       setUnseenMessageCount(0);
