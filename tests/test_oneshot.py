@@ -317,7 +317,7 @@ class TestClaudeOneShotReasonerSubprocessError:
     @pytest.mark.asyncio
     async def test_non_zero_exit_raises_with_returncode_and_stderr(self, tmp_path):
         reasoner = ClaudeOneShotReasoner(cwd=tmp_path)
-        proc = _make_proc(stdout=b"", stderr=b"oauth refused", returncode=2)
+        proc = _make_proc(stdout=b"partial event stream", stderr=b"oauth refused", returncode=2)
 
         with (
             patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
@@ -327,6 +327,9 @@ class TestClaudeOneShotReasonerSubprocessError:
 
         assert excinfo.value.returncode == 2
         assert excinfo.value.stderr == b"oauth refused"
+        # stdout rides along because some CLIs (codex exec --json)
+        # report the failure cause there rather than on stderr.
+        assert excinfo.value.stdout == b"partial event stream"
 
 
 class TestOneShotSubprocessErrorStr:
@@ -948,7 +951,11 @@ class TestCodexOneShotReasonerSubprocessError:
     @pytest.mark.asyncio
     async def test_non_zero_exit_raises_with_returncode_and_stderr(self, tmp_path):
         reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
-        proc = _make_proc(stdout=b"", stderr=b"codex auth failed", returncode=2)
+        proc = _make_proc(
+            stdout=b'{"type":"turn.failed","error":{"message":"usage limit"}}',
+            stderr=b"codex auth failed",
+            returncode=2,
+        )
 
         with (
             patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
@@ -962,6 +969,10 @@ class TestCodexOneShotReasonerSubprocessError:
 
         assert excinfo.value.returncode == 2
         assert excinfo.value.stderr == b"codex auth failed"
+        # codex exec --json reports the failure cause in events on
+        # stdout (stderr carries only the stdin banner), so the
+        # exception must carry stdout for the stage-1 warning to log.
+        assert excinfo.value.stdout == b'{"type":"turn.failed","error":{"message":"usage limit"}}'
 
 
 class TestCodexOneShotReasonerOutputError:
