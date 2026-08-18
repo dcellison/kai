@@ -599,6 +599,20 @@ class TestSendStream:
         assert events[-1].response.error == f"{b.backend_label} turn exceeded its deadline"
         assert "still going" in events[-1].text_so_far
 
+    def test_concrete_lanes_inherit_the_deadline_carrying_loop(self):
+        """
+        The deadline tests above run against the base class, which is
+        only sufficient while goose and opencode actually use its read
+        loop. A lane that grew its own send path would silently drop
+        the deadline; this pin turns that into a loud failure.
+        """
+        from kai.goose import GooseBackend
+        from kai.opencode import OpenCodeBackend
+
+        for lane in (GooseBackend, OpenCodeBackend):
+            assert lane.send is AcpBackend.send, lane
+            assert lane._send_locked is AcpBackend._send_locked, lane
+
     @pytest.mark.asyncio
     async def test_turn_completing_within_deadline_is_untouched(self):
         """A normal turn under the deadline ends by completion, not the backstop."""
