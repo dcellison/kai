@@ -47,6 +47,7 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -77,6 +78,14 @@ _SNAPSHOT_NAME_RE = re.compile(r"^\d{8}_\d{6}$")
 _SQLITE_SUFFIXES = frozenset({".db", ".sqlite", ".sqlite3"})
 _SQLITE_SIDECAR_ENDINGS = ("-wal", "-shm", "-journal")
 
+# Root-owned helper installed by `python -m kai install apply` that
+# reads exactly DATA_DIR/memory/<name>/MEMORY.md after validating the
+# name. Protected installs keep per-principal directories 0700 per
+# inner-agent OS user, so the service user cannot read the MEMORY.md
+# fallback stores directly; the sudoers grant on this fixed script is
+# the narrow read path. install.py owns the path; keep them in sync.
+_PRINCIPAL_MEMORY_READER = "/etc/kai/read-principal-memory"
+
 
 # ── Snapshot ─────────────────────────────────────────────────────────
 
@@ -89,6 +98,29 @@ _previous_unreadable: frozenset[str] | None = None
 def _is_sqlite_sidecar(name: str) -> bool:
     """Check if a filename is a SQLite WAL/SHM/journal sidecar."""
     return name.endswith(_SQLITE_SIDECAR_ENDINGS)
+
+
+def _privileged_read_principal_memory(name: str) -> bytes | None:
+    """
+    Read one foreign-owned principal's MEMORY.md via the sudo helper.
+
+    Returns the file content, or None when the read is unavailable for
+    any reason: helper not installed (non-protected installs), no
+    sudoers grant, or no MEMORY.md in that directory. `-n` keeps sudo
+    from ever prompting; a missing grant fails immediately. Callers
+    treat None as "still unreadable" and fall back to the warning.
+    """
+    try:
+        result = subprocess.run(
+            ["sudo", "-n", _PRINCIPAL_MEMORY_READER, name],
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
 
 
 def _backup_sqlite(source: Path, target: Path) -> None:
@@ -124,10 +156,12 @@ def _snapshot_tree(memory_dir: Path, snapshot_dir: Path) -> None:
     Per-principal MEMORY.md directories are 0700 and owned by the
     per-OS-user inner agent processes, so the service user cannot read
     them. os.walk's default is to skip unlistable directories silently;
-    that would make the snapshot quietly incomplete, so unreadable
-    subtrees are collected and reported in one loud warning instead.
-    The run still succeeds: the SQLite corpus is the critical asset,
-    and failing outright would mean no backups at all.
+    that would make the snapshot quietly incomplete, so each unreadable
+    top-level directory first gets a salvage attempt through the
+    root-owned sudo reader (which captures its MEMORY.md), and whatever
+    remains unreadable is reported in one loud warning. The run still
+    succeeds either way: the SQLite corpus is the critical asset, and
+    failing outright would mean no backups at all.
     """
     unreadable: list[str] = []
 
@@ -149,6 +183,35 @@ def _snapshot_tree(memory_dir: Path, snapshot_dir: Path) -> None:
             else:
                 shutil.copy2(src, dst)
             os.chmod(dst, 0o600)
+
+    # Salvage pass for foreign-owned per-principal directories: their
+    # MEMORY.md fallback stores are exactly the content the backup
+    # exists to protect, and the sudo helper is the narrow read path
+    # protected installs provide. Only direct children of the memory
+    # root are candidates (that is the per-principal layout); anything
+    # else unreadable stays in the warning. A None from the helper
+    # (not installed, no grant, no MEMORY.md inside) also stays.
+    captured = 0
+    still_unreadable: list[str] = []
+    for dir_path in unreadable:
+        path = Path(dir_path)
+        content = None if path.parent != memory_dir else _privileged_read_principal_memory(path.name)
+        if content is None:
+            still_unreadable.append(dir_path)
+            continue
+        dst_dir = snapshot_dir / path.name
+        dst_dir.mkdir(exist_ok=True)
+        os.chmod(dst_dir, 0o700)
+        dst = dst_dir / "MEMORY.md"
+        dst.write_bytes(content)
+        os.chmod(dst, 0o600)
+        captured += 1
+    unreadable = still_unreadable
+    if captured:
+        log.info(
+            "Memory backup: captured %d foreign-owned MEMORY.md file(s) via the privileged reader",
+            captured,
+        )
 
     # WARNING only when the unreadable set changes (or on the first run
     # after startup), INFO otherwise. In a multi-user deployment the

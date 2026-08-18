@@ -9,6 +9,7 @@ import signal
 import sqlite3
 import stat
 import subprocess
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -53,6 +54,7 @@ from kai.install import (
     _generate_env_file,
     _generate_launchd_plist,
     _generate_launcher_script,
+    _generate_principal_memory_reader,
     _generate_sudoers,
     _generate_systemd_unit,
     _generate_users_yaml,
@@ -399,6 +401,134 @@ class TestGenerateSudoers:
         result = _generate_sudoers("kai")
         tee_path = shutil.which("tee") or "/usr/bin/tee"
         assert f"{tee_path} /etc/kai/totp.attempts" in result
+
+    def test_principal_memory_reader_rule_requires_foreign_users(self):
+        """The nightly backup's privileged MEMORY.md read targets the
+        fixed validating helper, never a cat wildcard (which would let
+        traversal in the matched argument read arbitrary files), and
+        the grant exists only when some inner agent runs as a foreign
+        OS user; single-user installs have nothing to salvage."""
+        rule = "kai ALL=(root) NOPASSWD: /etc/kai/read-principal-memory *"
+        assert rule in _generate_sudoers("kai", ["daniel"])
+        assert rule not in _generate_sudoers("kai")
+        assert rule not in _generate_sudoers("kai", ["kai"])
+        cat_path = shutil.which("cat") or "/bin/cat"
+        assert f"{cat_path} /var/lib" not in _generate_sudoers("kai", ["daniel"])
+
+
+class TestGeneratePrincipalMemoryReader:
+    """The helper script is the confinement boundary for the sudoers
+    grant: argument validation, fd-anchored O_NOFOLLOW opens (a planted
+    symlink must not turn the grant into an arbitrary read as root),
+    and post-open fstat guards against hard links and root-owned
+    targets. These tests pin the generated content; the execution
+    test below drives the script itself through the attack matrix."""
+
+    def test_script_shape(self):
+        script = _generate_principal_memory_reader("/var/lib/kai")
+        # Fixed system interpreter: an install-time which() could
+        # resolve to a non-root-owned python that root must not run.
+        assert script.startswith("#!/usr/bin/python3\n")
+        assert 're.fullmatch(r"[A-Za-z0-9_-]+", sys.argv[1])' in script
+        assert "len(sys.argv) != 2" in script
+        # Every component opened O_NOFOLLOW, anchored via dir_fd.
+        assert script.count("os.O_NOFOLLOW") == 3
+        assert script.count("dir_fd=") == 2
+        # Post-open guards: regular file, no hard links, not root-owned.
+        assert "st_nlink != 1" in script
+        assert "info.st_uid == 0" in script
+        assert "stat.S_ISREG" in script
+        # The file open is non-blocking so a planted FIFO cannot hang
+        # the root process; S_ISREG then rejects it.
+        assert "os.O_NONBLOCK" in script
+        # The memory root is a repr'd literal; no env consultation.
+        assert "MEMORY_ROOT = '/var/lib/kai/memory'" in script
+        assert "environ" not in script
+        assert "Managed by 'python -m kai install apply'" in script
+
+    def test_data_dir_is_baked_in_via_repr(self):
+        script = _generate_principal_memory_reader("/srv/kai-data")
+        assert "MEMORY_ROOT = '/srv/kai-data/memory'" in script
+        # A hostile data_dir cannot escape the string literal.
+        weird = _generate_principal_memory_reader("/srv/o'dd\"dir")
+        assert repr("/srv/o'dd\"dir/memory") in weird
+
+    def test_generated_script_compiles(self):
+        compile(_generate_principal_memory_reader("/var/lib/kai"), "<reader>", "exec")
+
+
+class TestPrincipalMemoryReaderExecution:
+    """Drive the generated script through the confinement attack
+    matrix for real. Root-ownership rejection (st_uid == 0) is the one
+    branch that cannot be exercised unprivileged; it is pinned by the
+    content test above."""
+
+    def _run(self, tmp_path, *args: str):
+        script = tmp_path / "reader.py"
+        script.write_text(_generate_principal_memory_reader(str(tmp_path)))
+        result = subprocess.run(
+            [sys.executable, str(script), *args],
+            capture_output=True,
+            timeout=30,
+        )
+        return result.returncode, result.stdout
+
+    def test_valid_name_reads_the_file(self, tmp_path):
+        principal = tmp_path / "memory" / "prn_ok"
+        principal.mkdir(parents=True)
+        (principal / "MEMORY.md").write_bytes(b"# facts\n")
+        assert self._run(tmp_path, "prn_ok") == (0, b"# facts\n")
+
+    def test_argument_validation(self, tmp_path):
+        (tmp_path / "memory").mkdir()
+        assert self._run(tmp_path)[0] == 64
+        assert self._run(tmp_path, "a", "b")[0] == 64
+        assert self._run(tmp_path, "")[0] == 64
+        assert self._run(tmp_path, "../memory")[0] == 64
+        assert self._run(tmp_path, "a/b")[0] == 64
+
+    def test_symlinked_principal_dir_is_refused(self, tmp_path):
+        target = tmp_path / "elsewhere"
+        target.mkdir()
+        (target / "MEMORY.md").write_bytes(b"secret")
+        (tmp_path / "memory").mkdir()
+        (tmp_path / "memory" / "prn_link").symlink_to(target)
+        code, out = self._run(tmp_path, "prn_link")
+        assert (code, out) == (1, b"")
+
+    def test_symlinked_memory_md_is_refused(self, tmp_path):
+        secret = tmp_path / "secret.txt"
+        secret.write_bytes(b"secret")
+        principal = tmp_path / "memory" / "prn_link"
+        principal.mkdir(parents=True)
+        (principal / "MEMORY.md").symlink_to(secret)
+        code, out = self._run(tmp_path, "prn_link")
+        assert (code, out) == (1, b"")
+
+    def test_hardlinked_memory_md_is_refused(self, tmp_path):
+        """A hard link to another file passes O_NOFOLLOW; the
+        st_nlink guard is what refuses it."""
+        secret = tmp_path / "secret.txt"
+        secret.write_bytes(b"secret")
+        principal = tmp_path / "memory" / "prn_hard"
+        principal.mkdir(parents=True)
+        os.link(secret, principal / "MEMORY.md")
+        code, out = self._run(tmp_path, "prn_hard")
+        assert (code, out) == (1, b"")
+
+    def test_missing_memory_md_exits_nonzero(self, tmp_path):
+        (tmp_path / "memory" / "prn_empty").mkdir(parents=True)
+        assert self._run(tmp_path, "prn_empty")[0] == 1
+
+    def test_fifo_memory_md_is_refused_without_blocking(self, tmp_path):
+        """A planted FIFO must be rejected, not block the root helper
+        forever waiting for a writer. O_NONBLOCK makes the open return
+        immediately; S_ISREG then refuses it."""
+        principal = tmp_path / "memory" / "prn_fifo"
+        principal.mkdir(parents=True)
+        os.mkfifo(principal / "MEMORY.md")
+        code, out = self._run(tmp_path, "prn_fifo")
+        assert (code, out) == (1, b"")
 
     def test_nopasswd(self):
         result = _generate_sudoers("kai")
