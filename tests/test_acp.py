@@ -1925,6 +1925,25 @@ class TestCrossUserKillEscalation:
         assert b._proc is None
         assert b._effective_os_user is None
 
+    @pytest.mark.asyncio
+    async def test_kill_racing_shutdown_is_serialized(self):
+        """Same interleaving with shutdown as the losing teardown."""
+        b, proc = self._wrapped_backend()
+
+        async def tree_kill(**kwargs):
+            await asyncio.sleep(0.01)
+
+        with (
+            patch("kai.acp._kill_target_user_tree", side_effect=tree_kill),
+            patch("kai.acp._kill_target_user_tree_sync"),
+        ):
+            await asyncio.gather(b._kill(), b.shutdown())
+
+        assert b._proc is None
+        # The losing shutdown found _proc already cleared under the
+        # gate, so it never sent its own SIGTERM.
+        proc.terminate.assert_not_called()
+
     def test_force_kill_escalates_sync_then_kills_wrapper(self):
         """force_kill (sync, the pool's last resort) runs the sync
         group-kill variant before SIGKILLing the wrapper, and nulls

@@ -800,7 +800,10 @@ class AcpBackend(AgentBackend):
         # reading process state and using it; two teardowns
         # interleaving across those awaits would let the second read
         # attributes the first already nulled. Always acquired after
-        # _lock when both are held, never before it.
+        # _lock when both are held, never before it. The sync
+        # force_kill stays outside this gate: it cannot be interleaved
+        # mid-function, and nothing it nulls is re-read unguarded by a
+        # gated body afterwards.
         self._teardown_lock = asyncio.Lock()
         # Secret values scrubbed from trace text. Snapshotted from the
         # fully built subprocess environment at spawn so constructor-only
