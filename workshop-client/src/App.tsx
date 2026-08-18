@@ -38,6 +38,7 @@ import { CHANNEL_PATTERN } from "./types";
 import { RunTraceCard } from "./RunTraceCard";
 import { useRunTrace } from "./useRunTrace";
 import { useWorkshopTimeline } from "./useWorkshopTimeline";
+import type { EarlierHistoryState } from "./useWorkshopTimeline";
 import { MarkdownMessage } from "./MarkdownMessage";
 
 const SESSION_KEY = "kai.workshop.read-session.v1";
@@ -636,6 +637,7 @@ function workshopRoleLabel(role: string): string {
 function WorkshopView({
   channel,
   connection,
+  earlier,
   messages,
   navigation,
   runActivity,
@@ -644,6 +646,7 @@ function WorkshopView({
   workshop,
   onForget,
   onCancelRun,
+  onLoadEarlier,
   onLoadRun,
   onLoadRunTrace,
   onSelectChannel,
@@ -651,6 +654,7 @@ function WorkshopView({
 }: {
   channel: WorkshopChannelSummary;
   connection: ConnectionState;
+  earlier: EarlierHistoryState;
   messages: TimelineMessage[];
   navigation: WorkshopNavigation;
   runActivity: WorkshopRunActivity | null;
@@ -659,6 +663,7 @@ function WorkshopView({
   workshop: WorkshopSummary;
   onForget: () => void;
   onCancelRun: (runId: string) => Promise<WorkshopRun>;
+  onLoadEarlier: () => void;
   onLoadRun: (runId: string) => Promise<WorkshopRun>;
   onLoadRunTrace: (runId: string, afterSeq: number) => Promise<WorkshopRunTracePage>;
   onSelectChannel: (channelId: string) => void;
@@ -691,6 +696,10 @@ function WorkshopView({
   const timelineInitializedRef = useRef(false);
   const timelineFollowRef = useRef(true);
   const latestMessagePositionRef = useRef(0);
+  const earliestMessagePositionRef = useRef(0);
+  // Viewport captured when "load earlier" is clicked, so the prepended
+  // page can be offset out of view instead of shoving the reader down.
+  const earlierAnchorRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
   const latestRunActivityRef = useRef<WorkshopRunActivity | null>(runActivity);
   const humanName = navigation.principal.displayName || "You";
   const humanRole = workshopRoleLabel(workshop.role);
@@ -905,6 +914,8 @@ function WorkshopView({
       timelineInitializedRef.current = false;
       timelineFollowRef.current = true;
       latestMessagePositionRef.current = 0;
+      earliestMessagePositionRef.current = 0;
+      earlierAnchorRef.current = null;
       setUnseenMessageCount(0);
     }
 
@@ -912,6 +923,8 @@ function WorkshopView({
       (position, message) => Math.max(position, message.eventPosition),
       0,
     );
+    // Messages arrive sorted, so the first one is the window's oldest.
+    const earliestPosition = messages[0]?.eventPosition ?? 0;
     if (!timelineInitializedRef.current) {
       if (messages.length === 0) {
         return;
@@ -923,9 +936,25 @@ function WorkshopView({
       timelineInitializedRef.current = true;
       timelineFollowRef.current = restoredViewport?.follow ?? true;
       latestMessagePositionRef.current = latestPosition;
+      earliestMessagePositionRef.current = earliestPosition;
       setUnseenMessageCount(0);
       return;
     }
+
+    // An earlier page grew the content above the viewport; restore the
+    // reader's position by the height that appeared. Consumed only when
+    // the window's oldest message actually moved back, so a live append
+    // racing the click cannot misapply the offset.
+    const anchor = earlierAnchorRef.current;
+    if (
+      anchor &&
+      messages.length > 0 &&
+      earliestPosition < earliestMessagePositionRef.current
+    ) {
+      earlierAnchorRef.current = null;
+      timeline.scrollTop = anchor.scrollTop + (timeline.scrollHeight - anchor.scrollHeight);
+    }
+    earliestMessagePositionRef.current = earliestPosition;
 
     const addedMessages = messages.filter(
       (message) => message.eventPosition > latestMessagePositionRef.current,
@@ -998,6 +1027,25 @@ function WorkshopView({
     });
     setUnseenMessageCount(0);
   };
+
+  const handleLoadEarlier = (): void => {
+    const timeline = timelineRef.current;
+    if (timeline) {
+      earlierAnchorRef.current = {
+        scrollHeight: timeline.scrollHeight,
+        scrollTop: timeline.scrollTop,
+      };
+    }
+    onLoadEarlier();
+  };
+
+  // A failed earlier-page fetch never prepends, so its captured viewport
+  // must not linger and misfire on the next successful one.
+  useEffect(() => {
+    if (earlier.error) {
+      earlierAnchorRef.current = null;
+    }
+  }, [earlier.error]);
 
   const submit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
@@ -1247,6 +1295,20 @@ function WorkshopView({
               </p>
             </div>
           </div>
+
+          {earlier.available && (
+            <div className="timeline-earlier">
+              <button
+                type="button"
+                className="timeline-earlier-button"
+                onClick={handleLoadEarlier}
+                disabled={earlier.loading}
+              >
+                {earlier.loading ? "Loading earlier messages…" : "Load earlier messages"}
+              </button>
+              {earlier.error && <p className="timeline-earlier-error">{earlier.error}</p>}
+            </div>
+          )}
 
           {messages.length === 0 ? (
             <p className="empty-timeline">No messages yet. New activity will appear here.</p>
@@ -1512,12 +1574,13 @@ function ActiveWorkshopClient({
   onSelectChannel: (channelId: string) => void;
 }): React.JSX.Element {
   const selected = findNavigationChannel(navigation, session.channelId);
-  const { connection, messages, runActivity, runPreview, runTrace } = useWorkshopTimeline(
-    session,
-    selected !== null,
-    onAuthenticationFailure,
-    onChannelAccessFailure,
-  );
+  const { connection, messages, runActivity, runPreview, runTrace, earlier, loadEarlier } =
+    useWorkshopTimeline(
+      session,
+      selected !== null,
+      onAuthenticationFailure,
+      onChannelAccessFailure,
+    );
   const withAccessHandling = useCallback(
     async <Result,>(operation: () => Promise<Result>): Promise<Result> => {
       try {
@@ -1559,8 +1622,10 @@ function ActiveWorkshopClient({
     <WorkshopView
       channel={selected.channel}
       connection={connection}
+      earlier={earlier}
       messages={messages}
       navigation={navigation}
+      onLoadEarlier={loadEarlier}
       runActivity={runActivity}
       runPreview={runPreview}
       runTrace={runTrace}

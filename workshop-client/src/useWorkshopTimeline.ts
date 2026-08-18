@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   AuthenticationError,
   ChannelAccessError,
+  loadEarlierTimeline,
   loadTimeline,
   ResynchronizationRequired,
   streamTimeline,
@@ -44,6 +45,36 @@ function appendUnique(
   );
 }
 
+function prependUnique(
+  messages: TimelineMessage[],
+  earlier: TimelineMessage[],
+): TimelineMessage[] {
+  const known = new Set(messages.map((message) => message.messageId));
+  const fresh = earlier.filter((message) => !known.has(message.messageId));
+  if (fresh.length === 0) {
+    return messages;
+  }
+  return [...fresh, ...messages].sort(
+    (left, right) => left.eventPosition - right.eventPosition,
+  );
+}
+
+export interface EarlierHistoryState {
+  available: boolean;
+  loading: boolean;
+  error: string | null;
+}
+
+// Everything a loadEarlier call needs from the snapshot it extends. Held
+// in a ref so the callback's identity survives snapshot reloads, with the
+// generation stamp guarding against a fetch outliving its snapshot.
+interface EarlierFetchContext {
+  session: WorkshopSession;
+  signal: AbortSignal;
+  throughPosition: number;
+  generation: number;
+}
+
 export function useWorkshopTimeline(
   session: WorkshopSession | null,
   active: boolean,
@@ -55,6 +86,8 @@ export function useWorkshopTimeline(
   runActivity: WorkshopRunActivity | null;
   runPreview: WorkshopRunPreview | null;
   runTrace: WorkshopRunTraceSignal | null;
+  earlier: EarlierHistoryState;
+  loadEarlier: () => void;
 } {
   const [messages, setMessages] = useState<TimelineMessage[]>([]);
   const [runActivity, setRunActivity] = useState<WorkshopRunActivity | null>(null);
@@ -64,9 +97,62 @@ export function useWorkshopTimeline(
     label: "Waiting",
     tone: "connecting",
   });
+  const [earlier, setEarlier] = useState<EarlierHistoryState>({
+    available: false,
+    loading: false,
+    error: null,
+  });
+  const earlierContextRef = useRef<EarlierFetchContext | null>(null);
+  const earlierCursorRef = useRef<string | null>(null);
+  const earlierLoadingRef = useRef(false);
+  const generationRef = useRef(0);
+
+  const loadEarlier = useCallback((): void => {
+    const context = earlierContextRef.current;
+    const cursor = earlierCursorRef.current;
+    if (!context || context.signal.aborted || earlierLoadingRef.current || cursor === null) {
+      return;
+    }
+    earlierLoadingRef.current = true;
+    setEarlier({ available: true, loading: true, error: null });
+    void loadEarlierTimeline(context.session, cursor, context.throughPosition, context.signal).then(
+      (page) => {
+        // A snapshot reload (channel switch, resynchronization) between
+        // request and response makes this page part of a window that no
+        // longer exists; drop it before touching ANY state, the loading
+        // guard included. Each snapshot resets the guard for its own
+        // generation, and a stale settlement resetting it here would let
+        // a duplicate in-flight fetch slip past.
+        if (context.signal.aborted || generationRef.current !== context.generation) {
+          return;
+        }
+        earlierLoadingRef.current = false;
+        earlierCursorRef.current = page.previousCursor;
+        setMessages((current) => prependUnique(current, page.messages));
+        setEarlier({ available: page.previousCursor !== null, loading: false, error: null });
+      },
+      (caught: unknown) => {
+        if (context.signal.aborted || generationRef.current !== context.generation) {
+          return;
+        }
+        earlierLoadingRef.current = false;
+        setEarlier({
+          available: true,
+          loading: false,
+          error:
+            caught instanceof Error ? caught.message : "Could not load earlier messages.",
+        });
+      },
+    );
+  }, []);
 
   useEffect(() => {
     if (!active || !session) {
+      generationRef.current += 1;
+      earlierContextRef.current = null;
+      earlierCursorRef.current = null;
+      earlierLoadingRef.current = false;
+      setEarlier({ available: false, loading: false, error: null });
       setMessages([]);
       setRunActivity(null);
       setRunPreview(null);
@@ -102,6 +188,23 @@ export function useWorkshopTimeline(
             );
             setMessages(snapshot.messages);
             needsSnapshot = false;
+            // Every snapshot starts a fresh backward-paging window; a
+            // resynchronization deliberately collapses back to the tail,
+            // discarding any earlier pages the reader had expanded.
+            generationRef.current += 1;
+            earlierContextRef.current = {
+              session,
+              signal,
+              throughPosition: snapshot.throughPosition,
+              generation: generationRef.current,
+            };
+            earlierCursorRef.current = snapshot.previousCursor;
+            earlierLoadingRef.current = false;
+            setEarlier({
+              available: snapshot.previousCursor !== null,
+              loading: false,
+              error: null,
+            });
           }
 
           setConnection({ label: "Connecting", tone: "connecting" });
@@ -202,5 +305,5 @@ export function useWorkshopTimeline(
     session,
   ]);
 
-  return { connection, messages, runActivity, runPreview, runTrace };
+  return { connection, messages, runActivity, runPreview, runTrace, earlier, loadEarlier };
 }

@@ -634,6 +634,7 @@ class TestWorkshopTimelineHTTPContract:
                     }
                 ],
                 "next_cursor": None,
+                "previous_cursor": None,
                 "through_position": payload["messages"][0]["event_position"],
             }
             assert payload["messages"][0]["message_id"].startswith("msg_")
@@ -687,6 +688,10 @@ class TestWorkshopTimelineHTTPContract:
             "?cursor=not-a-cursor",
             "?cursor=one&cursor=two",
             "?chat_id=101",
+            "?tail=0",
+            "?tail=true",
+            "?tail=1&tail=1",
+            "?tail=1&cursor=not-a-cursor",
         ],
     )
     async def test_invalid_pagination_input_returns_bounded_error(self, tmp_path: Path, query: str):
@@ -737,6 +742,39 @@ class TestWorkshopTimelineHTTPContract:
         finally:
             await second_client.close()
             await restarted.close()
+
+    async def test_tail_request_pages_backwards_over_http(self, tmp_path: Path):
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        await _record_messages(store, 3)
+        client = await _open_client(store, _Authenticator({"alice-token": alice_id}))
+        try:
+            headers = {"Authorization": "Bearer alice-token"}
+            response = await client.get(
+                f"/v1/channels/{alice_channel}/timeline?tail=1&limit=2",
+                headers=headers,
+            )
+            tail_page = await response.json()
+
+            assert response.status == 200
+            assert [message["body"] for message in tail_page["messages"]] == ["Message 2", "Message 3"]
+            assert tail_page["next_cursor"] is None
+            assert tail_page["previous_cursor"] is not None
+
+            response = await client.get(
+                f"/v1/channels/{alice_channel}/timeline",
+                params={"cursor": tail_page["previous_cursor"], "limit": "2"},
+                headers=headers,
+            )
+            earlier_page = await response.json()
+
+            assert response.status == 200
+            assert [message["body"] for message in earlier_page["messages"]] == ["Message 1"]
+            assert earlier_page["previous_cursor"] is None
+            assert earlier_page["next_cursor"] is None
+            assert earlier_page["through_position"] == tail_page["through_position"]
+        finally:
+            await client.close()
+            await store.close()
 
     async def test_route_accepts_no_write_method(self, tmp_path: Path):
         store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")

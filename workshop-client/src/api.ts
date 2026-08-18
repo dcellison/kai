@@ -21,8 +21,6 @@ import {
   WORKSHOP_PATTERN,
 } from "./types";
 
-const MAX_TIMELINE_PAGES = 1000;
-
 export class AuthenticationError extends Error {}
 export class ChannelAccessError extends Error {}
 export class ResynchronizationRequired extends Error {}
@@ -455,66 +453,75 @@ export async function cancelRun(
   return run;
 }
 
+function parseTimelinePage(payload: unknown, channelId: string): TimelineSnapshot {
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    payload.channel_id !== channelId ||
+    !Array.isArray(payload.messages) ||
+    !Number.isSafeInteger(payload.through_position)
+  ) {
+    throw new Error("Kai returned an unsupported timeline response.");
+  }
+  const messages: TimelineMessage[] = [];
+  for (const rawMessage of payload.messages) {
+    const message = parseMessage(rawMessage, channelId);
+    if (!message) {
+      throw new Error("Kai returned an unsupported timeline message.");
+    }
+    messages.push(message);
+  }
+  return {
+    messages,
+    throughPosition: payload.through_position as number,
+    previousCursor:
+      typeof payload.previous_cursor === "string" ? payload.previous_cursor : null,
+  };
+}
+
 export async function loadTimeline(
   session: WorkshopSession,
   signal: AbortSignal,
 ): Promise<TimelineSnapshot> {
-  const messages: TimelineMessage[] = [];
-  let cursor: string | null = null;
-  let throughPosition: number | null = null;
-  let pageCount = 0;
-
-  do {
-    const query = new URLSearchParams({ limit: "100" });
-    if (cursor) {
-      query.set("cursor", cursor);
-    }
-    const response = await authorizedFetch(
-      session,
-      `/v1/channels/${encodeURIComponent(session.channelId)}/timeline?${query}`,
-      { signal },
-    );
-    const payload = await responsePayload(response);
-    if (!response.ok) {
-      throw new Error(
-        safeErrorMessage(payload, "Could not load this channel."),
-      );
-    }
-    if (
-      !isRecord(payload) ||
-      payload.version !== 1 ||
-      payload.channel_id !== session.channelId ||
-      !Array.isArray(payload.messages) ||
-      !Number.isSafeInteger(payload.through_position)
-    ) {
-      throw new Error("Kai returned an unsupported timeline response.");
-    }
-
-    const pageThroughPosition = payload.through_position as number;
-    if (throughPosition === null) {
-      throughPosition = pageThroughPosition;
-    } else if (throughPosition !== pageThroughPosition) {
-      throw new Error("The timeline snapshot changed while it was loading.");
-    }
-    for (const rawMessage of payload.messages) {
-      const message = parseMessage(rawMessage, session.channelId);
-      if (!message) {
-        throw new Error("Kai returned an unsupported timeline message.");
-      }
-      messages.push(message);
-    }
-    cursor =
-      typeof payload.next_cursor === "string" ? payload.next_cursor : null;
-    pageCount += 1;
-    if (pageCount > MAX_TIMELINE_PAGES) {
-      throw new Error("The timeline exceeded the client safety limit.");
-    }
-  } while (cursor);
-
-  if (throughPosition === null) {
-    throw new Error("Kai returned an unsupported timeline response.");
+  // Tail-first: one bounded request for the newest window, so opening a
+  // channel costs the same regardless of how long its history is.
+  // Earlier history stays behind previousCursor and loads on demand.
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/timeline?tail=1&limit=100`,
+    { signal },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load this channel."));
   }
-  return { messages, throughPosition };
+  return parseTimelinePage(payload, session.channelId);
+}
+
+export async function loadEarlierTimeline(
+  session: WorkshopSession,
+  cursor: string,
+  expectedThroughPosition: number,
+  signal: AbortSignal,
+): Promise<TimelineSnapshot> {
+  const query = new URLSearchParams({ cursor, limit: "100" });
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/timeline?${query}`,
+    { signal },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load earlier messages."));
+  }
+  const page = parseTimelinePage(payload, session.channelId);
+  // The cursor pins the snapshot server-side, so a different bound here
+  // means the pages cannot belong together; fail loudly over merging
+  // history from two snapshots.
+  if (page.throughPosition !== expectedThroughPosition) {
+    throw new Error("The timeline snapshot changed while it was loading.");
+  }
+  return page;
 }
 
 export class EventStreamDecoder {

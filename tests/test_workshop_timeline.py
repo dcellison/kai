@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -274,6 +276,227 @@ class TestCanonicalTimelineQuery:
         finally:
             await store.close()
 
+
+class TestTailTimelineQuery:
+    async def test_tail_returns_newest_page_in_event_order(self, tmp_path: Path):
+        store, principal_id, channel_id, _, _ = await _open_store(tmp_path / "kai.db")
+        try:
+            for ordinal in range(1, 6):
+                await _record_user_message(store, ordinal=ordinal, body=f"Message {ordinal}")
+
+            page = await read_channel_timeline(
+                store,
+                principal_id=principal_id,
+                channel_id=channel_id,
+                authorizer=_Authorizer({(principal_id, channel_id)}),
+                tail=True,
+                limit=2,
+            )
+
+            assert [message.body for message in page.messages] == ["Message 4", "Message 5"]
+            assert page.through_position == page.messages[-1].event_position
+            assert page.next_cursor is None
+            assert page.previous_cursor is not None
+        finally:
+            await store.close()
+
+    async def test_previous_cursor_walks_to_channel_start(self, tmp_path: Path):
+        store, principal_id, channel_id, _, _ = await _open_store(tmp_path / "kai.db")
+        try:
+            for ordinal in range(1, 6):
+                await _record_user_message(store, ordinal=ordinal, body=f"Message {ordinal}")
+            authorizer = _Authorizer({(principal_id, channel_id)})
+
+            pages = []
+            cursor: str | None = None
+            tail = True
+            while True:
+                page = await read_channel_timeline(
+                    store,
+                    principal_id=principal_id,
+                    channel_id=channel_id,
+                    authorizer=authorizer,
+                    cursor=cursor,
+                    tail=tail,
+                    limit=2,
+                )
+                pages.append(page)
+                tail = False
+                cursor = page.previous_cursor
+                if cursor is None:
+                    break
+
+            assert [[message.body for message in page.messages] for page in pages] == [
+                ["Message 4", "Message 5"],
+                ["Message 2", "Message 3"],
+                ["Message 1"],
+            ]
+            assert len({page.through_position for page in pages}) == 1
+            assert all(page.next_cursor is None for page in pages)
+        finally:
+            await store.close()
+
+    async def test_tail_snapshot_excludes_messages_added_after_first_page(self, tmp_path: Path):
+        store, principal_id, channel_id, _, _ = await _open_store(tmp_path / "kai.db")
+        try:
+            for ordinal in range(1, 4):
+                await _record_user_message(store, ordinal=ordinal, body=f"Message {ordinal}")
+            authorizer = _Authorizer({(principal_id, channel_id)})
+
+            first = await read_channel_timeline(
+                store,
+                principal_id=principal_id,
+                channel_id=channel_id,
+                authorizer=authorizer,
+                tail=True,
+                limit=2,
+            )
+            assert [message.body for message in first.messages] == ["Message 2", "Message 3"]
+            assert first.previous_cursor is not None
+
+            await _record_user_message(store, ordinal=4, body="Message 4")
+            earlier = await read_channel_timeline(
+                store,
+                principal_id=principal_id,
+                channel_id=channel_id,
+                authorizer=authorizer,
+                cursor=first.previous_cursor,
+                limit=2,
+            )
+
+            assert [message.body for message in earlier.messages] == ["Message 1"]
+            assert earlier.through_position == first.through_position
+            assert earlier.previous_cursor is None
+
+            fresh = await read_channel_timeline(
+                store,
+                principal_id=principal_id,
+                channel_id=channel_id,
+                authorizer=authorizer,
+                tail=True,
+                limit=10,
+            )
+            assert [message.body for message in fresh.messages] == [
+                "Message 1",
+                "Message 2",
+                "Message 3",
+                "Message 4",
+            ]
+            assert fresh.through_position > first.through_position
+        finally:
+            await store.close()
+
+    async def test_short_and_empty_channels_have_no_previous_cursor(self, tmp_path: Path):
+        store, principal_id, channel_id, second_principal, second_channel = await _open_store(tmp_path / "kai.db")
+        try:
+            for ordinal in range(1, 3):
+                await _record_user_message(store, ordinal=ordinal, body=f"Message {ordinal}")
+
+            short = await read_channel_timeline(
+                store,
+                principal_id=principal_id,
+                channel_id=channel_id,
+                authorizer=_Authorizer({(principal_id, channel_id)}),
+                tail=True,
+                limit=10,
+            )
+            assert [message.body for message in short.messages] == ["Message 1", "Message 2"]
+            assert short.previous_cursor is None
+
+            empty = await read_channel_timeline(
+                store,
+                principal_id=second_principal,
+                channel_id=second_channel,
+                authorizer=_Authorizer({(second_principal, second_channel)}),
+                tail=True,
+                limit=10,
+            )
+            assert empty.messages == ()
+            assert empty.previous_cursor is None
+            assert empty.through_position == 0
+        finally:
+            await store.close()
+
+    async def test_tail_with_cursor_is_rejected_before_authorization(self, tmp_path: Path):
+        store, principal_id, channel_id, _, _ = await _open_store(tmp_path / "kai.db")
+        try:
+            authorizer = _Authorizer({(principal_id, channel_id)})
+            with pytest.raises(ValueError, match="tail"):
+                await read_channel_timeline(
+                    store,
+                    principal_id=principal_id,
+                    channel_id=channel_id,
+                    authorizer=authorizer,
+                    cursor="v1.anything",
+                    tail=True,
+                )
+            assert authorizer.calls == []
+        finally:
+            await store.close()
+
+    async def test_tail_cursor_is_bound_to_its_channel(self, tmp_path: Path):
+        store, principal_id, channel_id, second_principal, second_channel = await _open_store(tmp_path / "kai.db")
+        try:
+            for ordinal in range(1, 3):
+                await _record_user_message(store, ordinal=ordinal, body=f"Message {ordinal}")
+            authorizer = _Authorizer(
+                {
+                    (principal_id, channel_id),
+                    (second_principal, second_channel),
+                }
+            )
+            tail_page = await read_channel_timeline(
+                store,
+                principal_id=principal_id,
+                channel_id=channel_id,
+                authorizer=authorizer,
+                tail=True,
+                limit=1,
+            )
+            assert tail_page.previous_cursor is not None
+
+            with pytest.raises(TimelineCursorError):
+                await read_channel_timeline(
+                    store,
+                    principal_id=second_principal,
+                    channel_id=second_channel,
+                    authorizer=authorizer,
+                    cursor=tail_page.previous_cursor,
+                )
+        finally:
+            await store.close()
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            # A boundary of zero cannot reference a returned message.
+            {"before_position": 0, "channel_id": None, "through_position": 5},
+            # Backward pages must stay inside the snapshot bound.
+            {"before_position": 6, "channel_id": None, "through_position": 5},
+            # A cursor cannot carry both directions at once.
+            {"after_position": 1, "before_position": 2, "channel_id": None, "through_position": 5},
+        ],
+    )
+    async def test_forged_tail_cursor_fails_closed(self, tmp_path: Path, payload: dict[str, object]):
+        store, principal_id, channel_id, _, _ = await _open_store(tmp_path / "kai.db")
+        try:
+            payload["channel_id"] = str(channel_id)
+            raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            forged = "v1." + base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+            with pytest.raises(TimelineCursorError):
+                await read_channel_timeline(
+                    store,
+                    principal_id=principal_id,
+                    channel_id=channel_id,
+                    authorizer=_Authorizer({(principal_id, channel_id)}),
+                    cursor=forged,
+                )
+        finally:
+            await store.close()
+
+
+class TestTimelineRequestBounds:
     @pytest.mark.parametrize("limit", [0, -1, 101, True])
     async def test_limit_is_bounded(self, tmp_path: Path, limit: int):
         store, principal_id, channel_id, _, _ = await _open_store(tmp_path / "kai.db")
