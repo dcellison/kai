@@ -63,6 +63,7 @@ _CONFIG_ENV_VARS = [
     "CLAUDE_AUTOCOMPACT_PCT",
     "CLAUDE_EFFORT_LEVEL",
     "CODEX_EFFORT_LEVEL",
+    "CODEX_TURN_DEADLINE_SECONDS",
     "TOTP_SESSION_MINUTES",
     "TOTP_CHALLENGE_SECONDS",
     "TOTP_LOCKOUT_ATTEMPTS",
@@ -1583,6 +1584,35 @@ class TestCodexEffortLevel:
         monkeypatch.setenv("CODEX_EFFORT_LEVEL", "   ")
         config = load_config()
         assert config.codex_effort_level == ""
+
+
+# ── CODEX_TURN_DEADLINE_SECONDS config ───────────────────────────────
+
+
+class TestCodexTurnDeadlineSeconds:
+    """Coverage for the CODEX_TURN_DEADLINE_SECONDS env var: the
+    total-turn backstop for the codex stream loop, whose idle guard
+    resets on any output. Positive integer, generous default."""
+
+    def test_default_when_unset(self, monkeypatch):
+        _set_required(monkeypatch)
+        config = load_config()
+        assert config.codex_turn_deadline_seconds == 3600
+
+    def test_valid_value_parses(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CODEX_TURN_DEADLINE_SECONDS", "7200")
+        config = load_config()
+        assert config.codex_turn_deadline_seconds == 7200
+
+    @pytest.mark.parametrize("value", ["0", "-5", "not-a-number", "3.5"])
+    def test_non_positive_or_non_integer_raises(self, monkeypatch, value):
+        # A zero or negative deadline would disable the backstop
+        # silently; fail fast at config load instead.
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CODEX_TURN_DEADLINE_SECONDS", value)
+        with pytest.raises(SystemExit, match="CODEX_TURN_DEADLINE_SECONDS"):
+            load_config()
 
 
 # ── Memory extraction config (spec §6.4, §13.1) ─────────────────────

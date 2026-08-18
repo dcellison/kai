@@ -603,6 +603,57 @@ class TestStreamParsing:
     """Verify _send_locked() correctly parses streaming responses."""
 
     @pytest.mark.asyncio
+    async def test_turn_deadline_ends_a_turn_that_keeps_trickling_output(self):
+        """
+        The idle guard resets on any output, so a turn that trickles
+        deltas without ever completing is bounded only by the turn
+        deadline; when it fires, the turn ends with a failed response
+        and the subprocess is killed.
+        """
+        c = _make_codex(codex_turn_deadline_seconds=1)
+        proc = _make_mock_proc([])
+
+        async def trickle():
+            # Frequent-enough output that the idle guard never fires.
+            await asyncio.sleep(0.4)
+            return _agent_message_delta("still going")
+
+        proc.stdout.readline = AsyncMock(side_effect=trickle)
+        c._proc = proc
+        c._session_id = "test-session"
+        c._fresh_session = False
+        c._next_id = 3
+
+        with patch.object(c, "_kill", new=AsyncMock()) as mock_kill:
+            events = await _collect_events(c)
+
+        assert events[-1].done is True
+        assert events[-1].response.success is False
+        assert events[-1].response.error == "Codex turn exceeded its deadline"
+        # The trickled text survives into the failed response.
+        assert "still going" in events[-1].text_so_far
+        mock_kill.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_turn_completing_within_deadline_is_untouched(self):
+        """A normal turn under the deadline ends by completion, not the backstop."""
+        c = _make_codex(codex_turn_deadline_seconds=5)
+        c._proc = _make_mock_proc(
+            [
+                _agent_message_delta("Hello"),
+                _turn_completed("completed"),
+            ]
+        )
+        c._session_id = "test-session"
+        c._fresh_session = False
+        c._next_id = 3
+
+        events = await _collect_events(c)
+
+        assert events[-1].done is True
+        assert events[-1].response.success is True
+
+    @pytest.mark.asyncio
     async def test_agent_message_chunk_accumulation(self):
         """agent_message_chunk events accumulate text and yield StreamEvents."""
         c = _make_codex()

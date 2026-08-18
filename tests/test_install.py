@@ -3075,6 +3075,7 @@ class TestCmdConfig:
                 "1800",  # idle eviction timeout seconds
                 # autocompact + claude effort skipped on non-claude backend
                 "",  # codex reasoning effort (empty = codex default)
+                "3600",  # codex turn deadline seconds (default)
                 "8080",  # webhook port
                 "",  # Workshop LAN address (disabled)
                 "test-secret",  # webhook secret
@@ -3645,6 +3646,7 @@ class TestCmdConfigDefaultModelDispatch:
             "1800",  # idle eviction timeout seconds
             # No autocompact_pct / claude effort prompts (claude-only)
             "",  # codex reasoning effort (empty = codex default)
+            "3600",  # codex turn deadline seconds (default)
             "8080",  # webhook port
             "",  # Workshop LAN address (disabled)
             "test-secret",  # webhook secret
@@ -3739,12 +3741,36 @@ class TestCmdConfigDefaultModelDispatch:
         self._setup(monkeypatch, tmp_path)
         base = list(self._inputs_for_codex_subscription())
         idx = base.index("8080")
-        # The slot immediately before the webhook port is the codex
-        # effort answer in this chain.
-        assert base[idx - 1] == ""
-        base[idx - 1] = "HIGH"
+        # The codex answers sit right before the webhook port in this
+        # chain: effort, then the turn deadline.
+        assert base[idx - 2] == ""
+        base[idx - 2] = "HIGH"
         _, env = self._run(monkeypatch, tmp_path, base, helper_return="gpt-5.5")
         assert env.get("CODEX_EFFORT_LEVEL") == "high"
+
+    def test_codex_turn_deadline_default_omits_env_key(self, tmp_path, monkeypatch):
+        """Accepting the 3600 default keeps CODEX_TURN_DEADLINE_SECONDS
+        out of install.conf: delta-from-defaults, so only operator
+        intent is persisted."""
+        self._setup(monkeypatch, tmp_path)
+        _, env = self._run(
+            monkeypatch,
+            tmp_path,
+            self._inputs_for_codex_subscription(),
+            helper_return="gpt-5.5",
+        )
+        assert "CODEX_TURN_DEADLINE_SECONDS" not in env
+
+    def test_codex_turn_deadline_non_default_writes_env_key(self, tmp_path, monkeypatch):
+        """A non-default deadline round-trips from the wizard prompt
+        into install.conf."""
+        self._setup(monkeypatch, tmp_path)
+        base = list(self._inputs_for_codex_subscription())
+        idx = base.index("8080")
+        assert base[idx - 1] == "3600"
+        base[idx - 1] = "7200"
+        _, env = self._run(monkeypatch, tmp_path, base, helper_return="gpt-5.5")
+        assert env.get("CODEX_TURN_DEADLINE_SECONDS") == "7200"
 
     def test_install_conf_legacy_AGENT_BACKEND_migrates_on_resave(self, tmp_path, monkeypatch):
         """Re-running the wizard against a prior install.conf that
