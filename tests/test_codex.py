@@ -2243,6 +2243,11 @@ class TestCodexCrossUserTeardown:
         c._inner_codex_pids = []
 
         async def lookup_and_null():
+            # Everything a completed _kill clears, so the resumed task
+            # sees the full post-teardown state, not just a missing user.
+            c._proc = None
+            c._pgid = None
+            c._inner_codex_pids = []
             c._effective_codex_user = None
             return [67890]
 
@@ -2252,14 +2257,18 @@ class TestCodexCrossUserTeardown:
 
         with (
             patch.object(c, "_async_lookup_inner_codex_pids", side_effect=lookup_and_null),
-            patch("kai.codex.asyncio.create_subprocess_exec", AsyncMock(return_value=sudo_proc)) as mock_exec,
-            patch("kai.codex.os.killpg"),
+            # The spawn happens inside the canonical acp helper; patch it
+            # where it runs.
+            patch("kai.acp.asyncio.create_subprocess_exec", AsyncMock(return_value=sudo_proc)) as mock_exec,
+            patch("kai.codex.os.killpg") as mock_killpg,
         ):
             await c._async_send_signal_for_close(signal.SIGKILL)
 
         sudo_argv = mock_exec.call_args[0]
         assert sudo_argv[:5] == ("sudo", "-n", "-u", "ci-fake-user", "/bin/kill")
         assert sudo_argv[6] == "67890"
+        # The wrapper reap also uses the snapshot, not the nulled attribute.
+        mock_killpg.assert_called_once_with(12345, signal.SIGKILL)
 
 
 class TestSudoKillEsrchDemotion:

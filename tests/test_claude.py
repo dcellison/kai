@@ -2552,6 +2552,10 @@ class TestKill:
         claude._inner_claude_pid = None
 
         async def lookup_and_null():
+            # Everything a completed _kill clears, so the resumed task
+            # sees the full post-teardown state, not just a missing user.
+            claude._proc = None
+            claude._pgid = None
             claude._effective_claude_user = None
             return 99999
 
@@ -2559,11 +2563,13 @@ class TestKill:
         with (
             patch.object(claude, "_async_lookup_inner_claude_pid", side_effect=lookup_and_null),
             patch.object(claude, "_async_sudo_kill", new=mock_sudo_kill),
-            patch("os.killpg"),
+            patch("os.killpg") as mock_killpg,
         ):
             await claude._async_send_signal_for_close(signal.SIGKILL)
 
         mock_sudo_kill.assert_awaited_once_with("daniel", 99999, int(signal.SIGKILL))
+        # The wrapper reap also uses the snapshot, not the nulled attribute.
+        mock_killpg.assert_called_once_with(12345, signal.SIGKILL)
 
     @pytest.mark.asyncio
     async def test_kill_skips_sudo_when_inner_pid_unknown(self):
