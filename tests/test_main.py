@@ -23,6 +23,7 @@ from kai.config import UserConfig
 from kai.main import (
     _file_age,
     _file_cleanup_loop,
+    _memory_backup_loop,
     _warn_if_compatibility_jobs_are_dormant,
     _workshop_bootstrap_humans,
     _workshop_bootstrap_notification_channels,
@@ -415,6 +416,94 @@ class TestFileCleanupLoop:
         # Error was logged
         mock_log.assert_called()
         # Should not raise - error is counted, not propagated
+
+
+# ── _memory_backup_loop() ────────────────────────────────────────────
+
+
+class TestMemoryBackupLoop:
+    @pytest.mark.asyncio
+    async def test_writes_snapshot(self, tmp_path, monkeypatch):
+        """One loop iteration produces a dated snapshot of DATA_DIR/memory."""
+        monkeypatch.setattr("kai.main.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.main._MEMORY_BACKUP_STARTUP_DELAY", 0)
+        monkeypatch.setattr("kai.main._MEMORY_BACKUP_INTERVAL", 0)
+
+        memory_dir = tmp_path / "memory"
+        memory_dir.mkdir()
+        (memory_dir / "MEMORY.md").write_text("# facts\n")
+
+        call_count = 0
+
+        async def mock_sleep(duration):
+            nonlocal call_count
+            call_count += 1
+            if call_count > 1:
+                raise asyncio.CancelledError
+
+        with patch("kai.main.asyncio.sleep", side_effect=mock_sleep):
+            try:
+                await _memory_backup_loop()
+            except asyncio.CancelledError:
+                pass
+
+        snapshots = list((tmp_path / "backups" / "memory").iterdir())
+        assert len(snapshots) == 1
+        assert (snapshots[0] / "MEMORY.md").read_text() == "# facts\n"
+
+    @pytest.mark.asyncio
+    async def test_missing_memory_directory_is_a_noop(self, tmp_path, monkeypatch):
+        """Without DATA_DIR/memory (memory never used), nothing is written."""
+        monkeypatch.setattr("kai.main.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.main._MEMORY_BACKUP_STARTUP_DELAY", 0)
+        monkeypatch.setattr("kai.main._MEMORY_BACKUP_INTERVAL", 0)
+
+        call_count = 0
+
+        async def mock_sleep(duration):
+            nonlocal call_count
+            call_count += 1
+            if call_count > 1:
+                raise asyncio.CancelledError
+
+        with patch("kai.main.asyncio.sleep", side_effect=mock_sleep):
+            try:
+                await _memory_backup_loop()
+            except asyncio.CancelledError:
+                pass
+
+        assert not (tmp_path / "backups").exists()
+
+    @pytest.mark.asyncio
+    async def test_failure_is_logged_and_loop_survives(self, tmp_path, monkeypatch):
+        """A failed backup logs loudly and the loop keeps running."""
+        monkeypatch.setattr("kai.main.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.main._MEMORY_BACKUP_STARTUP_DELAY", 0)
+        monkeypatch.setattr("kai.main._MEMORY_BACKUP_INTERVAL", 0)
+
+        (tmp_path / "memory").mkdir()
+
+        call_count = 0
+
+        async def mock_sleep(duration):
+            nonlocal call_count
+            call_count += 1
+            if call_count > 2:
+                raise asyncio.CancelledError
+
+        with (
+            patch("kai.main.asyncio.sleep", side_effect=mock_sleep),
+            patch("kai.main.run_memory_backup", side_effect=OSError("disk full")),
+            patch("kai.main.logging.exception") as mock_log,
+        ):
+            try:
+                await _memory_backup_loop()
+            except asyncio.CancelledError:
+                pass
+
+        # Loop ran twice (not terminated after the first failure)
+        assert call_count == 3
+        mock_log.assert_called()
 
 
 # ── main() startup-error choke point ─────────────────────────────────

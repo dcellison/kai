@@ -45,6 +45,7 @@ from kai.application_host import KaiApplicationHost
 from kai.backend_registry import load_backend_registry
 from kai.config import DATA_DIR, PROJECT_ROOT, _read_protected_file, load_config
 from kai.http_adapter import HttpAdapter
+from kai.memory_backup import run_memory_backup
 from kai.telegram_adapter import TelegramAdapter
 from kai.workshop.bootstrap import BootstrapHuman, BootstrapNotificationChannel
 from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
@@ -248,6 +249,48 @@ async def _file_cleanup_loop(retention_days: int) -> None:
         await asyncio.sleep(_CLEANUP_INTERVAL)
 
 
+# ── Memory backup ────────────────────────────────────────────────────
+
+# How often the backup loop wakes up (seconds). The freshness floor in
+# run_memory_backup (MIN_SNAPSHOT_AGE) is what actually spaces the
+# snapshots; the wake interval just has to be at most nightly.
+_MEMORY_BACKUP_INTERVAL = 86400  # 24 hours
+
+# Initial delay before the first backup attempt (seconds). Long enough
+# to stay clear of startup work, short enough that a restarted service
+# still snapshots promptly when the last snapshot is stale.
+_MEMORY_BACKUP_STARTUP_DELAY = 300
+
+
+async def _memory_backup_loop() -> None:
+    """
+    Nightly snapshot of the semantic memory corpus.
+
+    Runs once after a short startup delay, then every 24 hours,
+    delegating the actual snapshot, freshness skip, and retention to
+    kai.memory_backup.run_memory_backup in a worker thread (the copy is
+    blocking I/O). Failures are logged loudly and the loop keeps
+    running: one bad night must not end backups.
+    """
+    await asyncio.sleep(_MEMORY_BACKUP_STARTUP_DELAY)
+
+    while True:
+        memory_dir = DATA_DIR / "memory"
+        if memory_dir.is_dir():
+            try:
+                snapshot = await asyncio.to_thread(
+                    run_memory_backup,
+                    memory_dir,
+                    DATA_DIR / "backups" / "memory",
+                    datetime.now(UTC),
+                )
+                if snapshot is not None:
+                    logging.info("Memory backup: snapshot written to %s", snapshot)
+            except Exception:
+                logging.exception("Memory backup FAILED - the memory corpus has no fresh snapshot")
+        await asyncio.sleep(_MEMORY_BACKUP_INTERVAL)
+
+
 def main() -> None:
     """
     Top-level entry point for the Kai bot.
@@ -357,6 +400,7 @@ def _start() -> None:
         core_host: KaiApplicationHost | None = None
         telegram_adapter: TelegramAdapter | None = None
         cleanup_task: asyncio.Task[None] | None = None
+        memory_backup_task: asyncio.Task[None] | None = None
 
         # Determine the default compatibility user (admin or first user) for
         # legacy per-user migrations. Workshop-only installations may have no
@@ -479,6 +523,12 @@ def _start() -> None:
             if config.file_retention_days > 0:
                 cleanup_task = asyncio.create_task(_file_cleanup_loop(config.file_retention_days))
 
+            # Start nightly memory backups. Unconditional: the loop
+            # no-ops when DATA_DIR/memory does not exist, and gating on
+            # memory_enabled would leave the MEMORY.md fallback store
+            # (used when memory is disabled) without backups.
+            memory_backup_task = asyncio.create_task(_memory_backup_loop())
+
             # Check for interrupted responses from a crash/restart.
             # Phase 2: check all files in the .responding directory (per-user
             # flags) instead of the old single .responding_to file.
@@ -532,6 +582,9 @@ def _start() -> None:
             if cleanup_task is not None:
                 cleanup_task.cancel()
                 await asyncio.gather(cleanup_task, return_exceptions=True)
+            if memory_backup_task is not None:
+                memory_backup_task.cancel()
+                await asyncio.gather(memory_backup_task, return_exceptions=True)
             from kai.memory import configure_memory_authority
 
             configure_memory_authority(None)
