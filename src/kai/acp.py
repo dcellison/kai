@@ -730,6 +730,11 @@ class AcpBackend(AgentBackend):
         # of daemon-read file contents; the user-isolated subprocess
         # can read its own files directly.
         defer_user_file_reads: bool = False,
+        # Total bound on one turn, in seconds. The stream loop's
+        # per-read and idle guards reset whenever output arrives; this
+        # backstop never does. Validated positive at config load (see
+        # Config.turn_deadline_seconds).
+        turn_deadline_seconds: int = 3600,
     ):
         # ABC-required attributes (pool.py reads/writes these)
         self.model = model
@@ -741,6 +746,7 @@ class AcpBackend(AgentBackend):
         self.memory_enabled = memory_enabled
         self.os_user = os_user
         self.defer_user_file_reads = defer_user_file_reads
+        self.turn_deadline_seconds = turn_deadline_seconds
         # Session-age recycling limit (ABC surface; checked by the
         # inherited _should_recycle at the top of _send_locked).
         self.max_session_hours = max_session_hours
@@ -1515,9 +1521,34 @@ class AcpBackend(AgentBackend):
             )
         last_activity = time.monotonic()
         max_idle_seconds = self.timeout_seconds * 5
+        turn_started = time.monotonic()
 
         try:
             while True:
+                # Check the total-turn deadline before each readline.
+                # Unlike the idle guard below, this never resets on
+                # output, so a turn that trickles retry notices without
+                # completing still ends here.
+                elapsed = time.monotonic() - turn_started
+                if elapsed > self.turn_deadline_seconds:
+                    log.error(
+                        "%s turn deadline exceeded (%.0fs elapsed, limit %ds)",
+                        self.backend_label,
+                        elapsed,
+                        self.turn_deadline_seconds,
+                    )
+                    await self._kill()
+                    yield StreamEvent(
+                        text_so_far=accumulated,
+                        done=True,
+                        response=AgentResponse(
+                            success=False,
+                            text=accumulated,
+                            error=f"{self.backend_label} turn exceeded its deadline",
+                        ),
+                    )
+                    return
+
                 # Check idle timeout before each readline.
                 idle = time.monotonic() - last_activity
                 if idle > max_idle_seconds:

@@ -275,6 +275,65 @@ class TestPiTurns:
         assert backend._transport.sent[0]["images"] == [{"type": "image", "data": "YWJj", "mimeType": "image/png"}]
 
     @pytest.mark.asyncio
+    async def test_turn_deadline_ends_a_turn_that_keeps_trickling_output(self, tmp_path, monkeypatch):
+        """
+        The per-receive timeout resets on any record, so a turn that
+        trickles deltas without settling is bounded only by the turn
+        deadline; when it fires, the turn ends with a failed response
+        and the subprocess is killed via the standard error path.
+        """
+        backend = make_backend(tmp_path, turn_deadline_seconds=1)
+        backend._proc = FakeProcess()
+        backend._session_id = "session-1"
+        backend._fresh_session = False
+
+        class TricklingTransport(FakeTransport):
+            async def receive(self, *, timeout_seconds=None):
+                if self.records:
+                    return self.records.pop(0)
+                # Frequent-enough records that the per-receive timeout
+                # never fires.
+                await asyncio.sleep(0.4)
+                return {
+                    "type": "message_update",
+                    "assistantMessageEvent": {"type": "text_delta", "delta": "still going"},
+                }
+
+        backend._transport = TricklingTransport(
+            [{"id": "kai-prompt-1", "type": "response", "command": "prompt", "success": True}]
+        )
+        monkeypatch.setattr(backend, "_ensure_started", AsyncMock())
+
+        events = await collect(backend)
+
+        assert events[-1].done is True
+        assert events[-1].response.success is False
+        assert "Pi turn exceeded its deadline" in (events[-1].response.error or "")
+        assert "still going" in events[-1].text_so_far
+        # The send handler killed the subprocess on the deadline error.
+        assert backend._proc is None
+
+    @pytest.mark.asyncio
+    async def test_turn_completing_within_deadline_is_untouched(self, tmp_path, monkeypatch):
+        """A normal turn under the deadline ends by settling, not the backstop."""
+        backend = make_backend(tmp_path, turn_deadline_seconds=5)
+        backend._proc = FakeProcess()
+        backend._session_id = "session-1"
+        backend._fresh_session = False
+        backend._transport = FakeTransport(
+            [
+                {"id": "kai-prompt-1", "type": "response", "command": "prompt", "success": True},
+                {"type": "agent_settled"},
+            ]
+        )
+        monkeypatch.setattr(backend, "_ensure_started", AsyncMock())
+
+        events = await collect(backend)
+
+        assert events[-1].done is True
+        assert events[-1].response.success is True
+
+    @pytest.mark.asyncio
     async def test_unsupported_image_gets_visible_notice(self, tmp_path, monkeypatch):
         backend = make_backend(tmp_path)
         backend._proc = FakeProcess()

@@ -1484,6 +1484,7 @@ class TestCmdConfig:
                 "sonnet",  # model
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # timeout
+                "3600",  # agent turn deadline (default)
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
                 "80",  # autocompact pct
@@ -1584,6 +1585,7 @@ class TestCmdConfig:
                 "sonnet",  # model
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # timeout
+                "3600",  # agent turn deadline (default)
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
                 "80",  # autocompact pct
@@ -1667,6 +1669,7 @@ class TestCmdConfig:
                 "sonnet",  # model
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # timeout
+                "3600",  # agent turn deadline (default)
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
                 "80",  # autocompact pct
@@ -1737,6 +1740,7 @@ class TestCmdConfig:
                 "sonnet",
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",
+                "3600",  # agent turn deadline (default)
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
                 "10.0",
@@ -1802,6 +1806,7 @@ class TestCmdConfig:
                 "sonnet",  # model
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # timeout
+                "3600",  # agent turn deadline (default)
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
                 "8080",  # port
@@ -1937,6 +1942,7 @@ class TestCmdConfig:
                 "sonnet",  # model
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # timeout
+                "3600",  # agent turn deadline (default)
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
                 "8080",  # port
@@ -2169,6 +2175,7 @@ class TestCmdConfig:
             "sonnet",  # model
             "false",  # customize per-role models (decline; use registry defaults)
             "120",  # timeout
+            "3600",  # agent turn deadline (default)
             "0",  # max session age hours (0 = no limit)
             "1800",  # idle eviction timeout seconds
             *claude_only_pre_webhook,  # autocompact + effort (claude only)
@@ -2731,6 +2738,7 @@ class TestCmdConfig:
                 "sonnet",  # model
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # timeout
+                "3600",  # agent turn deadline (default)
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
                 "8080",  # port
@@ -3071,11 +3079,12 @@ class TestCmdConfig:
                 # model: handled by _prompt_default_model mock
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # agent timeout
+                "3600",  # agent turn deadline (default)
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
                 # autocompact + claude effort skipped on non-claude backend
                 "",  # codex reasoning effort (empty = codex default)
-                "3600",  # codex turn deadline seconds (default)
+                "",  # codex turn deadline override (empty = shared)
                 "8080",  # webhook port
                 "",  # Workshop LAN address (disabled)
                 "test-secret",  # webhook secret
@@ -3599,6 +3608,7 @@ class TestCmdConfigDefaultModelDispatch:
             # no DEFAULT_MODEL prompt; agent default comes from MODEL_REGISTRY
             "false",  # customize per-role models (decline; use registry defaults)
             "120",  # agent timeout (global default)
+            "3600",  # agent turn deadline (default)
             "0",  # max session age hours (0 = no limit)
             "1800",  # idle eviction timeout seconds
             "80",  # autocompact pct
@@ -3642,11 +3652,12 @@ class TestCmdConfigDefaultModelDispatch:
             # no DEFAULT_MODEL prompt; agent default comes from MODEL_REGISTRY
             "false",  # customize per-role models (decline; use registry defaults)
             "120",  # agent timeout (global default)
+            "3600",  # agent turn deadline (default)
             "0",  # max session age hours (0 = no limit)
             "1800",  # idle eviction timeout seconds
             # No autocompact_pct / claude effort prompts (claude-only)
             "",  # codex reasoning effort (empty = codex default)
-            "3600",  # codex turn deadline seconds (default)
+            "",  # codex turn deadline override (empty = shared)
             "8080",  # webhook port
             "",  # Workshop LAN address (disabled)
             "test-secret",  # webhook secret
@@ -3678,6 +3689,7 @@ class TestCmdConfigDefaultModelDispatch:
             # no DEFAULT_MODEL prompt; agent default comes from MODEL_REGISTRY
             "false",  # customize per-role models (decline; use registry defaults)
             "120",  # agent timeout (global default)
+            "3600",  # agent turn deadline (default)
             "0",  # max session age hours (0 = no limit)
             "1800",  # idle eviction timeout seconds
             # autocompact_pct / effort prompts are backend-gated
@@ -3748,10 +3760,10 @@ class TestCmdConfigDefaultModelDispatch:
         _, env = self._run(monkeypatch, tmp_path, base, helper_return="gpt-5.5")
         assert env.get("CODEX_EFFORT_LEVEL") == "high"
 
-    def test_codex_turn_deadline_default_omits_env_key(self, tmp_path, monkeypatch):
-        """Accepting the 3600 default keeps CODEX_TURN_DEADLINE_SECONDS
-        out of install.conf: delta-from-defaults, so only operator
-        intent is persisted."""
+    def test_codex_turn_deadline_empty_omits_env_key(self, tmp_path, monkeypatch):
+        """Accepting the empty default keeps CODEX_TURN_DEADLINE_SECONDS
+        out of install.conf: set-or-absent, absence means the codex
+        lane follows the shared deadline."""
         self._setup(monkeypatch, tmp_path)
         _, env = self._run(
             monkeypatch,
@@ -3761,16 +3773,40 @@ class TestCmdConfigDefaultModelDispatch:
         )
         assert "CODEX_TURN_DEADLINE_SECONDS" not in env
 
-    def test_codex_turn_deadline_non_default_writes_env_key(self, tmp_path, monkeypatch):
-        """A non-default deadline round-trips from the wizard prompt
-        into install.conf."""
+    def test_codex_turn_deadline_override_writes_env_key(self, tmp_path, monkeypatch):
+        """A codex override round-trips from the wizard prompt into
+        install.conf."""
         self._setup(monkeypatch, tmp_path)
         base = list(self._inputs_for_codex_subscription())
         idx = base.index("8080")
-        assert base[idx - 1] == "3600"
+        assert base[idx - 1] == ""
         base[idx - 1] = "7200"
         _, env = self._run(monkeypatch, tmp_path, base, helper_return="gpt-5.5")
         assert env.get("CODEX_TURN_DEADLINE_SECONDS") == "7200"
+
+    def test_shared_turn_deadline_default_omits_env_key(self, tmp_path, monkeypatch):
+        """Accepting the 3600 default keeps TURN_DEADLINE_SECONDS out
+        of install.conf: delta-from-defaults, so only operator intent
+        is persisted."""
+        self._setup(monkeypatch, tmp_path)
+        _, env = self._run(
+            monkeypatch,
+            tmp_path,
+            self._inputs_for_codex_subscription(),
+            helper_return="gpt-5.5",
+        )
+        assert "TURN_DEADLINE_SECONDS" not in env
+
+    def test_shared_turn_deadline_non_default_writes_env_key(self, tmp_path, monkeypatch):
+        """A non-default shared deadline round-trips from the wizard
+        prompt into install.conf."""
+        self._setup(monkeypatch, tmp_path)
+        base = list(self._inputs_for_codex_subscription())
+        idx = base.index("3600")
+        assert base[idx - 1] == "120"
+        base[idx] = "5400"
+        _, env = self._run(monkeypatch, tmp_path, base, helper_return="gpt-5.5")
+        assert env.get("TURN_DEADLINE_SECONDS") == "5400"
 
     def test_install_conf_legacy_AGENT_BACKEND_migrates_on_resave(self, tmp_path, monkeypatch):
         """Re-running the wizard against a prior install.conf that
@@ -9618,6 +9654,7 @@ class TestCmdConfigCanonicalUsersYaml:
             "sonnet",
             "false",  # customize per-role models (decline)
             "120",
+            "3600",  # agent turn deadline (default)
             "0",  # max session age hours (0 = no limit)
             "1800",  # idle eviction timeout seconds
             "10.0",
@@ -10085,6 +10122,7 @@ class TestCmdConfigSingleUserMode:
             "sonnet",  # model
             "false",  # customize per-role models (decline; use registry defaults)
             "120",  # timeout
+            "3600",  # agent turn deadline (default)
             "0",  # max session age hours (0 = no limit)
             "1800",  # idle eviction timeout seconds
             "80",  # autocompact
@@ -11584,6 +11622,7 @@ class TestOpenCodeConfigWizard:
             # model: handled by _prompt_default_model mock
             "false",  # customize per-role models (decline; use registry defaults)
             "120",  # agent timeout
+            "3600",  # agent turn deadline (default)
             "0",  # max session age hours (0 = no limit)
             "1800",  # idle eviction timeout seconds
             "8080",  # webhook port

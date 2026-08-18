@@ -570,6 +570,55 @@ class TestSendStream:
         assert text_events[0].text_so_far == "ok"
 
     @pytest.mark.asyncio
+    async def test_turn_deadline_ends_a_turn_that_keeps_trickling_output(self):
+        """
+        The idle guard resets on any output, so a turn that trickles
+        text chunks without ever completing is bounded only by the
+        turn deadline; when it fires, the turn ends with a failed
+        response preserving the accumulated text. One check in the
+        ACP base covers both the goose and opencode lanes.
+        """
+        b = _make_fake(turn_deadline_seconds=1)
+        proc = _make_mock_proc([])
+
+        async def trickle() -> bytes:
+            # Frequent-enough output that the idle guard never fires.
+            await asyncio.sleep(0.4)
+            return _text_chunk("still going")
+
+        proc.stdout.readline = trickle
+        b._proc = proc
+        b._session_id = "sess-1"
+        b._fresh_session = False
+        b._next_id = 3
+
+        events = await _collect_events(b, prompt="hi")
+
+        assert events[-1].done is True
+        assert events[-1].response.success is False
+        assert events[-1].response.error == f"{b.backend_label} turn exceeded its deadline"
+        assert "still going" in events[-1].text_so_far
+
+    @pytest.mark.asyncio
+    async def test_turn_completing_within_deadline_is_untouched(self):
+        """A normal turn under the deadline ends by completion, not the backstop."""
+        b = _make_fake(turn_deadline_seconds=5)
+        b._proc = _make_mock_proc(
+            [
+                _text_chunk("ok"),
+                _completion_result(prompt_id=3),
+            ]
+        )
+        b._session_id = "sess-1"
+        b._fresh_session = False
+        b._next_id = 3
+
+        events = await _collect_events(b, prompt="hi")
+
+        assert events[-1].done is True
+        assert events[-1].response.success is True
+
+    @pytest.mark.asyncio
     async def test_jsonrpc_error_yields_failed_response(self):
         """JSON-RPC error response yields done StreamEvent with the error message."""
         b = _make_fake()

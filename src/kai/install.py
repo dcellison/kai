@@ -2038,6 +2038,19 @@ def _cmd_config() -> None:
             break
         print("  Must be a positive integer.")
 
+    # Total bound on one turn for every backend: the backstop that
+    # ends a turn trickling output without completing, since the idle
+    # guards reset on any output. Generous default so legitimate long
+    # agentic turns never hit it.
+    while True:
+        turn_deadline = _prompt(
+            "Agent turn deadline (seconds)",
+            existing_env.get("TURN_DEADLINE_SECONDS", "3600"),
+        )
+        if _validate_positive_int(turn_deadline):
+            break
+        print("  Must be a positive integer.")
+
     # Session lifecycle tunables. Both govern the subprocess pool for
     # every backend (recycle-by-age and idle eviction), hence the
     # AGENT_ prefix; the CLAUDE_-prefixed forms are legacy aliases
@@ -2124,7 +2137,7 @@ def _cmd_config() -> None:
     # enforces at load so install.conf cannot carry a value that fails
     # at service startup, while accepting "" as the no-override signal.
     codex_effort_level = ""
-    codex_turn_deadline = "3600"
+    codex_turn_deadline = ""
     if agent_backend == "codex":
         codex_effort_level = _prompt_optional_choice(
             "Codex reasoning effort",
@@ -2134,18 +2147,18 @@ def _cmd_config() -> None:
         )
         print()
 
-        # Total bound on one codex turn: the backstop that ends a turn
-        # trickling output without completing, since the idle guard
-        # resets on any output. Generous default so legitimate long
-        # agentic turns never hit it.
+        # Codex-only override of the shared turn deadline, set-or-
+        # absent like the effort prompt above: empty means the codex
+        # lane follows TURN_DEADLINE_SECONDS. A previously persisted
+        # override prefills and survives a resave.
         while True:
             codex_turn_deadline = _prompt(
-                "Codex turn deadline (seconds)",
-                existing_env.get("CODEX_TURN_DEADLINE_SECONDS", "3600"),
+                "Codex turn deadline override (seconds, empty = shared)",
+                existing_env.get("CODEX_TURN_DEADLINE_SECONDS", ""),
             )
-            if _validate_positive_int(codex_turn_deadline):
+            if not codex_turn_deadline or _validate_positive_int(codex_turn_deadline):
                 break
-            print("  Must be a positive integer.")
+            print("  Must be a positive integer or empty.")
         print()
 
     # -- Webhook server --
@@ -2633,9 +2646,14 @@ def _cmd_config() -> None:
     if codex_effort_level:
         env["CODEX_EFFORT_LEVEL"] = codex_effort_level
 
-    # CODEX_TURN_DEADLINE_SECONDS: delta-from-defaults; only a
-    # non-default value is operator intent worth persisting.
-    if codex_turn_deadline != "3600":
+    # TURN_DEADLINE_SECONDS: delta-from-defaults; only a non-default
+    # value is operator intent worth persisting.
+    if turn_deadline != "3600":
+        env["TURN_DEADLINE_SECONDS"] = turn_deadline
+
+    # CODEX_TURN_DEADLINE_SECONDS: set-or-absent; any value is a
+    # codex-only override of the shared deadline.
+    if codex_turn_deadline:
         env["CODEX_TURN_DEADLINE_SECONDS"] = codex_turn_deadline
 
     # Conditionally add optional values

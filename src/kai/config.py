@@ -1513,12 +1513,18 @@ class Config:
     # Only consulted when the user's effective backend is codex.
     codex_effort_level: str = ""
 
-    # Total bound on one codex turn, in seconds. The stream loop's
-    # per-read and idle guards both reset whenever output arrives, so
-    # a turn that trickles output without completing (a quota-starved
-    # retry spin) would otherwise run forever; this backstop ends it.
-    # Generous by default so legitimate long agentic turns never hit
-    # it. Must be a positive integer.
+    # Total bound on one turn, in seconds, for every backend. The
+    # stream loops' per-read and idle guards all reset whenever output
+    # arrives, so a turn that trickles output without completing (a
+    # quota-starved retry spin) would otherwise run forever; this
+    # backstop ends it. Generous by default so legitimate long agentic
+    # turns never hit it. Must be a positive integer.
+    turn_deadline_seconds: int = 3600
+
+    # Codex-specific override of turn_deadline_seconds, set-or-absent:
+    # when CODEX_TURN_DEADLINE_SECONDS is unset this field carries the
+    # shared value, so the codex lane never needs to know which one
+    # the operator configured.
     codex_turn_deadline_seconds: int = 3600
 
     # Database - uses DATA_DIR so the db lands in the writable data directory
@@ -3252,13 +3258,27 @@ def load_config() -> Config:
             f"CODEX_EFFORT_LEVEL must be one of {list(CODEX_EFFORT_LEVELS)} or empty, got {codex_effort_level!r}"
         )
 
-    raw_turn_deadline = os.environ.get("CODEX_TURN_DEADLINE_SECONDS", "3600").strip()
+    raw_turn_deadline = os.environ.get("TURN_DEADLINE_SECONDS", "3600").strip()
     try:
-        codex_turn_deadline_seconds = int(raw_turn_deadline)
-        if codex_turn_deadline_seconds <= 0:
+        turn_deadline_seconds = int(raw_turn_deadline)
+        if turn_deadline_seconds <= 0:
             raise ValueError
     except ValueError:
-        raise SystemExit("CODEX_TURN_DEADLINE_SECONDS must be a positive integer") from None
+        raise SystemExit("TURN_DEADLINE_SECONDS must be a positive integer") from None
+
+    # Set-or-absent: empty or unset means the codex lane follows the
+    # shared deadline; a value is a codex-only override that wins over
+    # the shared var.
+    raw_codex_deadline = os.environ.get("CODEX_TURN_DEADLINE_SECONDS", "").strip()
+    if raw_codex_deadline:
+        try:
+            codex_turn_deadline_seconds = int(raw_codex_deadline)
+            if codex_turn_deadline_seconds <= 0:
+                raise ValueError
+        except ValueError:
+            raise SystemExit("CODEX_TURN_DEADLINE_SECONDS must be a positive integer") from None
+    else:
+        codex_turn_deadline_seconds = turn_deadline_seconds
 
     # PR review agent config. The global `pr_review` toggle now lives
     # per-user in users.yaml; PR_REVIEW_COOLDOWN / PR_REVIEW_TIMEOUT_S
@@ -3778,6 +3798,7 @@ def load_config() -> Config:
         claude_effort_level=claude_effort_level,
         codex_auth_mode=codex_auth_mode,
         codex_effort_level=codex_effort_level,
+        turn_deadline_seconds=turn_deadline_seconds,
         codex_turn_deadline_seconds=codex_turn_deadline_seconds,
         webhook_port=webhook_port,
         workshop_lan_host=workshop_lan_host,

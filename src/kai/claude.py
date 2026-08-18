@@ -141,6 +141,11 @@ class ClaudeCodeBackend(AgentBackend):
         # of daemon-read file contents; the user-isolated subprocess
         # can read its own files directly.
         defer_user_file_reads: bool = False,
+        # Total bound on one turn, in seconds. The stream loop's
+        # per-read and idle guards reset whenever output arrives; this
+        # backstop never does. Validated positive at config load (see
+        # Config.turn_deadline_seconds).
+        turn_deadline_seconds: int = 3600,
     ):
         # ABC-required attributes (pool.py reads/writes these)
         self.model = model
@@ -157,6 +162,7 @@ class ClaudeCodeBackend(AgentBackend):
         # a default after a /workspace switch (see workspace_config block
         # below for the pattern that DOES need a default shadow).
         self.claude_effort_level = claude_effort_level
+        self.turn_deadline_seconds = turn_deadline_seconds
         self.provider = "anthropic"  # Claude CLI always uses Anthropic
         # Session-age recycling limit (ABC surface; checked by the
         # inherited _should_recycle at the top of _send_locked).
@@ -887,8 +893,32 @@ class ClaudeCodeBackend(AgentBackend):
         # this is a secondary safety net measured across the whole interaction.
         last_activity = time.monotonic()
         max_idle_seconds = self.timeout_seconds * 5  # 10 min of silence at default 120s
+        turn_started = time.monotonic()
         try:
             while True:
+                # Check the total-turn deadline before each readline.
+                # Unlike the idle guard below, this never resets on
+                # output, so a turn that trickles retry notices without
+                # completing still ends here.
+                elapsed = time.monotonic() - turn_started
+                if elapsed > self.turn_deadline_seconds:
+                    log.error(
+                        "Claude turn deadline exceeded (%.0fs elapsed, limit %ds)",
+                        elapsed,
+                        self.turn_deadline_seconds,
+                    )
+                    await self._kill()
+                    yield StreamEvent(
+                        text_so_far=accumulated_text,
+                        done=True,
+                        response=AgentResponse(
+                            success=False,
+                            text=accumulated_text,
+                            error="Claude turn exceeded its deadline",
+                        ),
+                    )
+                    return
+
                 # Check idle timeout before each readline
                 idle_seconds = time.monotonic() - last_activity
                 if idle_seconds > max_idle_seconds:

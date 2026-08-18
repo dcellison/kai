@@ -491,6 +491,7 @@ class SubprocessPool:
                 memory_enabled=self._config.memory_enabled,
                 os_user=os_user,
                 max_session_hours=self._config.agent_max_session_hours,
+                turn_deadline_seconds=self._config.turn_deadline_seconds,
                 defer_user_file_reads=getattr(self._config, "protected_install", False) is True,
             )
 
@@ -513,6 +514,7 @@ class SubprocessPool:
                 memory_enabled=self._config.memory_enabled,
                 os_user=os_user,
                 max_session_hours=self._config.agent_max_session_hours,
+                turn_deadline_seconds=self._config.turn_deadline_seconds,
                 defer_user_file_reads=getattr(self._config, "protected_install", False) is True,
             )
 
@@ -557,6 +559,7 @@ class SubprocessPool:
                 memory_enabled=self._config.memory_enabled,
                 os_user=os_user,
                 max_session_hours=self._config.agent_max_session_hours,
+                turn_deadline_seconds=self._config.turn_deadline_seconds,
                 defer_user_file_reads=getattr(self._config, "protected_install", False) is True,
             )
 
@@ -574,6 +577,7 @@ class SubprocessPool:
                 workspace_config=ws_config,
                 autocompact_pct=self._config.claude_autocompact_pct,
                 claude_effort_level=self._config.claude_effort_level,
+                turn_deadline_seconds=self._config.turn_deadline_seconds,
                 memory_enabled=self._config.memory_enabled,
                 defer_user_file_reads=getattr(self._config, "protected_install", False) is True,
             )

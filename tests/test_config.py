@@ -64,6 +64,7 @@ _CONFIG_ENV_VARS = [
     "CLAUDE_EFFORT_LEVEL",
     "CODEX_EFFORT_LEVEL",
     "CODEX_TURN_DEADLINE_SECONDS",
+    "TURN_DEADLINE_SECONDS",
     "TOTP_SESSION_MINUTES",
     "TOTP_CHALLENGE_SECONDS",
     "TOTP_LOCKOUT_ATTEMPTS",
@@ -1589,26 +1590,64 @@ class TestCodexEffortLevel:
 # ── CODEX_TURN_DEADLINE_SECONDS config ───────────────────────────────
 
 
-class TestCodexTurnDeadlineSeconds:
-    """Coverage for the CODEX_TURN_DEADLINE_SECONDS env var: the
-    total-turn backstop for the codex stream loop, whose idle guard
-    resets on any output. Positive integer, generous default."""
+class TestTurnDeadlineSeconds:
+    """Coverage for the shared TURN_DEADLINE_SECONDS env var and its
+    codex-only override CODEX_TURN_DEADLINE_SECONDS: the total-turn
+    backstop for every stream loop, whose idle guards reset on any
+    output. Positive integers; the override is set-or-absent."""
 
-    def test_default_when_unset(self, monkeypatch):
+    def test_defaults_when_neither_is_set(self, monkeypatch):
         _set_required(monkeypatch)
         config = load_config()
+        assert config.turn_deadline_seconds == 3600
         assert config.codex_turn_deadline_seconds == 3600
 
-    def test_valid_value_parses(self, monkeypatch):
+    def test_shared_value_governs_every_lane(self, monkeypatch):
+        # The shared var alone must reach the codex field too; the
+        # codex lane never consults the shared field directly.
+        _set_required(monkeypatch)
+        monkeypatch.setenv("TURN_DEADLINE_SECONDS", "5400")
+        config = load_config()
+        assert config.turn_deadline_seconds == 5400
+        assert config.codex_turn_deadline_seconds == 5400
+
+    def test_codex_override_wins_for_codex_only(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("TURN_DEADLINE_SECONDS", "5400")
+        monkeypatch.setenv("CODEX_TURN_DEADLINE_SECONDS", "7200")
+        config = load_config()
+        assert config.turn_deadline_seconds == 5400
+        assert config.codex_turn_deadline_seconds == 7200
+
+    def test_codex_override_alone_keeps_its_meaning(self, monkeypatch):
+        # A pre-existing install.conf carrying only the codex var must
+        # keep binding codex at that value, with every other lane on
+        # the default.
         _set_required(monkeypatch)
         monkeypatch.setenv("CODEX_TURN_DEADLINE_SECONDS", "7200")
         config = load_config()
+        assert config.turn_deadline_seconds == 3600
         assert config.codex_turn_deadline_seconds == 7200
 
+    def test_empty_codex_override_follows_shared(self, monkeypatch):
+        # Empty is unset, not an error: the set-or-absent contract.
+        _set_required(monkeypatch)
+        monkeypatch.setenv("TURN_DEADLINE_SECONDS", "5400")
+        monkeypatch.setenv("CODEX_TURN_DEADLINE_SECONDS", "  ")
+        config = load_config()
+        assert config.codex_turn_deadline_seconds == 5400
+
     @pytest.mark.parametrize("value", ["0", "-5", "not-a-number", "3.5"])
-    def test_non_positive_or_non_integer_raises(self, monkeypatch, value):
+    def test_non_positive_or_non_integer_shared_raises(self, monkeypatch, value):
         # A zero or negative deadline would disable the backstop
         # silently; fail fast at config load instead.
+        _set_required(monkeypatch)
+        monkeypatch.setenv("TURN_DEADLINE_SECONDS", value)
+        with pytest.raises(SystemExit, match="TURN_DEADLINE_SECONDS"):
+            load_config()
+
+    @pytest.mark.parametrize("value", ["0", "-5", "not-a-number", "3.5"])
+    def test_non_positive_or_non_integer_override_raises(self, monkeypatch, value):
         _set_required(monkeypatch)
         monkeypatch.setenv("CODEX_TURN_DEADLINE_SECONDS", value)
         with pytest.raises(SystemExit, match="CODEX_TURN_DEADLINE_SECONDS"):

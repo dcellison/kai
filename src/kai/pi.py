@@ -35,6 +35,7 @@ from kai.pi_rpc import (
     PI_RPC_STREAM_LIMIT,
     PiRpcError,
     PiRpcProtocolError,
+    PiRpcTimeoutError,
     PiRpcTransport,
     pi_rpc_extension_error,
     pi_rpc_is_settled,
@@ -164,6 +165,11 @@ class PiBackend(AgentBackend):
         os_user: str | None = None,
         max_session_hours: float = 0,
         defer_user_file_reads: bool = False,
+        # Total bound on one turn, in seconds. The per-receive timeout
+        # resets whenever any RPC record arrives; this backstop never
+        # does. Validated positive at config load (see
+        # Config.turn_deadline_seconds).
+        turn_deadline_seconds: int = 3600,
     ) -> None:
         self.model = model
         self.workspace = workspace
@@ -175,6 +181,7 @@ class PiBackend(AgentBackend):
         self.os_user = os_user
         self.max_session_hours = max_session_hours
         self.defer_user_file_reads = defer_user_file_reads
+        self.turn_deadline_seconds = turn_deadline_seconds
 
         self._api_context = ApiContext(
             webhook_port=webhook_port,
@@ -481,6 +488,20 @@ class PiBackend(AgentBackend):
         terminal_error: str | None = None
 
         while True:
+            # Check the total-turn deadline before each receive. The
+            # per-receive timeout resets whenever any record arrives,
+            # so a turn that trickles retry notices without completing
+            # ends here instead; the raise rides the same
+            # PiRpcError-to-failed-final-event path as a receive
+            # timeout, killing the subprocess in the send handler.
+            elapsed = time.monotonic() - started_at
+            if elapsed > self.turn_deadline_seconds:
+                log.error(
+                    "Pi turn deadline exceeded (%.0fs elapsed, limit %ds)",
+                    elapsed,
+                    self.turn_deadline_seconds,
+                )
+                raise PiRpcTimeoutError("Pi turn exceeded its deadline")
             message = await self._transport.receive(timeout_seconds=self.timeout_seconds)
             message_type = message.get("type")
 
