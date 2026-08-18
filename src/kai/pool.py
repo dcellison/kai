@@ -537,6 +537,7 @@ class SubprocessPool:
                 memory_enabled=self._config.memory_enabled,
                 max_session_hours=self._config.agent_max_session_hours,
                 codex_effort_level=self._config.codex_effort_level,
+                codex_turn_deadline_seconds=self._config.codex_turn_deadline_seconds,
                 defer_user_file_reads=getattr(self._config, "protected_install", False) is True,
             )
 

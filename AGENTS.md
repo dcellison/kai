@@ -17,7 +17,7 @@ Follow the existing pattern exactly:
 2. Validated parsing in `load_config()` (try/except ValueError, SystemExit on bad input)
 3. Pass through `pool.py` to `claude.py` if it affects the inner Claude
 4. Prompt in `install.py` `_cmd_config()` (with validation loop)
-5. Document in `.env.example`
+5. Document in `templates/.env`
 6. Add to `_CONFIG_ENV_VARS` list in `tests/test_config.py`
 
 ## Key Patterns

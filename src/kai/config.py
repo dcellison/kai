@@ -1513,6 +1513,14 @@ class Config:
     # Only consulted when the user's effective backend is codex.
     codex_effort_level: str = ""
 
+    # Total bound on one codex turn, in seconds. The stream loop's
+    # per-read and idle guards both reset whenever output arrives, so
+    # a turn that trickles output without completing (a quota-starved
+    # retry spin) would otherwise run forever; this backstop ends it.
+    # Generous by default so legitimate long agentic turns never hit
+    # it. Must be a positive integer.
+    codex_turn_deadline_seconds: int = 3600
+
     # Database - uses DATA_DIR so the db lands in the writable data directory
     session_db_path: Path = field(default_factory=lambda: DATA_DIR / "kai.db")
 
@@ -3244,6 +3252,14 @@ def load_config() -> Config:
             f"CODEX_EFFORT_LEVEL must be one of {list(CODEX_EFFORT_LEVELS)} or empty, got {codex_effort_level!r}"
         )
 
+    raw_turn_deadline = os.environ.get("CODEX_TURN_DEADLINE_SECONDS", "3600").strip()
+    try:
+        codex_turn_deadline_seconds = int(raw_turn_deadline)
+        if codex_turn_deadline_seconds <= 0:
+            raise ValueError
+    except ValueError:
+        raise SystemExit("CODEX_TURN_DEADLINE_SECONDS must be a positive integer") from None
+
     # PR review agent config. The global `pr_review` toggle now lives
     # per-user in users.yaml; PR_REVIEW_COOLDOWN / PR_REVIEW_TIMEOUT_S
     # remain as global resource controls.
@@ -3762,6 +3778,7 @@ def load_config() -> Config:
         claude_effort_level=claude_effort_level,
         codex_auth_mode=codex_auth_mode,
         codex_effort_level=codex_effort_level,
+        codex_turn_deadline_seconds=codex_turn_deadline_seconds,
         webhook_port=webhook_port,
         workshop_lan_host=workshop_lan_host,
         github_webhook_secret=github_webhook_secret,

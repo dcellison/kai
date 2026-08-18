@@ -2124,6 +2124,7 @@ def _cmd_config() -> None:
     # enforces at load so install.conf cannot carry a value that fails
     # at service startup, while accepting "" as the no-override signal.
     codex_effort_level = ""
+    codex_turn_deadline = "3600"
     if agent_backend == "codex":
         codex_effort_level = _prompt_optional_choice(
             "Codex reasoning effort",
@@ -2131,6 +2132,20 @@ def _cmd_config() -> None:
             existing_env.get("CODEX_EFFORT_LEVEL", ""),
             empty_hint="empty = codex default",
         )
+        print()
+
+        # Total bound on one codex turn: the backstop that ends a turn
+        # trickling output without completing, since the idle guard
+        # resets on any output. Generous default so legitimate long
+        # agentic turns never hit it.
+        while True:
+            codex_turn_deadline = _prompt(
+                "Codex turn deadline (seconds)",
+                existing_env.get("CODEX_TURN_DEADLINE_SECONDS", "3600"),
+            )
+            if _validate_positive_int(codex_turn_deadline):
+                break
+            print("  Must be a positive integer.")
         print()
 
     # -- Webhook server --
@@ -2617,6 +2632,11 @@ def _cmd_config() -> None:
     # install.conf entirely.
     if codex_effort_level:
         env["CODEX_EFFORT_LEVEL"] = codex_effort_level
+
+    # CODEX_TURN_DEADLINE_SECONDS: delta-from-defaults; only a
+    # non-default value is operator intent worth persisting.
+    if codex_turn_deadline != "3600":
+        env["CODEX_TURN_DEADLINE_SECONDS"] = codex_turn_deadline
 
     # Conditionally add optional values
     if transport == "webhook":

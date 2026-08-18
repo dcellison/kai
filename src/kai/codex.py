@@ -329,6 +329,14 @@ class CodexBackend(AgentBackend):
         # of daemon-read file contents; the user-isolated subprocess
         # can read its own files directly.
         defer_user_file_reads: bool = False,
+        # Total bound on one turn, in seconds. The per-read and idle
+        # guards in the stream loop both reset whenever output arrives,
+        # so a turn that trickles output without completing (a
+        # quota-starved retry spin) would otherwise run forever; this
+        # backstop ends it. Generous by default so legitimate long
+        # agentic turns never hit it. Validated positive at config
+        # load (see Config.codex_turn_deadline_seconds).
+        codex_turn_deadline_seconds: int = 3600,
     ):
         # ABC-required attributes (pool.py reads/writes these)
         self.model = model
@@ -341,6 +349,7 @@ class CodexBackend(AgentBackend):
         self.memory_enabled = memory_enabled
         self.codex_effort_level = codex_effort_level
         self.defer_user_file_reads = defer_user_file_reads
+        self.codex_turn_deadline_seconds = codex_turn_deadline_seconds
         # Session-age recycling limit (ABC surface; checked by the
         # inherited _should_recycle at the top of _send_locked).
         self.max_session_hours = max_session_hours
@@ -1051,9 +1060,34 @@ class CodexBackend(AgentBackend):
 
         last_activity = time.monotonic()
         max_idle_seconds = self.timeout_seconds * 5
+        turn_started = time.monotonic()
 
         try:
             while True:
+                # Check the total-turn deadline before each readline.
+                # Unlike the idle guard below, this never resets on
+                # output, so a turn that trickles retry notices without
+                # completing still ends here.
+                elapsed = time.monotonic() - turn_started
+                if elapsed > self.codex_turn_deadline_seconds:
+                    log.error(
+                        "Codex turn deadline exceeded (%.0fs elapsed, limit %ds)",
+                        elapsed,
+                        self.codex_turn_deadline_seconds,
+                    )
+                    await self._kill()
+                    visible = _visible_text()
+                    yield StreamEvent(
+                        text_so_far=visible,
+                        done=True,
+                        response=AgentResponse(
+                            success=False,
+                            text=visible,
+                            error="Codex turn exceeded its deadline",
+                        ),
+                    )
+                    return
+
                 # Check idle timeout before each readline
                 idle = time.monotonic() - last_activity
                 if idle > max_idle_seconds:
