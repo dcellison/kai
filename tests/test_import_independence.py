@@ -14,12 +14,17 @@ import sys
 
 import pytest
 
+# When breaking a new import cycle, add its entry module here so the fix
+# stays proven; the list only covers what it names.
 _ENTRY_MODULES = (
+    "kai.bot",
     "kai.conversation_compatibility",
     "kai.pool",
     "kai.sessions",
     "kai.workshop",
     "kai.workshop.client_commands",
+    "kai.workshop.protected_execution",
+    "kai.workshop.runtime_pool",
 )
 
 
