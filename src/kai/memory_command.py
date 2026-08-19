@@ -669,7 +669,7 @@ def _build_dashboard(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup | No
 
     The dashboard surfaces two user-visible counts (facts and episode
     summaries) and a single utility keyboard row holding two optional
-    browse buttons (Facts when extracted_count + migration_count > 0;
+    browse buttons (Facts when the fact-bucket counts sum > 0;
     Episodes when episode_count > 0), plus an unconditional Stats
     button. There is no per-source filter axis: the parent decision
     in #388 settled tags as row decoration only, not a primary
@@ -690,24 +690,31 @@ def _build_dashboard(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup | No
     # source has rows, fall through to render the dashboard - the
     # source-count headline communicates that memory is alive even
     # for an episode-only or migration-only operator.
-    if stats.extracted_count == 0 and stats.episode_count == 0 and stats.migration_count == 0:
+    if (
+        stats.extracted_count == 0
+        and stats.episode_count == 0
+        and stats.migration_count == 0
+        and stats.explicit_count == 0
+    ):
         return _MSG_NO_FACTS, None
 
     # Cache the visibility predicates once. The Facts button rolls
-    # extracted and migration into one count; the Episodes button is
-    # episode-only. The empty-state guard above ensures at least one
-    # of facts_visible or episode_count > 0 is true on every reachable
-    # path through the rest of this function (otherwise all three
-    # counts would be zero, which the guard already returns for).
-    facts_count = stats.extracted_count + stats.migration_count
+    # extracted, migration, and explicit into one count (mirroring
+    # `_FACT_BUCKET_SOURCES`, so the label agrees with the list the
+    # button opens); the Episodes button is episode-only. The
+    # empty-state guard above ensures at least one of facts_visible or
+    # episode_count > 0 is true on every reachable path through the
+    # rest of this function (otherwise all the counts would be zero,
+    # which the guard already returns for).
+    facts_count = stats.extracted_count + stats.migration_count + stats.explicit_count
     facts_visible = facts_count > 0
     episodes_visible = stats.episode_count > 0
 
     lines: list[str] = []
     # Headline assembled from non-zero counts. The fact bucket sums
-    # extracted and migration into a single "facts" count because the
-    # operator does not need to be reminded that some facts arrived
-    # via migration rather than extraction. The summing matches the
+    # extracted, migration, and explicit into a single "facts" count
+    # because the operator does not need to be reminded which write
+    # path a fact arrived through. The summing matches the
     # Facts button label so the headline and the keyboard agree on
     # the same number. Zero-valued counts are omitted from the comma
     # list rather than rendered as "0 episodes" - readability over
@@ -1254,13 +1261,13 @@ def _build_forget_fact_confirm(fact: MemoryResult) -> tuple[str, InlineKeyboardM
 def _source_noun(fact: MemoryResult) -> str:
     """Operator-facing noun for a row, keyed on `metadata.source`.
 
-    Extracted and migration share "fact" because the UI does not
-    surface that distinction; the generic "memory" fallback covers
-    an unknown source slipping through a stale cache during a deploy
-    transition (same defensive posture as the forget flow).
+    Extracted, migration, and explicit share "fact" because the UI
+    does not surface that distinction; the generic "memory" fallback
+    covers an unknown source slipping through a stale cache during a
+    deploy transition (same defensive posture as the forget flow).
     """
     source = (fact.metadata or {}).get("source", "")
-    return {"extracted": "fact", "episode": "episode", "migration": "fact"}.get(source, "memory")
+    return {"extracted": "fact", "episode": "episode", "migration": "fact", "explicit": "fact"}.get(source, "memory")
 
 
 # ── Builder: scope screen and confirm ───────────────────────────────
@@ -1455,7 +1462,12 @@ def _build_stats(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup]:
     # memories yet." Wording mirrors the dashboard's two-bucket
     # surface (facts + episodes); the migration count folds into
     # "facts" so the empty-state phrasing has no third item.
-    if stats.extracted_count == 0 and stats.episode_count == 0 and stats.migration_count == 0:
+    if (
+        stats.extracted_count == 0
+        and stats.episode_count == 0
+        and stats.migration_count == 0
+        and stats.explicit_count == 0
+    ):
         text = "Memory stats\n\nNo facts or episodes yet."
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("back", callback_data=_encode_callback("dash"))]])
         return text, kb
@@ -1463,10 +1475,10 @@ def _build_stats(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup]:
     # Headline block: per-bucket totals, one line per non-zero bucket.
     # Right-padding holds the "Total <bucket>:" labels at consistent
     # width across the header lines so the count column lines up.
-    # The fact bucket sums extracted and migration so a migration-only
-    # operator sees a single "Total facts:" rather than the prior
-    # split rows; the underlying source field stays unchanged.
-    total_facts = stats.extracted_count + stats.migration_count
+    # The fact bucket sums extracted, migration, and explicit so a
+    # single "Total facts:" line matches the facts browser's admit
+    # list; the underlying source field stays unchanged.
+    total_facts = stats.extracted_count + stats.migration_count + stats.explicit_count
     lines = ["Memory stats", ""]
     if total_facts:
         lines.append(f"Total facts:      {total_facts}")

@@ -2074,6 +2074,23 @@ async def _handle_memory_add(request: web.Request, principal: InternalAPIPrincip
     if metadata is not None and not isinstance(metadata, dict):
         return web.json_response({"error": "metadata must be a JSON object"}, status=400)
 
+    # The two caller-overridable provenance keys get the same 400
+    # treatment as every other field: these values feed arithmetic
+    # (ranking multiplies weight by confidence, the browser sorts by
+    # it) and string formatting in now-visible UI rows, so a stored
+    # bad type surfaces later as a broken facts browser rather than a
+    # clean error here. bool is rejected for confidence because JSON
+    # true/false pass isinstance(int) and would silently rank as 1/0.
+    if metadata is not None:
+        speaker = metadata.get("speaker")
+        if speaker is not None and not isinstance(speaker, str):
+            return web.json_response({"error": "metadata.speaker must be a string"}, status=400)
+        confidence = metadata.get("confidence")
+        if confidence is not None and (
+            isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0.0 <= confidence <= 1.0
+        ):
+            return web.json_response({"error": "metadata.confidence must be a number in [0.0, 1.0]"}, status=400)
+
     try:
         chat_id = _resolve_chat_id(principal, payload)
     except ValueError as e:
@@ -2108,12 +2125,20 @@ async def _handle_memory_add(request: web.Request, principal: InternalAPIPrincip
     # rules as the extraction path with no classifier hint. A missing
     # pool (transient startup state) collapses to no-workspace
     # semantics: global scope, the same posture scoped retrieval takes.
-    pool = request.app.get(POOL_KEY)
-    active_project = None
-    if pool is not None:
-        api_config: Config = request.app[CONFIG_KEY]
-        workspace = await pool.get_effective_workspace(chat_id)
-        active_project = detect_active_memory_project(workspace, merged_registry(api_config.memory_projects))
+    # The workspace resolution is guarded because it is not a pure
+    # read (settings DB, path validation); a transient failure there
+    # must surface as the handler's clean JSON 500, not mis-scope the
+    # write to global silently or escape as a framework HTML 500.
+    try:
+        pool = request.app.get(POOL_KEY)
+        active_project = None
+        if pool is not None:
+            api_config: Config = request.app[CONFIG_KEY]
+            workspace = await pool.get_effective_workspace(chat_id)
+            active_project = detect_active_memory_project(workspace, merged_registry(api_config.memory_projects))
+    except Exception:
+        log.exception("memory add: workspace scope resolution failed for chat %d", chat_id)
+        return web.json_response({"error": "Memory storage failed"}, status=500)
     final_metadata.update(_route_write_scope(None, active_project))
 
     # Defense-in-depth guard, matching the pattern used in the other

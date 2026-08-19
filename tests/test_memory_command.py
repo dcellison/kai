@@ -99,6 +99,7 @@ def _stats(
     confidence_below_0_6: int = 0,
     confirmation_quote_count: int = 0,
     by_prompt_version: dict[str, int] | None = None,
+    explicit_count: int = 0,
 ) -> MemoryStats:
     """Construct a MemoryStats with extracted-only aggregates.
 
@@ -108,11 +109,12 @@ def _stats(
     explicitly.
     """
     return MemoryStats(
-        total_count=extracted_count + episode_count + migration_count,
+        total_count=extracted_count + episode_count + migration_count + explicit_count,
         by_type={"fact": extracted_count} if extracted_count else {},
         extracted_count=extracted_count,
         episode_count=episode_count,
         migration_count=migration_count,
+        explicit_count=explicit_count,
         by_tag=by_tag or {},
         confidence_min=confidence_min,
         confidence_median=confidence_median,
@@ -741,6 +743,22 @@ class TestDashboardMultiSource:
         assert len(kb.inline_keyboard) == 1
         utility_row = kb.inline_keyboard[-1]
         assert [btn.text for btn in utility_row] == ["Episodes (4)", "Stats"]
+
+    def test_dashboard_explicit_only_user_renders(self):
+        """Explicit-only operator (a realistic fresh-install shape:
+        deliberate API saves land before the extractor has anything to
+        extract). The empty-state guard must not fire, and the Facts
+        button and headline must count the explicit rows, matching the
+        list the button opens; otherwise API-written rows would be
+        unreachable in /memory despite being admitted by the browser."""
+        stats = _stats(explicit_count=36)
+        text, kb = memory_command._build_dashboard(stats)
+        assert "No memories yet" not in text
+        assert kb is not None
+        assert "36 facts" in text
+        assert len(kb.inline_keyboard) == 1
+        utility_row = kb.inline_keyboard[-1]
+        assert utility_row[0].text == "Facts (36)"
 
     def test_dashboard_migration_only_user_renders(self):
         """Migration-only operator: migration_count > 0,

@@ -840,6 +840,38 @@ class TestFormatContext:
         output = await format_context("history", user_id="123")
         assert "- (2026-01-15, legacy) Old pre-spec entry" in output
 
+    async def test_format_context_explicit_source_labeled_fact(self):
+        """API-written rows carry a recognized source and must render
+        with the 'fact' provenance tag, not fall through to 'legacy'
+        (which the inner agent's reading contract treats as schema
+        drift)."""
+        import kai.memory as mem_mod
+        from kai.memory import format_context
+
+        mock_mem = MagicMock()
+        mock_mem.search.return_value = {
+            "results": [
+                {
+                    "id": "api-row",
+                    "memory": "User prefers Earl Grey",
+                    "score": 0.9,
+                    "metadata": {
+                        "type": "preference",
+                        "source": "explicit",
+                        "speaker": "assistant",
+                        "confidence": 0.9,
+                    },
+                    "created_at": "2026-08-19T00:00:00",
+                },
+            ]
+        }
+        mem_mod._memory = mock_mem
+        mem_mod._config = _make_config()
+
+        output = await format_context("tea", user_id="123")
+        assert "- (2026-08-19, fact) User prefers Earl Grey" in output
+        assert "legacy" not in output
+
     async def test_format_context_orders_by_weighted_score(self):
         """At equal raw cosine, a user-speaker row ranks above an
         assistant-speaker row. The new ranking key is `cosine *

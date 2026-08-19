@@ -305,6 +305,10 @@ _SOURCE_SHORT: dict[str, str] = {
     # distinguish operator-imported facts from conversation-extracted
     # facts when they surface in retrieval.
     "migration": "fact",
+    # Explicit (API-written) rows likewise render as "fact": the
+    # source tag is for provenance, and the reader does not need the
+    # API-written vs conversation-extracted distinction either.
+    "explicit": "fact",
     "": "legacy",
 }
 
@@ -602,9 +606,10 @@ class MemoryStats:
     grouped fields) so a caller that constructs `MemoryStats(total_count=0,
     by_type={})` (the legacy two-arg form) still produces a valid value.
 
-    `episode_count` and `migration_count` are parallel per-source counts,
-    added so the /memory dashboard and stats screens can surface
-    user-visible non-extracted sources alongside the extracted total.
+    `episode_count`, `migration_count`, and `explicit_count` are
+    parallel per-source counts, added so the /memory dashboard and
+    stats screens can surface user-visible non-extracted sources
+    alongside the extracted total.
     Their sum with `extracted_count` may be less than `total_count`
     because legacy ""-source rows still contribute to the total but are
     not enumerated as a separate per-source field. Confidence aggregates
@@ -627,8 +632,10 @@ class MemoryStats:
     # legacy two-arg `MemoryStats(total_count=0, by_type={})`
     # construction in tests stays source-compatible. Episode rows come
     # from issue #385/#387; migration rows come from issue #406/#408.
+    # Explicit rows are API-written deliberate saves.
     episode_count: int = 0
     migration_count: int = 0
+    explicit_count: int = 0
     by_tag: dict[str, int] = field(default_factory=dict)
     confidence_min: float | None = None
     confidence_median: float | None = None
@@ -3125,10 +3132,12 @@ def count_points_by_owner() -> dict[str, int]:
 def list_api_written_points() -> list[tuple[str, dict[str, object]]]:
     """List points whose source marks them as API-written, collection-wide.
 
-    Selects points whose `source` payload value is non-empty and not an
-    extraction-pipeline source (extracted / episode / migration): the
-    canonical `explicit` rows plus any drifted variant strings callers
-    self-reported before the server-side stamp existed. Same isolated
+    Selects points whose `source` payload value starts with `explicit`:
+    the canonical rows plus the drifted variant strings callers
+    self-reported before the server-side stamp existed (all variants
+    share the prefix). The prefix predicate, rather than "anything
+    non-pipeline", so a hypothetical future non-pipeline source can
+    never be silently renamed by the backfill. Same isolated
     Qdrant-scroll boundary as `count_points_by_owner` above, and
     deliberately below the Mem0 read gates: the drifted variants are
     exactly the rows `USER_VISIBLE_SOURCES`-gated reads refuse to
@@ -3149,7 +3158,6 @@ def list_api_written_points() -> list[tuple[str, dict[str, object]]]:
     if not callable(scroll):
         raise RuntimeError("Semantic-memory provider does not support a source scan")
 
-    pipeline_sources = {"extracted", "episode", "migration"}
     found: list[tuple[str, dict[str, object]]] = []
     offset = None
     while True:
@@ -3163,7 +3171,7 @@ def list_api_written_points() -> list[tuple[str, dict[str, object]]]:
         for point in points:
             payload = dict(point.payload or {})
             source = payload.get("source")
-            if isinstance(source, str) and source and source not in pipeline_sources:
+            if isinstance(source, str) and source.startswith("explicit"):
                 found.append((str(point.id), payload))
         if offset is None:
             break
@@ -3602,6 +3610,7 @@ def get_stats(*, user_id: str) -> MemoryStats:
     extracted: list[MemoryResult] = []
     episode_count = 0
     migration_count = 0
+    explicit_count = 0
     by_scope: dict[str, int] = {}
     for m in memories:
         src = m.metadata.get("source")
@@ -3611,6 +3620,8 @@ def get_stats(*, user_id: str) -> MemoryStats:
             episode_count += 1
         elif src == "migration":
             migration_count += 1
+        elif src == "explicit":
+            explicit_count += 1
         # Scope distribution covers every user-visible source, not
         # just extracted: scope is a cross-source axis and the
         # legacy-default bucket is the operator's running measure of
@@ -3705,6 +3716,7 @@ def get_stats(*, user_id: str) -> MemoryStats:
         extracted_count=len(extracted),
         episode_count=episode_count,
         migration_count=migration_count,
+        explicit_count=explicit_count,
         by_tag=by_tag,
         confidence_min=confidence_min,
         confidence_median=confidence_median,

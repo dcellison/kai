@@ -2800,6 +2800,53 @@ class TestMemoryAdd:
         assert stamped["scope"] == "global"
         assert stamped["scope_source"] == "extraction_default"
 
+    async def test_returns_400_on_bad_speaker_type(self, mock_request):
+        """The caller-overridable speaker key gets the same 400-boundary
+        treatment as every other field: a non-string speaker would
+        surface later as a broken detail view, not a clean error."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"content": "x", "metadata": {"speaker": 42}})
+        with patch("kai.memory.add_structured") as mock_add:
+            resp = await _handle_memory_add(mock_request)
+        assert resp.status == 400
+        mock_add.assert_not_called()
+
+    @pytest.mark.parametrize("bad_confidence", ["high", True, 1.5, -0.1])
+    async def test_returns_400_on_bad_confidence(self, mock_request, bad_confidence):
+        """Confidence feeds ranking arithmetic and formatted rendering;
+        non-numeric, boolean, and out-of-range values are rejected at
+        the boundary (bool passes isinstance(int) and would silently
+        rank as 1/0, so it is rejected explicitly)."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"content": "x", "metadata": {"confidence": bad_confidence}})
+        with patch("kai.memory.add_structured") as mock_add:
+            resp = await _handle_memory_add(mock_request)
+        assert resp.status == 400
+        mock_add.assert_not_called()
+
+    async def test_returns_500_when_workspace_resolution_fails(self, mock_request):
+        """Scope routing hits the settings DB via the pool; a transient
+        failure there must produce the handler's clean JSON 500, not
+        mis-scope the write to global silently or escape as a framework
+        HTML 500."""
+        from kai.webhook import POOL_KEY
+
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"content": "x"})
+        pool = MagicMock()
+        pool.get_effective_workspace = AsyncMock(side_effect=RuntimeError("settings DB down"))
+        mock_request.app[POOL_KEY] = pool
+
+        with (
+            patch("kai.memory.is_enabled", return_value=True),
+            patch("kai.memory.add_structured") as mock_add,
+        ):
+            resp = await _handle_memory_add(mock_request)
+
+        assert resp.status == 500
+        assert json.loads(resp.body.decode()) == {"error": "Memory storage failed"}
+        mock_add.assert_not_called()
+
     async def test_stamped_write_is_visible_to_the_memory_ui(self, mock_request):
         """Integration seam: what the HTTP add endpoint writes must
         pass the exact gates the /memory UI reads through.
