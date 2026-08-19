@@ -23,7 +23,8 @@ Architectural shape:
 Source filtering has three filter-site categories:
 
   1. Multi-source admit list (`memory.USER_VISIBLE_SOURCES`, the
-     frozenset of `extracted`, `episode`, `migration`). The data-
+     frozenset of `extracted`, `episode`, `migration`, `explicit`).
+     The data-
      layer gate is canonical: `memory.get_by_id` and
      `memory.get_by_tag` admit only those sources, and
      `memory.delete_by_id` inherits the gate via its delegation.
@@ -37,10 +38,10 @@ Source filtering has three filter-site categories:
      to the literal `"episode"` source for the dashboard's episode-
      list browser.
   3. Multi-source enumeration scoped to the fact bucket:
-     `memory.get_all_facts`, scoped to `{"extracted", "migration"}`
-     for the dashboard's facts-list browser. Narrower than
-     `USER_VISIBLE_SOURCES` (excludes episode), broader than
-     `get_all_episodes` (admits two sources). Episodes are
+     `memory.get_all_facts`, scoped to `{"extracted", "migration",
+     "explicit"}` for the dashboard's facts-list browser. Narrower
+     than `USER_VISIBLE_SOURCES` (excludes episode), broader than
+     `get_all_episodes` (admits several sources). Episodes are
      intentionally excluded because they have their own browser.
 
 Categories 2 and 3 do not participate in `USER_VISIBLE_SOURCES`:
@@ -668,7 +669,7 @@ def _build_dashboard(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup | No
 
     The dashboard surfaces two user-visible counts (facts and episode
     summaries) and a single utility keyboard row holding two optional
-    browse buttons (Facts when extracted_count + migration_count > 0;
+    browse buttons (Facts when the fact-bucket counts sum > 0;
     Episodes when episode_count > 0), plus an unconditional Stats
     button. There is no per-source filter axis: the parent decision
     in #388 settled tags as row decoration only, not a primary
@@ -689,24 +690,31 @@ def _build_dashboard(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup | No
     # source has rows, fall through to render the dashboard - the
     # source-count headline communicates that memory is alive even
     # for an episode-only or migration-only operator.
-    if stats.extracted_count == 0 and stats.episode_count == 0 and stats.migration_count == 0:
+    if (
+        stats.extracted_count == 0
+        and stats.episode_count == 0
+        and stats.migration_count == 0
+        and stats.explicit_count == 0
+    ):
         return _MSG_NO_FACTS, None
 
     # Cache the visibility predicates once. The Facts button rolls
-    # extracted and migration into one count; the Episodes button is
-    # episode-only. The empty-state guard above ensures at least one
-    # of facts_visible or episode_count > 0 is true on every reachable
-    # path through the rest of this function (otherwise all three
-    # counts would be zero, which the guard already returns for).
-    facts_count = stats.extracted_count + stats.migration_count
+    # extracted, migration, and explicit into one count (mirroring
+    # `_FACT_BUCKET_SOURCES`, so the label agrees with the list the
+    # button opens); the Episodes button is episode-only. The
+    # empty-state guard above ensures at least one of facts_visible or
+    # episode_count > 0 is true on every reachable path through the
+    # rest of this function (otherwise all the counts would be zero,
+    # which the guard already returns for).
+    facts_count = stats.extracted_count + stats.migration_count + stats.explicit_count
     facts_visible = facts_count > 0
     episodes_visible = stats.episode_count > 0
 
     lines: list[str] = []
     # Headline assembled from non-zero counts. The fact bucket sums
-    # extracted and migration into a single "facts" count because the
-    # operator does not need to be reminded that some facts arrived
-    # via migration rather than extraction. The summing matches the
+    # extracted, migration, and explicit into a single "facts" count
+    # because the operator does not need to be reminded which write
+    # path a fact arrived through. The summing matches the
     # Facts button label so the headline and the keyboard agree on
     # the same number. Zero-valued counts are omitted from the comma
     # list rather than rendered as "0 episodes" - readability over
@@ -1037,7 +1045,10 @@ def _build_fact_view(
     speaker_value, confidence_value = memory._read_time_speaker(md)
     speaker_label = _humanize_speaker(speaker_value)
 
-    if source == "episode" or source == "migration":
+    # Explicit (API-written) rows share the minimal migration shape:
+    # no extractor-only fields (prompt_version, confirmation quotes),
+    # so the extractor arm below would render placeholders for them.
+    if source in ("episode", "migration", "explicit"):
         # Episode and migration rows share a minimal body shape with
         # none of the extractor-only rows. The episode arm splices in
         # Approach / Outcome / Lessons (when present) / Actors between
@@ -1049,10 +1060,10 @@ def _build_fact_view(
         # quoted text plus the Tags / Date footer.
         tags_line = f"Tags:  {', '.join(tags) if tags else '(none)'}"
         speaker_line = f"Speaker:  {speaker_label}"
-        # Migration rows render Confidence (always 0.9 via the
-        # migration default), episode rows omit it (the constant 1.0
+        # Migration and explicit rows render Confidence (a real stored
+        # value in both cases), episode rows omit it (the constant 1.0
         # would be operator-side noise).
-        confidence_line = f"Confidence:  {confidence_value:.2f}" if source == "migration" else None
+        confidence_line = f"Confidence:  {confidence_value:.2f}" if source != "episode" else None
         detail_lines: list[str] = []
         if source == "episode":
             # Episode rows surface the outcome_quality field as a
@@ -1098,12 +1109,13 @@ def _build_fact_view(
         else:
             # Migration rows already include the H3 title and section
             # structure inside `fact.text` (the migration script writes
-            # the chunk as `### <title>\n<body>` per #408), so no
-            # additional section rendering is needed here. The header
-            # matches extracted (`Fact`) rather than calling out
-            # `Imported` because the operator-facing UI no longer
-            # surfaces the extracted/migration distinction; the
-            # data-layer `source` field stays unchanged.
+            # the chunk as `### <title>\n<body>` per #408), and explicit
+            # rows are plain API-written text; neither needs additional
+            # section rendering here. The header matches extracted
+            # (`Fact`) rather than calling out the source because the
+            # operator-facing UI no longer surfaces the per-source
+            # distinction; the data-layer `source` field stays
+            # unchanged.
             header = "Fact"
         # Footer row order: detail_lines (episode-only Approach/Outcome
         # /Lessons/Actors block, empty for migration), Tags, Speaker,
@@ -1249,13 +1261,13 @@ def _build_forget_fact_confirm(fact: MemoryResult) -> tuple[str, InlineKeyboardM
 def _source_noun(fact: MemoryResult) -> str:
     """Operator-facing noun for a row, keyed on `metadata.source`.
 
-    Extracted and migration share "fact" because the UI does not
-    surface that distinction; the generic "memory" fallback covers
-    an unknown source slipping through a stale cache during a deploy
-    transition (same defensive posture as the forget flow).
+    Extracted, migration, and explicit share "fact" because the UI
+    does not surface that distinction; the generic "memory" fallback
+    covers an unknown source slipping through a stale cache during a
+    deploy transition (same defensive posture as the forget flow).
     """
     source = (fact.metadata or {}).get("source", "")
-    return {"extracted": "fact", "episode": "episode", "migration": "fact"}.get(source, "memory")
+    return {"extracted": "fact", "episode": "episode", "migration": "fact", "explicit": "fact"}.get(source, "memory")
 
 
 # ── Builder: scope screen and confirm ───────────────────────────────
@@ -1450,7 +1462,12 @@ def _build_stats(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup]:
     # memories yet." Wording mirrors the dashboard's two-bucket
     # surface (facts + episodes); the migration count folds into
     # "facts" so the empty-state phrasing has no third item.
-    if stats.extracted_count == 0 and stats.episode_count == 0 and stats.migration_count == 0:
+    if (
+        stats.extracted_count == 0
+        and stats.episode_count == 0
+        and stats.migration_count == 0
+        and stats.explicit_count == 0
+    ):
         text = "Memory stats\n\nNo facts or episodes yet."
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("back", callback_data=_encode_callback("dash"))]])
         return text, kb
@@ -1458,10 +1475,10 @@ def _build_stats(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup]:
     # Headline block: per-bucket totals, one line per non-zero bucket.
     # Right-padding holds the "Total <bucket>:" labels at consistent
     # width across the header lines so the count column lines up.
-    # The fact bucket sums extracted and migration so a migration-only
-    # operator sees a single "Total facts:" rather than the prior
-    # split rows; the underlying source field stays unchanged.
-    total_facts = stats.extracted_count + stats.migration_count
+    # The fact bucket sums extracted, migration, and explicit so a
+    # single "Total facts:" line matches the facts browser's admit
+    # list; the underlying source field stays unchanged.
+    total_facts = stats.extracted_count + stats.migration_count + stats.explicit_count
     lines = ["Memory stats", ""]
     if total_facts:
         lines.append(f"Total facts:      {total_facts}")
@@ -2376,8 +2393,8 @@ async def _send_search(
     # render "This memory no longer exists." for a row the user just
     # saw - confusing and wrong. Filtering here keeps the UI honest:
     # what the user sees in results is what they can act on.
-    # `USER_VISIBLE_SOURCES` (the {extracted, episode, migration}
-    # frozenset) is read from `memory.py` so a future change to the
+    # `USER_VISIBLE_SOURCES` is read from `memory.py` so a future
+    # change to the
     # admit list lives in one place.
     filtered = [r for r in results if r.score >= floor and r.metadata.get("source") in memory.USER_VISIBLE_SOURCES]
     text, kb, memory_ids = _build_search_results(query, filtered, floor)

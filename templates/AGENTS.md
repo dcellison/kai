@@ -200,10 +200,12 @@ This is distinct from your `MEMORY.md` file, which holds operator notes and proj
 curl -s -X POST http://localhost:8080/api/memory/add \
   -H 'Content-Type: application/json' \
   -H "X-Webhook-Secret: $KAI_WEBHOOK_SECRET" \
-  -d '{"chat_id": <chat_id>, "content": "User prefers Earl Grey over English Breakfast", "memory_type": "preference", "tags": ["beverage", "preference"], "metadata": {"source": "explicit"}}'
+  -d '{"chat_id": <chat_id>, "content": "User prefers Earl Grey over English Breakfast", "memory_type": "preference", "tags": ["beverage", "preference"]}'
 ```
 
 Fields: `content` (string, required), `memory_type` (string, default `"fact"`), `tags` (list of strings, optional), `metadata` (dict, optional), `chat_id` (integer, required for routing). Response: `{"id": "<mem0-uuid>"}`.
+
+Provenance is stamped by the server: `source` and scope are set automatically (your value would be overridden), and `speaker`/`confidence` default to `"assistant"`/`0.9`. Override the defaults via `metadata` only when you know better, e.g. `"metadata": {"speaker": "user"}` for a fact the user stated directly.
 
 ### Searching memories
 

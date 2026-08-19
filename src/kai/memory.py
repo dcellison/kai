@@ -305,6 +305,10 @@ _SOURCE_SHORT: dict[str, str] = {
     # distinguish operator-imported facts from conversation-extracted
     # facts when they surface in retrieval.
     "migration": "fact",
+    # Explicit (API-written) rows likewise render as "fact": the
+    # source tag is for provenance, and the reader does not need the
+    # API-written vs conversation-extracted distinction either.
+    "explicit": "fact",
     "": "legacy",
 }
 
@@ -317,8 +321,9 @@ _DELETE_PAGE_SIZE = 10_000
 
 # Sources that the /memory Telegram UI surfaces as user-visible rows.
 # Used by `get_by_id` and `get_by_tag` (and via delegation, `delete_by_id`)
-# to gate addressability from the operator-facing surface. Three reasons
-# the set is intentional rather than "everything except legacy":
+# to gate addressability from the operator-facing surface. The set is
+# intentional rather than "everything except legacy"; each entry earns
+# its place:
 #   - extracted: Track 2 Haiku-derived facts; the original target of the
 #     /memory dashboard.
 #   - episode:   per-conversation episode summaries (issue #385/#387).
@@ -327,11 +332,15 @@ _DELETE_PAGE_SIZE = 10_000
 #   - migration: operator-curated MEMORY.md content imported via #408.
 #     Fact-view header reads "Imported" so operators can distinguish at
 #     a glance from extracted facts whose freshness implications differ.
+#   - explicit:  deliberate saves through the /api/memory/add endpoint.
+#     The handler stamps the value server-side, so rows from that path
+#     are first-class: visible, deletable, and ranked by their stamped
+#     speaker/confidence rather than the harshest read-time defaults.
 # Legacy ""-source rows (from pre-spec ingestion paths or any future-
 # additional source not in this set) stay hidden in the UI; they are
 # managed via memory_admin.py / `delete_by_source`. A frozenset is used
 # so the constant cannot be mutated by importing callers.
-USER_VISIBLE_SOURCES: frozenset[str] = frozenset({"extracted", "episode", "migration"})
+USER_VISIBLE_SOURCES: frozenset[str] = frozenset({"extracted", "episode", "migration", "explicit"})
 
 
 # ── Scope metadata: schema for scoped global/project memory ──────────
@@ -597,9 +606,10 @@ class MemoryStats:
     grouped fields) so a caller that constructs `MemoryStats(total_count=0,
     by_type={})` (the legacy two-arg form) still produces a valid value.
 
-    `episode_count` and `migration_count` are parallel per-source counts,
-    added so the /memory dashboard and stats screens can surface
-    user-visible non-extracted sources alongside the extracted total.
+    `episode_count`, `migration_count`, and `explicit_count` are
+    parallel per-source counts, added so the /memory dashboard and
+    stats screens can surface user-visible non-extracted sources
+    alongside the extracted total.
     Their sum with `extracted_count` may be less than `total_count`
     because legacy ""-source rows still contribute to the total but are
     not enumerated as a separate per-source field. Confidence aggregates
@@ -622,8 +632,10 @@ class MemoryStats:
     # legacy two-arg `MemoryStats(total_count=0, by_type={})`
     # construction in tests stays source-compatible. Episode rows come
     # from issue #385/#387; migration rows come from issue #406/#408.
+    # Explicit rows are API-written deliberate saves.
     episode_count: int = 0
     migration_count: int = 0
+    explicit_count: int = 0
     by_tag: dict[str, int] = field(default_factory=dict)
     confidence_min: float | None = None
     confidence_median: float | None = None
@@ -632,8 +644,8 @@ class MemoryStats:
     confidence_below_0_6: int = 0
     confirmation_quote_count: int = 0
     by_prompt_version: dict[str, int] = field(default_factory=dict)
-    # Scope distribution over USER-VISIBLE rows (extracted, episode,
-    # migration), unlike the extracted-only aggregates above: scope
+    # Scope distribution over USER-VISIBLE rows (all sources in
+    # USER_VISIBLE_SOURCES), unlike the extracted-only aggregates above: scope
     # applies to every user-visible source, so restricting the
     # distribution to extracted rows would hide mis-scoped episodes
     # and understate the legacy-default backlog that reclassification
@@ -3117,6 +3129,68 @@ def count_points_by_owner() -> dict[str, int]:
     return counts
 
 
+def list_api_written_points() -> list[tuple[str, dict[str, object]]]:
+    """List points whose source marks them as API-written, collection-wide.
+
+    Selects points whose `source` payload value starts with `explicit`:
+    the canonical rows plus the drifted variant strings callers
+    self-reported before the server-side stamp existed (all variants
+    share the prefix). The prefix predicate, rather than "anything
+    non-pipeline", so a hypothetical future non-pipeline source can
+    never be silently renamed by the backfill. Same isolated
+    Qdrant-scroll boundary as `count_points_by_owner` above, and
+    deliberately below the Mem0 read gates: the drifted variants are
+    exactly the rows `USER_VISIBLE_SOURCES`-gated reads refuse to
+    return, and the owner filter must not hide backfill candidates.
+
+    Returns (point_id, payload_subset) pairs where the payload subset
+    carries `user_id`, `source`, `speaker`, and `confidence` (absent
+    keys omitted), which is everything the provenance backfill needs
+    to decide its patch. Read-only. Raises RuntimeError when memory is
+    not initialized or the provider lacks a Qdrant-style scroll, for
+    the same loud-beats-empty reason as the owner census.
+    """
+    if _memory is None:
+        raise RuntimeError("Semantic memory is not initialized")
+    vector_store = getattr(_memory, "vector_store", None)
+    client = getattr(vector_store, "client", None)
+    scroll = getattr(client, "scroll", None)
+    if not callable(scroll):
+        raise RuntimeError("Semantic-memory provider does not support a source scan")
+
+    found: list[tuple[str, dict[str, object]]] = []
+    offset = None
+    while True:
+        points, offset = scroll(
+            collection_name=vector_store.collection_name,
+            limit=1000,
+            offset=offset,
+            with_payload=["user_id", "source", "speaker", "confidence"],
+            with_vectors=False,
+        )
+        for point in points:
+            payload = dict(point.payload or {})
+            source = payload.get("source")
+            if isinstance(source, str) and source.startswith("explicit"):
+                found.append((str(point.id), payload))
+        if offset is None:
+            break
+    return found
+
+
+def patch_point_payload(*, point_id: str, payload: dict[str, object]) -> None:
+    """Merge payload fields onto one point without a semantic edit.
+
+    Public wrapper over the `_patch_memory_payload` boundary for the
+    provenance backfill: a metadata-only repair is not a semantic edit,
+    so it must not re-embed, must not advance `updated_at` through
+    Mem0's update path, and must not be refused by the
+    `USER_VISIBLE_SOURCES` gate that (correctly) rejects the drifted
+    source variants the backfill exists to normalize.
+    """
+    _patch_memory_payload(memory_id=point_id, payload=payload)
+
+
 def migrate_memory_namespace(
     namespace: _CanonicalMemoryNamespace,
     *,
@@ -3257,14 +3331,14 @@ def get_all_episodes(*, user_id: str) -> list[MemoryResult]:
 
 # A literal frozen set, NOT an alias for `USER_VISIBLE_SOURCES`. The two
 # admit lists serve different purposes and must not drift together: the
-# shared list (extracted, episode, migration) gates per-id and per-tag
-# reads where any of the three sources is acceptable; this list
-# (extracted, migration) gates the fact-bucket enumeration where
-# episodes are intentionally excluded because they have their own
+# shared list gates per-id and per-tag reads where any user-visible
+# source is acceptable; this list gates the fact-bucket enumeration
+# where episodes are intentionally excluded because they have their own
 # browser. Aliasing would silently change the function's semantics if
-# `USER_VISIBLE_SOURCES` ever gains a fourth source. The duplication
-# is deliberate.
-_FACT_BUCKET_SOURCES: frozenset[str] = frozenset({"extracted", "migration"})
+# `USER_VISIBLE_SOURCES` ever gains another source. The duplication is
+# deliberate; `explicit` sits in both because API-written facts belong
+# in the fact list alongside extracted and imported ones.
+_FACT_BUCKET_SOURCES: frozenset[str] = frozenset({"extracted", "migration", "explicit"})
 
 
 def get_all_facts(*, user_id: str) -> list[MemoryResult]:
@@ -3325,8 +3399,8 @@ def get_by_id(*, user_id: str, memory_id: str) -> MemoryResult | None:
       - Legacy ""-source rows are out of scope for /memory UI
         surfaces; they belong to memory_admin.py. Hide them here
         rather than letting the dashboard expose them. The accepted
-        sources are those in `USER_VISIBLE_SOURCES` (extracted,
-        episode, migration). Issue #407 expanded the set from
+        sources are those in `USER_VISIBLE_SOURCES`. Issue #407
+        expanded the set from
         extracted-only so episode (#385/#387) and migration (#406/
         #408) rows are addressable from the operator-facing surface;
         `delete_by_id` inherits the broader admit list via its
@@ -3368,8 +3442,7 @@ def get_by_id(*, user_id: str, memory_id: str) -> MemoryResult | None:
     if (row.get("metadata") or {}).get("source") not in USER_VISIBLE_SOURCES:
         # Legacy ""-source (or any future-additional non-UI source) is
         # deliberately invisible to /memory. The user-visible set
-        # (extracted, episode, migration) is enumerated in
-        # `USER_VISIBLE_SOURCES`. No log: this is a routine filter,
+        # is enumerated in `USER_VISIBLE_SOURCES`. No log: this is a routine filter,
         # not an anomaly.
         return None
 
@@ -3446,8 +3519,8 @@ def update_metadata(*, user_id: str, memory_id: str, data: str, metadata: dict[s
     only metadata still pay one embedding API call per row.
 
     Source-scope: the user-id gate admits any row whose
-    `metadata.source` is in `USER_VISIBLE_SOURCES` (extracted, episode,
-    migration). Callers wanting narrower scope must filter at the
+    `metadata.source` is in `USER_VISIBLE_SOURCES`. Callers wanting
+    narrower scope must filter at the
     caller level. The `confirmed_action`-tag protection used by the
     tag dedup pass is the caller's responsibility, not this wrapper's.
 
@@ -3537,6 +3610,7 @@ def get_stats(*, user_id: str) -> MemoryStats:
     extracted: list[MemoryResult] = []
     episode_count = 0
     migration_count = 0
+    explicit_count = 0
     by_scope: dict[str, int] = {}
     for m in memories:
         src = m.metadata.get("source")
@@ -3546,6 +3620,8 @@ def get_stats(*, user_id: str) -> MemoryStats:
             episode_count += 1
         elif src == "migration":
             migration_count += 1
+        elif src == "explicit":
+            explicit_count += 1
         # Scope distribution covers every user-visible source, not
         # just extracted: scope is a cross-source axis and the
         # legacy-default bucket is the operator's running measure of
@@ -3640,6 +3716,7 @@ def get_stats(*, user_id: str) -> MemoryStats:
         extracted_count=len(extracted),
         episode_count=episode_count,
         migration_count=migration_count,
+        explicit_count=explicit_count,
         by_tag=by_tag,
         confidence_min=confidence_min,
         confidence_median=confidence_median,

@@ -840,6 +840,38 @@ class TestFormatContext:
         output = await format_context("history", user_id="123")
         assert "- (2026-01-15, legacy) Old pre-spec entry" in output
 
+    async def test_format_context_explicit_source_labeled_fact(self):
+        """API-written rows carry a recognized source and must render
+        with the 'fact' provenance tag, not fall through to 'legacy'
+        (which the inner agent's reading contract treats as schema
+        drift)."""
+        import kai.memory as mem_mod
+        from kai.memory import format_context
+
+        mock_mem = MagicMock()
+        mock_mem.search.return_value = {
+            "results": [
+                {
+                    "id": "api-row",
+                    "memory": "User prefers Earl Grey",
+                    "score": 0.9,
+                    "metadata": {
+                        "type": "preference",
+                        "source": "explicit",
+                        "speaker": "assistant",
+                        "confidence": 0.9,
+                    },
+                    "created_at": "2026-08-19T00:00:00",
+                },
+            ]
+        }
+        mem_mod._memory = mock_mem
+        mem_mod._config = _make_config()
+
+        output = await format_context("tea", user_id="123")
+        assert "- (2026-08-19, fact) User prefers Earl Grey" in output
+        assert "legacy" not in output
+
     async def test_format_context_orders_by_weighted_score(self):
         """At equal raw cosine, a user-speaker row ranks above an
         assistant-speaker row. The new ranking key is `cosine *
@@ -6336,3 +6368,25 @@ class TestStoreDirMem0HomeGuard:
         config = replace(_make_config(), memory_enabled=False)
         with patch.dict(sys.modules, {"mem0.memory.setup": setup_mod}):
             init_memory(config)
+
+
+# ── explicit source visibility ───────────────────────────────────────
+
+
+class TestExplicitSourceVisibility:
+    """API-written rows are first-class in the operator UI: `explicit`
+    sits in the shared admit list (per-id and per-tag reads, search
+    post-filter, delete gating) AND in the fact-bucket enumeration, so
+    a stamped row is both listable and addressable."""
+
+    def test_explicit_is_user_visible(self):
+        from kai.memory import USER_VISIBLE_SOURCES
+
+        assert "explicit" in USER_VISIBLE_SOURCES
+
+    def test_explicit_is_in_the_fact_bucket(self):
+        from kai.memory import _FACT_BUCKET_SOURCES
+
+        assert "explicit" in _FACT_BUCKET_SOURCES
+        # Episodes keep their own browser; the bucket must not gain them.
+        assert "episode" not in _FACT_BUCKET_SOURCES
