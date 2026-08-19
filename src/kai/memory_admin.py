@@ -26,6 +26,10 @@ Scope (spec §16 + Phase 4 of spec 320):
   `sandbox-`) from the collection. Censuses owners collection-wide,
   prints the plan, and verifies by re-census that no sandbox rows
   survive and real principals' counts are unchanged.
+- `backfill-explicit`: normalize provenance on API-written rows.
+  Payload-only patches (source variants to `explicit`, missing
+  speaker/confidence to the server-side defaults), verified by
+  re-scan; idempotent once clean.
 
 Commands that modify the store require an explicit `--yes` flag. When
 `--yes` is absent, the command prints the action it WOULD take and
@@ -158,6 +162,24 @@ def _build_parser() -> argparse.ArgumentParser:
         "--yes",
         action="store_true",
         help="Confirm deletion. Without this flag the command prints the planned deletions and exits with status 2.",
+    )
+
+    bx = sub.add_parser(
+        "backfill-explicit",
+        help="Normalize provenance on API-written rows (source variants, missing speaker/confidence)",
+        description=(
+            "Find every row whose source marks it as API-written (the "
+            "canonical 'explicit' plus drifted variant strings) and "
+            "patch it in place: source normalized to 'explicit', and "
+            "speaker/confidence stamped with the server-side defaults "
+            "('assistant', 0.9) where absent. Payload-only patches; no "
+            "re-embedding, no content changes."
+        ),
+    )
+    bx.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm the patches. Without this flag the command prints the plan and exits with status 2.",
     )
 
     # Lazy import: the choices list is the only config dependency at
@@ -507,6 +529,81 @@ def _cmd_purge_sandbox(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_backfill_explicit(args: argparse.Namespace) -> int:
+    """Execute the `backfill-explicit` subcommand. Returns an exit code.
+
+    Patch construction is per-row: source is normalized only when it
+    differs from 'explicit', and speaker/confidence are stamped only
+    when absent, so re-running is a no-op once the corpus is clean.
+    Patches go through the payload-only path (no re-embed, no Mem0
+    update bookkeeping) because a provenance repair is not a semantic
+    edit; success is verified by re-scanning, which must find no row
+    still carrying a variant source or missing either stamped field.
+    """
+    if not _initialize_memory():
+        return 1
+
+    from kai.memory import list_api_written_points, patch_point_payload
+
+    try:
+        points = list_api_written_points()
+    except Exception as e:
+        print(f"memory admin: source scan failed: {e}", file=sys.stderr)
+        return 1
+
+    def _patch_for(payload: dict[str, object]) -> dict[str, object]:
+        patch: dict[str, object] = {}
+        if payload.get("source") != "explicit":
+            patch["source"] = "explicit"
+        if "speaker" not in payload:
+            patch["speaker"] = "assistant"
+        if "confidence" not in payload:
+            patch["confidence"] = 0.9
+        return patch
+
+    todo = [(pid, payload, _patch_for(payload)) for pid, payload in points]
+    todo = [(pid, payload, patch) for pid, payload, patch in todo if patch]
+
+    if not todo:
+        print(f"memory admin: {len(points)} API-written row(s), all fully stamped; nothing to backfill.")
+        return 0
+
+    normalize = sum(1 for _, _, patch in todo if "source" in patch)
+    speaker = sum(1 for _, _, patch in todo if "speaker" in patch)
+    confidence = sum(1 for _, _, patch in todo if "confidence" in patch)
+    print(
+        f"memory admin: {len(todo)} of {len(points)} API-written row(s) need patches: "
+        f"{normalize} source normalization(s), {speaker} missing speaker(s), "
+        f"{confidence} missing confidence value(s)."
+    )
+    for pid, payload, patch in todo:
+        print(f"  {pid} (owner {payload.get('user_id', '?')}, source {payload.get('source')!r}): {patch}")
+
+    if not args.yes:
+        # Dry-run path; exit 2 mirrors the sibling subcommands.
+        print("memory admin: re-run with --yes to execute.")
+        return 2
+
+    for pid, _, patch in todo:
+        try:
+            patch_point_payload(point_id=pid, payload=patch)
+        except Exception as e:
+            print(f"memory admin: patch failed for {pid}: {e}", file=sys.stderr)
+            return 1
+
+    try:
+        remaining = [(pid, payload) for pid, payload in list_api_written_points() if _patch_for(payload)]
+    except Exception as e:
+        print(f"memory admin: post-backfill scan failed: {e}", file=sys.stderr)
+        return 1
+    if remaining:
+        print(f"memory admin: backfill incomplete; rows still need patches: {remaining}", file=sys.stderr)
+        return 1
+
+    print(f"memory admin: patched {len(todo)} row(s); re-scan clean.")
+    return 0
+
+
 def _cmd_reclassify(args: argparse.Namespace) -> int:
     """Execute the `reclassify-scope` subcommand. Returns an exit code.
 
@@ -787,6 +884,8 @@ def cli(argv: list[str]) -> None:
         sys.exit(_cmd_purge(args))
     if args.command == "purge-sandbox":
         sys.exit(_cmd_purge_sandbox(args))
+    if args.command == "backfill-explicit":
+        sys.exit(_cmd_backfill_explicit(args))
     if args.command == "reclassify-scope":
         sys.exit(_cmd_reclassify(args))
     if args.command == "backfill-provenance":

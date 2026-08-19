@@ -23,7 +23,8 @@ Architectural shape:
 Source filtering has three filter-site categories:
 
   1. Multi-source admit list (`memory.USER_VISIBLE_SOURCES`, the
-     frozenset of `extracted`, `episode`, `migration`). The data-
+     frozenset of `extracted`, `episode`, `migration`, `explicit`).
+     The data-
      layer gate is canonical: `memory.get_by_id` and
      `memory.get_by_tag` admit only those sources, and
      `memory.delete_by_id` inherits the gate via its delegation.
@@ -37,10 +38,10 @@ Source filtering has three filter-site categories:
      to the literal `"episode"` source for the dashboard's episode-
      list browser.
   3. Multi-source enumeration scoped to the fact bucket:
-     `memory.get_all_facts`, scoped to `{"extracted", "migration"}`
-     for the dashboard's facts-list browser. Narrower than
-     `USER_VISIBLE_SOURCES` (excludes episode), broader than
-     `get_all_episodes` (admits two sources). Episodes are
+     `memory.get_all_facts`, scoped to `{"extracted", "migration",
+     "explicit"}` for the dashboard's facts-list browser. Narrower
+     than `USER_VISIBLE_SOURCES` (excludes episode), broader than
+     `get_all_episodes` (admits several sources). Episodes are
      intentionally excluded because they have their own browser.
 
 Categories 2 and 3 do not participate in `USER_VISIBLE_SOURCES`:
@@ -1037,7 +1038,10 @@ def _build_fact_view(
     speaker_value, confidence_value = memory._read_time_speaker(md)
     speaker_label = _humanize_speaker(speaker_value)
 
-    if source == "episode" or source == "migration":
+    # Explicit (API-written) rows share the minimal migration shape:
+    # no extractor-only fields (prompt_version, confirmation quotes),
+    # so the extractor arm below would render placeholders for them.
+    if source in ("episode", "migration", "explicit"):
         # Episode and migration rows share a minimal body shape with
         # none of the extractor-only rows. The episode arm splices in
         # Approach / Outcome / Lessons (when present) / Actors between
@@ -1049,10 +1053,10 @@ def _build_fact_view(
         # quoted text plus the Tags / Date footer.
         tags_line = f"Tags:  {', '.join(tags) if tags else '(none)'}"
         speaker_line = f"Speaker:  {speaker_label}"
-        # Migration rows render Confidence (always 0.9 via the
-        # migration default), episode rows omit it (the constant 1.0
+        # Migration and explicit rows render Confidence (a real stored
+        # value in both cases), episode rows omit it (the constant 1.0
         # would be operator-side noise).
-        confidence_line = f"Confidence:  {confidence_value:.2f}" if source == "migration" else None
+        confidence_line = f"Confidence:  {confidence_value:.2f}" if source != "episode" else None
         detail_lines: list[str] = []
         if source == "episode":
             # Episode rows surface the outcome_quality field as a
@@ -1098,12 +1102,13 @@ def _build_fact_view(
         else:
             # Migration rows already include the H3 title and section
             # structure inside `fact.text` (the migration script writes
-            # the chunk as `### <title>\n<body>` per #408), so no
-            # additional section rendering is needed here. The header
-            # matches extracted (`Fact`) rather than calling out
-            # `Imported` because the operator-facing UI no longer
-            # surfaces the extracted/migration distinction; the
-            # data-layer `source` field stays unchanged.
+            # the chunk as `### <title>\n<body>` per #408), and explicit
+            # rows are plain API-written text; neither needs additional
+            # section rendering here. The header matches extracted
+            # (`Fact`) rather than calling out the source because the
+            # operator-facing UI no longer surfaces the per-source
+            # distinction; the data-layer `source` field stays
+            # unchanged.
             header = "Fact"
         # Footer row order: detail_lines (episode-only Approach/Outcome
         # /Lessons/Actors block, empty for migration), Tags, Speaker,
@@ -2376,8 +2381,8 @@ async def _send_search(
     # render "This memory no longer exists." for a row the user just
     # saw - confusing and wrong. Filtering here keeps the UI honest:
     # what the user sees in results is what they can act on.
-    # `USER_VISIBLE_SOURCES` (the {extracted, episode, migration}
-    # frozenset) is read from `memory.py` so a future change to the
+    # `USER_VISIBLE_SOURCES` is read from `memory.py` so a future
+    # change to the
     # admit list lives in one place.
     filtered = [r for r in results if r.score >= floor and r.metadata.get("source") in memory.USER_VISIBLE_SOURCES]
     text, kb, memory_ids = _build_search_results(query, filtered, floor)

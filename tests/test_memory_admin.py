@@ -589,3 +589,107 @@ class TestPurgeSandbox:
             memory_admin.cli(["purge-sandbox"])
         assert exc.value.code == 0
         cmd.assert_called_once()
+
+
+# ── backfill-explicit ────────────────────────────────────────────────
+
+
+class TestBackfillExplicit:
+    """Provenance backfill for API-written rows: per-row patches
+    (source normalization, missing speaker/confidence), payload-only
+    application, and verify-by-rescan."""
+
+    @staticmethod
+    def _args(yes: bool):
+        parser = memory_admin._build_parser()
+        return parser.parse_args(["backfill-explicit", "--yes"] if yes else ["backfill-explicit"])
+
+    # Three shapes from the live corpus: a variant source with no
+    # stamps, a canonical source missing both stamps, and a fully
+    # stamped row needing nothing.
+    _POINTS = [
+        ("p1", {"user_id": "prn_a", "source": "explicit-decision"}),
+        ("p2", {"user_id": "prn_a", "source": "explicit"}),
+        ("p3", {"user_id": "prn_b", "source": "explicit", "speaker": "user", "confidence": 0.8}),
+    ]
+
+    def test_dry_run_plans_per_row_patches_and_exits_2(self, capsys):
+        patch_mock = MagicMock()
+        with (
+            patch.object(memory_admin, "_initialize_memory", return_value=True),
+            patch("kai.memory.list_api_written_points", return_value=self._POINTS),
+            patch("kai.memory.patch_point_payload", patch_mock),
+        ):
+            code = memory_admin._cmd_backfill_explicit(self._args(yes=False))
+        assert code == 2
+        patch_mock.assert_not_called()
+        out = capsys.readouterr().out
+        assert "2 of 3 API-written row(s) need patches" in out
+        assert "1 source normalization(s)" in out
+        assert "2 missing speaker(s)" in out
+        assert "2 missing confidence value(s)" in out
+
+    def test_yes_patches_only_what_each_row_lacks(self, capsys):
+        patch_mock = MagicMock()
+        clean = [
+            ("p1", {"user_id": "prn_a", "source": "explicit", "speaker": "assistant", "confidence": 0.9}),
+            ("p2", {"user_id": "prn_a", "source": "explicit", "speaker": "assistant", "confidence": 0.9}),
+            ("p3", {"user_id": "prn_b", "source": "explicit", "speaker": "user", "confidence": 0.8}),
+        ]
+        with (
+            patch.object(memory_admin, "_initialize_memory", return_value=True),
+            patch("kai.memory.list_api_written_points", side_effect=[self._POINTS, clean]),
+            patch("kai.memory.patch_point_payload", patch_mock),
+        ):
+            code = memory_admin._cmd_backfill_explicit(self._args(yes=True))
+        assert code == 0
+        patches = {c.kwargs["point_id"]: c.kwargs["payload"] for c in patch_mock.call_args_list}
+        assert patches == {
+            "p1": {"source": "explicit", "speaker": "assistant", "confidence": 0.9},
+            "p2": {"speaker": "assistant", "confidence": 0.9},
+        }
+        assert "patched 2 row(s); re-scan clean" in capsys.readouterr().out
+
+    def test_fully_stamped_corpus_is_a_clean_noop(self, capsys):
+        patch_mock = MagicMock()
+        with (
+            patch.object(memory_admin, "_initialize_memory", return_value=True),
+            patch("kai.memory.list_api_written_points", return_value=[self._POINTS[2]]),
+            patch("kai.memory.patch_point_payload", patch_mock),
+        ):
+            code = memory_admin._cmd_backfill_explicit(self._args(yes=True))
+        assert code == 0
+        patch_mock.assert_not_called()
+        assert "nothing to backfill" in capsys.readouterr().out
+
+    def test_dirty_rescan_fails_the_run(self, capsys):
+        with (
+            patch.object(memory_admin, "_initialize_memory", return_value=True),
+            patch("kai.memory.list_api_written_points", side_effect=[self._POINTS, self._POINTS]),
+            patch("kai.memory.patch_point_payload", MagicMock()),
+        ):
+            code = memory_admin._cmd_backfill_explicit(self._args(yes=True))
+        assert code == 1
+        assert "backfill incomplete" in capsys.readouterr().err
+
+    def test_scan_failure_exits_1(self, capsys):
+        with (
+            patch.object(memory_admin, "_initialize_memory", return_value=True),
+            patch("kai.memory.list_api_written_points", side_effect=RuntimeError("no scroll")),
+        ):
+            code = memory_admin._cmd_backfill_explicit(self._args(yes=True))
+        assert code == 1
+        assert "source scan failed" in capsys.readouterr().err
+
+    def test_init_failure_exits_1(self):
+        with patch.object(memory_admin, "_initialize_memory", return_value=None):
+            assert memory_admin._cmd_backfill_explicit(self._args(yes=True)) == 1
+
+    def test_cli_dispatches_backfill_explicit(self):
+        with (
+            patch.object(memory_admin, "_cmd_backfill_explicit", return_value=0) as cmd,
+            pytest.raises(SystemExit) as exc,
+        ):
+            memory_admin.cli(["backfill-explicit"])
+        assert exc.value.code == 0
+        cmd.assert_called_once()

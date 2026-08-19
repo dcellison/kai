@@ -6336,3 +6336,25 @@ class TestStoreDirMem0HomeGuard:
         config = replace(_make_config(), memory_enabled=False)
         with patch.dict(sys.modules, {"mem0.memory.setup": setup_mod}):
             init_memory(config)
+
+
+# ── explicit source visibility ───────────────────────────────────────
+
+
+class TestExplicitSourceVisibility:
+    """API-written rows are first-class in the operator UI: `explicit`
+    sits in the shared admit list (per-id and per-tag reads, search
+    post-filter, delete gating) AND in the fact-bucket enumeration, so
+    a stamped row is both listable and addressable."""
+
+    def test_explicit_is_user_visible(self):
+        from kai.memory import USER_VISIBLE_SOURCES
+
+        assert "explicit" in USER_VISIBLE_SOURCES
+
+    def test_explicit_is_in_the_fact_bucket(self):
+        from kai.memory import _FACT_BUCKET_SOURCES
+
+        assert "explicit" in _FACT_BUCKET_SOURCES
+        # Episodes keep their own browser; the bucket must not gain them.
+        assert "episode" not in _FACT_BUCKET_SOURCES

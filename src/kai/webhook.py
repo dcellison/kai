@@ -2005,6 +2005,14 @@ async def _handle_memory_add(request: web.Request, principal: InternalAPIPrincip
             add_structured; user values for those will be overwritten)
         chat_id: int, optional, defaults to the authenticated principal
 
+    Provenance is stamped server-side: `source` is always "explicit"
+    (a caller-supplied value is overridden, so the convention cannot
+    drift per caller), the scope fields are routed from the caller's
+    detected workspace project exactly like the extraction path with
+    no classifier hint, and `speaker`/`confidence` receive defaults
+    ("assistant", 0.9) that the caller MAY override, since a caller
+    relaying a user-stated fact legitimately knows the speaker.
+
     Responses:
         200 {"id": "<mem0-uuid>"} on success
         400 on bad input (invalid JSON, missing/empty content, bad chat_id)
@@ -2082,6 +2090,32 @@ async def _handle_memory_add(request: web.Request, principal: InternalAPIPrincip
     # int -> str at the memory boundary; do NOT remove the cast.
     user_id = str(chat_id)
 
+    # Server-side provenance stamp. Lazy imports keep
+    # memory_extraction (and its one-shot reasoner stack) out of this
+    # module's import graph for callers that never write memories.
+    from kai.memory_extraction import _route_write_scope
+    from kai.memory_projects import detect_active_memory_project, merged_registry
+
+    final_metadata = dict(metadata) if metadata else {}
+    # Defaults the caller may override; a caller relaying a
+    # user-stated fact legitimately knows the speaker.
+    final_metadata.setdefault("speaker", "assistant")
+    final_metadata.setdefault("confidence", 0.9)
+    # The stamp the caller may NOT override: provenance conventions
+    # drifted when callers self-reported this value from doc examples.
+    final_metadata["source"] = "explicit"
+    # Scope routed from the caller's detected workspace project, same
+    # rules as the extraction path with no classifier hint. A missing
+    # pool (transient startup state) collapses to no-workspace
+    # semantics: global scope, the same posture scoped retrieval takes.
+    pool = request.app.get(POOL_KEY)
+    active_project = None
+    if pool is not None:
+        api_config: Config = request.app[CONFIG_KEY]
+        workspace = await pool.get_effective_workspace(chat_id)
+        active_project = detect_active_memory_project(workspace, merged_registry(api_config.memory_projects))
+    final_metadata.update(_route_write_scope(None, active_project))
+
     # Defense-in-depth guard, matching the pattern used in the other
     # three memory handlers. add_structured catches its own internal
     # exceptions and returns None (which the None-check below maps to
@@ -2096,7 +2130,7 @@ async def _handle_memory_add(request: web.Request, principal: InternalAPIPrincip
             user_id=user_id,
             memory_type=memory_type,
             tags=tags,
-            metadata=metadata,
+            metadata=final_metadata,
         )
     except Exception:
         log.exception("memory.add_structured failed for chat %d", chat_id)

@@ -2747,14 +2747,15 @@ class TestMemoryAdd:
         assert resp.status == 401
 
     async def test_passes_optional_fields_through(self, mock_request):
-        """memory_type, tags, metadata are forwarded to add_structured verbatim."""
+        """memory_type and tags are forwarded verbatim; metadata is
+        forwarded with the server-side provenance stamp on top."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.json = AsyncMock(
             return_value={
                 "content": "User prefers dark mode",
                 "memory_type": "preference",
                 "tags": ["ui", "preference"],
-                "metadata": {"source": "explicit"},
+                "metadata": {"project_note": "kept"},
             }
         )
 
@@ -2771,7 +2772,71 @@ class TestMemoryAdd:
         kwargs = mock_add.call_args.kwargs
         assert kwargs["memory_type"] == "preference"
         assert kwargs["tags"] == ["ui", "preference"]
-        assert kwargs["metadata"] == {"source": "explicit"}
+        assert kwargs["metadata"]["project_note"] == "kept"
+
+    async def test_server_stamp_overrides_caller_source(self, mock_request):
+        """Caller-supplied source cannot override the server stamp;
+        speaker is a caller-overridable default; confidence defaults
+        when absent; scope is routed server-side (global here, since
+        the test app has no pool and therefore no detected project)."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(
+            return_value={
+                "content": "User said they prefer tabs",
+                "metadata": {"source": "extracted", "speaker": "user"},
+            }
+        )
+
+        with (
+            patch("kai.memory.is_enabled", return_value=True),
+            patch("kai.memory.add_structured", return_value="id-1") as mock_add,
+        ):
+            await _handle_memory_add(mock_request)
+
+        stamped = mock_add.call_args.kwargs["metadata"]
+        assert stamped["source"] == "explicit"
+        assert stamped["speaker"] == "user"
+        assert stamped["confidence"] == 0.9
+        assert stamped["scope"] == "global"
+        assert stamped["scope_source"] == "extraction_default"
+
+    async def test_stamped_write_is_visible_to_the_memory_ui(self, mock_request):
+        """Integration seam: what the HTTP add endpoint writes must
+        pass the exact gates the /memory UI reads through.
+        The stamped metadata from a real handler call is stored in a
+        fake Mem0 and must come back out of get_all_facts (fact list)
+        and get_by_id (detail view / delete gate)."""
+        from types import SimpleNamespace
+
+        from kai import memory
+
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"content": "User prefers Earl Grey"})
+
+        with (
+            patch("kai.memory.is_enabled", return_value=True),
+            patch("kai.memory.add_structured", return_value="id-1") as mock_add,
+        ):
+            await _handle_memory_add(mock_request)
+        stamped = mock_add.call_args.kwargs["metadata"]
+
+        row = {
+            "id": "mem-1",
+            "memory": "User prefers Earl Grey",
+            "metadata": stamped,
+            "user_id": "123",
+            "created_at": "2026-08-19T00:00:00+00:00",
+            "updated_at": "2026-08-19T00:00:00+00:00",
+        }
+        fake_mem0 = SimpleNamespace(
+            get_all=lambda filters, top_k: {"results": [row]},
+            get=lambda memory_id: row,
+        )
+        with patch("kai.memory._memory", fake_mem0):
+            facts = memory.get_all_facts(user_id="123")
+            assert [f.id for f in facts] == ["mem-1"]
+            detail = memory.get_by_id(user_id="123", memory_id="mem-1")
+            assert detail is not None and detail.metadata["source"] == "explicit"
 
     async def test_stringifies_chat_id_for_user_id(self, mock_request):
         """Handler converts int chat_id -> str user_id at the memory boundary.
