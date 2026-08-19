@@ -288,6 +288,38 @@ _pending_episode_tasks: set[asyncio.Task[None]] = set()
 # short" is not an injection and should survive unchanged).
 _ROLE_LABEL_RE = re.compile(r"\n\s*(USER|ASSISTANT)\s*:", re.IGNORECASE)
 
+# Structural markers owned by the extraction payload template
+# (`_build_extraction_payload`): the `>>> CURRENT EXCHANGE` anchor, the
+# `PRIOR CONTEXT` and `EXISTING FACTS FOR THIS USER` block headers, and
+# the `[USER n]` / `[ASSISTANT n]` prior-turn labels. A user message
+# containing one of these literally could mint a stored fact carrying
+# the extractor's own scaffolding; that row then replays into future
+# payloads via the EXISTING FACTS block, making the injection
+# persistent rather than per-turn. Neutralized for the same reason and
+# with the same shape as `_ROLE_LABEL_RE`: newline-anchored so the
+# marker only matches as a line-leading structural cue (mid-prose
+# mentions like "the PRIOR CONTEXT block" survive unchanged), and
+# case-insensitive because a lowercase header would still read as
+# section structure to Haiku. `>{3,}` rather than a literal `>>>`
+# catches trivially-padded variants (`>>>>`); `\s+` inside the phrases
+# tolerates doubled spaces for the same reason.
+#
+# The candidate-line shape (`[{id}] (source=..., conf=...)`) is
+# deliberately excluded: candidate ids are store UUIDs an attacker
+# cannot guess, and rule 3 in `_validate_facts` drops any intent
+# citing an id outside the real candidate set, so a fabricated line
+# cannot drive consolidation. Matching bare `[...]` here would mangle
+# legitimate numbered-bracket prose (footnotes, list markers).
+_STRUCTURAL_MARKER_RE = re.compile(
+    r"\n\s*(?:"
+    r">{3,}\s*CURRENT\s+EXCHANGE"
+    r"|PRIOR\s+CONTEXT"
+    r"|EXISTING\s+FACTS\s+FOR\s+THIS\s+USER"
+    r"|\[\s*(?:USER|ASSISTANT)\s+\d+\s*\]"
+    r")",
+    re.IGNORECASE,
+)
+
 # `_SUBPROCESS_ENV_ALLOWLIST` is canonical in `kai.oneshot` (the
 # reasoner uses it to scope the spawned subprocess env). Re-exported
 # here so that test imports of `kai.memory_extraction._SUBPROCESS_ENV_ALLOWLIST`
@@ -956,8 +988,18 @@ def _strip_role_labels(text: str) -> str:
     visibly-different placeholder so Haiku sees the stripping happened;
     the replacement also preserves approximate character count to avoid
     surprising truncation side effects.
+
+    Also neutralizes the payload template's structural markers (`>>>
+    CURRENT EXCHANGE`, `PRIOR CONTEXT`, `EXISTING FACTS FOR THIS
+    USER`, `[USER n]`) via `_STRUCTURAL_MARKER_RE`; see that regex's
+    comment for the threat model. Handled here rather than in a
+    sibling function so every interpolation site (current exchange,
+    prior pairs, candidate lines, the stage-2 episode payload) gets
+    both defenses from the single call it already makes; a separate
+    function would need each site to remember to call it.
     """
-    return _ROLE_LABEL_RE.sub("\n[role label stripped] ", text)
+    text = _ROLE_LABEL_RE.sub("\n[role label stripped] ", text)
+    return _STRUCTURAL_MARKER_RE.sub("\n[structural marker stripped] ", text)
 
 
 def _capped_assistant(text: str) -> str:
@@ -3497,6 +3539,7 @@ __all__ = [
     "_SCOPE_CONFIDENCE_DEFAULTED",
     "_SCOPE_CONFIDENCE_HINTED",
     "_SEMAPHORE_CAP",
+    "_STRUCTURAL_MARKER_RE",
     "_allowed_write_project_id",
     "_build_extraction_payload",
     "_capped_assistant",
