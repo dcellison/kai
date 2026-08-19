@@ -303,6 +303,13 @@ _ROLE_LABEL_RE = re.compile(r"\n\s*(USER|ASSISTANT)\s*:", re.IGNORECASE)
 # section structure to Haiku. `>{3,}` rather than a literal `>>>`
 # catches trivially-padded variants (`>>>>`); `\s+` inside the phrases
 # tolerates doubled spaces for the same reason.
+#
+# The candidate-line shape (`[{id}] (source=..., conf=...)`) is
+# deliberately excluded: candidate ids are store UUIDs an attacker
+# cannot guess, and rule 3 in `_validate_facts` drops any intent
+# citing an id outside the real candidate set, so a fabricated line
+# cannot drive consolidation. Matching bare `[...]` here would mangle
+# legitimate numbered-bracket prose (footnotes, list markers).
 _STRUCTURAL_MARKER_RE = re.compile(
     r"\n\s*(?:"
     r">{3,}\s*CURRENT\s+EXCHANGE"
