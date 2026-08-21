@@ -145,11 +145,17 @@ class _ScreenCache:
     never push callback data over the Telegram 64-byte ceiling. A
     project id stored here may also collide with no reserved word:
     the tuple's kind discriminator is what distinguishes "move to
-    the project named 'global'" from "make global".
+    the project named 'global'" from "make global". The scope-confirm
+    screen carries the list forward so the apply verb can resolve its
+    payload index against the exact list its screen was rendered
+    from.
 
-    `scope_target` is the entry the user tapped, carried from the
-    scope screen to its confirm step so the apply verb needs no
-    callback arguments at all.
+    The cache is NAVIGATION state only, never the authority on what a
+    destructive tap targets. The cache is keyed by chat while
+    authorization is by user, so in a group chat one authorized
+    user's navigation overwrites another's; confirm verbs therefore
+    carry their fact id in the callback payload and verify it against
+    this cache where a cached list is still needed (scope targets).
     """
 
     screen: str
@@ -158,7 +164,6 @@ class _ScreenCache:
     query: str | None = None
     return_to: tuple[str, list[str]] | None = None
     scope_targets: list[tuple[str, str | None]] = field(default_factory=list)
-    scope_target: tuple[str, str | None] | None = None
     created_at: float = field(default_factory=time.monotonic)
 
 
@@ -1219,8 +1224,15 @@ def _build_fact_view(
     row: list[InlineKeyboardButton] = [InlineKeyboardButton("back", callback_data=back_callback)]
     if provenance is not None and provenance.present:
         row.append(InlineKeyboardButton("source", callback_data=_encode_callback("src")))
-    row.append(InlineKeyboardButton("scope", callback_data=_encode_callback("scp")))
-    row.append(InlineKeyboardButton("forget", callback_data=_encode_callback("ffc")))
+    # Action buttons carry the fact id in the payload rather than
+    # relying on the shared per-chat cache: in a group chat another
+    # authorized user's navigation overwrites the cache, and a
+    # cache-resolved target would act on whatever THEY last opened.
+    # A 36-char id plus the verb stays well under the 64-byte
+    # callback ceiling (the ceiling only forces index encoding on
+    # the numbered LIST buttons, where many ids are in play).
+    row.append(InlineKeyboardButton("scope", callback_data=_encode_callback("scp", fact.id)))
+    row.append(InlineKeyboardButton("forget", callback_data=_encode_callback("ffc", fact.id)))
     kb = InlineKeyboardMarkup([row])
     return text, kb
 
@@ -1247,11 +1259,15 @@ def _build_forget_fact_confirm(fact: MemoryResult) -> tuple[str, InlineKeyboardM
     """
     label = _source_noun(fact)
     text = f'Forget this {label}?\n\n"{fact.text}"\n\nThis cannot be undone.'
+    # Both buttons carry the fact id so confirm deletes exactly the
+    # fact this screen quoted and cancel re-renders that same fact,
+    # regardless of what the shared per-chat cache holds by tap time
+    # (group-chat collision: see the _ScreenCache docstring).
     kb = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("confirm forget", callback_data=_encode_callback("ffd")),
-                InlineKeyboardButton("cancel", callback_data=_encode_callback("fview")),
+                InlineKeyboardButton("confirm forget", callback_data=_encode_callback("ffd", fact.id)),
+                InlineKeyboardButton("cancel", callback_data=_encode_callback("fview", fact.id)),
             ]
         ]
     )
@@ -1291,9 +1307,13 @@ def _build_scope_screen(
     the registry size, which is small by construction. The nav row
     holds a single back button to the fact view.
 
-    Targets render by cache index (`sct:<idx>`), never by id, for
-    the same 64-byte-ceiling reason the list views use indexed
-    `fact` callbacks.
+    Targets render by cache index plus the fact id
+    (`sct:<idx>:<fact_id>`): the index keeps arbitrary-length
+    project ids out of callback data (the 64-byte ceiling), and the
+    fact id lets the handler verify the cache still describes THIS
+    fact before resolving the index, so a group-chat cache overwrite
+    by another user routes to session-expired instead of resolving
+    against their target list.
     """
     lines = [
         "Scope",
@@ -1316,14 +1336,15 @@ def _build_scope_screen(
     rows: list[list[InlineKeyboardButton]] = []
     for idx, (kind, pid) in enumerate(targets):
         label = "Make global" if kind == "global" else f"Move to '{pid}'"
-        rows.append([InlineKeyboardButton(label, callback_data=_encode_callback("sct", str(idx)))])
-    rows.append([InlineKeyboardButton("back", callback_data=_encode_callback("fview"))])
+        rows.append([InlineKeyboardButton(label, callback_data=_encode_callback("sct", str(idx), fact.id))])
+    rows.append([InlineKeyboardButton("back", callback_data=_encode_callback("fview", fact.id))])
     return text, InlineKeyboardMarkup(rows)
 
 
 def _build_scope_confirm(
     fact: MemoryResult,
     target: tuple[str, str | None],
+    target_idx: int,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Render the scope-change confirmation.
 
@@ -1342,11 +1363,16 @@ def _build_scope_confirm(
     noun = _source_noun(fact)
     question = f"Make this {noun} global?" if kind == "global" else f"Move this {noun} to project '{pid}'?"
     text = f'{question}\n\n"{fact.text}"'
+    # Confirm carries the target index plus the fact id (the target
+    # tuple itself cannot ride the callback: project ids are
+    # operator-chosen and unbounded, and the ceiling is 64 bytes).
+    # The handler resolves the index against the cached target list
+    # only after verifying the cache still describes this fact.
     kb = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("confirm", callback_data=_encode_callback("scd")),
-                InlineKeyboardButton("cancel", callback_data=_encode_callback("scp")),
+                InlineKeyboardButton("confirm", callback_data=_encode_callback("scd", str(target_idx), fact.id)),
+                InlineKeyboardButton("cancel", callback_data=_encode_callback("scp", fact.id)),
             ]
         ]
     )
@@ -1754,42 +1780,49 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
             await query.answer()
             return
         if verb == "fview":
-            # Cancel button on the forget-fact confirmation: re-render
-            # the fact view from cache. The cache was preserved when
-            # we transitioned to the confirm screen.
-            cache = _get_cache(chat_id)
-            if cache is None or not cache.memory_ids:
+            # Cancel button on a confirmation, or back from the scope
+            # screen: re-render the fact view for the id carried in
+            # the payload. Payload rather than cache so a group-chat
+            # cache overwrite by another authorized user cannot swap
+            # which fact this button shows (see _ScreenCache).
+            # Argless `fview` callbacks from pre-payload messages in
+            # chat history fall into the session-expired path.
+            if not args:
                 await _send_dashboard(update, context, chat_id, edit=True)
                 await query.answer(_MSG_SESSION_EXPIRED)
                 return
-            # The fact id is the only one in the cache when we're on
-            # a fact view. (We overwrote the page-of-ids list when
-            # navigating to the fact screen; see _send_fact_view.)
-            memory_id = cache.memory_ids[0]
-            await _send_fact_view(update, context, chat_id, memory_id)
+            await _send_fact_view(update, context, chat_id, args[0])
             await query.answer()
             return
         if verb == "ffc":
-            # Forget single fact: confirm step. The memory id lives
-            # in the screen cache (set by _send_fact_view).
-            cache = _get_cache(chat_id)
-            if cache is None or not cache.memory_ids:
+            # Forget single fact: confirm step for the fact id in the
+            # payload. `_send_forget_fact_confirm` re-fetches through
+            # `get_by_id`, which re-verifies chat ownership for the
+            # tapping chat before anything renders.
+            if not args:
                 await _send_dashboard(update, context, chat_id, edit=True)
                 await query.answer(_MSG_SESSION_EXPIRED)
                 return
-            await _send_forget_fact_confirm(update, context, chat_id, cache.memory_ids[0])
+            await _send_forget_fact_confirm(update, context, chat_id, args[0])
             await query.answer()
             return
         if verb == "ffd":
-            # Forget single fact: execute. Read id from cache, delete,
-            # then return to the screen the fact was opened from.
-            cache = _get_cache(chat_id)
-            if cache is None or not cache.memory_ids:
+            # Forget single fact: execute against the PAYLOAD id, the
+            # fact the confirm screen actually quoted to the tapping
+            # user. Before the payload carried it, the id came from
+            # the shared per-chat cache, and another authorized
+            # user's navigation could swap the target between confirm
+            # render and tap (the group-chat collision this guards).
+            # `delete_by_id` re-verifies ownership for this chat, so
+            # a forged or foreign id deletes nothing. The cache
+            # contributes only the return_to navigation hint.
+            if not args:
                 await _send_dashboard(update, context, chat_id, edit=True)
                 await query.answer(_MSG_SESSION_EXPIRED)
                 return
-            memory_id = cache.memory_ids[0]
-            return_to = cache.return_to
+            memory_id = args[0]
+            cache = _get_cache(chat_id)
+            return_to = cache.return_to if cache is not None else None
             ok = memory.delete_by_id(user_id=str(chat_id), memory_id=memory_id)
             # Return to whatever screen the user was on before the
             # fact view. Episode list, facts list, or dashboard
@@ -1832,24 +1865,31 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
             await query.answer()
             return
         if verb == "scp":
-            # Scope screen for the fact in cache. Reached from the
-            # fact view's scope button and from the confirm screen's
-            # cancel button; both leave the fact id at memory_ids[0].
-            cache = _get_cache(chat_id)
-            if cache is None or not cache.memory_ids:
+            # Scope screen for the fact id in the payload. Reached
+            # from the fact view's scope button and from the confirm
+            # screen's cancel button; both carry the id so neither
+            # depends on the shared per-chat cache surviving another
+            # user's navigation.
+            if not args:
                 await _send_dashboard(update, context, chat_id, edit=True)
                 await query.answer(_MSG_SESSION_EXPIRED)
                 return
-            await _send_scope_screen(update, context, chat_id, cache.memory_ids[0])
+            await _send_scope_screen(update, context, chat_id, args[0])
             await query.answer()
             return
         if verb == "sct":
-            # Scope target tapped. The integer arg indexes
-            # cache.scope_targets (set by _send_scope_screen); any
-            # decode or range failure routes through the standard
-            # session-expired fallback like the fact verb does.
+            # Scope target tapped. args[0] indexes cache.scope_targets
+            # (set by _send_scope_screen); args[1] is the fact id the
+            # target list was rendered for. The index can only be
+            # resolved against the cache, so before resolving, verify
+            # the cache still describes THIS fact: in a group chat
+            # another authorized user's navigation overwrites the
+            # cache, and resolving a stale index against their target
+            # list would confirm a change the tapper never saw. Any
+            # decode, range, or fact-mismatch failure routes through
+            # the standard session-expired fallback.
             cache = _get_cache(chat_id)
-            if cache is None or not cache.memory_ids or not args:
+            if cache is None or not cache.memory_ids or len(args) < 2 or cache.memory_ids[0] != args[1]:
                 await _send_dashboard(update, context, chat_id, edit=True)
                 await query.answer(_MSG_SESSION_EXPIRED)
                 return
@@ -1863,19 +1903,33 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
                 await _send_dashboard(update, context, chat_id, edit=True)
                 await query.answer(_MSG_SESSION_EXPIRED)
                 return
-            await _send_scope_confirm(update, context, chat_id, cache.memory_ids[0], cache.scope_targets[idx])
+            await _send_scope_confirm(update, context, chat_id, args[1], cache.scope_targets[idx], idx)
             await query.answer()
             return
         if verb == "scd":
-            # Scope change confirmed. The selected target rode the
-            # cache from the confirm screen, so the callback carries
-            # no arguments to validate.
+            # Scope change confirmed. Same payload-plus-verification
+            # shape as sct: args[0] is the target index, args[1] the
+            # fact id the confirm screen quoted. The confirm screen's
+            # cache carries the target list forward, and the apply
+            # only proceeds when the cache still describes the
+            # payload's fact, so a cache overwrite by another user
+            # expires this tap instead of crossing its wires.
             cache = _get_cache(chat_id)
-            if cache is None or not cache.memory_ids or cache.scope_target is None:
+            if cache is None or not cache.memory_ids or len(args) < 2 or cache.memory_ids[0] != args[1]:
                 await _send_dashboard(update, context, chat_id, edit=True)
                 await query.answer(_MSG_SESSION_EXPIRED)
                 return
-            answer = await _apply_scope_change(update, context, chat_id, cache.memory_ids[0], cache.scope_target)
+            try:
+                idx = int(args[0])
+            except ValueError:
+                await _send_dashboard(update, context, chat_id, edit=True)
+                await query.answer(_MSG_SESSION_EXPIRED)
+                return
+            if idx < 0 or idx >= len(cache.scope_targets):
+                await _send_dashboard(update, context, chat_id, edit=True)
+                await query.answer(_MSG_SESSION_EXPIRED)
+                return
+            answer = await _apply_scope_change(update, context, chat_id, args[1], cache.scope_targets[idx])
             await query.answer(answer)
             return
     except Exception as exc:
@@ -2070,8 +2124,10 @@ async def _send_fact_view(
     scope_view = _build_scope_view(fact, registry, active)
     provenance = read_transcript_provenance(fact.metadata)
     text, kb = _build_fact_view(fact, return_to, scope_view, provenance)
-    # Cache holds only this fact's id so the forget flow knows what to
-    # delete without re-encoding the id into callback data.
+    # Cache holds only this fact's id: navigation state (the source
+    # view resolves against it, and return_to rides here). The
+    # destructive flows carry the fact id in their own callback
+    # payloads and do not depend on this entry surviving.
     _set_cache(
         chat_id,
         _ScreenCache(
@@ -2099,8 +2155,9 @@ async def _send_forget_fact_confirm(
         await _send_or_edit(update, "This memory no longer exists.", None, edit=True)
         return
     text, kb = _build_forget_fact_confirm(fact)
-    # Preserve cache so cancel returns to the same fact, and confirm
-    # knows what to delete.
+    # The confirm and cancel buttons carry the fact id themselves;
+    # the cache is refreshed only for the return_to navigation hint
+    # the post-delete render uses.
     cache = _get_cache(chat_id)
     return_to = cache.return_to if cache is not None else None
     _set_cache(
@@ -2263,31 +2320,36 @@ async def _send_scope_confirm(
     chat_id: int,
     memory_id: str,
     target: tuple[str, str | None],
+    target_idx: int,
 ) -> None:
     """Render the scope-change confirmation for a tapped target.
 
-    The selected target moves into `cache.scope_target` so the apply
-    verb (`scd`) needs no callback arguments. `scope_targets` is NOT
-    carried forward: the confirm screen has no target buttons, so an
-    empty list is the honest cache state, and a stale `sct` tap from
-    an older message in chat history falls into the standard
-    session-expired path instead of resolving against a list the
-    user is no longer looking at.
+    The confirm button carries `target_idx` plus the fact id; the
+    apply verb (`scd`) resolves the index against `scope_targets`,
+    which this cache entry carries forward from the scope screen for
+    exactly that purpose. Resolution is safe against group-chat
+    cache overwrites because `scd` verifies the cache still
+    describes the payload's fact before it indexes the list; a
+    mismatch expires the tap. A stale `sct` tap from an older
+    message in chat history passes through the same verification
+    and expires unless the chat is genuinely on this fact's scope
+    flow, in which case re-rendering its confirm screen is correct.
     """
     fact = memory.get_by_id(user_id=str(chat_id), memory_id=memory_id)
     if fact is None:
         await _send_or_edit(update, "This memory no longer exists.", None, edit=True)
         return
-    text, kb = _build_scope_confirm(fact, target)
+    text, kb = _build_scope_confirm(fact, target, target_idx)
     cache = _get_cache(chat_id)
     return_to = cache.return_to if cache is not None else None
+    scope_targets = cache.scope_targets if cache is not None else []
     _set_cache(
         chat_id,
         _ScreenCache(
             screen="scope_confirm",
             memory_ids=[memory_id],
             return_to=return_to,
-            scope_target=target,
+            scope_targets=scope_targets,
         ),
     )
     await _send_or_edit(update, text, kb, edit=True)

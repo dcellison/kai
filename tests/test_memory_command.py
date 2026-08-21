@@ -1951,7 +1951,7 @@ class TestForgetFactReturnFacts:
             ),
         )
 
-        upd = update_factory(callback_data="mem:ffd")
+        upd = update_factory(callback_data="mem:ffd:f1")
         ctx = context_factory()
         await memory_command.handle_memory_callback(upd, ctx)
 
@@ -1987,7 +1987,7 @@ class TestForgetFactReturnFacts:
             ),
         )
 
-        upd = update_factory(callback_data="mem:ffd")
+        upd = update_factory(callback_data="mem:ffd:f1")
         ctx = context_factory()
         await memory_command.handle_memory_callback(upd, ctx)
         assert captured["page"] == 0
@@ -2732,7 +2732,7 @@ class TestCallbackDispatch:
                 return_to=("eps", ["0"]),
             ),
         )
-        upd = update_factory(callback_data="mem:ffd")
+        upd = update_factory(callback_data="mem:ffd:mem-id-1")
         ctx = context_factory()
         await memory_command.handle_memory_callback(upd, ctx)
         assert deleted == ["mem-id-1"]
@@ -2771,7 +2771,7 @@ class TestCallbackDispatch:
                 memory_ids=["any-id"],
             ),
         )
-        upd = update_factory(callback_data="mem:ffc")
+        upd = update_factory(callback_data="mem:ffc:any-id")
         ctx = context_factory()
         await memory_command.handle_memory_callback(upd, ctx)
         # query.answer must have been called exactly once, with the
@@ -3177,9 +3177,9 @@ class TestBuildScopeScreen:
         # One button per target row, then the nav row.
         labels = [row[0].text for row in kb.inline_keyboard]
         assert labels == ["Make global", "Move to 'kai'", "back"]
-        assert kb.inline_keyboard[0][0].callback_data == "mem:sct:0"
-        assert kb.inline_keyboard[1][0].callback_data == "mem:sct:1"
-        assert kb.inline_keyboard[-1][0].callback_data == "mem:fview"
+        assert kb.inline_keyboard[0][0].callback_data == f"mem:sct:0:{fact.id}"
+        assert kb.inline_keyboard[1][0].callback_data == f"mem:sct:1:{fact.id}"
+        assert kb.inline_keyboard[-1][0].callback_data == f"mem:fview:{fact.id}"
 
     def test_no_targets_renders_empty_message(self):
         fact = _scoped_fact("global")
@@ -3192,24 +3192,24 @@ class TestBuildScopeScreen:
 class TestBuildScopeConfirm:
     def test_global_target_question(self):
         fact = _scoped_fact("project", project_id="kai", scope_source="operator")
-        text, kb = memory_command._build_scope_confirm(fact, ("global", None))
+        text, kb = memory_command._build_scope_confirm(fact, ("global", None), 0)
         assert text.startswith("Make this fact global?")
         assert '"Scoped fact text."' in text
         # Reversible action: no irreversibility warning.
         assert "cannot be undone" not in text
         row = kb.inline_keyboard[0]
         assert [btn.text for btn in row] == ["confirm", "cancel"]
-        assert row[0].callback_data == "mem:scd"
-        assert row[1].callback_data == "mem:scp"
+        assert row[0].callback_data == f"mem:scd:0:{fact.id}"
+        assert row[1].callback_data == f"mem:scp:{fact.id}"
 
     def test_project_target_question(self):
         fact = _scoped_fact("global")
-        text, _ = memory_command._build_scope_confirm(fact, ("project", "anvil"))
+        text, _ = memory_command._build_scope_confirm(fact, ("project", "anvil"), 1)
         assert text.startswith("Move this fact to project 'anvil'?")
 
     def test_episode_noun(self):
         fact = _episode_fact()
-        text, _ = memory_command._build_scope_confirm(fact, ("project", "kai"))
+        text, _ = memory_command._build_scope_confirm(fact, ("project", "kai"), 1)
         assert text.startswith("Move this episode to project 'kai'?")
 
 
@@ -3262,8 +3262,8 @@ class TestScopeCallbackDispatch:
             sent["memory_id"] = memory_id
 
         monkeypatch.setattr(memory_command, "_send_scope_screen", fake_scope_screen)
-        memory_command._set_cache(100, memory_command._ScreenCache(screen="fact", memory_ids=["m1"]))
-        upd = update_factory(callback_data="mem:scp")
+        # No cache priming: the payload id is the whole contract now.
+        upd = update_factory(callback_data="mem:scp:m1")
         await memory_command.handle_memory_callback(upd, context_factory())
         assert sent["memory_id"] == "m1"
 
@@ -3280,7 +3280,7 @@ class TestScopeCallbackDispatch:
             100,
             memory_command._ScreenCache(screen="scope", memory_ids=["m1"], scope_targets=[("global", None)]),
         )
-        upd = update_factory(callback_data="mem:sct:5")
+        upd = update_factory(callback_data="mem:sct:5:m1")
         await memory_command.handle_memory_callback(upd, context_factory())
         assert sent.get("dash") is True
 
@@ -3289,8 +3289,9 @@ class TestScopeCallbackDispatch:
         monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
         sent = {}
 
-        async def fake_confirm(update, context, chat_id, memory_id, target):
+        async def fake_confirm(update, context, chat_id, memory_id, target, target_idx):
             sent["target"] = target
+            sent["target_idx"] = target_idx
 
         monkeypatch.setattr(memory_command, "_send_scope_confirm", fake_confirm)
         memory_command._set_cache(
@@ -3301,12 +3302,13 @@ class TestScopeCallbackDispatch:
                 scope_targets=[("global", None), ("project", "kai")],
             ),
         )
-        upd = update_factory(callback_data="mem:sct:1")
+        upd = update_factory(callback_data="mem:sct:1:m1")
         await memory_command.handle_memory_callback(upd, context_factory())
         assert sent["target"] == ("project", "kai")
+        assert sent["target_idx"] == 1
 
     @pytest.mark.asyncio
-    async def test_scd_without_selected_target_expires(self, monkeypatch, update_factory, context_factory):
+    async def test_scd_without_payload_expires(self, monkeypatch, update_factory, context_factory):
         monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
         sent = {}
 
@@ -3335,10 +3337,10 @@ class TestScopeCallbackDispatch:
             memory_command._ScreenCache(
                 screen="scope_confirm",
                 memory_ids=["m1"],
-                scope_target=("project", "kai"),
+                scope_targets=[("global", None), ("project", "kai")],
             ),
         )
-        upd = update_factory(callback_data="mem:scd")
+        upd = update_factory(callback_data="mem:scd:1:m1")
         await memory_command.handle_memory_callback(upd, context_factory())
         assert applied == {"memory_id": "m1", "target": ("project", "kai")}
         upd.callback_query.answer.assert_awaited_once_with("Scope updated.")
@@ -3765,3 +3767,118 @@ class TestSourceViewOwnership:
         await memory_command._send_source_view(update_factory(callback_data="mem:src"), context_factory(), 1, fact.id)
         assert "does not match this chat" in sent["text"]
         assert "secret" not in sent["text"]
+
+
+class TestGroupChatConfirmCollision:
+    """Two authorized users share one group chat and therefore one
+    screen-cache entry. These tests pin the fix for the collision
+    where user B's navigation overwrote the cache and user A's stale
+    confirm tap then acted on whatever B last opened."""
+
+    @pytest.mark.asyncio
+    async def test_confirm_deletes_what_the_tapper_was_shown(self, monkeypatch, update_factory, context_factory):
+        """User A's confirm screen quoted fact-A; user B then opened
+        fact-B, overwriting the shared cache. A's tap must delete
+        fact-A (the payload target A confirmed), not cache-resident
+        fact-B."""
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        deleted: list[str] = []
+
+        def fake_delete(*, user_id, memory_id):
+            deleted.append(memory_id)
+            return True
+
+        monkeypatch.setattr(memory_command.memory, "delete_by_id", fake_delete)
+
+        async def fake_dash(update, context, chat_id, edit=False):
+            pass
+
+        monkeypatch.setattr(memory_command, "_send_dashboard", fake_dash)
+
+        ctx = context_factory()
+        ctx.bot_data["config"].allowed_user_ids = {999, 888}
+
+        # User B (888) navigated after A's confirm screen rendered:
+        # the shared cache now describes B's fact.
+        memory_command._set_cache(
+            100,
+            memory_command._ScreenCache(screen="fact", memory_ids=["fact-B"]),
+        )
+
+        # User A (999) taps the confirm button rendered for fact-A.
+        upd = update_factory(callback_data="mem:ffd:fact-A", user_id=999)
+        await memory_command.handle_memory_callback(upd, ctx)
+
+        assert deleted == ["fact-A"]
+
+    @pytest.mark.asyncio
+    async def test_scope_confirm_expires_when_cache_describes_another_fact(
+        self, monkeypatch, update_factory, context_factory
+    ):
+        """The scope apply resolves its target index against the
+        cached list, so it cannot act on the payload alone; when the
+        cache no longer describes the payload's fact (user B moved
+        on), the tap must expire with no scope change instead of
+        resolving the index against B's target list."""
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        applied = {}
+
+        async def fake_apply(update, context, chat_id, memory_id, target):
+            applied["memory_id"] = memory_id
+            return "Scope updated."
+
+        monkeypatch.setattr(memory_command, "_apply_scope_change", fake_apply)
+        sent = {}
+
+        async def fake_dash(update, context, chat_id, edit=False):
+            sent["dash"] = True
+
+        monkeypatch.setattr(memory_command, "_send_dashboard", fake_dash)
+
+        ctx = context_factory()
+        ctx.bot_data["config"].allowed_user_ids = {999, 888}
+
+        # B's scope screen for fact-B holds the cache now.
+        memory_command._set_cache(
+            100,
+            memory_command._ScreenCache(
+                screen="scope_confirm",
+                memory_ids=["fact-B"],
+                scope_targets=[("global", None)],
+            ),
+        )
+
+        # A taps the confirm rendered for fact-A.
+        upd = update_factory(callback_data="mem:scd:0:fact-A", user_id=999)
+        await memory_command.handle_memory_callback(upd, ctx)
+
+        assert applied == {}
+        assert sent.get("dash") is True
+        upd.callback_query.answer.assert_awaited_once_with(memory_command._MSG_SESSION_EXPIRED)
+
+
+class TestUnauthorizedCallback:
+    """The unauthorized-callback path had no test (audit L3 gap).
+    Authorization is by user id, independent of the chat: an
+    unauthorized member of a group chat whose other members are
+    authorized must get the refusal toast and no dispatch."""
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_user_gets_refusal_and_no_dispatch(self, monkeypatch, update_factory, context_factory):
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        deleted: list[str] = []
+        monkeypatch.setattr(
+            memory_command.memory,
+            "delete_by_id",
+            lambda *, user_id, memory_id: deleted.append(memory_id) or True,
+        )
+
+        # user 777 is not in auth_config's allowed set; the payload
+        # is a destructive verb to prove the gate sits before
+        # dispatch, not inside individual handlers.
+        upd = update_factory(callback_data="mem:ffd:fact-A", user_id=777)
+        await memory_command.handle_memory_callback(upd, context_factory())
+
+        assert deleted == []
+        upd.callback_query.answer.assert_awaited_once_with("Not authorized.")
+        upd.callback_query.edit_message_text.assert_not_called()
