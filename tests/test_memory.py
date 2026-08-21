@@ -6140,6 +6140,27 @@ class TestFormatScopedContextWithRecallPayload:
         # the 0.9 project row first).
         assert payload["lines_used"] == 2
         assert [h["id"] for h in payload["hits"]] == ["g1", "p1"]
+        assert "query" not in payload
+        assert all("snippet" not in hit for hit in payload["hits"])
+
+    async def test_explicit_diagnostic_mode_retains_eval_content(self, tmp_path):
+        import kai.memory as mem_mod
+        from kai.memory import format_scoped_context_with_recall_payload
+
+        mock_mem = MagicMock()
+        mock_mem.search.return_value = {"results": [_search_row("g1", "diagnostic fact", 0.8, scope="global")]}
+        mem_mod._memory = mock_mem
+        mem_mod._config = _mp_config()
+
+        result = await format_scoped_context_with_recall_payload(
+            "diagnostic query",
+            user_id="123",
+            workspace=tmp_path,
+            include_diagnostic_content=True,
+        )
+
+        assert result.recall_payload["query"] == "diagnostic query"
+        assert result.recall_payload["hits"][0]["snippet"] == "diagnostic fact"
 
     async def test_global_cap_drops_rows_out_of_prompt_prefix(self, tmp_path):
         """With both sections populated, the renderer caps the global
@@ -6273,7 +6294,7 @@ class TestFormatScopedContextWithRecallPayload:
         payload = result.recall_payload
         assert payload["reason"] == "scoped_error"
         assert payload["scoped_error_type"] == "RuntimeError"
-        assert "qdrant exploded" in str(payload["scoped_error_message"])
+        assert "scoped_error_message" not in payload
         assert payload["returned_empty"] is True
 
     async def test_disabled_memory_short_circuits(self, tmp_path):

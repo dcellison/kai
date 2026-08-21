@@ -2225,15 +2225,11 @@ async def _run_extractor(
         )
         return ExtractionResult(facts=[], has_episode=False)
     except OneShotSubprocessError as e:
-        # stderr head AND stdout tail: codex `exec --json` reports its
-        # failure cause in error / turn.failed events streamed to
-        # stdout (stderr carries only the stdin banner), and the cause
-        # events arrive last, so the tail is the informative end.
         log.warning(
-            "Memory extraction subprocess exited %d: stderr=%s stdout_tail=%s",
+            "Memory extraction subprocess exited %d (stderr_bytes=%d, stdout_bytes=%d)",
             e.returncode,
-            e.stderr[:500].decode("utf-8", errors="replace"),
-            e.stdout[-500:].decode("utf-8", errors="replace"),
+            len(e.stderr),
+            len(e.stdout),
         )
         _consecutive_subprocess_failures += 1
         if _consecutive_subprocess_failures == _FAILURE_STREAK_ALARM_THRESHOLD:
@@ -2244,12 +2240,12 @@ async def _run_extractor(
             # every turn; the ERROR is the operator's signal to look.
             log.error(
                 "Memory extraction has failed %d consecutive times; every affected "
-                "turn's facts are being lost. See the stderr/stdout capture on the "
-                "preceding warnings for the provider's failure detail.",
+                "turn's facts are being lost. Check the backend authentication and "
+                "availability for the affected runtime profile.",
                 _consecutive_subprocess_failures,
             )
         return ExtractionResult(facts=[], has_episode=False)
-    except OneShotError:
+    except OneShotError as exc:
         # OneShotOutputError or any future OneShotError subclass the
         # reasoner adds. Collapse to empty extraction rather than
         # propagate; the broad outer handler in extract_and_store
@@ -2257,7 +2253,7 @@ async def _run_extractor(
         # exceptions, but typed reasoner failures are expected and
         # should produce the same zero-state result as the older
         # subprocess-error path.
-        log.warning("Memory extraction reasoner error", exc_info=True)
+        log.warning("Memory extraction reasoner error (type=%s)", type(exc).__name__)
         return ExtractionResult(facts=[], has_episode=False)
 
     # The subprocess ran to completion, so any failure streak is over;
@@ -2267,21 +2263,17 @@ async def _run_extractor(
     try:
         parsed = json.loads(result.text)
     except json.JSONDecodeError:
-        log.warning(
-            "Memory extraction produced invalid JSON: %r",
-            result.text[:500],
-        )
+        log.warning("Memory extraction produced invalid JSON (chars=%d)", len(result.text))
         return ExtractionResult(facts=[], has_episode=False)
     if not isinstance(parsed, dict):
-        log.warning("Memory extraction returned non-object JSON: %r", parsed)
+        log.warning("Memory extraction returned non-object JSON (type=%s)", type(parsed).__name__)
         return ExtractionResult(facts=[], has_episode=False)
     # Defense-in-depth: the CLI can exit 0 with is_error=true while the
     # envelope still parses. Treat that as extraction failure, not
     # silent success with partial data.
     if parsed.get("is_error") is True:
         log.warning(
-            "Memory extraction CLI envelope reports is_error=true (subtype=%s)",
-            parsed.get("subtype"),
+            "Memory extraction CLI envelope reports is_error=true",
         )
         return ExtractionResult(facts=[], has_episode=False)
     # The §13.2 step-5 smoke test revealed that `claude --print
@@ -2394,7 +2386,7 @@ async def _run_episode_extractor(
     effective_backend: str,
     effective_provider: str,
     os_user: str | None = None,
-) -> tuple[dict | None, float, str | None]:
+) -> tuple[dict | None, str | None]:
     """
     Spawn `claude --print` with the episode-generator prompt and parse.
 
@@ -2418,8 +2410,8 @@ async def _run_episode_extractor(
     # Stage 2 routes through the same reasoner as stage 1; the
     # caller-side mapping recovers the exact failure-reason strings
     # downstream telemetry depends on (`"timeout"` and
-    # `"exit_<code>: <stderr>"`). OneShotSubprocessError carries the
-    # returncode and stderr bytes precisely so this mapping works.
+    # `"exit_<code>"`). Provider output is intentionally excluded
+    # because it may echo private conversation content.
     # `os_user` is the routing target resolved once at the top of
     # `extract_and_store` (per-user OS routing); stage 2 inherits the
     # same target so the policy boundary is enforced consistently.
@@ -2442,10 +2434,7 @@ async def _run_episode_extractor(
     except OneShotTimeout:
         return None, "timeout"
     except OneShotSubprocessError as e:
-        return (
-            None,
-            f"exit_{e.returncode}: {e.stderr[:200].decode('utf-8', errors='replace')}",
-        )
+        return None, f"exit_{e.returncode}"
     except OneShotError:
         # Future-proof: any other reasoner-level failure collapses to
         # a parse-shaped reason rather than propagating. The outer
@@ -2456,11 +2445,11 @@ async def _run_episode_extractor(
     try:
         parsed = json.loads(result.text)
     except json.JSONDecodeError:
-        return None, f"invalid_json: {result.text[:200]}"
+        return None, "invalid_json"
     if not isinstance(parsed, dict):
         return None, "non_object_envelope"
     if parsed.get("is_error") is True:
-        return None, f"is_error subtype={parsed.get('subtype')}"
+        return None, "is_error"
     # Same nested/root resolution as stage 1: `claude --print
     # --output-format json --json-schema ...` puts the schema-validated
     # payload under `structured_output`. Fall back to root for tests

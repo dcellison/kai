@@ -266,11 +266,10 @@ class OneShotSubprocessError(OneShotError):
     """
     The provider subprocess exited with a non-zero return code.
 
-    Carries `returncode` and raw `stderr` bytes because stage 2's
-    episode-extraction failure-reason string is
-    `f"exit_{returncode}: {stderr[:200].decode('utf-8', errors='replace')}"`.
-    Preserving that string is part of Acceptance 4 (stage 2 failure-
-    reason shape). The fields are dataclass attributes, not
+    Carries `returncode` and raw output bytes so trusted callers can
+    classify provider failures. Memory telemetry records only the exit
+    code and byte counts; it never copies these buffers into logs. The
+    fields are dataclass attributes, not
     constructor args, because Python's stdlib `Exception` does not
     play nicely with `__init__` parameter capture in subclasses;
     `@dataclass(eq=False)` on the subclass would also work but is not
@@ -282,14 +281,12 @@ class OneShotSubprocessError(OneShotError):
     # Captured stdout, for backends whose CLIs report failure detail
     # there rather than on stderr: codex `exec --json` streams its
     # error and turn.failed events to stdout as JSONL while stderr
-    # carries only the "Reading prompt from stdin..." banner, so a
-    # stderr-only capture logs the banner and discards the cause.
+    # carries only the "Reading prompt from stdin..." banner.
     # Defaulted so raise sites with no captured output stay valid.
     # Deliberately absent from __str__: that rendering's shape is
     # pinned by its own tests and embedded verbatim by callers that
     # fold str(e) into their error messages, and a stdout tail there
-    # would bloat every such message. Callers that want the stdout
-    # detail (the stage-1 extraction warning) read the field directly.
+    # would bloat every such message.
     stdout: bytes = b""
 
     def __str__(self) -> str:

@@ -1444,24 +1444,13 @@ def _estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
-# Maximum characters of the query field to embed in the memory.recall
-# log line. The full query reaches the semantic search; this cap
-# applies only to the log copy. 256 covers the common single-message
-# user turn so an eval harness can reproduce the search input from
-# logs alone without joining against chat-history JSONL by timestamp.
-# Queries longer than 256 chars still hit the fallback path (the eval
-# harness reads the full text from chat history); the cap exists to
-# bound multi-paragraph paste cases that would otherwise inflate
-# every recall log line.
+# Maximum characters of the query field in explicit evaluation and
+# diagnostic recall payloads. Production recall telemetry omits the
+# field entirely. The full query still reaches semantic search.
 _RECALL_QUERY_TRUNC = 256
 
-# Maximum characters of each per-hit snippet in the memory.recall log
-# line. 80 is enough to fingerprint a hit for an eval harness, which
-# treats the snippet as an identifier rather than full retrieved
-# text. The snippet cap stays narrower than the query cap because a
-# single recall returns up to MEMORY_K hits; raising both together
-# would multiply the log-line length by the hit count for a use case
-# (full hit-text recovery) that the eval harness does not need.
+# Maximum characters of each per-hit snippet in explicit evaluation
+# and diagnostic recall payloads. Production telemetry omits snippets.
 _RECALL_SNIPPET_TRUNC = 80
 
 
@@ -1501,7 +1490,12 @@ _RECALL_REASON_ALL_BELOW_FLOOR = "all_below_floor"
 _RECALL_REASON_BUDGET_EXHAUSTED = "budget_exhausted"
 
 
-def _base_recall_payload(user_id: str, query: str) -> dict[str, object]:
+def _base_recall_payload(
+    user_id: str,
+    query: str,
+    *,
+    include_content: bool,
+) -> dict[str, object]:
     """
     Build a memory.recall payload with all uniform-shape fields set.
 
@@ -1516,8 +1510,9 @@ def _base_recall_payload(user_id: str, query: str) -> dict[str, object]:
     `returned_empty` defaults to True; the success path flips it to
     False just before emit. `reason` is the one non-uniform field:
     present only on short-circuit lines, omitted on success, so it's
-    not in the base payload. Real query and user_id are always
-    populated; they are never sentineled.
+    not in the base payload. ``include_content`` is reserved for
+    explicit evaluation and diagnostics. Production telemetry keeps
+    query length and structural signals but omits the raw query.
     """
     return {
         "user_id": user_id,
@@ -1528,7 +1523,6 @@ def _base_recall_payload(user_id: str, query: str) -> dict[str, object]:
         # the two identities agree.
         "resolved_user_id": canonical_memory_user_id(user_id),
         "query_len": len(query),
-        "query": _truncate(query, _RECALL_QUERY_TRUNC),
         "fetch_limit": 0,
         "hits_raw": 0,
         "hits_after_floor": 0,
@@ -1538,6 +1532,7 @@ def _base_recall_payload(user_id: str, query: str) -> dict[str, object]:
         "lines_used": 0,
         "budget_tokens": 0,
         "hits": [],
+        **({"query": _truncate(query, _RECALL_QUERY_TRUNC)} if include_content else {}),
     }
 
 
@@ -1550,15 +1545,11 @@ def _emit_recall_log(payload: dict[str, object]) -> None:
     output would break extraction. The "memory.recall " prefix is
     the stable greppable tag.
 
-    PII posture (recorded here so a future reviewer does not
-    re-litigate it): the query and per-hit snippets are logged in
-    their truncated form (80 chars), unhashed and unredacted. Target
-    log file is operator-local and already contains the full
-    conversation under other paths (CLAUDE_DEBUG=true, history
-    storage). Pattern-based redaction is fragile and creates a false
-    sense of safety; truncation is the only meaningful protection
-    here. Operators wanting stricter handling should rotate logs
-    aggressively or shift the log level for this module.
+    Content posture: live callers use content-free payloads. Raw query,
+    hit snippets, and exception messages appear only when an explicit
+    evaluation/diagnostic caller requests them. Filesystem protection
+    remains defense in depth, not permission to add conversation text
+    back to routine telemetry.
     """
     log.info("memory.recall %s", json.dumps(payload, separators=(",", ":")))
 
@@ -2041,7 +2032,7 @@ async def format_context(
     # fields it knows about. Centralizing construction here guarantees
     # that query and user_id (always-populated fields) cannot be
     # forgotten on any return path.
-    payload = _base_recall_payload(user_id, query)
+    payload = _base_recall_payload(user_id, query, include_content=True)
 
     if not is_enabled() or _config is None:
         payload["reason"] = _RECALL_REASON_DISABLED
@@ -2681,7 +2672,11 @@ def _scoped_debug_to_payload(debug: ScopedRetrievalDebug) -> dict[str, object]:
     }
 
 
-def _scoped_hit_to_payload(hit: ScopedMemoryHit) -> dict[str, object]:
+def _scoped_hit_to_payload(
+    hit: ScopedMemoryHit,
+    *,
+    include_content: bool,
+) -> dict[str, object]:
     """
     Convert a `ScopedMemoryHit` to a JSON-safe dict for the `hits`
     array on the `memory.recall` payload. Carries
@@ -2692,7 +2687,7 @@ def _scoped_hit_to_payload(hit: ScopedMemoryHit) -> dict[str, object]:
     consistent with the rest of the payload.
     """
     r = hit.result
-    return {
+    payload: dict[str, object] = {
         "id": r.id,
         "scope": hit.resolved_scope.scope,
         "project_id": hit.resolved_scope.project_id,
@@ -2701,8 +2696,10 @@ def _scoped_hit_to_payload(hit: ScopedMemoryHit) -> dict[str, object]:
         "confidence": hit.confidence,
         "score": round(r.score, 4),
         "adj": round(hit.adjusted_score, 4),
-        "snippet": _truncate(r.text, _RECALL_SNIPPET_TRUNC),
     }
+    if include_content:
+        payload["snippet"] = _truncate(r.text, _RECALL_SNIPPET_TRUNC)
+    return payload
 
 
 @dataclass(frozen=True)
@@ -2745,6 +2742,7 @@ async def format_scoped_context_with_recall_payload(
     job_type: str | None = None,
     session_id: str | None = None,
     token_budget: int | None = None,
+    include_diagnostic_content: bool = False,
 ) -> ScopedRecallResult:
     """
     Run the scoped recall pipeline for LIVE prompt injection.
@@ -2766,8 +2764,16 @@ async def format_scoped_context_with_recall_payload(
     `ScopedRetrievalContext.workspace`); unlike the shadow path there
     is no skip branch, because this IS the live content path and a
     workspace-less caller still deserves its global memories.
+
+    ``include_diagnostic_content`` is deliberately false by default.
+    Evaluation tooling opts in when it needs query and hit fingerprints;
+    live backend callers must retain the content-free default.
     """
-    payload = _base_recall_payload(user_id, query)
+    payload = _base_recall_payload(
+        user_id,
+        query,
+        include_content=include_diagnostic_content,
+    )
 
     try:
         context = ScopedRetrievalContext(
@@ -2792,7 +2798,8 @@ async def format_scoped_context_with_recall_payload(
     except Exception as exc:
         payload["reason"] = _RECALL_REASON_SCOPED_ERROR
         payload["scoped_error_type"] = type(exc).__name__
-        payload["scoped_error_message"] = _truncate(str(exc), _SCOPED_ERROR_MESSAGE_TRUNC)
+        if include_diagnostic_content:
+            payload["scoped_error_message"] = _truncate(str(exc), _SCOPED_ERROR_MESSAGE_TRUNC)
         payload["returned_empty"] = True
         return ScopedRecallResult(rendered_context="", recall_payload=payload)
 
@@ -2822,7 +2829,9 @@ async def format_scoped_context_with_recall_payload(
     # math depends on.
     rendered_ids = {h.result.id for h in rendered_hits}
     overflow_hits = [h for h in scoped_result.hits if h.result.id not in rendered_ids]
-    payload["hits"] = [_scoped_hit_to_payload(h) for h in rendered_hits + overflow_hits]
+    payload["hits"] = [
+        _scoped_hit_to_payload(h, include_content=include_diagnostic_content) for h in rendered_hits + overflow_hits
+    ]
     payload["lines_used"] = len(rendered_hits)
     return ScopedRecallResult(rendered_context=rendered, recall_payload=payload)
 
