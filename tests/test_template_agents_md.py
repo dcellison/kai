@@ -8,9 +8,8 @@ into every freshly-seeded per-user copy on the next install.
 
 Coverage focus: the `## Reading Recalled Memory` section added for the
 anti-fabrication rule. The assertions pin the section's structure and the
-worked-example literals against the values `_SOURCE_SHORT` actually emits
-at render time, so a future regression that desyncs the example tags from
-production output fails this test before reaching review.
+typed record fields emitted at render time, so a future regression that
+desyncs the reading contract from production output fails before review.
 """
 
 from __future__ import annotations
@@ -93,26 +92,22 @@ def test_inference_example_hedge_present() -> None:
     assert "Memory doesn't state" in section, "inference worked example must include the `Memory doesn't state` hedge"
 
 
-def test_source_tag_literals_match_render_output() -> None:
-    """Worked examples use the source tags `_SOURCE_SHORT` actually emits.
-
-    `_SOURCE_SHORT` in `kai.memory` maps `extracted` -> `fact`,
-    `migration` -> `fact`, `episode` -> `episode`. The agent never sees
-    `extracted` in a row prefix. An earlier spec revision used
-    `, extracted)` in the worked examples, which broke the pattern-match
-    anchor the rule relies on; this test pins the corrected literals so
-    a future regression of the same class fails before reaching production.
-    """
+def test_typed_record_fields_match_render_output() -> None:
+    """The reading contract names the typed fields the renderer emits."""
     section = _extract_section()
-    assert ", fact)" in section, (
-        "citation/inference examples must use the `fact` source tag "
-        "(what `_SOURCE_SHORT['extracted']` and `_SOURCE_SHORT['migration']` "
-        "actually emit), not `extracted`"
-    )
-    assert ", episode," in section, (
-        "partial-match example must use the `episode, <quality>` source-tag "
-        "shape that `format_context` actually emits for episode rows"
-    )
+    for field in (
+        "content",
+        "source",
+        "speaker",
+        "confidence",
+        "scope",
+        "project_id",
+        "created_at",
+        "outcome_quality",
+    ):
+        assert f"`{field}`" in section, f"typed memory field {field!r} missing"
+    assert "JSON Lines" in section
+    assert "randomized outer boundary" in section
 
 
 def test_no_em_or_en_dashes_in_section() -> None:
