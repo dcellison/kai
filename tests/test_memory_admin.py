@@ -775,3 +775,64 @@ class TestReportDirectoryFallback:
         )
 
         assert result == tmp_path / "data" / "home" / "42" / "docs" / "reclassify"
+
+
+class TestRunAndCloseSessions:
+    """The exit-wedge fix: reclassify entrypoints open the session DB
+    (via load_project_registry) and aiosqlite's per-connection worker
+    thread is non-daemon, so a CLI process that never closes the
+    connection hangs forever at interpreter shutdown. The wrapper
+    closes at the process-lifetime boundary, inside the loop that
+    opened it."""
+
+    @pytest.mark.asyncio
+    async def test_returns_result_and_closes(self, monkeypatch):
+        closed = []
+
+        async def fake_close():
+            closed.append(True)
+
+        monkeypatch.setattr("kai.sessions.close_db", fake_close)
+
+        async def entrypoint():
+            return 7
+
+        assert await memory_admin._run_and_close_sessions(entrypoint()) == 7
+        assert closed == [True]
+
+    @pytest.mark.asyncio
+    async def test_closes_even_when_entrypoint_raises(self, monkeypatch):
+        closed = []
+
+        async def fake_close():
+            closed.append(True)
+
+        monkeypatch.setattr("kai.sessions.close_db", fake_close)
+
+        async def entrypoint():
+            raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await memory_admin._run_and_close_sessions(entrypoint())
+        assert closed == [True]
+
+    def test_dry_run_dispatch_closes_sessions(self, monkeypatch):
+        """The dry-run dispatch site actually routes through the
+        wrapper: a stubbed run_dry_run must be followed by close_db
+        before the command returns."""
+        order = []
+
+        async def fake_dry_run(*args, **kwargs):
+            order.append("run")
+            return 0
+
+        async def fake_close():
+            order.append("close")
+
+        monkeypatch.setattr("kai.memory_reclassify.run_dry_run", fake_dry_run)
+        monkeypatch.setattr("kai.sessions.close_db", fake_close)
+        monkeypatch.setattr(memory_admin, "_initialize_memory", lambda: SimpleNamespace(session_db_path="x"))
+
+        args = memory_admin._build_parser().parse_args(["reclassify-scope", "100", "--out-dir", "/tmp/x"])
+        assert memory_admin._cmd_reclassify(args) == 0
+        assert order == ["run", "close"]
