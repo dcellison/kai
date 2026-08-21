@@ -956,10 +956,45 @@ def _memory_result_has_owner(
     result: MemoryResult,
     namespace: _CanonicalMemoryNamespace | None,
 ) -> bool:
+    """Strict four-key provenance match (principal, channel, agent,
+    runtime profile). Used ONLY by `_memory_owner_state` to classify
+    rows during authority migration, where exact-vs-sibling matters.
+    Read and delete paths use `_memory_result_belongs_to_principal`
+    instead; see that function for the ownership model decision."""
     if namespace is None:
         return True
     expected = _owner_metadata(namespace)
     return all(result.metadata.get(key) == value for key, value in expected.items())
+
+
+def _memory_result_belongs_to_principal(
+    result: MemoryResult,
+    namespace: _CanonicalMemoryNamespace | None,
+) -> bool:
+    """Ownership predicate for reads and deletes: principal id only.
+
+    DECISION (audit follow-up): semantic memory is PER-PRINCIPAL,
+    not per-profile. Storage has always been namespaced on the
+    principal alone, and the memory is about the person, not the
+    transport they used: a fact learned through one runtime profile
+    must be recallable through the principal's other profiles.
+    The previous filter required equality on all four owner keys,
+    so a principal with two profiles read back only the subset its
+    current profile had written; the rest was silently invisible.
+
+    Channel, agent, and runtime profile remain STAMPED on every
+    row (`_owner_metadata`) as provenance, and the strict four-key
+    check above still guards authority migration; they are simply
+    no longer part of the ownership test. Rows with no principal
+    stamp, or a different principal's stamp, stay invisible exactly
+    as before.
+
+    `delete_all` applies this same predicate, so what a caller can
+    see and what a caller can wipe coincide by construction.
+    """
+    if namespace is None:
+        return True
+    return result.metadata.get(WORKSHOP_PRINCIPAL_ID_KEY) == str(namespace.principal_id)
 
 
 def _memory_owner_state(
@@ -1893,7 +1928,11 @@ def search(query: str, *, user_id: str, limit: int | None = None) -> list[Memory
         )
         # Mem0 v2.0.0 wraps results in {"results": [...]}
         raw_results = result.get("results", []) if isinstance(result, dict) else result
-        return [wrapped for raw in raw_results if _memory_result_has_owner((wrapped := _wrap_result(raw)), namespace)]
+        return [
+            wrapped
+            for raw in raw_results
+            if _memory_result_belongs_to_principal((wrapped := _wrap_result(raw)), namespace)
+        ]
     except Exception:
         log.warning("Memory search failed", exc_info=True)
         return []
@@ -2833,7 +2872,7 @@ def count_by_source(user_id: str, source: str) -> int:
     count = 0
     for row in rows:
         if namespace is not None and (
-            not isinstance(row, dict) or not _memory_result_has_owner(_wrap_result(row), namespace)
+            not isinstance(row, dict) or not _memory_result_belongs_to_principal(_wrap_result(row), namespace)
         ):
             continue
         row_source = row.get("metadata", {}).get("source") if isinstance(row, dict) else None
@@ -2935,7 +2974,7 @@ async def delete_by_source(user_id: str, source: str) -> int:
         matches: list[dict] = []
         for row in rows:
             if namespace is not None and (
-                not isinstance(row, dict) or not _memory_result_has_owner(_wrap_result(row), namespace)
+                not isinstance(row, dict) or not _memory_result_belongs_to_principal(_wrap_result(row), namespace)
             ):
                 continue
             row_source = row.get("metadata", {}).get("source") if isinstance(row, dict) else None
@@ -3120,7 +3159,11 @@ def get_all(*, user_id: str, limit: int | None = 1000) -> list[MemoryResult]:
     try:
         result = _memory.get_all(filters={"user_id": storage_user_id}, top_k=effective_top_k)
         raw_results = result.get("results", []) if isinstance(result, dict) else result
-        return [wrapped for raw in raw_results if _memory_result_has_owner((wrapped := _wrap_result(raw)), namespace)]
+        return [
+            wrapped
+            for raw in raw_results
+            if _memory_result_belongs_to_principal((wrapped := _wrap_result(raw)), namespace)
+        ]
     except Exception:
         log.warning("Memory get_all failed", exc_info=True)
         return []
@@ -3518,7 +3561,7 @@ def get_by_id(*, user_id: str, memory_id: str) -> MemoryResult | None:
         return None
 
     result = _wrap_result(row)
-    return result if _memory_result_has_owner(result, namespace) else None
+    return result if _memory_result_belongs_to_principal(result, namespace) else None
 
 
 def delete_by_id(*, user_id: str, memory_id: str) -> bool:
@@ -3624,17 +3667,46 @@ def update_metadata(*, user_id: str, memory_id: str, data: str, metadata: dict[s
 
 def delete_all(*, user_id: str) -> None:
     """
-    Delete all memories for a user.
+    Delete every memory the caller can see.
 
     No-op if disabled. Used for the future /memory forget all
     command and for testing.
+
+    Applies `_memory_result_belongs_to_principal`, the same owner
+    filter every read path uses, via per-row deletes instead of
+    Mem0's namespace-wide `delete_all`. The namespace-wide call
+    deleted rows the read filter refuses to show (unowned or
+    foreign-stamped rows sharing the storage namespace), so what a
+    caller could see and what a caller could wipe did not coincide.
+    Per-row deletes also record one DELETE per row in the history
+    DB, which the bulk call bypasses.
+
+    Paged like `delete_by_source`: fetch a page, delete the matches,
+    refetch; stop when a page yields no matches. Non-matching rows
+    are exactly the rows reads hide, and they are left in place.
     """
     if _memory is None:
         return
 
-    storage_user_id, _ = _canonical_memory_owner(user_id)
+    storage_user_id, namespace = _canonical_memory_owner(user_id)
     try:
-        _memory.delete_all(user_id=storage_user_id)
+        while True:
+            result = _memory.get_all(
+                filters={"user_id": storage_user_id},
+                top_k=_DELETE_PAGE_SIZE,
+            )
+            rows = result.get("results", []) if isinstance(result, dict) else result or []
+            matching_ids = [
+                row["id"]
+                for row in rows
+                if isinstance(row, dict)
+                and row.get("id")
+                and _memory_result_belongs_to_principal(_wrap_result(row), namespace)
+            ]
+            if not matching_ids:
+                break
+            for memory_id in matching_ids:
+                _memory.delete(memory_id=memory_id)
     except Exception:
         log.warning("Memory delete_all failed", exc_info=True)
 
