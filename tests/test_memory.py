@@ -1851,16 +1851,29 @@ class TestDeleteAll:
         # Should not raise
         delete_all(user_id="123")
 
-    def test_delete_all_calls_mem0(self):
-        """delete_all() delegates to Mem0's delete_all."""
+    def test_delete_all_deletes_per_row_not_namespace_wide(self):
+        """delete_all() enumerates and deletes row by row through the
+        read-side owner filter instead of delegating to Mem0's
+        namespace-wide delete_all. The bulk call wiped rows the read
+        filter refuses to show, and it bypassed the history DB's
+        per-row DELETE audit trail."""
         import kai.memory as mem_mod
         from kai.memory import delete_all
 
         mock_mem = MagicMock()
+        mock_mem.get_all.side_effect = [
+            {"results": [{"id": "row-1", "memory": "a"}, {"id": "row-2", "memory": "b"}]},
+            {"results": []},
+        ]
         mem_mod._memory = mock_mem
 
         delete_all(user_id="user-abc")
-        mock_mem.delete_all.assert_called_once_with(user_id="user-abc")
+
+        mock_mem.delete_all.assert_not_called()
+        assert [c.kwargs["memory_id"] for c in mock_mem.delete.call_args_list] == [
+            "row-1",
+            "row-2",
+        ]
 
 
 class TestDeleteBySource:
@@ -3841,6 +3854,71 @@ class TestGetAllFacts:
         assert mock_mem.get_all.call_args.kwargs["top_k"] >= 100_000
 
 
+class TestPrincipalOwnershipPredicate:
+    """Unit pins for `_memory_result_belongs_to_principal`, the
+    ownership-model decision (per-principal, not per-profile). A
+    regression back to four-key equality re-opens the audit finding:
+    sibling-profile rows silently invisible on read."""
+
+    @staticmethod
+    def _namespace(principal_id=None, config_id: int = 1):
+        from kai.workshop.domain import AgentId, ChannelId, PrincipalId, RuntimeProfileId
+        from kai.workshop.execution_state import WorkshopExecutionStateNamespace
+
+        return WorkshopExecutionStateNamespace(
+            principal_id=principal_id or PrincipalId.new(),
+            channel_id=ChannelId.new(),
+            agent_id=AgentId.new(),
+            runtime_profile_id=RuntimeProfileId.new(),
+            runtime_config_id=config_id,
+        )
+
+    @staticmethod
+    def _row(metadata: dict):
+        from kai.memory import MemoryResult
+
+        return MemoryResult(
+            id="m1",
+            text="t",
+            score=0.9,
+            memory_type="fact",
+            metadata=metadata,
+            created_at="",
+        )
+
+    def test_sibling_profile_row_is_visible(self):
+        """The audit case: a row stamped by profile A must satisfy
+        the predicate for profile B of the same principal. Only the
+        principal key decides ownership; channel, agent, and profile
+        are provenance."""
+        from kai.memory import _memory_result_belongs_to_principal, _owner_metadata
+
+        profile_a = self._namespace()
+        profile_b = self._namespace(principal_id=profile_a.principal_id, config_id=2)
+        row = self._row(dict(_owner_metadata(profile_a)))
+        assert _memory_result_belongs_to_principal(row, profile_b)
+
+    def test_foreign_principal_row_is_hidden(self):
+        from kai.memory import _memory_result_belongs_to_principal, _owner_metadata
+
+        row = self._row(dict(_owner_metadata(self._namespace())))
+        assert not _memory_result_belongs_to_principal(row, self._namespace())
+
+    def test_unstamped_row_is_hidden(self):
+        """Rows without a workshop stamp stay invisible under a
+        canonical namespace, matching the old filter."""
+        from kai.memory import _memory_result_belongs_to_principal
+
+        assert not _memory_result_belongs_to_principal(self._row({}), self._namespace())
+
+    def test_no_namespace_passes_everything(self):
+        """Callers with no authority registry (namespace None) keep
+        unfiltered reads, matching the old filter."""
+        from kai.memory import _memory_result_belongs_to_principal
+
+        assert _memory_result_belongs_to_principal(self._row({}), None)
+
+
 # ── Integration tests (real Mem0 + Qdrant, slower) ──────────────────
 
 
@@ -4029,6 +4107,78 @@ class TestMemoryIntegration:
         finally:
             mem_mod.configure_memory_authority(None)
             real_memory_instance.delete_all(user_id=legacy_user_id)
+            real_memory_instance.delete_all(user_id=canonical_user_id)
+
+    def test_two_profile_principal_reads_and_wipes_the_same_rows(self, real_memory_instance):
+        """The audit's two-profile fixture, end to end. Storage is
+        namespaced on the principal; a fact written through profile
+        A must be readable through profile B of the same principal
+        (the old four-key filter hid it), and delete_all through
+        either profile must wipe exactly what reads show: the
+        principal's rows, never a foreign-stamped row sharing the
+        storage namespace."""
+        import kai.memory as mem_mod
+        from kai.workshop.domain import AgentId, ChannelId, PrincipalId, RuntimeProfileId
+        from kai.workshop.execution_state import (
+            WorkshopExecutionStateNamespace,
+            WorkshopExecutionStateRegistry,
+        )
+
+        principal = PrincipalId.new()
+
+        def profile(config_id: int) -> WorkshopExecutionStateNamespace:
+            return WorkshopExecutionStateNamespace(
+                principal_id=principal,
+                channel_id=ChannelId.new(),
+                agent_id=AgentId.new(),
+                runtime_profile_id=RuntimeProfileId.new(),
+                runtime_config_id=config_id,
+            )
+
+        profile_a, profile_b = profile(910001), profile(910002)
+        canonical_user_id = str(principal)
+        foreign = WorkshopExecutionStateNamespace(
+            principal_id=PrincipalId.new(),
+            channel_id=ChannelId.new(),
+            agent_id=AgentId.new(),
+            runtime_profile_id=RuntimeProfileId.new(),
+            runtime_config_id=910003,
+        )
+
+        mem_mod._memory = real_memory_instance
+        mem_mod._config = _make_config()
+        real_memory_instance.delete_all(user_id=canonical_user_id)
+
+        try:
+            mem_mod.configure_memory_authority(WorkshopExecutionStateRegistry((profile_a, profile_b)))
+            memory_id = mem_mod.add_structured(
+                "User prefers dark roast coffee",
+                user_id=str(profile_a.runtime_config_id),
+                memory_type="fact",
+            )
+            assert memory_id is not None
+            # A foreign-stamped row planted in the SAME storage
+            # namespace: the trap the audit named. Reads must hide
+            # it and delete_all must leave it.
+            real_memory_instance.add(
+                "Foreign principal's fact",
+                user_id=canonical_user_id,
+                infer=False,
+                metadata=dict(mem_mod._owner_metadata(foreign)),
+            )
+
+            # Read through the OTHER profile: visible.
+            visible = mem_mod.get_all(user_id=str(profile_b.runtime_config_id))
+            assert [item.id for item in visible] == [memory_id]
+
+            # Wipe through the other profile: the principal's row
+            # goes, the foreign-stamped row stays.
+            mem_mod.delete_all(user_id=str(profile_b.runtime_config_id))
+            assert mem_mod.get_all(user_id=str(profile_a.runtime_config_id)) == []
+            leftover = mem_mod._get_all_raw(user_id=canonical_user_id)
+            assert [row.text for row in leftover] == ["Foreign principal's fact"]
+        finally:
+            mem_mod.configure_memory_authority(None)
             real_memory_instance.delete_all(user_id=canonical_user_id)
 
     async def test_format_context_integration(self, real_memory_instance):
