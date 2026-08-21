@@ -146,6 +146,7 @@ _SERVICE_START_RETRY_SECONDS = 2
 _PRIVATE_USER_ROOT_MODE = 0o711
 _PRIVATE_USER_DIR_MODE = 0o700
 _PRIVATE_USER_FILE_MODE = 0o600
+_SERVICE_LOG_NAMES = ("kai.log", "kai.stdout.log", "kai.stderr.log")
 _OPTIONAL_PROTECTED_YAML_CONFIGS: tuple[str, ...] = (
     "services.yaml",
     "workspaces.yaml",
@@ -2945,6 +2946,66 @@ def _set_private_user_tree_modes(path: Path) -> None:
         os.chmod(path, _PRIVATE_USER_FILE_MODE)
 
 
+def _secure_log_storage(
+    log_dir: Path,
+    svc_uid: int,
+    svc_gid: int,
+    *,
+    dry_run: bool,
+) -> None:
+    """Create or repair service-private log storage without following links."""
+    if log_dir.is_symlink():
+        raise ValueError(f"Refusing symlinked log directory: {log_dir}")
+    if log_dir.exists() and not log_dir.is_dir():
+        raise ValueError(f"Log path is not a directory: {log_dir}")
+
+    if log_dir.exists():
+        for root, dirs, files in os.walk(log_dir, followlinks=False):
+            root_path = Path(root)
+            for name in (*dirs, *files):
+                entry = root_path / name
+                entry_stat = entry.lstat()
+                if stat.S_ISLNK(entry_stat.st_mode):
+                    raise ValueError(f"Refusing symlink in log directory: {entry}")
+                if not (stat.S_ISDIR(entry_stat.st_mode) or stat.S_ISREG(entry_stat.st_mode)):
+                    raise ValueError(f"Refusing non-file log entry: {entry}")
+
+    if dry_run:
+        print(f"[DRY RUN] Would secure log storage: {log_dir} ({svc_uid}:{svc_gid}, directories 0700, files 0600)")
+        return
+
+    log_dir.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_DIR_MODE)
+    os.chmod(log_dir, _PRIVATE_USER_DIR_MODE)
+    os.chown(log_dir, svc_uid, svc_gid)
+
+    for root, dirs, files in os.walk(log_dir, followlinks=False):
+        root_path = Path(root)
+        os.chmod(root_path, _PRIVATE_USER_DIR_MODE)
+        os.chown(root_path, svc_uid, svc_gid)
+        for name in dirs:
+            child = root_path / name
+            os.chmod(child, _PRIVATE_USER_DIR_MODE)
+            os.chown(child, svc_uid, svc_gid)
+        for name in files:
+            child = root_path / name
+            os.chmod(child, _PRIVATE_USER_FILE_MODE)
+            os.chown(child, svc_uid, svc_gid)
+
+    # launchd opens stdout/stderr before Python starts. Pre-creating all
+    # service logs at 0600 makes those opens preserve the same contract as
+    # the rotating application log.
+    open_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    open_flags |= getattr(os, "O_NOFOLLOW", 0)
+    for name in _SERVICE_LOG_NAMES:
+        path = log_dir / name
+        if path.is_symlink():
+            raise ValueError(f"Refusing symlinked service log: {path}")
+        descriptor = os.open(path, open_flags, _PRIVATE_USER_FILE_MODE)
+        os.close(descriptor)
+        os.chmod(path, _PRIVATE_USER_FILE_MODE)
+        os.chown(path, svc_uid, svc_gid)
+
+
 def _set_static_install_tree_modes(path: Path) -> bool:
     """Make root-owned installed code traversable and readable by the service.
 
@@ -4993,6 +5054,8 @@ def _apply_migrate(
                 # Set ownership on the entire logs directory
                 _set_ownership(logs_dst, svc_uid, svc_gid, recursive=True)
 
+    _secure_log_storage(logs_dst, svc_uid, svc_gid, dry_run=dry_run)
+
     # -- MEMORY.md migration --
     # One-time: land personal memory at the per-user path
     # DATA_DIR/memory/<principal_id>/MEMORY.md. The "primary operator"
@@ -6203,7 +6266,7 @@ def _apply_directories(
         (install_path, 0, 0, 0o755),  # root-owned install dir
         (home_path, svc_uid, svc_gid, 0o755),  # user-writable home workspace
         (data_path, svc_uid, svc_gid, 0o755),  # user-owned data dir
-        (data_path / "logs", svc_uid, svc_gid, 0o755),
+        (data_path / "logs", svc_uid, svc_gid, _PRIVATE_USER_DIR_MODE),
         (data_path / "files", svc_uid, svc_gid, _PRIVATE_USER_ROOT_MODE),
         (data_path / "history", svc_uid, svc_gid, _PRIVATE_USER_ROOT_MODE),
         (data_path / "memory", svc_uid, svc_gid, _PRIVATE_USER_ROOT_MODE),
@@ -7930,6 +7993,66 @@ def _check_path(path: Path, label: str) -> str:
     return f"{label}: {path} (exists, {owner}:{group})"
 
 
+def _log_security_status(log_dir: Path, service_user: str) -> str:
+    """Report log ownership and modes without reading names or content."""
+    try:
+        service = pwd.getpwnam(service_user)
+    except KeyError:
+        return f"Log security: unavailable; service user {service_user!r} not found"
+
+    try:
+        root_stat = log_dir.lstat()
+        if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+            return "Log security: INSECURE; log root is not a real directory"
+
+        unsafe_modes = 0
+        unsafe_owners = 0
+        unsafe_types = 0
+        directory_count = 1
+        file_count = 0
+
+        if stat.S_IMODE(root_stat.st_mode) != _PRIVATE_USER_DIR_MODE:
+            unsafe_modes += 1
+        if (root_stat.st_uid, root_stat.st_gid) != (service.pw_uid, service.pw_gid):
+            unsafe_owners += 1
+
+        for root, dirs, files in os.walk(log_dir, followlinks=False):
+            root_path = Path(root)
+            for name in dirs:
+                directory_count += 1
+                entry_stat = (root_path / name).lstat()
+                if stat.S_ISLNK(entry_stat.st_mode) or not stat.S_ISDIR(entry_stat.st_mode):
+                    unsafe_types += 1
+                    continue
+                if stat.S_IMODE(entry_stat.st_mode) != _PRIVATE_USER_DIR_MODE:
+                    unsafe_modes += 1
+                if (entry_stat.st_uid, entry_stat.st_gid) != (service.pw_uid, service.pw_gid):
+                    unsafe_owners += 1
+            for name in files:
+                file_count += 1
+                entry_stat = (root_path / name).lstat()
+                if stat.S_ISLNK(entry_stat.st_mode) or not stat.S_ISREG(entry_stat.st_mode):
+                    unsafe_types += 1
+                    continue
+                if stat.S_IMODE(entry_stat.st_mode) != _PRIVATE_USER_FILE_MODE:
+                    unsafe_modes += 1
+                if (entry_stat.st_uid, entry_stat.st_gid) != (service.pw_uid, service.pw_gid):
+                    unsafe_owners += 1
+    except FileNotFoundError:
+        return f"Log security: {log_dir} (not found)"
+    except PermissionError:
+        return f"Log security: {log_dir} (permission denied; run status with sudo)"
+
+    summary = f"directories={directory_count}, files={file_count}"
+    if unsafe_modes or unsafe_owners or unsafe_types:
+        return (
+            "Log security: INSECURE; "
+            f"{summary}, unsafe modes={unsafe_modes}, "
+            f"unsafe owners={unsafe_owners}, unsafe entries={unsafe_types}"
+        )
+    return f"Log security: secure; {summary}, service-owned, directories=0700, files=0600"
+
+
 def _check_traversal(path: Path, service_user: str) -> str | None:
     """
     Check if every component of path is traversable by the service user.
@@ -8043,6 +8166,7 @@ def _cmd_status() -> None:
     print("=" * 30)
     print(_check_path(Path(install_dir), "Installation"))
     print(_check_path(Path(data_dir), "Data"))
+    print(_log_security_status(Path(data_dir) / "logs", service_user))
     print(_check_path(_DEPLOYED_ENV_FILE, "Secrets"))
     print(_check_path(Path("/etc/kai/services.yaml"), "Services"))
     print(_check_path(RUNTIME_PROFILES_YAML, "Runtime profiles"))

@@ -618,10 +618,10 @@ class TestStage2Isolation:
         assert len(records) == 1
         payload = json.loads(records[0].message[len("memory.episode ") :])
         assert payload["outcome"] == "subprocess_error"
-        # The subtype detail survives in the reason field so operators
-        # can distinguish failure classes.
-        assert payload["reason"] is not None
-        assert "error_during_execution" in payload["reason"]
+        # Provider-controlled subtype text may echo prompt content, so
+        # production telemetry retains only the content-free class.
+        assert payload["reason"] == "is_error"
+        assert "error_during_execution" not in records[0].message
 
     @pytest.mark.asyncio
     async def test_stage2_unexpected_exception_caught(self, monkeypatch, caplog):
@@ -1193,11 +1193,8 @@ class TestRunEpisodeExtractorViaReasoner:
         assert reason == "timeout"
 
     @pytest.mark.asyncio
-    async def test_subprocess_error_preserves_exit_reason_format(self):
-        """OneShotSubprocessError must carry returncode and stderr; the
-        stage-2 mapping recomposes them into the `exit_<code>: <stderr>`
-        reason format that telemetry has used since the original
-        subprocess path."""
+    async def test_subprocess_error_reason_omits_stderr_content(self):
+        """Stage-2 telemetry keeps the exit code but not provider output."""
         from kai.oneshot import OneShotSubprocessError
 
         class _FailingReasoner:
@@ -1214,9 +1211,8 @@ class TestRunEpisodeExtractorViaReasoner:
             )
 
         assert episode is None
-        assert reason is not None
-        assert reason.startswith("exit_2: ")
-        assert "oauth refused" in reason
+        assert reason == "exit_2"
+        assert "oauth refused" not in reason
 
 
 class TestRunEpisodeExtractorWithCodexEnvelope:

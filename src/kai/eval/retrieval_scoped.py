@@ -651,6 +651,7 @@ async def _run_one_probe(
         backend_name=None,
         job_type="eval",
         session_id=None,
+        include_diagnostic_content=True,
     )
     payload = rendered.recall_payload
     payload_hits = payload.get("hits") or []

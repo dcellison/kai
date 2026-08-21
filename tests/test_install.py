@@ -58,6 +58,7 @@ from kai.install import (
     _generate_sudoers,
     _generate_systemd_unit,
     _generate_users_yaml,
+    _log_security_status,
     _migrate_identity_to_claude_md,
     _migrate_managed_home_database_paths,
     _optional_file_checksum,
@@ -73,6 +74,7 @@ from kai.install import (
     _runtime_storage_targets,
     _secure_codex_turn_image_staging,
     _secure_history_directories,
+    _secure_log_storage,
     _secure_upload_directories,
     _set_ownership,
     _set_static_install_tree_modes,
@@ -5043,6 +5045,66 @@ class TestCmdStatus:
 
 
 # ── Venv creation ────────────────────────────────────────────────────
+
+
+class TestLogStorageSecurity:
+    def test_repairs_existing_tree_and_precreates_service_logs(self, tmp_path, monkeypatch):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(mode=0o755)
+        rotated = log_dir / "kai.log.2026-08-20"
+        rotated.write_text("private recalled memory")
+        rotated.chmod(0o644)
+        monkeypatch.setattr("kai.install.os.chown", lambda *args: None)
+
+        _secure_log_storage(log_dir, 503, 20, dry_run=False)
+
+        assert stat.S_IMODE(log_dir.stat().st_mode) == 0o700
+        assert stat.S_IMODE(rotated.stat().st_mode) == 0o600
+        for name in ("kai.log", "kai.stdout.log", "kai.stderr.log"):
+            assert stat.S_IMODE((log_dir / name).stat().st_mode) == 0o600
+
+    def test_dry_run_reports_policy_without_reading_content(self, tmp_path, capsys):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        log_file = log_dir / "kai.log"
+        log_file.write_text("SECRET MEMORY TEXT")
+        log_file.chmod(0o644)
+
+        _secure_log_storage(log_dir, 503, 20, dry_run=True)
+
+        output = capsys.readouterr().out
+        assert "directories 0700, files 0600" in output
+        assert "SECRET MEMORY TEXT" not in output
+        assert stat.S_IMODE(log_file.stat().st_mode) == 0o644
+
+    def test_rejects_symlink_in_log_tree(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        target = tmp_path / "outside"
+        target.write_text("outside")
+        (log_dir / "kai.log").symlink_to(target)
+
+        with pytest.raises(ValueError, match="Refusing symlink"):
+            _secure_log_storage(log_dir, 503, 20, dry_run=False)
+
+    def test_status_reports_secure_and_insecure_modes(self, tmp_path, monkeypatch):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(mode=0o700)
+        log_file = log_dir / "kai.log"
+        log_file.write_text("SECRET MEMORY TEXT")
+        log_file.chmod(0o600)
+        owner = log_dir.stat()
+        account = MagicMock(pw_uid=owner.st_uid, pw_gid=owner.st_gid)
+        monkeypatch.setattr("kai.install.pwd.getpwnam", lambda _name: account)
+
+        secure = _log_security_status(log_dir, "kai")
+        assert "Log security: secure" in secure
+        assert "SECRET MEMORY TEXT" not in secure
+
+        log_file.chmod(0o644)
+        insecure = _log_security_status(log_dir, "kai")
+        assert "Log security: INSECURE" in insecure
+        assert "unsafe modes=1" in insecure
 
 
 class TestApplyVenv:

@@ -5096,11 +5096,7 @@ class TestProvenanceStamping:
 
 
 class TestSubprocessFailureCaptureAlarm:
-    """Stage 1's OneShotSubprocessError handler must log the stdout
-    tail (codex exec --json reports its failure cause there, not on
-    stderr) and must escalate to one ERROR-level line when consecutive
-    failures cross the streak threshold, since observed bursts are
-    sustained conditions during which every turn's facts are lost."""
+    """Stage 1 failures retain useful counters without provider content."""
 
     @staticmethod
     def _failing_reasoner(stdout: bytes = b"", stderr: bytes = b"banner"):
@@ -5136,7 +5132,7 @@ class TestSubprocessFailureCaptureAlarm:
             )
 
     @pytest.mark.asyncio
-    async def test_warning_includes_stdout_tail(self, caplog, monkeypatch):
+    async def test_warning_omits_stdout_and_stderr_content(self, caplog, monkeypatch):
         monkeypatch.setattr(memory_extraction, "_consecutive_subprocess_failures", 0)
         stdout = b'{"type":"turn.failed","error":{"message":"usage limit reached"}}'
 
@@ -5147,8 +5143,47 @@ class TestSubprocessFailureCaptureAlarm:
             r for r in caplog.records if "subprocess exited" in r.message or "subprocess exited" in r.getMessage()
         ]
         rendered = warning.getMessage()
-        assert "usage limit reached" in rendered
-        assert "banner" in rendered
+        assert "usage limit reached" not in rendered
+        assert "banner" not in rendered
+        assert "stdout_bytes=" in rendered
+        assert "stderr_bytes=6" in rendered
+
+    @pytest.mark.asyncio
+    async def test_invalid_output_log_omits_provider_content(self, caplog, monkeypatch):
+        monkeypatch.setattr(memory_extraction, "_consecutive_subprocess_failures", 0)
+
+        class _InvalidReasoner:
+            async def run(self, **kwargs):
+                return type("Result", (), {"text": "SECRET USER CONTENT not-json"})()
+
+        with caplog.at_level(logging.WARNING, logger="kai.memory_extraction"):
+            await self._run(_InvalidReasoner())
+
+        assert "invalid JSON" in caplog.text
+        assert "SECRET USER CONTENT" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_episode_failure_reason_omits_stderr_content(self):
+        from kai.oneshot import OneShotSubprocessError
+
+        class _Failing:
+            async def run(self, **kwargs):
+                raise OneShotSubprocessError(
+                    returncode=9,
+                    stderr=b"SECRET USER CONTENT",
+                )
+
+        with patch("kai.memory_extraction._build_memory_reasoner", return_value=_Failing()):
+            episode, reason = await memory_extraction._run_episode_extractor(
+                payload_text="payload",
+                config=_cfg(),
+                user_id="u1",
+                effective_backend="codex",
+                effective_provider="openai",
+            )
+
+        assert episode is None
+        assert reason == "exit_9"
 
     @pytest.mark.asyncio
     async def test_alarm_fires_at_threshold_crossing_only(self, caplog, monkeypatch):

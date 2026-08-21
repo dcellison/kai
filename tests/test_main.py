@@ -11,6 +11,8 @@ coverage for that path now lives in tests/test_backend.py.
 
 import asyncio
 import logging
+import os
+import stat
 from datetime import UTC, datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
@@ -129,6 +131,49 @@ class TestSetupLogging:
         with patch("kai.main.DATA_DIR", tmp_path):
             setup_logging()
         assert (tmp_path / "logs").is_dir()
+        assert stat.S_IMODE((tmp_path / "logs").stat().st_mode) == 0o700
+
+    def test_repairs_existing_log_file_modes(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(mode=0o755)
+        old_log = log_dir / "kai.log.older"
+        old_log.write_text("private memory text")
+        old_log.chmod(0o644)
+
+        with patch("kai.main.DATA_DIR", tmp_path):
+            setup_logging()
+
+        assert stat.S_IMODE(log_dir.stat().st_mode) == 0o700
+        assert stat.S_IMODE(old_log.stat().st_mode) == 0o600
+        assert stat.S_IMODE((log_dir / "kai.log").stat().st_mode) == 0o600
+
+    def test_rotation_keeps_every_log_private(self, tmp_path):
+        with patch("kai.main.DATA_DIR", tmp_path):
+            setup_logging()
+
+        handler = next(h for h in logging.getLogger().handlers if isinstance(h, TimedRotatingFileHandler))
+        handler.doRollover()
+        handler.emit(logging.LogRecord("test", logging.INFO, __file__, 1, "after", (), None))
+
+        log_files = list((tmp_path / "logs").iterdir())
+        assert len(log_files) >= 2
+        assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in log_files)
+
+    def test_rejects_symlinked_log_entries(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        target = tmp_path / "outside.log"
+        target.write_text("outside")
+        os.symlink(target, log_dir / "kai.log.older")
+
+        with (
+            patch("kai.main.DATA_DIR", tmp_path),
+            pytest.raises(
+                RuntimeError,
+                match="Refusing symlink",
+            ),
+        ):
+            setup_logging()
 
     def test_adds_file_handler(self, tmp_path):
         """Adds a TimedRotatingFileHandler to the root logger."""

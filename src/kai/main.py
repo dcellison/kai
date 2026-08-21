@@ -35,8 +35,10 @@ The shutdown sequence (in the finally block) reverses this order:
 
 import asyncio
 import logging
+import os
 import re
 import signal
+import stat
 from datetime import UTC, datetime, timedelta
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
@@ -50,6 +52,41 @@ from kai.memory_backup import run_memory_backup
 from kai.telegram_adapter import TelegramAdapter
 from kai.workshop.bootstrap import BootstrapHuman, BootstrapNotificationChannel
 from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
+
+
+class _PrivateTimedRotatingFileHandler(TimedRotatingFileHandler):
+    """Timed file handler whose active log is always service-private."""
+
+    def _open(self):
+        stream = super()._open()
+        os.chmod(self.baseFilename, 0o600)
+        return stream
+
+
+def _secure_runtime_log_tree(log_dir: Path) -> None:
+    """Create or repair Kai's log tree without following symlinks."""
+    if log_dir.is_symlink():
+        raise RuntimeError(f"Refusing symlinked log directory: {log_dir}")
+    log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not log_dir.is_dir():
+        raise RuntimeError(f"Log path is not a directory: {log_dir}")
+    os.chmod(log_dir, 0o700)
+
+    for root, dirs, files in os.walk(log_dir, followlinks=False):
+        root_path = Path(root)
+        for name in dirs:
+            child = root_path / name
+            if child.is_symlink():
+                raise RuntimeError(f"Refusing symlink in log directory: {child}")
+            os.chmod(child, 0o700)
+        for name in files:
+            child = root_path / name
+            child_stat = child.lstat()
+            if stat.S_ISLNK(child_stat.st_mode):
+                raise RuntimeError(f"Refusing symlink in log directory: {child}")
+            if not stat.S_ISREG(child_stat.st_mode):
+                raise RuntimeError(f"Refusing non-regular log entry: {child}")
+            os.chmod(child, 0o600)
 
 
 async def _warn_if_compatibility_jobs_are_dormant(config) -> int:
@@ -123,17 +160,17 @@ def setup_logging() -> None:
     - StreamHandler: writes to stderr for terminal visibility during `make run`
       (harmless under launchd since there's no terminal attached)
 
-    Creates the logs/ directory if it doesn't already exist.
+    Creates or repairs the service-private logs/ tree before opening a file.
     """
     # Logs go under DATA_DIR so they're writable even when source is read-only
     log_dir = DATA_DIR / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    _secure_runtime_log_tree(log_dir)
 
     formatter = logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
 
     # Daily rotation at midnight, keep 2 weeks of history, use UTF-8 for
     # emoji and non-ASCII content in Claude responses
-    file_handler = TimedRotatingFileHandler(
+    file_handler = _PrivateTimedRotatingFileHandler(
         filename=log_dir / "kai.log",
         when="midnight",
         backupCount=14,
