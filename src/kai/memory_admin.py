@@ -376,6 +376,33 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+async def _run_and_close_sessions(coro):
+    """Await a reclassify entrypoint, then close the session DB.
+
+    `load_project_registry` (called by the dry-run and apply
+    entrypoints) opens the session DB the way daemon startup does,
+    and each aiosqlite connection runs a NON-DAEMON worker thread
+    that exits only when the connection is closed. The daemon closes
+    it in main.py's shutdown path; a CLI process has no shutdown
+    path, so the leaked worker thread pinned interpreter exit and
+    every reclassify invocation hung forever after finishing its
+    work. Closing here, at the process-lifetime boundary and inside
+    the same event loop that opened the connection (aiosqlite
+    futures are loop-bound, so a second asyncio.run cannot close
+    it), is what lets the process exit.
+
+    close_db() no-ops when nothing was opened, so wrapping the
+    rollback entrypoint (which never loads the registry) is safe
+    and keeps the three dispatch sites uniform.
+    """
+    from kai import sessions
+
+    try:
+        return await coro
+    finally:
+        await sessions.close_db()
+
+
 def _initialize_memory() -> Config | None:
     """Load config and call `init_memory()`; return the Config on success.
 
@@ -677,15 +704,17 @@ def _cmd_reclassify(args: argparse.Namespace) -> int:
 
     if not mutating:
         return asyncio.run(
-            memory_reclassify.run_dry_run(
-                config,
-                args.user_id,
-                backend=args.backend,
-                os_user=args.os_user,
-                provider=args.provider,
-                threshold=threshold,
-                sample=sample,
-                out_dir=out_dir,
+            _run_and_close_sessions(
+                memory_reclassify.run_dry_run(
+                    config,
+                    args.user_id,
+                    backend=args.backend,
+                    os_user=args.os_user,
+                    provider=args.provider,
+                    threshold=threshold,
+                    sample=sample,
+                    out_dir=out_dir,
+                )
             )
         )
 
@@ -717,9 +746,13 @@ def _cmd_reclassify(args: argparse.Namespace) -> int:
 
     if args.apply is not None:
         return asyncio.run(
-            memory_reclassify.run_apply(config, args.user_id, proposals_path=artifact_path, out_dir=out_dir)
+            _run_and_close_sessions(
+                memory_reclassify.run_apply(config, args.user_id, proposals_path=artifact_path, out_dir=out_dir)
+            )
         )
-    return asyncio.run(memory_reclassify.run_rollback(config, args.user_id, preimages_path=artifact_path))
+    return asyncio.run(
+        _run_and_close_sessions(memory_reclassify.run_rollback(config, args.user_id, preimages_path=artifact_path))
+    )
 
 
 def _cmd_backfill_provenance(args: argparse.Namespace) -> int:
