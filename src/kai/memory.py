@@ -375,12 +375,23 @@ SCOPE_GLOBAL = "global"
 SCOPE_PROJECT = "project"
 SCOPE_TASK = "task"
 
-# Frozenset of valid scope values used by the resolver and builder.
+# Frozenset of valid scope values used by the read-time resolver.
 # A row whose stored `scope` is outside this set is treated as
 # invalid-defaulted (not legacy-defaulted) so the audit boundary
 # between "row predates scope" and "row has corrupted scope" stays
 # visible to later reclassification passes.
 _VALID_SCOPES: frozenset[str] = frozenset({SCOPE_GLOBAL, SCOPE_PROJECT, SCOPE_TASK})
+
+# Scopes the write path may mint. Deliberately narrower than
+# `_VALID_SCOPES`: task retrieval semantics do not exist, and the
+# admission gate excludes task rows unconditionally, so minting one
+# would create a write-only row that no read path can ever surface.
+# `SCOPE_TASK` stays in `_VALID_SCOPES` so a stored task row (from
+# an older write or a foreign store) still resolves as a recognized
+# shape and is refused at admission, rather than being misfiled as
+# corrupted. If task retrieval ever ships, widen this set and remove
+# the admission exclusion together.
+_MINTABLE_SCOPES: frozenset[str] = frozenset({SCOPE_GLOBAL, SCOPE_PROJECT})
 
 # `legacy_default` and `invalid_default` are read-time resolver
 # outputs only; `build_scope_metadata` rejects them so no write path
@@ -1204,7 +1215,10 @@ def build_scope_metadata(
     `add_structured()` or `update_metadata()`.
 
     Validation rules (all raise `ValueError` on violation):
-    - `scope` must be one of `global`, `project`, or `task`.
+    - `scope` must be one of `global` or `project`. `task` is a
+      recognized stored shape but is not mintable: admission
+      excludes task rows unconditionally, so a task write would be
+      permanently unreadable.
     - `scope_source` must be one of `operator`, `classifier`, or
       `extraction_default`. The resolver-only values
       `legacy_default` and `invalid_default` are rejected so no
@@ -1220,9 +1234,8 @@ def build_scope_metadata(
       time.
 
     Args:
-        scope: Scope value (global/project/task).
-        project_id: Required for project scope; ignored for global;
-            optional for task.
+        scope: Scope value (global/project).
+        project_id: Required for project scope; ignored for global.
         workspace_root: Optional absolute workspace path; ignored
             for global.
         scope_confidence: Confidence in the scope assignment, in
@@ -1237,8 +1250,11 @@ def build_scope_metadata(
         ValueError: If any validation rule fails. The message names
             the offending field so callers can fix the input.
     """
-    if scope not in _VALID_SCOPES:
-        raise ValueError(f"build_scope_metadata: scope must be one of {sorted(_VALID_SCOPES)}, got {scope!r}")
+    if scope not in _MINTABLE_SCOPES:
+        raise ValueError(
+            f"build_scope_metadata: scope must be one of {sorted(_MINTABLE_SCOPES)}, got {scope!r} "
+            "(task is read-rejected at admission and therefore not mintable)"
+        )
     if scope_source not in _BUILDER_SCOPE_SOURCES:
         raise ValueError(
             "build_scope_metadata: scope_source must be one of "
@@ -1250,8 +1266,7 @@ def build_scope_metadata(
 
     # Global scope discards stray project/workspace values so the
     # write shape matches the resolver's read-time invariant. Project
-    # scope requires a non-empty id; task scope allows None because
-    # task rows that belong to no detected project are valid.
+    # scope requires a non-empty id.
     if scope == SCOPE_GLOBAL:
         project_id = None
         workspace_root = None
@@ -1312,7 +1327,9 @@ def _scoped_memory_admission_reason(
       this whole epic guards against.
     - scope=project with matching project_id: admit.
     - scope=task: exclude as `task_scope_not_supported`. Task
-      retrieval semantics do not exist yet.
+      retrieval semantics do not exist, and `build_scope_metadata`
+      refuses to mint task rows; this branch guards rows written
+      before that refusal or by a foreign store.
     - Any other scope value reaching this helper: exclude as
       `unknown_scope`. Defensive belt for future schema drift; in
       practice the resolver never emits a non-recognized scope.
