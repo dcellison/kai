@@ -965,25 +965,11 @@ class TestStage2SubprocessAssembly:
 
 
 class TestEpisodeRetrieval:
-    """Episodes surface in `format_context` under a distinct provenance
-    label, rendered as the Sophia "moderate relevance" form (goal +
-    outcome + outcome_quality inline). The remaining Sophia fields are
-    stored but not rendered inline in v1."""
-
-    def test_source_short_includes_episode(self):
-        """Per-line provenance label for episodes is the literal
-        "episode" string - distinguishes from facts' "fact" label and
-        legacy rows' "legacy" label in the injected context block."""
-        from kai.memory import _SOURCE_SHORT
-
-        assert _SOURCE_SHORT.get("episode") == "episode"
+    """Episodes surface as typed memory records with compact content."""
 
     @pytest.mark.asyncio
     async def test_format_context_renders_episode_moderate_relevance(self, monkeypatch):
-        """End-to-end: an episode row in the search response renders
-        as `- (YYYY-MM-DD, episode, <quality>) <goal>. Outcome:
-        <outcome>`. The remaining Sophia fields (context, approach,
-        lessons, tags, actors) are stored but not rendered inline."""
+        """An episode renders as one typed memory record."""
         import kai.memory as mem_mod
         from kai.memory import format_context
 
@@ -1014,12 +1000,16 @@ class TestEpisodeRetrieval:
 
         result = await format_context("memory slowness", user_id="u1")
 
-        assert "- (2026-04-23, episode, success)" in result
-        assert "Diagnose memory extraction slowness" in result
-        assert "Outcome: Cap reduced from 1000 to 500 chars" in result
+        record = next(json.loads(line) for line in result.splitlines() if line.startswith("{"))
+        assert record["created_at"] == "2026-04-23T10:00:00"
+        assert record["source"] == "episode"
+        assert record["outcome_quality"] == "success"
+        assert record["content"] == (
+            "Diagnose memory extraction slowness. Outcome: Cap reduced from 1000 to 500 chars; mean dropped to 17s"
+        )
         # The non-rendered Sophia fields stay in metadata; they must
-        # NOT leak into the rendered line.
-        assert "approach" not in result.lower()
+        # NOT leak into the rendered record.
+        assert "approach" not in record
 
     @pytest.mark.asyncio
     async def test_format_context_episode_missing_goal_falls_back(self, monkeypatch):
@@ -1048,8 +1038,11 @@ class TestEpisodeRetrieval:
 
         result = await format_context("anything", user_id="u1")
 
-        assert "Fallback first line" in result
-        assert "- (2026-04-23, episode, partial)" in result
+        record = next(json.loads(line) for line in result.splitlines() if line.startswith("{"))
+        assert record["content"] == "Fallback first line"
+        assert record["created_at"] == "2026-04-23T10:00:00"
+        assert record["source"] == "episode"
+        assert record["outcome_quality"] == "partial"
 
     @pytest.mark.asyncio
     async def test_format_context_episode_weighting_flows_through(self, monkeypatch):

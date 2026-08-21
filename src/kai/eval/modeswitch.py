@@ -93,9 +93,9 @@ class _InvariantResult:
 
 
 # Substring markers from `build_session_context` (the [Memory subsystem:
-# enabled/disabled] line) and from `memory.format_context` (the
-# [Relevant memories from past conversations ...] header). These are
-# the load-bearing strings the harness asserts on.
+# enabled/disabled] line) and from `memory.format_context` (the hardened
+# untrusted JSON Lines envelope). These are the load-bearing strings the
+# harness asserts on.
 #
 # `_MARKER_PERSISTENT_MEMORY` matches the `[Your persistent memory
 # (file: ...):]` block that build_session_context emits ONLY in
@@ -103,13 +103,14 @@ class _InvariantResult:
 # a full-line match so the test does not have to predict the
 # tmp-path part of the format string.
 #
-# `_MARKER_RELEVANT_MEMORIES` matches the recall-block header that
-# format_context emits when search returns non-empty after the
-# floor and budget filters. Same leading-substring approach.
+# `_MARKER_RELEVANT_MEMORIES` matches the recall block's randomized
+# boundary prefix. The generic JSON Lines label is shared with the
+# disabled-mode persistent-file block and therefore cannot distinguish
+# the two mode-switch surfaces.
 _MARKER_DISABLED = "[Memory subsystem: disabled]"
 _MARKER_ENABLED = "[Memory subsystem: enabled]"
 _MARKER_PERSISTENT_MEMORY = "[Your persistent memory (file:"
-_MARKER_RELEVANT_MEMORIES = "[Relevant memories from past conversations"
+_MARKER_RELEVANT_MEMORIES = "--- BEGIN MEMORY DATA "
 
 
 # Minimal MEMORY.md fixture used by the verify subcommand. A single

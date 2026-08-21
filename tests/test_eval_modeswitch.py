@@ -353,7 +353,7 @@ class TestRecallReasonField:
         # produced the recall-prefixed string. A miss here suggests
         # the floor was tuned above 0.95 or the budget was tightened
         # below the single-line cost.
-        assert result.startswith(_MARKER_RELEVANT_MEMORIES), f"expected recall-prefixed output; got {result[:80]!r}"
+        assert _MARKER_RELEVANT_MEMORIES in result, f"expected recall boundary; got {result[:80]!r}"
 
 
 # ── TestExtractionCallSiteGating ────────────────────────────────────
