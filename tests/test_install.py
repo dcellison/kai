@@ -5443,10 +5443,22 @@ class TestApplyVenv:
             "-m",
             "pip",
             "install",
+            "--upgrade",
+            "--constraint",
+            str(constraints),
+            "pip",
+            "setuptools",
+        ] in commands
+        assert [
+            str(install / "venv" / "bin" / "python"),
+            "-m",
+            "pip",
+            "install",
             "--constraint",
             str(constraints),
             f"{install}[memory,totp,tts]",
         ] in commands
+        assert "Updated constrained packaging tools" in output
         assert (install / ".constraints.sha256").read_text().strip() == _file_checksum(constraints)
 
     def test_dry_run_reports_constraints_change(self, tmp_path, monkeypatch, capsys):
@@ -7998,6 +8010,32 @@ class TestOptionalFileChecksum:
         path = tmp_path / "constraints.txt"
         path.write_text("aiohttp==3.13.4\n")
         assert _optional_file_checksum(path) == _file_checksum(path)
+
+
+class TestReviewedDependencyConstraints:
+    """Pin the security-reviewed packages shared by dev, CI, and install."""
+
+    def test_audit_remediations_remain_constrained(self):
+        constraints = {
+            line.strip()
+            for line in (kai.install.PROJECT_ROOT / "requirements" / "constraints.txt").read_text().splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+
+        assert {
+            "click==8.3.3",
+            "h2==4.4.1",
+            "idna==3.15",
+            "pip==26.2.1",
+            "pygments==2.20.0",
+            "pytest==9.0.3",
+            "python-dotenv==1.2.2",
+            "requests==2.33.0",
+            "setuptools==83.0.0",
+            "torch==2.13.0",
+            "tornado==6.5.7",
+            "urllib3==2.7.0",
+        } <= constraints
 
 
 # ── _retire_install_home_claude ──────────────────────────────────────

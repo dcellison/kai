@@ -26,6 +26,8 @@ audit-deps:
 	$(BIN)pip-audit --local --skip-editable
 
 check-install-constraints:
+	$(BIN)python -m pip install --dry-run --upgrade \
+		--constraint requirements/constraints.txt pip setuptools
 	$(BIN)python -m pip install --dry-run --constraint requirements/constraints.txt -e '.[memory,totp,tts]'
 
 module-sizes:
@@ -36,7 +38,10 @@ test:
 
 # Development environment setup (editable install with dev tools)
 setup:
-	$(BIN)pip install -e '.[dev]'
+	$(BIN)python -m pip install --upgrade \
+		--constraint requirements/constraints.txt pip setuptools
+	$(BIN)python -m pip install --upgrade \
+		--constraint requirements/constraints.txt -e '.[dev]'
 
 # Protected installation targets
 config:
