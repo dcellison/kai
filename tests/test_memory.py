@@ -4648,6 +4648,17 @@ class TestBuildScopeMetadata:
         with pytest.raises(ValueError, match="scope must be one of"):
             build_scope_metadata(scope="garbage", scope_source=SCOPE_SOURCE_OPERATOR)
 
+    def test_rejects_task_scope(self):
+        """Task scope is recognized at read time (a stored task row
+        resolves as a valid shape and is refused at admission) but is
+        NOT mintable: admission excludes task rows unconditionally,
+        so a task write would be permanently unreadable. The builder
+        refuses so the contradiction cannot recur."""
+        from kai.memory import SCOPE_SOURCE_OPERATOR, SCOPE_TASK, build_scope_metadata
+
+        with pytest.raises(ValueError, match="not mintable"):
+            build_scope_metadata(scope=SCOPE_TASK, scope_source=SCOPE_SOURCE_OPERATOR)
+
     def test_rejects_invalid_confidence(self):
         """Confidence outside [0.0, 1.0] indicates a classifier bug.
         Reject rather than clamp so the bug surfaces at the write
