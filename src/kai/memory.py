@@ -139,6 +139,13 @@ _LEGACY_CONFIDENCE = 0.5
 def build_migration_metadata(*, section: str, subsection: str) -> dict[str, Any]:
     """Return the metadata dict used by the MEMORY.md -> Qdrant migration.
 
+    No production caller: the migration writer is the hyphenated
+    operator script, not module code, so within the package this
+    helper is exercised only by the migration-metadata tests.
+    Retained deliberately as the single authority on migration-row
+    shape; see the next paragraph for why the script and tests must
+    share it.
+
     Centralizes the speaker / confidence / source / section /
     subsection assignment so the migration writer (the
     migrate-memory-md script) and the test that pins migration-row
@@ -1514,6 +1521,12 @@ def _base_recall_payload(user_id: str, query: str) -> dict[str, object]:
     """
     return {
         "user_id": user_id,
+        # The caller-facing id above is often the legacy numeric chat
+        # id while retrieval actually filters on the resolved
+        # canonical principal; logging both makes the mapping
+        # verifiable on every line instead of leaving readers to wonder whether
+        # the two identities agree.
+        "resolved_user_id": canonical_memory_user_id(user_id),
         "query_len": len(query),
         "query": _truncate(query, _RECALL_QUERY_TRUNC),
         "fetch_limit": 0,
@@ -2457,9 +2470,13 @@ def format_scoped_context(
     Render a ScopedRetrievalResult into a two-section prompt block.
 
     Pure formatting layer. Does NOT search memory, detect projects,
-    emit log lines, or call `retrieve_scoped_memories`. Consumed by
-    `format_scoped_context_with_recall_payload` for live prompt
-    injection.
+    emit log lines, or call `retrieve_scoped_memories`. No production
+    caller: the live path (`format_scoped_context_with_recall_payload`)
+    renders through the shared `_render_scoped_sections`
+    implementation directly, and this public wrapper survives as the
+    payload-free entry point the rendering tests drive. Deleting it
+    would force those tests through the recall-payload plumbing they
+    are not about.
 
     Section shape (D3 / D4):
 
@@ -2857,12 +2874,18 @@ def count_by_source(user_id: str, source: str) -> int:
 
     # Single fetch: top_k bounds the result; no looping. See docstring
     # for why a paged loop is unsafe here even though it works in
-    # delete_by_source.
-    storage_user_id, namespace = _canonical_memory_owner(user_id)
-    result = _memory.get_all(
-        filters={"user_id": storage_user_id},
-        top_k=_DELETE_PAGE_SIZE,
-    )
+    # delete_by_source. Guarded like every sibling read helper: a
+    # Mem0 failure degrades to a zero count with a warning rather
+    # than propagating out of a counting utility.
+    try:
+        storage_user_id, namespace = _canonical_memory_owner(user_id)
+        result = _memory.get_all(
+            filters={"user_id": storage_user_id},
+            top_k=_DELETE_PAGE_SIZE,
+        )
+    except Exception:
+        log.warning("count_by_source failed (user_id=%s)", user_id, exc_info=True)
+        return 0
     rows = result.get("results", []) if isinstance(result, dict) else result or []
 
     # Match logic mirrors delete_by_source: empty-source means legacy
@@ -3088,16 +3111,23 @@ def add_structured(
     if not content.strip():
         return None
 
-    storage_user_id, namespace = _canonical_memory_owner(user_id)
-
-    # Build the metadata dict. Caller-provided metadata comes first so
-    # the reserved keys (type, tags) can override caller values.
-    final_metadata: dict = _metadata_for_owner(metadata, namespace)
-    final_metadata["type"] = memory_type
-    if tags is not None:
-        final_metadata["tags"] = tags
-
     try:
+        # Owner resolution and metadata merge sit INSIDE the guard:
+        # `_metadata_for_owner` raises on a provenance conflict with
+        # the canonical owner, and this function documents a
+        # never-raise contract; a conflicting caller must get the
+        # same None-plus-warning failure surface as a store error,
+        # not an exception the caller was told cannot happen.
+        storage_user_id, namespace = _canonical_memory_owner(user_id)
+
+        # Build the metadata dict. Caller-provided metadata comes
+        # first so the reserved keys (type, tags) can override
+        # caller values.
+        final_metadata: dict = _metadata_for_owner(metadata, namespace)
+        final_metadata["type"] = memory_type
+        if tags is not None:
+            final_metadata["tags"] = tags
+
         # infer=False means no LLM call; Mem0 only embeds + stores.
         # This is the entire point of the Track 2 primitive.
         raw = _memory.add(

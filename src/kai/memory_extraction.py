@@ -180,13 +180,6 @@ _EPISODE_PROMPT_VERSION: str = "2"
 _FAILURE_STREAK_ALARM_THRESHOLD = 3
 _consecutive_subprocess_failures = 0
 
-# Memory `type` values this module writes. Track 1 writes "exchange"
-# from memory.py; Track 2 writes "fact" from here. Any other type value
-# in add_structured() metadata produced by this module is a bug.
-# NOTE: metadata["type"] is NOT the same namespace as metadata["tags"]
-# ("fact" happens to appear in both but the semantics differ).
-_ALLOWED_TYPES: frozenset[str] = frozenset({"exchange", "fact"})
-
 # Minimum length for a valid confirmation_quote on a confirmed_action
 # fact. Matches the "20 characters" rule in the extractor prompt.
 _CONFIRMATION_QUOTE_MIN_CHARS = 20
@@ -3526,7 +3519,6 @@ async def extract_and_store(
 # assembly directly without going through subprocess. Kept explicit
 # at module level rather than via __all__ for grep discoverability.
 __all__ = [
-    "_ALLOWED_TYPES",
     "_CONFIRMATION_QUOTE_MIN_CHARS",
     "_CONSOLIDATION_INTENTS",
     "_DEDUP_NEIGHBOR_FETCH_N",

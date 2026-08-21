@@ -206,18 +206,27 @@ class TestCanonicalMemoryNamespace:
         assert memory.get_by_id(user_id="101", memory_id=memory_id) is None
 
     def test_conflicting_owner_metadata_fails_closed(self):
+        """Fail-closed means the misowned row is never stored. The
+        refusal surfaces as the documented never-raise failure shape
+        (None plus a warning) rather than an escaping
+        CanonicalMemoryAuthorityError; the audit flagged the old
+        raise as a contract violation, and callers of add_structured
+        are written against the None contract."""
         namespace = _namespace()
-        memory._memory = _FakeMem0()
+        fake = _FakeMem0()
+        memory._memory = fake
         memory._config = SimpleNamespace(memory_search_limit=10)
         memory.configure_memory_authority(WorkshopExecutionStateRegistry((namespace,)))
 
-        with pytest.raises(memory.CanonicalMemoryAuthorityError, match="conflicts"):
-            memory.add_structured(
-                "Misowned fact",
-                user_id="101",
-                memory_type="fact",
-                metadata={memory.WORKSHOP_PRINCIPAL_ID_KEY: str(PrincipalId.new())},
-            )
+        result = memory.add_structured(
+            "Misowned fact",
+            user_id="101",
+            memory_type="fact",
+            metadata={memory.WORKSHOP_PRINCIPAL_ID_KEY: str(PrincipalId.new())},
+        )
+
+        assert result is None
+        assert memory.get_all(user_id="101") == []
 
     def test_partial_external_store_move_resumes_without_duplication(self):
         namespace = _namespace()

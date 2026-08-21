@@ -693,3 +693,85 @@ class TestBackfillExplicit:
             memory_admin.cli(["backfill-explicit"])
         assert exc.value.code == 0
         cmd.assert_called_once()
+
+
+class TestBackfillProvenanceParser:
+    """Parser pins for backfill-provenance, previously the only
+    subcommand with no parser tests (audit test-gap item). Shapes
+    mirror the reclassify pins: required user_id, None defaults that
+    the mutating-mode rejection depends on, exclusive modes."""
+
+    def test_requires_user_id(self):
+        parser = memory_admin._build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["backfill-provenance"])
+
+    def test_flags_default_to_none(self):
+        """None defaults are load-bearing: the mutating-mode rejection
+        distinguishes explicitly-passed flags from defaults by None,
+        including the store_const shape of --no-assistant-pass."""
+        parser = memory_admin._build_parser()
+        args = parser.parse_args(["backfill-provenance", "100"])
+        assert args.window_seconds is None
+        assert args.min_overlap is None
+        assert args.strong_overlap_ratio is None
+        assert args.overlap_shingle_n is None
+        assert args.no_assistant_pass is None
+        assert args.assistant_max_user_gap_seconds is None
+        assert args.sample is None
+        assert args.out_dir is None
+        assert args.apply is None
+        assert args.rollback is None
+        assert args.yes is False
+
+    def test_modes_are_mutually_exclusive(self):
+        parser = memory_admin._build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["backfill-provenance", "100", "--apply", "a.jsonl", "--rollback", "b.jsonl"])
+
+    def test_dispatch_calls_backfill_provenance(self):
+        with (
+            patch.object(memory_admin, "_cmd_backfill_provenance", return_value=0) as cmd_mock,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            memory_admin.cli(["backfill-provenance", "100"])
+        assert exc_info.value.code == 0
+        assert cmd_mock.call_args[0][0].user_id == "100"
+
+
+class TestKnownSourcesDrift:
+    def test_known_sources_track_user_visible_sources(self):
+        """_KNOWN_SOURCES is a literal copy (this module keeps
+        kai.memory imports lazy so --help stays fast); this pin is
+        the drift guard the literal relies on. The two purge-only
+        extras are the Track-1 legacy source and the empty string
+        for rows with no source key."""
+        from kai.memory import USER_VISIBLE_SOURCES
+
+        expected = frozenset(USER_VISIBLE_SOURCES) | {"user_raw", ""}
+        assert expected == memory_admin._KNOWN_SOURCES
+
+
+class TestReportDirectoryFallback:
+    def test_unmapped_user_falls_back_to_literal_path(self, tmp_path, monkeypatch):
+        """An unmapped user (no external-identity row) lands on the
+        literal-user-id path like every other unresolvable branch,
+        instead of raising and killing the whole admin command over
+        a default that --out-dir can override anyway."""
+        db_path = tmp_path / "kai.db"
+        connection = sqlite3.connect(db_path)
+        connection.execute(
+            "CREATE TABLE external_identities ("
+            "principal_id TEXT NOT NULL, provider TEXT NOT NULL, external_subject TEXT NOT NULL)"
+        )
+        connection.commit()
+        connection.close()
+        monkeypatch.setattr("kai.config.DATA_DIR", tmp_path / "data")
+
+        result = memory_admin._default_human_report_directory(
+            SimpleNamespace(session_db_path=db_path),
+            "42",
+            "reclassify",
+        )
+
+        assert result == tmp_path / "data" / "home" / "42" / "docs" / "reclassify"
