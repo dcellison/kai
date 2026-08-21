@@ -93,20 +93,31 @@ def _default_human_report_directory(config: Config, user_id: str, report_name: s
     finally:
         connection.close()
     if len(rows) != 1:
-        raise RuntimeError("Memory admin user has no unique canonical Workshop principal")
+        # Unmapped user (zero rows) or ambiguous mapping (several):
+        # fall back to the literal-user-id path exactly like every
+        # other unresolvable branch above. This helper picks a
+        # DEFAULT artifact directory; failing the whole admin command
+        # over a missing identity mapping punished the operator for a
+        # condition --out-dir already handles.
+        return DATA_DIR / "home" / user_id / "docs" / report_name
     return DATA_DIR / "home" / str(rows[0][0]) / "docs" / report_name
 
 
 # ── Known source values ─────────────────────────────────────────────
 #
-# Accepted values for --source. The empty-string option covers LEGACY
-# rows (pre-Phase-1 entries whose metadata dict has no "source" key).
-# `delete_by_source(user_id, source="")` deliberately matches both the
-# key-absent and key-empty cases, per the implementation in memory.py.
+# Accepted values for --source: every source the live system mints
+# (mirrors memory.USER_VISIBLE_SOURCES; the literal copy exists
+# because this module keeps kai.memory imports lazy so --help stays
+# fast, and a test pins the two sets against drift) plus two
+# purge-only extras: "user_raw" targets Track-1-era legacy rows that
+# survive only as purge candidates, and the empty string covers
+# LEGACY rows whose metadata dict has no "source" key at all
+# (`delete_by_source(user_id, source="")` deliberately matches both
+# the key-absent and key-empty cases, per memory.py).
 #
 # We enumerate explicitly so a typo ("user-raw" vs "user_raw") fails
 # at arg-parse time rather than silently no-op'ing against every row.
-_KNOWN_SOURCES = frozenset({"extracted", "user_raw", ""})
+_KNOWN_SOURCES = frozenset({"extracted", "episode", "migration", "explicit", "user_raw", ""})
 
 
 def _build_parser() -> argparse.ArgumentParser:

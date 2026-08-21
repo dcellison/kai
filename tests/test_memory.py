@@ -5648,6 +5648,7 @@ class TestFormatContextUnchangedByScopedHelper:
         # docstring); short-circuit lines add it.
         expected_keys = {
             "user_id",
+            "resolved_user_id",
             "query_len",
             "query",
             "fetch_limit",
@@ -6644,3 +6645,54 @@ class TestExplicitSourceVisibility:
         assert "explicit" in _FACT_BUCKET_SOURCES
         # Episodes keep their own browser; the bucket must not gain them.
         assert "episode" not in _FACT_BUCKET_SOURCES
+
+
+class TestNeverRaiseContracts:
+    """The audit's L2 contract nits: add_structured documents a
+    never-raise contract but the owner-conflict check sat outside its
+    exception shell, and count_by_source lacked the guard every
+    sibling read helper has."""
+
+    def test_add_structured_swallows_provenance_conflict(self):
+        """A caller-supplied owner key that conflicts with the
+        canonical namespace must produce the documented None-plus-
+        warning failure, not a CanonicalMemoryAuthorityError escaping
+        a function that promises not to raise."""
+        import kai.memory as mem_mod
+        from kai.memory import WORKSHOP_PRINCIPAL_ID_KEY, add_structured
+        from kai.workshop.domain import AgentId, ChannelId, PrincipalId, RuntimeProfileId
+        from kai.workshop.execution_state import (
+            WorkshopExecutionStateNamespace,
+            WorkshopExecutionStateRegistry,
+        )
+
+        namespace = WorkshopExecutionStateNamespace(
+            principal_id=PrincipalId.new(),
+            channel_id=ChannelId.new(),
+            agent_id=AgentId.new(),
+            runtime_profile_id=RuntimeProfileId.new(),
+            runtime_config_id=424242,
+        )
+        mem_mod._memory = MagicMock()
+        try:
+            mem_mod.configure_memory_authority(WorkshopExecutionStateRegistry((namespace,)))
+            result = add_structured(
+                "conflicting fact",
+                user_id=str(namespace.runtime_config_id),
+                metadata={WORKSHOP_PRINCIPAL_ID_KEY: "prn_" + "f" * 32},
+            )
+        finally:
+            mem_mod.configure_memory_authority(None)
+
+        assert result is None
+        mem_mod._memory.add.assert_not_called()
+
+    def test_count_by_source_returns_zero_on_store_error(self):
+        import kai.memory as mem_mod
+        from kai.memory import count_by_source
+
+        mock_mem = MagicMock()
+        mock_mem.get_all.side_effect = RuntimeError("mem0 down")
+        mem_mod._memory = mock_mem
+
+        assert count_by_source(user_id="123", source="extracted") == 0
