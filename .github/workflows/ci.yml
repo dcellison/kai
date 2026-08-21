@@ -25,7 +25,11 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install --constraint requirements/constraints.txt -e '.[dev,totp]'
+        run: |
+          python -m pip install --upgrade \
+            --constraint requirements/constraints.txt pip setuptools
+          python -m pip install --upgrade \
+            --constraint requirements/constraints.txt -e '.[dev,totp]'
 
       - name: Install Workshop client dependencies
         run: npm ci --prefix workshop-client

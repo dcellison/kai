@@ -7151,6 +7151,27 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
         shutil.rmtree(build_path)
         print(f"  Removed stale package build artifacts: {build_path}")
 
+    # Keep the venv's packaging tools inside the same reviewed constraint set
+    # as Kai itself. They are installed into (and audited as part of) the
+    # protected environment, but ordinary package installation does not
+    # otherwise upgrade the copies originally seeded by ``venv``.
+    if constraints_dst.is_file():
+        subprocess.run(
+            [
+                str(venv_python),
+                "-m",
+                "pip",
+                "install",
+                "--upgrade",
+                "--constraint",
+                str(constraints_dst),
+                "pip",
+                "setuptools",
+            ],
+            check=True,
+        )
+        print("  Updated constrained packaging tools")
+
     # Install the package with optional dependencies.
     # Uses a non-editable install (not -e) so the venv is self-contained
     # and doesn't depend on the source directory being writable.
