@@ -187,6 +187,8 @@ You have a per-user vector store that holds extracted facts about the user (pref
 
 This is distinct from your `MEMORY.md` file, which holds operator notes and project state. In enabled mode, MEMORY.md is not injected; the vector store is the active fact surface, populated automatically by the extractor and on demand via the API.
 
+There is deliberately no delete endpoint in this API. When the user asks to remove memories, point them at the `/memory` Telegram command (per-fact review and forget) or at the operator; do not attempt deletion through this API or retry variations hoping for one.
+
 ### When to store a fact via the API
 
 - The user states a stable preference, constraint, or piece of identity
@@ -235,23 +237,12 @@ For a fresh user with no extracted facts (`extracted_count == 0`), the confidenc
 
 `null` here means "no extracted facts to summarize," NOT a store failure. Treat it as expected for new users.
 
-### Deleting all memories
-
-```bash
-curl -s -X DELETE http://localhost:8080/api/memory/all \
-  -H 'Content-Type: application/json' \
-  -H "X-Webhook-Secret: $KAI_WEBHOOK_SECRET" \
-  -d '{"chat_id": <chat_id>, "confirm": "delete-all-memories"}'
-```
-
-The `confirm` field MUST equal the literal string `"delete-all-memories"`. Anything else returns 400. This is intentional: a stray curl or prompt-injected fetch call cannot accidentally wipe a user's memory store. Only invoke this when the user has explicitly asked to clear their memories. Response: `{"status": "deleted"}`.
-
 ### Error handling
 
-- `400` - your request was bad (missing field, invalid JSON, wrong confirm token). Fix the request and retry.
+- `400` - your request was bad (missing field, invalid JSON). Fix the request and retry.
 - `401` - wrong webhook secret. Configuration bug; surface to the operator.
-- `403` - the chat_id you sent isn't authorized. Use your own chat_id.
-- `503` - the memory system is disabled. Don't retry; surface to the operator. Same status across all four memory endpoints, so a single retry policy covers the disabled case.
+- `403` - the chat_id does not belong to your credential, or your credential lacks the permission scope for that operation. Not retryable: no change to the request will make it succeed. If you believe the chat_id is your own, surface the error to the user instead of retrying.
+- `503` - the memory system is disabled. Don't retry; surface to the operator. Same status across all three memory endpoints, so a single retry policy covers the disabled case.
 - `500` - on `/api/memory/add` only, the underlying store call failed despite memory being enabled. May be transient; retrying once with a short backoff is reasonable. Persistent 500s should be surfaced to the operator.
 
 ## Issue-First Workflow
