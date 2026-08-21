@@ -29,7 +29,7 @@ dev = [
 ]
 memory = [
     "mem0ai>=2.0.0,<3",
-    "sentence-transformers>=3.0.0,<6",
+    "sentence-transformers>=6.0.0,<7",
 ]
 tts = [
     "piper-tts>=1.4.0,<2",
