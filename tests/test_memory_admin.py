@@ -300,6 +300,62 @@ class TestCliDispatch:
         assert exc_info.value.code == 0
         assert cmd_mock.call_args[0][0].user_id == "100"
 
+    def test_dispatch_calls_review_legacy_scope(self):
+        with (
+            patch.object(memory_admin, "_cmd_review_legacy_scope", return_value=0) as cmd_mock,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            memory_admin.cli(["review-legacy-scope", "100"])
+        assert exc_info.value.code == 0
+        assert cmd_mock.call_args[0][0].user_id == "100"
+
+
+class TestReviewLegacyScopeCLI:
+    def test_parser_modes_are_mutually_exclusive(self):
+        parser = memory_admin._build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["review-legacy-scope", "100", "--apply", "review.jsonl", "--rollback", "pre.jsonl"])
+
+    def test_census_dispatches_without_yes(self, tmp_path):
+        args = memory_admin._build_parser().parse_args(["review-legacy-scope", "100", "--out-dir", str(tmp_path)])
+        run = AsyncMock(return_value=0)
+        with (
+            patch.object(memory_admin, "_initialize_memory", return_value=MagicMock()),
+            patch("kai.memory_scope_review.run_census", run),
+        ):
+            assert memory_admin._cmd_review_legacy_scope(args) == 0
+        run.assert_awaited_once()
+
+    def test_apply_refuses_review_required_before_authorization_plan(self, tmp_path, capsys):
+        from kai import memory_scope_review as review
+
+        row = review.ReviewRow(
+            memory_id="m1",
+            text_sha256=review._sha256("text"),
+            text="text",
+            source="extracted",
+            created_at="",
+            disposition=review.DISPOSITION_REVIEW_REQUIRED,
+            project_id=None,
+            operator_note="",
+        )
+        path = tmp_path / "review.jsonl"
+        path.write_text(
+            review.render_manifest(
+                {
+                    "kind": "kai.memory_scope_review",
+                    "version": 1,
+                    "review_id": "lsr-1",
+                    "user_id": "100",
+                },
+                [row],
+            )
+        )
+        args = memory_admin._build_parser().parse_args(["review-legacy-scope", "100", "--apply", str(path)])
+        with patch.object(memory_admin, "_initialize_memory", return_value=MagicMock()):
+            assert memory_admin._cmd_review_legacy_scope(args) == 1
+        assert "review_required" in capsys.readouterr().err
+
 
 # ── reclassify-scope: parser ─────────────────────────────────────────
 

@@ -3037,14 +3037,14 @@ class TestBuildScopeView:
 
     def test_legacy_row_defaults_global_with_legacy_source(self):
         view = memory_command._build_scope_view(_scoped_fact(None), {}, None)
-        assert view.scope_label == "global"
+        assert view.scope_label == "unresolved (quarantined)"
         assert view.resolved.legacy_defaulted is True
         assert "legacy_default" in view.source_label
-        assert view.retrievable_label == "yes"
+        assert view.retrievable_label == "no (legacy_scope_quarantined)"
 
     def test_invalid_scope_value_renders_invalid_source(self):
         view = memory_command._build_scope_view(_scoped_fact("bogus"), {}, None)
-        assert view.scope_label == "global"
+        assert view.scope_label == "global (invalid, quarantined)"
         assert view.resolved.invalid_defaulted is True
         assert "invalid_default" in view.source_label
 
@@ -3171,7 +3171,7 @@ class TestBuildScopeScreen:
         targets = memory_command._scope_change_targets(view.resolved, registry)
         text, kb = memory_command._build_scope_screen(fact, view, targets)
         assert '"Scoped fact text."' in text
-        assert "Scope:  global" in text
+        assert "Scope:  unresolved (quarantined)" in text
         assert "legacy_default" in text
         assert "Choose a new scope:" in text
         # One button per target row, then the nav row.
@@ -3226,9 +3226,9 @@ class TestFactViewScopeBlock:
         fact = _episode_fact()
         view = memory_command._build_scope_view(fact, {}, None)
         text, _ = memory_command._build_fact_view(fact, return_to=None, scope_view=view)
-        assert "Scope:  global" in text
+        assert "Scope:  unresolved (quarantined)" in text
         assert "Scope source:  legacy_default (confidence 1.00)" in text
-        assert "Retrievable here:  yes" in text
+        assert "Retrievable here:  no (legacy_scope_quarantined)" in text
 
     def test_no_scope_view_omits_block(self):
         text, _ = memory_command._build_fact_view(_fact("a", "x", ["t"]), return_to=None)
@@ -3500,7 +3500,7 @@ class TestStatsScopeSection:
         text, _ = memory_command._build_stats(stats)
         assert "Scope:" in text
         idx_global = text.index("global ")
-        idx_legacy = text.index("global (legacy)")
+        idx_legacy = text.index("unresolved (quarantined)")
         idx_project = text.index("project 'kai'")
         idx_invalid = text.index("invalid")
         assert idx_global < idx_legacy < idx_project < idx_invalid

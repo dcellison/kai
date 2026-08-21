@@ -59,6 +59,7 @@ from kai.install import (
     _generate_systemd_unit,
     _generate_users_yaml,
     _log_security_status,
+    _memory_scope_review_status,
     _migrate_identity_to_claude_md,
     _migrate_managed_home_database_paths,
     _optional_file_checksum,
@@ -5105,6 +5106,41 @@ class TestLogStorageSecurity:
         insecure = _log_security_status(log_dir, "kai")
         assert "Log security: INSECURE" in insecure
         assert "unsafe modes=1" in insecure
+
+
+class TestMemoryScopeReviewStatus:
+    def test_pending_without_protected_census(self, tmp_path):
+        assert "pending" in _memory_scope_review_status(
+            tmp_path / "missing.json",
+            memory_enabled=True,
+        )
+
+    def test_reports_incomplete_and_active_without_content(self, tmp_path):
+        path = tmp_path / "memory-scope-review.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "observed": {
+                        "raw_legacy_default": 45,
+                        "quarantined": 44,
+                        "unreviewed": 1,
+                        "invalid_quarantined": 2,
+                    }
+                }
+            )
+        )
+        incomplete = _memory_scope_review_status(path, memory_enabled=True)
+        assert "INCOMPLETE" in incomplete
+        assert "unreviewed=1" in incomplete
+        assert "reviewed quarantine=44" in incomplete
+
+        document = json.loads(path.read_text())
+        document["observed"]["quarantined"] = 45
+        document["observed"]["unreviewed"] = 0
+        path.write_text(json.dumps(document))
+        active = _memory_scope_review_status(path, memory_enabled=True)
+        assert "active" in active
+        assert "legacy/invalid retrieval=fail-closed" in active
 
 
 class TestApplyVenv:

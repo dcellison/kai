@@ -4615,10 +4615,9 @@ class TestResolveMemoryScope:
 
     def test_defaults_invalid_scope_to_invalid_global(self):
         """A row carrying an unknown `scope` value is corrupted, not
-        legacy. The resolver still returns global so retrieval keeps
-        working, but uses `invalid_default` provenance and zero
-        confidence so audit queries can find these rows separately
-        from genuine legacy rows."""
+        legacy. The resolver retains its compatibility representation
+        as global, but admission quarantines it using `invalid_default`
+        provenance and zero confidence so it cannot affect retrieval."""
         from kai.memory import (
             SCOPE_GLOBAL,
             SCOPE_SOURCE_INVALID_DEFAULT,
@@ -5152,6 +5151,34 @@ class TestScopedMemoryAdmission:
         )
         assert reason is None
 
+    def test_scoped_admission_quarantines_legacy_default(self):
+        """A missing scope is compatibility metadata, not authority."""
+        from kai.memory import SCOPE_GLOBAL, _scoped_memory_admission_reason
+
+        reason = _scoped_memory_admission_reason(
+            _resolved_scope(
+                scope=SCOPE_GLOBAL,
+                scope_source="legacy_default",
+                legacy_defaulted=True,
+            ),
+            allowed_project_id="kai",
+        )
+        assert reason == "legacy_scope_quarantined"
+
+    def test_scoped_admission_quarantines_invalid_scope(self):
+        """Malformed scope provenance also fails closed before scope use."""
+        from kai.memory import SCOPE_GLOBAL, _scoped_memory_admission_reason
+
+        reason = _scoped_memory_admission_reason(
+            _resolved_scope(
+                scope=SCOPE_GLOBAL,
+                scope_source="invalid_default",
+                invalid_defaulted=True,
+            ),
+            allowed_project_id=None,
+        )
+        assert reason == "invalid_scope_quarantined"
+
     def test_scoped_admission_rejects_project_when_no_active_project(self):
         """When no project is active (allowed_project_id=None), a
         valid project-scoped row is excluded as
@@ -5301,6 +5328,28 @@ def _context(workspace: Path, *, message: str = "what is kai?", chat_id: int | s
         backend_name="claude",
         session_id="sess-1",
     )
+
+
+@pytest.mark.asyncio
+async def test_scoped_retrieval_quarantines_legacy_before_ranking(tmp_path):
+    """A high-scoring legacy row cannot outrank an explicit global row."""
+    import kai.memory as mem_mod
+    from kai.memory import retrieve_scoped_memories
+
+    mock_mem = MagicMock()
+    mock_mem.search.return_value = {
+        "results": [
+            _search_row("legacy", "unreviewed", 0.99),
+            _search_row("global", "reviewed", 0.70, scope="global"),
+        ]
+    }
+    mem_mod._memory = mock_mem
+    mem_mod._config = _mp_config()
+
+    result = await retrieve_scoped_memories(_context(tmp_path))
+
+    assert [hit.result.id for hit in result.hits] == ["global"]
+    assert result.debug.excluded_by_scope == {"legacy_scope_quarantined": 1}
 
 
 class TestRetrieveScopedMemories:
@@ -6645,6 +6694,41 @@ class TestCountPointsByOwner:
         # Pagination contract: first call starts at None, second call
         # resumes from the returned cursor.
         assert calls["offsets"] == [None, "cursor"]
+
+
+class TestScopeCensusPoints:
+    _fake_memory = staticmethod(TestCountPointsByOwner._fake_memory)
+
+    def test_reads_only_scope_fields_and_user_visible_sources(self):
+        from kai.memory import list_scope_census_points
+
+        calls = []
+
+        def scroll(**kwargs):
+            calls.append(kwargs)
+            return (
+                [
+                    SimpleNamespace(
+                        id="visible",
+                        payload={"user_id": "prn_1", "source": "extracted", "scope": "global"},
+                    ),
+                    SimpleNamespace(id="hidden", payload={"user_id": "prn_1", "source": "user_raw"}),
+                ],
+                None,
+            )
+
+        fake = SimpleNamespace(
+            vector_store=SimpleNamespace(
+                client=SimpleNamespace(scroll=scroll),
+                collection_name="kai_memory",
+            )
+        )
+        with patch("kai.memory._memory", fake):
+            points = list_scope_census_points()
+
+        assert points == [("visible", "prn_1", {"source": "extracted", "scope": "global"})]
+        assert calls[0]["with_vectors"] is False
+        assert "memory" not in calls[0]["with_payload"]
 
     def test_missing_payload_counts_as_empty_owner(self):
         from kai.memory import count_points_by_owner

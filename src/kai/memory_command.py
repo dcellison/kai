@@ -451,7 +451,11 @@ def _build_scope_view(
     # in the registry is flagged rather than hidden, because the row
     # is still movable and the operator needs to see why it stopped
     # being retrievable anywhere.
-    if resolved.scope == memory.SCOPE_PROJECT:
+    if resolved.legacy_defaulted:
+        scope_label = "unresolved (quarantined)"
+    elif resolved.invalid_defaulted:
+        scope_label = f"{resolved.scope} (invalid, quarantined)"
+    elif resolved.scope == memory.SCOPE_PROJECT:
         pid = resolved.project_id
         if pid is None:
             scope_label = "project (no project id)"
@@ -1430,7 +1434,7 @@ def _build_search_results(
 # tiebreaker, matching the prompt-version table's determinism rule.
 _SCOPE_BUCKET_ORDER: list[tuple[str, str]] = [
     ("global", "global"),
-    ("global_legacy", "global (legacy)"),
+    ("global_legacy", "unresolved (quarantined)"),
     ("task", "task"),
     ("project_missing_id", "project (no project id)"),
     ("invalid", "invalid"),
@@ -1514,9 +1518,8 @@ def _build_stats(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup]:
     # Scope distribution over all user-visible rows. Sits right after
     # the headline because (unlike the extracted-only sections below)
     # it spans every user-visible source. The global_legacy row is
-    # the operator's running measure of reclassification debt - rows
-    # that retrieval treats as global only because nothing has
-    # classified them yet.
+    # the operator's running measure of reclassification debt: rows
+    # that retrieval quarantines until an operator classifies them.
     if stats.by_scope:
         lines.append("")
         lines.append("Scope:")
