@@ -320,6 +320,99 @@ class TestEmbeddingModelResolution:
         assert config["history_db_path"] == str(override / "mem0_history.db")
         assert (override / "qdrant").is_dir()
 
+    def test_qdrant_dir_created_owner_only(self, tmp_path):
+        """The qdrant dir must land 0700 at creation regardless of
+        umask (mkdir's mode argument is umask-masked; the explicit
+        chmod is what makes the mode deterministic). Any local user
+        able to list or read this tree can read every principal's
+        extracted facts."""
+        from kai.memory import _mem0_config
+
+        with (
+            patch("kai.memory.DATA_DIR", tmp_path),
+            patch(
+                "kai.memory._resolve_cached_embedding_model",
+                return_value=("m", False),
+            ),
+        ):
+            _mem0_config(_make_config())
+
+        mode = (tmp_path / "memory" / "qdrant").stat().st_mode & 0o777
+        assert mode == 0o700
+
+
+class TestTightenStorePermissions:
+    """The post-construction sweep that closes the vector store's
+    on-disk exposure. Modes are pinned exactly (0700 dirs, 0600
+    files) so a regression to umask-default creation surfaces here,
+    and the scope boundary (store-owned paths only) is pinned so the
+    sweep can never start chmodding the per-user MEMORY.md dirs or
+    the extractor cwd that foreign os_users must traverse."""
+
+    def _build_store(self, root):
+        """Synthetic store tree with deliberately loose modes."""
+        coll = root / "qdrant" / "collection" / "kai_memory"
+        coll.mkdir(parents=True)
+        (coll / "storage.sqlite").write_bytes(b"x")
+        (root / "qdrant" / "meta.json").write_text("{}")
+        (root / "migrations_qdrant").mkdir()
+        (root / "migrations_qdrant" / "m.sqlite").write_bytes(b"x")
+        (root / "mem0_history.db").write_bytes(b"x")
+        for p in (root / "qdrant").rglob("*"):
+            p.chmod(0o755 if p.is_dir() else 0o644)
+        (root / "qdrant").chmod(0o755)
+        (root / "migrations_qdrant").chmod(0o755)
+        (root / "migrations_qdrant" / "m.sqlite").chmod(0o644)
+        (root / "mem0_history.db").chmod(0o644)
+
+    def test_tightens_store_owned_paths(self, tmp_path):
+        from kai.memory import _tighten_store_permissions
+
+        self._build_store(tmp_path)
+        _tighten_store_permissions(tmp_path)
+
+        for d in (
+            tmp_path / "qdrant",
+            tmp_path / "qdrant" / "collection",
+            tmp_path / "qdrant" / "collection" / "kai_memory",
+            tmp_path / "migrations_qdrant",
+        ):
+            assert d.stat().st_mode & 0o777 == 0o700, d
+        for f in (
+            tmp_path / "qdrant" / "meta.json",
+            tmp_path / "qdrant" / "collection" / "kai_memory" / "storage.sqlite",
+            tmp_path / "migrations_qdrant" / "m.sqlite",
+            tmp_path / "mem0_history.db",
+        ):
+            assert f.stat().st_mode & 0o777 == 0o600, f
+
+    def test_leaves_non_store_paths_alone(self, tmp_path):
+        """The store root also hosts per-user MEMORY.md fallback dirs
+        and the neutral extractor cwd; the sweep must not touch
+        anything outside the three store-owned paths."""
+        from kai.memory import _tighten_store_permissions
+
+        self._build_store(tmp_path)
+        foreign = tmp_path / "2114582497"
+        foreign.mkdir()
+        (foreign / "MEMORY.md").write_text("x")
+        foreign.chmod(0o755)
+        (foreign / "MEMORY.md").chmod(0o644)
+
+        _tighten_store_permissions(tmp_path)
+
+        assert foreign.stat().st_mode & 0o777 == 0o755
+        assert (foreign / "MEMORY.md").stat().st_mode & 0o777 == 0o644
+
+    def test_no_op_on_missing_paths(self, tmp_path):
+        """A dev-shaped store without a migrations dir or history DB
+        (mem0's home elsewhere, nothing written yet) must not raise."""
+        from kai.memory import _tighten_store_permissions
+
+        (tmp_path / "qdrant").mkdir()
+        _tighten_store_permissions(tmp_path)
+        assert (tmp_path / "qdrant").stat().st_mode & 0o777 == 0o700
+
 
 # Third-party warnings scoped to this class: qdrant-client's local
 # mode opens a transient `:memory:` sqlite inside a `with` block

@@ -1027,6 +1027,14 @@ def _mem0_config(config: Config, store_dir: Path | None = None) -> dict:
         store_dir = DATA_DIR / "memory"
     qdrant_path = store_dir / "qdrant"
     qdrant_path.mkdir(parents=True, exist_ok=True)
+    # Owner-only from birth (audit: any local user could read every
+    # principal's extracted facts straight from disk). mkdir's mode
+    # argument is umask-masked, so an explicit chmod is the
+    # deterministic way to land tight. Files mem0/qdrant create
+    # inside are tightened by `_tighten_store_permissions` after
+    # construction; SQLite then propagates the db file's mode to the
+    # WAL/journal siblings it creates at runtime.
+    os.chmod(qdrant_path, 0o700)
     embedding_model, local_only = _resolve_cached_embedding_model(config.memory_embedding_model)
     model_kwargs: dict[str, object] = {"device": "cpu"}
     if local_only:
@@ -1057,6 +1065,45 @@ def _mem0_config(config: Config, store_dir: Path | None = None) -> dict:
         # wrong location.
         "history_db_path": str(store_dir / "mem0_history.db"),
     }
+
+
+def _tighten_store_permissions(store_dir: Path) -> None:
+    """
+    Force owner-only modes on everything the memory store owns.
+
+    The isolation model for the file store (per-user MEMORY.md dirs)
+    is 0700 per owner, but the vector store's isolation was
+    query-time only: mem0 and embedded qdrant create their files
+    with umask-default modes, leaving every principal's extracted
+    facts group/world-readable on disk. This sweep closes that gap
+    at the one place all store layouts pass through (production
+    init, eval stores via `store_dir`, a fresh install's first run).
+
+    Scope is deliberately the three store-owned paths rather than
+    the whole store root: in production the root also holds the
+    per-user MEMORY.md fallback dirs (owned by other os_users,
+    0700 per owner already, not ours to chmod) and the neutral
+    extractor cwd (which foreign os_users must be able to enter,
+    and which holds no memory content). The root's own
+    execute-only mode is likewise the file store's traversal
+    posture, not this function's concern.
+
+    Runs on every init rather than only on creation: files mem0
+    creates mid-run land with umask modes and are caught on the
+    next startup, and the sweep doubles as repair for a tree that
+    predates this enforcement. SQLite copies the main db file's
+    mode onto the WAL/journal files it creates, so 0600 on the two
+    db files covers their runtime siblings.
+    """
+    for root in (store_dir / "qdrant", store_dir / "migrations_qdrant"):
+        if not root.exists():
+            continue
+        os.chmod(root, 0o700)
+        for p in root.rglob("*"):
+            os.chmod(p, 0o700 if p.is_dir() else 0o600)
+    history_db = store_dir / "mem0_history.db"
+    if history_db.exists():
+        os.chmod(history_db, 0o600)
 
 
 def _wrap_result(raw: dict) -> MemoryResult:
@@ -1709,6 +1756,13 @@ def init_memory(config: Config, *, store_dir: Path | None = None) -> None:
 
     mem0_cfg = _mem0_config(config, store_dir)
     m = Memory.from_config(mem0_cfg)
+
+    # Construction is the moment the store's files all exist
+    # (qdrant meta/collection tree, history db, mem0's migrations
+    # store), so tighten before anything else can run; deliberately
+    # ahead of the dims-mismatch bailout below so even that early
+    # return leaves the tree owner-only.
+    _tighten_store_permissions(store_dir if store_dir is not None else DATA_DIR / "memory")
 
     # Validate that the embedding model's output dimensions match the
     # hardcoded 384 in the Qdrant config. A mismatch means the user
