@@ -1891,9 +1891,10 @@ def _scope_admitted(metadata: dict | None, allowed_project_id: str | None) -> bo
 
     Thin composition of the read side's resolver and admission helper
     so write-time reads (consolidation candidates, the dedup gate)
-    apply EXACTLY the rule retrieval uses: global always admitted
-    (including legacy rows), project rows only under a matching
-    allowed_project_id, task rows never. Write-time reads control
+    apply EXACTLY the rule retrieval uses: explicit global rows are
+    admitted, unresolved legacy and invalid rows are quarantined,
+    project rows require a matching allowed_project_id, and task rows
+    are never admitted. Write-time reads control
     deletion (`update_of`) and suppression (`skip_redundant`, dedup),
     so their candidate authority must be at least as scoped as the
     write authority they gate.

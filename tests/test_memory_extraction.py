@@ -653,6 +653,7 @@ class TestParaphraseGate:
         monkeypatch.setattr("kai.memory_extraction.memory.is_enabled", lambda: True)
         fake = MagicMock()
         fake.score = 0.85
+        fake.metadata = {"scope": "global", "scope_source": "operator"}
         monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: [fake])
         assert _paraphrase_neighbor("x", "user-1", threshold=0.9) is None
 
@@ -665,6 +666,7 @@ class TestParaphraseGate:
         fake = MagicMock()
         fake.score = 0.9
         fake.id = "neighbor-id"
+        fake.metadata = {"scope": "global", "scope_source": "operator"}
         monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: [fake])
         result = _paraphrase_neighbor("x", "user-1", threshold=0.9)
         assert result is fake
@@ -677,6 +679,7 @@ class TestParaphraseGate:
         fake = MagicMock()
         fake.score = 0.95
         fake.id = "neighbor-id"
+        fake.metadata = {"scope": "global", "scope_source": "operator"}
         monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: [fake])
         result = _paraphrase_neighbor("x", "user-1", threshold=0.9)
         assert result is fake
@@ -747,6 +750,7 @@ class TestParaphraseGate:
         fake = MagicMock()
         fake.score = 0.79  # 0.01 below the cfg'd threshold of 0.80
         fake.id = "neighbor"
+        fake.metadata = {"scope": "global", "scope_source": "operator"}
         monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: [fake])
         add_calls: list = []
         monkeypatch.setattr(
@@ -767,6 +771,7 @@ class TestParaphraseGate:
         monkeypatch.setattr("kai.memory_extraction.memory.is_enabled", lambda: True)
         fake = MagicMock()
         fake.score = 1.0
+        fake.metadata = {"scope": "global", "scope_source": "operator"}
         monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: [fake])
         assert _paraphrase_neighbor("x", "user-1", threshold=1.01) is None
 
@@ -793,6 +798,7 @@ class TestParaphraseGate:
         fake = MagicMock()
         fake.score = 0.9234567
         fake.id = "surviving-neighbor"
+        fake.metadata = {"scope": "global", "scope_source": "operator"}
         monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: [fake])
         monkeypatch.setattr(
             "kai.memory_extraction.memory.add_structured",
@@ -1364,6 +1370,7 @@ class TestStoreFactsDedup:
             # JSON encoder must serialize; an auto-generated MagicMock
             # attribute is not serializable, so pin a real string here.
             fake.id = "neighbor-id"
+            fake.metadata = {"scope": "global", "scope_source": "operator"}
             return [fake]
 
         monkeypatch.setattr("kai.memory_extraction.memory.search", _fake_search)
@@ -1412,7 +1419,12 @@ def _candidate(
     focused on whatever they are actually exercising. Tests that care
     about source/confidence sentinels override `metadata` explicitly.
     """
-    md = {"source": "extracted", "confidence": 0.85}
+    md = {
+        "source": "extracted",
+        "confidence": 0.85,
+        "scope": "global",
+        "scope_source": "operator",
+    }
     if metadata is not None:
         md.update(metadata)
     return MemoryResult(
@@ -1927,6 +1939,7 @@ class TestStoreFactsIntent:
         # JSON-serializable id - the dedup-fire log line carries
         # neighbor.id verbatim and chokes on a default MagicMock.
         fake.id = "neighbor-id"
+        fake.metadata = {"scope": "global", "scope_source": "operator"}
         monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: [fake])
         # add_structured must NOT be called.
         monkeypatch.setattr(
@@ -4837,9 +4850,9 @@ class TestScopeAdmittedWriteReads:
     these tests pin the composition (which rows a write-time read may
     act on), not the helpers' internals."""
 
-    def test_legacy_row_admitted_everywhere(self):
-        assert memory_extraction._scope_admitted({}, None) is True
-        assert memory_extraction._scope_admitted({}, "kai") is True
+    def test_legacy_row_quarantined_everywhere(self):
+        assert memory_extraction._scope_admitted({}, None) is False
+        assert memory_extraction._scope_admitted({}, "kai") is False
 
     def test_matching_project_row_admitted(self):
         assert memory_extraction._scope_admitted(_KAI_PROJECT_META, "kai") is True
@@ -4889,7 +4902,7 @@ class TestConsolidationCandidateScope:
             },
         )
         candidates = [
-            _mem_result("legacy-row", {}),
+            _mem_result("global-row", {"scope": "global", "scope_source": "operator"}),
             _mem_result("kai-row", dict(_KAI_PROJECT_META)),
             _mem_result("other-row", dict(_OTHER_PROJECT_META)),
         ]
@@ -4918,7 +4931,7 @@ class TestConsolidationCandidateScope:
 
         # The wrong-project row is gone from both the citable id set
         # and the rendered payload; admissible rows survive.
-        assert seen["candidate_ids"] == {"legacy-row", "kai-row"}
+        assert seen["candidate_ids"] == {"global-row", "kai-row"}
         assert "other-row" not in seen["payload"]
         # The candidate log line reports the exclusion so an operator
         # can see scope filtering acting on write-time reads.
@@ -4930,12 +4943,12 @@ class TestConsolidationCandidateScope:
 
     @pytest.mark.asyncio
     async def test_no_project_excludes_all_project_candidates(self, monkeypatch):
-        """Outside any registered project, project-scoped rows from
-        EVERY project lose candidate authority; only global/legacy
-        rows remain citable."""
+        """Outside any registered project, project-scoped and unresolved
+        rows lose candidate authority; only reviewed global rows remain."""
         cfg = _cfg(memory_consolidation_candidates_n=8)
         candidates = [
             _mem_result("legacy-row", {}),
+            _mem_result("global-row", {"scope": "global", "scope_source": "operator"}),
             _mem_result("kai-row", dict(_KAI_PROJECT_META)),
         ]
         monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: list(candidates))
@@ -4953,7 +4966,7 @@ class TestConsolidationCandidateScope:
 
         await extract_and_store(user_text="u", assistant_text="a", user_id="1", config=cfg)
 
-        assert seen["candidate_ids"] == {"legacy-row"}
+        assert seen["candidate_ids"] == {"global-row"}
 
 
 class TestDedupGateScope:
@@ -5000,13 +5013,11 @@ class TestDedupGateScope:
         neighbor = _paraphrase_neighbor("x", "u1", threshold=0.9, active_project=_active_project())
         assert neighbor is None
 
-    def test_legacy_neighbor_still_fires_without_project(self, monkeypatch):
-        """The pre-scoping behavior is preserved for the global-only
-        state: a legacy row above threshold suppresses the duplicate."""
+    def test_legacy_neighbor_is_quarantined_without_project(self, monkeypatch):
+        """An unresolved legacy row cannot suppress a new global write."""
         self._searches(monkeypatch, [_mem_result("legacy-row", {}, score=0.95)])
         neighbor = _paraphrase_neighbor("x", "u1", threshold=0.9)
-        assert neighbor is not None
-        assert neighbor.id == "legacy-row"
+        assert neighbor is None
 
 
 # ── Transcript provenance stamping ──────────────────────────────────

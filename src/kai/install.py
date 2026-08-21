@@ -8133,6 +8133,29 @@ def _check_service_status(platform: str) -> str:
     return f"Service: unknown platform '{platform}'"
 
 
+def _memory_scope_review_status(path: Path, *, memory_enabled: bool | None) -> str:
+    """Report content-free scope-review/quarantine counts."""
+    prefix = "Semantic memory scope review:"
+    if memory_enabled is False:
+        return f"{prefix} disabled by policy"
+    if not path.is_file() or path.is_symlink():
+        return f"{prefix} pending; no protected census"
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        observed = document["observed"]
+        raw = int(observed["raw_legacy_default"])
+        quarantined = int(observed["quarantined"])
+        unreviewed = int(observed["unreviewed"])
+        invalid = int(observed["invalid_quarantined"])
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    state = "active" if unreviewed == 0 else "INCOMPLETE"
+    return (
+        f"{prefix} {state}; raw legacy-default={raw}, reviewed quarantine={quarantined}, "
+        f"unreviewed={unreviewed}, invalid quarantine={invalid}; legacy/invalid retrieval=fail-closed"
+    )
+
+
 def _cmd_status() -> None:
     """
     Report the current installation state.
@@ -8219,6 +8242,12 @@ def _cmd_status() -> None:
     print(
         workshop_memory_authority_status(
             Path(data_dir) / "kai.db",
+            memory_enabled=_read_deployed_memory_enabled(_DEPLOYED_ENV_FILE),
+        )
+    )
+    print(
+        _memory_scope_review_status(
+            Path(data_dir) / "memory-scope-review.json",
             memory_enabled=_read_deployed_memory_enabled(_DEPLOYED_ENV_FILE),
         )
     )

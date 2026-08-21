@@ -16,6 +16,9 @@ Scope (spec §16 + Phase 4 of spec 320):
   file. The pass logic lives in `src/kai/memory_reclassify.py`; this
   module owns only argument parsing, the authorization gates, and
   dispatch.
+- `review-legacy-scope <user_id> [...]`: export every residual
+  legacy-default row for an explicit operator disposition, then apply
+  the complete reviewed manifest with pre-images and rollback guards.
 - `backfill-provenance <user_id> [...]`: stamp transcript provenance
   on legacy rows via content-overlap matching against the JSONL
   history. Dry-run by default; `--apply` writes the four required
@@ -272,6 +275,47 @@ def _build_parser() -> argparse.ArgumentParser:
         "--yes",
         action="store_true",
         help="Confirm a mutating mode. Without it, --apply/--rollback print the planned change count and exit with status 2.",
+    )
+
+    review = sub.add_parser(
+        "review-legacy-scope",
+        help="Census and explicitly dispose every residual legacy-default row",
+        description=(
+            "Export every remaining legacy-default memory row into a protected "
+            "JSONL review manifest. Replace every review_required disposition "
+            "with global, project, delete, or quarantine. --apply requires a "
+            "fresh complete manifest and dumps pre-images before any write. "
+            "--rollback restores metadata changes guarded by the review id. "
+            "The daemon must be stopped."
+        ),
+    )
+    review.add_argument(
+        "user_id",
+        help="Memory owner key; protected runtime IDs resolve to their canonical principal.",
+    )
+    review.add_argument(
+        "--out-dir",
+        dest="out_dir",
+        default=None,
+        help="Artifact directory. Default: <DATA_DIR>/home/<principal>/docs/legacy-scope-review/.",
+    )
+    review_mode = review.add_mutually_exclusive_group()
+    review_mode.add_argument(
+        "--apply",
+        metavar="MANIFEST",
+        default=None,
+        help="Apply a complete operator-reviewed manifest (requires --yes).",
+    )
+    review_mode.add_argument(
+        "--rollback",
+        metavar="PREIMAGES",
+        default=None,
+        help="Restore metadata changes from a pre-image file (requires --yes).",
+    )
+    review.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm a mutating mode. Without it, --apply/--rollback print the plan and exit with status 2.",
     )
 
     bp = sub.add_parser(
@@ -755,6 +799,73 @@ def _cmd_reclassify(args: argparse.Namespace) -> int:
     )
 
 
+def _cmd_review_legacy_scope(args: argparse.Namespace) -> int:
+    """Execute the complete residual legacy-scope review workflow."""
+    config = _initialize_memory()
+    if config is None:
+        return 1
+    from kai import memory_scope_review
+
+    out_dir = (
+        Path(args.out_dir)
+        if args.out_dir
+        else _default_human_report_directory(config, args.user_id, "legacy-scope-review")
+    )
+    artifact_value = args.apply if args.apply is not None else args.rollback
+    if artifact_value is None:
+        return asyncio.run(
+            _run_and_close_sessions(memory_scope_review.run_census(config, args.user_id, out_dir=out_dir))
+        )
+
+    artifact_path = Path(artifact_value)
+    row_type = "review manifest" if args.apply is not None else "pre-image file"
+    try:
+        text = artifact_path.read_text(encoding="utf-8")
+        if args.apply is not None:
+            header, rows = memory_scope_review.parse_manifest(text, user_id=args.user_id)
+            pending = [row for row in rows if row.disposition == memory_scope_review.DISPOSITION_REVIEW_REQUIRED]
+            if pending:
+                print(
+                    f"memory admin: {len(pending)} row(s) still have disposition review_required; "
+                    "complete the manifest before --apply.",
+                    file=sys.stderr,
+                )
+                return 1
+        else:
+            header, rows = memory_scope_review.parse_preimages(text, user_id=args.user_id)
+    except (OSError, ValueError) as exc:
+        print(f"memory admin: cannot read {row_type}: {exc}", file=sys.stderr)
+        return 1
+    if not args.yes:
+        verb = "apply" if args.apply is not None else "roll back"
+        print(
+            f"memory admin: would {verb} {len(rows)} row(s) from review "
+            f"{header.get('review_id')} for user {args.user_id}."
+        )
+        print("memory admin: re-run with --yes to execute.")
+        return 2
+    if args.apply is not None:
+        return asyncio.run(
+            _run_and_close_sessions(
+                memory_scope_review.run_apply(
+                    config,
+                    args.user_id,
+                    manifest_path=artifact_path,
+                    out_dir=out_dir,
+                )
+            )
+        )
+    return asyncio.run(
+        _run_and_close_sessions(
+            memory_scope_review.run_rollback(
+                config,
+                args.user_id,
+                preimages_path=artifact_path,
+            )
+        )
+    )
+
+
 def _cmd_backfill_provenance(args: argparse.Namespace) -> int:
     """Execute the `backfill-provenance` subcommand. Returns an exit code.
 
@@ -932,6 +1043,8 @@ def cli(argv: list[str]) -> None:
         sys.exit(_cmd_backfill_explicit(args))
     if args.command == "reclassify-scope":
         sys.exit(_cmd_reclassify(args))
+    if args.command == "review-legacy-scope":
+        sys.exit(_cmd_review_legacy_scope(args))
     if args.command == "backfill-provenance":
         sys.exit(_cmd_backfill_provenance(args))
     # argparse's required=True on the subparsers guarantees a known

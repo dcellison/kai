@@ -584,6 +584,21 @@ def _start() -> None:
                     memory_migration.stamped,
                     memory_migration.total,
                 )
+                try:
+                    from kai.memory_scope_review import refresh_scope_review_status
+
+                    scope_status = await asyncio.to_thread(refresh_scope_review_status)
+                    observed = scope_status.get("observed", {})
+                    logging.info(
+                        "Semantic memory scope census ready "
+                        "(legacy_default=%d, reviewed_quarantine=%d, unreviewed=%d, invalid=%d)",
+                        int(observed.get("raw_legacy_default", 0)),
+                        int(observed.get("quarantined", 0)),
+                        int(observed.get("unreviewed", 0)),
+                        int(observed.get("invalid_quarantined", 0)),
+                    )
+                except Exception:
+                    logging.warning("Could not refresh semantic memory scope census", exc_info=True)
 
         try:
             core_host = KaiApplicationHost(

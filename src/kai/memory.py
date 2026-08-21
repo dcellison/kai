@@ -645,7 +645,7 @@ class MemoryStats:
     # needs to measure. Keys are stable bucket identifiers consumed
     # by the /memory stats renderer:
     #   "global"             - explicit valid global rows
-    #   "global_legacy"      - rows resolved global via legacy_default
+    #   "global_legacy"      - unresolved legacy rows quarantined from retrieval
     #   "invalid"            - rows flagged invalid_defaulted by the
     #                          resolver (corrupted scope or provenance)
     #   "project:<id>"       - valid project rows, one bucket per id
@@ -780,10 +780,9 @@ class ScopedRetrievalDebug:
         ok                     - at least one hit returned.
 
     `excluded_by_scope` counts only exclusions (admission reasons
-    from `_scoped_memory_admission_reason`). Admitted rows that
-    were resolved as legacy- or invalid-default are visible
-    through `ScopedMemoryHit.resolved_scope`; the spec prefers the
-    per-hit channel over a second audit dict.
+    from `_scoped_memory_admission_reason`). Legacy- and
+    invalid-default rows appear there because their unresolved
+    authority is quarantined before ranking.
     """
 
     active_project_id: str | None
@@ -1355,6 +1354,8 @@ _ADMISSION_PROJECT_SCOPE_NOT_ALLOWED = "project_scope_not_allowed"
 _ADMISSION_PROJECT_SCOPE_MISSING_PROJECT_ID = "project_scope_missing_project_id"
 _ADMISSION_PROJECT_ID_MISMATCH = "project_id_mismatch"
 _ADMISSION_TASK_SCOPE_NOT_SUPPORTED = "task_scope_not_supported"
+_ADMISSION_LEGACY_SCOPE_QUARANTINED = "legacy_scope_quarantined"
+_ADMISSION_INVALID_SCOPE_QUARANTINED = "invalid_scope_quarantined"
 _ADMISSION_UNKNOWN_SCOPE = "unknown_scope"
 
 
@@ -1373,10 +1374,11 @@ def _scoped_memory_admission_reason(
     the project detector, or the singleton.
 
     Admission matrix:
-    - scope=global: admit. (Includes rows that resolved to global
-      via legacy_default and invalid_default branches in
-      `resolve_memory_scope`; the per-hit `resolved_scope` channel
-      preserves the audit trail.)
+    - Any row defaulted by the resolver because its scope is absent
+      or malformed: exclude. These rows have no reviewed authority to
+      cross workspace boundaries; treating their compatibility
+      fallback as an authorization decision would fail open.
+    - scope=global with explicit valid provenance: admit.
     - scope=project with allowed_project_id None: exclude as
       `project_scope_not_allowed`. Covers both "no active project
       detected" and "active project has memory_enabled=False"; the
@@ -1398,6 +1400,11 @@ def _scoped_memory_admission_reason(
       `unknown_scope`. Defensive belt for future schema drift; in
       practice the resolver never emits a non-recognized scope.
     """
+    if resolved_scope.legacy_defaulted:
+        return _ADMISSION_LEGACY_SCOPE_QUARANTINED
+    if resolved_scope.invalid_defaulted:
+        return _ADMISSION_INVALID_SCOPE_QUARANTINED
+
     scope = resolved_scope.scope
     if scope == SCOPE_GLOBAL:
         return None
@@ -3221,6 +3228,23 @@ def get_all(*, user_id: str, limit: int | None = 1000) -> list[MemoryResult]:
         return []
 
 
+def get_all_for_admin(*, user_id: str) -> list[MemoryResult]:
+    """Return the complete canonical-owner corpus, raising on read failure.
+
+    Interactive callers intentionally degrade to an empty result when Mem0
+    is unavailable. Administrative reconciliation must not: mistaking a
+    failed read for an empty census could authorize an incomplete review.
+    """
+    if _memory is None:
+        raise RuntimeError("Semantic memory is not initialized")
+    storage_user_id, namespace = _canonical_memory_owner(user_id)
+    result = _memory.get_all(filters={"user_id": storage_user_id}, top_k=100_000)
+    raw_results = result.get("results", []) if isinstance(result, dict) else result
+    return [
+        wrapped for raw in raw_results if _memory_result_belongs_to_principal((wrapped := _wrap_result(raw)), namespace)
+    ]
+
+
 def _get_all_raw(*, user_id: str) -> list[MemoryResult]:
     """Read one exact Mem0 namespace without applying canonical aliases."""
     if _memory is None:
@@ -3293,6 +3317,42 @@ def count_points_by_owner() -> dict[str, int]:
         if offset is None:
             break
     return counts
+
+
+def list_scope_census_points() -> list[tuple[str, str, dict[str, object]]]:
+    """Return collection-wide fields needed for scope status diagnostics.
+
+    The result contains ``(point_id, user_id, metadata_subset)`` and never
+    reads memory text or vectors. It uses the same isolated Qdrant scroll
+    boundary as the owner census because Mem0 has no collection-wide API.
+    """
+    if _memory is None:
+        raise RuntimeError("Semantic memory is not initialized")
+    vector_store = getattr(_memory, "vector_store", None)
+    client = getattr(vector_store, "client", None)
+    scroll = getattr(client, "scroll", None)
+    if not callable(scroll):
+        raise RuntimeError("Semantic-memory provider does not support a scope census")
+
+    fields = ["user_id", "source", "scope", "project_id", "workspace_root", "scope_confidence", "scope_source"]
+    found: list[tuple[str, str, dict[str, object]]] = []
+    offset = None
+    while True:
+        points, offset = scroll(
+            collection_name=vector_store.collection_name,
+            limit=1000,
+            offset=offset,
+            with_payload=fields,
+            with_vectors=False,
+        )
+        for point in points:
+            payload = dict(point.payload or {})
+            owner = payload.pop("user_id", "")
+            if isinstance(owner, str) and payload.get("source") in USER_VISIBLE_SOURCES:
+                found.append((str(point.id), owner, payload))
+        if offset is None:
+            break
+    return found
 
 
 def list_api_written_points() -> list[tuple[str, dict[str, object]]]:
