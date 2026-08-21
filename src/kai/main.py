@@ -36,6 +36,7 @@ The shutdown sequence (in the finally block) reverses this order:
 import asyncio
 import logging
 import re
+import signal
 from datetime import UTC, datetime, timedelta
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
@@ -260,6 +261,66 @@ _MEMORY_BACKUP_INTERVAL = 86400  # 24 hours
 # to stay clear of startup work, short enough that a restarted service
 # still snapshots promptly when the last snapshot is stale.
 _MEMORY_BACKUP_STARTUP_DELAY = 300
+
+
+# Budget for finishing in-flight memory work at shutdown. Bounded by
+# launchd's SIGTERM-to-SIGKILL grace, which defaults to 20 seconds
+# (ExitTimeOut is not set in the service plist): the drain must fit
+# inside that window alongside adapter teardown and the launcher's
+# port-release wait, or the whole process group is SIGKILLed
+# mid-drain and the warning below never lands in the log.
+_MEMORY_DRAIN_TIMEOUT_S = 10.0
+
+
+async def _drain_pending_memory_work() -> None:
+    """
+    Await in-flight extraction and episode tasks before the loop dies.
+
+    Both stages of memory ingestion are fire-and-forget tasks
+    (`_pending_memory_tasks` holds stage-1 extraction wrappers,
+    `_pending_episode_tasks` holds stage-2 episode generation).
+    Without this drain, closing the event loop cancels them silently
+    and every restart discards whatever the extractor was in the
+    middle of learning from the last exchange.
+
+    Runs after `core_host.stop()`: the adapters are down, so no new
+    ingestion can start while the drain waits; the loop below only
+    has to chase tasks that already existed plus their direct
+    descendants. The loop shape (re-collect, wait, repeat) exists
+    because completing a stage-1 task can SPAWN a stage-2 task; a
+    single `asyncio.wait` over the initial snapshot would drain
+    stage 1 and then close the loop on the freshly spawned stage 2.
+
+    On deadline, survivors are cancelled and one WARNING states what
+    was dropped; losing a turn's facts on a slow provider call is
+    acceptable, losing them silently is the audit finding.
+    """
+    from kai import memory_extraction
+    from kai.conversation_compatibility import _pending_memory_tasks
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _MEMORY_DRAIN_TIMEOUT_S
+    while True:
+        pending = _pending_memory_tasks | memory_extraction._pending_episode_tasks
+        if not pending:
+            return
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        logging.info("Draining %d in-flight memory task(s) before shutdown", len(pending))
+        _, not_done = await asyncio.wait(pending, timeout=remaining)
+        if not_done:
+            break
+    leftover = _pending_memory_tasks | memory_extraction._pending_episode_tasks
+    for task in leftover:
+        task.cancel()
+    await asyncio.gather(*leftover, return_exceptions=True)
+    logging.warning(
+        "Shutdown drain exceeded %.0fs; cancelled %d in-flight memory task(s); "
+        "facts or episodes from those turns are lost",
+        _MEMORY_DRAIN_TIMEOUT_S,
+        len(leftover),
+    )
 
 
 async def _memory_backup_loop() -> None:
@@ -571,7 +632,36 @@ def _start() -> None:
                     old_flag.unlink(missing_ok=True)
 
             logging.info("Kai is running. Press Ctrl+C to stop.")
-            await core_host.wait()
+            # launchd stops the service with SIGTERM (the launcher
+            # script forwards it to this process group). Python's
+            # default SIGTERM action terminates the interpreter
+            # WITHOUT running finally blocks, so before this handler
+            # existed every service stop skipped the shutdown path
+            # below entirely; the graceful path only ever ran on
+            # Ctrl+C. The handler turns SIGTERM into an event so the
+            # supervision wait returns and the finally block (host
+            # stop, memory drain, db close) actually executes.
+            stop_requested = asyncio.Event()
+            asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stop_requested.set)
+            host_supervision = asyncio.create_task(core_host.wait())
+            sigterm_wait = asyncio.create_task(stop_requested.wait())
+            done, pending = await asyncio.wait(
+                {host_supervision, sigterm_wait},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            if sigterm_wait in done:
+                logging.info("SIGTERM received; shutting down")
+            # Preserve the pre-existing failure semantics: a
+            # supervised worker's crash must still propagate out of
+            # _init_and_run as an exception, not be flattened into a
+            # clean-looking exit by the wait restructure.
+            if host_supervision in done:
+                supervision_error = host_supervision.exception()
+                if supervision_error is not None:
+                    raise supervision_error
         finally:
             # Shutdown in reverse order of startup
             if core_host is not None:
@@ -585,6 +675,14 @@ def _start() -> None:
             if memory_backup_task is not None:
                 memory_backup_task.cancel()
                 await asyncio.gather(memory_backup_task, return_exceptions=True)
+            # After host stop (no new ingestion), before the db and
+            # memory authority go away (a draining extraction still
+            # stores through them). Guarded like core_host.stop()
+            # above: an exception here must not skip close_db.
+            try:
+                await _drain_pending_memory_work()
+            except Exception:
+                logging.exception("Shutdown memory drain failed")
             from kai.memory import configure_memory_authority
 
             configure_memory_authority(None)

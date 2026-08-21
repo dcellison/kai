@@ -636,3 +636,97 @@ class TestStartCrashExit:
             _start()
 
         assert calls == [("local", str(Path(__file__).resolve().parents[1] / "services.yaml"))]
+
+
+class TestDrainPendingMemoryWork:
+    """The shutdown drain for in-flight extraction and episode tasks.
+    Uses real (fast) asyncio tasks against the actual module-level
+    pending sets; each test leaves both sets empty so state cannot
+    leak between tests."""
+
+    async def test_waits_for_pending_tasks(self):
+        """Tasks in both sets complete and the drain returns without
+        cancelling anything."""
+        from kai import memory_extraction
+        from kai.conversation_compatibility import _pending_memory_tasks
+        from kai.main import _drain_pending_memory_work
+
+        finished: list[str] = []
+
+        async def work(tag: str) -> None:
+            await asyncio.sleep(0)
+            finished.append(tag)
+
+        t1 = asyncio.create_task(work("extraction"))
+        _pending_memory_tasks.add(t1)
+        t1.add_done_callback(_pending_memory_tasks.discard)
+        t2 = asyncio.create_task(work("episode"))
+        memory_extraction._pending_episode_tasks.add(t2)
+        t2.add_done_callback(memory_extraction._pending_episode_tasks.discard)
+
+        await _drain_pending_memory_work()
+
+        assert sorted(finished) == ["episode", "extraction"]
+        assert not _pending_memory_tasks
+        assert not memory_extraction._pending_episode_tasks
+
+    async def test_waits_for_episode_task_spawned_by_extraction(self):
+        """The production shape the loop exists for: completing a
+        stage-1 task spawns a stage-2 task into the episode set. A
+        single-snapshot drain would miss it; the re-collect loop must
+        wait for the descendant too."""
+        from kai import memory_extraction
+        from kai.conversation_compatibility import _pending_memory_tasks
+        from kai.main import _drain_pending_memory_work
+
+        finished: list[str] = []
+
+        async def episode() -> None:
+            await asyncio.sleep(0)
+            finished.append("episode")
+
+        async def extraction() -> None:
+            await asyncio.sleep(0)
+            ep = asyncio.create_task(episode())
+            memory_extraction._pending_episode_tasks.add(ep)
+            ep.add_done_callback(memory_extraction._pending_episode_tasks.discard)
+            finished.append("extraction")
+
+        t = asyncio.create_task(extraction())
+        _pending_memory_tasks.add(t)
+        t.add_done_callback(_pending_memory_tasks.discard)
+
+        await _drain_pending_memory_work()
+
+        assert sorted(finished) == ["episode", "extraction"]
+        assert not memory_extraction._pending_episode_tasks
+
+    async def test_deadline_cancels_survivors_with_warning(self, monkeypatch, caplog):
+        """A task that outlives the budget is cancelled and one
+        WARNING names the loss; silence was the audit finding. The
+        timeout is patched tiny per the no-real-timeouts rule."""
+        from kai.conversation_compatibility import _pending_memory_tasks
+        from kai.main import _drain_pending_memory_work
+
+        monkeypatch.setattr("kai.main._MEMORY_DRAIN_TIMEOUT_S", 0.05)
+
+        hung = asyncio.create_task(asyncio.sleep(3600))
+        _pending_memory_tasks.add(hung)
+        hung.add_done_callback(_pending_memory_tasks.discard)
+
+        with caplog.at_level(logging.WARNING):
+            await _drain_pending_memory_work()
+
+        assert hung.cancelled()
+        assert not _pending_memory_tasks
+        assert "cancelled 1 in-flight memory task(s)" in caplog.text
+
+    async def test_no_op_when_nothing_pending(self, caplog):
+        """Empty sets: return immediately, no drain chatter in the
+        log (every restart would print it otherwise)."""
+        from kai.main import _drain_pending_memory_work
+
+        with caplog.at_level(logging.INFO):
+            await _drain_pending_memory_work()
+
+        assert "Draining" not in caplog.text
