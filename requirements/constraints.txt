@@ -16,7 +16,7 @@ pyyaml==6.0.3
 mem0ai==2.0.0
 sentence-transformers==5.4.1
 
-piper-tts==1.4.1
+piper-tts==1.7.0
 
 pyotp==2.9.0
 qrcode==8.2
