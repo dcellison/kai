@@ -53,6 +53,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import time
 from collections.abc import Callable
@@ -720,6 +721,9 @@ async def _handle_health(request: web.Request) -> web.Response:
         "status": "ok",
         "memory_enabled": memory.is_enabled(),
     }
+    service_generation = os.environ.get("KAI_SERVICE_GENERATION", "").strip()
+    if service_generation.isdigit():
+        response["service_generation"] = service_generation
     host = request.app.get(CORE_HOST_KEY)
     if host is not None:
         response["core"] = host.readiness.as_dict()

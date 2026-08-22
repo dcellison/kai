@@ -300,13 +300,39 @@ _MEMORY_BACKUP_INTERVAL = 86400  # 24 hours
 _MEMORY_BACKUP_STARTUP_DELAY = 300
 
 
-# Budget for finishing in-flight memory work at shutdown. Bounded by
-# launchd's SIGTERM-to-SIGKILL grace, which defaults to 20 seconds
-# (ExitTimeOut is not set in the service plist): the drain must fit
-# inside that window alongside adapter teardown and the launcher's
-# port-release wait, or the whole process group is SIGKILLed
-# mid-drain and the warning below never lands in the log.
+# Budget for finishing in-flight memory work at shutdown. The installed
+# launchd wrapper and ExitTimeOut provide a larger bounded generation grace;
+# this inner budget remains deliberately short so memory cannot consume it all.
 _MEMORY_DRAIN_TIMEOUT_S = 10.0
+_LAUNCHER_PARENT_POLL_SECONDS = 0.5
+
+
+def _configured_launcher_pid() -> int | None:
+    """Return the root-owned launcher's generation PID when configured."""
+    raw = os.environ.get("KAI_SERVICE_GENERATION", "").strip()
+    if not raw.isdigit():
+        return None
+    pid = int(raw)
+    return pid if pid > 1 else None
+
+
+async def _watch_launcher_parent(parent_pid: int, stop_requested: asyncio.Event) -> None:
+    """Request graceful shutdown if launchd kills only the wrapper shell."""
+    while not stop_requested.is_set():
+        if os.getppid() != parent_pid:
+            logging.warning(
+                "Kai launcher generation %d disappeared; beginning graceful shutdown",
+                parent_pid,
+            )
+            stop_requested.set()
+            return
+        try:
+            await asyncio.wait_for(
+                stop_requested.wait(),
+                timeout=_LAUNCHER_PARENT_POLL_SECONDS,
+            )
+        except TimeoutError:
+            continue
 
 
 async def _drain_pending_memory_work() -> None:
@@ -499,6 +525,7 @@ def _start() -> None:
         telegram_adapter: TelegramAdapter | None = None
         cleanup_task: asyncio.Task[None] | None = None
         memory_backup_task: asyncio.Task[None] | None = None
+        launcher_watch_task: asyncio.Task[None] | None = None
 
         # Determine the default compatibility user (admin or first user) for
         # legacy per-user migrations. Workshop-only installations may have no
@@ -695,6 +722,11 @@ def _start() -> None:
             # stop, memory drain, db close) actually executes.
             stop_requested = asyncio.Event()
             asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stop_requested.set)
+            if launcher_pid := _configured_launcher_pid():
+                launcher_watch_task = asyncio.create_task(
+                    _watch_launcher_parent(launcher_pid, stop_requested),
+                    name="kai-launcher-parent-watch",
+                )
             host_supervision = asyncio.create_task(core_host.wait())
             sigterm_wait = asyncio.create_task(stop_requested.wait())
             done, pending = await asyncio.wait(
@@ -716,6 +748,9 @@ def _start() -> None:
                     raise supervision_error
         finally:
             # Shutdown in reverse order of startup
+            if launcher_watch_task is not None:
+                launcher_watch_task.cancel()
+                await asyncio.gather(launcher_watch_task, return_exceptions=True)
             if core_host is not None:
                 try:
                     await core_host.stop()
