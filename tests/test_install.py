@@ -6,6 +6,7 @@ import os
 import pwd
 import shutil
 import signal
+import socket
 import sqlite3
 import stat
 import subprocess
@@ -22,6 +23,7 @@ import kai.install
 from kai.install import (
     _LAUNCHD_LABEL,
     ServiceStartError,
+    ServiceStopError,
     _adapter_policy_status,
     _apply_backend_registry,
     _apply_directories,
@@ -36,6 +38,7 @@ from kai.install import (
     _apply_venv,
     _backend_command_trust_issues,
     _build_migrated_runtime_profiles,
+    _capture_darwin_service_generation,
     _check_path,
     _check_service_status,
     _check_traversal,
@@ -47,10 +50,12 @@ from kai.install import (
     _collect_user_memory_owners,
     _copy_managed_home_tree,
     _copy_tree,
+    _DarwinServiceGeneration,
     _deployed_adapter_policy_status,
     _deployed_webhook_secret_migration_status,
     _dormant_compatibility_schedule_status,
     _file_checksum,
+    _finish_stopping_darwin_generation,
     _generate_env_file,
     _generate_launchd_plist,
     _generate_launcher_script,
@@ -63,6 +68,7 @@ from kai.install import (
     _migrate_identity_to_claude_md,
     _migrate_managed_home_database_paths,
     _optional_file_checksum,
+    _probe_service_readiness,
     _prompt_choice,
     _prompt_optional_choice,
     _read_users_yaml_text,
@@ -1154,6 +1160,11 @@ class TestGenerateLaunchdPlist:
         result = _generate_launchd_plist("/opt/kai", "/srv/kai", "kai")
         assert "<string>/srv/kai/logs/kai.stderr.log</string>" in result
         assert "<string>/srv/kai/logs/kai.stdout.log</string>" in result
+
+    def test_exit_timeout_covers_bounded_launcher_shutdown(self):
+        result = _generate_launchd_plist("/opt/kai", "/var/lib/kai", "kai")
+        assert "<key>ExitTimeOut</key>" in result
+        assert "<integer>65</integer>" in result
 
 
 class TestGenerateSystemdUnit:
@@ -7207,22 +7218,53 @@ class TestGitignoreRuntimePreferencesDir:
 
 
 class TestStopService:
+    def test_captures_only_group_leader_launchd_generation(self, monkeypatch):
+        monkeypatch.setattr(
+            "kai.install.subprocess.run",
+            lambda cmd, **kwargs: subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout="\tpid = 4321\n",
+            ),
+        )
+        monkeypatch.setattr("kai.install.os.getpgid", lambda pid: pid)
+
+        assert _capture_darwin_service_generation() == _DarwinServiceGeneration(
+            pid=4321,
+            pgid=4321,
+        )
+
+    def test_refuses_non_leader_launchd_generation(self, monkeypatch):
+        monkeypatch.setattr(
+            "kai.install.subprocess.run",
+            lambda cmd, **kwargs: subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout="\tpid = 4321\n",
+            ),
+        )
+        monkeypatch.setattr("kai.install.os.getpgid", lambda _pid: 4000)
+
+        with pytest.raises(ServiceStopError, match="expected process group 4321, observed 4000"):
+            _capture_darwin_service_generation()
+
     def test_darwin(self, monkeypatch, tmp_path):
         """Calls launchctl bootout on macOS with system domain."""
         calls: list[list[str]] = []
 
         def mock_run(cmd, **kwargs):
             calls.append(list(cmd))
+            if cmd[:2] == ["launchctl", "print"]:
+                return subprocess.CompletedProcess(args=cmd, returncode=1)
             return subprocess.CompletedProcess(args=cmd, returncode=0)
 
         monkeypatch.setattr("kai.install.subprocess.run", mock_run)
 
         _stop_service("darwin", svc_uid=501, service_user="kai", dry_run=False)
 
-        assert len(calls) == 1
-        assert calls[0][0] == "launchctl"
-        assert calls[0][1] == "bootout"
-        assert calls[0][2] == "system/com.syrinx.kai"
+        assert len(calls) == 2
+        assert calls[0] == ["launchctl", "print", "system/com.syrinx.kai"]
+        assert calls[1] == ["launchctl", "bootout", "system/com.syrinx.kai"]
 
     def test_linux(self, monkeypatch):
         """Calls systemctl stop on Linux."""
@@ -7252,8 +7294,51 @@ class TestStopService:
         assert "[DRY RUN]" in output
         assert len(calls) == 0
 
+    def test_waits_for_complete_verified_generation(self, monkeypatch):
+        generation = _DarwinServiceGeneration(pid=4321, pgid=4321)
+        states = iter((True, True, False))
+        monkeypatch.setattr("kai.install._darwin_generation_alive", lambda _generation: next(states))
+        monkeypatch.setattr("kai.install.time.sleep", lambda _seconds: None)
+
+        _finish_stopping_darwin_generation(generation)
+
+    def test_escalates_only_verified_generation_after_grace(self, monkeypatch):
+        generation = _DarwinServiceGeneration(pid=4321, pgid=4321)
+        states = iter((True, False))
+        signals: list[tuple[int, int]] = []
+        monkeypatch.setattr("kai.install._SERVICE_STOP_GRACE_SECONDS", 0)
+        monkeypatch.setattr("kai.install._darwin_generation_alive", lambda _generation: next(states))
+        monkeypatch.setattr("kai.install.os.killpg", lambda pgid, sig: signals.append((pgid, sig)))
+
+        _finish_stopping_darwin_generation(generation)
+
+        assert signals == [(4321, signal.SIGKILL)]
+
+    def test_refuses_apply_when_bootout_fails_for_live_generation(self, monkeypatch):
+        generation = _DarwinServiceGeneration(pid=4321, pgid=4321)
+        monkeypatch.setattr("kai.install._capture_darwin_service_generation", lambda: generation)
+        monkeypatch.setattr("kai.install._darwin_generation_alive", lambda _generation: True)
+        monkeypatch.setattr(
+            "kai.install.subprocess.run",
+            lambda cmd, **kwargs: subprocess.CompletedProcess(
+                args=cmd,
+                returncode=1,
+                stderr=b"bootout failed",
+            ),
+        )
+
+        with pytest.raises(ServiceStopError, match="bootout failed for running generation 4321"):
+            _stop_service("darwin", dry_run=False)
+
 
 class TestStartService:
+    @pytest.fixture(autouse=True)
+    def _ready_service(self, monkeypatch):
+        monkeypatch.setattr(
+            "kai.install._wait_for_service_readiness",
+            lambda _port, *, expected_generation: (True, f"ready:{expected_generation}"),
+        )
+
     def test_darwin(self, monkeypatch):
         """Calls launchctl bootstrap then launchctl print to verify on
         macOS. Two calls per attempt because the bootstrap exit code is
@@ -7262,6 +7347,8 @@ class TestStartService:
 
         def mock_run(cmd, **kwargs):
             calls.append(list(cmd))
+            if cmd[:2] == ["launchctl", "print"]:
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=b"\tpid = 4321\n")
             return subprocess.CompletedProcess(args=cmd, returncode=0)
 
         monkeypatch.setattr("kai.install.subprocess.run", mock_run)
@@ -7324,7 +7411,7 @@ class TestStartService:
                     returncode=5,
                     stderr=b"Bootstrap failed: 5: Input/output error",
                 )
-            return subprocess.CompletedProcess(args=cmd, returncode=0)
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=b"\tpid = 4321\n")
 
         monkeypatch.setattr("kai.install.subprocess.run", mock_run)
         monkeypatch.setattr("kai.install.time.sleep", lambda _s: None)
@@ -7344,7 +7431,8 @@ class TestStartService:
             if cmd[:2] == ["launchctl", "print"]:
                 verify_calls += 1
                 rc = 0 if verify_calls >= 2 else 1
-                return subprocess.CompletedProcess(args=cmd, returncode=rc)
+                stdout = b"\tpid = 4321\n" if rc == 0 else b""
+                return subprocess.CompletedProcess(args=cmd, returncode=rc, stdout=stdout)
             return subprocess.CompletedProcess(args=cmd, returncode=0)
 
         monkeypatch.setattr("kai.install.subprocess.run", mock_run)
@@ -7406,6 +7494,72 @@ class TestStartService:
             _start_service("linux", svc_uid=1000, service_user="kai", dry_run=False)
 
         assert "systemctl is-active" in str(excinfo.value)
+
+    def test_requires_readiness_from_registered_darwin_generation(self, monkeypatch):
+        observed: list[tuple[int, str | None]] = []
+
+        def mock_run(cmd, **kwargs):
+            if cmd[:2] == ["launchctl", "print"]:
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=b"\tpid = 9876\n")
+            return subprocess.CompletedProcess(args=cmd, returncode=0)
+
+        def not_ready(port: int, *, expected_generation: str | None):
+            observed.append((port, expected_generation))
+            return False, "not ready"
+
+        monkeypatch.setattr("kai.install.subprocess.run", mock_run)
+        monkeypatch.setattr("kai.install.time.sleep", lambda _seconds: None)
+        monkeypatch.setattr("kai.install._wait_for_service_readiness", not_ready)
+
+        with pytest.raises(ServiceStartError, match=r"generation 9876.*did not become ready"):
+            _start_service("darwin", dry_run=False, webhook_port=9090)
+
+        assert observed == [(9090, "9876")]
+
+    def test_refuses_registered_darwin_service_without_generation_pid(self, monkeypatch):
+        monkeypatch.setattr(
+            "kai.install.subprocess.run",
+            lambda cmd, **kwargs: subprocess.CompletedProcess(args=cmd, returncode=0, stdout=b"state = running\n"),
+        )
+        monkeypatch.setattr("kai.install.time.sleep", lambda _seconds: None)
+
+        with pytest.raises(ServiceStartError, match="did not report a generation PID"):
+            _start_service("darwin", dry_run=False)
+
+    def test_health_probe_accepts_only_ready_expected_generation(self, monkeypatch):
+        payload = {
+            "status": "ok",
+            "service_generation": "9876",
+            "core": {"ready": True},
+            "adapters": {
+                "http": {"ready": True},
+                "telegram": {"ready": True},
+            },
+        }
+
+        class Response:
+            status = 200
+
+            def read(self, _limit):
+                return json.dumps(payload).encode()
+
+        class Connection:
+            def request(self, _method, _path):
+                return None
+
+            def getresponse(self):
+                return Response()
+
+            def close(self):
+                return None
+
+        monkeypatch.setattr("kai.install.http.client.HTTPConnection", lambda *args, **kwargs: Connection())
+
+        assert _probe_service_readiness(8080, expected_generation="9876") == (True, "ready")
+        assert _probe_service_readiness(8080, expected_generation="1234") == (
+            False,
+            "health belongs to a different service generation",
+        )
 
 
 # ── CLI dispatch ─────────────────────────────────────────────────────
@@ -7690,6 +7844,26 @@ class TestGenerateLauncherScript:
         script = _generate_launcher_script("/opt/kai", webhook_port=9090)
         assert "9090" in script
 
+    def test_records_and_exports_service_generation(self):
+        script = _generate_launcher_script(
+            "/opt/kai",
+            data_dir="/var/lib/kai",
+        )
+        assert 'GENERATION_FILE="/var/lib/kai/.service-generation"' in script
+        assert '[ "$PREVIOUS_GENERATION" -gt 1 ]' in script
+        assert 'export KAI_SERVICE_GENERATION="$$"' in script
+
+    def test_listener_must_belong_to_current_process_group(self):
+        script = _generate_launcher_script("/opt/kai")
+        assert '/bin/ps -o pgid= -p "$CANDIDATE_PID"' in script
+        assert '[ "$CANDIDATE_PGID" = "$$" ]' in script
+
+    def test_shutdown_and_previous_generation_waits_are_bounded(self):
+        script = _generate_launcher_script("/opt/kai")
+        assert "previous generation exceeded shutdown grace" in script
+        assert "generation $$ exceeded shutdown grace" in script
+        assert "kill -KILL" in script
+
     def test_starts_with_shebang(self):
         script = _generate_launcher_script("/opt/kai")
         assert script.startswith("#!/bin/bash")
@@ -7729,7 +7903,7 @@ class TestGenerateLauncherScript:
         script = _generate_launcher_script("/opt/kai")
         assert script.index("trap cleanup TERM INT") < script.index("seq 1 60")
 
-    def test_sigterm_during_bind_poll_tears_down_the_child(self, tmp_path):
+    def test_sigterm_during_bind_poll_tears_down_the_child(self, tmp_path, monkeypatch):
         """Behavioral check on the generated script: SIGTERM arriving
         while the launcher is still polling for the listener must
         tear the spawned python down, not exit the wrapper alone. The
@@ -7749,9 +7923,16 @@ class TestGenerateLauncherScript:
         fake.write_text(f"#!/bin/bash\necho $$ > {pid_file}\nexec sleep 30\n")
         fake.chmod(0o755)
 
+        monkeypatch.setattr("kai.install._LAUNCHER_STARTUP_SHUTDOWN_GRACE_STEPS", 2)
         script_path = tmp_path / "run.sh"
         # Port 1 is never listened on, so the poll cannot succeed.
-        script_path.write_text(_generate_launcher_script(str(tmp_path), webhook_port=1))
+        script_path.write_text(
+            _generate_launcher_script(
+                str(tmp_path),
+                webhook_port=1,
+                data_dir=str(tmp_path),
+            )
+        )
         script_path.chmod(0o755)
 
         # New session mirrors launchd: the wrapper is its own process
@@ -7784,6 +7965,71 @@ class TestGenerateLauncherScript:
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(proc.pid, signal.SIGKILL)
             proc.wait(timeout=5)
+
+    @pytest.mark.skipif(not Path("/usr/sbin/lsof").is_file(), reason="requires macOS lsof path")
+    def test_foreign_listener_is_not_adopted_as_current_generation(self, tmp_path, monkeypatch):
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+
+        foreign = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1"],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        wrapper: subprocess.Popen | None = None
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                        break
+                except OSError:
+                    time.sleep(0.05)
+            else:
+                pytest.fail("foreign listener did not start")
+
+            venv_bin = tmp_path / "venv" / "bin"
+            venv_bin.mkdir(parents=True)
+            fake_pid_file = tmp_path / "fake.pid"
+            fake = venv_bin / "python3"
+            fake.write_text(f"#!/bin/bash\necho $$ > {fake_pid_file}\nexec sleep 30\n")
+            fake.chmod(0o755)
+            monkeypatch.setattr("kai.install._LAUNCHER_STARTUP_SHUTDOWN_GRACE_STEPS", 2)
+            script_path = tmp_path / "run.sh"
+            script_path.write_text(
+                _generate_launcher_script(
+                    str(tmp_path),
+                    webhook_port=port,
+                    data_dir=str(tmp_path),
+                )
+            )
+            script_path.chmod(0o755)
+
+            wrapper = subprocess.Popen(
+                ["/bin/bash", str(script_path)],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            deadline = time.time() + 5
+            while time.time() < deadline and not fake_pid_file.exists():
+                time.sleep(0.05)
+            assert fake_pid_file.exists()
+
+            wrapper.send_signal(signal.SIGTERM)
+            wrapper.wait(timeout=6)
+            assert foreign.poll() is None
+        finally:
+            if wrapper is not None and wrapper.poll() is None:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(wrapper.pid, signal.SIGKILL)
+                wrapper.wait(timeout=5)
+            if foreign.poll() is None:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(foreign.pid, signal.SIGKILL)
+            foreign.wait(timeout=5)
 
 
 # ── _apply_source ────────────────────────────────────────────────────

@@ -98,11 +98,25 @@ def test_workshop_only_omits_telegram_owned_routes() -> None:
 
 async def test_health_reports_non_sensitive_memory_mode(monkeypatch) -> None:
     monkeypatch.setattr("kai.webhook.memory.is_enabled", lambda: True)
+    monkeypatch.delenv("KAI_SERVICE_GENERATION", raising=False)
 
     request = SimpleNamespace(app=web.Application())
     response = await _handle_health(request)  # type: ignore[arg-type]
 
     assert json.loads(response.body) == {"status": "ok", "memory_enabled": True}
+
+
+async def test_health_reports_non_sensitive_service_generation(monkeypatch) -> None:
+    monkeypatch.setattr("kai.webhook.memory.is_enabled", lambda: False)
+    monkeypatch.setenv("KAI_SERVICE_GENERATION", "4321")
+
+    response = await _handle_health(SimpleNamespace(app=web.Application()))  # type: ignore[arg-type]
+
+    assert json.loads(response.body) == {
+        "status": "ok",
+        "memory_enabled": False,
+        "service_generation": "4321",
+    }
 
 
 async def test_health_reports_typed_core_component_readiness(monkeypatch) -> None:

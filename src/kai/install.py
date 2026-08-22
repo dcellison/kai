@@ -23,12 +23,14 @@ It's a JSON file with a version field for forward compatibility.
 
 import grp
 import hashlib
+import http.client
 import json
 import os
 import pwd
 import re
 import secrets
 import shutil
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -144,6 +146,19 @@ _LAUNCHD_LABEL = "com.syrinx.kai"
 _SERVICE_START_MAX_ATTEMPTS = 3
 _SERVICE_START_SETTLE_SECONDS = 1
 _SERVICE_START_RETRY_SECONDS = 2
+_SERVICE_READY_TIMEOUT_SECONDS = 120.0
+_SERVICE_READY_POLL_SECONDS = 1.0
+_SERVICE_STOP_GRACE_SECONDS = 65.0
+_SERVICE_STOP_KILL_SECONDS = 5.0
+_SERVICE_STOP_POLL_SECONDS = 0.25
+_LAUNCHD_EXIT_TIMEOUT_SECONDS = 65
+
+# The launchd wrapper uses the same bounded grace period when it receives
+# TERM directly or discovers a previous service generation after `kickstart
+# -k`.  Half-second steps keep the generated shell portable on macOS.
+_LAUNCHER_SHUTDOWN_POLL_SECONDS = 0.5
+_LAUNCHER_SHUTDOWN_GRACE_STEPS = 120
+_LAUNCHER_STARTUP_SHUTDOWN_GRACE_STEPS = 20
 
 _PRIVATE_USER_ROOT_MODE = 0o711
 _PRIVATE_USER_DIR_MODE = 0o700
@@ -173,6 +188,18 @@ class ServiceStartError(Exception):
     original) or propagate (apply succeeded; the install has not
     produced a working system).
     """
+
+
+class ServiceStopError(Exception):
+    """Raised when the verified previous service generation cannot stop."""
+
+
+@dataclass(frozen=True, slots=True)
+class _DarwinServiceGeneration:
+    """Verified launchd wrapper process group for one Kai generation."""
+
+    pid: int
+    pgid: int
 
 
 # Files and directories to copy from source to the install location.
@@ -3912,7 +3939,11 @@ def _user_home(username: str) -> str:
         return f"/home/{username}"
 
 
-def _generate_launcher_script(install_dir: str, webhook_port: int = 8080) -> str:
+def _generate_launcher_script(
+    install_dir: str,
+    webhook_port: int = 8080,
+    data_dir: str = _DEFAULT_DATA_DIR,
+) -> str:
     """
     Generate a launcher script for launchd.
 
@@ -3927,32 +3958,97 @@ def _generate_launcher_script(install_dir: str, webhook_port: int = 8080) -> str
         # Keeps bash as the tracked PID so launchd can manage the service
         # even when Homebrew Python re-execs through the framework bundle.
         #
-        # Homebrew Python's framework binary fork+execs through Python.app,
-        # creating a grandchild process with a new PID. Launchd tracks this
-        # bash script instead, and we forward signals to the real Python.
+        # A generation file lets a replacement wrapper wait for a predecessor
+        # left behind by `launchctl kickstart -k`. The Python child also watches
+        # this wrapper PID and begins graceful shutdown if launchd kills only
+        # the shell.
+        GENERATION_FILE="{data_dir}/.service-generation"
+        PREVIOUS_GENERATION=""
+        [ -f "$GENERATION_FILE" ] && PREVIOUS_GENERATION=$(tr -d '[:space:]' < "$GENERATION_FILE")
+
+        wait_for_generation_exit() {{
+            local pgid="$1"
+            local steps="$2"
+            for _ in $(seq 1 "$steps"); do
+                if ! kill -0 -- "-$pgid" 2>/dev/null; then
+                    return 0
+                fi
+                sleep {_LAUNCHER_SHUTDOWN_POLL_SECONDS}
+            done
+            return 1
+        }}
+
+        if [[ "$PREVIOUS_GENERATION" =~ ^[0-9]+$ ]] \
+            && [ "$PREVIOUS_GENERATION" -gt 1 ] \
+            && [ "$PREVIOUS_GENERATION" != "$$" ] \
+            && kill -0 -- "-$PREVIOUS_GENERATION" 2>/dev/null; then
+            echo "kai launcher: waiting for previous generation $PREVIOUS_GENERATION to exit" >&2
+            if ! wait_for_generation_exit \
+                "$PREVIOUS_GENERATION" {_LAUNCHER_SHUTDOWN_GRACE_STEPS}; then
+                echo "kai launcher: previous generation exceeded shutdown grace; sending SIGKILL" >&2
+                kill -KILL -- "-$PREVIOUS_GENERATION" 2>/dev/null || true
+                if ! wait_for_generation_exit "$PREVIOUS_GENERATION" 10; then
+                    echo "kai launcher: previous generation still exists after SIGKILL" >&2
+                    exit 1
+                fi
+            fi
+        fi
+
+        umask 077
+        GENERATION_TMP="$GENERATION_FILE.$$"
+        printf '%s\\n' "$$" > "$GENERATION_TMP"
+        mv -f "$GENERATION_TMP" "$GENERATION_FILE"
+        export KAI_SERVICE_GENERATION="$$"
+
+        # Homebrew Python's framework binary fork+execs through Python.app.
+        # Launchd tracks this bash script while the generation PID and process
+        # group bind the wrapper and Python descendants together.
         {install_dir}/venv/bin/python3 -m kai &
         CHILD_PID=$!
+        REAL_PID=""
+
+        clear_generation_file() {{
+            local recorded=""
+            [ -f "$GENERATION_FILE" ] && recorded=$(tr -d '[:space:]' < "$GENERATION_FILE")
+            if [ "$recorded" = "$$" ]; then
+                rm -f "$GENERATION_FILE"
+            fi
+        }}
+
+        terminate_generation() {{
+            local exit_code="$1"
+            local steps={_LAUNCHER_STARTUP_SHUTDOWN_GRACE_STEPS}
+            # Ignore further TERM/INT while tearing down so the group signal
+            # below does not re-enter this handler.
+            trap '' TERM INT
+            kill -TERM -- -$$ 2>/dev/null || kill -TERM "$CHILD_PID" 2>/dev/null
+
+            if [ -n "$REAL_PID" ]; then
+                steps={_LAUNCHER_SHUTDOWN_GRACE_STEPS}
+                for _ in $(seq 1 "$steps"); do
+                    if ! kill -0 "$REAL_PID" 2>/dev/null; then
+                        clear_generation_file
+                        exit "$exit_code"
+                    fi
+                    sleep {_LAUNCHER_SHUTDOWN_POLL_SECONDS}
+                done
+            else
+                # During the pre-bind re-exec window there is no stable child
+                # PID to await. TERM reached the complete process group; allow
+                # a short bounded grace before escalating the same group.
+                for _ in $(seq 1 "$steps"); do
+                    sleep {_LAUNCHER_SHUTDOWN_POLL_SECONDS}
+                done
+            fi
+
+            echo "kai launcher: generation $$ exceeded shutdown grace; sending SIGKILL" >&2
+            clear_generation_file
+            kill -KILL -- -$$ 2>/dev/null || kill -KILL "$CHILD_PID" 2>/dev/null
+            exit "$exit_code"
+        }}
 
         cleanup() {{
-            # Ignore further TERM/INT while tearing down so the group
-            # signal below does not re-enter this handler.
-            trap '' TERM INT
-            # Signal the launcher's whole process group: launchd runs
-            # this script as its own group leader and non-interactive
-            # bash creates no job-control groups, so the python child,
-            # its re-exec'd grandchild, and any helper sleeps all share
-            # the group (fork and exec both preserve the pgid). The
-            # group signal is the only handle that reaches a python
-            # that has re-exec'd but not yet bound the port; in that
-            # window it has no individually resolvable pid. Fall back
-            # to the direct child if this shell is somehow not a group
-            # leader.
-            kill -TERM -- -$$ 2>/dev/null || kill -TERM "$CHILD_PID" 2>/dev/null
-            # Wait for the webhook port to be released so the stop is
-            # not reported complete while a dying python still holds
-            # the port a successor will need.
-            while [ -n "$(/usr/sbin/lsof -ti :{webhook_port} -sTCP:LISTEN 2>/dev/null)" ]; do sleep 0.5; done
-            exit 0
+            terminate_generation 0
         }}
         # Installed BEFORE the bind poll: a service stop during the
         # (up to 120s) startup window must still tear the agent down;
@@ -3960,17 +4056,17 @@ def _generate_launcher_script(install_dir: str, webhook_port: int = 8080) -> str
         # orphan the starting python.
         trap cleanup TERM INT
 
-        # Find the actual Python process (the re-exec'd grandchild) by
-        # its listen port. lsof lives at /usr/sbin/ which may not be in
-        # the service PATH. Healthy startups bind in 15-25 seconds on
-        # this stack (the memory subsystem loads its embedding model
-        # before the webhook server starts), so poll for up to 120s.
-        # The direct child exits on the framework re-exec in normal
-        # operation, so child death alone is not a failure signal;
-        # only the port answers whether the agent came up.
-        REAL_PID=""
+        # Find the actual Python process by its listener, but accept only a PID
+        # in this wrapper's process group. A stale listener from a draining
+        # predecessor must never be adopted as the current generation.
         for _ in $(seq 1 60); do
-            REAL_PID=$(/usr/sbin/lsof -ti :{webhook_port} -sTCP:LISTEN 2>/dev/null)
+            for CANDIDATE_PID in $(/usr/sbin/lsof -ti :{webhook_port} -sTCP:LISTEN 2>/dev/null); do
+                CANDIDATE_PGID=$(/bin/ps -o pgid= -p "$CANDIDATE_PID" 2>/dev/null | /usr/bin/tr -d ' ')
+                if [ "$CANDIDATE_PGID" = "$$" ]; then
+                    REAL_PID="$CANDIDATE_PID"
+                    break
+                fi
+            done
             [ -n "$REAL_PID" ] && break
             sleep 2
         done
@@ -3985,15 +4081,14 @@ def _generate_launcher_script(install_dir: str, webhook_port: int = 8080) -> str
             # visible retry loop instead of an eternal sleep that
             # reports state=running with no agent behind it.
             echo "kai launcher: no listener on :{webhook_port} after 120s; exiting so launchd restarts the service" >&2
-            trap '' TERM INT
-            kill -TERM -- -$$ 2>/dev/null || kill -TERM "$CHILD_PID" 2>/dev/null
-            exit 1
+            terminate_generation 1
         fi
 
         # Poll for the real Python process to exit.
         # kill -0 checks if PID exists without sending a signal.
         # This is macOS-compatible (no GNU tail --pid needed).
         while kill -0 "$REAL_PID" 2>/dev/null; do sleep 1; done
+        clear_generation_file
     """)
 
 
@@ -4080,6 +4175,9 @@ def _generate_launchd_plist(install_dir: str, data_dir: str, service_user: str) 
 
             <key>ProcessType</key>
             <string>Background</string>
+
+            <key>ExitTimeOut</key>
+            <integer>{_LAUNCHD_EXIT_TIMEOUT_SECONDS}</integer>
         </dict>
         </plist>
     """)
@@ -4127,20 +4225,100 @@ def _generate_systemd_unit(install_dir: str, data_dir: str, service_user: str) -
     """)
 
 
+def _capture_darwin_service_generation() -> _DarwinServiceGeneration | None:
+    """Return the verified launchd wrapper process group, if running."""
+    result = subprocess.run(
+        ["launchctl", "print", f"system/{_LAUNCHD_LABEL}"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    match = re.search(r"(?m)^\s*pid = ([0-9]+)\s*$", result.stdout or "")
+    if match is None:
+        return None
+    pid = int(match.group(1))
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return None
+    if pgid != pid:
+        raise ServiceStopError(
+            f"Refusing to stop launchd generation {pid}: expected process group {pid}, observed {pgid}"
+        )
+    return _DarwinServiceGeneration(pid=pid, pgid=pgid)
+
+
+def _darwin_generation_alive(generation: _DarwinServiceGeneration) -> bool:
+    """Return whether any process remains in a verified service generation."""
+    try:
+        os.killpg(generation.pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for_darwin_generation_exit(
+    generation: _DarwinServiceGeneration,
+    *,
+    timeout: float,
+) -> bool:
+    """Wait a bounded interval for every process in one generation to exit."""
+    deadline = time.monotonic() + timeout
+    while _darwin_generation_alive(generation):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_SERVICE_STOP_POLL_SECONDS)
+    return True
+
+
+def _finish_stopping_darwin_generation(generation: _DarwinServiceGeneration) -> None:
+    """Await graceful exit, then safely escalate the exact verified group."""
+    if _wait_for_darwin_generation_exit(
+        generation,
+        timeout=_SERVICE_STOP_GRACE_SECONDS,
+    ):
+        return
+    print(
+        f"  Service generation {generation.pid} exceeded "
+        f"{_SERVICE_STOP_GRACE_SECONDS:g}s shutdown grace; sending SIGKILL"
+    )
+    try:
+        os.killpg(generation.pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except PermissionError as exc:
+        raise ServiceStopError(f"Could not terminate verified service generation {generation.pid}") from exc
+    if not _wait_for_darwin_generation_exit(
+        generation,
+        timeout=_SERVICE_STOP_KILL_SECONDS,
+    ):
+        raise ServiceStopError(f"Service generation {generation.pid} still exists after SIGKILL")
+
+
 def _stop_service(platform: str, dry_run: bool, **_kwargs: object) -> None:
     """
     Stop the Kai service before applying changes.
 
-    Best-effort: uses check=False since the service may not be running
-    (first install) or may not exist yet. Failing to stop is not fatal.
+    A missing service is harmless on first install. A registered macOS service
+    is different: capture its verified wrapper process group before bootout,
+    then wait for the complete generation to exit. If graceful shutdown exceeds
+    its bounded deadline, SIGKILL is sent only to that verified group. Apply
+    must not continue while an old generation can retain Qdrant or listeners.
 
     Args:
         platform: "darwin" or "linux".
         dry_run: If True, print the command without executing.
     """
+    generation: _DarwinServiceGeneration | None = None
     if platform == "darwin":
         # Boot out from the system domain (LaunchDaemon, not LaunchAgent)
         cmd = ["launchctl", "bootout", f"system/{_LAUNCHD_LABEL}"]
+        if not dry_run:
+            generation = _capture_darwin_service_generation()
     elif platform == "linux":
         cmd = ["systemctl", "stop", "kai"]
     else:
@@ -4152,21 +4330,87 @@ def _stop_service(platform: str, dry_run: bool, **_kwargs: object) -> None:
     else:
         result = subprocess.run(cmd, check=False, capture_output=True)
         if result.returncode == 0:
+            if generation is not None:
+                _finish_stopping_darwin_generation(generation)
             print(f"  Stopped service ({' '.join(cmd[:2])})")
-            # Give launchd time to fully release the service domain.
-            # Without this, a subsequent bootstrap can fail transiently
-            # on KeepAlive daemons.
-            if platform == "darwin":
-                time.sleep(2)
         else:
-            # Non-zero is expected on first install (service not yet registered)
+            if generation is not None and _darwin_generation_alive(generation):
+                detail = (result.stderr or b"").decode().strip()
+                suffix = f": {detail}" if detail else ""
+                raise ServiceStopError(f"launchctl bootout failed for running generation {generation.pid}{suffix}")
+            # Non-zero is expected on first install (service not yet registered).
             print(f"  Service not running ({' '.join(cmd[:2])})")
 
 
-def _start_service(platform: str, dry_run: bool, **_kwargs: object) -> None:
+def _probe_service_readiness(
+    webhook_port: int,
+    *,
+    expected_generation: str | None,
+) -> tuple[bool, str]:
+    """Probe content-free readiness for the expected service generation."""
+    connection = http.client.HTTPConnection("127.0.0.1", webhook_port, timeout=1.0)
+    try:
+        connection.request("GET", "/health")
+        response = connection.getresponse()
+        body = response.read(65536)
+    except (OSError, http.client.HTTPException) as exc:
+        return False, type(exc).__name__
+    finally:
+        connection.close()
+    if response.status != 200:
+        return False, f"HTTP {response.status}"
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False, "invalid health payload"
+    if not isinstance(payload, dict):
+        return False, "invalid health payload"
+    if expected_generation is not None and payload.get("service_generation") != expected_generation:
+        return False, "health belongs to a different service generation"
+    core = payload.get("core")
+    if not isinstance(core, dict) or core.get("ready") is not True:
+        return False, "core is not ready"
+    adapters = payload.get("adapters")
+    if not isinstance(adapters, dict):
+        return False, "adapter readiness is unavailable"
+    http_adapter = adapters.get("http")
+    if not isinstance(http_adapter, dict) or http_adapter.get("ready") is not True:
+        return False, "HTTP adapter is not ready"
+    for adapter_name, readiness in adapters.items():
+        if not isinstance(readiness, dict) or readiness.get("ready") is not True:
+            return False, f"adapter {adapter_name!r} is not ready"
+    return True, "ready"
+
+
+def _wait_for_service_readiness(
+    webhook_port: int,
+    *,
+    expected_generation: str | None,
+) -> tuple[bool, str]:
+    """Wait until the expected service generation reports full readiness."""
+    deadline = time.monotonic() + _SERVICE_READY_TIMEOUT_SECONDS
+    detail = "health endpoint has not responded"
+    while True:
+        ready, detail = _probe_service_readiness(
+            webhook_port,
+            expected_generation=expected_generation,
+        )
+        if ready:
+            return True, detail
+        if time.monotonic() >= deadline:
+            return False, detail
+        time.sleep(_SERVICE_READY_POLL_SECONDS)
+
+
+def _start_service(
+    platform: str,
+    dry_run: bool,
+    *,
+    webhook_port: int = 8080,
+    **_kwargs: object,
+) -> None:
     """
-    Start the Kai service after applying changes and verify it actually
-    registered.
+    Start the Kai service and verify registration plus application readiness.
 
     The platform start commands (`launchctl bootstrap` on macOS,
     `systemctl start` on Linux) do not always report failures
@@ -4178,8 +4422,11 @@ def _start_service(platform: str, dry_run: bool, **_kwargs: object) -> None:
     the daemon was actually unregistered, leaving the operator
     with a silently broken bot.
 
-    The bootstrap/start exit code is now treated as advisory; the
-    authoritative check is the post-condition verify query
+    The bootstrap/start exit code is treated as advisory. Registration is
+    checked through the service manager, then `/health` must report ready core
+    and adapters. On macOS, the health generation must match launchd's wrapper
+    PID so a stale listener cannot satisfy the new service's readiness gate.
+    The service-manager post-condition query is
     (`launchctl print system/<label>` on macOS, `systemctl
     is-active <unit>` on Linux). The cycle is retried up to
     _SERVICE_START_MAX_ATTEMPTS times with a brief settle delay
@@ -4215,6 +4462,8 @@ def _start_service(platform: str, dry_run: bool, **_kwargs: object) -> None:
 
     last_start_stderr = ""
     last_verify_stderr = ""
+    expected_generation: str | None = None
+    registered = False
     for attempt in range(1, _SERVICE_START_MAX_ATTEMPTS + 1):
         # Exit code from the start command is advisory only. The
         # authoritative check is the verify query below.
@@ -4224,8 +4473,17 @@ def _start_service(platform: str, dry_run: bool, **_kwargs: object) -> None:
         time.sleep(_SERVICE_START_SETTLE_SECONDS)
         verify = subprocess.run(verify_cmd, check=False, capture_output=True)
         if verify.returncode == 0:
-            print(f"  Started service ({' '.join(start_cmd[:2])})")
-            return
+            registered = True
+            if platform == "darwin":
+                verify_stdout = (verify.stdout or b"").decode()
+                match = re.search(r"(?m)^\s*pid = ([0-9]+)\s*$", verify_stdout)
+                if match is None:
+                    raise ServiceStartError(
+                        "launchctl registered Kai but did not report a generation PID; "
+                        "readiness cannot be attributed safely"
+                    )
+                expected_generation = match.group(1)
+            break
         # Verify failed. Capture both stderrs for the retry hint and
         # the eventual exhaustion error. Guard with `or b""` so a
         # CompletedProcess with stderr=None (only reachable via test
@@ -4246,18 +4504,31 @@ def _start_service(platform: str, dry_run: bool, **_kwargs: object) -> None:
             )
             time.sleep(_SERVICE_START_RETRY_SECONDS)
 
-    # Retry budget exhausted. Surface both the start stderr and the
-    # verify stderr so the operator sees the authoritative failure
-    # state rather than only the unreliable start exit code.
-    detail = (
-        f"verify command ({' '.join(verify_cmd)}) reported the service is not registered "
-        f"after {_SERVICE_START_MAX_ATTEMPTS} attempts"
+    if not registered:
+        # Retry budget exhausted. Surface both the start stderr and the
+        # verify stderr so the operator sees the authoritative failure
+        # state rather than only the unreliable start exit code.
+        detail = (
+            f"verify command ({' '.join(verify_cmd)}) reported the service is not registered "
+            f"after {_SERVICE_START_MAX_ATTEMPTS} attempts"
+        )
+        if last_verify_stderr:
+            detail += f"; verify stderr: {last_verify_stderr}"
+        if last_start_stderr:
+            detail += f"; last start stderr: {last_start_stderr}"
+        raise ServiceStartError(detail)
+
+    ready, readiness_detail = _wait_for_service_readiness(
+        webhook_port,
+        expected_generation=expected_generation,
     )
-    if last_verify_stderr:
-        detail += f"; verify stderr: {last_verify_stderr}"
-    if last_start_stderr:
-        detail += f"; last start stderr: {last_start_stderr}"
-    raise ServiceStartError(detail)
+    if not ready:
+        generation_detail = f" generation {expected_generation}" if expected_generation is not None else ""
+        raise ServiceStartError(
+            f"registered service{generation_detail} did not become ready within "
+            f"{_SERVICE_READY_TIMEOUT_SECONDS:g}s: {readiness_detail}"
+        )
+    print(f"  Started service ({' '.join(start_cmd[:2])}); readiness confirmed")
 
 
 def _secure_codex_turn_image_staging(data_path: Path, dry_run: bool) -> None:
@@ -5980,7 +6251,10 @@ def _cmd_apply() -> None:
         )
 
     # -- Stop service before making changes --
-    _stop_service(platform, dry_run)
+    try:
+        _stop_service(platform, dry_run)
+    except ServiceStopError as exc:
+        raise SystemExit(f"Service stop failed; no installation changes were made:\n{exc}") from exc
 
     # apply_succeeded is initialized BEFORE the try block so the
     # finally handler can always read it. Several apply-time
@@ -6167,7 +6441,11 @@ def _cmd_apply() -> None:
         # installation is better than an offline bot. Most steps are idempotent,
         # so re-running apply after fixing the cause will complete the update.
         try:
-            _start_service(platform, dry_run)
+            _start_service(
+                platform,
+                dry_run,
+                webhook_port=int(env.get("WEBHOOK_PORT", "8080")),
+            )
         except ServiceStartError as e:
             # Verify confirmed the service is not registered after the
             # retry budget. Two paths:
@@ -7953,7 +8231,11 @@ def _apply_service(
         # Launcher script keeps bash as the tracked PID so launchd can
         # manage the service even when Homebrew Python re-execs.
         launcher_path = Path(install_dir) / "run.sh"
-        launcher_content = _generate_launcher_script(install_dir, webhook_port)
+        launcher_content = _generate_launcher_script(
+            install_dir,
+            webhook_port=webhook_port,
+            data_dir=data_dir,
+        )
 
         if dry_run:
             print(f"[DRY RUN] Would write: {launcher_path}")

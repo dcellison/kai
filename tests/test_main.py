@@ -23,15 +23,44 @@ import pytest
 
 from kai.config import UserConfig
 from kai.main import (
+    _configured_launcher_pid,
     _file_age,
     _file_cleanup_loop,
     _memory_backup_loop,
     _warn_if_compatibility_jobs_are_dormant,
+    _watch_launcher_parent,
     _workshop_bootstrap_humans,
     _workshop_bootstrap_notification_channels,
     setup_logging,
 )
 from tests.workshop_profiles import profile_id, profile_registry
+
+
+class TestLauncherParentWatch:
+    def test_configured_launcher_pid_is_strictly_positive(self, monkeypatch):
+        monkeypatch.setenv("KAI_SERVICE_GENERATION", "4321")
+        assert _configured_launcher_pid() == 4321
+
+        for invalid in ("", "not-a-pid", "0", "1", "-2"):
+            monkeypatch.setenv("KAI_SERVICE_GENERATION", invalid)
+            assert _configured_launcher_pid() is None
+
+    async def test_missing_launcher_requests_graceful_shutdown(self, monkeypatch):
+        stop_requested = asyncio.Event()
+        monkeypatch.setattr("kai.main.os.getppid", lambda: 1)
+
+        await _watch_launcher_parent(4321, stop_requested)
+
+        assert stop_requested.is_set()
+
+    async def test_live_launcher_watch_exits_when_shutdown_is_requested(self, monkeypatch):
+        stop_requested = asyncio.Event()
+        monkeypatch.setattr("kai.main.os.getppid", lambda: 4321)
+        task = asyncio.create_task(_watch_launcher_parent(4321, stop_requested))
+
+        await asyncio.sleep(0)
+        stop_requested.set()
+        await task
 
 
 class TestWorkshopBootstrapMapping:
