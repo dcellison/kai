@@ -6555,6 +6555,56 @@ class TestReadTranscriptProvenance:
         assert p.present is True
         assert p.assistant_ts is None
 
+    def test_workshop_owner_metadata_does_not_invalidate_historical_locator(self):
+        """Canonical ownership is not itself a canonical source pointer."""
+        from kai.memory import read_transcript_provenance
+
+        p = read_transcript_provenance(
+            self._md(
+                workshop_principal_id="prn_1",
+                workshop_channel_id="chn_1",
+                workshop_agent_id="agt_1",
+                workshop_runtime_profile_id="rtp_1",
+            )
+        )
+        assert p.present is True
+        assert p.canonical_present is False
+        assert p.malformed is False
+        assert p.chat_id == 100
+
+    def test_workshop_owner_metadata_without_locator_remains_legacy(self):
+        """Migrated owner stamps do not fabricate a source locator."""
+        from kai.memory import read_transcript_provenance
+
+        p = read_transcript_provenance(
+            {
+                "workshop_principal_id": "prn_1",
+                "workshop_channel_id": "chn_1",
+                "workshop_agent_id": "agt_1",
+                "workshop_runtime_profile_id": "rtp_1",
+            }
+        )
+        assert p.present is False
+        assert p.canonical_present is False
+        assert p.malformed is False
+
+    def test_partial_canonical_source_locator_is_malformed(self):
+        """A run/message pointer must never be resolved by guessing."""
+        from kai.memory import read_transcript_provenance
+
+        p = read_transcript_provenance(
+            {
+                "workshop_principal_id": "prn_1",
+                "workshop_channel_id": "chn_1",
+                "workshop_agent_id": "agt_1",
+                "workshop_runtime_profile_id": "rtp_1",
+                "workshop_run_id": "run_1",
+            }
+        )
+        assert p.present is False
+        assert p.canonical_present is False
+        assert p.malformed is True
+
     def test_date_end_populated_only_on_midnight_cross(self):
         from kai.memory import read_transcript_provenance
 

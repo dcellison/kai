@@ -514,21 +514,25 @@ def read_transcript_provenance(metadata: dict[str, Any] | None) -> TranscriptPro
     )
     assistant_ts = md.get(SOURCE_ASSISTANT_TS_KEY)
     date_end = md.get(SOURCE_DATE_END_KEY)
-    canonical_keys = (
+    canonical_owner_keys = (
         WORKSHOP_PRINCIPAL_ID_KEY,
         WORKSHOP_CHANNEL_ID_KEY,
         WORKSHOP_AGENT_ID_KEY,
         WORKSHOP_RUNTIME_PROFILE_ID_KEY,
+    )
+    canonical_source_keys = (
         WORKSHOP_RUN_ID_KEY,
         WORKSHOP_SOURCE_MESSAGE_ID_KEY,
         WORKSHOP_RESULT_MESSAGE_ID_KEY,
     )
+    canonical_keys = canonical_owner_keys + canonical_source_keys
     canonical_values = tuple(md.get(key) for key in canonical_keys)
-    canonical_any = any(value is not None for value in canonical_values)
+    canonical_source_values = tuple(md.get(key) for key in canonical_source_keys)
+    canonical_source_any = any(value is not None for value in canonical_source_values)
     canonical_present = all(isinstance(value, str) and bool(value) for value in canonical_values)
     legacy_values = (chat_id, date, user_ts, user_text_sha256)
     legacy_any = any(value is not None for value in legacy_values)
-    malformed = (canonical_any and not canonical_present) or (legacy_any and not required_present)
+    malformed = (canonical_source_any and not canonical_present) or (legacy_any and not required_present)
     return TranscriptProvenance(
         present=(canonical_present or required_present) and not malformed,
         chat_id=chat_id if isinstance(chat_id, int) else None,
