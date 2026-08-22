@@ -14,6 +14,7 @@ import pytest
 from kai import sessions
 from kai.backend import AgentResponse, StreamEvent
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+from kai.workshop.client_events import ClientTimelineMessageEvent, read_client_channel_events
 from kai.workshop.conversation_commands import ConversationCommandDisposition
 from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
 from kai.workshop.domain import ChannelId, PrincipalId, RuntimeProfileId
@@ -31,6 +32,7 @@ from kai.workshop.scheduler import (
     _scheduled_success_outcome,
 )
 from kai.workshop.store import WorkshopEventStore
+from kai.workshop.timeline import read_channel_timeline
 from tests.workshop_profiles import profile_id, profile_registry
 
 
@@ -40,6 +42,12 @@ class _UnusedExecution:
 
 class _UnusedCompatibilityState:
     pass
+
+
+class _AllowRead:
+    async def can_read_channel(self, principal_id: PrincipalId, channel_id: ChannelId) -> bool:
+        del principal_id, channel_id
+        return True
 
 
 class _AgentExecution:
@@ -203,6 +211,16 @@ async def _install_owned_job(
     return store, job_id
 
 
+async def _job_owner(store: WorkshopEventStore, job_id: int) -> tuple[PrincipalId, ChannelId]:
+    async with store.connection.execute(
+        "SELECT principal_id, channel_id FROM workshop_job_owners WHERE job_id = ?",
+        (job_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    return PrincipalId(str(row[0])), ChannelId(str(row[1]))
+
+
 @pytest.mark.parametrize(
     ("text", "notify", "expected_body", "expected_delivery", "condition_met"),
     [
@@ -285,6 +303,15 @@ async def test_workshop_only_reminder_fires_canonically_without_delivery(tmp_pat
             firing = await cursor.fetchone()
         assert tuple(firing[:2]) == ("succeeded", 1)
         assert str(firing[2]).startswith("msg_")
+        principal_id, channel_id = await _job_owner(source_store, job_id)
+        page = await read_channel_timeline(
+            source_store,
+            principal_id=principal_id,
+            channel_id=channel_id,
+            authorizer=_AllowRead(),
+        )
+        assert [message.body for message in page.messages] == ["Remember this"]
+        assert [message.author_kind for message in page.messages] == ["agent"]
     finally:
         await scheduler.stop()
         await source_store.close()
@@ -525,6 +552,36 @@ async def test_agent_firing_completes_through_real_canonical_coordinator(
             )
         async with source_store.connection.execute("SELECT COUNT(*) FROM delivery_outbox") as cursor:
             assert (await cursor.fetchone())[0] == 0
+        principal_id, channel_id = await _job_owner(source_store, job_id)
+        page = await read_channel_timeline(
+            source_store,
+            principal_id=principal_id,
+            channel_id=channel_id,
+            authorizer=_AllowRead(),
+            limit=1,
+        )
+        assert [message.body for message in page.messages] == ["[Job: Canonical reminder]\nScheduled agent answer"]
+        hidden_only = await read_client_channel_events(
+            source_store,
+            principal_id=principal_id,
+            channel_id=channel_id,
+            authorizer=_AllowRead(),
+            after_position=0,
+            limit=1,
+        )
+        assert hidden_only.events == ()
+        assert hidden_only.next_position > 0
+        live = await read_client_channel_events(
+            source_store,
+            principal_id=principal_id,
+            channel_id=channel_id,
+            authorizer=_AllowRead(),
+            after_position=0,
+        )
+        visible_messages = [
+            event.message.body for event in live.events if isinstance(event, ClientTimelineMessageEvent)
+        ]
+        assert visible_messages == ["[Job: Canonical reminder]\nScheduled agent answer"]
     finally:
         await scheduler.stop()
         await execution.stop()
