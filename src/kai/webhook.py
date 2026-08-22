@@ -166,6 +166,7 @@ _webhook_registered: bool = False
 # Each task removes itself from the set via a done callback.
 _background_tasks: set[asyncio.Task] = set()
 _BACKGROUND_TASK_DRAIN_TIMEOUT = 30.0
+_HTTP_RUNNER_SHUTDOWN_TIMEOUT = 5.0
 _telegram_queue_worker_task: asyncio.Task | None = None
 _telegram_queue_worker_active_row_id: int | None = None
 _TELEGRAM_UPDATE_MAX_ATTEMPTS = 5
@@ -2741,7 +2742,11 @@ async def start(
             run_previews=core_services.run_previews,
         )
 
-    _runner = web.AppRunner(_app, access_log=None)
+    _runner = web.AppRunner(
+        _app,
+        access_log=None,
+        shutdown_timeout=_HTTP_RUNNER_SHUTDOWN_TIMEOUT,
+    )
     await _runner.setup()
     # The mixed webhook/internal API application remains loopback-only.  A
     # separately configured LAN listener below receives only Workshop client
@@ -2754,7 +2759,11 @@ async def start(
         assert register_workshop_routes is not None
         workshop_lan_app = web.Application()
         register_workshop_routes(workshop_lan_app)
-        _workshop_lan_runner = web.AppRunner(workshop_lan_app, access_log=None)
+        _workshop_lan_runner = web.AppRunner(
+            workshop_lan_app,
+            access_log=None,
+            shutdown_timeout=_HTTP_RUNNER_SHUTDOWN_TIMEOUT,
+        )
         await _workshop_lan_runner.setup()
         workshop_lan_site = web.TCPSite(
             _workshop_lan_runner,
