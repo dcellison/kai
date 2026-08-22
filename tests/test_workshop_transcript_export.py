@@ -231,6 +231,10 @@ def test_partial_canonical_provenance_never_falls_back_to_jsonl(monkeypatch):
     provenance = read_transcript_provenance(
         {
             "workshop_principal_id": "prn_incomplete",
+            "workshop_channel_id": "chn_incomplete",
+            "workshop_agent_id": "agt_incomplete",
+            "workshop_runtime_profile_id": "rtp_incomplete",
+            "workshop_run_id": "run_incomplete",
             "source_chat_id": 919191,
             "source_date": "2026-08-15",
             "source_user_ts": "2026-08-15T09:00:00Z",
