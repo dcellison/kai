@@ -43,6 +43,23 @@ class ProtectedPreparation(Protocol):
 type StreamObserver = Callable[[StreamEvent], Awaitable[None]]
 
 
+@dataclass(frozen=True, slots=True)
+class CanonicalSuccessOutcome:
+    """Caller policy for presenting and optionally delivering a successful result."""
+
+    body: str
+    request_delivery: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.body, str) or not self.body.strip():
+            raise ValueError("body must contain non-whitespace text")
+        if not isinstance(self.request_delivery, bool):
+            raise ValueError("request_delivery must be a boolean")
+
+
+type SuccessTransformer = Callable[[AgentResponse], Awaitable[CanonicalSuccessOutcome]]
+
+
 class CanonicalExecutionDisposition(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
@@ -146,6 +163,7 @@ class WorkshopCanonicalExecutionCoordinator:
         run_id: RunId,
         *,
         stream_observer: StreamObserver | None = None,
+        success_transformer: SuccessTransformer | None = None,
     ) -> CanonicalExecutionResult:
         if not isinstance(run_id, RunId):
             raise ValueError("run_id must be a RunId")
@@ -161,7 +179,12 @@ class WorkshopCanonicalExecutionCoordinator:
             async with self._map_lock:
                 self._active[run_id] = active
             try:
-                return await self._execute_owned(active, run, stream_observer=stream_observer)
+                return await self._execute_owned(
+                    active,
+                    run,
+                    stream_observer=stream_observer,
+                    success_transformer=success_transformer,
+                )
             finally:
                 active.finished.set()
                 active.ready.set()
@@ -258,6 +281,7 @@ class WorkshopCanonicalExecutionCoordinator:
         run: DurableRun,
         *,
         stream_observer: StreamObserver | None,
+        success_transformer: SuccessTransformer | None,
     ) -> CanonicalExecutionResult:
         try:
             async with self._database_lock:
@@ -288,6 +312,13 @@ class WorkshopCanonicalExecutionCoordinator:
             response = await self._consume_with_renewal(active, prepared, stream_observer=stream_observer)
             if active.cancellation_requested:
                 return await self._settle_requested_cancellation(active)
+            success_outcome = None
+            if response is not None and response.success and response.text.strip():
+                success_outcome = (
+                    await success_transformer(response)
+                    if success_transformer is not None
+                    else CanonicalSuccessOutcome(response.text)
+                )
             terminal = WorkshopRunTerminalTransactionCoordinator(authority)
             async with self._database_lock:
                 active.settling = True
@@ -299,10 +330,12 @@ class WorkshopCanonicalExecutionCoordinator:
                     )
                     disposition = CanonicalExecutionDisposition.FAILED
                 elif response.success:
+                    assert success_outcome is not None
                     settled = await terminal.complete(
                         active.claim,
-                        body=response.text,
+                        body=success_outcome.body,
                         occurred_at=self._now(),
+                        request_delivery=success_outcome.request_delivery,
                         runtime_session=RuntimeSessionSettlement(
                             channel_id=prepared.run.channel_id,
                             agent_id=prepared.run.agent_id,

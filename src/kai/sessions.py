@@ -922,7 +922,7 @@ async def get_jobs(chat_id: int) -> list[dict]:
 
 
 async def get_job_by_id(job_id: int) -> dict | None:
-    """Get a single job by ID, or None if not found. Used by cron.register_job_by_id()."""
+    """Get a single job by ID, or None if not found."""
     async with _get_db().execute(
         "SELECT j.id, j.chat_id, j.name, j.job_type, j.prompt, j.schedule_type, "
         "j.schedule_data, j.auto_remove, j.notify_on_check, "
@@ -937,7 +937,7 @@ async def get_job_by_id(job_id: int) -> dict | None:
 
 
 async def get_all_active_jobs() -> list[dict]:
-    """Get all active jobs across all chats. Used at startup to register with APScheduler."""
+    """Get all active jobs across all protected runtime aliases."""
     async with _get_db().execute(
         "SELECT j.id, j.chat_id, j.name, j.job_type, j.prompt, j.schedule_type, "
         "j.schedule_data, j.auto_remove, j.notify_on_check, "
@@ -987,7 +987,7 @@ async def deactivate_job(job_id: int, chat_id: int | None = None) -> bool:
     When chat_id is provided, the job is only deactivated if it belongs to
     that user. This prevents cross-user job manipulation. When None, the
     job is deactivated unconditionally (backward-compatible for internal
-    callers like cron.py that have already verified ownership).
+    core callers that have already verified ownership).
 
     Returns True if a row was deactivated, False if not found or not
     owned by chat_id.

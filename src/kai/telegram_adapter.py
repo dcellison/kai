@@ -10,7 +10,6 @@ from enum import StrEnum
 from telegram import Bot, BotCommand
 from telegram.error import NetworkError
 
-from kai import cron
 from kai.application_host import KaiCoreServices
 from kai.bot import create_bot
 from kai.config import Config
@@ -88,7 +87,7 @@ _TELEGRAM_COMMANDS = (
 
 
 class TelegramAdapter:
-    """Own Telegram application, polling, scheduler bridge, and delivery workers.
+    """Own Telegram application, polling, and delivery workers.
 
     HTTP webhook registration remains in the HTTP adapter during this
     milestone. The core host starts, supervises, reports, and stops this
@@ -174,7 +173,6 @@ class TelegramAdapter:
             await application.start()
             self._application_started = True
             await application.bot.set_my_commands(_TELEGRAM_COMMANDS)
-            await cron.init_jobs(application)
 
             self._conversation_delivery = await WorkshopTelegramConversationDeliveryService.open_and_start(
                 self._config.session_db_path,

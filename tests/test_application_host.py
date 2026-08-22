@@ -105,6 +105,27 @@ class _FakeClientCommands:
         self.ready = False
 
 
+class _FakeScheduler:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.readiness = SimpleNamespace(ready=True)
+
+    async def wait(self) -> None:
+        self.events.append("scheduler:wait")
+
+    async def stop(self) -> None:
+        self.events.append("scheduler:stop")
+        self.readiness = SimpleNamespace(ready=False)
+
+
+class _FakeSchedulerFactory:
+    @classmethod
+    async def open_and_start(cls, *_args, **_kwargs):
+        events = _FakeExecutionFactory.events
+        events.append("scheduler:start")
+        return _FakeScheduler(events)
+
+
 class _FakeAdapterReadiness:
     def __init__(self, *, ready: bool) -> None:
         self.ready = ready
@@ -147,6 +168,7 @@ def host_dependencies(monkeypatch):
     monkeypatch.setattr(host_module, "WorkshopEventStore", _FakeStore)
     monkeypatch.setattr(host_module, "WorkshopConversationDeliveryAuthority", _FakeDeliveryAuthority)
     monkeypatch.setattr(host_module, "WorkshopClientCommandExecutor", _FakeClientCommands)
+    monkeypatch.setattr(host_module, "WorkshopCanonicalScheduler", _FakeSchedulerFactory)
     monkeypatch.setattr(host_module, "WorkshopCompatibilityStateWriter", lambda config, pool: (config, pool))
     return events
 
@@ -175,6 +197,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
             "executor": True,
             "client_api": True,
             "store": True,
+            "scheduler": True,
         },
     }
     assert services.subprocess_pool is not None
@@ -184,6 +207,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
         "authority:activate",
         "execution:start",
         "client:start",
+        "scheduler:start",
     ]
 
     await host.wait()
@@ -191,8 +215,10 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
 
     assert host.readiness.state == KaiApplicationState.STOPPED
     assert host.readiness.ready is False
-    assert host_dependencies[-5:] == [
+    assert host_dependencies[-7:] == [
         "execution:wait",
+        "scheduler:wait",
+        "scheduler:stop",
         "client:stop",
         "store:close",
         "execution:stop",

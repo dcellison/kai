@@ -22,6 +22,7 @@ from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionServ
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
+from kai.workshop.scheduler import WorkshopCanonicalScheduler
 from kai.workshop.storage_namespaces import WorkshopPrincipalStorageRegistry
 from kai.workshop.store import WorkshopEventStore
 
@@ -65,11 +66,12 @@ class KaiCoreReadiness:
     executor: bool
     client_api: bool
     store: bool
+    scheduler: bool
 
     @property
     def ready(self) -> bool:
         return self.state == KaiApplicationState.READY and all(
-            (self.runtime, self.executor, self.client_api, self.store)
+            (self.runtime, self.executor, self.client_api, self.store, self.scheduler)
         )
 
     def as_dict(self) -> dict[str, object]:
@@ -81,6 +83,7 @@ class KaiCoreReadiness:
                 "executor": self.executor,
                 "client_api": self.client_api,
                 "store": self.store,
+                "scheduler": self.scheduler,
             },
         }
 
@@ -99,6 +102,7 @@ class KaiCoreServices:
     principal_storage: WorkshopPrincipalStorageRegistry
     delivery_authority_epoch: DeliveryAuthorityEpoch
     run_previews: WorkshopRunPreviewRegistry
+    scheduler: WorkshopCanonicalScheduler
 
 
 class KaiApplicationHost:
@@ -143,6 +147,7 @@ class KaiApplicationHost:
             executor=services is not None and services.private_text_execution.ready,
             client_api=services is not None and services.client_commands.ready,
             store=services is not None,
+            scheduler=services is not None and services.scheduler.readiness.ready,
         )
 
     @property
@@ -159,6 +164,7 @@ class KaiApplicationHost:
         private_execution: WorkshopPrivateTextExecutionService | None = None
         client_store: WorkshopEventStore | None = None
         client_commands: WorkshopClientCommandExecutor | None = None
+        scheduler: WorkshopCanonicalScheduler | None = None
         try:
             subprocess_pool = SubprocessPool(
                 config=self._config,
@@ -189,6 +195,12 @@ class KaiApplicationHost:
                 run_previews=run_previews,
             )
             await client_commands.start()
+            compatibility_state = WorkshopCompatibilityStateWriter(self._config, runtime_pool)
+            scheduler = await WorkshopCanonicalScheduler.open_and_start(
+                Path(self._config.session_db_path),
+                private_execution,
+                compatibility_state,
+            )
 
             self._services = KaiCoreServices(
                 subprocess_pool=subprocess_pool,
@@ -201,11 +213,14 @@ class KaiApplicationHost:
                 principal_storage=self._principal_storage,
                 delivery_authority_epoch=delivery_authority_epoch,
                 run_previews=run_previews,
+                scheduler=scheduler,
             )
             self._state = KaiApplicationState.READY
             return self._services
         except BaseException:
             self._state = KaiApplicationState.FAILED
+            if scheduler is not None:
+                await scheduler.stop()
             if client_commands is not None:
                 await client_commands.stop()
             if client_store is not None:
@@ -239,6 +254,7 @@ class KaiApplicationHost:
         """Expose failure of a required supervised core worker."""
         await asyncio.gather(
             self.services.private_text_execution.wait(),
+            self.services.scheduler.wait(),
             *(adapter.wait() for adapter in self._adapters.values()),
         )
 
@@ -260,6 +276,7 @@ class KaiApplicationHost:
                 errors.append(exc)
         self._adapters.clear()
         for operation in (
+            services.scheduler.stop,
             services.client_commands.stop,
             services.client_store.close,
             services.private_text_execution.stop,

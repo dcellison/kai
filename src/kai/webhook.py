@@ -65,7 +65,7 @@ from aiohttp import web
 from telegram import Bot, Update
 from telegram.ext import Application
 
-from kai import cron, memory, review, services, sessions, triage
+from kai import memory, review, services, sessions, triage
 from kai.application_host import KaiApplicationHost, KaiCoreServices
 from kai.config import (
     DATA_DIR,
@@ -95,6 +95,7 @@ from kai.workshop.client_sessions import (
 from kai.workshop.client_shell import register_workshop_shell_routes
 from kai.workshop.github_notifications import GitHubNotification
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
+from kai.workshop.scheduler import WorkshopCanonicalScheduler
 from kai.workshop.storage_namespaces import (
     WorkshopPrincipalStorageRegistry,
     WorkshopStorageNamespaceError,
@@ -1297,7 +1298,7 @@ def _validate_schedule_data(
 
     Handles both dict and pre-serialized string inputs. Validates
     that the JSON structure matches what the given schedule_type
-    requires so cron.py never encounters malformed data at fire time.
+    requires so the core scheduler never encounters malformed data at fire time.
 
     Args:
         schedule_data: Either a dict or a JSON string.
@@ -1377,8 +1378,8 @@ async def _handle_schedule(request: web.Request, principal: InternalAPIPrincipal
     Optional fields: job_type (default "reminder"), auto_remove (default false),
         notify_on_check (default false).
 
-    The job is persisted to the database and immediately registered with
-    APScheduler so it starts firing without a restart.
+    The job is persisted to the database and immediately registered with the
+    core-owned scheduler so it starts firing without a restart.
 
     Returns:
         JSON with job_id and name on success, or an error message on failure.
@@ -1437,7 +1438,7 @@ async def _handle_schedule(request: web.Request, principal: InternalAPIPrincipal
 
     # Validate schedule_data structure before persisting. Catches malformed
     # JSON strings and wrong-shape payloads (e.g., interval keys on a daily
-    # job) that would otherwise crash cron.py on every fire attempt.
+    # job) that would otherwise fail the core scheduler on every fire attempt.
     schedule_data_str, error = _validate_schedule_data(schedule_data, schedule_type)
     if error:
         return web.json_response({"error": error}, status=400)
@@ -1459,10 +1460,9 @@ async def _handle_schedule(request: web.Request, principal: InternalAPIPrincipal
         log.exception("Failed to create job")
         return web.json_response({"error": "Failed to create job"}, status=500)
 
-    # Register with APScheduler immediately so it starts firing
-    telegram_app = request.app[TELEGRAM_APP_KEY]
+    scheduler = request.app[CORE_HOST_KEY].services.scheduler
     try:
-        registered = await cron.register_job_by_id(telegram_app, job_id)
+        registered = await scheduler.register_job(job_id)
     except Exception:
         log.exception("Failed to register job %d with scheduler", job_id)
         await sessions.deactivate_job(job_id, chat_id=chat_id)
@@ -1536,8 +1536,7 @@ async def _handle_delete_job(request: web.Request, principal: InternalAPIPrincip
     """
     Delete a scheduled job by ID via the HTTP API.
 
-    Removes the job from both the database and APScheduler's in-memory
-    queue. Uses the same logic as the /canceljob Telegram command.
+    Removes the job from both the database and core scheduler.
     Returns 404 if the job doesn't exist.
     """
 
@@ -1558,16 +1557,7 @@ async def _handle_delete_job(request: web.Request, principal: InternalAPIPrincip
     if not deleted:
         return web.json_response({"error": "Job not found"}, status=404)
 
-    # Remove from APScheduler's in-memory queue. Daily jobs with multiple
-    # times get suffixed names (e.g., cron_19_0, cron_19_1), so we match
-    # both the exact name and the prefix pattern.
-    telegram_app = request.app[TELEGRAM_APP_KEY]
-    jq = telegram_app.job_queue
-    assert jq is not None
-    prefix = f"cron_{job_id}"
-    for j in jq.jobs():
-        if j.name == prefix or (j.name and j.name.startswith(f"{prefix}_")):
-            j.schedule_removal()
+    await request.app[CORE_HOST_KEY].services.scheduler.remove_job(job_id)
 
     log.info("Deleted job %d via API", job_id)
     return web.json_response({"deleted": job_id})
@@ -1581,7 +1571,7 @@ async def _handle_update_job(request: web.Request, principal: InternalAPIPrincip
     Accepts a JSON body with any of: name, prompt, schedule_type,
     schedule_data, auto_remove, notify_on_check. Only provided fields
     are updated. If the schedule changes (type or data), the job is
-    re-registered with APScheduler to pick up the new timing.
+    re-registered with the core scheduler to pick up the new timing.
 
     Returns 404 if the job doesn't exist or is inactive.
     """
@@ -1646,8 +1636,8 @@ async def _handle_update_job(request: web.Request, principal: InternalAPIPrincip
 
     # If the schedule changes, keep the previous row so a failed scheduler
     # re-registration can be compensated. Without this, PATCH can leave the DB
-    # saying a job is active on the new schedule while APScheduler has no
-    # corresponding in-memory job.
+    # saying a job is active on the new schedule while the core scheduler has
+    # no corresponding task.
     schedule_changed = new_schedule_type is not None or schedule_data is not None
     if schedule_changed:
         if existing_job is None:
@@ -1671,22 +1661,16 @@ async def _handle_update_job(request: web.Request, principal: InternalAPIPrincip
 
     if schedule_changed:
         assert existing_job is not None
-        telegram_app = request.app[TELEGRAM_APP_KEY]
-        jq = telegram_app.job_queue
-        assert jq is not None
-        prefix = f"cron_{job_id}"
-        for j in jq.jobs():
-            if j.name == prefix or (j.name and j.name.startswith(f"{prefix}_")):
-                j.schedule_removal()
+        scheduler = request.app[CORE_HOST_KEY].services.scheduler
         try:
-            registered = await cron.register_job_by_id(telegram_app, job_id)
+            registered = await scheduler.register_job(job_id)
         except Exception:
             log.exception("Failed to re-register updated job %d with scheduler", job_id)
-            await _restore_job_after_failed_reschedule(telegram_app, job_id, chat_id, existing_job)
+            await _restore_job_after_failed_reschedule(scheduler, job_id, chat_id, existing_job)
             return web.json_response({"error": "Failed to register job"}, status=500)
         if not registered:
             log.error("Failed to re-register updated job %d with scheduler", job_id)
-            await _restore_job_after_failed_reschedule(telegram_app, job_id, chat_id, existing_job)
+            await _restore_job_after_failed_reschedule(scheduler, job_id, chat_id, existing_job)
             return web.json_response({"error": "Failed to register job"}, status=500)
 
     log.info("Updated job %d via API", job_id)
@@ -1694,7 +1678,7 @@ async def _handle_update_job(request: web.Request, principal: InternalAPIPrincip
 
 
 async def _restore_job_after_failed_reschedule(
-    telegram_app: Application,
+    scheduler: WorkshopCanonicalScheduler,
     job_id: int,
     chat_id: int,
     previous_job: dict,
@@ -1714,7 +1698,7 @@ async def _restore_job_after_failed_reschedule(
         log.error("Failed to restore job %d after scheduler registration failure", job_id)
         return
     try:
-        restored_registered = await cron.register_job_by_id(telegram_app, job_id)
+        restored_registered = await scheduler.register_job(job_id)
     except Exception:
         log.exception("Failed to restore scheduler entry for job %d after rollback", job_id)
         return
@@ -2575,14 +2559,11 @@ def _register_routes(
     app.router.add_post("/api/memory/search", _handle_memory_search)
     app.router.add_get("/api/memory/stats", _handle_memory_stats)
     app.router.add_delete("/api/memory/all", _handle_memory_delete_all)
+    app.router.add_post("/api/schedule", _handle_schedule)
+    app.router.add_delete("/api/jobs/{id}", _handle_delete_job)
+    app.router.add_patch("/api/jobs/{id}", _handle_update_job)
     if telegram_enabled:
-        # These compatibility operations still use Telegram's scheduler or
-        # delivery surface. They are absent when the adapter is disabled and
-        # are not silently redirected. Later canonical scheduler, message,
-        # and artifact services will replace them.
-        app.router.add_post("/api/schedule", _handle_schedule)
-        app.router.add_delete("/api/jobs/{id}", _handle_delete_job)
-        app.router.add_patch("/api/jobs/{id}", _handle_update_job)
+        # These compatibility operations still use Telegram delivery.
         app.router.add_post("/api/send-message", _handle_send_message)
         app.router.add_post("/api/send-file", _handle_send_file)
 

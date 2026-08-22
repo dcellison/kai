@@ -76,6 +76,34 @@ class ClientInboundMessage:
 
 
 @dataclass(frozen=True, slots=True)
+class ScheduledInboundMessage:
+    """One core-owned scheduled command resolved through canonical ownership."""
+
+    principal_id: PrincipalId
+    channel_id: ChannelId
+    job_id: int
+    occurrence_id: str
+    body: str
+    occurred_at: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.principal_id, PrincipalId):
+            raise ValueError("principal_id must be a PrincipalId")
+        if not isinstance(self.channel_id, ChannelId):
+            raise ValueError("channel_id must be a ChannelId")
+        if isinstance(self.job_id, bool) or not isinstance(self.job_id, int) or self.job_id <= 0:
+            raise ValueError("job_id must be a positive integer")
+        if not _CLIENT_MESSAGE_ID_PATTERN.fullmatch(self.occurrence_id):
+            raise ValueError("occurrence_id must be a bounded opaque identifier")
+        if not isinstance(self.body, str) or not self.body.strip():
+            raise ValueError("body must contain non-whitespace text")
+        if len(self.body) > 50_000:
+            raise ValueError("body must be at most 50000 characters")
+        if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
+            raise ValueError("occurred_at must be timezone-aware")
+
+
+@dataclass(frozen=True, slots=True)
 class _ResolvedInboundBinding:
     workshop_id: WorkshopId
     principal_id: PrincipalId
@@ -174,6 +202,27 @@ async def _resolve_client_binding(
     )
 
 
+async def _resolve_scheduled_binding(
+    store: WorkshopEventStore,
+    message: ScheduledInboundMessage,
+) -> _ResolvedInboundBinding:
+    async with store.connection.execute(
+        "SELECT c.workshop_id FROM workshop_job_owners o "
+        "JOIN channels c ON c.id = o.channel_id "
+        "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.principal_id = o.principal_id "
+        "WHERE o.job_id = ? AND o.principal_id = ? AND o.channel_id = ?",
+        (message.job_id, message.principal_id, message.channel_id),
+    ) as cursor:
+        rows = list(await cursor.fetchall())
+    if len(rows) != 1:
+        raise InboundBindingNotFoundError("Scheduled job does not have one canonical owner and channel")
+    return _ResolvedInboundBinding(
+        workshop_id=WorkshopId(str(rows[0][0])),
+        principal_id=message.principal_id,
+        channel_id=message.channel_id,
+    )
+
+
 def _client_inbound_envelope(
     binding: _ResolvedInboundBinding,
     message: ClientInboundMessage,
@@ -198,6 +247,35 @@ def _client_inbound_envelope(
         metadata={
             "source": "workshop_client",
             "client_message_id": message.client_message_id,
+        },
+    )
+
+
+def _scheduled_inbound_envelope(
+    binding: _ResolvedInboundBinding,
+    message: ScheduledInboundMessage,
+) -> EventEnvelope:
+    stable_name = f"scheduled-job:{message.job_id}:{message.occurrence_id}"
+    message_id = MessageId.derived(binding.workshop_id, stable_name)
+    return EventEnvelope.create(
+        event_id=EventId.derived(binding.workshop_id, f"scheduled-job-event:{message_id}"),
+        event_type=WorkshopEventType.MESSAGE_CREATED,
+        event_version=1,
+        workshop_id=binding.workshop_id,
+        aggregate_type="message",
+        aggregate_id=message_id,
+        actor_principal_id=binding.principal_id,
+        occurred_at=message.occurred_at,
+        idempotency_key=f"workshop-scheduled-job:v1:{message_id}",
+        payload={
+            "channel_id": binding.channel_id,
+            "author_principal_id": binding.principal_id,
+            "body": message.body,
+        },
+        metadata={
+            "source": "scheduled_job",
+            "job_id": message.job_id,
+            "occurrence_id": message.occurrence_id,
         },
     )
 
@@ -229,6 +307,28 @@ async def record_client_inbound_message_in_transaction(
     existing = await store.event_by_idempotency_key(envelope.idempotency_key)
     if existing is not None:
         envelope = _client_inbound_envelope(
+            binding,
+            replace(message, occurred_at=existing.envelope.occurred_at),
+        )
+    result = await store.append_in_transaction(envelope)
+    await store.project_pending_in_transaction(CanonicalConversationProjection())
+    return result
+
+
+async def record_scheduled_inbound_message_in_transaction(
+    store: WorkshopEventStore,
+    message: ScheduledInboundMessage,
+) -> AppendResult:
+    """Append one core-owned scheduled command inside a caller transaction."""
+    if not store.connection.in_transaction:
+        raise RuntimeError("record_scheduled_inbound_message_in_transaction requires an active transaction")
+    binding = await _resolve_scheduled_binding(store, message)
+    envelope = _scheduled_inbound_envelope(binding, message)
+    if envelope.idempotency_key is None:
+        raise RuntimeError("Scheduled message envelope did not define an idempotency key")
+    existing = await store.event_by_idempotency_key(envelope.idempotency_key)
+    if existing is not None:
+        envelope = _scheduled_inbound_envelope(
             binding,
             replace(message, occurred_at=existing.envelope.occurred_at),
         )

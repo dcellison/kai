@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 25
+WORKSHOP_SCHEMA_VERSION = 26
 
 
 @dataclass(frozen=True, slots=True)
@@ -1077,9 +1077,9 @@ _CANONICAL_OPERATIONAL_STATE_SCHEMA = SchemaMigration(
     version=23,
     name="canonical_operational_state_authority",
     statements=(
-        # Jobs remain in the compatibility scheduler table until the
-        # scheduler-service cutover, but ownership is canonical and immutable.
-        # The legacy chat_id is then only a private execution/delivery alias.
+        # Job definitions remain in the compatibility table while scheduling
+        # and ownership are core-owned and canonical. The legacy chat_id is
+        # only a protected runtime compatibility alias.
         """
         CREATE TABLE workshop_job_owners (
             job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
@@ -1184,6 +1184,42 @@ _CANONICAL_TRANSCRIPT_AUTHORITY_SCHEMA = SchemaMigration(
     ),
 )
 
+_CORE_SCHEDULER_SCHEMA = SchemaMigration(
+    version=26,
+    name="core_scheduler_firing_authority",
+    statements=(
+        """
+        CREATE TABLE workshop_schedule_firings (
+            firing_id TEXT PRIMARY KEY CHECK (length(firing_id) BETWEEN 1 AND 128),
+            job_id INTEGER NOT NULL CHECK (job_id > 0),
+            occurrence_id TEXT NOT NULL CHECK (
+                length(occurrence_id) BETWEEN 1 AND 128
+            ),
+            scheduled_for TEXT NOT NULL,
+            job_type TEXT NOT NULL CHECK (job_type IN ('reminder', 'agent')),
+            status TEXT NOT NULL CHECK (
+                status IN ('pending', 'executing', 'succeeded', 'failed')
+            ),
+            canonical_message_id TEXT,
+            run_id TEXT,
+            terminal_code TEXT,
+            condition_met INTEGER NOT NULL DEFAULT 0 CHECK (
+                condition_met IN (0, 1)
+            ),
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+            last_error_code TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            UNIQUE (job_id, occurrence_id)
+        )
+        """,
+        "CREATE INDEX workshop_schedule_firings_status_idx "
+        "ON workshop_schedule_firings (status, scheduled_for, firing_id)",
+        "CREATE INDEX workshop_schedule_firings_job_idx "
+        "ON workshop_schedule_firings (job_id, scheduled_for, firing_id)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -1210,6 +1246,7 @@ _MIGRATIONS = (
     _CANONICAL_OPERATIONAL_STATE_SCHEMA,
     _RUN_TRACE_SCHEMA,
     _CANONICAL_TRANSCRIPT_AUTHORITY_SCHEMA,
+    _CORE_SCHEDULER_SCHEMA,
 )
 
 

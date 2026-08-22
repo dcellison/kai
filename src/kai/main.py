@@ -89,20 +89,6 @@ def _secure_runtime_log_tree(log_dir: Path) -> None:
             os.chmod(child, 0o600)
 
 
-async def _warn_if_compatibility_jobs_are_dormant(config) -> int:
-    """Warn when disabling Telegram also pauses its compatibility scheduler."""
-    if config.telegram_enabled:
-        return 0
-    active_jobs = await sessions.get_all_active_jobs()
-    count = len(active_jobs)
-    if count:
-        logging.warning(
-            "Telegram adapter is disabled; %d active compatibility scheduled job(s) are dormant",
-            count,
-        )
-    return count
-
-
 def _workshop_bootstrap_humans(
     config,
     runtime_profiles: WorkshopRuntimeProfileRegistry,
@@ -187,7 +173,7 @@ def setup_logging() -> None:
     root.addHandler(file_handler)
     root.addHandler(stream_handler)
 
-    # Silence noisy per-request HTTP logs and APScheduler tick logs
+    # Silence noisy per-request HTTP logs and routine scheduler execution logs.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
 
@@ -574,8 +560,6 @@ def _start() -> None:
             operational_migration.jobs,
             operational_migration.github_subscriptions,
         )
-        await _warn_if_compatibility_jobs_are_dormant(config)
-
         # Phase 3: per-user workspace restoration is deferred to the
         # SubprocessPool. Each user's workspace is restored lazily on
         # their first message (in pool.send()). No startup restore needed.

@@ -50,10 +50,10 @@ from kai.install import (
     _collect_user_memory_owners,
     _copy_managed_home_tree,
     _copy_tree,
+    _core_schedule_status,
     _DarwinServiceGeneration,
     _deployed_adapter_policy_status,
     _deployed_webhook_secret_migration_status,
-    _dormant_compatibility_schedule_status,
     _file_checksum,
     _finish_stopping_darwin_generation,
     _generate_env_file,
@@ -4966,33 +4966,32 @@ class TestCmdStatus:
         assert "workshop; Telegram disabled, stored token ignored" in status
         assert "disabled-secret-token" not in status
 
-    def test_status_reports_dormant_compatibility_jobs_without_telegram(self, tmp_path, monkeypatch):
-        env_path = tmp_path / "env"
-        env_path.write_text("KAI_ENABLED_ADAPTERS=workshop\n")
+    def test_status_reports_core_owned_active_jobs(self, tmp_path):
         db_path = tmp_path / "kai.db"
         connection = sqlite3.connect(db_path)
         connection.execute("CREATE TABLE jobs (id INTEGER PRIMARY KEY, active INTEGER NOT NULL)")
+        connection.execute("CREATE TABLE workshop_job_owners (job_id INTEGER PRIMARY KEY)")
+        connection.execute("CREATE TABLE workshop_schedule_firings (status TEXT NOT NULL)")
+        connection.executemany(
+            "INSERT INTO workshop_schedule_firings(status) VALUES (?)",
+            [("pending",), ("executing",), ("failed",)],
+        )
         connection.executemany("INSERT INTO jobs(active) VALUES (?)", [(1,), (1,), (0,)])
+        connection.execute("INSERT INTO workshop_job_owners(job_id) VALUES (1)")
         connection.commit()
         connection.close()
-        monkeypatch.setattr(
-            "kai.install.validate_protected_file_metadata",
-            lambda *args, **kwargs: True,
+
+        status = _core_schedule_status(db_path)
+
+        assert status == (
+            "Workshop scheduler: INCOMPLETE; active jobs=2, canonically owned=1, "
+            "unowned=1, pending firings=1, executing=1, failed=1"
         )
 
-        status = _dormant_compatibility_schedule_status(db_path, env_path)
-
-        assert status == "Compatibility schedules: 2 active job(s) dormant; Telegram adapter disabled"
-
-    def test_status_omits_dormant_schedule_line_when_telegram_is_enabled(self, tmp_path, monkeypatch):
-        env_path = tmp_path / "env"
-        env_path.write_text("KAI_ENABLED_ADAPTERS=telegram,workshop\n")
-        monkeypatch.setattr(
-            "kai.install.validate_protected_file_metadata",
-            lambda *args, **kwargs: True,
+    def test_status_reports_unavailable_core_schedule_database(self, tmp_path):
+        assert _core_schedule_status(tmp_path / "missing.db") == (
+            "Workshop scheduler: NOT VERIFIED (database unavailable)"
         )
-
-        assert _dormant_compatibility_schedule_status(tmp_path / "missing.db", env_path) is None
 
     def test_deployed_status_reports_named_secrets_without_values(self, tmp_path, monkeypatch):
         env_path = tmp_path / "env"

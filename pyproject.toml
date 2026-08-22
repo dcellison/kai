@@ -9,7 +9,8 @@ description = "Telegram gateway to AI coding-agent backends"
 license = "Apache-2.0"
 requires-python = ">=3.13"
 dependencies = [
-    "python-telegram-bot[ext]>=20.0,<23",
+    "python-telegram-bot>=20.0,<23",
+    "apscheduler>=3.10.4,<4",
     "aiosqlite>=0.19.0,<1",
     "python-dotenv>=1.0.0,<2",
     "aiohttp>=3.9.0,<4",

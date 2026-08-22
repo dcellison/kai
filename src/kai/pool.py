@@ -136,7 +136,7 @@ class SubprocessPool:
     timeout to manage memory on resource-constrained machines.
 
     Thread safety: send() for a given chat_id is serialized by the
-    per-chat lock in bot.py/cron.py. The pool does not add its own
+    per-channel execution lane. The pool does not add its own
     locking because the callers already guarantee single-writer-per-user.
     If a future caller bypasses the per-chat lock, add an asyncio.Lock
     per chat_id here.

@@ -1171,15 +1171,7 @@ async def handle_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if not deleted:
             await update.message.reply_text(f"Job #{job_id} not found.")
             return
-        # Remove from APScheduler's in-memory queue. Daily jobs with multiple
-        # times get suffixed names (cron_19_0, cron_19_1), so match both the
-        # exact name and any suffixed variants - same pattern as cron.py.
-        jq = context.application.job_queue
-        assert jq is not None
-        prefix = f"cron_{job_id}"
-        current = [j for j in jq.jobs() if j.name == prefix or (j.name and j.name.startswith(f"{prefix}_"))]
-        for j in current:
-            j.schedule_removal()
+        await _get_core_services(context).scheduler.remove_job(job_id)
         await update.message.reply_text(f"Job #{job_id} cancelled.")
         return
 

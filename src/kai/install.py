@@ -8501,12 +8501,7 @@ def _cmd_status() -> None:
     print(_check_path(Path("/etc/sudoers.d/kai"), "Sudoers"))
     print(_check_service_status(platform))
     print(_deployed_adapter_policy_status(_DEPLOYED_ENV_FILE))
-    schedule_status = _dormant_compatibility_schedule_status(
-        Path(data_dir) / "kai.db",
-        _DEPLOYED_ENV_FILE,
-    )
-    if schedule_status is not None:
-        print(schedule_status)
+    print(_core_schedule_status(Path(data_dir) / "kai.db"))
     if conf_env is None:
         print("Client adapters (install.conf artifact): unavailable")
     else:
@@ -8818,25 +8813,39 @@ def _read_deployed_memory_enabled(env_path: Path) -> bool | None:
         return None
 
 
-def _dormant_compatibility_schedule_status(db_path: Path, env_path: Path) -> str | None:
-    """Report active Telegram-owned jobs that cannot fire without the adapter."""
-    try:
-        configured = _read_deployed_adapter_configuration(env_path)
-        adapters = parse_enabled_adapters(configured.get("KAI_ENABLED_ADAPTERS"))
-    except (FileNotFoundError, OSError, UnicodeError, ProtectedConfigError, ValueError):
-        return None
-    if "telegram" in adapters or not db_path.is_file():
-        return None
+def _core_schedule_status(db_path: Path) -> str:
+    """Report canonical job ownership and durable firing state."""
+    if not db_path.is_file():
+        return "Workshop scheduler: NOT VERIFIED (database unavailable)"
     try:
         connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
         try:
-            row = connection.execute("SELECT COUNT(*) FROM jobs WHERE active = 1").fetchone()
+            ownership = connection.execute(
+                "SELECT COUNT(*), COUNT(o.job_id) FROM jobs j "
+                "LEFT JOIN workshop_job_owners o ON o.job_id = j.id WHERE j.active = 1"
+            ).fetchone()
+            firings = connection.execute(
+                "SELECT "
+                "SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status = 'executing' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) "
+                "FROM workshop_schedule_firings"
+            ).fetchone()
         finally:
             connection.close()
     except sqlite3.Error as exc:
-        return f"Compatibility schedules: NOT VERIFIED ({exc})"
-    count = int(row[0]) if row else 0
-    return f"Compatibility schedules: {count} active job(s) dormant; Telegram adapter disabled"
+        return f"Workshop scheduler: NOT VERIFIED ({exc})"
+    active = int(ownership[0]) if ownership else 0
+    owned = int(ownership[1]) if ownership else 0
+    pending = int(firings[0] or 0) if firings else 0
+    executing = int(firings[1] or 0) if firings else 0
+    failed = int(firings[2] or 0) if firings else 0
+    status = "active" if active == owned else "INCOMPLETE"
+    return (
+        f"Workshop scheduler: {status}; active jobs={active}, "
+        f"canonically owned={owned}, unowned={active - owned}, "
+        f"pending firings={pending}, executing={executing}, failed={failed}"
+    )
 
 
 def _deployed_webhook_secret_migration_status(env_path: Path) -> str:

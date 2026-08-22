@@ -89,9 +89,9 @@ def test_workshop_only_omits_telegram_owned_routes() -> None:
     assert ("POST", "/webhook/telegram") not in routes
     assert ("POST", "/webhook/github") not in routes
     assert ("POST", "/webhook") not in routes
-    assert ("POST", "/api/schedule") not in routes
-    assert ("DELETE", "/api/jobs/{id}") not in routes
-    assert ("PATCH", "/api/jobs/{id}") not in routes
+    assert ("POST", "/api/schedule") in routes
+    assert ("DELETE", "/api/jobs/{id}") in routes
+    assert ("PATCH", "/api/jobs/{id}") in routes
     assert ("POST", "/api/send-message") not in routes
     assert ("POST", "/api/send-file") not in routes
 
