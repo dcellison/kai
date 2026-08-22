@@ -13,6 +13,7 @@ from kai.workshop.timeline import (
     TimelineAccessDeniedError,
     TimelineMessage,
     TimelineResumeError,
+    is_internal_scheduled_invocation,
 )
 
 _MAX_BATCH_SIZE = 100
@@ -158,7 +159,7 @@ async def read_client_channel_events(
         "m.id AS message_id, m.channel_id AS message_channel_id, "
         "m.author_principal_id, p.kind AS author_kind, p.display_name AS author_display_name, "
         "m.reply_to_message_id, m.body, m.created_at AS message_created_at, "
-        "r.id AS run_id "
+        "e.metadata_json AS message_metadata_json, r.id AS run_id "
         "FROM event_log e "
         "LEFT JOIN messages m ON m.created_event_position = e.position "
         "LEFT JOIN principals p ON p.id = m.author_principal_id "
@@ -172,9 +173,16 @@ async def read_client_channel_events(
         rows = list(await cursor.fetchall())
 
     events: list[ClientChannelEvent] = []
+    next_position = after_position
     for row in rows:
         position = int(row["position"])
+        next_position = position
         if row["message_id"] is not None:
+            if is_internal_scheduled_invocation(
+                row["message_metadata_json"],
+                row["author_kind"],
+            ):
+                continue
             events.append(
                 ClientTimelineMessageEvent(
                     TimelineMessage(
@@ -209,5 +217,4 @@ async def read_client_channel_events(
             )
         )
 
-    next_position = events[-1].event_position if events else after_position
     return ClientChannelEventBatch(tuple(events), next_position)

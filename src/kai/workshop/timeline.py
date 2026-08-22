@@ -18,6 +18,9 @@ _CURSOR_PREFIX = "v1."
 _MAX_CURSOR_LENGTH = 512
 _MAX_PAGE_SIZE = 100
 _MAX_SQLITE_INTEGER = 2**63 - 1
+_VISIBLE_MESSAGE_PREDICATE = (
+    "NOT (p.kind = 'human' AND COALESCE(json_extract(e.metadata_json, '$.source'), '') = 'scheduled_job')"
+)
 
 
 class TimelineAccessDeniedError(PermissionError):
@@ -168,6 +171,25 @@ def _parse_timestamp(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
 
 
+def is_internal_scheduled_invocation(metadata_json: object, author_kind: object) -> bool:
+    """Return whether a canonical message is an internal scheduled command.
+
+    Scheduled agent work is represented by a human-authored canonical message
+    so the run keeps durable ownership, context, and audit provenance. That
+    record is not a message the human sent from a client and must not be echoed
+    into client timelines. Scheduled reminders use the same source metadata
+    but are agent-authored user-visible output, so author kind is part of the
+    classification.
+    """
+    if str(author_kind) != "human":
+        return False
+    try:
+        metadata = json.loads(str(metadata_json))
+    except json.JSONDecodeError:
+        return False
+    return isinstance(metadata, dict) and metadata.get("source") == "scheduled_job"
+
+
 def _validate_request(principal_id: PrincipalId, channel_id: ChannelId, limit: int) -> None:
     if not isinstance(principal_id, PrincipalId):
         raise ValueError("principal_id must be a PrincipalId")
@@ -212,20 +234,24 @@ async def _latest_event_position(store: WorkshopEventStore) -> int:
 
 
 def _messages_from_rows(rows: list[aiosqlite.Row]) -> tuple[TimelineMessage, ...]:
-    return tuple(
-        TimelineMessage(
-            message_id=MessageId(str(row[0])),
-            channel_id=ChannelId(str(row[1])),
-            author_principal_id=PrincipalId(str(row[2])),
-            author_kind=str(row[3]),
-            author_display_name=str(row[4]),
-            reply_to_message_id=MessageId(str(row[5])) if row[5] is not None else None,
-            body=str(row[6]),
-            event_position=int(row[7]),
-            created_at=_parse_timestamp(str(row[8])),
+    messages: list[TimelineMessage] = []
+    for row in rows:
+        if is_internal_scheduled_invocation(row[9], row[3]):
+            continue
+        messages.append(
+            TimelineMessage(
+                message_id=MessageId(str(row[0])),
+                channel_id=ChannelId(str(row[1])),
+                author_principal_id=PrincipalId(str(row[2])),
+                author_kind=str(row[3]),
+                author_display_name=str(row[4]),
+                reply_to_message_id=MessageId(str(row[5])) if row[5] is not None else None,
+                body=str(row[6]),
+                event_position=int(row[7]),
+                created_at=_parse_timestamp(str(row[8])),
+            )
         )
-        for row in rows
-    )
+    return tuple(messages)
 
 
 async def _read_forward_page(
@@ -236,10 +262,12 @@ async def _read_forward_page(
 ) -> TimelinePage:
     async with store.connection.execute(
         "SELECT m.id, m.channel_id, m.author_principal_id, p.kind, p.display_name, "
-        "m.reply_to_message_id, m.body, m.created_event_position, m.created_at "
+        "m.reply_to_message_id, m.body, m.created_event_position, m.created_at, e.metadata_json "
         "FROM messages m JOIN principals p ON p.id = m.author_principal_id "
+        "JOIN event_log e ON e.position = m.created_event_position "
         "WHERE m.channel_id = ? AND m.created_event_position > ? "
-        "AND m.created_event_position <= ? ORDER BY m.created_event_position ASC LIMIT ?",
+        f"AND m.created_event_position <= ? AND {_VISIBLE_MESSAGE_PREDICATE} "
+        "ORDER BY m.created_event_position ASC LIMIT ?",
         (channel_id, state.after_position, state.through_position, limit + 1),
     ) as query_cursor:
         rows = list(await query_cursor.fetchall())
@@ -273,10 +301,11 @@ async def _read_tail_page(
     # in event order.
     async with store.connection.execute(
         "SELECT m.id, m.channel_id, m.author_principal_id, p.kind, p.display_name, "
-        "m.reply_to_message_id, m.body, m.created_event_position, m.created_at "
+        "m.reply_to_message_id, m.body, m.created_event_position, m.created_at, e.metadata_json "
         "FROM messages m JOIN principals p ON p.id = m.author_principal_id "
+        "JOIN event_log e ON e.position = m.created_event_position "
         "WHERE m.channel_id = ? AND m.created_event_position < ? "
-        "ORDER BY m.created_event_position DESC LIMIT ?",
+        f"AND {_VISIBLE_MESSAGE_PREDICATE} ORDER BY m.created_event_position DESC LIMIT ?",
         (channel_id, state.before_position, limit + 1),
     ) as query_cursor:
         rows = list(await query_cursor.fetchall())
@@ -380,8 +409,9 @@ async def read_channel_timeline_updates(
 
     async with store.connection.execute(
         "SELECT m.id, m.channel_id, m.author_principal_id, p.kind, p.display_name, "
-        "m.reply_to_message_id, m.body, m.created_event_position, m.created_at "
+        "m.reply_to_message_id, m.body, m.created_event_position, m.created_at, e.metadata_json "
         "FROM messages m JOIN principals p ON p.id = m.author_principal_id "
+        "JOIN event_log e ON e.position = m.created_event_position "
         "WHERE m.channel_id = ? AND m.created_event_position > ? "
         "ORDER BY m.created_event_position ASC LIMIT ?",
         (channel_id, after_position, limit),
@@ -389,5 +419,5 @@ async def read_channel_timeline_updates(
         rows = list(await query_cursor.fetchall())
 
     messages = _messages_from_rows(rows)
-    next_position = messages[-1].event_position if messages else after_position
+    next_position = int(rows[-1][7]) if rows else after_position
     return TimelineUpdateBatch(messages, next_position)
