@@ -14,9 +14,6 @@ Test sections:
 - TestStage2Isolation: stage 2 never breaks stage 1
 - TestStage2Storage: full Sophia field set + telemetry
 - TestEpisodeRetrieval: format_context surfacing
-
-The opt-in classifier evaluation set lives in
-tests/test_episode_classifier_eval.py and tests/data/.
 """
 
 from __future__ import annotations
