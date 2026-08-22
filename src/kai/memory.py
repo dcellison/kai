@@ -472,6 +472,15 @@ class TranscriptProvenance:
     user_text_sha256: str | None
     assistant_ts: str | None
     date_end: str | None
+    canonical_present: bool = False
+    malformed: bool = False
+    principal_id: str | None = None
+    channel_id: str | None = None
+    agent_id: str | None = None
+    runtime_profile_id: str | None = None
+    run_id: str | None = None
+    source_message_id: str | None = None
+    result_message_id: str | None = None
 
 
 def read_transcript_provenance(metadata: dict[str, Any] | None) -> TranscriptProvenance:
@@ -505,14 +514,38 @@ def read_transcript_provenance(metadata: dict[str, Any] | None) -> TranscriptPro
     )
     assistant_ts = md.get(SOURCE_ASSISTANT_TS_KEY)
     date_end = md.get(SOURCE_DATE_END_KEY)
+    canonical_keys = (
+        WORKSHOP_PRINCIPAL_ID_KEY,
+        WORKSHOP_CHANNEL_ID_KEY,
+        WORKSHOP_AGENT_ID_KEY,
+        WORKSHOP_RUNTIME_PROFILE_ID_KEY,
+        WORKSHOP_RUN_ID_KEY,
+        WORKSHOP_SOURCE_MESSAGE_ID_KEY,
+        WORKSHOP_RESULT_MESSAGE_ID_KEY,
+    )
+    canonical_values = tuple(md.get(key) for key in canonical_keys)
+    canonical_any = any(value is not None for value in canonical_values)
+    canonical_present = all(isinstance(value, str) and bool(value) for value in canonical_values)
+    legacy_values = (chat_id, date, user_ts, user_text_sha256)
+    legacy_any = any(value is not None for value in legacy_values)
+    malformed = (canonical_any and not canonical_present) or (legacy_any and not required_present)
     return TranscriptProvenance(
-        present=required_present,
+        present=(canonical_present or required_present) and not malformed,
         chat_id=chat_id if isinstance(chat_id, int) else None,
         date=date if isinstance(date, str) and date else None,
         user_ts=user_ts if isinstance(user_ts, str) and user_ts else None,
         user_text_sha256=user_text_sha256 if isinstance(user_text_sha256, str) and user_text_sha256 else None,
         assistant_ts=assistant_ts if isinstance(assistant_ts, str) and assistant_ts else None,
         date_end=date_end if isinstance(date_end, str) and date_end else None,
+        canonical_present=canonical_present,
+        malformed=malformed,
+        principal_id=(str(canonical_values[0]) if canonical_present else None),
+        channel_id=(str(canonical_values[1]) if canonical_present else None),
+        agent_id=(str(canonical_values[2]) if canonical_present else None),
+        runtime_profile_id=(str(canonical_values[3]) if canonical_present else None),
+        run_id=(str(canonical_values[4]) if canonical_present else None),
+        source_message_id=(str(canonical_values[5]) if canonical_present else None),
+        result_message_id=(str(canonical_values[6]) if canonical_present else None),
     )
 
 

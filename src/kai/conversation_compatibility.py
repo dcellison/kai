@@ -36,6 +36,7 @@ def schedule_memory_ingestion(
     user_log: LogEntry | None,
     assistant_log: LogEntry | None,
     canonical_provenance: CanonicalMemoryProvenance | None = None,
+    canonical_prior_pairs: tuple[tuple[str, str], ...] | None = None,
     reasoner_backends: frozenset[str] = ONESHOT_REASONER_BACKENDS,
     effective_backend: str | None = None,
 ) -> None:
@@ -64,10 +65,16 @@ def schedule_memory_ingestion(
                 if config.memory_extraction_enabled and backend in reasoner_backends:
                     prior_pairs: list[tuple[str, str]] = []
                     if config.episode_classifier_context_turns > 0:
-                        from kai.history import get_recent_pairs
+                        if canonical_provenance is not None:
+                            # Canonical callers supply completed exchanges from
+                            # the exact principal/channel/agent run lane. Never
+                            # fall back to compatibility JSONL for this path.
+                            prior_pairs = list(canonical_prior_pairs or ())
+                        else:
+                            from kai.history import get_recent_pairs
 
-                        fetched = get_recent_pairs(chat_id, config.episode_classifier_context_turns + 1)
-                        prior_pairs = fetched[:-1]
+                            fetched = get_recent_pairs(chat_id, config.episode_classifier_context_turns + 1)
+                            prior_pairs = fetched[:-1]
                     await memory_extraction.extract_and_store(
                         user_text=user_text,
                         assistant_text=assistant_text,

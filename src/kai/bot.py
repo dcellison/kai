@@ -4271,7 +4271,6 @@ async def _handle_workshop_private_text(
     run_id: RunId,
     inbound_message_id: MessageId,
     prompt: str,
-    user_log: LogEntry | None,
 ) -> None:
     """Render streaming previews while Workshop owns execution and final delivery."""
     assert update.message is not None
@@ -4331,16 +4330,14 @@ async def _handle_workshop_private_text(
     final_text = result.terminal.body
     if result.session_id and result.selection is not None:
         await sessions.save_session(chat_id, result.session_id, result.selection.model)
-    assistant_log = log_message(
-        direction="assistant",
-        chat_id=chat_id,
-        text=final_text,
-        reader_user=_upload_reader_user(context, chat_id),
-    )
     if result.disposition == CanonicalExecutionDisposition.COMPLETED and result.workspace is not None:
         result_message_id = result.terminal.finalization.message.event.envelope.aggregate_id
         if not isinstance(result_message_id, MessageId):
             raise RuntimeError("Workshop execution returned a non-message result aggregate")
+        prior_pairs = await execution.prior_conversation_pairs(
+            run_id,
+            limit=config.episode_classifier_context_turns,
+        )
         schedule_memory_ingestion(
             prompt=prompt,
             assistant_text=final_text,
@@ -4348,13 +4345,14 @@ async def _handle_workshop_private_text(
             session_id=result.session_id,
             config=config,
             workspace=result.workspace,
-            user_log=user_log,
-            assistant_log=assistant_log,
+            user_log=None,
+            assistant_log=None,
             canonical_provenance=CanonicalMemoryProvenance(
                 run_id=run_id,
                 source_message_id=inbound_message_id,
                 result_message_id=result_message_id,
             ),
+            canonical_prior_pairs=prior_pairs,
             reasoner_backends=ONESHOT_REASONER_BACKENDS,
             effective_backend=_get_pool(context).get_backend_provider(chat_id)[0],
         )
@@ -4455,11 +4453,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     update.message.message_id,
                 )
 
-    # Capture the user LogEntry so response processing can thread it to
-    # provenance. Exact durable replays must not duplicate JSONL history.
+    # JSONL remains a compatibility archive only for routes that have not
+    # crossed canonical execution. Protected private text uses the Workshop
+    # timeline exclusively.
     user_log = (
         log_message(direction="user", chat_id=chat_id, text=prompt, reader_user=reader_user)
-        if acceptance_disposition in {None, ConversationCommandDisposition.NEWLY_ACCEPTED}
+        if not private_text_activation
+        and acceptance_disposition in {None, ConversationCommandDisposition.NEWLY_ACCEPTED}
         else None
     )
     if private_text_activation:
@@ -4472,7 +4472,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             run_id=workshop_run_id,
             inbound_message_id=workshop_inbound_message_id,
             prompt=prompt,
-            user_log=user_log,
         )
         return
 
