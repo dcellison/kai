@@ -1,7 +1,7 @@
 """Tests for profile-addressed compatibility-state writes."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, call
+from unittest.mock import AsyncMock, Mock
 
 from kai.workshop.compatibility_state import WorkshopCompatibilityStateWriter
 from kai.workshop.domain import CanonicalMemoryProvenance, MessageId, RunId
@@ -23,10 +23,8 @@ async def test_profile_state_preserves_existing_storage_keys(monkeypatch):
             )
         )
     )
-    log = Mock(side_effect=["user-log", "assistant-log"])
     save_session = AsyncMock()
     schedule = Mock()
-    monkeypatch.setattr("kai.workshop.compatibility_state.log_message", log)
     monkeypatch.setattr(
         "kai.workshop.compatibility_state.sessions.save_session",
         save_session,
@@ -37,8 +35,6 @@ async def test_profile_state_preserves_existing_storage_keys(monkeypatch):
     )
 
     state = WorkshopCompatibilityStateWriter(config, runtime_pool).for_profile(profile_id(101))
-    user_log = state.append_history(direction="user", text="Hello")
-    assistant_log = state.append_history(direction="assistant", text="Hi")
     provenance = CanonicalMemoryProvenance(RunId.new(), MessageId.new(), MessageId.new())
     await state.save_session("session-1", "gpt-5.6-sol")
     state.schedule_memory_ingestion(
@@ -46,26 +42,11 @@ async def test_profile_state_preserves_existing_storage_keys(monkeypatch):
         assistant_text="Hi",
         session_id="session-1",
         workspace="/workspace/project",
-        user_log=user_log,
-        assistant_log=assistant_log,
         canonical_provenance=provenance,
+        canonical_prior_pairs=(("Earlier", "Exchange"),),
     )
 
     runtime_pool.runtime_profile.assert_called_once_with(profile_id(101))
-    assert log.call_args_list == [
-        call(
-            direction="user",
-            chat_id=101,
-            text="Hello",
-            reader_user="daniel",
-        ),
-        call(
-            direction="assistant",
-            chat_id=101,
-            text="Hi",
-            reader_user="daniel",
-        ),
-    ]
     save_session.assert_awaited_once_with(101, "session-1", "gpt-5.6-sol")
     schedule.assert_called_once_with(
         prompt="Hello",
@@ -74,8 +55,9 @@ async def test_profile_state_preserves_existing_storage_keys(monkeypatch):
         session_id="session-1",
         config=config,
         workspace="/workspace/project",
-        user_log="user-log",
-        assistant_log="assistant-log",
+        user_log=None,
+        assistant_log=None,
         canonical_provenance=provenance,
+        canonical_prior_pairs=(("Earlier", "Exchange"),),
         effective_backend="codex",
     )

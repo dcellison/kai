@@ -2956,7 +2956,6 @@ class TestHandleMessage:
             await handle_message(update, ctx)
 
         execute.assert_awaited_once()
-        assert execute.await_args.kwargs["user_log"] is None
         history.assert_not_called()
 
     @pytest.mark.asyncio

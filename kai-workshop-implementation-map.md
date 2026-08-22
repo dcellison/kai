@@ -408,7 +408,7 @@ No entry may use an indefinite condition such as "keep for compatibility." A gen
 | Transitional mechanism | Replacement authority | Required evidence and removal gate | Retirement work | State |
 |---|---|---|---|---|
 | Authenticated plain-text/photo/document/voice and successful assistant-result canonical shadow writes beside current history, plus non-authoritative Telegram delivery observations | Workshop event store, message/artifact projections, and durable delivery outbox | Deterministic replay, duplicate-ingress/result tests, restart tests, full media-ingress coverage, delivery parity diagnostics, and sustained parity with current history and Telegram outcomes | Remove the `workshop_inbound_recorder`, `workshop_artifact_recorder`, `workshop_outbound_recorder`, and `workshop_delivery_recorder` bot-data adapters and their fail-open handler branches; remove the transitional `workshop_message_shadowed` JSONL marker; remove `workshop_message_parity_status` and its install-status output after canonical reads and outbox delivery become authoritative; make canonical command/event transactions and the delivery outbox the sole write and delivery paths | Active (private text finalization is authoritative in the outbox; inbound/media artifacts, remaining assistant results and delivery observations, JSONL history, and parity diagnostics remain transitional) |
-| JSONL transcript writes and reads | Canonical message projection, with an explicit export facility if still useful | All five harnesses rebuild restart context from canonical messages; excluded media, command, group, schedule, and integration lanes have crossed the canonical execution boundary; canonical history search replaces the compatibility full-log pointer; migration/parity diagnostics report no unexplained divergence | Stop JSONL writes; remove compatibility-route reads, dual-write recovery code, the split fresh-process bootstrap source, and JSONL-only full-history instructions; retain only a documented importer/exporter if required | Active (canonical private-text runs use a bounded canonical timeline window and durable channel-agent continuity after the schema-v20 cutover; JSONL remains the context source for excluded compatibility routes and remains a transitional write/archive surface) |
+| JSONL transcript writes and reads | Canonical message projection plus the derived `canonical-transcript.ndjson` export | Installed qualification proves protected Telegram/browser private text, restart continuity, older-history search, canonical and historical memory source views, and hybrid operation; excluded media, command, group, schedule, and integration lanes later cross their own bounded canonical boundaries | Remove compatibility-route reads and writes only as those routes migrate; retain historical JSONL as non-authoritative import/archive data while provenance rows still reference it; remove the retired combined parity diagnostic after the archive window closes | Cut over for protected private text, awaiting installed qualification (#1047): canonical messages supply bounded prompt context, completed run lineage supplies episode context, and new memory source views resolve exact canonical provenance. Protected Telegram/browser private text performs no JSONL read or write. Excluded routes and older memory provenance retain JSONL compatibility. |
 | Telegram `chat_id` used as internal identity, namespace, and routing key | Durable principal, channel, agent, and binding IDs | Private chats, notification-only groups, duplicate updates, and restart routing all resolve correctly through bindings | Confine Telegram IDs to external identity, transport binding, and idempotency records; remove chat-shaped domain keys | Active (authoritative private text now enters execution by canonical message ID, but the compatibility resolver still derives the current pool key from the human principal's protected Telegram identity; settings, locks, history, files, memory, and excluded routes remain chat-keyed) |
 | `SubprocessPool` keyed by Telegram chat ID | Durable channel/agent session plus run and attempt orchestration | All five harnesses pass continuity, restart, cancellation, and isolation tests through durable identities | Remove chat-key compatibility lookup and move lifecycle ownership behind the orchestrator/runtime contract | Active (a canonical conversation-run service hides the private-text pool lookup behind a temporary compatibility resolution; the pool and all five harness processes remain keyed by that resolved integer) |
 | Direct backend invocation from Telegram handlers | Transport-neutral command and run services | Telegram and the first Workshop client produce equivalent authorized runs and visible results | Remove handler-owned orchestration; leave authentication, parsing, and rendering in the Telegram adapter | Active (authenticated private-chat text and authenticated Workshop browser commands now accept and execute by canonical `RunId`, with fenced attempts, durable cancellation, atomic terminal settlement, and replay suppression; the first browser path temporarily resolves the existing direct-Telegram compatibility identity, while media, voice modes, groups, schedules, and integrations retain their compatibility orchestration) |
@@ -2143,6 +2143,49 @@ available; canonical private text currently has only the bounded timeline
 window. Retiring the split source requires canonical execution for the
 remaining media, commands, groups, schedules, and integrations, plus a
 canonical history-search/export facility for older context.
+
+## 46. Protected private-text transcript authority
+
+**Implementation date:** 2026-08-22
+
+Schema version 25 records a durable event-position cutover rather than
+inferring transcript authority from the existence of canonical tables.
+Protected Telegram and Workshop browser private text no longer reads or writes
+compatibility JSONL. Bounded prompt context comes from canonical channel
+messages, while semantic-memory episode context comes only from completed runs
+for the same principal, channel, and agent. Interleaved humans, other agents,
+notifications, failures, and the current inbound turn cannot be paired merely
+because they are adjacent in the timeline.
+
+New semantic-memory provenance continues to carry the protected canonical
+principal, channel, agent, runtime profile, run, source message, and result
+message. Source views verify that exact completed exchange in SQLite and fail
+closed on malformed, missing, stale, or cross-principal provenance; they never
+fall back to JSONL. Older rows with complete JSONL provenance remain readable
+through the existing owner-gated archive path.
+
+Older searchable history is available as a deterministic derived NDJSON
+projection named `canonical-transcript.ndjson`, deliberately outside the
+compatibility `*.jsonl` pattern. The projection appends new canonical messages
+incrementally, rebuilds atomically after truncation or drift, applies the
+channel's protected reader access, and performs filesystem writes and `fsync`
+outside the shared SQLite lock. The explicit `kai workshop transcript export`
+command can reproduce the same canonical record format on demand. SQLite is
+the sole authority in both cases.
+
+Installed diagnostics now report canonical event-replay/projection integrity,
+the durable transcript cutover, and legacy JSONL archive classification as
+three separate states. Canonical-only messages are classified by bounded
+origin/direction counts and do not make canonical integrity appear diverged.
+The legacy archive remains non-authoritative and content-free in status output.
+
+This implementation does not complete Milestone 4 by itself. The installed
+exit gate in #1047 must still prove Workshop-only restart continuity,
+deliberate older-history retrieval, canonical and historical memory source
+views, hybrid Telegram/Workshop continuity, unchanged Telegram private text
+and GitHub notification delivery, and clean authoritative status. Media,
+commands, groups, schedules, integrations, and their historical JSONL records
+remain explicitly excluded compatibility routes.
 
 ## Canonical notification feed activation
 

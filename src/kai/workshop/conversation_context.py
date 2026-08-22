@@ -63,3 +63,47 @@ async def assemble_canonical_conversation_context(
     text = "\n\n".join(_render(name, kind, body) for name, kind, body, _ in selected)
     through = selected[-1][3] if selected else 0
     return CanonicalConversationContext(text, len(selected), through)
+
+
+async def assemble_canonical_prior_pairs(
+    store: WorkshopEventStore,
+    run: DurableRun,
+    *,
+    limit: int,
+) -> tuple[tuple[str, str], ...]:
+    """Return completed exchanges before ``run`` in its exact owner lane.
+
+    Pairing follows durable run lineage rather than adjacent channel messages.
+    That prevents another human, another agent, notifications, failures, or an
+    interleaved run from becoming semantic-memory episode context.
+    """
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+        raise ValueError("limit must be a non-negative integer")
+    if limit == 0:
+        return ()
+    async with store.connection.execute(
+        "SELECT created_event_position FROM messages WHERE id = ? AND channel_id = ?",
+        (run.inbound_message_id, run.channel_id),
+    ) as cursor:
+        inbound = await cursor.fetchone()
+    if inbound is None:
+        raise RuntimeError("Canonical inbound message no longer exists")
+
+    async with store.connection.execute(
+        "SELECT source.body, result.body FROM runs prior "
+        "JOIN messages source ON source.id = prior.inbound_message_id "
+        "JOIN messages result ON result.id = prior.result_message_id "
+        "WHERE prior.channel_id = ? AND prior.agent_id = ? "
+        "AND prior.requested_by_principal_id = ? AND prior.status = 'completed' "
+        "AND source.created_event_position < ? "
+        "ORDER BY source.created_event_position DESC, prior.id DESC LIMIT ?",
+        (
+            run.channel_id,
+            run.agent_id,
+            run.requested_by_principal_id,
+            int(inbound[0]),
+            limit,
+        ),
+    ) as cursor:
+        rows = list(await cursor.fetchall())
+    return tuple((str(row[0]), str(row[1])) for row in reversed(rows))

@@ -6,7 +6,6 @@ import asyncio
 import logging
 from dataclasses import dataclass
 
-from kai.history import LogEntry
 from kai.streaming_text import stream_publishable_prefix
 from kai.workshop.compatibility_state import WorkshopCompatibilityStateWriter
 from kai.workshop.conversation_commands import (
@@ -48,7 +47,6 @@ class _ClientRunContext:
     runtime_profile_id: RuntimeProfileId
     inbound_message_id: MessageId
     body: str
-    user_log: LogEntry | None = None
 
 
 class WorkshopClientCommandExecutor:
@@ -90,13 +88,6 @@ class WorkshopClientCommandExecutor:
         if not self.ready:
             raise ClientCommandExecutorUnavailableError("Workshop client command executor is unavailable")
         accepted = await self._execution.accept_client(message)
-        user_log: LogEntry | None = None
-        if accepted.command.disposition == ConversationCommandDisposition.NEWLY_ACCEPTED:
-            compatibility_state = self._compatibility_state.for_profile(accepted.runtime_profile_id)
-            user_log = compatibility_state.append_history(
-                direction="user",
-                text=message.body,
-            )
         if accepted.command.disposition in {
             ConversationCommandDisposition.NEWLY_ACCEPTED,
             ConversationCommandDisposition.READY_REPLAY,
@@ -110,7 +101,6 @@ class WorkshopClientCommandExecutor:
                     accepted.runtime_profile_id,
                     inbound_message_id,
                     message.body,
-                    user_log,
                 )
             )
         return ClientCommandSubmission(
@@ -163,10 +153,6 @@ class WorkshopClientCommandExecutor:
             if result.terminal is None:
                 return
             compatibility_state = self._compatibility_state.for_profile(context.runtime_profile_id)
-            assistant_log = compatibility_state.append_history(
-                direction="assistant",
-                text=result.terminal.body,
-            )
             if result.session_id and result.selection is not None:
                 await compatibility_state.save_session(
                     result.session_id,
@@ -176,18 +162,21 @@ class WorkshopClientCommandExecutor:
                 result_message_id = result.terminal.finalization.message.event.envelope.aggregate_id
                 if not isinstance(result_message_id, MessageId):
                     raise RuntimeError("Workshop execution did not identify a canonical result message")
+                prior_pairs = await self._execution.prior_conversation_pairs(
+                    context.run_id,
+                    limit=compatibility_state.memory_context_turns,
+                )
                 compatibility_state.schedule_memory_ingestion(
                     prompt=context.body,
                     assistant_text=result.terminal.body,
                     session_id=result.session_id,
                     workspace=result.workspace,
-                    user_log=context.user_log,
-                    assistant_log=assistant_log,
                     canonical_provenance=CanonicalMemoryProvenance(
                         run_id=context.run_id,
                         source_message_id=context.inbound_message_id,
                         result_message_id=result_message_id,
                     ),
+                    canonical_prior_pairs=prior_pairs,
                 )
         except Exception:
             log.exception("Workshop client run task failed for %s", context.run_id)

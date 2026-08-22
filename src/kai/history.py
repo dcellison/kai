@@ -1,10 +1,10 @@
 """
-Conversation history logging and retrieval.
+Compatibility history logging plus canonical memory-source lookup.
 
 Provides functionality to:
-1. Log every user and assistant message as JSONL (one file per day)
-2. Retrieve recent messages for injection into new Claude sessions
-3. Serve as the "episodic memory" layer of Kai's three-layer memory system
+Protected Workshop private text uses canonical SQLite messages and the derived
+``canonical-transcript.ndjson`` projection. JSONL remains an archive and the
+history source for excluded compatibility routes and older memory provenance.
 
 Log files are stored in per-channel subdirectories under DATA_DIR/history/
 (e.g., DATA_DIR/history/<channel_id>/2026-02-11.jsonl). During the Workshop
@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -614,6 +615,9 @@ LookupReason = Literal[
     "ts_not_found",
     "hash_mismatch",
     "chat_mismatch",
+    "canonical_missing",
+    "principal_mismatch",
+    "provenance_invalid",
 ]
 
 _TRANSCRIPT_WINDOW_TURN_CAP = 50
@@ -646,12 +650,14 @@ class TranscriptContext:
     parameters).
     """
 
-    chat_id: int
+    chat_id: int | None
     target_user: TranscriptTurn
     target_assistant: TranscriptTurn | None
     before: list[TranscriptTurn]
     after: list[TranscriptTurn]
     truncated: bool
+    principal_id: str | None = None
+    channel_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -739,6 +745,7 @@ def fetch_transcript_context(
     after: int = 1,
     memory_id: str | None = None,
     expected_chat_id: int | None = None,
+    expected_principal_id: str | None = None,
 ) -> TranscriptLookup:
     """
     Resolve a row's transcript provenance into surrounding turns.
@@ -792,8 +799,20 @@ def fetch_transcript_context(
     The helper never returns a "maybe matched" turn. A wrong-turn
     render would be worse than no render at all.
     """
+    if getattr(provenance, "malformed", False):
+        _emit_drift_log(memory_id=memory_id, chat_id=None, reason="provenance_invalid")
+        return TranscriptLookup(reason="provenance_invalid", context=None)
     if not provenance.present:
         return TranscriptLookup(reason="legacy", context=None)
+
+    if getattr(provenance, "canonical_present", False):
+        return _fetch_canonical_transcript_context(
+            provenance,
+            before=before,
+            after=after,
+            memory_id=memory_id,
+            expected_principal_id=expected_principal_id,
+        )
 
     chat_id: int = provenance.chat_id
     if expected_chat_id is not None and chat_id != expected_chat_id:
@@ -882,6 +901,130 @@ def fetch_transcript_context(
             truncated=False,
         ),
     )
+
+
+def _fetch_canonical_transcript_context(
+    provenance,
+    *,
+    before: int,
+    after: int,
+    memory_id: str | None,
+    expected_principal_id: str | None,
+) -> TranscriptLookup:
+    """Resolve an exact completed canonical exchange without JSONL fallback."""
+    principal_id = str(provenance.principal_id)
+    channel_id = str(provenance.channel_id)
+    if expected_principal_id is not None and principal_id != expected_principal_id:
+        _emit_drift_log(memory_id=memory_id, chat_id=None, reason="principal_mismatch")
+        return TranscriptLookup(reason="principal_mismatch", context=None)
+
+    database = DATA_DIR / "kai.db"
+    if database.is_symlink() or not database.is_file():
+        _emit_drift_log(memory_id=memory_id, chat_id=None, reason="canonical_missing")
+        return TranscriptLookup(reason="canonical_missing", context=None)
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        run = connection.execute(
+            "SELECT requested_by_principal_id, channel_id, agent_id, "
+            "inbound_message_id, result_message_id, status, a.principal_id "
+            "FROM runs JOIN agents a ON a.id = runs.agent_id WHERE runs.id = ?",
+            (str(provenance.run_id),),
+        ).fetchone()
+        expected_run = (
+            principal_id,
+            channel_id,
+            str(provenance.agent_id),
+            str(provenance.source_message_id),
+            str(provenance.result_message_id),
+            "completed",
+        )
+        if run is None or tuple(str(run[index]) for index in range(6)) != expected_run:
+            return _canonical_lookup_failure(memory_id)
+        authority = connection.execute(
+            "SELECT 1 FROM workshop_memory_authority_migrations "
+            "WHERE runtime_profile_id = ? AND principal_id = ? "
+            "AND channel_id = ? AND agent_id = ?",
+            (
+                str(provenance.runtime_profile_id),
+                principal_id,
+                channel_id,
+                str(provenance.agent_id),
+            ),
+        ).fetchone()
+        if authority is None:
+            return _canonical_lookup_failure(memory_id)
+
+        targets = connection.execute(
+            "SELECT m.id, m.body, m.created_at, m.created_event_position, "
+            "m.author_principal_id, p.kind FROM messages m "
+            "JOIN principals p ON p.id = m.author_principal_id "
+            "WHERE m.id IN (?, ?) AND m.channel_id = ? "
+            "ORDER BY m.created_event_position",
+            (str(provenance.source_message_id), str(provenance.result_message_id), channel_id),
+        ).fetchall()
+        if (
+            len(targets) != 2
+            or str(targets[0][0]) != str(provenance.source_message_id)
+            or str(targets[1][0]) != str(provenance.result_message_id)
+            or str(targets[0][4]) != principal_id
+            or str(targets[0][5]) != "human"
+            or str(targets[1][4]) != str(run[6])
+            or str(targets[1][5]) != "agent"
+        ):
+            return _canonical_lookup_failure(memory_id)
+        source_position = int(targets[0][3])
+        result_position = int(targets[1][3])
+        before_rows = connection.execute(
+            "SELECT m.body, m.created_at, p.kind FROM messages m "
+            "JOIN principals p ON p.id = m.author_principal_id "
+            "WHERE m.channel_id = ? AND m.created_event_position < ? "
+            "AND p.kind IN ('human', 'agent') "
+            "ORDER BY m.created_event_position DESC LIMIT ?",
+            (channel_id, source_position, max(0, before)),
+        ).fetchall()
+        after_rows = connection.execute(
+            "SELECT m.body, m.created_at, p.kind FROM messages m "
+            "JOIN principals p ON p.id = m.author_principal_id "
+            "WHERE m.channel_id = ? AND m.created_event_position > ? "
+            "AND p.kind IN ('human', 'agent') "
+            "ORDER BY m.created_event_position LIMIT ?",
+            (channel_id, result_position, max(0, after)),
+        ).fetchall()
+    except sqlite3.Error:
+        log.warning("Canonical transcript provenance lookup failed", exc_info=True)
+        return _canonical_lookup_failure(memory_id)
+    finally:
+        if connection is not None:
+            connection.close()
+
+    def turn(row: sqlite3.Row) -> TranscriptTurn:
+        return TranscriptTurn(
+            ts=str(row[1]),
+            direction="user" if str(row[2]) == "human" else "assistant",
+            text=str(row[0]),
+        )
+
+    return TranscriptLookup(
+        reason="ok",
+        context=TranscriptContext(
+            chat_id=None,
+            target_user=TranscriptTurn(str(targets[0][2]), "user", str(targets[0][1])),
+            target_assistant=TranscriptTurn(str(targets[1][2]), "assistant", str(targets[1][1])),
+            before=[turn(row) for row in reversed(before_rows)],
+            after=[turn(row) for row in after_rows],
+            truncated=False,
+            principal_id=principal_id,
+            channel_id=channel_id,
+        ),
+    )
+
+
+def _canonical_lookup_failure(memory_id: str | None) -> TranscriptLookup:
+    _emit_drift_log(memory_id=memory_id, chat_id=None, reason="canonical_missing")
+    return TranscriptLookup(reason="canonical_missing", context=None)
 
 
 def _find_record_index(records: list[dict], *, ts: str, direction: str) -> int | None:

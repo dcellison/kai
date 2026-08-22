@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 24
+WORKSHOP_SCHEMA_VERSION = 25
 
 
 @dataclass(frozen=True, slots=True)
@@ -1160,6 +1160,30 @@ _RUN_TRACE_SCHEMA = SchemaMigration(
     ),
 )
 
+_CANONICAL_TRANSCRIPT_AUTHORITY_SCHEMA = SchemaMigration(
+    version=25,
+    name="canonical_transcript_authority",
+    statements=(
+        """
+        CREATE TABLE workshop_transcript_authority (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            protected_private_text_cutover_position INTEGER NOT NULL CHECK (
+                protected_private_text_cutover_position >= 0
+            ),
+            activated_at TEXT NOT NULL
+        )
+        """,
+        """
+        INSERT INTO workshop_transcript_authority (
+            singleton, protected_private_text_cutover_position, activated_at
+        )
+        SELECT 1, COALESCE(MAX(position), 0),
+               strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+          FROM event_log
+        """,
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -1185,6 +1209,7 @@ _MIGRATIONS = (
     _CANONICAL_MEMORY_AUTHORITY_SCHEMA,
     _CANONICAL_OPERATIONAL_STATE_SCHEMA,
     _RUN_TRACE_SCHEMA,
+    _CANONICAL_TRANSCRIPT_AUTHORITY_SCHEMA,
 )
 
 

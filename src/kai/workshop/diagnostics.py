@@ -40,6 +40,10 @@ _PARITY_TABLES = {
     "channel_bindings",
     "workshop_memberships",
 }
+_TRANSCRIPT_AUTHORITY_TABLES = _PARITY_TABLES | {
+    "runs",
+    "workshop_transcript_authority",
+}
 _DELIVERY_AUTHORITY_TABLES = {
     "delivery_authority_epochs",
     "delivery_outbox",
@@ -94,6 +98,7 @@ class _ReplayMessage:
     event_position: int
     created_at: str
     direction: str
+    source: str
 
     @property
     def legacy_key(self) -> tuple[str, str]:
@@ -768,6 +773,7 @@ def _replay_state(connection: sqlite3.Connection) -> _ReplayState:
                 event_position=int(row["position"]),
                 created_at=envelope.occurred_at.isoformat(),
                 direction=direction,
+                source=str(envelope.metadata.get("source", "unknown")),
             )
         )
     return _ReplayState(
@@ -969,6 +975,48 @@ def _compare_legacy_suffix(
     return matched, missing, unmatched
 
 
+def _classify_legacy_suffix(
+    canonical: list[_ReplayMessage],
+    legacy_keys: list[tuple[str, str]],
+) -> tuple[set[int], int]:
+    """Return exact canonical match indices and unmatched archive count."""
+    if not canonical:
+        return set(), 0
+    canonical_keys = [message.legacy_key for message in canonical]
+    suffix_matches = _longest_common_subsequence_suffix_lengths(canonical_keys[1:], legacy_keys)
+    candidates = [
+        (1 + suffix_matches[start + 1], start) for start, key in enumerate(legacy_keys) if key == canonical_keys[0]
+    ]
+    if not candidates:
+        return set(), 0
+    matched_count, start = min(
+        candidates,
+        key=lambda item: (-item[0], len(canonical_keys) - item[0] + len(legacy_keys) - item[1] - item[0], -item[1]),
+    )
+    left = canonical_keys[1:]
+    right = legacy_keys[start + 1 :]
+    table = [[0] * (len(right) + 1) for _ in range(len(left) + 1)]
+    for left_index in range(len(left) - 1, -1, -1):
+        for right_index in range(len(right) - 1, -1, -1):
+            table[left_index][right_index] = (
+                table[left_index + 1][right_index + 1] + 1
+                if left[left_index] == right[right_index]
+                else max(table[left_index + 1][right_index], table[left_index][right_index + 1])
+            )
+    indices = {0}
+    left_index = right_index = 0
+    while left_index < len(left) and right_index < len(right):
+        if left[left_index] == right[right_index]:
+            indices.add(left_index + 1)
+            left_index += 1
+            right_index += 1
+        elif table[left_index + 1][right_index] >= table[left_index][right_index + 1]:
+            left_index += 1
+        else:
+            right_index += 1
+    return indices, len(legacy_keys) - start - matched_count
+
+
 def _longest_common_subsequence_suffix_lengths(
     canonical_keys: list[tuple[str, str]],
     legacy_keys: list[tuple[str, str]],
@@ -1081,3 +1129,205 @@ def workshop_message_parity_status(db_path: Path, history_root: Path) -> str:
         f"replay mismatches={replay_mismatches}, JSONL matched={matched}, JSONL missing={missing}, "
         f"JSONL unmatched={unmatched}, Telegram channels={channel_count}"
     )
+
+
+def workshop_canonical_message_integrity_status(db_path: Path) -> str:
+    """Verify the authoritative message projection against its event log."""
+    prefix = "Workshop canonical message integrity:"
+    if not db_path.is_file():
+        return f"{prefix} pending; canonical message schema unavailable"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if not tables >= _PARITY_TABLES:
+                return f"{prefix} pending; canonical message schema unavailable"
+            replayed = _replay_state(connection)
+            projected_count, mismatches = _projection_mismatches(connection, replayed)
+        finally:
+            connection.close()
+    except (sqlite3.Error, OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    state = "clean" if mismatches == 0 else "DIVERGED"
+    return (
+        f"{prefix} {state}; canonical={len(replayed.messages)}, "
+        f"projected={projected_count}, replay mismatches={mismatches}"
+    )
+
+
+def workshop_transcript_authority_status(db_path: Path) -> str:
+    """Describe the durable protected private-text transcript cutover."""
+    prefix = "Workshop transcript authority:"
+    if not db_path.is_file():
+        return f"{prefix} pending; canonical transcript schema unavailable"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if not tables >= _TRANSCRIPT_AUTHORITY_TABLES:
+                return f"{prefix} pending; canonical transcript schema unavailable"
+            marker = connection.execute(
+                "SELECT protected_private_text_cutover_position FROM workshop_transcript_authority WHERE singleton = 1"
+            ).fetchone()
+            if marker is None:
+                return f"{prefix} INCOMPLETE; durable cutover marker missing"
+            cutover = int(marker[0])
+            completed_runs = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM runs WHERE status = 'completed'",
+            )
+            post_cutover_messages = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM messages WHERE created_event_position > ?",
+                (cutover,),
+            )
+        finally:
+            connection.close()
+    except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    return (
+        f"{prefix} active; completed runs={completed_runs}, "
+        f"post-cutover messages={post_cutover_messages}; "
+        "protected JSONL reads=disabled, writes=disabled; "
+        "canonical export=v1"
+    )
+
+
+def workshop_legacy_jsonl_archive_status(db_path: Path, history_root: Path) -> str:
+    """Classify retained JSONL without treating it as canonical authority."""
+    prefix = "Workshop legacy JSONL archive:"
+    if not db_path.is_file():
+        return f"{prefix} pending; canonical message schema unavailable"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if not tables >= _TRANSCRIPT_AUTHORITY_TABLES:
+                return f"{prefix} pending; canonical message schema unavailable"
+            replayed = _replay_state(connection)
+            (
+                matched,
+                required_missing,
+                archive_only,
+                canonical_only,
+                channels,
+                malformed,
+                unreadable,
+                missing_classes,
+                canonical_only_classes,
+            ) = _classified_legacy_archive(
+                connection,
+                replayed,
+                history_root,
+            )
+        finally:
+            connection.close()
+    except (sqlite3.Error, OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    if malformed or unreadable:
+        return f"{prefix} NOT VERIFIED; malformed records={malformed}, unreadable sources={unreadable}"
+    return (
+        f"{prefix} classified; historical required matched={matched}, "
+        f"historical required missing={required_missing}, "
+        f"archive-only={archive_only}, intentional canonical-only={canonical_only}, "
+        f"missing classes={_format_message_classes(missing_classes)}, "
+        f"canonical-only classes={_format_message_classes(canonical_only_classes)}, "
+        f"Telegram channels={channels}; "
+        "archive is non-authoritative"
+    )
+
+
+def _classified_legacy_archive(
+    connection: sqlite3.Connection,
+    replayed: _ReplayState,
+    history_root: Path,
+) -> tuple[int, int, int, int, int, int, int, dict[str, int], dict[str, int]]:
+    """Classify pre-cutover rollback records separately from canonical-only data."""
+    marker = connection.execute(
+        "SELECT protected_private_text_cutover_position FROM workshop_transcript_authority WHERE singleton = 1"
+    ).fetchone()
+    if marker is None:
+        raise ValueError("Canonical transcript cutover marker is absent")
+    cutover = int(marker[0])
+    required_ids = {
+        str(value)
+        for row in connection.execute(
+            "SELECT inbound_message_id, result_message_id FROM runs WHERE result_message_id IS NOT NULL"
+        ).fetchall()
+        for value in row
+        if value is not None
+    }
+    bindings = {
+        channel_id: external_channel_id
+        for channel_id, transport, external_channel_id in replayed.channel_bindings.values()
+        if transport == "telegram" and replayed.channel_kinds.get(channel_id) == "direct"
+    }
+    matched = required_missing = archive_only = canonical_only = malformed = unreadable = 0
+    missing_classes: dict[str, int] = {}
+    canonical_only_classes: dict[str, int] = {}
+    for channel_id, external_channel_id in bindings.items():
+        messages = [message for message in replayed.messages if message.channel_id == channel_id]
+        required = [
+            message for message in messages if message.message_id in required_ids and message.event_position <= cutover
+        ]
+        intentional = [message for message in messages if message not in required]
+        canonical_only += len(intentional)
+        for message in intentional:
+            key = f"{message.source}/{message.direction}"
+            canonical_only_classes[key] = canonical_only_classes.get(key, 0) + 1
+        legacy_keys, channel_malformed, channel_unreadable = _read_legacy_keys(
+            history_root,
+            external_channel_id,
+            channel_id,
+        )
+        matched_indices, channel_unmatched = _classify_legacy_suffix(required, legacy_keys)
+        channel_matched = len(matched_indices)
+        channel_missing = len(required) - channel_matched
+        matched += channel_matched
+        required_missing += channel_missing
+        archive_only += channel_unmatched
+        malformed += channel_malformed
+        unreadable += channel_unreadable
+        if channel_missing:
+            # Count the unmatched required population by non-identifying
+            # origin/direction. Exact sequence alignment remains content-free.
+            for index, message in enumerate(required):
+                if index in matched_indices:
+                    continue
+                key = f"{message.source}/{message.direction}"
+                missing_classes[key] = missing_classes.get(key, 0) + 1
+    return (
+        matched,
+        required_missing,
+        archive_only,
+        canonical_only,
+        len(bindings),
+        malformed,
+        unreadable,
+        missing_classes,
+        canonical_only_classes,
+    )
+
+
+def _format_message_classes(classes: dict[str, int]) -> str:
+    if not classes:
+        return "none"
+    return ",".join(f"{key}={classes[key]}" for key in sorted(classes))
