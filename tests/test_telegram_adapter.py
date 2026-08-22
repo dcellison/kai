@@ -86,10 +86,6 @@ def adapter_dependencies(monkeypatch):
             events.append("notification:start")
             return _FakeDelivery(events, "notification")
 
-    async def fake_init_jobs(app) -> None:
-        assert app is application
-        events.append("jobs:start")
-
     monkeypatch.setattr(adapter_module, "KaiTelegramApplication", _FakeApplication)
     monkeypatch.setattr(adapter_module, "create_bot", fake_create_bot)
     monkeypatch.setattr(
@@ -102,7 +98,6 @@ def adapter_dependencies(monkeypatch):
         "WorkshopTelegramNotificationService",
         FakeNotificationDelivery,
     )
-    monkeypatch.setattr(adapter_module.cron, "init_jobs", fake_init_jobs)
     return events
 
 
@@ -146,7 +141,6 @@ async def test_webhook_adapter_owns_application_and_delivery_lifecycle(
         "application:initialize",
         "application:start",
         "commands:set",
-        "jobs:start",
         "conversation:start",
         "notification:start",
         "notification:stop",

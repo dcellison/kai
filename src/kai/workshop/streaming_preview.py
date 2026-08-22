@@ -92,6 +92,7 @@ async def _resolve_telegram_target(
     inbound_message_id: MessageId,
     *,
     allow_workshop_client: bool,
+    allow_scheduled: bool,
     require_binding: bool,
 ) -> ResolvedTelegramFinalizationTarget | None:
     async with store.connection.execute(
@@ -116,14 +117,23 @@ async def _resolve_telegram_target(
         and isinstance(row[7], str)
         and bool(row[7])
     )
+    valid_scheduled = (
+        allow_scheduled and row is not None and row[5] == "scheduled_job" and row[6] is None and row[7] is None
+    )
     if (
         row is None
         or row[2] != "direct"
         or row[3] != "human"
         or row[4] is not None
-        or not (valid_telegram or valid_workshop_client)
+        or not (valid_telegram or valid_workshop_client or valid_scheduled)
     ):
-        expected = "Telegram or Workshop client" if allow_workshop_client else "Telegram inbound"
+        expected = (
+            "Telegram, Workshop client, or scheduled"
+            if allow_scheduled
+            else "Telegram or Workshop client"
+            if allow_workshop_client
+            else "Telegram inbound"
+        )
         raise StreamingPreviewTargetError(
             f"Target must be an existing {expected} message from a human in a direct channel"
         )
@@ -158,6 +168,7 @@ async def resolve_telegram_streaming_target(
         store,
         inbound_message_id,
         allow_workshop_client=False,
+        allow_scheduled=False,
         require_binding=True,
     )
     assert target is not None
@@ -177,6 +188,7 @@ async def resolve_telegram_finalization_target(
         store,
         inbound_message_id,
         allow_workshop_client=True,
+        allow_scheduled=True,
         require_binding=False,
     )
 

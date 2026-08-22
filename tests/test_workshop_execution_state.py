@@ -57,7 +57,7 @@ class TestCanonicalExecutionStateMigration:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 25
+            assert await upgraded.schema_version() == 26
             tables = await upgraded.schema_tables()
             assert {
                 "channel_agent_execution_settings",

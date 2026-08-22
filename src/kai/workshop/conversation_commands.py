@@ -15,8 +15,10 @@ from kai.workshop.domain import ChannelBindingId, ChannelId, MessageId, Principa
 from kai.workshop.inbound import (
     ClientInboundMessage,
     InboundMessage,
+    ScheduledInboundMessage,
     record_client_inbound_message_in_transaction,
     record_inbound_message_in_transaction,
+    record_scheduled_inbound_message_in_transaction,
 )
 from kai.workshop.run_lifecycle import DurableRun, RunLifecycleResult, RunStatus, WorkshopRunLifecycle
 from kai.workshop.runtime_assignments import (
@@ -170,6 +172,50 @@ class WorkshopConversationCommandService:
             return ClientConversationCommandAcceptance(
                 command=ConversationCommandAcceptance(inbound, lifecycle, disposition),
                 delivery=delivery,
+                runtime_profile_id=runtime_profile_id,
+            )
+        except Exception:
+            await connection.rollback()
+            raise
+
+    async def accept_scheduled(
+        self,
+        message: ScheduledInboundMessage,
+    ) -> ClientConversationCommandAcceptance:
+        """Accept core-owned scheduled work without creating an inbound echo."""
+        if not isinstance(message, ScheduledInboundMessage):
+            raise ValueError("message must be a ScheduledInboundMessage")
+        connection = self._store.connection
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            inbound = await record_scheduled_inbound_message_in_transaction(self._store, message)
+            inbound_message_id = inbound.event.envelope.aggregate_id
+            if not isinstance(inbound_message_id, MessageId):
+                raise ConversationCommandStateConflictError("Scheduled inbound event did not identify a message")
+            lifecycle = await WorkshopRunLifecycle(self._store).accept_in_transaction(
+                inbound_message_id,
+                occurred_at=inbound.event.envelope.occurred_at,
+            )
+            try:
+                _, runtime_profile_id = await resolve_channel_runtime_profile(
+                    self._store,
+                    message.channel_id,
+                )
+            except WorkshopRuntimeAssignmentError as exc:
+                raise ConversationCommandStateConflictError(str(exc)) from exc
+            if inbound.inserted != lifecycle.changed:
+                raise ConversationCommandStateConflictError(
+                    "Scheduled inbound and run acceptance did not share one prior state"
+                )
+            disposition = (
+                ConversationCommandDisposition.NEWLY_ACCEPTED
+                if inbound.inserted
+                else await self._replay_disposition(lifecycle.run)
+            )
+            await connection.commit()
+            return ClientConversationCommandAcceptance(
+                command=ConversationCommandAcceptance(inbound, lifecycle, disposition),
+                delivery=None,
                 runtime_profile_id=runtime_profile_id,
             )
         except Exception:

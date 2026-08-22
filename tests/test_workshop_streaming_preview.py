@@ -246,6 +246,53 @@ class TestTelegramStreamingPreviewBinding:
         finally:
             await store.close()
 
+    async def test_scheduled_message_is_finalizable_but_not_a_preview_target(
+        self,
+        tmp_path: Path,
+    ):
+        store, inbound_id = await _open_with_inbound(tmp_path / "kai.db")
+        try:
+            async with store.connection.execute(
+                "SELECT c.workshop_id, m.channel_id, m.author_principal_id "
+                "FROM messages m JOIN channels c ON c.id = m.channel_id WHERE m.id = ?",
+                (inbound_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            assert row is not None
+            message_id = MessageId.new()
+            await store.append(
+                EventEnvelope.create(
+                    event_type=WorkshopEventType.MESSAGE_CREATED,
+                    event_version=1,
+                    workshop_id=WorkshopId(str(row[0])),
+                    aggregate_type="message",
+                    aggregate_id=message_id,
+                    actor_principal_id=PrincipalId(str(row[2])),
+                    occurred_at=_NOW,
+                    payload={
+                        "channel_id": str(row[1]),
+                        "author_principal_id": str(row[2]),
+                        "body": "Scheduled canonical command",
+                    },
+                    metadata={
+                        "source": "scheduled_job",
+                        "job_id": 7,
+                        "occurrence_id": "2026-08-22T12:00:00Z",
+                    },
+                )
+            )
+            await store.project_pending(CanonicalConversationProjection())
+
+            with pytest.raises(StreamingPreviewTargetError, match="Telegram inbound"):
+                await bind_confirmed_telegram_streaming_preview(store, _preview(message_id))
+
+            target = await resolve_telegram_finalization_target(store, message_id)
+            assert target is not None
+            assert target.channel_id == ChannelId(str(row[1]))
+            assert target.preview_eligible is False
+        finally:
+            await store.close()
+
     async def test_notification_channel_message_is_not_a_direct_preview_target(self, tmp_path: Path):
         store, _ = await _open_with_inbound(tmp_path / "kai.db")
         try:
@@ -370,7 +417,7 @@ class TestTelegramStreamingPreviewMigration:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 25
+            assert await upgraded.schema_version() == 26
             assert "telegram_streaming_previews" in await upgraded.schema_tables()
             async with upgraded.connection.execute(
                 "SELECT name FROM workshop_schema_migrations WHERE version = 12"

@@ -8,7 +8,6 @@ from types import SimpleNamespace
 import pytest
 
 from kai import sessions
-from kai.main import _warn_if_compatibility_jobs_are_dormant
 from kai.workshop.bootstrap import BootstrapHuman
 from kai.workshop.diagnostics import workshop_operational_state_status
 from kai.workshop.execution_state import (
@@ -135,7 +134,6 @@ class TestCanonicalOperationalStateMigration:
         assert migration.newly_migrated == 0
         assert migration.jobs == 1
         assert [job["id"] for job in await sessions.get_jobs(101)] == [job_id]
-        assert await _warn_if_compatibility_jobs_are_dormant(SimpleNamespace(telegram_enabled=False)) == 1
 
     async def test_restart_rejects_conflicting_job_owner_with_remediation(self, database: Path):
         registry = await _bootstrap(101)

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac as hmac_mod
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -17,6 +18,7 @@ from kai.webhook import (
     ALLOWED_USER_IDS_KEY,
     CHAT_ID_KEY,
     CONFIG_KEY,
+    CORE_HOST_KEY,
     GENERIC_WEBHOOK_SECRET_KEY,
     GITHUB_WEBHOOK_SECRET_KEY,
     INTERNAL_API_AUTH_KEY,
@@ -114,6 +116,14 @@ def mock_request():
         TELEGRAM_BOT_KEY: AsyncMock(),
         CHAT_ID_KEY: 123,
         ALLOWED_USER_IDS_KEY: {123, 456},
+        CORE_HOST_KEY: SimpleNamespace(
+            services=SimpleNamespace(
+                scheduler=SimpleNamespace(
+                    register_job=AsyncMock(return_value=True),
+                    remove_job=AsyncMock(),
+                )
+            )
+        ),
     }
     # Mock the job_queue on the telegram app
     job_queue = MagicMock()
@@ -157,11 +167,6 @@ class TestScheduleJobType:
         mock_request.app[CHAT_ID_KEY] = 123
         mock_request.app[TELEGRAM_APP_KEY].job_queue = MagicMock()
 
-        # Mock register_job_by_id so we don't need a full APScheduler setup
-        import kai.cron as cron_mod
-
-        cron_mod.register_job_by_id = AsyncMock()
-
         mock_request.json = AsyncMock(
             return_value={
                 "name": "test agent job",
@@ -183,9 +188,6 @@ class TestScheduleJobType:
         mock_request.app[CHAT_ID_KEY] = 123
         mock_request.app[TELEGRAM_APP_KEY].job_queue = MagicMock()
 
-        import kai.cron as cron_mod
-
-        cron_mod.register_job_by_id = AsyncMock(return_value=True)
         mock_request.json = AsyncMock(
             return_value={
                 "name": "legacy agent job",
@@ -420,9 +422,6 @@ class TestUpdateJob:
             auto_remove=False,
             notify_on_check=True,
         )
-        queued_job = MagicMock()
-        queued_job.name = f"cron_{job_id}"
-        mock_request.app[TELEGRAM_APP_KEY].job_queue.jobs.return_value = [queued_job]
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.match_info = {"id": str(job_id)}
         mock_request.json = AsyncMock(
@@ -435,21 +434,17 @@ class TestUpdateJob:
             }
         )
 
-        with patch(
-            "kai.cron.register_job_by_id",
-            new_callable=AsyncMock,
-            side_effect=[False, True],
-        ) as mock_register:
-            resp = await _handle_update_job(mock_request)
+        scheduler = mock_request.app[CORE_HOST_KEY].services.scheduler
+        scheduler.register_job.side_effect = [False, True]
+        resp = await _handle_update_job(mock_request)
 
         assert resp.status == 500
         body = json.loads(resp.body.decode())
         assert body["error"] == "Failed to register job"
-        queued_job.schedule_removal.assert_called_once()
-        mock_register.assert_has_awaits(
+        scheduler.register_job.assert_has_awaits(
             [
-                call(mock_request.app[TELEGRAM_APP_KEY], job_id),
-                call(mock_request.app[TELEGRAM_APP_KEY], job_id),
+                call(job_id),
+                call(job_id),
             ]
         )
         job = await sessions.get_job_by_id(job_id)
@@ -475,12 +470,9 @@ class TestUpdateJob:
         mock_request.match_info = {"id": str(job_id)}
         mock_request.json = AsyncMock(return_value={"schedule_data": {"times": ["10:00"]}})
 
-        with patch(
-            "kai.cron.register_job_by_id",
-            new_callable=AsyncMock,
-            side_effect=[RuntimeError("scheduler unavailable"), True],
-        ):
-            resp = await _handle_update_job(mock_request)
+        scheduler = mock_request.app[CORE_HOST_KEY].services.scheduler
+        scheduler.register_job.side_effect = [RuntimeError("scheduler unavailable"), True]
+        resp = await _handle_update_job(mock_request)
 
         assert resp.status == 500
         body = json.loads(resp.body.decode())
@@ -1559,8 +1551,7 @@ class TestScheduleValidation:
                 "schedule_data": {"seconds": 600},
             }
         )
-        with patch("kai.cron.register_job_by_id", new_callable=AsyncMock):
-            resp = await _handle_schedule(mock_request)
+        resp = await _handle_schedule(mock_request)
 
         assert resp.status == 200
         body = json.loads(resp.body.decode())
@@ -1582,8 +1573,7 @@ class TestScheduleValidation:
                 "schedule_data": '{"seconds": 900}',
             }
         )
-        with patch("kai.cron.register_job_by_id", new_callable=AsyncMock):
-            resp = await _handle_schedule(mock_request)
+        resp = await _handle_schedule(mock_request)
 
         assert resp.status == 200
         body = json.loads(resp.body.decode())
@@ -1622,8 +1612,7 @@ class TestScheduleValidation:
                 "schedule_data": {"run_at": "2026-06-01T12:00:00+00:00"},
             }
         )
-        with patch("kai.cron.register_job_by_id", new_callable=AsyncMock):
-            resp = await _handle_schedule(mock_request)
+        resp = await _handle_schedule(mock_request)
 
         assert resp.status == 200
         body = json.loads(resp.body.decode())
@@ -1667,12 +1656,12 @@ class TestScheduleValidation:
                 "schedule_data": {"seconds": 300},
             }
         )
-        with patch("kai.cron.register_job_by_id", new_callable=AsyncMock) as mock_register:
-            resp = await _handle_schedule(mock_request)
+        scheduler = mock_request.app[CORE_HOST_KEY].services.scheduler
+        resp = await _handle_schedule(mock_request)
 
         assert resp.status == 200
         body = json.loads(resp.body.decode())
-        mock_register.assert_called_once_with(mock_request.app[TELEGRAM_APP_KEY], body["job_id"])
+        scheduler.register_job.assert_awaited_once_with(body["job_id"])
 
     async def test_scheduler_false_deactivates_created_job(self, db, mock_request):
         """A registration miss returns 500 and does not leave an active duplicateable job."""
@@ -1686,8 +1675,8 @@ class TestScheduleValidation:
                 "schedule_data": {"seconds": 300},
             }
         )
-        with patch("kai.cron.register_job_by_id", new_callable=AsyncMock, return_value=False):
-            resp = await _handle_schedule(mock_request)
+        mock_request.app[CORE_HOST_KEY].services.scheduler.register_job.return_value = False
+        resp = await _handle_schedule(mock_request)
 
         assert resp.status == 500
         body = json.loads(resp.body.decode())
@@ -1706,12 +1695,10 @@ class TestScheduleValidation:
                 "schedule_data": {"seconds": 300},
             }
         )
-        with patch(
-            "kai.cron.register_job_by_id",
-            new_callable=AsyncMock,
-            side_effect=RuntimeError("scheduler unavailable"),
-        ):
-            resp = await _handle_schedule(mock_request)
+        mock_request.app[CORE_HOST_KEY].services.scheduler.register_job.side_effect = RuntimeError(
+            "scheduler unavailable"
+        )
+        resp = await _handle_schedule(mock_request)
 
         assert resp.status == 500
         body = json.loads(resp.body.decode())
@@ -1860,8 +1847,7 @@ class TestUpdateJobScheduleDataValidation:
                 "schedule_data": {"seconds": 600},
             }
         )
-        with patch("kai.cron.register_job_by_id", new_callable=AsyncMock):
-            resp = await _handle_schedule(mock_request)
+        resp = await _handle_schedule(mock_request)
         job_id = json.loads(resp.body.decode())["job_id"]
 
         # Now PATCH with invalid schedule_data

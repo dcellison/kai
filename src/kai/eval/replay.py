@@ -395,7 +395,7 @@ def _attach_log_file(path: Path) -> None:
     root.setLevel(logging.INFO)
     root.addHandler(handler)
     # Match `setup_logging`'s noise suppression so a replay file does
-    # not balloon with per-request HTTP and APScheduler tick chatter.
+    # not balloon with per-request HTTP and scheduler execution chatter.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
 

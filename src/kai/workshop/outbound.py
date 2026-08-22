@@ -328,6 +328,8 @@ async def record_outbound_message_with_streaming_finalization(
 async def record_outbound_message_with_streaming_finalization_in_transaction(
     store: WorkshopEventStore,
     message: OutboundMessage,
+    *,
+    request_delivery: bool = True,
 ) -> OutboundStreamingFinalizationResult:
     """Persist a reply and immutable delivery plan in a caller-owned transaction."""
     if not store.connection.in_transaction:
@@ -335,9 +337,13 @@ async def record_outbound_message_with_streaming_finalization_in_transaction(
             "record_outbound_message_with_streaming_finalization_in_transaction requires an active transaction"
         )
     binding = await _resolve_outbound(store, message.in_reply_to_message_id)
-    streaming_target = await resolve_telegram_finalization_target(
-        store,
-        message.in_reply_to_message_id,
+    streaming_target = (
+        await resolve_telegram_finalization_target(
+            store,
+            message.in_reply_to_message_id,
+        )
+        if request_delivery
+        else None
     )
     if streaming_target is not None and (
         streaming_target.workshop_id != binding.workshop_id or streaming_target.channel_id != binding.channel_id

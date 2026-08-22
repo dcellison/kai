@@ -128,6 +128,7 @@ class WorkshopRunTerminalTransactionCoordinator:
         body: str,
         occurred_at: datetime,
         runtime_session: RuntimeSessionSettlement | None = None,
+        request_delivery: bool = True,
     ) -> TerminalTransactionResult:
         return await self._resolve_possible_commit(
             lambda: self._settle_once(
@@ -136,6 +137,7 @@ class WorkshopRunTerminalTransactionCoordinator:
                 body=body,
                 occurred_at=occurred_at,
                 runtime_session=runtime_session,
+                request_delivery=request_delivery,
             )
         )
 
@@ -215,6 +217,7 @@ class WorkshopRunTerminalTransactionCoordinator:
         failure_code: TerminalFailureCode | None = None,
         expired_interruption: bool = False,
         runtime_session: RuntimeSessionSettlement | None = None,
+        request_delivery: bool = True,
     ) -> TerminalTransactionResult:
         if not isinstance(claim, RunExecutionClaim):
             raise ValueError("claim must be a RunExecutionClaim")
@@ -229,6 +232,7 @@ class WorkshopRunTerminalTransactionCoordinator:
                     body=body,
                     occurred_at=occurred_at,
                 ),
+                request_delivery=request_delivery,
             )
             message_id = finalization.message.event.envelope.aggregate_id
             if not isinstance(message_id, MessageId):

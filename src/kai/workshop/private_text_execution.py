@@ -17,9 +17,10 @@ from kai.workshop.execution_coordinator import (
     CanonicalCancellationDisposition,
     CanonicalExecutionResult,
     StreamObserver,
+    SuccessTransformer,
     WorkshopCanonicalExecutionCoordinator,
 )
-from kai.workshop.inbound import ClientInboundMessage, InboundMessage
+from kai.workshop.inbound import ClientInboundMessage, InboundMessage, ScheduledInboundMessage
 from kai.workshop.protected_execution import WorkshopProtectedExecutionPreparationService
 from kai.workshop.run_lifecycle import WorkshopRunLifecycle
 from kai.workshop.runtime_pool import WorkshopRuntimePool
@@ -117,15 +118,29 @@ class WorkshopPrivateTextExecutionService:
         async with self._database_lock:
             return await self._command_service.accept_client(message)
 
+    async def accept_scheduled(
+        self,
+        message: ScheduledInboundMessage,
+    ) -> ClientConversationCommandAcceptance:
+        if self._closed:
+            raise RuntimeError("Workshop private-text execution service is closed")
+        async with self._database_lock:
+            return await self._command_service.accept_scheduled(message)
+
     async def execute(
         self,
         run_id: RunId,
         *,
         stream_observer: StreamObserver | None = None,
+        success_transformer: SuccessTransformer | None = None,
     ) -> CanonicalExecutionResult:
         if self._closed:
             raise RuntimeError("Workshop private-text execution service is closed")
-        return await self._coordinator.execute(run_id, stream_observer=stream_observer)
+        return await self._coordinator.execute(
+            run_id,
+            stream_observer=stream_observer,
+            success_transformer=success_transformer,
+        )
 
     async def run_state(self, run_id: RunId):
         """Return canonical state for one typed run ID."""

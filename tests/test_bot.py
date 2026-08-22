@@ -915,6 +915,7 @@ def _make_context(config=None, claude=None, pool=None, args=None, user_data=None
         private_text_execution=None,
         conversation_runs=None,
         principal_storage=principal_storage,
+        scheduler=SimpleNamespace(remove_job=AsyncMock()),
     )
     ctx.application = application
     ctx.args = args or []
@@ -1489,17 +1490,12 @@ class TestHandleJob:
 
     @pytest.mark.asyncio
     async def test_cancel_successful(self):
-        """Deletes from DB and removes APScheduler jobs."""
+        """Deletes from DB and removes the core scheduler task."""
         update = _make_update()
-        mock_job = MagicMock()
-        mock_job.name = "cron_5"
-        mock_job.schedule_removal = MagicMock()
-        jq = MagicMock()
-        jq.jobs.return_value = [mock_job]
-        ctx = _make_context(args=["cancel", "5"], job_queue=jq)
+        ctx = _make_context(args=["cancel", "5"])
         with patch("kai.bot.sessions.delete_job", new_callable=AsyncMock, return_value=True):
             await handle_job(update, ctx)
-        mock_job.schedule_removal.assert_called_once()
+        ctx.application.core_services.scheduler.remove_job.assert_awaited_once_with(5)
         reply = update.message.reply_text.call_args[0][0]
         assert "cancelled" in reply.lower()
 
