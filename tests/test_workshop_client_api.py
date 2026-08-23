@@ -70,6 +70,10 @@ class _Authenticator:
             return self.principals_by_token.get(token)
         return None
 
+    async def authenticate_token(self, token: str) -> PrincipalId | None:
+        self.calls.append(f"Form {token}")
+        return self.principals_by_token.get(token)
+
 
 @dataclass
 class _CommandSubmitter:
@@ -698,7 +702,7 @@ class TestWorkshopCommandHTTPContract:
 
 
 class TestWorkshopArtifactHTTPContract:
-    async def test_member_downloads_an_opaque_artifact_without_storage_metadata(
+    async def test_member_previews_and_natively_downloads_an_opaque_artifact(
         self,
         tmp_path: Path,
     ):
@@ -712,8 +716,8 @@ class TestWorkshopArtifactHTTPContract:
             principal_id=alice_id,
             channel_id=alice_channel,
             client_message_id="browser-download-1",
-            filename="private.txt",
-            claimed_media_type="text/plain",
+            filename="qualification.aiff",
+            claimed_media_type="audio/aiff",
             chunks=content(),
             occurred_at=_NOW,
         )
@@ -738,6 +742,18 @@ class TestWorkshopArtifactHTTPContract:
                 f"/v1/channels/{alice_channel}/artifacts/{artifact_id}/content",
                 headers={"Authorization": "Bearer alice-token"},
             )
+            download = await client.post(
+                f"/v1/channels/{alice_channel}/artifacts/{artifact_id}/download",
+                data={"session_token": "alice-token"},
+            )
+            unauthenticated_download = await client.post(
+                f"/v1/channels/{alice_channel}/artifacts/{artifact_id}/download",
+                data={"session_token": "unknown-token"},
+            )
+            cross_principal_download = await client.post(
+                f"/v1/channels/{alice_channel}/artifacts/{artifact_id}/download",
+                data={"session_token": "bob-token"},
+            )
             cross_principal = await client.get(
                 f"/v1/channels/{alice_channel}/artifacts/{artifact_id}/content",
                 headers={"Authorization": "Bearer bob-token"},
@@ -757,13 +773,19 @@ class TestWorkshopArtifactHTTPContract:
             assert await response.read() == b"private attachment"
             assert response.headers["Cache-Control"] == "private, no-store"
             assert response.headers["X-Content-Type-Options"] == "nosniff"
-            assert response.headers["Content-Disposition"].startswith("attachment;")
+            assert response.headers["Content-Disposition"].startswith("inline;")
+            assert download.status == 200
+            assert await download.read() == b"private attachment"
+            assert download.headers["Content-Disposition"].startswith("attachment;")
+            assert 'filename="qualification.aiff"' in download.headers["Content-Disposition"]
+            assert unauthenticated_download.status == 401
+            assert cross_principal_download.status == 403
             assert cross_principal.status == 403
             assert wrong_channel.status == 403
             assert await cross_principal.json() == await wrong_channel.json()
             assert artifact_payload["artifact_id"] == artifact_id
-            assert artifact_payload["original_filename"] == "private.txt"
-            assert artifact_payload["media_type"] == "text/plain"
+            assert artifact_payload["original_filename"] == "qualification.aiff"
+            assert artifact_payload["media_type"] == "audio/aiff"
             assert "storage_path" not in artifact_payload
             assert "source_unique_id" not in artifact_payload
         finally:

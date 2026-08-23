@@ -42,7 +42,7 @@ import { useRunTrace } from "./useRunTrace";
 import { useWorkshopTimeline } from "./useWorkshopTimeline";
 import type { EarlierHistoryState } from "./useWorkshopTimeline";
 import { MarkdownMessage } from "./MarkdownMessage";
-import { downloadArtifactBlob } from "./artifactDownload";
+import { startArtifactDownload } from "./artifactDownload";
 
 const SESSION_KEY = "kai.workshop.read-session.v1";
 const ACTIVE_RUN_KEY = "kai.workshop.active-run.v1";
@@ -540,10 +540,12 @@ function ConnectionIndicator({
 function MessageItem({
   message,
   notification = false,
+  onDownloadArtifact,
   onLoadArtifact,
 }: {
   message: TimelineMessage;
   notification?: boolean;
+  onDownloadArtifact: (artifactId: string) => void;
   onLoadArtifact: (artifactId: string) => Promise<Blob>;
 }): React.JSX.Element {
   const isAgent = message.authorKind === "agent";
@@ -564,6 +566,7 @@ function MessageItem({
             <ArtifactAttachment
               artifact={artifact}
               key={artifact.artifactId}
+              onDownload={onDownloadArtifact}
               onLoad={onLoadArtifact}
             />
           ))}
@@ -588,6 +591,7 @@ function MessageItem({
           <ArtifactAttachment
             artifact={artifact}
             key={artifact.artifactId}
+            onDownload={onDownloadArtifact}
             onLoad={onLoadArtifact}
           />
         ))}
@@ -605,9 +609,11 @@ const SAFE_INLINE_IMAGE_TYPES = new Set([
 
 function ArtifactAttachment({
   artifact,
+  onDownload,
   onLoad,
 }: {
   artifact: WorkshopArtifactSummary;
+  onDownload: (artifactId: string) => void;
   onLoad: (artifactId: string) => Promise<Blob>;
 }): React.JSX.Element {
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
@@ -642,11 +648,10 @@ function ArtifactAttachment({
     };
   }, [artifact.artifactId, inline, onLoad]);
 
-  const download = async (): Promise<void> => {
+  const download = (): void => {
     setError(null);
     try {
-      const blob = await onLoad(artifact.artifactId);
-      downloadArtifactBlob(blob, artifact.originalFilename ?? "artifact");
+      onDownload(artifact.artifactId);
     } catch {
       setError("Could not download this attachment.");
     }
@@ -663,7 +668,7 @@ function ArtifactAttachment({
       <div className="artifact-meta">
         <span>{artifact.originalFilename ?? "Attachment"}</span>
         <small>{Math.max(1, Math.ceil(artifact.byteSize / 1024))} KB</small>
-        <button type="button" onClick={() => void download()}>Download</button>
+        <button type="button" onClick={download}>Download</button>
       </div>
       {error && <p className="artifact-error" role="alert">{error}</p>}
     </section>
@@ -739,6 +744,7 @@ function WorkshopView({
   workshop,
   onForget,
   onCancelRun,
+  onDownloadArtifact,
   onLoadEarlier,
   onLoadArtifact,
   onLoadRun,
@@ -757,6 +763,7 @@ function WorkshopView({
   workshop: WorkshopSummary;
   onForget: () => void;
   onCancelRun: (runId: string) => Promise<WorkshopRun>;
+  onDownloadArtifact: (artifactId: string) => void;
   onLoadEarlier: () => void;
   onLoadArtifact: (artifactId: string) => Promise<Blob>;
   onLoadRun: (runId: string) => Promise<WorkshopRun>;
@@ -1439,6 +1446,7 @@ function WorkshopView({
                   key={message.messageId}
                   message={message}
                   notification={channel.kind === "notification"}
+                  onDownloadArtifact={onDownloadArtifact}
                   onLoadArtifact={onLoadArtifact}
                 />
               ))}
@@ -1785,6 +1793,10 @@ function ActiveWorkshopClient({
       withAccessHandling(() => loadArtifactBlob(session, artifactId)),
     [session, withAccessHandling],
   );
+  const downloadSelectedArtifact = useCallback(
+    (artifactId: string) => startArtifactDownload(session, artifactId),
+    [session],
+  );
   if (!selected) {
     return <main className="loading-workshop">Workshop access changed.</main>;
   }
@@ -1797,6 +1809,7 @@ function ActiveWorkshopClient({
       messages={messages}
       navigation={navigation}
       onLoadEarlier={loadEarlier}
+      onDownloadArtifact={downloadSelectedArtifact}
       onLoadArtifact={loadSelectedArtifact}
       runActivity={runActivity}
       runPreview={runPreview}

@@ -32,6 +32,7 @@ class TestWorkshopClientShell:
                     "script-src 'self'",
                     "style-src 'self'",
                     "connect-src 'self'",
+                    "frame-src 'self'",
                     "base-uri 'none'",
                     "form-action 'self'",
                     "frame-ancestors 'none'",
