@@ -7338,7 +7338,7 @@ class TestStartService:
             lambda _port, *, expected_generation: (True, f"ready:{expected_generation}"),
         )
 
-    def test_darwin(self, monkeypatch):
+    def test_darwin(self, monkeypatch, capsys):
         """Calls launchctl bootstrap then launchctl print to verify on
         macOS. Two calls per attempt because the bootstrap exit code is
         treated as advisory; verify is the authoritative check."""
@@ -7358,8 +7358,14 @@ class TestStartService:
         assert len(calls) == 2
         assert calls[0][:3] == ["launchctl", "bootstrap", "system"]
         assert calls[1] == ["launchctl", "print", "system/com.syrinx.kai"]
+        output = capsys.readouterr().out
+        assert "Starting service (launchctl bootstrap)..." in output
+        assert (
+            "Service registered; waiting for full application readiness "
+            "(including configured semantic memory, up to 120s)..."
+        ) in output
 
-    def test_linux(self, monkeypatch):
+    def test_linux(self, monkeypatch, capsys):
         """Calls systemctl start then systemctl is-active to verify on
         Linux. Mirrors the macOS verify-after-start shape so an
         operator does not see different success contracts per platform."""
@@ -7378,6 +7384,9 @@ class TestStartService:
             ["systemctl", "start", "kai"],
             ["systemctl", "is-active", "kai"],
         ]
+        output = capsys.readouterr().out
+        assert "Starting service (systemctl start)..." in output
+        assert "including configured semantic memory, up to 120s" in output
 
     def test_dry_run(self, monkeypatch, capsys):
         """Dry run prints the command without executing."""
@@ -7391,6 +7400,8 @@ class TestStartService:
 
         output = capsys.readouterr().out
         assert "[DRY RUN]" in output
+        assert "Starting service" not in output
+        assert "waiting for full application readiness" not in output
         assert len(calls) == 0
 
     def test_succeeds_when_bootstrap_returns_nonzero_but_verify_passes(self, monkeypatch):
