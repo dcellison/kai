@@ -23,6 +23,7 @@ from kai.workshop.artifacts import (
     ArtifactSummary,
     ArtifactTooLargeError,
     StagedArtifact,
+    StoredArtifact,
     WorkshopArtifactService,
 )
 from kai.workshop.authorization import CanonicalChannelAuthorizer
@@ -58,6 +59,7 @@ _CLIENT_NAVIGATION_PATH = "/v1/client/navigation"
 _ENROLLMENT_REDEMPTION_PATH = "/v1/client/enrollment/redeem"
 _COMMAND_SUBMISSION_PATH = "/v1/channels/{channel_id}/commands"
 _ARTIFACT_CONTENT_PATH = "/v1/channels/{channel_id}/artifacts/{artifact_id}/content"
+_ARTIFACT_DOWNLOAD_PATH = "/v1/channels/{channel_id}/artifacts/{artifact_id}/download"
 _RUN_STATE_PATH = "/v1/channels/{channel_id}/runs/{run_id}"
 _RUN_TRACE_PATH = "/v1/channels/{channel_id}/runs/{run_id}/trace"
 _RUN_CANCELLATION_PATH = "/v1/channels/{channel_id}/runs/{run_id}/cancel"
@@ -78,6 +80,8 @@ class WorkshopClientAuthenticator(Protocol):
     """Resolve a human Workshop principal from a client request."""
 
     async def authenticate(self, request: web.Request) -> PrincipalId | None: ...
+
+    async def authenticate_token(self, token: str) -> PrincipalId | None: ...
 
 
 class WorkshopClientCommandSubmitter(Protocol):
@@ -1019,6 +1023,23 @@ async def _handle_command_submission(
     )
 
 
+def _artifact_file_response(
+    artifact: StoredArtifact,
+    artifact_id: ArtifactId,
+    *,
+    disposition: str,
+) -> web.FileResponse:
+    filename = artifact.summary.original_filename or f"{artifact_id}.bin"
+    safe_ascii = re.sub(r"[^A-Za-z0-9._-]", "_", filename) or "artifact.bin"
+    response = web.FileResponse(artifact.storage_path)
+    response.content_type = artifact.summary.media_type
+    response.headers["Content-Disposition"] = (
+        f"{disposition}; filename=\"{safe_ascii}\"; filename*=UTF-8''{quote(filename)}"
+    )
+    _apply_client_security_headers(response)
+    return response
+
+
 async def _handle_artifact_content(
     request: web.Request,
     *,
@@ -1053,8 +1074,6 @@ async def _handle_artifact_content(
     except (ArtifactAccessDeniedError, ArtifactStorageBoundaryError):
         return _error_response(status=403, code="access_denied", message="Access denied")
 
-    filename = artifact.summary.original_filename or f"{artifact_id}.bin"
-    safe_ascii = re.sub(r"[^A-Za-z0-9._-]", "_", filename) or "artifact.bin"
     disposition = (
         "inline"
         if (
@@ -1063,16 +1082,55 @@ async def _handle_artifact_content(
         )
         else "attachment"
     )
-    response = web.FileResponse(artifact.storage_path)
-    response.content_type = artifact.summary.media_type
-    response.headers["Content-Disposition"] = (
-        f"{disposition}; filename=\"{safe_ascii}\"; filename*=UTF-8''{quote(filename)}"
-    )
-    response.headers["Cache-Control"] = "private, no-store"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Content-Security-Policy"] = "default-src 'none'"
-    response.headers["Referrer-Policy"] = "no-referrer"
-    return response
+    return _artifact_file_response(artifact, artifact_id, disposition=disposition)
+
+
+async def _handle_artifact_download(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    artifact_service: WorkshopArtifactService,
+    request_lock: asyncio.Lock,
+) -> web.StreamResponse:
+    if (
+        request.query
+        or request.content_type != "application/x-www-form-urlencoded"
+        or request.content_length is None
+        or request.content_length > 512
+    ):
+        return _error_response(status=400, code="invalid_request", message="Invalid artifact download request")
+    try:
+        form = await request.post()
+    except ValueError:
+        return _error_response(status=400, code="invalid_request", message="Invalid artifact download request")
+    if set(form) != {"session_token"} or len(form.getall("session_token", [])) != 1:
+        return _error_response(status=400, code="invalid_request", message="Invalid artifact download request")
+    token = form["session_token"]
+    if not isinstance(token, str) or not token:
+        response = _error_response(status=401, code="authentication_required", message="Authentication required")
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    async with request_lock:
+        principal_id = await authenticator.authenticate_token(token)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(status=401, code="authentication_required", message="Authentication required")
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    try:
+        channel_id = ChannelId(request.match_info["channel_id"])
+        artifact_id = ArtifactId(request.match_info["artifact_id"])
+    except (TypeError, ValueError):
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    try:
+        async with request_lock:
+            artifact = await artifact_service.authorized_artifact(
+                principal_id,
+                channel_id,
+                artifact_id,
+            )
+    except (ArtifactAccessDeniedError, ArtifactStorageBoundaryError):
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    return _artifact_file_response(artifact, artifact_id, disposition="attachment")
 
 
 async def _authorized_run(
@@ -1299,7 +1357,16 @@ def register_workshop_read_routes(
                 request_lock=request_lock,
             )
 
+        async def handle_artifact_download(request: web.Request) -> web.StreamResponse:
+            return await _handle_artifact_download(
+                request,
+                authenticator=authenticator,
+                artifact_service=artifact_service,
+                request_lock=request_lock,
+            )
+
         app.router.add_get(_ARTIFACT_CONTENT_PATH, handle_artifact_content)
+        app.router.add_post(_ARTIFACT_DOWNLOAD_PATH, handle_artifact_download)
 
 
 def register_workshop_enrollment_routes(

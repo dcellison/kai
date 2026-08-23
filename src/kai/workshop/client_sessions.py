@@ -494,6 +494,12 @@ class WorkshopBearerSessionAuthenticator:
     def __init__(self, sessions: WorkshopClientSessionManager) -> None:
         self._sessions = sessions
 
+    async def authenticate_token(self, token: str) -> PrincipalId | None:
+        if not isinstance(token, str) or not token:
+            return None
+        authenticated = await self._sessions.authenticate_token(token)
+        return authenticated.principal_id if authenticated is not None else None
+
     async def authenticate(self, request: web.Request) -> PrincipalId | None:
         values = request.headers.getall("Authorization", [])
         if len(values) != 1:
@@ -501,5 +507,4 @@ class WorkshopBearerSessionAuthenticator:
         parts = values[0].split(" ")
         if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1]:
             return None
-        authenticated = await self._sessions.authenticate_token(parts[1])
-        return authenticated.principal_id if authenticated is not None else None
+        return await self.authenticate_token(parts[1])
