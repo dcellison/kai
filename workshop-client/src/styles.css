@@ -1240,9 +1240,15 @@ button:disabled {
 
 .composer-form .attach-button {
   min-width: auto;
-  border-color: var(--line-strong);
-  background: var(--atom-surface-raised);
-  color: var(--atom-muted);
+  border-color: rgba(171, 178, 191, 0.48);
+  background: transparent;
+  color: var(--atom-foreground-strong);
+}
+
+.composer-form .attach-button:hover:not(:disabled) {
+  border-color: var(--atom-blue);
+  background: rgba(97, 175, 239, 0.1);
+  color: var(--atom-blue);
 }
 
 .selected-artifact {
@@ -1290,12 +1296,37 @@ button:disabled {
   color: var(--atom-blue);
   font: 700 0.72rem var(--sans);
   cursor: pointer;
+  transition:
+    background 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease,
+    transform 80ms ease;
+}
+
+.composer-form .send-button {
+  border-color: var(--atom-blue);
+  background: var(--atom-blue);
+  color: var(--atom-bg-dark);
+}
+
+.composer-form .send-button:hover:not(:disabled) {
+  border-color: #82c4f7;
+  background: #82c4f7;
+}
+
+.composer-form button:active:not(:disabled) {
+  transform: translateY(1px);
 }
 
 .composer-form button:disabled,
 .composer-form textarea:disabled {
+  cursor: not-allowed;
+  opacity: 0.46;
+}
+
+.composer-form button[aria-busy="true"] {
   cursor: wait;
-  opacity: 0.58;
+  opacity: 0.72;
 }
 
 .composer-form .stop-button {
