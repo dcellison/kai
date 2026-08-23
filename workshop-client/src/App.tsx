@@ -1559,7 +1559,9 @@ function WorkshopView({
                 rows={1}
               />
               <button
+                className="send-button"
                 type="submit"
+                aria-busy={submitting}
                 disabled={
                   submitting ||
                   isRunActive(activeRun) ||

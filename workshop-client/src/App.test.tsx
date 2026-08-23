@@ -951,10 +951,17 @@ describe("Workshop React client", () => {
     const artifact = new File(["artifact body"], "notes.txt", {
       type: "text/plain",
     });
+    const attachButton = screen.getByRole("button", { name: "Attach" });
+    const sendButton = screen.getByRole("button", { name: "Send" });
+    expect(attachButton).toBeEnabled();
+    expect(attachButton).toHaveClass("attach-button");
+    expect(sendButton).toBeDisabled();
+    expect(sendButton).toHaveClass("send-button");
 
     await user.upload(screen.getByLabelText("Attach a file"), artifact);
     expect(screen.getByText("notes.txt")).toBeVisible();
-    await user.click(screen.getByRole("button", { name: "Send" }));
+    expect(sendButton).toBeEnabled();
+    await user.click(sendButton);
 
     await waitFor(() => expect(submitCommand).toHaveBeenCalledOnce());
     expect(submitCommand).toHaveBeenCalledWith(
@@ -1164,6 +1171,9 @@ describe("Workshop React client", () => {
     await user.type(screen.getByLabelText("Message Kai"), "Finish very quickly");
     const submitting = user.click(screen.getByRole("button", { name: "Send" }));
     await waitFor(() => expect(submitCommand).toHaveBeenCalledOnce());
+    const sendingButton = screen.getByRole("button", { name: "Sending…" });
+    expect(sendingButton).toBeDisabled();
+    expect(sendingButton).toHaveAttribute("aria-busy", "true");
     act(() =>
       handlers?.onRunActivity(
         {
