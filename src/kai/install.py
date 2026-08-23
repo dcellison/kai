@@ -4460,6 +4460,8 @@ def _start_service(
         print(f"[DRY RUN] Would run: {' '.join(start_cmd)}")
         return
 
+    print(f"  Starting service ({' '.join(start_cmd[:2])})...")
+
     last_start_stderr = ""
     last_verify_stderr = ""
     expected_generation: str | None = None
@@ -4518,6 +4520,10 @@ def _start_service(
             detail += f"; last start stderr: {last_start_stderr}"
         raise ServiceStartError(detail)
 
+    print(
+        "  Service registered; waiting for full application readiness "
+        f"(including configured semantic memory, up to {_SERVICE_READY_TIMEOUT_SECONDS:g}s)..."
+    )
     ready, readiness_detail = _wait_for_service_readiness(
         webhook_port,
         expected_generation=expected_generation,
