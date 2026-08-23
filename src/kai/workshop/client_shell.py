@@ -19,7 +19,8 @@ _DOCUMENT_CSP = "; ".join(
         "base-uri 'none'",
         "form-action 'self'",
         "frame-ancestors 'none'",
-        "img-src 'none'",
+        "img-src blob:",
+        "media-src blob:",
         "font-src 'none'",
     )
 )
