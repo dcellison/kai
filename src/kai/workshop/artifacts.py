@@ -308,7 +308,7 @@ def canonical_artifact_media_type(filename: str | None, claimed_media_type: str 
         normalized = claimed_media_type.split(";", 1)[0].strip().lower()
         if _MEDIA_TYPE_PATTERN.fullmatch(normalized):
             normalized_claim = normalized
-    if normalized_claim not in {None, "application/octet-stream"}:
+    if normalized_claim is not None and normalized_claim != "application/octet-stream":
         # Active browser content is still forced to attachment by the
         # download endpoint. Retaining the type here is provenance, not
         # permission to render it inline.

@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 from urllib.parse import quote
 
-from aiohttp import web
+from aiohttp import BodyPartReader, web
 
 from kai.workshop.artifacts import (
     MAX_ARTIFACT_BYTES,
@@ -908,17 +908,17 @@ async def _handle_command_submission(
         try:
             reader = await request.multipart()
             first = await reader.next()
-            if first is None or first.name != "client_message_id":
+            if not isinstance(first, BodyPartReader) or first.name != "client_message_id":
                 raise ValueError("invalid multipart fields")
             client_message_id = await first.text()
             second = await reader.next()
-            if second is None or second.name != "body":
+            if not isinstance(second, BodyPartReader) or second.name != "body":
                 raise ValueError("invalid multipart fields")
             body = await second.text()
             if not _CLIENT_MESSAGE_ID_PATTERN.fullmatch(client_message_id) or len(body) > 50_000:
                 raise ValueError("invalid multipart command metadata")
             file_field = await reader.next()
-            if file_field is None or file_field.name != "file":
+            if not isinstance(file_field, BodyPartReader) or file_field.name != "file":
                 raise ValueError("invalid multipart fields")
 
             async def chunks():
