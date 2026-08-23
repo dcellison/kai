@@ -626,6 +626,7 @@ async def _handle_channel_event_stream(
     heartbeat_interval: float,
     authentication_recheck_interval: float,
     stream_limiter: WorkshopEventStreamLimiter,
+    shutdown_event: asyncio.Event,
     run_previews: WorkshopRunPreviewRegistry | None = None,
 ) -> web.StreamResponse:
     try:
@@ -722,7 +723,11 @@ async def _handle_channel_event_stream(
             if now - last_heartbeat >= heartbeat_interval:
                 await response.write(b": keep-alive\n\n")
                 last_heartbeat = now
-            await asyncio.sleep(poll_interval)
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=poll_interval)
+                break
+            except TimeoutError:
+                pass
 
             reauthenticate = time.monotonic() - last_authentication_check >= authentication_recheck_interval
             _, next_batch = await _authorized_update_batch(
@@ -1090,6 +1095,13 @@ def register_workshop_read_routes(
     if event_poll_interval <= 0 or event_heartbeat_interval <= 0 or event_authentication_recheck_interval <= 0:
         raise ValueError("Event-stream intervals must be positive")
     stream_limiter = event_stream_limiter or WorkshopEventStreamLimiter()
+    shutdown_event = asyncio.Event()
+
+    async def stop_event_streams(_app: web.Application) -> None:
+        """Release persistent SSE requests before aiohttp drains handlers."""
+        shutdown_event.set()
+
+    app.on_shutdown.append(stop_event_streams)
 
     async def handle_channel_timeline(request: web.Request) -> web.Response:
         async with request_lock:
@@ -1117,6 +1129,7 @@ def register_workshop_read_routes(
             heartbeat_interval=event_heartbeat_interval,
             authentication_recheck_interval=event_authentication_recheck_interval,
             stream_limiter=stream_limiter,
+            shutdown_event=shutdown_event,
             run_previews=run_previews,
         )
 

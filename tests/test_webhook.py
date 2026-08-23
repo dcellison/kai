@@ -2676,11 +2676,13 @@ class TestNotificationChatIdMutations:
         github_notifications = MagicMock(spec=WorkshopTelegramNotificationService)
 
         apps: list[web.Application] = []
+        runner_shutdown_timeouts: list[float] = []
         runners: list[MagicMock] = []
         sites: list[tuple[MagicMock, str, int]] = []
 
-        def fake_runner(app, *, access_log=None):
+        def fake_runner(app, *, access_log=None, shutdown_timeout):
             apps.append(app)
+            runner_shutdown_timeouts.append(shutdown_timeout)
             runner = MagicMock()
             runner.setup = AsyncMock()
             runner.cleanup = AsyncMock()
@@ -2710,6 +2712,10 @@ class TestNotificationChatIdMutations:
                 ("10.0.0.36", 8080),
             ]
             assert len(apps) == 2
+            assert runner_shutdown_timeouts == [
+                wh._HTTP_RUNNER_SHUTDOWN_TIMEOUT,
+                wh._HTTP_RUNNER_SHUTDOWN_TIMEOUT,
+            ]
             lan_paths = {resource.canonical for resource in apps[1].router.resources()}
             assert lan_paths == {
                 "/v1/client/enrollment/redeem",
