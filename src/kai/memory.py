@@ -1591,6 +1591,54 @@ def init_offline_memory(config: Config) -> None:
     init_memory(config)
 
 
+def _close_memory_instance(memory: object) -> None:
+    """Close every independently owned resource behind one Mem0 instance."""
+    errors: list[Exception] = []
+    close = getattr(memory, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception as exc:
+            errors.append(exc)
+
+    closed_clients: set[int] = set()
+    for attribute in ("vector_store", "_telemetry_vector_store"):
+        store = getattr(memory, attribute, None)
+        client = getattr(store, "client", None)
+        client_close = getattr(client, "close", None)
+        if client is None or not callable(client_close) or id(client) in closed_clients:
+            continue
+        closed_clients.add(id(client))
+        try:
+            client_close()
+        except Exception as exc:
+            errors.append(exc)
+
+    if errors:
+        raise ExceptionGroup("Semantic memory shutdown failed", errors)
+
+
+def close_memory() -> None:
+    """Close the process-owned Mem0 singleton and release embedded-store locks.
+
+    Mem0's public ``close()`` closes its history database but leaves both
+    Qdrant clients open. The primary and telemetry clients independently own
+    SQLite connections and local-storage locks, so production shutdown must
+    close all three resources explicitly. Singleton state is cleared first
+    to make repeated teardown safe even when one close operation fails.
+    """
+    global _memory, _config
+
+    memory = _memory
+    _memory = None
+    _config = None
+    if memory is None:
+        return
+
+    _close_memory_instance(memory)
+    log.info("Memory system stopped")
+
+
 def init_memory(config: Config, *, store_dir: Path | None = None) -> None:
     """
     Initialize the Mem0 memory instance with Qdrant embedded storage.
@@ -1815,19 +1863,27 @@ def init_memory(config: Config, *, store_dir: Path | None = None) -> None:
     mem0_cfg = _mem0_config(config, store_dir)
     m = Memory.from_config(mem0_cfg)
 
-    # Construction is the moment the store's files all exist
-    # (qdrant meta/collection tree, history db, mem0's migrations
-    # store), so tighten before anything else can run; deliberately
-    # ahead of the dims-mismatch bailout below so even that early
-    # return leaves the tree owner-only.
-    _tighten_store_permissions(store_dir if store_dir is not None else DATA_DIR / "memory")
+    try:
+        # Construction is the moment the store's files all exist
+        # (qdrant meta/collection tree, history db, mem0's migrations
+        # store), so tighten before anything else can run; deliberately
+        # ahead of the dims-mismatch bailout below so even that early
+        # return leaves the tree owner-only.
+        _tighten_store_permissions(store_dir if store_dir is not None else DATA_DIR / "memory")
 
-    # Validate that the embedding model's output dimensions match the
-    # hardcoded 384 in the Qdrant config. A mismatch means the user
-    # configured a different model via MEMORY_EMBEDDING_MODEL but the
-    # Qdrant collection was created for 384-dim vectors. Catch this at
-    # startup rather than getting cryptic Qdrant errors at first use.
-    actual_dims = m.embedding_model.model.get_embedding_dimension()
+        # Validate that the embedding model's output dimensions match the
+        # hardcoded 384 in the Qdrant config. A mismatch means the user
+        # configured a different model via MEMORY_EMBEDDING_MODEL but the
+        # Qdrant collection was created for 384-dim vectors. Catch this at
+        # startup rather than getting cryptic Qdrant errors at first use.
+        actual_dims = m.embedding_model.model.get_embedding_dimension()
+    except BaseException:
+        _config = None
+        try:
+            _close_memory_instance(m)
+        except Exception:
+            log.exception("Could not close semantic memory after initialization failed")
+        raise
     if actual_dims != 384:
         log.error(
             "Embedding model '%s' outputs %d dimensions but Qdrant "
@@ -1838,6 +1894,10 @@ def init_memory(config: Config, *, store_dir: Path | None = None) -> None:
             actual_dims,
         )
         _config = None
+        try:
+            _close_memory_instance(m)
+        except Exception:
+            log.exception("Could not close semantic memory after dimension validation failed")
         return
 
     _memory = m
