@@ -42,6 +42,7 @@ import { useRunTrace } from "./useRunTrace";
 import { useWorkshopTimeline } from "./useWorkshopTimeline";
 import type { EarlierHistoryState } from "./useWorkshopTimeline";
 import { MarkdownMessage } from "./MarkdownMessage";
+import { downloadArtifactBlob } from "./artifactDownload";
 
 const SESSION_KEY = "kai.workshop.read-session.v1";
 const ACTIVE_RUN_KEY = "kai.workshop.active-run.v1";
@@ -645,12 +646,7 @@ function ArtifactAttachment({
     setError(null);
     try {
       const blob = await onLoad(artifact.artifactId);
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = artifact.originalFilename ?? "artifact";
-      anchor.click();
-      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+      downloadArtifactBlob(blob, artifact.originalFilename ?? "artifact");
     } catch {
       setError("Could not download this attachment.");
     }
