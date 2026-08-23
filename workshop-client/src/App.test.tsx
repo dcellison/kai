@@ -8,6 +8,7 @@ import {
   cancelRun,
   ChannelAccessError,
   loadEarlierTimeline,
+  loadArtifactBlob,
   loadNavigation,
   loadRun,
   loadRunTrace,
@@ -29,6 +30,7 @@ vi.mock("./api", async (importOriginal) => {
     ...original,
     cancelRun: vi.fn(),
     loadEarlierTimeline: vi.fn(),
+    loadArtifactBlob: vi.fn(),
     loadNavigation: vi.fn(),
     loadTimeline: vi.fn(),
     loadRun: vi.fn(),
@@ -104,6 +106,7 @@ const navigation: WorkshopNavigation = {
   ],
 };
 const historyMessage: TimelineMessage = {
+  artifacts: [],
   authorDisplayName: "Kai",
   authorKind: "agent",
   body: "Canonical history is ready.",
@@ -145,6 +148,9 @@ describe("Workshop React client", () => {
     });
     vi.mocked(loadRun).mockResolvedValue(completedRun);
     vi.mocked(loadRunTrace).mockResolvedValue({ entries: [], hasMore: false });
+    vi.mocked(loadArtifactBlob).mockResolvedValue(
+      new Blob(["artifact"], { type: "text/plain" }),
+    );
     vi.mocked(cancelRun).mockResolvedValue({
       ...completedRun,
       status: "cancelled",
@@ -920,12 +926,77 @@ describe("Workshop React client", () => {
       { channelId, token: "existing-session" },
       "browser-2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a",
       "Hello from Workshop",
+      null,
     ]);
     expect(vi.mocked(submitCommand).mock.calls[1]).toEqual(
       vi.mocked(submitCommand).mock.calls[0],
     );
     expect(getRandomValues).toHaveBeenCalledTimes(1);
     expect(screen.getByLabelText("Message Kai")).toHaveValue("");
+  });
+
+  it("submits a file-only command and clears the selected attachment on success", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    const getRandomValues = vi.fn((array: Uint8Array): Uint8Array => {
+      array.fill(0x3b);
+      return array;
+    });
+    vi.stubGlobal("crypto", { getRandomValues });
+    render(<App />);
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+    const artifact = new File(["artifact body"], "notes.txt", {
+      type: "text/plain",
+    });
+
+    await user.upload(screen.getByLabelText("Attach a file"), artifact);
+    expect(screen.getByText("notes.txt")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(submitCommand).toHaveBeenCalledOnce());
+    expect(submitCommand).toHaveBeenCalledWith(
+      { channelId, token: "existing-session" },
+      "browser-3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b",
+      "",
+      artifact,
+    );
+    expect(screen.queryByText("notes.txt")).toBeNull();
+  });
+
+  it("renders canonical artifact metadata from the timeline", async () => {
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    vi.mocked(loadTimeline).mockResolvedValueOnce({
+      messages: [
+        {
+          ...historyMessage,
+          artifacts: [
+            {
+              artifactId: "art_00000000000000000000000000000001",
+              byteSize: 1200,
+              contentSha256: "a".repeat(64),
+              createdAt: "2026-08-13T09:00:00Z",
+              kind: "document",
+              mediaType: "text/plain",
+              originalFilename: "workshop-notes.txt",
+            },
+          ],
+        },
+      ],
+      throughPosition: 25,
+      previousCursor: null,
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("workshop-notes.txt")).toBeVisible();
+    expect(screen.getByText("2 KB")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Download" })).toBeVisible();
   });
 
   it("sends the draft on Enter and keeps Shift+Enter as a newline", async () => {

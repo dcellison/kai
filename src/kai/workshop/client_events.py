@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from kai.workshop.artifacts import artifacts_for_messages
 from kai.workshop.domain import ChannelId, MessageId, PrincipalId, RunId, WorkshopEventType
 from kai.workshop.run_lifecycle import DurableRun, load_durable_run
 from kai.workshop.store import WorkshopEventStore
@@ -172,6 +173,11 @@ async def read_client_channel_events(
     ) as cursor:
         rows = list(await cursor.fetchall())
 
+    artifact_map = await artifacts_for_messages(
+        store,
+        tuple(MessageId(str(row["message_id"])) for row in rows if row["message_id"] is not None),
+    )
+
     events: list[ClientChannelEvent] = []
     next_position = after_position
     for row in rows:
@@ -183,10 +189,11 @@ async def read_client_channel_events(
                 row["author_kind"],
             ):
                 continue
+            message_id = MessageId(str(row["message_id"]))
             events.append(
                 ClientTimelineMessageEvent(
                     TimelineMessage(
-                        message_id=MessageId(str(row["message_id"])),
+                        message_id=message_id,
                         channel_id=ChannelId(str(row["message_channel_id"])),
                         author_principal_id=PrincipalId(str(row["author_principal_id"])),
                         author_kind=str(row["author_kind"]),
@@ -199,6 +206,7 @@ async def read_client_channel_events(
                         body=str(row["body"]),
                         event_position=position,
                         created_at=_parse_timestamp(row["message_created_at"]),
+                        artifacts=artifact_map.get(message_id, ()),
                     )
                 )
             )

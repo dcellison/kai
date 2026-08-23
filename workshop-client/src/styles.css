@@ -845,6 +845,58 @@ button:disabled {
   white-space: nowrap;
 }
 
+.message-artifact {
+  margin-top: 0.8rem;
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 0.42rem;
+  background: rgba(33, 37, 43, 0.72);
+}
+
+.message-artifact img {
+  display: block;
+  max-width: min(100%, 40rem);
+  max-height: 28rem;
+  object-fit: contain;
+  background: var(--atom-bg-deep);
+}
+
+.message-artifact audio {
+  display: block;
+  width: min(100%, 32rem);
+  margin: 0.8rem;
+}
+
+.artifact-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.65rem 0.8rem;
+  color: var(--atom-foreground);
+  font-size: 0.72rem;
+}
+
+.artifact-meta small {
+  color: var(--atom-muted);
+}
+
+.artifact-meta button,
+.selected-artifact button {
+  margin-left: auto;
+  border: 0;
+  background: transparent;
+  color: var(--atom-blue);
+  font: 700 0.68rem var(--sans);
+  cursor: pointer;
+}
+
+.artifact-error {
+  margin: 0;
+  padding: 0 0.8rem 0.7rem;
+  color: var(--atom-red);
+  font-size: 0.68rem;
+}
+
 /* Streaming preview bubble: visually a normal agent message, with a
    pulsing label instead of a timestamp while text is still arriving. */
 .run-preview-label {
@@ -1180,6 +1232,29 @@ button:disabled {
   display: flex;
   align-items: flex-end;
   gap: 0.65rem;
+}
+
+.artifact-input {
+  display: none;
+}
+
+.composer-form .attach-button {
+  min-width: auto;
+  border-color: var(--line-strong);
+  background: var(--atom-surface-raised);
+  color: var(--atom-muted);
+}
+
+.selected-artifact {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  margin-top: 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 0.35rem;
+  padding: 0.45rem 0.65rem;
+  color: var(--atom-foreground);
+  font-size: 0.7rem;
 }
 
 .composer-form textarea {

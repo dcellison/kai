@@ -89,7 +89,11 @@ from kai.telegram_context import KaiTelegramApplication, get_core_services
 from kai.telegram_utils import chunk_text
 from kai.transcribe import TranscriptionError, transcribe_voice
 from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
-from kai.workshop.artifacts import InboundArtifact
+from kai.workshop.artifacts import (
+    StagedArtifact,
+    canonical_artifact_filename,
+    canonical_artifact_media_type,
+)
 from kai.workshop.conversation_commands import ConversationCommandDisposition
 from kai.workshop.conversation_runs import PreparedConversationRun
 from kai.workshop.domain import CanonicalMemoryProvenance, MessageId, PrincipalId, RunId
@@ -3459,6 +3463,35 @@ def _upload_principal_id(
     return registry.for_runtime_config_id(runtime_config_id).principal_id
 
 
+async def _stage_media_upload(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    actor_id: int,
+    data: bytes,
+    filename: str,
+    media_type: str | None,
+    source_unique_id: str,
+    occurred_at: datetime,
+    kind: str,
+) -> StagedArtifact:
+    async def chunks():
+        yield data
+
+    namespace = _get_core_services(context).principal_storage.for_runtime_config_id(actor_id)
+    return await _get_core_services(context).artifacts.stage_upload(
+        principal_id=namespace.principal_id,
+        runtime_profile_id=namespace.runtime_profile_id,
+        filename=filename,
+        claimed_media_type=media_type,
+        chunks=chunks(),
+        source_transport="telegram",
+        source_unique_id=source_unique_id,
+        occurred_at=occurred_at,
+        kind=kind,
+        original_filename=filename if kind == "document" else None,
+    )
+
+
 def _save_upload(
     data: bytes,
     filename: str,
@@ -3558,13 +3591,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     # Save to DATA_DIR/files/ so Claude can access the file via shell tools
     try:
-        saved = _save_upload(
-            raw,
-            f"photo_{photo.file_unique_id}.jpg",
-            principal_id=_upload_principal_id(context, actor_id),
-            reader_user=reader_user,
+        staged_artifact = await _stage_media_upload(
+            context,
+            actor_id=actor_id,
+            data=raw,
+            filename=f"photo_{photo.file_unique_id}.jpg",
+            media_type="image/jpeg",
+            source_unique_id=photo.file_unique_id,
+            occurred_at=update.message.date,
+            kind="photo",
         )
-    except (OSError, WorkshopStorageNamespaceError) as exc:
+        saved = staged_artifact.storage_path
+    except (OSError, ValueError, WorkshopStorageNamespaceError) as exc:
         log.exception("Failed to save uploaded photo for chat %d", chat_id)
         await update.message.reply_text(f"Couldn't save the upload for agent access: {exc}")
         return
@@ -3600,16 +3638,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if workshop_inbound_message_id is not None and artifact_recorder is not None:
         try:
             await artifact_recorder(
-                InboundArtifact(
-                    message_id=workshop_inbound_message_id,
-                    kind="photo",
-                    media_type="image/jpeg",
-                    storage_path=saved,
-                    source_transport="telegram",
-                    source_unique_id=photo.file_unique_id,
-                    occurred_at=update.message.date,
-                    original_filename=None,
-                ),
+                staged_artifact.for_message(workshop_inbound_message_id),
                 storage_root=DATA_DIR / "files",
             )
         except Exception:
@@ -3717,29 +3746,16 @@ _IMAGE_MEDIA_TYPES = {
     ".gif": "image/gif",
     ".webp": "image/webp",
 }
-_DOCUMENT_MEDIA_TYPE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$")
 
 
 def _canonical_document_media_type(file_name: str, claimed_media_type: str | None) -> str:
-    """Return stable artifact MIME metadata without trusting malformed input."""
-    suffix = Path(file_name).suffix.lower()
-    if suffix in _IMAGE_MEDIA_TYPES:
-        return _IMAGE_MEDIA_TYPES[suffix]
-    if isinstance(claimed_media_type, str):
-        normalized = claimed_media_type.split(";", 1)[0].strip().lower()
-        if _DOCUMENT_MEDIA_TYPE_PATTERN.fullmatch(normalized):
-            return normalized
-    if suffix in _TEXT_EXTENSIONS:
-        return "text/plain"
-    return "application/octet-stream"
+    """Keep the Telegram adapter on the shared artifact metadata policy."""
+    return canonical_artifact_media_type(file_name, claimed_media_type)
 
 
 def _canonical_document_filename(file_name: str) -> str | None:
-    """Return a bounded cross-platform basename for artifact provenance."""
-    filename = Path(file_name.replace("\\", "/")).name.strip()
-    if not filename or filename in {".", ".."} or len(filename) > 255 or "\0" in filename:
-        return None
-    return filename
+    """Keep the Telegram adapter on the shared artifact filename policy."""
+    return canonical_artifact_filename(file_name)
 
 
 @_require_auth
@@ -3782,13 +3798,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         # Save to DATA_DIR/files/ so Claude can access the file via shell tools
         try:
-            saved = _save_upload(
-                raw,
-                file_name,
-                principal_id=_upload_principal_id(context, actor_id),
-                reader_user=reader_user,
+            staged_artifact = await _stage_media_upload(
+                context,
+                actor_id=actor_id,
+                data=raw,
+                filename=file_name,
+                media_type=artifact_media_type,
+                source_unique_id=doc.file_unique_id,
+                occurred_at=update.message.date,
+                kind="document",
             )
-        except (OSError, WorkshopStorageNamespaceError) as exc:
+            saved = staged_artifact.storage_path
+        except (OSError, ValueError, WorkshopStorageNamespaceError) as exc:
             log.exception("Failed to save uploaded image document for chat %d", chat_id)
             await update.message.reply_text(f"Couldn't save the upload for agent access: {exc}")
             return
@@ -3813,13 +3834,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         # Save to DATA_DIR/files/ so Claude can access the file via shell tools
         try:
-            saved = _save_upload(
-                raw,
-                file_name,
-                principal_id=_upload_principal_id(context, actor_id),
-                reader_user=reader_user,
+            staged_artifact = await _stage_media_upload(
+                context,
+                actor_id=actor_id,
+                data=raw,
+                filename=file_name,
+                media_type=artifact_media_type,
+                source_unique_id=doc.file_unique_id,
+                occurred_at=update.message.date,
+                kind="document",
             )
-        except (OSError, WorkshopStorageNamespaceError) as exc:
+            saved = staged_artifact.storage_path
+        except (OSError, ValueError, WorkshopStorageNamespaceError) as exc:
             log.exception("Failed to save uploaded text document for chat %d", chat_id)
             await update.message.reply_text(f"Couldn't save the upload for agent access: {exc}")
             return
@@ -3836,13 +3862,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         file = await context.bot.get_file(doc.file_id)
         data = await file.download_as_bytearray()
         try:
-            saved = _save_upload(
-                bytes(data),
-                file_name,
-                principal_id=_upload_principal_id(context, actor_id),
-                reader_user=reader_user,
+            staged_artifact = await _stage_media_upload(
+                context,
+                actor_id=actor_id,
+                data=bytes(data),
+                filename=file_name,
+                media_type=artifact_media_type,
+                source_unique_id=doc.file_unique_id,
+                occurred_at=update.message.date,
+                kind="document",
             )
-        except (OSError, WorkshopStorageNamespaceError) as exc:
+            saved = staged_artifact.storage_path
+        except (OSError, ValueError, WorkshopStorageNamespaceError) as exc:
             log.exception("Failed to save uploaded document for chat %d", chat_id)
             await update.message.reply_text(f"Couldn't save the upload for agent access: {exc}")
             return
@@ -3879,16 +3910,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if workshop_inbound_message_id is not None and artifact_recorder is not None:
         try:
             await artifact_recorder(
-                InboundArtifact(
-                    message_id=workshop_inbound_message_id,
-                    kind="document",
-                    media_type=artifact_media_type,
-                    storage_path=saved,
-                    source_transport="telegram",
-                    source_unique_id=doc.file_unique_id,
-                    occurred_at=update.message.date,
-                    original_filename=_canonical_document_filename(file_name),
-                ),
+                staged_artifact.for_message(workshop_inbound_message_id),
                 storage_root=DATA_DIR / "files",
             )
         except Exception:
@@ -4049,22 +4071,18 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             # inside the canonical principal-owned upload boundary so canonical
             # artifact provenance never points at an ephemeral path. This
             # path is not added to the backend prompt.
-            saved_voice = _save_upload(
-                audio_data,
-                "voice.oga",
-                principal_id=_upload_principal_id(context, actor_id),
+            staged_voice = await _stage_media_upload(
+                context,
+                actor_id=actor_id,
+                data=audio_data,
+                filename="voice.oga",
+                media_type="audio/ogg",
+                source_unique_id=voice.file_unique_id,
+                occurred_at=update.message.date,
+                kind="voice",
             )
             await artifact_recorder(
-                InboundArtifact(
-                    message_id=workshop_inbound_message_id,
-                    kind="voice",
-                    media_type="audio/ogg",
-                    storage_path=saved_voice,
-                    source_transport="telegram",
-                    source_unique_id=voice.file_unique_id,
-                    occurred_at=update.message.date,
-                    original_filename=None,
-                ),
+                staged_voice.for_message(workshop_inbound_message_id),
                 storage_root=DATA_DIR / "files",
             )
         except Exception:

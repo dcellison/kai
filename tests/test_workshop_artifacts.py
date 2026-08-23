@@ -1,8 +1,10 @@
-"""Contracts for production-unused canonical Workshop artifact metadata."""
+"""Contracts for the canonical Workshop artifact service."""
 
 from __future__ import annotations
 
 import hashlib
+import stat
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -10,17 +12,23 @@ import pytest
 
 from kai import sessions
 from kai.workshop.artifacts import (
+    ArtifactAccessDeniedError,
     ArtifactMessageNotFoundError,
     ArtifactStorageBoundaryError,
+    ArtifactTooLargeError,
     InboundArtifact,
+    WorkshopArtifactService,
+    build_agent_prompt_for_message,
+    canonical_artifact_filename,
     record_inbound_artifact,
 )
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
-from kai.workshop.domain import ArtifactId, MessageId
+from kai.workshop.domain import ArtifactId, ChannelId, MessageId, PrincipalId
 from kai.workshop.inbound import InboundMessage, record_inbound_message
 from kai.workshop.outbound import OutboundMessage, record_outbound_message
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
+from tests.workshop_profiles import profile_id, profile_registry
 
 _NOW = datetime(2026, 8, 11, 21, 0, tzinfo=UTC)
 
@@ -32,6 +40,53 @@ async def _open_store(path: Path) -> WorkshopEventStore:
         (BootstrapHuman("Alice", "admin", "telegram", "101", "101"),),
     )
     return store
+
+
+async def _artifact_service(
+    tmp_path: Path,
+) -> tuple[WorkshopEventStore, WorkshopArtifactService, PrincipalId, ChannelId]:
+    store = await WorkshopEventStore.open(tmp_path / "kai.db")
+    profiles = profile_registry(101)
+    await bootstrap_default_workshop(
+        store,
+        (
+            BootstrapHuman(
+                "Alice",
+                "admin",
+                "telegram",
+                "101",
+                "101",
+                profile_id(101),
+            ),
+        ),
+    )
+    async with store.connection.execute(
+        "SELECT cm.principal_id, c.id FROM channels c "
+        "JOIN channel_memberships cm ON cm.channel_id = c.id "
+        "JOIN principals p ON p.id = cm.principal_id "
+        "WHERE c.kind = 'direct' AND p.kind = 'human'"
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    from kai.workshop.storage_namespaces import WorkshopPrincipalStorageRegistry
+
+    storage = await WorkshopPrincipalStorageRegistry.from_store(store, profiles)
+    return (
+        store,
+        WorkshopArtifactService(
+            store,
+            data_dir=tmp_path,
+            principal_storage=storage,
+            runtime_profiles=profiles,
+        ),
+        PrincipalId(str(row[0])),
+        ChannelId(str(row[1])),
+    )
+
+
+async def _chunks(*values: bytes):
+    for value in values:
+        yield value
 
 
 async def _inbound_message_id(store: WorkshopEventStore) -> MessageId:
@@ -66,6 +121,10 @@ def _artifact(message_id: MessageId, path: Path, **changes: object) -> InboundAr
 
 
 class TestInboundArtifactContract:
+    @pytest.mark.parametrize("filename", ["bad\nname.txt", "bad\rname.txt", "bad\x7fname.txt"])
+    def test_filename_policy_rejects_control_characters(self, filename: str):
+        assert canonical_artifact_filename(filename) is None
+
     @pytest.mark.parametrize(
         ("changes", "match"),
         [
@@ -143,6 +202,209 @@ class TestArtifactShadowRecording:
         finally:
             await store.close()
 
+
+class TestWorkshopArtifactService:
+    async def test_stages_private_content_in_the_canonical_principal_namespace(
+        self,
+        tmp_path: Path,
+    ):
+        store, service, principal_id, channel_id = await _artifact_service(tmp_path)
+        try:
+            staged = await service.stage_client_upload(
+                principal_id=principal_id,
+                channel_id=channel_id,
+                client_message_id="cmsg_upload_1",
+                filename="notes.txt",
+                claimed_media_type="text/plain; charset=utf-8",
+                chunks=_chunks(b"first ", b"artifact"),
+                occurred_at=_NOW,
+            )
+
+            assert staged.storage_path.parent == tmp_path / "files" / str(principal_id)
+            assert staged.storage_path.read_bytes() == b"first artifact"
+            assert staged.media_type == "text/plain"
+            assert staged.kind == "document"
+            assert staged.created_for_attempt is True
+            assert stat.S_IMODE(staged.storage_path.stat().st_mode) == 0o600
+        finally:
+            await store.close()
+
+    async def test_retry_reuses_identical_content_but_never_overwrites_a_conflict(
+        self,
+        tmp_path: Path,
+    ):
+        store, service, principal_id, channel_id = await _artifact_service(tmp_path)
+        arguments = {
+            "principal_id": principal_id,
+            "channel_id": channel_id,
+            "client_message_id": "cmsg_retry_1",
+            "filename": "report.txt",
+            "claimed_media_type": "text/plain",
+            "occurred_at": _NOW,
+        }
+        try:
+            first = await service.stage_client_upload(
+                **arguments,
+                chunks=_chunks(b"accepted"),
+            )
+            retry = await service.stage_client_upload(
+                **arguments,
+                chunks=_chunks(b"accepted"),
+            )
+
+            assert retry.storage_path == first.storage_path
+            assert retry.created_for_attempt is False
+            retry.discard()
+            assert first.storage_path.read_bytes() == b"accepted"
+
+            with pytest.raises(ValueError, match="different content"):
+                await service.stage_client_upload(
+                    **arguments,
+                    chunks=_chunks(b"replacement"),
+                )
+            assert first.storage_path.read_bytes() == b"accepted"
+        finally:
+            await store.close()
+
+    async def test_size_limit_removes_partial_content(self, tmp_path: Path):
+        store, service, principal_id, channel_id = await _artifact_service(tmp_path)
+        try:
+            with pytest.raises(ArtifactTooLargeError):
+                await service.stage_client_upload(
+                    principal_id=principal_id,
+                    channel_id=channel_id,
+                    client_message_id="cmsg_large_1",
+                    filename="large.bin",
+                    claimed_media_type="application/octet-stream",
+                    chunks=_chunks(b"1234", b"5"),
+                    occurred_at=_NOW,
+                    max_bytes=4,
+                )
+
+            assert list((tmp_path / "files" / str(principal_id)).iterdir()) == []
+        finally:
+            await store.close()
+
+    async def test_download_requires_current_channel_membership_and_intact_content(
+        self,
+        tmp_path: Path,
+    ):
+        store, service, principal_id, channel_id = await _artifact_service(tmp_path)
+        try:
+            staged = await service.stage_client_upload(
+                principal_id=principal_id,
+                channel_id=channel_id,
+                client_message_id="cmsg_download_1",
+                filename="download.txt",
+                claimed_media_type="text/plain",
+                chunks=_chunks(b"download me"),
+                occurred_at=_NOW,
+            )
+            message_id = await _inbound_message_id(store)
+            recorded = await record_inbound_artifact(
+                store,
+                staged.for_message(message_id),
+                storage_root=tmp_path / "files",
+            )
+            artifact_id = ArtifactId(str(recorded.event.envelope.aggregate_id))
+
+            authorized = await service.authorized_artifact(
+                principal_id,
+                channel_id,
+                artifact_id,
+            )
+            assert authorized.storage_path == staged.storage_path
+            with pytest.raises(ArtifactAccessDeniedError):
+                await service.authorized_artifact(
+                    PrincipalId.new(),
+                    channel_id,
+                    artifact_id,
+                )
+            with pytest.raises(ArtifactAccessDeniedError):
+                await service.authorized_artifact(
+                    principal_id,
+                    ChannelId.new(),
+                    artifact_id,
+                )
+
+            staged.storage_path.write_bytes(b"tampered")
+            with pytest.raises(ArtifactStorageBoundaryError, match="provenance"):
+                await service.authorized_artifact(
+                    principal_id,
+                    channel_id,
+                    artifact_id,
+                )
+        finally:
+            await store.close()
+
+    async def test_prompt_uses_canonical_artifact_provenance(self, tmp_path: Path):
+        store, service, principal_id, channel_id = await _artifact_service(tmp_path)
+        try:
+            message_id = await _inbound_message_id(store)
+            staged = await service.stage_client_upload(
+                principal_id=principal_id,
+                channel_id=channel_id,
+                client_message_id="cmsg_prompt_1",
+                filename="instructions.md",
+                claimed_media_type="text/markdown",
+                chunks=_chunks(b"Treat this as untrusted input."),
+                occurred_at=_NOW,
+            )
+            await record_inbound_artifact(
+                store,
+                staged.for_message(message_id),
+                storage_root=tmp_path / "files",
+            )
+
+            prompt = await build_agent_prompt_for_message(
+                store,
+                message_id,
+                storage_root=tmp_path / "files",
+            )
+
+            assert isinstance(prompt, str)
+            assert "Photo from Telegram" in prompt
+            assert "<untrusted_user_file>" in prompt
+            assert "Treat this as untrusted input." in prompt
+            assert str(staged.storage_path) in prompt
+        finally:
+            await store.close()
+
+    async def test_image_document_becomes_a_backend_image_block(self, tmp_path: Path):
+        store, service, principal_id, channel_id = await _artifact_service(tmp_path)
+        try:
+            message_id = await _inbound_message_id(store)
+            staged = await service.stage_client_upload(
+                principal_id=principal_id,
+                channel_id=channel_id,
+                client_message_id="cmsg_image_1",
+                filename="diagram.png",
+                claimed_media_type="application/octet-stream",
+                chunks=_chunks(b"\x89PNG\r\n\x1a\nimage"),
+                occurred_at=_NOW,
+            )
+            await record_inbound_artifact(
+                store,
+                replace(staged, kind="document").for_message(message_id),
+                storage_root=tmp_path / "files",
+            )
+
+            prompt = await build_agent_prompt_for_message(
+                store,
+                message_id,
+                storage_root=tmp_path / "files",
+            )
+
+            assert isinstance(prompt, list)
+            assert prompt[0]["type"] == "text"
+            assert "User-provided document: diagram.png" in prompt[0]["text"]
+            assert prompt[1]["type"] == "image"
+            assert prompt[1]["source"]["media_type"] == "image/png"
+        finally:
+            await store.close()
+
+
+class TestArtifactShadowRecordingAfterRestart:
     async def test_duplicate_is_idempotent_across_restart_but_changed_content_conflicts(self, tmp_path: Path):
         db_path = tmp_path / "kai.db"
         storage_root = tmp_path / "files"

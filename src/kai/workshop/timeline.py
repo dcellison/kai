@@ -5,12 +5,13 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Protocol
 
 import aiosqlite
 
+from kai.workshop.artifacts import ArtifactSummary, artifacts_for_messages
 from kai.workshop.domain import ChannelId, MessageId, PrincipalId
 from kai.workshop.store import WorkshopEventStore
 
@@ -54,6 +55,7 @@ class TimelineMessage:
     body: str
     event_position: int
     created_at: datetime
+    artifacts: tuple[ArtifactSummary, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,6 +256,17 @@ def _messages_from_rows(rows: list[aiosqlite.Row]) -> tuple[TimelineMessage, ...
     return tuple(messages)
 
 
+async def attach_message_artifacts(
+    store: WorkshopEventStore,
+    messages: tuple[TimelineMessage, ...],
+) -> tuple[TimelineMessage, ...]:
+    grouped = await artifacts_for_messages(
+        store,
+        tuple(message.message_id for message in messages),
+    )
+    return tuple(replace(message, artifacts=grouped.get(message.message_id, ())) for message in messages)
+
+
 async def _read_forward_page(
     store: WorkshopEventStore,
     channel_id: ChannelId,
@@ -274,7 +287,7 @@ async def _read_forward_page(
 
     has_more = len(rows) > limit
     page_rows = rows[:limit]
-    messages = _messages_from_rows(page_rows)
+    messages = await attach_message_artifacts(store, _messages_from_rows(page_rows))
     next_cursor = None
     if has_more:
         next_cursor = _encode_cursor(
@@ -312,7 +325,7 @@ async def _read_tail_page(
 
     has_more = len(rows) > limit
     page_rows = list(reversed(rows[:limit]))
-    messages = _messages_from_rows(page_rows)
+    messages = await attach_message_artifacts(store, _messages_from_rows(page_rows))
     previous_cursor = None
     if has_more:
         previous_cursor = _encode_tail_cursor(
@@ -418,6 +431,6 @@ async def read_channel_timeline_updates(
     ) as query_cursor:
         rows = list(await query_cursor.fetchall())
 
-    messages = _messages_from_rows(rows)
+    messages = await attach_message_artifacts(store, _messages_from_rows(rows))
     next_position = int(rows[-1][7]) if rows else after_position
     return TimelineUpdateBatch(messages, next_position)

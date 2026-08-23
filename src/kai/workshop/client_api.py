@@ -12,9 +12,19 @@ from collections import deque
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Protocol
+from urllib.parse import quote
 
 from aiohttp import web
 
+from kai.workshop.artifacts import (
+    MAX_ARTIFACT_BYTES,
+    ArtifactAccessDeniedError,
+    ArtifactStorageBoundaryError,
+    ArtifactSummary,
+    ArtifactTooLargeError,
+    StagedArtifact,
+    WorkshopArtifactService,
+)
 from kai.workshop.authorization import CanonicalChannelAuthorizer
 from kai.workshop.client_commands import (
     ClientCommandExecutorUnavailableError,
@@ -28,7 +38,7 @@ from kai.workshop.client_events import (
 )
 from kai.workshop.client_sessions import EnrollmentGrantUnavailableError, WorkshopClientEnrollmentManager
 from kai.workshop.conversation_commands import ConversationCommandAcceptanceError
-from kai.workshop.domain import ChannelId, PrincipalId, RunId
+from kai.workshop.domain import ArtifactId, ChannelId, PrincipalId, RunId
 from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.inbound import ClientInboundMessage, InboundBindingNotFoundError
 from kai.workshop.run_lifecycle import DurableRun, RunNotFoundError, RunStatus
@@ -47,6 +57,7 @@ _TIMELINE_EVENTS_PATH = "/v1/channels/{channel_id}/events"
 _CLIENT_NAVIGATION_PATH = "/v1/client/navigation"
 _ENROLLMENT_REDEMPTION_PATH = "/v1/client/enrollment/redeem"
 _COMMAND_SUBMISSION_PATH = "/v1/channels/{channel_id}/commands"
+_ARTIFACT_CONTENT_PATH = "/v1/channels/{channel_id}/artifacts/{artifact_id}/content"
 _RUN_STATE_PATH = "/v1/channels/{channel_id}/runs/{run_id}"
 _RUN_TRACE_PATH = "/v1/channels/{channel_id}/runs/{run_id}/trace"
 _RUN_CANCELLATION_PATH = "/v1/channels/{channel_id}/runs/{run_id}/cancel"
@@ -55,6 +66,7 @@ _ALLOWED_EVENT_QUERY_PARAMETERS = frozenset({"after_position"})
 _ENROLLMENT_REQUEST_FIELDS = frozenset({"enrollment_token", "device_display_name"})
 _COMMAND_REQUEST_FIELDS = frozenset({"client_message_id", "body"})
 _DECIMAL_INTEGER = re.compile(r"^[0-9]+$")
+_CLIENT_MESSAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _EVENT_BATCH_SIZE = 100
 _SSE_RETRY_MILLISECONDS = 2000
 # Trace entries served per /trace response; the client pages with
@@ -69,7 +81,12 @@ class WorkshopClientAuthenticator(Protocol):
 
 
 class WorkshopClientCommandSubmitter(Protocol):
-    async def submit(self, message: ClientInboundMessage) -> ClientCommandSubmission: ...
+    async def submit(
+        self,
+        message: ClientInboundMessage,
+        *,
+        artifact: StagedArtifact | None = None,
+    ) -> ClientCommandSubmission: ...
 
     async def state(self, run_id: RunId) -> DurableRun: ...
 
@@ -263,6 +280,19 @@ def _serialize_message(message: TimelineMessage) -> dict[str, object]:
         "body": message.body,
         "event_position": message.event_position,
         "created_at": _format_timestamp(message.created_at),
+        "artifacts": [_serialize_artifact(artifact) for artifact in message.artifacts],
+    }
+
+
+def _serialize_artifact(artifact: ArtifactSummary) -> dict[str, object]:
+    return {
+        "artifact_id": str(artifact.artifact_id),
+        "kind": artifact.kind,
+        "media_type": artifact.media_type,
+        "byte_size": artifact.byte_size,
+        "content_sha256": artifact.content_sha256,
+        "original_filename": artifact.original_filename,
+        "created_at": _format_timestamp(artifact.created_at),
     }
 
 
@@ -841,6 +871,7 @@ async def _handle_command_submission(
     authenticator: WorkshopClientAuthenticator,
     submitter: WorkshopClientCommandSubmitter,
     request_lock: asyncio.Lock,
+    artifact_service: WorkshopArtifactService | None = None,
 ) -> web.Response:
     """Authenticate, authorize, and durably enqueue one canonical command."""
     async with request_lock:
@@ -853,28 +884,84 @@ async def _handle_command_submission(
         )
         response.headers["WWW-Authenticate"] = "Bearer"
         return response
-    if request.content_type != "application/json":
-        return _error_response(
-            status=415,
-            code="unsupported_media_type",
-            message="Content-Type must be application/json",
-        )
     try:
         channel_id = ChannelId(request.match_info["channel_id"])
-        payload = await request.json()
-    except (UnicodeDecodeError, ValueError):
-        return _error_response(status=400, code="invalid_request", message="Invalid command request")
-    if not isinstance(payload, dict) or set(payload) != _COMMAND_REQUEST_FIELDS:
-        return _error_response(status=400, code="invalid_request", message="Invalid command request")
-    client_message_id = payload["client_message_id"]
-    body = payload["body"]
-    if not isinstance(client_message_id, str) or not isinstance(body, str):
+    except (TypeError, ValueError):
         return _error_response(status=400, code="invalid_request", message="Invalid command request")
 
     async with request_lock:
         authorized = await CanonicalChannelAuthorizer(store).can_submit_command(principal_id, channel_id)
     if not authorized:
         return _error_response(status=403, code="access_denied", message="Access denied")
+
+    artifact: StagedArtifact | None = None
+    if request.content_type == "application/json":
+        try:
+            payload = await request.json()
+        except (UnicodeDecodeError, ValueError):
+            payload = None
+        if not isinstance(payload, dict) or set(payload) != _COMMAND_REQUEST_FIELDS:
+            return _error_response(status=400, code="invalid_request", message="Invalid command request")
+        client_message_id = payload["client_message_id"]
+        body = payload["body"]
+    elif request.content_type == "multipart/form-data" and artifact_service is not None:
+        try:
+            reader = await request.multipart()
+            first = await reader.next()
+            if first is None or first.name != "client_message_id":
+                raise ValueError("invalid multipart fields")
+            client_message_id = await first.text()
+            second = await reader.next()
+            if second is None or second.name != "body":
+                raise ValueError("invalid multipart fields")
+            body = await second.text()
+            if not _CLIENT_MESSAGE_ID_PATTERN.fullmatch(client_message_id) or len(body) > 50_000:
+                raise ValueError("invalid multipart command metadata")
+            file_field = await reader.next()
+            if file_field is None or file_field.name != "file":
+                raise ValueError("invalid multipart fields")
+
+            async def chunks():
+                while chunk := await file_field.read_chunk(size=64 * 1024):
+                    yield bytes(chunk)
+
+            occurred_at = datetime.now(UTC)
+            artifact = await artifact_service.stage_client_upload(
+                principal_id=principal_id,
+                channel_id=channel_id,
+                client_message_id=client_message_id,
+                filename=file_field.filename,
+                claimed_media_type=file_field.headers.get("Content-Type"),
+                chunks=chunks(),
+                occurred_at=occurred_at,
+            )
+            if await reader.next() is not None:
+                artifact.discard()
+                raise ValueError("invalid multipart fields")
+            if not body.strip():
+                body = f"[Attached file: {artifact.original_filename or 'upload'}]"
+        except ArtifactTooLargeError:
+            return _error_response(
+                status=413,
+                code="artifact_too_large",
+                message=f"Attachments must be no larger than {MAX_ARTIFACT_BYTES // (1024 * 1024)} MB",
+            )
+        except ArtifactAccessDeniedError:
+            return _error_response(status=403, code="access_denied", message="Access denied")
+        except (OSError, TypeError, ValueError):
+            return _error_response(
+                status=400,
+                code="invalid_request",
+                message="Invalid artifact command request",
+            )
+    else:
+        return _error_response(
+            status=415,
+            code="unsupported_media_type",
+            message="Content-Type must be application/json or multipart/form-data",
+        )
+    if not isinstance(client_message_id, str) or not isinstance(body, str):
+        return _error_response(status=400, code="invalid_request", message="Invalid command request")
 
     try:
         command = ClientInboundMessage(
@@ -883,19 +970,28 @@ async def _handle_command_submission(
             client_message_id=client_message_id,
             body=body,
             occurred_at=datetime.now(UTC),
+            artifact_source_unique_id=(artifact.source_unique_id if artifact is not None else None),
         )
     except (TypeError, ValueError):
+        if artifact is not None:
+            artifact.discard()
         return _error_response(status=400, code="invalid_request", message="Invalid command request")
 
     try:
-        result = await submitter.submit(command)
+        result = (
+            await submitter.submit(command) if artifact is None else await submitter.submit(command, artifact=artifact)
+        )
     except IdempotencyConflictError:
+        if artifact is not None:
+            artifact.discard()
         return _error_response(
             status=409,
             code="idempotency_conflict",
             message="Command identity conflicts with an existing request",
         )
     except (ConversationCommandAcceptanceError, InboundBindingNotFoundError):
+        if artifact is not None:
+            artifact.discard()
         return _error_response(
             status=409,
             code="command_state_conflict",
@@ -921,6 +1017,62 @@ async def _handle_command_submission(
         },
         status=200 if terminal else 202,
     )
+
+
+async def _handle_artifact_content(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    artifact_service: WorkshopArtifactService,
+    request_lock: asyncio.Lock,
+) -> web.StreamResponse:
+    async with request_lock:
+        principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(
+            status=401,
+            code="authentication_required",
+            message="Authentication required",
+        )
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid artifact request")
+    try:
+        channel_id = ChannelId(request.match_info["channel_id"])
+        artifact_id = ArtifactId(request.match_info["artifact_id"])
+    except (TypeError, ValueError):
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    try:
+        async with request_lock:
+            artifact = await artifact_service.authorized_artifact(
+                principal_id,
+                channel_id,
+                artifact_id,
+            )
+    except (ArtifactAccessDeniedError, ArtifactStorageBoundaryError):
+        return _error_response(status=403, code="access_denied", message="Access denied")
+
+    filename = artifact.summary.original_filename or f"{artifact_id}.bin"
+    safe_ascii = re.sub(r"[^A-Za-z0-9._-]", "_", filename) or "artifact.bin"
+    disposition = (
+        "inline"
+        if (
+            artifact.summary.media_type in {"image/gif", "image/jpeg", "image/png", "image/webp"}
+            or artifact.summary.media_type.startswith("audio/")
+        )
+        else "attachment"
+    )
+    response = web.FileResponse(artifact.storage_path)
+    response.content_type = artifact.summary.media_type
+    response.headers["Content-Disposition"] = (
+        f"{disposition}; filename=\"{safe_ascii}\"; filename*=UTF-8''{quote(filename)}"
+    )
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Content-Security-Policy"] = "default-src 'none'"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
 
 
 async def _authorized_run(
@@ -1090,6 +1242,7 @@ def register_workshop_read_routes(
     event_authentication_recheck_interval: float = 15.0,
     event_stream_limiter: WorkshopEventStreamLimiter | None = None,
     run_previews: WorkshopRunPreviewRegistry | None = None,
+    artifact_service: WorkshopArtifactService | None = None,
 ) -> None:
     """Register the read-only contract on an explicitly supplied application."""
     if event_poll_interval <= 0 or event_heartbeat_interval <= 0 or event_authentication_recheck_interval <= 0:
@@ -1136,6 +1289,17 @@ def register_workshop_read_routes(
     app.router.add_get(_CLIENT_NAVIGATION_PATH, handle_client_navigation)
     app.router.add_get(_TIMELINE_PATH, handle_channel_timeline)
     app.router.add_get(_TIMELINE_EVENTS_PATH, handle_channel_event_stream)
+    if artifact_service is not None:
+
+        async def handle_artifact_content(request: web.Request) -> web.StreamResponse:
+            return await _handle_artifact_content(
+                request,
+                authenticator=authenticator,
+                artifact_service=artifact_service,
+                request_lock=request_lock,
+            )
+
+        app.router.add_get(_ARTIFACT_CONTENT_PATH, handle_artifact_content)
 
 
 def register_workshop_enrollment_routes(
@@ -1165,6 +1329,7 @@ def register_workshop_command_routes(
     authenticator: WorkshopClientAuthenticator,
     submitter: WorkshopClientCommandSubmitter,
     request_lock: asyncio.Lock,
+    artifact_service: WorkshopArtifactService | None = None,
 ) -> None:
     """Register the authenticated command boundary on a supplied application."""
 
@@ -1175,6 +1340,7 @@ def register_workshop_command_routes(
             authenticator=authenticator,
             submitter=submitter,
             request_lock=request_lock,
+            artifact_service=artifact_service,
         )
 
     async def handle_run_state(request: web.Request) -> web.Response:

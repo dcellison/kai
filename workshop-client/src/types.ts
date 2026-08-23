@@ -2,6 +2,7 @@ export const CHANNEL_PATTERN = /^chn_[0-9a-f]{32}$/;
 export const AGENT_PATTERN = /^agt_[0-9a-f]{32}$/;
 export const PRINCIPAL_PATTERN = /^prn_[0-9a-f]{32}$/;
 export const WORKSHOP_PATTERN = /^wsp_[0-9a-f]{32}$/;
+export const ARTIFACT_PATTERN = /^art_[0-9a-f]{32}$/;
 
 export interface WorkshopSession {
   channelId: string;
@@ -47,6 +48,7 @@ export interface WorkshopNavigation {
 }
 
 export interface TimelineMessage {
+  artifacts: WorkshopArtifactSummary[];
   authorDisplayName: string;
   authorKind: string;
   body: string;
@@ -54,6 +56,18 @@ export interface TimelineMessage {
   createdAt: string;
   eventPosition: number;
   messageId: string;
+}
+
+export type WorkshopArtifactKind = "photo" | "document" | "voice";
+
+export interface WorkshopArtifactSummary {
+  artifactId: string;
+  byteSize: number;
+  contentSha256: string;
+  createdAt: string;
+  kind: WorkshopArtifactKind;
+  mediaType: string;
+  originalFilename: string | null;
 }
 
 export interface TimelineSnapshot {

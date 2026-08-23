@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 
+from kai.workshop.artifacts import StagedArtifact
 from kai.workshop.conversation_commands import (
     ClientConversationCommandAcceptance,
     ConversationCommandAcceptance,
@@ -80,11 +81,15 @@ class WorkshopPrivateTextExecutionService:
             registered_backend_ids=registered_backend_ids,
             database_lock=database_lock,
             transcript_projection=CanonicalTranscriptProjection(database_path.parent / "history"),
+            artifact_storage_root=database_path.parent / "files",
         )
         service = cls(
             store,
             coordinator,
-            WorkshopConversationCommandService(store),
+            WorkshopConversationCommandService(
+                store,
+                artifact_storage_root=database_path.parent / "files",
+            ),
             database_lock,
             runtime_pool,
         )
@@ -112,11 +117,13 @@ class WorkshopPrivateTextExecutionService:
     async def accept_client(
         self,
         message: ClientInboundMessage,
+        *,
+        artifact: StagedArtifact | None = None,
     ) -> ClientConversationCommandAcceptance:
         if self._closed:
             raise RuntimeError("Workshop private-text execution service is closed")
         async with self._database_lock:
-            return await self._command_service.accept_client(message)
+            return await self._command_service.accept_client(message, artifact=artifact)
 
     async def accept_scheduled(
         self,
