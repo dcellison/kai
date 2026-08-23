@@ -8,10 +8,12 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from pathlib import Path
 from typing import Protocol
 
 from kai.agent_failure import AgentFailureKind
 from kai.backend import AgentResponse, StreamEvent
+from kai.workshop.artifacts import ArtifactMessageNotFoundError, build_agent_prompt_for_message
 from kai.workshop.conversation_context import assemble_canonical_conversation_context
 from kai.workshop.domain import AgentId, ChannelId, RunExecutionOwnerId, RunId
 from kai.workshop.protected_execution import PreparedWorkshopExecution
@@ -141,6 +143,7 @@ class WorkshopCanonicalExecutionCoordinator:
         lease_duration: timedelta = timedelta(minutes=5),
         database_lock: asyncio.Lock | None = None,
         transcript_projection: CanonicalTranscriptProjection | None = None,
+        artifact_storage_root: Path | None = None,
     ) -> None:
         if not registered_backend_ids:
             raise ValueError("registered_backend_ids must not be empty")
@@ -156,6 +159,7 @@ class WorkshopCanonicalExecutionCoordinator:
         self._map_lock = asyncio.Lock()
         self._database_lock = database_lock or asyncio.Lock()
         self._transcript_projection = transcript_projection
+        self._artifact_storage_root = artifact_storage_root
         self._trace_store = WorkshopRunTraceStore(store)
 
     async def execute(
@@ -513,7 +517,16 @@ class WorkshopCanonicalExecutionCoordinator:
                     )
                 active.claim = renewed.claim
 
-    async def _prompt(self, run: DurableRun) -> str:
+    async def _prompt(self, run: DurableRun) -> str | list:
+        if self._artifact_storage_root is not None:
+            try:
+                return await build_agent_prompt_for_message(
+                    self._store,
+                    run.inbound_message_id,
+                    storage_root=self._artifact_storage_root,
+                )
+            except ArtifactMessageNotFoundError as exc:
+                raise RunExecutionConflictError("Durable run no longer resolves its canonical prompt") from exc
         async with (
             self._database_lock,
             self._store.connection.execute(

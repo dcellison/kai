@@ -13,9 +13,12 @@ import type {
   WorkshopRunTraceSignal,
   WorkshopRunTransition,
   WorkshopSession,
+  WorkshopArtifactKind,
+  WorkshopArtifactSummary,
 } from "./types";
 import {
   AGENT_PATTERN,
+  ARTIFACT_PATTERN,
   CHANNEL_PATTERN,
   PRINCIPAL_PATTERN,
   WORKSHOP_PATTERN,
@@ -98,7 +101,9 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
     created_at: createdAt,
     event_position: eventPosition,
     message_id: messageId,
+    artifacts: suppliedArtifacts,
   } = value;
+  const rawArtifacts = suppliedArtifacts ?? [];
   if (
     typeof authorDisplayName !== "string" ||
     typeof authorKind !== "string" ||
@@ -106,11 +111,51 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
     messageChannelId !== channelId ||
     typeof createdAt !== "string" ||
     !Number.isSafeInteger(eventPosition) ||
-    typeof messageId !== "string"
+    typeof messageId !== "string" ||
+    !Array.isArray(rawArtifacts)
   ) {
     return null;
   }
+  const artifacts: WorkshopArtifactSummary[] = [];
+  for (const rawArtifact of rawArtifacts) {
+    if (!isRecord(rawArtifact)) {
+      return null;
+    }
+    const {
+      artifact_id: artifactId,
+      byte_size: byteSize,
+      content_sha256: contentSha256,
+      created_at: artifactCreatedAt,
+      kind,
+      media_type: mediaType,
+      original_filename: originalFilename,
+    } = rawArtifact;
+    if (
+      typeof artifactId !== "string" ||
+      !ARTIFACT_PATTERN.test(artifactId) ||
+      !Number.isSafeInteger(byteSize) ||
+      typeof contentSha256 !== "string" ||
+      !/^[0-9a-f]{64}$/.test(contentSha256) ||
+      typeof artifactCreatedAt !== "string" ||
+      typeof kind !== "string" ||
+      !["photo", "document", "voice"].includes(kind) ||
+      typeof mediaType !== "string" ||
+      (originalFilename !== null && typeof originalFilename !== "string")
+    ) {
+      return null;
+    }
+    artifacts.push({
+      artifactId,
+      byteSize: byteSize as number,
+      contentSha256,
+      createdAt: artifactCreatedAt,
+      kind: kind as WorkshopArtifactKind,
+      mediaType,
+      originalFilename,
+    });
+  }
   return {
+    artifacts,
     authorDisplayName,
     authorKind,
     body,
@@ -313,15 +358,25 @@ export async function submitCommand(
   session: WorkshopSession,
   clientMessageId: string,
   body: string,
+  artifact: File | null = null,
 ): Promise<CommandSubmissionResult> {
+  const request = artifact
+    ? (() => {
+        const form = new FormData();
+        form.append("client_message_id", clientMessageId);
+        form.append("body", body);
+        form.append("file", artifact, artifact.name);
+        return { body: form, method: "POST" } satisfies RequestInit;
+      })()
+    : {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ body, client_message_id: clientMessageId }),
+      };
   const response = await authorizedFetch(
     session,
     `/v1/channels/${encodeURIComponent(session.channelId)}/commands`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ body, client_message_id: clientMessageId }),
-    },
+    request,
   );
   const payload = await responsePayload(response);
   if (!response.ok) {
@@ -346,6 +401,24 @@ export async function submitCommand(
     messageId: payload.message_id,
     run,
   };
+}
+
+export async function loadArtifactBlob(
+  session: WorkshopSession,
+  artifactId: string,
+): Promise<Blob> {
+  if (!ARTIFACT_PATTERN.test(artifactId)) {
+    throw new Error("Invalid artifact identity.");
+  }
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/artifacts/${encodeURIComponent(artifactId)}/content`,
+  );
+  if (!response.ok) {
+    const payload = await responsePayload(response);
+    throw new Error(safeErrorMessage(payload, "Could not load this attachment."));
+  }
+  return await response.blob();
 }
 
 export async function loadRun(

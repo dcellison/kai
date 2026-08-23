@@ -10,9 +10,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from aiohttp import web
+from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 
+from kai.workshop.artifacts import (
+    StagedArtifact,
+    WorkshopArtifactService,
+    record_inbound_artifact,
+)
 from kai.workshop.bootstrap import (
     BootstrapHuman,
     BootstrapNotificationChannel,
@@ -35,7 +40,6 @@ from kai.workshop.domain import (
     MessageId,
     PrincipalId,
     RunId,
-    RuntimeProfileId,
 )
 from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.inbound import ClientInboundMessage, InboundMessage, record_inbound_message
@@ -46,7 +50,9 @@ from kai.workshop.run_lifecycle import (
     WorkshopRunLifecycle,
 )
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
+from kai.workshop.storage_namespaces import WorkshopPrincipalStorageRegistry
 from kai.workshop.store import WorkshopEventStore
+from tests.workshop_profiles import profile_id, profile_registry
 
 _NOW = datetime(2026, 8, 11, 14, 0, tzinfo=UTC)
 
@@ -68,10 +74,17 @@ class _Authenticator:
 @dataclass
 class _CommandSubmitter:
     messages: list[ClientInboundMessage] = field(default_factory=list)
+    artifacts: list[StagedArtifact | None] = field(default_factory=list)
     runs: dict[RunId, DurableRun] = field(default_factory=dict)
 
-    async def submit(self, message: ClientInboundMessage):
+    async def submit(
+        self,
+        message: ClientInboundMessage,
+        *,
+        artifact: StagedArtifact | None = None,
+    ):
         self.messages.append(message)
+        self.artifacts.append(artifact)
         message_id = MessageId.new()
         run_id = RunId.new()
         run = DurableRun(
@@ -151,7 +164,7 @@ async def _open_store(path: Path) -> tuple[WorkshopEventStore, PrincipalId, Chan
                 "telegram",
                 "101",
                 "101",
-                RuntimeProfileId("rtp_11111111111111111111111111111111"),
+                profile_id(101),
             ),
             BootstrapHuman(
                 "Bob",
@@ -159,7 +172,7 @@ async def _open_store(path: Path) -> tuple[WorkshopEventStore, PrincipalId, Chan
                 "telegram",
                 "202",
                 "202",
-                RuntimeProfileId("rtp_22222222222222222222222222222222"),
+                profile_id(202),
             ),
         ),
         notification_channels=(BootstrapNotificationChannel("telegram", "-100123", ("101", "202")),),
@@ -194,6 +207,7 @@ async def _open_client(
     event_authentication_recheck_interval: float = 0.01,
     event_stream_limiter: WorkshopEventStreamLimiter | None = None,
     run_previews: WorkshopRunPreviewRegistry | None = None,
+    artifact_service: WorkshopArtifactService | None = None,
 ) -> TestClient:
     app = web.Application()
     register_workshop_read_routes(
@@ -206,6 +220,7 @@ async def _open_client(
         event_authentication_recheck_interval=event_authentication_recheck_interval,
         event_stream_limiter=event_stream_limiter,
         run_previews=run_previews,
+        artifact_service=artifact_service,
     )
     client = TestClient(TestServer(app))
     await client.start_server()
@@ -216,18 +231,34 @@ async def _open_command_client(
     store: WorkshopEventStore,
     authenticator: _Authenticator,
     submitter: _CommandSubmitter,
+    artifact_service: WorkshopArtifactService | None = None,
 ) -> TestClient:
-    app = web.Application()
+    app = web.Application(client_max_size=21 * 1024 * 1024)
     register_workshop_command_routes(
         app,
         store=store,
         authenticator=authenticator,
         submitter=submitter,
         request_lock=asyncio.Lock(),
+        artifact_service=artifact_service,
     )
     client = TestClient(TestServer(app))
     await client.start_server()
     return client
+
+
+async def _artifact_service(
+    store: WorkshopEventStore,
+    data_dir: Path,
+) -> WorkshopArtifactService:
+    profiles = profile_registry(101, 202)
+    storage = await WorkshopPrincipalStorageRegistry.from_store(store, profiles)
+    return WorkshopArtifactService(
+        store,
+        data_dir=data_dir,
+        principal_storage=storage,
+        runtime_profiles=profiles,
+    )
 
 
 async def _read_sse_event(response) -> dict[str, object]:
@@ -385,6 +416,73 @@ class TestWorkshopNavigationHTTPContract:
 
 
 class TestWorkshopCommandHTTPContract:
+    async def test_authenticated_multipart_upload_is_staged_for_canonical_acceptance(
+        self,
+        tmp_path: Path,
+    ):
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        service = await _artifact_service(store, tmp_path)
+        submitter = _CommandSubmitter()
+        client = await _open_command_client(
+            store,
+            _Authenticator({"alice-token": alice_id}),
+            submitter,
+            service,
+        )
+        form = FormData()
+        form.add_field("client_message_id", "browser-artifact-1")
+        form.add_field("body", "Please inspect the attachment")
+        form.add_field(
+            "file",
+            b"Workshop artifact content",
+            filename="notes.txt",
+            content_type="text/plain",
+        )
+        try:
+            response = await client.post(
+                f"/v1/channels/{alice_channel}/commands",
+                headers={"Authorization": "Bearer alice-token"},
+                data=form,
+            )
+
+            response_body = await response.text()
+            assert response.status == 202, response_body
+            assert len(submitter.messages) == 1
+            assert len(submitter.artifacts) == 1
+            artifact = submitter.artifacts[0]
+            assert artifact is not None
+            assert artifact.storage_path.read_bytes() == b"Workshop artifact content"
+            assert artifact.storage_path.parent == tmp_path / "files" / str(alice_id)
+            assert artifact.original_filename == "notes.txt"
+            assert submitter.messages[0].artifact_source_unique_id == "browser-artifact-1"
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_upload_authorization_precedes_multipart_parsing(self, tmp_path: Path):
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        service = await _artifact_service(store, tmp_path)
+        submitter = _CommandSubmitter()
+        client = await _open_command_client(
+            store,
+            _Authenticator({"alice-token": alice_id}),
+            submitter,
+            service,
+        )
+        try:
+            response = await client.post(
+                f"/v1/channels/{alice_channel}/commands",
+                data=b"untrusted body that must not be parsed",
+                headers={"Content-Type": "multipart/form-data"},
+            )
+
+            assert response.status == 401
+            assert submitter.messages == []
+            assert not (tmp_path / "files").exists()
+        finally:
+            await client.close()
+            await store.close()
+
     async def test_authenticated_member_submits_only_server_scoped_command_fields(
         self,
         tmp_path: Path,
@@ -599,6 +697,80 @@ class TestWorkshopCommandHTTPContract:
             await store.close()
 
 
+class TestWorkshopArtifactHTTPContract:
+    async def test_member_downloads_an_opaque_artifact_without_storage_metadata(
+        self,
+        tmp_path: Path,
+    ):
+        store, alice_id, alice_channel, bob_id, bob_channel = await _open_store(tmp_path / "kai.db")
+        service = await _artifact_service(store, tmp_path)
+
+        async def content():
+            yield b"private attachment"
+
+        staged = await service.stage_client_upload(
+            principal_id=alice_id,
+            channel_id=alice_channel,
+            client_message_id="browser-download-1",
+            filename="private.txt",
+            claimed_media_type="text/plain",
+            chunks=content(),
+            occurred_at=_NOW,
+        )
+        await _record_messages(store, 1)
+        async with store.connection.execute(
+            "SELECT id FROM messages ORDER BY created_event_position DESC LIMIT 1"
+        ) as cursor:
+            message_id = MessageId(str((await cursor.fetchone())[0]))
+        recorded = await record_inbound_artifact(
+            store,
+            staged.for_message(message_id),
+            storage_root=tmp_path / "files",
+        )
+        artifact_id = recorded.event.envelope.aggregate_id
+        client = await _open_client(
+            store,
+            _Authenticator({"alice-token": alice_id, "bob-token": bob_id}),
+            artifact_service=service,
+        )
+        try:
+            response = await client.get(
+                f"/v1/channels/{alice_channel}/artifacts/{artifact_id}/content",
+                headers={"Authorization": "Bearer alice-token"},
+            )
+            cross_principal = await client.get(
+                f"/v1/channels/{alice_channel}/artifacts/{artifact_id}/content",
+                headers={"Authorization": "Bearer bob-token"},
+            )
+            wrong_channel = await client.get(
+                f"/v1/channels/{bob_channel}/artifacts/{artifact_id}/content",
+                headers={"Authorization": "Bearer alice-token"},
+            )
+            timeline = await client.get(
+                f"/v1/channels/{alice_channel}/timeline",
+                headers={"Authorization": "Bearer alice-token"},
+            )
+            timeline_payload = await timeline.json()
+            artifact_payload = timeline_payload["messages"][0]["artifacts"][0]
+
+            assert response.status == 200
+            assert await response.read() == b"private attachment"
+            assert response.headers["Cache-Control"] == "private, no-store"
+            assert response.headers["X-Content-Type-Options"] == "nosniff"
+            assert response.headers["Content-Disposition"].startswith("attachment;")
+            assert cross_principal.status == 403
+            assert wrong_channel.status == 403
+            assert await cross_principal.json() == await wrong_channel.json()
+            assert artifact_payload["artifact_id"] == artifact_id
+            assert artifact_payload["original_filename"] == "private.txt"
+            assert artifact_payload["media_type"] == "text/plain"
+            assert "storage_path" not in artifact_payload
+            assert "source_unique_id" not in artifact_payload
+        finally:
+            await client.close()
+            await store.close()
+
+
 class TestWorkshopTimelineHTTPContract:
     async def test_authenticated_member_receives_versioned_canonical_page(self, tmp_path: Path):
         store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
@@ -631,6 +803,7 @@ class TestWorkshopTimelineHTTPContract:
                         "body": "Message 1",
                         "event_position": payload["messages"][0]["event_position"],
                         "created_at": "2026-08-11T14:00:01Z",
+                        "artifacts": [],
                     }
                 ],
                 "next_cursor": None,
@@ -949,6 +1122,7 @@ class TestWorkshopTimelineEventStreamHTTPContract:
                     "body": "Message 1",
                     "event_position": int(str(first["id"])),
                     "created_at": "2026-08-11T14:00:01Z",
+                    "artifacts": [],
                 },
             }
             assert second["data"]["message"]["body"] == "Message 2"

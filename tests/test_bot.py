@@ -90,7 +90,11 @@ from kai.config import (
 )
 from kai.review import CollectionWarning, PRReviewResult
 from kai.tts import DEFAULT_VOICE, VOICES
-from kai.workshop.artifacts import InboundArtifact
+from kai.workshop.artifacts import (
+    InboundArtifact,
+    StagedArtifact,
+    canonical_artifact_media_type,
+)
 from kai.workshop.conversation_commands import ConversationCommandDisposition
 from kai.workshop.conversation_runs import (
     CanonicalConversationRunTarget,
@@ -843,6 +847,42 @@ def _make_mock_claude(model="sonnet", workspace=None, is_alive=True, provider="a
     return pool
 
 
+class _TestArtifactService:
+    async def stage_upload(
+        self,
+        *,
+        principal_id,
+        filename,
+        claimed_media_type,
+        chunks,
+        source_transport,
+        source_unique_id,
+        occurred_at,
+        kind,
+        **_unused,
+    ):
+        content = b"".join([chunk async for chunk in chunks])
+        from kai import bot as bot_module
+
+        path = bot_module._save_upload(
+            content,
+            filename,
+            principal_id=principal_id,
+        )
+        return StagedArtifact(
+            kind=kind,
+            media_type=canonical_artifact_media_type(filename, claimed_media_type),
+            storage_path=path,
+            source_transport=source_transport,
+            source_unique_id=source_unique_id,
+            occurred_at=occurred_at,
+            original_filename=(
+                Path(filename.replace("\\", "/")).name if source_transport != "telegram" or kind == "document" else None
+            ),
+            created_for_attempt=True,
+        )
+
+
 def _make_context(config=None, claude=None, pool=None, args=None, user_data=None, job_queue=None):
     """Create a mock PTB context with bot_data, args, and user_data."""
     ctx = MagicMock()
@@ -915,6 +955,7 @@ def _make_context(config=None, claude=None, pool=None, args=None, user_data=None
         private_text_execution=None,
         conversation_runs=None,
         principal_storage=principal_storage,
+        artifacts=_TestArtifactService(),
         scheduler=SimpleNamespace(remove_job=AsyncMock()),
     )
     ctx.application = application

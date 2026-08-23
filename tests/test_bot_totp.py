@@ -438,6 +438,11 @@ async def test_photo_passes_with_valid_totp():
             "kai.bot._upload_principal_id",
             return_value=PrincipalId("prn_00000000000000000000000000000001"),
         ),
+        patch(
+            "kai.bot._stage_media_upload",
+            new_callable=AsyncMock,
+            return_value=MagicMock(storage_path="/tmp/totp-photo.jpg"),
+        ),
         patch("kai.bot.log_message"),
         patch("kai.bot._notify_if_queued", new_callable=AsyncMock, return_value=False),
         patch("kai.bot._acquire_lock_or_kill", new_callable=AsyncMock, return_value=None),

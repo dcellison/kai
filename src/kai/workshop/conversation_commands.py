@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 
+from kai.workshop.artifacts import StagedArtifact, record_inbound_artifact_in_transaction
 from kai.workshop.delivery_outbox import (
     CONVERSATION_REPLY_PURPOSE,
     DeliveryRequest,
@@ -77,8 +79,9 @@ class WorkshopConversationCommandService:
     the execution coordinator owned by the production private-text runtime.
     """
 
-    def __init__(self, store: WorkshopEventStore) -> None:
+    def __init__(self, store: WorkshopEventStore, *, artifact_storage_root: Path | None = None) -> None:
         self._store = store
+        self._artifact_storage_root = artifact_storage_root
 
     async def accept(self, message: InboundMessage) -> ConversationCommandAcceptance:
         if not isinstance(message, InboundMessage):
@@ -116,6 +119,8 @@ class WorkshopConversationCommandService:
     async def accept_client(
         self,
         message: ClientInboundMessage,
+        *,
+        artifact: StagedArtifact | None = None,
     ) -> ClientConversationCommandAcceptance:
         """Accept one canonical browser command and optional Telegram echo."""
         if not isinstance(message, ClientInboundMessage):
@@ -127,6 +132,17 @@ class WorkshopConversationCommandService:
             inbound_message_id = inbound.event.envelope.aggregate_id
             if not isinstance(inbound_message_id, MessageId):
                 raise ConversationCommandStateConflictError("Canonical inbound event did not identify a message")
+            artifact_result = None
+            if artifact is not None:
+                if self._artifact_storage_root is None:
+                    raise ConversationCommandStateConflictError("Canonical artifact storage is unavailable")
+                if message.artifact_source_unique_id != artifact.source_unique_id:
+                    raise ConversationCommandStateConflictError("Canonical message and artifact identity disagree")
+                artifact_result = await record_inbound_artifact_in_transaction(
+                    self._store,
+                    artifact.for_message(inbound_message_id),
+                    storage_root=self._artifact_storage_root,
+                )
             lifecycle = await WorkshopRunLifecycle(self._store).accept_in_transaction(
                 inbound_message_id,
                 occurred_at=inbound.event.envelope.occurred_at,
@@ -157,6 +173,8 @@ class WorkshopConversationCommandService:
                 else None
             )
             prior_states = {inbound.inserted, lifecycle.changed}
+            if artifact_result is not None:
+                prior_states.add(artifact_result.inserted)
             if delivery is not None:
                 prior_states.add(delivery.inserted)
             if len(prior_states) != 1:

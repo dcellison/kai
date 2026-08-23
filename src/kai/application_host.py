@@ -11,6 +11,7 @@ from typing import Protocol
 from kai import sessions
 from kai.config import Config
 from kai.pool import SubprocessPool
+from kai.workshop.artifacts import WorkshopArtifactService
 from kai.workshop.client_commands import WorkshopClientCommandExecutor
 from kai.workshop.compatibility_state import WorkshopCompatibilityStateWriter
 from kai.workshop.conversation_runs import WorkshopConversationRunService
@@ -103,6 +104,7 @@ class KaiCoreServices:
     delivery_authority_epoch: DeliveryAuthorityEpoch
     run_previews: WorkshopRunPreviewRegistry
     scheduler: WorkshopCanonicalScheduler
+    artifacts: WorkshopArtifactService
 
 
 class KaiApplicationHost:
@@ -201,6 +203,12 @@ class KaiApplicationHost:
                 private_execution,
                 compatibility_state,
             )
+            artifacts = WorkshopArtifactService(
+                client_store,
+                data_dir=Path(self._config.session_db_path).parent,
+                principal_storage=self._principal_storage,
+                runtime_profiles=self._runtime_profiles,
+            )
 
             self._services = KaiCoreServices(
                 subprocess_pool=subprocess_pool,
@@ -214,6 +222,7 @@ class KaiApplicationHost:
                 delivery_authority_epoch=delivery_authority_epoch,
                 run_previews=run_previews,
                 scheduler=scheduler,
+                artifacts=artifacts,
             )
             self._state = KaiApplicationState.READY
             return self._services

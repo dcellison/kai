@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   EventStreamDecoder,
   cancelRun,
+  loadArtifactBlob,
   loadEarlierTimeline,
   loadNavigation,
   loadRun,
@@ -264,6 +265,71 @@ describe("Workshop client API", () => {
       body: "Hello from Workshop",
       client_message_id: "browser-command-1",
     });
+  });
+
+  it("submits one attachment as ordered multipart data under bearer authority", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      Response.json({
+        version: 2,
+        acceptance: "newly_accepted",
+        message_id: "msg_00000000000000000000000000000001",
+        run_id: "run_00000000000000000000000000000001",
+        run: run(),
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const artifact = new File(["attachment body"], "notes.txt", {
+      type: "text/plain",
+    });
+
+    await submitCommand(
+      session,
+      "browser-artifact-1",
+      "Inspect this",
+      artifact,
+    );
+
+    const [path, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(path).toBe(`/v1/channels/${channelId}/commands`);
+    expect(new Headers(options.headers).get("Authorization")).toBe(
+      "Bearer session-secret",
+    );
+    expect(new Headers(options.headers).has("Content-Type")).toBe(false);
+    expect(options.body).toBeInstanceOf(FormData);
+    const fields = Array.from((options.body as FormData).entries());
+    expect(fields.map(([name]) => name)).toEqual([
+      "client_message_id",
+      "body",
+      "file",
+    ]);
+    expect(fields[0]?.[1]).toBe("browser-artifact-1");
+    expect(fields[1]?.[1]).toBe("Inspect this");
+    const submittedFile = fields[2]?.[1];
+    expect(submittedFile).toBeInstanceOf(File);
+    expect((submittedFile as File).name).toBe("notes.txt");
+    await expect((submittedFile as File).text()).resolves.toBe("attachment body");
+  });
+
+  it("loads an opaque channel-scoped artifact with bearer authority", async () => {
+    const blob = new Blob(["artifact"], { type: "text/plain" });
+    const fetchMock = vi.fn().mockResolvedValue({
+      blob: vi.fn().mockResolvedValue(blob),
+      ok: true,
+      status: 200,
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const artifactId = "art_00000000000000000000000000000001";
+
+    await expect(loadArtifactBlob(session, artifactId)).resolves.toEqual(blob);
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      `/v1/channels/${channelId}/artifacts/${artifactId}/content`,
+    );
+    expect(
+      new Headers((fetchMock.mock.calls[0]?.[1] as RequestInit).headers).get(
+        "Authorization",
+      ),
+    ).toBe("Bearer session-secret");
   });
 
   it("inspects and cancels a run through channel-scoped routes", async () => {

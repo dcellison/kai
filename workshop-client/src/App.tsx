@@ -15,6 +15,7 @@ import {
   cancelRun,
   ChannelAccessError,
   loadNavigation,
+  loadArtifactBlob,
   loadRun,
   loadRunTrace,
   redeemEnrollment,
@@ -33,6 +34,7 @@ import type {
   WorkshopNavigation,
   WorkshopSession,
   WorkshopSummary,
+  WorkshopArtifactSummary,
 } from "./types";
 import { CHANNEL_PATTERN } from "./types";
 import { RunTraceCard } from "./RunTraceCard";
@@ -537,9 +539,11 @@ function ConnectionIndicator({
 function MessageItem({
   message,
   notification = false,
+  onLoadArtifact,
 }: {
   message: TimelineMessage;
   notification?: boolean;
+  onLoadArtifact: (artifactId: string) => Promise<Blob>;
 }): React.JSX.Element {
   const isAgent = message.authorKind === "agent";
   const displayName = message.authorDisplayName || "Unknown author";
@@ -555,6 +559,13 @@ function MessageItem({
             </time>
           </header>
           <MarkdownMessage body={message.body} />
+          {message.artifacts.map((artifact) => (
+            <ArtifactAttachment
+              artifact={artifact}
+              key={artifact.artifactId}
+              onLoad={onLoadArtifact}
+            />
+          ))}
         </article>
       </li>
     );
@@ -572,8 +583,94 @@ function MessageItem({
           </time>
         </header>
         <MarkdownMessage body={message.body} />
+        {message.artifacts.map((artifact) => (
+          <ArtifactAttachment
+            artifact={artifact}
+            key={artifact.artifactId}
+            onLoad={onLoadArtifact}
+          />
+        ))}
       </article>
     </li>
+  );
+}
+
+const SAFE_INLINE_IMAGE_TYPES = new Set([
+  "image/gif",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+]);
+
+function ArtifactAttachment({
+  artifact,
+  onLoad,
+}: {
+  artifact: WorkshopArtifactSummary;
+  onLoad: (artifactId: string) => Promise<Blob>;
+}): React.JSX.Element {
+  const [objectUrl, setObjectUrl] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const inline = SAFE_INLINE_IMAGE_TYPES.has(artifact.mediaType) ||
+    artifact.mediaType.startsWith("audio/");
+
+  useEffect(() => {
+    if (!inline) {
+      return;
+    }
+    let cancelled = false;
+    let createdUrl: string | null = null;
+    void onLoad(artifact.artifactId)
+      .then((blob) => {
+        if (cancelled) {
+          return;
+        }
+        createdUrl = URL.createObjectURL(blob);
+        setObjectUrl(createdUrl);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setError("Attachment preview unavailable.");
+        }
+      });
+    return () => {
+      cancelled = true;
+      if (createdUrl) {
+        URL.revokeObjectURL(createdUrl);
+      }
+    };
+  }, [artifact.artifactId, inline, onLoad]);
+
+  const download = async (): Promise<void> => {
+    setError(null);
+    try {
+      const blob = await onLoad(artifact.artifactId);
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = artifact.originalFilename ?? "artifact";
+      anchor.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    } catch {
+      setError("Could not download this attachment.");
+    }
+  };
+
+  return (
+    <section className="message-artifact">
+      {objectUrl && SAFE_INLINE_IMAGE_TYPES.has(artifact.mediaType) && (
+        <img src={objectUrl} alt={artifact.originalFilename ?? "Attached image"} />
+      )}
+      {objectUrl && artifact.mediaType.startsWith("audio/") && (
+        <audio src={objectUrl} controls preload="metadata" />
+      )}
+      <div className="artifact-meta">
+        <span>{artifact.originalFilename ?? "Attachment"}</span>
+        <small>{Math.max(1, Math.ceil(artifact.byteSize / 1024))} KB</small>
+        <button type="button" onClick={() => void download()}>Download</button>
+      </div>
+      {error && <p className="artifact-error" role="alert">{error}</p>}
+    </section>
   );
 }
 
@@ -647,6 +744,7 @@ function WorkshopView({
   onForget,
   onCancelRun,
   onLoadEarlier,
+  onLoadArtifact,
   onLoadRun,
   onLoadRunTrace,
   onSelectChannel,
@@ -664,12 +762,14 @@ function WorkshopView({
   onForget: () => void;
   onCancelRun: (runId: string) => Promise<WorkshopRun>;
   onLoadEarlier: () => void;
+  onLoadArtifact: (artifactId: string) => Promise<Blob>;
   onLoadRun: (runId: string) => Promise<WorkshopRun>;
   onLoadRunTrace: (runId: string, afterSeq: number) => Promise<WorkshopRunTracePage>;
   onSelectChannel: (channelId: string) => void;
   onSubmitCommand: (
     clientMessageId: string,
     body: string,
+    artifact: File | null,
   ) => Promise<CommandSubmissionResult>;
 }): React.JSX.Element {
   const channelId = channel.channelId;
@@ -679,6 +779,7 @@ function WorkshopView({
   const [pendingMessageId, setPendingMessageId] = useState<string | null>(null);
   const [submissionError, setSubmissionError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [selectedArtifact, setSelectedArtifact] = useState<File | null>(null);
   const [stopping, setStopping] = useState(false);
   const [activeRun, setActiveRun] = useState<WorkshopRun | null>(null);
   const [runClock, setRunClock] = useState(() => Date.now());
@@ -695,6 +796,7 @@ function WorkshopView({
   const [resizingContext, setResizingContext] = useState(false);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const artifactInputRef = useRef<HTMLInputElement | null>(null);
   const sidebarRef = useRef<HTMLElement | null>(null);
   const sidebarResizeStartRef = useRef({ pointerX: 0, width: 0 });
   const contextResizeStartRef = useRef({ pointerX: 0, width: 0 });
@@ -1065,7 +1167,7 @@ function WorkshopView({
   const submit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
     const body = draft.trim();
-    if (!body || submitting || isRunActive(activeRun)) {
+    if ((!body && !selectedArtifact) || submitting || isRunActive(activeRun)) {
       return;
     }
     setSubmissionError(null);
@@ -1073,10 +1175,14 @@ function WorkshopView({
     try {
       const clientMessageId = pendingMessageId ?? createClientMessageId();
       setPendingMessageId(clientMessageId);
-      const result = await onSubmitCommand(clientMessageId, body);
+      const result = await onSubmitCommand(clientMessageId, body, selectedArtifact);
       setDraft("");
       storeDraft(channelId, "");
       setPendingMessageId(null);
+      setSelectedArtifact(null);
+      if (artifactInputRef.current) {
+        artifactInputRef.current.value = "";
+      }
       const streamed = latestRunActivityRef.current;
       setActiveRun(
         streamed?.run.runId === result.run.runId ? streamed.run : result.run,
@@ -1337,6 +1443,7 @@ function WorkshopView({
                   key={message.messageId}
                   message={message}
                   notification={channel.kind === "notification"}
+                  onLoadArtifact={onLoadArtifact}
                 />
               ))}
               {runPreview && channel.kind !== "notification" && (
@@ -1395,6 +1502,24 @@ function WorkshopView({
           )}
           {channel.canSubmitCommands ? (
             <form className="composer-form" onSubmit={(event) => void submit(event)}>
+              <input
+                ref={artifactInputRef}
+                className="artifact-input"
+                type="file"
+                aria-label="Attach a file"
+                onChange={(event) => {
+                  setSelectedArtifact(event.target.files?.[0] ?? null);
+                  setPendingMessageId(null);
+                }}
+              />
+              <button
+                className="attach-button"
+                type="button"
+                disabled={submitting || isRunActive(activeRun)}
+                onClick={() => artifactInputRef.current?.click()}
+              >
+                Attach
+              </button>
               <textarea
                 ref={composerRef}
                 aria-label={`Message ${channelName}`}
@@ -1435,7 +1560,11 @@ function WorkshopView({
               />
               <button
                 type="submit"
-                disabled={submitting || isRunActive(activeRun) || !draft.trim()}
+                disabled={
+                  submitting ||
+                  isRunActive(activeRun) ||
+                  (!draft.trim() && !selectedArtifact)
+                }
               >
                 {submitting ? "Sending…" : "Send"}
               </button>
@@ -1459,6 +1588,23 @@ function WorkshopView({
           )}
           {submissionError && (
             <p className="composer-error" role="alert">{submissionError}</p>
+          )}
+          {selectedArtifact && (
+            <div className="selected-artifact">
+              <span>{selectedArtifact.name}</span>
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedArtifact(null);
+                  setPendingMessageId(null);
+                  if (artifactInputRef.current) {
+                    artifactInputRef.current.value = "";
+                  }
+                }}
+              >
+                Remove
+              </button>
+            </div>
           )}
           {!activeRun && channel.canSubmitCommands && (
             <span className="composer-mode" role="status">
@@ -1630,8 +1776,15 @@ function ActiveWorkshopClient({
     [session, withAccessHandling],
   );
   const submitSelectedCommand = useCallback(
-    (clientMessageId: string, body: string) =>
-      withAccessHandling(() => submitCommand(session, clientMessageId, body)),
+    (clientMessageId: string, body: string, artifact: File | null) =>
+      withAccessHandling(() =>
+        submitCommand(session, clientMessageId, body, artifact)
+      ),
+    [session, withAccessHandling],
+  );
+  const loadSelectedArtifact = useCallback(
+    (artifactId: string) =>
+      withAccessHandling(() => loadArtifactBlob(session, artifactId)),
     [session, withAccessHandling],
   );
   if (!selected) {
@@ -1646,6 +1799,7 @@ function ActiveWorkshopClient({
       messages={messages}
       navigation={navigation}
       onLoadEarlier={loadEarlier}
+      onLoadArtifact={loadSelectedArtifact}
       runActivity={runActivity}
       runPreview={runPreview}
       runTrace={runTrace}

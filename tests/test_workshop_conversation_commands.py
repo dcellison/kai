@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from kai.workshop.artifacts import ArtifactStorageBoundaryError, StagedArtifact
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.conversation_commands import (
     ConversationCommandDisposition,
@@ -92,6 +93,7 @@ def _client_message(
     *,
     body: str = "Run this from Workshop",
     occurred_at: datetime = _NOW,
+    artifact_source_unique_id: str | None = None,
 ) -> ClientInboundMessage:
     return ClientInboundMessage(
         principal_id=principal_id,
@@ -99,6 +101,7 @@ def _client_message(
         client_message_id="browser-command-1",
         body=body,
         occurred_at=occurred_at,
+        artifact_source_unique_id=artifact_source_unique_id,
     )
 
 
@@ -333,6 +336,102 @@ class TestConversationCommandReplay:
 
 
 class TestAtomicClientConversationCommandAcceptance:
+    async def test_accepts_artifact_message_run_and_echo_in_one_transaction(
+        self,
+        tmp_path: Path,
+    ):
+        store, principal_id, channel_id = await _open_client_store(tmp_path / "kai.db")
+        storage_root = tmp_path / "files"
+        artifact_path = storage_root / str(principal_id) / "artifact.txt"
+        artifact_path.parent.mkdir(parents=True)
+        artifact_path.write_text("canonical attachment", encoding="utf-8")
+        artifact = StagedArtifact(
+            kind="document",
+            media_type="text/plain",
+            storage_path=artifact_path,
+            source_transport="workshop_client",
+            source_unique_id="browser-command-1",
+            occurred_at=_NOW,
+            original_filename="artifact.txt",
+            created_for_attempt=True,
+        )
+        message = _client_message(
+            principal_id,
+            channel_id,
+            artifact_source_unique_id="browser-command-1",
+        )
+        service = WorkshopConversationCommandService(
+            store,
+            artifact_storage_root=storage_root,
+        )
+        try:
+            accepted = await service.accept_client(message, artifact=artifact)
+            replay = await service.accept_client(message, artifact=artifact)
+
+            assert accepted.command.disposition == ConversationCommandDisposition.NEWLY_ACCEPTED
+            assert replay.command.disposition == ConversationCommandDisposition.READY_REPLAY
+            async with store.connection.execute(
+                "SELECT event_type FROM event_log WHERE position BETWEEN ? AND ? ORDER BY position",
+                (
+                    accepted.command.message.event.position,
+                    accepted.delivery.delivery.requested_event_position,
+                ),
+            ) as cursor:
+                assert [str(row[0]) for row in await cursor.fetchall()] == [
+                    "message.created",
+                    "artifact.created",
+                    "run.accepted",
+                    "delivery.requested",
+                ]
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM artifacts WHERE message_id = ?",
+                (accepted.command.message.event.envelope.aggregate_id,),
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 1
+
+            with pytest.raises(IdempotencyConflictError):
+                await service.accept_client(
+                    _client_message(principal_id, channel_id),
+                )
+            async with store.connection.execute("SELECT COUNT(*) FROM event_log") as cursor:
+                event_count = int((await cursor.fetchone())[0])
+            assert event_count == accepted.delivery.delivery.requested_event_position
+        finally:
+            await store.close()
+
+    async def test_artifact_failure_rolls_back_the_message_and_run(self, tmp_path: Path):
+        store, principal_id, channel_id = await _open_client_store(tmp_path / "kai.db")
+        storage_root = tmp_path / "files"
+        artifact = StagedArtifact(
+            kind="document",
+            media_type="application/octet-stream",
+            storage_path=(storage_root / "missing.bin").resolve(),
+            source_transport="workshop_client",
+            source_unique_id="browser-command-1",
+            occurred_at=_NOW,
+            original_filename="missing.bin",
+        )
+        try:
+            with pytest.raises(ArtifactStorageBoundaryError):
+                await WorkshopConversationCommandService(
+                    store,
+                    artifact_storage_root=storage_root,
+                ).accept_client(
+                    _client_message(
+                        principal_id,
+                        channel_id,
+                        artifact_source_unique_id="browser-command-1",
+                    ),
+                    artifact=artifact,
+                )
+
+            async with store.connection.execute(
+                "SELECT (SELECT COUNT(*) FROM messages), (SELECT COUNT(*) FROM artifacts), (SELECT COUNT(*) FROM runs)"
+            ) as cursor:
+                assert tuple(await cursor.fetchone()) == (0, 0, 0)
+        finally:
+            await store.close()
+
     async def test_accepts_message_run_and_telegram_echo_in_one_transaction(
         self,
         tmp_path: Path,

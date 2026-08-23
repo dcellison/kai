@@ -7,6 +7,7 @@ import logging
 from dataclasses import dataclass
 
 from kai.streaming_text import stream_publishable_prefix
+from kai.workshop.artifacts import StagedArtifact
 from kai.workshop.compatibility_state import WorkshopCompatibilityStateWriter
 from kai.workshop.conversation_commands import (
     ClientConversationCommandAcceptance,
@@ -84,10 +85,15 @@ class WorkshopClientCommandExecutor:
             name="kai-workshop-client-run-reconciliation",
         )
 
-    async def submit(self, message: ClientInboundMessage) -> ClientCommandSubmission:
+    async def submit(
+        self,
+        message: ClientInboundMessage,
+        *,
+        artifact: StagedArtifact | None = None,
+    ) -> ClientCommandSubmission:
         if not self.ready:
             raise ClientCommandExecutorUnavailableError("Workshop client command executor is unavailable")
-        accepted = await self._execution.accept_client(message)
+        accepted = await self._execution.accept_client(message, artifact=artifact)
         if accepted.command.disposition in {
             ConversationCommandDisposition.NEWLY_ACCEPTED,
             ConversationCommandDisposition.READY_REPLAY,

@@ -59,6 +59,7 @@ class ClientInboundMessage:
     client_message_id: str
     body: str
     occurred_at: datetime
+    artifact_source_unique_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.principal_id, PrincipalId):
@@ -71,6 +72,12 @@ class ClientInboundMessage:
             raise ValueError("body must contain non-whitespace text")
         if len(self.body) > 50_000:
             raise ValueError("body must be at most 50000 characters")
+        if self.artifact_source_unique_id is not None and (
+            not isinstance(self.artifact_source_unique_id, str)
+            or not self.artifact_source_unique_id
+            or len(self.artifact_source_unique_id) > 512
+        ):
+            raise ValueError("artifact_source_unique_id must be bounded or None")
         if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
             raise ValueError("occurred_at must be timezone-aware")
 
@@ -229,6 +236,12 @@ def _client_inbound_envelope(
 ) -> EventEnvelope:
     stable_name = f"client-message:{message.principal_id}:{message.channel_id}:{message.client_message_id}"
     message_id = MessageId.derived(binding.workshop_id, stable_name)
+    metadata: dict[str, object] = {
+        "source": "workshop_client",
+        "client_message_id": message.client_message_id,
+    }
+    if message.artifact_source_unique_id is not None:
+        metadata["artifact_source_unique_id"] = message.artifact_source_unique_id
     return EventEnvelope.create(
         event_id=EventId.derived(binding.workshop_id, f"client-message-event:{message_id}"),
         event_type=WorkshopEventType.MESSAGE_CREATED,
@@ -244,10 +257,7 @@ def _client_inbound_envelope(
             "author_principal_id": binding.principal_id,
             "body": message.body,
         },
-        metadata={
-            "source": "workshop_client",
-            "client_message_id": message.client_message_id,
-        },
+        metadata=metadata,
     )
 
 

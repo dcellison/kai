@@ -79,6 +79,7 @@ from kai.config import (
 from kai.internal_api_auth import InternalAPIAuth, InternalAPIPrincipal, InternalAPIScope
 from kai.job_types import CANONICAL_JOB_TYPES, normalize_job_type
 from kai.telegram_utils import chunk_text
+from kai.workshop.artifacts import MAX_ARTIFACT_BYTES, WorkshopArtifactService
 from kai.workshop.client_api import (
     WorkshopClientCommandSubmitter,
     WorkshopEnrollmentRateLimiter,
@@ -2575,6 +2576,7 @@ async def _register_workshop_client_api(
     *,
     command_submitter: WorkshopClientCommandSubmitter | None = None,
     run_previews: WorkshopRunPreviewRegistry | None = None,
+    artifact_service: WorkshopArtifactService | None = None,
 ) -> Callable[[web.Application], None]:
     """Register the client API against the core-owned canonical store.
 
@@ -2606,6 +2608,7 @@ async def _register_workshop_client_api(
             request_lock=request_lock,
             event_stream_limiter=event_stream_limiter,
             run_previews=run_previews,
+            artifact_service=artifact_service,
         )
         if command_submitter is not None:
             register_workshop_command_routes(
@@ -2614,6 +2617,7 @@ async def _register_workshop_client_api(
                 authenticator=authenticator,
                 submitter=command_submitter,
                 request_lock=request_lock,
+                artifact_service=artifact_service,
             )
         register_workshop_shell_routes(target)
 
@@ -2651,7 +2655,7 @@ async def start(
     """
     global _app, _runner, _workshop_lan_runner, _webhook_registered, _health_monitor_task
 
-    _app = web.Application()
+    _app = web.Application(client_max_size=MAX_ARTIFACT_BYTES + 128 * 1024)
     _app[CORE_HOST_KEY] = core_host
     telegram_enabled = telegram_app is not None
     if telegram_enabled:
@@ -2740,6 +2744,7 @@ async def start(
             core_services.client_store,
             command_submitter=core_services.client_commands,
             run_previews=core_services.run_previews,
+            artifact_service=core_services.artifacts,
         )
 
     _runner = web.AppRunner(
@@ -2757,7 +2762,7 @@ async def start(
 
     if workshop_enabled and config.workshop_lan_host:
         assert register_workshop_routes is not None
-        workshop_lan_app = web.Application()
+        workshop_lan_app = web.Application(client_max_size=MAX_ARTIFACT_BYTES + 128 * 1024)
         register_workshop_routes(workshop_lan_app)
         _workshop_lan_runner = web.AppRunner(
             workshop_lan_app,
