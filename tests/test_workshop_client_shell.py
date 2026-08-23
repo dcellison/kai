@@ -26,11 +26,20 @@ class TestWorkshopClientShell:
             assert response.status == 200
             assert response.content_type == "text/html"
             assert response.headers["Cache-Control"] == "private, no-store"
-            assert "default-src 'none'" in response.headers["Content-Security-Policy"]
-            assert "script-src 'self'" in response.headers["Content-Security-Policy"]
-            assert "style-src 'self'" in response.headers["Content-Security-Policy"]
-            assert "connect-src 'self'" in response.headers["Content-Security-Policy"]
-            assert "frame-ancestors 'none'" in response.headers["Content-Security-Policy"]
+            assert response.headers["Content-Security-Policy"] == "; ".join(
+                (
+                    "default-src 'none'",
+                    "script-src 'self'",
+                    "style-src 'self'",
+                    "connect-src 'self'",
+                    "base-uri 'none'",
+                    "form-action 'self'",
+                    "frame-ancestors 'none'",
+                    "img-src blob:",
+                    "media-src blob:",
+                    "font-src 'none'",
+                )
+            )
             assert response.headers["Cross-Origin-Opener-Policy"] == "same-origin"
             assert response.headers["Cross-Origin-Resource-Policy"] == "same-origin"
             assert response.headers["Referrer-Policy"] == "no-referrer"
