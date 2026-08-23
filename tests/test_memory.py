@@ -82,32 +82,10 @@ def _reset_memory_module():
 
 
 def _close_init_memory() -> None:
-    """Close the singleton Memory created by a `TestInitMemory` test.
-
-    Mem0's own `close()` only closes the history SQLite db. The
-    Qdrant `vector_store` and `_telemetry_vector_store` hold separate
-    `QdrantClient` instances that own SQLite connections and embedded
-    storage locks; both need explicit `client.close()`. Each step is
-    wrapped in try/except because we may be tearing down a half-init
-    object and individual cleanup failures must not stop later steps.
-    """
+    """Close the singleton Memory created by a `TestInitMemory` test."""
     import kai.memory as mem_mod
 
-    memory = mem_mod._memory
-    if memory is None:
-        return
-    try:
-        memory.close()
-    except Exception:
-        pass
-    for attr in ("vector_store", "_telemetry_vector_store"):
-        store = getattr(memory, attr, None)
-        client = getattr(store, "client", None)
-        if client is not None and hasattr(client, "close"):
-            try:
-                client.close()
-            except Exception:
-                pass
+    mem_mod.close_memory()
 
 
 # ── Fixtures ────────────────────────────────────────────────────────
@@ -460,6 +438,49 @@ class TestInitMemory:
         init_memory(config)
         assert not is_enabled()
 
+    def test_close_releases_all_owned_resources_and_is_idempotent(self):
+        import kai.memory as mem_mod
+
+        primary_client = MagicMock()
+        telemetry_client = MagicMock()
+        memory = MagicMock(
+            vector_store=SimpleNamespace(client=primary_client),
+            _telemetry_vector_store=SimpleNamespace(client=telemetry_client),
+        )
+        mem_mod._memory = memory
+        mem_mod._config = _make_config()
+
+        mem_mod.close_memory()
+        mem_mod.close_memory()
+
+        memory.close.assert_called_once_with()
+        primary_client.close.assert_called_once_with()
+        telemetry_client.close.assert_called_once_with()
+        assert mem_mod._memory is None
+        assert mem_mod._config is None
+
+    def test_close_attempts_every_resource_and_clears_state_after_errors(self):
+        import kai.memory as mem_mod
+
+        primary_client = MagicMock()
+        telemetry_client = MagicMock()
+        memory = MagicMock(
+            vector_store=SimpleNamespace(client=primary_client),
+            _telemetry_vector_store=SimpleNamespace(client=telemetry_client),
+        )
+        memory.close.side_effect = RuntimeError("history close failed")
+        primary_client.close.side_effect = RuntimeError("primary close failed")
+        mem_mod._memory = memory
+        mem_mod._config = _make_config()
+
+        with pytest.raises(ExceptionGroup) as exc_info:
+            mem_mod.close_memory()
+
+        assert len(exc_info.value.exceptions) == 2
+        telemetry_client.close.assert_called_once_with()
+        assert mem_mod._memory is None
+        assert mem_mod._config is None
+
     def test_init_disabled_emits_config_log_with_null_fields(self, caplog):
         """Even when memory is disabled, init_memory emits exactly
         one structured `memory.config` log so an operator scanning
@@ -687,6 +708,18 @@ class TestInitMemory:
         assert is_enabled()
 
     @integration
+    def test_close_releases_qdrant_for_immediate_reinitialization(self, tmp_path):
+        from kai.memory import close_memory, init_memory, is_enabled
+
+        config = _make_config()
+        with patch("kai.memory.DATA_DIR", tmp_path):
+            init_memory(config)
+            close_memory()
+            init_memory(config)
+
+        assert is_enabled()
+
+    @integration
     def test_init_failure_propagates(self):
         """If Mem0 raises during init, the exception propagates and memory stays disabled."""
         from kai.memory import init_memory, is_enabled
@@ -739,6 +772,28 @@ class TestInitMemory:
 
         # Should be disabled due to dimension mismatch
         assert not is_enabled()
+        mock_memory.close.assert_called_once_with()
+        mock_memory.vector_store.client.close.assert_called_once_with()
+        mock_memory._telemetry_vector_store.client.close.assert_called_once_with()
+
+    @integration
+    def test_post_construction_init_failure_closes_all_resources(self, tmp_path):
+        from kai.memory import init_memory, is_enabled
+
+        mock_memory = MagicMock()
+        mock_memory.embedding_model.model.get_embedding_dimension.side_effect = RuntimeError("dimension failed")
+
+        with (
+            patch("kai.memory.DATA_DIR", tmp_path),
+            patch("mem0.Memory.from_config", return_value=mock_memory),
+            pytest.raises(RuntimeError, match="dimension failed"),
+        ):
+            init_memory(_make_config())
+
+        assert not is_enabled()
+        mock_memory.close.assert_called_once_with()
+        mock_memory.vector_store.client.close.assert_called_once_with()
+        mock_memory._telemetry_vector_store.client.close.assert_called_once_with()
 
 
 class TestSearch:

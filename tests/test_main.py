@@ -17,12 +17,13 @@ from datetime import UTC, datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from kai.config import UserConfig
 from kai.main import (
+    _close_semantic_memory,
     _configured_launcher_pid,
     _file_age,
     _file_cleanup_loop,
@@ -778,3 +779,31 @@ class TestDrainPendingMemoryWork:
             await _drain_pending_memory_work()
 
         assert "Draining" not in caplog.text
+
+
+class TestCloseSemanticMemory:
+    def test_closes_memory_before_clearing_authority(self):
+        events: list[str] = []
+
+        with (
+            patch("kai.memory.close_memory", side_effect=lambda: events.append("close")),
+            patch(
+                "kai.memory.configure_memory_authority",
+                side_effect=lambda registry: events.append(f"authority:{registry}"),
+            ),
+        ):
+            _close_semantic_memory()
+
+        assert events == ["close", "authority:None"]
+
+    def test_close_failure_is_logged_and_authority_is_still_cleared(self, caplog):
+        configure = MagicMock()
+        with (
+            patch("kai.memory.close_memory", side_effect=RuntimeError("close failed")),
+            patch("kai.memory.configure_memory_authority", configure),
+            caplog.at_level(logging.ERROR),
+        ):
+            _close_semantic_memory()
+
+        configure.assert_called_once_with(None)
+        assert "Semantic memory stopped with an error" in caplog.text

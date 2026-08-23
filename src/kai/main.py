@@ -372,6 +372,18 @@ async def _drain_pending_memory_work() -> None:
     )
 
 
+def _close_semantic_memory() -> None:
+    """Release Mem0/Qdrant resources and always clear canonical authority."""
+    from kai.memory import close_memory, configure_memory_authority
+
+    try:
+        close_memory()
+    except Exception:
+        logging.exception("Semantic memory stopped with an error")
+    finally:
+        configure_memory_authority(None)
+
+
 async def _memory_backup_loop() -> None:
     """
     Nightly snapshot of the semantic memory corpus.
@@ -754,9 +766,7 @@ def _start() -> None:
                 await _drain_pending_memory_work()
             except Exception:
                 logging.exception("Shutdown memory drain failed")
-            from kai.memory import configure_memory_authority
-
-            configure_memory_authority(None)
+            _close_semantic_memory()
             await sessions.close_db()
 
     try:
