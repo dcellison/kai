@@ -94,7 +94,9 @@ Use the scheduling API to create reminders and scheduled tasks. The API endpoint
 
 **Timezones:** All times in `schedule_data` must be UTC. If the user's timezone is known from memory, convert their stated local time to UTC before creating the job. Confirm the conversion in your reply so they can catch any error.
 
-**Routing:** Always include `"chat_id": <your chat_id>` in the POST body. Your chat_id is provided in your session context.
+**Routing:** Do not include a user, chat, channel, agent, or runtime identity in
+internal API requests. `$KAI_WEBHOOK_SECRET` is a short-lived scoped credential
+that already binds the canonical execution context server-side.
 
 ### Examples:
 ```bash
@@ -102,19 +104,19 @@ Use the scheduling API to create reminders and scheduled tasks. The API endpoint
 curl -s -X POST http://localhost:8080/api/schedule \
   -H 'Content-Type: application/json' \
   -H "X-Webhook-Secret: $KAI_WEBHOOK_SECRET" \
-  -d '{"chat_id": <chat_id>, "name": "Laundry", "prompt": "Time to do the laundry!", "schedule_type": "once", "schedule_data": {"run_at": "2026-02-08T19:00:00+00:00"}}'
+  -d '{"name": "Laundry", "prompt": "Time to do the laundry!", "schedule_type": "once", "schedule_data": {"run_at": "2026-02-08T19:00:00+00:00"}}'
 
 # Agent job (you process the prompt each time it fires)
 curl -s -X POST http://localhost:8080/api/schedule \
   -H 'Content-Type: application/json' \
   -H "X-Webhook-Secret: $KAI_WEBHOOK_SECRET" \
-  -d '{"chat_id": <chat_id>, "name": "Weather", "prompt": "What is the weather today?", "job_type": "agent", "schedule_type": "daily", "schedule_data": {"times": ["08:00"]}}'
+  -d '{"name": "Weather", "prompt": "What is the weather today?", "job_type": "agent", "schedule_type": "daily", "schedule_data": {"times": ["08:00"]}}'
 
 # Auto-remove job (deactivates when condition is met, with progress updates)
 curl -s -X POST http://localhost:8080/api/schedule \
   -H 'Content-Type: application/json' \
   -H "X-Webhook-Secret: $KAI_WEBHOOK_SECRET" \
-  -d '{"chat_id": <chat_id>, "name": "Package tracker", "prompt": "Has my package arrived? Give a brief status update.", "job_type": "agent", "auto_remove": true, "notify_on_check": true, "schedule_type": "interval", "schedule_data": {"seconds": 3600}}'
+  -d '{"name": "Package tracker", "prompt": "Has my package arrived? Give a brief status update.", "job_type": "agent", "auto_remove": true, "notify_on_check": true, "schedule_type": "interval", "schedule_data": {"seconds": 3600}}'
 ```
 
 For auto-remove jobs, start your response with `CONDITION_MET: <message>` when the condition is satisfied, or `CONDITION_NOT_MET` to silently continue. If `notify_on_check` is enabled, use `CONDITION_NOT_MET: <status message>` to send progress updates while continuing to monitor.
@@ -130,7 +132,6 @@ For auto-remove jobs, start your response with `CONDITION_MET: <message>` when t
 - `job_type` - `reminder` (default) or `agent`
 - `auto_remove` - deactivate when condition met (agent jobs only)
 - `notify_on_check` - send CONDITION_NOT_MET messages to user (auto_remove only, default false)
-- `chat_id` - integer; required for correct routing in multi-user setups
 
 ### Managing jobs:
 ```bash
@@ -158,10 +159,10 @@ To proactively send a message to the user (background task results, notification
 curl -s -X POST http://localhost:8080/api/send-message \
   -H 'Content-Type: application/json' \
   -H "X-Webhook-Secret: $KAI_WEBHOOK_SECRET" \
-  -d '{"chat_id": <chat_id>, "text": "Your build finished successfully."}'
+  -d '{"text": "Your build finished successfully."}'
 ```
 
-Fields: `chat_id` (integer, required), `text` (string, required). Long messages are automatically split at Telegram's 4096-character limit.
+Fields: `text` (string, required).
 
 ## Sending Files
 
@@ -171,10 +172,9 @@ To send a file from the filesystem to the user:
 curl -s -X POST http://localhost:8080/api/send-file \
   -H 'Content-Type: application/json' \
   -H "X-Webhook-Secret: $KAI_WEBHOOK_SECRET" \
-  -d '{"chat_id": <chat_id>, "path": "/absolute/path/to/file.png", "caption": "Here is your chart."}'
+  -d '{"path": "/absolute/path/to/file.png", "caption": "Here is your chart."}'
 ```
 
-- `chat_id` - integer; required for routing
 - `path` - required; absolute path within the current workspace
 - `caption` - string; optional
 - Images (png, jpg, webp) are sent as photos (rendered inline). Everything else is sent as a document attachment.
@@ -202,10 +202,10 @@ There is deliberately no delete endpoint in this API. When the user asks to remo
 curl -s -X POST http://localhost:8080/api/memory/add \
   -H 'Content-Type: application/json' \
   -H "X-Webhook-Secret: $KAI_WEBHOOK_SECRET" \
-  -d '{"chat_id": <chat_id>, "content": "User prefers Earl Grey over English Breakfast", "memory_type": "preference", "tags": ["beverage", "preference"]}'
+  -d '{"content": "User prefers Earl Grey over English Breakfast", "memory_type": "preference", "tags": ["beverage", "preference"]}'
 ```
 
-Fields: `content` (string, required), `memory_type` (string, default `"fact"`), `tags` (list of strings, optional), `metadata` (dict, optional), `chat_id` (integer, required for routing). Response: `{"id": "<mem0-uuid>"}`.
+Fields: `content` (string, required), `memory_type` (string, default `"fact"`), `tags` (list of strings, optional), `metadata` (dict, optional). Response: `{"id": "<mem0-uuid>"}`.
 
 Provenance is stamped by the server: `source` and scope are set automatically (your value would be overridden), and `speaker`/`confidence` default to `"assistant"`/`0.9`. Override the defaults via `metadata` only when you know better, e.g. `"metadata": {"speaker": "user"}` for a fact the user stated directly.
 
@@ -215,15 +215,15 @@ Provenance is stamped by the server: `source` and scope are set automatically (y
 curl -s -X POST http://localhost:8080/api/memory/search \
   -H 'Content-Type: application/json' \
   -H "X-Webhook-Secret: $KAI_WEBHOOK_SECRET" \
-  -d '{"chat_id": <chat_id>, "query": "what tea does the user like"}'
+  -d '{"query": "what tea does the user like"}'
 ```
 
-Fields: `query` (string, required), `limit` (integer, optional), `chat_id` (integer, required). Response: `{"results": [{"id": ..., "text": ..., "score": ..., "memory_type": ..., "metadata": {...}, "created_at": ...}, ...]}`. Empty `results` means no matches above the relevance threshold; this is a normal 200, not an error.
+Fields: `query` (string, required), `limit` (integer, optional). Response: `{"results": [{"id": ..., "text": ..., "score": ..., "memory_type": ..., "metadata": {...}, "created_at": ...}, ...]}`. Empty `results` means no matches above the relevance threshold; this is a normal 200, not an error.
 
 ### Stats
 
 ```bash
-curl -s "http://localhost:8080/api/memory/stats?chat_id=<chat_id>" \
+curl -s "http://localhost:8080/api/memory/stats" \
   -H "X-Webhook-Secret: $KAI_WEBHOOK_SECRET"
 ```
 
@@ -241,7 +241,7 @@ For a fresh user with no extracted facts (`extracted_count == 0`), the confidenc
 
 - `400` - your request was bad (missing field, invalid JSON). Fix the request and retry.
 - `401` - wrong webhook secret. Configuration bug; surface to the operator.
-- `403` - the chat_id does not belong to your credential, or your credential lacks the permission scope for that operation. Not retryable: no change to the request will make it succeed. If you believe the chat_id is your own, surface the error to the user instead of retrying.
+- `403` - your credential lacks the permission scope for that operation. Not retryable: no change to the request will make it succeed.
 - `503` - the memory system is disabled. Don't retry; surface to the operator. Same status across all three memory endpoints, so a single retry policy covers the disabled case.
 - `500` - on `/api/memory/add` only, the underlying store call failed despite memory being enabled. May be transient; retrying once with a short backoff is reasonable. Persistent 500s should be surfaced to the operator.
 

@@ -22,7 +22,11 @@ from kai.config import Config, ModelRole, UserConfig, WorkspaceConfig, get_model
 from kai.goose import GooseBackend
 from kai.internal_api_auth import InternalAPIScope
 from kai.pool import SubprocessPool
-from tests.workshop_profiles import profile_registry
+from kai.workshop.internal_api_contexts import (
+    WorkshopInternalAPIContextRegistry,
+    WorkshopInternalAPIExecutionContext,
+)
+from tests.workshop_profiles import profile_id, profile_registry
 
 
 def _make_config(**overrides) -> Config:
@@ -55,10 +59,33 @@ def _make_config(**overrides) -> Config:
     return Config(**defaults)
 
 
+def _internal_api_contexts(*runtime_config_ids: int) -> WorkshopInternalAPIContextRegistry:
+    return WorkshopInternalAPIContextRegistry(
+        tuple(
+            WorkshopInternalAPIExecutionContext.for_unprotected_runtime(
+                runtime_config_id,
+                profile_id(runtime_config_id),
+            )
+            for runtime_config_id in runtime_config_ids
+        )
+    )
+
+
 # ── Instance creation ───────────────────────────────────────────────
 
 
 class TestInstanceCreation:
+    def test_protected_install_requires_canonical_internal_api_contexts(self):
+        """Protected runtimes must never synthesize API authority from config IDs."""
+        with pytest.raises(
+            RuntimeError,
+            match="Protected runtime requires canonical internal API execution contexts",
+        ):
+            SubprocessPool(
+                config=_make_config(protected_install=True),
+                services_info=[],
+            )
+
     def test_get_creates_instance(self):
         """First get(chat_id) creates an instance; second returns same one."""
         pool = SubprocessPool(config=_make_config(), services_info=[])
@@ -90,7 +117,8 @@ class TestInstanceCreation:
         assert credential
         principal = pool.internal_api_auth.authenticate(credential)
         assert principal is not None
-        assert principal.chat_id == 111
+        assert principal.compatibility_runtime_config_id() == 111
+        assert principal.runtime_profile_id == profile_id(111)
 
     def test_services_are_filtered_per_user_and_bound_to_principal(self):
         """Only explicitly allowed, available services reach each agent."""
@@ -500,7 +528,11 @@ class TestPerUserBackendRouting:
         for chat_id in users:
             (tmp_path / "home" / str(chat_id)).mkdir(parents=True)
         config = _make_config(protected_install=True, user_configs=users)
-        pool = SubprocessPool(config=config, services_info=[])
+        pool = SubprocessPool(
+            config=config,
+            services_info=[],
+            internal_api_contexts=_internal_api_contexts(*users),
+        )
         for chat_id, expected_type in [
             (111, ClaudeCodeBackend),
             (222, CodexBackend),

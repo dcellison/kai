@@ -12,6 +12,10 @@ from kai.backend import AgentResponse, StreamEvent
 from kai.config import Config, UserConfig
 from kai.internal_api_auth import InternalAPIScope
 from kai.workshop.domain import RuntimeProfileId
+from kai.workshop.internal_api_contexts import (
+    WorkshopInternalAPIContextRegistry,
+    WorkshopInternalAPIExecutionContext,
+)
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.runtime_profiles import (
     ProtectedRuntimeProfile,
@@ -26,6 +30,20 @@ async def _events():
         text_so_far="Done.",
         done=True,
         response=AgentResponse(text="Done.", success=True),
+    )
+
+
+def _contexts_for_profiles(
+    profiles: WorkshopRuntimeProfileRegistry,
+) -> WorkshopInternalAPIContextRegistry:
+    return WorkshopInternalAPIContextRegistry(
+        tuple(
+            WorkshopInternalAPIExecutionContext.for_unprotected_runtime(
+                profile.runtime_config_id,
+                profile.profile_id,
+            )
+            for profile in profiles.profiles
+        )
     )
 
 
@@ -209,7 +227,7 @@ def test_profile_without_telegram_user_receives_runtime_credential(tmp_path, mon
 
     assert instance.backend_name == "codex"
     assert principal is not None
-    assert principal.chat_id == runtime_config_id
+    assert principal.compatibility_runtime_config_id() == runtime_config_id
     assert principal.allowed_services == frozenset({"perplexity"})
     assert instance._api_context.services_info == services_info
     assert instance.workspace == tmp_path / "home" / str(runtime_config_id)
@@ -322,7 +340,12 @@ def test_unavailable_explicit_profile_home_fails_only_that_runtime(tmp_path, mon
             ),
         )
     )
-    pool = SubprocessPool(config=config, services_info=[], runtime_profiles=profiles)
+    pool = SubprocessPool(
+        config=config,
+        services_info=[],
+        runtime_profiles=profiles,
+        internal_api_contexts=_contexts_for_profiles(profiles),
+    )
 
     with pytest.raises(RuntimeError, match="Mount or create it, or update the protected runtime profile"):
         pool.get(runtime_config_id)
@@ -360,7 +383,12 @@ def test_profile_only_canonical_home_error_has_actionable_remediation(tmp_path, 
             ),
         )
     )
-    pool = SubprocessPool(config=config, services_info=[], runtime_profiles=profiles)
+    pool = SubprocessPool(
+        config=config,
+        services_info=[],
+        runtime_profiles=profiles,
+        internal_api_contexts=_contexts_for_profiles(profiles),
+    )
 
     with pytest.raises(RuntimeError, match="profile-only runtimes require an explicit home_workspace"):
         pool.get(runtime_config_id)
@@ -446,7 +474,7 @@ def test_negative_group_key_retains_legacy_compatibility_runtime(tmp_path, monke
     assert instance.backend_name == "codex"
     principal = pool.internal_api_auth.authenticate(instance._api_context.webhook_secret)
     assert principal is not None
-    assert principal.chat_id == -100999
+    assert principal.compatibility_runtime_config_id() == -100999
     assert principal.allowed_services == frozenset()
 
 

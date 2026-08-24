@@ -584,7 +584,9 @@ def build_session_context(
         home_workspace: Kai's home workspace (identity + memory source).
         api: Webhook port, secret, and services info.
         workspace_config: Per-workspace config (for system_prompt).
-        chat_id: Telegram chat ID for history scoping and API routing.
+        chat_id: Private compatibility runtime key used by transitional
+            history and storage adapters. Internal API authorization and
+            routing derive from the credential-bound canonical context.
         data_dir: Root data directory (memory, history, files live here).
         backend_name: Canonical backend identifier used to validate explicit
             identity routing. Required whenever the active workspace differs
@@ -879,16 +881,13 @@ def build_session_context(
         )
         parts.append("\n".join(svc_lines))
 
-    # Include chat_id so the inner agent can pass it back in API
-    # calls for correct multi-user routing. Without this, all
-    # API calls route to the default admin user.
-    if chat_id is not None:
+    # Internal API authority is carried only by the short-lived credential.
+    # Explicit identity selectors are rejected at the HTTP boundary.
+    if api.webhook_secret:
         parts.append(
-            f"[Your chat_id for API calls: {chat_id}. Include "
-            f'"chat_id": {chat_id} in the JSON body of all '
-            f"POST requests to /api/schedule, /api/send-message, "
-            f"and /api/send-file so responses route to the "
-            f"correct user.]"
+            "[Internal API identity: $KAI_WEBHOOK_SECRET already binds your "
+            "canonical human, channel, agent, and runtime context. Never include "
+            "chat_id or another identity selector in an internal API request.]"
         )
 
     # No trailing \n\n here - prepend_to_prompt() adds the separator

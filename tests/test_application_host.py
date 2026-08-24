@@ -22,6 +22,10 @@ from kai.workshop.execution_state import (
     WorkshopExecutionStateRegistry,
 )
 from kai.workshop.inbound import InboundMessage
+from kai.workshop.internal_api_contexts import (
+    WorkshopInternalAPIContextRegistry,
+    WorkshopInternalAPIExecutionContext,
+)
 from kai.workshop.run_execution_authority import (
     RunAttemptStatus,
     RunExecutionSelection,
@@ -243,6 +247,7 @@ def _host() -> KaiApplicationHost:
         runtime_profiles=SimpleNamespace(),  # type: ignore[arg-type]
         execution_state=SimpleNamespace(),  # type: ignore[arg-type]
         principal_storage=SimpleNamespace(),  # type: ignore[arg-type]
+        internal_api_contexts=SimpleNamespace(contexts=()),  # type: ignore[arg-type]
         services_info=[],
         registered_backend_ids=frozenset({"codex"}),
     )
@@ -257,6 +262,20 @@ def _execution_state(principal_id: PrincipalId, runtime_config_id: int):
                 agent_id=AgentId(f"agt_{runtime_config_id:032x}"),
                 runtime_profile_id=profile_id(runtime_config_id),
                 runtime_config_id=runtime_config_id,
+            ),
+        )
+    )
+
+
+def _internal_contexts(principal_id: PrincipalId, runtime_config_id: int):
+    return WorkshopInternalAPIContextRegistry(
+        (
+            WorkshopInternalAPIExecutionContext(
+                principal_id=principal_id,
+                channel_id=ChannelId(f"chn_{runtime_config_id:032x}"),
+                agent_id=AgentId(f"agt_{runtime_config_id:032x}"),
+                runtime_profile_id=profile_id(runtime_config_id),
+                _runtime_config_id=runtime_config_id,
             ),
         )
     )
@@ -421,6 +440,7 @@ async def test_real_core_lifecycle_uses_workshop_identity_without_telegram_appli
         runtime_profiles=profiles,
         execution_state=_execution_state(PrincipalId(str(principal_id)), 101),
         principal_storage=principal_storage,
+        internal_api_contexts=_internal_contexts(PrincipalId(str(principal_id)), 101),
         services_info=[],
         registered_backend_ids=frozenset({"codex"}),
     )
@@ -515,6 +535,7 @@ async def test_core_activates_delivery_authority_before_recovering_expired_start
                 ),
             )
         ),
+        internal_api_contexts=_internal_contexts(PrincipalId(str(principal_id)), 101),
         services_info=[],
         registered_backend_ids=frozenset({"codex"}),
     )

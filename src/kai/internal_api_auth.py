@@ -14,6 +14,9 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
+from kai.workshop.domain import AgentId, ChannelId, PrincipalId, RuntimeProfileId
+from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
+
 
 class InternalAPIScope(StrEnum):
     """Operations an internal API credential may perform."""
@@ -49,7 +52,11 @@ _NOTIFICATION_SCOPES = frozenset({InternalAPIScope.MESSAGES_SEND})
 class InternalAPIPrincipal:
     """Identity and authority resolved from an internal API credential."""
 
-    chat_id: int
+    principal_id: PrincipalId
+    channel_id: ChannelId
+    agent_id: AgentId
+    runtime_profile_id: RuntimeProfileId
+    _runtime_config_id: int
     scopes: frozenset[InternalAPIScope]
     allowed_services: frozenset[str] = frozenset()
 
@@ -61,6 +68,10 @@ class InternalAPIPrincipal:
         """Return whether this principal may call one named service."""
         return self.allows(InternalAPIScope.SERVICES_CALL) and service_name in self.allowed_services
 
+    def compatibility_runtime_config_id(self) -> int:
+        """Return the server-private key for compatibility persistence adapters."""
+        return self._runtime_config_id
+
 
 class InternalAPIAuth:
     """Issue and resolve random credentials for internal API principals.
@@ -70,52 +81,52 @@ class InternalAPIAuth:
     credential whenever they start and do not require an at-rest token store.
 
     Args:
-        agent_credentials: Optional fixed per-user credentials. Production code
+        agent_credentials: Optional fixed per-context credentials. Production code
             leaves this unset and receives cryptographically random tokens; the
             explicit form keeps direct handler tests deterministic.
-        allowed_services_by_user: Explicit service names each persistent user
-            agent may call. Omitted users receive no service-call scope.
+        allowed_services_by_profile: Explicit service names each protected
+            runtime may call. Omitted profiles receive no service-call scope.
     """
 
     def __init__(
         self,
-        agent_credentials: Mapping[int, str] | None = None,
+        agent_credentials: Mapping[WorkshopInternalAPIExecutionContext, str] | None = None,
         *,
-        allowed_services_by_user: Mapping[int, Iterable[str]] | None = None,
+        allowed_services_by_profile: Mapping[RuntimeProfileId, Iterable[str]] | None = None,
     ) -> None:
         self._principals_by_credential: dict[str, InternalAPIPrincipal] = {}
         self._credentials_by_principal: dict[InternalAPIPrincipal, str] = {}
-        self._allowed_services_by_user = {
-            chat_id: frozenset(name for name in names if name)
-            for chat_id, names in (allowed_services_by_user or {}).items()
+        self._allowed_services_by_profile = {
+            profile_id: frozenset(name for name in names if name)
+            for profile_id, names in (allowed_services_by_profile or {}).items()
         }
 
-        for chat_id, credential in (agent_credentials or {}).items():
+        for context, credential in (agent_credentials or {}).items():
             self._register(
                 credential,
-                self._agent_principal(chat_id),
+                self._agent_principal(context),
             )
 
     @classmethod
-    def for_users(
+    def for_execution_contexts(
         cls,
-        user_ids: Iterable[int],
+        contexts: Iterable[WorkshopInternalAPIExecutionContext],
         *,
-        allowed_services_by_user: Mapping[int, Iterable[str]] | None = None,
+        allowed_services_by_profile: Mapping[RuntimeProfileId, Iterable[str]] | None = None,
     ) -> InternalAPIAuth:
-        """Create an auth store with a persistent-agent credential for each user."""
-        auth = cls(allowed_services_by_user=allowed_services_by_user)
-        for chat_id in sorted(set(user_ids)):
-            auth.agent_credential_for(chat_id)
+        """Create one credential for every canonical execution context."""
+        auth = cls(allowed_services_by_profile=allowed_services_by_profile)
+        for context in sorted(set(contexts), key=lambda item: item.runtime_profile_id):
+            auth.agent_credential_for(context)
         return auth
 
-    def agent_credential_for(self, chat_id: int) -> str:
-        """Return the scoped internal API credential for a persistent user agent."""
-        return self._credential_for(self._agent_principal(chat_id))
+    def agent_credential_for(self, context: WorkshopInternalAPIExecutionContext) -> str:
+        """Return the scoped credential for one canonical agent context."""
+        return self._credential_for(self._agent_principal(context))
 
-    def notification_credential_for(self, chat_id: int) -> str:
+    def notification_credential_for(self, context: WorkshopInternalAPIExecutionContext) -> str:
         """Return a send-message-only credential for a notification agent."""
-        return self._credential_for(InternalAPIPrincipal(chat_id=chat_id, scopes=_NOTIFICATION_SCOPES))
+        return self._credential_for(self._principal(context, _NOTIFICATION_SCOPES))
 
     def authenticate(self, credential: str) -> InternalAPIPrincipal | None:
         """Resolve a credential to its server-owned principal, if valid.
@@ -134,15 +145,34 @@ class InternalAPIAuth:
                 matched = principal
         return matched
 
-    def _agent_principal(self, chat_id: int) -> InternalAPIPrincipal:
-        """Build the configured persistent-agent principal for one user."""
-        allowed_services = self._allowed_services_by_user.get(chat_id, frozenset())
+    def _agent_principal(
+        self,
+        context: WorkshopInternalAPIExecutionContext,
+    ) -> InternalAPIPrincipal:
+        """Build the persistent-agent principal for one canonical context."""
+        allowed_services = self._allowed_services_by_profile.get(context.runtime_profile_id, frozenset())
         scopes = set(_PERSISTENT_AGENT_BASE_SCOPES)
         if allowed_services:
             scopes.add(InternalAPIScope.SERVICES_CALL)
+        return self._principal(
+            context,
+            frozenset(scopes),
+            allowed_services,
+        )
+
+    @staticmethod
+    def _principal(
+        context: WorkshopInternalAPIExecutionContext,
+        scopes: frozenset[InternalAPIScope],
+        allowed_services: frozenset[str] = frozenset(),
+    ) -> InternalAPIPrincipal:
         return InternalAPIPrincipal(
-            chat_id=chat_id,
-            scopes=frozenset(scopes),
+            principal_id=context.principal_id,
+            channel_id=context.channel_id,
+            agent_id=context.agent_id,
+            runtime_profile_id=context.runtime_profile_id,
+            _runtime_config_id=context.compatibility_runtime_config_id(),
+            scopes=scopes,
             allowed_services=allowed_services,
         )
 

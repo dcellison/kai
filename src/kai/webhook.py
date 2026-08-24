@@ -155,10 +155,6 @@ WORKSHOP_GITHUB_AUTOMATION_KEY: web.AppKey[WorkshopGitHubAutomationService] = we
 )
 
 
-class UnauthorizedChatIdError(Exception):
-    """Raised when a request targets a chat_id other than its principal."""
-
-
 # Module-level server state, managed by start() and stop()
 _app: web.Application | None = None
 _runner: web.AppRunner | None = None
@@ -444,9 +440,9 @@ def _require_internal_api(scope: InternalAPIScope):
                 return web.Response(status=401, text="Invalid credential")
             if not principal.allows(scope):
                 log.warning(
-                    "Internal API scope denial on %s for principal %d",
+                    "Internal API scope denial on %s for principal %s",
                     request.path,
-                    principal.chat_id,
+                    principal.principal_id,
                 )
                 return web.Response(status=403, text="Credential is not authorized for this operation")
             return await handler(request, principal)
@@ -456,35 +452,41 @@ def _require_internal_api(scope: InternalAPIScope):
     return decorator
 
 
-def _resolve_chat_id(principal: InternalAPIPrincipal, payload: dict) -> int:
-    """
-    Resolve identity from the authenticated principal, not request data.
+_INTERNAL_API_IDENTITY_SELECTORS = frozenset(
+    {
+        "chat_id",
+        "user_id",
+        "principal_id",
+        "channel_id",
+        "agent_id",
+        "runtime_profile_id",
+        "runtime_config_id",
+    }
+)
 
-    A caller may include chat_id for clarity and compatibility, but it must
-    match the server-resolved credential owner. Omitting chat_id uses that
-    owner directly; there is no admin or application-default fallback.
+
+def _resolve_internal_runtime_config_id(
+    principal: InternalAPIPrincipal,
+    payload: dict,
+) -> int:
+    """
+    Resolve the private compatibility key from authenticated authority.
+
+    Canonical identity is bound to the process-lifetime credential. Request
+    bodies and query strings may not repeat or select the retired ``chat_id``
+    identity field. The returned integer is confined to this server adapter
+    while legacy persistence primitives are being replaced.
 
     Raises:
-        ValueError: If chat_id is present but not a valid integer.
-        UnauthorizedChatIdError: If chat_id differs from the principal.
+        ValueError: If the retired caller-supplied identity field is present.
     """
-    explicit = payload.get("chat_id")
-    if explicit is not None:
-        # Reject bools (int(True) == 1) and non-integer floats
-        if isinstance(explicit, bool):
-            raise ValueError(f"chat_id must be an integer, got {explicit!r}")
-        if isinstance(explicit, float) and not float(explicit).is_integer():
-            raise ValueError(f"chat_id must be an integer, got {explicit!r}")
-        try:
-            resolved = int(explicit)
-        except (TypeError, ValueError):
-            raise ValueError(f"chat_id must be an integer, got {explicit!r}") from None
-        if resolved != principal.chat_id:
-            raise UnauthorizedChatIdError(
-                f"chat_id {resolved} does not match authenticated principal {principal.chat_id}"
-            )
-        return resolved
-    return principal.chat_id
+    supplied = sorted(_INTERNAL_API_IDENTITY_SELECTORS.intersection(payload))
+    if supplied:
+        raise ValueError(
+            f"Identity selector {supplied[0]} is not accepted; the internal API credential already binds "
+            "the canonical execution context"
+        )
+    return principal.compatibility_runtime_config_id()
 
 
 # ── GitHub event formatters ───────────────────────────────────────────
@@ -1086,11 +1088,9 @@ async def _handle_schedule(request: web.Request, principal: InternalAPIPrincipal
     auto_remove = payload.get("auto_remove", False)
     notify_on_check = payload.get("notify_on_check", False)
     try:
-        chat_id = _resolve_chat_id(principal, payload)
+        chat_id = _resolve_internal_runtime_config_id(principal, payload)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
-    except UnauthorizedChatIdError as e:
-        return web.json_response({"error": str(e)}, status=403)
 
     # Validate schedule_data structure before persisting. Catches malformed
     # JSON strings and wrong-shape payloads (e.g., interval keys on a daily
@@ -1144,15 +1144,11 @@ async def _handle_get_jobs(request: web.Request, principal: InternalAPIPrincipal
     without needing to parse Telegram bot command output.
     """
 
-    # Resolve the caller's identity. Query params are passed as the payload
-    # dict so _resolve_chat_id can extract and validate chat_id the same
-    # way it does for POST endpoints with JSON bodies.
+    # Query parameters cannot select identity; the credential owns routing.
     try:
-        chat_id = _resolve_chat_id(principal, dict(request.query))
+        chat_id = _resolve_internal_runtime_config_id(principal, dict(request.query))
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
-    except UnauthorizedChatIdError as e:
-        return web.json_response({"error": str(e)}, status=403)
     jobs = await sessions.get_jobs(chat_id)
     return web.json_response(jobs)
 
@@ -1172,15 +1168,13 @@ async def _handle_get_job(request: web.Request, principal: InternalAPIPrincipal)
 
     # Resolve caller identity for ownership check
     try:
-        chat_id = _resolve_chat_id(principal, dict(request.query))
+        chat_id = _resolve_internal_runtime_config_id(principal, dict(request.query))
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
-    except UnauthorizedChatIdError as e:
-        return web.json_response({"error": str(e)}, status=403)
 
     job = await sessions.get_job_by_id(job_id)
     # Return 404 for missing OR wrong-owner jobs (don't leak existence).
-    # Both sides are ints: _resolve_chat_id always returns int, and
+    # Both sides are ints: _resolve_internal_runtime_config_id always returns int, and
     # chat_id is stored as INTEGER in the jobs table.
     if not job or job["chat_id"] != chat_id:
         return web.json_response({"error": "Job not found"}, status=404)
@@ -1201,14 +1195,11 @@ async def _handle_delete_job(request: web.Request, principal: InternalAPIPrincip
     except ValueError:
         return web.json_response({"error": "Invalid job ID"}, status=400)
 
-    # Resolve caller identity from its server-owned principal. A query-string
-    # chat_id is accepted only when it repeats that identity.
+    # Resolve compatibility storage only from server-owned authority.
     try:
-        chat_id = _resolve_chat_id(principal, dict(request.query))
+        chat_id = _resolve_internal_runtime_config_id(principal, dict(request.query))
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
-    except UnauthorizedChatIdError as e:
-        return web.json_response({"error": str(e)}, status=403)
     deleted = await sessions.delete_job(job_id, chat_id=chat_id)
     if not deleted:
         return web.json_response({"error": "Job not found"}, status=404)
@@ -1278,17 +1269,11 @@ async def _handle_update_job(request: web.Request, principal: InternalAPIPrincip
         if error:
             return web.json_response({"error": error}, status=400)
 
-    # Resolve caller identity from the JSON body (e.g., {"chat_id": 456, ...}).
-    # Falls back to admin chat_id when omitted. The chat_id field is used
-    # solely for authorization (WHERE clause filter in update_job), not as
-    # an updatable column - update_job only writes explicitly named fields
-    # (name, prompt, schedule_type, etc.) to the SET clause.
+    # The credential selects authority; request data cannot choose identity.
     try:
-        chat_id = _resolve_chat_id(principal, payload)
+        chat_id = _resolve_internal_runtime_config_id(principal, payload)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
-    except UnauthorizedChatIdError as e:
-        return web.json_response({"error": str(e)}, status=403)
 
     # If the schedule changes, keep the previous row so a failed scheduler
     # re-registration can be compensated. Without this, PATCH can leave the DB
@@ -1390,8 +1375,8 @@ async def _handle_service_call(request: web.Request, principal: InternalAPIPrinc
     service_name = request.match_info["name"]
     if not principal.allows_service(service_name):
         log.warning(
-            "Internal API service denial for principal %d: %s",
-            principal.chat_id,
+            "Internal API service denial for principal %s: %s",
+            principal.principal_id,
             service_name,
         )
         return web.json_response({"error": "Service is not authorized for this principal"}, status=403)
@@ -1467,11 +1452,9 @@ async def _handle_send_message(request: web.Request, principal: InternalAPIPrinc
 
     bot = request.app[TELEGRAM_BOT_KEY]
     try:
-        chat_id = _resolve_chat_id(principal, payload)
+        chat_id = _resolve_internal_runtime_config_id(principal, payload)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
-    except UnauthorizedChatIdError as e:
-        return web.json_response({"error": str(e)}, status=403)
 
     try:
         for part in chunk_text(text):
@@ -1525,11 +1508,9 @@ async def _handle_send_file(request: web.Request, principal: InternalAPIPrincipa
 
     # Resolve chat_id first - needed for per-user workspace confinement
     try:
-        chat_id = _resolve_chat_id(principal, payload)
+        chat_id = _resolve_internal_runtime_config_id(principal, payload)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
-    except UnauthorizedChatIdError as e:
-        return web.json_response({"error": str(e)}, status=403)
 
     path = Path(file_path).resolve()
 
@@ -1552,7 +1533,7 @@ async def _handle_send_file(request: web.Request, principal: InternalAPIPrincipa
     if storage_registry is None:
         return web.json_response({"error": "Principal storage unavailable"}, status=403)
     try:
-        storage_namespace = storage_registry.for_runtime_config_id(principal.chat_id)
+        storage_namespace = storage_registry.for_runtime_config_id(principal.compatibility_runtime_config_id())
     except WorkshopStorageNamespaceError:
         return web.json_response({"error": "Principal storage unavailable"}, status=403)
     allowed_roots = (
@@ -1598,7 +1579,7 @@ async def _handle_send_file(request: web.Request, principal: InternalAPIPrincipa
 #     "no data" and inner Claude could not pick a retry policy from the
 #     status code alone.
 #
-#   - Memory primitives take user_id as a string; _resolve_chat_id returns
+#   - Memory primitives take user_id as a string; _resolve_internal_runtime_config_id returns
 #     int. Stringify at the boundary in every handler. Removing the cast
 #     is a load-bearing bug: Mem0 keys are stored under the string form,
 #     so a missed cast would silently isolate the caller's memories from
@@ -1647,8 +1628,6 @@ async def _handle_memory_add(request: web.Request, principal: InternalAPIPrincip
         tags: list[str], optional
         metadata: dict, optional (keys "type" and "tags" are reserved by
             add_structured; user values for those will be overwritten)
-        chat_id: int, optional, defaults to the authenticated principal
-
     Provenance is stamped server-side: `source` is always "explicit"
     (a caller-supplied value is overridden, so the convention cannot
     drift per caller), the scope fields are routed from the caller's
@@ -1659,9 +1638,8 @@ async def _handle_memory_add(request: web.Request, principal: InternalAPIPrincip
 
     Responses:
         200 {"id": "<mem0-uuid>"} on success
-        400 on bad input (invalid JSON, missing/empty content, bad chat_id)
+        400 on bad input or a retired caller identity selector
         401 on bad/missing internal API credential (handled by the decorator)
-        403 on a chat_id that differs from the authenticated principal
         503 when memory is disabled (precheck; do not retry, escalate)
         500 when add_structured() returns None despite memory being enabled
             (the underlying store call failed; may be transient)
@@ -1736,11 +1714,9 @@ async def _handle_memory_add(request: web.Request, principal: InternalAPIPrincip
             return web.json_response({"error": "metadata.confidence must be a number in [0.0, 1.0]"}, status=400)
 
     try:
-        chat_id = _resolve_chat_id(principal, payload)
+        chat_id = _resolve_internal_runtime_config_id(principal, payload)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
-    except UnauthorizedChatIdError as e:
-        return web.json_response({"error": str(e)}, status=403)
 
     # Symmetric is_enabled() precheck. Runs after auth + 400-level
     # validation but before the primitive call. See the §Memory API
@@ -1834,14 +1810,11 @@ async def _handle_memory_search(request: web.Request, principal: InternalAPIPrin
     Request body (JSON):
         query: str, required, non-empty after strip
         limit: int, optional (defaults to config.memory_search_limit)
-        chat_id: int, optional, defaults to the authenticated principal
-
     Responses:
         200 {"results": [<MemoryResult-dict>, ...]} on success (empty list
             is a valid 200 result for "no matches")
         400 on bad input
         401 on bad secret
-        403 on unauthorized chat_id
         503 when memory is disabled
     """
     try:
@@ -1875,11 +1848,9 @@ async def _handle_memory_search(request: web.Request, principal: InternalAPIPrin
         return web.json_response({"error": "limit must be a positive integer"}, status=400)
 
     try:
-        chat_id = _resolve_chat_id(principal, payload)
+        chat_id = _resolve_internal_runtime_config_id(principal, payload)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
-    except UnauthorizedChatIdError as e:
-        return web.json_response({"error": str(e)}, status=403)
 
     # search() degrades to [] when memory is disabled, but returning []
     # at the API layer would be indistinguishable from "no matches".
@@ -1917,10 +1888,7 @@ async def _handle_memory_stats(request: web.Request, principal: InternalAPIPrinc
     """
     Return memory statistics via memory.get_stats().
 
-    GET endpoint reads chat_id from query params, mirroring _handle_get_jobs.
-
-    Query params:
-        chat_id: int, optional (defaults to the authenticated principal)
+    GET endpoint derives its scope from the authenticated execution context.
 
     Response is the MemoryStats object at the top level, NOT wrapped in
     {"results": ...} - single-object reads return the object bare per
@@ -1934,19 +1902,15 @@ async def _handle_memory_stats(request: web.Request, principal: InternalAPIPrinc
 
     Responses:
         200 <MemoryStats-dict> on success
-        400 on bad chat_id
+        400 on a retired caller identity selector
         401 on bad secret
-        403 on unauthorized chat_id
         503 when memory is disabled
     """
-    # GET handlers feed query params to _resolve_chat_id; established
-    # pattern at _handle_get_jobs.
+    # Query parameters cannot select identity; the credential owns routing.
     try:
-        chat_id = _resolve_chat_id(principal, dict(request.query))
+        chat_id = _resolve_internal_runtime_config_id(principal, dict(request.query))
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
-    except UnauthorizedChatIdError as e:
-        return web.json_response({"error": str(e)}, status=403)
 
     # get_stats() returns zeroed MemoryStats when memory is disabled,
     # but - same as search - "memory off" and "user has no facts yet"
@@ -1984,21 +1948,13 @@ async def _handle_memory_delete_all(request: web.Request, principal: InternalAPI
     well-known token (not per-request UUID) because the threat model
     is typo + prompt-injection defense, not replay protection.
 
-    Convention divergence (deliberate): _handle_delete_job reads chat_id
-    from query params, but this handler reads chat_id from the body
-    alongside the confirm token, since the body already exists for the
-    confirm field. Splitting confirm into the body and chat_id into the
-    query would be inconsistent within the same endpoint.
-
     Request body (JSON):
         confirm: str, required, must equal "delete-all-memories"
-        chat_id: int, optional, defaults to the authenticated principal
 
     Responses:
         200 {"status": "deleted"} on success
-        400 on missing/wrong confirm or bad chat_id
+        400 on missing/wrong confirm or a retired caller identity selector
         401 on bad secret
-        403 on unauthorized chat_id
         503 when memory is disabled
 
     Caveat: delete_all() swallows internal errors (memory.py:1066-1069).
@@ -2019,10 +1975,10 @@ async def _handle_memory_delete_all(request: web.Request, principal: InternalAPI
     if not isinstance(payload, dict):
         return web.json_response({"error": "Request body must be a JSON object"}, status=400)
 
-    # Confirm-token check before chat_id resolution: a request with the
+    # Confirm-token check before compatibility storage resolution: a request with the
     # wrong token is structurally bad input regardless of which user it
     # was aimed at, and rejecting it first means we don't waste a
-    # _resolve_chat_id call on requests we will reject anyway.
+    # _resolve_internal_runtime_config_id call on requests we will reject anyway.
     if payload.get("confirm") != _DELETE_ALL_CONFIRM_TOKEN:
         return web.json_response(
             {"error": f'Missing or incorrect confirm field; expected "{_DELETE_ALL_CONFIRM_TOKEN}"'},
@@ -2030,11 +1986,9 @@ async def _handle_memory_delete_all(request: web.Request, principal: InternalAPI
         )
 
     try:
-        chat_id = _resolve_chat_id(principal, payload)
+        chat_id = _resolve_internal_runtime_config_id(principal, payload)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
-    except UnauthorizedChatIdError as e:
-        return web.json_response({"error": str(e)}, status=403)
 
     # Symmetric precheck. delete_all() is a no-op when disabled, but
     # callers asking the API to wipe their memories deserve to know the

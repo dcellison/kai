@@ -22,6 +22,7 @@ from kai.workshop.delivery_authority import (
 from kai.workshop.execution_state import WorkshopExecutionStateRegistry
 from kai.workshop.github_automation import WorkshopGitHubAutomationService
 from kai.workshop.integration_notifications import WorkshopIntegrationNotificationService
+from kai.workshop.internal_api_contexts import WorkshopInternalAPIContextRegistry
 from kai.workshop.memory_queries import WorkshopMemoryQueryService
 from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
@@ -115,6 +116,7 @@ class KaiCoreServices:
     client_commands: WorkshopClientCommandExecutor
     client_store: WorkshopEventStore
     principal_storage: WorkshopPrincipalStorageRegistry
+    internal_api_contexts: WorkshopInternalAPIContextRegistry
     delivery_authority_epoch: DeliveryAuthorityEpoch
     run_previews: WorkshopRunPreviewRegistry
     scheduler: WorkshopCanonicalScheduler
@@ -140,6 +142,7 @@ class KaiApplicationHost:
         runtime_profiles: WorkshopRuntimeProfileRegistry,
         execution_state: WorkshopExecutionStateRegistry,
         principal_storage: WorkshopPrincipalStorageRegistry,
+        internal_api_contexts: WorkshopInternalAPIContextRegistry,
         services_info: list[dict],
         registered_backend_ids: frozenset[str],
     ) -> None:
@@ -147,6 +150,7 @@ class KaiApplicationHost:
         self._runtime_profiles = runtime_profiles
         self._execution_state = execution_state
         self._principal_storage = principal_storage
+        self._internal_api_contexts = internal_api_contexts
         self._services_info = services_info
         self._registered_backend_ids = registered_backend_ids
         self._state = KaiApplicationState.NEW
@@ -195,6 +199,7 @@ class KaiApplicationHost:
                 config=self._config,
                 services_info=self._services_info,
                 runtime_profiles=self._runtime_profiles,
+                internal_api_contexts=self._internal_api_contexts,
             )
             runtime_pool = WorkshopRuntimePool(subprocess_pool, self._runtime_profiles)
             conversation_runs = WorkshopConversationRunService(
@@ -265,6 +270,7 @@ class KaiApplicationHost:
                 client_commands=client_commands,
                 client_store=client_store,
                 principal_storage=self._principal_storage,
+                internal_api_contexts=self._internal_api_contexts,
                 delivery_authority_epoch=delivery_authority_epoch,
                 run_previews=run_previews,
                 scheduler=scheduler,

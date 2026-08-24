@@ -29,7 +29,6 @@ from kai.webhook import (
     WORKSHOP_GITHUB_AUTOMATION_KEY,
     WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY,
     WORKSHOP_PRINCIPAL_STORAGE_KEY,
-    UnauthorizedChatIdError,
     _handle_delete_job,
     _handle_generic,
     _handle_get_job,
@@ -45,10 +44,11 @@ from kai.webhook import (
     _handle_service_call,
     _handle_telegram_update,
     _handle_update_job,
-    _resolve_chat_id,
+    _resolve_internal_runtime_config_id,
     stop,
 )
-from kai.workshop.domain import PrincipalId
+from kai.workshop.domain import AgentId, ChannelId, PrincipalId
+from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
 from kai.workshop.storage_namespaces import (
     WorkshopPrincipalStorageNamespace,
     WorkshopPrincipalStorageRegistry,
@@ -58,9 +58,21 @@ from tests.workshop_profiles import profile_id
 
 def _make_internal_api_auth() -> InternalAPIAuth:
     """Create deterministic credentials for the two API test principals."""
+    context_123 = _internal_api_context(123)
+    context_456 = _internal_api_context(456)
     return InternalAPIAuth(
-        {123: "test-secret", 456: "other-secret"},
-        allowed_services_by_user={123: {"perplexity"}},
+        {context_123: "test-secret", context_456: "other-secret"},
+        allowed_services_by_profile={context_123.runtime_profile_id: {"perplexity"}},
+    )
+
+
+def _internal_api_context(runtime_config_id: int) -> WorkshopInternalAPIExecutionContext:
+    return WorkshopInternalAPIExecutionContext(
+        principal_id=PrincipalId(f"prn_{runtime_config_id:032x}"),
+        channel_id=ChannelId(f"chn_{runtime_config_id:032x}"),
+        agent_id=AgentId(f"agt_{runtime_config_id:032x}"),
+        runtime_profile_id=profile_id(runtime_config_id),
+        _runtime_config_id=runtime_config_id,
     )
 
 
@@ -83,8 +95,13 @@ def _principal_storage_registry() -> WorkshopPrincipalStorageRegistry:
 
 async def _call_memory_delete_all_as_authorized(request, *, chat_id: int = 123):
     """Exercise delete-all handler behavior with an explicitly privileged principal."""
+    context = _internal_api_context(chat_id)
     principal = InternalAPIPrincipal(
-        chat_id=chat_id,
+        principal_id=context.principal_id,
+        channel_id=context.channel_id,
+        agent_id=context.agent_id,
+        runtime_profile_id=context.runtime_profile_id,
+        _runtime_config_id=context.compatibility_runtime_config_id(),
         scopes=frozenset({InternalAPIScope.MEMORY_DELETE_ALL}),
     )
     return await _handle_memory_delete_all.__wrapped__(request, principal)
@@ -1898,10 +1915,10 @@ class TestServiceCall:
         mock_call.assert_not_called()
 
 
-# ── _resolve_chat_id ────────────────────────────────────────────────
+# ── _resolve_internal_runtime_config_id ────────────────────────────────────────────────
 
 
-class TestResolveChatId:
+class TestResolveInternalRuntimeConfigId:
     def _principal(self, chat_id: int = 123) -> InternalAPIPrincipal:
         """Resolve a deterministic test principal from its credential."""
         auth = _make_internal_api_auth()
@@ -1910,50 +1927,34 @@ class TestResolveChatId:
         assert principal is not None
         return principal
 
-    def test_mismatched_explicit_chat_id_rejected(self):
-        """Rejects a request-supplied identity that differs from the principal."""
+    @pytest.mark.parametrize(
+        "selector",
+        [
+            "chat_id",
+            "user_id",
+            "principal_id",
+            "channel_id",
+            "agent_id",
+            "runtime_profile_id",
+            "runtime_config_id",
+        ],
+    )
+    def test_any_explicit_identity_selector_is_rejected(self, selector):
+        """Request data can never repeat or select execution identity."""
         principal = self._principal()
-        with pytest.raises(UnauthorizedChatIdError, match="does not match authenticated principal"):
-            _resolve_chat_id(principal, {"chat_id": 42})
+        with pytest.raises(ValueError, match=f"Identity selector {selector} is not accepted"):
+            _resolve_internal_runtime_config_id(principal, {selector: "anything"})
 
     def test_omitted_chat_id_uses_principal(self):
         """Omitted chat_id resolves to the authenticated principal."""
         principal = self._principal()
-        assert _resolve_chat_id(principal, {}) == 123
-
-    def test_invalid_non_numeric(self):
-        """Raises ValueError for non-numeric chat_id."""
-        principal = self._principal()
-        with pytest.raises(ValueError, match="must be an integer"):
-            _resolve_chat_id(principal, {"chat_id": "abc"})
-
-    def test_invalid_float(self):
-        """Raises ValueError for non-integer float chat_id."""
-        principal = self._principal()
-        with pytest.raises(ValueError, match="must be an integer"):
-            _resolve_chat_id(principal, {"chat_id": 12345.6})
-
-    def test_invalid_bool(self):
-        """Raises ValueError for boolean chat_id."""
-        principal = self._principal()
-        with pytest.raises(ValueError, match="must be an integer"):
-            _resolve_chat_id(principal, {"chat_id": True})
-
-    def test_integer_like_float_accepted(self):
-        """Integer-like float (e.g. 42.0) is accepted."""
-        principal = self._principal(chat_id=456)
-        assert _resolve_chat_id(principal, {"chat_id": 456.0}) == 456
-
-    def test_string_integer_accepted(self):
-        """String-encoded integer (e.g. from JSON) is accepted."""
-        principal = self._principal(chat_id=456)
-        assert _resolve_chat_id(principal, {"chat_id": "456"}) == 456
+        assert _resolve_internal_runtime_config_id(principal, {}) == 123
 
 
-class TestGetJobsChatIdRouting:
+class TestGetJobsCredentialRouting:
     @pytest.mark.asyncio
-    async def test_query_param_routes_to_user(self, db, mock_request):
-        """GET /api/jobs?chat_id=456 returns jobs for that user."""
+    async def test_query_identity_selector_is_rejected(self, db, mock_request):
+        """GET /api/jobs rejects the retired query identity selector."""
         mock_request.headers = {"X-Webhook-Secret": "other-secret"}
         mock_request.app[CHAT_ID_KEY] = 123
         mock_request.query = {"chat_id": "456"}
@@ -1969,13 +1970,12 @@ class TestGetJobsChatIdRouting:
         )
 
         resp = await _handle_get_jobs(mock_request)
-        body = json.loads(resp.body.decode())
-        assert len(body) == 1
-        assert body[0]["name"] == "User 456 Job"
+        assert resp.status == 400
+        assert "Identity selector chat_id is not accepted" in resp.text
 
     @pytest.mark.asyncio
     async def test_invalid_query_param_returns_400(self, db, mock_request):
-        """GET /api/jobs?chat_id=abc returns 400."""
+        """Any query identity selector returns 400."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.app[CHAT_ID_KEY] = 123
         mock_request.query = {"chat_id": "abc"}
@@ -1984,10 +1984,10 @@ class TestGetJobsChatIdRouting:
         assert resp.status == 400
 
 
-class TestScheduleChatIdRouting:
+class TestScheduleCredentialRouting:
     @pytest.mark.asyncio
-    async def test_explicit_chat_id_in_body(self, db, mock_request):
-        """POST /api/schedule with chat_id routes job to that user."""
+    async def test_explicit_chat_id_in_body_is_rejected(self, db, mock_request):
+        """POST /api/schedule rejects caller-selected identity."""
         mock_request.headers = {"X-Webhook-Secret": "other-secret"}
         mock_request.app[CHAT_ID_KEY] = 123
         mock_request.app[TELEGRAM_APP_KEY].job_queue = MagicMock()
@@ -2004,16 +2004,8 @@ class TestScheduleChatIdRouting:
         )
 
         resp = await _handle_schedule(mock_request)
-        assert resp.status == 200
-
-        # Verify the job was created for user 456, not 123
-        jobs = await sessions.get_jobs(456)
-        assert len(jobs) == 1
-        assert jobs[0]["name"] == "Routed Job"
-
-        # User 123 should have no jobs
-        jobs_123 = await sessions.get_jobs(123)
-        assert len(jobs_123) == 0
+        assert resp.status == 400
+        assert await sessions.get_jobs(456) == []
 
 
 # ── chat_id authorization ──────────────────────────────────────────
@@ -2035,7 +2027,7 @@ class TestChatIdAuthorization:
     async def test_notification_credential_cannot_manage_jobs(self, mock_request):
         """A review/triage notification credential is limited to sending messages."""
         auth = mock_request.app[INTERNAL_API_AUTH_KEY]
-        credential = auth.notification_credential_for(123)
+        credential = auth.notification_credential_for(_internal_api_context(123))
         mock_request.headers = {"X-Webhook-Secret": credential}
 
         mock_request.json = AsyncMock(return_value={"text": "review complete"})
@@ -2046,8 +2038,8 @@ class TestChatIdAuthorization:
         assert schedule_resp.status == 403
 
     @pytest.mark.asyncio
-    async def test_unauthorized_chat_id_returns_403(self, db, mock_request):
-        """POST /api/schedule with chat_id differing from the principal returns 403."""
+    async def test_caller_selected_chat_id_returns_400(self, db, mock_request):
+        """POST /api/schedule rejects the retired identity selector."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.app[TELEGRAM_APP_KEY].job_queue = MagicMock()
         mock_request.app[TELEGRAM_APP_KEY].job_queue.jobs.return_value = []
@@ -2063,7 +2055,7 @@ class TestChatIdAuthorization:
         )
 
         resp = await _handle_schedule(mock_request)
-        assert resp.status == 403
+        assert resp.status == 400
 
     @pytest.mark.asyncio
     async def test_other_authorized_chat_id_rejected(self, db, mock_request):
@@ -2083,40 +2075,41 @@ class TestChatIdAuthorization:
         )
 
         resp = await _handle_schedule(mock_request)
-        assert resp.status == 403
+        assert resp.status == 400
         assert await sessions.get_jobs(456) == []
 
     @pytest.mark.asyncio
-    async def test_send_message_unauthorized_returns_403(self, db, mock_request):
-        """POST /api/send-message with unauthorized chat_id returns 403."""
+    async def test_send_message_identity_selector_returns_400(self, db, mock_request):
+        """POST /api/send-message rejects caller-selected identity."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.json = AsyncMock(return_value={"text": "hello", "chat_id": 999999})
 
         resp = await _handle_send_message(mock_request)
-        assert resp.status == 403
+        assert resp.status == 400
 
     @pytest.mark.asyncio
-    async def test_send_file_unauthorized_returns_403(self, db, mock_request):
-        """POST /api/send-file with unauthorized chat_id returns 403."""
+    async def test_send_file_identity_selector_returns_400(self, db, mock_request):
+        """POST /api/send-file rejects caller-selected identity."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.json = AsyncMock(return_value={"path": "/tmp/test.txt", "chat_id": 999999})
 
         resp = await _handle_send_file(mock_request)
-        assert resp.status == 403
+        assert resp.status == 400
 
-    def test_resolve_chat_id_unauthorized(self):
-        """_resolve_chat_id rejects any identity other than the principal."""
+    def test_resolve_internal_runtime_config_id_rejects_selector(self):
+        """The server-private resolver rejects request identity fields."""
         principal = _make_internal_api_auth().authenticate("test-secret")
         assert principal is not None
 
-        with pytest.raises(UnauthorizedChatIdError):
-            _resolve_chat_id(principal, {"chat_id": 999999})
+        with pytest.raises(ValueError, match="Identity selector chat_id is not accepted"):
+            _resolve_internal_runtime_config_id(principal, {"chat_id": 999999})
 
-    def test_resolve_chat_id_accepts_matching_principal(self):
-        """_resolve_chat_id accepts an explicit repetition of the principal."""
+    def test_resolve_internal_runtime_config_id_rejects_matching_selector(self):
+        """Even a matching repeated identity is rejected."""
         principal = _make_internal_api_auth().authenticate("test-secret")
         assert principal is not None
-        assert _resolve_chat_id(principal, {"chat_id": 123}) == 123
+        with pytest.raises(ValueError, match="Identity selector chat_id is not accepted"):
+            _resolve_internal_runtime_config_id(principal, {"chat_id": 123})
 
 
 # ── Job ownership ──────────────────────────────────────────────────
@@ -2235,19 +2228,19 @@ class TestGetJobsAuth:
         assert body[0]["name"] == "Principal Job"
 
     @pytest.mark.asyncio
-    async def test_unauthorized_chat_id_returns_403(self, db, mock_request):
-        """GET /api/jobs?chat_id=999 returns 403 for unauthorized users."""
+    async def test_identity_selector_returns_400(self, db, mock_request):
+        """GET /api/jobs rejects caller-supplied identity."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.query = {"chat_id": "999"}
 
         resp = await _handle_get_jobs(mock_request)
-        assert resp.status == 403
+        assert resp.status == 400
 
     @pytest.mark.asyncio
-    async def test_authorized_chat_id_returns_only_their_jobs(self, db, mock_request):
-        """GET /api/jobs?chat_id=456 returns only user 456's jobs."""
+    async def test_credential_returns_only_its_jobs(self, db, mock_request):
+        """GET /api/jobs uses only the authenticated canonical context."""
         mock_request.headers = {"X-Webhook-Secret": "other-secret"}
-        mock_request.query = {"chat_id": "456"}
+        mock_request.query = {}
 
         await sessions.create_job(
             chat_id=123,
@@ -2300,7 +2293,7 @@ class TestGetJobAuth:
         """GET /api/jobs/{id} returns 404 when job belongs to another user."""
         mock_request.headers = {"X-Webhook-Secret": "other-secret"}
         # Caller is user 456, job belongs to user 123
-        mock_request.query = {"chat_id": "456"}
+        mock_request.query = {}
         job_id = await sessions.create_job(
             chat_id=123,
             name="Admin Job",
@@ -2316,9 +2309,9 @@ class TestGetJobAuth:
 
     @pytest.mark.asyncio
     async def test_owner_can_view_own_job(self, db, mock_request):
-        """GET /api/jobs/{id}?chat_id=456 returns the job when owned by 456."""
+        """The credential owner can view its own job."""
         mock_request.headers = {"X-Webhook-Secret": "other-secret"}
-        mock_request.query = {"chat_id": "456"}
+        mock_request.query = {}
         job_id = await sessions.create_job(
             chat_id=456,
             name="User Job",
@@ -2335,14 +2328,14 @@ class TestGetJobAuth:
         assert body["name"] == "User Job"
 
     @pytest.mark.asyncio
-    async def test_unauthorized_chat_id_returns_403(self, db, mock_request):
-        """GET /api/jobs/{id}?chat_id=999 returns 403 for unauthorized user."""
+    async def test_identity_selector_returns_400(self, db, mock_request):
+        """GET /api/jobs/{id} rejects caller-supplied identity."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.query = {"chat_id": "999"}
         mock_request.match_info = {"id": "1"}
 
         resp = await _handle_get_job(mock_request)
-        assert resp.status == 403
+        assert resp.status == 400
 
 
 class TestDeleteJobAuth:
@@ -2369,9 +2362,9 @@ class TestDeleteJobAuth:
 
     @pytest.mark.asyncio
     async def test_user_can_delete_own_job(self, db, mock_request):
-        """DELETE /api/jobs/{id}?chat_id=456 deletes user 456's job."""
+        """A credential can delete its own job."""
         mock_request.headers = {"X-Webhook-Secret": "other-secret"}
-        mock_request.query = {"chat_id": "456"}
+        mock_request.query = {}
         job_id = await sessions.create_job(
             chat_id=456,
             name="User Job",
@@ -2388,9 +2381,9 @@ class TestDeleteJobAuth:
 
     @pytest.mark.asyncio
     async def test_cannot_delete_other_users_job(self, db, mock_request):
-        """DELETE /api/jobs/{id}?chat_id=456 returns 404 for admin's job."""
+        """A credential cannot delete another context's job."""
         mock_request.headers = {"X-Webhook-Secret": "other-secret"}
-        mock_request.query = {"chat_id": "456"}
+        mock_request.query = {}
         job_id = await sessions.create_job(
             chat_id=123,
             name="Admin Job",
@@ -2407,14 +2400,14 @@ class TestDeleteJobAuth:
         assert await sessions.get_job_by_id(job_id) is not None
 
     @pytest.mark.asyncio
-    async def test_unauthorized_chat_id_returns_403(self, db, mock_request):
-        """DELETE /api/jobs/{id}?chat_id=999 returns 403."""
+    async def test_identity_selector_returns_400(self, db, mock_request):
+        """DELETE /api/jobs/{id} rejects caller-supplied identity."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.query = {"chat_id": "999"}
         mock_request.match_info = {"id": "1"}
 
         resp = await _handle_delete_job(mock_request)
-        assert resp.status == 403
+        assert resp.status == 400
 
 
 class TestUpdateJobAuth:
@@ -2445,7 +2438,7 @@ class TestUpdateJobAuth:
 
     @pytest.mark.asyncio
     async def test_user_can_update_own_job(self, db, mock_request):
-        """PATCH with chat_id in body updates the user's own job."""
+        """PATCH uses the authenticated context to update its own job."""
         mock_request.headers = {"X-Webhook-Secret": "other-secret"}
         job_id = await sessions.create_job(
             chat_id=456,
@@ -2456,7 +2449,7 @@ class TestUpdateJobAuth:
             schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
         )
         mock_request.match_info = {"id": str(job_id)}
-        mock_request.json = AsyncMock(return_value={"chat_id": 456, "name": "Updated"})
+        mock_request.json = AsyncMock(return_value={"name": "Updated"})
 
         resp = await _handle_update_job(mock_request)
         assert resp.status == 200
@@ -2466,7 +2459,7 @@ class TestUpdateJobAuth:
 
     @pytest.mark.asyncio
     async def test_cannot_update_other_users_job(self, db, mock_request):
-        """PATCH with chat_id=456 returns 404 for admin's job."""
+        """PATCH returns 404 for another context's job."""
         mock_request.headers = {"X-Webhook-Secret": "other-secret"}
         job_id = await sessions.create_job(
             chat_id=123,
@@ -2477,7 +2470,7 @@ class TestUpdateJobAuth:
             schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
         )
         mock_request.match_info = {"id": str(job_id)}
-        mock_request.json = AsyncMock(return_value={"chat_id": 456, "name": "Hacked"})
+        mock_request.json = AsyncMock(return_value={"name": "Hacked"})
 
         resp = await _handle_update_job(mock_request)
         assert resp.status == 404
@@ -2487,14 +2480,14 @@ class TestUpdateJobAuth:
         assert job["name"] == "Admin Job"
 
     @pytest.mark.asyncio
-    async def test_unauthorized_chat_id_returns_403(self, db, mock_request):
-        """PATCH with unauthorized chat_id returns 403."""
+    async def test_identity_selector_returns_400(self, db, mock_request):
+        """PATCH rejects caller-supplied identity."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.match_info = {"id": "1"}
         mock_request.json = AsyncMock(return_value={"chat_id": 999, "name": "Nope"})
 
         resp = await _handle_update_job(mock_request)
-        assert resp.status == 403
+        assert resp.status == 400
 
 
 # ── Filename sanitization ──────────────────────────────────────────
@@ -2800,7 +2793,7 @@ class TestMemoryAdd:
         succeed).
         """
         mock_request.headers = {"X-Webhook-Secret": "other-secret"}
-        mock_request.json = AsyncMock(return_value={"content": "x", "chat_id": 456})
+        mock_request.json = AsyncMock(return_value={"content": "x"})
 
         with (
             patch("kai.memory.is_enabled", return_value=True),
@@ -2812,8 +2805,8 @@ class TestMemoryAdd:
         assert kwargs["user_id"] == "456"
         assert isinstance(kwargs["user_id"], str)
 
-    async def test_returns_403_on_unauthorized_chat_id(self, mock_request):
-        """chat_id differing from the principal -> 403, primitive not called."""
+    async def test_returns_400_on_identity_selector(self, mock_request):
+        """Caller-supplied identity is rejected before the primitive."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         # The credential resolves to principal 123, not the requested 999.
         mock_request.json = AsyncMock(return_value={"content": "x", "chat_id": 999})
@@ -2821,7 +2814,7 @@ class TestMemoryAdd:
         with patch("kai.memory.is_enabled", return_value=True), patch("kai.memory.add_structured") as mock_add:
             resp = await _handle_memory_add(mock_request)
 
-        assert resp.status == 403
+        assert resp.status == 400
         mock_add.assert_not_called()
 
     async def test_returns_500_when_add_structured_raises(self, mock_request):
@@ -3144,8 +3137,8 @@ class TestMemorySearch:
         body = json.loads(resp.body.decode())
         assert body == {"error": "Memory search failed"}
 
-    async def test_returns_403_on_unauthorized_chat_id(self, mock_request):
-        """chat_id differing from the principal -> 403, primitive not called."""
+    async def test_returns_400_on_identity_selector(self, mock_request):
+        """Caller-supplied identity is rejected before the primitive."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.json = AsyncMock(return_value={"query": "x", "chat_id": 999})
 
@@ -3155,7 +3148,7 @@ class TestMemorySearch:
         ):
             resp = await _handle_memory_search(mock_request)
 
-        assert resp.status == 403
+        assert resp.status == 400
         mock_search.assert_not_called()
 
 
@@ -3231,8 +3224,7 @@ class TestMemoryStats:
         from kai.memory import MemoryStats
 
         mock_request.headers = {"X-Webhook-Secret": "other-secret"}
-        # The user-456 credential matches the string query parameter.
-        mock_request.query = {"chat_id": "456"}
+        mock_request.query = {}
 
         with (
             patch("kai.memory.is_enabled", return_value=True),
@@ -3252,15 +3244,15 @@ class TestMemoryStats:
 
         assert resp.status == 401
 
-    async def test_returns_403_on_unauthorized_chat_id(self, mock_request):
-        """Query-string chat_id differing from the principal -> 403."""
+    async def test_returns_400_on_identity_selector(self, mock_request):
+        """Query-string identity selectors are rejected."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.query = {"chat_id": "999"}
 
         with patch("kai.memory.is_enabled", return_value=True), patch("kai.memory.get_stats") as mock_get_stats:
             resp = await _handle_memory_stats(mock_request)
 
-        assert resp.status == 403
+        assert resp.status == 400
         mock_get_stats.assert_not_called()
 
     async def test_returns_500_when_get_stats_raises(self, mock_request):
@@ -3366,7 +3358,7 @@ class TestMemoryDeleteAll:
     async def test_calls_delete_all_with_stringified_user_id(self, mock_request):
         """int -> str cast at the memory boundary, same as add."""
         mock_request.headers = {"X-Webhook-Secret": "other-secret"}
-        mock_request.json = AsyncMock(return_value={"confirm": self._CONFIRM, "chat_id": 456})
+        mock_request.json = AsyncMock(return_value={"confirm": self._CONFIRM})
 
         with patch("kai.memory.is_enabled", return_value=True), patch("kai.memory.delete_all") as mock_del:
             await _call_memory_delete_all_as_authorized(mock_request, chat_id=456)
@@ -3403,10 +3395,10 @@ class TestMemoryDeleteAll:
         body = json.loads(resp.body.decode())
         assert body == {"error": "Memory delete failed"}
 
-    async def test_returns_403_on_unauthorized_chat_id(self, mock_request):
-        """chat_id differing from the principal -> 403, primitive not called.
+    async def test_returns_400_on_identity_selector(self, mock_request):
+        """Caller-supplied identity is rejected before the primitive.
 
-        Verifies the 403 path runs even when the confirm token is
+        Verifies the 400 path runs even when the confirm token is
         correct: an unauthorized caller with the right token should
         still be blocked at the chat_id resolution step.
         """
@@ -3419,7 +3411,7 @@ class TestMemoryDeleteAll:
         ):
             resp = await _call_memory_delete_all_as_authorized(mock_request)
 
-        assert resp.status == 403
+        assert resp.status == 400
         mock_del.assert_not_called()
 
     async def test_persistent_agent_scope_cannot_delete_all(self, mock_request):

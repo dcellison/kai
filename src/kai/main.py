@@ -500,6 +500,11 @@ def _start() -> None:
             "Workshop principal storage ready (namespaces=%d)",
             len(principal_storage.namespaces),
         )
+        internal_api_contexts = await sessions.load_workshop_internal_api_context_registry(runtime_profiles)
+        logging.info(
+            "Workshop internal API authority ready (contexts=%d)",
+            len(internal_api_contexts.contexts),
+        )
         channel_history = await sessions.load_workshop_channel_history_registry(runtime_profiles)
         from kai.history import configure_channel_history_namespaces
 
@@ -629,6 +634,7 @@ def _start() -> None:
                 runtime_profiles=runtime_profiles,
                 execution_state=execution_state,
                 principal_storage=principal_storage,
+                internal_api_contexts=internal_api_contexts,
                 services_info=services.get_available_services(),
                 registered_backend_ids=_workshop_registered_backend_ids(config),
             )

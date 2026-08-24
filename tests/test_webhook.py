@@ -37,8 +37,9 @@ from kai.webhook import (
     add_notification_chat_id,
     remove_notification_chat_id,
 )
-from kai.workshop.domain import PrincipalId
+from kai.workshop.domain import AgentId, ChannelId, PrincipalId
 from kai.workshop.integration_notifications import WorkshopIntegrationNotificationService
+from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
 from kai.workshop.storage_namespaces import (
     WorkshopPrincipalStorageNamespace,
@@ -46,6 +47,17 @@ from kai.workshop.storage_namespaces import (
 )
 from kai.workshop.store import WorkshopEventStore
 from tests.workshop_profiles import profile_id
+
+
+def _internal_api_auth() -> InternalAPIAuth:
+    context = WorkshopInternalAPIExecutionContext(
+        principal_id=PrincipalId("prn_" + "1" * 32),
+        channel_id=ChannelId("chn_" + "1" * 32),
+        agent_id=AgentId("agt_" + "1" * 32),
+        runtime_profile_id=profile_id(111),
+        _runtime_config_id=111,
+    )
+    return InternalAPIAuth({context: "secret"})
 
 
 def _principal_storage_registry() -> WorkshopPrincipalStorageRegistry:
@@ -664,7 +676,7 @@ class TestNotificationChatIdMutations:
         telegram_app = MagicMock()
         telegram_app.bot = AsyncMock()
         core_services = SimpleNamespace(
-            subprocess_pool=MagicMock(internal_api_auth=InternalAPIAuth({111: "secret"})),
+            subprocess_pool=MagicMock(internal_api_auth=_internal_api_auth()),
             principal_storage=_principal_storage_registry(),
             client_store=MagicMock(),
             client_commands=MagicMock(),
@@ -734,7 +746,7 @@ class TestNotificationChatIdMutations:
 
         store = await WorkshopEventStore.open(config.session_db_path)
         core_services = SimpleNamespace(
-            subprocess_pool=MagicMock(internal_api_auth=InternalAPIAuth({111: "secret"})),
+            subprocess_pool=MagicMock(internal_api_auth=_internal_api_auth()),
             principal_storage=_principal_storage_registry(),
             client_store=store,
             client_commands=MagicMock(),
@@ -806,7 +818,7 @@ class TestNotificationChatIdMutations:
         telegram_app.bot = AsyncMock()
         core_store = await WorkshopEventStore.open(config.session_db_path)
         core_services = SimpleNamespace(
-            subprocess_pool=MagicMock(internal_api_auth=InternalAPIAuth({111: "secret"})),
+            subprocess_pool=MagicMock(internal_api_auth=_internal_api_auth()),
             principal_storage=_principal_storage_registry(),
             client_store=core_store,
             client_commands=MagicMock(),
