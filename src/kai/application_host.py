@@ -19,11 +19,13 @@ from kai.workshop.delivery_authority import (
     DeliveryAuthorityEpoch,
     WorkshopConversationDeliveryAuthority,
 )
+from kai.workshop.execution_state import WorkshopExecutionStateRegistry
 from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
 from kai.workshop.scheduler import WorkshopCanonicalScheduler
+from kai.workshop.settings_workspaces import WorkshopSettingsWorkspaceService
 from kai.workshop.storage_namespaces import WorkshopPrincipalStorageRegistry
 from kai.workshop.store import WorkshopEventStore
 
@@ -105,6 +107,7 @@ class KaiCoreServices:
     run_previews: WorkshopRunPreviewRegistry
     scheduler: WorkshopCanonicalScheduler
     artifacts: WorkshopArtifactService
+    settings_workspaces: WorkshopSettingsWorkspaceService
 
 
 class KaiApplicationHost:
@@ -120,12 +123,14 @@ class KaiApplicationHost:
         *,
         config: Config,
         runtime_profiles: WorkshopRuntimeProfileRegistry,
+        execution_state: WorkshopExecutionStateRegistry,
         principal_storage: WorkshopPrincipalStorageRegistry,
         services_info: list[dict],
         registered_backend_ids: frozenset[str],
     ) -> None:
         self._config = config
         self._runtime_profiles = runtime_profiles
+        self._execution_state = execution_state
         self._principal_storage = principal_storage
         self._services_info = services_info
         self._registered_backend_ids = registered_backend_ids
@@ -209,6 +214,11 @@ class KaiApplicationHost:
                 principal_storage=self._principal_storage,
                 runtime_profiles=self._runtime_profiles,
             )
+            settings_workspaces = WorkshopSettingsWorkspaceService(
+                self._config,
+                runtime_pool,
+                self._execution_state,
+            )
 
             self._services = KaiCoreServices(
                 subprocess_pool=subprocess_pool,
@@ -223,6 +233,7 @@ class KaiApplicationHost:
                 run_previews=run_previews,
                 scheduler=scheduler,
                 artifacts=artifacts,
+                settings_workspaces=settings_workspaces,
             )
             self._state = KaiApplicationState.READY
             return self._services

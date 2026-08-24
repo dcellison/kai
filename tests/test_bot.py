@@ -106,6 +106,10 @@ from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.inbound import InboundMessage
 from kai.workshop.outbound import DeliveryObservation, OutboundMessage
 from kai.workshop.runtime_pool import WorkshopRuntimePool
+from kai.workshop.settings_workspaces import (
+    EffectiveValue,
+    WorkspaceConfigSnapshot,
+)
 from kai.workshop.storage_namespaces import (
     WorkshopPrincipalStorageNamespace,
     WorkshopPrincipalStorageRegistry,
@@ -5635,6 +5639,40 @@ class TestHandleWorkspaceConfig:
         # users.yaml > global default).
         mock.get_user_settings = AsyncMock(return_value=user_settings or {})
         return mock
+
+    @pytest.mark.asyncio
+    async def test_protected_runtime_uses_core_workspace_config_service(self):
+        update = _make_update(text="/workspace config model opus")
+        ctx = _make_context()
+        authority = SimpleNamespace(runtime_profile_id=profile_id(12345))
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = authority
+        service.set_workspace_config = AsyncMock(
+            return_value=WorkspaceConfigSnapshot(
+                workspace="/srv/kai",
+                model=EffectiveValue("opus", "workspace override"),
+                timeout_seconds=EffectiveValue(120, "runtime policy"),
+                environment_keys=(),
+                prompt=None,
+                has_prompt=False,
+                prompt_source=None,
+                override_fields=("model",),
+            )
+        )
+        ctx.application.core_services.settings_workspaces = service
+
+        await _handle_workspace_config(
+            update,
+            ctx,
+            "config model opus",
+        )
+
+        service.set_workspace_config.assert_awaited_once_with(
+            authority,
+            field="model",
+            value="opus",
+        )
+        assert "opus" in update.message.reply_text.call_args[0][0]
 
     # ── 1. Show config with no overrides ────────────────────────────
 

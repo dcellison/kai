@@ -44,6 +44,14 @@ from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.inbound import ClientInboundMessage, InboundBindingNotFoundError
 from kai.workshop.run_lifecycle import DurableRun, RunNotFoundError, RunStatus
 from kai.workshop.run_previews import RunPreview, WorkshopRunPreviewRegistry
+from kai.workshop.settings_workspaces import (
+    SettingsWorkspaceAuthority,
+    SettingsWorkspaceSnapshot,
+    WorkshopSettingsWorkspaceAccessDenied,
+    WorkshopSettingsWorkspaceService,
+    WorkshopSettingsWorkspaceValidationError,
+    WorkspaceConfigSnapshot,
+)
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
 from kai.workshop.timeline import (
     TimelineAccessDeniedError,
@@ -63,10 +71,17 @@ _ARTIFACT_DOWNLOAD_PATH = "/v1/channels/{channel_id}/artifacts/{artifact_id}/dow
 _RUN_STATE_PATH = "/v1/channels/{channel_id}/runs/{run_id}"
 _RUN_TRACE_PATH = "/v1/channels/{channel_id}/runs/{run_id}/trace"
 _RUN_CANCELLATION_PATH = "/v1/channels/{channel_id}/runs/{run_id}/cancel"
+_RUNTIME_SETTINGS_PATH = "/v1/channels/{channel_id}/settings"
+_ACTIVE_WORKSPACE_PATH = "/v1/channels/{channel_id}/workspace"
+_WORKSPACE_CONFIG_PATH = "/v1/channels/{channel_id}/workspace-config"
 _ALLOWED_TIMELINE_QUERY_PARAMETERS = frozenset({"cursor", "limit", "tail"})
 _ALLOWED_EVENT_QUERY_PARAMETERS = frozenset({"after_position"})
 _ENROLLMENT_REQUEST_FIELDS = frozenset({"enrollment_token", "device_display_name"})
 _COMMAND_REQUEST_FIELDS = frozenset({"client_message_id", "body"})
+_SETTINGS_REQUEST_FIELDS = frozenset({"model", "timeout_seconds", "reset"})
+_WORKSPACE_REQUEST_FIELDS = frozenset({"path"})
+_WORKSPACE_CONFIG_REQUEST_FIELDS = frozenset({"field", "value", "path"})
+_WORKSPACE_CONFIG_RESET_FIELDS = frozenset({"reset", "path"})
 _DECIMAL_INTEGER = re.compile(r"^[0-9]+$")
 _CLIENT_MESSAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _EVENT_BATCH_SIZE = 100
@@ -95,6 +110,318 @@ class WorkshopClientCommandSubmitter(Protocol):
     async def state(self, run_id: RunId) -> DurableRun: ...
 
     async def cancel(self, run_id: RunId) -> CanonicalCancellationDisposition: ...
+
+
+def _serialize_settings_workspace(
+    snapshot: SettingsWorkspaceSnapshot,
+) -> dict[str, object]:
+    return {
+        "version": 1,
+        "principal_id": str(snapshot.principal_id),
+        "channel_id": str(snapshot.channel_id),
+        "runtime_profile_id": str(snapshot.runtime_profile_id),
+        "backend": snapshot.backend,
+        "provider": snapshot.provider,
+        "model": {
+            "value": snapshot.model.value,
+            "source": snapshot.model.source,
+        },
+        "timeout_seconds": {
+            "value": snapshot.timeout_seconds.value,
+            "source": snapshot.timeout_seconds.source,
+        },
+        "workspace": snapshot.workspace,
+        "model_options": (
+            [
+                {
+                    "model_id": option.model_id,
+                    "display_name": option.display_name,
+                }
+                for option in snapshot.model_options
+            ]
+            if snapshot.model_options is not None
+            else None
+        ),
+        "workspaces": [
+            {
+                "path": option.path,
+                "name": option.name,
+                "current": option.current,
+                "home": option.home,
+            }
+            for option in snapshot.workspaces
+        ],
+    }
+
+
+def _serialize_workspace_config(
+    snapshot: WorkspaceConfigSnapshot,
+) -> dict[str, object]:
+    return {
+        "version": 1,
+        "workspace": snapshot.workspace,
+        "model": {
+            "value": snapshot.model.value,
+            "source": snapshot.model.source,
+        },
+        "timeout_seconds": {
+            "value": snapshot.timeout_seconds.value,
+            "source": snapshot.timeout_seconds.source,
+        },
+        "environment_keys": list(snapshot.environment_keys),
+        "prompt": snapshot.prompt,
+        "has_prompt": snapshot.has_prompt,
+        "prompt_source": snapshot.prompt_source,
+        "override_fields": list(snapshot.override_fields),
+    }
+
+
+async def _authenticate_settings_authority(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopSettingsWorkspaceService,
+) -> tuple[SettingsWorkspaceAuthority | None, web.Response | None]:
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        return None, _error_response(
+            status=401,
+            code="authentication_required",
+            message="Authentication required",
+        )
+    try:
+        channel_id = ChannelId(request.match_info["channel_id"])
+        authority = service.authority_for_principal_channel(
+            principal_id,
+            channel_id,
+        )
+    except (KeyError, TypeError, ValueError):
+        return None, _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid channel request",
+        )
+    except WorkshopSettingsWorkspaceAccessDenied:
+        return None, _error_response(
+            status=403,
+            code="access_denied",
+            message="Access denied",
+        )
+    return authority, None
+
+
+async def _handle_runtime_settings(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopSettingsWorkspaceService,
+) -> web.Response:
+    authority, error = await _authenticate_settings_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        if error.status == 401:
+            error.headers["WWW-Authenticate"] = "Bearer"
+        return error
+    assert authority is not None
+    if request.query or request.can_read_body:
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid settings request",
+        )
+    return _json_response(
+        _serialize_settings_workspace(await service.inspect(authority)),
+        status=200,
+    )
+
+
+async def _handle_runtime_settings_update(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopSettingsWorkspaceService,
+) -> web.Response:
+    authority, error = await _authenticate_settings_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        if error.status == 401:
+            error.headers["WWW-Authenticate"] = "Bearer"
+        return error
+    assert authority is not None
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid settings request")
+    try:
+        payload = await request.json()
+    except (UnicodeDecodeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid JSON request")
+    if not isinstance(payload, dict) or not payload or not set(payload).issubset(_SETTINGS_REQUEST_FIELDS):
+        return _error_response(status=400, code="invalid_request", message="Invalid settings request")
+    operations = sum(field in payload for field in _SETTINGS_REQUEST_FIELDS)
+    if operations != 1:
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Change exactly one setting at a time",
+        )
+    try:
+        if "model" in payload:
+            if not isinstance(payload["model"], str):
+                raise WorkshopSettingsWorkspaceValidationError("Model must be text")
+            snapshot = await service.set_model(authority, payload["model"])
+        elif "timeout_seconds" in payload:
+            snapshot = await service.set_timeout(
+                authority,
+                payload["timeout_seconds"],
+            )
+        else:
+            reset = payload["reset"]
+            if reset not in {"model", "timeout", "all"}:
+                raise WorkshopSettingsWorkspaceValidationError("Reset must be model, timeout, or all")
+            snapshot = await service.reset_settings(
+                authority,
+                None if reset == "all" else reset,
+            )
+    except WorkshopSettingsWorkspaceValidationError as exc:
+        return _error_response(
+            status=400,
+            code="invalid_setting",
+            message=str(exc),
+        )
+    return _json_response(_serialize_settings_workspace(snapshot), status=200)
+
+
+async def _handle_active_workspace_update(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopSettingsWorkspaceService,
+) -> web.Response:
+    authority, error = await _authenticate_settings_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        if error.status == 401:
+            error.headers["WWW-Authenticate"] = "Bearer"
+        return error
+    assert authority is not None
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid workspace request")
+    try:
+        payload = await request.json()
+    except (UnicodeDecodeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid JSON request")
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != _WORKSPACE_REQUEST_FIELDS
+        or not isinstance(payload.get("path"), str)
+    ):
+        return _error_response(status=400, code="invalid_request", message="Invalid workspace request")
+    try:
+        snapshot = await service.switch_workspace(authority, payload["path"])
+    except WorkshopSettingsWorkspaceAccessDenied:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except WorkshopSettingsWorkspaceValidationError as exc:
+        return _error_response(status=400, code="invalid_workspace", message=str(exc))
+    return _json_response(_serialize_settings_workspace(snapshot), status=200)
+
+
+async def _handle_workspace_config(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopSettingsWorkspaceService,
+) -> web.Response:
+    authority, error = await _authenticate_settings_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        if error.status == 401:
+            error.headers["WWW-Authenticate"] = "Bearer"
+        return error
+    assert authority is not None
+    if request.query or request.can_read_body:
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid workspace config request",
+        )
+    try:
+        snapshot = await service.workspace_config(authority)
+    except WorkshopSettingsWorkspaceAccessDenied:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    return _json_response(_serialize_workspace_config(snapshot), status=200)
+
+
+async def _handle_workspace_config_update(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopSettingsWorkspaceService,
+) -> web.Response:
+    authority, error = await _authenticate_settings_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        if error.status == 401:
+            error.headers["WWW-Authenticate"] = "Bearer"
+        return error
+    assert authority is not None
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid workspace config request")
+    try:
+        payload = await request.json()
+    except (UnicodeDecodeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid JSON request")
+    if not isinstance(payload, dict):
+        return _error_response(status=400, code="invalid_request", message="Invalid workspace config request")
+    keys = set(payload)
+    path = payload.get("path")
+    if path is not None and not isinstance(path, str):
+        return _error_response(status=400, code="invalid_request", message="Invalid workspace config request")
+    try:
+        if "reset" in payload:
+            if not keys.issubset(_WORKSPACE_CONFIG_RESET_FIELDS):
+                raise WorkshopSettingsWorkspaceValidationError("Invalid workspace config reset")
+            reset = payload["reset"]
+            if reset not in {"model", "timeout", "env", "prompt", "all"}:
+                raise WorkshopSettingsWorkspaceValidationError("Invalid workspace config reset")
+            snapshot = await service.reset_workspace_config(
+                authority,
+                field=None if reset == "all" else reset,
+                workspace_path=path,
+            )
+        else:
+            if (
+                not keys.issubset(_WORKSPACE_CONFIG_REQUEST_FIELDS)
+                or "field" not in payload
+                or "value" not in payload
+                or not isinstance(payload["field"], str)
+                or not isinstance(payload["value"], str)
+            ):
+                raise WorkshopSettingsWorkspaceValidationError("Invalid workspace config change")
+            snapshot = await service.set_workspace_config(
+                authority,
+                field=payload["field"],
+                value=payload["value"],
+                workspace_path=path,
+            )
+    except WorkshopSettingsWorkspaceAccessDenied:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except WorkshopSettingsWorkspaceValidationError as exc:
+        return _error_response(status=400, code="invalid_setting", message=str(exc))
+    return _json_response(_serialize_workspace_config(snapshot), status=200)
 
 
 class WorkshopEnrollmentRateLimiter:
@@ -1301,6 +1628,7 @@ def register_workshop_read_routes(
     event_stream_limiter: WorkshopEventStreamLimiter | None = None,
     run_previews: WorkshopRunPreviewRegistry | None = None,
     artifact_service: WorkshopArtifactService | None = None,
+    settings_workspaces: WorkshopSettingsWorkspaceService | None = None,
 ) -> None:
     """Register the read-only contract on an explicitly supplied application."""
     if event_poll_interval <= 0 or event_heartbeat_interval <= 0 or event_authentication_recheck_interval <= 0:
@@ -1367,6 +1695,61 @@ def register_workshop_read_routes(
 
         app.router.add_get(_ARTIFACT_CONTENT_PATH, handle_artifact_content)
         app.router.add_post(_ARTIFACT_DOWNLOAD_PATH, handle_artifact_download)
+    if settings_workspaces is not None:
+
+        async def handle_runtime_settings(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_runtime_settings(
+                    request,
+                    authenticator=authenticator,
+                    service=settings_workspaces,
+                )
+
+        async def handle_runtime_settings_update(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_runtime_settings_update(
+                    request,
+                    authenticator=authenticator,
+                    service=settings_workspaces,
+                )
+
+        async def handle_active_workspace_update(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_active_workspace_update(
+                    request,
+                    authenticator=authenticator,
+                    service=settings_workspaces,
+                )
+
+        async def handle_workspace_config(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_workspace_config(
+                    request,
+                    authenticator=authenticator,
+                    service=settings_workspaces,
+                )
+
+        async def handle_workspace_config_update(
+            request: web.Request,
+        ) -> web.Response:
+            async with request_lock:
+                return await _handle_workspace_config_update(
+                    request,
+                    authenticator=authenticator,
+                    service=settings_workspaces,
+                )
+
+        app.router.add_get(_RUNTIME_SETTINGS_PATH, handle_runtime_settings)
+        app.router.add_patch(
+            _RUNTIME_SETTINGS_PATH,
+            handle_runtime_settings_update,
+        )
+        app.router.add_post(_ACTIVE_WORKSPACE_PATH, handle_active_workspace_update)
+        app.router.add_get(_WORKSPACE_CONFIG_PATH, handle_workspace_config)
+        app.router.add_patch(
+            _WORKSPACE_CONFIG_PATH,
+            handle_workspace_config_update,
+        )
 
 
 def register_workshop_enrollment_routes(

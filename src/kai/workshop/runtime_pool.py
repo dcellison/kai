@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from kai.backend import StreamEvent
+from kai.config import WorkspaceConfig
 from kai.workshop.domain import RuntimeProfileId
 from kai.workshop.runtime_profiles import ProtectedRuntimeProfile, WorkshopRuntimeProfileRegistry
 
@@ -76,3 +77,80 @@ class WorkshopRuntimePool:
     ) -> Path:
         runtime_config_id = self.compatibility_runtime_config_id(runtime_profile_id)
         return await self._pool.get_effective_workspace(runtime_config_id)
+
+    def get_home_workspace(
+        self,
+        runtime_profile_id: str | RuntimeProfileId,
+    ) -> Path:
+        runtime_config_id = self.compatibility_runtime_config_id(runtime_profile_id)
+        return self._pool.get_home_workspace(runtime_config_id)
+
+    async def resolve_workspace_access(
+        self,
+        runtime_profile_id: str | RuntimeProfileId,
+    ) -> tuple[Path | None, list[Path]]:
+        runtime_config_id = self.compatibility_runtime_config_id(runtime_profile_id)
+        return await self._pool.resolve_workspace_access(runtime_config_id)
+
+    def set_model_if_running(
+        self,
+        runtime_profile_id: str | RuntimeProfileId,
+        model: str,
+    ) -> None:
+        runtime_config_id = self.compatibility_runtime_config_id(runtime_profile_id)
+        instance = self._pool.get_if_exists(runtime_config_id)
+        if instance is not None:
+            instance.model = model
+
+    def set_timeout_if_running(
+        self,
+        runtime_profile_id: str | RuntimeProfileId,
+        timeout_seconds: int,
+    ) -> None:
+        runtime_config_id = self.compatibility_runtime_config_id(runtime_profile_id)
+        instance = self._pool.get_if_exists(runtime_config_id)
+        if instance is not None:
+            instance.timeout_seconds = timeout_seconds
+
+    async def apply_workspace_config_if_running(
+        self,
+        runtime_profile_id: str | RuntimeProfileId,
+        workspace: Path,
+        *,
+        workspace_config: WorkspaceConfig | None,
+        model: str,
+        timeout_seconds: int,
+    ) -> None:
+        """Apply a complete effective configuration without spawning a runtime."""
+        runtime_config_id = self.compatibility_runtime_config_id(runtime_profile_id)
+        instance = self._pool.get_if_exists(runtime_config_id)
+        if instance is None:
+            return
+        await instance.change_workspace(
+            workspace,
+            workspace_config=workspace_config,
+        )
+        # change_workspace resets to the backend's construction defaults and
+        # applies workspace-local fields. Reapply the fully resolved values so
+        # user-level overrides remain effective when the workspace has no
+        # corresponding override.
+        instance.model = model
+        instance.timeout_seconds = timeout_seconds
+
+    async def change_workspace(
+        self,
+        runtime_profile_id: str | RuntimeProfileId,
+        workspace: Path,
+        *,
+        workspace_config: WorkspaceConfig | None,
+    ) -> None:
+        runtime_config_id = self.compatibility_runtime_config_id(runtime_profile_id)
+        await self._pool.change_workspace(
+            runtime_config_id,
+            workspace,
+            workspace_config=workspace_config,
+        )
+
+    async def restart(self, runtime_profile_id: str | RuntimeProfileId) -> None:
+        runtime_config_id = self.compatibility_runtime_config_id(runtime_profile_id)
+        await self._pool.restart(runtime_config_id)

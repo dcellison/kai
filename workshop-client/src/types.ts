@@ -47,6 +47,31 @@ export interface WorkshopNavigation {
   workshops: WorkshopSummary[];
 }
 
+export interface WorkshopModelOption {
+  displayName: string;
+  modelId: string;
+}
+
+export interface WorkshopWorkspaceOption {
+  current: boolean;
+  home: boolean;
+  name: string;
+  path: string;
+}
+
+export interface WorkshopSettingsWorkspace {
+  backend: string;
+  channelId: string;
+  model: { source: string; value: string };
+  modelOptions: WorkshopModelOption[] | null;
+  principalId: string;
+  provider: string;
+  runtimeProfileId: string;
+  timeoutSeconds: { source: string; value: number };
+  workspace: string;
+  workspaces: WorkshopWorkspaceOption[];
+}
+
 export interface TimelineMessage {
   artifacts: WorkshopArtifactSummary[];
   authorDisplayName: string;

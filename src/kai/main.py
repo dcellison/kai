@@ -627,6 +627,7 @@ def _start() -> None:
             core_host = KaiApplicationHost(
                 config=config,
                 runtime_profiles=runtime_profiles,
+                execution_state=execution_state,
                 principal_storage=principal_storage,
                 services_info=services.get_available_services(),
                 registered_backend_ids=_workshop_registered_backend_ids(config),
