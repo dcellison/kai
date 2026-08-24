@@ -8903,7 +8903,7 @@ def _core_schedule_status(db_path: Path) -> str:
     except sqlite3.Error as exc:
         return f"Workshop scheduler: NOT VERIFIED ({exc})"
     active = int(ownership[0]) if ownership else 0
-    owned = int(ownership[1]) if ownership else 0
+    owned = int(ownership[1] or 0) if ownership else 0
     pending = int(firings[0] or 0) if firings else 0
     executing = int(firings[1] or 0) if firings else 0
     failed = int(firings[2] or 0) if firings else 0
