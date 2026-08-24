@@ -1468,9 +1468,10 @@ async def _handle_send_file(request: web.Request, principal: InternalAPIPrincipa
     if not file_path:
         return web.json_response({"error": "Missing required field: path"}, status=400)
 
-    # Resolve chat_id first - needed for per-user workspace confinement
+    # Identity and authority are bound to the credential. Caller-supplied
+    # selectors are rejected before any filesystem lookup.
     try:
-        chat_id = _resolve_internal_runtime_config_id(principal, payload)
+        _reject_internal_identity_selectors(payload)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
 
@@ -1481,27 +1482,31 @@ async def _handle_send_file(request: web.Request, principal: InternalAPIPrincipa
     # has their own per-user home workspace resolved from the pool (#353).
     # When the pool is unavailable (transient startup state) we refuse the
     # request rather than opening a global fallback path.
-    pool = request.app.get(POOL_KEY)
-    if pool is None:
+    core_host = request.app.get(CORE_HOST_KEY)
+    if core_host is None:
         return web.json_response({"error": "No workspace configured"}, status=403)
-    workspace = str(await pool.get_effective_workspace(chat_id))
-    # Allow files from either the workspace or this authenticated principal's
-    # canonical upload directory. The prior configured-user directory remains
-    # readable during migration, but the legacy shared root and sibling
-    # principals' directories are excluded. Both scopes are resolved from the
-    # authenticated credential, never from caller-selected request fields.
+    try:
+        workspace = str(await core_host.services.runtime_pool.get_effective_workspace(principal.runtime_profile_id))
+    except Exception:
+        log.exception("Internal file workspace resolution failed")
+        return web.json_response({"error": "No workspace configured"}, status=403)
+
+    # Allow files from the effective workspace or this authenticated
+    # principal's canonical upload directory. Numeric compatibility
+    # directories are archives and are never protected runtime read roots.
     workspace_resolved = Path(workspace).resolve()
     storage_registry = request.app.get(WORKSHOP_PRINCIPAL_STORAGE_KEY)
     if storage_registry is None:
         return web.json_response({"error": "Principal storage unavailable"}, status=403)
     try:
-        storage_namespace = storage_registry.for_runtime_config_id(principal.compatibility_runtime_config_id())
+        storage_namespace = storage_registry.for_runtime_profile(principal.runtime_profile_id)
     except WorkshopStorageNamespaceError:
+        return web.json_response({"error": "Principal storage unavailable"}, status=403)
+    if storage_namespace.principal_id != principal.principal_id:
         return web.json_response({"error": "Principal storage unavailable"}, status=403)
     allowed_roots = (
         workspace_resolved,
         storage_namespace.files_directory(DATA_DIR).resolve(),
-        storage_namespace.legacy_files_directory(DATA_DIR).resolve(),
     )
     if not any(path.is_relative_to(root) for root in allowed_roots):
         return web.json_response({"error": "Path outside allowed directories"}, status=403)
@@ -1509,6 +1514,10 @@ async def _handle_send_file(request: web.Request, principal: InternalAPIPrincipa
     if not path.is_file():
         return web.json_response({"error": f"File not found: {file_path}"}, status=404)
 
+    # Direct Telegram publication is the remaining bounded compatibility seam
+    # and is retired in the next internal-API slice. It is not consulted for
+    # workspace or storage authorization above.
+    chat_id = principal.compatibility_runtime_config_id()
     bot = request.app[TELEGRAM_BOT_KEY]
     caption = payload.get("caption", "")
 
@@ -1541,11 +1550,10 @@ async def _handle_send_file(request: web.Request, principal: InternalAPIPrincipa
 #     "no data" and inner Claude could not pick a retry policy from the
 #     status code alone.
 #
-#   - Memory primitives take user_id as a string; _resolve_internal_runtime_config_id returns
-#     int. Stringify at the boundary in every handler. Removing the cast
-#     is a load-bearing bug: Mem0 keys are stored under the string form,
-#     so a missed cast would silently isolate the caller's memories from
-#     their existing facts.
+#   - Memory primitives take user_id as a string. Every handler passes the
+#     credential-bound canonical principal ID; memory.py's configured
+#     authority resolver adds and verifies the complete canonical provenance
+#     tuple without creating a second namespace.
 #
 #   - Handlers import memory as a module (`from kai import memory`) so
 #     tests can patch `kai.memory.<func>` uniformly. Function-level
@@ -1676,7 +1684,7 @@ async def _handle_memory_add(request: web.Request, principal: InternalAPIPrincip
             return web.json_response({"error": "metadata.confidence must be a number in [0.0, 1.0]"}, status=400)
 
     try:
-        chat_id = _resolve_internal_runtime_config_id(principal, payload)
+        _reject_internal_identity_selectors(payload)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
 
@@ -1686,8 +1694,7 @@ async def _handle_memory_add(request: web.Request, principal: InternalAPIPrincip
     if not memory.is_enabled():
         return _memory_disabled_response()
 
-    # int -> str at the memory boundary; do NOT remove the cast.
-    user_id = str(chat_id)
+    user_id = str(principal.principal_id)
 
     # Server-side provenance stamp. Lazy imports keep
     # memory_extraction (and its one-shot reasoner stack) out of this
@@ -1712,14 +1719,16 @@ async def _handle_memory_add(request: web.Request, principal: InternalAPIPrincip
     # must surface as the handler's clean JSON 500, not mis-scope the
     # write to global silently or escape as a framework HTML 500.
     try:
-        pool = request.app.get(POOL_KEY)
-        active_project = None
-        if pool is not None:
-            api_config: Config = request.app[CONFIG_KEY]
-            workspace = await pool.get_effective_workspace(chat_id)
-            active_project = detect_active_memory_project(workspace, merged_registry(api_config.memory_projects))
+        api_config: Config = request.app[CONFIG_KEY]
+        workspace = await request.app[CORE_HOST_KEY].services.runtime_pool.get_effective_workspace(
+            principal.runtime_profile_id
+        )
+        active_project = detect_active_memory_project(
+            workspace,
+            merged_registry(api_config.memory_projects),
+        )
     except Exception:
-        log.exception("memory add: workspace scope resolution failed for chat %d", chat_id)
+        log.exception("Memory add workspace scope resolution failed")
         return web.json_response({"error": "Memory storage failed"}, status=500)
     final_metadata.update(_route_write_scope(None, active_project))
 
@@ -1738,9 +1747,10 @@ async def _handle_memory_add(request: web.Request, principal: InternalAPIPrincip
             memory_type=memory_type,
             tags=tags,
             metadata=final_metadata,
+            runtime_profile_id=str(principal.runtime_profile_id),
         )
     except Exception:
-        log.exception("memory.add_structured failed for chat %d", chat_id)
+        log.exception("memory.add_structured failed for canonical principal")
         return web.json_response({"error": "Memory storage failed"}, status=500)
 
     if memory_id is None:
@@ -1755,7 +1765,7 @@ async def _handle_memory_add(request: web.Request, principal: InternalAPIPrincip
         # transient store failures.
         return web.json_response({"error": "Memory storage failed"}, status=500)
 
-    log.info("Stored memory %s for chat %d via API", memory_id, chat_id)
+    log.info("Stored memory %s through canonical internal API authority", memory_id)
     return web.json_response({"id": memory_id})
 
 
@@ -1810,7 +1820,7 @@ async def _handle_memory_search(request: web.Request, principal: InternalAPIPrin
         return web.json_response({"error": "limit must be a positive integer"}, status=400)
 
     try:
-        chat_id = _resolve_internal_runtime_config_id(principal, payload)
+        _reject_internal_identity_selectors(payload)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
 
@@ -1822,7 +1832,7 @@ async def _handle_memory_search(request: web.Request, principal: InternalAPIPrin
     if not memory.is_enabled():
         return _memory_disabled_response()
 
-    user_id = str(chat_id)
+    user_id = str(principal.principal_id)
 
     # Defense-in-depth around the full risky path: primitive call AND
     # serialization. search() catches its own exceptions and returns []
@@ -1834,14 +1844,19 @@ async def _handle_memory_search(request: web.Request, principal: InternalAPIPrin
     # Without the wider guard, asdict raising TypeError or json_response
     # raising ValueError would escape to aiohttp as an unstyled HTML 500.
     try:
-        results = memory.search(query, user_id=user_id, limit=limit)
+        results = memory.search(
+            query,
+            user_id=user_id,
+            limit=limit,
+            runtime_profile_id=str(principal.runtime_profile_id),
+        )
         # asdict() flattens each frozen dataclass to a plain dict. Every
         # value inside MemoryResult.metadata is JSON-native because Mem0
         # stores metadata in Qdrant as JSON, so json_response can
         # serialize the whole structure without a custom encoder.
         return web.json_response({"results": [asdict(r) for r in results]})
     except Exception:
-        log.exception("memory.search failed for chat %d", chat_id)
+        log.exception("memory.search failed for canonical principal")
         return web.json_response({"error": "Memory search failed"}, status=500)
 
 
@@ -1870,7 +1885,7 @@ async def _handle_memory_stats(request: web.Request, principal: InternalAPIPrinc
     """
     # Query parameters cannot select identity; the credential owns routing.
     try:
-        chat_id = _resolve_internal_runtime_config_id(principal, dict(request.query))
+        _reject_internal_identity_selectors(dict(request.query))
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
 
@@ -1881,7 +1896,7 @@ async def _handle_memory_stats(request: web.Request, principal: InternalAPIPrinc
     if not memory.is_enabled():
         return _memory_disabled_response()
 
-    user_id = str(chat_id)
+    user_id = str(principal.principal_id)
 
     # Wider guard around primitive call AND serialization, matching the
     # search handler. get_stats() doesn't have its own try/except today
@@ -1890,14 +1905,17 @@ async def _handle_memory_stats(request: web.Request, principal: InternalAPIPrinc
     # remaining route by which an exception could escape to aiohttp as
     # an HTML 500.
     try:
-        stats = memory.get_stats(user_id=user_id)
+        stats = memory.get_stats(
+            user_id=user_id,
+            runtime_profile_id=str(principal.runtime_profile_id),
+        )
         # asdict() preserves None for the optional confidence_* fields,
         # which become JSON null on the wire. The CLAUDE.md
         # "Memory System" section documents this so inner Claude does
         # not misread null as a store failure.
         return web.json_response(asdict(stats))
     except Exception:
-        log.exception("memory.get_stats failed for chat %d", chat_id)
+        log.exception("memory.get_stats failed for canonical principal")
         return web.json_response({"error": "Memory stats failed"}, status=500)
 
 
@@ -1937,10 +1955,10 @@ async def _handle_memory_delete_all(request: web.Request, principal: InternalAPI
     if not isinstance(payload, dict):
         return web.json_response({"error": "Request body must be a JSON object"}, status=400)
 
-    # Confirm-token check before compatibility storage resolution: a request with the
+    # Confirm-token check before canonical authority validation: a request with the
     # wrong token is structurally bad input regardless of which user it
     # was aimed at, and rejecting it first means we don't waste a
-    # _resolve_internal_runtime_config_id call on requests we will reject anyway.
+    # selector check on requests we will reject anyway.
     if payload.get("confirm") != _DELETE_ALL_CONFIRM_TOKEN:
         return web.json_response(
             {"error": f'Missing or incorrect confirm field; expected "{_DELETE_ALL_CONFIRM_TOKEN}"'},
@@ -1948,7 +1966,7 @@ async def _handle_memory_delete_all(request: web.Request, principal: InternalAPI
         )
 
     try:
-        chat_id = _resolve_internal_runtime_config_id(principal, payload)
+        _reject_internal_identity_selectors(payload)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
 
@@ -1958,7 +1976,7 @@ async def _handle_memory_delete_all(request: web.Request, principal: InternalAPI
     if not memory.is_enabled():
         return _memory_disabled_response()
 
-    user_id = str(chat_id)
+    user_id = str(principal.principal_id)
     # Defense-in-depth guard, matching the pattern used in
     # _handle_memory_search and _handle_memory_stats. delete_all()
     # catches its own internal errors today (memory.py:1066-1069), so
@@ -1968,12 +1986,15 @@ async def _handle_memory_delete_all(request: web.Request, principal: InternalAPI
     # shape), the handler still returns a clean 500 JSON body instead
     # of an aiohttp HTML 500 page.
     try:
-        memory.delete_all(user_id=user_id)
+        memory.delete_all(
+            user_id=user_id,
+            runtime_profile_id=str(principal.runtime_profile_id),
+        )
     except Exception:
-        log.exception("memory.delete_all failed for chat %d", chat_id)
+        log.exception("memory.delete_all failed for canonical principal")
         return web.json_response({"error": "Memory delete failed"}, status=500)
 
-    log.info("Deleted all memories for chat %d via API", chat_id)
+    log.info("Deleted memories through canonical internal API authority")
     return web.json_response({"status": "deleted"})
 
 

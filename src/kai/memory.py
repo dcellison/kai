@@ -892,6 +892,8 @@ class CanonicalMemoryNamespaceResolver(Protocol):
 
     def maybe_for_principal_id(self, principal_id: str) -> _CanonicalMemoryNamespace | None: ...
 
+    def maybe_for_runtime_profile_id(self, runtime_profile_id: str) -> _CanonicalMemoryNamespace | None: ...
+
 
 class CanonicalMemoryAuthorityError(RuntimeError):
     """Semantic memory cannot be attributed to one canonical owner."""
@@ -919,8 +921,19 @@ def configure_memory_authority(
 
 def _canonical_memory_owner(
     user_id: str,
+    *,
+    runtime_profile_id: str | None = None,
 ) -> tuple[str, _CanonicalMemoryNamespace | None]:
     registry = _MEMORY_AUTHORITY_REGISTRY
+    if runtime_profile_id is not None:
+        if registry is None:
+            raise CanonicalMemoryAuthorityError("Canonical semantic-memory authority is not configured")
+        namespace = registry.maybe_for_runtime_profile_id(runtime_profile_id)
+        if namespace is None or str(namespace.principal_id) != user_id:
+            raise CanonicalMemoryAuthorityError(
+                "Runtime profile does not belong to the canonical semantic-memory principal"
+            )
+        return user_id, namespace
     if registry is None:
         return user_id, None
     canonical = registry.maybe_for_principal_id(user_id)
@@ -1995,7 +2008,13 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     return _embed_via_configured_embedder(texts)
 
 
-def search(query: str, *, user_id: str, limit: int | None = None) -> list[MemoryResult]:
+def search(
+    query: str,
+    *,
+    user_id: str,
+    limit: int | None = None,
+    runtime_profile_id: str | None = None,
+) -> list[MemoryResult]:
     """
     Search for memories semantically similar to the query.
 
@@ -2004,6 +2023,9 @@ def search(query: str, *, user_id: str, limit: int | None = None) -> list[Memory
         user_id: Semantic-memory owner key. Protected runtime IDs resolve to
             their canonical Workshop principal.
         limit: Max results. Defaults to config.memory_search_limit.
+        runtime_profile_id: Optional exact protected runtime authority. When
+            supplied, it must belong to ``user_id`` and canonical memory
+            authority must be configured.
 
     Returns:
         List of MemoryResult sorted by descending similarity score.
@@ -2013,7 +2035,10 @@ def search(query: str, *, user_id: str, limit: int | None = None) -> list[Memory
         return []
 
     effective_limit = limit if limit is not None else _config.memory_search_limit
-    storage_user_id, namespace = _canonical_memory_owner(user_id)
+    storage_user_id, namespace = _canonical_memory_owner(
+        user_id,
+        runtime_profile_id=runtime_profile_id,
+    )
 
     try:
         result = _memory.search(
@@ -3239,6 +3264,7 @@ def add_structured(
     memory_type: str = "fact",
     tags: list[str] | None = None,
     metadata: dict | None = None,
+    runtime_profile_id: str | None = None,
 ) -> str | None:
     """
     Store a single structured memory with explicit type and metadata.
@@ -3259,6 +3285,9 @@ def add_structured(
         metadata: Optional additional key/value pairs. Merged into the final
             metadata dict; the keys "type" and "tags" are reserved and will
             be overwritten by memory_type and tags arguments.
+        runtime_profile_id: Optional exact protected runtime authority. When
+            supplied, it must belong to ``user_id`` and is stamped into
+            canonical provenance.
 
     Returns:
         The Mem0 memory ID as a string on success. None if memory is
@@ -3284,7 +3313,10 @@ def add_structured(
         # never-raise contract; a conflicting caller must get the
         # same None-plus-warning failure surface as a store error,
         # not an exception the caller was told cannot happen.
-        storage_user_id, namespace = _canonical_memory_owner(user_id)
+        storage_user_id, namespace = _canonical_memory_owner(
+            user_id,
+            runtime_profile_id=runtime_profile_id,
+        )
 
         # Build the metadata dict. Caller-provided metadata comes
         # first so the reserved keys (type, tags) can override
@@ -3319,7 +3351,12 @@ def add_structured(
     return None
 
 
-def get_all(*, user_id: str, limit: int | None = 1000) -> list[MemoryResult]:
+def get_all(
+    *,
+    user_id: str,
+    limit: int | None = 1000,
+    runtime_profile_id: str | None = None,
+) -> list[MemoryResult]:
     """
     Get all memories for a user.
 
@@ -3340,6 +3377,8 @@ def get_all(*, user_id: str, limit: int | None = 1000) -> list[MemoryResult]:
             see spec 310 §7.2.1 for the cap-vs-pagination tradeoff and
             the long-term plan to switch to true cursor pagination once
             single users approach the new ceiling.
+        runtime_profile_id: Optional exact protected runtime authority used to
+            enforce the complete provenance tuple.
     """
     if _memory is None:
         return []
@@ -3351,7 +3390,10 @@ def get_all(*, user_id: str, limit: int | None = 1000) -> list[MemoryResult]:
     # 1000. Aligned with the spec §7.2.1 guidance ("100000").
     effective_top_k = 100_000 if limit is None else limit
 
-    storage_user_id, namespace = _canonical_memory_owner(user_id)
+    storage_user_id, namespace = _canonical_memory_owner(
+        user_id,
+        runtime_profile_id=runtime_profile_id,
+    )
     try:
         result = _memory.get_all(filters={"user_id": storage_user_id}, top_k=effective_top_k)
         raw_results = result.get("results", []) if isinstance(result, dict) else result
@@ -3914,7 +3956,7 @@ def update_metadata(*, user_id: str, memory_id: str, data: str, metadata: dict[s
     return True
 
 
-def delete_all(*, user_id: str) -> None:
+def delete_all(*, user_id: str, runtime_profile_id: str | None = None) -> None:
     """
     Delete every memory the caller can see.
 
@@ -3937,7 +3979,10 @@ def delete_all(*, user_id: str) -> None:
     if _memory is None:
         return
 
-    storage_user_id, namespace = _canonical_memory_owner(user_id)
+    storage_user_id, namespace = _canonical_memory_owner(
+        user_id,
+        runtime_profile_id=runtime_profile_id,
+    )
     try:
         while True:
             result = _memory.get_all(
@@ -3960,7 +4005,7 @@ def delete_all(*, user_id: str) -> None:
         log.warning("Memory delete_all failed", exc_info=True)
 
 
-def get_stats(*, user_id: str) -> MemoryStats:
+def get_stats(*, user_id: str, runtime_profile_id: str | None = None) -> MemoryStats:
     """
     Get memory statistics for a user.
 
@@ -3986,7 +4031,11 @@ def get_stats(*, user_id: str) -> MemoryStats:
 
     Returns zeroed stats if disabled (memories will be []).
     """
-    memories = get_all(user_id=user_id, limit=None)
+    memories = get_all(
+        user_id=user_id,
+        limit=None,
+        runtime_profile_id=runtime_profile_id,
+    )
 
     # All-rows aggregates (legacy). Computed across every source.
     by_type: dict[str, int] = {}
