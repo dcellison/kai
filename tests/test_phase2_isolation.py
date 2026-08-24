@@ -15,7 +15,7 @@ from unittest.mock import patch
 import pytest
 
 from kai import sessions
-from kai.bot import _clear_responding, _save_upload, _set_responding
+from kai.bot import _save_upload
 from kai.history import get_recent_history
 from kai.workshop.domain import PrincipalId
 
@@ -275,30 +275,6 @@ class TestWorkspaceHistoryPerUser:
 
 
 # ── Crash recovery ──────────────────────────────────────────────────
-
-
-class TestCrashRecoveryPerUser:
-    def test_multiple_users_in_flight(self, tmp_path):
-        """Two users in-flight. Both flag files exist. Clear one; the other remains."""
-        with patch("kai.bot._RESPONDING_DIR", tmp_path / ".responding"):
-            _set_responding(111)
-            _set_responding(222)
-
-            assert (tmp_path / ".responding" / "111").exists()
-            assert (tmp_path / ".responding" / "222").exists()
-
-            _clear_responding(111)
-
-            assert not (tmp_path / ".responding" / "111").exists()
-            assert (tmp_path / ".responding" / "222").exists()
-
-    def test_clear_noop_if_missing(self, tmp_path):
-        """Clearing a non-existent flag is a no-op."""
-        responding_dir = tmp_path / ".responding"
-        responding_dir.mkdir()
-
-        with patch("kai.bot._RESPONDING_DIR", responding_dir):
-            _clear_responding(999)  # should not raise
 
 
 class TestCrashRecoveryFlagOrdering:

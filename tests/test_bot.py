@@ -20,13 +20,9 @@ import pytest
 from telegram.error import BadRequest
 
 from kai import sessions
-from kai.backend import AgentResponse, StreamEvent, resolve_home_workspace
+from kai.backend import AgentResponse, resolve_home_workspace
 from kai.bot import (
-    _QUEUED_MESSAGE_MARKER,
     KaiTelegramApplication,
-    ResponseDeliveryRoute,
-    _acquire_lock_or_kill,
-    _clear_responding,
     _do_switch_workspace,
     _edit_message_safe,
     _handle_settings_reset,
@@ -37,13 +33,10 @@ from kai.bot import (
     _is_authorized,
     _is_notify_chat_used,
     _models_keyboard,
-    _notify_if_queued,
-    _prepend_queue_marker,
     _reply_safe,
     _require_auth,
     _resolve_workspace_path,
     _save_upload,
-    _set_responding,
     _short_workspace_name,
     _show_github,
     _show_settings,
@@ -89,22 +82,20 @@ from kai.config import (
     resolve_user_model,
 )
 from kai.review import CollectionWarning, PRReviewResult
-from kai.tts import DEFAULT_VOICE, VOICES
+from kai.transcribe import TranscriptionError
+from kai.tts import DEFAULT_VOICE, VOICES, TTSError
 from kai.workshop.artifacts import (
-    InboundArtifact,
     StagedArtifact,
     canonical_artifact_media_type,
 )
 from kai.workshop.conversation_commands import ConversationCommandDisposition
-from kai.workshop.conversation_runs import (
-    CanonicalConversationRunTarget,
-    PreparedConversationRun,
-    WorkshopConversationRunService,
+from kai.workshop.conversation_runs import WorkshopConversationRunService
+from kai.workshop.domain import AgentId, ChannelId, MessageId, PrincipalId, RunId
+from kai.workshop.execution_coordinator import (
+    CanonicalCancellationDisposition,
+    CanonicalExecutionDisposition,
 )
-from kai.workshop.domain import AgentId, ChannelId, MessageId, PrincipalId, RunId, RuntimeProfileId, WorkshopId
-from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.inbound import InboundMessage
-from kai.workshop.outbound import DeliveryObservation, OutboundMessage
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.settings_workspaces import (
     EffectiveValue,
@@ -114,7 +105,6 @@ from kai.workshop.storage_namespaces import (
     WorkshopPrincipalStorageNamespace,
     WorkshopPrincipalStorageRegistry,
 )
-from kai.workshop.streaming_preview import ConfirmedTelegramStreamingPreview
 from kai.workspace_utils import is_workspace_allowed
 from tests.workshop_profiles import profile_id, profile_registry
 
@@ -746,16 +736,10 @@ class TestCreateBotTransportMode:
         with pytest.raises(RuntimeError, match="cannot start without TELEGRAM_BOT_TOKEN"):
             create_bot(config, core_services=_bot_core_services(config))
 
-    def test_installs_workshop_shadow_recorder(self):
+    def test_installs_typed_core_services_without_shadow_recorders(self):
         config = _make_config()
         app = create_bot(config, core_services=_bot_core_services(config))
 
-        assert app.bot_data["workshop_inbound_recorder"] is sessions.record_workshop_inbound_message
-        assert app.bot_data["workshop_artifact_recorder"] is sessions.record_workshop_inbound_artifact
-        assert app.bot_data["workshop_outbound_recorder"] is sessions.record_workshop_outbound_message
-        assert app.bot_data["workshop_delivery_recorder"] is sessions.record_workshop_delivery_observation
-        assert app.bot_data["workshop_streaming_preview_recorder"] is sessions.record_workshop_streaming_preview
-        assert app.bot_data["workshop_streaming_finalizer"] is sessions.record_workshop_streaming_finalization
         assert isinstance(app, KaiTelegramApplication)
         assert isinstance(app.core_services.runtime_pool, WorkshopRuntimePool)
         assert isinstance(app.core_services.conversation_runs, WorkshopConversationRunService)
@@ -765,15 +749,21 @@ class TestCreateBotTransportMode:
             "workshop_conversation_run_service",
             "workshop_private_text_execution",
             "workshop_principal_storage",
+            "workshop_inbound_recorder",
+            "workshop_artifact_recorder",
+            "workshop_outbound_recorder",
+            "workshop_delivery_recorder",
+            "workshop_streaming_preview_recorder",
+            "workshop_streaming_finalizer",
         ):
             assert removed_key not in app.bot_data
 
-    def test_does_not_register_durable_run_lifecycle_before_cutover(self):
+    def test_does_not_publish_untyped_run_lifecycle_alias(self):
         config = _make_config()
         app = create_bot(config, core_services=_bot_core_services(config))
 
-        # The durable lifecycle remains deliberately unregistered until the
-        # run-authority cutover gates in the Workshop map are satisfied.
+        # The application host owns the typed canonical services; Telegram
+        # must not publish an alternate lifecycle through mutable bot_data.
         assert "workshop_run_lifecycle" not in app.bot_data
 
 
@@ -986,16 +976,6 @@ def _make_context(config=None, claude=None, pool=None, args=None, user_data=None
     return ctx
 
 
-def _fake_lock(*_args, **_kwargs):
-    """Return a real asyncio.Lock to stand in for the per-chat lock.
-
-    Uses a real Lock instead of a bare async context manager so that both
-    async-with and .locked() work (the latter is needed by _notify_if_queued).
-    The lock starts unlocked, so _notify_if_queued correctly skips notification.
-    """
-    return asyncio.Lock()
-
-
 def _mock_resolve(base=None, allowed=None):
     """Return a patch context that mocks sessions.resolve_workspace_access.
 
@@ -1008,59 +988,6 @@ def _mock_resolve(base=None, allowed=None):
         new_callable=AsyncMock,
         return_value=(base, allowed or []),
     )
-
-
-def _text_event(text: str) -> StreamEvent:
-    """Non-final streaming event with accumulated text."""
-    return StreamEvent(text_so_far=text, done=False, response=None)
-
-
-def _done_event(text="Final response", session_id="sess-1", success=True, error=None) -> StreamEvent:
-    """Final streaming event with an AgentResponse."""
-    return StreamEvent(
-        text_so_far=text,
-        done=True,
-        response=AgentResponse(
-            text=text,
-            success=success,
-            error=error,
-            duration_ms=1000,
-            session_id=session_id,
-        ),
-    )
-
-
-async def _fake_stream(*events):
-    """Async generator that yields StreamEvents."""
-    for e in events:
-        yield e
-
-
-# ── Crash recovery flag ──────────────────────────────────────────────
-
-
-class TestCrashRecoveryFlag:
-    def test_set_responding_writes_chat_id(self, tmp_path):
-        """Per-user flag file is created under the .responding directory."""
-        responding_dir = tmp_path / ".responding"
-        with patch("kai.bot._RESPONDING_DIR", responding_dir):
-            _set_responding(12345)
-        assert (responding_dir / "12345").exists()
-
-    def test_clear_responding_removes_flag(self, tmp_path):
-        """Per-user flag file is deleted after clearing."""
-        responding_dir = tmp_path / ".responding"
-        responding_dir.mkdir()
-        (responding_dir / "12345").touch()
-        with patch("kai.bot._RESPONDING_DIR", responding_dir):
-            _clear_responding(12345)
-        assert not (responding_dir / "12345").exists()
-
-    def test_clear_responding_noop_if_missing(self, tmp_path):
-        """No error when flag file doesn't exist."""
-        responding_dir = tmp_path / ".responding"
-        with patch("kai.bot._RESPONDING_DIR", responding_dir):
-            _clear_responding(12345)  # should not raise
 
 
 # ── Authorization ────────────────────────────────────────────────────
@@ -2909,30 +2836,10 @@ class TestSwitchWorkspaceConfig:
 
 class TestHandleMessage:
     @pytest.mark.asyncio
-    async def test_normal_message(self):
-        """Normal message: logs, acquires lock, calls _handle_response."""
-        update = _make_update(text="hello world")
-        ctx = _make_context()
-        with (
-            patch("kai.bot.is_totp_configured", return_value=False),
-            patch("kai.bot._handle_response", new_callable=AsyncMock) as mock_resp,
-            patch("kai.bot.log_message") as mock_log,
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
-            patch("kai.bot.get_lock", return_value=_fake_lock()),
-        ):
-            await handle_message(update, ctx)
-        mock_resp.assert_called_once()
-        assert mock_resp.await_args.kwargs["delivery_route"] == ResponseDeliveryRoute.LEGACY
-        mock_log.assert_called_once()
-
-    @pytest.mark.asyncio
     async def test_records_authenticated_message_after_totp_gate(self):
         update = _make_update(text="canonical input", chat_id=1, user_id=1)
         ctx = _make_context(config=_make_config(allowed_user_ids={1}))
-        recorder = AsyncMock()
         inbound_id = MessageId("msg_00000000000000000000000000000001")
-        ctx.bot_data["workshop_inbound_recorder"] = recorder
         run_id = RunId("run_00000000000000000000000000000001")
         execution = MagicMock()
         execution.accept = AsyncMock()
@@ -2940,13 +2847,10 @@ class TestHandleMessage:
         execution.accept.return_value.run.run_id = run_id
         execution.accept.return_value.disposition = ConversationCommandDisposition.NEWLY_ACCEPTED
         ctx.application.core_services.private_text_execution = execution
+
         with (
             patch("kai.bot.is_totp_configured", return_value=False),
             patch("kai.bot._handle_workshop_private_text", new_callable=AsyncMock) as response,
-            patch("kai.bot.log_message"),
-            patch("kai.bot._set_responding") as set_responding,
-            patch("kai.bot._clear_responding") as clear_responding,
-            patch("kai.bot.get_lock", return_value=_fake_lock()) as get_lock,
         ):
             await handle_message(update, ctx)
 
@@ -2961,12 +2865,31 @@ class TestHandleMessage:
                 occurred_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
             )
         )
-        recorder.assert_not_awaited()
-        assert response.await_args.kwargs["inbound_message_id"] == inbound_id
-        assert response.await_args.kwargs["run_id"] == run_id
-        get_lock.assert_not_called()
-        set_responding.assert_not_called()
-        clear_responding.assert_not_called()
+        response.assert_awaited_once_with(
+            update,
+            ctx,
+            chat_id=1,
+            run_id=run_id,
+            inbound_message_id=inbound_id,
+            prompt="canonical input",
+            voice_mode="off",
+        )
+
+    @pytest.mark.asyncio
+    async def test_private_text_voice_mode_still_uses_canonical_execution(self):
+        update = _make_update(text="speak this", chat_id=1, user_id=1)
+        ctx = _make_context(config=_make_config(allowed_user_ids={1}, tts_enabled=True))
+        execution, _, _ = _configure_canonical_media_execution(ctx)
+
+        with (
+            patch("kai.bot.is_totp_configured", return_value=False),
+            patch("kai.bot.sessions.get_setting", new_callable=AsyncMock, return_value="only"),
+            patch("kai.bot._handle_workshop_private_text", new_callable=AsyncMock) as canonical_execute,
+        ):
+            await handle_message(update, ctx)
+
+        execution.accept.assert_awaited_once()
+        assert canonical_execute.await_args.kwargs["voice_mode"] == "only"
 
     @pytest.mark.asyncio
     async def test_private_text_without_durable_service_fails_closed(self):
@@ -2981,2629 +2904,490 @@ class TestHandleMessage:
         assert "durable execution service is unavailable" in update.message.reply_text.await_args.args[0]
 
     @pytest.mark.asyncio
-    async def test_private_text_terminal_replay_does_not_duplicate_jsonl_user_history(self):
+    async def test_private_text_terminal_replay_uses_canonical_execution_only(self):
         update = _make_update(text="same durable update", chat_id=1, user_id=1)
         ctx = _make_context(config=_make_config(allowed_user_ids={1}))
-        execution = MagicMock()
-        execution.accept = AsyncMock()
-        execution.accept.return_value.message.event.envelope.aggregate_id = MessageId(
-            "msg_00000000000000000000000000000001"
-        )
-        execution.accept.return_value.run.run_id = RunId("run_00000000000000000000000000000001")
+        execution, _, _ = _configure_canonical_media_execution(ctx)
         execution.accept.return_value.disposition = ConversationCommandDisposition.TERMINAL_REPLAY
-        ctx.application.core_services.private_text_execution = execution
 
         with (
             patch("kai.bot.is_totp_configured", return_value=False),
             patch("kai.bot._handle_workshop_private_text", new_callable=AsyncMock) as execute,
-            patch("kai.bot.log_message") as history,
         ):
             await handle_message(update, ctx)
 
+        execution.accept.assert_awaited_once()
         execute.assert_awaited_once()
-        history.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_does_not_record_when_totp_denies_message(self):
+    async def test_totp_denial_does_not_accept_message(self):
         update = _make_update(chat_id=1, user_id=1)
         ctx = _make_context(config=_make_config(allowed_user_ids={1}))
-        recorder = AsyncMock()
-        ctx.bot_data["workshop_inbound_recorder"] = recorder
+        execution, _, _ = _configure_canonical_media_execution(ctx)
+
         with patch("kai.bot._check_totp_text", new_callable=AsyncMock, return_value=False):
             await handle_message(update, ctx)
 
-        recorder.assert_not_awaited()
+        execution.accept.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_does_not_record_unauthorized_message(self):
+    async def test_unauthorized_message_is_not_accepted(self):
         update = _make_update(chat_id=99, user_id=99)
         ctx = _make_context(config=_make_config(allowed_user_ids={1}))
-        recorder = AsyncMock()
-        ctx.bot_data["workshop_inbound_recorder"] = recorder
+        execution, _, _ = _configure_canonical_media_execution(ctx)
 
         await handle_message(update, ctx)
 
-        recorder.assert_not_awaited()
+        execution.accept.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_group_shadow_failure_does_not_change_existing_response_path(self, caplog):
+    async def test_group_text_is_ignored_outside_canonical_agent_addressing(self):
         update = _make_update(chat_id=-100, user_id=1)
         ctx = _make_context(config=_make_config(allowed_user_ids={1}))
-        ctx.bot_data["workshop_inbound_recorder"] = AsyncMock(side_effect=RuntimeError("shadow failed"))
-        with (
-            patch("kai.bot.is_totp_configured", return_value=False),
-            patch("kai.bot._handle_response", new_callable=AsyncMock) as mock_response,
-            patch("kai.bot.log_message"),
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
-            patch("kai.bot.get_lock", return_value=_fake_lock()),
-            caplog.at_level(logging.ERROR),
-        ):
+        execution, _, _ = _configure_canonical_media_execution(ctx)
+
+        with patch("kai.bot._check_totp_text", new_callable=AsyncMock) as totp:
             await handle_message(update, ctx)
 
-        mock_response.assert_awaited_once()
-        assert "Workshop inbound shadow write failed" in caplog.text
+        totp.assert_not_awaited()
+        execution.accept.assert_not_awaited()
+        update.message.reply_text.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_empty_message(self):
-        """Empty text: returns early without processing."""
-        update = _make_update()
+        update = _make_update(chat_id=1, user_id=1)
         update.message.text = None
-        ctx = _make_context()
-        with (
-            patch("kai.bot.is_totp_configured", return_value=False),
-            patch("kai.bot._handle_response", new_callable=AsyncMock) as mock_resp,
-        ):
-            await handle_message(update, ctx)
-        mock_resp.assert_not_called()
+        ctx = _make_context(config=_make_config(allowed_user_ids={1}))
+        execution, _, _ = _configure_canonical_media_execution(ctx)
 
-    @pytest.mark.asyncio
-    async def test_set_and_clear_responding(self):
-        """_set_responding called before and _clear_responding after, even on error."""
-        update = _make_update()
-        ctx = _make_context()
-        with (
-            patch("kai.bot.is_totp_configured", return_value=False),
-            patch("kai.bot._handle_response", new_callable=AsyncMock, side_effect=RuntimeError("boom")),
-            patch("kai.bot.log_message"),
-            patch("kai.bot._set_responding") as mock_set,
-            patch("kai.bot._clear_responding") as mock_clear,
-            patch("kai.bot.get_lock", return_value=_fake_lock()),
-            pytest.raises(RuntimeError),
-        ):
-            await handle_message(update, ctx)
-        mock_set.assert_called_once()
-        mock_clear.assert_called_once()
+        await handle_message(update, ctx)
+
+        execution.accept.assert_not_awaited()
 
 
 # ── handle_photo ─────────────────────────────────────────────────────
 
 
+def _configure_canonical_media_execution(ctx):
+    inbound_id = MessageId("msg_00000000000000000000000000000001")
+    run_id = RunId("run_00000000000000000000000000000001")
+    execution = MagicMock()
+    execution.accept = AsyncMock()
+    execution.accept.return_value.message.event.envelope.aggregate_id = inbound_id
+    execution.accept.return_value.run.run_id = run_id
+    execution.accept.return_value.disposition = ConversationCommandDisposition.NEWLY_ACCEPTED
+    ctx.application.core_services.private_text_execution = execution
+    return execution, inbound_id, run_id
+
+
 class TestHandlePhoto:
     @pytest.mark.asyncio
-    async def test_group_upload_belongs_to_human_actor(self, tmp_path):
-        """A transport channel ID never becomes the file-storage owner."""
-        update = _make_update(chat_id=-100999, user_id=1)
-        photo = MagicMock(file_id="file123", file_unique_id="uniq123")
-        update.message.photo = [photo]
-        mock_file = MagicMock()
-        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"image-data"))
-        ctx = _make_context(config=_make_config(allowed_user_ids={1}))
-        ctx.bot.get_file = AsyncMock(return_value=mock_file)
-
-        with (
-            patch("kai.bot.DATA_DIR", tmp_path),
-            patch("kai.bot._handle_response", new_callable=AsyncMock),
-            patch("kai.bot.log_message"),
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
-            patch("kai.bot.get_lock", return_value=_fake_lock()),
-        ):
-            await handle_photo(update, ctx)
-
-        namespace = ctx.application.core_services.principal_storage.for_runtime_config_id(1)
-        files = list(namespace.files_directory(tmp_path).iterdir())
-        assert len(files) == 1
-        assert not (tmp_path / "files" / "-100999").exists()
-
-    @pytest.mark.asyncio
-    async def test_records_authenticated_photo_message_and_artifact(self, tmp_path):
+    async def test_accepts_photo_as_one_canonical_artifact_run(self, tmp_path):
         update = _make_update(chat_id=1, user_id=1)
-        photo = MagicMock()
-        photo.file_id = "download-capability"
-        photo.file_unique_id = "stable-photo-id"
-        update.message.photo = [photo]
+        photo = MagicMock(file_id="download-capability", file_unique_id="stable-photo-id")
+        update.message.photo = [MagicMock(), photo]
         update.message.caption = "Inspect this detail"
-        saved = (tmp_path / "files" / "1" / "saved.jpg").resolve()
-        saved.parent.mkdir(parents=True)
-        saved.write_bytes(b"image-data")
-
-        mock_file = MagicMock()
-        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"image-data"))
-        ctx = _make_context(
-            config=_make_config(
-                allowed_user_ids={1},
-                user_configs={1: UserConfig(telegram_id=1, name="Daniel", os_user="daniel")},
-            )
-        )
-        ctx.bot.get_file = AsyncMock(return_value=mock_file)
-        inbound = AsyncMock()
-        inbound_id = MessageId("msg_00000000000000000000000000000001")
-        inbound.return_value.event.envelope.aggregate_id = inbound_id
-        artifact = AsyncMock()
-        ctx.bot_data["workshop_inbound_recorder"] = inbound
-        ctx.bot_data["workshop_artifact_recorder"] = artifact
+        downloaded = MagicMock()
+        downloaded.download_as_bytearray = AsyncMock(return_value=bytearray(b"image-data"))
+        ctx = _make_context(config=_make_config(allowed_user_ids={1}))
+        ctx.bot.get_file = AsyncMock(return_value=downloaded)
+        execution, inbound_id, run_id = _configure_canonical_media_execution(ctx)
 
         with (
             patch("kai.bot.DATA_DIR", tmp_path),
-            patch("kai.bot._save_upload", return_value=saved),
-            patch("kai.bot._handle_response", new_callable=AsyncMock) as response,
-            patch("kai.bot.log_message") as history,
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
-            patch("kai.bot.get_lock", return_value=_fake_lock()),
+            patch("kai.bot._handle_workshop_private_text", new_callable=AsyncMock) as execute,
         ):
             await handle_photo(update, ctx)
 
-        body = f"Inspect this detail\n[File saved to: {saved}]"
-        inbound.assert_awaited_once_with(
-            InboundMessage(
-                transport="telegram",
-                update_id="9001",
-                message_id="42",
-                sender_subject="1",
-                channel_subject="1",
-                body=body,
-                occurred_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
-            )
-        )
-        artifact.assert_awaited_once_with(
-            InboundArtifact(
-                message_id=inbound_id,
-                kind="photo",
-                media_type="image/jpeg",
-                storage_path=saved,
-                source_transport="telegram",
-                source_unique_id="stable-photo-id",
-                occurred_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
-                original_filename=None,
-            ),
-            storage_root=tmp_path / "files",
-        )
         ctx.bot.get_file.assert_awaited_once_with("download-capability")
-        history.assert_called_once_with(
-            direction="user",
-            chat_id=1,
-            text=body,
-            reader_user="daniel",
-            media={"type": "photo", "workshop_message_shadowed": True},
+        accepted_message = execution.accept.await_args.args[0]
+        artifact = execution.accept.await_args.kwargs["artifact"]
+        assert accepted_message == InboundMessage(
+            transport="telegram",
+            update_id="9001",
+            message_id="42",
+            sender_subject="1",
+            channel_subject="1",
+            body="Inspect this detail",
+            occurred_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
         )
-        assert response.await_args.kwargs["workshop_inbound_message_id"] == inbound_id
+        assert artifact.kind == "photo"
+        assert artifact.media_type == "image/jpeg"
+        assert artifact.source_unique_id == "stable-photo-id"
+        assert artifact.storage_path.read_bytes() == b"image-data"
+        execute.assert_awaited_once_with(
+            update,
+            ctx,
+            chat_id=1,
+            run_id=run_id,
+            inbound_message_id=inbound_id,
+            prompt="Inspect this detail",
+        )
 
     @pytest.mark.asyncio
-    async def test_inbound_shadow_failure_skips_artifact_and_preserves_response(self, tmp_path, caplog):
+    async def test_failed_photo_acceptance_discards_new_staging(self, tmp_path):
         update = _make_update(chat_id=1, user_id=1)
-        photo = MagicMock(file_id="file123", file_unique_id="uniq123")
-        update.message.photo = [photo]
-        saved = (tmp_path / "files" / "1" / "saved.jpg").resolve()
-        saved.parent.mkdir(parents=True)
-        saved.write_bytes(b"image-data")
-        mock_file = MagicMock()
-        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"image-data"))
+        update.message.photo = [MagicMock(file_id="photo", file_unique_id="stable-photo-id")]
+        downloaded = MagicMock()
+        downloaded.download_as_bytearray = AsyncMock(return_value=bytearray(b"image-data"))
         ctx = _make_context(config=_make_config(allowed_user_ids={1}))
-        ctx.bot.get_file = AsyncMock(return_value=mock_file)
-        ctx.bot_data["workshop_inbound_recorder"] = AsyncMock(side_effect=RuntimeError("shadow failed"))
-        artifact = AsyncMock()
-        ctx.bot_data["workshop_artifact_recorder"] = artifact
+        ctx.bot.get_file = AsyncMock(return_value=downloaded)
+        execution = MagicMock()
+        execution.accept = AsyncMock(side_effect=RuntimeError("canonical unavailable"))
+        ctx.application.core_services.private_text_execution = execution
 
         with (
             patch("kai.bot.DATA_DIR", tmp_path),
-            patch("kai.bot._save_upload", return_value=saved),
-            patch("kai.bot._handle_response", new_callable=AsyncMock) as response,
-            patch("kai.bot.log_message") as history,
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
-            patch("kai.bot.get_lock", return_value=_fake_lock()),
-            caplog.at_level(logging.ERROR),
+            patch("kai.bot._handle_workshop_private_text", new_callable=AsyncMock) as execute,
         ):
             await handle_photo(update, ctx)
 
-        artifact.assert_not_awaited()
-        response.assert_awaited_once()
-        assert response.await_args.kwargs["workshop_inbound_message_id"] is None
-        assert history.call_args.kwargs["media"] == {
-            "type": "photo",
-            "workshop_message_shadowed": False,
-        }
-        assert "Workshop photo message shadow write failed" in caplog.text
+        execute.assert_not_awaited()
+        assert not [path for path in (tmp_path / "files").rglob("*") if path.is_file()]
+        assert "could not safely accept" in update.message.reply_text.await_args.args[0].lower()
 
     @pytest.mark.asyncio
-    async def test_artifact_shadow_failure_preserves_message_and_response(self, tmp_path, caplog):
-        update = _make_update(chat_id=1, user_id=1)
-        photo = MagicMock(file_id="file123", file_unique_id="uniq123")
-        update.message.photo = [photo]
-        saved = (tmp_path / "files" / "1" / "saved.jpg").resolve()
-        saved.parent.mkdir(parents=True)
-        saved.write_bytes(b"image-data")
-        mock_file = MagicMock()
-        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"image-data"))
+    async def test_group_photo_is_rejected_before_download(self):
+        update = _make_update(chat_id=-100999, user_id=1)
+        update.message.photo = [MagicMock(file_id="photo", file_unique_id="stable-photo-id")]
         ctx = _make_context(config=_make_config(allowed_user_ids={1}))
-        ctx.bot.get_file = AsyncMock(return_value=mock_file)
-        inbound = AsyncMock()
-        inbound_id = MessageId("msg_00000000000000000000000000000001")
-        inbound.return_value.event.envelope.aggregate_id = inbound_id
-        ctx.bot_data["workshop_inbound_recorder"] = inbound
-        ctx.bot_data["workshop_artifact_recorder"] = AsyncMock(side_effect=RuntimeError("artifact failed"))
+        ctx.bot.get_file = AsyncMock()
 
-        with (
-            patch("kai.bot.DATA_DIR", tmp_path),
-            patch("kai.bot._save_upload", return_value=saved),
-            patch("kai.bot._handle_response", new_callable=AsyncMock) as response,
-            patch("kai.bot.log_message") as history,
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
-            patch("kai.bot.get_lock", return_value=_fake_lock()),
-            caplog.at_level(logging.ERROR),
-        ):
+        with patch("kai.bot._check_totp", new_callable=AsyncMock) as totp:
             await handle_photo(update, ctx)
 
-        response.assert_awaited_once()
-        assert response.await_args.kwargs["workshop_inbound_message_id"] == inbound_id
-        assert history.call_args.kwargs["media"]["workshop_message_shadowed"] is True
-        assert "Workshop photo artifact shadow write failed" in caplog.text
-
-    @pytest.mark.asyncio
-    async def test_downloads_and_sends_multimodal(self, tmp_path):
-        """Downloads photo, base64-encodes, and calls _handle_response with list content."""
-        update = _make_update()
-        photo = MagicMock()
-        photo.file_id = "file123"
-        photo.file_unique_id = "uniq123"
-        update.message.photo = [MagicMock(), photo]  # last is highest res
-
-        mock_file = MagicMock()
-        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"image-data"))
-        claude = _make_mock_claude(workspace=tmp_path)
-        ctx = _make_context(claude=claude)
-        ctx.bot.get_file = AsyncMock(return_value=mock_file)
-
-        with (
-            patch("kai.bot._handle_response", new_callable=AsyncMock) as mock_resp,
-            patch("kai.bot.log_message"),
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
-            patch("kai.bot.get_lock", return_value=_fake_lock()),
-        ):
-            await handle_photo(update, ctx)
-        # The content arg should be a list (multi-modal)
-        content = mock_resp.call_args[0][3]
-        assert isinstance(content, list)
-        assert content[1]["type"] == "image"
-
-    @pytest.mark.asyncio
-    async def test_uses_caption(self, tmp_path):
-        """Uses caption if provided instead of default question."""
-        update = _make_update()
-        photo = MagicMock()
-        photo.file_id = "file123"
-        photo.file_unique_id = "uniq123"
-        update.message.photo = [photo]
-        update.message.caption = "Describe this logo"
-
-        mock_file = MagicMock()
-        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"img"))
-        claude = _make_mock_claude(workspace=tmp_path)
-        ctx = _make_context(claude=claude)
-        ctx.bot.get_file = AsyncMock(return_value=mock_file)
-
-        with (
-            patch("kai.bot._handle_response", new_callable=AsyncMock) as mock_resp,
-            patch("kai.bot.log_message"),
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
-            patch("kai.bot.get_lock", return_value=_fake_lock()),
-        ):
-            await handle_photo(update, ctx)
-        content = mock_resp.call_args[0][3]
-        assert "Describe this logo" in content[0]["text"]
-
-
-# ── handle_document ──────────────────────────────────────────────────
+        totp.assert_not_awaited()
+        ctx.bot.get_file.assert_not_awaited()
+        assert "direct chat" in update.message.reply_text.await_args.args[0]
 
 
 class TestHandleDocument:
-    def _setup_doc(self, update, file_name, mime_type=None, data=b"content"):
-        """Attach a mock document to the update."""
-        update.message.document = MagicMock()
-        update.message.document.file_name = file_name
-        update.message.document.file_id = "doc_file_id"
-        update.message.document.file_unique_id = "stable-document-id"
-        update.message.document.mime_type = mime_type
-        return data
+    @staticmethod
+    def _setup_doc(update, file_name, mime_type, content):
+        update.message.document = MagicMock(
+            file_id="document-download-capability",
+            file_unique_id="stable-document-id",
+            file_name=file_name,
+            mime_type=mime_type,
+        )
+        downloaded = MagicMock()
+        downloaded.download_as_bytearray = AsyncMock(return_value=bytearray(content))
+        return downloaded
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("file_name", "mime_type", "data", "expected_body", "expected_media_type", "expected_filename"),
+        ("file_name", "mime_type", "content", "expected_kind", "expected_body"),
         (
-            ("logo.png", "application/octet-stream", b"png-data", "logo.png", "image/png", "logo.png"),
-            (
-                "script.py",
-                "Text/X-Python; charset=UTF-8",
-                b"print('hi')",
-                "[file: script.py]",
-                "text/x-python",
-                "script.py",
-            ),
-            (
-                "archive.zip",
-                "not a mime type",
-                b"PK...",
-                "[file: archive.zip]",
-                "application/octet-stream",
-                "archive.zip",
-            ),
-            (
-                "folder\\report.pdf",
-                "application/pdf",
-                b"pdf-data",
-                "[file: folder\\report.pdf]",
-                "application/pdf",
-                "report.pdf",
-            ),
+            ("logo.png", "image/png", b"png-data", "document", "What's in this image (logo.png)?"),
+            ("script.py", "text/x-python", b"print('hi')", "document", "[file: script.py]"),
+            ("archive.zip", "application/zip", b"PK...", "document", "[file: archive.zip]"),
+            ("data.txt", "text/plain", b"\xff\xfe", "document", "[file: data.txt]"),
         ),
     )
-    async def test_records_authenticated_document_message_and_artifact(
+    async def test_accepts_documents_through_shared_artifact_prompt_policy(
         self,
         tmp_path,
         file_name,
         mime_type,
-        data,
+        content,
+        expected_kind,
         expected_body,
-        expected_media_type,
-        expected_filename,
     ):
         update = _make_update(chat_id=1, user_id=1)
-        self._setup_doc(update, file_name, mime_type, data)
-        saved = (tmp_path / "files" / "1" / "saved-document").resolve()
-        saved.parent.mkdir(parents=True)
-        saved.write_bytes(data)
-        mock_file = MagicMock()
-        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(data))
+        downloaded = self._setup_doc(update, file_name, mime_type, content)
         ctx = _make_context(config=_make_config(allowed_user_ids={1}))
-        ctx.bot.get_file = AsyncMock(return_value=mock_file)
-        inbound = AsyncMock()
-        inbound_id = MessageId("msg_00000000000000000000000000000001")
-        inbound.return_value.event.envelope.aggregate_id = inbound_id
-        artifact = AsyncMock()
-        ctx.bot_data["workshop_inbound_recorder"] = inbound
-        ctx.bot_data["workshop_artifact_recorder"] = artifact
+        ctx.bot.get_file = AsyncMock(return_value=downloaded)
+        execution, inbound_id, run_id = _configure_canonical_media_execution(ctx)
 
         with (
             patch("kai.bot.DATA_DIR", tmp_path),
-            patch("kai.bot._save_upload", return_value=saved),
-            patch("kai.bot._handle_response", new_callable=AsyncMock) as response,
-            patch("kai.bot.log_message") as history,
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
-            patch("kai.bot.get_lock", return_value=_fake_lock()),
+            patch("kai.bot._handle_workshop_private_text", new_callable=AsyncMock) as execute,
         ):
             await handle_document(update, ctx)
 
-        inbound.assert_awaited_once_with(
-            InboundMessage(
-                transport="telegram",
-                update_id="9001",
-                message_id="42",
-                sender_subject="1",
-                channel_subject="1",
-                body=expected_body,
-                occurred_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
-            )
-        )
-        artifact.assert_awaited_once_with(
-            InboundArtifact(
-                message_id=inbound_id,
-                kind="document",
-                media_type=expected_media_type,
-                storage_path=saved,
-                source_transport="telegram",
-                source_unique_id="stable-document-id",
-                occurred_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
-                original_filename=expected_filename,
-            ),
-            storage_root=tmp_path / "files",
-        )
-        history.assert_called_once_with(
-            direction="user",
+        accepted_message = execution.accept.await_args.args[0]
+        artifact = execution.accept.await_args.kwargs["artifact"]
+        assert accepted_message.body == expected_body
+        assert artifact.kind == expected_kind
+        assert artifact.source_unique_id == "stable-document-id"
+        assert artifact.original_filename == file_name
+        assert artifact.storage_path.read_bytes() == content
+        execute.assert_awaited_once_with(
+            update,
+            ctx,
             chat_id=1,
-            text=expected_body,
-            reader_user=None,
-            media={
-                "type": "document",
-                "filename": file_name,
-                "workshop_message_shadowed": True,
-            },
+            run_id=run_id,
+            inbound_message_id=inbound_id,
+            prompt=expected_body,
         )
-        assert response.await_args.kwargs["workshop_inbound_message_id"] == inbound_id
 
     @pytest.mark.asyncio
-    async def test_inbound_shadow_failure_skips_artifact_and_preserves_response(self, tmp_path, caplog):
+    async def test_document_caption_is_canonical_message_body(self, tmp_path):
         update = _make_update(chat_id=1, user_id=1)
-        self._setup_doc(update, "report.txt", "text/plain", b"report")
-        saved = (tmp_path / "files" / "1" / "report.txt").resolve()
-        saved.parent.mkdir(parents=True)
-        saved.write_bytes(b"report")
-        mock_file = MagicMock()
-        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"report"))
+        update.message.caption = "Summarize this"
+        downloaded = self._setup_doc(update, "report.txt", "text/plain", b"report")
         ctx = _make_context(config=_make_config(allowed_user_ids={1}))
-        ctx.bot.get_file = AsyncMock(return_value=mock_file)
-        ctx.bot_data["workshop_inbound_recorder"] = AsyncMock(side_effect=RuntimeError("shadow failed"))
-        artifact = AsyncMock()
-        ctx.bot_data["workshop_artifact_recorder"] = artifact
+        ctx.bot.get_file = AsyncMock(return_value=downloaded)
+        execution, _, _ = _configure_canonical_media_execution(ctx)
 
         with (
             patch("kai.bot.DATA_DIR", tmp_path),
-            patch("kai.bot._save_upload", return_value=saved),
-            patch("kai.bot._handle_response", new_callable=AsyncMock) as response,
-            patch("kai.bot.log_message") as history,
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
-            patch("kai.bot.get_lock", return_value=_fake_lock()),
-            caplog.at_level(logging.ERROR),
+            patch("kai.bot._handle_workshop_private_text", new_callable=AsyncMock),
         ):
             await handle_document(update, ctx)
 
-        artifact.assert_not_awaited()
-        response.assert_awaited_once()
-        assert response.await_args.kwargs["workshop_inbound_message_id"] is None
-        assert history.call_args.kwargs["media"]["workshop_message_shadowed"] is False
-        assert "Workshop document message shadow write failed" in caplog.text
+        assert execution.accept.await_args.args[0].body == "Summarize this"
 
     @pytest.mark.asyncio
-    async def test_artifact_shadow_failure_preserves_message_and_response(self, tmp_path, caplog):
-        update = _make_update(chat_id=1, user_id=1)
+    async def test_group_document_is_rejected_before_download(self):
+        update = _make_update(chat_id=-100999, user_id=1)
         self._setup_doc(update, "report.txt", "text/plain", b"report")
-        saved = (tmp_path / "files" / "1" / "report.txt").resolve()
-        saved.parent.mkdir(parents=True)
-        saved.write_bytes(b"report")
-        mock_file = MagicMock()
-        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"report"))
         ctx = _make_context(config=_make_config(allowed_user_ids={1}))
-        ctx.bot.get_file = AsyncMock(return_value=mock_file)
-        inbound = AsyncMock()
-        inbound_id = MessageId("msg_00000000000000000000000000000001")
-        inbound.return_value.event.envelope.aggregate_id = inbound_id
-        ctx.bot_data["workshop_inbound_recorder"] = inbound
-        ctx.bot_data["workshop_artifact_recorder"] = AsyncMock(side_effect=RuntimeError("artifact failed"))
+        ctx.bot.get_file = AsyncMock()
 
-        with (
-            patch("kai.bot.DATA_DIR", tmp_path),
-            patch("kai.bot._save_upload", return_value=saved),
-            patch("kai.bot._handle_response", new_callable=AsyncMock) as response,
-            patch("kai.bot.log_message") as history,
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
-            patch("kai.bot.get_lock", return_value=_fake_lock()),
-            caplog.at_level(logging.ERROR),
-        ):
-            await handle_document(update, ctx)
+        await handle_document(update, ctx)
 
-        response.assert_awaited_once()
-        assert response.await_args.kwargs["workshop_inbound_message_id"] == inbound_id
-        assert history.call_args.kwargs["media"]["workshop_message_shadowed"] is True
-        assert "Workshop document artifact shadow write failed" in caplog.text
-
-    @pytest.mark.asyncio
-    async def test_image_document(self, tmp_path):
-        """Image file extension: sent as multi-modal content."""
-        update = _make_update()
-        self._setup_doc(update, "logo.png", "image/png")
-        mock_file = MagicMock()
-        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"png-data"))
-        claude = _make_mock_claude(workspace=tmp_path)
-        ctx = _make_context(claude=claude)
-        ctx.bot.get_file = AsyncMock(return_value=mock_file)
-
-        with (
-            patch("kai.bot._handle_response", new_callable=AsyncMock) as mock_resp,
-            patch("kai.bot.log_message"),
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
-            patch("kai.bot.get_lock", return_value=_fake_lock()),
-        ):
-            await handle_document(update, ctx)
-        content = mock_resp.call_args[0][3]
-        assert isinstance(content, list)
-        assert content[1]["type"] == "image"
-
-    @pytest.mark.asyncio
-    async def test_text_document(self, tmp_path):
-        """Text file: decoded as UTF-8 and sent as code block string."""
-        update = _make_update()
-        self._setup_doc(update, "script.py", "text/python")
-        mock_file = MagicMock()
-        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"print('hi')"))
-        claude = _make_mock_claude(workspace=tmp_path)
-        ctx = _make_context(claude=claude)
-        ctx.bot.get_file = AsyncMock(return_value=mock_file)
-
-        with (
-            patch("kai.bot._handle_response", new_callable=AsyncMock) as mock_resp,
-            patch("kai.bot.log_message"),
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
-            patch("kai.bot.get_lock", return_value=_fake_lock()),
-        ):
-            await handle_document(update, ctx)
-        content = mock_resp.call_args[0][3]
-        assert isinstance(content, str)
-        assert "```" in content
-
-    @pytest.mark.asyncio
-    async def test_text_decode_error(self, tmp_path):
-        """UTF-8 decode failure: sends error reply, no _handle_response call."""
-        update = _make_update()
-        self._setup_doc(update, "data.txt", "text/plain")
-        mock_file = MagicMock()
-        # Invalid UTF-8 bytes
-        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"\xff\xfe"))
-        claude = _make_mock_claude(workspace=tmp_path)
-        ctx = _make_context(claude=claude)
-        ctx.bot.get_file = AsyncMock(return_value=mock_file)
-
-        with (
-            patch("kai.bot._handle_response", new_callable=AsyncMock) as mock_resp,
-            patch("kai.bot.log_message"),
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
-            patch("kai.bot.get_lock", return_value=_fake_lock()),
-        ):
-            await handle_document(update, ctx)
-        mock_resp.assert_not_called()
-        reply = update.message.reply_text.call_args[0][0]
-        assert "decode" in reply.lower() or "text" in reply.lower()
-
-    @pytest.mark.asyncio
-    async def test_other_file_type(self, tmp_path):
-        """Non-image, non-text file: saved to disk, path sent in prompt."""
-        update = _make_update()
-        self._setup_doc(update, "archive.zip", "application/zip")
-        mock_file = MagicMock()
-        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"PK..."))
-        claude = _make_mock_claude(workspace=tmp_path)
-        ctx = _make_context(claude=claude)
-        ctx.bot.get_file = AsyncMock(return_value=mock_file)
-
-        with (
-            patch("kai.bot._handle_response", new_callable=AsyncMock) as mock_resp,
-            patch("kai.bot.log_message"),
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
-            patch("kai.bot.get_lock", return_value=_fake_lock()),
-        ):
-            await handle_document(update, ctx)
-        content = mock_resp.call_args[0][3]
-        assert isinstance(content, str)
-        assert "archive.zip" in content
-
-
-# ── handle_voice ─────────────────────────────────────────────────────
+        ctx.bot.get_file.assert_not_awaited()
+        assert "direct chat" in update.message.reply_text.await_args.args[0]
 
 
 class TestHandleVoice:
-    @pytest.mark.asyncio
-    async def test_records_authenticated_voice_message_and_artifact(self, tmp_path):
-        model_file = tmp_path / "model.bin"
-        model_file.touch()
-        update = _make_update(chat_id=1, user_id=1)
-        voice = MagicMock(
+    @staticmethod
+    def _setup_voice(update):
+        update.message.voice = MagicMock(
             file_id="voice-download-capability",
             file_unique_id="stable-voice-id",
             duration=5,
         )
-        update.message.voice = voice
-        mock_file = MagicMock()
-        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"audio-data"))
-        saved = (tmp_path / "files" / "1" / "saved.oga").resolve()
-        saved.parent.mkdir(parents=True)
-        saved.write_bytes(b"audio-data")
+        downloaded = MagicMock()
+        downloaded.download_as_bytearray = AsyncMock(return_value=bytearray(b"audio-data"))
+        return downloaded
+
+    @pytest.mark.asyncio
+    async def test_accepts_transcribed_voice_as_one_canonical_artifact_run(self, tmp_path):
+        model_file = tmp_path / "model.bin"
+        model_file.touch()
+        update = _make_update(chat_id=1, user_id=1)
+        downloaded = self._setup_voice(update)
         ctx = _make_context(
-            config=_make_config(allowed_user_ids={1}, voice_enabled=True, whisper_model_path=model_file)
-        )
-        ctx.bot.get_file = AsyncMock(return_value=mock_file)
-        inbound = AsyncMock()
-        inbound_id = MessageId("msg_00000000000000000000000000000001")
-        inbound.return_value.event.envelope.aggregate_id = inbound_id
-        artifact = AsyncMock()
-        ctx.bot_data["workshop_inbound_recorder"] = inbound
-        ctx.bot_data["workshop_artifact_recorder"] = artifact
-
-        with (
-            patch("shutil.which", return_value="/usr/bin/tool"),
-            patch("kai.bot.DATA_DIR", tmp_path),
-            patch("kai.bot.transcribe_voice", new_callable=AsyncMock, return_value="Hello there"),
-            patch("kai.bot._save_upload", return_value=saved) as save_upload,
-            patch("kai.bot.log_message") as history,
-            patch("kai.bot._handle_response", new_callable=AsyncMock) as response,
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
-            patch("kai.bot.get_lock", return_value=_fake_lock()),
-        ):
-            await handle_voice(update, ctx)
-
-        inbound.assert_awaited_once_with(
-            InboundMessage(
-                transport="telegram",
-                update_id="9001",
-                message_id="42",
-                sender_subject="1",
-                channel_subject="1",
-                body="Hello there",
-                occurred_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
+            config=_make_config(
+                allowed_user_ids={1},
+                voice_enabled=True,
+                whisper_model_path=model_file,
             )
         )
-        save_upload.assert_called_once_with(
-            b"audio-data",
-            "voice.oga",
-            principal_id=PrincipalId("prn_00000000000000000000000000000001"),
-        )
-        artifact.assert_awaited_once_with(
-            InboundArtifact(
-                message_id=inbound_id,
-                kind="voice",
-                media_type="audio/ogg",
-                storage_path=saved,
-                source_transport="telegram",
-                source_unique_id="stable-voice-id",
-                occurred_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
-                original_filename=None,
-            ),
-            storage_root=tmp_path / "files",
-        )
-        history.assert_called_once_with(
-            direction="user",
-            chat_id=1,
-            text="Hello there",
-            media={"type": "voice", "duration": 5, "workshop_message_shadowed": True},
-            reader_user=None,
-        )
-        assert response.await_args.args[3] == "[Voice message transcription]: Hello there"
-        assert response.await_args.kwargs["workshop_inbound_message_id"] == inbound_id
-
-    @pytest.mark.asyncio
-    async def test_inbound_shadow_failure_skips_voice_artifact_and_preserves_response(self, tmp_path, caplog):
-        model_file = tmp_path / "model.bin"
-        model_file.touch()
-        update = _make_update(chat_id=1, user_id=1)
-        update.message.voice = MagicMock(file_id="v1", file_unique_id="stable-voice-id", duration=5)
-        mock_file = MagicMock()
-        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"audio-data"))
-        ctx = _make_context(
-            config=_make_config(allowed_user_ids={1}, voice_enabled=True, whisper_model_path=model_file)
-        )
-        ctx.bot.get_file = AsyncMock(return_value=mock_file)
-        ctx.bot_data["workshop_inbound_recorder"] = AsyncMock(side_effect=RuntimeError("shadow failed"))
-        artifact = AsyncMock()
-        ctx.bot_data["workshop_artifact_recorder"] = artifact
-
-        with (
-            patch("shutil.which", return_value="/usr/bin/tool"),
-            patch("kai.bot.transcribe_voice", new_callable=AsyncMock, return_value="Hello there"),
-            patch("kai.bot._save_upload") as save_upload,
-            patch("kai.bot.log_message") as history,
-            patch("kai.bot._handle_response", new_callable=AsyncMock) as response,
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
-            patch("kai.bot.get_lock", return_value=_fake_lock()),
-            caplog.at_level(logging.ERROR),
-        ):
-            await handle_voice(update, ctx)
-
-        save_upload.assert_not_called()
-        artifact.assert_not_awaited()
-        response.assert_awaited_once()
-        assert response.await_args.kwargs["workshop_inbound_message_id"] is None
-        assert history.call_args.kwargs["media"] == {
-            "type": "voice",
-            "duration": 5,
-            "workshop_message_shadowed": False,
-        }
-        assert "Workshop voice message shadow write failed" in caplog.text
-
-    @pytest.mark.asyncio
-    async def test_voice_artifact_failure_preserves_message_and_response(self, tmp_path, caplog):
-        model_file = tmp_path / "model.bin"
-        model_file.touch()
-        update = _make_update(chat_id=1, user_id=1)
-        update.message.voice = MagicMock(file_id="v1", file_unique_id="stable-voice-id", duration=5)
-        mock_file = MagicMock()
-        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"audio-data"))
-        saved = (tmp_path / "files" / "1" / "saved.oga").resolve()
-        saved.parent.mkdir(parents=True)
-        saved.write_bytes(b"audio-data")
-        ctx = _make_context(
-            config=_make_config(allowed_user_ids={1}, voice_enabled=True, whisper_model_path=model_file)
-        )
-        ctx.bot.get_file = AsyncMock(return_value=mock_file)
-        inbound = AsyncMock()
-        inbound_id = MessageId("msg_00000000000000000000000000000001")
-        inbound.return_value.event.envelope.aggregate_id = inbound_id
-        ctx.bot_data["workshop_inbound_recorder"] = inbound
-        ctx.bot_data["workshop_artifact_recorder"] = AsyncMock(side_effect=RuntimeError("artifact failed"))
+        ctx.bot.get_file = AsyncMock(return_value=downloaded)
+        execution, inbound_id, run_id = _configure_canonical_media_execution(ctx)
 
         with (
             patch("shutil.which", return_value="/usr/bin/tool"),
             patch("kai.bot.DATA_DIR", tmp_path),
             patch("kai.bot.transcribe_voice", new_callable=AsyncMock, return_value="Hello there"),
-            patch("kai.bot._save_upload", return_value=saved),
-            patch("kai.bot.log_message") as history,
-            patch("kai.bot._handle_response", new_callable=AsyncMock) as response,
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
-            patch("kai.bot.get_lock", return_value=_fake_lock()),
-            caplog.at_level(logging.ERROR),
+            patch("kai.bot._handle_workshop_private_text", new_callable=AsyncMock) as execute,
         ):
             await handle_voice(update, ctx)
 
-        response.assert_awaited_once()
-        assert response.await_args.kwargs["workshop_inbound_message_id"] == inbound_id
-        assert history.call_args.kwargs["media"]["workshop_message_shadowed"] is True
-        assert "Workshop voice artifact shadow write failed" in caplog.text
+        accepted_message = execution.accept.await_args.args[0]
+        artifact = execution.accept.await_args.kwargs["artifact"]
+        assert accepted_message.body == "Hello there"
+        assert artifact.kind == "voice"
+        assert artifact.media_type == "audio/ogg"
+        assert artifact.source_unique_id == "stable-voice-id"
+        assert artifact.storage_path.read_bytes() == b"audio-data"
+        assert update.message.reply_text.await_args_list[0].args[0] == "_Heard:_ Hello there"
+        execute.assert_awaited_once_with(
+            update,
+            ctx,
+            chat_id=1,
+            run_id=run_id,
+            inbound_message_id=inbound_id,
+            prompt="Hello there",
+        )
 
     @pytest.mark.asyncio
-    async def test_voice_artifact_save_failure_preserves_message_and_response(self, tmp_path, caplog):
+    async def test_transcription_error_does_not_accept_run(self, tmp_path):
         model_file = tmp_path / "model.bin"
         model_file.touch()
         update = _make_update(chat_id=1, user_id=1)
-        update.message.voice = MagicMock(file_id="v1", file_unique_id="stable-voice-id", duration=5)
-        mock_file = MagicMock()
-        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"audio-data"))
+        downloaded = self._setup_voice(update)
         ctx = _make_context(
-            config=_make_config(allowed_user_ids={1}, voice_enabled=True, whisper_model_path=model_file)
+            config=_make_config(
+                allowed_user_ids={1},
+                voice_enabled=True,
+                whisper_model_path=model_file,
+            )
         )
-        ctx.bot.get_file = AsyncMock(return_value=mock_file)
-        inbound = AsyncMock()
-        inbound_id = MessageId("msg_00000000000000000000000000000001")
-        inbound.return_value.event.envelope.aggregate_id = inbound_id
-        artifact = AsyncMock()
-        ctx.bot_data["workshop_inbound_recorder"] = inbound
-        ctx.bot_data["workshop_artifact_recorder"] = artifact
+        ctx.bot.get_file = AsyncMock(return_value=downloaded)
+        execution, _, _ = _configure_canonical_media_execution(ctx)
 
         with (
             patch("shutil.which", return_value="/usr/bin/tool"),
-            patch("kai.bot.transcribe_voice", new_callable=AsyncMock, return_value="Hello there"),
-            patch("kai.bot._save_upload", side_effect=OSError("storage unavailable")),
-            patch("kai.bot.log_message") as history,
-            patch("kai.bot._handle_response", new_callable=AsyncMock) as response,
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
-            patch("kai.bot.get_lock", return_value=_fake_lock()),
-            caplog.at_level(logging.ERROR),
+            patch("kai.bot.transcribe_voice", new_callable=AsyncMock, side_effect=TranscriptionError("bad audio")),
         ):
             await handle_voice(update, ctx)
 
-        artifact.assert_not_awaited()
-        response.assert_awaited_once()
-        assert response.await_args.kwargs["workshop_inbound_message_id"] == inbound_id
-        assert history.call_args.kwargs["media"]["workshop_message_shadowed"] is True
-        assert "Workshop voice artifact shadow write failed" in caplog.text
+        execution.accept.assert_not_awaited()
+        assert "Transcription failed" in update.message.reply_text.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_empty_transcription_does_not_accept_run(self, tmp_path):
+        model_file = tmp_path / "model.bin"
+        model_file.touch()
+        update = _make_update(chat_id=1, user_id=1)
+        downloaded = self._setup_voice(update)
+        ctx = _make_context(
+            config=_make_config(
+                allowed_user_ids={1},
+                voice_enabled=True,
+                whisper_model_path=model_file,
+            )
+        )
+        ctx.bot.get_file = AsyncMock(return_value=downloaded)
+        execution, _, _ = _configure_canonical_media_execution(ctx)
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/tool"),
+            patch("kai.bot.transcribe_voice", new_callable=AsyncMock, return_value=""),
+        ):
+            await handle_voice(update, ctx)
+
+        execution.accept.assert_not_awaited()
+        assert "make out" in update.message.reply_text.await_args.args[0]
 
     @pytest.mark.asyncio
     async def test_voice_not_enabled(self):
-        update = _make_update()
+        update = _make_update(chat_id=1, user_id=1)
         update.message.voice = MagicMock()
-        ctx = _make_context(config=_make_config(voice_enabled=False))
+        ctx = _make_context(config=_make_config(allowed_user_ids={1}, voice_enabled=False))
+
         await handle_voice(update, ctx)
-        reply = update.message.reply_text.call_args[0][0]
-        assert "not enabled" in reply.lower()
+
+        assert "not enabled" in update.message.reply_text.await_args.args[0].lower()
 
     @pytest.mark.asyncio
     async def test_missing_dependencies(self, tmp_path):
-        """Lists missing deps when ffmpeg/whisper/model aren't available."""
-        update = _make_update()
+        update = _make_update(chat_id=1, user_id=1)
         update.message.voice = MagicMock()
-        config = _make_config(voice_enabled=True, whisper_model_path=tmp_path / "nomodel")
-        ctx = _make_context(config=config)
+        ctx = _make_context(
+            config=_make_config(
+                allowed_user_ids={1},
+                voice_enabled=True,
+                whisper_model_path=tmp_path / "missing-model",
+            )
+        )
+
         with patch("shutil.which", return_value=None):
             await handle_voice(update, ctx)
-        reply = update.message.reply_text.call_args[0][0]
+
+        reply = update.message.reply_text.await_args.args[0]
         assert "ffmpeg" in reply
+        assert "whisper-cpp" in reply
+        assert "whisper model" in reply
 
     @pytest.mark.asyncio
-    async def test_transcription_error(self, tmp_path):
-        """TranscriptionError: sends error reply."""
-        from kai.transcribe import TranscriptionError
+    async def test_group_voice_is_rejected_before_download(self):
+        update = _make_update(chat_id=-100999, user_id=1)
+        update.message.voice = MagicMock()
+        ctx = _make_context(config=_make_config(allowed_user_ids={1}, voice_enabled=True))
+        ctx.bot.get_file = AsyncMock()
 
-        model_file = tmp_path / "model.bin"
-        model_file.touch()
-        update = _make_update()
-        voice_msg = MagicMock()
-        voice_msg.file_id = "v1"
-        voice_msg.duration = 5
-        update.message.voice = voice_msg
-        mock_file = MagicMock()
-        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"audio"))
-        config = _make_config(voice_enabled=True, whisper_model_path=model_file)
-        ctx = _make_context(config=config)
-        ctx.bot.get_file = AsyncMock(return_value=mock_file)
+        await handle_voice(update, ctx)
 
-        with (
-            patch("shutil.which", return_value="/usr/bin/ffmpeg"),
-            patch("kai.bot.transcribe_voice", new_callable=AsyncMock, side_effect=TranscriptionError("fail")),
-            patch("kai.bot.log_message"),
-        ):
-            await handle_voice(update, ctx)
-        reply = update.message.reply_text.call_args[0][0]
-        assert "Transcription failed" in reply
+        ctx.bot.get_file.assert_not_awaited()
+        assert "direct chat" in update.message.reply_text.await_args.args[0]
 
+
+class TestCanonicalTelegramVoiceRendering:
     @pytest.mark.asyncio
-    async def test_empty_transcript(self, tmp_path):
-        model_file = tmp_path / "model.bin"
-        model_file.touch()
-        update = _make_update()
-        voice_msg = MagicMock()
-        voice_msg.file_id = "v1"
-        voice_msg.duration = 5
-        update.message.voice = voice_msg
-        mock_file = MagicMock()
-        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"audio"))
-        config = _make_config(voice_enabled=True, whisper_model_path=model_file)
-        ctx = _make_context(config=config)
-        ctx.bot.get_file = AsyncMock(return_value=mock_file)
+    @pytest.mark.parametrize(
+        ("voice_mode", "request_delivery"),
+        (("on", True), ("only", False)),
+    )
+    async def test_tts_is_transport_rendering_of_canonical_result(
+        self,
+        voice_mode,
+        request_delivery,
+    ):
+        from kai.bot import _handle_workshop_private_text
+
+        update = _make_update(chat_id=1, user_id=1)
+        ctx = _make_context(config=_make_config(allowed_user_ids={1}, tts_enabled=True))
+        execution = MagicMock()
+        outcomes = []
+
+        async def execute(_run_id, *, stream_observer, success_transformer):
+            del stream_observer
+            outcomes.append(await success_transformer(AgentResponse(success=True, text="Canonical voice answer")))
+            return SimpleNamespace(
+                disposition=CanonicalExecutionDisposition.COMPLETED,
+                terminal=SimpleNamespace(body="Canonical voice answer"),
+                session_id=None,
+                selection=None,
+                workspace=None,
+            )
+
+        execution.execute = AsyncMock(side_effect=execute)
+        ctx.application.core_services.private_text_execution = execution
 
         with (
-            patch("shutil.which", return_value="/usr/bin/ffmpeg"),
-            patch("kai.bot.transcribe_voice", new_callable=AsyncMock, return_value=""),
-            patch("kai.bot.log_message"),
+            patch("kai.bot.sessions.get_setting", new_callable=AsyncMock, return_value=DEFAULT_VOICE),
+            patch("kai.bot.synthesize_speech", new_callable=AsyncMock, return_value=b"voice"),
         ):
-            await handle_voice(update, ctx)
-        reply = update.message.reply_text.call_args[0][0]
-        assert "speech" in reply.lower()
-
-    @pytest.mark.asyncio
-    async def test_successful_transcription(self, tmp_path):
-        """Echoes transcript, then sends it to the configured agent."""
-        model_file = tmp_path / "model.bin"
-        model_file.touch()
-        update = _make_update()
-        voice_msg = MagicMock()
-        voice_msg.file_id = "v1"
-        voice_msg.duration = 5
-        update.message.voice = voice_msg
-        mock_file = MagicMock()
-        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"audio"))
-        claude = _make_mock_claude(workspace=tmp_path)
-        config = _make_config(voice_enabled=True, whisper_model_path=model_file)
-        ctx = _make_context(config=config, claude=claude)
-        ctx.bot.get_file = AsyncMock(return_value=mock_file)
-
-        with (
-            patch("shutil.which", return_value="/usr/bin/ffmpeg"),
-            patch("kai.bot.transcribe_voice", new_callable=AsyncMock, return_value="Hello there"),
-            patch("kai.bot.log_message"),
-            patch("kai.bot._handle_response", new_callable=AsyncMock) as mock_resp,
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
-            patch("kai.bot.get_lock", return_value=_fake_lock()),
-        ):
-            await handle_voice(update, ctx)
-        # Echo the transcript
-        echo_call = update.message.reply_text.call_args
-        assert "Hello there" in echo_call[0][0]
-        # Then send to the configured agent
-        prompt = mock_resp.call_args[0][3]
-        assert "Hello there" in prompt
-
-
-# ── _handle_response ─────────────────────────────────────────────────
-
-
-class TestHandleResponse:
-    """Tests for the streaming response handler."""
-
-    def _base_patches(self):
-        """
-        Common patches for _handle_response tests.
-
-        Returns a dict suitable for patch.multiple("kai.bot", ...).
-        Voice mode defaults to "off" (normal text mode).
-        """
-        return {
-            "sessions": MagicMock(
-                get_setting=AsyncMock(return_value="off"),
-                save_session=AsyncMock(),
-            ),
-            "log_message": MagicMock(),
-        }
-
-    @staticmethod
-    def _install_workshop_recorders(ctx, message_id: MessageId):
-        outbound = AsyncMock()
-        outbound.return_value.event.envelope.aggregate_id = message_id
-        delivery = AsyncMock()
-        ctx.bot_data["workshop_outbound_recorder"] = outbound
-        ctx.bot_data["workshop_delivery_recorder"] = delivery
-        return outbound, delivery
-
-    @staticmethod
-    def _install_workshop_finalizer(ctx, message_id: MessageId):
-        preview = AsyncMock()
-        finalizer = AsyncMock()
-        finalizer.return_value.message.event.envelope.aggregate_id = message_id
-        ctx.bot_data["workshop_streaming_preview_recorder"] = preview
-        ctx.bot_data["workshop_streaming_finalizer"] = finalizer
-        return preview, finalizer
-
-    @staticmethod
-    def _prepared_workshop_run(pool, inbound_message_id: MessageId) -> PreparedConversationRun:
-        return PreparedConversationRun(
-            target=CanonicalConversationRunTarget(
-                inbound_message_id=inbound_message_id,
-                workshop_id=WorkshopId("wsp_00000000000000000000000000000001"),
-                channel_id=ChannelId("chn_00000000000000000000000000000001"),
-                requested_by_principal_id=PrincipalId("prn_00000000000000000000000000000001"),
-                agent_id=AgentId("agt_00000000000000000000000000000001"),
-            ),
-            model="sonnet",
-            _pool=pool,
-            _runtime_profile_id=RuntimeProfileId("rtp_00000000000000000000000000000001"),
-        )
-
-    @pytest.mark.asyncio
-    async def test_workshop_private_text_commits_without_direct_send_or_shadow_observation(self):
-        from kai.bot import _handle_response
-
-        inbound_id = MessageId("msg_00000000000000000000000000000001")
-        outbound_id = MessageId("msg_00000000000000000000000000000002")
-        update = _make_update()
-        pool = _make_mock_claude()
-        pool.send = MagicMock(return_value=_fake_stream(_done_event("Durable answer")))
-        ctx = _make_context(pool=pool)
-        _, finalizer = self._install_workshop_finalizer(ctx, outbound_id)
-        outbound, delivery = self._install_workshop_recorders(ctx, outbound_id)
-
-        with (
-            patch.multiple("kai.bot", **self._base_patches()),
-            patch("kai.bot._send_response", new_callable=AsyncMock) as direct_send,
-        ):
-            await _handle_response(
+            await _handle_workshop_private_text(
                 update,
                 ctx,
-                12345,
-                "test",
-                pool,
-                "sonnet",
-                workshop_inbound_message_id=inbound_id,
-                delivery_route=ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT,
-                workshop_run=self._prepared_workshop_run(pool, inbound_id),
+                chat_id=1,
+                run_id=RunId("run_00000000000000000000000000000001"),
+                inbound_message_id=MessageId("msg_00000000000000000000000000000001"),
+                prompt="Speak",
+                voice_mode=voice_mode,
             )
 
-        finalizer.assert_awaited_once()
-        assert finalizer.await_args.args[0].body == "Durable answer"
-        direct_send.assert_not_awaited()
-        outbound.assert_not_awaited()
-        delivery.assert_not_awaited()
+        assert outcomes[0].body == "Canonical voice answer"
+        assert outcomes[0].request_delivery is request_delivery
+        ctx.bot.send_voice.assert_awaited_once_with(chat_id=1, voice=b"voice")
 
     @pytest.mark.asyncio
-    async def test_workshop_streaming_preview_is_bound_and_final_edit_is_left_to_worker(self):
-        from kai.bot import _handle_response
+    async def test_voice_only_synthesis_failure_requests_canonical_text_delivery(self):
+        from kai.bot import _handle_workshop_private_text
 
-        inbound_id = MessageId("msg_00000000000000000000000000000001")
-        outbound_id = MessageId("msg_00000000000000000000000000000002")
-        update = _make_update()
-        live_message = MagicMock(message_id=7001)
-        update.message.reply_text = AsyncMock(return_value=live_message)
-        pool = _make_mock_claude()
-        pool.send = MagicMock(
-            return_value=_fake_stream(
-                _text_event("Stable streamed sentence."),
-                _done_event("Final durable answer."),
+        update = _make_update(chat_id=1, user_id=1)
+        ctx = _make_context(config=_make_config(allowed_user_ids={1}, tts_enabled=True))
+        execution = MagicMock()
+        outcomes = []
+
+        async def execute(_run_id, *, stream_observer, success_transformer):
+            del stream_observer
+            outcomes.append(await success_transformer(AgentResponse(success=True, text="Canonical text fallback")))
+            return SimpleNamespace(
+                disposition=CanonicalExecutionDisposition.COMPLETED,
+                terminal=SimpleNamespace(body="Canonical text fallback"),
+                session_id=None,
+                selection=None,
+                workspace=None,
             )
-        )
-        ctx = _make_context(pool=pool)
-        preview, finalizer = self._install_workshop_finalizer(ctx, outbound_id)
+
+        execution.execute = AsyncMock(side_effect=execute)
+        ctx.application.core_services.private_text_execution = execution
 
         with (
-            patch.multiple("kai.bot", **self._base_patches()),
-            patch("kai.bot._edit_message_safe", new_callable=AsyncMock) as direct_edit,
+            patch("kai.bot.sessions.get_setting", new_callable=AsyncMock, return_value=DEFAULT_VOICE),
+            patch("kai.bot.synthesize_speech", new_callable=AsyncMock, side_effect=TTSError("unavailable")),
+            patch("kai.bot._send_response", new_callable=AsyncMock) as direct_fallback,
         ):
-            await _handle_response(
+            await _handle_workshop_private_text(
                 update,
                 ctx,
-                12345,
-                "test",
-                pool,
-                "sonnet",
-                workshop_inbound_message_id=inbound_id,
-                delivery_route=ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT,
-                workshop_run=self._prepared_workshop_run(pool, inbound_id),
+                chat_id=1,
+                run_id=RunId("run_00000000000000000000000000000001"),
+                inbound_message_id=MessageId("msg_00000000000000000000000000000001"),
+                prompt="Speak",
+                voice_mode="only",
             )
 
-        bound = preview.await_args.args[0]
-        assert isinstance(bound, ConfirmedTelegramStreamingPreview)
-        assert bound.inbound_message_id == inbound_id
-        assert bound.external_message_id == 7001
-        finalizer.assert_awaited_once()
-        direct_edit.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_definite_workshop_failure_refuses_direct_delivery(self):
-        from kai.bot import _handle_response
-
-        inbound_id = MessageId("msg_00000000000000000000000000000001")
-        outbound_id = MessageId("msg_00000000000000000000000000000002")
-        update = _make_update()
-        pool = _make_mock_claude()
-        pool.send = MagicMock(return_value=_fake_stream(_done_event("Durable answer")))
-        ctx = _make_context(pool=pool)
-        _, finalizer = self._install_workshop_finalizer(ctx, outbound_id)
-        finalizer.side_effect = RuntimeError("definite preparation failure")
-        outbound, _ = self._install_workshop_recorders(ctx, outbound_id)
-        patches = self._base_patches()
-
-        with (
-            patch.multiple("kai.bot", **patches),
-            patch("kai.bot._send_response", new_callable=AsyncMock) as direct_send,
-        ):
-            await _handle_response(
-                update,
-                ctx,
-                12345,
-                "test",
-                pool,
-                "sonnet",
-                workshop_inbound_message_id=inbound_id,
-                delivery_route=ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT,
-                workshop_run=self._prepared_workshop_run(pool, inbound_id),
-            )
-
-        finalizer.assert_awaited_once()
-        direct_send.assert_not_awaited()
-        outbound.assert_not_awaited()
-        assert "could not safely finalize durable delivery" in update.message.reply_text.await_args.args[0]
-        assert patches["log_message"].call_args.kwargs["text"] == "[error: durable delivery finalization failed]"
-
-    @pytest.mark.asyncio
-    async def test_workshop_private_text_without_canonical_inbound_refuses_agent_and_direct_delivery(self):
-        from kai.bot import _handle_response
-
-        update = _make_update()
-        pool = _make_mock_claude()
-        ctx = _make_context(pool=pool)
-        self._install_workshop_finalizer(ctx, MessageId("msg_00000000000000000000000000000002"))
-        patches = self._base_patches()
-
-        with (
-            patch.multiple("kai.bot", **patches),
-            patch("kai.bot._send_response", new_callable=AsyncMock) as direct_send,
-        ):
-            await _handle_response(
-                update,
-                ctx,
-                12345,
-                "test",
-                pool,
-                "sonnet",
-                workshop_inbound_message_id=None,
-                delivery_route=ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT,
-            )
-
-        pool.send.assert_not_called()
-        direct_send.assert_not_awaited()
-        assert "could not safely prepare durable delivery" in update.message.reply_text.await_args.args[0]
-        assert patches["log_message"].call_args.kwargs["text"] == "[error: durable delivery preparation failed]"
-
-    @pytest.mark.asyncio
-    async def test_workshop_preview_binding_failure_replaces_preview_with_notice_and_stops(self):
-        from kai.bot import _handle_response
-
-        inbound_id = MessageId("msg_00000000000000000000000000000001")
-        outbound_id = MessageId("msg_00000000000000000000000000000002")
-        update = _make_update()
-        live_message = MagicMock(message_id=7001)
-        update.message.reply_text = AsyncMock(return_value=live_message)
-        pool = _make_mock_claude()
-        pool.send = MagicMock(
-            return_value=_fake_stream(
-                _text_event("Stable streamed sentence."),
-                _done_event("Final durable answer."),
-            )
-        )
-        ctx = _make_context(pool=pool)
-        preview, finalizer = self._install_workshop_finalizer(ctx, outbound_id)
-        preview.side_effect = RuntimeError("preview binding failed")
-        patches = self._base_patches()
-
-        with (
-            patch.multiple("kai.bot", **patches),
-            patch("kai.bot._edit_message_safe", new_callable=AsyncMock, return_value=True) as direct_edit,
-            patch("kai.bot._send_response", new_callable=AsyncMock) as direct_send,
-        ):
-            await _handle_response(
-                update,
-                ctx,
-                12345,
-                "test",
-                pool,
-                "sonnet",
-                workshop_inbound_message_id=inbound_id,
-                delivery_route=ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT,
-                workshop_run=self._prepared_workshop_run(pool, inbound_id),
-            )
-
-        preview.assert_awaited_once()
-        finalizer.assert_not_awaited()
-        direct_send.assert_not_awaited()
-        direct_edit.assert_awaited_once()
-        assert "could not safely prepare durable delivery" in direct_edit.await_args.args[1]
-        assert patches["log_message"].call_args.kwargs["text"] == "[error: durable delivery preparation failed]"
-
-    @pytest.mark.asyncio
-    async def test_workshop_finalization_failure_replaces_bound_preview_without_direct_answer(self):
-        from kai.bot import _handle_response
-
-        inbound_id = MessageId("msg_00000000000000000000000000000001")
-        outbound_id = MessageId("msg_00000000000000000000000000000002")
-        update = _make_update()
-        live_message = MagicMock(message_id=7001)
-        update.message.reply_text = AsyncMock(return_value=live_message)
-        pool = _make_mock_claude()
-        pool.send = MagicMock(
-            return_value=_fake_stream(
-                _text_event("Stable streamed sentence."),
-                _done_event("Undelivered durable answer."),
-            )
-        )
-        ctx = _make_context(pool=pool)
-        preview, finalizer = self._install_workshop_finalizer(ctx, outbound_id)
-        finalizer.side_effect = RuntimeError("finalization failed")
-        outbound, delivery = self._install_workshop_recorders(ctx, outbound_id)
-        patches = self._base_patches()
-
-        with (
-            patch.multiple("kai.bot", **patches),
-            patch("kai.bot._edit_message_safe", new_callable=AsyncMock, return_value=True) as direct_edit,
-            patch("kai.bot._send_response", new_callable=AsyncMock) as direct_send,
-        ):
-            await _handle_response(
-                update,
-                ctx,
-                12345,
-                "test",
-                pool,
-                "sonnet",
-                workshop_inbound_message_id=inbound_id,
-                delivery_route=ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT,
-                workshop_run=self._prepared_workshop_run(pool, inbound_id),
-            )
-
-        preview.assert_awaited_once()
-        finalizer.assert_awaited_once()
-        direct_send.assert_not_awaited()
-        outbound.assert_not_awaited()
-        delivery.assert_not_awaited()
-        assert "could not safely finalize durable delivery" in direct_edit.await_args.args[1]
-        assert patches["log_message"].call_args.kwargs["text"] == "[error: durable delivery finalization failed]"
-
-    @pytest.mark.asyncio
-    async def test_uncertain_workshop_commit_refuses_duplicate_direct_send(self):
-        from kai.bot import _handle_response
-
-        inbound_id = MessageId("msg_00000000000000000000000000000001")
-        outbound_id = MessageId("msg_00000000000000000000000000000002")
-        update = _make_update()
-        pool = _make_mock_claude()
-        pool.send = MagicMock(return_value=_fake_stream(_done_event("Possibly committed answer")))
-        ctx = _make_context(pool=pool)
-        _, finalizer = self._install_workshop_finalizer(ctx, outbound_id)
-        finalizer.side_effect = sessions.WorkshopFinalizationCommitUncertainError("unknown")
-
-        with (
-            patch.multiple("kai.bot", **self._base_patches()),
-            patch("kai.bot._send_response", new_callable=AsyncMock) as direct_send,
-        ):
-            await _handle_response(
-                update,
-                ctx,
-                12345,
-                "test",
-                pool,
-                "sonnet",
-                workshop_inbound_message_id=inbound_id,
-                delivery_route=ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT,
-                workshop_run=self._prepared_workshop_run(pool, inbound_id),
-            )
-
-        direct_send.assert_not_awaited()
-        assert "avoid a duplicate" in update.message.reply_text.await_args.args[0]
-
-    @pytest.mark.asyncio
-    async def test_text_plus_voice_never_enters_workshop_text_cutover(self):
-        from kai.bot import _handle_response
-
-        inbound_id = MessageId("msg_00000000000000000000000000000001")
-        outbound_id = MessageId("msg_00000000000000000000000000000002")
-        update = _make_update()
-        pool = _make_mock_claude()
-        pool.send = MagicMock(return_value=_fake_stream(_done_event("Text and voice")))
-        ctx = _make_context(config=_make_config(tts_enabled=True), pool=pool)
-        _, finalizer = self._install_workshop_finalizer(ctx, outbound_id)
-        self._install_workshop_recorders(ctx, outbound_id)
-        patches = self._base_patches()
-        patches["sessions"].get_setting = AsyncMock(return_value="on")
-
-        with (
-            patch.multiple("kai.bot", **patches),
-            patch("kai.bot.synthesize_speech", new_callable=AsyncMock, return_value=b"audio"),
-        ):
-            await _handle_response(
-                update,
-                ctx,
-                12345,
-                "test",
-                pool,
-                "sonnet",
-                workshop_inbound_message_id=inbound_id,
-                delivery_route=ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT,
-            )
-
-        finalizer.assert_not_awaited()
-        update.message.reply_text.assert_awaited()
-
-    @pytest.mark.asyncio
-    async def test_legacy_route_does_not_retry_failed_jsonl_append(self):
-        from kai.bot import _handle_response
-
-        update = _make_update()
-        pool = _make_mock_claude()
-        pool.send = MagicMock(return_value=_fake_stream(_done_event("Legacy answer")))
-        ctx = _make_context(pool=pool)
-        patches = self._base_patches()
-        patches["log_message"].return_value = None
-
-        with patch.multiple("kai.bot", **patches):
-            await _handle_response(
-                update,
-                ctx,
-                12345,
-                "test",
-                pool,
-                "sonnet",
-                delivery_route=ResponseDeliveryRoute.LEGACY,
-            )
-
-        patches["log_message"].assert_called_once()
-        assert patches["log_message"].call_args.kwargs["text"] == "Legacy answer"
-
-    @pytest.mark.asyncio
-    async def test_shadows_successful_assistant_result_and_text_delivery(self):
-        from kai.bot import _handle_response
-
-        inbound_id = MessageId("msg_00000000000000000000000000000001")
-        outbound_id = MessageId("msg_00000000000000000000000000000002")
-        update = _make_update()
-        pool = _make_mock_claude()
-        pool.send = MagicMock(return_value=_fake_stream(_done_event("Canonical answer")))
-        ctx = _make_context(pool=pool)
-        outbound, delivery = self._install_workshop_recorders(ctx, outbound_id)
-
-        with patch.multiple("kai.bot", **self._base_patches()):
-            await _handle_response(
-                update,
-                ctx,
-                12345,
-                "test",
-                pool,
-                "sonnet",
-                workshop_inbound_message_id=inbound_id,
-            )
-
-        outbound.assert_awaited_once()
-        outbound_message = outbound.await_args.args[0]
-        assert isinstance(outbound_message, OutboundMessage)
-        assert outbound_message.in_reply_to_message_id == inbound_id
-        assert outbound_message.body == "Canonical answer"
-        delivery.assert_awaited_once()
-        observation = delivery.await_args.args[0]
-        assert isinstance(observation, DeliveryObservation)
-        assert observation.message_id == outbound_id
-        assert (observation.transport, observation.mode, observation.succeeded) == (
-            "telegram",
-            "text",
-            True,
-        )
-
-    @pytest.mark.asyncio
-    async def test_outbound_shadow_failure_does_not_change_delivery(self, caplog):
-        from kai.bot import _handle_response
-
-        inbound_id = MessageId("msg_00000000000000000000000000000001")
-        update = _make_update()
-        pool = _make_mock_claude()
-        pool.send = MagicMock(return_value=_fake_stream(_done_event("Still delivered")))
-        ctx = _make_context(pool=pool)
-        ctx.bot_data["workshop_outbound_recorder"] = AsyncMock(side_effect=RuntimeError("shadow failed"))
-        delivery = AsyncMock()
-        ctx.bot_data["workshop_delivery_recorder"] = delivery
-
-        with patch.multiple("kai.bot", **self._base_patches()), caplog.at_level(logging.ERROR):
-            await _handle_response(
-                update,
-                ctx,
-                12345,
-                "test",
-                pool,
-                "sonnet",
-                workshop_inbound_message_id=inbound_id,
-            )
-
-        assert update.message.reply_text.called
-        delivery.assert_not_awaited()
-        assert "Workshop outbound shadow write failed" in caplog.text
-
-    @pytest.mark.asyncio
-    async def test_delivery_shadow_failure_does_not_change_existing_response_path(self, caplog):
-        from kai.bot import _handle_response
-
-        inbound_id = MessageId("msg_00000000000000000000000000000001")
-        outbound_id = MessageId("msg_00000000000000000000000000000002")
-        update = _make_update()
-        pool = _make_mock_claude()
-        pool.send = MagicMock(return_value=_fake_stream(_done_event("Delivered despite shadow failure")))
-        ctx = _make_context(pool=pool)
-        outbound, _ = self._install_workshop_recorders(ctx, outbound_id)
-        ctx.bot_data["workshop_delivery_recorder"] = AsyncMock(side_effect=RuntimeError("shadow failed"))
-
-        with patch.multiple("kai.bot", **self._base_patches()), caplog.at_level(logging.ERROR):
-            await _handle_response(
-                update,
-                ctx,
-                12345,
-                "test",
-                pool,
-                "sonnet",
-                workshop_inbound_message_id=inbound_id,
-            )
-
-        outbound.assert_awaited_once()
-        assert update.message.reply_text.called
-        assert "Workshop delivery shadow write failed" in caplog.text
-
-    @pytest.mark.asyncio
-    async def test_text_delivery_failure_is_observed_and_original_error_propagates(self):
-        from kai.bot import _handle_response
-
-        inbound_id = MessageId("msg_00000000000000000000000000000001")
-        outbound_id = MessageId("msg_00000000000000000000000000000002")
-        update = _make_update()
-        pool = _make_mock_claude()
-        pool.send = MagicMock(return_value=_fake_stream(_done_event("Undelivered")))
-        ctx = _make_context(pool=pool)
-        _, delivery = self._install_workshop_recorders(ctx, outbound_id)
-
-        with (
-            patch.multiple("kai.bot", **self._base_patches()),
-            patch("kai.bot._send_response", new_callable=AsyncMock, side_effect=ConnectionError("network")),
-            pytest.raises(ConnectionError, match="network"),
-        ):
-            await _handle_response(
-                update,
-                ctx,
-                12345,
-                "test",
-                pool,
-                "sonnet",
-                workshop_inbound_message_id=inbound_id,
-            )
-
-        assert delivery.await_args.args[0].succeeded is False
-
-    @pytest.mark.asyncio
-    async def test_best_effort_final_edit_failure_is_observed_without_new_exception(self):
-        from kai.bot import _handle_response
-
-        inbound_id = MessageId("msg_00000000000000000000000000000001")
-        outbound_id = MessageId("msg_00000000000000000000000000000002")
-        update = _make_update()
-        pool = _make_mock_claude()
-        pool.send = MagicMock(return_value=_fake_stream(_text_event("Stable sentence."), _done_event("Final answer.")))
-        ctx = _make_context(pool=pool)
-        _, delivery = self._install_workshop_recorders(ctx, outbound_id)
-
-        with (
-            patch.multiple("kai.bot", **self._base_patches()),
-            patch("kai.bot._edit_message_safe", new_callable=AsyncMock, return_value=False),
-        ):
-            await _handle_response(
-                update,
-                ctx,
-                12345,
-                "test",
-                pool,
-                "sonnet",
-                workshop_inbound_message_id=inbound_id,
-            )
-
-        assert delivery.await_args.args[0].succeeded is False
-
-    @pytest.mark.asyncio
-    async def test_voice_only_delivery_success_is_observed(self):
-        from kai.bot import _handle_response
-
-        inbound_id = MessageId("msg_00000000000000000000000000000001")
-        outbound_id = MessageId("msg_00000000000000000000000000000002")
-        update = _make_update()
-        pool = _make_mock_claude()
-        pool.send = MagicMock(return_value=_fake_stream(_done_event("Spoken")))
-        ctx = _make_context(config=_make_config(tts_enabled=True), pool=pool)
-        _, delivery = self._install_workshop_recorders(ctx, outbound_id)
-        patches = self._base_patches()
-        patches["sessions"].get_setting = AsyncMock(return_value="only")
-
-        with (
-            patch.multiple("kai.bot", **patches),
-            patch("kai.bot.synthesize_speech", new_callable=AsyncMock, return_value=b"audio"),
-        ):
-            await _handle_response(
-                update,
-                ctx,
-                12345,
-                "test",
-                pool,
-                "sonnet",
-                workshop_inbound_message_id=inbound_id,
-            )
-
-        observation = delivery.await_args.args[0]
-        assert (observation.mode, observation.succeeded) == ("voice", True)
-
-    @pytest.mark.asyncio
-    async def test_failed_backend_does_not_create_workshop_outbound_message(self):
-        from kai.bot import _handle_response
-
-        inbound_id = MessageId("msg_00000000000000000000000000000001")
-        update = _make_update()
-        pool = _make_mock_claude()
-        pool.send = MagicMock(return_value=_fake_stream(_done_event("bad", success=False, error="bad")))
-        ctx = _make_context(pool=pool)
-        outbound = AsyncMock()
-        ctx.bot_data["workshop_outbound_recorder"] = outbound
-
-        with patch.multiple("kai.bot", **self._base_patches()):
-            await _handle_response(
-                update,
-                ctx,
-                12345,
-                "test",
-                pool,
-                "sonnet",
-                workshop_inbound_message_id=inbound_id,
-            )
-
-        outbound.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_normal_flow(self):
-        """Streams text, creates live message, delivers final text."""
-        from kai.bot import _handle_response
-
-        update = _make_update()
-        claude = _make_mock_claude()
-        claude.send = MagicMock(return_value=_fake_stream(_text_event("Hello"), _done_event("Hello world")))
-        ctx = _make_context(claude=claude)
-
-        with patch.multiple("kai.bot", **self._base_patches()):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
-
-        # Live message should have been created via reply_text
-        assert update.message.reply_text.called
-
-    @pytest.mark.asyncio
-    async def test_final_matches_last_edit_no_redundant(self):
-        """When final text matches last edit, no extra edit is made."""
-        from kai.bot import _handle_response
-
-        update = _make_update()
-        # The live message mock - track edit_text calls
-        live_msg = MagicMock()
-        live_msg.edit_text = AsyncMock()
-        update.message.reply_text = AsyncMock(return_value=live_msg)
-
-        claude = _make_mock_claude()
-        claude.send = MagicMock(return_value=_fake_stream(_text_event("Done"), _done_event("Done")))
-        ctx = _make_context(claude=claude)
-
-        with patch.multiple("kai.bot", **self._base_patches()):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
-
-        # The important thing is no exception was raised and
-        # the response completed successfully
-
-    @pytest.mark.asyncio
-    async def test_stop_interruption(self):
-        """Stop event during streaming: edits '(stopped)', returns without error."""
-        from kai.bot import _handle_response
-
-        update = _make_update()
-        live_msg = MagicMock()
-        live_msg.edit_text = AsyncMock()
-        update.message.reply_text = AsyncMock(return_value=live_msg)
-
-        stop_event = asyncio.Event()
-
-        async def _streaming(*args):
-            yield _text_event("Partial")
-            # Simulate /stop during streaming
-            stop_event.set()
-            yield _text_event("More text")
-            yield _done_event("Should not reach")
-
-        claude = _make_mock_claude()
-        claude.send = MagicMock(return_value=_streaming())
-        ctx = _make_context(claude=claude)
-
-        with (
-            patch.multiple("kai.bot", **self._base_patches()),
-            patch("kai.bot.get_stop_event", return_value=stop_event),
-        ):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
-
-        # Should NOT send the "No response" error
-        replies = [c[0][0] for c in update.message.reply_text.call_args_list]
-        assert not any("Error" in r for r in replies)
-
-    @pytest.mark.asyncio
-    async def test_no_done_event_error(self):
-        """No done event: sends 'No response from agent' error."""
-        from kai.bot import _handle_response
-
-        update = _make_update()
-        claude = _make_mock_claude()
-        # Stream that ends without a done event
-        claude.send = MagicMock(return_value=_fake_stream(_text_event("Partial")))
-        ctx = _make_context(claude=claude)
-
-        with patch.multiple("kai.bot", **self._base_patches()):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
-
-        replies = [c[0][0] for c in update.message.reply_text.call_args_list]
-        assert any("No response from agent" in r for r in replies)
-
-    @pytest.mark.asyncio
-    async def test_error_response_with_live_msg(self):
-        """success=False with existing live message: error appears as
-        a NEW follow-up reply via _reply_safe (not edited into the
-        live message via _edit_message_safe). The live streamed
-        content stays visible so any tool-use, partial reasoning, and
-        intermediate output the user was watching survives the error.
-
-        Patches kai.bot._reply_safe directly rather than relying on
-        its internal call to reply_text - the latter would couple
-        this assertion to _reply_safe's implementation, and a future
-        refactor of _reply_safe (e.g., to use a different telegram
-        method on its first attempt) would silently void this
-        assertion. The streaming loop also uses _reply_safe to
-        create live_msg, so we filter the captured calls to those
-        carrying an "Error" prefix to isolate the error-path
-        invocations from the streaming-text invocations."""
-        from kai.bot import _handle_response
-
-        update = _make_update()
-        live_msg = MagicMock()
-        live_msg.edit_text = AsyncMock()
-        update.message.reply_text = AsyncMock(return_value=live_msg)
-
-        claude = _make_mock_claude()
-        claude.send = MagicMock(
-            return_value=_fake_stream(
-                _text_event("Partial"),
-                _done_event("Something broke", success=False, error="Something broke"),
-            )
-        )
-        ctx = _make_context(claude=claude)
-
-        with (
-            patch.multiple("kai.bot", **self._base_patches()),
-            patch("kai.bot._reply_safe", new_callable=AsyncMock) as mock_reply_safe,
-            patch("kai.bot._edit_message_safe", new_callable=AsyncMock) as mock_edit_safe,
-        ):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
-
-        # The error path uses _reply_safe (NOT _edit_message_safe) -
-        # error appears as a follow-up message, not an in-place edit.
-        # Pinning the negative property because the absence of an
-        # edit is the load-bearing contract change. Length guard on
-        # args[1] mirrors the pattern used in test_error_recovery.py
-        # so a future _reply_safe call site that omits the text arg
-        # produces a meaningful assertion failure rather than
-        # IndexError.
-        for call in mock_edit_safe.await_args_list:
-            text_arg = call.args[1] if len(call.args) > 1 else ""
-            assert "Error" not in text_arg, (
-                f"_edit_message_safe was called with an error string ({text_arg!r}), "
-                f"violating the append-not-overwrite contract"
-            )
-        error_calls = [
-            call
-            for call in mock_reply_safe.await_args_list
-            if (call.args[1] if len(call.args) > 1 else "").startswith("Error")
-        ]
-        assert len(error_calls) >= 1, "expected the error to appear via _reply_safe"
-        assert "Something broke" in error_calls[-1].args[1]
-
-    @pytest.mark.asyncio
-    async def test_error_response_no_live_msg(self):
-        """success=False with no live message: sends error as new reply."""
-        from kai.bot import _handle_response
-
-        update = _make_update()
-        claude = _make_mock_claude()
-        # Done event immediately (no text events to create a live message)
-        claude.send = MagicMock(
-            return_value=_fake_stream(
-                _done_event("Broke", success=False, error="Broke"),
-            )
-        )
-        ctx = _make_context(claude=claude)
-
-        with patch.multiple("kai.bot", **self._base_patches()):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
-
-        replies = [c[0][0] for c in update.message.reply_text.call_args_list]
-        assert any("Error" in r for r in replies)
-
-    @pytest.mark.asyncio
-    async def test_long_response_chunked(self):
-        """Response > 4096 chars: first chunk edits live message, rest sent as new messages."""
-        from kai.bot import _handle_response
-
-        update = _make_update()
-        live_msg = MagicMock()
-        live_msg.edit_text = AsyncMock()
-        update.message.reply_text = AsyncMock(return_value=live_msg)
-
-        long_text = "a" * 5000
-        claude = _make_mock_claude()
-        claude.send = MagicMock(return_value=_fake_stream(_text_event("start"), _done_event(long_text)))
-        ctx = _make_context(claude=claude)
-
-        with patch.multiple("kai.bot", **self._base_patches()):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
-
-        # Multiple messages should have been sent (chunked)
-        assert update.message.reply_text.call_count >= 2
-
-    @pytest.mark.asyncio
-    async def test_session_saved_with_id(self):
-        """Saves session when session_id is present."""
-        from kai.bot import _handle_response
-
-        update = _make_update()
-        claude = _make_mock_claude()
-        claude.send = MagicMock(return_value=_fake_stream(_done_event("Ok", session_id="sess-abc")))
-        ctx = _make_context(claude=claude)
-        mock_sessions = MagicMock(
-            get_setting=AsyncMock(return_value="off"),
-            save_session=AsyncMock(),
-        )
-
-        with patch("kai.bot.sessions", mock_sessions), patch("kai.bot.log_message"):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
-
-        mock_sessions.save_session.assert_called_once()
-        args = mock_sessions.save_session.call_args[0]
-        assert args[0] == 12345
-        assert args[1] == "sess-abc"
-
-    @pytest.mark.asyncio
-    async def test_session_not_saved_without_id(self):
-        """Does NOT save session when session_id is None."""
-        from kai.bot import _handle_response
-
-        update = _make_update()
-        claude = _make_mock_claude()
-        claude.send = MagicMock(return_value=_fake_stream(_done_event("Ok", session_id=None)))
-        ctx = _make_context(claude=claude)
-        mock_sessions = MagicMock(
-            get_setting=AsyncMock(return_value="off"),
-            save_session=AsyncMock(),
-        )
-
-        with patch("kai.bot.sessions", mock_sessions), patch("kai.bot.log_message"):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
-
-        mock_sessions.save_session.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_voice_only_mode(self):
-        """Voice-only: no live text message, synthesizes and sends voice."""
-        from kai.bot import _handle_response
-
-        update = _make_update()
-        claude = _make_mock_claude()
-        claude.send = MagicMock(return_value=_fake_stream(_done_event("Hello voice")))
-        config = _make_config(tts_enabled=True, piper_model_dir=Path("/models"))
-        ctx = _make_context(config=config, claude=claude)
-        mock_sessions = MagicMock(
-            get_setting=AsyncMock(return_value="only"),
-            save_session=AsyncMock(),
-        )
-
-        with (
-            patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.log_message"),
-            patch("kai.bot.synthesize_speech", new_callable=AsyncMock, return_value=b"audio-bytes"),
-        ):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
-
-        ctx.bot.send_voice.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_voice_only_tts_failure_falls_back(self):
-        """Voice-only TTS failure: falls back to text delivery."""
-        from kai.bot import _handle_response
-        from kai.tts import TTSError
-
-        update = _make_update()
-        claude = _make_mock_claude()
-        claude.send = MagicMock(return_value=_fake_stream(_done_event("Fallback text")))
-        config = _make_config(tts_enabled=True, piper_model_dir=Path("/models"))
-        ctx = _make_context(config=config, claude=claude)
-        mock_sessions = MagicMock(
-            get_setting=AsyncMock(return_value="only"),
-            save_session=AsyncMock(),
-        )
-
-        with (
-            patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.log_message"),
-            patch("kai.bot.synthesize_speech", new_callable=AsyncMock, side_effect=TTSError("fail")),
-        ):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
-
-        # Should fall back to text
-        assert update.message.reply_text.called
-
-    @pytest.mark.asyncio
-    async def test_text_plus_voice_mode(self):
-        """Text+voice mode: sends text normally, then sends voice note."""
-        from kai.bot import _handle_response
-
-        update = _make_update()
-        live_msg = MagicMock()
-        live_msg.edit_text = AsyncMock()
-        update.message.reply_text = AsyncMock(return_value=live_msg)
-
-        claude = _make_mock_claude()
-        claude.send = MagicMock(return_value=_fake_stream(_text_event("Hi"), _done_event("Hi there")))
-        config = _make_config(tts_enabled=True, piper_model_dir=Path("/models"))
-        ctx = _make_context(config=config, claude=claude)
-
-        async def _get_setting(key):
-            if "voice_mode" in key:
-                return "on"
-            return DEFAULT_VOICE
-
-        mock_sessions = MagicMock(
-            get_setting=AsyncMock(side_effect=_get_setting),
-            save_session=AsyncMock(),
-        )
-
-        with (
-            patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.log_message"),
-            patch("kai.bot.synthesize_speech", new_callable=AsyncMock, return_value=b"audio"),
-        ):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
-
-        # Both text (reply_text) and voice (send_voice) should be sent
-        assert update.message.reply_text.called
-        ctx.bot.send_voice.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_typing_task_cancelled(self):
-        """Typing indicator task is cancelled in finally block."""
-        from kai.bot import _handle_response
-
-        update = _make_update()
-        claude = _make_mock_claude()
-        claude.send = MagicMock(return_value=_fake_stream(_done_event("Ok")))
-        ctx = _make_context(claude=claude)
-
-        with patch.multiple("kai.bot", **self._base_patches()):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
-
-        # If we got here without hanging, the typing task was properly cancelled
-
-    @pytest.mark.asyncio
-    async def test_extraction_skipped_when_memory_disabled(self, monkeypatch):
-        """Switch point 5 (#434): under memory.is_enabled() == False,
-        the post-response ingestion guard short-circuits and
-        extract_and_store is never invoked. The fire-and-forget task
-        is gated, so no _ingest_memory task is even created.
-
-        Pinned regression: a refactor that flips the
-        `if memory_is_enabled() and chat_id is not None:` guard to
-        `if True:` (or removes it entirely) fails this test because
-        extract_and_store would then run under disabled mode and write
-        to Qdrant from a mode that promises never to write.
-        """
-        from kai.bot import _handle_response
-
-        monkeypatch.setattr("kai.memory.is_enabled", lambda: False)
-        extract_mock = AsyncMock()
-        monkeypatch.setattr("kai.memory_extraction.extract_and_store", extract_mock)
-
-        update = _make_update()
-        pool = _make_mock_claude()
-        pool.send = MagicMock(return_value=_fake_stream(_done_event("Hello world")))
-        # memory_extraction_enabled=True ensures the inner config check
-        # in _ingest_memory does NOT short-circuit before reaching the
-        # extract_and_store call. The OUTER is_enabled() guard is the
-        # contract under test; the inner check would mask its failure
-        # if both were False.
-        #
-        # episode_classifier_context_turns=0 mirrors the enabled-mode
-        # counterpart's setup so the two tests are structurally
-        # symmetric. Under current behavior the disabled test never
-        # reaches the inner block, so the value is unread; the
-        # symmetry is defense-in-depth: if the monkeypatch ever stops
-        # taking effect or the guard moves, the inner block would
-        # otherwise execute with the default value of 3 and trigger
-        # an unstated `get_recent_pairs(12345, 4)` disk read.
-        config = _make_config(
-            memory_extraction_enabled=True,
-            episode_classifier_context_turns=0,
-        )
-        ctx = _make_context(config=config, pool=pool)
-
-        # Snapshot the task set BEFORE the call so we can compute the
-        # delta after. A bare `asyncio.all_tasks()` post-call would
-        # also pick up unrelated tasks (pytest-asyncio fixtures,
-        # leftover work from a prior test) and gather them too,
-        # which is fragile even when it does not currently break.
-        tasks_before = asyncio.all_tasks()
-
-        with patch.multiple("kai.bot", **self._base_patches()):
-            await _handle_response(update, ctx, 12345, "test prompt", pool, "claude-opus")
-
-        # Drain any tasks the call may have spawned. The disabled-path
-        # contract is that NO ingest task is created, so this should
-        # be a no-op; if a regression spawned a task anyway, the
-        # gather lets it run before the assertion, surfacing the bug
-        # as a failed call_count check rather than a timing-flake.
-        new_tasks = asyncio.all_tasks() - tasks_before - {asyncio.current_task()}
-        if new_tasks:
-            await asyncio.gather(*new_tasks, return_exceptions=True)
-
-        extract_mock.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_extraction_invoked_when_memory_enabled(self, monkeypatch):
-        """Switch point 5 (#434): under memory.is_enabled() == True
-        plus a successful response, the post-response ingestion path
-        spawns a background _ingest_memory task that calls
-        extract_and_store exactly once.
-
-        Pinned regression: a refactor that flips the guard to
-        `if False:` (or removes the call site from the closure) fails
-        this test because extract_and_store would not run under
-        enabled mode and the Qdrant fact surface would never receive
-        new extractions.
-
-        The fire-and-forget task is awaited explicitly via
-        `asyncio.gather` over the post-call task set so the assertion
-        does not race the create_task'd coroutine.
-        """
-        from kai.bot import _handle_response
-
-        monkeypatch.setattr("kai.memory.is_enabled", lambda: True)
-        extract_mock = AsyncMock()
-        monkeypatch.setattr("kai.memory_extraction.extract_and_store", extract_mock)
-
-        update = _make_update()
-        pool = _make_mock_claude()
-        pool.send = MagicMock(return_value=_fake_stream(_done_event("Hello world", session_id="sess-1")))
-        # episode_classifier_context_turns=0 skips the history fetch
-        # inside _ingest_memory (no get_recent_pairs call needed); the
-        # contract under test is the outer gate plus the inner config
-        # branch, neither of which depends on prior_pairs being
-        # non-empty. memory_extraction_enabled=True so the inner gate
-        # passes; _make_config explicitly selects the Claude backend
-        # used by this test's mocked pool.
-        config = _make_config(
-            memory_extraction_enabled=True,
-            episode_classifier_context_turns=0,
-        )
-        ctx = _make_context(config=config, pool=pool)
-
-        # Snapshot pre-call so the post-call delta reflects only the
-        # tasks _handle_response spawned. See the disabled counterpart
-        # for the full rationale.
-        tasks_before = asyncio.all_tasks()
-
-        with patch.multiple("kai.bot", **self._base_patches()):
-            await _handle_response(update, ctx, 12345, "test prompt", pool, "claude-opus")
-
-        # Wait for the fire-and-forget _ingest_memory task to run to
-        # completion. asyncio.create_task at the call site schedules
-        # the coroutine onto the event loop; the test's coroutine
-        # cannot assert until the scheduled task has had a chance to
-        # progress past its `await extract_and_store(...)` line.
-        #
-        # NOT `return_exceptions=True`: in the positive test, a task
-        # that crashed BEFORE reaching extract_and_store (e.g., a
-        # config-guard mismatch, a missing attribute) would be
-        # silently swallowed and surface only as "expected called
-        # once, called zero times" - hiding the real cause. The
-        # disabled-mode counterpart uses return_exceptions=True
-        # because there a task appearing at all is the regression
-        # signal; here we want crashes to propagate.
-        new_tasks = asyncio.all_tasks() - tasks_before - {asyncio.current_task()}
-        if new_tasks:
-            await asyncio.gather(*new_tasks)
-
-        extract_mock.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_extraction_invoked_for_opencode_users(self, monkeypatch):
-        """The bot.py extraction gate now admits opencode users. Pin
-        that an effective `agent_backend="opencode"` flows through the
-        post-response ingestion path and calls extract_and_store. The
-        gate widening at bot.py:_ingest_memory is what unlocks the
-        opencode one-shot reasoner; a regression that reverts the
-        tuple literal would silently lose extraction for opencode
-        users while leaving claude / codex flowing."""
-        from kai.bot import _handle_response
-        from kai.config import UserConfig
-
-        monkeypatch.setattr("kai.memory.is_enabled", lambda: True)
-        extract_mock = AsyncMock()
-        monkeypatch.setattr("kai.memory_extraction.extract_and_store", extract_mock)
-
-        update = _make_update()
-        pool = _make_mock_claude()
-        pool.send = MagicMock(return_value=_fake_stream(_done_event("Hello world", session_id="sess-1")))
-        # Per-user opencode override on a global-claude install; the
-        # bot.py gate consults the effective backend (user override
-        # wins), which is the same shape an all-opencode install
-        # produces for the gate.
-        config = _make_config(
-            memory_extraction_enabled=True,
-            episode_classifier_context_turns=0,
-            user_configs={
-                12345: UserConfig(
-                    telegram_id=12345,
-                    name="opencode-user",
-                    backend="opencode",
-                ),
-            },
-        )
-        ctx = _make_context(config=config, pool=pool)
-
-        tasks_before = asyncio.all_tasks()
-
-        with patch.multiple("kai.bot", **self._base_patches()):
-            await _handle_response(update, ctx, 12345, "test prompt", pool, "anthropic/claude-sonnet-4-5")
-
-        new_tasks = asyncio.all_tasks() - tasks_before - {asyncio.current_task()}
-        if new_tasks:
-            await asyncio.gather(*new_tasks)
-
-        extract_mock.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_extraction_skipped_for_non_reasoner_backend_users(self, monkeypatch):
-        """Symmetric guard: users whose effective backend has no
-        OneShotReasoner must NOT reach the extractor; an extraction
-        attempt would crash. Every real backend is a member today, so
-        the gate's negative branch is exercised by patching the
-        constant down rather than naming a real backend."""
-        from kai.bot import _handle_response
-        from kai.config import UserConfig
-
-        monkeypatch.setattr("kai.memory.is_enabled", lambda: True)
-        monkeypatch.setattr("kai.bot.ONESHOT_REASONER_BACKENDS", frozenset({"claude", "codex"}))
-        extract_mock = AsyncMock()
-        monkeypatch.setattr("kai.memory_extraction.extract_and_store", extract_mock)
-
-        update = _make_update()
-        pool = _make_mock_claude()
-        pool.send = MagicMock(return_value=_fake_stream(_done_event("Hello world", session_id="sess-1")))
-        config = _make_config(
-            memory_extraction_enabled=True,
-            episode_classifier_context_turns=0,
-            user_configs={
-                12345: UserConfig(
-                    telegram_id=12345,
-                    name="goose-user",
-                    backend="goose",
-                    provider="openai",
-                ),
-            },
-        )
-        ctx = _make_context(config=config, pool=pool)
-
-        tasks_before = asyncio.all_tasks()
-
-        with patch.multiple("kai.bot", **self._base_patches()):
-            await _handle_response(update, ctx, 12345, "test prompt", pool, "gpt-4")
-
-        new_tasks = asyncio.all_tasks() - tasks_before - {asyncio.current_task()}
-        if new_tasks:
-            await asyncio.gather(*new_tasks, return_exceptions=True)
-
-        extract_mock.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_memory_ingest_task_held_by_module_set(self, monkeypatch):
-        """The ingest task is added to `_pending_memory_tasks` at
-        schedule time and discarded by the done-callback after the
-        task completes. Pinning both sides of the lifecycle prevents
-        a regression that reverts to `asyncio.create_task(...)` with
-        no strong reference, which Python's GC can reap mid-flight.
-
-        Drives the lifecycle with an asyncio.Event so the test can
-        observe the set membership at three points: pre-call (empty
-        baseline), mid-task (one entry, task in flight), and
-        post-task (back to empty after the done-callback fires)."""
-        from kai import bot
-        from kai.bot import _handle_response, _pending_memory_tasks
-
-        # Baseline: prior tests may have left the set populated if
-        # they did not wait for their tasks to complete. Snapshot the
-        # baseline rather than asserting empty so test ordering does
-        # not couple this test to its siblings.
-        baseline = set(_pending_memory_tasks)
-
-        monkeypatch.setattr("kai.memory.is_enabled", lambda: True)
-
-        # extract_and_store waits on this event so the test can
-        # inspect the set while the task is in flight. The mid-task
-        # assertion races the done-callback only if extract returns
-        # immediately; the event keeps the task pending until the
-        # test releases it.
-        in_flight = asyncio.Event()
-        release = asyncio.Event()
-
-        async def blocking_extract(*args, **kwargs):
-            in_flight.set()
-            await release.wait()
-
-        monkeypatch.setattr("kai.memory_extraction.extract_and_store", blocking_extract)
-
-        update = _make_update()
-        pool = _make_mock_claude()
-        pool.send = MagicMock(return_value=_fake_stream(_done_event("Hello world", session_id="sess-1")))
-        config = _make_config(
-            memory_extraction_enabled=True,
-            episode_classifier_context_turns=0,
-        )
-        ctx = _make_context(config=config, pool=pool)
-
-        with patch.multiple("kai.bot", **self._base_patches()):
-            await _handle_response(update, ctx, 12345, "test prompt", pool, "claude-opus")
-
-        # The ingest task is scheduled inside _handle_response and
-        # blocked at the extract_and_store await. Wait for the
-        # in-flight signal so the assertion does not race the
-        # task's first await.
-        await asyncio.wait_for(in_flight.wait(), timeout=1.0)
-
-        # Mid-task: exactly one new entry above baseline. The
-        # add() at schedule time put it there; the done-callback
-        # has not fired because the task is still blocked.
-        assert len(_pending_memory_tasks - baseline) == 1, (
-            "ingest task should be held in _pending_memory_tasks while it runs"
-        )
-
-        # Release the task so it can complete and the done-callback
-        # can run.
-        release.set()
-
-        # Wait for the done-callback to discard the task. The
-        # task itself completes inside extract_and_store; the
-        # discard runs as a callback after. A short asyncio.sleep
-        # loop lets the runtime schedule both.
-        for _ in range(100):
-            if not (_pending_memory_tasks - baseline):
-                break
-            await asyncio.sleep(0.01)
-
-        # Post-task: the set is back to baseline. The discard
-        # callback fired and self-pruned the entry, so a
-        # long-running deployment does not accumulate references.
-        assert _pending_memory_tasks - baseline == set(), (
-            "done-callback should have discarded the completed task from _pending_memory_tasks"
-        )
-
-        # Silence pyflakes/ruff: `bot` is imported above to anchor
-        # the patched attribute path; the assertions read from the
-        # re-imported `_pending_memory_tasks` reference.
-        _ = bot
-
-    # ── Stable-prefix streaming gate ─────────────────────────────────
-
-    @pytest.mark.asyncio
-    async def test_does_not_create_live_message_for_initial_single_word(self):
-        """First non-empty partial is a single word; gate withholds live message."""
-        from kai.bot import _handle_response
-
-        update = _make_update()
-        claude = _make_mock_claude()
-        claude.send = MagicMock(return_value=_fake_stream(_text_event("One"), _done_event("One final answer.")))
-        ctx = _make_context(claude=claude)
-
-        with (
-            patch.multiple("kai.bot", **self._base_patches()),
-            patch("kai.bot._reply_safe", new_callable=AsyncMock) as mock_reply,
-            patch("kai.bot._edit_message_safe", new_callable=AsyncMock) as mock_edit,
-        ):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
-
-        # No live edit ever fired; final answer arrived through _reply_safe
-        # via _send_response. The unstable "One" partial never created a
-        # live message.
-        mock_edit.assert_not_called()
-        published_texts = [c.args[1] for c in mock_reply.call_args_list]
-        assert "One" not in published_texts
-        assert any("One final answer." in t for t in published_texts)
-
-    @pytest.mark.asyncio
-    async def test_does_not_create_live_message_for_bare_numbered_marker(self):
-        """First non-empty partial is a single in-progress numbered item;
-        the stable-prefix gate must withhold the live message. Without
-        the ordered-list-aware sentence cut, the gate would publish the
-        bare marker ``1.`` as if it were a complete sentence.
-        """
-        from kai.bot import _handle_response
-
-        update = _make_update()
-        claude = _make_mock_claude()
-        claude.send = MagicMock(
-            return_value=_fake_stream(
-                _text_event("1. Item one"),
-                _done_event("1. Item one\n2. Item two\n3. Item three"),
-            )
-        )
-        ctx = _make_context(claude=claude)
-
-        with (
-            patch.multiple("kai.bot", **self._base_patches()),
-            patch("kai.bot._reply_safe", new_callable=AsyncMock) as mock_reply,
-            patch("kai.bot._edit_message_safe", new_callable=AsyncMock) as mock_edit,
-        ):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
-
-        # No live message edit ever fired; the unstable single in-progress
-        # item never produced a stable-prefix candidate, so the live
-        # message was never created mid-stream.
-        mock_edit.assert_not_called()
-        published_texts = [c.args[1] for c in mock_reply.call_args_list]
-        # The bare marker is the worst Telegram artifact this PR
-        # prevents; no published text may show it.
-        assert "1." not in published_texts
-        assert "1. Item one" not in published_texts
-        # Final delivery still carries the complete answer via _reply_safe.
-        assert any("3. Item three" in t for t in published_texts)
-
-    @pytest.mark.asyncio
-    async def test_publishes_completed_prefix_not_dangling_suffix(self):
-        """Live message uses the completed paragraph, never the dangling word."""
-        from kai.bot import _handle_response
-
-        update = _make_update()
-        claude = _make_mock_claude()
-        claude.send = MagicMock(
-            return_value=_fake_stream(
-                _text_event("Complete paragraph.\n\nOne"),
-                _done_event("Complete paragraph.\n\nOne final answer."),
-            )
-        )
-        ctx = _make_context(claude=claude)
-
-        with (
-            patch.multiple("kai.bot", **self._base_patches()),
-            patch("kai.bot._reply_safe", new_callable=AsyncMock) as mock_reply,
-            patch("kai.bot._edit_message_safe", new_callable=AsyncMock) as mock_edit,
-        ):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
-
-        # The live message creation received the completed paragraph
-        # without the dangling "One" suffix.
-        live_create_texts = [c.args[1] for c in mock_reply.call_args_list]
-        assert "Complete paragraph." in live_create_texts
-        # No reply / edit ever showed the bare "Complete paragraph.\n\nOne"
-        # intermediate. (The final delivery edit carries the complete
-        # final answer, not the dangling intermediate.)
-        edit_texts = [c.args[1] for c in mock_edit.call_args_list]
-        assert "Complete paragraph.\n\nOne" not in edit_texts
-        assert "Complete paragraph.\n\nOne" not in live_create_texts
-
-    @pytest.mark.asyncio
-    async def test_edits_only_when_publishable_prefix_advances(self):
-        """A dangling suffix after a stable sentence does not trigger an edit."""
-        from kai.bot import EDIT_INTERVAL, _handle_response
-
-        update = _make_update()
-        live_msg = MagicMock()
-        live_msg.edit_text = AsyncMock()
-        update.message.reply_text = AsyncMock(return_value=live_msg)
-
-        claude = _make_mock_claude()
-        claude.send = MagicMock(
-            return_value=_fake_stream(
-                _text_event("One complete sentence."),
-                _text_event("One complete sentence. Two"),  # dangling suffix
-                _done_event("One complete sentence. Two complete sentences."),
-            )
-        )
-        ctx = _make_context(claude=claude)
-
-        # Patch monotonic so the second event is past EDIT_INTERVAL.
-        times = iter([0.0, EDIT_INTERVAL + 1.0, EDIT_INTERVAL + 2.0, EDIT_INTERVAL + 3.0])
-        with (
-            patch.multiple("kai.bot", **self._base_patches()),
-            patch("kai.bot._edit_message_safe", new_callable=AsyncMock) as mock_edit,
-            patch("kai.bot.time.monotonic", side_effect=lambda: next(times)),
-        ):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
-
-        # No edit ever published a dangling "Two" mid-stream.
-        edit_texts = [c.args[1] for c in mock_edit.call_args_list]
-        assert not any(t.endswith(" Two") for t in edit_texts)
-        # Final edit carries the complete final text (not the dangling
-        # intermediate).
-        if edit_texts:
-            assert "Two complete sentences." in edit_texts[-1]
-
-    @pytest.mark.asyncio
-    async def test_stop_before_stable_live_message_sends_no_fragment(self):
-        """Stop while only unstable partials seen: no fragment reply, no error reply, stop logged."""
-        from kai.bot import _handle_response
-
-        update = _make_update()
-        stop_event = asyncio.Event()
-
-        async def _streaming(*args):
-            yield _text_event("One")
-            stop_event.set()
-            yield _text_event("One more")  # still unstable
-            yield _done_event("Should not reach")
-
-        claude = _make_mock_claude()
-        claude.send = MagicMock(return_value=_streaming())
-        ctx = _make_context(claude=claude)
-
-        patches = self._base_patches()
-        log_message_mock = patches["log_message"]
-
-        with (
-            patch.multiple("kai.bot", **patches),
-            patch("kai.bot.get_stop_event", return_value=stop_event),
-            patch("kai.bot._reply_safe", new_callable=AsyncMock) as mock_reply,
-            patch("kai.bot._edit_message_safe", new_callable=AsyncMock) as mock_edit,
-        ):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
-
-        # The unstable "One" partial never created a live message.
-        mock_edit.assert_not_called()
-        # Error fallback was NOT sent. update.message.reply_text is the
-        # entry point for the bare "Error: No response from agent" path
-        # (it bypasses _reply_safe).
-        error_calls = [
-            c
-            for c in update.message.reply_text.call_args_list
-            if c.args and "Error: No response from agent" in c.args[0]
-        ]
-        assert not error_calls
-        # _reply_safe was never called with "One" or "One more".
-        reply_texts = [c.args[1] for c in mock_reply.call_args_list]
-        assert "One" not in reply_texts
-        assert "One more" not in reply_texts
-        # The stop was logged with the canonical marker.
-        stop_log_calls = [c for c in log_message_mock.call_args_list if c.kwargs.get("text") == "[stopped by user]"]
-        assert stop_log_calls, "expected '[stopped by user]' log entry"
-
-    @pytest.mark.asyncio
-    async def test_final_delivery_after_withheld_live_updates(self):
-        """Stream only unstable partials; final delivery still sends the complete answer."""
-        from kai.bot import _handle_response
-
-        update = _make_update()
-        claude = _make_mock_claude()
-        claude.send = MagicMock(
-            return_value=_fake_stream(
-                _text_event("One"),
-                _text_event("One more"),
-                _done_event("One final complete response."),
-            )
-        )
-        ctx = _make_context(claude=claude)
-
-        with (
-            patch.multiple("kai.bot", **self._base_patches()),
-            patch("kai.bot._reply_safe", new_callable=AsyncMock) as mock_reply,
-            patch("kai.bot._edit_message_safe", new_callable=AsyncMock) as mock_edit,
-        ):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
-
-        # No live edits, no fragment replies; only the final delivery.
-        mock_edit.assert_not_called()
-        published_texts = [c.args[1] for c in mock_reply.call_args_list]
-        assert any("One final complete response." in t for t in published_texts)
-
-    @pytest.mark.asyncio
-    async def test_publishes_completed_list_items_not_dangling_next(self):
-        """Live message receives `- Item one\\n- Item two`; the dangling `- Three` is withheld."""
-        from kai.bot import _handle_response
-
-        update = _make_update()
-        claude = _make_mock_claude()
-        claude.send = MagicMock(
-            return_value=_fake_stream(
-                _text_event("- Item one\n- Item two\n- Three"),
-                _done_event("- Item one\n- Item two\n- Three is complete."),
-            )
-        )
-        ctx = _make_context(claude=claude)
-
-        with (
-            patch.multiple("kai.bot", **self._base_patches()),
-            patch("kai.bot._reply_safe", new_callable=AsyncMock) as mock_reply,
-            patch("kai.bot._edit_message_safe", new_callable=AsyncMock) as mock_edit,
-        ):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
-
-        live_create_texts = [c.args[1] for c in mock_reply.call_args_list]
-        edit_texts = [c.args[1] for c in mock_edit.call_args_list]
-
-        # The live message carried the completed pair, never the
-        # dangling next item.
-        assert "- Item one\n- Item two" in live_create_texts
-        assert "- Item one\n- Item two\n- Three" not in live_create_texts
-        assert "- Item one\n- Item two\n- Three" not in edit_texts
-
-
-# ── _notify_if_queued ────────────────────────────────────────────────
-
-
-class TestNotifyIfQueued:
-    """Tests for the pre-lock queue notification and context-switch marker."""
-
-    @pytest.mark.asyncio
-    async def test_sends_when_locked(self):
-        """Sends a notification and returns True when the lock is already held."""
-        update = _make_update()
-        chat_id = 12345
-
-        # Acquire the lock to simulate Kai being busy
-        from kai.locks import get_lock
-
-        lock = get_lock(chat_id)
-        await lock.acquire()
-        try:
-            result = await _notify_if_queued(update, chat_id)
-            assert result is True
-            # The notification goes via reply_text (called by _reply_safe)
-            update.message.reply_text.assert_called()
-            call_text = update.message.reply_text.call_args[0][0]
-            assert "Got your message" in call_text
-            assert "/stop" in call_text
-        finally:
-            lock.release()
-
-    @pytest.mark.asyncio
-    async def test_silent_when_unlocked(self):
-        """Does nothing and returns False when the lock is free."""
-        update = _make_update()
-        # Use a unique chat_id to avoid lock state from other tests
-        chat_id = 99999
-
-        result = await _notify_if_queued(update, chat_id)
-
-        assert result is False
-        update.message.reply_text.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_notification_not_sent_to_claude(self):
-        """The notification goes directly to Telegram, not through Claude."""
-        update = _make_update()
-        chat_id = 12345
-
-        from kai.locks import get_lock
-
-        lock = get_lock(chat_id)
-        await lock.acquire()
-        try:
-            # Mock Claude's send to verify it's never called
-            mock_claude = _make_mock_claude()
-            mock_claude.send = MagicMock()
-
-            await _notify_if_queued(update, chat_id)
-
-            # Claude.send was never called; the notification uses reply_text
-            mock_claude.send.assert_not_called()
-            update.message.reply_text.assert_called()
-        finally:
-            lock.release()
-
-    @pytest.mark.asyncio
-    async def test_queued_message_gets_notification_then_processes(self):
-        """Integration test: message B gets a notification while A holds the lock.
-
-        Simulates two concurrent messages: A acquires the lock and processes,
-        B arrives while A is busy, gets a notification, then processes after
-        A releases. Proves the full flow works end to end.
-        """
-        update_b = _make_update(text="second message")
-        chat_id = 77777
-
-        from kai.locks import get_lock
-
-        lock = get_lock(chat_id)
-
-        # Track ordering of events
-        events: list[str] = []
-
-        async def handler_a():
-            """Simulate message A holding the lock."""
-            async with lock:
-                events.append("a_acquired")
-                # Simulate processing time so B's handler runs
-                await asyncio.sleep(0.05)
-                events.append("a_released")
-
-        async def handler_b():
-            """Simulate message B arriving while A is busy."""
-            # Small delay so A grabs the lock first
-            await asyncio.sleep(0.01)
-            # This is the pre-lock notification
-            result = await _notify_if_queued(update_b, chat_id)
-            assert result is True
-            events.append("b_notified")
-            async with lock:
-                events.append("b_acquired")
-
-        await asyncio.gather(handler_a(), handler_b())
-
-        # B's notification happened while A held the lock
-        assert events.index("b_notified") > events.index("a_acquired")
-        assert events.index("b_notified") < events.index("a_released")
-        # B acquired the lock after A released
-        assert events.index("b_acquired") > events.index("a_released")
-        # B got the notification
-        update_b.message.reply_text.assert_called()
-        call_text = update_b.message.reply_text.call_args[0][0]
-        assert "Got your message" in call_text
-
-
-class TestPrependQueueMarker:
-    """Tests for _prepend_queue_marker(), the context-switch prompt helper."""
-
-    def test_string_prompt(self):
-        """Prepends marker to a plain string prompt."""
-        result = _prepend_queue_marker("hello world")
-        assert result.startswith(_QUEUED_MESSAGE_MARKER)
-        assert result.endswith("hello world")
-
-    def test_multimodal_prompt(self):
-        """Prepends marker to the first text block of a multimodal list."""
-        content = [
-            {"type": "text", "text": "Photo caption"},
-            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "abc"}},
-        ]
-        result = _prepend_queue_marker(content)
-        assert isinstance(result, list)
-        assert len(result) == 2
-        # First block has marker prepended
-        assert result[0]["text"].startswith(_QUEUED_MESSAGE_MARKER)
-        assert result[0]["text"].endswith("Photo caption")
-        # Second block (image) is unchanged
-        assert result[1] == content[1]
-
-    def test_does_not_mutate_original(self):
-        """Returns a new list; does not mutate the original content."""
-        content = [
-            {"type": "text", "text": "original"},
-            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "abc"}},
-        ]
-        _prepend_queue_marker(content)
-        # Original is untouched
-        assert content[0]["text"] == "original"
-
-
-# ── _acquire_lock_or_kill ───────────────────────────────────────────
-
-
-class TestAcquireLockOrKill:
-    """Tests for the lock-with-timeout safety net."""
-
-    @pytest.mark.asyncio
-    async def test_acquires_free_lock(self):
-        """Returns the lock when it's free - normal fast path."""
-        update = _make_update()
-        claude = _make_mock_claude()
-        # Use a unique chat_id to avoid state from other tests
-        chat_id = 88801
-
-        lock = await _acquire_lock_or_kill(chat_id, claude, update)
-
-        assert lock is not None
-        assert lock.locked()
-        lock.release()
-        claude.force_kill.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_timeout_kills_claude(self):
-        """When the lock is held too long, force-kills Claude and notifies user."""
-        update = _make_update()
-        claude = _make_mock_claude()
-        chat_id = 88802
-
-        from kai.locks import get_lock
-
-        held_lock = get_lock(chat_id)
-        await held_lock.acquire()
-
-        try:
-            # Patch the timeout to something tiny so the test doesn't wait 1 hour
-            with patch("kai.bot._LOCK_ACQUIRE_TIMEOUT", 0.05):
-                result = await _acquire_lock_or_kill(chat_id, claude, update)
-        finally:
-            held_lock.release()
-
-        assert result is None
-        claude.force_kill.assert_called_once()
-        update.message.reply_text.assert_called()
-        msg = update.message.reply_text.call_args[0][0]
-        assert "timed out" in msg.lower()
-
-    @pytest.mark.asyncio
-    async def test_returns_same_lock_object(self):
-        """The returned lock is the same object from get_lock, not a copy."""
-        update = _make_update()
-        claude = _make_mock_claude()
-        chat_id = 88803
-
-        from kai.locks import get_lock
-
-        expected_lock = get_lock(chat_id)
-        returned_lock = await _acquire_lock_or_kill(chat_id, claude, update)
-
-        assert returned_lock is expected_lock
-        returned_lock.release()
-
-    @pytest.mark.asyncio
-    async def test_handle_message_releases_lock_on_error(self):
-        """Lock is released even when _handle_response raises."""
-        update = _make_update()
-        ctx = _make_context()
-        chat_id = 88804
-
-        from kai.locks import get_lock
-
-        lock = get_lock(chat_id)
-
-        with (
-            # Bypass the TOTP gate so handle_message reaches the lock
-            # acquisition and _handle_response code paths under test.
-            patch("kai.bot.is_totp_configured", return_value=False),
-            patch(
-                "kai.bot._handle_response",
-                new_callable=AsyncMock,
-                side_effect=RuntimeError("boom"),
-            ),
-            patch("kai.bot.log_message"),
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
-            # Use real get_lock so we can verify the lock state after
-            pytest.raises(RuntimeError),
-        ):
-            await handle_message(update, ctx)
-
-        # Lock must be released after the error
-        assert not lock.locked()
+        assert outcomes[0].request_delivery is True
+        ctx.bot.send_voice.assert_not_awaited()
+        direct_fallback.assert_not_awaited()
 
 
 # ── _handle_workspace_config ────────────────────────────────────────

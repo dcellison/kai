@@ -1,36 +1,15 @@
-"""
-Telegram bot interface — command handlers, message routing, and streaming responses.
+"""Telegram client adapter for Kai's canonical Workshop core.
 
-Provides functionality to:
-1. Handle all Telegram slash commands (/new, /model, /workspace, /voice, etc.)
-2. Process text, photo, document, and voice messages from the user
-3. Stream Claude's responses in real-time with progressive message edits
-4. Manage model switching, voice TTS output, and workspace navigation
-5. Enforce authorization (only allowed user IDs can interact)
+The handlers in this module authenticate Telegram updates, translate them into
+canonical commands and artifacts, and render transport-specific controls and
+previews. Durable messages, runs, execution, and final delivery are owned by
+Workshop services rather than by this adapter.
 
-This module is the "presentation layer" of Kai — it receives Telegram updates,
-translates them into prompts for the Claude process (claude.py), streams the
-response back to the user, and handles all Telegram-specific concerns like
-message length limits, Markdown fallback, inline keyboards, and typing indicators.
-
-The response flow for a text message:
-    1. User message arrives → handle_message()
-    2. Message logged to JSONL history
-    3. Per-chat lock acquired (prevents concurrent Claude interactions)
-    4. Flag file written (for crash recovery)
-    5. Prompt sent to ClaudeCodeBackend.send() → streaming begins
-    6. Live message created and progressively edited (2-second intervals)
-    7. Final response delivered (text, voice, or both depending on voice mode)
-    8. Session saved to database
-    9. Flag file cleared
-
-Handler registration order in create_bot() matters: python-telegram-bot matches
-the first handler whose filters pass, so specific commands are registered before
-the catch-all text message handler.
+Handler registration order in :func:`create_bot` matters because
+python-telegram-bot selects the first handler whose filters match.
 """
 
 import asyncio
-import base64
 import functools
 import json
 import logging
@@ -42,7 +21,6 @@ import subprocess
 import sys
 import time
 from datetime import UTC, datetime
-from enum import StrEnum
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
@@ -59,7 +37,6 @@ from telegram.ext import (
 )
 
 from kai import github_api, memory_command, review, sessions, webhook
-from kai.agent_failure import render_agent_failure
 from kai.application_host import KaiCoreServices
 from kai.config import (
     DATA_DIR,
@@ -80,29 +57,21 @@ from kai.conversation_compatibility import (
 from kai.conversation_compatibility import (
     schedule_memory_ingestion,
 )
-from kai.history import LogEntry, log_message
-from kai.locks import get_lock, get_stop_event
+from kai.locks import get_stop_event
 from kai.pool import SubprocessPool
-from kai.sessions import WorkshopFinalizationCommitUncertainError
 from kai.streaming_text import stream_publishable_prefix as _stream_publishable_prefix
 from kai.telegram_context import KaiTelegramApplication, get_core_services
 from kai.telegram_utils import chunk_text
 from kai.transcribe import TranscriptionError, transcribe_voice
 from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
-from kai.workshop.artifacts import (
-    StagedArtifact,
-    canonical_artifact_filename,
-    canonical_artifact_media_type,
-)
-from kai.workshop.conversation_commands import ConversationCommandDisposition
-from kai.workshop.conversation_runs import PreparedConversationRun
+from kai.workshop.artifacts import StagedArtifact
 from kai.workshop.domain import CanonicalMemoryProvenance, MessageId, PrincipalId, RunId
 from kai.workshop.execution_coordinator import (
     CanonicalCancellationDisposition,
     CanonicalExecutionDisposition,
+    CanonicalSuccessOutcome,
 )
 from kai.workshop.inbound import InboundMessage
-from kai.workshop.outbound import DeliveryObservation, OutboundMessage
 from kai.workshop.scheduled_jobs import WorkshopScheduledJobAuthority
 from kai.workshop.settings_workspaces import (
     SettingsWorkspaceAuthority,
@@ -164,134 +133,8 @@ log = logging.getLogger(__name__)
 EDIT_INTERVAL = 2.0
 
 
-class ResponseDeliveryRoute(StrEnum):
-    """Explicit final-delivery authority selected by an ingress handler."""
-
-    LEGACY = "legacy"
-    WORKSHOP_PRIVATE_TEXT = "workshop_private_text"
-
-
-# Flag file written while processing a message. If the process crashes mid-response,
-# main.py detects this file at startup and notifies the user to resend. Lives under
-# DATA_DIR so it's writable even when source is in read-only /opt/kai/.
-# Directory for per-user crash recovery flags. Each file is named by
-# chat_id and exists only while that user's response is in-flight.
-# Using a directory of files (not a single JSON file) avoids locking
-# and allows atomic per-user create/delete.
-_RESPONDING_DIR = DATA_DIR / ".responding"
-
-
-# ── Crash recovery flag ──────────────────────────────────────────────
-
-
-def _set_responding(chat_id: int) -> None:
-    """Mark a response as in-flight for crash recovery."""
-    _RESPONDING_DIR.mkdir(exist_ok=True)
-    (_RESPONDING_DIR / str(chat_id)).touch()
-
-
-def _clear_responding(chat_id: int) -> None:
-    """Mark a response as complete for a specific user."""
-    (_RESPONDING_DIR / str(chat_id)).unlink(missing_ok=True)
-
-
-async def _notify_if_queued(update: Update, chat_id: int) -> bool:
-    """Send a notification if the user's message will queue behind the lock.
-
-    Called immediately before acquiring the per-chat lock. If the lock is
-    already held (Kai is mid-response), sends a one-line Telegram message
-    so the user knows their message was received. The notification goes
-    directly to Telegram via _reply_safe - Claude never sees it. Do NOT
-    add a log_message call here; the notification is purely for the user.
-
-    Returns True if the message is queuing (lock was held), False otherwise.
-    The caller uses this to decide whether to prepend a context-switch
-    marker to the prompt via _prepend_queue_marker().
-
-    There is a harmless TOCTOU gap: if the lock holder releases between
-    the locked() check and the subsequent acquire, the user sees "finishing
-    something up" followed by an instant response, and Claude gets a
-    context-switch marker for a task that already finished. Both are
-    harmless and not worth fixing.
-    """
-    if get_lock(sessions.execution_lane_key(chat_id)).locked():
-        assert update.message is not None
-        await _reply_safe(
-            update.message,
-            "Got your message - finishing something up. /stop to interrupt.",
-        )
-        return True
-    return False
-
-
-# Prepended to prompts that waited behind the lock, so Claude focuses on the
-# new message instead of continuing from the previous task's tool output.
-_QUEUED_MESSAGE_MARKER = (
-    "[The user sent this while you were working on something else. "
-    "Their previous task is done. Focus on this new message.]\n\n"
-)
-
-# Safety-net timeout for acquiring the per-chat lock (seconds). If the
-# idle timeout in claude.py doesn't fire for some reason, this prevents
-# a stuck interaction from blocking all future messages indefinitely.
-# Set generously: the idle timer in claude.py is the real safety net
-# (fires after timeout_seconds * 5 of silence); this is a last-resort
-# backstop for interactions that run legitimately long with active output.
-_LOCK_ACQUIRE_TIMEOUT = 3600  # 1 hour
-
 # Backward-compatible diagnostic/test view of the shared ingestion task owner.
 _pending_memory_tasks = _shared_pending_memory_tasks
-
-
-async def _acquire_lock_or_kill(
-    chat_id: int,
-    pool: "SubprocessPool",
-    update: Update,
-) -> asyncio.Lock | None:
-    """Acquire the per-chat lock with a timeout, force-killing if stuck.
-
-    Returns the acquired lock on success (caller must call lock.release()
-    in a finally block). Returns None if the lock timed out, in which case
-    the stuck Claude process was killed and the user was notified - caller
-    should return without further action.
-
-    Returns the lock object directly rather than a bool so the caller
-    releases the same object that was acquired (avoids issues if get_lock
-    is called again and returns a different instance).
-    """
-    lock = get_lock(sessions.execution_lane_key(chat_id))
-    try:
-        await asyncio.wait_for(lock.acquire(), timeout=_LOCK_ACQUIRE_TIMEOUT)
-        return lock
-    except TimeoutError:
-        log.error(
-            "Lock acquisition timed out for chat %d after %ds; force-killing agent subprocess",
-            chat_id,
-            _LOCK_ACQUIRE_TIMEOUT,
-        )
-        await pool.force_kill(chat_id)
-        # update.message can be None for edited messages or callback
-        # queries, so guard rather than assert.
-        if update.message is not None:
-            await _reply_safe(
-                update.message,
-                "Previous task timed out and was stopped. Please send your message again.",
-            )
-        return None
-
-
-def _prepend_queue_marker(prompt: str | list[dict[str, str]]) -> str | list[dict[str, str]]:
-    """Prepend context-switch marker to a prompt that waited behind the lock.
-
-    Handles both plain string prompts (text, document, voice) and multimodal
-    content lists (photo). For lists, prepends to the first text block's text
-    field and passes subsequent blocks (e.g., base64 image) through unchanged.
-    """
-    if isinstance(prompt, list):
-        # Multimodal content (photo): prepend to the first text block
-        first = prompt[0]
-        return [{"type": "text", "text": _QUEUED_MESSAGE_MARKER + first["text"]}] + prompt[1:]
-    return _QUEUED_MESSAGE_MARKER + prompt
 
 
 # ── Update property helpers (Pyright can't narrow @property returns) ─
@@ -398,8 +241,8 @@ async def _edit_message_safe(msg: Message, text: str) -> bool:
     (Telegram rejecting the markup), retries without parse_mode. All other
     errors are silently ignored since edits are best-effort during streaming
     (e.g., message not modified, message deleted by user, network blip). Returns
-    whether either edit attempt succeeded so shadow delivery observations can
-    describe the outcome without changing this best-effort behavior.
+    whether either edit attempt succeeded so the canonical streaming preview
+    adapter can describe the outcome without changing this best-effort behavior.
     """
     truncated = _truncate_for_telegram(text)
     try:
@@ -1300,13 +1143,7 @@ async def handle_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 @_require_auth
 async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handle /stop — abort the current Claude response.
-
-    Sets the per-chat stop event (checked by the streaming loop) and kills
-    the Claude process immediately. The streaming loop in _handle_response()
-    sees the stop event and appends "(stopped)" to the live message.
-    """
+    """Handle /stop through canonical cancellation, with a legacy fallback."""
     assert update.message is not None
     chat_id = _chat_id(update)
     execution = _get_core_services(context).private_text_execution
@@ -3862,6 +3699,67 @@ async def _stage_media_upload(
     )
 
 
+async def _accept_workshop_media_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    body: str,
+    artifact: StagedArtifact,
+) -> None:
+    """Atomically accept and execute one authenticated Telegram artifact."""
+    assert update.message is not None
+    actor_id = _user_id(update)
+    chat_id = _chat_id(update)
+    if chat_id != actor_id:
+        artifact.discard()
+        await _reply_safe(
+            update.message,
+            "Agent media requests are available in a direct chat with Kai.",
+        )
+        return
+
+    execution = _get_core_services(context).private_text_execution
+    if execution is None:
+        artifact.discard()
+        log.error("Workshop media execution service is unavailable")
+        await _reply_safe(update.message, "Kai's durable execution service is unavailable. Please try again.")
+        return
+    try:
+        acceptance = await execution.accept(
+            InboundMessage(
+                transport="telegram",
+                update_id=str(update.update_id),
+                message_id=str(update.message.message_id),
+                sender_subject=str(actor_id),
+                channel_subject=str(chat_id),
+                body=body,
+                occurred_at=update.message.date,
+            ),
+            artifact=artifact,
+        )
+        inbound_message_id = acceptance.message.event.envelope.aggregate_id
+        if not isinstance(inbound_message_id, MessageId):
+            raise RuntimeError("Workshop media acceptance returned a non-message aggregate")
+    except Exception:
+        artifact.discard()
+        log.exception(
+            "Workshop media acceptance failed; refusing legacy backend fallback (update_id=%s, message_id=%s)",
+            update.update_id,
+            update.message.message_id,
+        )
+        await _reply_safe(update.message, "Kai could not safely accept this upload. Please try again.")
+        return
+
+    await _handle_workshop_private_text(
+        update,
+        context,
+        chat_id=chat_id,
+        run_id=acceptance.run.run_id,
+        inbound_message_id=inbound_message_id,
+        prompt=body,
+    )
+
+
 def _save_upload(
     data: bytes,
     filename: str,
@@ -3932,34 +3830,22 @@ def _save_upload(
 
 @_require_auth
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handle photo messages — download, base64-encode, and send to Claude.
-
-    Downloads the highest-resolution version of the photo, encodes it as
-    base64, and sends it to Claude as a multi-modal content block alongside
-    the caption (or "What's in this image?" if no caption).
-    """
+    """Stage a Telegram photo and execute it through the canonical run path."""
     if not update.message or not update.message.photo:
-        return
-
-    # TOTP gate: require valid session for content that invokes Claude
-    if not await _check_totp(update, context):
         return
 
     actor_id = _user_id(update)
     chat_id = _chat_id(update)
-    pool = _get_pool(context)
-    model = pool.get_model(chat_id)
-    reader_user = _upload_reader_user(context, actor_id)
+    if chat_id != actor_id:
+        await _reply_safe(update.message, "Agent media requests are available in a direct chat with Kai.")
+        return
+    if not await _check_totp(update, context):
+        return
 
-    # Download the largest available resolution (last in the list)
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     data = await file.download_as_bytearray()
     raw = bytes(data)
-    b64 = base64.b64encode(raw).decode()
-
-    # Save to DATA_DIR/files/ so Claude can access the file via shell tools
     try:
         staged_artifact = await _stage_media_upload(
             context,
@@ -3971,357 +3857,64 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             occurred_at=update.message.date,
             kind="photo",
         )
-        saved = staged_artifact.storage_path
     except (OSError, ValueError, WorkshopStorageNamespaceError) as exc:
         log.exception("Failed to save uploaded photo for chat %d", chat_id)
         await update.message.reply_text(f"Couldn't save the upload for agent access: {exc}")
         return
 
-    caption = update.message.caption or "What's in this image?"
-    caption += f"\n[File saved to: {saved}]"
-    workshop_inbound_message_id: MessageId | None = None
-    inbound_recorder = context.bot_data.get("workshop_inbound_recorder")
-    if inbound_recorder is not None:
-        try:
-            result = await inbound_recorder(
-                InboundMessage(
-                    transport="telegram",
-                    update_id=str(update.update_id),
-                    message_id=str(update.message.message_id),
-                    sender_subject=str(_user_id(update)),
-                    channel_subject=str(chat_id),
-                    body=caption,
-                    occurred_at=update.message.date,
-                )
-            )
-            aggregate_id = result.event.envelope.aggregate_id
-            if not isinstance(aggregate_id, MessageId):
-                raise RuntimeError("Workshop inbound recorder returned a non-message aggregate")
-            workshop_inbound_message_id = aggregate_id
-        except Exception:
-            log.exception(
-                "Workshop photo message shadow write failed (update_id=%s, message_id=%s)",
-                update.update_id,
-                update.message.message_id,
-            )
-    artifact_recorder = context.bot_data.get("workshop_artifact_recorder")
-    if workshop_inbound_message_id is not None and artifact_recorder is not None:
-        try:
-            await artifact_recorder(
-                staged_artifact.for_message(workshop_inbound_message_id),
-                storage_root=DATA_DIR / "files",
-            )
-        except Exception:
-            log.exception(
-                "Workshop photo artifact shadow write failed (update_id=%s, message_id=%s)",
-                update.update_id,
-                update.message.message_id,
-            )
-    # Capture the user LogEntry for transcript provenance threading.
-    user_log = log_message(
-        direction="user",
-        chat_id=chat_id,
-        text=caption,
-        reader_user=reader_user,
-        media={
-            "type": "photo",
-            "workshop_message_shadowed": workshop_inbound_message_id is not None,
-        },
+    await _accept_workshop_media_command(
+        update,
+        context,
+        body=update.message.caption or "What's in this image?",
+        artifact=staged_artifact,
     )
-    content = [
-        {"type": "text", "text": caption},
-        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
-    ]
-
-    was_queued = await _notify_if_queued(update, chat_id)
-    lock = await _acquire_lock_or_kill(chat_id, pool, update)
-    if lock is None:
-        return
-    try:
-        _set_responding(chat_id)
-        try:
-            await _handle_response(
-                update,
-                context,
-                chat_id,
-                _prepend_queue_marker(content) if was_queued else content,
-                pool,
-                model,
-                user_log=user_log,
-                workshop_inbound_message_id=workshop_inbound_message_id,
-            )
-        finally:
-            _clear_responding(chat_id)
-    finally:
-        lock.release()
-
-
-# File extensions treated as readable text (sent to Claude as code blocks)
-_TEXT_EXTENSIONS = {
-    ".txt",
-    ".py",
-    ".js",
-    ".ts",
-    ".jsx",
-    ".tsx",
-    ".json",
-    ".csv",
-    ".tsv",
-    ".md",
-    ".rst",
-    ".xml",
-    ".html",
-    ".htm",
-    ".css",
-    ".yaml",
-    ".yml",
-    ".toml",
-    ".ini",
-    ".cfg",
-    ".conf",
-    ".sh",
-    ".bash",
-    ".zsh",
-    ".fish",
-    ".sql",
-    ".log",
-    ".env",
-    ".gitignore",
-    ".dockerfile",
-    ".makefile",
-    ".rb",
-    ".go",
-    ".rs",
-    ".java",
-    ".kt",
-    ".c",
-    ".cpp",
-    ".h",
-    ".hpp",
-    ".swift",
-    ".r",
-    ".lua",
-    ".pl",
-    ".php",
-    ".ex",
-    ".exs",
-    ".erl",
-}
-
-# Map image file extensions to MIME types for Claude's image content blocks
-_IMAGE_MEDIA_TYPES = {
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".gif": "image/gif",
-    ".webp": "image/webp",
-}
-
-
-def _canonical_document_media_type(file_name: str, claimed_media_type: str | None) -> str:
-    """Keep the Telegram adapter on the shared artifact metadata policy."""
-    return canonical_artifact_media_type(file_name, claimed_media_type)
-
-
-def _canonical_document_filename(file_name: str) -> str | None:
-    """Keep the Telegram adapter on the shared artifact filename policy."""
-    return canonical_artifact_filename(file_name)
 
 
 @_require_auth
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handle document (file) uploads -- images, text files, and everything else.
-
-    All files are saved to workspace/files/ so Claude can access them via
-    shell tools. Routes based on file extension for content presentation:
-    - Image files -- base64-encoded and sent as multi-modal content
-    - Text/code files -- decoded as UTF-8 and sent as a code block
-    - Other files -- saved to disk, Claude gets the path to work with
-    """
+    """Stage a Telegram document and execute it through the canonical run path."""
     if not update.message or not update.message.document:
-        return
-
-    # TOTP gate: require valid session for content that invokes Claude
-    if not await _check_totp(update, context):
         return
 
     doc = update.message.document
     file_name = doc.file_name or "unknown"
-    suffix = Path(file_name).suffix.lower()
-    caption = update.message.caption or ""
-
     actor_id = _user_id(update)
     chat_id = _chat_id(update)
-    pool = _get_pool(context)
-    model = pool.get_model(chat_id)
-    reader_user = _upload_reader_user(context, actor_id)
-    artifact_media_type = _canonical_document_media_type(file_name, doc.mime_type)
-
-    if suffix in _IMAGE_MEDIA_TYPES:
-        # Handle images sent as documents (uncompressed upload)
-        file = await context.bot.get_file(doc.file_id)
-        data = await file.download_as_bytearray()
-        raw = bytes(data)
-        b64 = base64.b64encode(raw).decode()
-        media_type = _IMAGE_MEDIA_TYPES[suffix]
-
-        # Save to DATA_DIR/files/ so Claude can access the file via shell tools
-        try:
-            staged_artifact = await _stage_media_upload(
-                context,
-                actor_id=actor_id,
-                data=raw,
-                filename=file_name,
-                media_type=artifact_media_type,
-                source_unique_id=doc.file_unique_id,
-                occurred_at=update.message.date,
-                kind="document",
-            )
-            saved = staged_artifact.storage_path
-        except (OSError, ValueError, WorkshopStorageNamespaceError) as exc:
-            log.exception("Failed to save uploaded image document for chat %d", chat_id)
-            await update.message.reply_text(f"Couldn't save the upload for agent access: {exc}")
-            return
-        img_caption = caption or f"What's in this image ({file_name})?"
-        img_caption += f"\n[File saved to: {saved}]"
-
-        history_text = caption or file_name
-        content = [
-            {"type": "text", "text": img_caption},
-            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
-        ]
-    elif suffix in _TEXT_EXTENSIONS or (doc.mime_type and doc.mime_type.startswith("text/")):
-        # Handle text/code files -- decode and wrap in a code block
-        file = await context.bot.get_file(doc.file_id)
-        data = await file.download_as_bytearray()
-        raw = bytes(data)
-        try:
-            text_content = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            await update.message.reply_text(f"Couldn't decode {file_name} as text.")
-            return
-
-        # Save to DATA_DIR/files/ so Claude can access the file via shell tools
-        try:
-            staged_artifact = await _stage_media_upload(
-                context,
-                actor_id=actor_id,
-                data=raw,
-                filename=file_name,
-                media_type=artifact_media_type,
-                source_unique_id=doc.file_unique_id,
-                occurred_at=update.message.date,
-                kind="document",
-            )
-            saved = staged_artifact.storage_path
-        except (OSError, ValueError, WorkshopStorageNamespaceError) as exc:
-            log.exception("Failed to save uploaded text document for chat %d", chat_id)
-            await update.message.reply_text(f"Couldn't save the upload for agent access: {exc}")
-            return
-        header = f"File: {file_name}\n```\n{text_content}\n```\n[File saved to: {saved}]"
-
-        history_text = caption or f"[file: {file_name}]"
-        if caption:
-            content = f"{caption}\n\n{header}"
-        else:
-            content = header
-    else:
-        # Any other file type -- save to disk and tell Claude the path so it
-        # can work with the file via shell tools (e.g., unzip, pdftotext, etc.)
-        file = await context.bot.get_file(doc.file_id)
-        data = await file.download_as_bytearray()
-        try:
-            staged_artifact = await _stage_media_upload(
-                context,
-                actor_id=actor_id,
-                data=bytes(data),
-                filename=file_name,
-                media_type=artifact_media_type,
-                source_unique_id=doc.file_unique_id,
-                occurred_at=update.message.date,
-                kind="document",
-            )
-            saved = staged_artifact.storage_path
-        except (OSError, ValueError, WorkshopStorageNamespaceError) as exc:
-            log.exception("Failed to save uploaded document for chat %d", chat_id)
-            await update.message.reply_text(f"Couldn't save the upload for agent access: {exc}")
-            return
-
-        history_text = caption or f"[file: {file_name}]"
-        content = (caption or f"File received: {file_name}") + f"\n[File saved to: {saved}]"
-
-    workshop_inbound_message_id: MessageId | None = None
-    inbound_recorder = context.bot_data.get("workshop_inbound_recorder")
-    if inbound_recorder is not None:
-        try:
-            result = await inbound_recorder(
-                InboundMessage(
-                    transport="telegram",
-                    update_id=str(update.update_id),
-                    message_id=str(update.message.message_id),
-                    sender_subject=str(_user_id(update)),
-                    channel_subject=str(chat_id),
-                    body=history_text,
-                    occurred_at=update.message.date,
-                )
-            )
-            aggregate_id = result.event.envelope.aggregate_id
-            if not isinstance(aggregate_id, MessageId):
-                raise RuntimeError("Workshop inbound recorder returned a non-message aggregate")
-            workshop_inbound_message_id = aggregate_id
-        except Exception:
-            log.exception(
-                "Workshop document message shadow write failed (update_id=%s, message_id=%s)",
-                update.update_id,
-                update.message.message_id,
-            )
-    artifact_recorder = context.bot_data.get("workshop_artifact_recorder")
-    if workshop_inbound_message_id is not None and artifact_recorder is not None:
-        try:
-            await artifact_recorder(
-                staged_artifact.for_message(workshop_inbound_message_id),
-                storage_root=DATA_DIR / "files",
-            )
-        except Exception:
-            log.exception(
-                "Workshop document artifact shadow write failed (update_id=%s, message_id=%s)",
-                update.update_id,
-                update.message.message_id,
-            )
-    user_log = log_message(
-        direction="user",
-        chat_id=chat_id,
-        text=history_text,
-        reader_user=reader_user,
-        media={
-            "type": "document",
-            "filename": file_name,
-            "workshop_message_shadowed": workshop_inbound_message_id is not None,
-        },
-    )
-
-    was_queued = await _notify_if_queued(update, chat_id)
-    lock = await _acquire_lock_or_kill(chat_id, pool, update)
-    if lock is None:
+    if chat_id != actor_id:
+        await _reply_safe(update.message, "Agent media requests are available in a direct chat with Kai.")
         return
+    if not await _check_totp(update, context):
+        return
+
+    file = await context.bot.get_file(doc.file_id)
+    raw = bytes(await file.download_as_bytearray())
     try:
-        _set_responding(chat_id)
-        try:
-            await _handle_response(
-                update,
-                context,
-                chat_id,
-                _prepend_queue_marker(content) if was_queued else content,
-                pool,
-                model,
-                user_log=user_log,
-                workshop_inbound_message_id=workshop_inbound_message_id,
-            )
-        finally:
-            _clear_responding(chat_id)
-    finally:
-        lock.release()
+        staged_artifact = await _stage_media_upload(
+            context,
+            actor_id=actor_id,
+            data=raw,
+            filename=file_name,
+            media_type=doc.mime_type,
+            source_unique_id=doc.file_unique_id,
+            occurred_at=update.message.date,
+            kind="document",
+        )
+    except (OSError, ValueError, WorkshopStorageNamespaceError) as exc:
+        log.exception("Failed to save uploaded document for chat %d", chat_id)
+        await update.message.reply_text(f"Couldn't save the upload for agent access: {exc}")
+        return
+
+    default_body = (
+        f"What's in this image ({file_name})?"
+        if staged_artifact.media_type.startswith("image/")
+        else f"[file: {file_name}]"
+    )
+    await _accept_workshop_media_command(
+        update,
+        context,
+        body=update.message.caption or default_body,
+        artifact=staged_artifact,
+    )
 
 
 @_require_auth
@@ -4338,15 +3931,15 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not update.message or not update.message.voice:
         return
 
-    # TOTP gate: require valid session for content that invokes Claude
-    if not await _check_totp(update, context):
-        return
-
     actor_id = _user_id(update)
     chat_id = _chat_id(update)
-    reader_user = _upload_reader_user(context, actor_id)
-    pool = _get_pool(context)
     config: Config = context.bot_data["config"]
+
+    if chat_id != actor_id:
+        await _reply_safe(update.message, "Agent media requests are available in a direct chat with Kai.")
+        return
+    if not await _check_totp(update, context):
+        return
 
     if not config.voice_enabled:
         await update.message.reply_text("Voice messages are not enabled.")
@@ -4371,137 +3964,39 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     file = await context.bot.get_file(voice.file_id)
     audio_data = bytes(await file.download_as_bytearray())
 
-    voice_media: dict[str, object] = {"type": "voice", "duration": voice.duration}
-    voice_placeholder = f"[voice message, {voice.duration}s]"
-
-    # Transcription failure paths preserve the historical placeholder
-    # entry so an operator grepping history sees that a voice message
-    # came in even when whisper failed. Extraction never runs on those
-    # paths, so the placeholder's lack of recoverable content is not a
-    # provenance gap; the only paths that ever stamp provenance are
-    # below, after a real transcript exists.
     try:
         transcript = await transcribe_voice(audio_data, config.whisper_model_path)
     except TranscriptionError as e:
-        log_message(
-            direction="user",
-            chat_id=chat_id,
-            text=voice_placeholder,
-            media=voice_media,
-            reader_user=reader_user,
-        )
         await update.message.reply_text(f"Transcription failed: {e}")
         return
 
     if not transcript:
-        log_message(
-            direction="user",
-            chat_id=chat_id,
-            text=voice_placeholder,
-            media=voice_media,
-            reader_user=reader_user,
-        )
         await update.message.reply_text("Couldn't make out any speech in that voice message.")
         return
 
-    # Echo the transcription so the user sees what Kai heard
     await _reply_safe(update.message, f"_Heard:_ {transcript}")
-
-    workshop_inbound_message_id: MessageId | None = None
-    inbound_recorder = context.bot_data.get("workshop_inbound_recorder")
-    if inbound_recorder is not None:
-        try:
-            result = await inbound_recorder(
-                InboundMessage(
-                    transport="telegram",
-                    update_id=str(update.update_id),
-                    message_id=str(update.message.message_id),
-                    sender_subject=str(_user_id(update)),
-                    channel_subject=str(chat_id),
-                    body=transcript,
-                    occurred_at=update.message.date,
-                )
-            )
-            aggregate_id = result.event.envelope.aggregate_id
-            if not isinstance(aggregate_id, MessageId):
-                raise RuntimeError("Workshop inbound recorder returned a non-message aggregate")
-            workshop_inbound_message_id = aggregate_id
-        except Exception:
-            log.exception(
-                "Workshop voice message shadow write failed (update_id=%s, message_id=%s)",
-                update.update_id,
-                update.message.message_id,
-            )
-
-    artifact_recorder = context.bot_data.get("workshop_artifact_recorder")
-    if workshop_inbound_message_id is not None and artifact_recorder is not None:
-        try:
-            # whisper-cpp uses a temporary copy that disappears after
-            # transcription. Preserve the original Telegram Ogg/Opus bytes
-            # inside the canonical principal-owned upload boundary so canonical
-            # artifact provenance never points at an ephemeral path. This
-            # path is not added to the backend prompt.
-            staged_voice = await _stage_media_upload(
-                context,
-                actor_id=actor_id,
-                data=audio_data,
-                filename="voice.oga",
-                media_type="audio/ogg",
-                source_unique_id=voice.file_unique_id,
-                occurred_at=update.message.date,
-                kind="voice",
-            )
-            await artifact_recorder(
-                staged_voice.for_message(workshop_inbound_message_id),
-                storage_root=DATA_DIR / "files",
-            )
-        except Exception:
-            log.exception(
-                "Workshop voice artifact shadow write failed (update_id=%s, message_id=%s)",
-                update.update_id,
-                update.message.message_id,
-            )
-
-    # Log the transcript itself as the user's message so the JSONL line
-    # carries what the extractor actually saw. This is the only history-
-    # output behaviour change in the provenance work: previous behaviour
-    # wrote only the duration placeholder, which silently lost the user's
-    # actual words and made source view useless for voice-derived rows.
-    user_log = log_message(
-        direction="user",
-        chat_id=chat_id,
-        text=transcript,
-        media={
-            **voice_media,
-            "workshop_message_shadowed": workshop_inbound_message_id is not None,
-        },
-        reader_user=reader_user,
-    )
-
-    prompt = f"[Voice message transcription]: {transcript}"
-    model = pool.get_model(chat_id)
-
-    was_queued = await _notify_if_queued(update, chat_id)
-    lock = await _acquire_lock_or_kill(chat_id, pool, update)
-    if lock is None:
-        return
     try:
-        _set_responding(chat_id)
-        try:
-            await _handle_response(
-                update,
-                context,
-                chat_id,
-                _prepend_queue_marker(prompt) if was_queued else prompt,
-                pool,
-                model,
-                user_log=user_log,
-                workshop_inbound_message_id=workshop_inbound_message_id,
-            )
-        finally:
-            _clear_responding(chat_id)
-    finally:
-        lock.release()
+        staged_voice = await _stage_media_upload(
+            context,
+            actor_id=actor_id,
+            data=audio_data,
+            filename="voice.oga",
+            media_type="audio/ogg",
+            source_unique_id=voice.file_unique_id,
+            occurred_at=update.message.date,
+            kind="voice",
+        )
+    except (OSError, ValueError, WorkshopStorageNamespaceError) as exc:
+        log.exception("Failed to save uploaded voice message for chat %d", chat_id)
+        await update.message.reply_text(f"Couldn't save the upload for agent access: {exc}")
+        return
+
+    await _accept_workshop_media_command(
+        update,
+        context,
+        body=transcript,
+        artifact=staged_voice,
+    )
 
 
 # ── Main message handler ─────────────────────────────────────────────
@@ -4651,6 +4146,7 @@ async def _handle_workshop_private_text(
     run_id: RunId,
     inbound_message_id: MessageId,
     prompt: str,
+    voice_mode: str = "off",
 ) -> None:
     """Render streaming previews while Workshop owns execution and final delivery."""
     assert update.message is not None
@@ -4660,10 +4156,12 @@ async def _handle_workshop_private_text(
     live_msg = None
     last_edit_time = 0.0
     last_edit_text = ""
+    voice_audio: bytes | None = None
+    voice_only = voice_mode == "only"
 
     async def observe(event) -> None:
         nonlocal live_msg, last_edit_time, last_edit_text
-        if not event.text_so_far:
+        if voice_only or not event.text_so_far:
             return
         publishable = _stream_publishable_prefix(event.text_so_far)
         if publishable is None or publishable == last_edit_text:
@@ -4685,9 +4183,36 @@ async def _handle_workshop_private_text(
             last_edit_time = now
             last_edit_text = publishable
 
-    typing_task = asyncio.create_task(_keep_private_text_typing(context, chat_id))
+    success_transformer = None
+    if voice_mode in {"on", "only"}:
+        voice_name = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
+
+        async def transform_success(response):
+            nonlocal voice_audio
+            try:
+                voice_audio = await synthesize_speech(response.text, config.piper_model_dir, voice_name)
+            except TTSError as exc:
+                log.warning("TTS failed, using canonical text delivery: %s", exc)
+            return CanonicalSuccessOutcome(
+                response.text,
+                request_delivery=voice_mode != "only" or voice_audio is None,
+            )
+
+        success_transformer = transform_success
+
+    typing_task = asyncio.create_task(
+        _keep_private_text_typing(
+            context,
+            chat_id,
+            action=ChatAction.RECORD_VOICE if voice_only else ChatAction.TYPING,
+        )
+    )
     try:
-        result = await execution.execute(run_id, stream_observer=observe)
+        result = await execution.execute(
+            run_id,
+            stream_observer=observe,
+            success_transformer=success_transformer,
+        )
     finally:
         typing_task.cancel()
         try:
@@ -4737,11 +4262,24 @@ async def _handle_workshop_private_text(
             effective_backend=_get_pool(context).get_backend_provider(chat_id)[0],
         )
 
+    if result.disposition == CanonicalExecutionDisposition.COMPLETED and voice_audio is not None:
+        try:
+            await context.bot.send_voice(chat_id=chat_id, voice=voice_audio)
+        except Exception:
+            log.exception("Telegram voice rendering failed for canonical run %s", run_id)
+            if voice_only:
+                await _send_response(update, final_text)
 
-async def _keep_private_text_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+
+async def _keep_private_text_typing(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    *,
+    action: str = ChatAction.TYPING,
+) -> None:
     while True:
         try:
-            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            await context.bot.send_chat_action(chat_id=chat_id, action=action)
         except Exception:
             pass
         await asyncio.sleep(4)
@@ -4749,604 +4287,67 @@ async def _keep_private_text_typing(context: ContextTypes.DEFAULT_TYPE, chat_id:
 
 @_require_auth
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handle plain text messages — the primary interaction path.
-
-    Logs the message, acquires the per-chat lock, and delegates accepted
-    private text to the canonical Workshop run service. Telegram remains the
-    renderer; the run service owns canonical execution-target resolution.
-    """
+    """Accept authenticated direct text through the canonical Workshop run path."""
     if not update.message or not update.message.text:
+        return
+
+    actor_id = _user_id(update)
+    chat_id = _chat_id(update)
+    if chat_id != actor_id:
+        log.info(
+            "Ignoring Telegram group text outside canonical agent addressing (chat_id=%s, actor_id=%s)",
+            chat_id,
+            actor_id,
+        )
         return
 
     if not await _check_totp_text(update, context):
         return
 
-    chat_id = _chat_id(update)
     prompt = update.message.text
-    reader_user = _upload_reader_user(context, chat_id)
     config: Config = context.bot_data["config"]
     voice_mode = "off"
     if config.tts_enabled:
         voice_mode = await sessions.get_setting(f"voice_mode:{chat_id}") or "off"
-    private_text_activation = chat_id == _user_id(update) and voice_mode == "off"
 
-    workshop_inbound_message_id: MessageId | None = None
-    workshop_run_id: RunId | None = None
-    acceptance_disposition: ConversationCommandDisposition | None = None
-    if private_text_activation:
-        execution = _get_core_services(context).private_text_execution
-        if execution is None:
-            log.error("Workshop private-text execution service is unavailable")
-            await _reply_safe(update.message, "Kai's durable execution service is unavailable. Please try again.")
-            return
-        try:
-            acceptance = await execution.accept(
-                InboundMessage(
-                    transport="telegram",
-                    update_id=str(update.update_id),
-                    message_id=str(update.message.message_id),
-                    sender_subject=str(_user_id(update)),
-                    channel_subject=str(chat_id),
-                    body=prompt,
-                    occurred_at=update.message.date,
-                )
-            )
-            aggregate_id = acceptance.message.event.envelope.aggregate_id
-            if not isinstance(aggregate_id, MessageId):
-                raise RuntimeError("Workshop command acceptance returned a non-message aggregate")
-            workshop_inbound_message_id = aggregate_id
-            workshop_run_id = acceptance.run.run_id
-            acceptance_disposition = acceptance.disposition
-        except Exception:
-            log.exception(
-                "Workshop private-text acceptance failed; refusing legacy backend fallback "
-                "(update_id=%s, message_id=%s)",
-                update.update_id,
-                update.message.message_id,
-            )
-            await _reply_safe(update.message, "Kai could not safely accept this request. Please try again.")
-            return
-    else:
-        recorder = context.bot_data.get("workshop_inbound_recorder")
-        if recorder is not None:
-            try:
-                result = await recorder(
-                    InboundMessage(
-                        transport="telegram",
-                        update_id=str(update.update_id),
-                        message_id=str(update.message.message_id),
-                        sender_subject=str(_user_id(update)),
-                        channel_subject=str(chat_id),
-                        body=prompt,
-                        occurred_at=update.message.date,
-                    )
-                )
-                aggregate_id = result.event.envelope.aggregate_id
-                if not isinstance(aggregate_id, MessageId):
-                    raise RuntimeError("Workshop inbound recorder returned a non-message aggregate")
-                workshop_inbound_message_id = aggregate_id
-            except Exception:
-                log.exception(
-                    "Workshop inbound shadow write failed (update_id=%s, message_id=%s)",
-                    update.update_id,
-                    update.message.message_id,
-                )
-
-    # JSONL remains a compatibility archive only for routes that have not
-    # crossed canonical execution. Protected private text uses the Workshop
-    # timeline exclusively.
-    user_log = (
-        log_message(direction="user", chat_id=chat_id, text=prompt, reader_user=reader_user)
-        if not private_text_activation
-        and acceptance_disposition in {None, ConversationCommandDisposition.NEWLY_ACCEPTED}
-        else None
-    )
-    if private_text_activation:
-        if workshop_run_id is None or workshop_inbound_message_id is None:
-            raise RuntimeError("Accepted private text is missing canonical run authority")
-        await _handle_workshop_private_text(
-            update,
-            context,
-            chat_id=chat_id,
-            run_id=workshop_run_id,
-            inbound_message_id=workshop_inbound_message_id,
-            prompt=prompt,
-        )
-        return
-
-    pool = _get_pool(context)
-    delivery_route = ResponseDeliveryRoute.LEGACY
-    workshop_run: PreparedConversationRun | None = None
-    if chat_id == _user_id(update) and workshop_inbound_message_id is not None:
-        delivery_route = ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT
-        run_service = _get_core_services(context).conversation_runs
-        if run_service is not None:
-            try:
-                workshop_run = await run_service.prepare(workshop_inbound_message_id)
-            except Exception:
-                log.exception(
-                    "Workshop conversation run preparation failed (inbound_message_id=%s)",
-                    workshop_inbound_message_id,
-                )
-    model = workshop_run.model if workshop_run is not None else pool.get_model(chat_id)
-
-    was_queued = await _notify_if_queued(update, chat_id)
-    lock = await _acquire_lock_or_kill(chat_id, pool, update)
-    if lock is None:
+    execution = _get_core_services(context).private_text_execution
+    if execution is None:
+        log.error("Workshop private-text execution service is unavailable")
+        await _reply_safe(update.message, "Kai's durable execution service is unavailable. Please try again.")
         return
     try:
-        _set_responding(chat_id)
-        try:
-            await _handle_response(
-                update,
-                context,
-                chat_id,
-                _prepend_queue_marker(prompt) if was_queued else prompt,
-                pool,
-                model,
-                user_log=user_log,
-                workshop_inbound_message_id=workshop_inbound_message_id,
-                delivery_route=delivery_route,
-                workshop_run=workshop_run,
+        acceptance = await execution.accept(
+            InboundMessage(
+                transport="telegram",
+                update_id=str(update.update_id),
+                message_id=str(update.message.message_id),
+                sender_subject=str(actor_id),
+                channel_subject=str(chat_id),
+                body=prompt,
+                occurred_at=update.message.date,
             )
-        finally:
-            _clear_responding(chat_id)
-    finally:
-        lock.release()
-
-
-# ── Streaming response handler ───────────────────────────────────────
-
-
-async def _handle_response(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    prompt: str | list,
-    pool: SubprocessPool,
-    model: str,
-    user_log: LogEntry | None = None,
-    workshop_inbound_message_id: MessageId | None = None,
-    delivery_route: ResponseDeliveryRoute = ResponseDeliveryRoute.LEGACY,
-    workshop_run: PreparedConversationRun | None = None,
-) -> None:
-    """
-    Stream Claude's response and deliver it to the user.
-
-    This is the central response handler used by all message types (text,
-    photo, document, voice). It manages the full response lifecycle:
-
-    1. Check voice mode to determine output format
-    2. Start a background typing indicator task
-    3. Stream events from Claude, creating/editing a live Telegram message
-    4. Handle /stop interruptions via the per-chat stop event
-    5. On completion: save session, log response, deliver final text/voice
-    6. Handle errors gracefully with user-visible error messages
-
-    In voice-only mode, streaming text edits are skipped (no live message)
-    and the final response is synthesized to speech via Piper TTS.
-
-    In text+voice mode, the text response is delivered normally, then a
-    voice note is sent as a follow-up.
-
-    Args:
-        update: The Telegram Update that triggered this response.
-        context: Telegram callback context.
-        chat_id: The Telegram chat ID.
-        prompt: Text string or list of content blocks to send to Claude.
-        pool: The runtime pool used for this response.
-        model: Current model name (for session tracking).
-    """
-    assert update.message is not None
-    if not isinstance(delivery_route, ResponseDeliveryRoute):
-        raise ValueError("delivery_route must be a ResponseDeliveryRoute")
-    # Check voice mode before starting
-    config: Config = context.bot_data["config"]
-    reader_user = pool.get_os_user(chat_id)
-    voice_mode = "off"
-    if config.tts_enabled:
-        voice_mode = await sessions.get_setting(f"voice_mode:{chat_id}") or "off"
-    voice_only = voice_mode == "only"
-    workshop_delivery_requested = delivery_route == ResponseDeliveryRoute.WORKSHOP_PRIVATE_TEXT and voice_mode == "off"
-    workshop_delivery_candidate = (
-        workshop_delivery_requested
-        and workshop_inbound_message_id is not None
-        and workshop_run is not None
-        and context.bot_data.get("workshop_streaming_preview_recorder") is not None
-        and context.bot_data.get("workshop_streaming_finalizer") is not None
-    )
-    if workshop_delivery_requested and not workshop_delivery_candidate:
-        log.error(
-            "Workshop authoritative delivery prerequisites are unavailable; refusing direct fallback "
-            "(inbound_message_id=%s)",
-            workshop_inbound_message_id,
         )
-        log_message(
-            direction="assistant",
-            chat_id=chat_id,
-            text="[error: durable delivery preparation failed]",
-            reader_user=reader_user,
-        )
-        await _reply_safe(
-            update.message,
-            "Kai could not safely prepare durable delivery for this reply. Please try again.",
-        )
-        return
-
-    # Keep activity indicator visible until the response completes.
-    # Telegram hides the typing indicator after ~5 seconds, so we
-    # re-send it every 4 seconds in a background task.
-    chat_action = ChatAction.RECORD_VOICE if voice_only else ChatAction.TYPING
-
-    async def _keep_typing():
-        # Loop runs until the task is cancelled via typing_task.cancel().
-        # No shared mutable flag needed - task cancellation is the proper
-        # async mechanism and avoids fragile closure-captured booleans.
-        while True:
-            try:
-                await context.bot.send_chat_action(chat_id=chat_id, action=chat_action)
-            except Exception:
-                pass
-            await asyncio.sleep(4)
-
-    typing_task = asyncio.create_task(_keep_typing())
-
-    live_msg = None
-    last_edit_time = 0.0
-    last_edit_text = ""
-    final_response = None
-    stopped_by_user = False
-
-    try:
-        # Reset the stop event (in case /stop was sent between messages)
-        stop_event = get_stop_event(sessions.execution_lane_key(chat_id))
-        stop_event.clear()
-
-        # Stream events from Claude. Pass chat_id so the inner Claude
-        # can include it in API calls for correct multi-user routing.
-        event_stream = (
-            workshop_run.stream(prompt)
-            if workshop_delivery_candidate and workshop_run is not None
-            else pool.send(prompt, chat_id=chat_id)
-        )
-        async for event in event_stream:
-            # Check for /stop between stream chunks
-            if stop_event.is_set():
-                stop_event.clear()
-                stopped_by_user = True
-                if live_msg:
-                    await _edit_message_safe(live_msg, last_edit_text + "\n\n_(stopped)_")
-                final_response = None
-                break
-
-            if event.done:
-                final_response = event.response
-                break
-
-            # In voice-only mode, skip live text updates
-            if voice_only:
-                continue
-
-            now = time.monotonic()
-            if not event.text_so_far:
-                continue
-
-            # Stable-prefix gate: only create or edit the live message
-            # when the accumulated text has a coherent prefix to show.
-            # Withholding unstable chunks here means /stop, final
-            # delivery, and edit suppression always operate against text
-            # Telegram actually saw, which is the invariant the rest of
-            # this function relies on. `last_edit_text` is the last
-            # PUBLISHED stable prefix, never raw accumulated text.
-            publishable = _stream_publishable_prefix(event.text_so_far)
-            if publishable is None or publishable == last_edit_text:
-                continue
-
-            if live_msg is None:
-                live_msg = await _reply_safe(update.message, _truncate_for_telegram(publishable))
-                last_edit_time = now
-                last_edit_text = publishable
-                if workshop_delivery_candidate:
-                    assert workshop_inbound_message_id is not None
-                    preview_recorder = context.bot_data["workshop_streaming_preview_recorder"]
-                    try:
-                        await preview_recorder(
-                            ConfirmedTelegramStreamingPreview(
-                                inbound_message_id=workshop_inbound_message_id,
-                                external_message_id=live_msg.message_id,
-                                confirmed_at=datetime.now(UTC),
-                            )
-                        )
-                    except Exception:
-                        log.exception(
-                            "Workshop streaming-preview binding failed; refusing direct fallback "
-                            "(inbound_message_id=%s)",
-                            workshop_inbound_message_id,
-                        )
-                        log_message(
-                            direction="assistant",
-                            chat_id=chat_id,
-                            text="[error: durable delivery preparation failed]",
-                            reader_user=reader_user,
-                        )
-                        notice = "Kai could not safely prepare durable delivery for this reply. Please try again."
-                        if not await _edit_message_safe(live_msg, notice):
-                            await _reply_safe(update.message, notice)
-                        return
-            elif now - last_edit_time >= EDIT_INTERVAL:
-                await _edit_message_safe(live_msg, publishable)
-                last_edit_time = now
-                last_edit_text = publishable
-    finally:
-        # Always cancel the typing indicator, even if the streaming loop
-        # exits with an exception. Without this, a leaked _keep_typing task
-        # sends typing indicators to the chat indefinitely.
-        typing_task.cancel()
-        try:
-            await typing_task
-        except asyncio.CancelledError:
-            pass
-
-    # Handle error cases. Skip the error message if /stop was used -
-    # the user already saw the "(stopped)" edit and doesn't need a false alarm.
-    # Failed responses are logged to history so that after a session restart,
-    # the injected history shows the message was attempted (not unanswered).
-    # Without this, the agent sees an unanswered user message in history and
-    # may try to address it instead of the current message.
-    if final_response is None:
-        if stopped_by_user:
-            log_message(
-                direction="assistant",
-                chat_id=chat_id,
-                text="[stopped by user]",
-                reader_user=reader_user,
-            )
-        else:
-            log_message(
-                direction="assistant",
-                chat_id=chat_id,
-                text="[no response]",
-                reader_user=reader_user,
-            )
-            await update.message.reply_text("Error: No response from agent")
-        return
-
-    if not final_response.success:
-        # Defensive fallback: claude.py now always populates `error`
-        # with a non-None string for is_error events (see the
-        # response_error resolution there). The `or` here is belt-and-
-        # suspenders against a future change that re-introduces None,
-        # so the literal "Error: None" string can't reappear via this
-        # surface even on a regression.
-        backend, provider = pool.get_backend_provider(chat_id)
-        error_text = render_agent_failure(
-            final_response.failure_kind,
-            final_response.error,
-            config,
-            chat_id,
-            runtime_route=(backend, provider, pool.get_os_user(chat_id)),
-        )
-        visible_error = error_text.removeprefix("Error: ")
-        log_message(
-            direction="assistant",
-            chat_id=chat_id,
-            text=f"[error: {visible_error}]",
-            reader_user=reader_user,
-        )
-        # Send the error notice as a NEW message (not an edit of the
-        # live streamed message), so any tool-use, partial reasoning,
-        # and intermediate output the user was watching stays visible.
-        # The previous in-place edit erased that context entirely,
-        # which on long sessions could mean minutes of visible work
-        # disappearing into a single error line. _reply_safe is the
-        # right wrapper here: error strings can carry markdown-like
-        # characters (parens, dollar signs, brackets) that Telegram's
-        # Markdown parser sometimes rejects, and the wrapper falls
-        # back to plain text on BadRequest while letting network
-        # errors propagate naturally.
-        await _reply_safe(update.message, error_text)
-        return
-
-    # Persist session info for /stats
-    if final_response.session_id:
-        await sessions.save_session(chat_id, final_response.session_id, model)
-
-    final_text = final_response.text
-    # Authoritative Workshop replies enter JSONL only after their durable
-    # finalization commit is confirmed. Legacy routes retain their existing
-    # write timing. None means the append failed (logged by log_message itself);
-    # the extraction path then skips provenance stamping for this exchange.
-    if workshop_delivery_candidate:
-        assistant_log = None
-    else:
-        assistant_log = log_message(
-            direction="assistant",
-            chat_id=chat_id,
-            text=final_text,
-            reader_user=reader_user,
-        )
-
-    workshop_outbound_message_id: MessageId | None = None
-    workshop_delivery_committed = False
-    if workshop_delivery_candidate:
-        assert workshop_inbound_message_id is not None
-        finalizer = context.bot_data["workshop_streaming_finalizer"]
-        try:
-            finalization_result = await finalizer(
-                OutboundMessage(
-                    in_reply_to_message_id=workshop_inbound_message_id,
-                    body=final_text,
-                    occurred_at=datetime.now(UTC),
-                )
-            )
-            aggregate_id = finalization_result.message.event.envelope.aggregate_id
-            if not isinstance(aggregate_id, MessageId):
-                raise RuntimeError("Workshop finalizer returned a non-message aggregate")
-            workshop_outbound_message_id = aggregate_id
-            workshop_delivery_committed = True
-        except WorkshopFinalizationCommitUncertainError:
-            log.critical(
-                "Workshop finalization commit outcome is uncertain; refusing direct fallback (inbound_message_id=%s)",
-                workshop_inbound_message_id,
-                exc_info=True,
-            )
-            # Preserve the answer for reconciliation: the durable transaction
-            # may already contain the identical canonical assistant message.
-            log_message(
-                direction="assistant",
-                chat_id=chat_id,
-                text=final_text,
-                reader_user=reader_user,
-            )
-            await _reply_safe(
-                update.message,
-                "Kai could not safely confirm final delivery. The reply was not sent again to avoid a duplicate.",
-            )
-            return
-        except Exception:
-            log.exception(
-                "Workshop authoritative finalization failed; refusing direct fallback (inbound_message_id=%s)",
-                workshop_inbound_message_id,
-            )
-            log_message(
-                direction="assistant",
-                chat_id=chat_id,
-                text="[error: durable delivery finalization failed]",
-                reader_user=reader_user,
-            )
-            notice = "Kai could not safely finalize durable delivery for this reply. Please try again."
-            if live_msg is None or not await _edit_message_safe(live_msg, notice):
-                await _reply_safe(update.message, notice)
-            return
-
-    if workshop_delivery_candidate:
-        assistant_log = log_message(
-            direction="assistant",
-            chat_id=chat_id,
-            text=final_text,
-            reader_user=reader_user,
-        )
-
-    outbound_recorder = context.bot_data.get("workshop_outbound_recorder")
-    if not workshop_delivery_committed and workshop_inbound_message_id is not None and outbound_recorder is not None:
-        try:
-            outbound_result = await outbound_recorder(
-                OutboundMessage(
-                    in_reply_to_message_id=workshop_inbound_message_id,
-                    body=final_text,
-                    occurred_at=datetime.now(UTC),
-                )
-            )
-            aggregate_id = outbound_result.event.envelope.aggregate_id
-            if not isinstance(aggregate_id, MessageId):
-                raise RuntimeError("Workshop outbound recorder returned a non-message aggregate")
-            workshop_outbound_message_id = aggregate_id
-        except Exception:
-            log.exception(
-                "Workshop outbound shadow write failed (inbound_message_id=%s)",
-                workshop_inbound_message_id,
-            )
-
-    async def _observe_delivery(mode: str, succeeded: bool) -> None:
-        if workshop_outbound_message_id is None:
-            return
-        delivery_recorder = context.bot_data.get("workshop_delivery_recorder")
-        if delivery_recorder is None:
-            return
-        try:
-            await delivery_recorder(
-                DeliveryObservation(
-                    message_id=workshop_outbound_message_id,
-                    transport="telegram",
-                    mode=mode,
-                    succeeded=succeeded,
-                    occurred_at=datetime.now(UTC),
-                )
-            )
-        except Exception:
-            log.exception(
-                "Workshop delivery shadow write failed (message_id=%s, mode=%s, succeeded=%s)",
-                workshop_outbound_message_id,
-                mode,
-                succeeded,
-            )
-
-    # Capture the workspace before scheduling ingestion so a later workspace
-    # switch cannot re-route facts from this exchange.
-    from kai.memory import is_enabled as memory_is_enabled
-
-    if memory_is_enabled():
-        if workshop_delivery_candidate and workshop_run is not None:
-            ingest_workspace = str(await workshop_run.effective_workspace())
-        else:
-            ingest_workspace = str(await pool.get_effective_workspace(chat_id))
-        schedule_memory_ingestion(
-            prompt=prompt,
-            assistant_text=final_text,
-            chat_id=chat_id,
-            session_id=final_response.session_id,
-            config=config,
-            workspace=ingest_workspace,
-            user_log=user_log,
-            assistant_log=assistant_log,
-            reasoner_backends=ONESHOT_REASONER_BACKENDS,
-        )
-
-    if workshop_delivery_committed:
-        return
-
-    # Voice-only mode: synthesize and send voice, fall back to text on failure
-    if voice_only and final_text:
-        voice_name = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
-        try:
-            audio = await synthesize_speech(final_text, config.piper_model_dir, voice_name)
-        except TTSError as e:
-            log.warning("TTS failed, falling back to text: %s", e)
-        else:
-            try:
-                await context.bot.send_voice(chat_id=chat_id, voice=audio)
-            except Exception:
-                await _observe_delivery("voice", False)
-                raise
-            await _observe_delivery("voice", True)
-            return
-
-    # Send text response (normal mode, or voice-only fallback)
-    text_delivery_succeeded = True
-    try:
-        if live_msg:
-            # Update the live message with the final text
-            if len(final_text) <= 4096:
-                if final_text != last_edit_text:
-                    text_delivery_succeeded = await _edit_message_safe(live_msg, final_text)
-            else:
-                # Response exceeds Telegram's limit — edit first chunk, send the rest
-                chunks = chunk_text(final_text)
-                text_delivery_succeeded = await _edit_message_safe(live_msg, chunks[0])
-                for chunk in chunks[1:]:
-                    await _reply_safe(update.message, chunk)
-        else:
-            await _send_response(update, final_text)
+        inbound_message_id = acceptance.message.event.envelope.aggregate_id
+        if not isinstance(inbound_message_id, MessageId):
+            raise RuntimeError("Workshop command acceptance returned a non-message aggregate")
     except Exception:
-        await _observe_delivery("text", False)
-        raise
-    await _observe_delivery("text", text_delivery_succeeded)
+        log.exception(
+            "Workshop private-text acceptance failed; refusing legacy backend fallback (update_id=%s, message_id=%s)",
+            update.update_id,
+            update.message.message_id,
+        )
+        await _reply_safe(update.message, "Kai could not safely accept this request. Please try again.")
+        return
 
-    # Text+voice mode: send voice note after text
-    if voice_mode == "on" and final_text:
-        voice_name = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
-        try:
-            audio = await synthesize_speech(final_text, config.piper_model_dir, voice_name)
-        except TTSError as e:
-            log.warning("TTS failed: %s", e)
-        else:
-            try:
-                await context.bot.send_voice(chat_id=chat_id, voice=audio)
-            except Exception:
-                await _observe_delivery("voice", False)
-                raise
-            await _observe_delivery("voice", True)
+    await _handle_workshop_private_text(
+        update,
+        context,
+        chat_id=chat_id,
+        run_id=acceptance.run.run_id,
+        inbound_message_id=inbound_message_id,
+        prompt=prompt,
+        voice_mode=voice_mode,
+    )
 
 
 # ── Application factory ─────────────────────────────────────────────
@@ -5401,12 +4402,6 @@ def create_bot(
 
     app = builder.build()
     app.bot_data["config"] = config
-    app.bot_data["workshop_inbound_recorder"] = sessions.record_workshop_inbound_message
-    app.bot_data["workshop_artifact_recorder"] = sessions.record_workshop_inbound_artifact
-    app.bot_data["workshop_outbound_recorder"] = sessions.record_workshop_outbound_message
-    app.bot_data["workshop_delivery_recorder"] = sessions.record_workshop_delivery_observation
-    app.bot_data["workshop_streaming_preview_recorder"] = sessions.record_workshop_streaming_preview
-    app.bot_data["workshop_streaming_finalizer"] = sessions.record_workshop_streaming_finalization
 
     # Default every recognized command to sensitive. `/start` and `/help`
     # disclose no user state and remain available so an authorized operator can
