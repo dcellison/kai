@@ -114,6 +114,7 @@ export interface WorkshopMemoryFilters {
 export interface WorkshopMemoryListOptions extends WorkshopMemoryFilters {
   cursor?: string;
   limit?: number;
+  order?: "newest" | "oldest";
 }
 
 export interface WorkshopMemorySearchOptions extends WorkshopMemoryFilters {

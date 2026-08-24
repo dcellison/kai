@@ -33,6 +33,7 @@ MAX_SOURCE_BODY_CHARACTERS = 50_000
 _CURSOR_VERSION = 1
 _VALID_KINDS = frozenset({"fact", "episode"})
 _VALID_SCOPES = frozenset({"global", "project", "task"})
+_VALID_ORDERS = frozenset({"newest", "oldest"})
 
 
 class WorkshopMemoryQueryError(RuntimeError):
@@ -210,7 +211,7 @@ def _compact_recall(
     return rendered
 
 
-def _filter_fingerprint(filters: MemoryQueryFilters) -> str:
+def _filter_fingerprint(filters: MemoryQueryFilters, *, order: str) -> str:
     encoded = json.dumps(
         {
             "kind": filters.kind,
@@ -219,6 +220,7 @@ def _filter_fingerprint(filters: MemoryQueryFilters) -> str:
             "tag": filters.tag,
             "scope": filters.scope,
             "project_id": filters.project_id,
+            "order": order,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -226,10 +228,15 @@ def _filter_fingerprint(filters: MemoryQueryFilters) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _encode_cursor(filters: MemoryQueryFilters, result: memory.MemoryResult) -> str:
+def _encode_cursor(
+    filters: MemoryQueryFilters,
+    result: memory.MemoryResult,
+    *,
+    order: str,
+) -> str:
     payload = {
         "v": _CURSOR_VERSION,
-        "f": _filter_fingerprint(filters),
+        "f": _filter_fingerprint(filters, order=order),
         "t": _sort_key(result)[0],
         "i": result.id,
     }
@@ -237,7 +244,12 @@ def _encode_cursor(filters: MemoryQueryFilters, result: memory.MemoryResult) -> 
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
 
-def _decode_cursor(cursor: str, filters: MemoryQueryFilters) -> tuple[str, str]:
+def _decode_cursor(
+    cursor: str,
+    filters: MemoryQueryFilters,
+    *,
+    order: str,
+) -> tuple[str, str]:
     if not cursor or len(cursor) > MAX_CURSOR_CHARACTERS:
         raise WorkshopMemoryCursorError("Invalid memory cursor")
     try:
@@ -253,7 +265,7 @@ def _decode_cursor(cursor: str, filters: MemoryQueryFilters) -> tuple[str, str]:
         not isinstance(payload, dict)
         or set(payload) != {"v", "f", "t", "i"}
         or payload.get("v") != _CURSOR_VERSION
-        or payload.get("f") != _filter_fingerprint(filters)
+        or payload.get("f") != _filter_fingerprint(filters, order=order)
         or not isinstance(payload.get("t"), str)
         or not isinstance(payload.get("i"), str)
         or not payload["i"]
@@ -412,22 +424,26 @@ class WorkshopMemoryQueryService:
         filters: MemoryQueryFilters = EMPTY_MEMORY_FILTERS,
         limit: int = DEFAULT_PAGE_SIZE,
         cursor: str | None = None,
+        order: str = "newest",
     ) -> MemoryRecordPage:
         self.validate_filters(filters)
+        if order not in _VALID_ORDERS:
+            raise WorkshopMemoryValidationError("Invalid memory record order")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_PAGE_SIZE:
             raise WorkshopMemoryValidationError(f"Memory page size must be between 1 and {MAX_PAGE_SIZE}")
-        anchor = _decode_cursor(cursor, filters) if cursor is not None else None
+        anchor = _decode_cursor(cursor, filters, order=order) if cursor is not None else None
         rows = [row for row in await self._all_visible(authority) if self._matches(row, filters)]
-        rows.sort(key=_sort_key, reverse=True)
+        reverse = order == "newest"
+        rows.sort(key=_sort_key, reverse=reverse)
         if anchor is not None:
-            rows = [row for row in rows if _sort_key(row) < anchor]
+            rows = [row for row in rows if (_sort_key(row) < anchor if reverse else _sort_key(row) > anchor)]
         selected = rows[: limit + 1]
         has_more = len(selected) > limit
         selected = selected[:limit]
         allowed_project_id = await self._allowed_project_id(authority)
         return MemoryRecordPage(
             records=tuple(self._summary(row, allowed_project_id=allowed_project_id) for row in selected),
-            next_cursor=(_encode_cursor(filters, selected[-1]) if has_more and selected else None),
+            next_cursor=(_encode_cursor(filters, selected[-1], order=order) if has_more and selected else None),
         )
 
     async def stats(

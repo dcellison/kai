@@ -10,6 +10,10 @@ import {
   loadEarlierTimeline,
   loadArtifactBlob,
   loadNavigation,
+  loadMemoryDetail,
+  loadMemoryRecords,
+  loadMemorySource,
+  loadMemoryStats,
   loadRun,
   loadRunTrace,
   loadSettingsWorkspace,
@@ -20,6 +24,7 @@ import {
   switchWorkspace,
 } from "./api";
 import type {
+  WorkshopMemoryRecord,
   TimelineMessage,
   TimelineSnapshot,
   WorkshopNavigation,
@@ -35,6 +40,10 @@ vi.mock("./api", async (importOriginal) => {
     loadEarlierTimeline: vi.fn(),
     loadArtifactBlob: vi.fn(),
     loadNavigation: vi.fn(),
+    loadMemoryDetail: vi.fn(),
+    loadMemoryRecords: vi.fn(),
+    loadMemorySource: vi.fn(),
+    loadMemoryStats: vi.fn(),
     loadTimeline: vi.fn(),
     loadRun: vi.fn(),
     loadRunTrace: vi.fn(),
@@ -120,6 +129,28 @@ const historyMessage: TimelineMessage = {
   eventPosition: 25,
   messageId: "msg_00000000000000000000000000000025",
 };
+const memoryRecord: WorkshopMemoryRecord = {
+  confidence: 1,
+  createdAt: "2026-08-24T10:00:00Z",
+  kind: "fact",
+  memoryId: "memory-1",
+  memoryType: "fact",
+  preview: "Workshop memory navigation works.",
+  scope: {
+    exclusionReason: null,
+    invalidDefaulted: false,
+    legacyDefaulted: false,
+    projectId: null,
+    retrievable: true,
+    scope: "global",
+    scopeConfidence: 1,
+    scopeSource: "operator",
+  },
+  source: "extracted",
+  speaker: "user",
+  tags: [],
+  updatedAt: "2026-08-24T10:00:00Z",
+};
 
 const completedRun: WorkshopRun = {
   acceptedAt: "2026-08-13T09:00:00Z",
@@ -169,6 +200,7 @@ describe("Workshop React client", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     sessionStorage.clear();
+    window.history.replaceState(null, "", "/workshop/");
     handlers = null;
     failStream = null;
     vi.mocked(redeemEnrollment).mockResolvedValue("redeemed-session-token");
@@ -181,6 +213,34 @@ describe("Workshop React client", () => {
     vi.mocked(loadRun).mockResolvedValue(completedRun);
     vi.mocked(loadRunTrace).mockResolvedValue({ entries: [], hasMore: false });
     vi.mocked(loadSettingsWorkspace).mockResolvedValue(settingsWorkspace);
+    vi.mocked(loadMemoryStats).mockResolvedValue({
+      byScope: { global: 1 },
+      bySource: { extracted: 1 },
+      byType: { fact: 1 },
+      episodes: 0,
+      facts: 1,
+      total: 1,
+    });
+    vi.mocked(loadMemoryRecords).mockResolvedValue({
+      nextCursor: null,
+      records: [memoryRecord],
+    });
+    vi.mocked(loadMemoryDetail).mockImplementation(async (_token, memoryId) => ({
+      ...memoryRecord,
+      memoryId,
+      compactRecall: "{\"record_type\":\"memory\"}",
+      confirmationQuote: null,
+      content: "Workshop memory navigation works.",
+      episode: null,
+      promptVersion: "v1",
+    }));
+    vi.mocked(loadMemorySource).mockResolvedValue({
+      reason: "legacy_source",
+      result: null,
+      runId: null,
+      source: null,
+      status: "unavailable",
+    });
     vi.mocked(switchWorkspace).mockResolvedValue({
       ...settingsWorkspace,
       workspace: "/var/lib/kai/home/principal",
@@ -262,6 +322,37 @@ describe("Workshop React client", () => {
 
     expect(await screen.findByText(liveMessage.body)).toBeVisible();
     expect(container.querySelector("img")).toBeNull();
+  });
+
+  it("restores a credential-free Memory deep link and returns to conversations", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "session-secret" }),
+    );
+    window.history.replaceState(
+      null,
+      "",
+      "/workshop/?view=memory&memory=memory-1",
+    );
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Memory", level: 1 })).toBeVisible();
+    expect(
+      (await screen.findAllByText("Workshop memory navigation works.")).length,
+    ).toBeGreaterThanOrEqual(2);
+    expect(loadMemoryDetail).toHaveBeenCalledWith("session-secret", "memory-1");
+    expect(window.location.search).toBe("?view=memory&memory=memory-1");
+    expect(window.location.href).not.toContain("session-secret");
+
+    await user.click(screen.getByRole("button", { name: "Back to conversation" }));
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+    expect(window.location.search).toBe("");
+
+    await user.click(screen.getByRole("button", { name: "Memory" }));
+    expect(await screen.findByRole("heading", { name: "Memory", level: 1 })).toBeVisible();
+    expect(window.location.search).toContain("view=memory");
   });
 
   it("shows canonical runtime settings and switches an authorized workspace", async () => {

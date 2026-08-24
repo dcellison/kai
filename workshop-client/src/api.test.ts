@@ -215,6 +215,7 @@ describe("Workshop client API", () => {
         kind: "fact",
         projectId: "kai",
         limit: 25,
+        order: "oldest",
       }),
     ).resolves.toMatchObject({
       nextCursor: null,
@@ -242,10 +243,27 @@ describe("Workshop client API", () => {
       result: null,
     });
     expect(fetchMock.mock.calls[1]?.[0]).toBe(
-      "/v1/memory/records?kind=fact&project_id=kai&limit=25",
+      "/v1/memory/records?kind=fact&project_id=kai&limit=25&order=oldest",
     );
     expect(fetchMock.mock.calls[2]?.[0]).toBe(
       "/v1/memory/search?tag=preference&scope=project&q=concise+output",
+    );
+  });
+
+  it("rejects malformed memory records instead of rendering partial data", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json({
+          version: 1,
+          records: [{ ...memoryRecord(), tags: "not-an-array" }],
+          next_cursor: null,
+        }),
+      ),
+    );
+
+    await expect(loadMemoryRecords("session-secret")).rejects.toThrow(
+      "Kai returned an unsupported memory record.",
     );
   });
 

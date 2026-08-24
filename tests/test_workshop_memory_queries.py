@@ -160,14 +160,30 @@ async def test_list_is_visible_filtered_deterministic_and_cursor_bound(
     assert calls == [(str(principal_id), None), (str(principal_id), None)]
     assert offloaded == [get_all, get_all]
 
+    oldest_first = await service.list_records(
+        authority,
+        filters=MemoryQueryFilters(tag="kai"),
+        order="oldest",
+    )
+    assert [record.memory_id for record in oldest_first.records] == ["old", "new"]
+
     with pytest.raises(WorkshopMemoryCursorError):
         await service.list_records(
             authority,
             filters=MemoryQueryFilters(source="episode"),
             cursor=first.next_cursor,
         )
+    with pytest.raises(WorkshopMemoryCursorError):
+        await service.list_records(
+            authority,
+            filters=MemoryQueryFilters(tag="kai"),
+            cursor=first.next_cursor,
+            order="oldest",
+        )
     with pytest.raises(WorkshopMemoryValidationError):
         await service.list_records(authority, limit=101)
+    with pytest.raises(WorkshopMemoryValidationError):
+        await service.list_records(authority, order="relevance")
 
 
 async def test_stats_and_detail_expose_only_bounded_stable_fields(

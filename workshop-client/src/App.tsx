@@ -46,6 +46,7 @@ import { useWorkshopTimeline } from "./useWorkshopTimeline";
 import type { EarlierHistoryState } from "./useWorkshopTimeline";
 import { MarkdownMessage } from "./MarkdownMessage";
 import { startArtifactDownload } from "./artifactDownload";
+import { MemoryExplorer } from "./MemoryExplorer";
 
 const SESSION_KEY = "kai.workshop.read-session.v1";
 const ACTIVE_RUN_KEY = "kai.workshop.active-run.v1";
@@ -57,6 +58,43 @@ const DEFAULT_SIDEBAR_WIDTH_PX = 264;
 const MIN_SIDEBAR_WIDTH_PX = 176;
 const MAX_SIDEBAR_WIDTH_PX = 420;
 const COLLAPSED_SIDEBAR_WIDTH_PX = 56;
+const MEMORY_ID_PATTERN = /^[A-Za-z0-9_-]{1,256}$/;
+
+type WorkshopDestination =
+  | { kind: "conversation" }
+  | { kind: "memory"; memoryId: string | null };
+
+function destinationFromLocation(): WorkshopDestination {
+  const parameters = new URLSearchParams(window.location.search);
+  if (parameters.get("view") !== "memory") {
+    return { kind: "conversation" };
+  }
+  const memoryId = parameters.get("memory");
+  return {
+    kind: "memory",
+    memoryId: memoryId && MEMORY_ID_PATTERN.test(memoryId) ? memoryId : null,
+  };
+}
+
+function writeDestination(
+  destination: WorkshopDestination,
+  mode: "push" | "replace",
+): void {
+  const url = new URL(window.location.href);
+  url.searchParams.delete("view");
+  url.searchParams.delete("memory");
+  if (destination.kind === "memory") {
+    url.searchParams.set("view", "memory");
+    if (destination.memoryId) {
+      url.searchParams.set("memory", destination.memoryId);
+    }
+  }
+  window.history[mode === "push" ? "pushState" : "replaceState"](
+    null,
+    "",
+    `${url.pathname}${url.search}${url.hash}`,
+  );
+}
 
 interface StoredSidebarLayout {
   collapsed: boolean;
@@ -740,6 +778,8 @@ function WorkshopView({
   connection,
   earlier,
   messages,
+  memoryDestination,
+  memoryToken,
   navigation,
   runActivity,
   runPreview,
@@ -753,6 +793,9 @@ function WorkshopView({
   onLoadRun,
   onLoadRunTrace,
   onLoadSettingsWorkspace,
+  onMemoryAuthenticationFailure,
+  onOpenMemory,
+  onSelectMemory,
   onSelectChannel,
   onSubmitCommand,
   onSwitchWorkspace,
@@ -761,6 +804,8 @@ function WorkshopView({
   connection: ConnectionState;
   earlier: EarlierHistoryState;
   messages: TimelineMessage[];
+  memoryDestination: { memoryId: string | null } | null;
+  memoryToken: string;
   navigation: WorkshopNavigation;
   runActivity: WorkshopRunActivity | null;
   runPreview: WorkshopRunPreview | null;
@@ -774,6 +819,9 @@ function WorkshopView({
   onLoadRun: (runId: string) => Promise<WorkshopRun>;
   onLoadRunTrace: (runId: string, afterSeq: number) => Promise<WorkshopRunTracePage>;
   onLoadSettingsWorkspace: () => Promise<WorkshopSettingsWorkspace>;
+  onMemoryAuthenticationFailure: (message: string) => void;
+  onOpenMemory: () => void;
+  onSelectMemory: (memoryId: string | null) => void;
   onSelectChannel: (channelId: string) => void;
   onSubmitCommand: (
     clientMessageId: string,
@@ -783,6 +831,7 @@ function WorkshopView({
   onSwitchWorkspace: (path: string) => Promise<WorkshopSettingsWorkspace>;
 }): React.JSX.Element {
   const channelId = channel.channelId;
+  const memoryOpen = memoryDestination !== null;
   const channelName = channelDisplayName(channel);
   const symbol = channelSymbol(channel);
   const [draft, setDraft] = useState(() => restoreDraft(channelId));
@@ -1277,7 +1326,7 @@ function WorkshopView({
 
   return (
     <main
-      className={`workshop-app ${sidebarLayout.collapsed ? "sidebar-collapsed" : ""} ${resizingSidebar || resizingContext ? "pane-resizing" : ""}`}
+      className={`workshop-app ${memoryOpen ? "memory-open" : ""} ${sidebarLayout.collapsed ? "sidebar-collapsed" : ""} ${resizingSidebar || resizingContext ? "pane-resizing" : ""}`}
       style={{
         "--channel-sidebar-width": `${
           sidebarLayout.collapsed
@@ -1311,6 +1360,19 @@ function WorkshopView({
         </header>
 
         <nav>
+          <p className="nav-heading">Workspace</p>
+          <button
+            className={`channel-link memory-link ${memoryOpen ? "active" : ""}`}
+            type="button"
+            aria-label="Memory"
+            title="Memory"
+            onClick={onOpenMemory}
+          >
+            <span aria-hidden="true">◇</span>
+            <span>Memory</span>
+            {memoryOpen && <span className="live-pip" aria-label="Open" />}
+          </button>
+
           {workshop.channels.some(
             (availableChannel) => availableChannel.kind === "direct",
           ) && (
@@ -1320,7 +1382,7 @@ function WorkshopView({
                 .filter((availableChannel) => availableChannel.kind === "direct")
                 .map((availableChannel) => (
                   <button
-                    className={`channel-link ${availableChannel.channelId === channelId ? "active" : ""}`}
+                    className={`channel-link ${!memoryOpen && availableChannel.channelId === channelId ? "active" : ""}`}
                     type="button"
                     aria-label={channelDisplayName(availableChannel)}
                     title={channelDisplayName(availableChannel)}
@@ -1329,7 +1391,7 @@ function WorkshopView({
                   >
                     <span>{channelSymbol(availableChannel)}</span>
                     <span>{channelDisplayName(availableChannel)}</span>
-                    {availableChannel.channelId === channelId && (
+                    {!memoryOpen && availableChannel.channelId === channelId && (
                       <span className="live-pip" aria-label="Live" />
                     )}
                   </button>
@@ -1346,7 +1408,7 @@ function WorkshopView({
                 .filter((availableChannel) => availableChannel.kind === "group")
                 .map((availableChannel) => (
                   <button
-                    className={`channel-link ${availableChannel.channelId === channelId ? "active" : ""}`}
+                    className={`channel-link ${!memoryOpen && availableChannel.channelId === channelId ? "active" : ""}`}
                     type="button"
                     aria-label={channelDisplayName(availableChannel)}
                     title={channelDisplayName(availableChannel)}
@@ -1355,7 +1417,7 @@ function WorkshopView({
                   >
                     <span>{channelSymbol(availableChannel)}</span>
                     <span>{channelDisplayName(availableChannel)}</span>
-                    {availableChannel.channelId === channelId && (
+                    {!memoryOpen && availableChannel.channelId === channelId && (
                       <span className="live-pip" aria-label="Live" />
                     )}
                   </button>
@@ -1372,7 +1434,7 @@ function WorkshopView({
                 .filter((availableChannel) => availableChannel.kind === "notification")
                 .map((availableChannel) => (
                   <button
-                    className={`channel-link notification ${availableChannel.channelId === channelId ? "active" : ""}`}
+                    className={`channel-link notification ${!memoryOpen && availableChannel.channelId === channelId ? "active" : ""}`}
                     type="button"
                     aria-label={channelDisplayName(availableChannel)}
                     title={channelDisplayName(availableChannel)}
@@ -1381,7 +1443,7 @@ function WorkshopView({
                   >
                     <span>!</span>
                     <span>{channelDisplayName(availableChannel)}</span>
-                    {availableChannel.channelId === channelId && (
+                    {!memoryOpen && availableChannel.channelId === channelId && (
                       <span className="live-pip" aria-label="Live" />
                     )}
                   </button>
@@ -1434,6 +1496,17 @@ function WorkshopView({
         )}
       </aside>
 
+      {memoryDestination ? (
+        <MemoryExplorer
+          initialMemoryId={memoryDestination.memoryId}
+          onAuthenticationFailure={onMemoryAuthenticationFailure}
+          onClose={() => onSelectChannel(channelId)}
+          onForget={onForget}
+          onSelectMemory={onSelectMemory}
+          token={memoryToken}
+        />
+      ) : (
+        <>
       <section className="conversation-pane">
         <header className="conversation-header">
           <div>
@@ -1779,6 +1852,8 @@ function WorkshopView({
 
         </div>
       </aside>
+        </>
+      )}
     </main>
   );
 }
@@ -1825,19 +1900,25 @@ function preferredNavigationChannel(
 }
 
 function ActiveWorkshopClient({
+  destination,
   navigation,
   session,
   onAuthenticationFailure,
   onChannelAccessFailure,
   onForget,
+  onOpenMemory,
   onSelectChannel,
+  onSelectMemory,
 }: {
+  destination: WorkshopDestination;
   navigation: WorkshopNavigation;
   session: WorkshopSession;
   onAuthenticationFailure: (message: string) => void;
   onChannelAccessFailure: (message: string) => void;
   onForget: () => void;
+  onOpenMemory: () => void;
   onSelectChannel: (channelId: string) => void;
+  onSelectMemory: (memoryId: string | null) => void;
 }): React.JSX.Element {
   const selected = findNavigationChannel(navigation, session.channelId);
   const { connection, messages, runActivity, runPreview, runTrace, earlier, loadEarlier } =
@@ -1909,6 +1990,8 @@ function ActiveWorkshopClient({
       connection={connection}
       earlier={earlier}
       messages={messages}
+      memoryDestination={destination.kind === "memory" ? destination : null}
+      memoryToken={session.token}
       navigation={navigation}
       onLoadEarlier={loadEarlier}
       onDownloadArtifact={downloadSelectedArtifact}
@@ -1922,6 +2005,9 @@ function ActiveWorkshopClient({
       onLoadRun={loadSelectedRun}
       onLoadRunTrace={loadSelectedRunTrace}
       onLoadSettingsWorkspace={loadSelectedSettingsWorkspace}
+      onMemoryAuthenticationFailure={onAuthenticationFailure}
+      onOpenMemory={onOpenMemory}
+      onSelectMemory={onSelectMemory}
       onSelectChannel={onSelectChannel}
       onSubmitCommand={submitSelectedCommand}
       onSwitchWorkspace={switchSelectedWorkspace}
@@ -1938,6 +2024,17 @@ export default function App(): React.JSX.Element {
     sessionStorage.getItem(SESSION_KEY) ? "workshop" : "enrollment",
   );
   const [notice, setNotice] = useState<string | null>(null);
+  const [destination, setDestination] = useState<WorkshopDestination>(
+    destinationFromLocation,
+  );
+
+  useEffect(() => {
+    const restoreDestination = (): void => {
+      setDestination(destinationFromLocation());
+    };
+    window.addEventListener("popstate", restoreDestination);
+    return () => window.removeEventListener("popstate", restoreDestination);
+  }, []);
 
   const forgetSession = useCallback((message: string | null = null): void => {
     forgetStoredSession();
@@ -2044,7 +2141,22 @@ export default function App(): React.JSX.Element {
     const nextSession = { ...session, channelId };
     storeSession(nextSession);
     setSession(nextSession);
+    const nextDestination: WorkshopDestination = { kind: "conversation" };
+    setDestination(nextDestination);
+    writeDestination(nextDestination, "push");
   };
+
+  const openMemory = (): void => {
+    const nextDestination: WorkshopDestination = { kind: "memory", memoryId: null };
+    setDestination(nextDestination);
+    writeDestination(nextDestination, "push");
+  };
+
+  const selectMemory = useCallback((memoryId: string | null): void => {
+    const nextDestination: WorkshopDestination = { kind: "memory", memoryId };
+    setDestination(nextDestination);
+    writeDestination(nextDestination, "replace");
+  }, []);
 
   if (view === "enrollment") {
     return (
@@ -2065,12 +2177,15 @@ export default function App(): React.JSX.Element {
   return (
     <ActiveWorkshopClient
       key={session.channelId}
+      destination={destination}
       navigation={navigation}
       session={session}
       onAuthenticationFailure={handleAuthenticationFailure}
       onChannelAccessFailure={(message) => void refreshChannelAccess(message)}
       onForget={() => forgetSession()}
+      onOpenMemory={openMemory}
       onSelectChannel={selectChannel}
+      onSelectMemory={selectMemory}
     />
   );
 }

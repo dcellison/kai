@@ -264,10 +264,11 @@ class _MemoryQueries:
             by_scope={"global": 1},
         )
 
-    async def list_records(self, _authority, *, filters, limit, cursor):
+    async def list_records(self, _authority, *, filters, limit, cursor, order):
         assert filters.source == "extracted"
         assert limit == 1
         assert cursor is None
+        assert order == "oldest"
         return MemoryRecordPage(
             records=(
                 MemoryRecordSummary(
@@ -305,6 +306,7 @@ class _MemoryQueries:
                 filters=SimpleNamespace(source="extracted"),
                 limit=1,
                 cursor=None,
+                order="oldest",
             )
         ).records[0]
         return MemoryRecordDetail(
@@ -325,6 +327,7 @@ class _MemoryQueries:
                 filters=SimpleNamespace(source="extracted"),
                 limit=1,
                 cursor=None,
+                order="oldest",
             )
         ).records[0]
         return MemorySearchSnapshot(
@@ -525,7 +528,7 @@ async def test_memory_api_uses_bearer_principal_and_stable_read_schema(
         }
 
         page = await client.get(
-            "/v1/memory/records?source=extracted&limit=1",
+            "/v1/memory/records?source=extracted&limit=1&order=oldest",
             headers={"Authorization": "Bearer alice-token"},
         )
         assert page.status == 200
