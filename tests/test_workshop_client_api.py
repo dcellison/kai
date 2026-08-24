@@ -50,6 +50,14 @@ from kai.workshop.run_lifecycle import (
     WorkshopRunLifecycle,
 )
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
+from kai.workshop.settings_workspaces import (
+    EffectiveValue,
+    ModelOption,
+    SettingsWorkspaceSnapshot,
+    WorkshopSettingsWorkspaceAccessDenied,
+    WorkspaceConfigSnapshot,
+    WorkspaceOption,
+)
 from kai.workshop.storage_namespaces import WorkshopPrincipalStorageRegistry
 from kai.workshop.store import WorkshopEventStore
 from tests.workshop_profiles import profile_id, profile_registry
@@ -144,6 +152,86 @@ class _AllowChannelRead:
         return True
 
 
+@dataclass
+class _SettingsWorkspaces:
+    principal_id: PrincipalId
+    channel_id: ChannelId
+    switched: list[str] = field(default_factory=list)
+    workspace_config_changes: list[tuple[str, str]] = field(default_factory=list)
+
+    def authority_for_principal_channel(self, principal_id, channel_id):
+        if principal_id != self.principal_id or channel_id != self.channel_id:
+            raise WorkshopSettingsWorkspaceAccessDenied("denied")
+        return SimpleNamespace(principal_id=principal_id, channel_id=channel_id)
+
+    async def inspect(self, _authority):
+        return self._snapshot()
+
+    async def switch_workspace(self, _authority, path: str):
+        self.switched.append(path)
+        return self._snapshot(workspace=path)
+
+    async def set_model(self, _authority, _model: str):
+        return self._snapshot()
+
+    async def set_timeout(self, _authority, _timeout: int):
+        return self._snapshot()
+
+    async def reset_settings(self, _authority, _field=None):
+        return self._snapshot()
+
+    async def workspace_config(self, _authority):
+        return self._workspace_config_snapshot()
+
+    async def set_workspace_config(
+        self,
+        _authority,
+        *,
+        field: str,
+        value: str,
+        workspace_path: str | None = None,
+    ):
+        self.workspace_config_changes.append((field, value))
+        return self._workspace_config_snapshot()
+
+    async def reset_workspace_config(
+        self,
+        _authority,
+        *,
+        field: str | None = None,
+        workspace_path: str | None = None,
+    ):
+        self.workspace_config_changes.append(("reset", field or "all"))
+        return self._workspace_config_snapshot()
+
+    def _snapshot(self, *, workspace: str = "/srv/kai"):
+        return SettingsWorkspaceSnapshot(
+            principal_id=self.principal_id,
+            channel_id=self.channel_id,
+            runtime_profile_id=profile_id(101),
+            backend="codex",
+            provider="openai",
+            model=EffectiveValue("gpt-5.6-sol", "runtime policy"),
+            timeout_seconds=EffectiveValue(120, "runtime policy"),
+            workspace=workspace,
+            model_options=(ModelOption("gpt-5.6-sol", "GPT-5.6 Sol"),),
+            workspaces=(WorkspaceOption(workspace, "kai", True, False),),
+        )
+
+    @staticmethod
+    def _workspace_config_snapshot() -> WorkspaceConfigSnapshot:
+        return WorkspaceConfigSnapshot(
+            workspace="/srv/kai",
+            model=EffectiveValue("gpt-5.6-sol", "runtime policy"),
+            timeout_seconds=EffectiveValue(120, "runtime policy"),
+            environment_keys=("SAFE_KEY",),
+            prompt=None,
+            has_prompt=False,
+            prompt_source=None,
+            override_fields=(),
+        )
+
+
 async def _identity_for(store: WorkshopEventStore, subject: str) -> tuple[PrincipalId, ChannelId]:
     async with store.connection.execute(
         "SELECT e.principal_id, b.channel_id FROM external_identities e "
@@ -212,6 +300,7 @@ async def _open_client(
     event_stream_limiter: WorkshopEventStreamLimiter | None = None,
     run_previews: WorkshopRunPreviewRegistry | None = None,
     artifact_service: WorkshopArtifactService | None = None,
+    settings_workspaces=None,
 ) -> TestClient:
     app = web.Application()
     register_workshop_read_routes(
@@ -225,6 +314,7 @@ async def _open_client(
         event_stream_limiter=event_stream_limiter,
         run_previews=run_previews,
         artifact_service=artifact_service,
+        settings_workspaces=settings_workspaces,
     )
     client = TestClient(TestServer(app))
     await client.start_server()
@@ -414,6 +504,134 @@ class TestWorkshopNavigationHTTPContract:
             ]
             assert direct["agents"] == []
             assert direct["can_submit_commands"] is False
+        finally:
+            await client.close()
+            await store.close()
+
+
+class TestWorkshopSettingsWorkspaceHTTPContract:
+    async def test_owner_reads_and_switches_canonical_runtime_workspace(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        service = _SettingsWorkspaces(alice_id, alice_channel)
+        client = await _open_client(
+            store,
+            _Authenticator({"alice-token": alice_id}),
+            settings_workspaces=service,
+        )
+        try:
+            settings = await client.get(
+                f"/v1/channels/{alice_channel}/settings",
+                headers={"Authorization": "Bearer alice-token"},
+            )
+            switched = await client.post(
+                f"/v1/channels/{alice_channel}/workspace",
+                headers={
+                    "Authorization": "Bearer alice-token",
+                    "Content-Type": "application/json",
+                },
+                json={"path": "/srv/other"},
+            )
+
+            assert settings.status == 200
+            assert (await settings.json())["model"] == {
+                "value": "gpt-5.6-sol",
+                "source": "runtime policy",
+            }
+            assert switched.status == 200
+            assert (await switched.json())["workspace"] == "/srv/other"
+            assert service.switched == ["/srv/other"]
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_workspace_config_uses_the_same_canonical_authority(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        service = _SettingsWorkspaces(alice_id, alice_channel)
+        client = await _open_client(
+            store,
+            _Authenticator({"alice-token": alice_id}),
+            settings_workspaces=service,
+        )
+        try:
+            current = await client.get(
+                f"/v1/channels/{alice_channel}/workspace-config",
+                headers={"Authorization": "Bearer alice-token"},
+            )
+            changed = await client.patch(
+                f"/v1/channels/{alice_channel}/workspace-config",
+                headers={
+                    "Authorization": "Bearer alice-token",
+                    "Content-Type": "application/json",
+                },
+                json={"field": "timeout", "value": "180"},
+            )
+
+            assert current.status == 200
+            assert (await current.json())["environment_keys"] == ["SAFE_KEY"]
+            assert changed.status == 200
+            assert service.workspace_config_changes == [("timeout", "180")]
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_cross_principal_settings_access_fails_before_service_mutation(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_channel, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        service = _SettingsWorkspaces(alice_id, alice_channel)
+        client = await _open_client(
+            store,
+            _Authenticator({"bob-token": bob_id}),
+            settings_workspaces=service,
+        )
+        try:
+            response = await client.post(
+                f"/v1/channels/{alice_channel}/workspace",
+                headers={
+                    "Authorization": "Bearer bob-token",
+                    "Content-Type": "application/json",
+                },
+                json={"path": "/srv/other"},
+            )
+
+            assert response.status == 403
+            assert (await response.json())["error"]["code"] == "access_denied"
+            assert service.switched == []
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_cross_channel_settings_access_fails_before_service_mutation(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_channel, _, bob_channel = await _open_store(tmp_path / "kai.db")
+        service = _SettingsWorkspaces(alice_id, alice_channel)
+        client = await _open_client(
+            store,
+            _Authenticator({"alice-token": alice_id}),
+            settings_workspaces=service,
+        )
+        try:
+            response = await client.post(
+                f"/v1/channels/{bob_channel}/workspace",
+                headers={
+                    "Authorization": "Bearer alice-token",
+                    "Content-Type": "application/json",
+                },
+                json={"path": "/srv/other"},
+            )
+
+            assert response.status == 403
+            assert (await response.json())["error"]["code"] == "access_denied"
+            assert service.switched == []
         finally:
             await client.close()
             await store.close()

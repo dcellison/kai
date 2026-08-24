@@ -1457,20 +1457,58 @@ button:disabled {
   white-space: nowrap;
 }
 
-.future-section ul {
+.runtime-settings {
   display: grid;
-  gap: 0.55rem;
-  margin: 0;
-  padding: 0;
-  color: var(--atom-muted);
-  font-size: 0.72rem;
-  list-style: none;
+  gap: 0.7rem;
 }
 
-.future-section li::before {
-  margin-right: 0.5rem;
-  color: var(--atom-purple);
-  content: "→";
+.runtime-settings p {
+  margin: 0;
+}
+
+.runtime-settings code {
+  display: inline;
+  border: 0;
+  padding: 0;
+  color: var(--atom-blue);
+  white-space: normal;
+}
+
+.runtime-settings label {
+  color: var(--atom-muted);
+  font-size: 0.68rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.runtime-settings select {
+  width: 100%;
+  border: 1px solid var(--line-bright);
+  border-radius: 4px;
+  background: var(--atom-panel-deep);
+  padding: 0.55rem 0.6rem;
+  color: var(--atom-foreground-strong);
+  font: 0.72rem var(--sans);
+}
+
+.runtime-settings select:focus-visible {
+  border-color: var(--atom-blue);
+  outline: 2px solid color-mix(in srgb, var(--atom-blue) 30%, transparent);
+  outline-offset: 1px;
+}
+
+.runtime-settings select:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.runtime-settings .settings-source,
+.context-section .settings-error {
+  font-size: 0.66rem;
+}
+
+.context-section .settings-error {
+  color: var(--atom-red);
 }
 
 @media (max-width: 1120px) {

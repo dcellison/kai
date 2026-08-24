@@ -103,6 +103,13 @@ from kai.workshop.execution_coordinator import (
 )
 from kai.workshop.inbound import InboundMessage
 from kai.workshop.outbound import DeliveryObservation, OutboundMessage
+from kai.workshop.settings_workspaces import (
+    SettingsWorkspaceAuthority,
+    WorkshopSettingsWorkspaceAccessDenied,
+    WorkshopSettingsWorkspaceService,
+    WorkshopSettingsWorkspaceValidationError,
+    WorkspaceConfigSnapshot,
+)
 from kai.workshop.storage_namespaces import WorkshopStorageNamespaceError
 from kai.workshop.streaming_preview import ConfirmedTelegramStreamingPreview
 from kai.workspace_utils import is_workspace_allowed
@@ -428,6 +435,27 @@ def _get_core_services(context: ContextTypes.DEFAULT_TYPE) -> KaiCoreServices:
     return get_core_services(context)
 
 
+def _canonical_settings_authority(
+    context: ContextTypes.DEFAULT_TYPE,
+    runtime_config_id: int,
+) -> SettingsWorkspaceAuthority | None:
+    """Resolve a Telegram compatibility runtime to canonical core authority."""
+    services = _get_core_services(context)
+    service = getattr(services, "settings_workspaces", None)
+    if service is None:
+        # Compatibility-only test/embedding contexts may omit the Workshop
+        # service. A fully constructed KaiApplicationHost never does.
+        return None
+    try:
+        storage = services.principal_storage.for_runtime_config_id(runtime_config_id)
+    except WorkshopStorageNamespaceError:
+        return None
+    return service.authority_for_principal_profile(
+        storage.principal_id,
+        storage.runtime_profile_id,
+    )
+
+
 # ── Basic command handlers ───────────────────────────────────────────
 
 
@@ -536,6 +564,20 @@ async def handle_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     pool = _get_pool(context)
     chat_id = _chat_id(update)
     config: Config = context.bot_data["config"]
+    authority = _canonical_settings_authority(context, chat_id)
+    if authority is not None:
+        snapshot = await _get_core_services(context).settings_workspaces.inspect(authority)
+        if snapshot.model_options is None:
+            await update.message.reply_text(
+                f"Current model: {snapshot.model.value}\nUse /model <id> to switch to any model your provider supports."
+            )
+            return
+        models = {option.model_id: option.display_name for option in snapshot.model_options}
+        await update.message.reply_text(
+            "Choose a model:",
+            reply_markup=_models_keyboard(str(snapshot.model.value), models),
+        )
+        return
     models = _get_user_models(pool, chat_id, config)
 
     if models is None:
@@ -564,6 +606,14 @@ async def _switch_model(context: ContextTypes.DEFAULT_TYPE, chat_id: int, model:
     /settings model handler. The model choice is written to the DB so
     it survives restarts (behavior change from session-only).
     """
+    authority = _canonical_settings_authority(context, chat_id)
+    if authority is not None:
+        await _get_core_services(context).settings_workspaces.set_model(
+            authority,
+            model,
+        )
+        return
+
     pool = _get_pool(context)
     # Resolve the effective workspace BEFORE setting the model. The
     # resolver may switch the live instance into the saved workspace
@@ -740,6 +790,14 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if timeout > 600:
             await update.message.reply_text("Timeout cannot exceed 600 seconds.")
             return
+        authority = _canonical_settings_authority(context, chat_id)
+        if authority is not None:
+            await _get_core_services(context).settings_workspaces.set_timeout(
+                authority,
+                timeout,
+            )
+            await update.message.reply_text(f"Default timeout set to {timeout}s.")
+            return
         await sessions.set_user_setting(chat_id, "timeout", str(timeout))
         # Apply to running instance if one exists. Don't use pool.get()
         # here - it would create a new instance just to set an attribute.
@@ -756,6 +814,18 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def _show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, config: Config) -> None:
     """Display the user's effective settings with source attribution."""
     assert update.message is not None
+    authority = _canonical_settings_authority(context, chat_id)
+    if authority is not None:
+        snapshot = await _get_core_services(context).settings_workspaces.inspect(authority)
+        await update.message.reply_text(
+            "Your settings:\n"
+            f"  Model: {snapshot.model.value} ({snapshot.model.source})\n"
+            f"  Provider: {snapshot.provider}\n"
+            f"  Timeout: {snapshot.timeout_seconds.value}s "
+            f"({snapshot.timeout_seconds.source})"
+        )
+        return
+
     db_settings = await sessions.get_user_settings(chat_id)
     user_config = config.get_user_config(chat_id)
     pool = _get_pool(context)
@@ -879,10 +949,19 @@ async def _handle_settings_reset(
     assert update.message is not None
     valid_fields = {"model", "timeout"}
 
+    authority = _canonical_settings_authority(context, chat_id)
+
     if field:
         field = field.lower()
         if field not in valid_fields:
             await update.message.reply_text(f"Unknown field: {field}\nFields: {', '.join(sorted(valid_fields))}")
+            return
+        if authority is not None:
+            await _get_core_services(context).settings_workspaces.reset_settings(
+                authority,
+                field,
+            )
+            await update.message.reply_text(f"Cleared {field} override. Using default. Session restarted.")
             return
         await sessions.delete_user_setting(chat_id, field)
         pool = _get_pool(context)
@@ -894,6 +973,10 @@ async def _handle_settings_reset(
         await _end_session(chat_id)
         await update.message.reply_text(f"Cleared {field} override. Using default. Session restarted.")
     else:
+        if authority is not None:
+            await _get_core_services(context).settings_workspaces.reset_settings(authority)
+            await update.message.reply_text("All settings cleared. Using defaults. Session restarted.")
+            return
         await sessions.delete_all_user_settings(chat_id)
         pool = _get_pool(context)
         # Revert all fields to their resolved defaults before
@@ -1289,6 +1372,14 @@ async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
     Returns the WorkspaceConfig for the target workspace (or None) so
     callers can display config details without a redundant lookup.
     """
+    authority = _canonical_settings_authority(context, chat_id)
+    if authority is not None:
+        await _get_core_services(context).settings_workspaces.switch_workspace(
+            authority,
+            str(path),
+        )
+        return context.bot_data["config"].get_workspace_config(path)
+
     pool = _get_pool(context)
     config: Config = context.bot_data["config"]
     home = pool.get_home_workspace(chat_id)
@@ -1428,15 +1519,27 @@ async def _handle_workspace_config(
     """
     assert update.message is not None
     chat_id = _chat_id(update)
-    pool = _get_pool(context)
-    config: Config = context.bot_data["config"]
-    workspace = await pool.get_effective_workspace(chat_id)
-    workspace_str = str(workspace)
 
     # Parse: "config [field] [value...]"
     parts = target.split(None, 2)  # ["config"], ["config", field], or ["config", field, value]
     field = parts[1].lower() if len(parts) > 1 else None
     value = parts[2] if len(parts) > 2 else None
+
+    authority = _canonical_settings_authority(context, chat_id)
+    if authority is not None:
+        await _handle_canonical_workspace_config(
+            update,
+            context,
+            authority,
+            field=field,
+            value=value,
+        )
+        return
+
+    pool = _get_pool(context)
+    config: Config = context.bot_data["config"]
+    workspace = await pool.get_effective_workspace(chat_id)
+    workspace_str = str(workspace)
 
     # /workspace config - show current settings
     if field is None:
@@ -1511,6 +1614,193 @@ async def _handle_workspace_config(
         return
 
     await update.message.reply_text(f"Unknown config field: {field}\nFields: model, timeout, env, prompt, reset")
+
+
+async def _handle_canonical_workspace_config(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    authority: SettingsWorkspaceAuthority,
+    *,
+    field: str | None,
+    value: str | None,
+) -> None:
+    """Present Telegram workspace-config commands over the core service."""
+    assert update.message is not None
+    service = _get_core_services(context).settings_workspaces
+    try:
+        if field is None:
+            snapshot = await service.workspace_config(authority)
+            await update.message.reply_text(_format_canonical_workspace_config(snapshot))
+            return
+
+        if field == "reset":
+            reset_field = value.lower() if value else None
+            snapshot = await service.reset_workspace_config(
+                authority,
+                field=reset_field,
+            )
+            if reset_field is None:
+                message = "All workspace config cleared. Using global defaults."
+            else:
+                message = f"{reset_field} reset to default."
+            await update.message.reply_text(message)
+            return
+
+        if field == "model":
+            if not value:
+                settings = await service.inspect(authority)
+                if settings.model_options:
+                    options = " | ".join(option.model_id for option in settings.model_options)
+                    await update.message.reply_text(f"Usage: /workspace config model <{options}>")
+                else:
+                    await update.message.reply_text("Usage: /workspace config model <model_id>")
+                return
+            snapshot = await service.set_workspace_config(
+                authority,
+                field="model",
+                value=value,
+            )
+            await update.message.reply_text(f"Model set to {snapshot.model.value}.")
+            return
+
+        if field == "timeout":
+            if not value:
+                await update.message.reply_text("Usage: /workspace config timeout <seconds>")
+                return
+            snapshot = await service.set_workspace_config(
+                authority,
+                field="timeout",
+                value=value,
+            )
+            await update.message.reply_text(f"Timeout set to {snapshot.timeout_seconds.value}s.")
+            return
+
+        if field == "env":
+            await _handle_canonical_workspace_environment(
+                update,
+                service,
+                authority,
+                value,
+            )
+            return
+
+        if field == "prompt":
+            await _handle_canonical_workspace_prompt(
+                update,
+                service,
+                authority,
+                value,
+            )
+            return
+
+        await update.message.reply_text(f"Unknown config field: {field}\nFields: model, timeout, env, prompt, reset")
+    except WorkshopSettingsWorkspaceAccessDenied:
+        await update.message.reply_text("Workspace access denied.")
+    except WorkshopSettingsWorkspaceValidationError as exc:
+        await update.message.reply_text(str(exc))
+
+
+def _format_canonical_workspace_config(
+    snapshot: WorkspaceConfigSnapshot,
+) -> str:
+    lines = [f"Config for {Path(snapshot.workspace).name}:"]
+    lines.append(f"  Model: {snapshot.model.value} ({snapshot.model.source})")
+    lines.append(f"  Timeout: {snapshot.timeout_seconds.value}s ({snapshot.timeout_seconds.source})")
+    if snapshot.environment_keys:
+        lines.append(f"  Env vars: {', '.join(snapshot.environment_keys)}")
+    if snapshot.has_prompt:
+        if snapshot.prompt is None:
+            lines.append(f"  Prompt: ({snapshot.prompt_source})")
+        else:
+            preview = snapshot.prompt[:100]
+            if len(snapshot.prompt) > 100:
+                preview += "..."
+            lines.append(f"  Prompt: {preview} ({snapshot.prompt_source})")
+    return "\n".join(lines)
+
+
+async def _handle_canonical_workspace_environment(
+    update: Update,
+    service: WorkshopSettingsWorkspaceService,
+    authority: SettingsWorkspaceAuthority,
+    value: str | None,
+) -> None:
+    assert update.message is not None
+    if not value:
+        snapshot = await service.workspace_config(authority)
+        if snapshot.environment_keys:
+            keys = "\n".join(f"  {key}" for key in snapshot.environment_keys)
+            await update.message.reply_text(f"Workspace env vars:\n{keys}")
+        else:
+            await update.message.reply_text("No workspace env vars set.")
+        return
+    if value.startswith("-"):
+        key = value[1:]
+        _, changed = await service.delete_workspace_environment_variable(
+            authority,
+            key=key,
+        )
+        await update.message.reply_text(f"Removed {key}." if changed else f"{key} is not set.")
+        return
+    if "=" not in value:
+        await update.message.reply_text("Usage: /workspace config env KEY=VALUE")
+        return
+    key, environment_value = value.split("=", 1)
+    key = key.strip()
+    await service.set_workspace_environment_variable(
+        authority,
+        key=key,
+        value=environment_value,
+    )
+    await update.message.reply_text(f"Set {key}.")
+
+
+async def _handle_canonical_workspace_prompt(
+    update: Update,
+    service: WorkshopSettingsWorkspaceService,
+    authority: SettingsWorkspaceAuthority,
+    value: str | None,
+) -> None:
+    assert update.message is not None
+    if update.message.document:
+        max_prompt_bytes = 100 * 1024
+        file_size = update.message.document.file_size
+        if file_size and file_size > max_prompt_bytes:
+            await update.message.reply_text(f"File too large ({file_size // 1024}KB). Max prompt file size is 100KB.")
+            return
+        file = await update.message.document.get_file()
+        raw = await file.download_as_bytearray()
+        try:
+            content = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            await update.message.reply_text("File must be UTF-8 text.")
+            return
+        await service.set_workspace_config(
+            authority,
+            field="prompt",
+            value=content.strip(),
+        )
+        await update.message.reply_text(f"Prompt set from file ({len(content)} chars).")
+        return
+    if not value:
+        snapshot = await service.workspace_config(authority)
+        if snapshot.prompt:
+            await update.message.reply_text(f"Current prompt:\n{snapshot.prompt}")
+        elif snapshot.has_prompt:
+            await update.message.reply_text(f"Prompt is configured through {snapshot.prompt_source}.")
+        else:
+            await update.message.reply_text("No workspace prompt set.")
+        return
+    if value.strip().lower() == "clear":
+        await service.reset_workspace_config(authority, field="prompt")
+        await update.message.reply_text("Prompt cleared.")
+        return
+    await service.set_workspace_config(
+        authority,
+        field="prompt",
+        value=value.strip(),
+    )
+    await update.message.reply_text("Prompt set.")
 
 
 async def _show_workspace_config(
@@ -1739,6 +2029,30 @@ async def handle_workspaces(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     """Handle /workspaces - show an inline keyboard of recent workspaces."""
     assert update.message is not None
     chat_id = _chat_id(update)
+    authority = _canonical_settings_authority(context, chat_id)
+    if authority is not None:
+        snapshot = await _get_core_services(context).settings_workspaces.inspect(authority)
+        if len(snapshot.workspaces) == 1 and snapshot.workspaces[0].home:
+            await update.message.reply_text("No workspace history yet.\nUse /workspace new <name> to create one.")
+            return
+        buttons: list[list[InlineKeyboardButton]] = []
+        for index, workspace in enumerate(snapshot.workspaces):
+            label = f"🏠 {workspace.name}" if workspace.home else workspace.name
+            if workspace.current:
+                label += " 🟢"
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        label,
+                        callback_data=f"ws:canonical:{index}",
+                    )
+                ]
+            )
+        await update.message.reply_text(
+            "Workspaces:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
     pool = _get_pool(context)
     base, allowed = await pool.resolve_workspace_access(chat_id)
     history = await sessions.get_workspace_history(chat_id)
@@ -1773,6 +2087,39 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
 
     assert query.data is not None
     data = query.data.removeprefix("ws:")
+    authority = _canonical_settings_authority(context, chat_id)
+    if data.startswith("canonical:") and authority is not None:
+        try:
+            index = int(data.removeprefix("canonical:"))
+        except ValueError:
+            await query.answer("Invalid selection.")
+            return
+        snapshot = await _get_core_services(context).settings_workspaces.inspect(authority)
+        if index < 0 or index >= len(snapshot.workspaces):
+            await query.answer("Workspace no longer available.")
+            await query.edit_message_text(
+                "No change.",
+                reply_markup=InlineKeyboardMarkup([]),
+            )
+            return
+        selected = snapshot.workspaces[index]
+        if selected.current:
+            await query.answer()
+            await query.edit_message_text(
+                "No change.",
+                reply_markup=InlineKeyboardMarkup([]),
+            )
+            return
+        await query.answer()
+        await _get_core_services(context).settings_workspaces.switch_workspace(
+            authority,
+            selected.path,
+        )
+        await query.edit_message_text(
+            f"Switched to {selected.name}. Session cleared.",
+            reply_markup=InlineKeyboardMarkup([]),
+        )
+        return
     pool = _get_pool(context)
     # Per-user resolution: the "Home" keyboard button maps to THIS user's
     # home directory, not a shared one.

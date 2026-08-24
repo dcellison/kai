@@ -130,6 +130,37 @@ class WorkshopExecutionStateRegistry:
             return None
         return self._by_principal.get(canonical_id)
 
+    def maybe_for_principal_channel(
+        self,
+        principal_id: str | PrincipalId,
+        channel_id: str | ChannelId,
+    ) -> WorkshopExecutionStateNamespace | None:
+        """Resolve one exact canonical direct-execution authority."""
+        try:
+            canonical_principal = principal_id if isinstance(principal_id, PrincipalId) else PrincipalId(principal_id)
+            canonical_channel = channel_id if isinstance(channel_id, ChannelId) else ChannelId(channel_id)
+        except (TypeError, ValueError):
+            return None
+        namespace = self._by_principal.get(canonical_principal)
+        if namespace is None or namespace.channel_id != canonical_channel:
+            return None
+        return namespace
+
+    def maybe_for_runtime_profile_id(
+        self,
+        runtime_profile_id: str | RuntimeProfileId,
+    ) -> WorkshopExecutionStateNamespace | None:
+        """Resolve one exact protected runtime profile."""
+        try:
+            canonical_id = (
+                runtime_profile_id
+                if isinstance(runtime_profile_id, RuntimeProfileId)
+                else RuntimeProfileId(runtime_profile_id)
+            )
+        except (TypeError, ValueError):
+            return None
+        return self._by_profile.get(canonical_id)
+
 
 async def reconcile_legacy_execution_state(
     connection: aiosqlite.Connection,

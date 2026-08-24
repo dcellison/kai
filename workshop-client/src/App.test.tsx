@@ -12,16 +12,19 @@ import {
   loadNavigation,
   loadRun,
   loadRunTrace,
+  loadSettingsWorkspace,
   loadTimeline,
   redeemEnrollment,
   streamTimeline,
   submitCommand,
+  switchWorkspace,
 } from "./api";
 import type {
   TimelineMessage,
   TimelineSnapshot,
   WorkshopNavigation,
   WorkshopRun,
+  WorkshopSettingsWorkspace,
 } from "./types";
 
 vi.mock("./api", async (importOriginal) => {
@@ -35,9 +38,11 @@ vi.mock("./api", async (importOriginal) => {
     loadTimeline: vi.fn(),
     loadRun: vi.fn(),
     loadRunTrace: vi.fn(),
+    loadSettingsWorkspace: vi.fn(),
     redeemEnrollment: vi.fn(),
     streamTimeline: vi.fn(),
     submitCommand: vi.fn(),
+    switchWorkspace: vi.fn(),
   };
 });
 
@@ -127,6 +132,33 @@ const completedRun: WorkshopRun = {
   terminalAt: "2026-08-13T09:00:02Z",
   terminalCode: null,
 };
+const settingsWorkspace: WorkshopSettingsWorkspace = {
+  backend: "codex",
+  channelId,
+  model: { source: "runtime policy", value: "gpt-5.6-sol" },
+  modelOptions: [
+    { displayName: "GPT-5.6 Sol", modelId: "gpt-5.6-sol" },
+  ],
+  principalId: "prn_00000000000000000000000000000001",
+  provider: "openai",
+  runtimeProfileId: "rtp_00000000000000000000000000000001",
+  timeoutSeconds: { source: "runtime policy", value: 120 },
+  workspace: "/Users/kai/Projects/kai",
+  workspaces: [
+    {
+      current: true,
+      home: false,
+      name: "kai",
+      path: "/Users/kai/Projects/kai",
+    },
+    {
+      current: false,
+      home: true,
+      name: "home",
+      path: "/var/lib/kai/home/principal",
+    },
+  ],
+};
 
 type StreamHandlers = Parameters<typeof streamTimeline>[2];
 
@@ -148,6 +180,15 @@ describe("Workshop React client", () => {
     });
     vi.mocked(loadRun).mockResolvedValue(completedRun);
     vi.mocked(loadRunTrace).mockResolvedValue({ entries: [], hasMore: false });
+    vi.mocked(loadSettingsWorkspace).mockResolvedValue(settingsWorkspace);
+    vi.mocked(switchWorkspace).mockResolvedValue({
+      ...settingsWorkspace,
+      workspace: "/var/lib/kai/home/principal",
+      workspaces: settingsWorkspace.workspaces.map((workspace) => ({
+        ...workspace,
+        current: workspace.home,
+      })),
+    });
     vi.mocked(loadArtifactBlob).mockResolvedValue(
       new Blob(["artifact"], { type: "text/plain" }),
     );
@@ -221,6 +262,31 @@ describe("Workshop React client", () => {
 
     expect(await screen.findByText(liveMessage.body)).toBeVisible();
     expect(container.querySelector("img")).toBeNull();
+  });
+
+  it("shows canonical runtime settings and switches an authorized workspace", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+
+    render(<App />);
+
+    expect(await screen.findByText("gpt-5.6-sol")).toBeVisible();
+    const selector = screen.getByLabelText("Workspace");
+    expect(selector).toHaveValue("/Users/kai/Projects/kai");
+    await user.selectOptions(selector, "/var/lib/kai/home/principal");
+
+    expect(switchWorkspace).toHaveBeenCalledWith(
+      { channelId, token: "existing-session" },
+      "/var/lib/kai/home/principal",
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("Workspace")).toHaveValue(
+        "/var/lib/kai/home/principal",
+      ),
+    );
   });
 
   it("fetches the run trace incrementally on trace doorbells", async () => {

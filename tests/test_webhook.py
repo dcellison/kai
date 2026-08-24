@@ -2538,6 +2538,7 @@ class TestNotificationChatIdMutations:
             client_commands=MagicMock(),
             run_previews=WorkshopRunPreviewRegistry(),
             artifacts=MagicMock(),
+            settings_workspaces=MagicMock(),
         )
         core_host = MagicMock()
         github_notifications = MagicMock(spec=WorkshopTelegramNotificationService)
@@ -2605,6 +2606,7 @@ class TestNotificationChatIdMutations:
             client_commands=MagicMock(),
             run_previews=WorkshopRunPreviewRegistry(),
             artifacts=MagicMock(),
+            settings_workspaces=MagicMock(),
         )
         fake_runner = MagicMock()
         fake_runner.setup = AsyncMock()
@@ -2674,6 +2676,7 @@ class TestNotificationChatIdMutations:
             client_commands=MagicMock(),
             run_previews=WorkshopRunPreviewRegistry(),
             artifacts=MagicMock(),
+            settings_workspaces=MagicMock(),
         )
         core_host = MagicMock()
         github_notifications = MagicMock(spec=WorkshopTelegramNotificationService)
@@ -2731,6 +2734,9 @@ class TestNotificationChatIdMutations:
                 "/v1/channels/{channel_id}/runs/{run_id}",
                 "/v1/channels/{channel_id}/runs/{run_id}/cancel",
                 "/v1/channels/{channel_id}/runs/{run_id}/trace",
+                "/v1/channels/{channel_id}/settings",
+                "/v1/channels/{channel_id}/workspace",
+                "/v1/channels/{channel_id}/workspace-config",
                 "/workshop",
                 "/workshop/",
                 "/workshop/app.css",

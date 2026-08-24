@@ -13,6 +13,7 @@ import type {
   WorkshopRunTraceSignal,
   WorkshopRunTransition,
   WorkshopSession,
+  WorkshopSettingsWorkspace,
   WorkshopArtifactKind,
   WorkshopArtifactSummary,
 } from "./types";
@@ -352,6 +353,119 @@ export async function loadNavigation(token: string): Promise<WorkshopNavigation>
     },
     workshops,
   };
+}
+
+function parseSettingsWorkspace(
+  payload: unknown,
+  channelId: string,
+): WorkshopSettingsWorkspace {
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    payload.channel_id !== channelId ||
+    typeof payload.principal_id !== "string" ||
+    !PRINCIPAL_PATTERN.test(payload.principal_id) ||
+    typeof payload.runtime_profile_id !== "string" ||
+    typeof payload.backend !== "string" ||
+    typeof payload.provider !== "string" ||
+    typeof payload.workspace !== "string" ||
+    !isRecord(payload.model) ||
+    typeof payload.model.value !== "string" ||
+    typeof payload.model.source !== "string" ||
+    !isRecord(payload.timeout_seconds) ||
+    !Number.isSafeInteger(payload.timeout_seconds.value) ||
+    typeof payload.timeout_seconds.source !== "string" ||
+    !Array.isArray(payload.workspaces) ||
+    (payload.model_options !== null && !Array.isArray(payload.model_options))
+  ) {
+    throw new Error("Kai returned unsupported settings and workspace state.");
+  }
+  const workspaces = payload.workspaces.map((rawWorkspace) => {
+    if (
+      !isRecord(rawWorkspace) ||
+      typeof rawWorkspace.path !== "string" ||
+      typeof rawWorkspace.name !== "string" ||
+      typeof rawWorkspace.current !== "boolean" ||
+      typeof rawWorkspace.home !== "boolean"
+    ) {
+      throw new Error("Kai returned unsupported workspace state.");
+    }
+    return {
+      current: rawWorkspace.current,
+      home: rawWorkspace.home,
+      name: rawWorkspace.name,
+      path: rawWorkspace.path,
+    };
+  });
+  const modelOptions = payload.model_options === null
+    ? null
+    : payload.model_options.map((rawModel) => {
+        if (
+          !isRecord(rawModel) ||
+          typeof rawModel.model_id !== "string" ||
+          typeof rawModel.display_name !== "string"
+        ) {
+          throw new Error("Kai returned unsupported model options.");
+        }
+        return {
+          displayName: rawModel.display_name,
+          modelId: rawModel.model_id,
+        };
+      });
+  return {
+    backend: payload.backend,
+    channelId,
+    model: {
+      source: payload.model.source,
+      value: payload.model.value,
+    },
+    modelOptions,
+    principalId: payload.principal_id,
+    provider: payload.provider,
+    runtimeProfileId: payload.runtime_profile_id,
+    timeoutSeconds: {
+      source: payload.timeout_seconds.source,
+      value: payload.timeout_seconds.value as number,
+    },
+    workspace: payload.workspace,
+    workspaces,
+  };
+}
+
+export async function loadSettingsWorkspace(
+  session: WorkshopSession,
+): Promise<WorkshopSettingsWorkspace> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/settings`,
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(
+      safeErrorMessage(payload, "Could not load settings and workspaces."),
+    );
+  }
+  return parseSettingsWorkspace(payload, session.channelId);
+}
+
+export async function switchWorkspace(
+  session: WorkshopSession,
+  path: string,
+): Promise<WorkshopSettingsWorkspace> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/workspace`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not switch workspace."));
+  }
+  return parseSettingsWorkspace(payload, session.channelId);
 }
 
 export async function submitCommand(

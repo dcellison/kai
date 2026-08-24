@@ -18,8 +18,10 @@ import {
   loadArtifactBlob,
   loadRun,
   loadRunTrace,
+  loadSettingsWorkspace,
   redeemEnrollment,
   submitCommand,
+  switchWorkspace,
 } from "./api";
 import type {
   CommandSubmissionResult,
@@ -33,6 +35,7 @@ import type {
   WorkshopChannelSummary,
   WorkshopNavigation,
   WorkshopSession,
+  WorkshopSettingsWorkspace,
   WorkshopSummary,
   WorkshopArtifactSummary,
 } from "./types";
@@ -749,8 +752,10 @@ function WorkshopView({
   onLoadArtifact,
   onLoadRun,
   onLoadRunTrace,
+  onLoadSettingsWorkspace,
   onSelectChannel,
   onSubmitCommand,
+  onSwitchWorkspace,
 }: {
   channel: WorkshopChannelSummary;
   connection: ConnectionState;
@@ -768,12 +773,14 @@ function WorkshopView({
   onLoadArtifact: (artifactId: string) => Promise<Blob>;
   onLoadRun: (runId: string) => Promise<WorkshopRun>;
   onLoadRunTrace: (runId: string, afterSeq: number) => Promise<WorkshopRunTracePage>;
+  onLoadSettingsWorkspace: () => Promise<WorkshopSettingsWorkspace>;
   onSelectChannel: (channelId: string) => void;
   onSubmitCommand: (
     clientMessageId: string,
     body: string,
     artifact: File | null,
   ) => Promise<CommandSubmissionResult>;
+  onSwitchWorkspace: (path: string) => Promise<WorkshopSettingsWorkspace>;
 }): React.JSX.Element {
   const channelId = channel.channelId;
   const channelName = channelDisplayName(channel);
@@ -797,6 +804,11 @@ function WorkshopView({
   const [resizingSidebar, setResizingSidebar] = useState(false);
   const [contextWidth, setContextWidth] = useState(restoreContextWidth);
   const [resizingContext, setResizingContext] = useState(false);
+  const [settingsWorkspace, setSettingsWorkspace] =
+    useState<WorkshopSettingsWorkspace | null>(null);
+  const [settingsWorkspaceError, setSettingsWorkspaceError] =
+    useState<string | null>(null);
+  const [switchingWorkspace, setSwitchingWorkspace] = useState(false);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const artifactInputRef = useRef<HTMLInputElement | null>(null);
@@ -831,6 +843,53 @@ function WorkshopView({
   useEffect(() => {
     storeContextWidth(contextWidth);
   }, [contextWidth]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setSettingsWorkspace(null);
+    setSettingsWorkspaceError(null);
+    if (!channel.canSubmitCommands) {
+      return () => {
+        cancelled = true;
+      };
+    }
+    void onLoadSettingsWorkspace()
+      .then((snapshot) => {
+        if (!cancelled) {
+          setSettingsWorkspace(snapshot);
+        }
+      })
+      .catch((caught) => {
+        if (!cancelled) {
+          setSettingsWorkspaceError(
+            caught instanceof Error
+              ? caught.message
+              : "Could not load settings and workspaces.",
+          );
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [channel.canSubmitCommands, channelId, onLoadSettingsWorkspace]);
+
+  const selectWorkspace = async (path: string): Promise<void> => {
+    if (!settingsWorkspace || path === settingsWorkspace.workspace) {
+      return;
+    }
+    setSettingsWorkspaceError(null);
+    setSwitchingWorkspace(true);
+    try {
+      setSettingsWorkspace(await onSwitchWorkspace(path));
+      setActiveRun(null);
+    } catch (caught) {
+      setSettingsWorkspaceError(
+        caught instanceof Error ? caught.message : "Could not switch workspace.",
+      );
+    } finally {
+      setSwitchingWorkspace(false);
+    }
+  };
 
   // The composer rests at a single line and grows with its content, so the
   // whole draft (including a restored per-channel draft) stays visible up to
@@ -1666,6 +1725,50 @@ function WorkshopView({
 
           <section className="context-section trace-section">
             <span className="section-number">04</span>
+            <h3>Runtime and workspace</h3>
+            {settingsWorkspace ? (
+              <div className="runtime-settings">
+                <p>
+                  <strong>{settingsWorkspace.backend}</strong>
+                  {settingsWorkspace.provider
+                    ? ` · ${settingsWorkspace.provider}`
+                    : ""}
+                </p>
+                <p>
+                  Model: <code>{settingsWorkspace.model.value}</code>
+                  <br />
+                  Timeout: {settingsWorkspace.timeoutSeconds.value}s
+                </p>
+                <label htmlFor={`workspace-${channelId}`}>Workspace</label>
+                <select
+                  id={`workspace-${channelId}`}
+                  value={settingsWorkspace.workspace}
+                  disabled={switchingWorkspace || isRunActive(activeRun)}
+                  onChange={(event) => void selectWorkspace(event.target.value)}
+                >
+                  {settingsWorkspace.workspaces.map((workspaceOption) => (
+                    <option key={workspaceOption.path} value={workspaceOption.path}>
+                      {workspaceOption.name}
+                      {workspaceOption.home ? " (home)" : ""}
+                    </option>
+                  ))}
+                </select>
+                <p className="settings-source">
+                  Model: {settingsWorkspace.model.source}; timeout:{" "}
+                  {settingsWorkspace.timeoutSeconds.source}
+                </p>
+              </div>
+            ) : settingsWorkspaceError ? (
+              <p className="settings-error">{settingsWorkspaceError}</p>
+            ) : channel.canSubmitCommands ? (
+              <p>Loading runtime settings…</p>
+            ) : (
+              <p>No agent runtime is assigned to this channel.</p>
+            )}
+          </section>
+
+          <section className="context-section trace-section">
+            <span className="section-number">05</span>
             <h3>Run inspector</h3>
             <RunTraceCard
               entries={traceEntries}
@@ -1675,14 +1778,6 @@ function WorkshopView({
             />
           </section>
 
-          <section className="context-section future-section">
-            <span className="section-number">05</span>
-            <h3>Coming into view</h3>
-            <ul>
-              <li>Threads</li>
-              <li>Projects and shared artifacts</li>
-            </ul>
-          </section>
         </div>
       </aside>
     </main>
@@ -1797,6 +1892,14 @@ function ActiveWorkshopClient({
     (artifactId: string) => startArtifactDownload(session, artifactId),
     [session],
   );
+  const loadSelectedSettingsWorkspace = useCallback(
+    () => withAccessHandling(() => loadSettingsWorkspace(session)),
+    [session, withAccessHandling],
+  );
+  const switchSelectedWorkspace = useCallback(
+    (path: string) => withAccessHandling(() => switchWorkspace(session, path)),
+    [session, withAccessHandling],
+  );
   if (!selected) {
     return <main className="loading-workshop">Workshop access changed.</main>;
   }
@@ -1819,8 +1922,10 @@ function ActiveWorkshopClient({
       onCancelRun={cancelSelectedRun}
       onLoadRun={loadSelectedRun}
       onLoadRunTrace={loadSelectedRunTrace}
+      onLoadSettingsWorkspace={loadSelectedSettingsWorkspace}
       onSelectChannel={onSelectChannel}
       onSubmitCommand={submitSelectedCommand}
+      onSwitchWorkspace={switchSelectedWorkspace}
     />
   );
 }
