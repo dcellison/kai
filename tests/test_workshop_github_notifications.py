@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from argparse import Namespace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from kai import workshop_cli
 from kai.workshop.bootstrap import (
     BootstrapHuman,
     BootstrapNotificationChannel,
@@ -17,6 +19,7 @@ from kai.workshop.delivery_outbox import NOTIFICATION_PURPOSE
 from kai.workshop.domain import ChannelId
 from kai.workshop.integration_notifications import (
     IntegrationNotification,
+    IntegrationNotificationError,
     WorkshopIntegrationNotificationService,
 )
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
@@ -87,6 +90,131 @@ class TestIntegrationNotificationInput:
 
 
 class TestWorkshopIntegrationNotificationService:
+    async def test_open_seeds_default_generic_route_from_canonical_admin(self, tmp_path: Path):
+        path = tmp_path / "kai.db"
+        store = await _open_notification_store(path)
+        await store.close()
+
+        service = await WorkshopIntegrationNotificationService.open(path)
+        try:
+            status = await service.route_status(source="generic", route_name="default")
+
+            assert status.state == "active"
+            assert status.channel_id is not None
+            assert status.detail == "canonical destination is configured"
+        finally:
+            await service.close()
+
+    async def test_route_records_without_resolving_any_transport_binding(self, tmp_path: Path):
+        path = tmp_path / "kai.db"
+        store = await _open_notification_store(path)
+        await store.close()
+        service = await WorkshopIntegrationNotificationService.open(path)
+        try:
+            notification = IntegrationNotification(
+                delivery_id="generic-route-1",
+                source="generic",
+                event_type="notification",
+                body="Canonical route",
+                occurred_at=_NOW,
+            )
+
+            result = await service.record_for_route(notification, route_name="default")
+
+            assert result.inserted is True
+            assert len(result.deliveries) == 1
+        finally:
+            await service.close()
+
+    async def test_ambiguous_admin_policy_does_not_seed_or_deliver(self, tmp_path: Path):
+        store = await WorkshopEventStore.open(tmp_path / "kai.db")
+        await bootstrap_default_workshop(
+            store,
+            (
+                BootstrapHuman(
+                    display_name="Daniel",
+                    role="admin",
+                    transport="telegram",
+                    external_subject="101",
+                    external_channel_id="101",
+                ),
+                BootstrapHuman(
+                    display_name="Scott",
+                    role="admin",
+                    transport="telegram",
+                    external_subject="202",
+                    external_channel_id="202",
+                ),
+            ),
+        )
+        try:
+            service = WorkshopIntegrationNotificationService(store)
+            status = await service.reconcile_default_generic_route()
+
+            assert status.state == "ambiguous"
+            with pytest.raises(IntegrationNotificationError, match="is missing"):
+                await service.record_for_route(
+                    IntegrationNotification(
+                        delivery_id="generic-route-ambiguous",
+                        source="generic",
+                        event_type="notification",
+                        body="Do not route",
+                        occurred_at=_NOW,
+                    ),
+                    route_name="default",
+                )
+        finally:
+            await store.close()
+
+    async def test_operator_can_inspect_and_assign_default_route(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        capsys,
+    ):
+        path = tmp_path / "kai.db"
+        store = await _open_notification_store(path)
+        async with store.connection.execute("SELECT id FROM channels WHERE kind = 'notification'") as cursor:
+            channel_id = str((await cursor.fetchone())[0])
+        await store.close()
+        monkeypatch.setattr(workshop_cli, "DATA_DIR", tmp_path)
+
+        assert await workshop_cli._run(Namespace(command="integration-route", action="status")) == 2
+        assert "Status: missing" in capsys.readouterr().out
+
+        assert (
+            await workshop_cli._run(
+                Namespace(
+                    command="integration-route",
+                    action="set",
+                    channel_id=channel_id,
+                )
+            )
+            == 0
+        )
+        output = capsys.readouterr().out
+        assert "Integration route: generic/default" in output
+        assert "Status: active" in output
+        assert f"Channel: {channel_id}" in output
+
+    async def test_operator_can_set_route_to_canonical_notification_channel(self, tmp_path: Path):
+        store = await _open_notification_store(tmp_path / "kai.db")
+        try:
+            async with store.connection.execute("SELECT id FROM channels WHERE kind = 'notification'") as cursor:
+                channel_id = ChannelId(str((await cursor.fetchone())[0]))
+            service = WorkshopIntegrationNotificationService(store)
+
+            status = await service.set_route(
+                source="generic",
+                route_name="default",
+                channel_id=channel_id,
+            )
+
+            assert status.state == "active"
+            assert status.channel_id == channel_id
+        finally:
+            await store.close()
+
     async def test_records_directly_to_authorized_canonical_channel(self, tmp_path: Path):
         store = await _open_notification_store(tmp_path / "kai.db")
         try:

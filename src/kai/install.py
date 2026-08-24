@@ -8509,6 +8509,7 @@ def _cmd_status() -> None:
     print(_deployed_adapter_policy_status(_DEPLOYED_ENV_FILE))
     print(_core_schedule_status(Path(data_dir) / "kai.db"))
     print(_github_automation_status(Path(data_dir) / "kai.db"))
+    print(_integration_route_status(Path(data_dir) / "kai.db"))
     if conf_env is None:
         print("Client adapters (install.conf artifact): unavailable")
     else:
@@ -8889,6 +8890,40 @@ def _github_automation_status(db_path: Path) -> str:
         f"succeeded={succeeded}, failed={failed}, uncertain={uncertain}; "
         "subscription routing=canonical"
     )
+
+
+def _integration_route_status(db_path: Path) -> str:
+    """Report the explicit canonical destination for generic webhooks."""
+    prefix = "Workshop integration routing:"
+    if not db_path.is_file():
+        return f"{prefix} NOT VERIFIED (database unavailable)"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'workshop_integration_routes'"
+            ).fetchone()
+            if table is None:
+                return f"{prefix} pending; canonical route registry unavailable"
+            row = connection.execute(
+                "SELECT c.kind, COUNT(p.id) FROM workshop_integration_routes r "
+                "LEFT JOIN channels c ON c.id = r.channel_id "
+                "LEFT JOIN channel_agents ca ON ca.channel_id = c.id "
+                "LEFT JOIN agents a ON a.id = ca.agent_id AND a.workshop_id = c.workshop_id "
+                "LEFT JOIN principals p ON p.id = a.principal_id AND p.kind = 'agent' "
+                "WHERE r.source = 'generic' AND r.route_name = 'default' "
+                "GROUP BY r.source, r.route_name, c.id, c.kind"
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        return f"{prefix} NOT VERIFIED ({exc})"
+    if row is None:
+        return f"{prefix} INCOMPLETE; generic/default=missing"
+    kind, agents = str(row[0] or "missing"), int(row[1] or 0)
+    if kind not in {"direct", "notification"} or agents != 1:
+        return f"{prefix} INCOMPLETE; generic/default=invalid, kind={kind}, agents={agents}"
+    return f"{prefix} active; generic/default={kind}, agents={agents}; transport lookup=disabled"
 
 
 def _deployed_webhook_secret_migration_status(env_path: Path) -> str:

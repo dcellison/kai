@@ -38,6 +38,12 @@ from kai.workshop.human_provisioning import (
     WorkshopHumanProvisioner,
     WorkshopHumanProvisioningError,
 )
+from kai.workshop.integration_notifications import (
+    DEFAULT_INTEGRATION_ROUTE,
+    GENERIC_INTEGRATION_SOURCE,
+    IntegrationNotificationError,
+    WorkshopIntegrationNotificationService,
+)
 from kai.workshop.runtime_assignments import (
     WorkshopRuntimeAssignmentError,
     WorkshopRuntimeAssignmentService,
@@ -162,6 +168,21 @@ def _parser() -> argparse.ArgumentParser:
         help="write one canonical channel transcript as NDJSON to standard output",
     )
     export.add_argument("--channel-id", required=True)
+    integration_route = commands.add_parser(
+        "integration-route",
+        help="inspect or assign the canonical generic-webhook destination",
+    )
+    integration_route_actions = integration_route.add_subparsers(dest="action", required=True)
+    integration_route_actions.add_parser("status")
+    integration_route_actions.add_parser(
+        "reconcile",
+        help="seed the route from canonical admin policy when unambiguous",
+    )
+    set_route = integration_route_actions.add_parser(
+        "set",
+        help="assign the generic/default route to a canonical channel",
+    )
+    set_route.add_argument("--channel-id", required=True)
     return parser
 
 
@@ -240,6 +261,31 @@ def _qualification_database(data_dir: Path) -> Path:
 async def _run(args: argparse.Namespace) -> int:
     store = await WorkshopEventStore.open(_qualification_database(DATA_DIR))
     try:
+        if args.command == "integration-route":
+            service = WorkshopIntegrationNotificationService(store)
+            if args.action == "set":
+                try:
+                    channel_id = ChannelId(args.channel_id)
+                except (TypeError, ValueError) as exc:
+                    raise IntegrationNotificationError("Invalid canonical channel ID") from exc
+                status = await service.set_route(
+                    source=GENERIC_INTEGRATION_SOURCE,
+                    route_name=DEFAULT_INTEGRATION_ROUTE,
+                    channel_id=channel_id,
+                )
+            elif args.action == "reconcile":
+                status = await service.reconcile_default_generic_route()
+            else:
+                status = await service.route_status(
+                    source=GENERIC_INTEGRATION_SOURCE,
+                    route_name=DEFAULT_INTEGRATION_ROUTE,
+                )
+            print(f"Integration route: {status.source}/{status.route_name}")
+            print(f"Status: {status.state}")
+            print(f"Channel: {status.channel_id or 'unavailable'}")
+            print(f"Detail: {status.detail}")
+            return 0 if status.state == "active" else 2
+
         if args.command == "transcript":
             export = await build_canonical_transcript_export(
                 store,
@@ -439,6 +485,8 @@ def cli(args: list[str]) -> None:
         raise SystemExit(f"Workshop runtime assignment failed: {exc}") from exc
     except WorkshopRuntimeProfileError as exc:
         raise SystemExit(f"Workshop runtime profile failed: {exc}") from exc
+    except IntegrationNotificationError as exc:
+        raise SystemExit(f"Workshop integration route failed: {exc}") from exc
     except CanonicalTranscriptExportError as exc:
         raise SystemExit(f"Workshop transcript export failed: {exc}") from exc
     except (DeliveryQualificationError, DeliveryTargetNotFoundError) as exc:

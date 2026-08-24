@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 27
+WORKSHOP_SCHEMA_VERSION = 28
 
 
 @dataclass(frozen=True, slots=True)
@@ -1255,6 +1255,31 @@ _GITHUB_AUTOMATION_SCHEMA = SchemaMigration(
     ),
 )
 
+_INTEGRATION_ROUTE_SCHEMA = SchemaMigration(
+    version=28,
+    name="canonical_integration_routes",
+    statements=(
+        """
+        CREATE TABLE workshop_integration_routes (
+            source TEXT NOT NULL CHECK (
+                length(source) BETWEEN 1 AND 32
+                AND source NOT GLOB '*[^a-z0-9_]*'
+            ),
+            route_name TEXT NOT NULL CHECK (
+                length(route_name) BETWEEN 1 AND 64
+                AND route_name NOT GLOB '*[^a-z0-9_-]*'
+            ),
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            PRIMARY KEY (source, route_name)
+        )
+        """,
+        "CREATE INDEX workshop_integration_routes_channel_idx "
+        "ON workshop_integration_routes (channel_id, source, route_name)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -1283,6 +1308,7 @@ _MIGRATIONS = (
     _CANONICAL_TRANSCRIPT_AUTHORITY_SCHEMA,
     _CORE_SCHEDULER_SCHEMA,
     _GITHUB_AUTOMATION_SCHEMA,
+    _INTEGRATION_ROUTE_SCHEMA,
 )
 
 

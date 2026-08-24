@@ -1207,7 +1207,7 @@ def generic_request():
     """Create a mock request for the generic webhook endpoint."""
     request = MagicMock(spec=web.Request)
     notification_service = MagicMock()
-    notification_service.record_for_default_admin = AsyncMock(
+    notification_service.record_for_route = AsyncMock(
         return_value=MagicMock(message_id="msg_" + "2" * 32, inserted=True)
     )
     request.app = {
@@ -1227,8 +1227,21 @@ class TestGenericWebhook:
 
         assert resp.status == 200
         service = generic_request.app[WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY]
-        service.record_for_default_admin.assert_awaited_once()
-        assert service.record_for_default_admin.await_args.args[0].body == "Alert: disk full"
+        service.record_for_route.assert_awaited_once()
+        assert service.record_for_route.await_args.kwargs == {"route_name": "default"}
+        assert service.record_for_route.await_args.args[0].body == "Alert: disk full"
+
+    async def test_ignores_legacy_telegram_chat_destination(self, generic_request):
+        generic_request.app[CHAT_ID_KEY] = 12345
+        service = generic_request.app[WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY]
+        service.record_for_binding = AsyncMock()
+        generic_request.json = AsyncMock(return_value={"message": "Canonical only"})
+
+        resp = await _handle_generic(generic_request)
+
+        assert resp.status == 200
+        service.record_for_binding.assert_not_awaited()
+        service.record_for_route.assert_awaited_once()
 
     async def test_dumps_full_payload_when_no_message(self, generic_request):
         payload = {"key": "value", "count": 42}
@@ -1238,7 +1251,7 @@ class TestGenericWebhook:
 
         assert resp.status == 200
         service = generic_request.app[WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY]
-        sent_text = service.record_for_default_admin.await_args.args[0].body
+        sent_text = service.record_for_route.await_args.args[0].body
         # Should be a pretty-printed JSON dump
         assert '"key": "value"' in sent_text
         assert '"count": 42' in sent_text
@@ -1258,7 +1271,7 @@ class TestGenericWebhook:
 
         assert resp.status == 200
         service = generic_request.app[WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY]
-        sent_text = service.record_for_default_admin.await_args.args[0].body
+        sent_text = service.record_for_route.await_args.args[0].body
         assert sent_text == long_msg
 
     async def test_invalid_json_returns_400(self, generic_request):
@@ -1272,7 +1285,7 @@ class TestGenericWebhook:
     async def test_record_failure_returns_retryable_unavailable(self, generic_request):
         generic_request.json = AsyncMock(return_value={"message": "test"})
         service = generic_request.app[WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY]
-        service.record_for_default_admin = AsyncMock(side_effect=RuntimeError("database error"))
+        service.record_for_route = AsyncMock(side_effect=RuntimeError("database error"))
 
         resp = await _handle_generic(generic_request)
 
@@ -1298,7 +1311,7 @@ class TestGenericWebhook:
 
         assert resp.status == 401
         service = generic_request.app[WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY]
-        service.record_for_default_admin.assert_not_awaited()
+        service.record_for_route.assert_not_awaited()
 
 
 # ── GET /api/jobs ──────────────────────────────────────────────────

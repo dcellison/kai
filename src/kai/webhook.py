@@ -97,6 +97,7 @@ from kai.workshop.github_automation import (
     WorkshopGitHubAutomationService,
 )
 from kai.workshop.integration_notifications import (
+    DEFAULT_INTEGRATION_ROUTE,
     IntegrationNotification,
     WorkshopIntegrationNotificationService,
 )
@@ -877,8 +878,8 @@ async def _handle_generic(request: web.Request) -> web.Response:
     Handle generic webhook notifications from any source.
 
     Extracts a "message" field from the JSON payload (or dumps the full
-    payload), records it in the canonical admin channel, and requests delivery
-    through any configured channel bindings.
+    payload), records it through the explicit canonical generic/default route,
+    and requests delivery through any configured channel bindings.
     """
     try:
         payload = await request.json()
@@ -921,18 +922,10 @@ async def _handle_generic(request: web.Request) -> web.Response:
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=400)
     try:
-        fallback_chat_id = request.app.get(CHAT_ID_KEY)
-        recorded = (
-            await service.record_for_binding(
-                notification,
-                transport="telegram",
-                external_channel_id=str(fallback_chat_id),
-            )
-            if fallback_chat_id is not None
-            else None
+        recorded = await service.record_for_route(
+            notification,
+            route_name=DEFAULT_INTEGRATION_ROUTE,
         )
-        if recorded is None:
-            recorded = await service.record_for_default_admin(notification)
     except Exception:
         log.exception("Failed to record generic webhook notification")
         return web.json_response({"status": "unavailable"}, status=503)
