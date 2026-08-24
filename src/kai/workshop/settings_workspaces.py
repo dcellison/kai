@@ -156,6 +156,7 @@ class WorkshopSettingsWorkspaceService:
             workspace,
         )
         home = self._runtime_pool.get_home_workspace(authority.runtime_profile_id)
+        home_resolved = home.resolve()
         base, allowed = await self._runtime_pool.resolve_workspace_access(authority.runtime_profile_id)
         history = await sessions.get_workspace_history(runtime_config_id)
         candidates: list[Path] = [home, workspace, *allowed]
@@ -166,7 +167,7 @@ class WorkshopSettingsWorkspaceService:
             resolved = path.expanduser().resolve()
             if resolved in seen or not resolved.is_dir():
                 continue
-            if resolved != home.resolve() and not is_workspace_allowed(
+            if resolved != home_resolved and not is_workspace_allowed(
                 resolved,
                 base,
                 allowed,
@@ -176,9 +177,9 @@ class WorkshopSettingsWorkspaceService:
             workspace_options.append(
                 WorkspaceOption(
                     path=str(resolved),
-                    name=self._workspace_name(resolved, base),
+                    name=self._workspace_name(resolved, base, home_resolved),
                     current=resolved == workspace.resolve(),
-                    home=resolved == home.resolve(),
+                    home=resolved == home_resolved,
                 )
             )
 
@@ -729,7 +730,9 @@ class WorkshopSettingsWorkspaceService:
         )
 
     @staticmethod
-    def _workspace_name(path: Path, base: Path | None) -> str:
+    def _workspace_name(path: Path, base: Path | None, home: Path) -> str:
+        if path == home:
+            return "Home"
         if base is not None:
             try:
                 return str(path.relative_to(base.resolve())) or path.name

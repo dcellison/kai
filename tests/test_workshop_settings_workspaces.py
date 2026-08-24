@@ -218,6 +218,9 @@ async def test_inspection_reports_workspace_precedence(
     assert snapshot.model.source == "workspace override"
     assert snapshot.timeout_seconds.value == 240
     assert snapshot.timeout_seconds.source == "workspace override"
+    assert snapshot.workspaces[0].path == str(pool.home.resolve())
+    assert snapshot.workspaces[0].name == "Home"
+    assert snapshot.workspaces[0].home is True
     assert pool.events == []
 
 
