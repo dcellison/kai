@@ -140,6 +140,72 @@ class TestAtomicConversationCommandAcceptance:
         finally:
             await store.close()
 
+    async def test_accepts_artifact_message_and_run_in_one_transaction(self, tmp_path: Path):
+        store = await _open_store(tmp_path / "kai.db")
+        storage_root = tmp_path / "files"
+        artifact_path = storage_root / "artifact.txt"
+        artifact_path.parent.mkdir(parents=True)
+        artifact_path.write_text("canonical attachment", encoding="utf-8")
+        artifact = StagedArtifact(
+            kind="document",
+            media_type="text/plain",
+            storage_path=artifact_path,
+            source_transport="desktop",
+            source_unique_id="artifact-1",
+            occurred_at=_NOW,
+            original_filename="artifact.txt",
+            created_for_attempt=True,
+        )
+        service = WorkshopConversationCommandService(
+            store,
+            artifact_storage_root=storage_root,
+        )
+        try:
+            accepted = await service.accept(_message(), artifact=artifact)
+            replay = await service.accept(_message(), artifact=artifact)
+
+            assert accepted.disposition == ConversationCommandDisposition.NEWLY_ACCEPTED
+            assert replay.disposition == ConversationCommandDisposition.READY_REPLAY
+            async with store.connection.execute(
+                "SELECT event_type FROM event_log WHERE position BETWEEN ? AND ? ORDER BY position",
+                (accepted.message.event.position, accepted.lifecycle.event.position),
+            ) as cursor:
+                assert [str(row[0]) for row in await cursor.fetchall()] == [
+                    "message.created",
+                    "artifact.created",
+                    "run.accepted",
+                ]
+            async with store.connection.execute("SELECT COUNT(*) FROM artifacts") as cursor:
+                assert int((await cursor.fetchone())[0]) == 1
+        finally:
+            await store.close()
+
+    async def test_artifact_failure_rolls_back_transport_message_and_run(self, tmp_path: Path):
+        store = await _open_store(tmp_path / "kai.db")
+        storage_root = tmp_path / "files"
+        artifact = StagedArtifact(
+            kind="document",
+            media_type="application/octet-stream",
+            storage_path=storage_root / "missing.bin",
+            source_transport="desktop",
+            source_unique_id="artifact-1",
+            occurred_at=_NOW,
+            original_filename="missing.bin",
+        )
+        try:
+            with pytest.raises(ArtifactStorageBoundaryError):
+                await WorkshopConversationCommandService(
+                    store,
+                    artifact_storage_root=storage_root,
+                ).accept(_message(), artifact=artifact)
+
+            async with store.connection.execute(
+                "SELECT (SELECT COUNT(*) FROM messages), (SELECT COUNT(*) FROM artifacts), (SELECT COUNT(*) FROM runs)"
+            ) as cursor:
+                assert tuple(await cursor.fetchone()) == (0, 0, 0)
+        finally:
+            await store.close()
+
     async def test_exact_retry_returns_ready_without_new_facts(self, tmp_path: Path):
         store = await _open_store(tmp_path / "kai.db")
         try:

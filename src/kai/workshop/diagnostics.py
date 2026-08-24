@@ -1191,7 +1191,7 @@ def workshop_canonical_message_integrity_status(db_path: Path) -> str:
 
 
 def workshop_transcript_authority_status(db_path: Path) -> str:
-    """Describe the durable protected private-text transcript cutover."""
+    """Describe the durable protected direct-interaction transcript cutover."""
     prefix = "Workshop transcript authority:"
     if not db_path.is_file():
         return f"{prefix} pending; canonical transcript schema unavailable"
@@ -1229,7 +1229,7 @@ def workshop_transcript_authority_status(db_path: Path) -> str:
     return (
         f"{prefix} active; completed runs={completed_runs}, "
         f"post-cutover messages={post_cutover_messages}; "
-        "protected JSONL reads=disabled, writes=disabled; "
+        "protected inputs=text/media, JSONL reads=disabled, writes=disabled; "
         "canonical export=v1"
     )
 

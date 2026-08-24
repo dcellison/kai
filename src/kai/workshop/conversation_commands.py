@@ -83,7 +83,12 @@ class WorkshopConversationCommandService:
         self._store = store
         self._artifact_storage_root = artifact_storage_root
 
-    async def accept(self, message: InboundMessage) -> ConversationCommandAcceptance:
+    async def accept(
+        self,
+        message: InboundMessage,
+        *,
+        artifact: StagedArtifact | None = None,
+    ) -> ConversationCommandAcceptance:
         if not isinstance(message, InboundMessage):
             raise ValueError("message must be an InboundMessage")
         connection = self._store.connection
@@ -93,13 +98,25 @@ class WorkshopConversationCommandService:
             inbound_message_id = inbound.event.envelope.aggregate_id
             if not isinstance(inbound_message_id, MessageId):
                 raise ConversationCommandStateConflictError("Canonical inbound event did not identify a message")
+            artifact_result = None
+            if artifact is not None:
+                if self._artifact_storage_root is None:
+                    raise ConversationCommandStateConflictError("Canonical artifact storage is unavailable")
+                artifact_result = await record_inbound_artifact_in_transaction(
+                    self._store,
+                    artifact.for_message(inbound_message_id),
+                    storage_root=self._artifact_storage_root,
+                )
             lifecycle = await WorkshopRunLifecycle(self._store).accept_in_transaction(
                 inbound_message_id,
                 occurred_at=inbound.event.envelope.occurred_at,
             )
-            if inbound.inserted != lifecycle.changed:
+            prior_states = {inbound.inserted, lifecycle.changed}
+            if artifact_result is not None:
+                prior_states.add(artifact_result.inserted)
+            if len(prior_states) != 1:
                 raise ConversationCommandStateConflictError(
-                    "Canonical inbound and run acceptance did not share one prior state"
+                    "Canonical inbound, artifact, and run acceptance did not share one prior state"
                 )
             disposition = (
                 ConversationCommandDisposition.NEWLY_ACCEPTED

@@ -108,11 +108,16 @@ class WorkshopPrivateTextExecutionService:
     def ready(self) -> bool:
         return not self._closed and self._task is not None and not self._task.done()
 
-    async def accept(self, message: InboundMessage) -> ConversationCommandAcceptance:
+    async def accept(
+        self,
+        message: InboundMessage,
+        *,
+        artifact: StagedArtifact | None = None,
+    ) -> ConversationCommandAcceptance:
         if self._closed:
             raise RuntimeError("Workshop private-text execution service is closed")
         async with self._database_lock:
-            return await self._command_service.accept(message)
+            return await self._command_service.accept(message, artifact=artifact)
 
     async def accept_client(
         self,

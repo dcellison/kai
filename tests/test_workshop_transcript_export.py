@@ -294,7 +294,7 @@ async def test_durable_authority_diagnostic_and_cli(tmp_path: Path):
         await store.close()
     status = workshop_transcript_authority_status(database)
     assert status.startswith("Workshop transcript authority: active;")
-    assert "protected JSONL reads=disabled, writes=disabled" in status
+    assert "protected inputs=text/media, JSONL reads=disabled, writes=disabled" in status
     assert workshop_canonical_message_integrity_status(database).startswith(
         "Workshop canonical message integrity: clean;"
     )

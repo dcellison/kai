@@ -5,8 +5,8 @@ These tests call handle_message() directly with mock Update/Context objects
 and patch the kai.totp functions at the bot module level (kai.bot.*) to
 control gate behavior without touching real files or subprocess calls.
 
-All downstream machinery (Claude, locks, session logging) is also mocked
-so tests that reach past the gate complete cleanly without starting processes.
+Canonical command acceptance and execution are also mocked so tests that reach
+past the gate complete cleanly without starting agent processes.
 
 Every test also patches _is_authorized to return True. handle_message is
 wrapped by @_require_auth which silently drops updates from unauthorized users
@@ -14,8 +14,8 @@ wrapped by @_require_auth which silently drops updates from unauthorized users
 access control, we bypass the auth check in all cases.
 """
 
-import asyncio
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from kai.bot import (
@@ -26,7 +26,7 @@ from kai.bot import (
     handle_voice,
 )
 from kai.totp import TotpStateError
-from kai.workshop.domain import PrincipalId
+from kai.workshop.domain import MessageId, RunId
 
 # ── Test helpers ──────────────────────────────────────────────────────────
 
@@ -44,7 +44,9 @@ def _make_update(text: str = "hello") -> MagicMock:
     update.message.delete = AsyncMock()
     update.effective_chat.id = 12345
     update.effective_chat.send_message = AsyncMock()
-    update.effective_user.id = 67890
+    # Private Telegram conversations use the human's Telegram ID as both
+    # sender and chat subject; canonical execution rejects group-shaped input.
+    update.effective_user.id = 12345
     update.callback_query = None
     return update
 
@@ -64,15 +66,6 @@ def _make_context(user_data: dict | None = None) -> MagicMock:
     return ctx
 
 
-def _fake_lock(*_args, **_kwargs):
-    """Return a real asyncio.Lock to stand in for the per-chat lock.
-
-    Uses a real Lock instead of a bare async context manager so that both
-    async-with and .locked() work (the latter is needed by _notify_if_queued).
-    """
-    return asyncio.Lock()
-
-
 def _downstream_patches() -> dict:
     """
     Return a dict of bare attribute names -> mocks for bot machinery that runs
@@ -80,16 +73,23 @@ def _downstream_patches() -> dict:
     suitable for use with patch.multiple("kai.bot", **_downstream_patches()).
 
     Applied when a test expects the gate to pass and execution to continue
-    into normal Claude handling. Prevents actual subprocess spawning.
+    into canonical command acceptance. Prevents actual subprocess spawning.
     """
+    execution = MagicMock()
+    execution.accept = AsyncMock(
+        return_value=SimpleNamespace(
+            message=SimpleNamespace(
+                event=SimpleNamespace(
+                    envelope=SimpleNamespace(aggregate_id=MessageId("msg_00000000000000000000000000000001"))
+                )
+            ),
+            run=SimpleNamespace(run_id=RunId("run_00000000000000000000000000000001")),
+        )
+    )
     return {
         "_is_authorized": MagicMock(return_value=True),
-        "_handle_response": AsyncMock(),
-        "_get_pool": MagicMock(return_value=MagicMock(get_model=MagicMock(return_value="opus"))),
-        "log_message": MagicMock(),
-        "_set_responding": MagicMock(),
-        "_clear_responding": MagicMock(),
-        "get_lock": MagicMock(return_value=_fake_lock()),
+        "_get_core_services": MagicMock(return_value=SimpleNamespace(private_text_execution=execution)),
+        "_handle_workshop_private_text": AsyncMock(),
     }
 
 
@@ -203,14 +203,14 @@ async def test_gate_fails_closed_when_totp_state_is_unavailable():
     with (
         patch("kai.bot._is_authorized", return_value=True),
         patch("kai.bot.is_totp_configured", side_effect=TotpStateError("sudo failed")),
-        patch("kai.bot._handle_response", new_callable=AsyncMock) as handle_response,
+        patch("kai.bot._get_core_services") as core_services,
     ):
         await handle_message(update, ctx)
 
     update.message.reply_text.assert_called_once_with(
         "Authentication service unavailable. Access denied; contact the Kai administrator."
     )
-    handle_response.assert_not_awaited()
+    core_services.assert_not_called()
 
 
 async def test_code_message_deleted_after_verification():
@@ -269,7 +269,7 @@ async def test_successful_auth_sets_timestamp():
     assert before <= ctx.user_data["totp_authenticated_at"] <= after
     # Pending state must be cleared after successful auth.
     assert "totp_pending" not in ctx.user_data
-    verify.assert_called_once_with("123456", 67890, 3, 15)
+    verify.assert_called_once_with("123456", 12345, 3, 15)
 
 
 async def test_gate_denies_when_attempt_state_write_fails():
@@ -334,8 +334,8 @@ async def test_invalid_code_shows_remaining_attempts():
 
 
 # ── Media handler TOTP tests ────────────────────────────────────────────
-# These verify that photo, document, and voice handlers check TOTP
-# before reaching Claude - the bypass that this PR fixes.
+# These verify that photo, document, and voice handlers check TOTP before
+# canonical acceptance.
 
 
 def _make_photo_update() -> MagicMock:
@@ -348,6 +348,7 @@ def _make_photo_update() -> MagicMock:
     update.message.delete = AsyncMock()
     update.effective_chat.id = 12345
     update.effective_chat.send_message = AsyncMock()
+    update.effective_user.id = 12345
     return update
 
 
@@ -363,6 +364,7 @@ def _make_document_update() -> MagicMock:
     update.message.delete = AsyncMock()
     update.effective_chat.id = 12345
     update.effective_chat.send_message = AsyncMock()
+    update.effective_user.id = 12345
     return update
 
 
@@ -375,11 +377,12 @@ def _make_voice_update() -> MagicMock:
     update.message.delete = AsyncMock()
     update.effective_chat.id = 12345
     update.effective_chat.send_message = AsyncMock()
+    update.effective_user.id = 12345
     return update
 
 
 async def test_photo_requires_totp():
-    """Sending a photo with expired TOTP session triggers challenge, not Claude."""
+    """Sending a photo with expired TOTP triggers a challenge, not acceptance."""
     update = _make_photo_update()
     ctx = _make_context()  # no totp_authenticated_at -> expired
 
@@ -389,12 +392,12 @@ async def test_photo_requires_totp():
     ):
         await handle_photo(update, ctx)
 
-    # Challenge sent, Claude NOT invoked
+    # Challenge sent; canonical acceptance is not reached.
     update.message.reply_text.assert_called_once_with("Session expired. Enter code from authenticator.")
 
 
 async def test_document_requires_totp():
-    """Sending a document with expired TOTP session triggers challenge, not Claude."""
+    """Sending a document with expired TOTP triggers a challenge, not acceptance."""
     update = _make_document_update()
     ctx = _make_context()
 
@@ -408,7 +411,7 @@ async def test_document_requires_totp():
 
 
 async def test_voice_requires_totp():
-    """Sending a voice message with expired TOTP session triggers challenge, not Claude."""
+    """Sending a voice message with expired TOTP triggers a challenge, not acceptance."""
     update = _make_voice_update()
     ctx = _make_context()
 
@@ -431,21 +434,12 @@ async def test_photo_passes_with_valid_totp():
         patch("kai.bot._is_authorized", return_value=True),
         patch("kai.bot.is_totp_configured", return_value=True),
         # Patch downstream to prevent actual processing past the gate.
-        # log_message MUST be patched to avoid writing test data (chat_id
-        # 12345, MagicMock paths) to the real production history files.
-        patch("kai.bot._get_pool"),
-        patch(
-            "kai.bot._upload_principal_id",
-            return_value=PrincipalId("prn_00000000000000000000000000000001"),
-        ),
         patch(
             "kai.bot._stage_media_upload",
             new_callable=AsyncMock,
             return_value=MagicMock(storage_path="/tmp/totp-photo.jpg"),
         ),
-        patch("kai.bot.log_message"),
-        patch("kai.bot._notify_if_queued", new_callable=AsyncMock, return_value=False),
-        patch("kai.bot._acquire_lock_or_kill", new_callable=AsyncMock, return_value=None),
+        patch("kai.bot._accept_workshop_media_command", new_callable=AsyncMock),
     ):
         await handle_photo(update, ctx)
 
