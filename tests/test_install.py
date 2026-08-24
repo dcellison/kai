@@ -64,6 +64,7 @@ from kai.install import (
     _generate_systemd_unit,
     _generate_users_yaml,
     _github_automation_status,
+    _integration_route_status,
     _log_security_status,
     _memory_scope_review_status,
     _migrate_identity_to_claude_md,
@@ -5013,6 +5014,41 @@ class TestCmdStatus:
     def test_status_reports_unavailable_github_automation_database(self, tmp_path):
         assert _github_automation_status(tmp_path / "missing.db") == (
             "Workshop GitHub automation: NOT VERIFIED (database unavailable)"
+        )
+
+    def test_status_reports_canonical_generic_integration_route(self, tmp_path):
+        db_path = tmp_path / "kai.db"
+        connection = sqlite3.connect(db_path)
+        connection.execute("CREATE TABLE channels (id TEXT PRIMARY KEY, kind TEXT NOT NULL, workshop_id TEXT)")
+        connection.execute("CREATE TABLE principals (id TEXT PRIMARY KEY, kind TEXT NOT NULL)")
+        connection.execute("CREATE TABLE agents (id TEXT PRIMARY KEY, workshop_id TEXT, principal_id TEXT)")
+        connection.execute("CREATE TABLE channel_agents (channel_id TEXT NOT NULL, agent_id TEXT NOT NULL)")
+        connection.execute("CREATE TABLE workshop_integration_routes (source TEXT, route_name TEXT, channel_id TEXT)")
+        connection.execute("INSERT INTO channels VALUES ('chn_direct', 'direct', 'wsp_one')")
+        connection.execute("INSERT INTO principals VALUES ('prn_agent', 'agent')")
+        connection.execute("INSERT INTO agents VALUES ('agt_kai', 'wsp_one', 'prn_agent')")
+        connection.execute("INSERT INTO channel_agents VALUES ('chn_direct', 'agt_kai')")
+        connection.execute("INSERT INTO workshop_integration_routes VALUES ('generic', 'default', 'chn_direct')")
+        connection.commit()
+        connection.close()
+
+        assert _integration_route_status(db_path) == (
+            "Workshop integration routing: active; generic/default=direct, agents=1; transport lookup=disabled"
+        )
+
+    def test_status_reports_missing_generic_integration_route(self, tmp_path):
+        db_path = tmp_path / "kai.db"
+        connection = sqlite3.connect(db_path)
+        connection.execute("CREATE TABLE workshop_integration_routes (source TEXT, route_name TEXT, channel_id TEXT)")
+        connection.execute("CREATE TABLE channels (id TEXT PRIMARY KEY, kind TEXT NOT NULL, workshop_id TEXT)")
+        connection.execute("CREATE TABLE principals (id TEXT PRIMARY KEY, kind TEXT NOT NULL)")
+        connection.execute("CREATE TABLE agents (id TEXT PRIMARY KEY, workshop_id TEXT, principal_id TEXT)")
+        connection.execute("CREATE TABLE channel_agents (channel_id TEXT NOT NULL, agent_id TEXT NOT NULL)")
+        connection.commit()
+        connection.close()
+
+        assert _integration_route_status(db_path) == (
+            "Workshop integration routing: INCOMPLETE; generic/default=missing"
         )
 
     def test_deployed_status_reports_named_secrets_without_values(self, tmp_path, monkeypatch):
