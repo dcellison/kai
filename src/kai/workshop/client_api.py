@@ -2023,41 +2023,46 @@ def register_workshop_read_routes(
     if memory_queries is not None:
 
         async def handle_memory_stats(request: web.Request) -> web.Response:
-            return await _handle_memory_stats(
-                request,
-                authenticator=authenticator,
-                service=memory_queries,
-            )
+            async with request_lock:
+                return await _handle_memory_stats(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                )
 
         async def handle_memory_records(request: web.Request) -> web.Response:
-            return await _handle_memory_records(
-                request,
-                authenticator=authenticator,
-                service=memory_queries,
-            )
+            async with request_lock:
+                return await _handle_memory_records(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                )
 
         async def handle_memory_search(request: web.Request) -> web.Response:
-            return await _handle_memory_search(
-                request,
-                authenticator=authenticator,
-                service=memory_queries,
-            )
+            async with request_lock:
+                return await _handle_memory_search(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                )
 
         async def handle_memory_detail(request: web.Request) -> web.Response:
-            return await _handle_memory_detail(
-                request,
-                authenticator=authenticator,
-                service=memory_queries,
-                source=False,
-            )
+            async with request_lock:
+                return await _handle_memory_detail(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                    source=False,
+                )
 
         async def handle_memory_source(request: web.Request) -> web.Response:
-            return await _handle_memory_detail(
-                request,
-                authenticator=authenticator,
-                service=memory_queries,
-                source=True,
-            )
+            async with request_lock:
+                return await _handle_memory_detail(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                    source=True,
+                )
 
         app.router.add_get(_MEMORY_STATS_PATH, handle_memory_stats)
         app.router.add_get(_MEMORY_RECORDS_PATH, handle_memory_records)
