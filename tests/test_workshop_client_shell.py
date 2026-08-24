@@ -90,6 +90,11 @@ class TestWorkshopClientShell:
             assert "/timeline" in script_body
             assert "/events" in script_body
 
+            # The document CSP deliberately excludes data: images. Keep CSS
+            # decorations self-contained so a blocked image cannot remove a
+            # control's only visible affordance.
+            assert re.search(r"url\([\"']?data:", stylesheet_body) is None
+
             # Every ancestor in the nested grid must be shrinkable; otherwise
             # a long timeline expands the implicit row and is clipped by the
             # viewport shell instead of scrolling within the conversation.
