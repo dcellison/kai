@@ -1158,7 +1158,9 @@ def _scheduled_job_authority(
     context: ContextTypes.DEFAULT_TYPE,
     runtime_config_id: int,
 ) -> WorkshopScheduledJobAuthority:
-    canonical = _get_core_services(context).internal_api_contexts.for_runtime_config_id(runtime_config_id)
+    services = _get_core_services(context)
+    runtime_profile = services.runtime_profiles.for_config_id(runtime_config_id)
+    canonical = services.internal_api_contexts.for_runtime_profile(runtime_profile.profile_id)
     return WorkshopScheduledJobAuthority(
         canonical.principal_id,
         canonical.channel_id,

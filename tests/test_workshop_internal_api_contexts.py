@@ -33,13 +33,15 @@ async def test_resolves_complete_canonical_context_for_every_profile(tmp_path: P
             store,
             profile_registry(101, 202),
         )
-        context = registry.for_runtime_config_id(101)
+        context = registry.for_runtime_profile(profile_id(101))
 
         assert context.principal_id.startswith("prn_")
         assert context.channel_id.startswith("chn_")
         assert context.agent_id.startswith("agt_")
         assert context.runtime_profile_id == profile_id(101)
         assert not hasattr(context, "compatibility_runtime_config_id")
+        assert not hasattr(context, "_runtime_config_id")
+        assert not hasattr(registry, "for_runtime_config_id")
         assert registry.for_runtime_profile(profile_id(101)) is context
     finally:
         await store.close()

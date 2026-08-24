@@ -1,10 +1,10 @@
 """
-Per-user agent subprocess pool with lazy creation and idle eviction.
+Canonical agent-runtime subprocess pool with lazy creation and idle eviction.
 
 Provides functionality to:
-1. Manage a dict of AgentBackend instances keyed by chat_id
-2. Create instances lazily on first message with per-user configuration
-3. Route prompts to the correct user's subprocess
+1. Manage protected AgentBackend instances by canonical runtime-profile ID
+2. Create instances lazily on first message with per-runtime configuration
+3. Route prompts to the correct runtime subprocess
 4. Evict idle subprocesses to reclaim memory on resource-constrained machines
 5. Restore per-user saved workspaces on first interaction
 
@@ -42,6 +42,7 @@ from kai.config import (
 )
 from kai.goose import GooseBackend
 from kai.internal_api_auth import InternalAPIAuth
+from kai.workshop.domain import RuntimeProfileId
 from kai.workspace_utils import is_workspace_allowed
 
 if TYPE_CHECKING:
@@ -49,6 +50,9 @@ if TYPE_CHECKING:
     from kai.workshop.runtime_profiles import ProtectedRuntimeProfile, WorkshopRuntimeProfileRegistry
 
 log = logging.getLogger(__name__)
+
+type RuntimeSelector = int | RuntimeProfileId
+type RuntimePoolKey = int | RuntimeProfileId
 
 
 # How often the eviction loop checks for idle subprocesses (seconds).
@@ -78,11 +82,16 @@ class _PreparedRuntimeFingerprint:
 class PreparedBackendExecution:
     """One-shot handle that can dispatch only through its exact prepared runtime."""
 
-    __slots__ = ("_chat_id", "_consumed", "_fingerprint", "_instance", "_pool")
+    __slots__ = ("_consumed", "_fingerprint", "_instance", "_pool", "_runtime_key")
 
-    def __init__(self, pool: SubprocessPool, chat_id: int, instance: AgentBackend) -> None:
+    def __init__(
+        self,
+        pool: SubprocessPool,
+        runtime_key: RuntimePoolKey,
+        instance: AgentBackend,
+    ) -> None:
         self._pool = pool
-        self._chat_id = chat_id
+        self._runtime_key = runtime_key
         self._instance = instance
         self._fingerprint = _runtime_fingerprint(instance)
         self._consumed = False
@@ -130,17 +139,19 @@ def _runtime_fingerprint(instance: AgentBackend) -> _PreparedRuntimeFingerprint:
 
 class SubprocessPool:
     """
-    Per-user agent subprocess pool with lazy creation and idle eviction.
+    Agent subprocess pool with canonical protected-runtime lifecycle ownership.
 
-    Each user gets an independent AgentBackend instance running as their
-    OS user. Instances are created on first message and evicted after idle
-    timeout to manage memory on resource-constrained machines.
+    Each protected RuntimeProfileId gets an independent AgentBackend instance
+    running as its configured OS user. Compatibility integer selectors are
+    normalized at entry and never become protected lifecycle keys. Negative
+    Telegram group IDs and unprotected development runtimes remain explicit
+    compatibility keys until their adapter paths are retired.
 
-    Thread safety: send() for a given chat_id is serialized by the
+    Thread safety: send() for a given runtime is serialized by the
     per-channel execution lane. The pool does not add its own
     locking because the callers already guarantee single-writer-per-user.
     If a future caller bypasses the per-chat lock, add an asyncio.Lock
-    per chat_id here.
+    per runtime key here.
     """
 
     def __init__(
@@ -157,7 +168,7 @@ class SubprocessPool:
             service["name"] for service in services_info if isinstance(service.get("name"), str) and service["name"]
         }
         allowed_services_by_profile = {}
-        self._services_info_by_user: dict[int, list[dict]] = {}
+        self._services_info_by_runtime: dict[RuntimePoolKey, list[dict]] = {}
         runtime_config_ids = (
             {profile.runtime_config_id for profile in runtime_profiles.profiles}
             if runtime_profiles is not None
@@ -194,7 +205,8 @@ class SubprocessPool:
 
                 service_profile_id = runtime_profile_id_for_config_id(chat_id)
             allowed_services_by_profile[service_profile_id] = allowed
-            self._services_info_by_user[chat_id] = [
+            runtime_key: RuntimePoolKey = protected_profile.profile_id if protected_profile is not None else chat_id
+            self._services_info_by_runtime[runtime_key] = [
                 service for service in services_info if service.get("name") in allowed
             ]
         if available_service_names and not any(allowed_services_by_profile.values()):
@@ -211,8 +223,12 @@ class SubprocessPool:
             from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
             from kai.workshop.runtime_profiles import runtime_profile_id_for_config_id
 
-            contexts_by_runtime_config_id = {
-                runtime_config_id: WorkshopInternalAPIExecutionContext.for_unprotected_runtime(
+            contexts_by_runtime = {
+                (
+                    protected_profiles_by_config_id[runtime_config_id].profile_id
+                    if runtime_config_id in protected_profiles_by_config_id
+                    else runtime_config_id
+                ): WorkshopInternalAPIExecutionContext.for_unprotected_runtime(
                     runtime_config_id,
                     (
                         protected_profiles_by_config_id[runtime_config_id].profile_id
@@ -222,22 +238,32 @@ class SubprocessPool:
                 )
                 for runtime_config_id in runtime_config_ids
             }
-            contexts = tuple(contexts_by_runtime_config_id.values())
+            contexts = tuple(contexts_by_runtime.values())
         else:
             contexts = internal_api_contexts.contexts
-            contexts_by_runtime_config_id = {
-                runtime_config_id: internal_api_contexts.for_runtime_config_id(runtime_config_id)
-                for runtime_config_id in runtime_config_ids
-            }
+            if runtime_profiles is None:
+                from kai.workshop.runtime_profiles import runtime_profile_id_for_config_id
+
+                contexts_by_runtime = {
+                    runtime_config_id: internal_api_contexts.for_runtime_profile(
+                        runtime_profile_id_for_config_id(runtime_config_id)
+                    )
+                    for runtime_config_id in runtime_config_ids
+                }
+            else:
+                contexts_by_runtime = {
+                    profile.profile_id: internal_api_contexts.for_runtime_profile(profile.profile_id)
+                    for profile in runtime_profiles.profiles
+                }
         self._internal_api_contexts = internal_api_contexts
         self._protected_internal_api_contexts = config.protected_install
-        self._contexts_by_runtime_config_id = contexts_by_runtime_config_id
+        self._contexts_by_runtime = contexts_by_runtime
         self._internal_api_auth = InternalAPIAuth.for_execution_contexts(
             contexts,
             allowed_services_by_profile=allowed_services_by_profile,
         )
-        self._pool: dict[int, AgentBackend] = {}
-        self._last_activity: dict[int, float] = {}
+        self._pool: dict[RuntimePoolKey, AgentBackend] = {}
+        self._last_activity: dict[RuntimePoolKey, float] = {}
         # Pending one-time setup for a freshly-created backend instance.
         # Split into two flags so a command-path workspace resolver call
         # can finish the workspace half without suppressing the DB-
@@ -245,38 +271,55 @@ class SubprocessPool:
         # marker would let a /memory or /workspace read clear the
         # pending state before send() ever had a chance to push the
         # user's stored model/timeout into the new subprocess.
-        self._pending_workspace_restore: set[int] = set()
-        self._pending_settings_restore: set[int] = set()
-        self._in_flight: set[int] = set()  # chat_ids with active send()
+        self._pending_workspace_restore: set[RuntimePoolKey] = set()
+        self._pending_settings_restore: set[RuntimePoolKey] = set()
+        self._in_flight: set[RuntimePoolKey] = set()
         self._eviction_task: asyncio.Task | None = None
 
-    def _protected_profile(self, runtime_config_id: int):
+    def _resolve_runtime(
+        self,
+        runtime: RuntimeSelector,
+    ) -> tuple[RuntimePoolKey, int, ProtectedRuntimeProfile | None]:
+        """Resolve a caller selector to its canonical pool key and legacy state key."""
+        from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError
+
+        if isinstance(runtime, bool):
+            raise TypeError("Runtime selector must be a runtime profile ID or integer")
+        if isinstance(runtime, RuntimeProfileId):
+            if self._runtime_profiles is None:
+                raise RuntimeError("Runtime profile selector requires protected runtime policy")
+            profile = self._runtime_profiles.resolve(runtime)
+            return profile.profile_id, profile.runtime_config_id, profile
+        if not isinstance(runtime, int):
+            raise TypeError("Runtime selector must be a runtime profile ID or integer")
+        if self._runtime_profiles is None:
+            return runtime, runtime, None
+        try:
+            profile = self._runtime_profiles.for_config_id(runtime)
+        except WorkshopRuntimeProfileError:
+            if runtime >= 0:
+                raise
+            return runtime, runtime, None
+        return profile.profile_id, profile.runtime_config_id, profile
+
+    def _protected_profile(self, runtime: RuntimeSelector):
         """Resolve protected policy while preserving the negative-group bridge."""
         # Imported at call time: kai.workshop's package initialization
         # reaches back into this module through kai.sessions, so a
         # module-level import of any workshop submodule from here is
         # circular for some first-import orders.
-        from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError
+        return self._resolve_runtime(runtime)[2]
 
-        if self._runtime_profiles is None:
-            return None
-        try:
-            return self._runtime_profiles.for_config_id(runtime_config_id)
-        except WorkshopRuntimeProfileError:
-            if runtime_config_id >= 0:
-                raise
-            return None
-
-    def get_runtime_profile(self, runtime_config_id: int) -> ProtectedRuntimeProfile | None:
+    def get_runtime_profile(self, runtime: RuntimeSelector) -> ProtectedRuntimeProfile | None:
         """Return protected policy for one runtime, when that boundary applies."""
-        return self._protected_profile(runtime_config_id)
+        return self._protected_profile(runtime)
 
-    def get_backend_provider(self, runtime_config_id: int) -> tuple[str, str]:
+    def get_backend_provider(self, runtime: RuntimeSelector) -> tuple[str, str]:
         """Resolve the active route without creating a backend process."""
-        profile = self._protected_profile(runtime_config_id)
+        _, runtime_config_id, profile = self._resolve_runtime(runtime)
         if profile is not None:
             return profile.backend, profile.provider
-        instance = self.get_if_exists(runtime_config_id)
+        instance = self.get_if_exists(runtime)
         if instance is not None:
             return require_backend_name(instance), instance.provider
         return get_user_backend_and_provider(
@@ -284,17 +327,18 @@ class SubprocessPool:
             self._config,
         )
 
-    def get_os_user(self, runtime_config_id: int) -> str | None:
+    def get_os_user(self, runtime: RuntimeSelector) -> str | None:
         """Resolve the OS execution identity from protected policy when present."""
-        profile = self._protected_profile(runtime_config_id)
+        _, runtime_config_id, profile = self._resolve_runtime(runtime)
         if profile is not None:
             return profile.os_user
         user = self._config.get_user_config(runtime_config_id)
         return user.os_user if user is not None else None
 
-    def get_role_model(self, runtime_config_id: int, role: ModelRole) -> str:
+    def get_role_model(self, runtime: RuntimeSelector, role: ModelRole) -> str:
         """Resolve an operator role model against the policy-selected route."""
-        backend, provider = self.get_backend_provider(runtime_config_id)
+        _, runtime_config_id, _ = self._resolve_runtime(runtime)
+        backend, provider = self.get_backend_provider(runtime)
         model = canonicalize_model_for_backend(
             resolve_user_model(
                 role,
@@ -319,9 +363,9 @@ class SubprocessPool:
         )
         return fallback
 
-    def get_home_workspace(self, runtime_config_id: int) -> Path:
+    def get_home_workspace(self, runtime: RuntimeSelector) -> Path:
         """Resolve home through protected profile policy when available."""
-        profile = self._protected_profile(runtime_config_id)
+        _, runtime_config_id, profile = self._resolve_runtime(runtime)
         if profile is not None:
             if profile.home_workspace is not None:
                 if not profile.home_workspace.is_dir():
@@ -340,10 +384,10 @@ class SubprocessPool:
 
     def get_static_workspace_policy(
         self,
-        runtime_config_id: int,
+        runtime: RuntimeSelector,
     ) -> tuple[Path | None, tuple[Path, ...], bool]:
         """Return per-runtime base/list policy and whether it is protected."""
-        profile = self._protected_profile(runtime_config_id)
+        _, runtime_config_id, profile = self._resolve_runtime(runtime)
         if profile is not None:
             return profile.workspace_base, profile.allowed_workspaces, True
         user = self._config.get_user_config(runtime_config_id)
@@ -351,9 +395,10 @@ class SubprocessPool:
             return None, (), False
         return user.workspace_base, tuple(user.allowed_workspaces), False
 
-    async def resolve_workspace_access(self, runtime_config_id: int) -> tuple[Path | None, list[Path]]:
+    async def resolve_workspace_access(self, runtime: RuntimeSelector) -> tuple[Path | None, list[Path]]:
         """Resolve mutable and static workspace access through runtime policy."""
-        base, allowed, protected = self.get_static_workspace_policy(runtime_config_id)
+        _, runtime_config_id, _ = self._resolve_runtime(runtime)
+        base, allowed, protected = self.get_static_workspace_policy(runtime)
         return await sessions.resolve_workspace_access(
             runtime_config_id,
             self._config,
@@ -369,7 +414,7 @@ class SubprocessPool:
 
     # ── Instance management ─────────────────────────────────────────
 
-    def get(self, chat_id: int) -> AgentBackend:
+    def get(self, runtime: RuntimeSelector) -> AgentBackend:
         """
         Get or create a backend instance for the given user.
 
@@ -377,20 +422,21 @@ class SubprocessPool:
         later (on first send()), not here - __init__ is cheap;
         _ensure_started() is where the process spawns.
         """
-        if chat_id not in self._pool:
-            instance = self._create_instance(chat_id)
+        runtime_key, _, _ = self._resolve_runtime(runtime)
+        if runtime_key not in self._pool:
+            instance = self._create_instance(runtime)
             require_backend_name(instance)
-            self._pool[chat_id] = instance
+            self._pool[runtime_key] = instance
             # Mark both one-time setup steps as pending. The split
             # matters at command-path callers that finish the workspace
             # half via get_effective_workspace; settings still need to
             # land on the first ordinary send().
-            self._pending_workspace_restore.add(chat_id)
-            self._pending_settings_restore.add(chat_id)
-        self._last_activity[chat_id] = time.monotonic()
-        return self._pool[chat_id]
+            self._pending_workspace_restore.add(runtime_key)
+            self._pending_settings_restore.add(runtime_key)
+        self._last_activity[runtime_key] = time.monotonic()
+        return self._pool[runtime_key]
 
-    def _create_instance(self, chat_id: int) -> AgentBackend:
+    def _create_instance(self, runtime: RuntimeSelector) -> AgentBackend:
         """
         Create an AgentBackend for a specific user.
 
@@ -402,14 +448,14 @@ class SubprocessPool:
         Per-user DB overrides (set via /settings or /model) are applied
         in _apply_user_db_settings() since they require async DB access.
         """
+        runtime_key, chat_id, protected_profile = self._resolve_runtime(runtime)
         user = self._config.get_user_config(chat_id)
-        protected_profile = self._protected_profile(chat_id)
 
         # Resolve through the single backend.resolve_home_workspace
         # helper: users.yaml override first, else DATA_DIR/home/<principal_id>/.
         # The old global home field on Config was removed by #353 because
         # it pointed every unconfigured user at a shared directory.
-        workspace = self.get_home_workspace(chat_id)
+        workspace = self.get_home_workspace(runtime)
 
         ws_config = self._config.get_workspace_config(workspace)
 
@@ -491,7 +537,7 @@ class SubprocessPool:
         # non-home default. The redundant stat/mkdir inside
         # ensure_user_home is cheap (idempotent mkdir + chmod); the
         # clarity of two separate resolution calls is worth it.
-        home_ws = self.get_home_workspace(chat_id)
+        home_ws = self.get_home_workspace(runtime)
 
         # os_user for sudo -u isolation. None = run as bot user.
         # Resolved here (rather than inside each branch) because all
@@ -509,7 +555,7 @@ class SubprocessPool:
         # Internal API availability is independent of public webhook ingress.
         # Agents receive only their random principal credential, never an
         # external webhook signing secret.
-        internal_api_context = self._contexts_by_runtime_config_id.get(chat_id)
+        internal_api_context = self._contexts_by_runtime.get(runtime_key)
         if internal_api_context is None:
             if self._protected_internal_api_contexts:
                 raise RuntimeError("Runtime has no canonical internal API execution context")
@@ -520,9 +566,9 @@ class SubprocessPool:
                 chat_id,
                 runtime_profile_id_for_config_id(abs(chat_id)),
             )
-            self._contexts_by_runtime_config_id[chat_id] = internal_api_context
+            self._contexts_by_runtime[runtime_key] = internal_api_context
         internal_api_credential = self._internal_api_auth.agent_credential_for(internal_api_context)
-        services_info = self._services_info_by_user.get(chat_id, [])
+        services_info = self._services_info_by_runtime.get(runtime_key, [])
 
         if backend == "goose":
             return GooseBackend(
@@ -633,21 +679,33 @@ class SubprocessPool:
 
     # ── Prompt routing ──────────────────────────────────────────────
 
-    async def _prepare_instance(self, chat_id: int) -> AgentBackend:
+    async def _prepare_instance(self, runtime: RuntimeSelector) -> AgentBackend:
         """Apply every pending effective setting before returning one runtime."""
-        instance = self.get(chat_id)
-        if chat_id in self._pending_workspace_restore:
-            await self._attempt_workspace_restore(chat_id, instance)
-        if chat_id in self._pending_settings_restore:
-            await self._apply_user_db_settings(chat_id, instance)
-            self._pending_settings_restore.discard(chat_id)
+        runtime_key, _, _ = self._resolve_runtime(runtime)
+        instance = self.get(runtime)
+        if runtime_key in self._pending_workspace_restore:
+            await self._attempt_workspace_restore(runtime, instance)
+        if runtime_key in self._pending_settings_restore:
+            await self._apply_user_db_settings(runtime, instance)
+            self._pending_settings_restore.discard(runtime_key)
         return instance
 
-    async def prepare_execution(self, chat_id: int) -> PreparedBackendExecution:
+    async def prepare_execution(self, runtime: RuntimeSelector) -> PreparedBackendExecution:
         """Bind the effective selection to the exact runtime that may dispatch later."""
-        return PreparedBackendExecution(self, chat_id, await self._prepare_instance(chat_id))
+        runtime_key, _, _ = self._resolve_runtime(runtime)
+        return PreparedBackendExecution(
+            self,
+            runtime_key,
+            await self._prepare_instance(runtime),
+        )
 
-    async def send(self, prompt: str | list, *, chat_id: int) -> AsyncGenerator[StreamEvent]:
+    async def send(
+        self,
+        prompt: str | list,
+        *,
+        runtime: RuntimeSelector | None = None,
+        chat_id: int | None = None,
+    ) -> AsyncGenerator[StreamEvent]:
         """
         Route a prompt to the user's subprocess.
 
@@ -661,16 +719,24 @@ class SubprocessPool:
 
         Marks the user as in-flight to prevent eviction mid-stream.
         """
-        instance = await self._prepare_instance(chat_id)
-        self._last_activity[chat_id] = time.monotonic()
-        self._in_flight.add(chat_id)
+        if (runtime is None) == (chat_id is None):
+            raise TypeError("Exactly one of runtime or chat_id must be provided")
+        if runtime is not None:
+            selector: RuntimeSelector = runtime
+        else:
+            assert chat_id is not None
+            selector = chat_id
+        runtime_key, runtime_config_id, _ = self._resolve_runtime(selector)
+        instance = await self._prepare_instance(selector)
+        self._last_activity[runtime_key] = time.monotonic()
+        self._in_flight.add(runtime_key)
         try:
-            async for event in instance.send(prompt, chat_id=chat_id):
+            async for event in instance.send(prompt, chat_id=runtime_config_id):
                 yield event
         finally:
             instance.discard_canonical_history()
-            self._in_flight.discard(chat_id)
-            self._last_activity[chat_id] = time.monotonic()
+            self._in_flight.discard(runtime_key)
+            self._last_activity[runtime_key] = time.monotonic()
 
     async def _send_prepared(
         self,
@@ -679,45 +745,46 @@ class SubprocessPool:
     ) -> AsyncGenerator[StreamEvent]:
         """Dispatch through a prepared handle only while its runtime remains exact."""
         self._validate_prepared(prepared)
-        chat_id = prepared._chat_id
+        runtime_key = prepared._runtime_key
+        _, runtime_config_id, _ = self._resolve_runtime(runtime_key)
         instance = prepared._instance
-        self._last_activity[chat_id] = time.monotonic()
-        self._in_flight.add(chat_id)
+        self._last_activity[runtime_key] = time.monotonic()
+        self._in_flight.add(runtime_key)
         try:
-            async for event in instance.send(prompt, chat_id=chat_id):
+            async for event in instance.send(prompt, chat_id=runtime_config_id):
                 yield event
         finally:
             instance.discard_canonical_history()
-            self._in_flight.discard(chat_id)
-            self._last_activity[chat_id] = time.monotonic()
+            self._in_flight.discard(runtime_key)
+            self._last_activity[runtime_key] = time.monotonic()
 
     def _validate_prepared(self, prepared: PreparedBackendExecution) -> None:
-        chat_id = prepared._chat_id
-        instance = self.get_if_exists(chat_id)
+        runtime_key = prepared._runtime_key
+        instance = self._pool.get(runtime_key)
         if instance is not prepared._instance:
             raise RuntimeError("Prepared backend runtime is no longer current")
-        if chat_id in self._pending_workspace_restore or chat_id in self._pending_settings_restore:
+        if runtime_key in self._pending_workspace_restore or runtime_key in self._pending_settings_restore:
             raise RuntimeError("Prepared backend runtime has pending effective settings")
         if _runtime_fingerprint(instance) != prepared._fingerprint:
             raise RuntimeError("Prepared backend runtime changed before dispatch")
 
     async def _cancel_prepared(self, prepared: PreparedBackendExecution) -> None:
         self._validate_prepared(prepared)
-        chat_id = prepared._chat_id
+        runtime_key = prepared._runtime_key
         instance = prepared._instance
         try:
             await asyncio.wait_for(instance.shutdown(), timeout=_FORCE_KILL_TIMEOUT)
         except Exception:
             instance.force_kill()
-            log.warning("prepared cancellation: shutdown failed for user %d, sent SIGKILL", chat_id)
+            log.warning("prepared cancellation: shutdown failed for runtime %s, sent SIGKILL", runtime_key)
         finally:
             # Never remove or stop a replacement installed while the exact
             # prepared runtime was shutting down.
-            if self._pool.get(chat_id) is instance:
-                self._pool.pop(chat_id, None)
-                self._last_activity.pop(chat_id, None)
+            if self._pool.get(runtime_key) is instance:
+                self._pool.pop(runtime_key, None)
+                self._last_activity.pop(runtime_key, None)
 
-    async def _attempt_workspace_restore(self, chat_id: int, instance: AgentBackend) -> Path:
+    async def _attempt_workspace_restore(self, runtime: RuntimeSelector, instance: AgentBackend) -> Path:
         """Restore the saved workspace into a live instance.
 
         Reads `settings.workspace:<chat_id>`, validates path existence
@@ -735,6 +802,7 @@ class SubprocessPool:
         Returns the effective workspace path (saved when valid,
         otherwise the user's home workspace).
         """
+        runtime_key, chat_id, _ = self._resolve_runtime(runtime)
         saved = await sessions.get_active_workspace(chat_id)
         effective: Path | None = None
         if saved:
@@ -747,7 +815,7 @@ class SubprocessPool:
                 )
                 await sessions.delete_active_workspace(chat_id)
             else:
-                base, allowed = await self.resolve_workspace_access(chat_id)
+                base, allowed = await self.resolve_workspace_access(runtime)
                 if not is_workspace_allowed(ws_path, base, allowed):
                     log.warning(
                         "Saved workspace for user %d is no longer allowed: %s",
@@ -766,12 +834,12 @@ class SubprocessPool:
                     log.info("Restored workspace for user %d: %s", chat_id, ws_path)
                     effective = ws_path
 
-        self._pending_workspace_restore.discard(chat_id)
+        self._pending_workspace_restore.discard(runtime_key)
         if effective is not None:
             return effective
-        return self.get_home_workspace(chat_id)
+        return self.get_home_workspace(runtime)
 
-    async def _apply_user_db_settings(self, chat_id: int, instance: AgentBackend) -> None:
+    async def _apply_user_db_settings(self, runtime: RuntimeSelector, instance: AgentBackend) -> None:
         """Apply per-user DB-stored settings to a live instance.
 
         Covers the model and timeout overrides set via /settings or
@@ -786,6 +854,7 @@ class SubprocessPool:
         effect when the model changes, which would interrupt any UI
         operation that just wanted to read the effective workspace.
         """
+        _, chat_id, _ = self._resolve_runtime(runtime)
         db_settings = await sessions.get_user_settings(chat_id)
         if not db_settings:
             return
@@ -857,7 +926,7 @@ class SubprocessPool:
 
     # ── Per-user actions ────────────────────────────────────────────
 
-    def get_if_exists(self, chat_id: int) -> AgentBackend | None:
+    def get_if_exists(self, runtime: RuntimeSelector) -> AgentBackend | None:
         """
         Look up a user's subprocess without creating one.
 
@@ -867,9 +936,10 @@ class SubprocessPool:
         side effects (e.g., force_kill refreshing the timestamp of a
         process it's about to kill).
         """
-        return self._pool.get(chat_id)
+        runtime_key, _, _ = self._resolve_runtime(runtime)
+        return self._pool.get(runtime_key)
 
-    async def force_kill(self, chat_id: int) -> None:
+    async def force_kill(self, runtime: RuntimeSelector) -> None:
         """
         Kill a specific user's subprocess and remove it from the pool.
 
@@ -882,10 +952,11 @@ class SubprocessPool:
         tracked. It is only removed after the subprocess is confirmed
         dead (either via clean shutdown or SIGKILL fallback).
         """
-        instance = self._pool.get(chat_id)
+        runtime_key, _, _ = self._resolve_runtime(runtime)
+        instance = self._pool.get(runtime_key)
         if not instance:
             # No instance to kill; clean up any orphaned tracking entry
-            self._last_activity.pop(chat_id, None)
+            self._last_activity.pop(runtime_key, None)
             return
         try:
             await asyncio.wait_for(instance.shutdown(), timeout=_FORCE_KILL_TIMEOUT)
@@ -894,48 +965,49 @@ class SubprocessPool:
             # SIGKILL. instance.force_kill() is effectively infallible
             # (catches its own OSError).
             instance.force_kill()
-            log.warning("force_kill: shutdown failed for user %d, sent SIGKILL", chat_id)
+            log.warning("force_kill: shutdown failed for runtime %s, sent SIGKILL", runtime_key)
         finally:
             # Remove from tracking regardless of how shutdown ended.
             # The finally block ensures cleanup even if CancelledError
             # (a BaseException, not caught by except Exception) propagates.
-            self._pool.pop(chat_id, None)
-            self._last_activity.pop(chat_id, None)
+            self._pool.pop(runtime_key, None)
+            self._last_activity.pop(runtime_key, None)
 
     async def change_workspace(
         self,
-        chat_id: int,
+        runtime: RuntimeSelector,
         new_workspace: Path,
         workspace_config: WorkspaceConfig | None = None,
     ) -> None:
         """Switch a specific user's workspace."""
-        instance = self.get(chat_id)
+        runtime_key, _, _ = self._resolve_runtime(runtime)
+        instance = self.get(runtime)
         # Explicit workspace change supersedes any pending restore.
         # Without this, the next send() would restore the old saved
         # workspace over the one just set. Settings-restore stays
         # pending: an explicit /workspace switch carries no signal
         # about user-level model or timeout preferences, and pre-split
         # behavior accidentally suppressed the DB-settings job here.
-        self._pending_workspace_restore.discard(chat_id)
+        self._pending_workspace_restore.discard(runtime_key)
         await instance.change_workspace(new_workspace, workspace_config=workspace_config)
 
-    async def restart(self, chat_id: int) -> None:
+    async def restart(self, runtime: RuntimeSelector) -> None:
         """Restart a specific user's subprocess."""
-        instance = self.get_if_exists(chat_id)
+        instance = self.get_if_exists(runtime)
         if instance:
             await instance.restart()
 
     # ── Per-user property accessors ─────────────────────────────────
 
-    def get_model(self, chat_id: int) -> str:
+    def get_model(self, runtime: RuntimeSelector) -> str:
         """Get the active model without bypassing protected runtime policy."""
-        instance = self.get_if_exists(chat_id)
+        instance = self.get_if_exists(runtime)
         if instance is not None:
             return instance.model
-        profile = self._protected_profile(chat_id)
+        profile = self._protected_profile(runtime)
         return profile.model if profile is not None else self._config.default_model
 
-    async def get_effective_model(self, chat_id: int) -> str:
+    async def get_effective_model(self, runtime: RuntimeSelector) -> str:
         """Get the effective model, checking persisted settings if no instance exists.
 
         Protected runtimes use the user settings DB over their protected
@@ -945,10 +1017,10 @@ class SubprocessPool:
         Use this in command handlers that display the current model
         (like /models) where accuracy matters more than speed.
         """
-        instance = self.get_if_exists(chat_id)
+        _, chat_id, profile = self._resolve_runtime(runtime)
+        instance = self.get_if_exists(runtime)
         if instance:
             return instance.model
-        profile = self._protected_profile(chat_id)
         if profile is None:
             defaults = await sessions.resolve_user_defaults(chat_id, self._config)
             return defaults["model"]
@@ -961,12 +1033,12 @@ class SubprocessPool:
             return model
         return profile.model
 
-    def set_model(self, chat_id: int, model: str) -> None:
+    def set_model(self, runtime: RuntimeSelector, model: str) -> None:
         """Set the model for a user's subprocess."""
-        instance = self.get(chat_id)
+        instance = self.get(runtime)
         instance.model = canonicalize_model_for_backend(model, require_backend_name(instance))
 
-    async def get_effective_workspace(self, chat_id: int) -> Path:
+    async def get_effective_workspace(self, runtime: RuntimeSelector) -> Path:
         """
         Get the effective workspace for a user, eagerly restoring the
         saved workspace into the live instance when one exists.
@@ -999,18 +1071,19 @@ class SubprocessPool:
         ordinary text turn even if a command-path resolver call
         already finalized the workspace half.
         """
-        instance = self._pool.get(chat_id)
-        if instance is not None and chat_id not in self._pending_workspace_restore:
+        runtime_key, chat_id, _ = self._resolve_runtime(runtime)
+        instance = self._pool.get(runtime_key)
+        if instance is not None and runtime_key not in self._pending_workspace_restore:
             return instance.workspace
 
         saved = await sessions.get_active_workspace(chat_id)
         if not saved:
             if instance is not None:
-                self._pending_workspace_restore.discard(chat_id)
-            return self.get_home_workspace(chat_id)
+                self._pending_workspace_restore.discard(runtime_key)
+            return self.get_home_workspace(runtime)
 
         ws_path = Path(saved)
-        base, allowed = await self.resolve_workspace_access(chat_id)
+        base, allowed = await self.resolve_workspace_access(runtime)
         if not ws_path.is_dir() or not is_workspace_allowed(ws_path, base, allowed):
             log.warning(
                 "Saved workspace for user %d invalid; clearing: %s",
@@ -1019,29 +1092,29 @@ class SubprocessPool:
             )
             await sessions.delete_active_workspace(chat_id)
             if instance is not None:
-                self._pending_workspace_restore.discard(chat_id)
-            return self.get_home_workspace(chat_id)
+                self._pending_workspace_restore.discard(runtime_key)
+            return self.get_home_workspace(runtime)
 
         # Only now do we materialize an instance. Avoiding instance
         # creation in the no-saved-row and stale-row branches keeps
         # the resolver cheap for cold reads that just want to confirm
         # "home is the right answer."
-        instance = self.get(chat_id)
+        instance = self.get(runtime)
         # Re-validate inside _attempt_workspace_restore via its own
         # DB read so a concurrent writer that cleared the setting
         # between this check and the helper call is still handled
         # correctly (it returns home instead of trying to switch to a
         # since-deleted target).
-        return await self._attempt_workspace_restore(chat_id, instance)
+        return await self._attempt_workspace_restore(runtime, instance)
 
-    def is_alive(self, chat_id: int) -> bool:
+    def is_alive(self, runtime: RuntimeSelector) -> bool:
         """True if this user's subprocess is running."""
-        instance = self.get_if_exists(chat_id)
+        instance = self.get_if_exists(runtime)
         return instance.is_alive if instance else False
 
-    def get_session_id(self, chat_id: int) -> str | None:
+    def get_session_id(self, runtime: RuntimeSelector) -> str | None:
         """Get the session ID for a user's subprocess."""
-        instance = self.get_if_exists(chat_id)
+        instance = self.get_if_exists(runtime)
         return instance.session_id if instance else None
 
     # ── Idle eviction ───────────────────────────────────────────────
@@ -1058,11 +1131,11 @@ class SubprocessPool:
             await asyncio.sleep(_EVICTION_CHECK_INTERVAL)
             now = time.monotonic()
             to_evict = [
-                chat_id
-                for chat_id, last in self._last_activity.items()
-                if now - last > idle_timeout and chat_id in self._pool and chat_id not in self._in_flight
+                runtime_key
+                for runtime_key, last in self._last_activity.items()
+                if now - last > idle_timeout and runtime_key in self._pool and runtime_key not in self._in_flight
             ]
-            for chat_id in to_evict:
+            for runtime_key in to_evict:
                 # Re-check all three snapshot conditions before evicting.
                 # Between the snapshot and this iteration (and between
                 # iterations), await points in shutdown() yield control.
@@ -1074,31 +1147,34 @@ class SubprocessPool:
                 # instance, clean up the orphaned _last_activity entry and
                 # skip. This must be checked before the timestamp/in-flight
                 # guards so the cleanup always fires when the instance is gone.
-                if chat_id not in self._pool:
-                    self._last_activity.pop(chat_id, None)
+                if runtime_key not in self._pool:
+                    self._last_activity.pop(runtime_key, None)
                     continue
-                if self._last_activity.get(chat_id, 0) > now:
+                if self._last_activity.get(runtime_key, 0) > now:
                     continue
-                if chat_id in self._in_flight:
+                if runtime_key in self._in_flight:
                     continue
-                instance = self._pool.get(chat_id)
+                instance = self._pool.get(runtime_key)
                 try:
                     if instance and instance.is_alive:
                         try:
-                            log.info("Evicting idle subprocess for user %d", chat_id)
+                            log.info("Evicting idle subprocess for runtime %s", runtime_key)
                             await instance.shutdown()
                         except Exception:
                             # Graceful shutdown failed. Fall back to raw SIGKILL
                             # so the process doesn't become an orphan. force_kill()
                             # is effectively infallible (catches its own OSError).
-                            log.exception("Error evicting subprocess for user %d, sending SIGKILL", chat_id)
+                            log.exception(
+                                "Error evicting subprocess for runtime %s, sending SIGKILL",
+                                runtime_key,
+                            )
                             instance.force_kill()
                 finally:
                     # Remove from tracking after shutdown (alive instances) or
                     # unconditionally (dead instances). The finally block ensures
                     # cleanup even if CancelledError propagates from shutdown().
-                    self._pool.pop(chat_id, None)
-                    self._last_activity.pop(chat_id, None)
+                    self._pool.pop(runtime_key, None)
+                    self._last_activity.pop(runtime_key, None)
 
     async def shutdown(self) -> None:
         """Shut down all subprocesses and stop the eviction task."""
@@ -1109,11 +1185,11 @@ class SubprocessPool:
             except asyncio.CancelledError:
                 pass
             self._eviction_task = None
-        for chat_id, instance in self._pool.items():
+        for runtime_key, instance in self._pool.items():
             try:
-                log.info("Shutting down subprocess for user %d", chat_id)
+                log.info("Shutting down subprocess for runtime %s", runtime_key)
                 await instance.shutdown()
             except Exception:
-                log.exception("Error shutting down subprocess for user %d", chat_id)
+                log.exception("Error shutting down subprocess for runtime %s", runtime_key)
         self._pool.clear()
         self._last_activity.clear()

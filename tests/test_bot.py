@@ -955,14 +955,15 @@ def _make_context(config=None, claude=None, pool=None, args=None, user_data=None
     }
     application = MagicMock(spec=KaiTelegramApplication)
     internal_api_contexts = MagicMock()
-    internal_api_contexts.for_runtime_config_id.side_effect = lambda runtime_config_id: SimpleNamespace(
-        principal_id=PrincipalId(f"prn_{runtime_config_id:032x}"),
-        channel_id=ChannelId(f"chn_{runtime_config_id:032x}"),
+    internal_api_contexts.for_runtime_profile.side_effect = lambda runtime_profile_id: SimpleNamespace(
+        principal_id=principal_storage.for_runtime_profile(runtime_profile_id).principal_id,
+        channel_id=ChannelId(f"chn_{int(str(runtime_profile_id).partition('_')[2], 16):032x}"),
         agent_id=AgentId("agt_" + "a" * 32),
-        runtime_profile_id=profile_id(runtime_config_id),
+        runtime_profile_id=runtime_profile_id,
     )
     application.core_services = SimpleNamespace(
         subprocess_pool=mock_pool,
+        runtime_profiles=profile_registry(*sorted(runtime_config_ids)),
         private_text_execution=None,
         conversation_runs=None,
         principal_storage=principal_storage,
@@ -1414,7 +1415,7 @@ class TestHandleJob:
 
         await handle_job(update, ctx)
 
-        ctx.application.core_services.internal_api_contexts.for_runtime_config_id.assert_called_once_with(1)
+        ctx.application.core_services.internal_api_contexts.for_runtime_profile.assert_called_once_with(profile_id(1))
 
     @pytest.mark.asyncio
     async def test_formats_interval_hours(self):

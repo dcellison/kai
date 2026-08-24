@@ -123,7 +123,7 @@ async def test_owner_accepts_executes_and_atomically_enqueues_terminal_reply(tmp
         assert len(runtime.canonical_histories) == 1
         assert "canonical-transcript.ndjson" in runtime.canonical_histories[0]
         assert "untrusted conversation data" in runtime.canonical_histories[0]
-        pool.prepare_execution.assert_awaited_once_with(101)
+        pool.prepare_execution.assert_awaited_once_with(profile_id(101))
     finally:
         await service.stop()
 

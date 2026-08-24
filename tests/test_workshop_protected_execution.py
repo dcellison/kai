@@ -71,7 +71,13 @@ async def _accepted_run(path: Path, home: Path):
             )
         },
     )
-    return store, accepted.run, SubprocessPool(config=config, services_info=[]), profile_registry(101)
+    profiles = profile_registry(101)
+    return (
+        store,
+        accepted.run,
+        SubprocessPool(config=config, services_info=[], runtime_profiles=profiles),
+        profiles,
+    )
 
 
 class TestProtectedExecutionPreparation:
@@ -87,14 +93,14 @@ class TestProtectedExecutionPreparation:
                 prepared = await WorkshopProtectedExecutionPreparationService(
                     store,
                     WorkshopRuntimePool(pool, profiles),
-                    registered_backend_ids=frozenset({"claude"}),
+                    registered_backend_ids=frozenset({"codex"}),
                 ).prepare(run.run_id)
 
             assert prepared.run == run
-            assert prepared.selection.backend == "claude"
-            assert prepared.selection.provider == "anthropic"
-            assert prepared.selection.model == "sonnet"
-            assert prepared.workspace == home
+            assert prepared.selection.backend == "codex"
+            assert prepared.selection.provider == "openai"
+            assert prepared.selection.model == "gpt-5.6-sol"
+            assert prepared.workspace == pool.get_home_workspace(profile_id(101))
             assert "_runtime" not in repr(prepared)
             assert not hasattr(prepared, "chat_id")
         finally:
@@ -114,7 +120,7 @@ class TestProtectedExecutionPreparation:
                 await WorkshopProtectedExecutionPreparationService(
                     store,
                     WorkshopRuntimePool(pool, profiles),
-                    registered_backend_ids=frozenset({"codex"}),
+                    registered_backend_ids=frozenset({"claude"}),
                 ).prepare(run.run_id)
         finally:
             await pool.shutdown()
