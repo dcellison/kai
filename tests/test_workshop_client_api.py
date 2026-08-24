@@ -33,6 +33,10 @@ from kai.workshop.client_events import (
     ClientTimelineMessageEvent,
     read_client_channel_events,
 )
+from kai.workshop.client_sessions import (
+    WorkshopBearerSessionAuthenticator,
+    WorkshopClientSessionManager,
+)
 from kai.workshop.conversation_commands import ConversationCommandDisposition
 from kai.workshop.domain import (
     ChannelId,
@@ -590,6 +594,36 @@ async def test_memory_api_rejects_owner_parameters_and_duplicate_values(
         ):
             response = await client.get(path, headers=headers)
             assert response.status == 400
+    finally:
+        await client.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_memory_reads_share_the_client_request_transaction_boundary(
+    tmp_path: Path,
+) -> None:
+    store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+    sessions = WorkshopClientSessionManager(store)
+    device = await sessions.register_device(alice_id, "Alice browser")
+    issued = await sessions.issue_session(alice_id, device.device_id)
+    client = await _open_client(
+        store,
+        WorkshopBearerSessionAuthenticator(sessions),
+        memory_queries=_MemoryQueries(alice_id),
+    )
+    headers = {"Authorization": f"Bearer {issued.token}"}
+    try:
+        stats, records = await asyncio.gather(
+            client.get("/v1/memory/stats", headers=headers),
+            client.get(
+                "/v1/memory/records?source=extracted&limit=1&order=oldest",
+                headers=headers,
+            ),
+        )
+
+        assert stats.status == 200
+        assert records.status == 200
     finally:
         await client.close()
         await store.close()
