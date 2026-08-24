@@ -17,10 +17,14 @@ from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.client_events import ClientTimelineMessageEvent, read_client_channel_events
 from kai.workshop.conversation_commands import ConversationCommandDisposition
 from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
-from kai.workshop.domain import ChannelId, PrincipalId, RuntimeProfileId
+from kai.workshop.domain import AgentId, ChannelId, PrincipalId, RuntimeProfileId
 from kai.workshop.execution_coordinator import CanonicalExecutionDisposition
 from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
 from kai.workshop.runtime_pool import WorkshopRuntimePool
+from kai.workshop.scheduled_jobs import (
+    WorkshopScheduledJobAuthority,
+    WorkshopScheduledJobStore,
+)
 from kai.workshop.scheduler import (
     WorkshopCanonicalScheduler,
     _CanonicalJob,
@@ -193,27 +197,25 @@ async def _install_owned_job(
         principal_id, channel_id = await cursor.fetchone()
     async with store.connection.execute("SELECT id FROM agents") as cursor:
         agent_id = (await cursor.fetchone())[0]
-    job_id = await sessions.create_job(
-        chat_id=101,
+    job = await WorkshopScheduledJobStore(store).create(
+        WorkshopScheduledJobAuthority(
+            PrincipalId(str(principal_id)),
+            ChannelId(str(channel_id)),
+            AgentId(str(agent_id)),
+            profile_id(101),
+        ),
         name="Canonical reminder",
         job_type=job_type,
         prompt=prompt,
         schedule_type="once",
         schedule_data=json.dumps({"run_at": run_at.isoformat()}),
     )
-    await sessions._get_db().execute(
-        "INSERT INTO workshop_job_owners "
-        "(job_id, principal_id, channel_id, agent_id, runtime_profile_id) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (job_id, principal_id, channel_id, agent_id, profile_id(101)),
-    )
-    await sessions._get_db().commit()
-    return store, job_id
+    return store, job.job_id
 
 
 async def _job_owner(store: WorkshopEventStore, job_id: int) -> tuple[PrincipalId, ChannelId]:
     async with store.connection.execute(
-        "SELECT principal_id, channel_id FROM workshop_job_owners WHERE job_id = ?",
+        "SELECT principal_id, channel_id FROM workshop_scheduled_jobs WHERE id = ?",
         (job_id,),
     ) as cursor:
         row = await cursor.fetchone()
@@ -292,7 +294,7 @@ async def test_workshop_only_reminder_fires_canonically_without_delivery(tmp_pat
         async with source_store.connection.execute("SELECT COUNT(*) FROM delivery_outbox") as cursor:
             assert (await cursor.fetchone())[0] == 0
         async with source_store.connection.execute(
-            "SELECT active FROM jobs WHERE id = ?",
+            "SELECT active FROM workshop_scheduled_jobs WHERE id = ?",
             (job_id,),
         ) as cursor:
             assert (await cursor.fetchone())[0] == 0
@@ -361,21 +363,24 @@ async def test_scheduler_fails_closed_for_active_job_without_canonical_owner(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "kai.db"
-    await sessions.init_db(database)
-    await sessions._get_db().execute(
-        "INSERT INTO jobs "
-        "(chat_id, name, job_type, prompt, schedule_type, schedule_data) "
-        "VALUES (101, 'Unowned', 'reminder', 'No fallback', 'interval', ?)",
-        (json.dumps({"seconds": 60}),),
+    store, job_id = await _install_owned_job(
+        database,
+        transport="workshop",
+        run_at=datetime.now(UTC) + timedelta(hours=1),
     )
-    await sessions._get_db().commit()
+    await store.connection.execute(
+        "UPDATE workshop_scheduled_jobs SET runtime_profile_id = ? WHERE id = ?",
+        (RuntimeProfileId("rtp_" + "9" * 32), job_id),
+    )
+    await store.connection.commit()
 
-    with pytest.raises(RuntimeError, match="complete canonical owner"):
+    with pytest.raises(RuntimeError, match="canonical execution lane"):
         await WorkshopCanonicalScheduler.open_and_start(
             database,
             _UnusedExecution(),  # type: ignore[arg-type]
             _UnusedCompatibilityState(),  # type: ignore[arg-type]
         )
+    await store.close()
     await sessions.close_db()
 
 
@@ -389,33 +394,35 @@ async def test_once_daily_and_interval_jobs_reconcile_into_core_scheduler(
         run_at=datetime.now(UTC) + timedelta(hours=1),
     )
     async with source_store.connection.execute(
-        "SELECT principal_id, channel_id, agent_id, runtime_profile_id FROM workshop_job_owners WHERE job_id = ?",
+        "SELECT principal_id, channel_id, agent_id, runtime_profile_id FROM workshop_scheduled_jobs WHERE id = ?",
         (once_id,),
     ) as cursor:
         owner = tuple(await cursor.fetchone())
-    interval_id = await sessions.create_job(
-        chat_id=102,
+    authority = WorkshopScheduledJobAuthority(
+        PrincipalId(str(owner[0])),
+        ChannelId(str(owner[1])),
+        AgentId(str(owner[2])),
+        RuntimeProfileId(str(owner[3])),
+    )
+    job_store = WorkshopScheduledJobStore(source_store)
+    interval = await job_store.create(
+        authority,
         name="Interval",
         job_type="reminder",
         prompt="Interval reminder",
         schedule_type="interval",
         schedule_data=json.dumps({"seconds": 60}),
     )
-    daily_id = await sessions.create_job(
-        chat_id=103,
+    daily = await job_store.create(
+        authority,
         name="Daily",
         job_type="reminder",
         prompt="Daily reminder",
         schedule_type="daily",
         schedule_data=json.dumps({"times": ["09:00", "17:00"]}),
     )
-    await sessions._get_db().executemany(
-        "INSERT INTO workshop_job_owners "
-        "(job_id, principal_id, channel_id, agent_id, runtime_profile_id) "
-        "VALUES (?, ?, ?, ?, ?)",
-        ((interval_id, *owner), (daily_id, *owner)),
-    )
-    await sessions._get_db().commit()
+    interval_id = interval.job_id
+    daily_id = daily.job_id
 
     scheduler = await WorkshopCanonicalScheduler.open_and_start(
         database,

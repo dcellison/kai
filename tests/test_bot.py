@@ -954,13 +954,25 @@ def _make_context(config=None, claude=None, pool=None, args=None, user_data=None
         "config": resolved_config,
     }
     application = MagicMock(spec=KaiTelegramApplication)
+    internal_api_contexts = MagicMock()
+    internal_api_contexts.for_runtime_config_id.side_effect = lambda runtime_config_id: SimpleNamespace(
+        principal_id=PrincipalId(f"prn_{runtime_config_id:032x}"),
+        channel_id=ChannelId(f"chn_{runtime_config_id:032x}"),
+        agent_id=AgentId("agt_" + "a" * 32),
+        runtime_profile_id=profile_id(runtime_config_id),
+    )
     application.core_services = SimpleNamespace(
         subprocess_pool=mock_pool,
         private_text_execution=None,
         conversation_runs=None,
         principal_storage=principal_storage,
         artifacts=_TestArtifactService(),
-        scheduler=SimpleNamespace(remove_job=AsyncMock()),
+        internal_api_contexts=internal_api_contexts,
+        scheduler=SimpleNamespace(
+            list_jobs=AsyncMock(return_value=[]),
+            get_job=AsyncMock(return_value=None),
+            delete_job=AsyncMock(return_value=False),
+        ),
     )
     ctx.application = application
     ctx.args = args or []
@@ -1382,8 +1394,7 @@ class TestHandleJob:
         """/job with no args lists all jobs."""
         update = _make_update()
         ctx = _make_context()
-        with patch("kai.bot.sessions.get_jobs", new_callable=AsyncMock, return_value=[]):
-            await handle_job(update, ctx)
+        await handle_job(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "No active" in reply
 
@@ -1392,10 +1403,18 @@ class TestHandleJob:
         """/job list is equivalent to /job with no args."""
         update = _make_update()
         ctx = _make_context(args=["list"])
-        with patch("kai.bot.sessions.get_jobs", new_callable=AsyncMock, return_value=[]):
-            await handle_job(update, ctx)
+        await handle_job(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "No active" in reply
+
+    @pytest.mark.asyncio
+    async def test_group_command_uses_authenticated_human_not_telegram_chat(self):
+        update = _make_update(chat_id=-100123, user_id=1)
+        ctx = _make_context()
+
+        await handle_job(update, ctx)
+
+        ctx.application.core_services.internal_api_contexts.for_runtime_config_id.assert_called_once_with(1)
 
     @pytest.mark.asyncio
     async def test_formats_interval_hours(self):
@@ -1411,8 +1430,8 @@ class TestHandleJob:
                 "schedule_data": json.dumps({"seconds": 7200}),
             }
         ]
-        with patch("kai.bot.sessions.get_jobs", new_callable=AsyncMock, return_value=jobs):
-            await handle_job(update, ctx)
+        ctx.application.core_services.scheduler.list_jobs.return_value = jobs
+        await handle_job(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "2h" in reply
         assert "\U0001f916" in reply  # robot emoji for claude type
@@ -1431,8 +1450,8 @@ class TestHandleJob:
                 "schedule_data": json.dumps({"seconds": 300}),
             }
         ]
-        with patch("kai.bot.sessions.get_jobs", new_callable=AsyncMock, return_value=jobs):
-            await handle_job(update, ctx)
+        ctx.application.core_services.scheduler.list_jobs.return_value = jobs
+        await handle_job(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "5m" in reply
         assert "\U0001f514" in reply  # bell emoji for reminder type
@@ -1450,8 +1469,8 @@ class TestHandleJob:
                 "schedule_data": json.dumps({"times": ["14:00"]}),
             }
         ]
-        with patch("kai.bot.sessions.get_jobs", new_callable=AsyncMock, return_value=jobs):
-            await handle_job(update, ctx)
+        ctx.application.core_services.scheduler.list_jobs.return_value = jobs
+        await handle_job(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "14:00" in reply
 
@@ -1464,7 +1483,6 @@ class TestHandleJob:
         ctx = _make_context(args=["info", "4"])
         job = {
             "id": 4,
-            "chat_id": 12345,
             "name": "Weather report",
             "job_type": "claude",
             "prompt": "What is the weather today?",
@@ -1473,8 +1491,8 @@ class TestHandleJob:
             "auto_remove": False,
             "notify_on_check": False,
         }
-        with patch("kai.bot.sessions.get_job_by_id", new_callable=AsyncMock, return_value=job):
-            await handle_job(update, ctx)
+        ctx.application.core_services.scheduler.get_job.return_value = job
+        await handle_job(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "Job #4" in reply
         assert "Weather report" in reply
@@ -1487,8 +1505,7 @@ class TestHandleJob:
         """/job info <id> returns not found for non-existent job."""
         update = _make_update()
         ctx = _make_context(args=["info", "999"])
-        with patch("kai.bot.sessions.get_job_by_id", new_callable=AsyncMock, return_value=None):
-            await handle_job(update, ctx)
+        await handle_job(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "not found" in reply.lower()
 
@@ -1497,19 +1514,7 @@ class TestHandleJob:
         """/job info <id> returns not found for a job owned by another chat."""
         update = _make_update(chat_id=12345)
         ctx = _make_context(args=["info", "4"])
-        job = {
-            "id": 4,
-            "chat_id": 99999,  # Different owner
-            "name": "Secret",
-            "job_type": "claude",
-            "prompt": "hidden",
-            "schedule_type": "daily",
-            "schedule_data": json.dumps({"times": ["08:00"]}),
-            "auto_remove": False,
-            "notify_on_check": False,
-        }
-        with patch("kai.bot.sessions.get_job_by_id", new_callable=AsyncMock, return_value=job):
-            await handle_job(update, ctx)
+        await handle_job(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "not found" in reply.lower()
 
@@ -1538,9 +1543,9 @@ class TestHandleJob:
         """Deletes from DB and removes the core scheduler task."""
         update = _make_update()
         ctx = _make_context(args=["cancel", "5"])
-        with patch("kai.bot.sessions.delete_job", new_callable=AsyncMock, return_value=True):
-            await handle_job(update, ctx)
-        ctx.application.core_services.scheduler.remove_job.assert_awaited_once_with(5)
+        ctx.application.core_services.scheduler.delete_job.return_value = True
+        await handle_job(update, ctx)
+        ctx.application.core_services.scheduler.delete_job.assert_awaited_once()
         reply = update.message.reply_text.call_args[0][0]
         assert "cancelled" in reply.lower()
 
@@ -1548,8 +1553,7 @@ class TestHandleJob:
     async def test_cancel_not_found(self):
         update = _make_update()
         ctx = _make_context(args=["cancel", "99"])
-        with patch("kai.bot.sessions.delete_job", new_callable=AsyncMock, return_value=False):
-            await handle_job(update, ctx)
+        await handle_job(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "not found" in reply.lower()
 
@@ -1588,8 +1592,7 @@ class TestHandleJob:
         """/jobs delegates to the list logic."""
         update = _make_update()
         ctx = _make_context()
-        with patch("kai.bot.sessions.get_jobs", new_callable=AsyncMock, return_value=[]):
-            await handle_jobs(update, ctx)
+        await handle_jobs(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "No active" in reply
 

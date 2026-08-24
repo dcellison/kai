@@ -54,10 +54,10 @@ class WorkshopScheduledReminderRecorder:
     async def _record_locked(self, reminder: ScheduledReminder) -> ScheduledReminderRecord:
         async with self._store.connection.execute(
             "SELECT c.workshop_id, c.id, a.principal_id "
-            "FROM workshop_job_owners o "
-            "JOIN channels c ON c.id = o.channel_id "
-            "JOIN agents a ON a.id = o.agent_id AND a.workshop_id = c.workshop_id "
-            "WHERE o.job_id = ?",
+            "FROM workshop_scheduled_jobs j "
+            "JOIN channels c ON c.id = j.channel_id "
+            "JOIN agents a ON a.id = j.agent_id AND a.workshop_id = c.workshop_id "
+            "WHERE j.id = ?",
             (reminder.job_id,),
         ) as cursor:
             rows = list(await cursor.fetchall())

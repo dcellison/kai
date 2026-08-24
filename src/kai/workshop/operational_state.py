@@ -120,9 +120,14 @@ async def reconcile_workshop_operational_state(
     try:
         await connection.execute("BEGIN IMMEDIATE")
         for namespace in registry.namespaces:
+            scheduled_jobs_migrated = await _scheduled_job_migration_owner(connection, namespace)
             migrated = await _migration_owner(connection, namespace)
             if migrated:
-                jobs += await _backfill_jobs(connection, namespace)
+                if not scheduled_jobs_migrated:
+                    job_count = await _backfill_jobs(connection, namespace)
+                    await _verify_legacy_jobs_for_cutover(connection, namespace)
+                    await _record_scheduled_job_migration(connection, namespace, job_count)
+                    jobs += job_count
                 await _sync_operator_github_policy(
                     connection,
                     namespace,
@@ -131,7 +136,11 @@ async def reconcile_workshop_operational_state(
                 await _verify_namespace(connection, namespace)
                 continue
 
-            job_count = await _backfill_jobs(connection, namespace)
+            job_count = 0
+            if not scheduled_jobs_migrated:
+                job_count = await _backfill_jobs(connection, namespace)
+                await _verify_legacy_jobs_for_cutover(connection, namespace)
+                await _record_scheduled_job_migration(connection, namespace, job_count)
             github_count = await _backfill_github_subscription(
                 connection,
                 namespace,
@@ -208,6 +217,54 @@ async def _migration_owner(
             "assignment or restore the database from backup"
         )
     return True
+
+
+async def _scheduled_job_migration_owner(
+    connection: aiosqlite.Connection,
+    namespace: WorkshopExecutionStateNamespace,
+) -> bool:
+    async with connection.execute(
+        "SELECT runtime_config_id, principal_id, channel_id, agent_id "
+        "FROM workshop_scheduled_job_migrations WHERE runtime_profile_id = ?",
+        (namespace.runtime_profile_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is None:
+        return False
+    recorded = (int(row[0]), str(row[1]), str(row[2]), str(row[3]))
+    current = (
+        namespace.runtime_config_id,
+        str(namespace.principal_id),
+        str(namespace.channel_id),
+        str(namespace.agent_id),
+    )
+    if recorded != current:
+        raise WorkshopOperationalStateError(
+            "Canonical scheduled-job migration conflicts with current protected ownership "
+            f"for runtime profile {namespace.runtime_profile_id}; restore its recorded canonical "
+            "assignment or restore the database from backup"
+        )
+    return True
+
+
+async def _record_scheduled_job_migration(
+    connection: aiosqlite.Connection,
+    namespace: WorkshopExecutionStateNamespace,
+    legacy_jobs_count: int,
+) -> None:
+    await connection.execute(
+        "INSERT INTO workshop_scheduled_job_migrations ("
+        "runtime_profile_id, runtime_config_id, principal_id, channel_id, agent_id, "
+        "legacy_jobs_count) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            namespace.runtime_profile_id,
+            namespace.runtime_config_id,
+            namespace.principal_id,
+            namespace.channel_id,
+            namespace.agent_id,
+            legacy_jobs_count,
+        ),
+    )
 
 
 async def _legacy_setting(
@@ -307,7 +364,7 @@ async def _backfill_jobs(
     connection: aiosqlite.Connection,
     namespace: WorkshopExecutionStateNamespace,
 ) -> int:
-    cursor = await connection.execute(
+    await connection.execute(
         "INSERT OR IGNORE INTO workshop_job_owners ("
         "job_id, principal_id, channel_id, agent_id, runtime_profile_id"
         ") SELECT id, ?, ?, ?, ? FROM jobs WHERE chat_id = ?",
@@ -319,7 +376,26 @@ async def _backfill_jobs(
             namespace.runtime_config_id,
         ),
     )
-    return cursor.rowcount
+    job_cursor = await connection.execute(
+        "INSERT OR IGNORE INTO workshop_scheduled_jobs ("
+        "id, principal_id, channel_id, agent_id, runtime_profile_id, name, job_type, "
+        "prompt, schedule_type, schedule_data, created_at, active, auto_remove, notify_on_check"
+        ") SELECT j.id, o.principal_id, o.channel_id, o.agent_id, o.runtime_profile_id, "
+        "j.name, j.job_type, j.prompt, j.schedule_type, j.schedule_data, "
+        "strftime('%Y-%m-%dT%H:%M:%fZ', j.created_at || 'Z'), j.active, "
+        "j.auto_remove, j.notify_on_check FROM jobs j "
+        "JOIN workshop_job_owners o ON o.job_id = j.id "
+        "JOIN principals p ON p.id = o.principal_id AND p.kind = 'human' "
+        "JOIN channels c ON c.id = o.channel_id AND c.kind = 'direct' "
+        "JOIN channel_memberships cm ON cm.channel_id = c.id "
+        "AND cm.principal_id = p.id AND cm.role = 'owner' "
+        "JOIN agents a ON a.id = o.agent_id AND a.workshop_id = c.workshop_id "
+        "JOIN channel_agent_runtime_assignments ra ON ra.channel_id = c.id "
+        "AND ra.agent_id = a.id AND ra.runtime_profile_id = o.runtime_profile_id "
+        "WHERE j.chat_id = ?",
+        (namespace.runtime_config_id,),
+    )
+    return job_cursor.rowcount
 
 
 async def _backfill_github_subscription(
@@ -395,6 +471,21 @@ async def _verify_namespace(
     namespace: WorkshopExecutionStateNamespace,
 ) -> None:
     async with connection.execute(
+        "SELECT COUNT(*) FROM principal_github_subscriptions WHERE principal_id = ?",
+        (namespace.principal_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is None or int(row[0]) != 1:
+        raise WorkshopOperationalStateError(
+            "Protected GitHub subscription policy has no unique canonical principal owner"
+        )
+
+
+async def _verify_legacy_jobs_for_cutover(
+    connection: aiosqlite.Connection,
+    namespace: WorkshopExecutionStateNamespace,
+) -> None:
+    async with connection.execute(
         "SELECT j.id FROM jobs j LEFT JOIN workshop_job_owners o ON o.job_id = j.id "
         "WHERE j.chat_id = ? AND (o.job_id IS NULL OR o.principal_id != ? OR o.channel_id != ? "
         "OR o.agent_id != ? OR o.runtime_profile_id != ?) ORDER BY j.id LIMIT 5",
@@ -415,11 +506,21 @@ async def _verify_namespace(
             "or remove and recreate the affected jobs"
         )
     async with connection.execute(
-        "SELECT COUNT(*) FROM principal_github_subscriptions WHERE principal_id = ?",
-        (namespace.principal_id,),
+        "SELECT j.id FROM jobs j JOIN workshop_job_owners o ON o.job_id = j.id "
+        "LEFT JOIN workshop_scheduled_jobs c ON c.id = j.id "
+        "WHERE j.chat_id = ? AND (c.id IS NULL OR c.principal_id != o.principal_id "
+        "OR c.channel_id != o.channel_id OR c.agent_id != o.agent_id "
+        "OR c.runtime_profile_id != o.runtime_profile_id OR c.name != j.name "
+        "OR c.job_type != j.job_type OR c.prompt != j.prompt "
+        "OR c.schedule_type != j.schedule_type OR c.schedule_data != j.schedule_data "
+        "OR c.active != j.active OR c.auto_remove != j.auto_remove "
+        "OR c.notify_on_check != j.notify_on_check) ORDER BY j.id LIMIT 5",
+        (namespace.runtime_config_id,),
     ) as cursor:
-        row = await cursor.fetchone()
-    if row is None or int(row[0]) != 1:
+        canonical_rows = await cursor.fetchall()
+    if canonical_rows:
+        job_ids = ", ".join(str(row[0]) for row in canonical_rows)
         raise WorkshopOperationalStateError(
-            "Protected GitHub subscription policy has no unique canonical principal owner"
+            "Protected scheduled jobs conflict with canonical definitions "
+            f"(job ids: {job_ids}); restore the database from the same pre-migration backup"
         )

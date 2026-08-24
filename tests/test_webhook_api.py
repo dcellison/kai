@@ -49,6 +49,7 @@ from kai.webhook import (
 )
 from kai.workshop.domain import AgentId, ChannelId, PrincipalId
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
+from kai.workshop.scheduler import WorkshopScheduledJobRegistrationError
 from kai.workshop.storage_namespaces import (
     WorkshopPrincipalStorageNamespace,
     WorkshopPrincipalStorageRegistry,
@@ -93,6 +94,83 @@ def _principal_storage_registry() -> WorkshopPrincipalStorageRegistry:
     )
 
 
+def _runtime_config_id_for_authority(authority) -> int:
+    return int(str(authority.principal_id).removeprefix("prn_"), 16)
+
+
+class _CanonicalSchedulerDouble:
+    """Exercise handler contracts while legacy session tests remain isolated."""
+
+    def __init__(self) -> None:
+        self.register_job = AsyncMock(return_value=True)
+        self.remove_job = AsyncMock()
+
+    async def create_job(self, authority, **fields) -> int:
+        runtime_config_id = _runtime_config_id_for_authority(authority)
+        job_id = await sessions.create_job(chat_id=runtime_config_id, **fields)
+        try:
+            if not await self.register_job(job_id):
+                raise RuntimeError("registration failed")
+        except Exception as exc:
+            await sessions.deactivate_job(job_id, chat_id=runtime_config_id)
+            raise WorkshopScheduledJobRegistrationError("registration failed") from exc
+        return job_id
+
+    async def list_jobs(self, authority) -> list[dict]:
+        jobs = await sessions.get_jobs(_runtime_config_id_for_authority(authority))
+        return [{key: value for key, value in job.items() if key != "chat_id"} for job in jobs]
+
+    async def get_job(self, job_id: int, authority) -> dict | None:
+        job = await sessions.get_job_by_id(job_id)
+        if job is None or job["chat_id"] != _runtime_config_id_for_authority(authority):
+            return None
+        return {key: value for key, value in job.items() if key != "chat_id"}
+
+    async def delete_job(self, job_id: int, authority) -> bool:
+        deleted = await sessions.delete_job(
+            job_id,
+            chat_id=_runtime_config_id_for_authority(authority),
+        )
+        if deleted:
+            await self.remove_job(job_id)
+        return deleted
+
+    async def update_job(self, job_id: int, authority, update) -> bool:
+        runtime_config_id = _runtime_config_id_for_authority(authority)
+        previous = await sessions.get_job_by_id(job_id)
+        if previous is None or previous["chat_id"] != runtime_config_id:
+            return False
+        updated = await sessions.update_job(
+            job_id,
+            chat_id=runtime_config_id,
+            name=update.name,
+            prompt=update.prompt,
+            schedule_type=update.schedule_type,
+            schedule_data=update.schedule_data,
+            auto_remove=update.auto_remove,
+            notify_on_check=update.notify_on_check,
+        )
+        if not updated or (update.schedule_type is None and update.schedule_data is None):
+            return updated
+        try:
+            if not await self.register_job(job_id):
+                raise RuntimeError("registration failed")
+        except Exception:
+            await sessions.update_job(
+                job_id,
+                chat_id=runtime_config_id,
+                name=previous["name"],
+                prompt=previous["prompt"],
+                schedule_type=previous["schedule_type"],
+                schedule_data=previous["schedule_data"],
+                auto_remove=previous["auto_remove"],
+                notify_on_check=previous["notify_on_check"],
+            )
+            await self.register_job(job_id)
+            raise
+        return True
+
+
 async def _call_memory_delete_all_as_authorized(request, *, chat_id: int = 123):
     """Exercise delete-all handler behavior with an explicitly privileged principal."""
     context = _internal_api_context(chat_id)
@@ -135,10 +213,7 @@ def mock_request():
         ALLOWED_USER_IDS_KEY: {123, 456},
         CORE_HOST_KEY: SimpleNamespace(
             services=SimpleNamespace(
-                scheduler=SimpleNamespace(
-                    register_job=AsyncMock(return_value=True),
-                    remove_job=AsyncMock(),
-                )
+                scheduler=_CanonicalSchedulerDouble(),
             )
         ),
     }

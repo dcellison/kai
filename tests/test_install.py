@@ -4973,15 +4973,35 @@ class TestCmdStatus:
     def test_status_reports_core_owned_active_jobs(self, tmp_path):
         db_path = tmp_path / "kai.db"
         connection = sqlite3.connect(db_path)
-        connection.execute("CREATE TABLE jobs (id INTEGER PRIMARY KEY, active INTEGER NOT NULL)")
-        connection.execute("CREATE TABLE workshop_job_owners (job_id INTEGER PRIMARY KEY)")
+        connection.execute("CREATE TABLE channels (id TEXT PRIMARY KEY, kind TEXT NOT NULL)")
+        connection.execute("CREATE TABLE channel_memberships (channel_id TEXT, principal_id TEXT, role TEXT)")
+        connection.execute("CREATE TABLE agents (id TEXT PRIMARY KEY, workshop_id TEXT)")
+        connection.execute("ALTER TABLE channels ADD COLUMN workshop_id TEXT")
+        connection.execute(
+            "CREATE TABLE channel_agent_runtime_assignments (channel_id TEXT, agent_id TEXT, runtime_profile_id TEXT)"
+        )
+        connection.execute(
+            "CREATE TABLE workshop_scheduled_jobs ("
+            "id INTEGER PRIMARY KEY, principal_id TEXT, channel_id TEXT, agent_id TEXT, "
+            "runtime_profile_id TEXT, active INTEGER NOT NULL)"
+        )
         connection.execute("CREATE TABLE workshop_schedule_firings (status TEXT NOT NULL)")
         connection.executemany(
             "INSERT INTO workshop_schedule_firings(status) VALUES (?)",
             [("pending",), ("executing",), ("failed",)],
         )
-        connection.executemany("INSERT INTO jobs(active) VALUES (?)", [(1,), (1,), (0,)])
-        connection.execute("INSERT INTO workshop_job_owners(job_id) VALUES (1)")
+        connection.execute("INSERT INTO channels VALUES ('channel-1', 'direct', 'workshop-1')")
+        connection.execute("INSERT INTO channel_memberships VALUES ('channel-1', 'human-1', 'owner')")
+        connection.execute("INSERT INTO agents VALUES ('agent-1', 'workshop-1')")
+        connection.execute("INSERT INTO channel_agent_runtime_assignments VALUES ('channel-1', 'agent-1', 'profile-1')")
+        connection.executemany(
+            "INSERT INTO workshop_scheduled_jobs VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (1, "human-1", "channel-1", "agent-1", "profile-1", 1),
+                (2, "human-2", "channel-2", "agent-2", "profile-2", 1),
+                (3, "human-1", "channel-1", "agent-1", "profile-1", 0),
+            ],
+        )
         connection.commit()
         connection.close()
 

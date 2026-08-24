@@ -214,10 +214,10 @@ async def _resolve_scheduled_binding(
     message: ScheduledInboundMessage,
 ) -> _ResolvedInboundBinding:
     async with store.connection.execute(
-        "SELECT c.workshop_id FROM workshop_job_owners o "
-        "JOIN channels c ON c.id = o.channel_id "
-        "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.principal_id = o.principal_id "
-        "WHERE o.job_id = ? AND o.principal_id = ? AND o.channel_id = ?",
+        "SELECT c.workshop_id FROM workshop_scheduled_jobs j "
+        "JOIN channels c ON c.id = j.channel_id "
+        "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.principal_id = j.principal_id "
+        "WHERE j.id = ? AND j.principal_id = ? AND j.channel_id = ?",
         (message.job_id, message.principal_id, message.channel_id),
     ) as cursor:
         rows = list(await cursor.fetchall())

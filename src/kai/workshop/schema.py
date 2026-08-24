@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 28
+WORKSHOP_SCHEMA_VERSION = 29
 
 
 @dataclass(frozen=True, slots=True)
@@ -1280,6 +1280,51 @@ _INTEGRATION_ROUTE_SCHEMA = SchemaMigration(
     ),
 )
 
+_CANONICAL_SCHEDULED_JOB_SCHEMA = SchemaMigration(
+    version=29,
+    name="canonical_scheduled_job_definitions",
+    statements=(
+        """
+        CREATE TABLE workshop_scheduled_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            principal_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            runtime_profile_id TEXT NOT NULL CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            name TEXT NOT NULL,
+            job_type TEXT NOT NULL CHECK (job_type IN ('reminder', 'agent')),
+            prompt TEXT NOT NULL,
+            schedule_type TEXT NOT NULL CHECK (
+                schedule_type IN ('once', 'daily', 'interval')
+            ),
+            schedule_data TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+            auto_remove INTEGER NOT NULL DEFAULT 0 CHECK (auto_remove IN (0, 1)),
+            notify_on_check INTEGER NOT NULL DEFAULT 0 CHECK (notify_on_check IN (0, 1))
+        )
+        """,
+        "CREATE INDEX workshop_scheduled_jobs_owner_idx ON workshop_scheduled_jobs "
+        "(principal_id, channel_id, agent_id, runtime_profile_id, active, id)",
+        "CREATE INDEX workshop_scheduled_jobs_active_idx ON workshop_scheduled_jobs (active, id)",
+        """
+        CREATE TABLE workshop_scheduled_job_migrations (
+            runtime_profile_id TEXT PRIMARY KEY CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            runtime_config_id INTEGER NOT NULL,
+            principal_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            legacy_jobs_count INTEGER NOT NULL CHECK (legacy_jobs_count >= 0),
+            migrated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+        """,
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -1309,6 +1354,7 @@ _MIGRATIONS = (
     _CORE_SCHEDULER_SCHEMA,
     _GITHUB_AUTOMATION_SCHEMA,
     _INTEGRATION_ROUTE_SCHEMA,
+    _CANONICAL_SCHEDULED_JOB_SCHEMA,
 )
 
 
