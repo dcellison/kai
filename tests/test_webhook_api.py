@@ -22,7 +22,6 @@ from kai.webhook import (
     GENERIC_WEBHOOK_SECRET_KEY,
     GITHUB_WEBHOOK_SECRET_KEY,
     INTERNAL_API_AUTH_KEY,
-    POOL_KEY,
     TELEGRAM_APP_KEY,
     TELEGRAM_BOT_KEY,
     TELEGRAM_WEBHOOK_SECRET_KEY,
@@ -81,12 +80,12 @@ def _principal_storage_registry() -> WorkshopPrincipalStorageRegistry:
     return WorkshopPrincipalStorageRegistry(
         (
             WorkshopPrincipalStorageNamespace(
-                PrincipalId("prn_" + "1" * 32),
+                _internal_api_context(123).principal_id,
                 profile_id(123),
                 123,
             ),
             WorkshopPrincipalStorageNamespace(
-                PrincipalId("prn_" + "2" * 32),
+                _internal_api_context(456).principal_id,
                 profile_id(456),
                 456,
             ),
@@ -201,7 +200,7 @@ def _default_github_token_lookup():
 
 
 @pytest.fixture
-def mock_request():
+def mock_request(tmp_path):
     """Create a minimal mock request with app dict and helpers."""
     request = MagicMock(spec=web.Request)
     request.app = {
@@ -211,9 +210,13 @@ def mock_request():
         TELEGRAM_BOT_KEY: AsyncMock(),
         CHAT_ID_KEY: 123,
         ALLOWED_USER_IDS_KEY: {123, 456},
+        CONFIG_KEY: SimpleNamespace(memory_projects={}),
         CORE_HOST_KEY: SimpleNamespace(
             services=SimpleNamespace(
                 scheduler=_CanonicalSchedulerDouble(),
+                runtime_pool=SimpleNamespace(
+                    get_effective_workspace=AsyncMock(return_value=tmp_path),
+                ),
             )
         ),
     }
@@ -581,19 +584,20 @@ class TestUpdateJob:
 @pytest.fixture
 def send_file_request(tmp_path):
     """Create a mock request for the send-file endpoint with workspace confinement."""
-    # Send-file resolves the workspace via pool.get_effective_workspace(chat_id)
-    # rather than a global app["workspace"] slot. The fixture supplies a mock
-    # pool whose get_effective_workspace() returns tmp_path so path confinement
-    # passes.
-    mock_pool = MagicMock()
-    mock_pool.get_effective_workspace = AsyncMock(return_value=tmp_path)
+    # Send-file resolves workspace through the credential's protected runtime
+    # profile. The fixture supplies that canonical facade directly.
+    runtime_pool = SimpleNamespace(
+        get_effective_workspace=AsyncMock(return_value=tmp_path),
+    )
     request = MagicMock(spec=web.Request)
     request.app = {
         INTERNAL_API_AUTH_KEY: _make_internal_api_auth(),
         GENERIC_WEBHOOK_SECRET_KEY: "signing-secret",
         TELEGRAM_BOT_KEY: AsyncMock(),
         CHAT_ID_KEY: 123,
-        POOL_KEY: mock_pool,
+        CORE_HOST_KEY: SimpleNamespace(
+            services=SimpleNamespace(runtime_pool=runtime_pool),
+        ),
         WORKSHOP_PRINCIPAL_STORAGE_KEY: _principal_storage_registry(),
     }
     request.headers = {"X-Webhook-Secret": "test-secret"}
@@ -607,7 +611,7 @@ def isolated_send_file_roots(tmp_path, send_file_request, monkeypatch):
     workspace.mkdir()
     data_dir = tmp_path / "data"
     monkeypatch.setattr("kai.webhook.DATA_DIR", data_dir)
-    send_file_request.app[POOL_KEY].get_effective_workspace.return_value = workspace
+    send_file_request.app[CORE_HOST_KEY].services.runtime_pool.get_effective_workspace.return_value = workspace
     return send_file_request, workspace, data_dir
 
 
@@ -638,6 +642,9 @@ class TestSendFile:
         body = json.loads(resp.body)
         assert body["status"] == "sent"
         send_file_request.app[TELEGRAM_BOT_KEY].send_document.assert_called_once()
+        send_file_request.app[CORE_HOST_KEY].services.runtime_pool.get_effective_workspace.assert_awaited_once_with(
+            profile_id(123)
+        )
 
     async def test_caption_forwarded_to_telegram(self, tmp_path, send_file_request):
         """Optional caption is passed through to the Telegram send call."""
@@ -672,7 +679,7 @@ class TestSendFile:
     async def test_authenticated_principal_can_send_own_uploaded_file(self, isolated_send_file_roots):
         """The principal's canonical opaque upload directory is allowed."""
         request, _workspace, data_dir = isolated_send_file_roots
-        namespace = request.app[WORKSHOP_PRINCIPAL_STORAGE_KEY].for_runtime_config_id(123)
+        namespace = request.app[WORKSHOP_PRINCIPAL_STORAGE_KEY].for_runtime_profile(profile_id(123))
         uploaded = namespace.files_directory(data_dir) / "report.txt"
         uploaded.parent.mkdir(parents=True)
         uploaded.write_text("principal-owned")
@@ -686,7 +693,7 @@ class TestSendFile:
     async def test_file_scope_follows_authenticated_credential(self, isolated_send_file_roots):
         """A second credential receives its own scope, independent of app defaults."""
         request, _workspace, data_dir = isolated_send_file_roots
-        namespace = request.app[WORKSHOP_PRINCIPAL_STORAGE_KEY].for_runtime_config_id(456)
+        namespace = request.app[WORKSHOP_PRINCIPAL_STORAGE_KEY].for_runtime_profile(profile_id(456))
         uploaded = namespace.files_directory(data_dir) / "report.txt"
         uploaded.parent.mkdir(parents=True)
         uploaded.write_text("second principal")
@@ -702,11 +709,37 @@ class TestSendFile:
     async def test_authenticated_principal_cannot_send_sibling_uploaded_file(self, isolated_send_file_roots):
         """A FILES_SEND credential cannot select another principal's upload."""
         request, _workspace, data_dir = isolated_send_file_roots
-        namespace = request.app[WORKSHOP_PRINCIPAL_STORAGE_KEY].for_runtime_config_id(456)
+        namespace = request.app[WORKSHOP_PRINCIPAL_STORAGE_KEY].for_runtime_profile(profile_id(456))
         sibling_file = namespace.files_directory(data_dir) / "secret.txt"
         sibling_file.parent.mkdir(parents=True)
         sibling_file.write_text("other principal")
         request.json = AsyncMock(return_value={"path": str(sibling_file)})
+
+        resp = await _handle_send_file(request)
+
+        assert resp.status == 403
+        request.app[TELEGRAM_BOT_KEY].send_document.assert_not_awaited()
+
+    async def test_runtime_profile_storage_must_belong_to_authenticated_principal(
+        self,
+        isolated_send_file_roots,
+    ):
+        """A mismatched protected profile/storage mapping fails closed."""
+        request, _workspace, data_dir = isolated_send_file_roots
+        wrong_owner = _internal_api_context(456)
+        request.app[WORKSHOP_PRINCIPAL_STORAGE_KEY] = WorkshopPrincipalStorageRegistry(
+            (
+                WorkshopPrincipalStorageNamespace(
+                    wrong_owner.principal_id,
+                    profile_id(123),
+                    123,
+                ),
+            )
+        )
+        uploaded = data_dir / "files" / str(wrong_owner.principal_id) / "secret.txt"
+        uploaded.parent.mkdir(parents=True)
+        uploaded.write_text("wrong owner")
+        request.json = AsyncMock(return_value={"path": str(uploaded)})
 
         resp = await _handle_send_file(request)
 
@@ -730,10 +763,10 @@ class TestSendFile:
         """Resolving a symlink into a sibling principal's directory is denied."""
         request, _workspace, data_dir = isolated_send_file_roots
         registry = request.app[WORKSHOP_PRINCIPAL_STORAGE_KEY]
-        sibling_file = registry.for_runtime_config_id(456).files_directory(data_dir) / "secret.txt"
+        sibling_file = registry.for_runtime_profile(profile_id(456)).files_directory(data_dir) / "secret.txt"
         sibling_file.parent.mkdir(parents=True)
         sibling_file.write_text("other principal")
-        link = registry.for_runtime_config_id(123).files_directory(data_dir) / "link.txt"
+        link = registry.for_runtime_profile(profile_id(123)).files_directory(data_dir) / "link.txt"
         link.parent.mkdir(parents=True)
         link.symlink_to(sibling_file)
         request.json = AsyncMock(return_value={"path": str(link)})
@@ -743,11 +776,11 @@ class TestSendFile:
         assert resp.status == 403
         request.app[TELEGRAM_BOT_KEY].send_document.assert_not_awaited()
 
-    async def test_authenticated_principal_can_send_pre_migration_uploaded_file(
+    async def test_authenticated_principal_cannot_send_from_numeric_archive(
         self,
         isolated_send_file_roots,
     ):
-        """Existing numeric upload directories remain readable during migration."""
+        """Numeric upload archives are not protected runtime read roots."""
         request, _workspace, data_dir = isolated_send_file_roots
         legacy = data_dir / "files" / "123" / "legacy.txt"
         legacy.parent.mkdir(parents=True)
@@ -756,8 +789,8 @@ class TestSendFile:
 
         resp = await _handle_send_file(request)
 
-        assert resp.status == 200
-        request.app[TELEGRAM_BOT_KEY].send_document.assert_awaited_once()
+        assert resp.status == 403
+        request.app[TELEGRAM_BOT_KEY].send_document.assert_not_awaited()
 
     async def test_invalid_json_returns_400(self, send_file_request):
         """Returns 400 for malformed JSON body."""
@@ -2643,6 +2676,9 @@ class TestMemoryAdd:
         assert resp.status == 200
         body = json.loads(resp.body.decode())
         assert body == {"id": "mem-uuid-123"}
+        mock_request.app[CORE_HOST_KEY].services.runtime_pool.get_effective_workspace.assert_awaited_once_with(
+            profile_id(123)
+        )
 
     async def test_returns_503_when_memory_disabled(self, mock_request):
         """Precheck path: is_enabled() False -> 503; primitive NOT called."""
@@ -2799,17 +2835,15 @@ class TestMemoryAdd:
         mock_add.assert_not_called()
 
     async def test_returns_500_when_workspace_resolution_fails(self, mock_request):
-        """Scope routing hits the settings DB via the pool; a transient
+        """Scope routing hits the settings DB via the runtime facade; a transient
         failure there must produce the handler's clean JSON 500, not
         mis-scope the write to global silently or escape as a framework
         HTML 500."""
-        from kai.webhook import POOL_KEY
-
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.json = AsyncMock(return_value={"content": "x"})
-        pool = MagicMock()
-        pool.get_effective_workspace = AsyncMock(side_effect=RuntimeError("settings DB down"))
-        mock_request.app[POOL_KEY] = pool
+        mock_request.app[CORE_HOST_KEY].services.runtime_pool.get_effective_workspace.side_effect = RuntimeError(
+            "settings DB down"
+        )
 
         with (
             patch("kai.memory.is_enabled", return_value=True),
@@ -2845,7 +2879,7 @@ class TestMemoryAdd:
             "id": "mem-1",
             "memory": "User prefers Earl Grey",
             "metadata": stamped,
-            "user_id": "123",
+            "user_id": str(_internal_api_context(123).principal_id),
             "created_at": "2026-08-19T00:00:00+00:00",
             "updated_at": "2026-08-19T00:00:00+00:00",
         }
@@ -2854,19 +2888,14 @@ class TestMemoryAdd:
             get=lambda memory_id: row,
         )
         with patch("kai.memory._memory", fake_mem0):
-            facts = memory.get_all_facts(user_id="123")
+            canonical_user_id = str(_internal_api_context(123).principal_id)
+            facts = memory.get_all_facts(user_id=canonical_user_id)
             assert [f.id for f in facts] == ["mem-1"]
-            detail = memory.get_by_id(user_id="123", memory_id="mem-1")
+            detail = memory.get_by_id(user_id=canonical_user_id, memory_id="mem-1")
             assert detail is not None and detail.metadata["source"] == "explicit"
 
-    async def test_stringifies_chat_id_for_user_id(self, mock_request):
-        """Handler converts int chat_id -> str user_id at the memory boundary.
-
-        This is load-bearing: Mem0 keys memories by the string form of
-        user_id. A missed cast would isolate API-stored memories from the
-        existing facts under the same chat_id (silently, since both writes
-        succeed).
-        """
+    async def test_uses_credential_bound_principal_for_user_id(self, mock_request):
+        """Memory ownership comes directly from the credential's principal."""
         mock_request.headers = {"X-Webhook-Secret": "other-secret"}
         mock_request.json = AsyncMock(return_value={"content": "x"})
 
@@ -2877,7 +2906,8 @@ class TestMemoryAdd:
             await _handle_memory_add(mock_request)
 
         kwargs = mock_add.call_args.kwargs
-        assert kwargs["user_id"] == "456"
+        assert kwargs["user_id"] == str(_internal_api_context(456).principal_id)
+        assert kwargs["runtime_profile_id"] == str(profile_id(456))
         assert isinstance(kwargs["user_id"], str)
 
     async def test_returns_400_on_identity_selector(self, mock_request):
@@ -3095,6 +3125,22 @@ class TestMemorySearch:
             await _handle_memory_search(mock_request)
 
         assert mock_search.call_args.kwargs["limit"] == 5
+        assert mock_search.call_args.kwargs["user_id"] == str(_internal_api_context(123).principal_id)
+        assert mock_search.call_args.kwargs["runtime_profile_id"] == str(profile_id(123))
+
+    async def test_search_credentials_keep_principals_isolated(self, mock_request):
+        """A second credential searches its own canonical namespace."""
+        mock_request.headers = {"X-Webhook-Secret": "other-secret"}
+        mock_request.json = AsyncMock(return_value={"query": "x"})
+
+        with (
+            patch("kai.memory.is_enabled", return_value=True),
+            patch("kai.memory.search", return_value=[]) as mock_search,
+        ):
+            await _handle_memory_search(mock_request)
+
+        assert mock_search.call_args.kwargs["user_id"] == str(_internal_api_context(456).principal_id)
+        assert mock_search.call_args.kwargs["runtime_profile_id"] == str(profile_id(456))
 
     async def test_passes_none_limit_when_omitted(self, mock_request):
         """When `limit` is omitted, the handler passes None so search()
@@ -3294,8 +3340,8 @@ class TestMemoryStats:
         assert resp.status == 503
         mock_get_stats.assert_not_called()
 
-    async def test_reads_chat_id_from_query_string(self, mock_request):
-        """GET endpoint: chat_id comes from query params, mirroring _handle_get_jobs."""
+    async def test_uses_credential_bound_principal_for_stats(self, mock_request):
+        """GET stats derives canonical ownership from the credential."""
         from kai.memory import MemoryStats
 
         mock_request.headers = {"X-Webhook-Secret": "other-secret"}
@@ -3308,8 +3354,8 @@ class TestMemoryStats:
             resp = await _handle_memory_stats(mock_request)
 
         assert resp.status == 200
-        # Verify the int->str cast happened at the memory boundary.
-        assert mock_get_stats.call_args.kwargs["user_id"] == "456"
+        assert mock_get_stats.call_args.kwargs["user_id"] == str(_internal_api_context(456).principal_id)
+        assert mock_get_stats.call_args.kwargs["runtime_profile_id"] == str(profile_id(456))
 
     async def test_returns_401_on_bad_secret(self, mock_request):
         mock_request.headers = {"X-Webhook-Secret": "nope"}
@@ -3430,15 +3476,16 @@ class TestMemoryDeleteAll:
         # acking a no-op.
         mock_del.assert_not_called()
 
-    async def test_calls_delete_all_with_stringified_user_id(self, mock_request):
-        """int -> str cast at the memory boundary, same as add."""
+    async def test_delete_all_uses_credential_bound_principal(self, mock_request):
+        """Delete-all receives the canonical principal string."""
         mock_request.headers = {"X-Webhook-Secret": "other-secret"}
         mock_request.json = AsyncMock(return_value={"confirm": self._CONFIRM})
 
         with patch("kai.memory.is_enabled", return_value=True), patch("kai.memory.delete_all") as mock_del:
             await _call_memory_delete_all_as_authorized(mock_request, chat_id=456)
 
-        assert mock_del.call_args.kwargs["user_id"] == "456"
+        assert mock_del.call_args.kwargs["user_id"] == str(_internal_api_context(456).principal_id)
+        assert mock_del.call_args.kwargs["runtime_profile_id"] == str(profile_id(456))
         assert isinstance(mock_del.call_args.kwargs["user_id"], str)
 
     async def test_returns_401_on_bad_secret(self, mock_request):

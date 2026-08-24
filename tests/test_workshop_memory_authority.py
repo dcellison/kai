@@ -314,6 +314,72 @@ class TestCanonicalMemoryNamespace:
         with pytest.raises(memory.CanonicalMemoryAuthorityError, match="restore the memory and database backups"):
             memory.migrate_memory_namespace(first, sibling_namespaces=(second,))
 
+    def test_exact_runtime_authority_stamps_shared_principal_provenance(self):
+        principal_id = PrincipalId.new()
+        first = WorkshopExecutionStateNamespace(
+            principal_id=principal_id,
+            channel_id=ChannelId.new(),
+            agent_id=AgentId.new(),
+            runtime_profile_id=profile_id(101),
+            runtime_config_id=101,
+        )
+        second = WorkshopExecutionStateNamespace(
+            principal_id=principal_id,
+            channel_id=ChannelId.new(),
+            agent_id=AgentId.new(),
+            runtime_profile_id=profile_id(202),
+            runtime_config_id=202,
+        )
+        fake = _FakeMem0(
+            [
+                {"id": "first", "memory": "First", "user_id": "101", "metadata": {}},
+                {"id": "second", "memory": "Second", "user_id": "202", "metadata": {}},
+            ]
+        )
+        memory._memory = fake
+        memory._config = SimpleNamespace(memory_search_limit=10)
+        registry = WorkshopExecutionStateRegistry((first, second))
+        memory.configure_memory_authority(registry)
+        memory.migrate_memory_namespace(first, sibling_namespaces=(second,))
+        memory.migrate_memory_namespace(second, sibling_namespaces=(first,))
+
+        first_hits = memory.search(
+            "fact",
+            user_id=str(principal_id),
+            runtime_profile_id=str(first.runtime_profile_id),
+        )
+        second_hits = memory.search(
+            "fact",
+            user_id=str(principal_id),
+            runtime_profile_id=str(second.runtime_profile_id),
+        )
+        added = memory.add_structured(
+            "First runtime only",
+            user_id=str(principal_id),
+            runtime_profile_id=str(first.runtime_profile_id),
+        )
+
+        # Memory ownership is intentionally per-principal: both runtime
+        # profiles recall the human's full corpus. Exact runtime authority is
+        # still required to stamp and validate the provenance of new writes.
+        assert [row.id for row in first_hits] == ["first", "second"]
+        assert [row.id for row in second_hits] == ["first", "second"]
+        assert added is not None
+        assert fake.rows[added]["metadata"][memory.WORKSHOP_RUNTIME_PROFILE_ID_KEY] == str(first.runtime_profile_id)
+
+    def test_exact_runtime_authority_rejects_wrong_principal(self):
+        namespace = _namespace(101)
+        memory._memory = _FakeMem0()
+        memory._config = SimpleNamespace(memory_search_limit=10)
+        memory.configure_memory_authority(WorkshopExecutionStateRegistry((namespace,)))
+
+        with pytest.raises(memory.CanonicalMemoryAuthorityError, match="does not belong"):
+            memory.search(
+                "fact",
+                user_id=str(PrincipalId.new()),
+                runtime_profile_id=str(namespace.runtime_profile_id),
+            )
+
     def test_two_protected_humans_have_disjoint_memory_namespaces(self):
         first = _namespace(101)
         second = _namespace(202)
