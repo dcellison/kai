@@ -103,6 +103,7 @@ from kai.workshop.execution_coordinator import (
 )
 from kai.workshop.inbound import InboundMessage
 from kai.workshop.outbound import DeliveryObservation, OutboundMessage
+from kai.workshop.scheduled_jobs import WorkshopScheduledJobAuthority
 from kai.workshop.settings_workspaces import (
     SettingsWorkspaceAuthority,
     WorkshopSettingsWorkspaceAccessDenied,
@@ -1153,16 +1154,34 @@ async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-async def _list_jobs(update: Update, chat_id: int) -> None:
+def _scheduled_job_authority(
+    context: ContextTypes.DEFAULT_TYPE,
+    runtime_config_id: int,
+) -> WorkshopScheduledJobAuthority:
+    canonical = _get_core_services(context).internal_api_contexts.for_runtime_config_id(runtime_config_id)
+    return WorkshopScheduledJobAuthority(
+        canonical.principal_id,
+        canonical.channel_id,
+        canonical.agent_id,
+        canonical.runtime_profile_id,
+    )
+
+
+async def _list_jobs(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    runtime_config_id: int,
+) -> None:
     """
-    List all active scheduled jobs for a chat.
+    List all active scheduled jobs for a Telegram-authenticated human.
 
     Formats each job with an emoji tag (bell for reminders, robot for Claude
     jobs), the job ID, name, and a human-readable schedule description.
     Shared by /job (list branch) and /jobs (alias).
     """
     assert update.message is not None
-    jobs = await sessions.get_jobs(chat_id)
+    services = _get_core_services(context)
+    jobs = await services.scheduler.list_jobs(_scheduled_job_authority(context, runtime_config_id))
     if not jobs:
         await update.message.reply_text("No active scheduled jobs.")
         return
@@ -1208,13 +1227,13 @@ async def handle_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         /job cancel <id> - cancel (delete) a job
     """
     assert update.message is not None
-    chat_id = _chat_id(update)
+    runtime_config_id = _user_id(update)
     args = context.args or []
     subcommand = args[0].lower() if args else None
 
     # No subcommand or "list": show all jobs
     if subcommand is None or subcommand == "list":
-        await _list_jobs(update, chat_id)
+        await _list_jobs(update, context, runtime_config_id)
         return
 
     if subcommand == "info":
@@ -1226,9 +1245,11 @@ async def handle_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         except ValueError:
             await update.message.reply_text("Job ID must be a number.")
             return
-        job = await sessions.get_job_by_id(job_id)
-        # Ownership check: only show jobs belonging to this chat
-        if not job or job["chat_id"] != chat_id:
+        job = await _get_core_services(context).scheduler.get_job(
+            job_id,
+            _scheduled_job_authority(context, runtime_config_id),
+        )
+        if job is None:
             await update.message.reply_text(f"Job #{job_id} not found.")
             return
         auto_remove = "yes" if job["auto_remove"] else "no"
@@ -1252,13 +1273,13 @@ async def handle_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         except ValueError:
             await update.message.reply_text("Job ID must be a number.")
             return
-        # Pass user's chat_id for ownership check - users can only cancel
-        # their own jobs (prevents cross-user job manipulation).
-        deleted = await sessions.delete_job(job_id, chat_id=chat_id)
+        deleted = await _get_core_services(context).scheduler.delete_job(
+            job_id,
+            _scheduled_job_authority(context, runtime_config_id),
+        )
         if not deleted:
             await update.message.reply_text(f"Job #{job_id} not found.")
             return
-        await _get_core_services(context).scheduler.remove_job(job_id)
         await update.message.reply_text(f"Job #{job_id} cancelled.")
         return
 
@@ -1272,7 +1293,7 @@ async def handle_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def handle_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Alias for /job list. Kept for backward compatibility."""
     assert update.message is not None
-    await _list_jobs(update, _chat_id(update))
+    await _list_jobs(update, context, _user_id(update))
 
 
 @_require_auth

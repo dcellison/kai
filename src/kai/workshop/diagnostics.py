@@ -79,6 +79,8 @@ _OPERATIONAL_STATE_TABLES = {
     "workshop_execution_state_migrations",
     "workshop_job_owners",
     "workshop_operational_state_migrations",
+    "workshop_scheduled_job_migrations",
+    "workshop_scheduled_jobs",
 }
 _TELEGRAM_SUBJECT_PATTERN = re.compile(r"^-?[0-9]+$")
 _SYNTHETIC_ASSISTANT_PATTERN = re.compile(
@@ -566,19 +568,40 @@ def workshop_operational_state_status(db_path: Path) -> str:
                 "WHERE a.runtime_profile_id = m.runtime_profile_id "
                 "AND a.channel_id = m.channel_id AND a.agent_id = m.agent_id)",
             )
-            jobs = _scalar(connection, "SELECT COUNT(*) FROM workshop_job_owners")
-            unowned_jobs = _scalar(
+            jobs = _scalar(connection, "SELECT COUNT(*) FROM workshop_scheduled_jobs")
+            legacy_jobs = _scalar(connection, "SELECT COUNT(*) FROM jobs")
+            job_migrations = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM workshop_scheduled_job_migrations",
+            )
+            missing_job_migrations = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_agent_runtime_assignments a WHERE NOT EXISTS ("
+                "SELECT 1 FROM workshop_scheduled_job_migrations m "
+                "WHERE m.runtime_profile_id = a.runtime_profile_id "
+                "AND m.channel_id = a.channel_id AND m.agent_id = a.agent_id)",
+            )
+            stale_job_migrations = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM workshop_scheduled_job_migrations m WHERE NOT EXISTS ("
+                "SELECT 1 FROM channel_agent_runtime_assignments a "
+                "WHERE a.runtime_profile_id = m.runtime_profile_id "
+                "AND a.channel_id = m.channel_id AND a.agent_id = m.agent_id)",
+            )
+            unmigrated_jobs = _scalar(
                 connection,
                 "SELECT COUNT(*) FROM jobs j JOIN workshop_execution_state_migrations e "
                 "ON e.runtime_config_id = j.chat_id LEFT JOIN workshop_job_owners o "
-                "ON o.job_id = j.id WHERE o.job_id IS NULL",
+                "ON o.job_id = j.id WHERE o.job_id IS NULL OR o.principal_id != e.principal_id "
+                "OR o.channel_id != e.channel_id OR o.agent_id != e.agent_id "
+                "OR o.runtime_profile_id != e.runtime_profile_id",
             )
             conflicting_jobs = _scalar(
                 connection,
-                "SELECT COUNT(*) FROM jobs j JOIN workshop_execution_state_migrations e "
-                "ON e.runtime_config_id = j.chat_id JOIN workshop_job_owners o ON o.job_id = j.id "
-                "WHERE o.principal_id != e.principal_id OR o.channel_id != e.channel_id "
-                "OR o.agent_id != e.agent_id OR o.runtime_profile_id != e.runtime_profile_id",
+                "SELECT COUNT(*) FROM workshop_scheduled_jobs c "
+                "JOIN workshop_job_owners o ON o.job_id = c.id "
+                "WHERE c.principal_id != o.principal_id OR c.channel_id != o.channel_id "
+                "OR c.agent_id != o.agent_id OR c.runtime_profile_id != o.runtime_profile_id",
             )
             github_subscriptions = _scalar(
                 connection,
@@ -601,17 +624,23 @@ def workshop_operational_state_status(db_path: Path) -> str:
         and migrated == profiles
         and missing == 0
         and stale == 0
-        and unowned_jobs == 0
+        and job_migrations == profiles
+        and missing_job_migrations == 0
+        and stale_job_migrations == 0
+        and unmigrated_jobs == 0
         and conflicting_jobs == 0
         and missing_subscriptions == 0
         else "INCOMPLETE"
     )
     return (
         f"{prefix} {state}; profiles={profiles}, migrated={migrated}, "
-        f"missing={missing}, stale={stale}, jobs={jobs}, unowned jobs={unowned_jobs}, "
-        f"conflicting jobs={conflicting_jobs}, GitHub principals={github_subscriptions}, "
+        f"missing={missing}, stale={stale}, jobs={jobs}, legacy archived={legacy_jobs}, "
+        f"job migrations={job_migrations}, missing job migrations={missing_job_migrations}, "
+        f"stale job migrations={stale_job_migrations}, "
+        f"unmigrated jobs={unmigrated_jobs}, conflicting jobs={conflicting_jobs}, "
+        f"GitHub principals={github_subscriptions}, "
         f"missing subscriptions={missing_subscriptions}; protected legacy ownership "
-        "reads=disabled, rollback dual writes=active"
+        "reads=disabled, compatibility job writes=disabled"
     )
 
 

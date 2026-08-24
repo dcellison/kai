@@ -103,7 +103,11 @@ from kai.workshop.integration_notifications import (
 )
 from kai.workshop.memory_queries import WorkshopMemoryQueryService
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
-from kai.workshop.scheduler import WorkshopCanonicalScheduler
+from kai.workshop.scheduled_jobs import (
+    WorkshopScheduledJobAuthority,
+    WorkshopScheduledJobUpdate,
+)
+from kai.workshop.scheduler import WorkshopScheduledJobRegistrationError
 from kai.workshop.settings_workspaces import WorkshopSettingsWorkspaceService
 from kai.workshop.storage_namespaces import (
     WorkshopPrincipalStorageRegistry,
@@ -465,28 +469,32 @@ _INTERNAL_API_IDENTITY_SELECTORS = frozenset(
 )
 
 
-def _resolve_internal_runtime_config_id(
-    principal: InternalAPIPrincipal,
-    payload: dict,
-) -> int:
-    """
-    Resolve the private compatibility key from authenticated authority.
-
-    Canonical identity is bound to the process-lifetime credential. Request
-    bodies and query strings may not repeat or select the retired ``chat_id``
-    identity field. The returned integer is confined to this server adapter
-    while legacy persistence primitives are being replaced.
-
-    Raises:
-        ValueError: If the retired caller-supplied identity field is present.
-    """
+def _reject_internal_identity_selectors(payload: dict) -> None:
+    """Reject identity fields whose authority is already bound to a credential."""
     supplied = sorted(_INTERNAL_API_IDENTITY_SELECTORS.intersection(payload))
     if supplied:
         raise ValueError(
             f"Identity selector {supplied[0]} is not accepted; the internal API credential already binds "
             "the canonical execution context"
         )
+
+
+def _resolve_internal_runtime_config_id(
+    principal: InternalAPIPrincipal,
+    payload: dict,
+) -> int:
+    """Resolve the remaining private key for handlers not yet cut over."""
+    _reject_internal_identity_selectors(payload)
     return principal.compatibility_runtime_config_id()
+
+
+def _scheduled_job_authority(principal: InternalAPIPrincipal) -> WorkshopScheduledJobAuthority:
+    return WorkshopScheduledJobAuthority(
+        principal.principal_id,
+        principal.channel_id,
+        principal.agent_id,
+        principal.runtime_profile_id,
+    )
 
 
 # ── GitHub event formatters ───────────────────────────────────────────
@@ -1075,9 +1083,8 @@ async def _handle_schedule(request: web.Request, principal: InternalAPIPrincipal
             status=400,
         )
 
-    # Normalize the compatibility alias at ingress so all new rows use the
-    # backend-neutral identifier. sessions.create_job repeats this validation
-    # as the persistence boundary for non-HTTP callers.
+    # Normalize the retired job-type alias at ingress so canonical storage
+    # never records a backend-specific scheduler identifier.
     try:
         job_type = normalize_job_type(payload.get("job_type", "reminder"))
     except ValueError:
@@ -1088,7 +1095,7 @@ async def _handle_schedule(request: web.Request, principal: InternalAPIPrincipal
     auto_remove = payload.get("auto_remove", False)
     notify_on_check = payload.get("notify_on_check", False)
     try:
-        chat_id = _resolve_internal_runtime_config_id(principal, payload)
+        _reject_internal_identity_selectors(payload)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
 
@@ -1100,10 +1107,10 @@ async def _handle_schedule(request: web.Request, principal: InternalAPIPrincipal
         return web.json_response({"error": error}, status=400)
     assert schedule_data_str is not None  # guaranteed when error is None
 
-    # Persist to database
+    scheduler = request.app[CORE_HOST_KEY].services.scheduler
     try:
-        job_id = await sessions.create_job(
-            chat_id=chat_id,
+        job_id = await scheduler.create_job(
+            _scheduled_job_authority(principal),
             name=name,
             job_type=job_type,
             prompt=prompt,
@@ -1112,21 +1119,12 @@ async def _handle_schedule(request: web.Request, principal: InternalAPIPrincipal
             auto_remove=auto_remove,
             notify_on_check=notify_on_check,
         )
+    except WorkshopScheduledJobRegistrationError:
+        log.exception("Failed to register created job")
+        return web.json_response({"error": "Failed to register job"}, status=500)
     except Exception:
         log.exception("Failed to create job")
         return web.json_response({"error": "Failed to create job"}, status=500)
-
-    scheduler = request.app[CORE_HOST_KEY].services.scheduler
-    try:
-        registered = await scheduler.register_job(job_id)
-    except Exception:
-        log.exception("Failed to register job %d with scheduler", job_id)
-        await sessions.deactivate_job(job_id, chat_id=chat_id)
-        return web.json_response({"error": "Failed to register job"}, status=500)
-    if not registered:
-        log.error("Failed to register job %d with scheduler", job_id)
-        await sessions.deactivate_job(job_id, chat_id=chat_id)
-        return web.json_response({"error": "Failed to register job"}, status=500)
 
     log.info("Scheduled job %d '%s' via API (%s)", job_id, name, schedule_type)
     return web.json_response({"job_id": job_id, "name": name})
@@ -1144,12 +1142,11 @@ async def _handle_get_jobs(request: web.Request, principal: InternalAPIPrincipal
     without needing to parse Telegram bot command output.
     """
 
-    # Query parameters cannot select identity; the credential owns routing.
     try:
-        chat_id = _resolve_internal_runtime_config_id(principal, dict(request.query))
+        _reject_internal_identity_selectors(dict(request.query))
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
-    jobs = await sessions.get_jobs(chat_id)
+    jobs = await request.app[CORE_HOST_KEY].services.scheduler.list_jobs(_scheduled_job_authority(principal))
     return web.json_response(jobs)
 
 
@@ -1166,17 +1163,15 @@ async def _handle_get_job(request: web.Request, principal: InternalAPIPrincipal)
     except ValueError:
         return web.json_response({"error": "Invalid job ID"}, status=400)
 
-    # Resolve caller identity for ownership check
     try:
-        chat_id = _resolve_internal_runtime_config_id(principal, dict(request.query))
+        _reject_internal_identity_selectors(dict(request.query))
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
-
-    job = await sessions.get_job_by_id(job_id)
-    # Return 404 for missing OR wrong-owner jobs (don't leak existence).
-    # Both sides are ints: _resolve_internal_runtime_config_id always returns int, and
-    # chat_id is stored as INTEGER in the jobs table.
-    if not job or job["chat_id"] != chat_id:
+    job = await request.app[CORE_HOST_KEY].services.scheduler.get_job(
+        job_id,
+        _scheduled_job_authority(principal),
+    )
+    if job is None:
         return web.json_response({"error": "Job not found"}, status=404)
     return web.json_response(job)
 
@@ -1195,16 +1190,14 @@ async def _handle_delete_job(request: web.Request, principal: InternalAPIPrincip
     except ValueError:
         return web.json_response({"error": "Invalid job ID"}, status=400)
 
-    # Resolve compatibility storage only from server-owned authority.
     try:
-        chat_id = _resolve_internal_runtime_config_id(principal, dict(request.query))
+        _reject_internal_identity_selectors(dict(request.query))
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
-    deleted = await sessions.delete_job(job_id, chat_id=chat_id)
+    scheduler = request.app[CORE_HOST_KEY].services.scheduler
+    deleted = await scheduler.delete_job(job_id, _scheduled_job_authority(principal))
     if not deleted:
         return web.json_response({"error": "Job not found"}, status=404)
-
-    await request.app[CORE_HOST_KEY].services.scheduler.remove_job(job_id)
 
     log.info("Deleted job %d via API", job_id)
     return web.json_response({"deleted": job_id})
@@ -1261,7 +1254,10 @@ async def _handle_update_job(request: web.Request, principal: InternalAPIPrincip
         # Otherwise, fetch the current job to get its existing schedule_type.
         effective_type = new_schedule_type
         if effective_type is None:
-            existing_job = await sessions.get_job_by_id(job_id)
+            existing_job = await request.app[CORE_HOST_KEY].services.scheduler.get_job(
+                job_id,
+                _scheduled_job_authority(principal),
+            )
             if existing_job is None:
                 return web.json_response({"error": "Job not found or inactive"}, status=404)
             effective_type = existing_job["schedule_type"]
@@ -1269,9 +1265,8 @@ async def _handle_update_job(request: web.Request, principal: InternalAPIPrincip
         if error:
             return web.json_response({"error": error}, status=400)
 
-    # The credential selects authority; request data cannot choose identity.
     try:
-        chat_id = _resolve_internal_runtime_config_id(principal, payload)
+        _reject_internal_identity_selectors(payload)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
 
@@ -1282,69 +1277,36 @@ async def _handle_update_job(request: web.Request, principal: InternalAPIPrincip
     schedule_changed = new_schedule_type is not None or schedule_data is not None
     if schedule_changed:
         if existing_job is None:
-            existing_job = await sessions.get_job_by_id(job_id)
-        if existing_job is None or existing_job["chat_id"] != chat_id:
+            existing_job = await request.app[CORE_HOST_KEY].services.scheduler.get_job(
+                job_id,
+                _scheduled_job_authority(principal),
+            )
+        if existing_job is None:
             return web.json_response({"error": "Job not found or inactive"}, status=404)
 
-    updated = await sessions.update_job(
-        job_id,
-        chat_id=chat_id,
-        name=payload.get("name"),
-        prompt=payload.get("prompt"),
-        schedule_type=new_schedule_type,
-        schedule_data=schedule_data,
-        auto_remove=payload.get("auto_remove"),
-        notify_on_check=payload.get("notify_on_check"),
-    )
+    scheduler = request.app[CORE_HOST_KEY].services.scheduler
+    try:
+        updated = await scheduler.update_job(
+            job_id,
+            _scheduled_job_authority(principal),
+            WorkshopScheduledJobUpdate(
+                name=payload.get("name"),
+                prompt=payload.get("prompt"),
+                schedule_type=new_schedule_type,
+                schedule_data=schedule_data,
+                auto_remove=payload.get("auto_remove"),
+                notify_on_check=payload.get("notify_on_check"),
+            ),
+        )
+    except Exception:
+        log.exception("Failed to update and re-register job %d", job_id)
+        return web.json_response({"error": "Failed to register job"}, status=500)
 
     if not updated:
         return web.json_response({"error": "Job not found or inactive"}, status=404)
 
-    if schedule_changed:
-        assert existing_job is not None
-        scheduler = request.app[CORE_HOST_KEY].services.scheduler
-        try:
-            registered = await scheduler.register_job(job_id)
-        except Exception:
-            log.exception("Failed to re-register updated job %d with scheduler", job_id)
-            await _restore_job_after_failed_reschedule(scheduler, job_id, chat_id, existing_job)
-            return web.json_response({"error": "Failed to register job"}, status=500)
-        if not registered:
-            log.error("Failed to re-register updated job %d with scheduler", job_id)
-            await _restore_job_after_failed_reschedule(scheduler, job_id, chat_id, existing_job)
-            return web.json_response({"error": "Failed to register job"}, status=500)
-
     log.info("Updated job %d via API", job_id)
     return web.json_response({"updated": job_id})
-
-
-async def _restore_job_after_failed_reschedule(
-    scheduler: WorkshopCanonicalScheduler,
-    job_id: int,
-    chat_id: int,
-    previous_job: dict,
-) -> None:
-    """Best-effort rollback after PATCH committed but scheduler registration failed."""
-    restored = await sessions.update_job(
-        job_id,
-        chat_id=chat_id,
-        name=previous_job["name"],
-        prompt=previous_job["prompt"],
-        schedule_type=previous_job["schedule_type"],
-        schedule_data=previous_job["schedule_data"],
-        auto_remove=previous_job["auto_remove"],
-        notify_on_check=previous_job["notify_on_check"],
-    )
-    if not restored:
-        log.error("Failed to restore job %d after scheduler registration failure", job_id)
-        return
-    try:
-        restored_registered = await scheduler.register_job(job_id)
-    except Exception:
-        log.exception("Failed to restore scheduler entry for job %d after rollback", job_id)
-        return
-    if not restored_registered:
-        log.error("Failed to restore scheduler entry for job %d after rollback", job_id)
 
 
 # ── Service proxy ────────────────────────────────────────────────────

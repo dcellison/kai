@@ -8881,8 +8881,15 @@ def _core_schedule_status(db_path: Path) -> str:
         connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
         try:
             ownership = connection.execute(
-                "SELECT COUNT(*), COUNT(o.job_id) FROM jobs j "
-                "LEFT JOIN workshop_job_owners o ON o.job_id = j.id WHERE j.active = 1"
+                "SELECT COUNT(*), SUM(CASE WHEN EXISTS ("
+                "SELECT 1 FROM channels c "
+                "JOIN channel_memberships cm ON cm.channel_id = c.id "
+                "AND cm.principal_id = j.principal_id AND cm.role = 'owner' "
+                "JOIN agents a ON a.id = j.agent_id AND a.workshop_id = c.workshop_id "
+                "JOIN channel_agent_runtime_assignments ra ON ra.channel_id = c.id "
+                "AND ra.agent_id = a.id AND ra.runtime_profile_id = j.runtime_profile_id "
+                "WHERE c.id = j.channel_id AND c.kind = 'direct') THEN 1 ELSE 0 END) "
+                "FROM workshop_scheduled_jobs j WHERE j.active = 1"
             ).fetchone()
             firings = connection.execute(
                 "SELECT "

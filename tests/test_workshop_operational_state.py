@@ -95,6 +95,21 @@ class TestCanonicalOperationalStateMigration:
         assert first.github_subscriptions == 1
         assert second.newly_migrated == 0
         assert [job["id"] for job in await sessions.get_jobs(101)] == [job_id]
+        async with sessions._get_db().execute(
+            "SELECT id, name, job_type, prompt, schedule_type, schedule_data FROM workshop_scheduled_jobs"
+        ) as cursor:
+            assert tuple(await cursor.fetchone()) == (
+                job_id,
+                "daily",
+                "agent",
+                "Check status",
+                "daily",
+                '{"times":["09:00"]}',
+            )
+        async with sessions._get_db().execute(
+            "SELECT legacy_jobs_count FROM workshop_scheduled_job_migrations"
+        ) as cursor:
+            assert (await cursor.fetchone())[0] == 1
         assert await sessions.get_effective_repos(101, ["ignored/after-cutover"]) == ["owner/added"]
         settings = await sessions.resolve_github_settings(101, _config(101))
         assert settings["pr_review"] is False
@@ -116,7 +131,36 @@ class TestCanonicalOperationalStateMigration:
         assert migration.newly_migrated == 0
         assert await sessions.get_effective_repos(101, []) == ["owner/repo-101"]
 
-    async def test_restart_self_heals_job_created_during_rollback_window(self, database: Path):
+    async def test_existing_operational_receipt_gets_one_time_job_cutover(self, database: Path):
+        legacy_job_id = await sessions.create_job(
+            101,
+            "existing",
+            "reminder",
+            "Preserve me",
+            "once",
+            "{}",
+        )
+        registry = await _bootstrap(101)
+        await sessions.initialize_workshop_operational_state(registry, _config(101))
+        await sessions._get_db().execute("DELETE FROM workshop_scheduled_job_migrations")
+        await sessions._get_db().execute("DELETE FROM workshop_scheduled_jobs")
+        await sessions._get_db().commit()
+
+        migration = await sessions.initialize_workshop_operational_state(registry, _config(101))
+
+        assert migration.newly_migrated == 0
+        assert migration.jobs == 1
+        async with sessions._get_db().execute(
+            "SELECT name FROM workshop_scheduled_jobs WHERE id = ?",
+            (legacy_job_id,),
+        ) as cursor:
+            assert (await cursor.fetchone())[0] == "existing"
+        async with sessions._get_db().execute(
+            "SELECT legacy_jobs_count FROM workshop_scheduled_job_migrations"
+        ) as cursor:
+            assert (await cursor.fetchone())[0] == 1
+
+    async def test_restart_does_not_import_post_cutover_legacy_job(self, database: Path):
         registry = await _bootstrap(101)
         await sessions.initialize_workshop_operational_state(registry, _config(101))
         cursor = await sessions._get_db().execute(
@@ -124,7 +168,7 @@ class TestCanonicalOperationalStateMigration:
             "VALUES (101, 'rollback', 'reminder', 'Check safely', 'once', '{}')"
         )
         await sessions._get_db().commit()
-        job_id = int(cursor.lastrowid)
+        legacy_job_id = int(cursor.lastrowid)
 
         await sessions.close_db()
         await sessions.init_db(database)
@@ -132,37 +176,46 @@ class TestCanonicalOperationalStateMigration:
         migration = await sessions.initialize_workshop_operational_state(registry, _config(101))
 
         assert migration.newly_migrated == 0
-        assert migration.jobs == 1
-        assert [job["id"] for job in await sessions.get_jobs(101)] == [job_id]
+        assert migration.jobs == 0
+        async with sessions._get_db().execute(
+            "SELECT 1 FROM workshop_scheduled_jobs WHERE id = ?",
+            (legacy_job_id,),
+        ) as canonical:
+            assert await canonical.fetchone() is None
+        assert "unmigrated jobs=1" in workshop_operational_state_status(database)
 
-    async def test_restart_rejects_conflicting_job_owner_with_remediation(self, database: Path):
+    async def test_restart_does_not_overwrite_post_cutover_canonical_update(
+        self,
+        database: Path,
+    ):
+        legacy_job_id = await sessions.create_job(
+            101,
+            "original",
+            "reminder",
+            "Remember",
+            "once",
+            "{}",
+        )
         registry = await _bootstrap(101)
         await sessions.initialize_workshop_operational_state(registry, _config(101))
-        cursor = await sessions._get_db().execute(
-            "INSERT INTO jobs (chat_id, name, job_type, prompt, schedule_type, schedule_data) "
-            "VALUES (101, 'conflict', 'reminder', 'Do not expose', 'once', '{}')"
-        )
-        job_id = int(cursor.lastrowid)
-        namespace = registry.namespaces[0]
         await sessions._get_db().execute(
-            "INSERT INTO workshop_job_owners "
-            "(job_id, principal_id, channel_id, agent_id, runtime_profile_id) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (
-                job_id,
-                "prn_00000000000000000000000000000001",
-                namespace.channel_id,
-                namespace.agent_id,
-                namespace.runtime_profile_id,
-            ),
+            "UPDATE workshop_scheduled_jobs SET name = ? WHERE id = ?",
+            ("canonical update", legacy_job_id),
         )
         await sessions._get_db().commit()
 
-        with pytest.raises(
-            WorkshopOperationalStateError,
-            match=rf"job ids: {job_id}.*restore workshop_job_owners",
-        ):
-            await sessions.initialize_workshop_operational_state(registry, _config(101))
+        await sessions.close_db()
+        await sessions.init_db(database)
+        registry = await _bootstrap(101)
+
+        migration = await sessions.initialize_workshop_operational_state(registry, _config(101))
+
+        assert migration.jobs == 0
+        async with sessions._get_db().execute(
+            "SELECT name FROM workshop_scheduled_jobs WHERE id = ?",
+            (legacy_job_id,),
+        ) as cursor:
+            assert (await cursor.fetchone())[0] == "canonical update"
 
     async def test_conflicting_receipt_owner_fails_closed(self, database: Path):
         registry = await _bootstrap(101)
@@ -310,5 +363,5 @@ class TestCanonicalOperationalStateDiagnostic:
 
         drifted = workshop_operational_state_status(database)
         assert drifted.startswith("Workshop operational state: INCOMPLETE;")
-        assert "unowned jobs=1" in drifted
+        assert "unmigrated jobs=1" in drifted
         assert "secret" not in drifted

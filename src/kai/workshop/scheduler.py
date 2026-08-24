@@ -18,7 +18,7 @@ from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from kai.backend import AgentResponse
-from kai.job_types import JOB_TYPE_AGENT, JOB_TYPE_REMINDER, normalize_job_type
+from kai.job_types import JOB_TYPE_AGENT, JOB_TYPE_REMINDER
 from kai.workshop.compatibility_state import WorkshopCompatibilityStateWriter
 from kai.workshop.conversation_commands import ConversationCommandDisposition
 from kai.workshop.domain import (
@@ -35,6 +35,11 @@ from kai.workshop.execution_coordinator import (
 )
 from kai.workshop.inbound import ScheduledInboundMessage
 from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
+from kai.workshop.scheduled_jobs import (
+    WorkshopScheduledJobAuthority,
+    WorkshopScheduledJobStore,
+    WorkshopScheduledJobUpdate,
+)
 from kai.workshop.scheduled_notifications import (
     ScheduledReminder,
     WorkshopScheduledReminderRecorder,
@@ -55,6 +60,10 @@ class WorkshopSchedulerState(StrEnum):
     STOPPING = "stopping"
     STOPPED = "stopped"
     FAILED = "failed"
+
+
+class WorkshopScheduledJobRegistrationError(RuntimeError):
+    """A persisted job could not be made active in the timing engine."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +114,7 @@ class WorkshopCanonicalScheduler:
         self._execution = execution
         self._compatibility_state = compatibility_state
         self._reminders = WorkshopScheduledReminderRecorder(store)
+        self._jobs = WorkshopScheduledJobStore(store)
         self._state = WorkshopSchedulerState.NEW
         self._stop_event = asyncio.Event()
         self._failure_event = asyncio.Event()
@@ -148,6 +158,110 @@ class WorkshopCanonicalScheduler:
             len(self._registered_jobs),
             len(self._firing_tasks),
         )
+
+    async def create_job(
+        self,
+        authority: WorkshopScheduledJobAuthority,
+        *,
+        name: str,
+        job_type: str,
+        prompt: str,
+        schedule_type: str,
+        schedule_data: str,
+        auto_remove: bool = False,
+        notify_on_check: bool = False,
+    ) -> int:
+        """Persist and register one canonically owned scheduled job."""
+        job = await self._jobs.create(
+            authority,
+            name=name,
+            job_type=job_type,
+            prompt=prompt,
+            schedule_type=schedule_type,
+            schedule_data=schedule_data,
+            auto_remove=auto_remove,
+            notify_on_check=notify_on_check,
+        )
+        try:
+            registered = await self.register_job(job.job_id)
+        except Exception as exc:
+            await self._jobs.deactivate(job.job_id, authority)
+            raise WorkshopScheduledJobRegistrationError(
+                "Canonical scheduler could not register the created job"
+            ) from exc
+        if not registered:
+            await self._jobs.deactivate(job.job_id, authority)
+            raise WorkshopScheduledJobRegistrationError("Canonical scheduler could not register the created job")
+        return job.job_id
+
+    async def list_jobs(
+        self,
+        authority: WorkshopScheduledJobAuthority,
+    ) -> list[dict[str, Any]]:
+        """List active jobs owned by one canonical execution lane."""
+        return [job.as_dict() for job in await self._jobs.list_active(authority)]
+
+    async def get_job(
+        self,
+        job_id: int,
+        authority: WorkshopScheduledJobAuthority,
+    ) -> dict[str, Any] | None:
+        """Return one active owned job without leaking cross-owner existence."""
+        job = await self._jobs.get(job_id, authority)
+        return None if job is None else job.as_dict()
+
+    async def delete_job(
+        self,
+        job_id: int,
+        authority: WorkshopScheduledJobAuthority,
+    ) -> bool:
+        """Delete one owned job and remove its registered timing callbacks."""
+        deleted = await self._jobs.delete(job_id, authority)
+        if deleted:
+            await self.remove_job(job_id)
+        return deleted
+
+    async def update_job(
+        self,
+        job_id: int,
+        authority: WorkshopScheduledJobAuthority,
+        update: WorkshopScheduledJobUpdate,
+    ) -> bool:
+        """Update one owned job, compensating if timing registration fails."""
+        previous = await self._jobs.get(job_id, authority)
+        if previous is None:
+            return False
+        changed_schedule = update.schedule_type is not None or update.schedule_data is not None
+        updated = await self._jobs.update(job_id, authority, update)
+        if not updated or not changed_schedule:
+            return updated
+        try:
+            registered = await self.register_job(job_id)
+            if not registered:
+                raise RuntimeError("Updated scheduled job could not be registered")
+        except Exception:
+            restored = await self._jobs.update(
+                job_id,
+                authority,
+                WorkshopScheduledJobUpdate(
+                    name=previous.name,
+                    prompt=previous.prompt,
+                    schedule_type=previous.schedule_type,
+                    schedule_data=previous.schedule_data,
+                    auto_remove=previous.auto_remove,
+                    notify_on_check=previous.notify_on_check,
+                ),
+            )
+            if not restored:
+                log.error("Failed to restore canonical job %d after scheduler registration failure", job_id)
+                raise
+            try:
+                if not await self.register_job(job_id):
+                    log.error("Restored canonical job %d could not be registered", job_id)
+            except Exception:
+                log.exception("Failed to restore scheduler entry for canonical job %d", job_id)
+            raise
+        return True
 
     async def register_job(self, job_id: int) -> bool:
         """Register or replace one active job after a committed mutation."""
@@ -223,10 +337,7 @@ class WorkshopCanonicalScheduler:
                 return
 
     async def _reconcile(self) -> None:
-        if not await self._jobs_table_exists():
-            return
-        async with self._store.connection.execute("SELECT id FROM jobs WHERE active = 1 ORDER BY id") as cursor:
-            active_ids = {int(row[0]) for row in await cursor.fetchall()}
+        active_ids = await self._jobs.active_ids()
         invalid_ids = [job_id for job_id in active_ids if await self._load_job(job_id) is None]
         if invalid_ids:
             rendered = ", ".join(str(job_id) for job_id in invalid_ids)
@@ -272,49 +383,26 @@ class WorkshopCanonicalScheduler:
                 _ensure_utc(datetime.fromisoformat(str(row[2]))),
             )
 
-    async def _jobs_table_exists(self) -> bool:
-        async with self._store.connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'"
-        ) as cursor:
-            return await cursor.fetchone() is not None
-
     async def _load_job(self, job_id: int, *, active_only: bool = True) -> _CanonicalJob | None:
-        if not await self._jobs_table_exists():
+        record = await self._jobs.get_for_scheduler(job_id, active_only=active_only)
+        if record is None:
             return None
-        async with self._store.connection.execute(
-            "SELECT j.id, j.name, j.job_type, j.prompt, j.schedule_type, j.schedule_data, "
-            "j.auto_remove, j.notify_on_check, j.created_at, "
-            "o.principal_id, o.channel_id, o.runtime_profile_id "
-            "FROM jobs j JOIN workshop_job_owners o ON o.job_id = j.id "
-            "JOIN principals p ON p.id = o.principal_id "
-            "JOIN channels c ON c.id = o.channel_id "
-            "JOIN channel_memberships cm ON cm.channel_id = c.id "
-            "AND cm.principal_id = p.id "
-            "JOIN agents a ON a.id = o.agent_id AND a.workshop_id = c.workshop_id "
-            "JOIN channel_agent_runtime_assignments ra ON ra.channel_id = c.id "
-            "AND ra.agent_id = a.id AND ra.runtime_profile_id = o.runtime_profile_id "
-            f"WHERE j.id = ?{' AND j.active = 1' if active_only else ''}",
-            (job_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-        if row is None:
-            return None
-        schedule_data = json.loads(str(row[5]))
+        schedule_data = json.loads(record.schedule_data)
         if not isinstance(schedule_data, dict):
             raise RuntimeError(f"Scheduled job {job_id} has invalid schedule data")
         return _CanonicalJob(
-            job_id=int(row[0]),
-            name=str(row[1]),
-            job_type=normalize_job_type(str(row[2])),
-            prompt=str(row[3]),
-            schedule_type=str(row[4]),
+            job_id=record.job_id,
+            name=record.name,
+            job_type=record.job_type,
+            prompt=record.prompt,
+            schedule_type=record.schedule_type,
             schedule_data=schedule_data,
-            created_at=_ensure_utc(datetime.fromisoformat(str(row[8]))),
-            auto_remove=bool(row[6]),
-            notify_on_check=bool(row[7]),
-            principal_id=PrincipalId(str(row[9])),
-            channel_id=ChannelId(str(row[10])),
-            runtime_profile_id=RuntimeProfileId(str(row[11])),
+            created_at=_ensure_utc(datetime.fromisoformat(record.created_at.replace("Z", "+00:00"))),
+            auto_remove=record.auto_remove,
+            notify_on_check=record.notify_on_check,
+            principal_id=record.authority.principal_id,
+            channel_id=record.authority.channel_id,
+            runtime_profile_id=record.authority.runtime_profile_id,
         )
 
     def _register_loaded_job(self, job: _CanonicalJob) -> None:
@@ -625,8 +713,7 @@ class WorkshopCanonicalScheduler:
         return row is not None and bool(row[0])
 
     async def _deactivate(self, job_id: int) -> None:
-        await self._store.connection.execute("UPDATE jobs SET active = 0 WHERE id = ?", (job_id,))
-        await self._store.connection.commit()
+        await self._jobs.deactivate(job_id)
         async with self._lock:
             self._remove_registered_job(job_id)
 
