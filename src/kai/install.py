@@ -5860,6 +5860,13 @@ def _apply_migrate(
             elif claude_content is not None:
                 migration_source = claude_path
             if migration_source is not None and home_template_exists:
+                api_migration = _migrate_internal_api_instructions(
+                    migration_source,
+                    home_template,
+                    dry_run=True,
+                )
+                if api_migration is True:
+                    print(f"[DRY RUN] Would replace legacy chat-routed internal API instructions in {agents_path}")
                 migration_result = _migrate_recalled_memory_section(
                     migration_source,
                     home_template,
@@ -5900,6 +5907,16 @@ def _apply_migrate(
                 and _migrate_recalled_memory_section(agents_path, home_template, dry_run=False) is True
             ):
                 print(f"  Appended Reading Recalled Memory section to {agents_path}")
+            if (
+                home_template_exists
+                and _migrate_internal_api_instructions(
+                    agents_path,
+                    home_template,
+                    dry_run=False,
+                )
+                is True
+            ):
+                print(f"  Replaced legacy chat-routed internal API instructions in {agents_path}")
 
             if backend_name == "claude":
                 claude_path.parent.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_DIR_MODE)
@@ -6759,6 +6776,40 @@ def _migrate_identity_to_claude_md(
 # string would let the migration re-append on every install (sentinel
 # always missing) and silently double-write the section.
 _RECALLED_MEMORY_SECTION_HEADER = "## Reading Recalled Memory"
+_INTERNAL_API_SECTION_START = "## Scheduling Jobs"
+_INTERNAL_API_SECTION_END = "## Issue-First Workflow"
+_LEGACY_INTERNAL_API_ROUTING = '**Routing:** Always include `"chat_id": <your chat_id>`'
+
+
+def _migrate_internal_api_instructions(
+    identity_dst: Path,
+    template_path: Path,
+    *,
+    dry_run: bool,
+) -> bool | None:
+    """Replace the retired caller-routed API block in managed identities."""
+    if not identity_dst.is_file() or not template_path.is_file():
+        return None
+    try:
+        current = identity_dst.read_text()
+        template = template_path.read_text()
+    except OSError:
+        return None
+    if _LEGACY_INTERNAL_API_ROUTING not in current:
+        return False
+
+    current_start = current.find(_INTERNAL_API_SECTION_START)
+    current_end = current.find(_INTERNAL_API_SECTION_END, current_start)
+    template_start = template.find(_INTERNAL_API_SECTION_START)
+    template_end = template.find(_INTERNAL_API_SECTION_END, template_start)
+    if min(current_start, current_end, template_start, template_end) < 0:
+        return None
+    replacement = template[template_start:template_end]
+    migrated = current[:current_start] + replacement + current[current_end:]
+    if dry_run:
+        return True
+    _write_managed_identity_atomic(identity_dst, migrated)
+    return True
 
 
 def _migrate_recalled_memory_section(
@@ -8510,6 +8561,7 @@ def _cmd_status() -> None:
     print(_core_schedule_status(Path(data_dir) / "kai.db"))
     print(_github_automation_status(Path(data_dir) / "kai.db"))
     print(_integration_route_status(Path(data_dir) / "kai.db"))
+    print(_internal_api_authority_status(Path(data_dir) / "kai.db"))
     if conf_env is None:
         print("Client adapters (install.conf artifact): unavailable")
     else:
@@ -8924,6 +8976,42 @@ def _integration_route_status(db_path: Path) -> str:
     if kind not in {"direct", "notification"} or agents != 1:
         return f"{prefix} INCOMPLETE; generic/default=invalid, kind={kind}, agents={agents}"
     return f"{prefix} active; generic/default={kind}, agents={agents}; transport lookup=disabled"
+
+
+def _internal_api_authority_status(db_path: Path) -> str:
+    """Report canonical protected-runtime credential context coverage."""
+    prefix = "Workshop internal API authority:"
+    if not db_path.is_file():
+        return f"{prefix} NOT VERIFIED (database unavailable)"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            profiles = int(connection.execute("SELECT COUNT(*) FROM channel_agent_runtime_assignments").fetchone()[0])
+            contexts = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM ("
+                    "SELECT ra.runtime_profile_id "
+                    "FROM channel_agent_runtime_assignments ra "
+                    "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' "
+                    "JOIN agents a ON a.id = ra.agent_id AND a.workshop_id = c.workshop_id "
+                    "JOIN channel_agents ca ON ca.channel_id = c.id AND ca.agent_id = a.id "
+                    "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.role = 'owner' "
+                    "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
+                    "JOIN workshop_memberships wm ON wm.principal_id = p.id "
+                    "AND wm.workshop_id = c.workshop_id "
+                    "GROUP BY ra.runtime_profile_id HAVING COUNT(DISTINCT cm.principal_id) = 1"
+                    ")"
+                ).fetchone()[0]
+            )
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        return f"{prefix} NOT VERIFIED ({exc})"
+    status = "active" if profiles > 0 and profiles == contexts else "INCOMPLETE"
+    return (
+        f"{prefix} {status}; profiles={profiles}, canonical contexts={contexts}, "
+        f"missing={profiles - contexts}; caller identity selectors=disabled"
+    )
 
 
 def _deployed_webhook_secret_migration_status(env_path: Path) -> str:

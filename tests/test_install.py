@@ -65,9 +65,11 @@ from kai.install import (
     _generate_users_yaml,
     _github_automation_status,
     _integration_route_status,
+    _internal_api_authority_status,
     _log_security_status,
     _memory_scope_review_status,
     _migrate_identity_to_claude_md,
+    _migrate_internal_api_instructions,
     _migrate_managed_home_database_paths,
     _optional_file_checksum,
     _probe_service_readiness,
@@ -5051,6 +5053,34 @@ class TestCmdStatus:
             "Workshop integration routing: INCOMPLETE; generic/default=missing"
         )
 
+    def test_status_reports_canonical_internal_api_context_coverage(self, tmp_path):
+        db_path = tmp_path / "kai.db"
+        connection = sqlite3.connect(db_path)
+        connection.executescript(
+            "CREATE TABLE channel_agent_runtime_assignments "
+            "(runtime_profile_id TEXT, channel_id TEXT, agent_id TEXT);"
+            "CREATE TABLE channels (id TEXT, kind TEXT, workshop_id TEXT);"
+            "CREATE TABLE agents (id TEXT, workshop_id TEXT);"
+            "CREATE TABLE channel_agents (channel_id TEXT, agent_id TEXT);"
+            "CREATE TABLE channel_memberships (channel_id TEXT, principal_id TEXT, role TEXT);"
+            "CREATE TABLE principals (id TEXT, kind TEXT);"
+            "CREATE TABLE workshop_memberships (principal_id TEXT, workshop_id TEXT);"
+            "INSERT INTO channel_agent_runtime_assignments VALUES ('rtp_one','chn_one','agt_one');"
+            "INSERT INTO channels VALUES ('chn_one','direct','wsp_one');"
+            "INSERT INTO agents VALUES ('agt_one','wsp_one');"
+            "INSERT INTO channel_agents VALUES ('chn_one','agt_one');"
+            "INSERT INTO channel_memberships VALUES ('chn_one','prn_one','owner');"
+            "INSERT INTO principals VALUES ('prn_one','human');"
+            "INSERT INTO workshop_memberships VALUES ('prn_one','wsp_one');"
+        )
+        connection.commit()
+        connection.close()
+
+        assert _internal_api_authority_status(db_path) == (
+            "Workshop internal API authority: active; profiles=1, "
+            "canonical contexts=1, missing=0; caller identity selectors=disabled"
+        )
+
     def test_deployed_status_reports_named_secrets_without_values(self, tmp_path, monkeypatch):
         env_path = tmp_path / "env"
         env_path.write_text(
@@ -8827,6 +8857,45 @@ class TestApplyMigrateManagedIdentity:
         )
         assert (home / "AGENTS.md").read_text() == "# Identity\n"
         assert not (home / ".claude" / "CLAUDE.md").exists()
+
+    def test_replaces_legacy_internal_api_block_without_touching_custom_identity(
+        self,
+        tmp_path,
+    ):
+        identity = tmp_path / "AGENTS.md"
+        template = tmp_path / "template.md"
+        identity.write_text(
+            "# Personal identity\nKeep me.\n\n"
+            "## Scheduling Jobs\n"
+            '**Routing:** Always include `"chat_id": <your chat_id>` in every call.\n\n'
+            "## Sending Messages\nOld examples.\n\n"
+            "## Issue-First Workflow\nKeep this too.\n"
+        )
+        template.write_text(
+            "# Template\n\n"
+            "## Scheduling Jobs\n"
+            "**Routing:** The credential binds canonical identity.\n\n"
+            "## Sending Messages\nNew examples.\n\n"
+            "## Issue-First Workflow\nTemplate tail.\n"
+        )
+
+        assert _migrate_internal_api_instructions(identity, template, dry_run=False) is True
+        migrated = identity.read_text()
+        assert "# Personal identity\nKeep me." in migrated
+        assert "The credential binds canonical identity" in migrated
+        assert "Old examples" not in migrated
+        assert "## Issue-First Workflow\nKeep this too." in migrated
+        assert "chat_id" not in migrated
+
+    def test_internal_api_instruction_migration_is_idempotent(self, tmp_path):
+        identity = tmp_path / "AGENTS.md"
+        template = tmp_path / "template.md"
+        current = "## Scheduling Jobs\nCanonical.\n\n## Issue-First Workflow\nTail.\n"
+        identity.write_text(current)
+        template.write_text(current)
+
+        assert _migrate_internal_api_instructions(identity, template, dry_run=False) is False
+        assert identity.read_text() == current
 
 
 # ── _migrate_identity_to_claude_md ───────────────────────────────────

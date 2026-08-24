@@ -62,6 +62,7 @@ from kai.workshop.execution_state import (
     reconcile_legacy_execution_state,
 )
 from kai.workshop.inbound import InboundMessage, record_inbound_message
+from kai.workshop.internal_api_contexts import WorkshopInternalAPIContextRegistry
 from kai.workshop.memory_authority import (
     WorkshopMemoryAuthorityMigration,
     reconcile_workshop_memory_authority,
@@ -376,6 +377,20 @@ async def load_workshop_principal_storage_registry(
     async with _workshop_event_lock:
         store = WorkshopEventStore.from_initialized_connection(_get_db())
         return await WorkshopPrincipalStorageRegistry.from_store(
+            store,
+            runtime_profiles,
+        )
+
+
+async def load_workshop_internal_api_context_registry(
+    runtime_profiles: WorkshopRuntimeProfileRegistry,
+) -> WorkshopInternalAPIContextRegistry:
+    """Resolve canonical internal API authority on the initialized database."""
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        store = WorkshopEventStore.from_initialized_connection(_get_db())
+        return await WorkshopInternalAPIContextRegistry.from_store(
             store,
             runtime_profiles,
         )

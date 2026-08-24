@@ -45,6 +45,7 @@ from kai.internal_api_auth import InternalAPIAuth
 from kai.workspace_utils import is_workspace_allowed
 
 if TYPE_CHECKING:
+    from kai.workshop.internal_api_contexts import WorkshopInternalAPIContextRegistry
     from kai.workshop.runtime_profiles import ProtectedRuntimeProfile, WorkshopRuntimeProfileRegistry
 
 log = logging.getLogger(__name__)
@@ -148,13 +149,14 @@ class SubprocessPool:
         config: Config,
         services_info: list[dict],
         runtime_profiles: WorkshopRuntimeProfileRegistry | None = None,
+        internal_api_contexts: WorkshopInternalAPIContextRegistry | None = None,
     ):
         self._config = config
         self._runtime_profiles = runtime_profiles
         available_service_names = {
             service["name"] for service in services_info if isinstance(service.get("name"), str) and service["name"]
         }
-        allowed_services_by_user: dict[int, frozenset[str]] = {}
+        allowed_services_by_profile = {}
         self._services_info_by_user: dict[int, list[dict]] = {}
         runtime_config_ids = (
             {profile.runtime_config_id for profile in runtime_profiles.profiles}
@@ -185,11 +187,17 @@ class SubprocessPool:
                     ", ".join(sorted(unavailable)),
                 )
             allowed = requested & available_service_names
-            allowed_services_by_user[chat_id] = allowed
+            if protected_profile is not None:
+                service_profile_id = protected_profile.profile_id
+            else:
+                from kai.workshop.runtime_profiles import runtime_profile_id_for_config_id
+
+                service_profile_id = runtime_profile_id_for_config_id(chat_id)
+            allowed_services_by_profile[service_profile_id] = allowed
             self._services_info_by_user[chat_id] = [
                 service for service in services_info if service.get("name") in allowed
             ]
-        if available_service_names and not any(allowed_services_by_user.values()):
+        if available_service_names and not any(allowed_services_by_profile.values()):
             log.warning(
                 "External services are loaded but no user has an allowed_services grant; "
                 "the agent service proxy is disabled for every user"
@@ -197,9 +205,33 @@ class SubprocessPool:
         # Tokens are random and process-local. The pool owns the store because
         # it creates every persistent backend; webhook.start() receives this
         # same object through bot_data so credential resolution cannot drift.
-        self._internal_api_auth = InternalAPIAuth.for_users(
-            runtime_config_ids,
-            allowed_services_by_user=allowed_services_by_user,
+        if internal_api_contexts is None:
+            if config.protected_install:
+                raise RuntimeError("Protected runtime requires canonical internal API execution contexts")
+            from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
+            from kai.workshop.runtime_profiles import runtime_profile_id_for_config_id
+
+            contexts = tuple(
+                WorkshopInternalAPIExecutionContext.for_unprotected_runtime(
+                    runtime_config_id,
+                    (
+                        protected_profiles_by_config_id[runtime_config_id].profile_id
+                        if runtime_config_id in protected_profiles_by_config_id
+                        else runtime_profile_id_for_config_id(runtime_config_id)
+                    ),
+                )
+                for runtime_config_id in runtime_config_ids
+            )
+        else:
+            contexts = internal_api_contexts.contexts
+        self._internal_api_contexts = internal_api_contexts
+        self._protected_internal_api_contexts = config.protected_install
+        self._contexts_by_runtime_config_id = {
+            context.compatibility_runtime_config_id(): context for context in contexts
+        }
+        self._internal_api_auth = InternalAPIAuth.for_execution_contexts(
+            contexts,
+            allowed_services_by_profile=allowed_services_by_profile,
         )
         self._pool: dict[int, AgentBackend] = {}
         self._last_activity: dict[int, float] = {}
@@ -474,7 +506,19 @@ class SubprocessPool:
         # Internal API availability is independent of public webhook ingress.
         # Agents receive only their random principal credential, never an
         # external webhook signing secret.
-        internal_api_credential = self._internal_api_auth.agent_credential_for(chat_id)
+        internal_api_context = self._contexts_by_runtime_config_id.get(chat_id)
+        if internal_api_context is None:
+            if self._protected_internal_api_contexts:
+                raise RuntimeError("Runtime has no canonical internal API execution context")
+            from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
+            from kai.workshop.runtime_profiles import runtime_profile_id_for_config_id
+
+            internal_api_context = WorkshopInternalAPIExecutionContext.for_unprotected_runtime(
+                chat_id,
+                runtime_profile_id_for_config_id(abs(chat_id)),
+            )
+            self._contexts_by_runtime_config_id[chat_id] = internal_api_context
+        internal_api_credential = self._internal_api_auth.agent_credential_for(internal_api_context)
         services_info = self._services_info_by_user.get(chat_id, [])
 
         if backend == "goose":
