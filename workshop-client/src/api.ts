@@ -565,6 +565,7 @@ export async function loadMemoryRecords(
 ): Promise<WorkshopMemoryPage> {
   const query = memoryQueryParameters(options);
   if (options.cursor !== undefined) query.set("cursor", options.cursor);
+  if (options.order !== undefined) query.set("order", options.order);
   const suffix = query.size ? `?${query}` : "";
   const response = await authorizedFetch(
     { channelId: "", token },

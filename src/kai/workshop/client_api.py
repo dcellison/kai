@@ -97,7 +97,7 @@ _MEMORY_SOURCE_PATH = "/v1/memory/records/{memory_id}/source"
 _ALLOWED_TIMELINE_QUERY_PARAMETERS = frozenset({"cursor", "limit", "tail"})
 _ALLOWED_EVENT_QUERY_PARAMETERS = frozenset({"after_position"})
 _ALLOWED_MEMORY_FILTERS = frozenset({"kind", "source", "memory_type", "tag", "scope", "project_id"})
-_ALLOWED_MEMORY_LIST_PARAMETERS = _ALLOWED_MEMORY_FILTERS | {"cursor", "limit"}
+_ALLOWED_MEMORY_LIST_PARAMETERS = _ALLOWED_MEMORY_FILTERS | {"cursor", "limit", "order"}
 _ALLOWED_MEMORY_SEARCH_PARAMETERS = _ALLOWED_MEMORY_FILTERS | {"q", "limit"}
 _ENROLLMENT_REQUEST_FIELDS = frozenset({"enrollment_token", "device_display_name"})
 _COMMAND_REQUEST_FIELDS = frozenset({"client_message_id", "body"})
@@ -362,6 +362,7 @@ async def _handle_memory_records(
             filters=_memory_filters(request),
             limit=_memory_limit(request, default=DEFAULT_PAGE_SIZE),
             cursor=_single_query_value(request, "cursor"),
+            order=_single_query_value(request, "order") or "newest",
         )
     except (ValueError, WorkshopMemoryValidationError) as exc:
         return _memory_error_response(exc)
