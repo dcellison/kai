@@ -154,7 +154,7 @@ const settingsWorkspace: WorkshopSettingsWorkspace = {
     {
       current: false,
       home: true,
-      name: "home",
+      name: "Home",
       path: "/var/lib/kai/home/principal",
     },
   ],
@@ -276,6 +276,12 @@ describe("Workshop React client", () => {
     expect(await screen.findByText("gpt-5.6-sol")).toBeVisible();
     const selector = screen.getByLabelText("Workspace");
     expect(selector).toHaveValue("/Users/kai/Projects/kai");
+    expect(screen.getByRole("option", { name: "Home" })).toHaveValue(
+      "/var/lib/kai/home/principal",
+    );
+    expect(
+      screen.queryByRole("option", { name: "Home (home)" }),
+    ).not.toBeInTheDocument();
     await user.selectOptions(selector, "/var/lib/kai/home/principal");
 
     expect(switchWorkspace).toHaveBeenCalledWith(

@@ -1749,7 +1749,6 @@ function WorkshopView({
                   {settingsWorkspace.workspaces.map((workspaceOption) => (
                     <option key={workspaceOption.path} value={workspaceOption.path}>
                       {workspaceOption.name}
-                      {workspaceOption.home ? " (home)" : ""}
                     </option>
                   ))}
                 </select>
