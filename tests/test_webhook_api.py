@@ -73,7 +73,6 @@ def _internal_api_context(runtime_config_id: int) -> WorkshopInternalAPIExecutio
         channel_id=ChannelId(f"chn_{runtime_config_id:032x}"),
         agent_id=AgentId(f"agt_{runtime_config_id:032x}"),
         runtime_profile_id=profile_id(runtime_config_id),
-        _runtime_config_id=runtime_config_id,
     )
 
 

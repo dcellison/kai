@@ -54,7 +54,6 @@ def _internal_api_auth() -> InternalAPIAuth:
         channel_id=ChannelId("chn_" + "1" * 32),
         agent_id=AgentId("agt_" + "1" * 32),
         runtime_profile_id=profile_id(111),
-        _runtime_config_id=111,
     )
     return InternalAPIAuth({context: "secret"})
 

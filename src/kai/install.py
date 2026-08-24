@@ -8661,7 +8661,7 @@ def _runtime_policy_status(policy_path: Path, backend_registry_path: Path) -> st
     except (OSError, yaml.YAMLError, WorkshopRuntimeProfileError) as exc:
         return f"{prefix} INVALID ({type(exc).__name__})"
     backends = ",".join(sorted({profile.backend for profile in profiles.profiles}))
-    return f"{prefix} initialized; profiles={len(profiles.profiles)}, backends={backends}"
+    return f"{prefix} initialized; profiles={len(profiles.profiles)}, backends={backends}, runtime kernel=canonical"
 
 
 def _runtime_storage_status(

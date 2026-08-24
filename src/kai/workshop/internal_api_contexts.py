@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from kai.workshop.domain import AgentId, ChannelId, PrincipalId, RuntimeProfileId
 from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
@@ -22,7 +22,6 @@ class WorkshopInternalAPIExecutionContext:
     channel_id: ChannelId
     agent_id: AgentId
     runtime_profile_id: RuntimeProfileId
-    _runtime_config_id: int = field(repr=False)
 
     @classmethod
     def for_unprotected_runtime(
@@ -37,7 +36,6 @@ class WorkshopInternalAPIExecutionContext:
             channel_id=ChannelId(f"chn_{digest[1:33]}"),
             agent_id=AgentId(f"agt_{digest[2:34]}"),
             runtime_profile_id=runtime_profile_id,
-            _runtime_config_id=runtime_config_id,
         )
 
 
@@ -49,20 +47,15 @@ class WorkshopInternalAPIContextRegistry:
         contexts: tuple[WorkshopInternalAPIExecutionContext, ...],
     ) -> None:
         by_profile: dict[RuntimeProfileId, WorkshopInternalAPIExecutionContext] = {}
-        by_config_id: dict[int, WorkshopInternalAPIExecutionContext] = {}
         for context in contexts:
             if not isinstance(context, WorkshopInternalAPIExecutionContext):
                 raise TypeError("contexts must contain WorkshopInternalAPIExecutionContext values")
             if context.runtime_profile_id in by_profile:
                 raise WorkshopInternalAPIContextError("Duplicate internal API runtime profile")
-            if context._runtime_config_id in by_config_id:
-                raise WorkshopInternalAPIContextError("Duplicate internal API runtime configuration")
             by_profile[context.runtime_profile_id] = context
-            by_config_id[context._runtime_config_id] = context
         if not by_profile:
             raise WorkshopInternalAPIContextError("At least one internal API execution context is required")
         self._by_profile = by_profile
-        self._by_config_id = by_config_id
 
     @classmethod
     async def from_store(
@@ -117,7 +110,6 @@ class WorkshopInternalAPIContextRegistry:
                     channel_id=channel_id,
                     agent_id=agent_id,
                     runtime_profile_id=profile.profile_id,
-                    _runtime_config_id=profile.runtime_config_id,
                 )
             )
         return cls(tuple(contexts))
@@ -141,12 +133,4 @@ class WorkshopInternalAPIContextRegistry:
         context = self._by_profile.get(normalized)
         if context is None:
             raise WorkshopInternalAPIContextError("Runtime profile has no canonical internal API context")
-        return context
-
-    def for_runtime_config_id(self, runtime_config_id: int) -> WorkshopInternalAPIExecutionContext:
-        if isinstance(runtime_config_id, bool) or not isinstance(runtime_config_id, int):
-            raise WorkshopInternalAPIContextError("Runtime configuration ID must be an integer")
-        context = self._by_config_id.get(runtime_config_id)
-        if context is None:
-            raise WorkshopInternalAPIContextError("Runtime configuration has no canonical internal API context")
         return context

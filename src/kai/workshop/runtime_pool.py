@@ -1,4 +1,4 @@
-"""Protected runtime-profile facade over Kai's compatibility subprocess pool."""
+"""Protected runtime-profile facade over Kai's canonical subprocess pool."""
 
 from __future__ import annotations
 
@@ -21,12 +21,7 @@ type AgentPrompt = str | list[dict[str, str]]
 
 
 class WorkshopRuntimePool:
-    """Address compatibility runtimes only by protected Workshop profile.
-
-    The underlying host pool and compatibility stores still require the
-    configured-user integer key. This facade owns that conversion so canonical
-    run resolution and execution services never receive or select it.
-    """
+    """Address protected agent runtimes only by canonical Workshop profile."""
 
     def __init__(
         self,
@@ -35,13 +30,6 @@ class WorkshopRuntimePool:
     ) -> None:
         self._pool = pool
         self._profiles = profiles
-
-    def compatibility_runtime_config_id(
-        self,
-        runtime_profile_id: str | RuntimeProfileId,
-    ) -> int:
-        """Return the private compatibility key for non-pool migrations."""
-        return self._profiles.resolve(runtime_profile_id).runtime_config_id
 
     def runtime_profile(
         self,
@@ -54,12 +42,12 @@ class WorkshopRuntimePool:
         self,
         runtime_profile_id: str | RuntimeProfileId,
     ) -> PreparedBackendExecution:
-        runtime_config_id = self.compatibility_runtime_config_id(runtime_profile_id)
-        return await self._pool.prepare_execution(runtime_config_id)
+        profile_id = self._profiles.resolve(runtime_profile_id).profile_id
+        return await self._pool.prepare_execution(profile_id)
 
     def get_model(self, runtime_profile_id: str | RuntimeProfileId) -> str:
-        runtime_config_id = self.compatibility_runtime_config_id(runtime_profile_id)
-        return self._pool.get_model(runtime_config_id)
+        profile_id = self._profiles.resolve(runtime_profile_id).profile_id
+        return self._pool.get_model(profile_id)
 
     def get_role_model(
         self,
@@ -67,8 +55,8 @@ class WorkshopRuntimePool:
         role: ModelRole,
     ) -> str:
         """Resolve a role model through one protected canonical profile."""
-        runtime_config_id = self.compatibility_runtime_config_id(runtime_profile_id)
-        return self._pool.get_role_model(runtime_config_id, role)
+        profile_id = self._profiles.resolve(runtime_profile_id).profile_id
+        return self._pool.get_role_model(profile_id, role)
 
     async def send(
         self,
@@ -76,38 +64,38 @@ class WorkshopRuntimePool:
         *,
         runtime_profile_id: str | RuntimeProfileId,
     ) -> AsyncIterator[StreamEvent]:
-        runtime_config_id = self.compatibility_runtime_config_id(runtime_profile_id)
-        async for event in self._pool.send(prompt, chat_id=runtime_config_id):
+        profile_id = self._profiles.resolve(runtime_profile_id).profile_id
+        async for event in self._pool.send(prompt, runtime=profile_id):
             yield event
 
     async def get_effective_workspace(
         self,
         runtime_profile_id: str | RuntimeProfileId,
     ) -> Path:
-        runtime_config_id = self.compatibility_runtime_config_id(runtime_profile_id)
-        return await self._pool.get_effective_workspace(runtime_config_id)
+        profile_id = self._profiles.resolve(runtime_profile_id).profile_id
+        return await self._pool.get_effective_workspace(profile_id)
 
     def get_home_workspace(
         self,
         runtime_profile_id: str | RuntimeProfileId,
     ) -> Path:
-        runtime_config_id = self.compatibility_runtime_config_id(runtime_profile_id)
-        return self._pool.get_home_workspace(runtime_config_id)
+        profile_id = self._profiles.resolve(runtime_profile_id).profile_id
+        return self._pool.get_home_workspace(profile_id)
 
     async def resolve_workspace_access(
         self,
         runtime_profile_id: str | RuntimeProfileId,
     ) -> tuple[Path | None, list[Path]]:
-        runtime_config_id = self.compatibility_runtime_config_id(runtime_profile_id)
-        return await self._pool.resolve_workspace_access(runtime_config_id)
+        profile_id = self._profiles.resolve(runtime_profile_id).profile_id
+        return await self._pool.resolve_workspace_access(profile_id)
 
     def set_model_if_running(
         self,
         runtime_profile_id: str | RuntimeProfileId,
         model: str,
     ) -> None:
-        runtime_config_id = self.compatibility_runtime_config_id(runtime_profile_id)
-        instance = self._pool.get_if_exists(runtime_config_id)
+        profile_id = self._profiles.resolve(runtime_profile_id).profile_id
+        instance = self._pool.get_if_exists(profile_id)
         if instance is not None:
             instance.model = model
 
@@ -116,8 +104,8 @@ class WorkshopRuntimePool:
         runtime_profile_id: str | RuntimeProfileId,
         timeout_seconds: int,
     ) -> None:
-        runtime_config_id = self.compatibility_runtime_config_id(runtime_profile_id)
-        instance = self._pool.get_if_exists(runtime_config_id)
+        profile_id = self._profiles.resolve(runtime_profile_id).profile_id
+        instance = self._pool.get_if_exists(profile_id)
         if instance is not None:
             instance.timeout_seconds = timeout_seconds
 
@@ -131,8 +119,8 @@ class WorkshopRuntimePool:
         timeout_seconds: int,
     ) -> None:
         """Apply a complete effective configuration without spawning a runtime."""
-        runtime_config_id = self.compatibility_runtime_config_id(runtime_profile_id)
-        instance = self._pool.get_if_exists(runtime_config_id)
+        profile_id = self._profiles.resolve(runtime_profile_id).profile_id
+        instance = self._pool.get_if_exists(profile_id)
         if instance is None:
             return
         await instance.change_workspace(
@@ -153,13 +141,13 @@ class WorkshopRuntimePool:
         *,
         workspace_config: WorkspaceConfig | None,
     ) -> None:
-        runtime_config_id = self.compatibility_runtime_config_id(runtime_profile_id)
+        profile_id = self._profiles.resolve(runtime_profile_id).profile_id
         await self._pool.change_workspace(
-            runtime_config_id,
+            profile_id,
             workspace,
             workspace_config=workspace_config,
         )
 
     async def restart(self, runtime_profile_id: str | RuntimeProfileId) -> None:
-        runtime_config_id = self.compatibility_runtime_config_id(runtime_profile_id)
-        await self._pool.restart(runtime_config_id)
+        profile_id = self._profiles.resolve(runtime_profile_id).profile_id
+        await self._pool.restart(profile_id)

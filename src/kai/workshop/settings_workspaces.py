@@ -139,7 +139,10 @@ class WorkshopSettingsWorkspaceService:
         return self._canonical_authority(namespace)
 
     def _runtime_config_id(self, authority: SettingsWorkspaceAuthority) -> int:
-        return self._runtime_pool.compatibility_runtime_config_id(authority.runtime_profile_id)
+        namespace = self._execution_state.maybe_for_runtime_profile_id(authority.runtime_profile_id)
+        if namespace is None:
+            raise WorkshopSettingsWorkspaceAccessDenied("Runtime profile has no canonical execution state")
+        return namespace.runtime_config_id
 
     def _lock(self, authority: SettingsWorkspaceAuthority) -> asyncio.Lock:
         return self._locks.setdefault(authority.runtime_profile_id, asyncio.Lock())

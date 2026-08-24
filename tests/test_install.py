@@ -9515,7 +9515,7 @@ backends:
 
         status = _runtime_policy_status(policy, backends)
 
-        assert status == "Workshop runtime policy: initialized; profiles=1, backends=codex"
+        assert status == ("Workshop runtime policy: initialized; profiles=1, backends=codex, runtime kernel=canonical")
         assert "Secret display name" not in status
         assert "101" not in status
 

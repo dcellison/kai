@@ -47,7 +47,7 @@ def _contexts_for_profiles(
     )
 
 
-async def test_profile_facade_owns_every_compatibility_pool_conversion():
+async def test_profile_facade_passes_canonical_profile_to_runtime_kernel():
     runtime = SimpleNamespace(selection="selection", workspace=Path("/srv/project"))
     pool = MagicMock()
     pool.prepare_execution = AsyncMock(return_value=runtime)
@@ -65,13 +65,14 @@ async def test_profile_facade_owns_every_compatibility_pool_conversion():
     assert model == "gpt-5.6-sol"
     assert events[0].response is not None and events[0].response.text == "Done."
     assert workspace == Path("/srv/project")
-    pool.prepare_execution.assert_awaited_once_with(101)
-    pool.get_model.assert_called_once_with(101)
-    pool.send.assert_called_once_with("hello", chat_id=101)
-    pool.get_effective_workspace.assert_awaited_once_with(101)
+    canonical_profile = profile_id(101)
+    pool.prepare_execution.assert_awaited_once_with(canonical_profile)
+    pool.get_model.assert_called_once_with(canonical_profile)
+    pool.send.assert_called_once_with("hello", runtime=canonical_profile)
+    pool.get_effective_workspace.assert_awaited_once_with(canonical_profile)
 
 
-async def test_unknown_profile_fails_before_touching_compatibility_pool():
+async def test_unknown_profile_fails_before_touching_runtime_kernel():
     pool = MagicMock()
     profiles = WorkshopRuntimePool(pool, profile_registry(101))
 
@@ -131,6 +132,29 @@ def test_protected_profile_selects_backend_and_os_user_over_compatibility_config
     assert instance.codex_user == "protected-user"
     assert instance.model == "gpt-5.6-sol"
     assert instance.timeout_seconds == 345
+
+
+def test_protected_runtime_lifecycle_is_keyed_by_canonical_profile():
+    from kai.pool import SubprocessPool
+
+    profiles = profile_registry(111)
+    config = Config(
+        telegram_bot_token="test",
+        allowed_user_ids={111},
+        default_backend="claude",
+        default_model="sonnet",
+        user_configs={111: UserConfig(telegram_id=111, name="Alice")},
+    )
+    pool = SubprocessPool(config=config, services_info=[], runtime_profiles=profiles)
+
+    from_profile = pool.get(profile_id(111))
+    from_compatibility_adapter = pool.get(111)
+
+    assert from_profile is from_compatibility_adapter
+    assert set(pool._pool) == {profile_id(111)}
+    assert set(pool._last_activity) == {profile_id(111)}
+    assert set(pool._pending_workspace_restore) == {profile_id(111)}
+    assert set(pool._pending_settings_restore) == {profile_id(111)}
 
 
 def test_protected_profile_service_scopes_override_compatibility_config(tmp_path, monkeypatch):
