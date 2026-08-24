@@ -156,7 +156,30 @@ class TestCanonicalExecutionStateMigration:
 
 
 class TestCanonicalExecutionStateWrites:
-    async def test_protected_mutations_dual_write_for_rollback_and_isolate_humans(self, database: Path):
+    async def test_protected_session_calls_cannot_read_or_mutate_legacy_archive(
+        self,
+        database: Path,
+    ):
+        await _initialize(database, 101)
+        await sessions._get_db().execute(
+            "INSERT INTO sessions (chat_id, session_id, model) VALUES (?, ?, ?)",
+            (101, "archived-session", "archived-model"),
+        )
+        await sessions._get_db().commit()
+
+        assert await sessions.get_session(101) is None
+        await sessions.save_session(101, "new-session", "gpt-5.6-sol")
+        await sessions.clear_session(101)
+
+        async with sessions._get_db().execute(
+            "SELECT session_id, model FROM sessions WHERE chat_id = ?",
+            (101,),
+        ) as cursor:
+            archived = await cursor.fetchone()
+        assert archived is not None
+        assert tuple(archived) == ("archived-session", "archived-model")
+
+    async def test_protected_mutations_freeze_legacy_archive_and_isolate_humans(self, database: Path):
         await _initialize(database, 101, 202)
 
         await sessions.set_user_setting(101, "model", "gpt-5.5")
@@ -169,12 +192,12 @@ class TestCanonicalExecutionStateWrites:
         assert await sessions.get_user_settings(202) == {}
         assert await sessions.get_workspace_history(202) == []
         assert await sessions.get_allowed_workspaces(202) == []
-        for key, expected in (
-            ("model:101", "gpt-5.5"),
-            ("workspace:101", "/projects/alice"),
-            ("ws_config:101:/projects/alice:timeout", "300"),
+        for key in (
+            "model:101",
+            "workspace:101",
+            "ws_config:101:/projects/alice:timeout",
         ):
-            assert await sessions.get_setting(key) == expected
+            assert await sessions.get_setting(key) is None
 
         await sessions.delete_user_setting(101, "model")
         await sessions.delete_active_workspace(101)
@@ -188,7 +211,7 @@ class TestCanonicalExecutionStateWrites:
         assert await sessions.get_workspace_history(101) == []
         assert await sessions.get_allowed_workspaces(101) == []
 
-    async def test_workspace_config_delete_preserves_colon_prefixed_workspace_in_both_stores(
+    async def test_workspace_config_delete_preserves_colon_prefixed_canonical_workspace(
         self,
         database: Path,
     ):
@@ -203,7 +226,7 @@ class TestCanonicalExecutionStateWrites:
         assert await sessions.get_workspace_config_settings(101, shorter) == {}
         assert await sessions.get_workspace_config_settings(101, colon_prefixed) == {"model": "gpt-5.6-sol"}
         assert await sessions.get_setting("ws_config:101:/projects/alice:model") is None
-        assert await sessions.get_setting("ws_config:101:/projects/alice:archive:model") == "gpt-5.6-sol"
+        assert await sessions.get_setting("ws_config:101:/projects/alice:archive:model") is None
 
     async def test_unmapped_development_callers_retain_legacy_behavior(self, database: Path):
         await _initialize(database, 101)
@@ -227,6 +250,7 @@ class TestCanonicalExecutionStateDiagnostic:
         assert status.startswith("Workshop execution state: active;")
         assert "profiles=1, migrated=1, missing=0, stale=0" in status
         assert "protected legacy reads=disabled" in status
+        assert "rollback dual writes=disabled" in status
         assert "secret-model-name" not in status
         assert "101" not in status
 

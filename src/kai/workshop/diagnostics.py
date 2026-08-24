@@ -458,7 +458,7 @@ def workshop_execution_state_status(db_path: Path) -> str:
         f"{prefix} {state}; profiles={profiles}, migrated={migrated}, "
         f"missing={missing}, stale={stale}, orphaned={orphaned}, unclassified={unclassified}, settings={settings}, "
         f"workspace settings={workspace_settings}, history={history}, grants={grants}; "
-        "protected legacy reads=disabled, rollback dual writes=active"
+        "protected legacy reads=disabled, rollback dual writes=disabled"
     )
 
 

@@ -74,7 +74,6 @@ async def test_submission_returns_before_execution_and_preserves_compatibility_s
     )
     profile_state = SimpleNamespace(
         memory_context_turns=4,
-        save_session=AsyncMock(),
         schedule_memory_ingestion=Mock(),
     )
     compatibility_state = SimpleNamespace(for_profile=Mock(return_value=profile_state))
@@ -93,7 +92,6 @@ async def test_submission_returns_before_execution_and_preserves_compatibility_s
         release.set()
         await executor.stop()
 
-    profile_state.save_session.assert_awaited_once_with("session-1", "gpt-5.6-sol")
     profile_state.schedule_memory_ingestion.assert_called_once_with(
         prompt="Hello from Workshop",
         assistant_text="Completed through the protected lane",
@@ -124,11 +122,7 @@ async def test_terminal_replay_does_not_schedule_or_duplicate_compatibility_writ
         recoverable_client_runs=AsyncMock(return_value=()),
         request_run_cancellation=AsyncMock(),
     )
-    profile_state = SimpleNamespace(
-        append_history=Mock(),
-        save_session=AsyncMock(),
-        schedule_memory_ingestion=Mock(),
-    )
+    profile_state = SimpleNamespace(schedule_memory_ingestion=Mock())
     compatibility_state = SimpleNamespace(for_profile=Mock(return_value=profile_state))
     executor = WorkshopClientCommandExecutor(execution, compatibility_state)
     await executor.start()

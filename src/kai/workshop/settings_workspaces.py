@@ -95,9 +95,8 @@ class SettingsWorkspaceAuthority:
 class WorkshopSettingsWorkspaceService:
     """Own settings/workspace mutations above all client adapters.
 
-    Public methods accept canonical authority only. The service contains the
-    temporary conversion to the compatibility persistence/runtime key so neither
-    Telegram nor Workshop HTTP can make independent mutation decisions.
+    Public methods and persistence are addressed only by canonical authority;
+    transport identities never enter this service.
     """
 
     def __init__(
@@ -138,11 +137,20 @@ class WorkshopSettingsWorkspaceService:
             raise WorkshopSettingsWorkspaceAccessDenied("The principal does not own this runtime profile")
         return self._canonical_authority(namespace)
 
-    def _runtime_config_id(self, authority: SettingsWorkspaceAuthority) -> int:
+    def _namespace(
+        self,
+        authority: SettingsWorkspaceAuthority,
+    ) -> WorkshopExecutionStateNamespace:
         namespace = self._execution_state.maybe_for_runtime_profile_id(authority.runtime_profile_id)
         if namespace is None:
             raise WorkshopSettingsWorkspaceAccessDenied("Runtime profile has no canonical execution state")
-        return namespace.runtime_config_id
+        if (
+            namespace.principal_id != authority.principal_id
+            or namespace.channel_id != authority.channel_id
+            or namespace.agent_id != authority.agent_id
+        ):
+            raise WorkshopSettingsWorkspaceAccessDenied("Runtime profile authority changed")
+        return namespace
 
     def _lock(self, authority: SettingsWorkspaceAuthority) -> asyncio.Lock:
         return self._locks.setdefault(authority.runtime_profile_id, asyncio.Lock())
@@ -152,7 +160,7 @@ class WorkshopSettingsWorkspaceService:
         authority: SettingsWorkspaceAuthority,
     ) -> SettingsWorkspaceSnapshot:
         profile = self._runtime_pool.runtime_profile(authority.runtime_profile_id)
-        runtime_config_id = self._runtime_config_id(authority)
+        namespace = self._namespace(authority)
         workspace = await self._runtime_pool.get_effective_workspace(authority.runtime_profile_id)
         model, timeout_value = await self._effective_values(
             authority,
@@ -161,7 +169,7 @@ class WorkshopSettingsWorkspaceService:
         home = self._runtime_pool.get_home_workspace(authority.runtime_profile_id)
         home_resolved = home.resolve()
         base, allowed = await self._runtime_pool.resolve_workspace_access(authority.runtime_profile_id)
-        history = await sessions.get_workspace_history(runtime_config_id)
+        history = await sessions.get_canonical_workspace_history(namespace)
         candidates: list[Path] = [home, workspace, *allowed]
         candidates.extend(Path(str(item["path"])) for item in history)
         seen: set[Path] = set()
@@ -219,26 +227,26 @@ class WorkshopSettingsWorkspaceService:
         ):
             raise WorkshopSettingsWorkspaceValidationError("The model is not allowed by this runtime profile")
         async with self._lock(authority):
-            runtime_config_id = self._runtime_config_id(authority)
+            namespace = self._namespace(authority)
             workspace = str(await self._runtime_pool.get_effective_workspace(authority.runtime_profile_id))
-            prior_user = await sessions.get_user_settings(runtime_config_id)
-            await sessions.set_user_setting(runtime_config_id, "model", normalized)
+            prior_user = await sessions.get_canonical_execution_settings(namespace)
+            await sessions.set_canonical_execution_setting(namespace, "model", normalized)
             try:
-                await sessions.delete_workspace_config_setting(
-                    runtime_config_id,
+                await sessions.delete_canonical_workspace_config_setting(
+                    namespace,
                     workspace,
                     "model",
                 )
             except BaseException:
                 if "model" in prior_user:
-                    await sessions.set_user_setting(
-                        runtime_config_id,
+                    await sessions.set_canonical_execution_setting(
+                        namespace,
                         "model",
                         prior_user["model"],
                     )
                 else:
-                    await sessions.delete_user_setting(
-                        runtime_config_id,
+                    await sessions.delete_canonical_execution_setting(
+                        namespace,
                         "model",
                     )
                 raise
@@ -247,7 +255,7 @@ class WorkshopSettingsWorkspaceService:
                 normalized,
             )
             await self._runtime_pool.restart(authority.runtime_profile_id)
-            await sessions.clear_session(runtime_config_id)
+            await sessions.clear_canonical_runtime_session(namespace)
         return await self.inspect(authority)
 
     async def set_timeout(
@@ -260,9 +268,9 @@ class WorkshopSettingsWorkspaceService:
         if timeout_seconds <= 0 or timeout_seconds > 600:
             raise WorkshopSettingsWorkspaceValidationError("Timeout must be between 1 and 600 seconds")
         async with self._lock(authority):
-            runtime_config_id = self._runtime_config_id(authority)
-            await sessions.set_user_setting(
-                runtime_config_id,
+            namespace = self._namespace(authority)
+            await sessions.set_canonical_execution_setting(
+                namespace,
                 "timeout",
                 str(timeout_seconds),
             )
@@ -280,11 +288,11 @@ class WorkshopSettingsWorkspaceService:
         if field not in {None, "model", "timeout"}:
             raise WorkshopSettingsWorkspaceValidationError("Only model and timeout settings can be reset")
         async with self._lock(authority):
-            runtime_config_id = self._runtime_config_id(authority)
+            namespace = self._namespace(authority)
             if field is None:
-                await sessions.delete_all_user_settings(runtime_config_id)
+                await sessions.delete_all_canonical_user_settings(namespace)
             else:
-                await sessions.delete_user_setting(runtime_config_id, field)
+                await sessions.delete_canonical_execution_setting(namespace, field)
             workspace = await self._runtime_pool.get_effective_workspace(authority.runtime_profile_id)
             model, timeout = await self._effective_values(authority, workspace)
             self._runtime_pool.set_model_if_running(
@@ -296,7 +304,7 @@ class WorkshopSettingsWorkspaceService:
                 int(timeout.value),
             )
             await self._runtime_pool.restart(authority.runtime_profile_id)
-            await sessions.clear_session(runtime_config_id)
+            await sessions.clear_canonical_runtime_session(namespace)
         return await self.inspect(authority)
 
     async def switch_workspace(
@@ -318,19 +326,21 @@ class WorkshopSettingsWorkspaceService:
                 allowed,
             ):
                 raise WorkshopSettingsWorkspaceAccessDenied("Workspace is outside this runtime profile's grants")
-            runtime_config_id = self._runtime_config_id(authority)
+            namespace = self._namespace(authority)
             yaml_config = self._config.get_workspace_config(requested)
-            workspace_config = await sessions.build_workspace_config(
+            workspace_config = await sessions.build_canonical_workspace_config(
                 yaml_config,
                 requested,
-                runtime_config_id,
+                namespace,
             )
-            prior_workspace = await sessions.get_active_workspace(runtime_config_id)
+            prior_settings = await sessions.get_canonical_execution_settings(namespace)
+            prior_workspace = prior_settings.get("workspace")
             if requested == home:
-                await sessions.delete_active_workspace(runtime_config_id)
+                await sessions.delete_canonical_execution_setting(namespace, "workspace")
             else:
-                await sessions.set_active_workspace(
-                    runtime_config_id,
+                await sessions.set_canonical_execution_setting(
+                    namespace,
+                    "workspace",
                     str(requested),
                 )
             try:
@@ -341,18 +351,19 @@ class WorkshopSettingsWorkspaceService:
                 )
             except BaseException:
                 if prior_workspace is None:
-                    await sessions.delete_active_workspace(runtime_config_id)
+                    await sessions.delete_canonical_execution_setting(namespace, "workspace")
                 else:
-                    await sessions.set_active_workspace(
-                        runtime_config_id,
+                    await sessions.set_canonical_execution_setting(
+                        namespace,
+                        "workspace",
                         prior_workspace,
                     )
                 raise
-            await sessions.clear_session(runtime_config_id)
+            await sessions.clear_canonical_runtime_session(namespace)
             if requested != home:
-                await sessions.upsert_workspace_history(
+                await sessions.upsert_canonical_workspace_history(
+                    namespace,
                     str(requested),
-                    runtime_config_id,
                 )
         return await self.inspect(authority)
 
@@ -361,11 +372,11 @@ class WorkshopSettingsWorkspaceService:
         authority: SettingsWorkspaceAuthority,
         workspace_path: str | None = None,
     ) -> WorkspaceConfigSnapshot:
-        runtime_config_id = self._runtime_config_id(authority)
+        namespace = self._namespace(authority)
         workspace = await self._authorized_workspace(authority, workspace_path)
         yaml_config = self._config.get_workspace_config(workspace)
-        overrides = await sessions.get_workspace_config_settings(
-            runtime_config_id,
+        overrides = await sessions.get_canonical_workspace_config_settings(
+            namespace,
             str(workspace),
         )
         model, timeout = await self._effective_values(authority, workspace)
@@ -487,8 +498,8 @@ class WorkshopSettingsWorkspaceService:
                 authority,
                 workspace_path,
             )
-            settings = await sessions.get_workspace_config_settings(
-                self._runtime_config_id(authority),
+            settings = await sessions.get_canonical_workspace_config_settings(
+                self._namespace(authority),
                 str(workspace),
             )
             environment = self._decode_environment(settings.get("env"))
@@ -513,8 +524,8 @@ class WorkshopSettingsWorkspaceService:
                 authority,
                 workspace_path,
             )
-            settings = await sessions.get_workspace_config_settings(
-                self._runtime_config_id(authority),
+            settings = await sessions.get_canonical_workspace_config_settings(
+                self._namespace(authority),
                 str(workspace),
             )
             environment = self._decode_environment(settings.get("env"))
@@ -546,13 +557,13 @@ class WorkshopSettingsWorkspaceService:
         field: str,
         value: str,
     ) -> None:
-        runtime_config_id = self._runtime_config_id(authority)
-        prior = await sessions.get_workspace_config_settings(
-            runtime_config_id,
+        namespace = self._namespace(authority)
+        prior = await sessions.get_canonical_workspace_config_settings(
+            namespace,
             str(workspace),
         )
-        await sessions.set_workspace_config_setting(
-            runtime_config_id,
+        await sessions.set_canonical_workspace_config_setting(
+            namespace,
             str(workspace),
             field,
             value,
@@ -561,15 +572,15 @@ class WorkshopSettingsWorkspaceService:
             await self._apply_workspace_config(authority, workspace)
         except BaseException:
             if field in prior:
-                await sessions.set_workspace_config_setting(
-                    runtime_config_id,
+                await sessions.set_canonical_workspace_config_setting(
+                    namespace,
                     str(workspace),
                     field,
                     prior[field],
                 )
             else:
-                await sessions.delete_workspace_config_setting(
-                    runtime_config_id,
+                await sessions.delete_canonical_workspace_config_setting(
+                    namespace,
                     str(workspace),
                     field,
                 )
@@ -582,32 +593,32 @@ class WorkshopSettingsWorkspaceService:
         *,
         field: str | None,
     ) -> None:
-        runtime_config_id = self._runtime_config_id(authority)
-        prior = await sessions.get_workspace_config_settings(
-            runtime_config_id,
+        namespace = self._namespace(authority)
+        prior = await sessions.get_canonical_workspace_config_settings(
+            namespace,
             str(workspace),
         )
         if field is None:
-            await sessions.delete_all_workspace_config(
-                runtime_config_id,
+            await sessions.delete_all_canonical_workspace_config(
+                namespace,
                 str(workspace),
             )
         else:
-            await sessions.delete_workspace_config_setting(
-                runtime_config_id,
+            await sessions.delete_canonical_workspace_config_setting(
+                namespace,
                 str(workspace),
                 field,
             )
         try:
             await self._apply_workspace_config(authority, workspace)
         except BaseException:
-            await sessions.delete_all_workspace_config(
-                runtime_config_id,
+            await sessions.delete_all_canonical_workspace_config(
+                namespace,
                 str(workspace),
             )
             for prior_field, prior_value in prior.items():
-                await sessions.set_workspace_config_setting(
-                    runtime_config_id,
+                await sessions.set_canonical_workspace_config_setting(
+                    namespace,
                     str(workspace),
                     prior_field,
                     prior_value,
@@ -637,12 +648,12 @@ class WorkshopSettingsWorkspaceService:
         authority: SettingsWorkspaceAuthority,
         workspace: Path,
     ) -> None:
-        runtime_config_id = self._runtime_config_id(authority)
+        namespace = self._namespace(authority)
         yaml_config: WorkspaceConfig | None = self._config.get_workspace_config(workspace)
-        config = await sessions.build_workspace_config(
+        config = await sessions.build_canonical_workspace_config(
             yaml_config,
             workspace,
-            runtime_config_id,
+            namespace,
         )
         model, timeout = await self._effective_values(authority, workspace)
         await self._runtime_pool.apply_workspace_config_if_running(
@@ -652,7 +663,7 @@ class WorkshopSettingsWorkspaceService:
             model=str(model.value),
             timeout_seconds=int(timeout.value),
         )
-        await sessions.clear_session(runtime_config_id)
+        await sessions.clear_canonical_runtime_session(namespace)
 
     async def _effective_values(
         self,
@@ -660,10 +671,10 @@ class WorkshopSettingsWorkspaceService:
         workspace: Path,
     ) -> tuple[EffectiveValue, EffectiveValue]:
         profile = self._runtime_pool.runtime_profile(authority.runtime_profile_id)
-        runtime_config_id = self._runtime_config_id(authority)
-        user = await sessions.get_user_settings(runtime_config_id)
-        workspace_overrides = await sessions.get_workspace_config_settings(
-            runtime_config_id,
+        namespace = self._namespace(authority)
+        user = await sessions.get_canonical_execution_settings(namespace)
+        workspace_overrides = await sessions.get_canonical_workspace_config_settings(
+            namespace,
             str(workspace),
         )
         yaml_config = self._config.get_workspace_config(workspace)

@@ -131,9 +131,6 @@ class _CanonicalRuntime:
 class _CanonicalCompatibility:
     memory_context_turns = 10
 
-    async def save_session(self, _session_id: str, _model: str) -> None:
-        pass
-
     def schedule_memory_ingestion(self, **_kwargs) -> None:
         pass
 

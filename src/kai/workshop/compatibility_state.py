@@ -30,9 +30,6 @@ class WorkshopProfileCompatibilityState:
         """Return the configured canonical episode-context window."""
         return self._config.episode_classifier_context_turns
 
-    async def save_session(self, session_id: str, model: str) -> None:
-        await sessions.save_session(self._runtime_config_id, session_id, model)
-
     async def github_token(self) -> str | None:
         """Read the transitional protected token without exposing its integer key."""
         return await sessions.get_setting(f"github_token:{self._runtime_config_id}")
