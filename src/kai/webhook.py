@@ -9,7 +9,7 @@ Provides functionality to:
 4. Expose a scheduling API for creating cron-style jobs via HTTP
 5. Expose a jobs query API for listing and fetching scheduled jobs
 6. Proxy authenticated requests to external services (service layer)
-7. Send text messages and files to the Telegram chat (messaging APIs)
+7. Publish proactive text messages and files to canonical Workshop channels
 8. Monitor webhook health and auto-recover from Telegram delivery failures
 9. Redeem Workshop client enrollment grants and synchronize authorized timelines
 
@@ -26,8 +26,8 @@ Routes are organized into these groups:
     - /api/jobs             - Job listing and detail API
     - /api/jobs/{id}        - Job detail (GET), deletion (DELETE), and update (PATCH)
     - /api/services/{name}  - External service proxy (injects auth from .env)
-    - /api/send-message     - Send a text message to the Telegram chat
-    - /api/send-file        - Send a file from the filesystem to the Telegram chat
+    - /api/send-message     - Publish a proactive canonical text message
+    - /api/send-file        - Publish a proactive canonical artifact
     - /api/memory/add       - Store a structured memory (POST)
     - /api/memory/search    - Search memories by query (POST)
     - /api/memory/stats     - Memory statistics for a user (GET)
@@ -71,12 +71,10 @@ from kai import memory, services, sessions
 from kai.application_host import KaiApplicationHost, KaiCoreServices
 from kai.config import (
     DATA_DIR,
-    IMAGE_EXTENSIONS,
     Config,
 )
 from kai.internal_api_auth import InternalAPIAuth, InternalAPIPrincipal, InternalAPIScope
 from kai.job_types import CANONICAL_JOB_TYPES, normalize_job_type
-from kai.telegram_utils import chunk_text
 from kai.workshop.artifacts import MAX_ARTIFACT_BYTES, WorkshopArtifactService
 from kai.workshop.client_api import (
     WorkshopClientCommandSubmitter,
@@ -102,6 +100,10 @@ from kai.workshop.integration_notifications import (
     WorkshopIntegrationNotificationService,
 )
 from kai.workshop.memory_queries import WorkshopMemoryQueryService
+from kai.workshop.proactive_publication import (
+    ProactivePublicationAuthority,
+    ProactivePublicationResult,
+)
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
 from kai.workshop.scheduled_jobs import (
     WorkshopScheduledJobAuthority,
@@ -143,7 +145,6 @@ GENERIC_WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("generic_webhook_secret
 GITHUB_WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("github_webhook_secret", str)
 INTERNAL_API_AUTH_KEY: web.AppKey[InternalAPIAuth] = web.AppKey("internal_api_auth", InternalAPIAuth)
 NOTIFICATION_CHAT_IDS_KEY: web.AppKey[set[int]] = web.AppKey("notification_chat_ids", set)
-POOL_KEY: web.AppKey[object] = web.AppKey("pool", object)
 TELEGRAM_APP_KEY: web.AppKey[Application] = web.AppKey("telegram_app", Application)
 TELEGRAM_BOT_KEY: web.AppKey[Bot] = web.AppKey("telegram_bot", Bot)
 TELEGRAM_WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("telegram_webhook_secret", str)
@@ -477,15 +478,6 @@ def _reject_internal_identity_selectors(payload: dict) -> None:
             f"Identity selector {supplied[0]} is not accepted; the internal API credential already binds "
             "the canonical execution context"
         )
-
-
-def _resolve_internal_runtime_config_id(
-    principal: InternalAPIPrincipal,
-    payload: dict,
-) -> int:
-    """Resolve the remaining private key for handlers not yet cut over."""
-    _reject_internal_identity_selectors(payload)
-    return principal.compatibility_runtime_config_id()
 
 
 def _scheduled_job_authority(principal: InternalAPIPrincipal) -> WorkshopScheduledJobAuthority:
@@ -1380,20 +1372,41 @@ async def _handle_service_call(request: web.Request, principal: InternalAPIPrinc
 # ── Messaging ────────────────────────────────────────────────────────
 
 
+def _proactive_authority(principal: InternalAPIPrincipal) -> ProactivePublicationAuthority:
+    return ProactivePublicationAuthority(
+        principal_id=principal.principal_id,
+        channel_id=principal.channel_id,
+        agent_id=principal.agent_id,
+        runtime_profile_id=principal.runtime_profile_id,
+    )
+
+
+def _proactive_response(result: ProactivePublicationResult, **extra: object) -> web.Response:
+    return web.json_response(
+        {
+            "status": "recorded",
+            "delivery": result.delivery_status,
+            "deliveries": len(result.deliveries),
+            **extra,
+        }
+    )
+
+
 @_require_internal_api(InternalAPIScope.MESSAGES_SEND)
 async def _handle_send_message(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
-    Send a text message to the Telegram chat.
+    Publish a proactive agent message to the credential's canonical channel.
 
     Called by the inner Claude process to proactively notify the user - e.g.,
     when a background task completes, or a scheduled job wants to report
     results without going through the full Claude prompt cycle.
 
-    Accepts a JSON body with a required "text" field. Messages longer than
-    Telegram's 4096-character limit are split into chunks.
+    Optional adapter delivery is requested durably after canonical recording.
+    An optional idempotency_key makes an uncertain caller retry resolve to the
+    same message and delivery work.
 
     Returns:
-        JSON {"status": "sent"} on success, or an appropriate HTTP error.
+        Recorded status plus queued/delivered/not-configured adapter state.
     """
     try:
         payload = await request.json()
@@ -1408,25 +1421,36 @@ async def _handle_send_message(request: web.Request, principal: InternalAPIPrinc
     if not isinstance(payload, dict):
         return web.json_response({"error": "Request body must be a JSON object"}, status=400)
 
-    text = payload.get("text", "").strip()
+    raw_text = payload.get("text", "")
+    if not isinstance(raw_text, str):
+        return web.json_response({"error": "text must be a string"}, status=400)
+    text = raw_text.strip()
     if not text:
         return web.json_response({"error": "Missing required field: text"}, status=400)
 
-    bot = request.app[TELEGRAM_BOT_KEY]
     try:
-        chat_id = _resolve_internal_runtime_config_id(principal, payload)
+        _reject_internal_identity_selectors(payload)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
 
     try:
-        for part in chunk_text(text):
-            await bot.send_message(chat_id, part)
+        request_id = payload.get("idempotency_key")
+        if request_id is None:
+            request_id = uuid.uuid4().hex
+        result = await request.app[CORE_HOST_KEY].services.proactive_publication.publish_text(
+            _proactive_authority(principal),
+            request_id=request_id,
+            body=text,
+            occurred_at=datetime.now(UTC),
+        )
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
     except Exception:
-        log.exception("Failed to send message to chat %d via API", chat_id)
-        return web.json_response({"error": "Failed to send message"}, status=500)
+        log.exception("Canonical proactive message publication failed")
+        return web.json_response({"error": "Message publication failed"}, status=500)
 
-    log.info("Sent message to chat %d via API (%d chars)", chat_id, len(text))
-    return web.json_response({"status": "sent"})
+    log.info("Recorded proactive canonical message (%d chars)", len(text))
+    return _proactive_response(result)
 
 
 # ── File exchange ────────────────────────────────────────────────────
@@ -1435,12 +1459,12 @@ async def _handle_send_message(request: web.Request, principal: InternalAPIPrinc
 @_require_internal_api(InternalAPIScope.FILES_SEND)
 async def _handle_send_file(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
-    Send a file from the filesystem to the Telegram chat.
+    Publish a file from the filesystem as a canonical channel artifact.
 
     Called by the inner Claude process to deliver files back to the user.
     Accepts a JSON body with a required "path" field (absolute path) and
-    an optional "caption". Images are sent as photos (rendered inline),
-    everything else as document attachments.
+    optional "caption" and "idempotency_key". Optional adapters deliver the
+    artifact later through durable channel-binding workers.
 
     Path confinement: the resolved path must be inside the authenticated
     principal's current workspace or its scoped upload directory. This
@@ -1448,8 +1472,7 @@ async def _handle_send_file(request: web.Request, principal: InternalAPIPrincipa
     principal from sending files from another principal's upload directory.
 
     Returns:
-        JSON {"status": "sent", "file": "<filename>"} on success, or an
-        appropriate HTTP error (400/401/403/404).
+        Recorded status, adapter state, and canonical filename on success.
     """
     try:
         payload = await request.json()
@@ -1467,6 +1490,8 @@ async def _handle_send_file(request: web.Request, principal: InternalAPIPrincipa
     file_path = payload.get("path")
     if not file_path:
         return web.json_response({"error": "Missing required field: path"}, status=400)
+    if not isinstance(file_path, str):
+        return web.json_response({"error": "path must be a string"}, status=400)
 
     # Identity and authority are bound to the credential. Caller-supplied
     # selectors are rejected before any filesystem lookup.
@@ -1514,29 +1539,28 @@ async def _handle_send_file(request: web.Request, principal: InternalAPIPrincipa
     if not path.is_file():
         return web.json_response({"error": f"File not found: {file_path}"}, status=404)
 
-    # Direct Telegram publication is the remaining bounded compatibility seam
-    # and is retired in the next internal-API slice. It is not consulted for
-    # workspace or storage authorization above.
-    chat_id = principal.compatibility_runtime_config_id()
-    bot = request.app[TELEGRAM_BOT_KEY]
     caption = payload.get("caption", "")
-
-    # Send images as photos (Telegram renders them inline) and everything
-    # else as document attachments (preserves filename, allows any type).
+    if not isinstance(caption, str):
+        return web.json_response({"error": "caption must be a string"}, status=400)
     try:
-        suffix = path.suffix.lower()
-        if suffix in IMAGE_EXTENSIONS:
-            with open(path, "rb") as f:
-                await bot.send_photo(chat_id, f, caption=caption or None)
-        else:
-            with open(path, "rb") as f:
-                await bot.send_document(chat_id, f, caption=caption or None, filename=path.name)
+        request_id = payload.get("idempotency_key")
+        if request_id is None:
+            request_id = uuid.uuid4().hex
+        result = await request.app[CORE_HOST_KEY].services.proactive_publication.publish_file(
+            _proactive_authority(principal),
+            request_id=request_id,
+            path=path,
+            caption=caption,
+            occurred_at=datetime.now(UTC),
+        )
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
     except Exception:
-        log.exception("Failed to send file %s to chat %d", path, chat_id)
-        return web.json_response({"error": "Failed to send file"}, status=500)
+        log.exception("Canonical proactive artifact publication failed")
+        return web.json_response({"error": "File publication failed"}, status=500)
 
-    log.info("Sent file %s to chat %d via API", path.name, chat_id)
-    return web.json_response({"status": "sent", "file": path.name})
+    log.info("Recorded proactive canonical artifact %s", path.name)
+    return _proactive_response(result, file=path.name)
 
 
 # ── Memory API ───────────────────────────────────────────────────────
@@ -2151,10 +2175,8 @@ def _register_routes(
     app.router.add_post("/api/schedule", _handle_schedule)
     app.router.add_delete("/api/jobs/{id}", _handle_delete_job)
     app.router.add_patch("/api/jobs/{id}", _handle_update_job)
-    if telegram_enabled:
-        # These compatibility operations still use Telegram delivery.
-        app.router.add_post("/api/send-message", _handle_send_message)
-        app.router.add_post("/api/send-file", _handle_send_file)
+    app.router.add_post("/api/send-message", _handle_send_message)
+    app.router.add_post("/api/send-file", _handle_send_file)
 
 
 async def _register_workshop_client_api(
@@ -2286,10 +2308,6 @@ async def start(
 
     # Retain the loaded application configuration for compatibility APIs.
     _app[CONFIG_KEY] = config
-
-    # Store the subprocess pool for per-user workspace lookup in send-file.
-    # Set by main.py after pool creation; may be None during init.
-    _app[POOL_KEY] = pool
 
     # Workspace policy lets canonical review work resolve a local checkout for
     # _resolve_local_repo() match incoming PR webhook repos against

@@ -20,7 +20,6 @@ from kai.webhook import (
     GITHUB_WEBHOOK_SECRET_KEY,
     INTERNAL_API_AUTH_KEY,
     NOTIFICATION_CHAT_IDS_KEY,
-    POOL_KEY,
     TELEGRAM_APP_KEY,
     TELEGRAM_BOT_KEY,
     WORKSPACE_BASE_KEY,
@@ -339,7 +338,6 @@ def _default_github_token_lookup():
 def _build_test_app(
     cooldown: int = 300,
     config: object | None = None,
-    pool: object | None = None,
 ) -> web.Application:
     """Build a minimal aiohttp app with _handle_github wired up.
 
@@ -403,8 +401,6 @@ def _build_test_app(
         app[CONFIG_KEY] = mock_config
     else:
         app[CONFIG_KEY] = config
-    if pool is not None:
-        app[POOL_KEY] = pool
     app.router.add_post("/webhook/github", _handle_github)
     return app
 

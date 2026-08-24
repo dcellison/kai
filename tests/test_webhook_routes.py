@@ -92,8 +92,8 @@ def test_workshop_only_keeps_integrations_but_omits_telegram_routes() -> None:
     assert ("POST", "/api/schedule") in routes
     assert ("DELETE", "/api/jobs/{id}") in routes
     assert ("PATCH", "/api/jobs/{id}") in routes
-    assert ("POST", "/api/send-message") not in routes
-    assert ("POST", "/api/send-file") not in routes
+    assert ("POST", "/api/send-message") in routes
+    assert ("POST", "/api/send-file") in routes
 
 
 async def test_health_reports_non_sensitive_memory_mode(monkeypatch) -> None:

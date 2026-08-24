@@ -117,7 +117,7 @@ class TestInstanceCreation:
         assert credential
         principal = pool.internal_api_auth.authenticate(credential)
         assert principal is not None
-        assert principal.compatibility_runtime_config_id() == 111
+        assert not hasattr(principal, "compatibility_runtime_config_id")
         assert principal.runtime_profile_id == profile_id(111)
 
     def test_services_are_filtered_per_user_and_bound_to_principal(self):
@@ -527,7 +527,11 @@ class TestPerUserBackendRouting:
         }
         for chat_id in users:
             (tmp_path / "home" / str(chat_id)).mkdir(parents=True)
-        config = _make_config(protected_install=True, user_configs=users)
+        config = _make_config(
+            protected_install=True,
+            allowed_user_ids=set(users),
+            user_configs=users,
+        )
         pool = SubprocessPool(
             config=config,
             services_info=[],

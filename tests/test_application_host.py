@@ -243,6 +243,7 @@ def _host() -> KaiApplicationHost:
             session_db_path=Path("/tmp/kai-test.db"),
             spec_dir="specs",
             pr_review_timeout_s=900,
+            telegram_enabled=False,
         ),  # type: ignore[arg-type]
         runtime_profiles=SimpleNamespace(),  # type: ignore[arg-type]
         execution_state=SimpleNamespace(),  # type: ignore[arg-type]
@@ -415,6 +416,8 @@ async def test_real_core_lifecycle_uses_workshop_identity_without_telegram_appli
             "workshop",
             "browser-human",
         )
+        internal_contexts = await WorkshopInternalAPIContextRegistry.from_store(store, profiles)
+        context = internal_contexts.for_runtime_profile(profile_id(101))
     finally:
         await store.close()
 
@@ -438,9 +441,19 @@ async def test_real_core_lifecycle_uses_workshop_identity_without_telegram_appli
     host = KaiApplicationHost(
         config=config,
         runtime_profiles=profiles,
-        execution_state=_execution_state(PrincipalId(str(principal_id)), 101),
+        execution_state=WorkshopExecutionStateRegistry(
+            (
+                WorkshopExecutionStateNamespace(
+                    principal_id=context.principal_id,
+                    channel_id=context.channel_id,
+                    agent_id=context.agent_id,
+                    runtime_profile_id=context.runtime_profile_id,
+                    runtime_config_id=101,
+                ),
+            )
+        ),
         principal_storage=principal_storage,
-        internal_api_contexts=_internal_contexts(PrincipalId(str(principal_id)), 101),
+        internal_api_contexts=internal_contexts,
         services_info=[],
         registered_backend_ids=frozenset({"codex"}),
     )
@@ -481,6 +494,8 @@ async def test_core_activates_delivery_authority_before_recovering_expired_start
             "telegram",
             "101",
         )
+        internal_contexts = await WorkshopInternalAPIContextRegistry.from_store(store, profiles)
+        context = internal_contexts.for_runtime_profile(profile_id(101))
         accepted = await WorkshopConversationCommandService(store).accept(
             InboundMessage(
                 transport="telegram",
@@ -525,7 +540,17 @@ async def test_core_activates_delivery_authority_before_recovering_expired_start
             default_model="gpt-5.6-sol",
         ),
         runtime_profiles=profiles,
-        execution_state=_execution_state(PrincipalId(str(principal_id)), 101),
+        execution_state=WorkshopExecutionStateRegistry(
+            (
+                WorkshopExecutionStateNamespace(
+                    principal_id=context.principal_id,
+                    channel_id=context.channel_id,
+                    agent_id=context.agent_id,
+                    runtime_profile_id=context.runtime_profile_id,
+                    runtime_config_id=101,
+                ),
+            )
+        ),
         principal_storage=WorkshopPrincipalStorageRegistry(
             (
                 WorkshopPrincipalStorageNamespace(
@@ -535,7 +560,7 @@ async def test_core_activates_delivery_authority_before_recovering_expired_start
                 ),
             )
         ),
-        internal_api_contexts=_internal_contexts(PrincipalId(str(principal_id)), 101),
+        internal_api_contexts=internal_contexts,
         services_info=[],
         registered_backend_ids=frozenset({"codex"}),
     )

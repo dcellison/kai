@@ -836,8 +836,8 @@ def build_session_context(
             f"(e.g., background task results), use curl (NEVER WebFetch) to POST JSON to "
             f"http://localhost:{api.webhook_port}/api/send-message "
             f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
-            f'Required: "text" (the message content). '
-            f"Long messages are automatically split at Telegram's 4096-char limit.]"
+            f'Required: "text" (the message content). Optional: "idempotency_key" for safe retries. '
+            f"Success records the message canonically before optional client delivery.]"
         )
         parts.append(
             f"[File API: To send a file to the user, use curl (NEVER WebFetch) to POST JSON to "
@@ -845,8 +845,8 @@ def build_session_context(
             f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
             f'Required: "path" (absolute file path within the current workspace {workspace} '
             f"or an exact incoming-file path previously supplied by Kai). "
-            f'Optional: "caption". Images are sent as photos, '
-            f"everything else as documents.\n"
+            f'Optional: "caption" and "idempotency_key" for safe retries. '
+            f"Success records a canonical artifact before optional client delivery.\n"
             f"Incoming files from the user are auto-saved and their exact paths "
             f"are included in the message.]"
         )

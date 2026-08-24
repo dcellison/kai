@@ -21,7 +21,10 @@ from kai.workshop.domain import DeliveryAuthorityEpochId
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.telegram_delivery import (
     WORKSHOP_CLIENT_TEXT_MODE,
+    TelegramArtifactBot,
     TelegramTextBot,
+    WorkshopTelegramArtifactDeliveryAdapter,
+    WorkshopTelegramArtifactDeliveryWorker,
     WorkshopTelegramDeliveryAdapter,
     WorkshopTelegramDeliveryWorker,
     WorkshopTelegramStreamingFinalizationAdapter,
@@ -330,9 +333,13 @@ class WorkshopTelegramNotificationService:
         self,
         worker_store: WorkshopEventStore,
         runtime: WorkshopTelegramDeliveryRuntime,
+        artifact_store: WorkshopEventStore,
+        artifact_runtime: WorkshopTelegramDeliveryRuntime,
     ) -> None:
         self._worker_store = worker_store
         self._runtime = runtime
+        self._artifact_store = artifact_store
+        self._artifact_runtime = artifact_runtime
         self._closed = False
 
     @classmethod
@@ -345,6 +352,8 @@ class WorkshopTelegramNotificationService:
     ) -> WorkshopTelegramNotificationService:
         worker_store: WorkshopEventStore | None = None
         runtime: WorkshopTelegramDeliveryRuntime | None = None
+        artifact_store: WorkshopEventStore | None = None
+        artifact_runtime: WorkshopTelegramDeliveryRuntime | None = None
         try:
             worker_store = await WorkshopEventStore.open(database_path)
             worker = WorkshopTelegramDeliveryWorker(
@@ -357,7 +366,26 @@ class WorkshopTelegramNotificationService:
             )
             runtime = WorkshopTelegramDeliveryRuntime(worker, worker)
             await runtime.start()
+            artifact_store = await WorkshopEventStore.open(database_path)
+            artifact_worker = WorkshopTelegramArtifactDeliveryWorker(
+                WorkshopDeliveryOutbox(artifact_store),
+                WorkshopTelegramArtifactDeliveryAdapter(
+                    artifact_store,
+                    cast(TelegramArtifactBot, bot),
+                    storage_root=database_path.parent / "files",
+                ),
+                worker_id=f"{worker_id}-artifact",
+            )
+            artifact_runtime = WorkshopTelegramDeliveryRuntime(artifact_worker, artifact_worker)
+            await artifact_runtime.start()
         except BaseException:
+            if artifact_runtime is not None:
+                try:
+                    await artifact_runtime.stop()
+                except Exception:
+                    pass
+            if artifact_store is not None:
+                await artifact_store.close()
             if runtime is not None:
                 try:
                     await runtime.stop()
@@ -368,20 +396,39 @@ class WorkshopTelegramNotificationService:
             raise
         assert worker_store is not None
         assert runtime is not None
-        return cls(worker_store, runtime)
+        assert artifact_store is not None
+        assert artifact_runtime is not None
+        return cls(worker_store, runtime, artifact_store, artifact_runtime)
 
     @property
     def ready(self) -> bool:
-        return not self._closed and self._runtime.ready
+        return not self._closed and self._runtime.ready and self._artifact_runtime.ready
 
     async def wait(self) -> None:
-        await self._runtime.wait()
+        waits = {
+            asyncio.create_task(self._runtime.wait()),
+            asyncio.create_task(self._artifact_runtime.wait()),
+        }
+        done, pending = await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            await task
 
     async def stop(self) -> None:
         if self._closed:
             return
         try:
-            await self._runtime.stop()
+            results = await asyncio.gather(
+                self._runtime.stop(),
+                self._artifact_runtime.stop(),
+                return_exceptions=True,
+            )
         finally:
             self._closed = True
+            await self._artifact_store.close()
             await self._worker_store.close()
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result

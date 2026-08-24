@@ -36,6 +36,8 @@ def test_agent_credentials_are_unique_and_resolve_server_side() -> None:
     assert principal_123.channel_id == context_123.channel_id
     assert principal_123.agent_id == context_123.agent_id
     assert principal_123.runtime_profile_id == context_123.runtime_profile_id
+    assert not hasattr(principal_123, "_runtime_config_id")
+    assert not hasattr(principal_123, "compatibility_runtime_config_id")
     assert principal_456.principal_id == context_456.principal_id
     assert auth.authenticate("not-a-token") is None
 

@@ -56,7 +56,6 @@ class InternalAPIPrincipal:
     channel_id: ChannelId
     agent_id: AgentId
     runtime_profile_id: RuntimeProfileId
-    _runtime_config_id: int
     scopes: frozenset[InternalAPIScope]
     allowed_services: frozenset[str] = frozenset()
 
@@ -67,10 +66,6 @@ class InternalAPIPrincipal:
     def allows_service(self, service_name: str) -> bool:
         """Return whether this principal may call one named service."""
         return self.allows(InternalAPIScope.SERVICES_CALL) and service_name in self.allowed_services
-
-    def compatibility_runtime_config_id(self) -> int:
-        """Return the server-private key for compatibility persistence adapters."""
-        return self._runtime_config_id
 
 
 class InternalAPIAuth:
@@ -171,7 +166,6 @@ class InternalAPIAuth:
             channel_id=context.channel_id,
             agent_id=context.agent_id,
             runtime_profile_id=context.runtime_profile_id,
-            _runtime_config_id=context.compatibility_runtime_config_id(),
             scopes=scopes,
             allowed_services=allowed_services,
         )

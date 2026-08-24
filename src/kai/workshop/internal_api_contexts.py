@@ -24,10 +24,6 @@ class WorkshopInternalAPIExecutionContext:
     runtime_profile_id: RuntimeProfileId
     _runtime_config_id: int = field(repr=False)
 
-    def compatibility_runtime_config_id(self) -> int:
-        """Return the private compatibility key used behind server adapters."""
-        return self._runtime_config_id
-
     @classmethod
     def for_unprotected_runtime(
         cls,

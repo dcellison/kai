@@ -25,6 +25,10 @@ from kai.workshop.integration_notifications import WorkshopIntegrationNotificati
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIContextRegistry
 from kai.workshop.memory_queries import WorkshopMemoryQueryService
 from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
+from kai.workshop.proactive_publication import (
+    ProactivePublicationAuthority,
+    WorkshopProactivePublicationService,
+)
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
@@ -123,6 +127,7 @@ class KaiCoreServices:
     artifacts: WorkshopArtifactService
     settings_workspaces: WorkshopSettingsWorkspaceService
     memory_queries: WorkshopMemoryQueryService
+    proactive_publication: WorkshopProactivePublicationService
     integration_notifications: WorkshopIntegrationNotificationService
     github_automation: WorkshopGitHubAutomationService
 
@@ -248,6 +253,21 @@ class KaiApplicationHost:
                 runtime_pool,
                 self._execution_state,
             )
+            proactive_publication = WorkshopProactivePublicationService(
+                client_store,
+                artifacts,
+                artifact_storage_root=Path(self._config.session_db_path).parent / "files",
+                delivery_transports=frozenset({"telegram"}) if self._config.telegram_enabled else frozenset(),
+            )
+            for context in self._internal_api_contexts.contexts:
+                await proactive_publication.validate_authority(
+                    ProactivePublicationAuthority(
+                        principal_id=context.principal_id,
+                        channel_id=context.channel_id,
+                        agent_id=context.agent_id,
+                        runtime_profile_id=context.runtime_profile_id,
+                    )
+                )
             integration_notifications = await WorkshopIntegrationNotificationService.open(
                 Path(self._config.session_db_path)
             )
@@ -277,6 +297,7 @@ class KaiApplicationHost:
                 artifacts=artifacts,
                 settings_workspaces=settings_workspaces,
                 memory_queries=memory_queries,
+                proactive_publication=proactive_publication,
                 integration_notifications=integration_notifications,
                 github_automation=github_automation,
             )
