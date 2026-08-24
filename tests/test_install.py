@@ -63,6 +63,7 @@ from kai.install import (
     _generate_sudoers,
     _generate_systemd_unit,
     _generate_users_yaml,
+    _github_automation_status,
     _log_security_status,
     _memory_scope_review_status,
     _migrate_identity_to_claude_md,
@@ -4991,6 +4992,27 @@ class TestCmdStatus:
     def test_status_reports_unavailable_core_schedule_database(self, tmp_path):
         assert _core_schedule_status(tmp_path / "missing.db") == (
             "Workshop scheduler: NOT VERIFIED (database unavailable)"
+        )
+
+    def test_status_reports_canonical_github_automation_queue(self, tmp_path):
+        db_path = tmp_path / "kai.db"
+        connection = sqlite3.connect(db_path)
+        connection.execute("CREATE TABLE workshop_github_automation_work (status TEXT NOT NULL)")
+        connection.executemany(
+            "INSERT INTO workshop_github_automation_work(status) VALUES (?)",
+            [("pending",), ("succeeded",), ("failed",), ("uncertain",)],
+        )
+        connection.commit()
+        connection.close()
+
+        assert _github_automation_status(db_path) == (
+            "Workshop GitHub automation: ATTENTION; pending=1, executing=0, "
+            "succeeded=1, failed=1, uncertain=1; subscription routing=canonical"
+        )
+
+    def test_status_reports_unavailable_github_automation_database(self, tmp_path):
+        assert _github_automation_status(tmp_path / "missing.db") == (
+            "Workshop GitHub automation: NOT VERIFIED (database unavailable)"
         )
 
     def test_deployed_status_reports_named_secrets_without_values(self, tmp_path, monkeypatch):

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from kai.backend import StreamEvent
-from kai.config import WorkspaceConfig
+from kai.config import ModelRole, WorkspaceConfig
 from kai.workshop.domain import RuntimeProfileId
 from kai.workshop.runtime_profiles import ProtectedRuntimeProfile, WorkshopRuntimeProfileRegistry
 
@@ -60,6 +60,15 @@ class WorkshopRuntimePool:
     def get_model(self, runtime_profile_id: str | RuntimeProfileId) -> str:
         runtime_config_id = self.compatibility_runtime_config_id(runtime_profile_id)
         return self._pool.get_model(runtime_config_id)
+
+    def get_role_model(
+        self,
+        runtime_profile_id: str | RuntimeProfileId,
+        role: ModelRole,
+    ) -> str:
+        """Resolve a role model through one protected canonical profile."""
+        runtime_config_id = self.compatibility_runtime_config_id(runtime_profile_id)
+        return self._pool.get_role_model(runtime_config_id, role)
 
     async def send(
         self,

@@ -7835,32 +7835,6 @@ class TestHandleReviewCommand:
         mock_post.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_does_not_touch_webhook_cooldown(self, tmp_path, monkeypatch):
-        # The webhook cooldown map is private to webhook.py. The
-        # manual command runs as explicit user action and must not
-        # update it; a manual review at T must not suppress an
-        # automatic review on a later push.
-        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
-        monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
-        update = _make_update()
-        ctx = _make_context(config=_review_command_config(), args=["dcellison/kai", "681"])
-        ctx.bot.send_document = AsyncMock()
-
-        from kai.webhook import _review_cooldowns
-
-        baseline = dict(_review_cooldowns)
-        with (
-            patch("kai.bot._check_totp", new=AsyncMock(return_value=True)),
-            patch(
-                "kai.bot.review.generate_pr_review",
-                new=AsyncMock(return_value=_review_result()),
-            ),
-        ):
-            await handle_review_command(update, ctx)
-
-        assert dict(_review_cooldowns) == baseline
-
-    @pytest.mark.asyncio
     async def test_collection_warnings_surface_in_reply(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
         monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)

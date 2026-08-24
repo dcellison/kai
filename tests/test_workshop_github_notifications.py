@@ -14,6 +14,7 @@ from kai.workshop.bootstrap import (
     bootstrap_default_workshop,
 )
 from kai.workshop.delivery_outbox import NOTIFICATION_PURPOSE
+from kai.workshop.domain import ChannelId
 from kai.workshop.integration_notifications import (
     IntegrationNotification,
     WorkshopIntegrationNotificationService,
@@ -86,6 +87,26 @@ class TestIntegrationNotificationInput:
 
 
 class TestWorkshopIntegrationNotificationService:
+    async def test_records_directly_to_authorized_canonical_channel(self, tmp_path: Path):
+        store = await _open_notification_store(tmp_path / "kai.db")
+        try:
+            async with store.connection.execute("SELECT id FROM channels WHERE kind = 'notification'") as cursor:
+                channel_id = ChannelId(str((await cursor.fetchone())[0]))
+
+            result = await WorkshopIntegrationNotificationService(store).record_for_channel(
+                _notification(),
+                channel_id,
+            )
+
+            async with store.connection.execute(
+                "SELECT channel_id FROM messages WHERE id = ?",
+                (result.message_id,),
+            ) as cursor:
+                assert str((await cursor.fetchone())[0]) == channel_id
+            assert len(result.deliveries) == 1
+        finally:
+            await store.close()
+
     async def test_atomically_records_feed_entry_and_durable_telegram_work(
         self,
         tmp_path: Path,
