@@ -50,13 +50,13 @@ from kai.webhook import (
     remove_notification_chat_id,
 )
 from kai.workshop.domain import PrincipalId
+from kai.workshop.integration_notifications import WorkshopIntegrationNotificationService
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
 from kai.workshop.storage_namespaces import (
     WorkshopPrincipalStorageNamespace,
     WorkshopPrincipalStorageRegistry,
 )
 from kai.workshop.store import WorkshopEventStore
-from kai.workshop.telegram_delivery_runtime import WorkshopTelegramNotificationService
 from tests.workshop_profiles import profile_id
 
 
@@ -1101,10 +1101,10 @@ class TestGitHubExceptionHandler:
     """Verify the top-level exception handler in _handle_github."""
 
     @pytest.mark.asyncio
-    async def test_exception_returns_500(self, _clear_cooldowns):
-        """An unhandled exception in event processing returns 500."""
+    async def test_missing_canonical_destination_without_telegram_returns_503(self, _clear_cooldowns):
         app = _build_test_app()
-        # Remove telegram_bot to trigger KeyError in _process_github_event
+        # With no Telegram compatibility path, GitHub must retry rather than
+        # silently losing a notification that has no canonical destination.
         del app[TELEGRAM_BOT_KEY]
         payload = {"action": "opened", "repository": {"full_name": "owner/repo"}}
         body = json.dumps(payload).encode()
@@ -1120,8 +1120,8 @@ class TestGitHubExceptionHandler:
                 },
             )
             result = await resp.json()
-            assert resp.status == 500
-            assert result["msg"] == "internal_error"
+            assert resp.status == 503
+            assert result == {"status": "unavailable"}
 
     @pytest.mark.asyncio
     async def test_signature_validation_unaffected(self, _clear_cooldowns):
@@ -1914,7 +1914,10 @@ class TestPerUserRouting:
                         "X-Hub-Signature-256": sig,
                     },
                 )
-                assert resp.status == 200
+                # The healthy subscriber is still processed, while 503 asks
+                # GitHub to retry the failed subscriber. Canonical delivery
+                # identity makes the healthy subscriber's retry idempotent.
+                assert resp.status == 503
 
         # Both users were attempted (resolve called twice)
         assert call_count == 2
@@ -2542,7 +2545,7 @@ class TestNotificationChatIdMutations:
             memory_queries=MagicMock(),
         )
         core_host = MagicMock()
-        github_notifications = MagicMock(spec=WorkshopTelegramNotificationService)
+        integration_notifications = MagicMock(spec=WorkshopIntegrationNotificationService)
 
         fake_runner = MagicMock()
         fake_runner.setup = AsyncMock()
@@ -2564,7 +2567,7 @@ class TestNotificationChatIdMutations:
                     config,
                     core_host=core_host,
                     core_services=core_services,
-                    github_notifications=github_notifications,
+                    integration_notifications=integration_notifications,
                 )
 
             assert wh._app[ALLOWED_USER_IDS_KEY] == {111}
@@ -2624,7 +2627,7 @@ class TestNotificationChatIdMutations:
             config,
             core_host=MagicMock(),
             core_services=core_services,
-            github_notifications=None,
+            integration_notifications=MagicMock(spec=WorkshopIntegrationNotificationService),
             workshop_enabled=True,
         )
         try:
@@ -2633,8 +2636,8 @@ class TestNotificationChatIdMutations:
             paths = {resource.canonical for resource in wh._app.router.resources()}
             assert "/workshop/" in paths
             assert "/webhook/telegram" not in paths
-            assert "/webhook/github" not in paths
-            assert "/webhook" not in paths
+            assert "/webhook/github" in paths
+            assert "/webhook" in paths
         finally:
             await wh.stop()
             await store.close()
@@ -2682,7 +2685,7 @@ class TestNotificationChatIdMutations:
             memory_queries=MagicMock(),
         )
         core_host = MagicMock()
-        github_notifications = MagicMock(spec=WorkshopTelegramNotificationService)
+        integration_notifications = MagicMock(spec=WorkshopIntegrationNotificationService)
 
         apps: list[web.Application] = []
         runner_shutdown_timeouts: list[float] = []
@@ -2713,7 +2716,7 @@ class TestNotificationChatIdMutations:
             config,
             core_host=core_host,
             core_services=core_services,
-            github_notifications=github_notifications,
+            integration_notifications=integration_notifications,
         )
         try:
             assert [(host, port) for _, host, port in sites] == [

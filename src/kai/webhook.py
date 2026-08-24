@@ -56,6 +56,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -94,7 +95,10 @@ from kai.workshop.client_sessions import (
     WorkshopClientSessionManager,
 )
 from kai.workshop.client_shell import register_workshop_shell_routes
-from kai.workshop.github_notifications import GitHubNotification
+from kai.workshop.integration_notifications import (
+    IntegrationNotification,
+    WorkshopIntegrationNotificationService,
+)
 from kai.workshop.memory_queries import WorkshopMemoryQueryService
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
 from kai.workshop.scheduler import WorkshopCanonicalScheduler
@@ -104,7 +108,6 @@ from kai.workshop.storage_namespaces import (
     WorkshopStorageNamespaceError,
 )
 from kai.workshop.store import WorkshopEventStore
-from kai.workshop.telegram_delivery_runtime import WorkshopTelegramNotificationService
 
 log = logging.getLogger(__name__)
 
@@ -146,8 +149,8 @@ WORKSPACE_BASE_KEY: web.AppKey[str | None] = web.AppKey("workspace_base")
 WORKSHOP_PRINCIPAL_STORAGE_KEY: web.AppKey[WorkshopPrincipalStorageRegistry] = web.AppKey(
     "workshop_principal_storage", WorkshopPrincipalStorageRegistry
 )
-WORKSHOP_GITHUB_NOTIFICATIONS_KEY: web.AppKey[WorkshopTelegramNotificationService] = web.AppKey(
-    "workshop_github_notifications", WorkshopTelegramNotificationService
+WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY: web.AppKey[WorkshopIntegrationNotificationService] = web.AppKey(
+    "workshop_integration_notifications", WorkshopIntegrationNotificationService
 )
 
 
@@ -903,7 +906,7 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
     admin wildcard exists - for example, when no users.yaml is configured
     or when all admins have opted into specific repos only.
     """
-    bot = request.app[TELEGRAM_BOT_KEY]
+    bot = request.app.get(TELEGRAM_BOT_KEY)
     config: Config = request.app[CONFIG_KEY]
 
     # Extract the repo that triggered this event
@@ -927,9 +930,27 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
             repo_full_name,
         )
         # Fall back to the first admin in the app config so the event is
-        # not silently dropped. Wrapped in try/except for consistency with
-        # the fan-out path - a transient failure should return 200, not 500.
-        fallback_chat_id = request.app[CHAT_ID_KEY]
+        # not silently dropped. A transient processing failure returns 503 so
+        # GitHub retries; canonical delivery identity makes repeats safe.
+        fallback_chat_id = request.app.get(CHAT_ID_KEY)
+        if fallback_chat_id is None:
+            formatter = _GITHUB_FORMATTERS.get(event_type)
+            if formatter is None:
+                return web.json_response({"msg": "ignored"})
+            message = formatter(payload)
+            if message is not None and await _record_github_default_notification(
+                request,
+                event_type=event_type,
+                repository=repo_full_name,
+                body=message,
+            ):
+                return web.json_response({"status": "ok"})
+            log.error(
+                "GitHub %s event for %s has no canonical subscriber or fallback admin",
+                event_type,
+                repo_full_name,
+            )
+            return web.json_response({"status": "unavailable"}, status=503)
         try:
             await _process_github_event_for_user(
                 request,
@@ -945,12 +966,14 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
                 event_type,
                 fallback_chat_id,
             )
+            return web.json_response({"status": "unavailable"}, status=503)
         return web.json_response({"status": "ok"})
 
     # Process the event for each subscribed user independently.
     # Each user has their own pr_review/issue_triage flags and
     # notification destination. Per-user try/except ensures a transient
     # failure (e.g., DB error) for one user does not block the others.
+    processing_failed = False
     for user_config in subscribed_users:
         chat_id = user_config.telegram_id
         try:
@@ -963,6 +986,7 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
                 chat_id,
             )
         except Exception:
+            processing_failed = True
             log.exception(
                 "Error processing %s event for user %s (chat %d)",
                 event_type,
@@ -970,6 +994,8 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
                 chat_id,
             )
 
+    if processing_failed:
+        return web.json_response({"status": "unavailable"}, status=503)
     return web.json_response({"status": "ok"})
 
 
@@ -977,7 +1003,7 @@ async def _process_github_event_for_user(
     request: web.Request,
     payload: dict,
     event_type: str,
-    bot: Bot,
+    bot: Bot | None,
     config: Config,
     chat_id: int,
 ) -> None:
@@ -1047,13 +1073,21 @@ async def _process_github_event_for_user(
                     "Skipping automated GitHub review for user %d: protected install requires a per-user token",
                     chat_id,
                 )
-                await bot.send_message(
-                    chat_id=target_chat_id,
-                    text=(
-                        f"PR review skipped for {repo_full_name}: protected installs require a stored "
-                        "per-user GitHub token. Send `/github token <token>` first."
-                    ),
+                message = (
+                    f"PR review skipped for {repo_full_name}: protected installs require a stored "
+                    "per-user GitHub token. Send `/github token <token>` first."
                 )
+                if not await _record_github_notification(
+                    request,
+                    target_chat_id=target_chat_id,
+                    event_type="review_skipped",
+                    repository=repo_full_name,
+                    body=message,
+                    delivery_suffix="review-skipped",
+                ):
+                    if bot is None:
+                        raise RuntimeError("PR review warning has no canonical destination")
+                    await bot.send_message(chat_id=target_chat_id, text=message)
                 return
             pr = payload.get("pull_request", {})
             pr_number = pr.get("number", 0)
@@ -1131,13 +1165,21 @@ async def _process_github_event_for_user(
                     "Skipping issue triage for user %d: protected install requires a per-user token",
                     chat_id,
                 )
-                await bot.send_message(
-                    chat_id=target_chat_id,
-                    text=(
-                        f"Issue triage skipped for {repo_full_name}: protected installs require a stored "
-                        "per-user GitHub token. Send `/github token <token>` first."
-                    ),
+                message = (
+                    f"Issue triage skipped for {repo_full_name}: protected installs require a stored "
+                    "per-user GitHub token. Send `/github token <token>` first."
                 )
+                if not await _record_github_notification(
+                    request,
+                    target_chat_id=target_chat_id,
+                    event_type="triage_skipped",
+                    repository=repo_full_name,
+                    body=message,
+                    delivery_suffix="triage-skipped",
+                ):
+                    if bot is None:
+                        raise RuntimeError("Issue triage warning has no canonical destination")
+                    await bot.send_message(chat_id=target_chat_id, text=message)
                 return
             issue = payload.get("issue", {})
             issue_number = issue.get("number", 0)
@@ -1194,41 +1236,22 @@ async def _process_github_event_for_user(
     if not message:
         return
 
-    # A configured Telegram notification group is also a canonical Workshop
-    # notification channel. Record the authenticated GitHub delivery once and
-    # let its durable outbox own both browser visibility and Telegram delivery.
-    github_delivery_id = request.headers.get("X-GitHub-Delivery", "")
-    notification_service = request.app.get(WORKSHOP_GITHUB_NOTIFICATIONS_KEY)
-    if target_chat_id < 0 and notification_service is not None and github_delivery_id:
-        try:
-            notification = GitHubNotification(
-                delivery_id=github_delivery_id,
-                event_type=event_type,
-                repository=repo_full_name,
-                telegram_chat_id=target_chat_id,
-                body=message,
-                occurred_at=datetime.now(UTC),
-            )
-        except ValueError:
-            log.warning(
-                "GitHub %s delivery has an unsupported identity; using compatibility delivery",
-                event_type,
-            )
-        else:
-            recorded = await notification_service.record(notification)
-            if recorded is not None:
-                log.info(
-                    "Recorded GitHub %s notification for Workshop channel delivery %s (user %d, inserted=%s)",
-                    event_type,
-                    recorded.delivery.delivery.delivery_id,
-                    chat_id,
-                    recorded.delivery.inserted,
-                )
-                return
+    # Canonical recording is core-owned. Any enabled channel bindings become
+    # durable outbox work; Telegram is only one optional delivery worker.
+    if await _record_github_notification(
+        request,
+        target_chat_id=target_chat_id,
+        event_type=event_type,
+        repository=repo_full_name,
+        body=message,
+    ):
+        return
 
     # Destinations not represented by a canonical Workshop notification
     # channel retain the compatibility route. This covers direct-chat installs
     # and a newly changed /github notify target until the next bootstrap.
+    if bot is None:
+        raise RuntimeError(f"GitHub {event_type} notification for {repo_full_name} has no canonical destination")
     try:
         await bot.send_message(target_chat_id, message, parse_mode="Markdown")
     except Exception:
@@ -1247,18 +1270,95 @@ async def _process_github_event_for_user(
     )
 
 
+async def _record_github_notification(
+    request: web.Request,
+    *,
+    target_chat_id: int,
+    event_type: str,
+    repository: str,
+    body: str,
+    delivery_suffix: str | None = None,
+) -> bool:
+    service = request.app.get(WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY)
+    delivery_id = request.headers.get("X-GitHub-Delivery", "")
+    if service is None or not delivery_id:
+        return False
+    if delivery_suffix is not None:
+        delivery_id = f"{delivery_id}:{delivery_suffix}"
+    try:
+        notification = IntegrationNotification(
+            delivery_id=delivery_id,
+            source="github",
+            event_type=event_type,
+            repository=repository,
+            body=body,
+            occurred_at=datetime.now(UTC),
+        )
+        recorded = await service.record_for_binding(
+            notification,
+            transport="telegram",
+            external_channel_id=str(target_chat_id),
+        )
+    except ValueError:
+        log.warning("GitHub %s delivery has an unsupported identity", event_type)
+        return False
+    if recorded is None:
+        return False
+    log.info(
+        "Recorded GitHub %s notification as canonical message %s (user target %d, inserted=%s, deliveries=%d)",
+        event_type,
+        recorded.message_id,
+        target_chat_id,
+        recorded.inserted,
+        len(recorded.deliveries),
+    )
+    return True
+
+
+async def _record_github_default_notification(
+    request: web.Request,
+    *,
+    event_type: str,
+    repository: str,
+    body: str,
+) -> bool:
+    service = request.app.get(WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY)
+    delivery_id = request.headers.get("X-GitHub-Delivery", "")
+    if service is None or not delivery_id:
+        return False
+    try:
+        recorded = await service.record_for_default_admin(
+            IntegrationNotification(
+                delivery_id=delivery_id,
+                source="github",
+                event_type=event_type,
+                repository=repository,
+                body=body,
+                occurred_at=datetime.now(UTC),
+            )
+        )
+    except ValueError:
+        log.warning("GitHub %s delivery has an unsupported identity", event_type)
+        return False
+    log.info(
+        "Recorded GitHub %s notification as canonical default-admin message %s (inserted=%s, deliveries=%d)",
+        event_type,
+        recorded.message_id,
+        recorded.inserted,
+        len(recorded.deliveries),
+    )
+    return True
+
+
 @_require_generic_webhook_secret
 async def _handle_generic(request: web.Request) -> web.Response:
     """
     Handle generic webhook notifications from any source.
 
     Extracts a "message" field from the JSON payload (or dumps the full
-    payload) and forwards it to the Telegram chat. Truncates to Telegram's
-    4096-char limit.
+    payload), records it in the canonical admin channel, and requests delivery
+    through any configured channel bindings.
     """
-    bot = request.app[TELEGRAM_BOT_KEY]
-    chat_id = request.app[CHAT_ID_KEY]
-
     try:
         payload = await request.json()
     except json.JSONDecodeError:
@@ -1276,15 +1376,53 @@ async def _handle_generic(request: web.Request) -> web.Response:
     # otherwise dump the full JSON. `is not None` avoids treating "" as absent.
     msg = payload.get("message")
     text = msg if msg is not None else json.dumps(payload, indent=2)
-    if len(text) > 4096:
-        text = text[:4093] + "..."
+    if not isinstance(text, str):
+        return web.json_response({"error": "message must be a string"}, status=400)
+    if not text:
+        return web.json_response({"error": "message must not be empty"}, status=400)
+    if len(text) > 4_096_000:
+        return web.json_response({"error": "message is too large"}, status=413)
 
+    service = request.app[WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY]
+    delivery_id = (
+        request.headers.get("Idempotency-Key")
+        or request.headers.get("X-Kai-Delivery")
+        or f"generated-{uuid.uuid4().hex}"
+    )
     try:
-        await bot.send_message(chat_id, text)
+        notification = IntegrationNotification(
+            delivery_id=delivery_id,
+            source="generic",
+            event_type="notification",
+            body=text,
+            occurred_at=datetime.now(UTC),
+        )
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    try:
+        fallback_chat_id = request.app.get(CHAT_ID_KEY)
+        recorded = (
+            await service.record_for_binding(
+                notification,
+                transport="telegram",
+                external_channel_id=str(fallback_chat_id),
+            )
+            if fallback_chat_id is not None
+            else None
+        )
+        if recorded is None:
+            recorded = await service.record_for_default_admin(notification)
     except Exception:
-        log.exception("Failed to send generic webhook notification")
+        log.exception("Failed to record generic webhook notification")
+        return web.json_response({"status": "unavailable"}, status=503)
 
-    return web.json_response({"status": "ok"})
+    return web.json_response(
+        {
+            "status": "ok",
+            "message_id": str(recorded.message_id),
+            "inserted": recorded.inserted,
+        }
+    )
 
 
 # ── Scheduling API ───────────────────────────────────────────────────
@@ -2538,21 +2676,17 @@ def _register_routes(
         app[TELEGRAM_WEBHOOK_SECRET_KEY] = config.telegram_webhook_secret
         app.router.add_post("/webhook/telegram", _handle_telegram_update)
 
-    if telegram_enabled and config.github_webhook_secret:
+    if config.github_webhook_secret:
         app[GITHUB_WEBHOOK_SECRET_KEY] = config.github_webhook_secret
         app.router.add_post("/webhook/github", _handle_github)
-    elif telegram_enabled:
+    else:
         log.warning("GITHUB_WEBHOOK_SECRET not set - GitHub webhook endpoint disabled")
-    elif config.github_webhook_secret:
-        log.info("GitHub webhook endpoint disabled because the Telegram adapter is disabled")
 
-    if telegram_enabled and config.generic_webhook_secret:
+    if config.generic_webhook_secret:
         app[GENERIC_WEBHOOK_SECRET_KEY] = config.generic_webhook_secret
         app.router.add_post("/webhook", _handle_generic)
-    elif telegram_enabled:
+    else:
         log.info("GENERIC_WEBHOOK_SECRET not set - generic webhook endpoint disabled")
-    elif config.generic_webhook_secret:
-        log.info("Generic webhook endpoint disabled because the Telegram adapter is disabled")
 
     # These routes authenticate through INTERNAL_API_AUTH_KEY. Their
     # availability must not be coupled to any public ingress configuration.
@@ -2637,16 +2771,16 @@ async def start(
     *,
     core_host: KaiApplicationHost,
     core_services: KaiCoreServices,
-    github_notifications: WorkshopTelegramNotificationService | None,
+    integration_notifications: WorkshopIntegrationNotificationService,
     workshop_enabled: bool = True,
 ) -> None:
     """
     Start the HTTP server and optionally register the Telegram webhook.
 
-    The HTTP server always starts for health and transport-independent internal
-    APIs. Workshop client routes are independently enabled. Telegram webhook,
-    compatibility scheduling/delivery, and external integration routes are
-    registered only when a Telegram application is supplied.
+    The HTTP server always starts for health, authenticated integration ingress,
+    and transport-independent internal APIs. Workshop client routes are
+    independently enabled. Only Telegram webhook and compatibility delivery
+    routes require a Telegram application.
 
     In polling mode, the server still runs but Telegram updates arrive via
     the Updater's long-polling loop in ``TelegramAdapter`` instead.
@@ -2656,7 +2790,7 @@ async def start(
         core_host: Core lifecycle owner used for health/readiness reporting.
         core_services: Typed core dependencies required by HTTP routes.
         telegram_app: Started Telegram application, or None when disabled.
-        github_notifications: Telegram notification service, or None when disabled.
+        integration_notifications: Core-owned canonical notification service.
         workshop_enabled: Whether to publish Workshop client routes.
     """
     global _app, _runner, _workshop_lan_runner, _webhook_registered, _health_monitor_task
@@ -2741,8 +2875,7 @@ async def start(
                 )
     _register_routes(_app, config, telegram_enabled=telegram_enabled)
     _app[WORKSHOP_PRINCIPAL_STORAGE_KEY] = core_services.principal_storage
-    if github_notifications is not None:
-        _app[WORKSHOP_GITHUB_NOTIFICATIONS_KEY] = github_notifications
+    _app[WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY] = integration_notifications
     register_workshop_routes: Callable[[web.Application], None] | None = None
     if workshop_enabled:
         register_workshop_routes = await _register_workshop_client_api(

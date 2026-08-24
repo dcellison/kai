@@ -67,7 +67,7 @@ def test_telegram_route_is_independent_of_other_webhooks() -> None:
     assert ("POST", "/webhook") not in routes
 
 
-def test_workshop_only_omits_telegram_owned_routes() -> None:
+def test_workshop_only_keeps_integrations_but_omits_telegram_routes() -> None:
     app = web.Application()
 
     _register_routes(
@@ -87,8 +87,8 @@ def test_workshop_only_omits_telegram_owned_routes() -> None:
     assert ("POST", "/api/services/{name}") in routes
     assert ("GET", "/api/memory/stats") in routes
     assert ("POST", "/webhook/telegram") not in routes
-    assert ("POST", "/webhook/github") not in routes
-    assert ("POST", "/webhook") not in routes
+    assert ("POST", "/webhook/github") in routes
+    assert ("POST", "/webhook") in routes
     assert ("POST", "/api/schedule") in routes
     assert ("DELETE", "/api/jobs/{id}") in routes
     assert ("PATCH", "/api/jobs/{id}") in routes

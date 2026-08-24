@@ -130,6 +130,20 @@ class _FakeSchedulerFactory:
         return _FakeScheduler(events)
 
 
+class _FakeIntegrationNotifications:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    @classmethod
+    async def open(cls, _path: Path):
+        events = _FakeExecutionFactory.events
+        events.append("integrations:open")
+        return cls(events)
+
+    async def close(self) -> None:
+        self.events.append("integrations:close")
+
+
 class _FakeAdapterReadiness:
     def __init__(self, *, ready: bool) -> None:
         self.ready = ready
@@ -173,6 +187,11 @@ def host_dependencies(monkeypatch):
     monkeypatch.setattr(host_module, "WorkshopConversationDeliveryAuthority", _FakeDeliveryAuthority)
     monkeypatch.setattr(host_module, "WorkshopClientCommandExecutor", _FakeClientCommands)
     monkeypatch.setattr(host_module, "WorkshopCanonicalScheduler", _FakeSchedulerFactory)
+    monkeypatch.setattr(
+        host_module,
+        "WorkshopIntegrationNotificationService",
+        _FakeIntegrationNotifications,
+    )
     monkeypatch.setattr(host_module, "WorkshopCompatibilityStateWriter", lambda config, pool: (config, pool))
     monkeypatch.setattr(
         host_module,
@@ -242,6 +261,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
         "execution:start",
         "client:start",
         "scheduler:start",
+        "integrations:open",
     ]
 
     await host.wait()
@@ -249,10 +269,11 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
 
     assert host.readiness.state == KaiApplicationState.STOPPED
     assert host.readiness.ready is False
-    assert host_dependencies[-7:] == [
+    assert host_dependencies[-8:] == [
         "execution:wait",
         "scheduler:wait",
         "scheduler:stop",
+        "integrations:close",
         "client:stop",
         "store:close",
         "execution:stop",

@@ -27,7 +27,7 @@ from kai.webhook import (
     TELEGRAM_APP_KEY,
     TELEGRAM_BOT_KEY,
     TELEGRAM_WEBHOOK_SECRET_KEY,
-    WORKSHOP_GITHUB_NOTIFICATIONS_KEY,
+    WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY,
     WORKSHOP_PRINCIPAL_STORAGE_KEY,
     UnauthorizedChatIdError,
     _handle_delete_job,
@@ -1126,15 +1126,14 @@ class TestGitHubWebhook:
             "X-GitHub-Delivery": "f8112a52-7129-11f1-8e31-acde48001122",
         }
         notification_service = MagicMock()
-        notification_service.record = AsyncMock(
+        notification_service.record_for_binding = AsyncMock(
             return_value=MagicMock(
-                delivery=MagicMock(
-                    delivery=MagicMock(delivery_id="dlv_" + "1" * 32),
-                    inserted=True,
-                )
+                message_id="msg_" + "1" * 32,
+                inserted=True,
+                deliveries=(MagicMock(),),
             )
         )
-        github_request.app[WORKSHOP_GITHUB_NOTIFICATIONS_KEY] = notification_service
+        github_request.app[WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY] = notification_service
         settings = {
             "repos": [],
             "notify_chat_id": -100123,
@@ -1151,10 +1150,43 @@ class TestGitHubWebhook:
 
         assert response.status == 200
         github_request.app[TELEGRAM_BOT_KEY].send_message.assert_not_called()
-        notification_service.record.assert_awaited_once()
-        notification = notification_service.record.await_args.args[0]
+        notification_service.record_for_binding.assert_awaited_once()
+        notification = notification_service.record_for_binding.await_args.args[0]
         assert notification.delivery_id == github_request.headers["X-GitHub-Delivery"]
-        assert notification.telegram_chat_id == -100123
+        assert notification.repository == "testuser/repo"
+        assert notification_service.record_for_binding.await_args.kwargs == {
+            "transport": "telegram",
+            "external_channel_id": "-100123",
+        }
+
+    async def test_workshop_only_records_github_delivery_to_canonical_admin(self, github_request):
+        payload = _github_push_payload()
+        body = json.dumps(payload).encode()
+        github_request.read = AsyncMock(return_value=body)
+        github_request.headers = {
+            "X-Hub-Signature-256": _sign_body("test-secret", body),
+            "X-GitHub-Event": "push",
+            "X-GitHub-Delivery": "workshop-only-delivery-1",
+        }
+        del github_request.app[TELEGRAM_BOT_KEY]
+        del github_request.app[CHAT_ID_KEY]
+        notification_service = MagicMock()
+        notification_service.record_for_default_admin = AsyncMock(
+            return_value=MagicMock(
+                message_id="msg_" + "3" * 32,
+                inserted=True,
+                deliveries=(),
+            )
+        )
+        github_request.app[WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY] = notification_service
+
+        response = await _handle_github(github_request)
+
+        assert response.status == 200
+        notification_service.record_for_default_admin.assert_awaited_once()
+        notification = notification_service.record_for_default_admin.await_args.args[0]
+        assert notification.source == "github"
+        assert notification.delivery_id == "workshop-only-delivery-1"
         assert notification.repository == "testuser/repo"
 
     async def test_markdown_failure_falls_back_to_plain(self, github_request):
@@ -1300,60 +1332,60 @@ class TestGitHubWebhook:
 def generic_request():
     """Create a mock request for the generic webhook endpoint."""
     request = MagicMock(spec=web.Request)
+    notification_service = MagicMock()
+    notification_service.record_for_default_admin = AsyncMock(
+        return_value=MagicMock(message_id="msg_" + "2" * 32, inserted=True)
+    )
     request.app = {
         INTERNAL_API_AUTH_KEY: _make_internal_api_auth(),
         GENERIC_WEBHOOK_SECRET_KEY: "test-secret",
-        TELEGRAM_BOT_KEY: AsyncMock(),
-        CHAT_ID_KEY: 12345,
+        WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY: notification_service,
     }
     request.headers = {"X-Webhook-Secret": "test-secret"}
     return request
 
 
 class TestGenericWebhook:
-    async def test_sends_message_field(self, generic_request):
-        """Payload with a 'message' field sends that string to Telegram."""
+    async def test_records_message_field_canonically(self, generic_request):
         generic_request.json = AsyncMock(return_value={"message": "Alert: disk full"})
 
         resp = await _handle_generic(generic_request)
 
         assert resp.status == 200
-        generic_request.app[TELEGRAM_BOT_KEY].send_message.assert_called_once_with(12345, "Alert: disk full")
+        service = generic_request.app[WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY]
+        service.record_for_default_admin.assert_awaited_once()
+        assert service.record_for_default_admin.await_args.args[0].body == "Alert: disk full"
 
     async def test_dumps_full_payload_when_no_message(self, generic_request):
-        """Payload without 'message' sends the full JSON dump to Telegram."""
         payload = {"key": "value", "count": 42}
         generic_request.json = AsyncMock(return_value=payload)
 
         resp = await _handle_generic(generic_request)
 
         assert resp.status == 200
-        sent_text = generic_request.app[TELEGRAM_BOT_KEY].send_message.call_args[0][1]
+        service = generic_request.app[WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY]
+        sent_text = service.record_for_default_admin.await_args.args[0].body
         # Should be a pretty-printed JSON dump
         assert '"key": "value"' in sent_text
         assert '"count": 42' in sent_text
 
-    async def test_empty_message_field_sends_empty_string(self, generic_request):
-        """Empty string 'message' is sent as-is (not treated as missing)."""
+    async def test_empty_message_field_is_rejected(self, generic_request):
         generic_request.json = AsyncMock(return_value={"message": ""})
 
         resp = await _handle_generic(generic_request)
 
-        assert resp.status == 200
-        sent_text = generic_request.app[TELEGRAM_BOT_KEY].send_message.call_args[0][1]
-        assert sent_text == ""
+        assert resp.status == 400
 
-    async def test_long_message_truncated(self, generic_request):
-        """Messages over 4096 chars are truncated with '...' suffix."""
+    async def test_long_message_is_preserved_for_transport_specific_fragmentation(self, generic_request):
         long_msg = "x" * 5000
         generic_request.json = AsyncMock(return_value={"message": long_msg})
 
         resp = await _handle_generic(generic_request)
 
         assert resp.status == 200
-        sent_text = generic_request.app[TELEGRAM_BOT_KEY].send_message.call_args[0][1]
-        assert len(sent_text) == 4096
-        assert sent_text.endswith("...")
+        service = generic_request.app[WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY]
+        sent_text = service.record_for_default_admin.await_args.args[0].body
+        assert sent_text == long_msg
 
     async def test_invalid_json_returns_400(self, generic_request):
         """Malformed JSON body returns 400."""
@@ -1363,16 +1395,16 @@ class TestGenericWebhook:
 
         assert resp.status == 400
 
-    async def test_send_failure_still_returns_ok(self, generic_request):
-        """Telegram send failures are logged but the response is still 200/ok."""
+    async def test_record_failure_returns_retryable_unavailable(self, generic_request):
         generic_request.json = AsyncMock(return_value={"message": "test"})
-        generic_request.app[TELEGRAM_BOT_KEY].send_message = AsyncMock(side_effect=RuntimeError("network error"))
+        service = generic_request.app[WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY]
+        service.record_for_default_admin = AsyncMock(side_effect=RuntimeError("database error"))
 
         resp = await _handle_generic(generic_request)
 
-        assert resp.status == 200
+        assert resp.status == 503
         body_json = json.loads(resp.body.decode())
-        assert body_json["status"] == "ok"
+        assert body_json["status"] == "unavailable"
 
     async def test_missing_secret_returns_401(self, generic_request):
         """Missing webhook secret header returns 401."""
@@ -1391,7 +1423,8 @@ class TestGenericWebhook:
         resp = await _handle_generic(generic_request)
 
         assert resp.status == 401
-        generic_request.app[TELEGRAM_BOT_KEY].send_message.assert_not_called()
+        service = generic_request.app[WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY]
+        service.record_for_default_admin.assert_not_awaited()
 
 
 # ── GET /api/jobs ──────────────────────────────────────────────────
