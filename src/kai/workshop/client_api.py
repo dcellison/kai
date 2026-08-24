@@ -42,6 +42,21 @@ from kai.workshop.conversation_commands import ConversationCommandAcceptanceErro
 from kai.workshop.domain import ArtifactId, ChannelId, PrincipalId, RunId
 from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.inbound import ClientInboundMessage, InboundBindingNotFoundError
+from kai.workshop.memory_queries import (
+    DEFAULT_PAGE_SIZE,
+    MemoryQueryAuthority,
+    MemoryQueryFilters,
+    MemoryRecordDetail,
+    MemoryRecordSummary,
+    MemorySourceContext,
+    MemorySourceMessage,
+    WorkshopMemoryAccessDenied,
+    WorkshopMemoryNotFound,
+    WorkshopMemoryQueryError,
+    WorkshopMemoryQueryService,
+    WorkshopMemoryResponseTooLarge,
+    WorkshopMemoryValidationError,
+)
 from kai.workshop.run_lifecycle import DurableRun, RunNotFoundError, RunStatus
 from kai.workshop.run_previews import RunPreview, WorkshopRunPreviewRegistry
 from kai.workshop.settings_workspaces import (
@@ -74,8 +89,16 @@ _RUN_CANCELLATION_PATH = "/v1/channels/{channel_id}/runs/{run_id}/cancel"
 _RUNTIME_SETTINGS_PATH = "/v1/channels/{channel_id}/settings"
 _ACTIVE_WORKSPACE_PATH = "/v1/channels/{channel_id}/workspace"
 _WORKSPACE_CONFIG_PATH = "/v1/channels/{channel_id}/workspace-config"
+_MEMORY_STATS_PATH = "/v1/memory/stats"
+_MEMORY_RECORDS_PATH = "/v1/memory/records"
+_MEMORY_SEARCH_PATH = "/v1/memory/search"
+_MEMORY_DETAIL_PATH = "/v1/memory/records/{memory_id}"
+_MEMORY_SOURCE_PATH = "/v1/memory/records/{memory_id}/source"
 _ALLOWED_TIMELINE_QUERY_PARAMETERS = frozenset({"cursor", "limit", "tail"})
 _ALLOWED_EVENT_QUERY_PARAMETERS = frozenset({"after_position"})
+_ALLOWED_MEMORY_FILTERS = frozenset({"kind", "source", "memory_type", "tag", "scope", "project_id"})
+_ALLOWED_MEMORY_LIST_PARAMETERS = _ALLOWED_MEMORY_FILTERS | {"cursor", "limit"}
+_ALLOWED_MEMORY_SEARCH_PARAMETERS = _ALLOWED_MEMORY_FILTERS | {"q", "limit"}
 _ENROLLMENT_REQUEST_FIELDS = frozenset({"enrollment_token", "device_display_name"})
 _COMMAND_REQUEST_FIELDS = frozenset({"client_message_id", "body"})
 _SETTINGS_REQUEST_FIELDS = frozenset({"model", "timeout_seconds", "reset"})
@@ -174,6 +197,251 @@ def _serialize_workspace_config(
         "prompt_source": snapshot.prompt_source,
         "override_fields": list(snapshot.override_fields),
     }
+
+
+def _serialize_memory_record(record: MemoryRecordSummary) -> dict[str, object]:
+    return {
+        "memory_id": record.memory_id,
+        "kind": record.kind,
+        "source": record.source,
+        "memory_type": record.memory_type,
+        "preview": record.preview,
+        "tags": list(record.tags),
+        "speaker": record.speaker,
+        "confidence": record.confidence,
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+        "scope": {
+            "scope": record.scope.scope,
+            "project_id": record.scope.project_id,
+            "scope_confidence": record.scope.scope_confidence,
+            "scope_source": record.scope.scope_source,
+            "legacy_defaulted": record.scope.legacy_defaulted,
+            "invalid_defaulted": record.scope.invalid_defaulted,
+            "retrievable": record.scope.retrievable,
+            "exclusion_reason": record.scope.exclusion_reason,
+        },
+    }
+
+
+def _serialize_memory_detail(detail: MemoryRecordDetail) -> dict[str, object]:
+    return {
+        **_serialize_memory_record(detail.record),
+        "content": detail.content,
+        "compact_recall": detail.compact_recall,
+        "confirmation_quote": detail.confirmation_quote,
+        "prompt_version": detail.prompt_version,
+        "episode": detail.episode,
+    }
+
+
+def _serialize_memory_source(context: MemorySourceContext) -> dict[str, object]:
+    def serialize_message(message: MemorySourceMessage | None) -> dict[str, object] | None:
+        if message is None:
+            return None
+        return {
+            "message_id": str(message.message_id),
+            "channel_id": str(message.channel_id),
+            "author_principal_id": str(message.author_principal_id),
+            "author_kind": message.author_kind,
+            "author_display_name": message.author_display_name,
+            "body": message.body,
+            "created_at": message.created_at,
+        }
+
+    return {
+        "status": context.status,
+        "reason": context.reason,
+        "run_id": str(context.run_id) if context.run_id is not None else None,
+        "source": serialize_message(context.source),
+        "result": serialize_message(context.result),
+    }
+
+
+def _memory_filters(request: web.Request) -> MemoryQueryFilters:
+    values: dict[str, str | None] = {}
+    for field in _ALLOWED_MEMORY_FILTERS:
+        values[field] = _single_query_value(request, field)
+    return MemoryQueryFilters(**values)
+
+
+def _memory_limit(request: web.Request, *, default: int) -> int:
+    raw = _single_query_value(request, "limit")
+    if raw is None:
+        return default
+    if not _DECIMAL_INTEGER.fullmatch(raw):
+        raise WorkshopMemoryValidationError("Invalid memory limit")
+    return int(raw)
+
+
+async def _memory_authority(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> tuple[MemoryQueryAuthority | None, web.Response | None]:
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(
+            status=401,
+            code="authentication_required",
+            message="Authentication required",
+        )
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return None, response
+    try:
+        return service.authority_for_principal(principal_id), None
+    except WorkshopMemoryAccessDenied:
+        return None, _error_response(
+            status=403,
+            code="access_denied",
+            message="Access denied",
+        )
+
+
+def _memory_error_response(exc: Exception) -> web.Response:
+    if isinstance(exc, WorkshopMemoryNotFound):
+        return _error_response(status=404, code="memory_not_found", message="Memory not found")
+    if isinstance(exc, WorkshopMemoryResponseTooLarge):
+        return _error_response(status=413, code="response_too_large", message=str(exc))
+    if isinstance(exc, WorkshopMemoryAccessDenied):
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    if isinstance(exc, WorkshopMemoryValidationError):
+        return _error_response(status=400, code="invalid_memory_query", message=str(exc))
+    return _error_response(
+        status=400,
+        code="invalid_memory_query",
+        message="Invalid memory query",
+    )
+
+
+async def _handle_memory_stats(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid memory request")
+    assert authority is not None
+    stats = await service.stats(authority)
+    return _json_response(
+        {
+            "version": 1,
+            "stats": {
+                "total": stats.total,
+                "facts": stats.facts,
+                "episodes": stats.episodes,
+                "by_source": stats.by_source,
+                "by_type": stats.by_type,
+                "by_scope": stats.by_scope,
+            },
+        },
+        status=200,
+    )
+
+
+async def _handle_memory_records(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if not set(request.query).issubset(_ALLOWED_MEMORY_LIST_PARAMETERS) or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid memory request")
+    assert authority is not None
+    try:
+        page = await service.list_records(
+            authority,
+            filters=_memory_filters(request),
+            limit=_memory_limit(request, default=DEFAULT_PAGE_SIZE),
+            cursor=_single_query_value(request, "cursor"),
+        )
+    except (ValueError, WorkshopMemoryValidationError) as exc:
+        return _memory_error_response(exc)
+    return _json_response(
+        {
+            "version": 1,
+            "records": [_serialize_memory_record(record) for record in page.records],
+            "next_cursor": page.next_cursor,
+        },
+        status=200,
+    )
+
+
+async def _handle_memory_search(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if not set(request.query).issubset(_ALLOWED_MEMORY_SEARCH_PARAMETERS) or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid memory request")
+    assert authority is not None
+    try:
+        query = _single_query_value(request, "q")
+        if query is None:
+            raise WorkshopMemoryValidationError("Memory search query is required")
+        snapshot = await service.search(
+            authority,
+            query,
+            filters=_memory_filters(request),
+            limit=_memory_limit(request, default=10),
+        )
+    except (ValueError, WorkshopMemoryQueryError) as exc:
+        return _memory_error_response(exc)
+    return _json_response(
+        {
+            "version": 1,
+            "active_project_id": snapshot.active_project_id,
+            "reason": snapshot.reason,
+            "hits": [
+                {
+                    "record": _serialize_memory_record(hit.record),
+                    "raw_score": hit.raw_score,
+                    "adjusted_score": hit.adjusted_score,
+                    "compact_recall": hit.compact_recall,
+                }
+                for hit in snapshot.hits
+            ],
+        },
+        status=200,
+    )
+
+
+async def _handle_memory_detail(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+    source: bool,
+) -> web.Response:
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid memory request")
+    assert authority is not None
+    try:
+        memory_id = request.match_info["memory_id"]
+        if source:
+            context = await service.source_context(authority, memory_id)
+            payload = {"version": 1, "source_context": _serialize_memory_source(context)}
+        else:
+            detail = await service.detail(authority, memory_id)
+            payload = {"version": 1, "record": _serialize_memory_detail(detail)}
+    except (KeyError, WorkshopMemoryQueryError) as exc:
+        return _memory_error_response(exc)
+    return _json_response(payload, status=200)
 
 
 async def _authenticate_settings_authority(
@@ -1629,6 +1897,7 @@ def register_workshop_read_routes(
     run_previews: WorkshopRunPreviewRegistry | None = None,
     artifact_service: WorkshopArtifactService | None = None,
     settings_workspaces: WorkshopSettingsWorkspaceService | None = None,
+    memory_queries: WorkshopMemoryQueryService | None = None,
 ) -> None:
     """Register the read-only contract on an explicitly supplied application."""
     if event_poll_interval <= 0 or event_heartbeat_interval <= 0 or event_authentication_recheck_interval <= 0:
@@ -1750,6 +2019,50 @@ def register_workshop_read_routes(
             _WORKSPACE_CONFIG_PATH,
             handle_workspace_config_update,
         )
+    if memory_queries is not None:
+
+        async def handle_memory_stats(request: web.Request) -> web.Response:
+            return await _handle_memory_stats(
+                request,
+                authenticator=authenticator,
+                service=memory_queries,
+            )
+
+        async def handle_memory_records(request: web.Request) -> web.Response:
+            return await _handle_memory_records(
+                request,
+                authenticator=authenticator,
+                service=memory_queries,
+            )
+
+        async def handle_memory_search(request: web.Request) -> web.Response:
+            return await _handle_memory_search(
+                request,
+                authenticator=authenticator,
+                service=memory_queries,
+            )
+
+        async def handle_memory_detail(request: web.Request) -> web.Response:
+            return await _handle_memory_detail(
+                request,
+                authenticator=authenticator,
+                service=memory_queries,
+                source=False,
+            )
+
+        async def handle_memory_source(request: web.Request) -> web.Response:
+            return await _handle_memory_detail(
+                request,
+                authenticator=authenticator,
+                service=memory_queries,
+                source=True,
+            )
+
+        app.router.add_get(_MEMORY_STATS_PATH, handle_memory_stats)
+        app.router.add_get(_MEMORY_RECORDS_PATH, handle_memory_records)
+        app.router.add_get(_MEMORY_SEARCH_PATH, handle_memory_search)
+        app.router.add_get(_MEMORY_DETAIL_PATH, handle_memory_detail)
+        app.router.add_get(_MEMORY_SOURCE_PATH, handle_memory_source)
 
 
 def register_workshop_enrollment_routes(

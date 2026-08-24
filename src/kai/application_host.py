@@ -20,6 +20,7 @@ from kai.workshop.delivery_authority import (
     WorkshopConversationDeliveryAuthority,
 )
 from kai.workshop.execution_state import WorkshopExecutionStateRegistry
+from kai.workshop.memory_queries import WorkshopMemoryQueryService
 from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
 from kai.workshop.runtime_pool import WorkshopRuntimePool
@@ -108,6 +109,7 @@ class KaiCoreServices:
     scheduler: WorkshopCanonicalScheduler
     artifacts: WorkshopArtifactService
     settings_workspaces: WorkshopSettingsWorkspaceService
+    memory_queries: WorkshopMemoryQueryService
 
 
 class KaiApplicationHost:
@@ -219,6 +221,12 @@ class KaiApplicationHost:
                 runtime_pool,
                 self._execution_state,
             )
+            memory_queries = WorkshopMemoryQueryService(
+                self._config,
+                client_store,
+                runtime_pool,
+                self._execution_state,
+            )
 
             self._services = KaiCoreServices(
                 subprocess_pool=subprocess_pool,
@@ -234,6 +242,7 @@ class KaiApplicationHost:
                 scheduler=scheduler,
                 artifacts=artifacts,
                 settings_workspaces=settings_workspaces,
+                memory_queries=memory_queries,
             )
             self._state = KaiApplicationState.READY
             return self._services

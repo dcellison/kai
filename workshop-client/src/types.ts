@@ -72,6 +72,102 @@ export interface WorkshopSettingsWorkspace {
   workspaces: WorkshopWorkspaceOption[];
 }
 
+export interface WorkshopMemoryScope {
+  exclusionReason: string | null;
+  invalidDefaulted: boolean;
+  legacyDefaulted: boolean;
+  projectId: string | null;
+  retrievable: boolean;
+  scope: "global" | "project" | "task";
+  scopeConfidence: number;
+  scopeSource: string;
+}
+
+export interface WorkshopMemoryRecord {
+  confidence: number;
+  createdAt: string;
+  kind: "fact" | "episode";
+  memoryId: string;
+  memoryType: string;
+  preview: string;
+  scope: WorkshopMemoryScope;
+  source: string;
+  speaker: string;
+  tags: string[];
+  updatedAt: string;
+}
+
+export interface WorkshopMemoryPage {
+  nextCursor: string | null;
+  records: WorkshopMemoryRecord[];
+}
+
+export interface WorkshopMemoryFilters {
+  kind?: "fact" | "episode";
+  memoryType?: string;
+  projectId?: string;
+  scope?: "global" | "project" | "task";
+  source?: string;
+  tag?: string;
+}
+
+export interface WorkshopMemoryListOptions extends WorkshopMemoryFilters {
+  cursor?: string;
+  limit?: number;
+}
+
+export interface WorkshopMemorySearchOptions extends WorkshopMemoryFilters {
+  limit?: number;
+}
+
+export interface WorkshopMemoryDetail extends WorkshopMemoryRecord {
+  compactRecall: string;
+  confirmationQuote: string | null;
+  content: string;
+  episode: Record<string, string> | null;
+  promptVersion: string | null;
+}
+
+export interface WorkshopMemorySourceMessage {
+  authorDisplayName: string;
+  authorKind: string;
+  authorPrincipalId: string;
+  body: string;
+  channelId: string;
+  createdAt: string;
+  messageId: string;
+}
+
+export interface WorkshopMemorySourceContext {
+  reason: string | null;
+  result: WorkshopMemorySourceMessage | null;
+  runId: string | null;
+  source: WorkshopMemorySourceMessage | null;
+  status: "available" | "unavailable";
+}
+
+export interface WorkshopMemoryStats {
+  byScope: Record<string, number>;
+  bySource: Record<string, number>;
+  byType: Record<string, number>;
+  episodes: number;
+  facts: number;
+  total: number;
+}
+
+export interface WorkshopMemorySearchHit {
+  adjustedScore: number;
+  compactRecall: string;
+  rawScore: number;
+  record: WorkshopMemoryRecord;
+}
+
+export interface WorkshopMemorySearch {
+  activeProjectId: string | null;
+  hits: WorkshopMemorySearchHit[];
+  reason: string;
+}
+
 export interface TimelineMessage {
   artifacts: WorkshopArtifactSummary[];
   authorDisplayName: string;

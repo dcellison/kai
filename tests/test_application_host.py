@@ -179,6 +179,16 @@ def host_dependencies(monkeypatch):
         "WorkshopSettingsWorkspaceService",
         lambda config, pool, execution_state: (config, pool, execution_state),
     )
+    monkeypatch.setattr(
+        host_module,
+        "WorkshopMemoryQueryService",
+        lambda config, store, pool, execution_state: (
+            config,
+            store,
+            pool,
+            execution_state,
+        ),
+    )
     return events
 
 

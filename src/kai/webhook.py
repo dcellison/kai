@@ -95,6 +95,7 @@ from kai.workshop.client_sessions import (
 )
 from kai.workshop.client_shell import register_workshop_shell_routes
 from kai.workshop.github_notifications import GitHubNotification
+from kai.workshop.memory_queries import WorkshopMemoryQueryService
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
 from kai.workshop.scheduler import WorkshopCanonicalScheduler
 from kai.workshop.settings_workspaces import WorkshopSettingsWorkspaceService
@@ -2579,6 +2580,7 @@ async def _register_workshop_client_api(
     run_previews: WorkshopRunPreviewRegistry | None = None,
     artifact_service: WorkshopArtifactService | None = None,
     settings_workspaces: WorkshopSettingsWorkspaceService | None = None,
+    memory_queries: WorkshopMemoryQueryService | None = None,
 ) -> Callable[[web.Application], None]:
     """Register the client API against the core-owned canonical store.
 
@@ -2612,6 +2614,7 @@ async def _register_workshop_client_api(
             run_previews=run_previews,
             artifact_service=artifact_service,
             settings_workspaces=settings_workspaces,
+            memory_queries=memory_queries,
         )
         if command_submitter is not None:
             register_workshop_command_routes(
@@ -2749,6 +2752,7 @@ async def start(
             run_previews=core_services.run_previews,
             artifact_service=core_services.artifacts,
             settings_workspaces=core_services.settings_workspaces,
+            memory_queries=core_services.memory_queries,
         )
 
     _runner = web.AppRunner(
