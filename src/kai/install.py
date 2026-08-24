@@ -8508,6 +8508,7 @@ def _cmd_status() -> None:
     print(_check_service_status(platform))
     print(_deployed_adapter_policy_status(_DEPLOYED_ENV_FILE))
     print(_core_schedule_status(Path(data_dir) / "kai.db"))
+    print(_github_automation_status(Path(data_dir) / "kai.db"))
     if conf_env is None:
         print("Client adapters (install.conf artifact): unavailable")
     else:
@@ -8851,6 +8852,42 @@ def _core_schedule_status(db_path: Path) -> str:
         f"Workshop scheduler: {status}; active jobs={active}, "
         f"canonically owned={owned}, unowned={active - owned}, "
         f"pending firings={pending}, executing={executing}, failed={failed}"
+    )
+
+
+def _github_automation_status(db_path: Path) -> str:
+    """Report canonical GitHub review/triage queue state."""
+    prefix = "Workshop GitHub automation:"
+    if not db_path.is_file():
+        return f"{prefix} NOT VERIFIED (database unavailable)"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'workshop_github_automation_work'"
+            ).fetchone()
+            if table is None:
+                return f"{prefix} pending; canonical queue unavailable"
+            counts = connection.execute(
+                "SELECT "
+                "SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status = 'executing' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status = 'uncertain' THEN 1 ELSE 0 END) "
+                "FROM workshop_github_automation_work"
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        return f"{prefix} NOT VERIFIED ({exc})"
+    values = tuple(int(value or 0) for value in (counts or (0, 0, 0, 0, 0)))
+    pending, executing, succeeded, failed, uncertain = values
+    status = "active" if executing == 0 and uncertain == 0 else "ATTENTION"
+    return (
+        f"{prefix} {status}; pending={pending}, executing={executing}, "
+        f"succeeded={succeeded}, failed={failed}, uncertain={uncertain}; "
+        "subscription routing=canonical"
     )
 
 

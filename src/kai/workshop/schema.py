@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 26
+WORKSHOP_SCHEMA_VERSION = 27
 
 
 @dataclass(frozen=True, slots=True)
@@ -1220,6 +1220,41 @@ _CORE_SCHEDULER_SCHEMA = SchemaMigration(
     ),
 )
 
+_GITHUB_AUTOMATION_SCHEMA = SchemaMigration(
+    version=27,
+    name="canonical_github_automation",
+    statements=(
+        """
+        CREATE TABLE workshop_github_automation_work (
+            work_id TEXT PRIMARY KEY CHECK (length(work_id) BETWEEN 1 AND 128),
+            delivery_id TEXT NOT NULL CHECK (length(delivery_id) BETWEEN 1 AND 128),
+            kind TEXT NOT NULL CHECK (kind IN ('pr_review', 'issue_triage')),
+            event_type TEXT NOT NULL,
+            action TEXT NOT NULL,
+            repository TEXT NOT NULL,
+            item_number INTEGER NOT NULL CHECK (item_number > 0),
+            principal_id TEXT NOT NULL,
+            execution_channel_id TEXT NOT NULL,
+            notification_channel_id TEXT NOT NULL,
+            runtime_profile_id TEXT NOT NULL,
+            local_repo_path TEXT NOT NULL DEFAULT '',
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (
+                status IN ('pending', 'executing', 'succeeded', 'failed', 'uncertain')
+            ),
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+            canonical_message_id TEXT,
+            last_error_code TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            UNIQUE (delivery_id, kind, principal_id)
+        )
+        """,
+        "CREATE INDEX workshop_github_automation_status_idx "
+        "ON workshop_github_automation_work (status, created_at, work_id)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -1247,6 +1282,7 @@ _MIGRATIONS = (
     _RUN_TRACE_SCHEMA,
     _CANONICAL_TRANSCRIPT_AUTHORITY_SCHEMA,
     _CORE_SCHEDULER_SCHEMA,
+    _GITHUB_AUTOMATION_SCHEMA,
 )
 
 

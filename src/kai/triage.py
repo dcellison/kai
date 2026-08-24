@@ -31,6 +31,7 @@ import logging
 import os
 import re
 import tempfile
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -769,7 +770,8 @@ async def apply_triage(
     notify_chat_id: int | None = None,
     allowed_triage_projects: list[str] | None = None,
     github_token: str | None = None,
-) -> None:
+    notification_sink: Callable[[str], Awaitable[None]] | None = None,
+) -> bool:
     """
     Apply triage results: labels, project assignment, comment, and notification.
 
@@ -1162,15 +1164,19 @@ async def apply_triage(
     if notify_chat_id is not None:
         body["chat_id"] = notify_chat_id
 
-    try:
-        async with (
-            aiohttp.ClientSession() as session,
-            session.post(url, json=body, headers=headers) as resp,
-        ):
-            if resp.status != 200:
-                log.warning("send-message API returned %d for triage summary", resp.status)
-    except Exception:
-        log.exception("Failed to send triage summary to Telegram")
+    if notification_sink is not None:
+        await notification_sink(text)
+    else:
+        try:
+            async with (
+                aiohttp.ClientSession() as session,
+                session.post(url, json=body, headers=headers) as resp,
+            ):
+                if resp.status != 200:
+                    log.warning("send-message API returned %d for triage summary", resp.status)
+        except Exception:
+            log.exception("Failed to send triage summary to Telegram")
+    return True
 
 
 async def triage_issue(
@@ -1185,7 +1191,8 @@ async def triage_issue(
     model_override: str = "",
     allowed_triage_projects: list[str] | None = None,
     github_token: str | None = None,
-) -> None:
+    notification_sink: Callable[[str], Awaitable[None]] | None = None,
+) -> bool:
     """
     Full triage pipeline: analyze issue, apply labels, post results.
 
@@ -1241,16 +1248,21 @@ async def triage_issue(
         if not raw_response.strip():
             log.warning("Empty triage output for %s#%d", metadata.repo, metadata.number)
             await _send_error_notification(
-                metadata, "Empty response from agent", webhook_port, webhook_secret, notify_chat_id
+                metadata,
+                "Empty response from agent",
+                webhook_port,
+                webhook_secret,
+                notify_chat_id,
+                notification_sink=notification_sink,
             )
-            return
+            return False
 
         # Step 5: Parse the JSON response
         triage_result = _parse_triage_json(raw_response)
 
         # Step 6: Apply triage (labels, project, comment, telegram).
         # Pass projects JSON to avoid a redundant gh project list call.
-        await apply_triage(
+        return await apply_triage(
             metadata,
             triage_result,
             webhook_port,
@@ -1259,6 +1271,7 @@ async def triage_issue(
             notify_chat_id=notify_chat_id,
             allowed_triage_projects=allowed_triage_projects,
             github_token=github_token,
+            notification_sink=notification_sink,
         )
 
     except Exception as exc:
@@ -1271,14 +1284,16 @@ async def triage_issue(
         # If metadata extraction itself failed, we can't build a useful
         # notification, so just log and bail.
         if metadata is None:
-            return
+            return False
         await _send_error_notification(
             metadata,
             type(exc).__name__,
             webhook_port,
             webhook_secret,
             notify_chat_id,
+            notification_sink=notification_sink,
         )
+        return False
 
 
 async def _send_error_notification(
@@ -1287,6 +1302,8 @@ async def _send_error_notification(
     webhook_port: int,
     webhook_secret: str,
     notify_chat_id: int | None = None,
+    *,
+    notification_sink: Callable[[str], Awaitable[None]] | None = None,
 ) -> None:
     """
     Send a triage failure notification to Telegram.
@@ -1312,6 +1329,9 @@ async def _send_error_notification(
     if notify_chat_id is not None:
         body["chat_id"] = notify_chat_id
 
+    if notification_sink is not None:
+        await notification_sink(text)
+        return
     try:
         async with (
             aiohttp.ClientSession() as session,

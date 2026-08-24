@@ -144,6 +144,27 @@ class _FakeIntegrationNotifications:
         self.events.append("integrations:close")
 
 
+class _FakeGitHubAutomation:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    @classmethod
+    async def open_and_start(cls, *_args, **_kwargs):
+        events = _FakeExecutionFactory.events
+        events.append("github-automation:start")
+        return cls(events)
+
+    async def wait(self) -> None:
+        self.events.append("github-automation:wait")
+
+    @property
+    def ready(self) -> bool:
+        return True
+
+    async def stop(self) -> None:
+        self.events.append("github-automation:stop")
+
+
 class _FakeAdapterReadiness:
     def __init__(self, *, ready: bool) -> None:
         self.ready = ready
@@ -192,6 +213,7 @@ def host_dependencies(monkeypatch):
         "WorkshopIntegrationNotificationService",
         _FakeIntegrationNotifications,
     )
+    monkeypatch.setattr(host_module, "WorkshopGitHubAutomationService", _FakeGitHubAutomation)
     monkeypatch.setattr(host_module, "WorkshopCompatibilityStateWriter", lambda config, pool: (config, pool))
     monkeypatch.setattr(
         host_module,
@@ -213,7 +235,11 @@ def host_dependencies(monkeypatch):
 
 def _host() -> KaiApplicationHost:
     return KaiApplicationHost(
-        config=SimpleNamespace(session_db_path=Path("/tmp/kai-test.db")),  # type: ignore[arg-type]
+        config=SimpleNamespace(
+            session_db_path=Path("/tmp/kai-test.db"),
+            spec_dir="specs",
+            pr_review_timeout_s=900,
+        ),  # type: ignore[arg-type]
         runtime_profiles=SimpleNamespace(),  # type: ignore[arg-type]
         execution_state=SimpleNamespace(),  # type: ignore[arg-type]
         principal_storage=SimpleNamespace(),  # type: ignore[arg-type]
@@ -251,6 +277,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
             "client_api": True,
             "store": True,
             "scheduler": True,
+            "github_automation": True,
         },
     }
     assert services.subprocess_pool is not None
@@ -262,6 +289,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
         "client:start",
         "scheduler:start",
         "integrations:open",
+        "github-automation:start",
     ]
 
     await host.wait()
@@ -269,10 +297,12 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
 
     assert host.readiness.state == KaiApplicationState.STOPPED
     assert host.readiness.ready is False
-    assert host_dependencies[-8:] == [
+    assert host_dependencies[-10:] == [
         "execution:wait",
         "scheduler:wait",
+        "github-automation:wait",
         "scheduler:stop",
+        "github-automation:stop",
         "integrations:close",
         "client:stop",
         "store:close",

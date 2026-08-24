@@ -149,6 +149,27 @@ class WorkshopIntegrationNotificationService:
                 )
             return await self._record_locked(notification, ChannelId(str(rows[0][0])))
 
+    async def record_for_channel(
+        self,
+        notification: IntegrationNotification,
+        channel_id: ChannelId,
+    ) -> IntegrationNotificationRecord:
+        """Record to one already-authorized canonical destination."""
+        if not isinstance(channel_id, ChannelId):
+            raise ValueError("channel_id must be a ChannelId")
+        async with self._lock:
+            self._ensure_open()
+            async with self._store.connection.execute(
+                "SELECT 1 FROM channels WHERE id = ? AND kind IN ('direct', 'notification')",
+                (channel_id,),
+            ) as cursor:
+                rows = tuple(await cursor.fetchall())
+            if len(rows) != 1:
+                raise AmbiguousIntegrationNotificationDestinationError(
+                    "Canonical notification destination is missing or unsupported"
+                )
+            return await self._record_locked(notification, channel_id)
+
     async def _record_locked(
         self,
         notification: IntegrationNotification,

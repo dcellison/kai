@@ -20,6 +20,7 @@ from kai.workshop.delivery_authority import (
     WorkshopConversationDeliveryAuthority,
 )
 from kai.workshop.execution_state import WorkshopExecutionStateRegistry
+from kai.workshop.github_automation import WorkshopGitHubAutomationService
 from kai.workshop.integration_notifications import WorkshopIntegrationNotificationService
 from kai.workshop.memory_queries import WorkshopMemoryQueryService
 from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
@@ -72,11 +73,19 @@ class KaiCoreReadiness:
     client_api: bool
     store: bool
     scheduler: bool
+    github_automation: bool
 
     @property
     def ready(self) -> bool:
         return self.state == KaiApplicationState.READY and all(
-            (self.runtime, self.executor, self.client_api, self.store, self.scheduler)
+            (
+                self.runtime,
+                self.executor,
+                self.client_api,
+                self.store,
+                self.scheduler,
+                self.github_automation,
+            )
         )
 
     def as_dict(self) -> dict[str, object]:
@@ -89,6 +98,7 @@ class KaiCoreReadiness:
                 "client_api": self.client_api,
                 "store": self.store,
                 "scheduler": self.scheduler,
+                "github_automation": self.github_automation,
             },
         }
 
@@ -112,6 +122,7 @@ class KaiCoreServices:
     settings_workspaces: WorkshopSettingsWorkspaceService
     memory_queries: WorkshopMemoryQueryService
     integration_notifications: WorkshopIntegrationNotificationService
+    github_automation: WorkshopGitHubAutomationService
 
 
 class KaiApplicationHost:
@@ -159,6 +170,7 @@ class KaiApplicationHost:
             client_api=services is not None and services.client_commands.ready,
             store=services is not None,
             scheduler=services is not None and services.scheduler.readiness.ready,
+            github_automation=services is not None and services.github_automation.ready,
         )
 
     @property
@@ -177,6 +189,7 @@ class KaiApplicationHost:
         client_commands: WorkshopClientCommandExecutor | None = None
         scheduler: WorkshopCanonicalScheduler | None = None
         integration_notifications: WorkshopIntegrationNotificationService | None = None
+        github_automation: WorkshopGitHubAutomationService | None = None
         try:
             subprocess_pool = SubprocessPool(
                 config=self._config,
@@ -233,6 +246,15 @@ class KaiApplicationHost:
             integration_notifications = await WorkshopIntegrationNotificationService.open(
                 Path(self._config.session_db_path)
             )
+            github_automation = await WorkshopGitHubAutomationService.open_and_start(
+                Path(self._config.session_db_path),
+                runtime_pool,
+                self._execution_state,
+                compatibility_state,
+                integration_notifications,
+                spec_dir=self._config.spec_dir,
+                review_timeout_seconds=self._config.pr_review_timeout_s,
+            )
 
             self._services = KaiCoreServices(
                 subprocess_pool=subprocess_pool,
@@ -250,6 +272,7 @@ class KaiApplicationHost:
                 settings_workspaces=settings_workspaces,
                 memory_queries=memory_queries,
                 integration_notifications=integration_notifications,
+                github_automation=github_automation,
             )
             self._state = KaiApplicationState.READY
             return self._services
@@ -257,6 +280,8 @@ class KaiApplicationHost:
             self._state = KaiApplicationState.FAILED
             if scheduler is not None:
                 await scheduler.stop()
+            if github_automation is not None:
+                await github_automation.stop()
             if integration_notifications is not None:
                 await integration_notifications.close()
             if client_commands is not None:
@@ -293,6 +318,7 @@ class KaiApplicationHost:
         await asyncio.gather(
             self.services.private_text_execution.wait(),
             self.services.scheduler.wait(),
+            self.services.github_automation.wait(),
             *(adapter.wait() for adapter in self._adapters.values()),
         )
 
@@ -315,6 +341,7 @@ class KaiApplicationHost:
         self._adapters.clear()
         for operation in (
             services.scheduler.stop,
+            services.github_automation.stop,
             services.integration_notifications.close,
             services.client_commands.stop,
             services.client_store.close,

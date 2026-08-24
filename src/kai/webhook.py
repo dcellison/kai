@@ -42,9 +42,10 @@ generic endpoint uses GENERIC_WEBHOOK_SECRET. Internal API routes always use
 random, principal-bound process credentials and do not depend on external webhook
 secrets.
 
-GitHub events are formatted into human-readable Markdown messages and sent
-to the configured Telegram chat. The formatter pattern (dispatch dict mapping
-event type to formatter function) makes it easy to add new event types.
+GitHub events are formatted into human-readable Markdown and routed to
+canonical Workshop channels. External delivery is performed later by each
+channel binding's outbox worker; GitHub ingress never sends through Telegram
+directly. The formatter dispatch makes it easy to add new event types.
 """
 
 import asyncio
@@ -66,16 +67,12 @@ from aiohttp import web
 from telegram import Bot, Update
 from telegram.ext import Application
 
-from kai import memory, review, services, sessions, triage
+from kai import memory, services, sessions
 from kai.application_host import KaiApplicationHost, KaiCoreServices
 from kai.config import (
     DATA_DIR,
     IMAGE_EXTENSIONS,
     Config,
-    ModelRole,
-    UserConfig,
-    get_user_backend_and_provider,
-    resolve_user_model,
 )
 from kai.internal_api_auth import InternalAPIAuth, InternalAPIPrincipal, InternalAPIScope
 from kai.job_types import CANONICAL_JOB_TYPES, normalize_job_type
@@ -95,6 +92,10 @@ from kai.workshop.client_sessions import (
     WorkshopClientSessionManager,
 )
 from kai.workshop.client_shell import register_workshop_shell_routes
+from kai.workshop.github_automation import (
+    GitHubSubscriptionRoute,
+    WorkshopGitHubAutomationService,
+)
 from kai.workshop.integration_notifications import (
     IntegrationNotification,
     WorkshopIntegrationNotificationService,
@@ -138,19 +139,18 @@ GITHUB_WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("github_webhook_secret",
 INTERNAL_API_AUTH_KEY: web.AppKey[InternalAPIAuth] = web.AppKey("internal_api_auth", InternalAPIAuth)
 NOTIFICATION_CHAT_IDS_KEY: web.AppKey[set[int]] = web.AppKey("notification_chat_ids", set)
 POOL_KEY: web.AppKey[object] = web.AppKey("pool", object)
-PR_REVIEW_COOLDOWN_KEY: web.AppKey[int] = web.AppKey("pr_review_cooldown", int)
-PR_REVIEW_TIMEOUT_S_KEY: web.AppKey[int] = web.AppKey("pr_review_timeout_s", int)
-SPEC_DIR_KEY: web.AppKey[str] = web.AppKey("spec_dir", str)
 TELEGRAM_APP_KEY: web.AppKey[Application] = web.AppKey("telegram_app", Application)
 TELEGRAM_BOT_KEY: web.AppKey[Bot] = web.AppKey("telegram_bot", Bot)
 TELEGRAM_WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("telegram_webhook_secret", str)
-WEBHOOK_PORT_KEY: web.AppKey[int] = web.AppKey("webhook_port", int)
 WORKSPACE_BASE_KEY: web.AppKey[str | None] = web.AppKey("workspace_base")
 WORKSHOP_PRINCIPAL_STORAGE_KEY: web.AppKey[WorkshopPrincipalStorageRegistry] = web.AppKey(
     "workshop_principal_storage", WorkshopPrincipalStorageRegistry
 )
 WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY: web.AppKey[WorkshopIntegrationNotificationService] = web.AppKey(
     "workshop_integration_notifications", WorkshopIntegrationNotificationService
+)
+WORKSHOP_GITHUB_AUTOMATION_KEY: web.AppKey[WorkshopGitHubAutomationService] = web.AppKey(
+    "workshop_github_automation", WorkshopGitHubAutomationService
 )
 
 
@@ -191,8 +191,8 @@ async def _drain_background_tasks(timeout: float = _BACKGROUND_TASK_DRAIN_TIMEOU
     """
     Wait briefly for fire-and-forget webhook work during shutdown.
 
-    Telegram update processing, PR review, and issue triage are launched as
-    background tasks so inbound webhooks can be acknowledged promptly. During a
+    Telegram update processing is launched as background work so inbound
+    updates can be acknowledged promptly. During a
     controlled shutdown, let those tasks finish before tearing down the server.
     If they overrun the bounded timeout, cancel them rather than hanging
     shutdown indefinitely.
@@ -348,115 +348,6 @@ def _dispatch_priority_telegram_stop(
 # Slightly longer than the check interval so a single transient error
 # in the previous cycle triggers a re-registration on the next check.
 _ERROR_RECENCY_THRESHOLD = 600  # 10 minutes
-
-
-# ── PR review rate limiting ─────────────────────────────────────────
-# In-memory cooldown dict: (repo_full_name, pr_number) -> last_review_timestamp.
-# Resets on restart, which is acceptable - worst case is one extra review
-# after a restart. No database table needed for stateless reviews.
-_review_cooldowns: dict[tuple[str, int], float] = {}
-
-
-def _prune_expired(cooldowns: dict[tuple[str, int], float], max_age: float) -> None:
-    """
-    Remove entries older than max_age seconds from a cooldown dict.
-
-    Called during record operations to prevent unbounded growth.
-    Builds a list of expired keys first to avoid mutating the dict
-    during iteration.
-
-    Args:
-        cooldowns: The cooldown dict to prune.
-        max_age: Maximum entry age in seconds.
-    """
-    now = time.time()
-    expired = [k for k, ts in cooldowns.items() if (now - ts) >= max_age]
-    for k in expired:
-        del cooldowns[k]
-
-
-def _should_skip_review(repo: str, pr_number: int, cooldown: int) -> bool:
-    """
-    Check if a PR was reviewed recently enough to skip this event.
-
-    Uses the in-memory cooldown dict to absorb force-push bursts.
-    Returns True if the PR should NOT be reviewed (still in cooldown).
-
-    Args:
-        repo: GitHub repo full name (e.g., "dcellison/kai").
-        pr_number: The PR number.
-        cooldown: Minimum seconds between reviews of the same PR.
-    """
-    key = (repo, pr_number)
-    last_review = _review_cooldowns.get(key)
-    if last_review is None:
-        return False
-    return (time.time() - last_review) < cooldown
-
-
-def _record_review(repo: str, pr_number: int, cooldown: float) -> None:
-    """
-    Record that a PR review was just initiated, updating the cooldown timestamp.
-
-    Prunes expired entries first to prevent unbounded dict growth.
-    Called after a review is successfully launched (not after it completes,
-    since the review runs as a background task and we want to prevent
-    duplicate launches, not duplicate completions).
-
-    Args:
-        repo: GitHub repo full name (e.g., "dcellison/kai").
-        pr_number: The PR number.
-        cooldown: Cooldown period in seconds (used as pruning threshold).
-    """
-    _prune_expired(_review_cooldowns, cooldown)
-    _review_cooldowns[(repo, pr_number)] = time.time()
-
-
-# ── Issue triage rate limiting ─────────────────────────────────────────
-# In-memory cooldown dict: (repo_full_name, issue_number) -> last_triage_timestamp.
-# Prevents duplicate triage if GitHub sends multiple webhook deliveries
-# for the same event (retries, duplicate deliveries). 60-second cooldown.
-_triage_cooldowns: dict[tuple[str, int], float] = {}
-
-# Fixed cooldown for triage - much shorter than PR review (300s) because
-# issues don't have the force-push burst problem. This is purely for
-# duplicate delivery protection.
-_TRIAGE_COOLDOWN_SECONDS = 60
-
-
-def _should_skip_triage(repo: str, issue_number: int) -> bool:
-    """
-    Check if an issue was triaged recently enough to skip this event.
-
-    Uses the in-memory cooldown dict to absorb duplicate deliveries.
-    Returns True if the issue should NOT be triaged (still in cooldown).
-
-    Args:
-        repo: GitHub repo full name (e.g., "dcellison/kai").
-        issue_number: The issue number.
-    """
-    key = (repo, issue_number)
-    last_triage = _triage_cooldowns.get(key)
-    if last_triage is None:
-        return False
-    return (time.time() - last_triage) < _TRIAGE_COOLDOWN_SECONDS
-
-
-def _record_triage(repo: str, issue_number: int) -> None:
-    """
-    Record that an issue triage was just initiated.
-
-    Prunes expired entries first to prevent unbounded dict growth.
-    Called after a triage is successfully launched (not after it completes,
-    since the triage runs as a background task and we want to prevent
-    duplicate launches, not duplicate completions).
-
-    Args:
-        repo: GitHub repo full name (e.g., "dcellison/kai").
-        issue_number: The issue number.
-    """
-    _prune_expired(_triage_cooldowns, _TRIAGE_COOLDOWN_SECONDS)
-    _triage_cooldowns[(repo, issue_number)] = time.time()
 
 
 async def _resolve_local_repo(repo_full_name: str, app: web.Application) -> str | None:
@@ -805,9 +696,9 @@ async def _handle_github(request: web.Request) -> web.Response:
     """
     Handle incoming GitHub webhook events.
 
-    Validates the HMAC-SHA256 signature, parses the event payload, dispatches
-    to the appropriate formatter, and sends the formatted message to Telegram.
-    Falls back to plain text if Markdown parsing fails.
+    Validates the HMAC-SHA256 signature, parses the event payload, and routes
+    it through canonical subscriptions, durable automation, and notification
+    channels.
 
     Supported events: push, pull_request, issues, issue_comment, pull_request_review.
     Unsupported events are silently acknowledged with {"msg": "ignored"}.
@@ -841,478 +732,108 @@ async def _handle_github(request: web.Request) -> web.Response:
         return web.json_response({"msg": "internal_error"}, status=500)
 
 
-async def _get_subscribed_users(config: Config, repo_full_name: str) -> list[UserConfig]:
-    """Find all users subscribed to a GitHub repo.
-
-    Computes each user's effective repo list (yaml + DB-added - DB-removed)
-    via sessions.get_effective_repos(), then matches against repo_full_name.
-    Comparison is case-insensitive since GitHub repo names are
-    case-insensitive.
-
-    Admin users with empty effective repos are treated as wildcards: they
-    receive all events for all repos, matching the pre-multi-user behavior
-    where admins received GitHub events globally. An admin who wants to
-    receive only specific repos should list them explicitly or use
-    /github add - once any repos are in the effective list, the wildcard
-    no longer applies.
-
-    Non-admin users with empty effective repos receive nothing. Regular
-    users never received global events before the multi-user buildout, so
-    this is the correct backward-compatible default.
-
-    Args:
-        config: The application Config instance.
-        repo_full_name: Full GitHub repo name (e.g., "dcellison/kai").
-
-    Returns:
-        List of UserConfig objects for users who should receive this event.
-        May contain both explicitly-subscribed users and admin wildcards.
-    """
-    repo_lower = repo_full_name.lower()
-
-    explicitly_subscribed: list[UserConfig] = []
-    admin_wildcards: list[UserConfig] = []
-
-    for uc in config.user_configs.values():
-        # Compute effective repos: yaml baseline + DB-added - DB-removed.
-        effective = await sessions.get_effective_repos(uc.telegram_id, uc.github_repos)
-
-        if repo_lower in effective:
-            explicitly_subscribed.append(uc)
-        elif (
-            await sessions.github_admin_wildcard(
-                uc.telegram_id,
-                legacy_admin=uc.role == "admin",
-            )
-            and not effective
-        ):
-            # Admin with no effective repos = wildcard (receives all events).
-            admin_wildcards.append(uc)
-
-    # No deduplication needed: admin_wildcards requires empty effective
-    # repos, so no user can appear in both lists simultaneously.
-    return explicitly_subscribed + admin_wildcards
-
-
 async def _process_github_event(request: web.Request, payload: dict, event_type: str) -> web.Response:
-    """Process a validated GitHub webhook event.
+    """Route one authenticated GitHub delivery through canonical services."""
+    repo_full_name = str(payload.get("repository", {}).get("full_name", ""))
+    delivery_id = request.headers.get("X-GitHub-Delivery", "")
+    if not delivery_id:
+        return web.json_response({"status": "invalid", "detail": "missing delivery identity"}, status=400)
 
-    Routes the event to all users subscribed to the triggering repo
-    via _get_subscribed_users(). Each user gets their own feature flag
-    check and notification destination via resolve_github_settings().
-
-    Admin users with empty github_repos receive all events (wildcard).
-    Only reaches the fallback path when no user is subscribed and no
-    admin wildcard exists - for example, when no users.yaml is configured
-    or when all admins have opted into specific repos only.
-    """
-    bot = request.app.get(TELEGRAM_BOT_KEY)
-    config: Config = request.app[CONFIG_KEY]
-
-    # Extract the repo that triggered this event
-    repo_full_name = payload.get("repository", {}).get("full_name", "")
-
-    # Find all users subscribed to this repo
-    subscribed_users = await _get_subscribed_users(config, repo_full_name)
-
-    if not subscribed_users:
-        # No subscribers and no admin wildcards for this repo. With
-        # users.yaml mandatory the cause is now narrowly that all
-        # admins have explicit github_repos that don't include this
-        # repo, or that no admin is configured at all (a warning at
-        # config load time covers the latter).
-        log.warning(
-            "GitHub %s event for %s: no subscribed users. "
-            "Add 'github_repos: [%s]' to users.yaml to receive "
-            "events for this repo.",
-            event_type,
-            repo_full_name,
-            repo_full_name,
-        )
-        # Fall back to the first admin in the app config so the event is
-        # not silently dropped. A transient processing failure returns 503 so
-        # GitHub retries; canonical delivery identity makes repeats safe.
-        fallback_chat_id = request.app.get(CHAT_ID_KEY)
-        if fallback_chat_id is None:
-            formatter = _GITHUB_FORMATTERS.get(event_type)
-            if formatter is None:
-                return web.json_response({"msg": "ignored"})
-            message = formatter(payload)
-            if message is not None and await _record_github_default_notification(
-                request,
-                event_type=event_type,
-                repository=repo_full_name,
-                body=message,
-            ):
-                return web.json_response({"status": "ok"})
-            log.error(
-                "GitHub %s event for %s has no canonical subscriber or fallback admin",
-                event_type,
-                repo_full_name,
-            )
-            return web.json_response({"status": "unavailable"}, status=503)
-        try:
-            await _process_github_event_for_user(
-                request,
-                payload,
-                event_type,
-                bot,
-                config,
-                fallback_chat_id,
-            )
-        except Exception:
-            log.exception(
-                "Error processing %s event for fallback admin (chat %d)",
-                event_type,
-                fallback_chat_id,
-            )
+    automation = request.app[WORKSHOP_GITHUB_AUTOMATION_KEY]
+    routes = await automation.routes_for_repository(repo_full_name)
+    formatter = _GITHUB_FORMATTERS.get(event_type)
+    formatted = formatter(payload) if formatter is not None else None
+    if not routes:
+        log.warning("GitHub %s event for %s has no canonical subscriber", event_type, repo_full_name)
+        if formatted is None:
+            return web.json_response({"msg": "ignored"})
+        if not await _record_github_default_notification(
+            request,
+            event_type=event_type,
+            repository=repo_full_name,
+            body=formatted,
+        ):
             return web.json_response({"status": "unavailable"}, status=503)
         return web.json_response({"status": "ok"})
 
-    # Process the event for each subscribed user independently.
-    # Each user has their own pr_review/issue_triage flags and
-    # notification destination. Per-user try/except ensures a transient
-    # failure (e.g., DB error) for one user does not block the others.
-    processing_failed = False
-    for user_config in subscribed_users:
-        chat_id = user_config.telegram_id
+    action = str(payload.get("action", ""))
+    local_repo_path: str | None = None
+    failures = False
+    for route in routes:
         try:
-            await _process_github_event_for_user(
-                request,
-                payload,
-                event_type,
-                bot,
-                config,
-                chat_id,
-            )
-        except Exception:
-            processing_failed = True
-            log.exception(
-                "Error processing %s event for user %s (chat %d)",
-                event_type,
-                user_config.name,
-                chat_id,
-            )
-
-    if processing_failed:
-        return web.json_response({"status": "unavailable"}, status=503)
-    return web.json_response({"status": "ok"})
-
-
-async def _process_github_event_for_user(
-    request: web.Request,
-    payload: dict,
-    event_type: str,
-    bot: Bot | None,
-    config: Config,
-    chat_id: int,
-) -> None:
-    """Process a GitHub event for a single user.
-
-    Resolves the user's GitHub settings (pr_review, issue_triage,
-    notify_chat_id) and dispatches accordingly. Called once per
-    subscribed user for each incoming event.
-
-    Args:
-        request: The aiohttp request (for app config access).
-        payload: The GitHub webhook payload dict.
-        event_type: GitHub event type (e.g., "pull_request", "issues").
-        bot: The Telegram bot instance.
-        config: The application Config instance.
-        chat_id: The user's Telegram chat ID.
-    """
-    # Resolve this user's effective GitHub settings
-    settings = await sessions.resolve_github_settings(chat_id, config)
-    target_chat_id = settings["notify_chat_id"]
-    github_token = await sessions.get_setting(f"github_token:{chat_id}")
-    protected_install = getattr(config, "protected_install", False) is True
-
-    user_config = config.get_user_config(chat_id)
-    repo_full_name = payload.get("repository", {}).get("full_name", "")
-    github_operations_authorized = bool(user_config and user_config.authorizes_github_repo(repo_full_name))
-
-    # Review and triage subprocess identity follows protected runtime policy.
-    # Development callers without a protected pool retain compatibility config;
-    # a protected install never falls back when the pool boundary is absent.
-    pool = request.app.get(POOL_KEY)
-    if pool is not None:
-        claude_user = pool.get_os_user(chat_id)
-        agent_backend, provider = pool.get_backend_provider(chat_id)
-        pr_review_model_override = pool.get_role_model(chat_id, ModelRole.PR_REVIEW)
-        issue_triage_model_override = pool.get_role_model(chat_id, ModelRole.ISSUE_TRIAGE)
-    elif protected_install:
-        raise RuntimeError("Protected runtime pool is unavailable for GitHub agent execution")
-    else:
-        claude_user = user_config.os_user if user_config and user_config.os_user else None
-        agent_backend, provider = get_user_backend_and_provider(user_config, config)
-        pr_review_model_override = resolve_user_model(
-            ModelRole.PR_REVIEW,
-            user_config,
-            config,
-            backend=agent_backend,
-            provider=provider,
-        )
-        issue_triage_model_override = resolve_user_model(
-            ModelRole.ISSUE_TRIAGE,
-            user_config,
-            config,
-            backend=agent_backend,
-            provider=provider,
-        )
-
-    # ── PR review routing ────────────────────────────────────────
-    # When PR review is enabled for this user, reviewable PR events
-    # (opened, reopened, synchronize) are routed to the review pipeline
-    # instead of the notification formatter. Non-reviewable actions
-    # (closed, merged) still get the standard Telegram notification.
-    if settings["pr_review"] and event_type == "pull_request":
-        action = payload.get("action", "")
-        if action in ("opened", "reopened", "synchronize") and github_operations_authorized:
-            if protected_install and not github_token:
-                log.warning(
-                    "Skipping automated GitHub review for user %d: protected install requires a per-user token",
-                    chat_id,
-                )
-                message = (
-                    f"PR review skipped for {repo_full_name}: protected installs require a stored "
-                    "per-user GitHub token. Send `/github token <token>` first."
-                )
-                if not await _record_github_notification(
-                    request,
-                    target_chat_id=target_chat_id,
-                    event_type="review_skipped",
-                    repository=repo_full_name,
-                    body=message,
-                    delivery_suffix="review-skipped",
-                ):
-                    if bot is None:
-                        raise RuntimeError("PR review warning has no canonical destination")
-                    await bot.send_message(chat_id=target_chat_id, text=message)
-                return
-            pr = payload.get("pull_request", {})
-            pr_number = pr.get("number", 0)
-            repo = repo_full_name
-            cooldown = request.app.get(PR_REVIEW_COOLDOWN_KEY, 300)
-
-            # Cooldown is server-level, shared across all users.
-            # One review per PR per cooldown window regardless of
-            # how many users are subscribed.
-            if _should_skip_review(repo, pr_number, cooldown):
-                log.info(
-                    "Skipping review of %s PR #%d (cooldown)",
-                    repo,
-                    pr_number,
-                )
-                return
-
-            _record_review(repo, pr_number, cooldown)
-
-            # Resolve a local repo path for spec/convention loading.
-            # Checks home workspace, WORKSPACE_BASE, ALLOWED_WORKSPACES,
-            # and workspace history for a directory matching the repo name.
-            local_repo_path = await _resolve_local_repo(repo, request.app)
-
-            # Launch the review as a fire-and-forget background task.
-            # Same pattern as Telegram update processing: create_task +
-            # _background_tasks set to prevent GC during execution.
-            # Always pass target_chat_id so the review notification
-            # reaches the subscribing user, not the default admin.
-            task = asyncio.create_task(
-                review.review_pr(
-                    payload,
-                    webhook_port=request.app[WEBHOOK_PORT_KEY],
-                    webhook_secret=request.app[INTERNAL_API_AUTH_KEY].notification_credential_for(target_chat_id),
-                    claude_user=claude_user,
+            queued = False
+            if (
+                event_type == "pull_request"
+                and action in {"opened", "reopened", "synchronize"}
+                and route.pr_review_enabled
+                and route.operations_authorized
+            ):
+                if local_repo_path is None:
+                    local_repo_path = await _resolve_local_repo(repo_full_name, request.app)
+                await automation.enqueue(
+                    delivery_id=delivery_id,
+                    kind="pr_review",
+                    event_type=event_type,
+                    payload=payload,
+                    route=route,
                     local_repo_path=local_repo_path,
-                    spec_dir=request.app.get(SPEC_DIR_KEY, "specs"),
-                    notify_chat_id=target_chat_id,
-                    agent_backend=agent_backend,
-                    provider=provider,
-                    timeout_s=request.app[PR_REVIEW_TIMEOUT_S_KEY],
-                    model_override=pr_review_model_override,
-                    github_token=github_token,
                 )
-            )
-            _background_tasks.add(task)
-            task.add_done_callback(_background_tasks.discard)
+                queued = True
+            elif (
+                event_type == "issues"
+                and action == "opened"
+                and route.issue_triage_enabled
+                and route.operations_authorized
+            ):
+                await automation.enqueue(
+                    delivery_id=delivery_id,
+                    kind="issue_triage",
+                    event_type=event_type,
+                    payload=payload,
+                    route=route,
+                )
+                queued = True
 
-            log.info(
-                "PR review triggered for %s PR #%d (%s) for user %d",
-                repo,
-                pr_number,
-                action,
-                chat_id,
-            )
-            return
-        if action in ("opened", "reopened", "synchronize"):
-            log.warning(
-                "Denied automated GitHub review for user %d: repository %s is not admin-authorized",
-                chat_id,
-                repo_full_name,
-            )
-
-    # ── Issue triage routing ────────────────────────────────────
-    # When issue triage is enabled for this user, opened issues are
-    # routed to the triage pipeline. The triage Telegram summary
-    # replaces the basic _fmt_issues() notification (richer content).
-    # Non-triaged actions (closed, reopened) still fall through to
-    # the standard formatter.
-    if settings["issue_triage"] and event_type == "issues":
-        action = payload.get("action", "")
-        if action == "opened" and github_operations_authorized:
-            if protected_install and not github_token:
-                log.warning(
-                    "Skipping issue triage for user %d: protected install requires a per-user token",
-                    chat_id,
-                )
-                message = (
-                    f"Issue triage skipped for {repo_full_name}: protected installs require a stored "
-                    "per-user GitHub token. Send `/github token <token>` first."
-                )
-                if not await _record_github_notification(
+            if not queued and formatted is not None:
+                await _record_github_route_notification(
                     request,
-                    target_chat_id=target_chat_id,
-                    event_type="triage_skipped",
+                    route=route,
+                    event_type=event_type,
                     repository=repo_full_name,
-                    body=message,
-                    delivery_suffix="triage-skipped",
-                ):
-                    if bot is None:
-                        raise RuntimeError("Issue triage warning has no canonical destination")
-                    await bot.send_message(chat_id=target_chat_id, text=message)
-                return
-            issue = payload.get("issue", {})
-            issue_number = issue.get("number", 0)
-            repo = repo_full_name
-
-            if _should_skip_triage(repo, issue_number):
-                log.info(
-                    "Skipping triage of %s issue #%d (cooldown)",
-                    repo,
-                    issue_number,
+                    body=formatted,
                 )
-                return
-
-            _record_triage(repo, issue_number)
-
-            task = asyncio.create_task(
-                triage.triage_issue(
-                    payload,
-                    webhook_port=request.app[WEBHOOK_PORT_KEY],
-                    webhook_secret=request.app[INTERNAL_API_AUTH_KEY].notification_credential_for(target_chat_id),
-                    claude_user=claude_user,
-                    notify_chat_id=target_chat_id,
-                    agent_backend=agent_backend,
-                    provider=provider,
-                    model_override=issue_triage_model_override,
-                    allowed_triage_projects=user_config.allowed_triage_projects if user_config else [],
-                    github_token=github_token,
-                )
-            )
-            _background_tasks.add(task)
-            task.add_done_callback(_background_tasks.discard)
-
-            log.info(
-                "Issue triage triggered for %s issue #%d for user %d",
-                repo,
-                issue_number,
-                chat_id,
-            )
-            return
-        if action == "opened":
-            log.warning(
-                "Denied automated GitHub issue triage for user %d: repository %s is not admin-authorized",
-                chat_id,
-                repo_full_name,
-            )
-
-    # ── Standard notification path ───────────────────────────────
-    # Look up the formatter for this event type
-    formatter = _GITHUB_FORMATTERS.get(event_type)
-    if not formatter:
-        return
-
-    message = formatter(payload)
-    if not message:
-        return
-
-    # Canonical recording is core-owned. Any enabled channel bindings become
-    # durable outbox work; Telegram is only one optional delivery worker.
-    if await _record_github_notification(
-        request,
-        target_chat_id=target_chat_id,
-        event_type=event_type,
-        repository=repo_full_name,
-        body=message,
-    ):
-        return
-
-    # Destinations not represented by a canonical Workshop notification
-    # channel retain the compatibility route. This covers direct-chat installs
-    # and a newly changed /github notify target until the next bootstrap.
-    if bot is None:
-        raise RuntimeError(f"GitHub {event_type} notification for {repo_full_name} has no canonical destination")
-    try:
-        await bot.send_message(target_chat_id, message, parse_mode="Markdown")
-    except Exception:
-        try:
-            await bot.send_message(target_chat_id, _strip_markdown(message))
         except Exception:
+            failures = True
             log.exception(
-                "Failed to send GitHub notification to chat %d",
-                target_chat_id,
+                "Canonical GitHub %s routing failed for principal %s",
+                event_type,
+                route.principal_id,
             )
-    log.info(
-        "Sent GitHub %s notification to chat %d (user %d)",
-        event_type,
-        target_chat_id,
-        chat_id,
-    )
+    return web.json_response({"status": "unavailable" if failures else "ok"}, status=503 if failures else 200)
 
 
-async def _record_github_notification(
+async def _record_github_route_notification(
     request: web.Request,
     *,
-    target_chat_id: int,
+    route: GitHubSubscriptionRoute,
     event_type: str,
     repository: str,
     body: str,
-    delivery_suffix: str | None = None,
-) -> bool:
-    service = request.app.get(WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY)
+) -> None:
     delivery_id = request.headers.get("X-GitHub-Delivery", "")
-    if service is None or not delivery_id:
-        return False
-    if delivery_suffix is not None:
-        delivery_id = f"{delivery_id}:{delivery_suffix}"
-    try:
-        notification = IntegrationNotification(
+    if not delivery_id:
+        raise RuntimeError("GitHub notification has no delivery identity")
+    await request.app[WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY].record_for_channel(
+        IntegrationNotification(
             delivery_id=delivery_id,
             source="github",
             event_type=event_type,
             repository=repository,
             body=body,
             occurred_at=datetime.now(UTC),
-        )
-        recorded = await service.record_for_binding(
-            notification,
-            transport="telegram",
-            external_channel_id=str(target_chat_id),
-        )
-    except ValueError:
-        log.warning("GitHub %s delivery has an unsupported identity", event_type)
-        return False
-    if recorded is None:
-        return False
-    log.info(
-        "Recorded GitHub %s notification as canonical message %s (user target %d, inserted=%s, deliveries=%d)",
-        event_type,
-        recorded.message_id,
-        target_chat_id,
-        recorded.inserted,
-        len(recorded.deliveries),
+        ),
+        route.notification_channel_id,
     )
-    return True
 
 
 async def _record_github_default_notification(
@@ -2833,26 +2354,18 @@ async def start(
     _app[ALLOWED_USER_IDS_KEY] = set(config.allowed_user_ids)
     _app[NOTIFICATION_CHAT_IDS_KEY] = set()
 
-    # Store config for GitHub actor routing in _handle_github()
+    # Retain the loaded application configuration for compatibility APIs.
     _app[CONFIG_KEY] = config
 
     # Store the subprocess pool for per-user workspace lookup in send-file.
     # Set by main.py after pool creation; may be None during init.
     _app[POOL_KEY] = pool
 
-    # Server-level config for review/triage background tasks. Per-user
-    # feature flags (pr_review, issue_triage) are resolved at event time
-    # via sessions.resolve_github_settings(), not stored here.
-    _app[PR_REVIEW_COOLDOWN_KEY] = config.pr_review_cooldown
-    _app[PR_REVIEW_TIMEOUT_S_KEY] = config.pr_review_timeout_s
-    _app[WEBHOOK_PORT_KEY] = config.webhook_port
-
-    # Workspace config for review agent repo resolution. These let
+    # Workspace policy lets canonical review work resolve a local checkout for
     # _resolve_local_repo() match incoming PR webhook repos against
     # local checkouts without a hardcoded GITHUB_REPO setting.
     _app[WORKSPACE_BASE_KEY] = str(config.workspace_base) if config.workspace_base else None
     _app[ALLOWED_WORKSPACES_KEY] = [str(p) for p in config.allowed_workspaces]
-    _app[SPEC_DIR_KEY] = config.spec_dir
 
     # Maintain the legacy live notification-destination registry from both
     # users.yaml and DB. This set is intentionally detached from Config's
@@ -2876,6 +2389,7 @@ async def start(
     _register_routes(_app, config, telegram_enabled=telegram_enabled)
     _app[WORKSHOP_PRINCIPAL_STORAGE_KEY] = core_services.principal_storage
     _app[WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY] = integration_notifications
+    _app[WORKSHOP_GITHUB_AUTOMATION_KEY] = core_services.github_automation
     register_workshop_routes: Callable[[web.Application], None] | None = None
     if workshop_enabled:
         register_workshop_routes = await _register_workshop_client_api(

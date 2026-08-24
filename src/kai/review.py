@@ -36,6 +36,7 @@ import logging
 import os
 import re
 import urllib.parse
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -3276,6 +3277,13 @@ async def send_review_summary(
         log.exception("Failed to send review summary to Telegram")
 
 
+def format_review_summary(metadata: PRMetadata, success: bool) -> str:
+    """Render the transport-neutral completion summary for one PR review."""
+    pr_url = f"https://github.com/{metadata.repo}/pull/{metadata.number}"
+    status = "Reviewed" if success else "Failed to review"
+    return f"{status} PR #{metadata.number} in {metadata.repo}\n{metadata.title}\n{pr_url}"
+
+
 async def generate_pr_review(
     repo: str,
     pr_number: int,
@@ -3365,7 +3373,8 @@ async def review_pr(
     timeout_s: int = _REVIEW_TIMEOUT,
     model_override: str = "",
     github_token: str | None = None,
-) -> None:
+    notification_sink: Callable[[str], Awaitable[None]] | None = None,
+) -> bool:
     """
     Full review pipeline: build the bundle, run the review, post results.
 
@@ -3404,7 +3413,12 @@ async def review_pr(
         early_patch = await fetch_pr_diff(metadata.repo, metadata.number, github_token=github_token)
         if not early_patch.strip():
             log.info("Empty diff for %s#%d, skipping review", metadata.repo, metadata.number)
-            return
+            summary = (
+                f"Skipped PR review for #{metadata.number} in {metadata.repo}: the pull request has no reviewable diff."
+            )
+            if notification_sink is not None:
+                await notification_sink(summary)
+            return True
 
         result = await generate_pr_review(
             metadata.repo,
@@ -3422,13 +3436,22 @@ async def review_pr(
 
         if not result.review_text.strip():
             log.warning("Empty review output for %s#%d", metadata.repo, metadata.number)
-            await send_review_summary(metadata, False, webhook_port, webhook_secret, notify_chat_id)
-            return
+            summary = format_review_summary(metadata, False)
+            if notification_sink is not None:
+                await notification_sink(summary)
+            else:
+                await send_review_summary(metadata, False, webhook_port, webhook_secret, notify_chat_id)
+            return False
 
         posted = await post_review_comment(
             metadata.repo, metadata.number, result.review_text, github_token=github_token
         )
-        await send_review_summary(metadata, posted, webhook_port, webhook_secret, notify_chat_id)
+        summary = format_review_summary(metadata, posted)
+        if notification_sink is not None:
+            await notification_sink(summary)
+        else:
+            await send_review_summary(metadata, posted, webhook_port, webhook_secret, notify_chat_id)
+        return posted
 
     except Exception:
         log.exception("Review failed for %s#%d", metadata.repo, metadata.number)
@@ -3436,10 +3459,15 @@ async def review_pr(
         # broke. A second failure here is logged and swallowed so the
         # outer webhook background task does not crash the server.
         try:
-            await send_review_summary(metadata, False, webhook_port, webhook_secret, notify_chat_id)
+            summary = format_review_summary(metadata, False)
+            if notification_sink is not None:
+                await notification_sink(summary)
+            else:
+                await send_review_summary(metadata, False, webhook_port, webhook_secret, notify_chat_id)
         except Exception:
             log.exception(
                 "Failed to send failure notification for %s#%d",
                 metadata.repo,
                 metadata.number,
             )
+        return False
