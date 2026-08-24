@@ -551,6 +551,14 @@ async def record_workshop_delivery_observation(observation: DeliveryObservation)
 
 async def get_session(chat_id: int) -> str | None:
     """Get the current agent session ID for a chat, or None if no session exists."""
+    namespace = _execution_state_namespace(chat_id)
+    if namespace is not None:
+        async with _get_db().execute(
+            "SELECT provider_session_id FROM channel_agent_runtime_sessions WHERE channel_id = ? AND agent_id = ?",
+            (namespace.channel_id, namespace.agent_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return str(row[0]) if row is not None and row[0] is not None else None
     async with _get_db().execute("SELECT session_id FROM sessions WHERE chat_id = ?", (chat_id,)) as cursor:
         row = await cursor.fetchone()
         return row["session_id"] if row else None
@@ -568,6 +576,11 @@ async def save_session(chat_id: int, session_id: str, model: str) -> None:
         session_id: Agent session identifier reported by the backend.
         model: Model name used for this session (e.g., "sonnet").
     """
+    # Protected runtimes settle provider continuity atomically with their
+    # canonical terminal run.  A later compatibility write must not recreate
+    # the retired integer-keyed session row.
+    if _execution_state_namespace(chat_id) is not None:
+        return
     await _get_db().execute(
         """
         INSERT INTO sessions (chat_id, session_id, model)
@@ -584,12 +597,29 @@ async def save_session(chat_id: int, session_id: str, model: str) -> None:
 
 async def clear_session(chat_id: int) -> None:
     """Delete the session record for a chat. Used by /new and workspace switching."""
+    namespace = _execution_state_namespace(chat_id)
+    if namespace is not None:
+        await _get_db().execute(
+            "DELETE FROM channel_agent_runtime_sessions WHERE channel_id = ? AND agent_id = ?",
+            (namespace.channel_id, namespace.agent_id),
+        )
+        await _get_db().commit()
+        return
     await _get_db().execute("DELETE FROM sessions WHERE chat_id = ?", (chat_id,))
     await _get_db().commit()
 
 
 async def get_stats(chat_id: int) -> dict | None:
     """Get session statistics for the /stats command. Returns None if no session exists."""
+    namespace = _execution_state_namespace(chat_id)
+    if namespace is not None:
+        async with _get_db().execute(
+            "SELECT provider_session_id AS session_id, model, created_at, updated_at AS last_used_at "
+            "FROM channel_agent_runtime_sessions WHERE channel_id = ? AND agent_id = ?",
+            (namespace.channel_id, namespace.agent_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row is not None else None
     async with _get_db().execute(
         "SELECT session_id, model, created_at, last_used_at FROM sessions WHERE chat_id = ?",
         (chat_id,),
@@ -1173,6 +1203,69 @@ async def delete_settings_by_prefix(prefix: str) -> None:
 # while User B uses sonnet on the same repo.
 
 
+async def get_canonical_workspace_config_settings(
+    namespace: WorkshopExecutionStateNamespace,
+    workspace_path: str,
+) -> dict[str, str]:
+    async with _get_db().execute(
+        "SELECT field, value FROM channel_agent_workspace_settings "
+        "WHERE channel_id = ? AND agent_id = ? AND workspace_path = ? ORDER BY field",
+        (namespace.channel_id, namespace.agent_id, workspace_path),
+    ) as cursor:
+        rows = await cursor.fetchall()
+    return {str(row["field"]): str(row["value"]) for row in rows}
+
+
+async def set_canonical_workspace_config_setting(
+    namespace: WorkshopExecutionStateNamespace,
+    workspace_path: str,
+    field: str,
+    value: str,
+) -> None:
+    if field not in {"model", "timeout", "env", "prompt"}:
+        raise ValueError(f"Unsupported workspace setting field: {field}")
+    await _get_db().execute(
+        "INSERT INTO channel_agent_workspace_settings "
+        "(channel_id, agent_id, runtime_profile_id, workspace_path, field, value) "
+        "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(channel_id, agent_id, workspace_path, field) "
+        "DO UPDATE SET runtime_profile_id = excluded.runtime_profile_id, "
+        "value = excluded.value, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+        (
+            namespace.channel_id,
+            namespace.agent_id,
+            namespace.runtime_profile_id,
+            workspace_path,
+            field,
+            value,
+        ),
+    )
+    await _get_db().commit()
+
+
+async def delete_canonical_workspace_config_setting(
+    namespace: WorkshopExecutionStateNamespace,
+    workspace_path: str,
+    field: str,
+) -> None:
+    await _get_db().execute(
+        "DELETE FROM channel_agent_workspace_settings "
+        "WHERE channel_id = ? AND agent_id = ? AND workspace_path = ? AND field = ?",
+        (namespace.channel_id, namespace.agent_id, workspace_path, field),
+    )
+    await _get_db().commit()
+
+
+async def delete_all_canonical_workspace_config(
+    namespace: WorkshopExecutionStateNamespace,
+    workspace_path: str,
+) -> None:
+    await _get_db().execute(
+        "DELETE FROM channel_agent_workspace_settings WHERE channel_id = ? AND agent_id = ? AND workspace_path = ?",
+        (namespace.channel_id, namespace.agent_id, workspace_path),
+    )
+    await _get_db().commit()
+
+
 async def get_workspace_config_settings(chat_id: int, workspace_path: str) -> dict[str, str]:
     """
     Get all config overrides for a user's workspace.
@@ -1183,13 +1276,7 @@ async def get_workspace_config_settings(chat_id: int, workspace_path: str) -> di
     """
     namespace = _execution_state_namespace(chat_id)
     if namespace is not None:
-        async with _get_db().execute(
-            "SELECT field, value FROM channel_agent_workspace_settings "
-            "WHERE channel_id = ? AND agent_id = ? AND workspace_path = ? ORDER BY field",
-            (namespace.channel_id, namespace.agent_id, workspace_path),
-        ) as cursor:
-            rows = await cursor.fetchall()
-            return {str(row["field"]): str(row["value"]) for row in rows}
+        return await get_canonical_workspace_config_settings(namespace, workspace_path)
 
     # Use SUBSTR for exact prefix matching instead of LIKE, which
     # treats underscores in filesystem paths as single-char wildcards.
@@ -1210,21 +1297,8 @@ async def set_workspace_config_setting(chat_id: int, workspace_path: str, field:
     key = f"ws_config:{chat_id}:{workspace_path}:{field}"
     namespace = _execution_state_namespace(chat_id)
     if namespace is not None:
-        await _get_db().execute(
-            "INSERT INTO channel_agent_workspace_settings "
-            "(channel_id, agent_id, runtime_profile_id, workspace_path, field, value) "
-            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(channel_id, agent_id, workspace_path, field) "
-            "DO UPDATE SET runtime_profile_id = excluded.runtime_profile_id, "
-            "value = excluded.value, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-            (
-                namespace.channel_id,
-                namespace.agent_id,
-                namespace.runtime_profile_id,
-                workspace_path,
-                field,
-                value,
-            ),
-        )
+        await set_canonical_workspace_config_setting(namespace, workspace_path, field, value)
+        return
     await _get_db().execute(
         "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, value),
@@ -1237,11 +1311,8 @@ async def delete_workspace_config_setting(chat_id: int, workspace_path: str, fie
     key = f"ws_config:{chat_id}:{workspace_path}:{field}"
     namespace = _execution_state_namespace(chat_id)
     if namespace is not None:
-        await _get_db().execute(
-            "DELETE FROM channel_agent_workspace_settings "
-            "WHERE channel_id = ? AND agent_id = ? AND workspace_path = ? AND field = ?",
-            (namespace.channel_id, namespace.agent_id, workspace_path, field),
-        )
+        await delete_canonical_workspace_config_setting(namespace, workspace_path, field)
+        return
     await _get_db().execute("DELETE FROM settings WHERE key = ?", (key,))
     await _get_db().commit()
 
@@ -1250,10 +1321,8 @@ async def delete_all_workspace_config(chat_id: int, workspace_path: str) -> None
     """Remove all config overrides for this user's workspace."""
     namespace = _execution_state_namespace(chat_id)
     if namespace is not None:
-        await _get_db().execute(
-            "DELETE FROM channel_agent_workspace_settings WHERE channel_id = ? AND agent_id = ? AND workspace_path = ?",
-            (namespace.channel_id, namespace.agent_id, workspace_path),
-        )
+        await delete_all_canonical_workspace_config(namespace, workspace_path)
+        return
     keys = tuple(f"ws_config:{chat_id}:{workspace_path}:{field}" for field in ("model", "timeout", "env", "prompt"))
     await _get_db().execute(
         "DELETE FROM settings WHERE key IN (?, ?, ?, ?)",
@@ -1285,9 +1354,41 @@ async def build_workspace_config(
     The WorkspaceConfig import is deferred to avoid a circular dependency
     (config.py does not import sessions.py; this direction is safe).
     """
-    from kai.config import WorkspaceConfig
-
     db_settings = await get_workspace_config_settings(chat_id, str(workspace_path))
+    return _build_workspace_config_from_settings(
+        yaml_config,
+        workspace_path,
+        db_settings,
+        owner_label=f"compatibility owner {chat_id}",
+    )
+
+
+async def build_canonical_workspace_config(
+    yaml_config: WorkspaceConfig | None,
+    workspace_path: Path,
+    namespace: WorkshopExecutionStateNamespace,
+) -> WorkspaceConfig | None:
+    """Layer canonical workspace overrides on top of operator policy."""
+    db_settings = await get_canonical_workspace_config_settings(
+        namespace,
+        str(workspace_path),
+    )
+    return _build_workspace_config_from_settings(
+        yaml_config,
+        workspace_path,
+        db_settings,
+        owner_label=f"runtime profile {namespace.runtime_profile_id}",
+    )
+
+
+def _build_workspace_config_from_settings(
+    yaml_config: WorkspaceConfig | None,
+    workspace_path: Path,
+    db_settings: dict[str, str],
+    *,
+    owner_label: str,
+) -> WorkspaceConfig | None:
+    from kai.config import WorkspaceConfig
 
     if not db_settings and yaml_config is None:
         return None
@@ -1308,7 +1409,7 @@ async def build_workspace_config(
         try:
             timeout = int(db_settings["timeout"])
         except (ValueError, TypeError):
-            log.warning("Corrupt timeout in DB for chat %d workspace %s", chat_id, workspace_path)
+            log.warning("Corrupt timeout in DB for %s workspace %s", owner_label, workspace_path)
     if "env" in db_settings:
         # DB env vars merge on top of YAML env vars (not replace).
         # This lets admins set baseline env vars in YAML and users
@@ -1316,7 +1417,7 @@ async def build_workspace_config(
         try:
             db_env = json.loads(db_settings["env"])
         except json.JSONDecodeError:
-            log.warning("Corrupt env JSON in DB for chat %d workspace %s", chat_id, workspace_path)
+            log.warning("Corrupt env JSON in DB for %s workspace %s", owner_label, workspace_path)
             db_env = {}
         if env is None:
             env = db_env
@@ -1351,6 +1452,75 @@ async def build_workspace_config(
 _USER_SETTING_FIELDS = {"model", "timeout"}
 
 
+async def get_canonical_execution_settings(
+    namespace: WorkshopExecutionStateNamespace,
+) -> dict[str, str]:
+    """Read mutable settings by their canonical channel-agent owner."""
+    async with _get_db().execute(
+        "SELECT field, value FROM channel_agent_execution_settings "
+        "WHERE channel_id = ? AND agent_id = ? ORDER BY field",
+        (namespace.channel_id, namespace.agent_id),
+    ) as cursor:
+        rows = await cursor.fetchall()
+    return {str(row["field"]): str(row["value"]) for row in rows}
+
+
+async def set_canonical_execution_setting(
+    namespace: WorkshopExecutionStateNamespace,
+    field: str,
+    value: str,
+) -> None:
+    if field not in {"model", "timeout", "workspace"}:
+        raise ValueError(f"Unsupported execution setting field: {field}")
+    await _get_db().execute(
+        "INSERT INTO channel_agent_execution_settings "
+        "(channel_id, agent_id, runtime_profile_id, field, value) VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(channel_id, agent_id, field) DO UPDATE SET "
+        "runtime_profile_id = excluded.runtime_profile_id, value = excluded.value, "
+        "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+        (
+            namespace.channel_id,
+            namespace.agent_id,
+            namespace.runtime_profile_id,
+            field,
+            value,
+        ),
+    )
+    await _get_db().commit()
+
+
+async def delete_canonical_execution_setting(
+    namespace: WorkshopExecutionStateNamespace,
+    field: str,
+) -> None:
+    await _get_db().execute(
+        "DELETE FROM channel_agent_execution_settings WHERE channel_id = ? AND agent_id = ? AND field = ?",
+        (namespace.channel_id, namespace.agent_id, field),
+    )
+    await _get_db().commit()
+
+
+async def delete_all_canonical_user_settings(
+    namespace: WorkshopExecutionStateNamespace,
+) -> None:
+    await _get_db().execute(
+        "DELETE FROM channel_agent_execution_settings "
+        "WHERE channel_id = ? AND agent_id = ? AND field IN ('model', 'timeout')",
+        (namespace.channel_id, namespace.agent_id),
+    )
+    await _get_db().commit()
+
+
+async def clear_canonical_runtime_session(
+    namespace: WorkshopExecutionStateNamespace,
+) -> None:
+    await _get_db().execute(
+        "DELETE FROM channel_agent_runtime_sessions WHERE channel_id = ? AND agent_id = ?",
+        (namespace.channel_id, namespace.agent_id),
+    )
+    await _get_db().commit()
+
+
 async def get_user_settings(chat_id: int) -> dict[str, str]:
     """
     Get all per-user settings from the database.
@@ -1362,14 +1532,8 @@ async def get_user_settings(chat_id: int) -> dict[str, str]:
     """
     namespace = _execution_state_namespace(chat_id)
     if namespace is not None:
-        async with _get_db().execute(
-            "SELECT field, value FROM channel_agent_execution_settings "
-            "WHERE channel_id = ? AND agent_id = ? AND field IN ('model', 'timeout') "
-            "ORDER BY field",
-            (namespace.channel_id, namespace.agent_id),
-        ) as cursor:
-            rows = await cursor.fetchall()
-            return {str(row["field"]): str(row["value"]) for row in rows}
+        settings = await get_canonical_execution_settings(namespace)
+        return {field: value for field, value in settings.items() if field in _USER_SETTING_FIELDS}
 
     result = {}
     for field in _USER_SETTING_FIELDS:
@@ -1404,11 +1568,8 @@ async def delete_all_user_settings(chat_id: int) -> None:
     """
     namespace = _execution_state_namespace(chat_id)
     if namespace is not None:
-        await _get_db().execute(
-            "DELETE FROM channel_agent_execution_settings "
-            "WHERE channel_id = ? AND agent_id = ? AND field IN ('model', 'timeout')",
-            (namespace.channel_id, namespace.agent_id),
-        )
+        await delete_all_canonical_user_settings(namespace)
+        return
     for field in _USER_SETTING_FIELDS:
         await _get_db().execute("DELETE FROM settings WHERE key = ?", (f"{field}:{chat_id}",))
     await _get_db().commit()
@@ -1434,27 +1595,15 @@ async def set_active_workspace(chat_id: int, workspace_path: str) -> None:
 
 
 async def delete_active_workspace(chat_id: int) -> None:
-    """Clear the active workspace from canonical and rollback storage."""
+    """Clear the active workspace from its authoritative storage."""
     await _delete_execution_setting(chat_id, "workspace")
 
 
 async def _set_execution_setting(chat_id: int, field: str, value: str) -> None:
     namespace = _execution_state_namespace(chat_id)
     if namespace is not None:
-        await _get_db().execute(
-            "INSERT INTO channel_agent_execution_settings "
-            "(channel_id, agent_id, runtime_profile_id, field, value) VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(channel_id, agent_id, field) DO UPDATE SET "
-            "runtime_profile_id = excluded.runtime_profile_id, value = excluded.value, "
-            "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-            (
-                namespace.channel_id,
-                namespace.agent_id,
-                namespace.runtime_profile_id,
-                field,
-                value,
-            ),
-        )
+        await set_canonical_execution_setting(namespace, field, value)
+        return
     await _get_db().execute(
         "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (f"{field}:{chat_id}", value),
@@ -1465,10 +1614,8 @@ async def _set_execution_setting(chat_id: int, field: str, value: str) -> None:
 async def _delete_execution_setting(chat_id: int, field: str) -> None:
     namespace = _execution_state_namespace(chat_id)
     if namespace is not None:
-        await _get_db().execute(
-            "DELETE FROM channel_agent_execution_settings WHERE channel_id = ? AND agent_id = ? AND field = ?",
-            (namespace.channel_id, namespace.agent_id, field),
-        )
+        await delete_canonical_execution_setting(namespace, field)
+        return
     await _get_db().execute("DELETE FROM settings WHERE key = ?", (f"{field}:{chat_id}",))
     await _get_db().commit()
 
@@ -1549,15 +1696,47 @@ async def upsert_workspace_history(path: str, chat_id: int) -> None:
     """Record or refresh a workspace path in the user's history."""
     namespace = _execution_state_namespace(chat_id)
     if namespace is not None:
-        await _get_db().execute(
-            "INSERT INTO principal_workspace_history (principal_id, path, last_used_at) "
-            "VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(principal_id, path) "
-            "DO UPDATE SET last_used_at = excluded.last_used_at",
-            (namespace.principal_id, path),
-        )
+        await upsert_canonical_workspace_history(namespace, path)
+        return
     await _get_db().execute(
         "INSERT OR REPLACE INTO workspace_history (path, chat_id, last_used_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
         (path, chat_id),
+    )
+    await _get_db().commit()
+
+
+async def get_canonical_workspace_history(
+    namespace: WorkshopExecutionStateNamespace,
+    limit: int = 10,
+) -> list[dict]:
+    async with _get_db().execute(
+        "SELECT path, last_used_at FROM principal_workspace_history "
+        "WHERE principal_id = ? ORDER BY last_used_at DESC LIMIT ?",
+        (namespace.principal_id, limit),
+    ) as cursor:
+        return [dict(row) for row in await cursor.fetchall()]
+
+
+async def upsert_canonical_workspace_history(
+    namespace: WorkshopExecutionStateNamespace,
+    path: str,
+) -> None:
+    await _get_db().execute(
+        "INSERT INTO principal_workspace_history (principal_id, path, last_used_at) "
+        "VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(principal_id, path) "
+        "DO UPDATE SET last_used_at = excluded.last_used_at",
+        (namespace.principal_id, path),
+    )
+    await _get_db().commit()
+
+
+async def delete_canonical_workspace_history(
+    namespace: WorkshopExecutionStateNamespace,
+    path: str,
+) -> None:
+    await _get_db().execute(
+        "DELETE FROM principal_workspace_history WHERE principal_id = ? AND path = ?",
+        (namespace.principal_id, path),
     )
     await _get_db().commit()
 
@@ -1674,13 +1853,7 @@ async def get_workspace_history(chat_id: int, limit: int = 10) -> list[dict]:
     """
     namespace = _execution_state_namespace(chat_id)
     if namespace is not None:
-        async with _get_db().execute(
-            "SELECT path, last_used_at FROM principal_workspace_history "
-            "WHERE principal_id = ? ORDER BY last_used_at DESC LIMIT ?",
-            (namespace.principal_id, limit),
-        ) as cursor:
-            rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
+        return await get_canonical_workspace_history(namespace, limit)
 
     async with _get_db().execute(
         "SELECT path, last_used_at FROM workspace_history WHERE chat_id = ? ORDER BY last_used_at DESC LIMIT ?",
@@ -1694,10 +1867,8 @@ async def delete_workspace_history(path: str, chat_id: int) -> None:
     """Remove a workspace path from a user's history."""
     namespace = _execution_state_namespace(chat_id)
     if namespace is not None:
-        await _get_db().execute(
-            "DELETE FROM principal_workspace_history WHERE principal_id = ? AND path = ?",
-            (namespace.principal_id, path),
-        )
+        await delete_canonical_workspace_history(namespace, path)
+        return
     await _get_db().execute(
         "DELETE FROM workspace_history WHERE path = ? AND chat_id = ?",
         (path, chat_id),
@@ -1740,10 +1911,8 @@ async def add_allowed_workspace(chat_id: int, path: str) -> None:
     db = _get_db()
     namespace = _execution_state_namespace(chat_id)
     if namespace is not None:
-        await db.execute(
-            "INSERT OR IGNORE INTO principal_workspace_grants (principal_id, path) VALUES (?, ?)",
-            (namespace.principal_id, path),
-        )
+        await add_canonical_workspace_grant(namespace, path)
+        return
     await db.execute(
         "INSERT OR IGNORE INTO allowed_workspaces (chat_id, path) VALUES (?, ?)",
         (chat_id, path),
@@ -1760,20 +1929,15 @@ async def remove_allowed_workspace(chat_id: int, path: str) -> bool:
     so the caller can give appropriate feedback).
     """
     db = _get_db()
-    canonical_removed = 0
     namespace = _execution_state_namespace(chat_id)
     if namespace is not None:
-        canonical_cursor = await db.execute(
-            "DELETE FROM principal_workspace_grants WHERE principal_id = ? AND path = ?",
-            (namespace.principal_id, path),
-        )
-        canonical_removed = canonical_cursor.rowcount
+        return await remove_canonical_workspace_grant(namespace, path)
     cursor = await db.execute(
         "DELETE FROM allowed_workspaces WHERE chat_id = ? AND path = ?",
         (chat_id, path),
     )
     await db.commit()
-    return canonical_removed > 0 if namespace is not None else cursor.rowcount > 0
+    return cursor.rowcount > 0
 
 
 async def get_allowed_workspaces(chat_id: int) -> list[Path]:
@@ -1787,18 +1951,46 @@ async def get_allowed_workspaces(chat_id: int) -> list[Path]:
     db = _get_db()
     namespace = _execution_state_namespace(chat_id)
     if namespace is not None:
-        cursor = await db.execute(
-            "SELECT path FROM principal_workspace_grants WHERE principal_id = ? ORDER BY created_at, rowid",
-            (namespace.principal_id,),
-        )
-        rows = await cursor.fetchall()
-        return [Path(row[0]) for row in rows]
+        return await get_canonical_workspace_grants(namespace)
     cursor = await db.execute(
         "SELECT path FROM allowed_workspaces WHERE chat_id = ? ORDER BY rowid",
         (chat_id,),
     )
     rows = await cursor.fetchall()
     return [Path(row[0]) for row in rows]
+
+
+async def add_canonical_workspace_grant(
+    namespace: WorkshopExecutionStateNamespace,
+    path: str,
+) -> None:
+    await _get_db().execute(
+        "INSERT OR IGNORE INTO principal_workspace_grants (principal_id, path) VALUES (?, ?)",
+        (namespace.principal_id, path),
+    )
+    await _get_db().commit()
+
+
+async def remove_canonical_workspace_grant(
+    namespace: WorkshopExecutionStateNamespace,
+    path: str,
+) -> bool:
+    cursor = await _get_db().execute(
+        "DELETE FROM principal_workspace_grants WHERE principal_id = ? AND path = ?",
+        (namespace.principal_id, path),
+    )
+    await _get_db().commit()
+    return cursor.rowcount > 0
+
+
+async def get_canonical_workspace_grants(
+    namespace: WorkshopExecutionStateNamespace,
+) -> list[Path]:
+    cursor = await _get_db().execute(
+        "SELECT path FROM principal_workspace_grants WHERE principal_id = ? ORDER BY created_at, rowid",
+        (namespace.principal_id,),
+    )
+    return [Path(row[0]) for row in await cursor.fetchall()]
 
 
 async def resolve_workspace_access(

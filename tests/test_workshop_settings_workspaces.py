@@ -38,9 +38,6 @@ class _RuntimePool:
             timeout_seconds=120,
         )
 
-    def compatibility_runtime_config_id(self, _profile_id) -> int:
-        return 101
-
     def runtime_profile(self, _profile_id):
         return self.profile
 
@@ -143,38 +140,38 @@ async def test_model_change_uses_one_ordered_core_transaction(
     service, pool, authority, _, _ = _service(tmp_path)
     calls: list[tuple[object, ...]] = []
 
-    async def get_settings(_runtime_config_id: int):
+    async def get_settings(_namespace):
         return {"model": "gpt-5.6-sol", "timeout": "120"}
 
-    async def history(_runtime_config_id: int):
+    async def history(_namespace):
         return []
 
-    async def workspace_settings(_runtime_config_id: int, _workspace: str):
+    async def workspace_settings(_namespace, _workspace: str):
         return {}
 
     async def record(name: str, *args):
         calls.append((name, *args))
 
-    monkeypatch.setattr(sessions, "get_user_settings", get_settings)
-    monkeypatch.setattr(sessions, "get_workspace_history", history)
+    monkeypatch.setattr(sessions, "get_canonical_execution_settings", get_settings)
+    monkeypatch.setattr(sessions, "get_canonical_workspace_history", history)
     monkeypatch.setattr(
         sessions,
-        "get_workspace_config_settings",
+        "get_canonical_workspace_config_settings",
         workspace_settings,
     )
     monkeypatch.setattr(
         sessions,
-        "set_user_setting",
+        "set_canonical_execution_setting",
         lambda *args: record("set", *args),
     )
     monkeypatch.setattr(
         sessions,
-        "delete_workspace_config_setting",
+        "delete_canonical_workspace_config_setting",
         lambda *args: record("clear-workspace-model", *args),
     )
     monkeypatch.setattr(
         sessions,
-        "clear_session",
+        "clear_canonical_runtime_session",
         lambda *args: record("clear-session", *args),
     )
 
@@ -182,9 +179,9 @@ async def test_model_change_uses_one_ordered_core_transaction(
 
     assert pool.events[:2] == ["running-model:gpt-5.6-terra", "restart"]
     assert calls == [
-        ("set", 101, "model", "gpt-5.6-terra"),
-        ("clear-workspace-model", 101, str(pool.home), "model"),
-        ("clear-session", 101),
+        ("set", calls[0][1], "model", "gpt-5.6-terra"),
+        ("clear-workspace-model", calls[0][1], str(pool.home), "model"),
+        ("clear-session", calls[0][1]),
     ]
     assert snapshot.backend == "codex"
 
@@ -195,22 +192,22 @@ async def test_inspection_reports_workspace_precedence(
 ) -> None:
     service, pool, authority, _, _ = _service(tmp_path)
 
-    async def get_settings(_runtime_config_id: int):
+    async def get_settings(_namespace):
         return {"model": "gpt-5.6-sol", "timeout": "120"}
 
-    async def workspace_settings(_runtime_config_id: int, _workspace: str):
+    async def workspace_settings(_namespace, _workspace: str):
         return {"model": "gpt-5.6-terra", "timeout": "240"}
 
-    async def history(_runtime_config_id: int):
+    async def history(_namespace):
         return []
 
-    monkeypatch.setattr(sessions, "get_user_settings", get_settings)
+    monkeypatch.setattr(sessions, "get_canonical_execution_settings", get_settings)
     monkeypatch.setattr(
         sessions,
-        "get_workspace_config_settings",
+        "get_canonical_workspace_config_settings",
         workspace_settings,
     )
-    monkeypatch.setattr(sessions, "get_workspace_history", history)
+    monkeypatch.setattr(sessions, "get_canonical_workspace_history", history)
 
     snapshot = await service.inspect(authority)
 
@@ -233,11 +230,11 @@ async def test_model_persistence_failure_does_not_mutate_live_runtime(
     async def fail_persistence(*_args):
         raise OSError("database unavailable")
 
-    async def get_settings(_runtime_config_id: int):
+    async def get_settings(_namespace):
         return {}
 
-    monkeypatch.setattr(sessions, "set_user_setting", fail_persistence)
-    monkeypatch.setattr(sessions, "get_user_settings", get_settings)
+    monkeypatch.setattr(sessions, "set_canonical_execution_setting", fail_persistence)
+    monkeypatch.setattr(sessions, "get_canonical_execution_settings", get_settings)
 
     with pytest.raises(OSError, match="database unavailable"):
         await service.set_model(authority, "gpt-5.6-terra")
@@ -275,17 +272,17 @@ async def test_workspace_config_mutation_applies_core_precedence_without_exposin
     service, pool, authority, _, _ = _service(tmp_path)
     stored: dict[str, str] = {}
 
-    async def get_settings(_runtime_config_id: int):
+    async def get_settings(_namespace):
         return {}
 
     async def get_workspace_settings(
-        _runtime_config_id: int,
+        _namespace,
         _workspace: str,
     ):
         return dict(stored)
 
     async def set_workspace_setting(
-        _runtime_config_id: int,
+        _namespace,
         _workspace: str,
         field: str,
         value: str,
@@ -295,22 +292,22 @@ async def test_workspace_config_mutation_applies_core_precedence_without_exposin
     async def build_config(*_args):
         return None
 
-    async def clear_session(_runtime_config_id: int) -> None:
+    async def clear_session(_namespace) -> None:
         return None
 
-    monkeypatch.setattr(sessions, "get_user_settings", get_settings)
+    monkeypatch.setattr(sessions, "get_canonical_execution_settings", get_settings)
     monkeypatch.setattr(
         sessions,
-        "get_workspace_config_settings",
+        "get_canonical_workspace_config_settings",
         get_workspace_settings,
     )
     monkeypatch.setattr(
         sessions,
-        "set_workspace_config_setting",
+        "set_canonical_workspace_config_setting",
         set_workspace_setting,
     )
-    monkeypatch.setattr(sessions, "build_workspace_config", build_config)
-    monkeypatch.setattr(sessions, "clear_session", clear_session)
+    monkeypatch.setattr(sessions, "build_canonical_workspace_config", build_config)
+    monkeypatch.setattr(sessions, "clear_canonical_runtime_session", clear_session)
 
     model_snapshot = await service.set_workspace_config(
         authority,

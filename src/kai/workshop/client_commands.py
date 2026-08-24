@@ -159,11 +159,6 @@ class WorkshopClientCommandExecutor:
             if result.terminal is None:
                 return
             compatibility_state = self._compatibility_state.for_profile(context.runtime_profile_id)
-            if result.session_id and result.selection is not None:
-                await compatibility_state.save_session(
-                    result.session_id,
-                    result.selection.model,
-                )
             if result.disposition == CanonicalExecutionDisposition.COMPLETED and result.workspace is not None:
                 result_message_id = result.terminal.finalization.message.event.envelope.aggregate_id
                 if not isinstance(result_message_id, MessageId):

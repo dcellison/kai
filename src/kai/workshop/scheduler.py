@@ -663,8 +663,6 @@ class WorkshopCanonicalScheduler:
             success_transformer=transform,
         )
         compatibility = self._compatibility_state.for_profile(accepted.runtime_profile_id)
-        if result.session_id and result.selection is not None:
-            await compatibility.save_session(result.session_id, result.selection.model)
         if result.disposition == CanonicalExecutionDisposition.COMPLETED and result.terminal is not None:
             result_message_id = result.terminal.finalization.message.event.envelope.aggregate_id
             inbound_message_id = accepted.command.message.event.envelope.aggregate_id
