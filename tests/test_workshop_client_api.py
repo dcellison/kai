@@ -43,6 +43,19 @@ from kai.workshop.domain import (
 )
 from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.inbound import ClientInboundMessage, InboundMessage, record_inbound_message
+from kai.workshop.memory_queries import (
+    MemoryQueryAuthority,
+    MemoryRecordDetail,
+    MemoryRecordPage,
+    MemoryRecordSummary,
+    MemoryScopeSnapshot,
+    MemorySearchHit,
+    MemorySearchSnapshot,
+    MemorySourceContext,
+    MemoryStatsSnapshot,
+    WorkshopMemoryAccessDenied,
+    WorkshopMemoryNotFound,
+)
 from kai.workshop.run_lifecycle import (
     DurableRun,
     RunNotFoundError,
@@ -232,6 +245,100 @@ class _SettingsWorkspaces:
         )
 
 
+@dataclass
+class _MemoryQueries:
+    principal_id: PrincipalId
+
+    def authority_for_principal(self, principal_id):
+        if principal_id != self.principal_id:
+            raise WorkshopMemoryAccessDenied("denied")
+        return MemoryQueryAuthority(principal_id, None)
+
+    async def stats(self, _authority):
+        return MemoryStatsSnapshot(
+            total=1,
+            facts=1,
+            episodes=0,
+            by_source={"extracted": 1},
+            by_type={"fact": 1},
+            by_scope={"global": 1},
+        )
+
+    async def list_records(self, _authority, *, filters, limit, cursor):
+        assert filters.source == "extracted"
+        assert limit == 1
+        assert cursor is None
+        return MemoryRecordPage(
+            records=(
+                MemoryRecordSummary(
+                    memory_id="memory-1",
+                    kind="fact",
+                    source="extracted",
+                    memory_type="fact",
+                    preview="Remember this",
+                    tags=("preference",),
+                    speaker="user",
+                    confidence=1.0,
+                    created_at="2026-08-24T10:00:00Z",
+                    updated_at="2026-08-24T10:00:00Z",
+                    scope=MemoryScopeSnapshot(
+                        scope="global",
+                        project_id=None,
+                        scope_confidence=1.0,
+                        scope_source="operator",
+                        legacy_defaulted=False,
+                        invalid_defaulted=False,
+                        retrievable=True,
+                        exclusion_reason=None,
+                    ),
+                ),
+            ),
+            next_cursor="next-page",
+        )
+
+    async def detail(self, _authority, memory_id):
+        if memory_id != "memory-1":
+            raise WorkshopMemoryNotFound("missing")
+        record = (
+            await self.list_records(
+                _authority,
+                filters=SimpleNamespace(source="extracted"),
+                limit=1,
+                cursor=None,
+            )
+        ).records[0]
+        return MemoryRecordDetail(
+            record=record,
+            content="Remember this",
+            compact_recall='{"record_type":"memory"}',
+            confirmation_quote=None,
+            prompt_version="v1",
+            episode=None,
+        )
+
+    async def search(self, _authority, query, *, filters, limit):
+        assert query == "remember"
+        assert limit == 10
+        record = (
+            await self.list_records(
+                _authority,
+                filters=SimpleNamespace(source="extracted"),
+                limit=1,
+                cursor=None,
+            )
+        ).records[0]
+        return MemorySearchSnapshot(
+            hits=(MemorySearchHit(record, 0.9, 0.9, '{"record_type":"memory"}'),),
+            active_project_id=None,
+            reason="ok",
+        )
+
+    async def source_context(self, _authority, memory_id):
+        if memory_id != "memory-1":
+            raise WorkshopMemoryNotFound("missing")
+        return MemorySourceContext("unavailable", "legacy_source", None, None, None)
+
+
 async def _identity_for(store: WorkshopEventStore, subject: str) -> tuple[PrincipalId, ChannelId]:
     async with store.connection.execute(
         "SELECT e.principal_id, b.channel_id FROM external_identities e "
@@ -301,6 +408,7 @@ async def _open_client(
     run_previews: WorkshopRunPreviewRegistry | None = None,
     artifact_service: WorkshopArtifactService | None = None,
     settings_workspaces=None,
+    memory_queries=None,
 ) -> TestClient:
     app = web.Application()
     register_workshop_read_routes(
@@ -315,6 +423,7 @@ async def _open_client(
         run_previews=run_previews,
         artifact_service=artifact_service,
         settings_workspaces=settings_workspaces,
+        memory_queries=memory_queries,
     )
     client = TestClient(TestServer(app))
     await client.start_server()
@@ -382,6 +491,105 @@ async def _read_sse_event(response) -> dict[str, object]:
             event_id = value
         elif field == "data":
             data_lines.append(value)
+
+
+@pytest.mark.asyncio
+async def test_memory_api_uses_bearer_principal_and_stable_read_schema(
+    tmp_path: Path,
+) -> None:
+    store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+    client = await _open_client(
+        store,
+        _Authenticator({"alice-token": alice_id}),
+        memory_queries=_MemoryQueries(alice_id),
+    )
+    try:
+        unauthorized = await client.get("/v1/memory/stats")
+        assert unauthorized.status == 401
+
+        stats = await client.get(
+            "/v1/memory/stats",
+            headers={"Authorization": "Bearer alice-token"},
+        )
+        assert stats.status == 200
+        assert await stats.json() == {
+            "version": 1,
+            "stats": {
+                "total": 1,
+                "facts": 1,
+                "episodes": 0,
+                "by_source": {"extracted": 1},
+                "by_type": {"fact": 1},
+                "by_scope": {"global": 1},
+            },
+        }
+
+        page = await client.get(
+            "/v1/memory/records?source=extracted&limit=1",
+            headers={"Authorization": "Bearer alice-token"},
+        )
+        assert page.status == 200
+        payload = await page.json()
+        assert payload["version"] == 1
+        assert payload["next_cursor"] == "next-page"
+        assert payload["records"][0]["memory_id"] == "memory-1"
+        assert payload["records"][0]["scope"]["retrievable"] is True
+        assert "principal_id" not in payload
+
+        search = await client.get(
+            "/v1/memory/search?q=remember",
+            headers={"Authorization": "Bearer alice-token"},
+        )
+        assert search.status == 200
+        assert (await search.json())["hits"][0]["raw_score"] == 0.9
+
+        detail = await client.get(
+            "/v1/memory/records/memory-1",
+            headers={"Authorization": "Bearer alice-token"},
+        )
+        assert detail.status == 200
+        assert (await detail.json())["record"]["compact_recall"] == '{"record_type":"memory"}'
+
+        source = await client.get(
+            "/v1/memory/records/memory-1/source",
+            headers={"Authorization": "Bearer alice-token"},
+        )
+        assert source.status == 200
+        assert (await source.json())["source_context"]["reason"] == "legacy_source"
+
+        foreign = await client.get(
+            "/v1/memory/records/foreign-memory-id",
+            headers={"Authorization": "Bearer alice-token"},
+        )
+        assert foreign.status == 404
+        assert await foreign.json() == {"error": {"code": "memory_not_found", "message": "Memory not found"}}
+    finally:
+        await client.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_api_rejects_owner_parameters_and_duplicate_values(
+    tmp_path: Path,
+) -> None:
+    store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+    client = await _open_client(
+        store,
+        _Authenticator({"alice-token": alice_id}),
+        memory_queries=_MemoryQueries(alice_id),
+    )
+    headers = {"Authorization": "Bearer alice-token"}
+    try:
+        for path in (
+            "/v1/memory/records?principal_id=prn_" + "9" * 32,
+            "/v1/memory/records?source=extracted&source=episode",
+            "/v1/memory/search?q=hello&q=other",
+        ):
+            response = await client.get(path, headers=headers)
+            assert response.status == 400
+    finally:
+        await client.close()
+        await store.close()
 
 
 class TestWorkshopNavigationHTTPContract:

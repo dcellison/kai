@@ -5,10 +5,15 @@ import {
   cancelRun,
   loadArtifactBlob,
   loadEarlierTimeline,
+  loadMemoryDetail,
+  loadMemoryRecords,
+  loadMemorySource,
+  loadMemoryStats,
   loadNavigation,
   loadRun,
   loadTimeline,
   redeemEnrollment,
+  searchMemories,
   submitCommand,
   streamTimeline,
 } from "./api";
@@ -40,6 +45,31 @@ function run(status = "accepted"): Record<string, unknown> {
     status,
     terminal_at: null,
     terminal_code: null,
+  };
+}
+
+function memoryRecord(): Record<string, unknown> {
+  return {
+    memory_id: "memory-1",
+    kind: "fact",
+    source: "extracted",
+    memory_type: "fact",
+    preview: "Daniel prefers concise output.",
+    tags: ["preference"],
+    speaker: "user",
+    confidence: 1,
+    created_at: "2026-08-24T10:00:00Z",
+    updated_at: "2026-08-24T10:00:00Z",
+    scope: {
+      scope: "global",
+      project_id: null,
+      scope_confidence: 1,
+      scope_source: "operator",
+      legacy_defaulted: false,
+      invalid_defaulted: false,
+      retrievable: true,
+      exclusion_reason: null,
+    },
   };
 }
 
@@ -121,6 +151,102 @@ describe("Workshop client API", () => {
     const [path] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(path).toContain("cursor=earlier-page");
     expect(path).not.toContain("tail=");
+  });
+
+  it("parses the stable Workshop memory read contracts", async () => {
+    const responses = [
+      Response.json({
+        version: 1,
+        stats: {
+          total: 1,
+          facts: 1,
+          episodes: 0,
+          by_source: { extracted: 1 },
+          by_type: { fact: 1 },
+          by_scope: { global: 1 },
+        },
+      }),
+      Response.json({ version: 1, records: [memoryRecord()], next_cursor: null }),
+      Response.json({
+        version: 1,
+        active_project_id: "kai",
+        reason: "ok",
+        hits: [
+          {
+            record: memoryRecord(),
+            raw_score: 0.9,
+            adjusted_score: 0.8,
+            compact_recall: "{\"record_type\":\"memory\"}",
+          },
+        ],
+      }),
+      Response.json({
+        version: 1,
+        record: {
+          ...memoryRecord(),
+          content: "Daniel prefers concise output.",
+          compact_recall: "{\"record_type\":\"memory\"}",
+          confirmation_quote: null,
+          prompt_version: "v1",
+          episode: null,
+        },
+      }),
+      Response.json({
+        version: 1,
+        source_context: {
+          status: "unavailable",
+          reason: "legacy_source",
+          run_id: null,
+          source: null,
+          result: null,
+        },
+      }),
+    ];
+    const fetchMock = vi.fn().mockImplementation(() => responses.shift());
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(loadMemoryStats("session-secret")).resolves.toMatchObject({
+      total: 1,
+      facts: 1,
+      bySource: { extracted: 1 },
+    });
+    await expect(
+      loadMemoryRecords("session-secret", {
+        kind: "fact",
+        projectId: "kai",
+        limit: 25,
+      }),
+    ).resolves.toMatchObject({
+      nextCursor: null,
+      records: [{ memoryId: "memory-1", source: "extracted" }],
+    });
+    await expect(
+      searchMemories("session-secret", "concise output", {
+        scope: "project",
+        tag: "preference",
+      }),
+    ).resolves.toMatchObject({
+      activeProjectId: "kai",
+      hits: [{ record: { memoryId: "memory-1" }, adjustedScore: 0.8 }],
+    });
+    await expect(loadMemoryDetail("session-secret", "memory-1")).resolves.toMatchObject({
+      memoryId: "memory-1",
+      content: "Daniel prefers concise output.",
+      promptVersion: "v1",
+    });
+    await expect(loadMemorySource("session-secret", "memory-1")).resolves.toEqual({
+      status: "unavailable",
+      reason: "legacy_source",
+      runId: null,
+      source: null,
+      result: null,
+    });
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      "/v1/memory/records?kind=fact&project_id=kai&limit=25",
+    );
+    expect(fetchMock.mock.calls[2]?.[0]).toBe(
+      "/v1/memory/search?tag=preference&scope=project&q=concise+output",
+    );
   });
 
   it("rejects an earlier page whose snapshot bound does not match", async () => {

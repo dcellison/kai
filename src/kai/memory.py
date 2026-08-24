@@ -1458,6 +1458,18 @@ def _scoped_memory_admission_reason(
     return _ADMISSION_UNKNOWN_SCOPE
 
 
+def memory_scope_admission_reason(
+    resolved_scope: ResolvedMemoryScope,
+    *,
+    allowed_project_id: str | None,
+) -> str | None:
+    """Expose the production scope-admission decision to trusted services."""
+    return _scoped_memory_admission_reason(
+        resolved_scope,
+        allowed_project_id=allowed_project_id,
+    )
+
+
 def _estimate_tokens(text: str) -> int:
     """Rough token count: ~4 chars per token for English text."""
     return len(text) // 4
@@ -2086,6 +2098,34 @@ def _format_memory_result_line(
     if outcome_quality is not None:
         record["outcome_quality"] = outcome_quality
     return encode_untrusted_json_record(record)
+
+
+def format_memory_result_for_recall(
+    result: MemoryResult,
+    *,
+    resolved_scope: ResolvedMemoryScope | None = None,
+    speaker: str | None = None,
+    confidence: float | None = None,
+) -> str:
+    """Return the exact compact record used by live memory recall.
+
+    Workshop read APIs use this public boundary instead of duplicating the
+    prompt-facing representation. The returned string remains untrusted data;
+    callers must not treat it as instructions.
+    """
+    return _format_memory_result_line(
+        result,
+        resolved_scope=resolved_scope,
+        speaker=speaker,
+        confidence=confidence,
+    )
+
+
+def read_time_memory_speaker(
+    metadata: dict[str, Any] | None,
+) -> tuple[str, float]:
+    """Expose the shared read-time speaker/confidence interpretation."""
+    return _read_time_speaker(metadata)
 
 
 async def format_context(
