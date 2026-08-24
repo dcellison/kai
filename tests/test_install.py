@@ -5017,6 +5017,30 @@ class TestCmdStatus:
             "Workshop scheduler: NOT VERIFIED (database unavailable)"
         )
 
+    def test_status_reports_empty_core_schedule_tables(self, tmp_path):
+        db_path = tmp_path / "kai.db"
+        connection = sqlite3.connect(db_path)
+        connection.execute("CREATE TABLE channels (id TEXT PRIMARY KEY, kind TEXT NOT NULL)")
+        connection.execute("CREATE TABLE channel_memberships (channel_id TEXT, principal_id TEXT, role TEXT)")
+        connection.execute("CREATE TABLE agents (id TEXT PRIMARY KEY, workshop_id TEXT)")
+        connection.execute("ALTER TABLE channels ADD COLUMN workshop_id TEXT")
+        connection.execute(
+            "CREATE TABLE channel_agent_runtime_assignments (channel_id TEXT, agent_id TEXT, runtime_profile_id TEXT)"
+        )
+        connection.execute(
+            "CREATE TABLE workshop_scheduled_jobs ("
+            "id INTEGER PRIMARY KEY, principal_id TEXT, channel_id TEXT, agent_id TEXT, "
+            "runtime_profile_id TEXT, active INTEGER NOT NULL)"
+        )
+        connection.execute("CREATE TABLE workshop_schedule_firings (status TEXT NOT NULL)")
+        connection.commit()
+        connection.close()
+
+        assert _core_schedule_status(db_path) == (
+            "Workshop scheduler: active; active jobs=0, canonically owned=0, "
+            "unowned=0, pending firings=0, executing=0, failed=0"
+        )
+
     def test_status_reports_canonical_github_automation_queue(self, tmp_path):
         db_path = tmp_path / "kai.db"
         connection = sqlite3.connect(db_path)
