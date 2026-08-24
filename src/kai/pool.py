@@ -211,8 +211,8 @@ class SubprocessPool:
             from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
             from kai.workshop.runtime_profiles import runtime_profile_id_for_config_id
 
-            contexts = tuple(
-                WorkshopInternalAPIExecutionContext.for_unprotected_runtime(
+            contexts_by_runtime_config_id = {
+                runtime_config_id: WorkshopInternalAPIExecutionContext.for_unprotected_runtime(
                     runtime_config_id,
                     (
                         protected_profiles_by_config_id[runtime_config_id].profile_id
@@ -221,14 +221,17 @@ class SubprocessPool:
                     ),
                 )
                 for runtime_config_id in runtime_config_ids
-            )
+            }
+            contexts = tuple(contexts_by_runtime_config_id.values())
         else:
             contexts = internal_api_contexts.contexts
+            contexts_by_runtime_config_id = {
+                runtime_config_id: internal_api_contexts.for_runtime_config_id(runtime_config_id)
+                for runtime_config_id in runtime_config_ids
+            }
         self._internal_api_contexts = internal_api_contexts
         self._protected_internal_api_contexts = config.protected_install
-        self._contexts_by_runtime_config_id = {
-            context.compatibility_runtime_config_id(): context for context in contexts
-        }
+        self._contexts_by_runtime_config_id = contexts_by_runtime_config_id
         self._internal_api_auth = InternalAPIAuth.for_execution_contexts(
             contexts,
             allowed_services_by_profile=allowed_services_by_profile,

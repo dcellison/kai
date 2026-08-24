@@ -705,6 +705,8 @@ class CanonicalConversationProjection:
                 ),
             )
         elif envelope.event_type == WorkshopEventType.ARTIFACT_CREATED:
+            if envelope.event_version not in {1, 2}:
+                raise ValueError("Unsupported Workshop artifact event version")
             created_by = _required_text(payload, "created_by_principal_id")
             if envelope.actor_principal_id != created_by:
                 raise ValueError("Workshop artifact actor must match created_by_principal_id")
@@ -717,13 +719,14 @@ class CanonicalConversationProjection:
                 (message_id,),
             ) as cursor:
                 message_row = await cursor.fetchone()
+            expected_author_kind = "human" if envelope.event_version == 1 else "agent"
             if message_row is None or tuple(message_row) != (
                 envelope.workshop_id,
                 channel_id,
                 created_by,
-                "human",
+                expected_author_kind,
             ):
-                raise ValueError("Workshop artifact must belong to its human-authored message")
+                raise ValueError("Workshop artifact must belong to a message with the event-version author kind")
             kind = _required_text(payload, "kind")
             if kind not in {"photo", "document", "voice"}:
                 raise ValueError("Workshop artifact kind is unsupported")

@@ -227,7 +227,7 @@ def test_profile_without_telegram_user_receives_runtime_credential(tmp_path, mon
 
     assert instance.backend_name == "codex"
     assert principal is not None
-    assert principal.compatibility_runtime_config_id() == runtime_config_id
+    assert not hasattr(principal, "compatibility_runtime_config_id")
     assert principal.allowed_services == frozenset({"perplexity"})
     assert instance._api_context.services_info == services_info
     assert instance.workspace == tmp_path / "home" / str(runtime_config_id)
@@ -474,7 +474,7 @@ def test_negative_group_key_retains_legacy_compatibility_runtime(tmp_path, monke
     assert instance.backend_name == "codex"
     principal = pool.internal_api_auth.authenticate(instance._api_context.webhook_secret)
     assert principal is not None
-    assert principal.compatibility_runtime_config_id() == -100999
+    assert not hasattr(principal, "compatibility_runtime_config_id")
     assert principal.allowed_services == frozenset()
 
 

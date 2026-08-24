@@ -5109,6 +5109,10 @@ class TestCmdStatus:
             "CREATE TABLE channel_memberships (channel_id TEXT, principal_id TEXT, role TEXT);"
             "CREATE TABLE principals (id TEXT, kind TEXT);"
             "CREATE TABLE workshop_memberships (principal_id TEXT, workshop_id TEXT);"
+            "CREATE TABLE event_log (position INTEGER);"
+            "CREATE TABLE messages (id TEXT);"
+            "CREATE TABLE artifacts (id TEXT);"
+            "CREATE TABLE delivery_outbox (id TEXT);"
             "INSERT INTO channel_agent_runtime_assignments VALUES ('rtp_one','chn_one','agt_one');"
             "INSERT INTO channels VALUES ('chn_one','direct','wsp_one');"
             "INSERT INTO agents VALUES ('agt_one','wsp_one');"
@@ -5122,7 +5126,8 @@ class TestCmdStatus:
 
         assert _internal_api_authority_status(db_path) == (
             "Workshop internal API authority: active; profiles=1, "
-            "canonical contexts=1, missing=0; caller identity selectors=disabled"
+            "canonical contexts=1, missing=0; caller identity selectors=disabled, "
+            "compatibility adapter=retired, proactive publication=canonical/outbox"
         )
 
     def test_deployed_status_reports_named_secrets_without_values(self, tmp_path, monkeypatch):

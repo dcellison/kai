@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import re
 import secrets
@@ -234,17 +235,21 @@ class _ResolvedArtifactMessage:
     created_by_principal_id: PrincipalId
 
 
-async def _resolve_inbound_message(
+async def _resolve_artifact_message(
     store: WorkshopEventStore,
     message_id: MessageId,
+    *,
+    author_kind: str,
 ) -> _ResolvedArtifactMessage:
+    if author_kind not in {"human", "agent"}:
+        raise ValueError("author_kind must be human or agent")
     async with store.connection.execute(
         "SELECT c.workshop_id, m.channel_id, m.author_principal_id "
         "FROM messages m "
         "JOIN channels c ON c.id = m.channel_id "
-        "JOIN principals p ON p.id = m.author_principal_id AND p.kind = 'human' "
+        "JOIN principals p ON p.id = m.author_principal_id AND p.kind = ? "
         "WHERE m.id = ?",
-        (message_id,),
+        (author_kind, message_id),
     ) as cursor:
         rows = list(await cursor.fetchall())
     if len(rows) != 1:
@@ -443,7 +448,51 @@ async def record_inbound_artifact_in_transaction(
         raise RuntimeError("record_inbound_artifact_in_transaction requires an active transaction")
     if not isinstance(storage_root, Path):
         raise ValueError("storage_root must be a Path")
-    resolved_message = await _resolve_inbound_message(store, artifact.message_id)
+    return await _record_artifact_in_transaction(
+        store,
+        artifact,
+        storage_root=storage_root,
+        author_kind="human",
+        event_version=1,
+        metadata_source="artifact_shadow",
+    )
+
+
+async def record_published_artifact_in_transaction(
+    store: WorkshopEventStore,
+    artifact: InboundArtifact,
+    *,
+    storage_root: Path,
+) -> AppendResult:
+    """Append agent-authored artifact metadata inside a publication transaction."""
+    return await _record_artifact_in_transaction(
+        store,
+        artifact,
+        storage_root=storage_root,
+        author_kind="agent",
+        event_version=2,
+        metadata_source="internal_api",
+    )
+
+
+async def _record_artifact_in_transaction(
+    store: WorkshopEventStore,
+    artifact: InboundArtifact,
+    *,
+    storage_root: Path,
+    author_kind: str,
+    event_version: int,
+    metadata_source: str,
+) -> AppendResult:
+    if not store.connection.in_transaction:
+        raise RuntimeError("artifact recording requires an active transaction")
+    if not isinstance(storage_root, Path):
+        raise ValueError("storage_root must be a Path")
+    resolved_message = await _resolve_artifact_message(
+        store,
+        artifact.message_id,
+        author_kind=author_kind,
+    )
     resolved_path = _resolve_storage_path(artifact.storage_path, storage_root)
     byte_size, content_sha256 = _file_identity(resolved_path)
     token = _stable_source_token(artifact)
@@ -453,7 +502,7 @@ async def record_inbound_artifact_in_transaction(
         return EventEnvelope.create(
             event_id=EventId.derived(resolved_message.workshop_id, f"artifact-event:{token}"),
             event_type=WorkshopEventType.ARTIFACT_CREATED,
-            event_version=1,
+            event_version=event_version,
             workshop_id=resolved_message.workshop_id,
             aggregate_type="artifact",
             aggregate_id=ArtifactId.derived(resolved_message.workshop_id, f"artifact:{token}"),
@@ -473,7 +522,7 @@ async def record_inbound_artifact_in_transaction(
                 "source_transport": artifact.source_transport,
                 "source_unique_id": artifact.source_unique_id,
             },
-            metadata={"source": "artifact_shadow"},
+            metadata={"source": metadata_source},
         )
 
     envelope = create_envelope(str(resolved_path))
@@ -494,6 +543,55 @@ async def record_inbound_artifact_in_transaction(
         result = await store.append_in_transaction(envelope)
     await store.project_pending_in_transaction(CanonicalConversationProjection())
     return result
+
+
+async def artifact_for_delivery(
+    store: WorkshopEventStore,
+    message_id: MessageId,
+    *,
+    storage_root: Path,
+) -> tuple[StoredArtifact, str]:
+    """Resolve one agent-published artifact and its transport caption."""
+    async with store.connection.execute(
+        "SELECT a.id, a.message_id, a.channel_id, a.kind, a.media_type, "
+        "a.byte_size, a.content_sha256, a.original_filename, a.created_at, "
+        "a.storage_path, e.metadata_json "
+        "FROM artifacts a JOIN messages m ON m.id = a.message_id "
+        "JOIN principals p ON p.id = m.author_principal_id AND p.kind = 'agent' "
+        "JOIN event_log e ON e.position = m.created_event_position "
+        "WHERE a.message_id = ? ORDER BY a.created_event_position, a.id",
+        (message_id,),
+    ) as cursor:
+        rows = list(await cursor.fetchall())
+    if len(rows) != 1:
+        raise ArtifactMessageNotFoundError("Published artifact message does not resolve uniquely")
+    row = rows[0]
+    path = _resolve_storage_path(Path(str(row[9])), storage_root)
+    summary = ArtifactSummary(
+        artifact_id=ArtifactId(str(row[0])),
+        message_id=MessageId(str(row[1])),
+        channel_id=ChannelId(str(row[2])),
+        kind=str(row[3]),
+        media_type=str(row[4]),
+        byte_size=int(row[5]),
+        content_sha256=str(row[6]),
+        original_filename=str(row[7]) if row[7] is not None else None,
+        created_at=datetime.fromisoformat(str(row[8]).replace("Z", "+00:00")),
+    )
+    actual_size, actual_hash = _file_identity(path)
+    if actual_size != summary.byte_size or actual_hash != summary.content_sha256:
+        raise ArtifactStorageBoundaryError("Artifact content no longer matches canonical provenance")
+    metadata = json.loads(str(row[10]))
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("source") != "internal_api"
+        or metadata.get("publication_kind") != "file"
+    ):
+        raise ArtifactStorageBoundaryError("Published artifact provenance is invalid")
+    caption = metadata.get("caption", "")
+    if not isinstance(caption, str):
+        raise ArtifactStorageBoundaryError("Published artifact caption is invalid")
+    return StoredArtifact(summary=summary, storage_path=path), caption
 
 
 async def artifacts_for_messages(

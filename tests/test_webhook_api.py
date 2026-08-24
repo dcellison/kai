@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import hmac as hmac_mod
+import inspect
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -43,11 +44,11 @@ from kai.webhook import (
     _handle_service_call,
     _handle_telegram_update,
     _handle_update_job,
-    _resolve_internal_runtime_config_id,
     stop,
 )
-from kai.workshop.domain import AgentId, ChannelId, PrincipalId
+from kai.workshop.domain import AgentId, ChannelId, MessageId, PrincipalId
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
+from kai.workshop.proactive_publication import ProactivePublicationResult
 from kai.workshop.scheduler import WorkshopScheduledJobRegistrationError
 from kai.workshop.storage_namespaces import (
     WorkshopPrincipalStorageNamespace,
@@ -178,7 +179,6 @@ async def _call_memory_delete_all_as_authorized(request, *, chat_id: int = 123):
         channel_id=context.channel_id,
         agent_id=context.agent_id,
         runtime_profile_id=context.runtime_profile_id,
-        _runtime_config_id=context.compatibility_runtime_config_id(),
         scopes=frozenset({InternalAPIScope.MEMORY_DELETE_ALL}),
     )
     return await _handle_memory_delete_all.__wrapped__(request, principal)
@@ -216,6 +216,10 @@ def mock_request(tmp_path):
                 scheduler=_CanonicalSchedulerDouble(),
                 runtime_pool=SimpleNamespace(
                     get_effective_workspace=AsyncMock(return_value=tmp_path),
+                ),
+                proactive_publication=SimpleNamespace(
+                    publish_text=AsyncMock(return_value=ProactivePublicationResult(MessageId.new(), True, ())),
+                    publish_file=AsyncMock(return_value=ProactivePublicationResult(MessageId.new(), True, ())),
                 ),
             )
         ),
@@ -593,10 +597,14 @@ def send_file_request(tmp_path):
     request.app = {
         INTERNAL_API_AUTH_KEY: _make_internal_api_auth(),
         GENERIC_WEBHOOK_SECRET_KEY: "signing-secret",
-        TELEGRAM_BOT_KEY: AsyncMock(),
         CHAT_ID_KEY: 123,
         CORE_HOST_KEY: SimpleNamespace(
-            services=SimpleNamespace(runtime_pool=runtime_pool),
+            services=SimpleNamespace(
+                runtime_pool=runtime_pool,
+                proactive_publication=SimpleNamespace(
+                    publish_file=AsyncMock(return_value=ProactivePublicationResult(MessageId.new(), True, ()))
+                ),
+            ),
         ),
         WORKSHOP_PRINCIPAL_STORAGE_KEY: _principal_storage_registry(),
     }
@@ -616,8 +624,8 @@ def isolated_send_file_roots(tmp_path, send_file_request, monkeypatch):
 
 
 class TestSendFile:
-    async def test_send_image_as_photo(self, tmp_path, send_file_request):
-        """Image files are sent via send_photo (rendered inline in Telegram)."""
+    async def test_records_image_as_canonical_artifact(self, tmp_path, send_file_request):
+        """Image files enter canonical publication before adapter delivery."""
         img = tmp_path / "photo.jpg"
         img.write_bytes(b"\xff\xd8\xff\xe0fake-jpeg")
 
@@ -626,12 +634,15 @@ class TestSendFile:
 
         assert resp.status == 200
         body = json.loads(resp.body)
-        assert body["status"] == "sent"
+        assert body["status"] == "recorded"
+        assert body["delivery"] == "not_configured"
         assert body["file"] == "photo.jpg"
-        send_file_request.app[TELEGRAM_BOT_KEY].send_photo.assert_called_once()
+        publish = send_file_request.app[CORE_HOST_KEY].services.proactive_publication.publish_file
+        publish.assert_awaited_once()
+        assert publish.await_args.kwargs["path"] == img
 
-    async def test_send_document(self, tmp_path, send_file_request):
-        """Non-image files are sent via send_document (as attachments)."""
+    async def test_records_document_as_canonical_artifact(self, tmp_path, send_file_request):
+        """Documents use the same canonical publication service."""
         doc = tmp_path / "report.pdf"
         doc.write_bytes(b"%PDF-1.4 fake")
 
@@ -640,14 +651,14 @@ class TestSendFile:
 
         assert resp.status == 200
         body = json.loads(resp.body)
-        assert body["status"] == "sent"
-        send_file_request.app[TELEGRAM_BOT_KEY].send_document.assert_called_once()
+        assert body["status"] == "recorded"
+        send_file_request.app[CORE_HOST_KEY].services.proactive_publication.publish_file.assert_awaited_once()
         send_file_request.app[CORE_HOST_KEY].services.runtime_pool.get_effective_workspace.assert_awaited_once_with(
             profile_id(123)
         )
 
-    async def test_caption_forwarded_to_telegram(self, tmp_path, send_file_request):
-        """Optional caption is passed through to the Telegram send call."""
+    async def test_caption_forwarded_to_canonical_publication(self, tmp_path, send_file_request):
+        """Optional caption is passed to canonical publication."""
         f = tmp_path / "pic.png"
         f.write_bytes(b"fake-png")
 
@@ -655,14 +666,32 @@ class TestSendFile:
         resp = await _handle_send_file(send_file_request)
 
         assert resp.status == 200
-        call_kwargs = send_file_request.app[TELEGRAM_BOT_KEY].send_photo.call_args
-        assert call_kwargs[1].get("caption") == "Here you go"
+        publish = send_file_request.app[CORE_HOST_KEY].services.proactive_publication.publish_file
+        assert publish.await_args.kwargs["caption"] == "Here you go"
+
+    async def test_idempotency_key_is_forwarded_to_file_publication(self, tmp_path, send_file_request):
+        f = tmp_path / "report.txt"
+        f.write_text("report")
+        send_file_request.json = AsyncMock(return_value={"path": str(f), "idempotency_key": "caller-file-1"})
+
+        assert (await _handle_send_file(send_file_request)).status == 200
+
+        publish = send_file_request.app[CORE_HOST_KEY].services.proactive_publication.publish_file
+        assert publish.await_args.kwargs["request_id"] == "caller-file-1"
 
     async def test_missing_path_returns_400(self, send_file_request):
         """Returns 400 when the required path field is absent."""
         send_file_request.json = AsyncMock(return_value={})
         resp = await _handle_send_file(send_file_request)
         assert resp.status == 400
+
+    async def test_non_string_path_returns_400(self, send_file_request):
+        send_file_request.json = AsyncMock(return_value={"path": 42})
+
+        resp = await _handle_send_file(send_file_request)
+
+        assert resp.status == 400
+        assert "path must be a string" in resp.text
 
     async def test_file_not_found_returns_404(self, tmp_path, send_file_request):
         """Returns 404 when the file doesn't exist on disk."""
@@ -688,7 +717,7 @@ class TestSendFile:
         resp = await _handle_send_file(request)
 
         assert resp.status == 200
-        request.app[TELEGRAM_BOT_KEY].send_document.assert_awaited_once()
+        request.app[CORE_HOST_KEY].services.proactive_publication.publish_file.assert_awaited_once()
 
     async def test_file_scope_follows_authenticated_credential(self, isolated_send_file_roots):
         """A second credential receives its own scope, independent of app defaults."""
@@ -703,8 +732,8 @@ class TestSendFile:
         resp = await _handle_send_file(request)
 
         assert resp.status == 200
-        request.app[TELEGRAM_BOT_KEY].send_document.assert_awaited_once()
-        assert request.app[TELEGRAM_BOT_KEY].send_document.await_args.args[0] == 456
+        publish = request.app[CORE_HOST_KEY].services.proactive_publication.publish_file
+        assert publish.await_args.args[0].principal_id == _internal_api_context(456).principal_id
 
     async def test_authenticated_principal_cannot_send_sibling_uploaded_file(self, isolated_send_file_roots):
         """A FILES_SEND credential cannot select another principal's upload."""
@@ -718,7 +747,7 @@ class TestSendFile:
         resp = await _handle_send_file(request)
 
         assert resp.status == 403
-        request.app[TELEGRAM_BOT_KEY].send_document.assert_not_awaited()
+        request.app[CORE_HOST_KEY].services.proactive_publication.publish_file.assert_not_awaited()
 
     async def test_runtime_profile_storage_must_belong_to_authenticated_principal(
         self,
@@ -744,7 +773,7 @@ class TestSendFile:
         resp = await _handle_send_file(request)
 
         assert resp.status == 403
-        request.app[TELEGRAM_BOT_KEY].send_document.assert_not_awaited()
+        request.app[CORE_HOST_KEY].services.proactive_publication.publish_file.assert_not_awaited()
 
     async def test_authenticated_principal_cannot_send_legacy_shared_file(self, isolated_send_file_roots):
         """Ambiguous files in the legacy shared root are not exposed by the API."""
@@ -757,7 +786,7 @@ class TestSendFile:
         resp = await _handle_send_file(request)
 
         assert resp.status == 403
-        request.app[TELEGRAM_BOT_KEY].send_document.assert_not_awaited()
+        request.app[CORE_HOST_KEY].services.proactive_publication.publish_file.assert_not_awaited()
 
     async def test_symlink_cannot_escape_principal_upload_directory(self, isolated_send_file_roots):
         """Resolving a symlink into a sibling principal's directory is denied."""
@@ -774,7 +803,7 @@ class TestSendFile:
         resp = await _handle_send_file(request)
 
         assert resp.status == 403
-        request.app[TELEGRAM_BOT_KEY].send_document.assert_not_awaited()
+        request.app[CORE_HOST_KEY].services.proactive_publication.publish_file.assert_not_awaited()
 
     async def test_authenticated_principal_cannot_send_from_numeric_archive(
         self,
@@ -790,7 +819,7 @@ class TestSendFile:
         resp = await _handle_send_file(request)
 
         assert resp.status == 403
-        request.app[TELEGRAM_BOT_KEY].send_document.assert_not_awaited()
+        request.app[CORE_HOST_KEY].services.proactive_publication.publish_file.assert_not_awaited()
 
     async def test_invalid_json_returns_400(self, send_file_request):
         """Returns 400 for malformed JSON body."""
@@ -816,34 +845,50 @@ def send_message_request():
     request.app = {
         INTERNAL_API_AUTH_KEY: _make_internal_api_auth(),
         GENERIC_WEBHOOK_SECRET_KEY: "signing-secret",
-        TELEGRAM_BOT_KEY: AsyncMock(),
         CHAT_ID_KEY: 123,
+        CORE_HOST_KEY: SimpleNamespace(
+            services=SimpleNamespace(
+                proactive_publication=SimpleNamespace(
+                    publish_text=AsyncMock(return_value=ProactivePublicationResult(MessageId.new(), True, ()))
+                )
+            )
+        ),
     }
     request.headers = {"X-Webhook-Secret": "test-secret"}
     return request
 
 
 class TestSendMessage:
-    async def test_sends_short_message(self, send_message_request):
-        """Short messages are sent as a single Telegram message."""
+    async def test_records_short_message(self, send_message_request):
+        """Short messages are recorded through canonical publication."""
         send_message_request.json = AsyncMock(return_value={"text": "Hello!"})
         resp = await _handle_send_message(send_message_request)
 
         assert resp.status == 200
         body = json.loads(resp.body)
-        assert body["status"] == "sent"
-        send_message_request.app[TELEGRAM_BOT_KEY].send_message.assert_called_once_with(123, "Hello!")
+        assert body == {"status": "recorded", "delivery": "not_configured", "deliveries": 0}
+        publish = send_message_request.app[CORE_HOST_KEY].services.proactive_publication.publish_text
+        publish.assert_awaited_once()
+        assert publish.await_args.kwargs["body"] == "Hello!"
 
-    async def test_splits_long_message(self, send_message_request):
-        """Messages exceeding 4096 chars are split into multiple sends."""
-        # Create a message with two paragraphs, each over 2048 chars
+    async def test_records_long_message_once(self, send_message_request):
+        """Transport chunking occurs in adapters, after one canonical record."""
         long_text = ("A" * 2100) + "\n\n" + ("B" * 2100)
         send_message_request.json = AsyncMock(return_value={"text": long_text})
         resp = await _handle_send_message(send_message_request)
 
         assert resp.status == 200
-        bot = send_message_request.app[TELEGRAM_BOT_KEY]
-        assert bot.send_message.call_count == 2
+        publish = send_message_request.app[CORE_HOST_KEY].services.proactive_publication.publish_text
+        publish.assert_awaited_once()
+        assert publish.await_args.kwargs["body"] == long_text
+
+    async def test_idempotency_key_is_forwarded_to_text_publication(self, send_message_request):
+        send_message_request.json = AsyncMock(return_value={"text": "Hello", "idempotency_key": "caller-text-1"})
+
+        assert (await _handle_send_message(send_message_request)).status == 200
+
+        publish = send_message_request.app[CORE_HOST_KEY].services.proactive_publication.publish_text
+        assert publish.await_args.kwargs["request_id"] == "caller-text-1"
 
     async def test_missing_text_returns_400(self, send_message_request):
         """Returns 400 when the required text field is absent."""
@@ -856,6 +901,14 @@ class TestSendMessage:
         send_message_request.json = AsyncMock(return_value={"text": "   "})
         resp = await _handle_send_message(send_message_request)
         assert resp.status == 400
+
+    async def test_non_string_text_returns_400(self, send_message_request):
+        send_message_request.json = AsyncMock(return_value={"text": ["not", "text"]})
+
+        resp = await _handle_send_message(send_message_request)
+
+        assert resp.status == 400
+        assert "text must be a string" in resp.text
 
     async def test_invalid_json_returns_400(self, send_message_request):
         """Returns 400 for malformed JSON body."""
@@ -870,10 +923,12 @@ class TestSendMessage:
         resp = await _handle_send_message(send_message_request)
         assert resp.status == 401
 
-    async def test_telegram_error_returns_500(self, send_message_request):
-        """Returns 500 when the Telegram send fails."""
+    async def test_publication_error_returns_500(self, send_message_request):
+        """Returns 500 when canonical publication fails."""
         send_message_request.json = AsyncMock(return_value={"text": "Hello"})
-        send_message_request.app[TELEGRAM_BOT_KEY].send_message = AsyncMock(side_effect=RuntimeError("Boom"))
+        send_message_request.app[CORE_HOST_KEY].services.proactive_publication.publish_text.side_effect = RuntimeError(
+            "Boom"
+        )
         resp = await _handle_send_message(send_message_request)
         assert resp.status == 500
 
@@ -2023,40 +2078,20 @@ class TestServiceCall:
         mock_call.assert_not_called()
 
 
-# ── _resolve_internal_runtime_config_id ────────────────────────────────────────────────
-
-
-class TestResolveInternalRuntimeConfigId:
-    def _principal(self, chat_id: int = 123) -> InternalAPIPrincipal:
-        """Resolve a deterministic test principal from its credential."""
-        auth = _make_internal_api_auth()
-        credential = "test-secret" if chat_id == 123 else "other-secret"
-        principal = auth.authenticate(credential)
-        assert principal is not None
-        return principal
-
-    @pytest.mark.parametrize(
-        "selector",
-        [
-            "chat_id",
-            "user_id",
-            "principal_id",
-            "channel_id",
-            "agent_id",
-            "runtime_profile_id",
-            "runtime_config_id",
-        ],
-    )
-    def test_any_explicit_identity_selector_is_rejected(self, selector):
-        """Request data can never repeat or select execution identity."""
-        principal = self._principal()
-        with pytest.raises(ValueError, match=f"Identity selector {selector} is not accepted"):
-            _resolve_internal_runtime_config_id(principal, {selector: "anything"})
-
-    def test_omitted_chat_id_uses_principal(self):
-        """Omitted chat_id resolves to the authenticated principal."""
-        principal = self._principal()
-        assert _resolve_internal_runtime_config_id(principal, {}) == 123
+class TestInternalPublicationRetirementGuard:
+    def test_handlers_have_no_compatibility_identity_or_direct_telegram_send(self):
+        """Protected publication cannot regress to direct transport effects."""
+        source = "\n".join(
+            (
+                inspect.getsource(webhook_mod._handle_send_message),
+                inspect.getsource(webhook_mod._handle_send_file),
+            )
+        )
+        assert "compatibility_runtime_config_id" not in source
+        assert "TELEGRAM_BOT_KEY" not in source
+        assert ".send_message(" not in source
+        assert ".send_photo(" not in source
+        assert ".send_document(" not in source
 
 
 class TestGetJobsCredentialRouting:
@@ -2129,7 +2164,7 @@ class TestChatIdAuthorization:
         resp = await _handle_send_message(mock_request)
 
         assert resp.status == 401
-        mock_request.app[TELEGRAM_BOT_KEY].send_message.assert_not_called()
+        mock_request.app[CORE_HOST_KEY].services.proactive_publication.publish_text.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_notification_credential_cannot_manage_jobs(self, mock_request):
@@ -2203,21 +2238,6 @@ class TestChatIdAuthorization:
 
         resp = await _handle_send_file(mock_request)
         assert resp.status == 400
-
-    def test_resolve_internal_runtime_config_id_rejects_selector(self):
-        """The server-private resolver rejects request identity fields."""
-        principal = _make_internal_api_auth().authenticate("test-secret")
-        assert principal is not None
-
-        with pytest.raises(ValueError, match="Identity selector chat_id is not accepted"):
-            _resolve_internal_runtime_config_id(principal, {"chat_id": 999999})
-
-    def test_resolve_internal_runtime_config_id_rejects_matching_selector(self):
-        """Even a matching repeated identity is rejected."""
-        principal = _make_internal_api_auth().authenticate("test-secret")
-        assert principal is not None
-        with pytest.raises(ValueError, match="Identity selector chat_id is not accepted"):
-            _resolve_internal_runtime_config_id(principal, {"chat_id": 123})
 
 
 # ── Job ownership ──────────────────────────────────────────────────

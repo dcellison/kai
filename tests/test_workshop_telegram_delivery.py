@@ -12,6 +12,7 @@ import pytest
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, InvalidToken, NetworkError, RetryAfter, TelegramError, TimedOut
 
+from kai.workshop.artifacts import WorkshopArtifactService
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.delivery_fragments import (
     DeliveryFragment,
@@ -37,17 +38,26 @@ from kai.workshop.domain import (
     WorkshopId,
 )
 from kai.workshop.inbound import InboundMessage, record_inbound_message
+from kai.workshop.internal_api_contexts import WorkshopInternalAPIContextRegistry
 from kai.workshop.outbound import OutboundMessage, record_outbound_message
+from kai.workshop.proactive_publication import (
+    ProactivePublicationAuthority,
+    WorkshopProactivePublicationService,
+)
 from kai.workshop.projection import CanonicalConversationProjection
+from kai.workshop.storage_namespaces import WorkshopPrincipalStorageRegistry
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.telegram_delivery import (
     WORKSHOP_CLIENT_TEXT_MODE,
     TelegramDeliveryContractError,
     TelegramDeliveryFailure,
     TelegramWorkOutcome,
+    WorkshopTelegramArtifactDeliveryAdapter,
+    WorkshopTelegramArtifactDeliveryWorker,
     WorkshopTelegramDeliveryAdapter,
     WorkshopTelegramDeliveryWorker,
 )
+from tests.workshop_profiles import profile_id, profile_registry
 
 _NOW = datetime(2026, 8, 12, 9, 32, tzinfo=UTC)
 
@@ -229,6 +239,61 @@ async def _add_group_binding(
     return binding_id
 
 
+async def _open_with_proactive_artifact(
+    tmp_path: Path,
+    *,
+    filename: str,
+    content: bytes,
+    caption: str,
+):
+    store = await WorkshopEventStore.open(tmp_path / "kai.db")
+    profiles = profile_registry(101)
+    await bootstrap_default_workshop(
+        store,
+        (
+            BootstrapHuman(
+                "Authorized Human",
+                "admin",
+                "telegram",
+                "101",
+                "101",
+                profile_id(101),
+            ),
+        ),
+    )
+    context = (await WorkshopInternalAPIContextRegistry.from_store(store, profiles)).for_runtime_profile(
+        profile_id(101)
+    )
+    storage = await WorkshopPrincipalStorageRegistry.from_store(store, profiles)
+    service = WorkshopProactivePublicationService(
+        store,
+        WorkshopArtifactService(
+            store,
+            data_dir=tmp_path,
+            principal_storage=storage,
+            runtime_profiles=profiles,
+        ),
+        artifact_storage_root=tmp_path / "files",
+        delivery_transports=frozenset({"telegram"}),
+    )
+    source = tmp_path / filename
+    source.write_bytes(content)
+    publication = await service.publish_file(
+        ProactivePublicationAuthority(
+            context.principal_id,
+            context.channel_id,
+            context.agent_id,
+            context.runtime_profile_id,
+        ),
+        request_id=f"artifact-{filename}",
+        path=source.resolve(),
+        caption=caption,
+        occurred_at=_NOW,
+    )
+    assert len(publication.deliveries) == 1
+    return store, publication.deliveries[0].delivery.delivery_id
+
+
 class TestWorkshopTelegramDeliveryAdapter:
     @pytest.mark.parametrize(
         ("external_channel_id", "expected_target"),
@@ -280,6 +345,107 @@ class TestWorkshopTelegramDeliveryAdapter:
 
         bot.send_message.assert_not_awaited()
 
+
+class TestWorkshopTelegramArtifactDelivery:
+    async def test_document_worker_delivers_canonical_artifact_and_settles_outbox(
+        self,
+        tmp_path: Path,
+    ):
+        store, delivery_id = await _open_with_proactive_artifact(
+            tmp_path,
+            filename="report.txt",
+            content=b"canonical report",
+            caption="Read this report",
+        )
+        bot = AsyncMock()
+        bot.send_document.return_value = SimpleNamespace(message_id=7001)
+        worker = WorkshopTelegramArtifactDeliveryWorker(
+            WorkshopDeliveryOutbox(store),
+            WorkshopTelegramArtifactDeliveryAdapter(
+                store,
+                bot,
+                storage_root=tmp_path / "files",
+            ),
+            worker_id="telegram-artifact-worker",
+        )
+        try:
+            result = await worker.run_once()
+
+            assert result.outcome == TelegramWorkOutcome.SUCCEEDED
+            assert result.delivery_id == delivery_id
+            assert (await WorkshopDeliveryOutbox(store).state(delivery_id)).status == "succeeded"
+            assert bot.send_document.await_args.kwargs["chat_id"] == 101
+            assert bot.send_document.await_args.kwargs["caption"] == "Read this report"
+            assert bot.send_document.await_args.kwargs["filename"] == "report.txt"
+            bot.send_photo.assert_not_awaited()
+        finally:
+            await store.close()
+
+    async def test_photo_adapter_uses_photo_delivery(self, tmp_path: Path):
+        store, _ = await _open_with_proactive_artifact(
+            tmp_path,
+            filename="image.png",
+            content=b"not decoded by the transport",
+            caption="Image caption",
+        )
+        outbox = WorkshopDeliveryOutbox(store)
+        claim = await outbox.claim_next(
+            "photo-worker",
+            purposes=("notification",),
+            execution_contracts=(SEND_FRAGMENTS_CONTRACT,),
+            transport="telegram",
+            modes=("artifact",),
+        )
+        assert claim is not None
+        bot = AsyncMock()
+        bot.send_photo.return_value = SimpleNamespace(message_id=7002)
+        try:
+            assert (
+                await WorkshopTelegramArtifactDeliveryAdapter(
+                    store,
+                    bot,
+                    storage_root=tmp_path / "files",
+                ).deliver(claim)
+                == 7002
+            )
+            assert bot.send_photo.await_args.kwargs["chat_id"] == 101
+            assert bot.send_photo.await_args.kwargs["caption"] == "Image caption"
+            bot.send_document.assert_not_awaited()
+        finally:
+            await store.close()
+
+    async def test_ambiguous_artifact_timeout_is_not_automatically_resent(self, tmp_path: Path):
+        store, delivery_id = await _open_with_proactive_artifact(
+            tmp_path,
+            filename="report.txt",
+            content=b"canonical report",
+            caption="Read this report",
+        )
+        bot = AsyncMock()
+        bot.send_document.side_effect = TimedOut()
+        worker = WorkshopTelegramArtifactDeliveryWorker(
+            WorkshopDeliveryOutbox(store),
+            WorkshopTelegramArtifactDeliveryAdapter(
+                store,
+                bot,
+                storage_root=tmp_path / "files",
+            ),
+            worker_id="telegram-artifact-worker",
+        )
+        try:
+            result = await worker.run_once()
+
+            assert result.outcome == TelegramWorkOutcome.FAILED
+            assert result.error_code == "telegram_timeout_uncertain"
+            state = await WorkshopDeliveryOutbox(store).state(delivery_id)
+            assert state.status == "failed"
+            assert await worker.run_once() == type(result)(outcome=TelegramWorkOutcome.IDLE)
+            assert bot.send_document.await_count == 1
+        finally:
+            await store.close()
+
+
+class TestWorkshopTelegramDeliveryAdapterContinued:
     async def test_markdown_rejection_retries_once_as_plain_text(self):
         bot = AsyncMock()
         bot.send_message.side_effect = [BadRequest("can't parse entities"), SimpleNamespace(message_id=1002)]

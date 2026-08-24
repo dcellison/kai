@@ -8,6 +8,7 @@ import warnings
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import StrEnum
+from pathlib import Path
 from typing import Protocol
 
 from telegram.constants import ParseMode
@@ -25,6 +26,11 @@ from telegram.error import (
 from telegram.warnings import PTBDeprecationWarning
 
 from kai.telegram_utils import chunk_text
+from kai.workshop.artifacts import (
+    ArtifactMessageNotFoundError,
+    ArtifactStorageBoundaryError,
+    artifact_for_delivery,
+)
 from kai.workshop.delivery_fragments import (
     EDIT_OPERATION,
     SEND_OPERATION,
@@ -33,6 +39,7 @@ from kai.workshop.delivery_fragments import (
 )
 from kai.workshop.delivery_outbox import (
     CONVERSATION_REPLY_PURPOSE,
+    NOTIFICATION_PURPOSE,
     SEND_FRAGMENTS_CONTRACT,
     STREAMING_FINALIZATION_CONTRACT,
     DeliveryClaim,
@@ -42,6 +49,8 @@ from kai.workshop.delivery_outbox import (
     WorkshopDeliveryOutbox,
 )
 from kai.workshop.domain import DeliveryAuthorityEpochId, DeliveryId
+from kai.workshop.proactive_publication import PROACTIVE_ARTIFACT_MODE
+from kai.workshop.store import WorkshopEventStore
 
 _NUMERIC_CHAT_ID_PATTERN = re.compile(r"^-?[1-9][0-9]{0,19}$")
 _USERNAME_CHAT_ID_PATTERN = re.compile(r"^@[A-Za-z][A-Za-z0-9_]{4,31}$")
@@ -75,6 +84,27 @@ class TelegramTextBot(Protocol):
         message_id: int,
         text: str,
         parse_mode: str | None = None,
+    ) -> TelegramSentMessage: ...
+
+
+class TelegramArtifactBot(Protocol):
+    """The Bot API surface needed by durable artifact delivery."""
+
+    async def send_photo(
+        self,
+        *,
+        chat_id: int | str,
+        photo: object,
+        caption: str | None = None,
+    ) -> TelegramSentMessage: ...
+
+    async def send_document(
+        self,
+        *,
+        chat_id: int | str,
+        document: object,
+        caption: str | None = None,
+        filename: str | None = None,
     ) -> TelegramSentMessage: ...
 
 
@@ -267,6 +297,159 @@ class WorkshopTelegramDeliveryAdapter:
                 ambiguous=True,
             )
         return message_id
+
+
+class WorkshopTelegramArtifactDeliveryAdapter:
+    """Deliver one canonically recorded agent artifact through Telegram."""
+
+    def __init__(
+        self,
+        store: WorkshopEventStore,
+        bot: TelegramArtifactBot,
+        *,
+        storage_root: Path,
+    ) -> None:
+        self._store = store
+        self._bot = bot
+        self._storage_root = storage_root.resolve()
+
+    async def deliver(self, claim: DeliveryClaim) -> int:
+        if not isinstance(claim, DeliveryClaim):
+            raise ValueError("claim must be a DeliveryClaim")
+        if claim.transport != "telegram":
+            raise TelegramDeliveryContractError("telegram_transport_mismatch")
+        if claim.mode != PROACTIVE_ARTIFACT_MODE:
+            raise TelegramDeliveryContractError("telegram_mode_unsupported")
+        try:
+            artifact, caption = await artifact_for_delivery(
+                self._store,
+                claim.message_id,
+                storage_root=self._storage_root,
+            )
+        except (ArtifactMessageNotFoundError, ArtifactStorageBoundaryError) as exc:
+            raise TelegramDeliveryContractError("telegram_artifact_unavailable") from exc
+
+        target = _telegram_target(claim.external_channel_id)
+        try:
+            with artifact.storage_path.open("rb") as source:
+                if artifact.summary.kind == "photo":
+                    sent = await self._bot.send_photo(
+                        chat_id=target,
+                        photo=source,
+                        caption=caption or None,
+                    )
+                else:
+                    sent = await self._bot.send_document(
+                        chat_id=target,
+                        document=source,
+                        caption=caption or None,
+                        filename=artifact.summary.original_filename,
+                    )
+        except TelegramError as error:
+            raise _classify_telegram_error(error) from error
+        except OSError as exc:
+            raise TelegramDeliveryContractError("telegram_artifact_unavailable") from exc
+        message_id = getattr(sent, "message_id", None)
+        if not isinstance(message_id, int) or isinstance(message_id, bool) or message_id <= 0:
+            raise TelegramDeliveryFailure(
+                retryable=False,
+                error_code="telegram_response_invalid",
+                ambiguous=True,
+            )
+        return message_id
+
+
+class WorkshopTelegramArtifactDeliveryWorker:
+    """Claim and settle the durable proactive-artifact Telegram lane."""
+
+    def __init__(
+        self,
+        outbox: WorkshopDeliveryOutbox,
+        adapter: WorkshopTelegramArtifactDeliveryAdapter,
+        *,
+        worker_id: str,
+        lease_duration: timedelta = timedelta(seconds=30),
+        poll_interval: float = 1.0,
+    ) -> None:
+        if poll_interval <= 0 or poll_interval > 60:
+            raise ValueError("poll_interval must be positive and at most 60 seconds")
+        self._outbox = outbox
+        self._adapter = adapter
+        self._worker_id = worker_id
+        self._lease_duration = lease_duration
+        self._poll_interval = poll_interval
+
+    async def run_once(self) -> TelegramWorkResult:
+        claim = await self._outbox.claim_next(
+            self._worker_id,
+            purposes=(NOTIFICATION_PURPOSE,),
+            execution_contracts=(SEND_FRAGMENTS_CONTRACT,),
+            lease_duration=self._lease_duration,
+            transport="telegram",
+            modes=(PROACTIVE_ARTIFACT_MODE,),
+        )
+        return await self._run_claim(claim)
+
+    async def run_delivery(self, delivery_id: DeliveryId) -> TelegramWorkResult:
+        if not isinstance(delivery_id, DeliveryId):
+            raise ValueError("delivery_id must be a DeliveryId")
+        claim = await self._outbox.claim_next(
+            self._worker_id,
+            purposes=(NOTIFICATION_PURPOSE,),
+            execution_contracts=(SEND_FRAGMENTS_CONTRACT,),
+            lease_duration=self._lease_duration,
+            transport="telegram",
+            modes=(PROACTIVE_ARTIFACT_MODE,),
+            delivery_id=delivery_id,
+        )
+        return await self._run_claim(claim)
+
+    async def recover_expired_leases(self) -> DeliveryRecoveryResult:
+        return await self._outbox.recover_expired_leases(
+            purposes=(NOTIFICATION_PURPOSE,),
+            execution_contracts=(SEND_FRAGMENTS_CONTRACT,),
+        )
+
+    async def _run_claim(self, claim: DeliveryClaim | None) -> TelegramWorkResult:
+        if claim is None:
+            return TelegramWorkResult(outcome=TelegramWorkOutcome.IDLE)
+        try:
+            await self._adapter.deliver(claim)
+        except TelegramDeliveryFailure as failure:
+            state = await self._outbox.mark_failed(
+                claim,
+                retryable=failure.retryable and not failure.ambiguous,
+                error_code=failure.error_code,
+                minimum_retry_delay=failure.minimum_retry_delay,
+            )
+            return TelegramWorkResult(
+                outcome=(
+                    TelegramWorkOutcome.RETRY_SCHEDULED if state.status == "retry_wait" else TelegramWorkOutcome.FAILED
+                ),
+                delivery_id=claim.delivery_id,
+                attempt_number=claim.attempt_number,
+                error_code=failure.error_code,
+            )
+        state = await self._outbox.mark_succeeded(claim)
+        if state.status != "succeeded":
+            raise RuntimeError("Successful Telegram artifact delivery did not reach succeeded state")
+        return TelegramWorkResult(
+            outcome=TelegramWorkOutcome.SUCCEEDED,
+            delivery_id=claim.delivery_id,
+            attempt_number=claim.attempt_number,
+        )
+
+    async def run(self, stop_event: asyncio.Event) -> None:
+        if not isinstance(stop_event, asyncio.Event):
+            raise ValueError("stop_event must be an asyncio.Event")
+        while not stop_event.is_set():
+            result = await self.run_once()
+            if result.outcome != TelegramWorkOutcome.IDLE:
+                continue
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=self._poll_interval)
+            except TimeoutError:
+                pass
 
 
 class WorkshopTelegramStreamingFinalizationAdapter:

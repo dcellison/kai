@@ -9010,14 +9010,29 @@ def _internal_api_authority_status(db_path: Path) -> str:
                     ")"
                 ).fetchone()[0]
             )
+            publication_tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "AND name IN ('event_log', 'messages', 'artifacts', 'delivery_outbox')"
+                ).fetchall()
+            }
         finally:
             connection.close()
     except sqlite3.Error as exc:
         return f"{prefix} NOT VERIFIED ({exc})"
-    status = "active" if profiles > 0 and profiles == contexts else "INCOMPLETE"
+    publication_ready = publication_tables == {
+        "event_log",
+        "messages",
+        "artifacts",
+        "delivery_outbox",
+    }
+    status = "active" if profiles > 0 and profiles == contexts and publication_ready else "INCOMPLETE"
     return (
         f"{prefix} {status}; profiles={profiles}, canonical contexts={contexts}, "
-        f"missing={profiles - contexts}; caller identity selectors=disabled"
+        f"missing={profiles - contexts}; caller identity selectors=disabled, "
+        f"compatibility adapter=retired, proactive publication="
+        f"{'canonical/outbox' if publication_ready else 'unavailable'}"
     )
 
 

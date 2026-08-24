@@ -162,7 +162,10 @@ curl -s -X POST http://localhost:8080/api/send-message \
   -d '{"text": "Your build finished successfully."}'
 ```
 
-Fields: `text` (string, required).
+Fields: `text` (string, required), `idempotency_key` (string, optional but
+recommended for retries). A successful response means the message was recorded
+canonically; `delivery` reports `queued`, `delivered`, or `not_configured` for
+optional client adapters.
 
 ## Sending Files
 
@@ -177,7 +180,10 @@ curl -s -X POST http://localhost:8080/api/send-file \
 
 - `path` - required; absolute path within the current workspace
 - `caption` - string; optional
-- Images (png, jpg, webp) are sent as photos (rendered inline). Everything else is sent as a document attachment.
+- `idempotency_key` - string; optional but recommended for retries
+- The artifact appears in Workshop first. Configured adapters deliver it from
+  the durable outbox; Telegram renders images as photos and other files as
+  document attachments.
 
 ## Memory System
 
