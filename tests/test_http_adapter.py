@@ -20,15 +20,14 @@ def http_dependencies(monkeypatch):
         *,
         core_host,
         core_services,
-        github_notifications,
+        integration_notifications,
         workshop_enabled,
     ) -> None:
         assert application in {None, "telegram-application"}
         assert config.workshop_lan_host in {None, "10.0.0.36"}
         assert core_host == "core-host"
-        assert core_services == "core-services"
-        expected_notifications = "notification-delivery" if application is not None else None
-        assert github_notifications == expected_notifications
+        assert core_services.integration_notifications == "integration-notifications"
+        assert integration_notifications == "integration-notifications"
         assert workshop_enabled is config.workshop_enabled
         events.append("http:start")
         state["loopback"] = True
@@ -66,14 +65,12 @@ def _adapter(
     )
     telegram = None
     if telegram_enabled:
-        telegram = SimpleNamespace(
-            application="telegram-application",
-            notification_delivery="notification-delivery",
-        )
+        telegram = SimpleNamespace(application="telegram-application")
+    core_services = SimpleNamespace(integration_notifications="integration-notifications")
     return HttpAdapter(  # type: ignore[arg-type]
         config,
         "core-host",  # type: ignore[arg-type]
-        "core-services",  # type: ignore[arg-type]
+        core_services,  # type: ignore[arg-type]
         telegram,  # type: ignore[arg-type]
     )
 

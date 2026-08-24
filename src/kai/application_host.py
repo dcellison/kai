@@ -20,6 +20,7 @@ from kai.workshop.delivery_authority import (
     WorkshopConversationDeliveryAuthority,
 )
 from kai.workshop.execution_state import WorkshopExecutionStateRegistry
+from kai.workshop.integration_notifications import WorkshopIntegrationNotificationService
 from kai.workshop.memory_queries import WorkshopMemoryQueryService
 from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
@@ -110,6 +111,7 @@ class KaiCoreServices:
     artifacts: WorkshopArtifactService
     settings_workspaces: WorkshopSettingsWorkspaceService
     memory_queries: WorkshopMemoryQueryService
+    integration_notifications: WorkshopIntegrationNotificationService
 
 
 class KaiApplicationHost:
@@ -174,6 +176,7 @@ class KaiApplicationHost:
         client_store: WorkshopEventStore | None = None
         client_commands: WorkshopClientCommandExecutor | None = None
         scheduler: WorkshopCanonicalScheduler | None = None
+        integration_notifications: WorkshopIntegrationNotificationService | None = None
         try:
             subprocess_pool = SubprocessPool(
                 config=self._config,
@@ -227,6 +230,9 @@ class KaiApplicationHost:
                 runtime_pool,
                 self._execution_state,
             )
+            integration_notifications = await WorkshopIntegrationNotificationService.open(
+                Path(self._config.session_db_path)
+            )
 
             self._services = KaiCoreServices(
                 subprocess_pool=subprocess_pool,
@@ -243,6 +249,7 @@ class KaiApplicationHost:
                 artifacts=artifacts,
                 settings_workspaces=settings_workspaces,
                 memory_queries=memory_queries,
+                integration_notifications=integration_notifications,
             )
             self._state = KaiApplicationState.READY
             return self._services
@@ -250,6 +257,8 @@ class KaiApplicationHost:
             self._state = KaiApplicationState.FAILED
             if scheduler is not None:
                 await scheduler.stop()
+            if integration_notifications is not None:
+                await integration_notifications.close()
             if client_commands is not None:
                 await client_commands.stop()
             if client_store is not None:
@@ -306,6 +315,7 @@ class KaiApplicationHost:
         self._adapters.clear()
         for operation in (
             services.scheduler.stop,
+            services.integration_notifications.close,
             services.client_commands.stop,
             services.client_store.close,
             services.private_text_execution.stop,

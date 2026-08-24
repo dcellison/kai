@@ -54,9 +54,10 @@ class HttpAdapterReadiness:
 class HttpAdapter:
     """Own HTTP listener startup, readiness, supervision, and shutdown.
 
-    Telegram-owned routes and dependencies are installed only when a started
-    Telegram adapter is supplied.  The loopback host and Workshop client can
-    therefore run without constructing any Telegram application.
+    Telegram ingress and compatibility APIs are installed only when a started
+    Telegram adapter is supplied. Authenticated integration ingress and the
+    Workshop client remain core-owned and can run without constructing any
+    Telegram application.
     """
 
     def __init__(
@@ -92,7 +93,7 @@ class HttpAdapter:
                 self._config,
                 core_host=self._core_host,
                 core_services=self._core_services,
-                github_notifications=(self._telegram_adapter.notification_delivery if self._telegram_adapter else None),
+                integration_notifications=self._core_services.integration_notifications,
                 workshop_enabled=self._config.workshop_enabled,
             )
         except BaseException:

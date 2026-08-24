@@ -18,11 +18,6 @@ from kai.workshop.delivery_outbox import (
     WorkshopDeliveryOutbox,
 )
 from kai.workshop.domain import DeliveryAuthorityEpochId
-from kai.workshop.github_notifications import (
-    GitHubNotification,
-    GitHubNotificationRecord,
-    WorkshopGitHubNotificationRecorder,
-)
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.telegram_delivery import (
     WORKSHOP_CLIENT_TEXT_MODE,
@@ -329,18 +324,14 @@ class WorkshopTelegramConversationDeliveryService:
 
 
 class WorkshopTelegramNotificationService:
-    """Own canonical GitHub recording and its dedicated Telegram worker."""
+    """Own the Telegram worker for canonical notification deliveries."""
 
     def __init__(
         self,
-        recorder_store: WorkshopEventStore,
         worker_store: WorkshopEventStore,
-        recorder: WorkshopGitHubNotificationRecorder,
         runtime: WorkshopTelegramDeliveryRuntime,
     ) -> None:
-        self._recorder_store = recorder_store
         self._worker_store = worker_store
-        self._recorder = recorder
         self._runtime = runtime
         self._closed = False
 
@@ -352,7 +343,6 @@ class WorkshopTelegramNotificationService:
         *,
         worker_id: str = "kai-telegram-notification",
     ) -> WorkshopTelegramNotificationService:
-        recorder_store = await WorkshopEventStore.open(database_path)
         worker_store: WorkshopEventStore | None = None
         runtime: WorkshopTelegramDeliveryRuntime | None = None
         try:
@@ -375,28 +365,14 @@ class WorkshopTelegramNotificationService:
                     pass
             if worker_store is not None:
                 await worker_store.close()
-            await recorder_store.close()
             raise
         assert worker_store is not None
         assert runtime is not None
-        return cls(
-            recorder_store,
-            worker_store,
-            WorkshopGitHubNotificationRecorder(recorder_store),
-            runtime,
-        )
+        return cls(worker_store, runtime)
 
     @property
     def ready(self) -> bool:
         return not self._closed and self._runtime.ready
-
-    async def record(
-        self,
-        notification: GitHubNotification,
-    ) -> GitHubNotificationRecord | None:
-        if self._closed:
-            raise RuntimeError("Workshop Telegram notification service is closed")
-        return await self._recorder.record(notification)
 
     async def wait(self) -> None:
         await self._runtime.wait()
@@ -409,4 +385,3 @@ class WorkshopTelegramNotificationService:
         finally:
             self._closed = True
             await self._worker_store.close()
-            await self._recorder_store.close()
