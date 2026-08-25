@@ -672,47 +672,6 @@ def _start() -> None:
             # (used when memory is disabled) without backups.
             memory_backup_task = asyncio.create_task(_memory_backup_loop())
 
-            # Check for interrupted responses from a crash/restart.
-            # Phase 2: check all files in the .responding directory (per-user
-            # flags) instead of the old single .responding_to file.
-            responding_dir = DATA_DIR / ".responding"
-            if telegram_adapter is not None:
-                try:
-                    flags = list(responding_dir.iterdir()) if responding_dir.is_dir() else []
-                except OSError:
-                    flags = []
-                for flag in flags:
-                    # Always unlink the flag first: prevents double-notify on
-                    # restart if send fails, and cleans up malformed files.
-                    flag.unlink(missing_ok=True)
-                    try:
-                        interrupted_chat_id = int(flag.name)
-                        await telegram_adapter.bot.send_message(
-                            interrupted_chat_id,
-                            "Sorry, my previous response was interrupted. Please resend your last message.",
-                        )
-                        logging.info("Notified chat %d of interrupted response", interrupted_chat_id)
-                    except Exception:
-                        logging.exception("Failed to process interrupted-response flag: %s", flag.name)
-
-            # Clean up old single-file flag if it exists (one-time migration).
-            # Unlink unconditionally (same pattern as the new-style flags)
-            # so malformed content doesn't persist across restarts.
-            old_flag = DATA_DIR / ".responding_to"
-            if old_flag.exists() and telegram_adapter is not None:
-                try:
-                    old_content = old_flag.read_text().strip()
-                    old_flag.unlink(missing_ok=True)
-                    old_chat_id = int(old_content)
-                    await telegram_adapter.bot.send_message(
-                        old_chat_id,
-                        "Sorry, my previous response was interrupted. Please resend your last message.",
-                    )
-                    logging.info("Notified chat %d of interrupted response (old flag)", old_chat_id)
-                except Exception:
-                    logging.exception("Failed to process old .responding_to flag")
-                    old_flag.unlink(missing_ok=True)
-
             logging.info("Kai is running. Press Ctrl+C to stop.")
             # launchd stops the service with SIGTERM (the launcher
             # script forwards it to this process group). Python's

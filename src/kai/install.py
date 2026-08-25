@@ -85,6 +85,7 @@ from kai.workshop.diagnostics import (
     workshop_operational_state_status,
     workshop_runtime_session_status,
     workshop_transcript_authority_status,
+    workshop_transition_tooling_status,
 )
 from kai.workshop.domain import WorkshopId
 from kai.workshop.runtime_profiles import (
@@ -8614,6 +8615,7 @@ def _cmd_status() -> None:
     print(workshop_canonical_message_integrity_status(Path(data_dir) / "kai.db"))
     print(workshop_transcript_authority_status(Path(data_dir) / "kai.db"))
     print(workshop_legacy_jsonl_archive_status(Path(data_dir) / "kai.db", Path(data_dir) / "history"))
+    print(workshop_transition_tooling_status())
 
     # Check workspace path traversal if install.conf has a service user
     if INSTALL_CONF.exists():

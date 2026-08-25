@@ -975,35 +975,6 @@ def _read_legacy_keys(
     return keys, malformed, unreadable
 
 
-def _compare_legacy_suffix(
-    canonical_keys: list[tuple[str, str]],
-    legacy_keys: list[tuple[str, str]],
-) -> tuple[int, int, int]:
-    """Align the canonical sequence after an allowed pre-shadow legacy prefix."""
-    if not canonical_keys:
-        return 0, 0, 0
-
-    suffix_matches = _longest_common_subsequence_suffix_lengths(
-        canonical_keys[1:],
-        legacy_keys,
-    )
-    candidates: list[tuple[int, int, int, int]] = []
-    for start, legacy_key in enumerate(legacy_keys):
-        if legacy_key != canonical_keys[0]:
-            continue
-        matched = 1 + suffix_matches[start + 1]
-        missing = len(canonical_keys) - matched
-        unmatched = len(legacy_keys) - start - matched
-        candidates.append((matched, missing, unmatched, start))
-    if not candidates:
-        return 0, len(canonical_keys), 0
-    matched, missing, unmatched, _ = min(
-        candidates,
-        key=lambda result: (-result[0], result[1] + result[2], -result[3]),
-    )
-    return matched, missing, unmatched
-
-
 def _classify_legacy_suffix(
     canonical: list[_ReplayMessage],
     legacy_keys: list[tuple[str, str]],
@@ -1065,99 +1036,6 @@ def _longest_common_subsequence_suffix_lengths(
                 )
         following = current
     return following
-
-
-def _legacy_parity(
-    replayed: _ReplayState,
-    history_root: Path,
-) -> tuple[int, int, int, int, int, int]:
-    bindings: dict[str, str] = {}
-    duplicate_bindings = 0
-    for channel_id, transport, external_channel_id in replayed.channel_bindings.values():
-        if transport != "telegram" or replayed.channel_kinds.get(channel_id) != "direct":
-            continue
-        if channel_id in bindings:
-            duplicate_bindings += 1
-        bindings[channel_id] = external_channel_id
-
-    by_channel: dict[str, list[_ReplayMessage]] = {}
-    for message in replayed.messages:
-        if message.channel_id in bindings:
-            by_channel.setdefault(message.channel_id, []).append(message)
-
-    matched = 0
-    missing = 0
-    unmatched = 0
-    malformed = 0
-    unreadable = duplicate_bindings
-    for channel_id, messages in by_channel.items():
-        legacy_keys, channel_malformed, channel_unreadable = _read_legacy_keys(
-            history_root,
-            bindings[channel_id],
-            channel_id,
-        )
-        malformed += channel_malformed
-        unreadable += channel_unreadable
-        channel_matched, channel_missing, channel_unmatched = _compare_legacy_suffix(
-            [message.legacy_key for message in messages],
-            legacy_keys,
-        )
-        matched += channel_matched
-        missing += channel_missing
-        unmatched += channel_unmatched
-    return matched, missing, unmatched, len(by_channel), malformed, unreadable
-
-
-def workshop_message_parity_status(db_path: Path, history_root: Path) -> str:
-    """Compare event-replayed messages with the projection and legacy JSONL.
-
-    The deployed database is opened in SQLite read-only mode. Message bodies,
-    principal identities, channel identities, filenames, and hashes never
-    appear in the returned operator status.
-    """
-    if not db_path.is_file():
-        return "Workshop message parity: pending; canonical message schema unavailable"
-
-    try:
-        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
-        connection.row_factory = sqlite3.Row
-        try:
-            connection.execute("PRAGMA query_only=ON")
-            connection.execute("BEGIN")
-            tables = {
-                str(row[0])
-                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
-            }
-            if not tables >= _PARITY_TABLES:
-                return "Workshop message parity: pending; canonical message schema unavailable"
-            replayed = _replay_state(connection)
-            projected_count, replay_mismatches = _projection_mismatches(connection, replayed)
-            matched, missing, unmatched, channel_count, malformed, unreadable = _legacy_parity(
-                replayed,
-                history_root,
-            )
-        finally:
-            connection.close()
-    except (OSError, sqlite3.Error, UnicodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
-        return f"Workshop message parity: NOT VERIFIED ({type(exc).__name__})"
-
-    if not replayed.messages and replay_mismatches == 0:
-        return "Workshop message parity: pending; canonical=0, projected=0; awaiting shadow messages"
-
-    if malformed or unreadable:
-        details: list[str] = []
-        if malformed:
-            details.append(f"malformed JSONL records={malformed}")
-        if unreadable:
-            details.append(f"unreadable history sources={unreadable}")
-        return f"Workshop message parity: NOT VERIFIED; {', '.join(details)}"
-
-    state = "clean" if replay_mismatches == 0 and missing == 0 and unmatched == 0 else "diverged"
-    return (
-        f"Workshop message parity: {state}; canonical={len(replayed.messages)}, projected={projected_count}, "
-        f"replay mismatches={replay_mismatches}, JSONL matched={matched}, JSONL missing={missing}, "
-        f"JSONL unmatched={unmatched}, Telegram channels={channel_count}"
-    )
 
 
 def workshop_canonical_message_integrity_status(db_path: Path) -> str:
@@ -1281,6 +1159,21 @@ def workshop_legacy_jsonl_archive_status(db_path: Path, history_root: Path) -> s
         f"canonical-only classes={_format_message_classes(canonical_only_classes)}, "
         f"Telegram channels={channels}; "
         "archive is non-authoritative"
+    )
+
+
+def workshop_transition_tooling_status() -> str:
+    """Describe source-level transition surfaces retired after authority cutover.
+
+    Historical database rows, migration receipts, and JSONL files remain
+    deliberate archives. This build contract covers only executable tooling
+    that could shadow, compare, or manually switch live production authority.
+    Regression guards pin the corresponding source deletions.
+    """
+    return (
+        "Workshop transition tooling: retired; shadow recorders=disabled, "
+        "crash flags=disabled, parity comparator=disabled, "
+        "delivery qualification=disabled; archives=retained"
     )
 
 
