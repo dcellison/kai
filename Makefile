@@ -29,6 +29,7 @@ check-install-constraints:
 	$(BIN)python -m pip install --dry-run --upgrade \
 		--constraint requirements/constraints.txt pip setuptools
 	$(BIN)python -m pip install --dry-run --constraint requirements/constraints.txt -e '.[memory,totp,tts]'
+	$(BIN)python -m pip install --dry-run --constraint requirements/constraints.txt -e '.[memory,telegram,totp,tts]'
 
 module-sizes:
 	$(BIN)python scripts/module-sizes.py
@@ -41,7 +42,7 @@ setup:
 	$(BIN)python -m pip install --upgrade \
 		--constraint requirements/constraints.txt pip setuptools
 	$(BIN)python -m pip install --upgrade \
-		--constraint requirements/constraints.txt -e '.[dev]'
+		--constraint requirements/constraints.txt -e '.[dev,telegram]'
 
 # Protected installation targets
 config:

@@ -86,6 +86,19 @@ def adapter_dependencies(monkeypatch):
             events.append("notification:start")
             return _FakeDelivery(events, "notification")
 
+    class FakeWebhookIngress:
+        def __init__(self, _application, _config):
+            events.append("webhook:create")
+
+        def register_routes(self, _app) -> None:
+            events.append("webhook:routes")
+
+        async def start(self) -> None:
+            events.append("webhook:start")
+
+        async def stop(self) -> None:
+            events.append("webhook:stop")
+
     monkeypatch.setattr(adapter_module, "KaiTelegramApplication", _FakeApplication)
     monkeypatch.setattr(adapter_module, "create_bot", fake_create_bot)
     monkeypatch.setattr(
@@ -98,6 +111,7 @@ def adapter_dependencies(monkeypatch):
         "WorkshopTelegramNotificationService",
         FakeNotificationDelivery,
     )
+    monkeypatch.setattr(adapter_module, "TelegramWebhookIngress", FakeWebhookIngress)
     return events
 
 
@@ -141,8 +155,11 @@ async def test_webhook_adapter_owns_application_and_delivery_lifecycle(
         "application:initialize",
         "application:start",
         "commands:set",
+        "webhook:create",
         "conversation:start",
         "notification:start",
+        "webhook:start",
+        "webhook:stop",
         "notification:stop",
         "conversation:stop",
         "application:stop",

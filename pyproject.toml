@@ -5,11 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "kai"
 version = "2.0.0"
-description = "Telegram gateway to AI coding-agent backends"
+description = "Personal AI assistant with pluggable clients and coding-agent backends"
 license = "Apache-2.0"
 requires-python = ">=3.13"
 dependencies = [
-    "python-telegram-bot>=20.0,<23",
     "apscheduler>=3.10.4,<4",
     "aiosqlite>=0.19.0,<1",
     "python-dotenv>=1.0.0,<2",
@@ -21,6 +20,9 @@ dependencies = [
 kai = "kai.main:main"
 
 [project.optional-dependencies]
+telegram = [
+    "python-telegram-bot>=20.0,<23",
+]
 dev = [
     "ruff>=0.9.0,<1",
     "pyright>=1.1.390,<2",

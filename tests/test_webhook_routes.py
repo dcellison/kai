@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from aiohttp import web
 
 from kai.config import Config
+from kai.telegram_http import TelegramWebhookIngress
 from kai.webhook import CORE_HOST_KEY, _handle_health, _register_routes
 
 
@@ -50,7 +51,7 @@ def test_external_webhook_routes_are_enabled_independently() -> None:
     assert ("POST", "/webhook/github") not in generic_routes
 
 
-def test_telegram_route_is_independent_of_other_webhooks() -> None:
+def test_telegram_route_is_contributed_only_by_telegram_adapter() -> None:
     app = web.Application()
 
     _register_routes(
@@ -61,6 +62,10 @@ def test_telegram_route_is_independent_of_other_webhooks() -> None:
         ),
     )
 
+    assert ("POST", "/webhook/telegram") not in _routes(app)
+
+    ingress = object.__new__(TelegramWebhookIngress)
+    ingress.register_routes(app)
     routes = _routes(app)
     assert ("POST", "/webhook/telegram") in routes
     assert ("POST", "/webhook/github") not in routes
@@ -78,7 +83,6 @@ def test_workshop_only_keeps_integrations_but_omits_telegram_routes() -> None:
             github_webhook_secret="github-secret",
             generic_webhook_secret="generic-secret",
         ),
-        telegram_enabled=False,
     )
 
     routes = _routes(app)

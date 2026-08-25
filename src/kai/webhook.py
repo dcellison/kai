@@ -1,25 +1,16 @@
 """
-Webhook HTTP server for receiving external notifications, scheduling jobs, and
-optionally serving as the Telegram update transport.
+Shared HTTP server for integrations, internal APIs, and the Workshop client.
 
 Provides functionality to:
-1. Receive Telegram updates via webhook (when TELEGRAM_WEBHOOK_URL is configured)
-2. Receive and validate GitHub webhook events (push, PR, issues, comments, reviews)
-3. Accept generic webhook notifications from any source
-4. Expose a scheduling API for creating cron-style jobs via HTTP
-5. Expose a jobs query API for listing and fetching scheduled jobs
-6. Proxy authenticated requests to external services (service layer)
-7. Publish proactive text messages and files to canonical Workshop channels
-8. Monitor webhook health and auto-recover from Telegram delivery failures
-9. Redeem Workshop client enrollment grants and synchronize authorized timelines
-
-The server always runs on aiohttp alongside the Telegram bot in the same event
-loop, regardless of transport mode. In polling mode, Telegram updates arrive via
-the Updater owned by ``TelegramAdapter``; this server still handles everything
-else. ``HttpAdapter`` owns this module's listener lifecycle.
+1. Receive and validate GitHub webhook events (push, PR, issues, comments, reviews)
+2. Accept generic webhook notifications from any source
+3. Expose scheduling and jobs APIs to authenticated internal agents
+4. Proxy authenticated requests to external services
+5. Publish proactive messages and artifacts to canonical Workshop channels
+6. Redeem Workshop client enrollment grants and synchronize authorized timelines
+7. Host explicitly configured adapter-owned routes through generic registrars
 
 Routes are organized into these groups:
-    - /webhook/telegram     - Telegram updates (webhook mode only, secret_token auth)
     - /webhook/github       - GitHub events with HMAC-SHA256 signature validation
     - /webhook              - Generic webhooks with shared-secret auth
     - /api/schedule         - Job creation API (used by persistent agents via curl)
@@ -36,11 +27,11 @@ Routes are organized into these groups:
     - /v1/channels/{id}/timeline   - Read one authorized canonical timeline
     - /v1/channels/{id}/events     - Resume authorized canonical message events
 
-Every ingress domain has an independent credential. Telegram uses its configured
-or process-generated secret token, GitHub uses GITHUB_WEBHOOK_SECRET, and the
-generic endpoint uses GENERIC_WEBHOOK_SECRET. Internal API routes always use
-random, principal-bound process credentials and do not depend on external webhook
-secrets.
+Every core ingress domain has an independent credential. GitHub uses
+GITHUB_WEBHOOK_SECRET, and the generic endpoint uses GENERIC_WEBHOOK_SECRET.
+Internal API routes always use random, principal-bound process credentials and
+do not depend on external webhook secrets. Adapter routes own their credentials
+and request handling outside this module.
 
 GitHub events are formatted into human-readable Markdown and routed to
 canonical Workshop channels. External delivery is performed later by each
@@ -56,16 +47,13 @@ import json
 import logging
 import os
 import re
-import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
 from aiohttp import web
-from telegram import Bot, Update
-from telegram.ext import Application
 
 from kai import memory, services, sessions
 from kai.application_host import KaiApplicationHost, KaiCoreServices
@@ -145,8 +133,10 @@ GENERIC_WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("generic_webhook_secret
 GITHUB_WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("github_webhook_secret", str)
 INTERNAL_API_AUTH_KEY: web.AppKey[InternalAPIAuth] = web.AppKey("internal_api_auth", InternalAPIAuth)
 NOTIFICATION_CHAT_IDS_KEY: web.AppKey[set[int]] = web.AppKey("notification_chat_ids", set)
-TELEGRAM_APP_KEY: web.AppKey[Application] = web.AppKey("telegram_app", Application)
-TELEGRAM_BOT_KEY: web.AppKey[Bot] = web.AppKey("telegram_bot", Bot)
+# Compatibility-only app keys retained for older API fixtures. The shared HTTP
+# host neither populates nor reads these; Telegram owns its concrete state.
+TELEGRAM_APP_KEY: web.AppKey[object] = web.AppKey("telegram_app", object)
+TELEGRAM_BOT_KEY: web.AppKey[object] = web.AppKey("telegram_bot", object)
 TELEGRAM_WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("telegram_webhook_secret", str)
 WORKSPACE_BASE_KEY: web.AppKey[str | None] = web.AppKey("workspace_base")
 WORKSHOP_PRINCIPAL_STORAGE_KEY: web.AppKey[WorkshopPrincipalStorageRegistry] = web.AppKey(
@@ -164,192 +154,7 @@ WORKSHOP_GITHUB_AUTOMATION_KEY: web.AppKey[WorkshopGitHubAutomationService] = we
 _app: web.Application | None = None
 _runner: web.AppRunner | None = None
 _workshop_lan_runner: web.AppRunner | None = None
-# Tracks whether we registered a Telegram webhook with the API, so stop()
-# knows whether to call delete_webhook(). Only True in webhook mode.
-_webhook_registered: bool = False
-
-# Background tasks for processing Telegram updates. Tasks are kept in this set
-# to prevent garbage collection (Python only weakly references fire-and-forget
-# tasks, so an unreferenced task can be silently collected mid-execution).
-# Each task removes itself from the set via a done callback.
-_background_tasks: set[asyncio.Task] = set()
-_BACKGROUND_TASK_DRAIN_TIMEOUT = 30.0
 _HTTP_RUNNER_SHUTDOWN_TIMEOUT = 5.0
-_telegram_queue_worker_task: asyncio.Task | None = None
-_telegram_queue_worker_active_row_id: int | None = None
-_TELEGRAM_UPDATE_MAX_ATTEMPTS = 5
-
-# Webhook health monitor task, started in start() and cancelled in stop().
-# Periodically checks Telegram's getWebhookInfo for delivery errors and
-# re-registers the webhook if needed to reset exponential backoff.
-_health_monitor_task: asyncio.Task | None = None
-
-# How often to check webhook health (seconds). Frequent enough to catch
-# problems quickly, infrequent enough to avoid API rate limits.
-_HEALTH_CHECK_INTERVAL = 300  # 5 minutes
-
-
-async def _drain_background_tasks(timeout: float = _BACKGROUND_TASK_DRAIN_TIMEOUT) -> None:
-    """
-    Wait briefly for fire-and-forget webhook work during shutdown.
-
-    Telegram update processing is launched as background work so inbound
-    updates can be acknowledged promptly. During a
-    controlled shutdown, let those tasks finish before tearing down the server.
-    If they overrun the bounded timeout, cancel them rather than hanging
-    shutdown indefinitely.
-    """
-    pending = {task for task in _background_tasks if not task.done()}
-    if not pending:
-        return
-
-    log.info("Waiting for %d webhook background task(s) to finish", len(pending))
-    done, still_pending = await asyncio.wait(pending, timeout=timeout)
-    for task in done:
-        try:
-            task.result()
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            log.exception("Webhook background task failed during shutdown")
-        finally:
-            _background_tasks.discard(task)
-
-    if not still_pending:
-        return
-
-    log.warning(
-        "Cancelling %d webhook background task(s) after %.1fs shutdown timeout",
-        len(still_pending),
-        timeout,
-    )
-    for task in still_pending:
-        task.cancel()
-    await asyncio.gather(*still_pending, return_exceptions=True)
-    for task in still_pending:
-        _background_tasks.discard(task)
-
-
-async def _process_queued_telegram_update(
-    row: sessions.TelegramUpdateQueueRow,
-    telegram_app: Application,
-    bot: Bot,
-) -> None:
-    row_id = row["id"]
-    try:
-        data = json.loads(row["payload"])
-        update = Update.de_json(data, bot)
-    except Exception as exc:
-        error = f"{type(exc).__name__}: {exc}"
-        log.exception("Discarding malformed queued Telegram update %s", row_id)
-        await sessions.discard_telegram_update(row_id, error)
-        return
-
-    if update is None:
-        await sessions.complete_telegram_update(row_id)
-        return
-
-    try:
-        await telegram_app.process_update(update)
-    except Exception as exc:
-        error = f"{type(exc).__name__}: {exc}"
-        if row["attempt_count"] >= _TELEGRAM_UPDATE_MAX_ATTEMPTS:
-            log.exception(
-                "Discarding Telegram update queue row %s after %d failed attempt(s)",
-                row_id,
-                row["attempt_count"],
-            )
-            await sessions.discard_telegram_update(row_id, error)
-            return
-        log.exception("Telegram update queue row %s failed; retrying later", row_id)
-        await sessions.retry_telegram_update(row_id, error)
-        return
-
-    await sessions.complete_telegram_update(row_id)
-
-
-async def _telegram_update_queue_worker(telegram_app: Application, bot: Bot) -> None:
-    global _telegram_queue_worker_active_row_id
-    try:
-        while True:
-            row = await sessions.claim_next_telegram_update()
-            if row is None:
-                return
-            _telegram_queue_worker_active_row_id = row["id"]
-            try:
-                await _process_queued_telegram_update(row, telegram_app, bot)
-            finally:
-                _telegram_queue_worker_active_row_id = None
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        log.exception("Telegram update queue worker crashed")
-
-
-def _telegram_worker_done(task: asyncio.Task) -> None:
-    global _telegram_queue_worker_task
-    if _telegram_queue_worker_task is task:
-        _telegram_queue_worker_task = None
-    _background_tasks.discard(task)
-
-
-def _ensure_telegram_update_queue_worker(telegram_app: Application, bot: Bot) -> None:
-    global _telegram_queue_worker_task
-    if _telegram_queue_worker_task is not None and not _telegram_queue_worker_task.done():
-        return
-    task = asyncio.create_task(_telegram_update_queue_worker(telegram_app, bot))
-    _telegram_queue_worker_task = task
-    _background_tasks.add(task)
-    task.add_done_callback(_telegram_worker_done)
-
-
-def _is_telegram_stop_update(data: object) -> bool:
-    """Return whether a raw Telegram update contains a /stop command message."""
-    if not isinstance(data, dict):
-        return False
-    message = data.get("message")
-    if not isinstance(message, dict):
-        return False
-    text = message.get("text")
-    if not isinstance(text, str):
-        return False
-    return re.match(r"^/stop(?:@[A-Za-z0-9_]+)?(?:\s|$)", text) is not None
-
-
-async def _process_priority_telegram_update(
-    row_id: int,
-    telegram_app: Application,
-    bot: Bot,
-) -> None:
-    """Claim and process one persisted control update outside the FIFO worker."""
-    try:
-        row = await sessions.claim_telegram_update(row_id)
-        if row is not None:
-            await _process_queued_telegram_update(row, telegram_app, bot)
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        log.exception("Priority Telegram update queue task crashed for row %s", row_id)
-
-
-def _dispatch_priority_telegram_stop(
-    row_id: int,
-    data: object,
-    telegram_app: Application,
-    bot: Bot,
-) -> None:
-    """Dispatch a persisted /stop concurrently when the FIFO worker is busy."""
-    if _telegram_queue_worker_active_row_id is None or not _is_telegram_stop_update(data):
-        return
-    task = asyncio.create_task(_process_priority_telegram_update(row_id, telegram_app, bot))
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-
-
-# If Telegram reports an error within this window, re-register the webhook.
-# Slightly longer than the check interval so a single transient error
-# in the previous cycle triggers a re-registration on the next check.
-_ERROR_RECENCY_THRESHOLD = 600  # 10 minutes
 
 
 async def _resolve_local_repo(repo_full_name: str, app: web.Application) -> str | None:
@@ -631,68 +436,6 @@ async def _handle_health(request: web.Request) -> web.Response:
         response["core"] = host.readiness.as_dict()
         response["adapters"] = host.adapter_readiness
     return web.json_response(response)
-
-
-async def _handle_telegram_update(request: web.Request) -> web.Response:
-    """
-    Receive a Telegram update pushed via webhook.
-
-    Validates the X-Telegram-Bot-Api-Secret-Token header against the configured
-    secret, persists the raw update to the durable inbound queue, and starts a
-    background worker that dispatches queued updates to process_update().  A
-    persisted /stop command may use a separately tracked task while that FIFO
-    worker is busy so it can interrupt the active request; other updates remain
-    serialized.
-
-    IMPORTANT: queued updates are processed by a background task, not awaited.
-    Claude responses can take 30+ seconds, and Telegram's webhook client times
-    out after ~30-35s. If we awaited process_update(), Telegram would assume
-    delivery failed and retry the same message, causing duplicate responses.
-    By returning 200 after durable enqueue and processing in the background, we
-    acknowledge receipt before Telegram's timeout while allowing restart replay.
-    The per-chat lock in bot.py serializes concurrent messages, so ordering is
-    preserved per chat.
-
-    Returns 200 after the update is durably queued. Payloads without a usable
-    update_id still return 200 to avoid permanent Telegram retries, but a local
-    persistence failure returns 500 because no work was accepted.
-    """
-    secret = request.app[TELEGRAM_WEBHOOK_SECRET_KEY]
-    provided = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if not hmac.compare_digest(provided, secret):
-        log.warning("Telegram update: invalid secret")
-        return web.Response(status=401, text="Invalid secret")
-
-    try:
-        data = await request.json()
-    except json.JSONDecodeError:
-        log.warning("Telegram update: malformed JSON")
-        return web.Response(status=200)
-
-    telegram_app = request.app[TELEGRAM_APP_KEY]
-    bot = request.app[TELEGRAM_BOT_KEY]
-    update_id = data.get("update_id") if isinstance(data, dict) else None
-    if isinstance(update_id, bool) or not isinstance(update_id, int):
-        log.warning("Telegram update: missing or invalid update_id")
-        return web.Response(status=200)
-
-    try:
-        row_id, _inserted = await sessions.enqueue_telegram_update(update_id, json.dumps(data))
-    except Exception:
-        log.exception("Failed to persist Telegram update %s", update_id)
-        return web.Response(status=500, text="Failed to enqueue update")
-
-    try:
-        _ensure_telegram_update_queue_worker(telegram_app, bot)
-    except Exception:
-        log.exception("Failed to start Telegram update queue worker")
-    else:
-        try:
-            _dispatch_priority_telegram_stop(row_id, data, telegram_app, bot)
-        except Exception:
-            log.exception("Failed to dispatch priority Telegram /stop row %s", row_id)
-
-    return web.Response(status=200)
 
 
 async def _handle_github(request: web.Request) -> web.Response:
@@ -2022,134 +1765,15 @@ async def _handle_memory_delete_all(request: web.Request, principal: InternalAPI
     return web.json_response({"status": "deleted"})
 
 
-# ── Webhook health monitor ───────────────────────────────────────────
-
-
-async def _webhook_health_loop(bot, webhook_url: str, webhook_secret: str, chat_id: int) -> None:
-    """
-    Periodically check Telegram webhook health and re-register if needed.
-
-    Telegram silently drops updates after repeated delivery failures (502s
-    from Cloudflare tunnel hiccups, etc.) via exponential backoff. Once
-    backed off far enough, the bot appears completely dead - no errors in
-    our logs, no pending_update_count on Telegram's side.
-
-    This loop calls getWebhookInfo every _HEALTH_CHECK_INTERVAL seconds
-    and re-registers the webhook when any of these conditions are met:
-
-    1. The webhook URL was cleared (manual intervention, competing instance)
-    2. Telegram reports a recent delivery error (last_error_date within
-       _ERROR_RECENCY_THRESHOLD)
-    3. pending_update_count has been >0 for two consecutive checks,
-       meaning Telegram is queuing updates it cannot deliver
-
-    Condition 3 requires two consecutive checks to avoid false positives
-    from normal message bursts (a single check catching in-flight updates).
-
-    If 3 consecutive health checks fail, the admin is notified once via
-    Telegram. The notification resets after a successful check.
-
-    Args:
-        bot: The Telegram bot instance.
-        webhook_url: The configured webhook URL.
-        webhook_secret: The Telegram webhook secret token.
-        chat_id: Admin chat ID for failure notifications.
-    """
-    await asyncio.sleep(_HEALTH_CHECK_INTERVAL)  # skip the first check (just registered)
-
-    # Track pending updates across consecutive checks. A single non-zero
-    # reading is normal (messages in flight); two in a row means delivery
-    # is stalled - Telegram is queuing but not successfully pushing.
-    prev_pending: int = 0
-    consecutive_failures: int = 0
-    failure_notified: bool = False
-
-    while True:
-        try:
-            info = await bot.get_webhook_info()
-            needs_reregister = False
-            reason = ""
-
-            # Re-register if the URL was cleared (e.g., by manual intervention
-            # or a competing bot instance calling deleteWebhook)
-            if not info.url:
-                needs_reregister = True
-                reason = "webhook URL is empty"
-
-            # Re-register if Telegram reports a recent delivery error.
-            # last_error_date is a datetime (None if no errors).
-            elif info.last_error_date:
-                error_age = time.time() - info.last_error_date.timestamp()
-                if error_age < _ERROR_RECENCY_THRESHOLD:
-                    needs_reregister = True
-                    reason = f"recent error ({int(error_age)}s ago): {info.last_error_message or 'unknown'}"
-
-            # Re-register if pending updates have been non-zero for two
-            # consecutive checks - Telegram is queuing but can't deliver.
-            current_pending = info.pending_update_count or 0
-            if not needs_reregister and current_pending > 0 and prev_pending > 0:
-                needs_reregister = True
-                reason = f"pending_update_count stuck at {current_pending} (was {prev_pending} on previous check)"
-            prev_pending = current_pending
-
-            if needs_reregister:
-                log.warning("Webhook health: %s - re-registering", reason)
-                await bot.delete_webhook()
-                await bot.set_webhook(
-                    url=webhook_url,
-                    secret_token=webhook_secret,
-                    allowed_updates=["message", "callback_query"],
-                )
-                log.info("Webhook re-registered (self-healing)")
-                # Reset pending tracker after re-registration so we don't
-                # immediately trigger again on the next check
-                prev_pending = 0
-
-            consecutive_failures = 0
-            failure_notified = False
-
-        except Exception:
-            # Don't let a failed health check kill the monitor loop.
-            # Network blips, API rate limits, etc. are transient.
-            log.exception("Webhook health check failed")
-            consecutive_failures += 1
-
-            # Notify admin once after 3 consecutive failures (15 min of
-            # downtime at the 5-minute check interval). Don't spam - only
-            # notify once until a successful check resets the flag.
-            if consecutive_failures >= 3 and not failure_notified:
-                try:
-                    await bot.send_message(
-                        chat_id,
-                        "Webhook health monitor has failed 3 consecutive checks. Self-healing may be degraded.",
-                    )
-                except Exception:
-                    # If we can't even reach Telegram, just log it.
-                    log.warning("Could not send health monitor failure notification")
-                # Set regardless of whether the send succeeded. We tried
-                # once per failure sequence - don't retry every 5 minutes.
-                failure_notified = True
-
-        await asyncio.sleep(_HEALTH_CHECK_INTERVAL)
-
-
 # ── Lifecycle ────────────────────────────────────────────────────────
 
 
 def _register_routes(
     app: web.Application,
     config: Config,
-    *,
-    telegram_enabled: bool = True,
 ) -> None:
-    """Register gated adapter routes and transport-independent internal APIs."""
+    """Register transport-independent integration and internal API routes."""
     app.router.add_get("/health", _handle_health)
-
-    if telegram_enabled and config.telegram_webhook_url:
-        if not config.telegram_webhook_secret:
-            raise RuntimeError("Telegram webhook mode requires a non-empty secret")
-        app[TELEGRAM_WEBHOOK_SECRET_KEY] = config.telegram_webhook_secret
-        app.router.add_post("/webhook/telegram", _handle_telegram_update)
 
     if config.github_webhook_secret:
         app[GITHUB_WEBHOOK_SECRET_KEY] = config.github_webhook_secret
@@ -2239,65 +1863,40 @@ async def _register_workshop_client_api(
 
 
 async def start(
-    telegram_app: Application | None,
     config: Config,
     *,
     core_host: KaiApplicationHost,
     core_services: KaiCoreServices,
     integration_notifications: WorkshopIntegrationNotificationService,
     workshop_enabled: bool = True,
+    route_registrars: Iterable[Callable[[web.Application], None]] = (),
 ) -> None:
     """
-    Start the HTTP server and optionally register the Telegram webhook.
+    Start the shared HTTP server and configured route registrars.
 
     The HTTP server always starts for health, authenticated integration ingress,
     and transport-independent internal APIs. Workshop client routes are
-    independently enabled. Only Telegram webhook and compatibility delivery
-    routes require a Telegram application.
-
-    In polling mode, the server still runs but Telegram updates arrive via
-    the Updater's long-polling loop in ``TelegramAdapter`` instead.
+    independently enabled. Optional adapters may contribute routes without
+    exposing their SDK objects to this host.
 
     Args:
         config: The application Config instance.
         core_host: Core lifecycle owner used for health/readiness reporting.
         core_services: Typed core dependencies required by HTTP routes.
-        telegram_app: Started Telegram application, or None when disabled.
         integration_notifications: Core-owned canonical notification service.
         workshop_enabled: Whether to publish Workshop client routes.
+        route_registrars: Explicitly configured adapter-owned HTTP routes.
     """
-    global _app, _runner, _workshop_lan_runner, _webhook_registered, _health_monitor_task
+    global _app, _runner, _workshop_lan_runner
 
     _app = web.Application(client_max_size=MAX_ARTIFACT_BYTES + 128 * 1024)
     _app[CORE_HOST_KEY] = core_host
-    telegram_enabled = telegram_app is not None
-    if telegram_enabled:
-        _app[TELEGRAM_APP_KEY] = telegram_app
-        _app[TELEGRAM_BOT_KEY] = telegram_app.bot
 
     pool = core_services.subprocess_pool
     internal_api_auth = getattr(pool, "internal_api_auth", None)
     if not isinstance(internal_api_auth, InternalAPIAuth):
         raise RuntimeError("Subprocess pool did not provide an internal API credential store")
     _app[INTERNAL_API_AUTH_KEY] = internal_api_auth
-
-    # Set the fallback destination for unattributed external webhook events.
-    # Internal API calls never use this value for identity; their credential
-    # resolves a principal before the handler runs.
-    if telegram_enabled:
-        admins = config.get_admins()
-        if admins:
-            _app[CHAT_ID_KEY] = admins[0].telegram_id
-        else:
-            fallback = next(iter(config.user_configs.values()))
-            log.warning(
-                "No admin users defined in users.yaml; using %s "
-                "(telegram_id: %d) as default webhook target. "
-                "External notifications may route unexpectedly.",
-                fallback.name,
-                fallback.telegram_id,
-            )
-            _app[CHAT_ID_KEY] = fallback.telegram_id
 
     # Keep notification destinations separate from Config.allowed_user_ids,
     # which is the immutable-at-runtime source for Telegram inbound auth. The
@@ -2319,11 +1918,11 @@ async def start(
     # users.yaml and DB. This set is intentionally detached from Config's
     # inbound Telegram principals and is not consulted by internal API auth.
     for uc in config.user_configs.values():
-        if telegram_enabled and uc.github_notify_chat_id is not None:
+        if uc.github_notify_chat_id is not None:
             _app[NOTIFICATION_CHAT_IDS_KEY].add(uc.github_notify_chat_id)
     # Also add any DB-stored notify chat IDs (set via /github notify).
     # webhook.start() is already async so the await is fine.
-    for uid in config.user_configs if telegram_enabled else ():
+    for uid in config.user_configs:
         val = await sessions.get_setting(f"github_notify_chat:{uid}")
         if val:
             try:
@@ -2334,7 +1933,9 @@ async def start(
                     uid,
                     val,
                 )
-    _register_routes(_app, config, telegram_enabled=telegram_enabled)
+    _register_routes(_app, config)
+    for register_routes in route_registrars:
+        register_routes(_app)
     _app[WORKSHOP_PRINCIPAL_STORAGE_KEY] = core_services.principal_storage
     _app[WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY] = integration_notifications
     _app[WORKSHOP_GITHUB_AUTOMATION_KEY] = core_services.github_automation
@@ -2385,92 +1986,10 @@ async def start(
             config.webhook_port,
         )
 
-    # Register the webhook URL with Telegram's API if in webhook mode. This must
-    # come after the server is listening so the endpoint is ready before Telegram
-    # starts pushing. allowed_updates limits which update types Telegram sends -
-    # Kai only handles messages and callback queries (inline keyboard taps).
-    #
-    # Retry with backoff because Telegram's API can time out transiently,
-    # especially after a period of downtime when queued updates are flushing.
-    # Without retries, a single timeout kills the whole startup and launchd
-    # eventually gives up restarting.
-    if telegram_app is not None and config.telegram_webhook_url:
-        requeued = await sessions.requeue_processing_telegram_updates()
-        if requeued:
-            log.info("Requeued %d unfinished Telegram update(s) from previous run", requeued)
-        _ensure_telegram_update_queue_worker(telegram_app, telegram_app.bot)
-
-        max_attempts = 5
-        for attempt in range(1, max_attempts + 1):
-            try:
-                await telegram_app.bot.set_webhook(
-                    url=config.telegram_webhook_url,
-                    secret_token=config.telegram_webhook_secret,
-                    allowed_updates=["message", "callback_query"],
-                )
-                _webhook_registered = True
-                log.info("Registered Telegram webhook: %s", config.telegram_webhook_url)
-                break
-            except Exception:
-                if attempt == max_attempts:
-                    log.exception("Failed to register webhook after %d attempts", max_attempts)
-                    raise
-                wait = 2**attempt  # 2, 4, 8, 16s
-                log.warning(
-                    "Webhook registration attempt %d/%d failed, retrying in %ds",
-                    attempt,
-                    max_attempts,
-                    wait,
-                )
-                await asyncio.sleep(wait)
-
-        # Start the background health monitor to detect and recover from
-        # Telegram delivery failures (e.g., Cloudflare tunnel drops causing
-        # 502s that trigger Telegram's exponential backoff).
-        _health_monitor_task = asyncio.create_task(
-            _webhook_health_loop(
-                telegram_app.bot,
-                config.telegram_webhook_url,
-                config.telegram_webhook_secret,
-                _app[CHAT_ID_KEY],
-            )
-        )
-
 
 async def stop() -> None:
-    """
-    Deregister the Telegram webhook (if active) and stop the HTTP server.
-
-    Called during shutdown by ``HttpAdapter``. In webhook mode,
-    deregisters the webhook with Telegram first (so Telegram stops sending
-    updates to an endpoint that's about to disappear). In polling mode,
-    skips the delete_webhook call since no webhook was registered.
-
-    The delete_webhook call is wrapped in try/except because it's not critical -
-    if the network is down at shutdown time, Telegram will just overwrite the
-    stale webhook on the next set_webhook call at startup.
-    """
-    global _app, _runner, _workshop_lan_runner, _webhook_registered, _health_monitor_task
-    # Cancel the webhook health monitor before tearing down the server
-    if _health_monitor_task is not None:
-        _health_monitor_task.cancel()
-        try:
-            await _health_monitor_task
-        except asyncio.CancelledError:
-            pass
-        _health_monitor_task = None
-
-    # Only deregister if we registered a webhook (i.e., webhook mode was active)
-    if _webhook_registered and _app is not None:
-        telegram_bot = _app.get(TELEGRAM_BOT_KEY)
-        if telegram_bot is not None:
-            try:
-                await telegram_bot.delete_webhook()
-                log.info("Deregistered Telegram webhook")
-            except Exception:
-                log.warning("Failed to deregister Telegram webhook (will re-register on next start)")
-        _webhook_registered = False
-    await _drain_background_tasks(_BACKGROUND_TASK_DRAIN_TIMEOUT)
+    """Stop the shared HTTP listeners after adapter ingress has drained."""
+    global _app, _runner, _workshop_lan_runner
     try:
         if _workshop_lan_runner:
             await _workshop_lan_runner.cleanup()

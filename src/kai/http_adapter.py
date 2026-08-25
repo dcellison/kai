@@ -6,13 +6,25 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Protocol
+
+from aiohttp import web
 
 from kai import webhook
-from kai.application_host import KaiApplicationHost, KaiCoreServices
+from kai.application_host import KaiApplicationAdapter, KaiApplicationHost, KaiCoreServices
 from kai.config import Config
-from kai.telegram_adapter import TelegramAdapter
 
 log = logging.getLogger(__name__)
+
+
+class HttpIngressAdapter(KaiApplicationAdapter, Protocol):
+    """Optional transport hooks hosted by Kai's shared HTTP listeners."""
+
+    def register_http_routes(self, app: web.Application) -> None: ...
+
+    async def activate_ingress(self) -> None: ...
+
+    async def deactivate_ingress(self) -> None: ...
 
 
 class HttpAdapterState(StrEnum):
@@ -65,12 +77,12 @@ class HttpAdapter:
         config: Config,
         core_host: KaiApplicationHost,
         core_services: KaiCoreServices,
-        telegram_adapter: TelegramAdapter | None,
+        ingress_adapter: HttpIngressAdapter | None,
     ) -> None:
         self._config = config
         self._core_host = core_host
         self._core_services = core_services
-        self._telegram_adapter = telegram_adapter
+        self._ingress_adapter = ingress_adapter
         self._state = HttpAdapterState.NEW
         self._stop_event = asyncio.Event()
 
@@ -89,15 +101,22 @@ class HttpAdapter:
         self._state = HttpAdapterState.STARTING
         try:
             await webhook.start(
-                self._telegram_adapter.application if self._telegram_adapter else None,
                 self._config,
                 core_host=self._core_host,
                 core_services=self._core_services,
                 integration_notifications=self._core_services.integration_notifications,
                 workshop_enabled=self._config.workshop_enabled,
+                route_registrars=(self._ingress_adapter.register_http_routes,) if self._ingress_adapter else (),
             )
+            if self._ingress_adapter is not None:
+                await self._ingress_adapter.activate_ingress()
         except BaseException:
             self._state = HttpAdapterState.FAILED
+            if self._ingress_adapter is not None:
+                try:
+                    await self._ingress_adapter.deactivate_ingress()
+                except Exception:
+                    log.exception("HTTP ingress cleanup failed after startup error")
             try:
                 await webhook.stop()
             except Exception:
@@ -117,6 +136,8 @@ class HttpAdapter:
             return
         self._state = HttpAdapterState.DRAINING
         try:
+            if self._ingress_adapter is not None:
+                await self._ingress_adapter.deactivate_ingress()
             await webhook.stop()
         except BaseException:
             self._state = HttpAdapterState.FAILED

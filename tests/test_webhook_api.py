@@ -11,10 +11,12 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 from aiohttp import web
 
+import kai.telegram_http as telegram_http_mod
 import kai.webhook as webhook_mod
 from kai import sessions
 from kai.internal_api_auth import InternalAPIAuth, InternalAPIPrincipal, InternalAPIScope
 from kai.services import ServiceResponse
+from kai.telegram_http import TelegramWebhookIngress
 from kai.webhook import (
     ALLOWED_USER_IDS_KEY,
     CHAT_ID_KEY,
@@ -42,9 +44,7 @@ from kai.webhook import (
     _handle_send_file,
     _handle_send_message,
     _handle_service_call,
-    _handle_telegram_update,
     _handle_update_job,
-    stop,
 )
 from kai.workshop.domain import AgentId, ChannelId, MessageId, PrincipalId
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
@@ -938,29 +938,43 @@ class TestSendMessage:
 @pytest.fixture
 def telegram_request():
     """Create a mock request for the Telegram webhook endpoint."""
-    request = MagicMock(spec=web.Request)
+    application = MagicMock()
+    application.bot = MagicMock()
+    application.process_update = AsyncMock()
+    config = SimpleNamespace(
+        telegram_webhook_url="https://example.com/webhook/telegram",
+        telegram_webhook_secret="tg-secret",
+        get_admins=lambda: [SimpleNamespace(telegram_id=123)],
+        user_configs={},
+    )
+    ingress = TelegramWebhookIngress(application, config)  # type: ignore[arg-type]
+    request = SimpleNamespace()
     request.app = {
         TELEGRAM_WEBHOOK_SECRET_KEY: "tg-secret",
-        TELEGRAM_APP_KEY: MagicMock(),
-        TELEGRAM_BOT_KEY: MagicMock(),
+        TELEGRAM_APP_KEY: application,
+        TELEGRAM_BOT_KEY: application.bot,
     }
-    request.app[TELEGRAM_APP_KEY].process_update = AsyncMock()
+    request.ingress = ingress
     request.headers = {"X-Telegram-Bot-Api-Secret-Token": "tg-secret"}
     return request
 
 
+async def _handle_telegram_update(request) -> web.Response:
+    return await request.ingress.handle_update(request)
+
+
 class TestTelegramUpdate:
     def test_priority_classifier_matches_only_stop_commands(self):
-        assert webhook_mod._is_telegram_stop_update({"message": {"text": "/stop"}}) is True
-        assert webhook_mod._is_telegram_stop_update({"message": {"text": "/stop@kai_bot"}}) is True
-        assert webhook_mod._is_telegram_stop_update({"message": {"text": "/stop now"}}) is True
-        assert webhook_mod._is_telegram_stop_update({"message": {"text": "/stopping"}}) is False
-        assert webhook_mod._is_telegram_stop_update({"message": {"caption": "/stop"}}) is False
+        assert TelegramWebhookIngress.is_stop_update({"message": {"text": "/stop"}}) is True
+        assert TelegramWebhookIngress.is_stop_update({"message": {"text": "/stop@kai_bot"}}) is True
+        assert TelegramWebhookIngress.is_stop_update({"message": {"text": "/stop now"}}) is True
+        assert TelegramWebhookIngress.is_stop_update({"message": {"text": "/stopping"}}) is False
+        assert TelegramWebhookIngress.is_stop_update({"message": {"caption": "/stop"}}) is False
 
     async def test_valid_secret_dispatches_update(self, db, telegram_request, monkeypatch):
         """Valid secret and JSON body dispatches to process_update."""
         fake_update = MagicMock()
-        monkeypatch.setattr("kai.webhook.Update.de_json", MagicMock(return_value=fake_update))
+        monkeypatch.setattr("kai.telegram_http.Update.de_json", MagicMock(return_value=fake_update))
         telegram_request.json = AsyncMock(return_value={"update_id": 123})
 
         resp = await _handle_telegram_update(telegram_request)
@@ -968,8 +982,8 @@ class TestTelegramUpdate:
         assert resp.status == 200
         # process_update runs from the durable queue worker. Wait for that
         # worker before the DB fixture closes.
-        assert webhook_mod._telegram_queue_worker_task is not None
-        await webhook_mod._telegram_queue_worker_task
+        assert telegram_request.ingress._queue_worker_task is not None
+        await telegram_request.ingress._queue_worker_task
         telegram_request.app[TELEGRAM_APP_KEY].process_update.assert_called_once_with(fake_update)
 
     async def test_wrong_secret_returns_401(self, telegram_request):
@@ -1023,7 +1037,7 @@ class TestTelegramUpdate:
             elif update.update_id == 2002:
                 stop_processed.set()
 
-        monkeypatch.setattr("kai.webhook.Update.de_json", deserialize)
+        monkeypatch.setattr("kai.telegram_http.Update.de_json", deserialize)
         telegram_request.app[TELEGRAM_APP_KEY].process_update = AsyncMock(side_effect=process)
 
         telegram_request.json = AsyncMock(return_value={"update_id": 2001, "message": {"text": "work"}})
@@ -1036,9 +1050,9 @@ class TestTelegramUpdate:
 
         assert release_first.is_set() is False
         release_first.set()
-        assert webhook_mod._telegram_queue_worker_task is not None
-        await webhook_mod._telegram_queue_worker_task
-        await asyncio.gather(*webhook_mod._background_tasks)
+        assert telegram_request.ingress._queue_worker_task is not None
+        await telegram_request.ingress._queue_worker_task
+        await asyncio.gather(*telegram_request.ingress._background_tasks)
 
         async with sessions._get_db().execute(
             "SELECT status, attempt_count FROM telegram_update_queue ORDER BY id"
@@ -1065,7 +1079,7 @@ class TestTelegramUpdate:
             elif update.update_id == 2012:
                 second_processed.set()
 
-        monkeypatch.setattr("kai.webhook.Update.de_json", deserialize)
+        monkeypatch.setattr("kai.telegram_http.Update.de_json", deserialize)
         telegram_request.app[TELEGRAM_APP_KEY].process_update = AsyncMock(side_effect=process)
 
         telegram_request.json = AsyncMock(return_value={"update_id": 2011, "message": {"text": "one"}})
@@ -1078,38 +1092,35 @@ class TestTelegramUpdate:
         assert second_processed.is_set() is False
 
         release_first.set()
-        assert webhook_mod._telegram_queue_worker_task is not None
-        await webhook_mod._telegram_queue_worker_task
+        assert telegram_request.ingress._queue_worker_task is not None
+        await telegram_request.ingress._queue_worker_task
         assert second_processed.is_set() is True
 
     async def test_persistence_failure_returns_500(self, telegram_request, monkeypatch):
         """If the durable queue write fails, do not acknowledge the update as accepted."""
         monkeypatch.setattr(
-            "kai.webhook.sessions.enqueue_telegram_update",
+            "kai.telegram_http.sessions.enqueue_telegram_update",
             AsyncMock(side_effect=RuntimeError("database locked")),
         )
         telegram_request.json = AsyncMock(return_value={"update_id": 123})
-        webhook_mod._background_tasks.clear()
+        telegram_request.ingress._background_tasks.clear()
 
         resp = await _handle_telegram_update(telegram_request)
 
         assert resp.status == 500
         telegram_request.app[TELEGRAM_APP_KEY].process_update.assert_not_called()
-        assert webhook_mod._background_tasks == set()
+        assert telegram_request.ingress._background_tasks == set()
 
     async def test_worker_retries_then_completes_transient_failure(self, db, telegram_request, monkeypatch):
         """A process_update exception requeues the durable row for another attempt."""
         fake_update = MagicMock()
-        monkeypatch.setattr("kai.webhook.Update.de_json", MagicMock(return_value=fake_update))
+        monkeypatch.setattr("kai.telegram_http.Update.de_json", MagicMock(return_value=fake_update))
         telegram_request.app[TELEGRAM_APP_KEY].process_update = AsyncMock(side_effect=[RuntimeError("boom"), None])
 
         row_id, _ = await sessions.enqueue_telegram_update(124, '{"update_id":124}')
-        webhook_mod._ensure_telegram_update_queue_worker(
-            telegram_request.app[TELEGRAM_APP_KEY],
-            telegram_request.app[TELEGRAM_BOT_KEY],
-        )
-        assert webhook_mod._telegram_queue_worker_task is not None
-        await webhook_mod._telegram_queue_worker_task
+        telegram_request.ingress._ensure_update_queue_worker()
+        assert telegram_request.ingress._queue_worker_task is not None
+        await telegram_request.ingress._queue_worker_task
 
         telegram_request.app[TELEGRAM_APP_KEY].process_update.assert_awaited_with(fake_update)
         assert telegram_request.app[TELEGRAM_APP_KEY].process_update.await_count == 2
@@ -1125,17 +1136,14 @@ class TestTelegramUpdate:
     async def test_worker_discards_poison_update_after_max_attempts(self, db, telegram_request, monkeypatch):
         """A permanently failing queued update is discarded after bounded retries."""
         fake_update = MagicMock()
-        monkeypatch.setattr("kai.webhook.Update.de_json", MagicMock(return_value=fake_update))
-        monkeypatch.setattr(webhook_mod, "_TELEGRAM_UPDATE_MAX_ATTEMPTS", 2)
+        monkeypatch.setattr("kai.telegram_http.Update.de_json", MagicMock(return_value=fake_update))
+        monkeypatch.setattr(telegram_http_mod, "_TELEGRAM_UPDATE_MAX_ATTEMPTS", 2)
         telegram_request.app[TELEGRAM_APP_KEY].process_update = AsyncMock(side_effect=RuntimeError("always bad"))
 
         row_id, _ = await sessions.enqueue_telegram_update(125, '{"update_id":125}')
-        webhook_mod._ensure_telegram_update_queue_worker(
-            telegram_request.app[TELEGRAM_APP_KEY],
-            telegram_request.app[TELEGRAM_BOT_KEY],
-        )
-        assert webhook_mod._telegram_queue_worker_task is not None
-        await webhook_mod._telegram_queue_worker_task
+        telegram_request.ingress._ensure_update_queue_worker()
+        assert telegram_request.ingress._queue_worker_task is not None
+        await telegram_request.ingress._queue_worker_task
 
         assert telegram_request.app[TELEGRAM_APP_KEY].process_update.await_count == 2
         async with sessions._get_db().execute(
@@ -1148,38 +1156,28 @@ class TestTelegramUpdate:
         assert "RuntimeError: always bad" in row["last_error"]
 
 
-# ── webhook shutdown background task drain ─────────────────────────
+# ── Telegram webhook shutdown background task drain ────────────────
 
 
 class TestWebhookStopBackgroundTasks:
-    async def test_stop_waits_for_background_tasks_before_runner_cleanup(self, monkeypatch):
-        """Clean shutdown drains in-flight webhook work before tearing down aiohttp."""
+    async def test_stop_waits_for_background_tasks(self, telegram_request):
+        """Clean adapter shutdown drains in-flight accepted Telegram work."""
         events: list[str] = []
 
         async def background_work():
             await asyncio.sleep(0)
             events.append("task")
 
-        async def cleanup():
-            events.append("cleanup")
-
         task = asyncio.create_task(background_work())
-        webhook_mod._background_tasks.add(task)
-        task.add_done_callback(webhook_mod._background_tasks.discard)
+        telegram_request.ingress._background_tasks.add(task)
+        task.add_done_callback(telegram_request.ingress._background_tasks.discard)
 
-        runner = MagicMock()
-        runner.cleanup = AsyncMock(side_effect=cleanup)
-        monkeypatch.setattr(webhook_mod, "_runner", runner)
-        monkeypatch.setattr(webhook_mod, "_app", None)
-        monkeypatch.setattr(webhook_mod, "_webhook_registered", False)
-        monkeypatch.setattr(webhook_mod, "_health_monitor_task", None)
+        await telegram_request.ingress._drain_background_tasks()
 
-        await stop()
+        assert events == ["task"]
+        assert telegram_request.ingress._background_tasks == set()
 
-        assert events == ["task", "cleanup"]
-        assert webhook_mod._background_tasks == set()
-
-    async def test_stop_cancels_background_tasks_after_timeout(self, monkeypatch):
+    async def test_stop_cancels_background_tasks_after_timeout(self, telegram_request, monkeypatch):
         """Shutdown remains bounded if webhook background work does not finish."""
         started = asyncio.Event()
 
@@ -1189,22 +1187,14 @@ class TestWebhookStopBackgroundTasks:
 
         task = asyncio.create_task(background_work())
         await started.wait()
-        webhook_mod._background_tasks.add(task)
-        task.add_done_callback(webhook_mod._background_tasks.discard)
+        telegram_request.ingress._background_tasks.add(task)
+        task.add_done_callback(telegram_request.ingress._background_tasks.discard)
+        monkeypatch.setattr(telegram_http_mod, "_BACKGROUND_TASK_DRAIN_TIMEOUT", 0.001)
 
-        runner = MagicMock()
-        runner.cleanup = AsyncMock()
-        monkeypatch.setattr(webhook_mod, "_runner", runner)
-        monkeypatch.setattr(webhook_mod, "_app", None)
-        monkeypatch.setattr(webhook_mod, "_webhook_registered", False)
-        monkeypatch.setattr(webhook_mod, "_health_monitor_task", None)
-        monkeypatch.setattr(webhook_mod, "_BACKGROUND_TASK_DRAIN_TIMEOUT", 0.001)
-
-        await stop()
+        await telegram_request.ingress._drain_background_tasks()
 
         assert task.cancelled()
-        assert webhook_mod._background_tasks == set()
-        runner.cleanup.assert_awaited_once()
+        assert telegram_request.ingress._background_tasks == set()
 
 
 # ── GitHub webhook helpers ─────────────────────────────────────────

@@ -15,20 +15,20 @@ def http_dependencies(monkeypatch):
     state = {"loopback": False, "lan": False}
 
     async def fake_start(
-        application,
         config,
         *,
         core_host,
         core_services,
         integration_notifications,
         workshop_enabled,
+        route_registrars,
     ) -> None:
-        assert application in {None, "telegram-application"}
         assert config.workshop_lan_host in {None, "10.0.0.36"}
         assert core_host == "core-host"
         assert core_services.integration_notifications == "integration-notifications"
         assert integration_notifications == "integration-notifications"
         assert workshop_enabled is config.workshop_enabled
+        assert len(route_registrars) in {0, 1}
         events.append("http:start")
         state["loopback"] = True
         state["lan"] = True
@@ -65,7 +65,18 @@ def _adapter(
     )
     telegram = None
     if telegram_enabled:
-        telegram = SimpleNamespace(application="telegram-application")
+
+        class FakeIngress:
+            def register_http_routes(self, _app) -> None:
+                return None
+
+            async def activate_ingress(self) -> None:
+                return None
+
+            async def deactivate_ingress(self) -> None:
+                return None
+
+        telegram = FakeIngress()
     core_services = SimpleNamespace(integration_notifications="integration-notifications")
     return HttpAdapter(  # type: ignore[arg-type]
         config,
