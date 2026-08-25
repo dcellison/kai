@@ -4833,6 +4833,7 @@ class TestCmdStatus:
         assert "Workshop canonical message integrity:" in output
         assert "Workshop transcript authority:" in output
         assert "Workshop legacy JSONL archive:" in output
+        assert "Workshop transition tooling: retired;" in output
 
     def test_reports_unsupported_webhook_secret(self, tmp_path, monkeypatch, capsys):
         conf_path = tmp_path / "install.conf"
