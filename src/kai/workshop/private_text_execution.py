@@ -13,6 +13,7 @@ from kai.workshop.conversation_commands import (
     WorkshopConversationCommandService,
 )
 from kai.workshop.conversation_context import assemble_canonical_prior_pairs
+from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import MessageId, RunId, RuntimeProfileId
 from kai.workshop.execution_coordinator import (
     CanonicalCancellationDisposition,
@@ -68,6 +69,7 @@ class WorkshopPrivateTextExecutionService:
         runtime_pool: WorkshopRuntimePool,
         *,
         registered_backend_ids: frozenset[str],
+        delivery_policy: WorkshopDeliveryBindingPolicy,
     ) -> WorkshopPrivateTextExecutionService:
         store = await WorkshopEventStore.open(database_path)
         database_lock = asyncio.Lock()
@@ -82,6 +84,7 @@ class WorkshopPrivateTextExecutionService:
             database_lock=database_lock,
             transcript_projection=CanonicalTranscriptProjection(database_path.parent / "history"),
             artifact_storage_root=database_path.parent / "files",
+            delivery_policy=delivery_policy,
         )
         service = cls(
             store,
@@ -89,6 +92,7 @@ class WorkshopPrivateTextExecutionService:
             WorkshopConversationCommandService(
                 store,
                 artifact_storage_root=database_path.parent / "files",
+                delivery_policy=delivery_policy,
             ),
             database_lock,
             runtime_pool,

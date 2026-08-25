@@ -37,6 +37,7 @@ from kai.workshop.scheduler import (
 )
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.timeline import read_channel_timeline
+from tests.workshop_delivery import DISABLED_DELIVERY_POLICY, TELEGRAM_DELIVERY_POLICY
 from tests.workshop_profiles import profile_id, profile_registry
 
 
@@ -280,6 +281,7 @@ async def test_workshop_only_reminder_fires_canonically_without_delivery(tmp_pat
         database,
         _UnusedExecution(),  # type: ignore[arg-type]
         _UnusedCompatibilityState(),  # type: ignore[arg-type]
+        DISABLED_DELIVERY_POLICY,
     )
     try:
         await asyncio.sleep(0.25)
@@ -328,11 +330,39 @@ async def test_telegram_bound_reminder_uses_notification_outbox(tmp_path: Path) 
         database,
         _UnusedExecution(),  # type: ignore[arg-type]
         _UnusedCompatibilityState(),  # type: ignore[arg-type]
+        TELEGRAM_DELIVERY_POLICY,
     )
     try:
         await asyncio.sleep(0.25)
         async with source_store.connection.execute("SELECT purpose, status FROM delivery_outbox") as cursor:
             assert tuple(await cursor.fetchone()) == ("notification", "pending")
+    finally:
+        await scheduler.stop()
+        await source_store.close()
+        await sessions.close_db()
+
+
+async def test_disabled_telegram_adapter_does_not_enqueue_retained_reminder_binding(tmp_path: Path) -> None:
+    database = tmp_path / "kai.db"
+    source_store, _ = await _install_owned_job(
+        database,
+        transport="telegram",
+        run_at=datetime.now(UTC) + timedelta(milliseconds=100),
+    )
+    scheduler = await WorkshopCanonicalScheduler.open_and_start(
+        database,
+        _UnusedExecution(),  # type: ignore[arg-type]
+        _UnusedCompatibilityState(),  # type: ignore[arg-type]
+        DISABLED_DELIVERY_POLICY,
+    )
+    try:
+        await asyncio.sleep(0.25)
+        async with source_store.connection.execute("SELECT COUNT(*) FROM delivery_outbox") as cursor:
+            assert int((await cursor.fetchone())[0]) == 0
+        async with source_store.connection.execute(
+            "SELECT COUNT(*) FROM channel_bindings WHERE transport = 'telegram'"
+        ) as cursor:
+            assert int((await cursor.fetchone())[0]) == 1
     finally:
         await scheduler.stop()
         await source_store.close()
@@ -348,6 +378,7 @@ async def test_scheduler_starts_without_legacy_jobs_table(tmp_path: Path) -> Non
         database,
         _UnusedExecution(),  # type: ignore[arg-type]
         _UnusedCompatibilityState(),  # type: ignore[arg-type]
+        DISABLED_DELIVERY_POLICY,
     )
     try:
         assert scheduler.readiness.ready is True
@@ -376,6 +407,7 @@ async def test_scheduler_fails_closed_for_active_job_without_canonical_owner(
             database,
             _UnusedExecution(),  # type: ignore[arg-type]
             _UnusedCompatibilityState(),  # type: ignore[arg-type]
+            DISABLED_DELIVERY_POLICY,
         )
     await store.close()
     await sessions.close_db()
@@ -425,6 +457,7 @@ async def test_once_daily_and_interval_jobs_reconcile_into_core_scheduler(
         database,
         _UnusedExecution(),  # type: ignore[arg-type]
         _UnusedCompatibilityState(),  # type: ignore[arg-type]
+        DISABLED_DELIVERY_POLICY,
     )
     try:
         assert scheduler.readiness.active_jobs == 3
@@ -458,6 +491,7 @@ async def test_interrupted_reminder_firing_recovers_once(tmp_path: Path) -> None
         database,
         _UnusedExecution(),  # type: ignore[arg-type]
         _UnusedCompatibilityState(),  # type: ignore[arg-type]
+        DISABLED_DELIVERY_POLICY,
     )
     try:
         await asyncio.sleep(0.2)
@@ -493,6 +527,7 @@ async def test_workshop_only_agent_job_uses_canonical_execution(tmp_path: Path) 
         database,
         execution,  # type: ignore[arg-type]
         _CompatibilityState(),  # type: ignore[arg-type]
+        DISABLED_DELIVERY_POLICY,
     )
     try:
         await asyncio.sleep(0.25)
@@ -534,11 +569,13 @@ async def test_agent_firing_completes_through_real_canonical_coordinator(
         database,
         WorkshopRuntimePool(pool, profile_registry(101)),  # type: ignore[arg-type]
         registered_backend_ids=frozenset({"codex"}),
+        delivery_policy=DISABLED_DELIVERY_POLICY,
     )
     scheduler = await WorkshopCanonicalScheduler.open_and_start(
         database,
         execution,
         _CanonicalCompatibilityState(),  # type: ignore[arg-type]
+        DISABLED_DELIVERY_POLICY,
     )
     try:
         await asyncio.sleep(0.35)

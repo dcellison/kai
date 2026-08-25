@@ -20,9 +20,9 @@ from kai.workshop.delivery_outbox import (
     DeliveryRequestResult,
     WorkshopDeliveryOutbox,
 )
+from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import (
     AgentId,
-    ChannelBindingId,
     ChannelId,
     EventEnvelope,
     EventId,
@@ -84,14 +84,12 @@ class WorkshopProactivePublicationService:
         artifacts: WorkshopArtifactService,
         *,
         artifact_storage_root: Path,
-        delivery_transports: frozenset[str],
+        delivery_policy: WorkshopDeliveryBindingPolicy,
     ) -> None:
-        if any(not isinstance(transport, str) or not transport for transport in delivery_transports):
-            raise ValueError("delivery_transports must contain non-empty identifiers")
         self._store = store
         self._artifacts = artifacts
         self._artifact_storage_root = artifact_storage_root.resolve()
-        self._delivery_transports = delivery_transports
+        self._delivery_policy = delivery_policy
         self._lock = asyncio.Lock()
 
     async def validate_authority(self, authority: ProactivePublicationAuthority) -> None:
@@ -224,16 +222,7 @@ class WorkshopProactivePublicationService:
                     artifact.for_message(message_id),
                     storage_root=self._artifact_storage_root,
                 )
-            binding_ids: tuple[ChannelBindingId, ...] = ()
-            if self._delivery_transports:
-                placeholders = ", ".join("?" for _ in self._delivery_transports)
-                parameters = (authority.channel_id, *sorted(self._delivery_transports))
-                async with connection.execute(
-                    "SELECT id FROM channel_bindings WHERE channel_id = ? "
-                    f"AND transport IN ({placeholders}) ORDER BY id",
-                    parameters,
-                ) as cursor:
-                    binding_ids = tuple(ChannelBindingId(str(row[0])) for row in await cursor.fetchall())
+            binding_ids = await self._delivery_policy.binding_ids(self._store, authority.channel_id)
             deliveries = tuple(
                 [
                     await WorkshopDeliveryOutbox(self._store).request_delivery_in_transaction(

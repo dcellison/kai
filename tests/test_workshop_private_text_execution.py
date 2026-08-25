@@ -24,6 +24,7 @@ from kai.workshop.private_text_execution import (
 from kai.workshop.run_lifecycle import RunStatus
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.store import WorkshopEventStore
+from tests.workshop_delivery import TELEGRAM_DELIVERY_POLICY
 from tests.workshop_profiles import profile_id, profile_registry
 
 _NOW = datetime(2026, 1, 1, 23, 0, tzinfo=UTC)
@@ -104,6 +105,7 @@ async def test_owner_accepts_executes_and_atomically_enqueues_terminal_reply(tmp
         database,
         WorkshopRuntimePool(pool, profile_registry(101)),  # type: ignore[arg-type]
         registered_backend_ids=frozenset({"codex"}),
+        delivery_policy=TELEGRAM_DELIVERY_POLICY,
     )
     observed: list[str] = []
     try:
@@ -149,6 +151,7 @@ async def test_owner_routes_stop_to_exact_active_runtime_and_terminal_cancellati
         database,
         WorkshopRuntimePool(pool, profile_registry(101)),  # type: ignore[arg-type]
         registered_backend_ids=frozenset({"codex"}),
+        delivery_policy=TELEGRAM_DELIVERY_POLICY,
     )
     try:
         accepted = await service.accept(_message())
@@ -191,6 +194,7 @@ async def test_owner_discovers_only_durably_accepted_workshop_client_runs(tmp_pa
         database,
         WorkshopRuntimePool(pool, profile_registry(101)),  # type: ignore[arg-type]
         registered_backend_ids=frozenset({"codex"}),
+        delivery_policy=TELEGRAM_DELIVERY_POLICY,
     )
     try:
         accepted = await service.accept_client(

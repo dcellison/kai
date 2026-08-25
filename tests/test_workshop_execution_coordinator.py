@@ -29,6 +29,7 @@ from kai.workshop.run_execution_authority import (
 from kai.workshop.run_lifecycle import RunStatus, WorkshopRunLifecycle
 from kai.workshop.runtime_sessions import load_runtime_session
 from kai.workshop.store import WorkshopEventStore
+from tests.workshop_delivery import TELEGRAM_DELIVERY_POLICY
 
 _NOW = datetime(2026, 8, 12, 22, 0, tzinfo=UTC)
 _RUNTIME_PROFILE_ID = RuntimeProfileId.new()
@@ -128,6 +129,7 @@ def _coordinator(store, preparation, *, lease_seconds: int = 60):
         registered_backend_ids=frozenset({"codex"}),
         clock=lambda: _NOW + timedelta(seconds=10),
         lease_duration=timedelta(seconds=lease_seconds),
+        delivery_policy=TELEGRAM_DELIVERY_POLICY,
     )
 
 

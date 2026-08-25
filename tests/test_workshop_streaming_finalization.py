@@ -36,7 +36,9 @@ from kai.workshop.outbound import (
     OutboundMessage,
     OutboundStreamingPreviewConflictError,
     record_outbound_message,
-    record_outbound_message_with_streaming_finalization,
+)
+from kai.workshop.outbound import (
+    record_outbound_message_with_streaming_finalization as _record_outbound_message_with_streaming_finalization,
 )
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.streaming_preview import (
@@ -48,8 +50,17 @@ from kai.workshop.telegram_delivery import (
     WorkshopTelegramDeliveryAdapter,
     WorkshopTelegramDeliveryWorker,
 )
+from tests.workshop_delivery import DISABLED_DELIVERY_POLICY, TELEGRAM_DELIVERY_POLICY
 
 _NOW = datetime(2026, 8, 12, 12, 0, tzinfo=UTC)
+
+
+async def record_outbound_message_with_streaming_finalization(store, message):
+    return await _record_outbound_message_with_streaming_finalization(
+        store,
+        message,
+        delivery_policy=TELEGRAM_DELIVERY_POLICY,
+    )
 
 
 @dataclass
@@ -122,6 +133,30 @@ async def _assert_no_finalization_state(store: WorkshopEventStore, inbound_id: M
 
 
 class TestAtomicStreamingFinalization:
+    async def test_disabled_telegram_adapter_records_reply_without_delivery_for_retained_binding(
+        self,
+        tmp_path: Path,
+    ):
+        store, inbound_id = await _open_with_inbound(tmp_path / "kai.db")
+        try:
+            result = await _record_outbound_message_with_streaming_finalization(
+                store,
+                _outbound(inbound_id),
+                delivery_policy=DISABLED_DELIVERY_POLICY,
+            )
+
+            assert result.message.inserted is True
+            assert result.delivery is None
+            assert result.plan is None
+            async with store.connection.execute("SELECT COUNT(*) FROM delivery_outbox") as cursor:
+                assert int((await cursor.fetchone())[0]) == 0
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM channel_bindings WHERE transport = 'telegram'"
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 1
+        finally:
+            await store.close()
+
     async def test_short_reply_with_preview_is_one_explicit_edit_operation(self, tmp_path: Path):
         store, inbound_id = await _open_with_inbound(tmp_path / "kai.db")
         try:

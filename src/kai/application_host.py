@@ -19,6 +19,7 @@ from kai.workshop.delivery_authority import (
     DeliveryAuthorityEpoch,
     WorkshopConversationDeliveryAuthority,
 )
+from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.execution_state import WorkshopExecutionStateRegistry
 from kai.workshop.github_automation import WorkshopGitHubAutomationService
 from kai.workshop.integration_notifications import WorkshopIntegrationNotificationService
@@ -130,6 +131,7 @@ class KaiCoreServices:
     proactive_publication: WorkshopProactivePublicationService
     integration_notifications: WorkshopIntegrationNotificationService
     github_automation: WorkshopGitHubAutomationService
+    delivery_policy: WorkshopDeliveryBindingPolicy
 
 
 class KaiApplicationHost:
@@ -200,6 +202,9 @@ class KaiApplicationHost:
         integration_notifications: WorkshopIntegrationNotificationService | None = None
         github_automation: WorkshopGitHubAutomationService | None = None
         try:
+            delivery_policy = WorkshopDeliveryBindingPolicy(
+                frozenset({"telegram"}) if self._config.telegram_enabled else frozenset()
+            )
             subprocess_pool = SubprocessPool(
                 config=self._config,
                 services_info=self._services_info,
@@ -222,6 +227,7 @@ class KaiApplicationHost:
                 Path(self._config.session_db_path),
                 runtime_pool,
                 registered_backend_ids=self._registered_backend_ids,
+                delivery_policy=delivery_policy,
             )
             run_previews = WorkshopRunPreviewRegistry()
             client_commands = WorkshopClientCommandExecutor(
@@ -235,6 +241,7 @@ class KaiApplicationHost:
                 Path(self._config.session_db_path),
                 private_execution,
                 compatibility_state,
+                delivery_policy,
             )
             artifacts = WorkshopArtifactService(
                 client_store,
@@ -257,7 +264,7 @@ class KaiApplicationHost:
                 client_store,
                 artifacts,
                 artifact_storage_root=Path(self._config.session_db_path).parent / "files",
-                delivery_transports=frozenset({"telegram"}) if self._config.telegram_enabled else frozenset(),
+                delivery_policy=delivery_policy,
             )
             for context in self._internal_api_contexts.contexts:
                 await proactive_publication.validate_authority(
@@ -269,7 +276,8 @@ class KaiApplicationHost:
                     )
                 )
             integration_notifications = await WorkshopIntegrationNotificationService.open(
-                Path(self._config.session_db_path)
+                Path(self._config.session_db_path),
+                delivery_policy,
             )
             github_automation = await WorkshopGitHubAutomationService.open_and_start(
                 Path(self._config.session_db_path),
@@ -300,6 +308,7 @@ class KaiApplicationHost:
                 proactive_publication=proactive_publication,
                 integration_notifications=integration_notifications,
                 github_automation=github_automation,
+                delivery_policy=delivery_policy,
             )
             self._state = KaiApplicationState.READY
             return self._services

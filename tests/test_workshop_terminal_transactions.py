@@ -34,11 +34,21 @@ from kai.workshop.terminal_transactions import (
     TerminalOutcome,
     TerminalTransactionCommitUncertainError,
     TerminalTransactionStateConflictError,
-    WorkshopRunTerminalTransactionCoordinator,
 )
+from kai.workshop.terminal_transactions import (
+    WorkshopRunTerminalTransactionCoordinator as _WorkshopRunTerminalTransactionCoordinator,
+)
+from tests.workshop_delivery import DISABLED_DELIVERY_POLICY, TELEGRAM_DELIVERY_POLICY
 from tests.workshop_profiles import profile_id
 
 _NOW = datetime(2026, 8, 12, 21, 0, tzinfo=UTC)
+
+
+def WorkshopRunTerminalTransactionCoordinator(authority):
+    return _WorkshopRunTerminalTransactionCoordinator(
+        authority,
+        delivery_policy=TELEGRAM_DELIVERY_POLICY,
+    )
 
 
 async def _started_run(
@@ -116,7 +126,10 @@ async def _started_client_run(
     ) as cursor:
         row = await cursor.fetchone()
     assert row is not None
-    accepted = await WorkshopConversationCommandService(store).accept_client(
+    accepted = await WorkshopConversationCommandService(
+        store,
+        delivery_policy=TELEGRAM_DELIVERY_POLICY,
+    ).accept_client(
         ClientInboundMessage(
             principal_id=PrincipalId(str(row[0])),
             channel_id=ChannelId(str(row[1])),
@@ -165,7 +178,10 @@ async def _started_workshop_only_client_run(
     ) as cursor:
         row = await cursor.fetchone()
     assert row is not None
-    accepted = await WorkshopConversationCommandService(store).accept_client(
+    accepted = await WorkshopConversationCommandService(
+        store,
+        delivery_policy=DISABLED_DELIVERY_POLICY,
+    ).accept_client(
         ClientInboundMessage(
             principal_id=PrincipalId(str(row[0])),
             channel_id=ChannelId(str(row[1])),
@@ -470,6 +486,7 @@ class TestAtomicTerminalTransactions:
                     body="Half state",
                     occurred_at=_NOW + timedelta(seconds=4),
                 ),
+                delivery_policy=TELEGRAM_DELIVERY_POLICY,
             )
 
             with pytest.raises(TerminalTransactionStateConflictError, match="share one prior state"):

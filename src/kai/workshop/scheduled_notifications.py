@@ -12,8 +12,8 @@ from kai.workshop.delivery_outbox import (
     DeliveryRequestResult,
     WorkshopDeliveryOutbox,
 )
+from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import (
-    ChannelBindingId,
     ChannelId,
     EventEnvelope,
     EventId,
@@ -43,8 +43,9 @@ class ScheduledReminderRecord:
 class WorkshopScheduledReminderRecorder:
     """Append one reminder to its canonical channel and optional adapter outbox."""
 
-    def __init__(self, store: WorkshopEventStore) -> None:
+    def __init__(self, store: WorkshopEventStore, delivery_policy: WorkshopDeliveryBindingPolicy) -> None:
         self._store = store
+        self._delivery_policy = delivery_policy
         self._lock = asyncio.Lock()
 
     async def record(self, reminder: ScheduledReminder) -> ScheduledReminderRecord:
@@ -106,11 +107,11 @@ class WorkshopScheduledReminderRecorder:
                 raise IdempotencyConflictError(f"Event identity {idempotency_key!r} was reused with different content")
             projection = CanonicalConversationProjection()
             await self._store.project_pending_in_transaction(projection)
-            async with connection.execute(
-                "SELECT id FROM channel_bindings WHERE channel_id = ? AND transport = 'telegram' ORDER BY id",
-                (channel_id,),
-            ) as cursor:
-                bindings = list(await cursor.fetchall())
+            bindings = await self._delivery_policy.binding_ids(
+                self._store,
+                channel_id,
+                transport="telegram",
+            )
             if len(bindings) > 1:
                 raise RuntimeError("Scheduled reminder channel has ambiguous Telegram bindings")
             delivery = None
@@ -118,7 +119,7 @@ class WorkshopScheduledReminderRecorder:
                 delivery = await WorkshopDeliveryOutbox(self._store).request_delivery_in_transaction(
                     DeliveryRequest(
                         message_id=message_id,
-                        channel_binding_id=ChannelBindingId(str(bindings[0][0])),
+                        channel_binding_id=bindings[0],
                         mode="text",
                         purpose=NOTIFICATION_PURPOSE,
                         occurred_at=occurred_at,

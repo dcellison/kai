@@ -12,6 +12,7 @@ import pytest
 from kai import sessions
 from kai.workshop.domain import MessageId
 from kai.workshop.outbound import OutboundMessage
+from tests.workshop_delivery import TELEGRAM_DELIVERY_POLICY
 
 
 @pytest.fixture
@@ -69,7 +70,10 @@ class TestWorkshopFinalizationAdapter:
         recorder = AsyncMock(side_effect=[aiosqlite.OperationalError("commit result lost"), expected])
 
         with patch("kai.sessions.record_outbound_message_with_streaming_finalization", recorder):
-            result = await sessions.record_workshop_streaming_finalization(message)
+            result = await sessions.record_workshop_streaming_finalization(
+                message,
+                delivery_policy=TELEGRAM_DELIVERY_POLICY,
+            )
 
         assert result is expected
         assert recorder.await_count == 2
@@ -91,7 +95,10 @@ class TestWorkshopFinalizationAdapter:
             patch("kai.sessions.record_outbound_message_with_streaming_finalization", recorder),
             pytest.raises(sessions.WorkshopFinalizationCommitUncertainError),
         ):
-            await sessions.record_workshop_streaming_finalization(message)
+            await sessions.record_workshop_streaming_finalization(
+                message,
+                delivery_policy=TELEGRAM_DELIVERY_POLICY,
+            )
 
         assert recorder.await_count == 2
 

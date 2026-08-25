@@ -32,6 +32,7 @@ from kai.workshop.transcript_export import (
     inspect_canonical_transcript_snapshot,
 )
 from kai.workshop_cli import _parser
+from tests.workshop_delivery import TELEGRAM_DELIVERY_POLICY
 from tests.workshop_profiles import profile_id
 
 _NOW = datetime(2026, 8, 15, 9, 0, tzinfo=UTC)
@@ -87,7 +88,10 @@ async def _complete(store: WorkshopEventStore, acceptance, suffix: str):
         lease_expires_at=_NOW + timedelta(minutes=int(suffix) + 2),
     )
     started = await authority.start(granted.claim, occurred_at=_NOW + timedelta(minutes=int(suffix), seconds=2))
-    return await WorkshopRunTerminalTransactionCoordinator(authority).complete(
+    return await WorkshopRunTerminalTransactionCoordinator(
+        authority,
+        delivery_policy=TELEGRAM_DELIVERY_POLICY,
+    ).complete(
         started.claim,
         body=f"Canonical answer {suffix}",
         occurred_at=_NOW + timedelta(minutes=int(suffix), seconds=3),

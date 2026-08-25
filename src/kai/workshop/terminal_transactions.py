@@ -9,6 +9,7 @@ from enum import StrEnum
 
 import aiosqlite
 
+from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import MessageId
 from kai.workshop.outbound import (
     OutboundMessage,
@@ -115,11 +116,17 @@ class WorkshopRunTerminalTransactionCoordinator:
     This service is not constructed by production code.
     """
 
-    def __init__(self, authority: WorkshopRunExecutionAuthority) -> None:
+    def __init__(
+        self,
+        authority: WorkshopRunExecutionAuthority,
+        *,
+        delivery_policy: WorkshopDeliveryBindingPolicy,
+    ) -> None:
         if not isinstance(authority, WorkshopRunExecutionAuthority):
             raise TypeError("authority must be a WorkshopRunExecutionAuthority")
         self._authority = authority
         self._store = authority.event_store
+        self._delivery_policy = delivery_policy
 
     async def complete(
         self,
@@ -232,6 +239,7 @@ class WorkshopRunTerminalTransactionCoordinator:
                     body=body,
                     occurred_at=occurred_at,
                 ),
+                delivery_policy=self._delivery_policy,
                 request_delivery=request_delivery,
             )
             message_id = finalization.message.event.envelope.aggregate_id

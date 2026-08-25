@@ -24,6 +24,7 @@ from kai.workshop.run_execution_authority import (
 )
 from kai.workshop.run_lifecycle import RunStatus, WorkshopRunLifecycle
 from kai.workshop.store import WorkshopEventStore
+from tests.workshop_delivery import TELEGRAM_DELIVERY_POLICY
 
 _NOW = datetime(2026, 8, 12, 18, 0, tzinfo=UTC)
 
@@ -340,7 +341,10 @@ class TestRunExecutionRecovery:
         try:
             accepted = await _accepted(store, inbound_id)
             first = await _grant(authority, accepted.run.run_id)
-            recovery = await authority.recover_expired(occurred_at=_NOW + timedelta(seconds=63))
+            recovery = await authority.recover_expired(
+                occurred_at=_NOW + timedelta(seconds=63),
+                delivery_policy=TELEGRAM_DELIVERY_POLICY,
+            )
             second = await _grant(authority, accepted.run.run_id, offset=64)
 
             assert recovery.expired_before_dispatch == 1
@@ -362,7 +366,10 @@ class TestRunExecutionRecovery:
             accepted = await _accepted(store, inbound_id)
             granted = await _grant(authority, accepted.run.run_id)
             await authority.start(granted.claim, occurred_at=_NOW + timedelta(seconds=3))
-            recovery = await authority.recover_expired(occurred_at=_NOW + timedelta(seconds=63))
+            recovery = await authority.recover_expired(
+                occurred_at=_NOW + timedelta(seconds=63),
+                delivery_policy=TELEGRAM_DELIVERY_POLICY,
+            )
 
             assert recovery.expired_before_dispatch == 0
             assert recovery.interrupted_after_dispatch == 1

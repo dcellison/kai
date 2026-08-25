@@ -139,7 +139,7 @@ class _FakeIntegrationNotifications:
         self.events = events
 
     @classmethod
-    async def open(cls, _path: Path):
+    async def open(cls, _path: Path, _delivery_policy):
         events = _FakeExecutionFactory.events
         events.append("integrations:open")
         return cls(events)
@@ -300,6 +300,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
         },
     }
     assert services.subprocess_pool is not None
+    assert services.delivery_policy.enabled_transports == frozenset()
     assert host_dependencies == [
         "pool:start",
         "store:open",
