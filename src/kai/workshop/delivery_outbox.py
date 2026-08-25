@@ -32,6 +32,7 @@ _MAX_ATTEMPTS = 20
 _MAX_MINIMUM_RETRY_DELAY = timedelta(days=1)
 _RETRY_BASE_SECONDS = 5
 _RETRY_MAX_SECONDS = 300
+CONVERSATION_FINALIZATION_LANE = "conversation_streaming_finalization"
 
 DeliveryPurpose = Literal["conversation_reply", "notification", "qualification"]
 CONVERSATION_REPLY_PURPOSE: DeliveryPurpose = "conversation_reply"
@@ -236,9 +237,9 @@ def _retry_delay(attempt_number: int) -> timedelta:
 class WorkshopDeliveryOutbox:
     """Durable delivery state with lease-based, at-least-once work claims.
 
-    Production private-text finalization and explicit qualification use this
-    class. Other Telegram paths retain their existing delivery behavior until
-    separately bounded cutovers move them.
+    Core application services publish transport-neutral work here. Each
+    enabled adapter claims and settles only the transport and execution
+    contracts it implements.
     """
 
     def __init__(
@@ -272,7 +273,7 @@ class WorkshopDeliveryOutbox:
         if request.authority_epoch_id is not None:
             async with connection.execute(
                 "SELECT COUNT(*) FROM delivery_authority_epochs "
-                "WHERE id = ? AND lane = 'telegram_conversation_streaming_finalization' "
+                "WHERE id = ? AND lane = 'conversation_streaming_finalization' "
                 "AND status = 'active'",
                 (request.authority_epoch_id,),
             ) as cursor:
@@ -442,7 +443,7 @@ class WorkshopDeliveryOutbox:
                 filters.append(
                     "EXISTS (SELECT 1 FROM delivery_authority_epochs ae "
                     "WHERE ae.id = o.authority_epoch_id "
-                    "AND ae.lane = 'telegram_conversation_streaming_finalization' "
+                    "AND ae.lane = 'conversation_streaming_finalization' "
                     "AND ae.status = 'active')"
                 )
             if delivery_id is not None:
@@ -614,7 +615,7 @@ class WorkshopDeliveryOutbox:
             if persisted_epoch is not None:
                 async with connection.execute(
                     "SELECT COUNT(*) FROM delivery_authority_epochs "
-                    "WHERE id = ? AND lane = 'telegram_conversation_streaming_finalization' "
+                    "WHERE id = ? AND lane = 'conversation_streaming_finalization' "
                     "AND status = 'active'",
                     (persisted_epoch,),
                 ) as cursor:
@@ -756,7 +757,7 @@ class WorkshopDeliveryOutbox:
         active_authority_filter = (
             " AND EXISTS (SELECT 1 FROM delivery_authority_epochs ae "
             "WHERE ae.id = delivery_outbox.authority_epoch_id "
-            "AND ae.lane = 'telegram_conversation_streaming_finalization' "
+            "AND ae.lane = 'conversation_streaming_finalization' "
             "AND ae.status = 'active')"
             if authority_epoch_id is not None
             else ""

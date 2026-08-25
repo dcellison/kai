@@ -11,7 +11,6 @@ import pytest
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.conversation_commands import WorkshopConversationCommandService
 from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
-from kai.workshop.delivery_fragments import SEND_OPERATION
 from kai.workshop.delivery_outbox import STREAMING_FINALIZATION_CONTRACT
 from kai.workshop.domain import ChannelId, MessageId, PrincipalId, RunExecutionOwnerId
 from kai.workshop.inbound import ClientInboundMessage, InboundMessage, record_inbound_message
@@ -237,12 +236,13 @@ class TestAtomicTerminalTransactions:
             assert result.execution.attempt.status == RunAttemptStatus.COMPLETED
             assert result.execution.run.result_message_id == result.finalization.message.event.envelope.aggregate_id
             assert result.finalization.delivery.delivery.authority_epoch_id is not None
-            assert [fragment.body for fragment in result.finalization.plan.fragments] == ["Canonical result"]
+            assert result.finalization.plan is None
+            assert result.finalization.message.event.envelope.payload["body"] == "Canonical result"
             assert retry.changed is False
             assert retry.finalization.message.event == result.finalization.message.event
             assert retry.finalization.delivery.delivery == result.finalization.delivery.delivery
-            assert retry.finalization.plan.fragments == result.finalization.plan.fragments
-            assert await _terminal_rows(store) == (1, 1, 1)
+            assert retry.finalization.plan is None
+            assert await _terminal_rows(store) == (1, 1, 0)
             async with store.connection.execute(
                 "SELECT event_type FROM event_log WHERE position >= ? ORDER BY position",
                 (result.finalization.message.event.position,),
@@ -287,7 +287,7 @@ class TestAtomicTerminalTransactions:
             assert result.execution.run.status == RunStatus.COMPLETED
             assert result.runtime_session is None
             assert await load_runtime_session(store, run.channel_id, run.agent_id) is None
-            assert await _terminal_rows(store) == (1, 1, 1)
+            assert await _terminal_rows(store) == (1, 1, 0)
         finally:
             await store.close()
 
@@ -332,7 +332,7 @@ class TestAtomicTerminalTransactions:
             session = await load_runtime_session(store, run.channel_id, run.agent_id)
             assert session is not None
             assert session.provider_session_id == "provider-session-original"
-            assert await _terminal_rows(store) == (1, 1, 1)
+            assert await _terminal_rows(store) == (1, 1, 0)
         finally:
             await store.close()
 
@@ -348,13 +348,11 @@ class TestAtomicTerminalTransactions:
             assert result.outcome == TerminalOutcome.COMPLETED
             assert result.execution.run.status == RunStatus.COMPLETED
             assert result.finalization.delivery.delivery.execution_contract == STREAMING_FINALIZATION_CONTRACT
-            assert [
-                (fragment.operation, fragment.target_external_message_id, fragment.body)
-                for fragment in result.finalization.plan.fragments
-            ] == [(SEND_OPERATION, None, "WORKSHOP-COMMAND-OK")]
+            assert result.finalization.plan is None
+            assert result.finalization.message.event.envelope.payload["body"] == "WORKSHOP-COMMAND-OK"
             # The browser command's attributed echo precedes the assistant
             # finalization and both remain durable outbox work.
-            assert await _terminal_rows(store) == (1, 2, 1)
+            assert await _terminal_rows(store) == (1, 2, 0)
         finally:
             await store.close()
 
@@ -399,9 +397,10 @@ class TestAtomicTerminalTransactions:
             assert result.execution.run.status == RunStatus.FAILED
             assert result.execution.run.terminal_code == "authentication_expired"
             assert result.execution.attempt.status == RunAttemptStatus.FAILED
-            assert [fragment.body for fragment in result.finalization.plan.fragments] == [
+            assert result.finalization.plan is None
+            assert result.finalization.message.event.envelope.payload["body"] == (
                 "Authentication for the configured agent has expired. Kai did not complete this request."
-            ]
+            )
             with pytest.raises(ValueError, match="TerminalFailureCode"):
                 await WorkshopRunTerminalTransactionCoordinator(authority).fail(
                     claim,
@@ -428,7 +427,8 @@ class TestAtomicTerminalTransactions:
             assert result.execution.run.status == RunStatus.CANCELLED
             assert result.execution.run.terminal_code == "requested_by_human"
             assert result.execution.attempt.status == RunAttemptStatus.CANCELLED
-            assert [fragment.body for fragment in result.finalization.plan.fragments] == ["This request was cancelled."]
+            assert result.finalization.plan is None
+            assert result.finalization.message.event.envelope.payload["body"] == "This request was cancelled."
         finally:
             await store.close()
 
@@ -453,7 +453,7 @@ class TestAtomicTerminalTransactions:
         finally:
             await store.close()
 
-    async def test_plan_failure_rolls_back_message_delivery_and_run_settlement(self, tmp_path: Path):
+    async def test_adapter_plan_storage_is_not_part_of_core_terminal_transaction(self, tmp_path: Path):
         store, authority, claim = await _started_run(tmp_path / "kai.db")
         try:
             await store.connection.execute(
@@ -462,16 +462,15 @@ class TestAtomicTerminalTransactions:
             )
             await store.connection.commit()
 
-            with pytest.raises(aiosqlite.IntegrityError, match="terminal plan rejected"):
-                await WorkshopRunTerminalTransactionCoordinator(authority).complete(
-                    claim,
-                    body="Must roll back",
-                    occurred_at=_NOW + timedelta(seconds=4),
-                )
+            result = await WorkshopRunTerminalTransactionCoordinator(authority).complete(
+                claim,
+                body="Core-owned result",
+                occurred_at=_NOW + timedelta(seconds=4),
+            )
 
-            assert await _terminal_rows(store) == (0, 0, 0)
-            assert (await WorkshopRunLifecycle(store).state(claim.run_id)).status == RunStatus.STARTED
-            assert (await authority.attempt(claim.attempt_id)).status == RunAttemptStatus.STARTED
+            assert result.outcome == TerminalOutcome.COMPLETED
+            assert result.finalization.plan is None
+            assert await _terminal_rows(store) == (1, 1, 0)
         finally:
             await store.close()
 
@@ -498,7 +497,7 @@ class TestAtomicTerminalTransactions:
 
             assert (await WorkshopRunLifecycle(store).state(claim.run_id)).status == RunStatus.STARTED
             assert (await authority.attempt(claim.attempt_id)).status == RunAttemptStatus.STARTED
-            assert await _terminal_rows(store) == (1, 1, 1)
+            assert await _terminal_rows(store) == (1, 1, 0)
         finally:
             await store.close()
 
@@ -522,7 +521,7 @@ class TestAtomicTerminalTransactions:
             run = await WorkshopRunLifecycle(store).state(claim.run_id)
             assert run.status == RunStatus.COMPLETED
             assert run.result_message_id == completed.finalization.message.event.envelope.aggregate_id
-            assert await _terminal_rows(store) == (1, 1, 1)
+            assert await _terminal_rows(store) == (1, 1, 0)
             async with store.connection.execute(
                 "SELECT COUNT(*) FROM event_log WHERE event_type IN ('run.failed', 'run_attempt.failed')"
             ) as cursor:
@@ -553,7 +552,7 @@ class TestAtomicTerminalTransactions:
 
             assert result.changed is False
             assert commit_calls == 2
-            assert await _terminal_rows(store) == (1, 1, 1)
+            assert await _terminal_rows(store) == (1, 1, 0)
             assert result.execution.run.status == RunStatus.COMPLETED
         finally:
             await store.close()

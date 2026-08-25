@@ -32,6 +32,7 @@ from kai.workshop.outbound import OutboundMessage, record_outbound_message_with_
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.telegram_delivery import (
     TelegramWorkOutcome,
+    WorkshopTelegramFinalizationPlanner,
     WorkshopTelegramStreamingFinalizationAdapter,
     WorkshopTelegramStreamingFinalizationWorker,
 )
@@ -184,6 +185,7 @@ class TestConversationDeliveryAuthority:
             WorkshopDeliveryOutbox(store, clock=worker_clock),
             WorkshopDeliveryFragments(store, clock=worker_clock),
             WorkshopTelegramStreamingFinalizationAdapter(first_bot),
+            WorkshopTelegramFinalizationPlanner(store),
             worker_id="first-authority-worker",
             authority_epoch_id=first_epoch.epoch_id,
         )
@@ -201,6 +203,7 @@ class TestConversationDeliveryAuthority:
             WorkshopDeliveryOutbox(store, clock=worker_clock),
             WorkshopDeliveryFragments(store, clock=worker_clock),
             WorkshopTelegramStreamingFinalizationAdapter(second_bot),
+            WorkshopTelegramFinalizationPlanner(store),
             worker_id="second-authority-worker",
             authority_epoch_id=second_epoch.epoch_id,
         )
@@ -236,6 +239,7 @@ class TestConversationDeliveryAuthority:
             WorkshopDeliveryOutbox(store, clock=worker_clock),
             WorkshopDeliveryFragments(store, clock=worker_clock),
             WorkshopTelegramStreamingFinalizationAdapter(bot),
+            WorkshopTelegramFinalizationPlanner(store),
             worker_id="failed-authority-worker",
             authority_epoch_id=epoch.epoch_id,
         )

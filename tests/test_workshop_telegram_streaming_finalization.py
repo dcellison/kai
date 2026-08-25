@@ -53,6 +53,7 @@ from kai.workshop.telegram_delivery import (
     TelegramDeliveryContractError,
     TelegramDeliveryFailure,
     TelegramWorkOutcome,
+    WorkshopTelegramFinalizationPlanner,
     WorkshopTelegramStreamingFinalizationAdapter,
     WorkshopTelegramStreamingFinalizationWorker,
 )
@@ -177,6 +178,7 @@ async def _worker(
         WorkshopDeliveryOutbox(store, clock=effective_clock),
         WorkshopDeliveryFragments(store, clock=effective_clock),
         WorkshopTelegramStreamingFinalizationAdapter(bot),
+        WorkshopTelegramFinalizationPlanner(store),
         worker_id="telegram-finalization-worker",
         authority_epoch_id=authority_epoch.epoch_id,
         lease_duration=lease_duration,
@@ -498,6 +500,10 @@ class TestTelegramStreamingFinalizationWorker:
             authority_epoch_id=authority_epoch.epoch_id,
         )
         assert claim is not None
+        await fragments.prepare_operations(
+            claim,
+            await WorkshopTelegramFinalizationPlanner(store).operations(claim),
+        )
         started = await fragments.begin_next(claim)
         assert started is not None and started.operation == EDIT_OPERATION
         await store.close()

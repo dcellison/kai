@@ -27,6 +27,7 @@ from kai.workshop.telegram_delivery import (
     WorkshopTelegramArtifactDeliveryWorker,
     WorkshopTelegramDeliveryAdapter,
     WorkshopTelegramDeliveryWorker,
+    WorkshopTelegramFinalizationPlanner,
     WorkshopTelegramStreamingFinalizationAdapter,
     WorkshopTelegramStreamingFinalizationWorker,
 )
@@ -269,6 +270,7 @@ class WorkshopTelegramConversationDeliveryService:
                 outbox,
                 fragments,
                 WorkshopTelegramStreamingFinalizationAdapter(cast(TelegramTextBot, bot)),
+                WorkshopTelegramFinalizationPlanner(store),
                 worker_id=worker_id,
                 authority_epoch_id=epoch.epoch_id,
             )

@@ -6,12 +6,8 @@ import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from kai.workshop.delivery_outbox import (
-    NOTIFICATION_PURPOSE,
-    DeliveryRequest,
-    DeliveryRequestResult,
-    WorkshopDeliveryOutbox,
-)
+from kai.workshop.delivery_outbox import NOTIFICATION_PURPOSE, DeliveryRequestResult
+from kai.workshop.delivery_planning import CanonicalDeliveryIntent, WorkshopDeliveryPlanner
 from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import (
     ChannelId,
@@ -37,7 +33,11 @@ class ScheduledReminder:
 @dataclass(frozen=True, slots=True)
 class ScheduledReminderRecord:
     message_id: MessageId
-    delivery: DeliveryRequestResult | None
+    deliveries: tuple[DeliveryRequestResult, ...]
+
+    @property
+    def delivery(self) -> DeliveryRequestResult | None:
+        return self.deliveries[0] if len(self.deliveries) == 1 else None
 
 
 class WorkshopScheduledReminderRecorder:
@@ -45,7 +45,7 @@ class WorkshopScheduledReminderRecorder:
 
     def __init__(self, store: WorkshopEventStore, delivery_policy: WorkshopDeliveryBindingPolicy) -> None:
         self._store = store
-        self._delivery_policy = delivery_policy
+        self._delivery_planner = WorkshopDeliveryPlanner(store, delivery_policy)
         self._lock = asyncio.Lock()
 
     async def record(self, reminder: ScheduledReminder) -> ScheduledReminderRecord:
@@ -107,30 +107,20 @@ class WorkshopScheduledReminderRecorder:
                 raise IdempotencyConflictError(f"Event identity {idempotency_key!r} was reused with different content")
             projection = CanonicalConversationProjection()
             await self._store.project_pending_in_transaction(projection)
-            bindings = await self._delivery_policy.binding_ids(
-                self._store,
-                channel_id,
-                transport="telegram",
-            )
-            if len(bindings) > 1:
-                raise RuntimeError("Scheduled reminder channel has ambiguous Telegram bindings")
-            delivery = None
-            if bindings:
-                delivery = await WorkshopDeliveryOutbox(self._store).request_delivery_in_transaction(
-                    DeliveryRequest(
-                        message_id=message_id,
-                        channel_binding_id=bindings[0],
-                        mode="text",
-                        purpose=NOTIFICATION_PURPOSE,
-                        occurred_at=occurred_at,
-                        max_attempts=5,
-                    )
+            planning = await self._delivery_planner.plan_in_transaction(
+                CanonicalDeliveryIntent(
+                    message_id=message_id,
+                    channel_id=channel_id,
+                    mode="text",
+                    purpose=NOTIFICATION_PURPOSE,
+                    occurred_at=occurred_at,
                 )
-                if delivery.inserted != inserted:
-                    raise RuntimeError("Scheduled reminder and delivery do not share one prior state")
+            )
+            if any(delivery.inserted != inserted for delivery in planning.deliveries):
+                raise RuntimeError("Scheduled reminder and deliveries do not share one prior state")
             await self._store.project_pending_in_transaction(projection)
             await connection.commit()
-            return ScheduledReminderRecord(message_id, delivery)
+            return ScheduledReminderRecord(message_id, planning.deliveries)
         except Exception:
             await connection.rollback()
             raise

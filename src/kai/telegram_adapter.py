@@ -14,12 +14,23 @@ from kai.application_host import KaiCoreServices
 from kai.bot import create_bot
 from kai.config import Config
 from kai.telegram_context import KaiTelegramApplication
+from kai.workshop.delivery_policy import DeliveryAdapterCapabilities
 from kai.workshop.telegram_delivery_runtime import (
     WorkshopTelegramConversationDeliveryService,
     WorkshopTelegramNotificationService,
 )
 
 log = logging.getLogger(__name__)
+
+TELEGRAM_DELIVERY_CAPABILITIES = DeliveryAdapterCapabilities(
+    transport="telegram",
+    final_text=True,
+    preview_streaming=True,
+    message_editing=True,
+    replies=True,
+    threads=True,
+    attachments=True,
+)
 
 
 class TelegramAdapterState(StrEnum):

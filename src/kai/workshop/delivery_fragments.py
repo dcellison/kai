@@ -17,7 +17,8 @@ from kai.workshop.delivery_outbox import (
 from kai.workshop.domain import DeliveryAttemptId, DeliveryId
 from kai.workshop.store import WorkshopEventStore
 
-_MAX_FRAGMENTS = 1000
+_MAX_FRAGMENTS = 10_000
+_MAX_FRAGMENT_BODY_SIZE = 1_000_000
 
 DeliveryFragmentOperationKind = Literal["send", "edit"]
 SEND_OPERATION: DeliveryFragmentOperationKind = "send"
@@ -52,29 +53,28 @@ class DeliveryFragment:
     external_message_id: str | None
     sent_at: datetime | None
     operation: DeliveryFragmentOperationKind = SEND_OPERATION
-    target_external_message_id: int | None = None
+    target_external_message_id: int | str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class DeliveryFragmentOperation:
     operation: DeliveryFragmentOperationKind
     body: str
-    target_external_message_id: int | None = None
+    target_external_message_id: int | str | None = None
 
     def __post_init__(self) -> None:
         if self.operation not in _OPERATION_KINDS:
             raise ValueError("operation must be send or edit")
-        if not isinstance(self.body, str) or not self.body or len(self.body) > 4096:
-            raise ValueError("body must contain between 1 and 4096 characters")
+        if not isinstance(self.body, str) or not 1 <= len(self.body) <= _MAX_FRAGMENT_BODY_SIZE:
+            raise ValueError(f"body must contain between 1 and {_MAX_FRAGMENT_BODY_SIZE} characters")
         if self.operation == SEND_OPERATION:
             if self.target_external_message_id is not None:
-                raise ValueError("send operations cannot identify an existing Telegram message")
-        elif (
-            not isinstance(self.target_external_message_id, int)
-            or isinstance(self.target_external_message_id, bool)
-            or self.target_external_message_id <= 0
+                raise ValueError("send operations cannot identify an existing external message")
+        elif isinstance(self.target_external_message_id, bool) or not (
+            (isinstance(self.target_external_message_id, int) and self.target_external_message_id > 0)
+            or (isinstance(self.target_external_message_id, str) and 1 <= len(self.target_external_message_id) <= 255)
         ):
-            raise ValueError("edit operations require a positive target_external_message_id")
+            raise ValueError("edit operations require a bounded target_external_message_id")
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +91,15 @@ def _parse_timestamp(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
 
 
+def _external_identifier(value: object) -> int | str | None:
+    if value is None:
+        return None
+    text = str(value)
+    if text.isdecimal() and int(text) > 0:
+        return int(text)
+    return text
+
+
 class WorkshopDeliveryFragments:
     """Persist an immutable plan and monotonic progress for one delivery.
 
@@ -98,7 +107,7 @@ class WorkshopDeliveryFragments:
     written before the external API call. If the call cannot be proven to have
     failed or succeeded, it moves to ``uncertain`` and must never be retried
     automatically. This deliberately prefers operator reconciliation over a
-    duplicate Telegram message.
+    duplicate external message.
     """
 
     def __init__(
@@ -120,6 +129,30 @@ class WorkshopDeliveryFragments:
             await connection.execute("BEGIN IMMEDIATE")
             await self._require_lease_owner(connection, claim, now=now, require_unexpired=True)
             result = await self._prepare_in_transaction(claim.delivery_id, operations, occurred_at=now)
+            await connection.commit()
+            return result.fragments
+        except Exception:
+            await connection.rollback()
+            raise
+
+    async def prepare_operations(
+        self,
+        claim: DeliveryClaim,
+        operations: tuple[DeliveryFragmentOperation, ...],
+    ) -> tuple[DeliveryFragment, ...]:
+        """Let the claiming adapter persist its immutable provider operation plan."""
+        self._validate_claim(claim)
+        self._validate_operations(operations)
+        connection = self._store.connection
+        now = self._now()
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            await self._require_lease_owner(connection, claim, now=now, require_unexpired=True)
+            result = await self._prepare_in_transaction(
+                claim.delivery_id,
+                operations,
+                occurred_at=now,
+            )
             await connection.commit()
             return result.fragments
         except Exception:
@@ -148,8 +181,14 @@ class WorkshopDeliveryFragments:
             row = await cursor.fetchone()
         if row is None or str(row["execution_contract"]) != STREAMING_FINALIZATION_CONTRACT:
             raise DeliveryFragmentStateError("Delivery does not own the streaming-finalization contract")
-        if str(row["status"]) != "pending" or int(row["attempt_count"]) != 0:
-            raise DeliveryFragmentStateError("Streaming-finalization plan must be created before its first claim")
+        status = str(row["status"])
+        attempt_count = int(row["attempt_count"])
+        if (status == "pending" and attempt_count == 0) or (status == "leased" and attempt_count > 0):
+            pass
+        else:
+            raise DeliveryFragmentStateError(
+                "Streaming-finalization plan must be created before or during its active claim"
+            )
         return await self._prepare_in_transaction(delivery_id, operations, occurred_at=occurred_at)
 
     async def _prepare_in_transaction(
@@ -166,11 +205,7 @@ class WorkshopDeliveryFragments:
                 DeliveryFragmentOperation(
                     operation=self._operation_kind(row["operation"]),
                     body=str(row["body"]),
-                    target_external_message_id=(
-                        int(row["target_external_message_id"])
-                        if row["target_external_message_id"] is not None
-                        else None
-                    ),
+                    target_external_message_id=_external_identifier(row["target_external_message_id"]),
                 )
                 for row in existing
             )
@@ -250,14 +285,13 @@ class WorkshopDeliveryFragments:
         claim: DeliveryClaim,
         fragment: DeliveryFragment,
         *,
-        external_message_id: int,
+        external_message_id: int | str,
     ) -> DeliveryFragment:
-        if (
-            not isinstance(external_message_id, int)
-            or isinstance(external_message_id, bool)
-            or external_message_id <= 0
+        if isinstance(external_message_id, bool) or not (
+            (isinstance(external_message_id, int) and external_message_id > 0)
+            or (isinstance(external_message_id, str) and 1 <= len(external_message_id) <= 255)
         ):
-            raise ValueError("external_message_id must be a positive integer")
+            raise ValueError("external_message_id must be a bounded provider identifier")
         self._validate_fragment_for_claim(claim, fragment)
         connection = self._store.connection
         now = self._now()
@@ -398,8 +432,8 @@ class WorkshopDeliveryFragments:
     def _validate_bodies(bodies: tuple[str, ...]) -> None:
         if not isinstance(bodies, tuple) or not bodies or len(bodies) > _MAX_FRAGMENTS:
             raise ValueError(f"bodies must contain between 1 and {_MAX_FRAGMENTS} fragments")
-        if any(not isinstance(body, str) or not body or len(body) > 4096 for body in bodies):
-            raise ValueError("each fragment body must contain between 1 and 4096 characters")
+        if any(not isinstance(body, str) or not 1 <= len(body) <= _MAX_FRAGMENT_BODY_SIZE for body in bodies):
+            raise ValueError(f"each fragment body must contain between 1 and {_MAX_FRAGMENT_BODY_SIZE} characters")
 
     @staticmethod
     def _validate_operations(operations: tuple[DeliveryFragmentOperation, ...]) -> None:
@@ -450,9 +484,7 @@ class WorkshopDeliveryFragments:
             external_message_id=(str(row["external_message_id"]) if row["external_message_id"] is not None else None),
             sent_at=(_parse_timestamp(str(row["sent_at"])) if row["sent_at"] is not None else None),
             operation=WorkshopDeliveryFragments._operation_kind(row["operation"]),
-            target_external_message_id=(
-                int(row["target_external_message_id"]) if row["target_external_message_id"] is not None else None
-            ),
+            target_external_message_id=_external_identifier(row["target_external_message_id"]),
         )
 
     def _now(self) -> datetime:

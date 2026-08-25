@@ -8,7 +8,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-import aiosqlite
 import pytest
 
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
@@ -34,7 +33,6 @@ from kai.workshop.inbound import InboundMessage, record_inbound_message
 from kai.workshop.outbound import (
     OutboundDeliveryStateConflictError,
     OutboundMessage,
-    OutboundStreamingPreviewConflictError,
     record_outbound_message,
 )
 from kai.workshop.outbound import (
@@ -49,6 +47,7 @@ from kai.workshop.telegram_delivery import (
     TelegramWorkOutcome,
     WorkshopTelegramDeliveryAdapter,
     WorkshopTelegramDeliveryWorker,
+    WorkshopTelegramFinalizationPlanner,
 )
 from tests.workshop_delivery import DISABLED_DELIVERY_POLICY, TELEGRAM_DELIVERY_POLICY
 
@@ -126,6 +125,22 @@ async def _assert_no_finalization_state(store: WorkshopEventStore, inbound_id: M
         "SELECT COUNT(*) FROM messages WHERE reply_to_message_id = ?", (inbound_id,)
     ) as cursor:
         assert (await cursor.fetchone())[0] == 0
+
+
+async def _claim_finalization(store: WorkshopEventStore, delivery_id: DeliveryId):
+    epoch = await WorkshopConversationDeliveryAuthority(store).active_epoch()
+    claim = await WorkshopDeliveryOutbox(
+        store,
+        clock=lambda: _NOW + timedelta(seconds=3),
+    ).claim_next(
+        "telegram-adapter-planner",
+        purposes=(CONVERSATION_REPLY_PURPOSE,),
+        execution_contracts=(STREAMING_FINALIZATION_CONTRACT,),
+        delivery_id=delivery_id,
+        authority_epoch_id=epoch.epoch_id,
+    )
+    assert claim is not None
+    return claim
     async with store.connection.execute("SELECT COUNT(*) FROM delivery_outbox") as cursor:
         assert (await cursor.fetchone())[0] == 0
     async with store.connection.execute("SELECT COUNT(*) FROM delivery_fragments") as cursor:
@@ -157,7 +172,7 @@ class TestAtomicStreamingFinalization:
         finally:
             await store.close()
 
-    async def test_short_reply_with_preview_is_one_explicit_edit_operation(self, tmp_path: Path):
+    async def test_short_reply_defers_preview_edit_planning_to_adapter_claim(self, tmp_path: Path):
         store, inbound_id = await _open_with_inbound(tmp_path / "kai.db")
         try:
             await _bind_preview(store, inbound_id)
@@ -169,18 +184,19 @@ class TestAtomicStreamingFinalization:
 
             assert result.message.inserted is True
             assert result.delivery.inserted is True
-            assert result.plan.inserted is True
+            assert result.plan is None
             assert result.delivery.delivery.purpose == CONVERSATION_REPLY_PURPOSE
             assert result.delivery.delivery.execution_contract == STREAMING_FINALIZATION_CONTRACT
             assert result.delivery.delivery.status == "pending"
             assert result.delivery.delivery.attempt_count == 0
-            assert len(result.plan.fragments) == 1
-            operation = result.plan.fragments[0]
+            assert await WorkshopDeliveryFragments(store).fragments(result.delivery.delivery.delivery_id) == ()
+            claim = await _claim_finalization(store, result.delivery.delivery.delivery_id)
+            operations = await WorkshopTelegramFinalizationPlanner(store).operations(claim)
+            assert len(operations) == 1
+            operation = operations[0]
             assert operation.operation == EDIT_OPERATION
             assert operation.target_external_message_id == 7001
             assert operation.body == "Final answer"
-            assert operation.status == "pending"
-            assert operation.external_message_id is None
         finally:
             await store.close()
 
@@ -194,7 +210,9 @@ class TestAtomicStreamingFinalization:
                 _outbound(inbound_id, body="Already published final snapshot"),
             )
 
-            assert [(item.operation, item.target_external_message_id, item.body) for item in result.plan.fragments] == [
+            claim = await _claim_finalization(store, result.delivery.delivery.delivery_id)
+            operations = await WorkshopTelegramFinalizationPlanner(store).operations(claim)
+            assert [(item.operation, item.target_external_message_id, item.body) for item in operations] == [
                 (EDIT_OPERATION, 7002, "Already published final snapshot")
             ]
         finally:
@@ -208,10 +226,11 @@ class TestAtomicStreamingFinalization:
 
             result = await record_outbound_message_with_streaming_finalization(store, _outbound(inbound_id, body))
 
-            assert [fragment.operation for fragment in result.plan.fragments] == [EDIT_OPERATION, SEND_OPERATION]
-            assert [fragment.target_external_message_id for fragment in result.plan.fragments] == [7001, None]
-            assert "".join(fragment.body for fragment in result.plan.fragments) == "A" * 4096 + "B" * 20
-            assert {fragment.fragment_count for fragment in result.plan.fragments} == {2}
+            claim = await _claim_finalization(store, result.delivery.delivery.delivery_id)
+            operations = await WorkshopTelegramFinalizationPlanner(store).operations(claim)
+            assert [item.operation for item in operations] == [EDIT_OPERATION, SEND_OPERATION]
+            assert [item.target_external_message_id for item in operations] == [7001, None]
+            assert "".join(item.body for item in operations) == "A" * 4096 + "B" * 20
         finally:
             await store.close()
 
@@ -222,8 +241,10 @@ class TestAtomicStreamingFinalization:
 
             result = await record_outbound_message_with_streaming_finalization(store, _outbound(inbound_id, body))
 
-            assert [fragment.operation for fragment in result.plan.fragments] == [SEND_OPERATION, SEND_OPERATION]
-            assert all(fragment.target_external_message_id is None for fragment in result.plan.fragments)
+            claim = await _claim_finalization(store, result.delivery.delivery.delivery_id)
+            operations = await WorkshopTelegramFinalizationPlanner(store).operations(claim)
+            assert [item.operation for item in operations] == [SEND_OPERATION, SEND_OPERATION]
+            assert all(item.target_external_message_id is None for item in operations)
         finally:
             await store.close()
 
@@ -242,28 +263,28 @@ class TestAtomicStreamingFinalization:
             )
             assert retry.message.inserted is False
             assert retry.delivery.inserted is False
-            assert retry.plan.inserted is False
+            assert retry.plan is None
             assert retry.message.event == first.message.event
             assert retry.delivery.delivery == first.delivery.delivery
-            assert retry.plan.fragments == first.plan.fragments
+            assert await WorkshopDeliveryFragments(reopened).fragments(retry.delivery.delivery.delivery_id) == ()
         finally:
             await reopened.close()
 
-    async def test_preview_bound_after_all_send_finalization_cannot_mutate_plan(self, tmp_path: Path):
+    async def test_preview_bound_before_adapter_claim_is_used_by_adapter_plan(self, tmp_path: Path):
         store, inbound_id = await _open_with_inbound(tmp_path / "kai.db")
         try:
             first = await record_outbound_message_with_streaming_finalization(store, _outbound(inbound_id))
             await _bind_preview(store, inbound_id)
 
-            with pytest.raises(RuntimeError, match="immutable"):
-                await record_outbound_message_with_streaming_finalization(store, _outbound(inbound_id))
-
-            persisted = await WorkshopDeliveryFragments(store).fragments(first.delivery.delivery.delivery_id)
-            assert [fragment.operation for fragment in persisted] == [SEND_OPERATION]
+            retry = await record_outbound_message_with_streaming_finalization(store, _outbound(inbound_id))
+            claim = await _claim_finalization(store, first.delivery.delivery.delivery_id)
+            operations = await WorkshopTelegramFinalizationPlanner(store).operations(claim)
+            assert retry.delivery.delivery == first.delivery.delivery
+            assert [item.operation for item in operations] == [EDIT_OPERATION]
         finally:
             await store.close()
 
-    async def test_tampered_preview_routing_fails_before_creating_reply(self, tmp_path: Path):
+    async def test_tampered_preview_routing_fails_at_telegram_adapter_boundary(self, tmp_path: Path):
         store, inbound_id = await _open_with_inbound(tmp_path / "kai.db")
         try:
             await _bind_preview(store, inbound_id)
@@ -273,13 +294,14 @@ class TestAtomicStreamingFinalization:
             )
             await store.connection.commit()
 
-            with pytest.raises(OutboundStreamingPreviewConflictError):
-                await record_outbound_message_with_streaming_finalization(store, _outbound(inbound_id))
-            await _assert_no_finalization_state(store, inbound_id)
+            result = await record_outbound_message_with_streaming_finalization(store, _outbound(inbound_id))
+            claim = await _claim_finalization(store, result.delivery.delivery.delivery_id)
+            with pytest.raises(Exception, match="telegram_preview_routing_invalid"):
+                await WorkshopTelegramFinalizationPlanner(store).operations(claim)
         finally:
             await store.close()
 
-    async def test_fragment_insert_failure_rolls_back_message_delivery_and_plan(self, tmp_path: Path):
+    async def test_core_commit_does_not_touch_adapter_fragment_table(self, tmp_path: Path):
         store, inbound_id = await _open_with_inbound(tmp_path / "kai.db")
         try:
             await store.connection.execute(
@@ -288,9 +310,10 @@ class TestAtomicStreamingFinalization:
             )
             await store.connection.commit()
 
-            with pytest.raises(aiosqlite.IntegrityError, match="test plan rejection"):
-                await record_outbound_message_with_streaming_finalization(store, _outbound(inbound_id))
-            await _assert_no_finalization_state(store, inbound_id)
+            result = await record_outbound_message_with_streaming_finalization(store, _outbound(inbound_id))
+            assert result.message.inserted is True
+            assert result.delivery.inserted is True
+            assert result.plan is None
         finally:
             await store.close()
 
@@ -313,7 +336,7 @@ class TestAtomicStreamingFinalization:
         finally:
             await store.close()
 
-    async def test_preexisting_message_and_delivery_without_plan_is_rejected_as_half_state(self, tmp_path: Path):
+    async def test_preexisting_message_and_delivery_without_adapter_plan_is_valid_core_state(self, tmp_path: Path):
         store, inbound_id = await _open_with_inbound(tmp_path / "kai.db")
         try:
             prior = await record_outbound_message(store, _outbound(inbound_id))
@@ -337,9 +360,9 @@ class TestAtomicStreamingFinalization:
                 )
             )
 
-            with pytest.raises(OutboundDeliveryStateConflictError):
-                await record_outbound_message_with_streaming_finalization(store, _outbound(inbound_id))
-
+            retry = await record_outbound_message_with_streaming_finalization(store, _outbound(inbound_id))
+            assert retry.delivery.delivery == delivery.delivery
+            assert retry.plan is None
             assert (await WorkshopDeliveryOutbox(store).state(delivery.delivery.delivery_id)).status == "pending"
             assert await WorkshopDeliveryFragments(store).fragments(delivery.delivery.delivery_id) == ()
         finally:
@@ -501,7 +524,7 @@ class TestStreamingFinalizationMigration:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 29
+            assert await upgraded.schema_version() == 30
             async with upgraded.connection.execute(
                 "SELECT execution_contract FROM delivery_outbox WHERE id = ?", (delivery_id,)
             ) as cursor:

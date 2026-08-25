@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 29
+WORKSHOP_SCHEMA_VERSION = 30
 
 
 @dataclass(frozen=True, slots=True)
@@ -1325,6 +1325,224 @@ _CANONICAL_SCHEDULED_JOB_SCHEMA = SchemaMigration(
     ),
 )
 
+_ADAPTER_PLUGGABLE_DELIVERY_SCHEMA = SchemaMigration(
+    version=30,
+    name="adapter_pluggable_delivery_authority",
+    statements=(
+        # Replace the transport-named authority lane without losing durable
+        # outbox, attempt, or fragment state. SQLite cannot alter the lane
+        # CHECK constraint or retarget the dependent foreign keys in place.
+        """
+        CREATE TABLE delivery_authority_epochs_v30 (
+            id TEXT PRIMARY KEY,
+            lane TEXT NOT NULL CHECK (lane = 'conversation_streaming_finalization'),
+            status TEXT NOT NULL CHECK (status IN ('active', 'deactivated')),
+            activated_at TEXT NOT NULL,
+            deactivated_at TEXT,
+            terminal_failures_acknowledged_at TEXT,
+            CHECK (
+                (status = 'active' AND deactivated_at IS NULL)
+                OR (status = 'deactivated' AND deactivated_at IS NOT NULL)
+            ),
+            CHECK (
+                status = 'deactivated' OR terminal_failures_acknowledged_at IS NULL
+            )
+        )
+        """,
+        """
+        INSERT INTO delivery_authority_epochs_v30 (
+            id, lane, status, activated_at, deactivated_at,
+            terminal_failures_acknowledged_at
+        ) SELECT
+            id, 'conversation_streaming_finalization', status, activated_at,
+            deactivated_at, terminal_failures_acknowledged_at
+        FROM delivery_authority_epochs
+        """,
+        """
+        CREATE TABLE delivery_outbox_v30 (
+            id TEXT PRIMARY KEY,
+            workshop_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            channel_binding_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            transport TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (
+                status IN ('pending', 'leased', 'retry_wait', 'succeeded', 'failed')
+            ),
+            max_attempts INTEGER NOT NULL CHECK (max_attempts BETWEEN 1 AND 20),
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (
+                attempt_count >= 0 AND attempt_count <= max_attempts
+            ),
+            available_at TEXT NOT NULL,
+            lease_id TEXT,
+            lease_owner TEXT,
+            lease_expires_at TEXT,
+            last_error_code TEXT,
+            requested_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            purpose TEXT NOT NULL DEFAULT 'qualification' CHECK (
+                purpose IN ('conversation_reply', 'notification', 'qualification')
+            ),
+            execution_contract TEXT NOT NULL DEFAULT 'send_fragments' CHECK (
+                execution_contract IN ('send_fragments', 'streaming_finalization')
+            ),
+            authority_epoch_id TEXT
+                REFERENCES delivery_authority_epochs_v30(id) ON DELETE RESTRICT,
+            UNIQUE (message_id, channel_binding_id, mode),
+            CHECK (
+                (
+                    status = 'leased'
+                    AND lease_id IS NOT NULL
+                    AND lease_owner IS NOT NULL
+                    AND lease_expires_at IS NOT NULL
+                ) OR (
+                    status != 'leased'
+                    AND lease_id IS NULL
+                    AND lease_owner IS NULL
+                    AND lease_expires_at IS NULL
+                )
+            ),
+            CHECK (
+                (status IN ('succeeded', 'failed') AND completed_at IS NOT NULL)
+                OR (status NOT IN ('succeeded', 'failed') AND completed_at IS NULL)
+            )
+        )
+        """,
+        """
+        INSERT INTO delivery_outbox_v30 (
+            id, workshop_id, channel_id, channel_binding_id, message_id,
+            transport, mode, status, max_attempts, attempt_count, available_at,
+            lease_id, lease_owner, lease_expires_at, last_error_code,
+            requested_event_position, created_at, updated_at, completed_at,
+            purpose, execution_contract, authority_epoch_id
+        ) SELECT
+            id, workshop_id, channel_id, channel_binding_id, message_id,
+            transport, mode, status, max_attempts, attempt_count, available_at,
+            lease_id, lease_owner, lease_expires_at, last_error_code,
+            requested_event_position, created_at, updated_at, completed_at,
+            purpose, execution_contract, authority_epoch_id
+        FROM delivery_outbox
+        """,
+        """
+        CREATE TABLE delivery_attempts_v30 (
+            id TEXT PRIMARY KEY,
+            delivery_id TEXT NOT NULL REFERENCES delivery_outbox_v30(id) ON DELETE CASCADE,
+            attempt_number INTEGER NOT NULL CHECK (attempt_number > 0),
+            worker_id TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            lease_expires_at TEXT NOT NULL,
+            completed_at TEXT,
+            outcome TEXT CHECK (
+                outcome IN ('succeeded', 'retry_scheduled', 'failed', 'lease_expired')
+            ),
+            error_code TEXT,
+            UNIQUE (delivery_id, attempt_number),
+            CHECK (
+                (completed_at IS NULL AND outcome IS NULL)
+                OR (completed_at IS NOT NULL AND outcome IS NOT NULL)
+            )
+        )
+        """,
+        """
+        INSERT INTO delivery_attempts_v30 (
+            id, delivery_id, attempt_number, worker_id, started_at,
+            lease_expires_at, completed_at, outcome, error_code
+        ) SELECT
+            id, delivery_id, attempt_number, worker_id, started_at,
+            lease_expires_at, completed_at, outcome, error_code
+        FROM delivery_attempts
+        """,
+        """
+        CREATE TABLE delivery_fragments_v30 (
+            delivery_id TEXT NOT NULL
+                REFERENCES delivery_outbox_v30(id) ON DELETE CASCADE,
+            fragment_index INTEGER NOT NULL CHECK (fragment_index >= 0),
+            fragment_count INTEGER NOT NULL CHECK (fragment_count > 0),
+            body TEXT NOT NULL CHECK (length(body) BETWEEN 1 AND 1000000),
+            status TEXT NOT NULL CHECK (
+                status IN ('pending', 'sending', 'sent', 'uncertain')
+            ),
+            attempt_id TEXT REFERENCES delivery_attempts_v30(id) ON DELETE RESTRICT,
+            external_message_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            sent_at TEXT,
+            operation TEXT NOT NULL DEFAULT 'send' CHECK (
+                operation IN ('send', 'edit')
+            ),
+            target_external_message_id TEXT CHECK (
+                (operation = 'send' AND target_external_message_id IS NULL)
+                OR (operation = 'edit' AND length(target_external_message_id) BETWEEN 1 AND 255)
+            ),
+            PRIMARY KEY (delivery_id, fragment_index),
+            CHECK (fragment_index < fragment_count),
+            CHECK (
+                (
+                    status = 'pending'
+                    AND attempt_id IS NULL
+                    AND external_message_id IS NULL
+                    AND sent_at IS NULL
+                ) OR (
+                    status IN ('sending', 'uncertain')
+                    AND attempt_id IS NOT NULL
+                    AND external_message_id IS NULL
+                    AND sent_at IS NULL
+                ) OR (
+                    status = 'sent'
+                    AND attempt_id IS NOT NULL
+                    AND external_message_id IS NOT NULL
+                    AND sent_at IS NOT NULL
+                )
+            )
+        )
+        """,
+        """
+        INSERT INTO delivery_fragments_v30 (
+            delivery_id, fragment_index, fragment_count, body, status,
+            attempt_id, external_message_id, created_at, updated_at, sent_at,
+            operation, target_external_message_id
+        ) SELECT
+            delivery_id, fragment_index, fragment_count, body, status,
+            attempt_id, external_message_id, created_at, updated_at, sent_at,
+            operation, target_external_message_id
+        FROM delivery_fragments
+        """,
+        "DROP TABLE delivery_fragments",
+        "DROP TABLE delivery_attempts",
+        "DROP TABLE delivery_outbox",
+        "DROP TABLE delivery_authority_epochs",
+        "ALTER TABLE delivery_authority_epochs_v30 RENAME TO delivery_authority_epochs",
+        "ALTER TABLE delivery_outbox_v30 RENAME TO delivery_outbox",
+        "ALTER TABLE delivery_attempts_v30 RENAME TO delivery_attempts",
+        "ALTER TABLE delivery_fragments_v30 RENAME TO delivery_fragments",
+        "CREATE UNIQUE INDEX delivery_authority_epochs_active_lane_idx "
+        "ON delivery_authority_epochs (lane) WHERE status = 'active'",
+        "CREATE INDEX delivery_outbox_due_idx ON delivery_outbox (status, available_at, requested_event_position)",
+        "CREATE INDEX delivery_outbox_lease_expiry_idx ON delivery_outbox (status, lease_expires_at)",
+        "CREATE INDEX delivery_outbox_binding_order_idx ON delivery_outbox "
+        "(channel_binding_id, requested_event_position, status)",
+        "CREATE INDEX delivery_outbox_purpose_due_idx ON delivery_outbox "
+        "(purpose, status, available_at, requested_event_position)",
+        "CREATE INDEX delivery_outbox_purpose_binding_order_idx ON delivery_outbox "
+        "(purpose, channel_binding_id, requested_event_position, status)",
+        "CREATE INDEX delivery_outbox_contract_due_idx ON delivery_outbox "
+        "(execution_contract, purpose, status, available_at, requested_event_position)",
+        "CREATE INDEX delivery_outbox_contract_binding_order_idx ON delivery_outbox "
+        "(execution_contract, purpose, channel_binding_id, requested_event_position, status)",
+        "CREATE INDEX delivery_outbox_authority_due_idx ON delivery_outbox "
+        "(authority_epoch_id, execution_contract, purpose, status, available_at, requested_event_position)",
+        "CREATE INDEX delivery_outbox_authority_binding_order_idx ON delivery_outbox "
+        "(authority_epoch_id, execution_contract, purpose, channel_binding_id, "
+        "requested_event_position, status)",
+        "CREATE INDEX delivery_attempts_delivery_idx ON delivery_attempts (delivery_id, attempt_number)",
+        "CREATE INDEX delivery_fragments_status_idx ON delivery_fragments (delivery_id, status, fragment_index)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -1355,6 +1573,7 @@ _MIGRATIONS = (
     _GITHUB_AUTOMATION_SCHEMA,
     _INTEGRATION_ROUTE_SCHEMA,
     _CANONICAL_SCHEDULED_JOB_SCHEMA,
+    _ADAPTER_PLUGGABLE_DELIVERY_SCHEMA,
 )
 
 

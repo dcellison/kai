@@ -22,7 +22,6 @@ from kai.workshop.domain import (
 from kai.workshop.inbound import InboundMessage, record_inbound_message
 from kai.workshop.outbound import (
     DeliveryObservation,
-    OutboundDeliveryBindingError,
     OutboundDeliveryStateConflictError,
     OutboundMessage,
     OutboundMessageNotFoundError,
@@ -284,20 +283,19 @@ class TestAtomicOutboundDelivery:
         finally:
             await store.close()
 
-    async def test_missing_telegram_binding_rolls_back_without_creating_reply(self, tmp_path: Path):
+    async def test_missing_enabled_adapter_binding_records_canonical_reply_only(self, tmp_path: Path):
         store, inbound_id = await _open_with_inbound(tmp_path / "kai.db")
         try:
             await store.connection.execute("DELETE FROM channel_bindings")
             await store.connection.commit()
 
-            with pytest.raises(OutboundDeliveryBindingError):
-                await record_outbound_message_with_delivery(store, _outbound(inbound_id))
-
-            await self._assert_no_outbound_delivery_state(store, inbound_id)
+            result = await record_outbound_message_with_delivery(store, _outbound(inbound_id))
+            assert result.message.inserted is True
+            assert result.deliveries == ()
         finally:
             await store.close()
 
-    async def test_ambiguous_telegram_binding_rolls_back_without_guessing(self, tmp_path: Path):
+    async def test_direct_reply_uses_only_binding_owned_by_canonical_recipient(self, tmp_path: Path):
         store, inbound_id = await _open_with_inbound(tmp_path / "kai.db")
         try:
             async with store.connection.execute(
@@ -327,10 +325,14 @@ class TestAtomicOutboundDelivery:
             )
             await store.project_pending(CanonicalConversationProjection())
 
-            with pytest.raises(OutboundDeliveryBindingError):
-                await record_outbound_message_with_delivery(store, _outbound(inbound_id))
-
-            await self._assert_no_outbound_delivery_state(store, inbound_id)
+            result = await record_outbound_message_with_delivery(store, _outbound(inbound_id))
+            assert len(result.deliveries) == 1
+            assert result.deliveries[0].delivery.transport == "telegram"
+            async with store.connection.execute(
+                "SELECT cb.external_channel_id FROM delivery_outbox d "
+                "JOIN channel_bindings cb ON cb.id = d.channel_binding_id"
+            ) as cursor:
+                assert (await cursor.fetchone())[0] == "101"
         finally:
             await store.close()
 
