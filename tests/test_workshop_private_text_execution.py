@@ -137,6 +137,17 @@ async def test_owner_accepts_executes_and_atomically_enqueues_terminal_reply(tmp
             "WHERE m.reply_to_message_id IS NOT NULL"
         ) as cursor:
             assert tuple(await cursor.fetchone()) == ("Durable answer", "pending")
+        async with inspection.connection.execute(
+            "SELECT status, runtime_profile_id, workspace, provider_session_id "
+            "FROM workshop_post_run_effects WHERE run_id = ?",
+            (result.run.run_id,),
+        ) as cursor:
+            assert tuple(await cursor.fetchone()) == (
+                "pending",
+                str(profile_id(101)),
+                str(tmp_path),
+                "session-1",
+            )
     finally:
         await inspection.close()
 

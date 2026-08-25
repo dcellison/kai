@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 from kai.workshop.client_commands import WorkshopClientCommandExecutor
 from kai.workshop.conversation_commands import ConversationCommandDisposition
-from kai.workshop.domain import CanonicalMemoryProvenance, ChannelId, MessageId, PrincipalId, RunId
+from kai.workshop.domain import ChannelId, MessageId, PrincipalId, RunId
 from kai.workshop.execution_coordinator import (
     CanonicalExecutionDisposition,
     CanonicalExecutionResult,
@@ -29,7 +29,7 @@ def _message() -> ClientInboundMessage:
     )
 
 
-async def test_submission_returns_before_execution_and_preserves_compatibility_state():
+async def test_submission_returns_before_execution_without_owning_post_run_effects():
     message = _message()
     run_id = RunId.new()
     inbound_message_id = MessageId.new()
@@ -72,12 +72,7 @@ async def test_submission_returns_before_execution_and_preserves_compatibility_s
         request_run_cancellation=AsyncMock(),
         prior_conversation_pairs=AsyncMock(return_value=(("Earlier", "Exchange"),)),
     )
-    profile_state = SimpleNamespace(
-        memory_context_turns=4,
-        schedule_memory_ingestion=Mock(),
-    )
-    compatibility_state = SimpleNamespace(for_profile=Mock(return_value=profile_state))
-    executor = WorkshopClientCommandExecutor(execution, compatibility_state)
+    executor = WorkshopClientCommandExecutor(execution)
     await executor.start()
     try:
         submission = await executor.submit(message)
@@ -92,21 +87,8 @@ async def test_submission_returns_before_execution_and_preserves_compatibility_s
         release.set()
         await executor.stop()
 
-    profile_state.schedule_memory_ingestion.assert_called_once_with(
-        prompt="Hello from Workshop",
-        assistant_text="Completed through the protected lane",
-        session_id="session-1",
-        workspace="/workspace/project",
-        canonical_provenance=CanonicalMemoryProvenance(
-            run_id=run_id,
-            source_message_id=inbound_message_id,
-            result_message_id=result_message_id,
-        ),
-        canonical_prior_pairs=(("Earlier", "Exchange"),),
-    )
 
-
-async def test_terminal_replay_does_not_schedule_or_duplicate_compatibility_writes():
+async def test_terminal_replay_does_not_schedule_execution():
     message = _message()
     run_id = RunId.new()
     run = SimpleNamespace(run_id=run_id, status="completed")
@@ -122,9 +104,7 @@ async def test_terminal_replay_does_not_schedule_or_duplicate_compatibility_writ
         recoverable_client_runs=AsyncMock(return_value=()),
         request_run_cancellation=AsyncMock(),
     )
-    profile_state = SimpleNamespace(schedule_memory_ingestion=Mock())
-    compatibility_state = SimpleNamespace(for_profile=Mock(return_value=profile_state))
-    executor = WorkshopClientCommandExecutor(execution, compatibility_state)
+    executor = WorkshopClientCommandExecutor(execution)
     await executor.start()
     try:
         await executor.submit(message)
@@ -132,7 +112,6 @@ async def test_terminal_replay_does_not_schedule_or_duplicate_compatibility_writ
         await executor.stop()
 
     execution.execute.assert_not_awaited()
-    compatibility_state.for_profile.assert_not_called()
 
 
 async def test_start_reconciles_durably_accepted_browser_run():
@@ -156,7 +135,7 @@ async def test_start_reconciles_durably_accepted_browser_run():
         ),
         request_run_cancellation=AsyncMock(),
     )
-    executor = WorkshopClientCommandExecutor(execution, SimpleNamespace())
+    executor = WorkshopClientCommandExecutor(execution)
 
     await executor.start()
     await asyncio.sleep(0)

@@ -19,17 +19,9 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from kai.backend import AgentResponse
 from kai.job_types import JOB_TYPE_AGENT, JOB_TYPE_REMINDER
-from kai.workshop.compatibility_state import WorkshopCompatibilityStateWriter
 from kai.workshop.conversation_commands import ConversationCommandDisposition
 from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
-from kai.workshop.domain import (
-    CanonicalMemoryProvenance,
-    ChannelId,
-    MessageId,
-    PrincipalId,
-    RunId,
-    RuntimeProfileId,
-)
+from kai.workshop.domain import ChannelId, MessageId, PrincipalId, RunId, RuntimeProfileId
 from kai.workshop.execution_coordinator import (
     CanonicalExecutionDisposition,
     CanonicalSuccessOutcome,
@@ -109,12 +101,10 @@ class WorkshopCanonicalScheduler:
         self,
         store: WorkshopEventStore,
         execution: WorkshopPrivateTextExecutionService,
-        compatibility_state: WorkshopCompatibilityStateWriter,
         delivery_policy: WorkshopDeliveryBindingPolicy,
     ) -> None:
         self._store = store
         self._execution = execution
-        self._compatibility_state = compatibility_state
         self._reminders = WorkshopScheduledReminderRecorder(store, delivery_policy)
         self._jobs = WorkshopScheduledJobStore(store)
         self._state = WorkshopSchedulerState.NEW
@@ -132,11 +122,10 @@ class WorkshopCanonicalScheduler:
         cls,
         database_path: Path,
         execution: WorkshopPrivateTextExecutionService,
-        compatibility_state: WorkshopCompatibilityStateWriter,
         delivery_policy: WorkshopDeliveryBindingPolicy,
     ) -> WorkshopCanonicalScheduler:
         store = await WorkshopEventStore.open(database_path)
-        service = cls(store, execution, compatibility_state, delivery_policy)
+        service = cls(store, execution, delivery_policy)
         try:
             await service._recover_interrupted_firings()
             service._scheduler.start(paused=True)
@@ -665,29 +654,6 @@ class WorkshopCanonicalScheduler:
             accepted.run.run_id,
             success_transformer=transform,
         )
-        compatibility = self._compatibility_state.for_profile(accepted.runtime_profile_id)
-        if result.disposition == CanonicalExecutionDisposition.COMPLETED and result.terminal is not None:
-            result_message_id = result.terminal.finalization.message.event.envelope.aggregate_id
-            inbound_message_id = accepted.command.message.event.envelope.aggregate_id
-            if not isinstance(result_message_id, MessageId) or not isinstance(inbound_message_id, MessageId):
-                raise RuntimeError("Scheduled execution did not identify canonical messages")
-            if result.workspace is not None:
-                prior_pairs = await self._execution.prior_conversation_pairs(
-                    accepted.run.run_id,
-                    limit=compatibility.memory_context_turns,
-                )
-                compatibility.schedule_memory_ingestion(
-                    prompt=job.prompt,
-                    assistant_text=result.terminal.body,
-                    session_id=result.session_id,
-                    workspace=result.workspace,
-                    canonical_provenance=CanonicalMemoryProvenance(
-                        run_id=accepted.run.run_id,
-                        source_message_id=inbound_message_id,
-                        result_message_id=result_message_id,
-                    ),
-                    canonical_prior_pairs=prior_pairs,
-                )
         if condition_met:
             await self._deactivate(job.job_id)
         terminal_code = result.run.terminal_code

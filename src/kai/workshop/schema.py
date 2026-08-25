@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 30
+WORKSHOP_SCHEMA_VERSION = 31
 
 
 @dataclass(frozen=True, slots=True)
@@ -1543,6 +1543,42 @@ _ADAPTER_PLUGGABLE_DELIVERY_SCHEMA = SchemaMigration(
     ),
 )
 
+_CANONICAL_POST_RUN_EFFECTS_SCHEMA = SchemaMigration(
+    version=31,
+    name="canonical_post_run_effects",
+    statements=(
+        """
+        CREATE TABLE workshop_post_run_effects (
+            run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+            effect_type TEXT NOT NULL CHECK (
+                effect_type = 'semantic_memory_ingestion'
+            ),
+            runtime_profile_id TEXT NOT NULL CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            source_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE RESTRICT,
+            result_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE RESTRICT,
+            workspace TEXT NOT NULL CHECK (length(trim(workspace)) > 0),
+            provider_session_id TEXT,
+            status TEXT NOT NULL CHECK (
+                status IN ('pending', 'executing', 'succeeded', 'failed')
+            ),
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+            last_error_code TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            CHECK (
+                (status IN ('succeeded', 'failed') AND completed_at IS NOT NULL)
+                OR (status IN ('pending', 'executing') AND completed_at IS NULL)
+            )
+        )
+        """,
+        "CREATE INDEX workshop_post_run_effects_status_idx ON workshop_post_run_effects (status, created_at, run_id)",
+        "CREATE INDEX workshop_post_run_effects_profile_idx ON workshop_post_run_effects (runtime_profile_id, status)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -1574,6 +1610,7 @@ _MIGRATIONS = (
     _INTEGRATION_ROUTE_SCHEMA,
     _CANONICAL_SCHEDULED_JOB_SCHEMA,
     _ADAPTER_PLUGGABLE_DELIVERY_SCHEMA,
+    _CANONICAL_POST_RUN_EFFECTS_SCHEMA,
 )
 
 

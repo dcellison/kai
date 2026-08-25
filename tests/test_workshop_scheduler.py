@@ -45,10 +45,6 @@ class _UnusedExecution:
     pass
 
 
-class _UnusedCompatibilityState:
-    pass
-
-
 class _AllowRead:
     async def can_read_channel(self, principal_id: PrincipalId, channel_id: ChannelId) -> bool:
         del principal_id, channel_id
@@ -97,12 +93,6 @@ class _AgentExecution:
         )
 
 
-class _CompatibilityState:
-    def for_profile(self, runtime_profile_id):
-        assert runtime_profile_id == profile_id(101)
-        return SimpleNamespace(memory_context_turns=10)
-
-
 class _CanonicalRuntime:
     def __init__(self, workspace: Path) -> None:
         self.selection = SimpleNamespace(
@@ -127,19 +117,6 @@ class _CanonicalRuntime:
             done=True,
             response=AgentResponse(success=True, text="Scheduled agent answer"),
         )
-
-
-class _CanonicalCompatibility:
-    memory_context_turns = 10
-
-    def schedule_memory_ingestion(self, **_kwargs) -> None:
-        pass
-
-
-class _CanonicalCompatibilityState:
-    def for_profile(self, runtime_profile_id):
-        assert runtime_profile_id == profile_id(101)
-        return _CanonicalCompatibility()
 
 
 def _job(
@@ -280,7 +257,6 @@ async def test_workshop_only_reminder_fires_canonically_without_delivery(tmp_pat
     scheduler = await WorkshopCanonicalScheduler.open_and_start(
         database,
         _UnusedExecution(),  # type: ignore[arg-type]
-        _UnusedCompatibilityState(),  # type: ignore[arg-type]
         DISABLED_DELIVERY_POLICY,
     )
     try:
@@ -329,7 +305,6 @@ async def test_telegram_bound_reminder_uses_notification_outbox(tmp_path: Path) 
     scheduler = await WorkshopCanonicalScheduler.open_and_start(
         database,
         _UnusedExecution(),  # type: ignore[arg-type]
-        _UnusedCompatibilityState(),  # type: ignore[arg-type]
         TELEGRAM_DELIVERY_POLICY,
     )
     try:
@@ -352,7 +327,6 @@ async def test_disabled_telegram_adapter_does_not_enqueue_retained_reminder_bind
     scheduler = await WorkshopCanonicalScheduler.open_and_start(
         database,
         _UnusedExecution(),  # type: ignore[arg-type]
-        _UnusedCompatibilityState(),  # type: ignore[arg-type]
         DISABLED_DELIVERY_POLICY,
     )
     try:
@@ -377,7 +351,6 @@ async def test_scheduler_starts_without_legacy_jobs_table(tmp_path: Path) -> Non
     scheduler = await WorkshopCanonicalScheduler.open_and_start(
         database,
         _UnusedExecution(),  # type: ignore[arg-type]
-        _UnusedCompatibilityState(),  # type: ignore[arg-type]
         DISABLED_DELIVERY_POLICY,
     )
     try:
@@ -406,7 +379,6 @@ async def test_scheduler_fails_closed_for_active_job_without_canonical_owner(
         await WorkshopCanonicalScheduler.open_and_start(
             database,
             _UnusedExecution(),  # type: ignore[arg-type]
-            _UnusedCompatibilityState(),  # type: ignore[arg-type]
             DISABLED_DELIVERY_POLICY,
         )
     await store.close()
@@ -456,7 +428,6 @@ async def test_once_daily_and_interval_jobs_reconcile_into_core_scheduler(
     scheduler = await WorkshopCanonicalScheduler.open_and_start(
         database,
         _UnusedExecution(),  # type: ignore[arg-type]
-        _UnusedCompatibilityState(),  # type: ignore[arg-type]
         DISABLED_DELIVERY_POLICY,
     )
     try:
@@ -490,7 +461,6 @@ async def test_interrupted_reminder_firing_recovers_once(tmp_path: Path) -> None
     scheduler = await WorkshopCanonicalScheduler.open_and_start(
         database,
         _UnusedExecution(),  # type: ignore[arg-type]
-        _UnusedCompatibilityState(),  # type: ignore[arg-type]
         DISABLED_DELIVERY_POLICY,
     )
     try:
@@ -526,7 +496,6 @@ async def test_workshop_only_agent_job_uses_canonical_execution(tmp_path: Path) 
     scheduler = await WorkshopCanonicalScheduler.open_and_start(
         database,
         execution,  # type: ignore[arg-type]
-        _CompatibilityState(),  # type: ignore[arg-type]
         DISABLED_DELIVERY_POLICY,
     )
     try:
@@ -574,7 +543,6 @@ async def test_agent_firing_completes_through_real_canonical_coordinator(
     scheduler = await WorkshopCanonicalScheduler.open_and_start(
         database,
         execution,
-        _CanonicalCompatibilityState(),  # type: ignore[arg-type]
         DISABLED_DELIVERY_POLICY,
     )
     try:
