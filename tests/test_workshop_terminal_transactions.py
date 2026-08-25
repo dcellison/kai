@@ -294,6 +294,112 @@ class TestAtomicTerminalTransactions:
         finally:
             await store.close()
 
+    async def test_projection_rebuild_preserves_post_run_effect_receipt(
+        self,
+        tmp_path: Path,
+    ):
+        store, authority, claim = await _started_run(tmp_path / "kai.db")
+        run = await WorkshopRunLifecycle(store).state(claim.run_id)
+        try:
+            result = await WorkshopRunTerminalTransactionCoordinator(authority).complete(
+                claim,
+                body="Canonical result before projection rebuild",
+                occurred_at=_NOW + timedelta(seconds=4),
+                runtime_session=RuntimeSessionSettlement(
+                    channel_id=run.channel_id,
+                    agent_id=run.agent_id,
+                    runtime_profile_id=profile_id(101),
+                    selection=RunExecutionSelection("codex", "gpt-5.6-sol"),
+                    workspace="/private/tmp/kai-workshop-test-workspace",
+                    provider_session_id="provider-session-before-rebuild",
+                    run_id=run.run_id,
+                ),
+            )
+            assert await _post_run_effect_count(store) == 1
+
+            await bootstrap_default_workshop(
+                store,
+                (
+                    BootstrapHuman(
+                        display_name="Workshop Human",
+                        role="admin",
+                        transport="telegram",
+                        external_subject="101",
+                        external_channel_id="101",
+                        runtime_profile_id=profile_id(101),
+                    ),
+                ),
+            )
+
+            assert await _post_run_effect_count(store) == 1
+            rebuilt = await WorkshopRunLifecycle(store).state(run.run_id)
+            assert rebuilt.status == RunStatus.COMPLETED
+            assert rebuilt.result_message_id == result.execution.run.result_message_id
+            async with store.connection.execute(
+                "SELECT status, source_message_id, result_message_id FROM workshop_post_run_effects WHERE run_id = ?",
+                (run.run_id,),
+            ) as cursor:
+                effect = await cursor.fetchone()
+            assert effect is not None
+            assert tuple(effect) == (
+                "pending",
+                str(run.inbound_message_id),
+                str(result.execution.run.result_message_id),
+            )
+        finally:
+            await store.close()
+
+    async def test_version_thirty_one_receipt_survives_schema_upgrade(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        from kai.workshop import schema
+
+        database = tmp_path / "kai.db"
+        with monkeypatch.context() as migration_context:
+            migration_context.setattr(schema, "WORKSHOP_SCHEMA_VERSION", 31)
+            migration_context.setattr(schema, "_MIGRATIONS", schema._MIGRATIONS[:31])
+            store, authority, claim = await _started_run(database)
+            run = await WorkshopRunLifecycle(store).state(claim.run_id)
+            result = await WorkshopRunTerminalTransactionCoordinator(authority).complete(
+                claim,
+                body="Canonical result before schema upgrade",
+                occurred_at=_NOW + timedelta(seconds=4),
+                runtime_session=RuntimeSessionSettlement(
+                    channel_id=run.channel_id,
+                    agent_id=run.agent_id,
+                    runtime_profile_id=profile_id(101),
+                    selection=RunExecutionSelection("codex", "gpt-5.6-sol"),
+                    workspace="/private/tmp/kai-workshop-test-workspace",
+                    provider_session_id="provider-session-before-upgrade",
+                    run_id=run.run_id,
+                ),
+            )
+            assert await store.schema_version() == 31
+            assert await _post_run_effect_count(store) == 1
+            await store.close()
+
+        upgraded = await WorkshopEventStore.open(database)
+        try:
+            assert await upgraded.schema_version() == 32
+            assert await _post_run_effect_count(upgraded) == 1
+            async with upgraded.connection.execute(
+                "SELECT status, source_message_id, result_message_id FROM workshop_post_run_effects WHERE run_id = ?",
+                (run.run_id,),
+            ) as cursor:
+                effect = await cursor.fetchone()
+            assert effect is not None
+            assert tuple(effect) == (
+                "pending",
+                str(run.inbound_message_id),
+                str(result.execution.run.result_message_id),
+            )
+            async with upgraded.connection.execute("PRAGMA foreign_key_list(workshop_post_run_effects)") as cursor:
+                assert await cursor.fetchall() == []
+        finally:
+            await upgraded.close()
+
     async def test_runtime_reassignment_does_not_discard_completed_answer(self, tmp_path: Path):
         store, authority, claim = await _started_run(tmp_path / "kai.db")
         run = await WorkshopRunLifecycle(store).state(claim.run_id)

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 31
+WORKSHOP_SCHEMA_VERSION = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -1579,6 +1579,61 @@ _CANONICAL_POST_RUN_EFFECTS_SCHEMA = SchemaMigration(
     ),
 )
 
+# These IDs deliberately are not foreign keys. Runs and messages are a
+# rebuildable projection: startup deletes and replays them from event_log.
+# The effect receipt is an independent durable ledger and must survive that
+# temporary absence. The worker validates all three IDs against the rebuilt
+# canonical run before executing pending work.
+_DURABLE_POST_RUN_EFFECT_RECEIPTS_SCHEMA = SchemaMigration(
+    version=32,
+    name="durable_post_run_effect_receipts",
+    statements=(
+        """
+        CREATE TABLE workshop_post_run_effects_durable (
+            run_id TEXT PRIMARY KEY,
+            effect_type TEXT NOT NULL CHECK (
+                effect_type = 'semantic_memory_ingestion'
+            ),
+            runtime_profile_id TEXT NOT NULL CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            source_message_id TEXT NOT NULL,
+            result_message_id TEXT NOT NULL,
+            workspace TEXT NOT NULL CHECK (length(trim(workspace)) > 0),
+            provider_session_id TEXT,
+            status TEXT NOT NULL CHECK (
+                status IN ('pending', 'executing', 'succeeded', 'failed')
+            ),
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+            last_error_code TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            CHECK (
+                (status IN ('succeeded', 'failed') AND completed_at IS NOT NULL)
+                OR (status IN ('pending', 'executing') AND completed_at IS NULL)
+            )
+        )
+        """,
+        """
+        INSERT INTO workshop_post_run_effects_durable (
+            run_id, effect_type, runtime_profile_id, source_message_id,
+            result_message_id, workspace, provider_session_id, status,
+            attempt_count, last_error_code, created_at, updated_at, completed_at
+        )
+        SELECT
+            run_id, effect_type, runtime_profile_id, source_message_id,
+            result_message_id, workspace, provider_session_id, status,
+            attempt_count, last_error_code, created_at, updated_at, completed_at
+        FROM workshop_post_run_effects
+        """,
+        "DROP TABLE workshop_post_run_effects",
+        "ALTER TABLE workshop_post_run_effects_durable RENAME TO workshop_post_run_effects",
+        "CREATE INDEX workshop_post_run_effects_status_idx ON workshop_post_run_effects (status, created_at, run_id)",
+        "CREATE INDEX workshop_post_run_effects_profile_idx ON workshop_post_run_effects (runtime_profile_id, status)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -1611,6 +1666,7 @@ _MIGRATIONS = (
     _CANONICAL_SCHEDULED_JOB_SCHEMA,
     _ADAPTER_PLUGGABLE_DELIVERY_SCHEMA,
     _CANONICAL_POST_RUN_EFFECTS_SCHEMA,
+    _DURABLE_POST_RUN_EFFECT_RECEIPTS_SCHEMA,
 )
 
 
