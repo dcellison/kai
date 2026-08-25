@@ -28,12 +28,23 @@ from kai.workshop.outbound import (
     OutboundMessageNotFoundError,
     record_delivery_observation,
     record_outbound_message,
-    record_outbound_message_with_delivery,
+)
+from kai.workshop.outbound import (
+    record_outbound_message_with_delivery as _record_outbound_message_with_delivery,
 )
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
+from tests.workshop_delivery import TELEGRAM_DELIVERY_POLICY
 
 _NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
+
+
+async def record_outbound_message_with_delivery(store, message):
+    return await _record_outbound_message_with_delivery(
+        store,
+        message,
+        delivery_policy=TELEGRAM_DELIVERY_POLICY,
+    )
 
 
 async def _open_with_inbound(path: Path) -> tuple[WorkshopEventStore, MessageId]:

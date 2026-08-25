@@ -11,6 +11,7 @@ import pytest
 
 from kai.workshop.artifacts import WorkshopArtifactService, artifact_for_delivery
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import AgentId
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIContextRegistry
 from kai.workshop.proactive_publication import (
@@ -60,7 +61,7 @@ async def _publication_service(
         store,
         artifacts,
         artifact_storage_root=tmp_path / "files",
-        delivery_transports=delivery_transports,
+        delivery_policy=WorkshopDeliveryBindingPolicy(delivery_transports),
     )
     authority = ProactivePublicationAuthority(
         context.principal_id,

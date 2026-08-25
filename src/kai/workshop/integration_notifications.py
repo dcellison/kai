@@ -14,6 +14,7 @@ from kai.workshop.delivery_outbox import (
     DeliveryRequestResult,
     WorkshopDeliveryOutbox,
 )
+from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import (
     ChannelBindingId,
     ChannelId,
@@ -93,15 +94,20 @@ class IntegrationRouteStatus:
 class WorkshopIntegrationNotificationService:
     """Own canonical integration recording independently of client adapters."""
 
-    def __init__(self, store: WorkshopEventStore) -> None:
+    def __init__(self, store: WorkshopEventStore, delivery_policy: WorkshopDeliveryBindingPolicy) -> None:
         self._store = store
+        self._delivery_policy = delivery_policy
         self._outbox = WorkshopDeliveryOutbox(store)
         self._lock = asyncio.Lock()
         self._closed = False
 
     @classmethod
-    async def open(cls, database_path: Path) -> WorkshopIntegrationNotificationService:
-        service = cls(await WorkshopEventStore.open(database_path))
+    async def open(
+        cls,
+        database_path: Path,
+        delivery_policy: WorkshopDeliveryBindingPolicy,
+    ) -> WorkshopIntegrationNotificationService:
+        service = cls(await WorkshopEventStore.open(database_path), delivery_policy)
         try:
             await service.reconcile_default_generic_route()
         except BaseException:
@@ -447,24 +453,20 @@ class WorkshopIntegrationNotificationService:
 
             projection = CanonicalConversationProjection()
             await self._store.project_pending_in_transaction(projection)
-            async with connection.execute(
-                "SELECT id FROM channel_bindings WHERE channel_id = ? ORDER BY id",
-                (channel_id,),
-            ) as cursor:
-                binding_rows = tuple(await cursor.fetchall())
+            binding_ids = await self._delivery_policy.binding_ids(self._store, channel_id)
             deliveries = tuple(
                 [
                     await self._outbox.request_delivery_in_transaction(
                         DeliveryRequest(
                             message_id=message_id,
-                            channel_binding_id=ChannelBindingId(str(row[0])),
+                            channel_binding_id=binding_id,
                             mode="text",
                             purpose=NOTIFICATION_PURPOSE,
                             occurred_at=occurred_at,
                             max_attempts=5,
                         )
                     )
-                    for row in binding_rows
+                    for binding_id in binding_ids
                 ]
             )
             if inserted and any(not delivery.inserted for delivery in deliveries):

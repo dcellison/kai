@@ -17,6 +17,7 @@ from kai.workshop.outbound import OutboundMessage
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.streaming_preview import ConfirmedTelegramStreamingPreview
 from kai.workshop.telegram_delivery_runtime import WorkshopTelegramConversationDeliveryService
+from tests.workshop_delivery import TELEGRAM_DELIVERY_POLICY
 
 _NOW = datetime(2026, 1, 1, 18, 0, tzinfo=UTC)
 
@@ -65,7 +66,8 @@ async def test_shared_finalizer_and_dedicated_worker_finalize_one_preview_withou
                 in_reply_to_message_id=inbound_id,
                 body="Durable final answer",
                 occurred_at=_NOW + timedelta(seconds=2),
-            )
+            ),
+            delivery_policy=TELEGRAM_DELIVERY_POLICY,
         )
 
         for _ in range(200):

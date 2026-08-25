@@ -16,6 +16,7 @@ from kai.workshop.bootstrap import (
     bootstrap_default_workshop,
 )
 from kai.workshop.delivery_outbox import NOTIFICATION_PURPOSE
+from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import ChannelId
 from kai.workshop.integration_notifications import (
     IntegrationNotification,
@@ -23,6 +24,7 @@ from kai.workshop.integration_notifications import (
     WorkshopIntegrationNotificationService,
 )
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
+from tests.workshop_delivery import DISABLED_DELIVERY_POLICY, TELEGRAM_DELIVERY_POLICY
 
 _NOW = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
 
@@ -49,6 +51,13 @@ async def _open_notification_store(path: Path) -> WorkshopEventStore:
         ),
     )
     return store
+
+
+async def _notification_channel(store: WorkshopEventStore) -> ChannelId:
+    async with store.connection.execute("SELECT id FROM channels WHERE kind = 'notification'") as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    return ChannelId(str(row[0]))
 
 
 def _notification(*, body: str = "**Push** to [kai](https://github.com/example/kai)") -> IntegrationNotification:
@@ -95,7 +104,7 @@ class TestWorkshopIntegrationNotificationService:
         store = await _open_notification_store(path)
         await store.close()
 
-        service = await WorkshopIntegrationNotificationService.open(path)
+        service = await WorkshopIntegrationNotificationService.open(path, TELEGRAM_DELIVERY_POLICY)
         try:
             status = await service.route_status(source="generic", route_name="default")
 
@@ -109,7 +118,7 @@ class TestWorkshopIntegrationNotificationService:
         path = tmp_path / "kai.db"
         store = await _open_notification_store(path)
         await store.close()
-        service = await WorkshopIntegrationNotificationService.open(path)
+        service = await WorkshopIntegrationNotificationService.open(path, TELEGRAM_DELIVERY_POLICY)
         try:
             notification = IntegrationNotification(
                 delivery_id="generic-route-1",
@@ -125,6 +134,61 @@ class TestWorkshopIntegrationNotificationService:
             assert len(result.deliveries) == 1
         finally:
             await service.close()
+
+    async def test_disabled_adapter_retains_binding_without_enqueuing_notification(self, tmp_path: Path):
+        store = await _open_notification_store(tmp_path / "kai.db")
+        try:
+            result = await WorkshopIntegrationNotificationService(
+                store,
+                DISABLED_DELIVERY_POLICY,
+            ).record_for_channel(_notification(), await _notification_channel(store))
+
+            assert result.inserted is True
+            assert result.deliveries == ()
+            async with store.connection.execute("SELECT COUNT(*) FROM delivery_outbox") as cursor:
+                assert int((await cursor.fetchone())[0]) == 0
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM channel_bindings WHERE transport = 'telegram'"
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 2
+
+            # Enabling an adapter later does not discover or enqueue historical
+            # canonical messages. Only new publication work can request delivery.
+            enabled_service = WorkshopIntegrationNotificationService(
+                store,
+                TELEGRAM_DELIVERY_POLICY,
+            )
+            await enabled_service.route_status(source="generic", route_name="default")
+            async with store.connection.execute("SELECT COUNT(*) FROM delivery_outbox") as cursor:
+                assert int((await cursor.fetchone())[0]) == 0
+        finally:
+            await store.close()
+
+    async def test_mixed_bindings_enqueue_only_for_enabled_transport(self, tmp_path: Path):
+        store = await _open_notification_store(tmp_path / "kai.db")
+        channel_id = await _notification_channel(store)
+        await store.connection.execute(
+            "INSERT INTO channel_bindings (id, channel_id, transport, external_channel_id, created_at) "
+            "VALUES (?, ?, 'desktop', 'desktop-notifications', '2026-08-25T00:00:00Z')",
+            ("cbd_00000000000000000000000000000002", channel_id),
+        )
+        await store.connection.commit()
+        try:
+            desktop_policy = WorkshopDeliveryBindingPolicy(frozenset({"desktop"}))
+            result = await WorkshopIntegrationNotificationService(store, desktop_policy).record_for_channel(
+                _notification(),
+                channel_id,
+            )
+
+            assert len(result.deliveries) == 1
+            assert result.deliveries[0].delivery.transport == "desktop"
+            async with store.connection.execute(
+                "SELECT transport FROM delivery_outbox WHERE message_id = ?",
+                (result.message_id,),
+            ) as cursor:
+                assert [str(row[0]) for row in await cursor.fetchall()] == ["desktop"]
+        finally:
+            await store.close()
 
     async def test_ambiguous_admin_policy_does_not_seed_or_deliver(self, tmp_path: Path):
         store = await WorkshopEventStore.open(tmp_path / "kai.db")
@@ -148,7 +212,7 @@ class TestWorkshopIntegrationNotificationService:
             ),
         )
         try:
-            service = WorkshopIntegrationNotificationService(store)
+            service = WorkshopIntegrationNotificationService(store, TELEGRAM_DELIVERY_POLICY)
             status = await service.reconcile_default_generic_route()
 
             assert status.state == "ambiguous"
@@ -202,7 +266,7 @@ class TestWorkshopIntegrationNotificationService:
         try:
             async with store.connection.execute("SELECT id FROM channels WHERE kind = 'notification'") as cursor:
                 channel_id = ChannelId(str((await cursor.fetchone())[0]))
-            service = WorkshopIntegrationNotificationService(store)
+            service = WorkshopIntegrationNotificationService(store, TELEGRAM_DELIVERY_POLICY)
 
             status = await service.set_route(
                 source="generic",
@@ -221,7 +285,7 @@ class TestWorkshopIntegrationNotificationService:
             async with store.connection.execute("SELECT id FROM channels WHERE kind = 'notification'") as cursor:
                 channel_id = ChannelId(str((await cursor.fetchone())[0]))
 
-            result = await WorkshopIntegrationNotificationService(store).record_for_channel(
+            result = await WorkshopIntegrationNotificationService(store, TELEGRAM_DELIVERY_POLICY).record_for_channel(
                 _notification(),
                 channel_id,
             )
@@ -241,7 +305,7 @@ class TestWorkshopIntegrationNotificationService:
     ):
         store = await _open_notification_store(tmp_path / "kai.db")
         try:
-            result = await WorkshopIntegrationNotificationService(store).record_for_binding(
+            result = await WorkshopIntegrationNotificationService(store, TELEGRAM_DELIVERY_POLICY).record_for_binding(
                 _notification(),
                 transport="telegram",
                 external_channel_id="-100123",
@@ -287,7 +351,7 @@ class TestWorkshopIntegrationNotificationService:
     ):
         path = tmp_path / "kai.db"
         store = await _open_notification_store(path)
-        first = await WorkshopIntegrationNotificationService(store).record_for_binding(
+        first = await WorkshopIntegrationNotificationService(store, TELEGRAM_DELIVERY_POLICY).record_for_binding(
             _notification(),
             transport="telegram",
             external_channel_id="-100123",
@@ -296,7 +360,7 @@ class TestWorkshopIntegrationNotificationService:
 
         reopened = await WorkshopEventStore.open(path)
         try:
-            retry = await WorkshopIntegrationNotificationService(reopened).record_for_binding(
+            retry = await WorkshopIntegrationNotificationService(reopened, TELEGRAM_DELIVERY_POLICY).record_for_binding(
                 IntegrationNotification(
                     **{
                         **{
@@ -329,7 +393,7 @@ class TestWorkshopIntegrationNotificationService:
     ):
         store = await _open_notification_store(tmp_path / "kai.db")
         try:
-            recorder = WorkshopIntegrationNotificationService(store)
+            recorder = WorkshopIntegrationNotificationService(store, TELEGRAM_DELIVERY_POLICY)
             await recorder.record_for_binding(_notification(), transport="telegram", external_channel_id="-100123")
             with pytest.raises(IdempotencyConflictError):
                 await recorder.record_for_binding(
@@ -355,7 +419,7 @@ class TestWorkshopIntegrationNotificationService:
                 occurred_at=_NOW,
             )
             assert (
-                await WorkshopIntegrationNotificationService(store).record_for_binding(
+                await WorkshopIntegrationNotificationService(store, TELEGRAM_DELIVERY_POLICY).record_for_binding(
                     notification,
                     transport="telegram",
                     external_channel_id="-100999",
@@ -377,7 +441,9 @@ class TestWorkshopIntegrationNotificationService:
                 body="Build complete",
                 occurred_at=_NOW,
             )
-            result = await WorkshopIntegrationNotificationService(store).record_for_default_admin(notification)
+            result = await WorkshopIntegrationNotificationService(
+                store, TELEGRAM_DELIVERY_POLICY
+            ).record_for_default_admin(notification)
 
             assert result.inserted is True
             assert len(result.deliveries) == 1
@@ -392,7 +458,7 @@ class TestWorkshopIntegrationNotificationService:
     async def test_generic_delivery_identity_is_idempotent(self, tmp_path: Path):
         store = await _open_notification_store(tmp_path / "kai.db")
         try:
-            service = WorkshopIntegrationNotificationService(store)
+            service = WorkshopIntegrationNotificationService(store, TELEGRAM_DELIVERY_POLICY)
             notification = IntegrationNotification(
                 delivery_id="generic-retry-1",
                 source="generic",

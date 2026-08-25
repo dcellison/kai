@@ -54,6 +54,7 @@ from kai.workshop.conversation_runs import (
     CanonicalConversationRunResolution,
     resolve_canonical_conversation_run,
 )
+from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import MessageId
 from kai.workshop.execution_state import (
     WorkshopExecutionStateMigration,
@@ -515,6 +516,8 @@ async def record_workshop_streaming_preview(
 
 async def record_workshop_streaming_finalization(
     message: OutboundMessage,
+    *,
+    delivery_policy: WorkshopDeliveryBindingPolicy,
 ) -> OutboundStreamingFinalizationResult:
     """Atomically record one authoritative reply and its delivery plan.
 
@@ -530,10 +533,18 @@ async def record_workshop_streaming_finalization(
     async with _workshop_event_lock:
         store = WorkshopEventStore.from_initialized_connection(_get_db())
         try:
-            return await record_outbound_message_with_streaming_finalization(store, message)
+            return await record_outbound_message_with_streaming_finalization(
+                store,
+                message,
+                delivery_policy=delivery_policy,
+            )
         except aiosqlite.Error:
             try:
-                return await record_outbound_message_with_streaming_finalization(store, message)
+                return await record_outbound_message_with_streaming_finalization(
+                    store,
+                    message,
+                    delivery_policy=delivery_policy,
+                )
             except Exception as resolution_error:
                 raise WorkshopFinalizationCommitUncertainError(
                     "Could not determine whether the Workshop reply transaction committed"

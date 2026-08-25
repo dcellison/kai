@@ -22,6 +22,7 @@ from kai.workshop.delivery_outbox import (
     DeliveryRequestResult,
     WorkshopDeliveryOutbox,
 )
+from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import (
     ChannelBindingId,
     ChannelId,
@@ -185,15 +186,12 @@ async def _existing_outbound(
 async def _resolve_telegram_binding(
     store: WorkshopEventStore,
     channel_id: ChannelId,
+    delivery_policy: WorkshopDeliveryBindingPolicy,
 ) -> ChannelBindingId:
-    async with store.connection.execute(
-        "SELECT id FROM channel_bindings WHERE channel_id = ? AND transport = 'telegram' ORDER BY id",
-        (channel_id,),
-    ) as cursor:
-        rows = list(await cursor.fetchall())
-    if len(rows) != 1:
+    binding_ids = await delivery_policy.binding_ids(store, channel_id, transport="telegram")
+    if len(binding_ids) != 1:
         raise OutboundDeliveryBindingError("Canonical reply channel must have exactly one Telegram binding")
-    return ChannelBindingId(str(rows[0][0]))
+    return binding_ids[0]
 
 
 async def _confirmed_preview_message_id(
@@ -261,6 +259,8 @@ async def record_outbound_message(store: WorkshopEventStore, message: OutboundMe
 async def record_outbound_message_with_delivery(
     store: WorkshopEventStore,
     message: OutboundMessage,
+    *,
+    delivery_policy: WorkshopDeliveryBindingPolicy,
 ) -> OutboundDeliveryResult:
     """Atomically create one canonical reply and its pending Telegram text delivery.
 
@@ -271,7 +271,7 @@ async def record_outbound_message_with_delivery(
     try:
         await connection.execute("BEGIN IMMEDIATE")
         binding = await _resolve_outbound(store, message.in_reply_to_message_id)
-        channel_binding_id = await _resolve_telegram_binding(store, binding.channel_id)
+        channel_binding_id = await _resolve_telegram_binding(store, binding.channel_id, delivery_policy)
         message_result = await _existing_outbound(store, binding, message)
         if message_result is None:
             message_result = await store.append_in_transaction(_outbound_envelope(binding, message))
@@ -306,6 +306,8 @@ async def record_outbound_message_with_delivery(
 async def record_outbound_message_with_streaming_finalization(
     store: WorkshopEventStore,
     message: OutboundMessage,
+    *,
+    delivery_policy: WorkshopDeliveryBindingPolicy,
 ) -> OutboundStreamingFinalizationResult:
     """Atomically persist a reply, delivery request, and immutable operation plan.
 
@@ -317,7 +319,11 @@ async def record_outbound_message_with_streaming_finalization(
     connection = store.connection
     try:
         await connection.execute("BEGIN IMMEDIATE")
-        result = await record_outbound_message_with_streaming_finalization_in_transaction(store, message)
+        result = await record_outbound_message_with_streaming_finalization_in_transaction(
+            store,
+            message,
+            delivery_policy=delivery_policy,
+        )
         await connection.commit()
         return result
     except Exception:
@@ -329,6 +335,7 @@ async def record_outbound_message_with_streaming_finalization_in_transaction(
     store: WorkshopEventStore,
     message: OutboundMessage,
     *,
+    delivery_policy: WorkshopDeliveryBindingPolicy,
     request_delivery: bool = True,
 ) -> OutboundStreamingFinalizationResult:
     """Persist a reply and immutable delivery plan in a caller-owned transaction."""
@@ -342,7 +349,7 @@ async def record_outbound_message_with_streaming_finalization_in_transaction(
             store,
             message.in_reply_to_message_id,
         )
-        if request_delivery
+        if request_delivery and delivery_policy.is_enabled("telegram")
         else None
     )
     if streaming_target is not None and (

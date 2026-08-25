@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
+from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import (
     EventEnvelope,
     EventId,
@@ -817,7 +818,12 @@ class WorkshopRunExecutionAuthority:
             changed=True,
         )
 
-    async def recover_expired(self, *, occurred_at: datetime) -> RunRecoveryResult:
+    async def recover_expired(
+        self,
+        *,
+        occurred_at: datetime,
+        delivery_policy: WorkshopDeliveryBindingPolicy,
+    ) -> RunRecoveryResult:
         """Recover expired authority through the canonical terminal contract."""
         occurred_at = _timestamp(occurred_at, field_name="occurred_at")
         expired = interrupted = 0
@@ -831,7 +837,10 @@ class WorkshopRunExecutionAuthority:
                 # part of the authority module's construction dependency.
                 from kai.workshop.terminal_transactions import WorkshopRunTerminalTransactionCoordinator
 
-                await WorkshopRunTerminalTransactionCoordinator(self).interrupt_expired(
+                await WorkshopRunTerminalTransactionCoordinator(
+                    self,
+                    delivery_policy=delivery_policy,
+                ).interrupt_expired(
                     claim,
                     occurred_at=occurred_at,
                 )

@@ -13,6 +13,7 @@ from kai.workshop.delivery_outbox import (
     DeliveryRequestResult,
     WorkshopDeliveryOutbox,
 )
+from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import ChannelBindingId, ChannelId, MessageId, PrincipalId, RuntimeProfileId
 from kai.workshop.inbound import (
     ClientInboundMessage,
@@ -79,9 +80,16 @@ class WorkshopConversationCommandService:
     the execution coordinator owned by the production private-text runtime.
     """
 
-    def __init__(self, store: WorkshopEventStore, *, artifact_storage_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        store: WorkshopEventStore,
+        *,
+        artifact_storage_root: Path | None = None,
+        delivery_policy: WorkshopDeliveryBindingPolicy | None = None,
+    ) -> None:
         self._store = store
         self._artifact_storage_root = artifact_storage_root
+        self._delivery_policy = delivery_policy or WorkshopDeliveryBindingPolicy.disabled()
 
     async def accept(
         self,
@@ -262,6 +270,8 @@ class WorkshopConversationCommandService:
         principal_id: PrincipalId,
         channel_id: ChannelId,
     ) -> ChannelBindingId | None:
+        if not self._delivery_policy.is_enabled("telegram"):
+            return None
         async with self._store.connection.execute(
             "SELECT cb.id, EXISTS (SELECT 1 FROM external_identities ei "
             "WHERE ei.principal_id = ? AND ei.provider = 'telegram' "

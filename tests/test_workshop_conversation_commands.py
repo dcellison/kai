@@ -25,6 +25,7 @@ from kai.workshop.run_execution_authority import (
 )
 from kai.workshop.run_lifecycle import RunStatus, WorkshopRunLifecycle
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
+from tests.workshop_delivery import DISABLED_DELIVERY_POLICY, TELEGRAM_DELIVERY_POLICY
 from tests.workshop_profiles import profile_id
 
 _NOW = datetime(2026, 8, 12, 20, 0, tzinfo=UTC)
@@ -159,6 +160,7 @@ class TestAtomicConversationCommandAcceptance:
         service = WorkshopConversationCommandService(
             store,
             artifact_storage_root=storage_root,
+            delivery_policy=TELEGRAM_DELIVERY_POLICY,
         )
         try:
             accepted = await service.accept(_message(), artifact=artifact)
@@ -429,6 +431,7 @@ class TestAtomicClientConversationCommandAcceptance:
         service = WorkshopConversationCommandService(
             store,
             artifact_storage_root=storage_root,
+            delivery_policy=TELEGRAM_DELIVERY_POLICY,
         )
         try:
             accepted = await service.accept_client(message, artifact=artifact)
@@ -504,9 +507,10 @@ class TestAtomicClientConversationCommandAcceptance:
     ):
         store, principal_id, channel_id = await _open_client_store(tmp_path / "kai.db")
         try:
-            accepted = await WorkshopConversationCommandService(store).accept_client(
-                _client_message(principal_id, channel_id)
-            )
+            accepted = await WorkshopConversationCommandService(
+                store,
+                delivery_policy=TELEGRAM_DELIVERY_POLICY,
+            ).accept_client(_client_message(principal_id, channel_id))
 
             assert accepted.command.disposition == ConversationCommandDisposition.NEWLY_ACCEPTED
             assert accepted.command.message.inserted is True
@@ -540,7 +544,10 @@ class TestAtomicClientConversationCommandAcceptance:
         tmp_path: Path,
     ):
         store, principal_id, channel_id = await _open_client_store(tmp_path / "kai.db")
-        service = WorkshopConversationCommandService(store)
+        service = WorkshopConversationCommandService(
+            store,
+            delivery_policy=TELEGRAM_DELIVERY_POLICY,
+        )
         message = _client_message(principal_id, channel_id)
         try:
             first = await service.accept_client(message)
@@ -613,5 +620,27 @@ class TestAtomicClientConversationCommandAcceptance:
                     "message.created",
                     "run.accepted",
                 ]
+        finally:
+            await store.close()
+
+    async def test_disabled_telegram_adapter_does_not_enqueue_for_retained_binding(
+        self,
+        tmp_path: Path,
+    ):
+        store, principal_id, channel_id = await _open_client_store(tmp_path / "kai.db")
+        try:
+            accepted = await WorkshopConversationCommandService(
+                store,
+                delivery_policy=DISABLED_DELIVERY_POLICY,
+            ).accept_client(_client_message(principal_id, channel_id))
+
+            assert accepted.delivery is None
+            async with store.connection.execute("SELECT COUNT(*) FROM delivery_outbox") as cursor:
+                assert int((await cursor.fetchone())[0]) == 0
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM channel_bindings WHERE channel_id = ? AND transport = 'telegram'",
+                (channel_id,),
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 1
         finally:
             await store.close()

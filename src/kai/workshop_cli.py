@@ -10,6 +10,7 @@ from pathlib import Path
 
 from kai.config import DATA_DIR, load_config
 from kai.workshop.client_access import WorkshopClientAccess, WorkshopClientAccessError
+from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import (
     ChannelId,
     DeviceId,
@@ -187,7 +188,10 @@ async def _run(args: argparse.Namespace) -> int:
     store = await WorkshopEventStore.open(_deployed_database(DATA_DIR))
     try:
         if args.command == "integration-route":
-            service = WorkshopIntegrationNotificationService(store)
+            service = WorkshopIntegrationNotificationService(
+                store,
+                WorkshopDeliveryBindingPolicy.disabled(),
+            )
             if args.action == "set":
                 try:
                     channel_id = ChannelId(args.channel_id)

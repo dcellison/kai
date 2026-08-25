@@ -15,6 +15,7 @@ from kai.agent_failure import AgentFailureKind
 from kai.backend import AgentResponse, StreamEvent
 from kai.workshop.artifacts import ArtifactMessageNotFoundError, build_agent_prompt_for_message
 from kai.workshop.conversation_context import assemble_canonical_conversation_context
+from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import AgentId, ChannelId, RunExecutionOwnerId, RunId
 from kai.workshop.protected_execution import PreparedWorkshopExecution
 from kai.workshop.run_execution_authority import (
@@ -144,6 +145,7 @@ class WorkshopCanonicalExecutionCoordinator:
         database_lock: asyncio.Lock | None = None,
         transcript_projection: CanonicalTranscriptProjection | None = None,
         artifact_storage_root: Path | None = None,
+        delivery_policy: WorkshopDeliveryBindingPolicy,
     ) -> None:
         if not registered_backend_ids:
             raise ValueError("registered_backend_ids must not be empty")
@@ -161,6 +163,7 @@ class WorkshopCanonicalExecutionCoordinator:
         self._transcript_projection = transcript_projection
         self._artifact_storage_root = artifact_storage_root
         self._trace_store = WorkshopRunTraceStore(store)
+        self._delivery_policy = delivery_policy
 
     async def execute(
         self,
@@ -272,7 +275,10 @@ class WorkshopCanonicalExecutionCoordinator:
                     await authority.expire_grant(claim, occurred_at=now)
                     expired += 1
                 else:
-                    await WorkshopRunTerminalTransactionCoordinator(authority).interrupt_expired(
+                    await WorkshopRunTerminalTransactionCoordinator(
+                        authority,
+                        delivery_policy=self._delivery_policy,
+                    ).interrupt_expired(
                         claim,
                         occurred_at=now,
                     )
@@ -323,7 +329,10 @@ class WorkshopCanonicalExecutionCoordinator:
                     if success_transformer is not None
                     else CanonicalSuccessOutcome(response.text)
                 )
-            terminal = WorkshopRunTerminalTransactionCoordinator(authority)
+            terminal = WorkshopRunTerminalTransactionCoordinator(
+                authority,
+                delivery_policy=self._delivery_policy,
+            )
             async with self._database_lock:
                 active.settling = True
                 if response is None or (response.success and not response.text.strip()):
@@ -382,7 +391,10 @@ class WorkshopCanonicalExecutionCoordinator:
                         pass
                 async with self._database_lock:
                     active.settling = True
-                    settled = await WorkshopRunTerminalTransactionCoordinator(active.authority).fail(
+                    settled = await WorkshopRunTerminalTransactionCoordinator(
+                        active.authority,
+                        delivery_policy=self._delivery_policy,
+                    ).fail(
                         active.claim,
                         failure_code=TerminalFailureCode.EXECUTION_INTERRUPTED,
                         occurred_at=self._now(),
@@ -405,7 +417,10 @@ class WorkshopCanonicalExecutionCoordinator:
             if active.started:
                 async with self._database_lock:
                     active.settling = True
-                    result = await WorkshopRunTerminalTransactionCoordinator(active.authority).fail(
+                    result = await WorkshopRunTerminalTransactionCoordinator(
+                        active.authority,
+                        delivery_policy=self._delivery_policy,
+                    ).fail(
                         active.claim,
                         failure_code=TerminalFailureCode.EXECUTION_INTERRUPTED,
                         occurred_at=self._now(),
@@ -423,7 +438,10 @@ class WorkshopCanonicalExecutionCoordinator:
             )
         async with self._database_lock:
             active.settling = True
-            result = await WorkshopRunTerminalTransactionCoordinator(active.authority).confirm_cancellation(
+            result = await WorkshopRunTerminalTransactionCoordinator(
+                active.authority,
+                delivery_policy=self._delivery_policy,
+            ).confirm_cancellation(
                 active.claim,
                 occurred_at=self._now(),
             )

@@ -21,6 +21,7 @@ from kai.backend import AgentResponse
 from kai.job_types import JOB_TYPE_AGENT, JOB_TYPE_REMINDER
 from kai.workshop.compatibility_state import WorkshopCompatibilityStateWriter
 from kai.workshop.conversation_commands import ConversationCommandDisposition
+from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import (
     CanonicalMemoryProvenance,
     ChannelId,
@@ -109,11 +110,12 @@ class WorkshopCanonicalScheduler:
         store: WorkshopEventStore,
         execution: WorkshopPrivateTextExecutionService,
         compatibility_state: WorkshopCompatibilityStateWriter,
+        delivery_policy: WorkshopDeliveryBindingPolicy,
     ) -> None:
         self._store = store
         self._execution = execution
         self._compatibility_state = compatibility_state
-        self._reminders = WorkshopScheduledReminderRecorder(store)
+        self._reminders = WorkshopScheduledReminderRecorder(store, delivery_policy)
         self._jobs = WorkshopScheduledJobStore(store)
         self._state = WorkshopSchedulerState.NEW
         self._stop_event = asyncio.Event()
@@ -131,9 +133,10 @@ class WorkshopCanonicalScheduler:
         database_path: Path,
         execution: WorkshopPrivateTextExecutionService,
         compatibility_state: WorkshopCompatibilityStateWriter,
+        delivery_policy: WorkshopDeliveryBindingPolicy,
     ) -> WorkshopCanonicalScheduler:
         store = await WorkshopEventStore.open(database_path)
-        service = cls(store, execution, compatibility_state)
+        service = cls(store, execution, compatibility_state, delivery_policy)
         try:
             await service._recover_interrupted_firings()
             service._scheduler.start(paused=True)

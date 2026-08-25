@@ -57,6 +57,7 @@ from kai.workshop.telegram_delivery import (
     WorkshopTelegramDeliveryAdapter,
     WorkshopTelegramDeliveryWorker,
 )
+from tests.workshop_delivery import TELEGRAM_DELIVERY_POLICY
 from tests.workshop_profiles import profile_id, profile_registry
 
 _NOW = datetime(2026, 8, 12, 9, 32, tzinfo=UTC)
@@ -274,7 +275,7 @@ async def _open_with_proactive_artifact(
             runtime_profiles=profiles,
         ),
         artifact_storage_root=tmp_path / "files",
-        delivery_transports=frozenset({"telegram"}),
+        delivery_policy=TELEGRAM_DELIVERY_POLICY,
     )
     source = tmp_path / filename
     source.write_bytes(content)

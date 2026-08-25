@@ -35,6 +35,7 @@ from kai.workshop.telegram_delivery import (
     WorkshopTelegramStreamingFinalizationAdapter,
     WorkshopTelegramStreamingFinalizationWorker,
 )
+from tests.workshop_delivery import TELEGRAM_DELIVERY_POLICY
 
 _NOW = datetime(2026, 8, 12, 15, 0, tzinfo=UTC)
 
@@ -84,6 +85,7 @@ async def _finalize(store: WorkshopEventStore, inbound_id: MessageId, *, sequenc
             body=f"Final answer {sequence}",
             occurred_at=_NOW + timedelta(minutes=sequence, seconds=1),
         ),
+        delivery_policy=TELEGRAM_DELIVERY_POLICY,
     )
 
 
