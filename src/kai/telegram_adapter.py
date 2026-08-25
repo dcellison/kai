@@ -7,6 +7,7 @@ import logging
 from dataclasses import dataclass
 from enum import StrEnum
 
+from aiohttp import web
 from telegram import Bot, BotCommand
 from telegram.error import NetworkError
 
@@ -14,6 +15,7 @@ from kai.application_host import KaiCoreServices
 from kai.bot import create_bot
 from kai.config import Config
 from kai.telegram_context import KaiTelegramApplication
+from kai.telegram_http import TelegramWebhookIngress
 from kai.workshop.delivery_policy import DeliveryAdapterCapabilities
 from kai.workshop.telegram_delivery_runtime import (
     WorkshopTelegramConversationDeliveryService,
@@ -98,11 +100,10 @@ _TELEGRAM_COMMANDS = (
 
 
 class TelegramAdapter:
-    """Own Telegram application, polling, and delivery workers.
+    """Own the Telegram application, ingress, and delivery workers.
 
-    HTTP webhook registration remains in the HTTP adapter during this
-    milestone. The core host starts, supervises, reports, and stops this
-    boundary without importing a Telegram package itself.
+    The shared HTTP adapter hosts an adapter-contributed webhook route, while
+    this class owns every Telegram SDK object and remote API registration.
     """
 
     def __init__(
@@ -122,6 +123,7 @@ class TelegramAdapter:
         self._ingress_started = False
         self._conversation_delivery: WorkshopTelegramConversationDeliveryService | None = None
         self._notification_delivery: WorkshopTelegramNotificationService | None = None
+        self._webhook_ingress: TelegramWebhookIngress | None = None
 
     @property
     def application(self) -> KaiTelegramApplication:
@@ -184,6 +186,8 @@ class TelegramAdapter:
             await application.start()
             self._application_started = True
             await application.bot.set_my_commands(_TELEGRAM_COMMANDS)
+            if self._use_webhook:
+                self._webhook_ingress = TelegramWebhookIngress(application, self._config)
 
             self._conversation_delivery = await WorkshopTelegramConversationDeliveryService.open_and_start(
                 self._config.session_db_path,
@@ -202,17 +206,20 @@ class TelegramAdapter:
             raise
 
     async def activate_ingress(self) -> None:
-        """Mark webhook ingress ready or start the polling updater.
+        """Register webhook ingress or start the polling updater.
 
-        In webhook mode the HTTP adapter has already registered Telegram's URL
-        before calling this method. The adapter therefore remains STARTING for
-        the brief handoff between confirmed registration and this readiness
-        transition, even though Telegram may begin delivering during it.
+        In webhook mode the HTTP adapter has already published the local route
+        before this method registers it with Telegram's remote API.
         """
         if self._state != TelegramAdapterState.STARTING:
             raise RuntimeError(f"Telegram ingress cannot start while {self._state.value}")
         try:
-            if not self._use_webhook:
+            if self._use_webhook:
+                ingress = self._webhook_ingress
+                if ingress is None:
+                    raise RuntimeError("Telegram webhook ingress is unavailable")
+                await ingress.start()
+            else:
                 updater = self.application.updater
                 if updater is None:
                     raise RuntimeError("Telegram polling mode has no updater")
@@ -223,6 +230,29 @@ class TelegramAdapter:
         except BaseException:
             self._state = TelegramAdapterState.FAILED
             raise
+
+    def register_http_routes(self, app: web.Application) -> None:
+        """Contribute Telegram webhook ingress only in configured webhook mode."""
+        if not self._use_webhook:
+            return
+        ingress = self._webhook_ingress
+        if ingress is None:
+            raise RuntimeError("Telegram webhook ingress is unavailable")
+        ingress.register_routes(app)
+
+    async def deactivate_ingress(self) -> None:
+        """Stop ingress before the shared HTTP listener is torn down."""
+        if not self._ingress_started:
+            return
+        if self._use_webhook:
+            ingress = self._webhook_ingress
+            if ingress is not None:
+                await ingress.stop()
+        else:
+            updater = self.application.updater
+            if updater is not None:
+                await updater.stop()
+        self._ingress_started = False
 
     async def wait(self) -> None:
         if self._state != TelegramAdapterState.READY:
@@ -249,14 +279,11 @@ class TelegramAdapter:
     async def _stop_components(self) -> list[Exception]:
         errors: list[Exception] = []
         application = self._application
-        if self._ingress_started and not self._use_webhook and application is not None:
-            updater = application.updater
-            if updater is not None:
-                try:
-                    await updater.stop()
-                except Exception as exc:
-                    errors.append(exc)
-        self._ingress_started = False
+        if self._ingress_started:
+            try:
+                await self.deactivate_ingress()
+            except Exception as exc:
+                errors.append(exc)
 
         for service in (self._notification_delivery, self._conversation_delivery):
             if service is not None:
@@ -280,4 +307,5 @@ class TelegramAdapter:
                 errors.append(exc)
         self._application_initialized = False
         self._application = None
+        self._webhook_ingress = None
         return errors

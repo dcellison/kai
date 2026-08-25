@@ -6324,7 +6324,12 @@ def _cmd_apply() -> None:
         _apply_source(install_path, svc_uid, svc_gid, dry_run)
 
         # -- Step 3: Create/update venv --
-        _apply_venv(install_path, is_update, dry_run)
+        _apply_venv(
+            install_path,
+            is_update,
+            dry_run,
+            enabled_adapters=parse_enabled_adapters(env.get("KAI_ENABLED_ADAPTERS")),
+        )
 
         # -- Step 4: Copy models (if they exist in source) --
         _apply_models(install_path, dry_run)
@@ -7346,7 +7351,22 @@ def _optional_file_checksum(path: Path) -> str:
     return _file_checksum(path) if path.is_file() else ""
 
 
-def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
+def _protected_install_extras(enabled_adapters: frozenset[str]) -> str:
+    """Return the deterministic protected-install extra set."""
+    extras = ["memory"]
+    if "telegram" in enabled_adapters:
+        extras.append("telegram")
+    extras.extend(("totp", "tts"))
+    return ",".join(extras)
+
+
+def _apply_venv(
+    install_path: Path,
+    is_update: bool,
+    dry_run: bool,
+    *,
+    enabled_adapters: frozenset[str] | None = None,
+) -> None:
     """
     Create or update the virtual environment in the install location.
 
@@ -7369,6 +7389,8 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
     constraints_dst = install_path / _INSTALL_CONSTRAINTS_REL
     src_dst = install_path / "src"
     build_path = install_path / "build"
+    effective_adapters = parse_enabled_adapters(None) if enabled_adapters is None else enabled_adapters
+    extras = _protected_install_extras(effective_adapters)
 
     if is_update and venv_path.exists():
         # A prior install (or pip update) may have run beneath a restrictive
@@ -7416,10 +7438,14 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
         incoming_src = PROJECT_ROOT / "src" if dry_run else src_dst
         new_src = _src_checksum(incoming_src)
 
+        extras_file = install_path / ".install-extras"
+        old_extras = extras_file.read_text().strip() if extras_file.exists() else ""
+
         if (
             old_pyproject == new_pyproject
             and old_constraints == new_constraints
             and old_src == new_src
+            and old_extras == extras
             and not venv_needs_repair
         ):
             print("  Venv unchanged (pyproject.toml, constraints, and source checksums match)")
@@ -7433,12 +7459,15 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
             changed.append("constraints")
         if old_src != new_src:
             changed.append("source")
+        if old_extras != extras:
+            changed.append("optional extras")
 
         if dry_run:
             if venv_needs_repair:
                 print("[DRY RUN] Would repair venv (Python interpreter missing or unusable)")
             if changed:
-                print(f"[DRY RUN] Would update venv ({' and '.join(changed)} changed)")
+                change_summary = ", ".join(f"{item} changed" for item in changed)
+                print(f"[DRY RUN] Would update venv ({change_summary})")
             if build_path.exists():
                 print(f"[DRY RUN] Would remove stale package build artifacts: {build_path}")
             return
@@ -7465,7 +7494,8 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
             print("  Repaired venv interpreter")
 
         if changed:
-            print(f"  Updating venv ({' and '.join(changed)} changed)...")
+            change_summary = ", ".join(f"{item} changed" for item in changed)
+            print(f"  Updating venv ({change_summary})...")
     else:
         if dry_run:
             print(f"[DRY RUN] Would create venv: {venv_path}")
@@ -7513,7 +7543,6 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
     # Install the package with optional dependencies.
     # Uses a non-editable install (not -e) so the venv is self-contained
     # and doesn't depend on the source directory being writable.
-    extras = "memory,totp,tts"
     install_spec = f"{install_path}[{extras}]"
     pip_install_cmd = [str(venv_python), "-m", "pip", "install"]
     if constraints_dst.is_file():
@@ -7534,6 +7563,7 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
     (install_path / ".pyproject.sha256").write_text(_file_checksum(pyproject_dst) + "\n")
     (install_path / ".constraints.sha256").write_text(_optional_file_checksum(constraints_dst) + "\n")
     (install_path / ".src.sha256").write_text(_src_checksum(src_dst) + "\n")
+    (install_path / ".install-extras").write_text(extras + "\n")
 
     # Set venv ownership to root (read-only for service user)
     _set_ownership(venv_path, 0, 0, recursive=True)

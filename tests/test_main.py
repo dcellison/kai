@@ -609,6 +609,7 @@ class TestStartCrashExit:
             lambda: SimpleNamespace(
                 default_model="gpt-test",
                 allowed_user_ids={123},
+                telegram_enabled=False,
                 telegram_webhook_url=None,
                 session_db_path=":memory:",
             ),

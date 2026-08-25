@@ -75,6 +75,7 @@ from kai.install import (
     _probe_service_readiness,
     _prompt_choice,
     _prompt_optional_choice,
+    _protected_install_extras,
     _read_users_yaml_text,
     _resolve_codex_bin_prompt_default,
     _retire_install_home_claude,
@@ -5351,6 +5352,7 @@ class TestApplyVenv:
         # Pre-populate checksum files as if a previous install wrote them
         (install / ".pyproject.sha256").write_text(_file_checksum(install / "pyproject.toml") + "\n")
         (install / ".src.sha256").write_text(_src_checksum(install / "src") + "\n")
+        (install / ".install-extras").write_text("memory,telegram,totp,tts\n")
 
         _apply_venv(install, is_update=True, dry_run=False)
 
@@ -5377,6 +5379,7 @@ class TestApplyVenv:
         (src / "__init__.py").write_text("# init")
         (install / ".pyproject.sha256").write_text(_file_checksum(install / "pyproject.toml") + "\n")
         (install / ".src.sha256").write_text(_src_checksum(install / "src") + "\n")
+        (install / ".install-extras").write_text("memory,telegram,totp,tts\n")
 
         for directory in (venv, venv_bin, package.parent, package):
             directory.chmod(0o700)
@@ -5606,7 +5609,7 @@ class TestApplyVenv:
             "install",
             "--constraint",
             str(constraints),
-            f"{install}[memory,totp,tts]",
+            f"{install}[memory,telegram,totp,tts]",
         ] in commands
         assert "Updated constrained packaging tools" in output
         assert (install / ".constraints.sha256").read_text().strip() == _file_checksum(constraints)
@@ -5710,7 +5713,77 @@ class TestApplyVenv:
         assert "Removed 3 dangling venv interpreter symlink" in output
         assert "Repaired venv interpreter" in output
         assert [base_python, "-m", "venv", "--upgrade", str(install / "venv")] in commands
-        assert [str(venv_python), "-m", "pip", "install", f"{install}[memory,totp,tts]"] in commands
+        assert [str(venv_python), "-m", "pip", "install", f"{install}[memory,telegram,totp,tts]"] in commands
+
+    def test_protected_install_extras_follow_enabled_adapters(self):
+        """Only a configured Telegram adapter pulls in the Telegram SDK."""
+        assert _protected_install_extras(frozenset({"workshop"})) == "memory,totp,tts"
+        assert _protected_install_extras(frozenset({"telegram", "workshop"})) == ("memory,telegram,totp,tts")
+
+    def test_workshop_only_install_omits_telegram_extra(self, tmp_path, monkeypatch):
+        """A protected Workshop-only environment installs no Telegram extra."""
+        install = tmp_path / "opt" / "kai"
+        (install / "venv" / "bin").mkdir(parents=True)
+        (install / "venv" / "bin" / "python").touch(mode=0o755)
+        (install / "pyproject.toml").write_text("[project]\nname = 'kai'\n")
+        src = install / "src" / "kai"
+        src.mkdir(parents=True)
+        (src / "__init__.py").write_text("# init")
+
+        commands = []
+
+        def fake_run(cmd, **kwargs):
+            commands.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr("kai.install._set_ownership", lambda *a, **kw: None)
+
+        _apply_venv(
+            install,
+            is_update=True,
+            dry_run=False,
+            enabled_adapters=frozenset({"workshop"}),
+        )
+
+        assert [
+            str(install / "venv" / "bin" / "python"),
+            "-m",
+            "pip",
+            "install",
+            f"{install}[memory,totp,tts]",
+        ] in commands
+        assert (install / ".install-extras").read_text() == "memory,totp,tts\n"
+
+    def test_adapter_change_reinstalls_matching_venv(self, tmp_path, monkeypatch, capsys):
+        """Adapter policy changes refresh the protected optional dependencies."""
+        install = tmp_path / "opt" / "kai"
+        (install / "venv" / "bin").mkdir(parents=True)
+        (install / "venv" / "bin" / "python").touch(mode=0o755)
+        (install / "pyproject.toml").write_text("[project]\nname = 'kai'\n")
+        src = install / "src" / "kai"
+        src.mkdir(parents=True)
+        (src / "__init__.py").write_text("# init")
+        (install / ".pyproject.sha256").write_text(_file_checksum(install / "pyproject.toml") + "\n")
+        (install / ".src.sha256").write_text(_src_checksum(install / "src") + "\n")
+        (install / ".install-extras").write_text("memory,telegram,totp,tts\n")
+
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0),
+        )
+        monkeypatch.setattr("kai.install._set_ownership", lambda *a, **kw: None)
+
+        _apply_venv(
+            install,
+            is_update=True,
+            dry_run=False,
+            enabled_adapters=frozenset({"workshop"}),
+        )
+
+        assert "optional extras changed" in capsys.readouterr().out
+        assert (install / ".install-extras").read_text() == "memory,totp,tts\n"
 
     def test_dry_run_reports_dangling_venv_python_without_repair(self, tmp_path, monkeypatch, capsys):
         """Dry-run detects a broken venv but never invokes a repair command."""

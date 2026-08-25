@@ -40,16 +40,18 @@ import re
 import signal
 import stat
 from datetime import UTC, datetime, timedelta
+from importlib import import_module
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
+from types import ModuleType
+from typing import cast
 
 from kai import services, sessions
 from kai.application_host import KaiApplicationHost
 from kai.backend_registry import load_backend_registry
 from kai.config import DATA_DIR, PROJECT_ROOT, _read_protected_file, load_config
-from kai.http_adapter import HttpAdapter
+from kai.http_adapter import HttpAdapter, HttpIngressAdapter
 from kai.memory_backup import run_memory_backup
-from kai.telegram_adapter import TELEGRAM_DELIVERY_CAPABILITIES, TelegramAdapter
 from kai.workshop.bootstrap import BootstrapHuman, BootstrapNotificationChannel
 from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
@@ -137,9 +139,24 @@ def _workshop_registered_backend_ids(config) -> frozenset[str]:
     return frozenset(configured)
 
 
-def _delivery_policy(config) -> WorkshopDeliveryBindingPolicy:
+def _load_telegram_adapter_module() -> ModuleType:
+    """Load the optional Telegram adapter with an operator-facing failure."""
+    try:
+        return import_module("kai.telegram_adapter")
+    except ModuleNotFoundError as exc:
+        if exc.name == "telegram" or (exc.name is not None and exc.name.startswith("telegram.")):
+            raise SystemExit(
+                "The Telegram adapter is enabled, but its optional dependency is not installed. "
+                "Install Kai with the 'telegram' extra or disable Telegram in KAI_ENABLED_ADAPTERS."
+            ) from None
+        raise
+
+
+def _delivery_policy(config, telegram_adapter_module: ModuleType | None) -> WorkshopDeliveryBindingPolicy:
     """Compose adapter declarations outside the transport-neutral host."""
-    capabilities = (TELEGRAM_DELIVERY_CAPABILITIES,) if config.telegram_enabled else ()
+    capabilities = (
+        (telegram_adapter_module.TELEGRAM_DELIVERY_CAPABILITIES,) if telegram_adapter_module is not None else ()
+    )
     return WorkshopDeliveryBindingPolicy(
         frozenset(item.transport for item in capabilities),
         capabilities,
@@ -461,6 +478,7 @@ def _start() -> None:
     """
     config = load_config()
     logging.info("Kai starting (model=%s, users=%s)", config.default_model, config.allowed_user_ids)
+    telegram_adapter_module = _load_telegram_adapter_module() if config.telegram_enabled else None
 
     # Load external service definitions. In a protected installation, services.yaml
     # lives in /etc/kai/ (root-owned). Falls back to PROJECT_ROOT for development.
@@ -535,7 +553,7 @@ def _start() -> None:
         load_db_registry(await sessions.get_memory_project_rows())
 
         core_host: KaiApplicationHost | None = None
-        telegram_adapter: TelegramAdapter | None = None
+        telegram_adapter: HttpIngressAdapter | None = None
         cleanup_task: asyncio.Task[None] | None = None
         memory_backup_task: asyncio.Task[None] | None = None
         launcher_watch_task: asyncio.Task[None] | None = None
@@ -647,16 +665,20 @@ def _start() -> None:
                 internal_api_contexts=internal_api_contexts,
                 services_info=services.get_available_services(),
                 registered_backend_ids=_workshop_registered_backend_ids(config),
-                delivery_policy=_delivery_policy(config),
+                delivery_policy=_delivery_policy(config, telegram_adapter_module),
             )
             core_services = await core_host.start()
             logging.info("Kai core application host is ready")
 
             if config.telegram_enabled:
-                telegram_adapter = TelegramAdapter(
-                    config,
-                    core_services,
-                    use_webhook=use_webhook,
+                assert telegram_adapter_module is not None
+                telegram_adapter = cast(
+                    HttpIngressAdapter,
+                    telegram_adapter_module.TelegramAdapter(
+                        config,
+                        core_services,
+                        use_webhook=use_webhook,
+                    ),
                 )
                 await core_host.attach_adapter("telegram", telegram_adapter)
 
@@ -667,8 +689,6 @@ def _start() -> None:
                 telegram_adapter,
             )
             await core_host.attach_adapter("http", http_adapter)
-            if telegram_adapter is not None:
-                await telegram_adapter.activate_ingress()
             # Phase 3: per-user file confinement is handled at request
             # time via pool.get_effective_workspace(chat_id) in
             # webhook.py. No global workspace sync needed at startup.

@@ -1,7 +1,7 @@
 # Reviewed install constraints for Kai's protected install.
 #
 # The protected installer copies this file into /opt/kai and passes it to
-# `pip install --constraint` when installing `.[memory,totp,tts]`.
+# `pip install --constraint` when installing the configured optional extras.
 #
 # Scope: direct runtime, optional-install, and development dependencies, plus
 # transitive or packaging-tool versions required by a vulnerability,

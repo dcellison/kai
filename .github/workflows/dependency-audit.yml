@@ -30,7 +30,7 @@ jobs:
           python -m pip install --upgrade \
             --constraint requirements/constraints.txt pip setuptools
           python -m pip install --upgrade \
-            --constraint requirements/constraints.txt -e '.[dev,memory,totp,tts]'
+            --constraint requirements/constraints.txt -e '.[dev,memory,telegram,totp,tts]'
 
       - name: Run dependency audit
         run: make BIN= audit-deps

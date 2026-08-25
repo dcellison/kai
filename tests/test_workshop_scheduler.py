@@ -578,19 +578,24 @@ async def test_agent_firing_completes_through_real_canonical_coordinator(
         DISABLED_DELIVERY_POLICY,
     )
     try:
-        await asyncio.sleep(0.35)
-        async with source_store.connection.execute(
-            "SELECT f.status, r.status, result.body FROM workshop_schedule_firings f "
-            "JOIN runs r ON r.id = f.run_id "
-            "JOIN messages result ON result.id = r.result_message_id "
-            "WHERE f.job_id = ?",
-            (job_id,),
-        ) as cursor:
-            assert tuple(await cursor.fetchone()) == (
-                "succeeded",
-                "completed",
-                "[Job: Canonical reminder]\nScheduled agent answer",
-            )
+        terminal_row = None
+        async with asyncio.timeout(5):
+            while terminal_row is None:
+                async with source_store.connection.execute(
+                    "SELECT f.status, r.status, result.body FROM workshop_schedule_firings f "
+                    "JOIN runs r ON r.id = f.run_id "
+                    "JOIN messages result ON result.id = r.result_message_id "
+                    "WHERE f.job_id = ?",
+                    (job_id,),
+                ) as cursor:
+                    terminal_row = await cursor.fetchone()
+                if terminal_row is None:
+                    await asyncio.sleep(0.02)
+        assert tuple(terminal_row) == (
+            "succeeded",
+            "completed",
+            "[Job: Canonical reminder]\nScheduled agent answer",
+        )
         async with source_store.connection.execute("SELECT COUNT(*) FROM delivery_outbox") as cursor:
             assert (await cursor.fetchone())[0] == 0
         principal_id, channel_id = await _job_owner(source_store, job_id)

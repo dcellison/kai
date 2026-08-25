@@ -12,6 +12,7 @@ from aiohttp import web
 
 from kai.config import UserConfig
 from kai.internal_api_auth import InternalAPIAuth
+from kai.telegram_http import TelegramWebhookIngress
 from kai.webhook import (
     ALLOWED_USER_IDS_KEY,
     ALLOWED_WORKSPACES_KEY,
@@ -32,7 +33,6 @@ from kai.webhook import (
     _resolve_local_repo,
     _strip_markdown,
     _verify_github_signature,
-    _webhook_health_loop,
     add_notification_chat_id,
     remove_notification_chat_id,
 )
@@ -537,9 +537,14 @@ class TestWebhookHealthMonitor:
             if call_count > 2:
                 raise asyncio.CancelledError
 
-        with patch("kai.webhook.asyncio.sleep", side_effect=mock_sleep):
+        ingress = object.__new__(TelegramWebhookIngress)
+        ingress._bot = bot
+        ingress._webhook_url = "https://example.com/webhook"
+        ingress._webhook_secret = "secret"
+        ingress._notification_chat_id = 12345
+        with patch("kai.telegram_http.asyncio.sleep", side_effect=mock_sleep):
             try:
-                await _webhook_health_loop(bot, "https://example.com/webhook", "secret", 12345)
+                await ingress._webhook_health_loop()
             except asyncio.CancelledError:
                 pass
 
@@ -563,9 +568,14 @@ class TestWebhookHealthMonitor:
             if call_count > 4:
                 raise asyncio.CancelledError
 
-        with patch("kai.webhook.asyncio.sleep", side_effect=mock_sleep):
+        ingress = object.__new__(TelegramWebhookIngress)
+        ingress._bot = bot
+        ingress._webhook_url = "https://example.com/webhook"
+        ingress._webhook_secret = "secret"
+        ingress._notification_chat_id = 12345
+        with patch("kai.telegram_http.asyncio.sleep", side_effect=mock_sleep):
             try:
-                await _webhook_health_loop(bot, "https://example.com/webhook", "secret", 12345)
+                await ingress._webhook_health_loop()
             except asyncio.CancelledError:
                 pass
 
@@ -594,9 +604,14 @@ class TestWebhookHealthMonitor:
             if call_count > 3:
                 raise asyncio.CancelledError
 
-        with patch("kai.webhook.asyncio.sleep", side_effect=mock_sleep):
+        ingress = object.__new__(TelegramWebhookIngress)
+        ingress._bot = bot
+        ingress._webhook_url = "https://example.com/webhook"
+        ingress._webhook_secret = "secret"
+        ingress._notification_chat_id = 12345
+        with patch("kai.telegram_http.asyncio.sleep", side_effect=mock_sleep):
             try:
-                await _webhook_health_loop(bot, "https://example.com/webhook", "secret", 12345)
+                await ingress._webhook_health_loop()
             except asyncio.CancelledError:
                 pass
 
@@ -618,9 +633,14 @@ class TestWebhookHealthMonitor:
             if call_count > 4:
                 raise asyncio.CancelledError
 
-        with patch("kai.webhook.asyncio.sleep", side_effect=mock_sleep):
+        ingress = object.__new__(TelegramWebhookIngress)
+        ingress._bot = bot
+        ingress._webhook_url = "https://example.com/webhook"
+        ingress._webhook_secret = "secret"
+        ingress._notification_chat_id = 12345
+        with patch("kai.telegram_http.asyncio.sleep", side_effect=mock_sleep):
             try:
-                await _webhook_health_loop(bot, "https://example.com/webhook", "secret", 12345)
+                await ingress._webhook_health_loop()
             except asyncio.CancelledError:
                 pass
 
@@ -668,8 +688,6 @@ class TestNotificationChatIdMutations:
 
         private_execution = MagicMock()
         private_execution.recoverable_client_runs = AsyncMock(return_value=())
-        telegram_app = MagicMock()
-        telegram_app.bot = AsyncMock()
         core_services = SimpleNamespace(
             subprocess_pool=MagicMock(internal_api_auth=_internal_api_auth()),
             principal_storage=_principal_storage_registry(),
@@ -700,7 +718,6 @@ class TestNotificationChatIdMutations:
                 patch("kai.webhook.web.TCPSite", return_value=fake_site),
             ):
                 await wh.start(
-                    telegram_app,
                     config,
                     core_host=core_host,
                     core_services=core_services,
@@ -761,7 +778,6 @@ class TestNotificationChatIdMutations:
         monkeypatch.setattr("kai.webhook.web.TCPSite", MagicMock(return_value=fake_site))
 
         await wh.start(
-            None,
             config,
             core_host=MagicMock(),
             core_services=core_services,
@@ -809,8 +825,6 @@ class TestNotificationChatIdMutations:
 
         private_execution = MagicMock()
         private_execution.recoverable_client_runs = AsyncMock(return_value=())
-        telegram_app = MagicMock()
-        telegram_app.bot = AsyncMock()
         core_store = await WorkshopEventStore.open(config.session_db_path)
         core_services = SimpleNamespace(
             subprocess_pool=MagicMock(internal_api_auth=_internal_api_auth()),
@@ -851,7 +865,6 @@ class TestNotificationChatIdMutations:
         monkeypatch.setattr("kai.webhook.sessions.get_setting", AsyncMock(return_value=None))
 
         await wh.start(
-            telegram_app,
             config,
             core_host=core_host,
             core_services=core_services,
