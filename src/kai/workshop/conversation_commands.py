@@ -7,14 +7,10 @@ from enum import StrEnum
 from pathlib import Path
 
 from kai.workshop.artifacts import StagedArtifact, record_inbound_artifact_in_transaction
-from kai.workshop.delivery_outbox import (
-    CONVERSATION_REPLY_PURPOSE,
-    DeliveryRequest,
-    DeliveryRequestResult,
-    WorkshopDeliveryOutbox,
-)
+from kai.workshop.delivery_outbox import CONVERSATION_REPLY_PURPOSE, DeliveryRequestResult
+from kai.workshop.delivery_planning import CanonicalDeliveryIntent, WorkshopDeliveryPlanner
 from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
-from kai.workshop.domain import ChannelBindingId, ChannelId, MessageId, PrincipalId, RuntimeProfileId
+from kai.workshop.domain import MessageId, RuntimeProfileId
 from kai.workshop.inbound import (
     ClientInboundMessage,
     InboundMessage,
@@ -62,11 +58,16 @@ class ConversationCommandAcceptance:
 
 @dataclass(frozen=True, slots=True)
 class ClientConversationCommandAcceptance:
-    """Atomic client acceptance plus optional transport compatibility work."""
+    """Atomic client acceptance plus independently durable adapter work."""
 
     command: ConversationCommandAcceptance
-    delivery: DeliveryRequestResult | None
+    deliveries: tuple[DeliveryRequestResult, ...]
     runtime_profile_id: RuntimeProfileId
+
+    @property
+    def delivery(self) -> DeliveryRequestResult | None:
+        """Compatibility view for callers that expect at most one adapter."""
+        return self.deliveries[0] if len(self.deliveries) == 1 else None
 
     @property
     def run(self) -> DurableRun:
@@ -89,7 +90,8 @@ class WorkshopConversationCommandService:
     ) -> None:
         self._store = store
         self._artifact_storage_root = artifact_storage_root
-        self._delivery_policy = delivery_policy or WorkshopDeliveryBindingPolicy.disabled()
+        effective_policy = delivery_policy or WorkshopDeliveryBindingPolicy.disabled()
+        self._delivery_planner = WorkshopDeliveryPlanner(self._store, effective_policy)
 
     async def accept(
         self,
@@ -147,7 +149,7 @@ class WorkshopConversationCommandService:
         *,
         artifact: StagedArtifact | None = None,
     ) -> ClientConversationCommandAcceptance:
-        """Accept one canonical browser command and optional Telegram echo."""
+        """Accept one canonical browser command and optional adapter echoes."""
         if not isinstance(message, ClientInboundMessage):
             raise ValueError("message must be a ClientInboundMessage")
         connection = self._store.connection
@@ -179,29 +181,20 @@ class WorkshopConversationCommandService:
                 )
             except WorkshopRuntimeAssignmentError as exc:
                 raise ConversationCommandStateConflictError(str(exc)) from exc
-            binding_id = await self._optional_telegram_binding(
-                message.principal_id,
-                message.channel_id,
-            )
-            delivery = (
-                await WorkshopDeliveryOutbox(self._store).request_delivery_in_transaction(
-                    DeliveryRequest(
-                        message_id=inbound_message_id,
-                        channel_binding_id=binding_id,
-                        mode="workshop_client_text",
-                        purpose=CONVERSATION_REPLY_PURPOSE,
-                        occurred_at=inbound.event.envelope.occurred_at,
-                        max_attempts=5,
-                    )
+            planning = await self._delivery_planner.plan_in_transaction(
+                CanonicalDeliveryIntent(
+                    message_id=inbound_message_id,
+                    channel_id=message.channel_id,
+                    mode="workshop_client_text",
+                    purpose=CONVERSATION_REPLY_PURPOSE,
+                    occurred_at=inbound.event.envelope.occurred_at,
+                    recipient_principal_id=message.principal_id,
                 )
-                if binding_id is not None
-                else None
             )
             prior_states = {inbound.inserted, lifecycle.changed}
             if artifact_result is not None:
                 prior_states.add(artifact_result.inserted)
-            if delivery is not None:
-                prior_states.add(delivery.inserted)
+            prior_states.update(delivery.inserted for delivery in planning.deliveries)
             if len(prior_states) != 1:
                 raise ConversationCommandStateConflictError(
                     "Canonical inbound, run acceptance, and delivery request did not share one prior state"
@@ -214,7 +207,7 @@ class WorkshopConversationCommandService:
             await connection.commit()
             return ClientConversationCommandAcceptance(
                 command=ConversationCommandAcceptance(inbound, lifecycle, disposition),
-                delivery=delivery,
+                deliveries=planning.deliveries,
                 runtime_profile_id=runtime_profile_id,
             )
         except Exception:
@@ -258,36 +251,12 @@ class WorkshopConversationCommandService:
             await connection.commit()
             return ClientConversationCommandAcceptance(
                 command=ConversationCommandAcceptance(inbound, lifecycle, disposition),
-                delivery=None,
+                deliveries=(),
                 runtime_profile_id=runtime_profile_id,
             )
         except Exception:
             await connection.rollback()
             raise
-
-    async def _optional_telegram_binding(
-        self,
-        principal_id: PrincipalId,
-        channel_id: ChannelId,
-    ) -> ChannelBindingId | None:
-        if not self._delivery_policy.is_enabled("telegram"):
-            return None
-        async with self._store.connection.execute(
-            "SELECT cb.id, EXISTS (SELECT 1 FROM external_identities ei "
-            "WHERE ei.principal_id = ? AND ei.provider = 'telegram' "
-            "AND ei.external_subject = cb.external_channel_id) "
-            "FROM channel_bindings cb "
-            "WHERE cb.channel_id = ? AND cb.transport = 'telegram'",
-            (principal_id, channel_id),
-        ) as cursor:
-            rows = list(await cursor.fetchall())
-        if not rows:
-            return None
-        if len(rows) != 1 or int(rows[0][1]) != 1:
-            raise ConversationCommandStateConflictError(
-                "Client command has an ambiguous or mismatched Telegram binding"
-            )
-        return ChannelBindingId(str(rows[0][0]))
 
     async def _replay_disposition(self, run: DurableRun) -> ConversationCommandDisposition:
         if run.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:

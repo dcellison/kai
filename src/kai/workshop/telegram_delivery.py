@@ -35,6 +35,7 @@ from kai.workshop.delivery_fragments import (
     EDIT_OPERATION,
     SEND_OPERATION,
     DeliveryFragment,
+    DeliveryFragmentOperation,
     WorkshopDeliveryFragments,
 )
 from kai.workshop.delivery_outbox import (
@@ -517,6 +518,62 @@ class WorkshopTelegramStreamingFinalizationAdapter:
         return message_id
 
 
+class WorkshopTelegramFinalizationPlanner:
+    """Build Telegram-specific finalization operations after durable claim."""
+
+    def __init__(self, store: WorkshopEventStore) -> None:
+        self._store = store
+
+    async def operations(self, claim: DeliveryClaim) -> tuple[DeliveryFragmentOperation, ...]:
+        if not isinstance(claim, DeliveryClaim):
+            raise ValueError("claim must be a DeliveryClaim")
+        if claim.execution_contract != STREAMING_FINALIZATION_CONTRACT:
+            raise TelegramDeliveryContractError("telegram_execution_contract_mismatch")
+        if claim.transport != "telegram":
+            raise TelegramDeliveryContractError("telegram_transport_mismatch")
+        if claim.mode != "text":
+            raise TelegramDeliveryContractError("telegram_mode_unsupported")
+
+        fragments = _telegram_fragments(_telegram_delivery_body(claim))
+        async with self._store.connection.execute(
+            "SELECT reply_to_message_id FROM messages WHERE id = ? AND channel_id = ?",
+            (claim.message_id, claim.channel_id),
+        ) as cursor:
+            message_row = await cursor.fetchone()
+        if message_row is None:
+            raise TelegramDeliveryContractError("telegram_canonical_message_missing")
+
+        inbound_message_id = message_row[0]
+        preview_message_id: int | None = None
+        if inbound_message_id is not None:
+            async with self._store.connection.execute(
+                "SELECT workshop_id, channel_id, channel_binding_id, "
+                "external_message_id, state FROM telegram_streaming_previews "
+                "WHERE inbound_message_id = ? AND channel_binding_id = ?",
+                (str(inbound_message_id), claim.channel_binding_id),
+            ) as cursor:
+                preview_row = await cursor.fetchone()
+            if preview_row is not None:
+                if (
+                    str(preview_row[0]) != claim.workshop_id
+                    or str(preview_row[1]) != claim.channel_id
+                    or str(preview_row[2]) != claim.channel_binding_id
+                ):
+                    raise TelegramDeliveryContractError("telegram_preview_routing_invalid")
+                if str(preview_row[4]) != "confirmed_non_final":
+                    raise TelegramDeliveryContractError("telegram_preview_state_invalid")
+                preview_message_id = int(preview_row[3])
+
+        operations = [DeliveryFragmentOperation(SEND_OPERATION, fragment) for fragment in fragments]
+        if preview_message_id is not None:
+            operations[0] = DeliveryFragmentOperation(
+                EDIT_OPERATION,
+                fragments[0],
+                target_external_message_id=preview_message_id,
+            )
+        return tuple(operations)
+
+
 class WorkshopTelegramDeliveryWorker:
     """Claim and settle one explicitly assigned lane of Telegram text work."""
 
@@ -660,6 +717,7 @@ class WorkshopTelegramStreamingFinalizationWorker:
         outbox: WorkshopDeliveryOutbox,
         fragments: WorkshopDeliveryFragments,
         adapter: WorkshopTelegramStreamingFinalizationAdapter,
+        planner: WorkshopTelegramFinalizationPlanner,
         *,
         worker_id: str,
         authority_epoch_id: DeliveryAuthorityEpochId,
@@ -673,6 +731,7 @@ class WorkshopTelegramStreamingFinalizationWorker:
         self._outbox = outbox
         self._fragments = fragments
         self._adapter = adapter
+        self._planner = planner
         self._worker_id = worker_id
         self._authority_epoch_id = authority_epoch_id
         self._lease_duration = lease_duration
@@ -719,6 +778,13 @@ class WorkshopTelegramStreamingFinalizationWorker:
         if claim.execution_contract != STREAMING_FINALIZATION_CONTRACT:
             raise RuntimeError("Finalization worker claimed another execution contract")
 
+        try:
+            if not await self._fragments.fragments(claim.delivery_id):
+                operations = await self._planner.operations(claim)
+                await self._fragments.prepare_operations(claim, operations)
+        except TelegramDeliveryFailure as failure:
+            return await self._settle_failure(claim, None, failure)
+
         while True:
             fragment = await self._fragments.begin_next(claim)
             if fragment is None:
@@ -759,13 +825,14 @@ class WorkshopTelegramStreamingFinalizationWorker:
     async def _settle_failure(
         self,
         claim: DeliveryClaim,
-        fragment: DeliveryFragment,
+        fragment: DeliveryFragment | None,
         failure: TelegramDeliveryFailure,
     ) -> TelegramWorkResult:
-        if failure.ambiguous:
-            await self._fragments.mark_uncertain(claim, fragment)
-        else:
-            await self._fragments.release_after_definitive_failure(claim, fragment)
+        if fragment is not None:
+            if failure.ambiguous:
+                await self._fragments.mark_uncertain(claim, fragment)
+            else:
+                await self._fragments.release_after_definitive_failure(claim, fragment)
         state = await self._outbox.mark_failed(
             claim,
             retryable=failure.retryable and not failure.ambiguous,

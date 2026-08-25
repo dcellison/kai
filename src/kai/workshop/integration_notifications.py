@@ -8,12 +8,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from kai.workshop.delivery_outbox import (
-    NOTIFICATION_PURPOSE,
-    DeliveryRequest,
-    DeliveryRequestResult,
-    WorkshopDeliveryOutbox,
-)
+from kai.workshop.delivery_outbox import NOTIFICATION_PURPOSE, DeliveryRequestResult
+from kai.workshop.delivery_planning import CanonicalDeliveryIntent, WorkshopDeliveryPlanner
 from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import (
     ChannelBindingId,
@@ -96,8 +92,7 @@ class WorkshopIntegrationNotificationService:
 
     def __init__(self, store: WorkshopEventStore, delivery_policy: WorkshopDeliveryBindingPolicy) -> None:
         self._store = store
-        self._delivery_policy = delivery_policy
-        self._outbox = WorkshopDeliveryOutbox(store)
+        self._delivery_planner = WorkshopDeliveryPlanner(store, delivery_policy)
         self._lock = asyncio.Lock()
         self._closed = False
 
@@ -453,22 +448,16 @@ class WorkshopIntegrationNotificationService:
 
             projection = CanonicalConversationProjection()
             await self._store.project_pending_in_transaction(projection)
-            binding_ids = await self._delivery_policy.binding_ids(self._store, channel_id)
-            deliveries = tuple(
-                [
-                    await self._outbox.request_delivery_in_transaction(
-                        DeliveryRequest(
-                            message_id=message_id,
-                            channel_binding_id=binding_id,
-                            mode="text",
-                            purpose=NOTIFICATION_PURPOSE,
-                            occurred_at=occurred_at,
-                            max_attempts=5,
-                        )
-                    )
-                    for binding_id in binding_ids
-                ]
+            planning = await self._delivery_planner.plan_in_transaction(
+                CanonicalDeliveryIntent(
+                    message_id=message_id,
+                    channel_id=channel_id,
+                    mode="text",
+                    purpose=NOTIFICATION_PURPOSE,
+                    occurred_at=occurred_at,
+                )
             )
+            deliveries = planning.deliveries
             if inserted and any(not delivery.inserted for delivery in deliveries):
                 raise IntegrationNotificationError(
                     "Canonical notification message and deliveries do not share one prior state"

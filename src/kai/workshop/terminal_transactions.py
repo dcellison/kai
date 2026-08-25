@@ -282,7 +282,7 @@ class WorkshopRunTerminalTransactionCoordinator:
                         occurred_at=occurred_at,
                     )
                 except RuntimeSessionStateConflictError:
-                    # The answer, delivery plan, and fenced run settlement are
+                    # The answer, delivery intents, and fenced run settlement are
                     # primary facts. An operator reassignment or stale
                     # continuity row must not discard an answer the backend
                     # has already produced. Missing/stale continuity remains
@@ -297,10 +297,7 @@ class WorkshopRunTerminalTransactionCoordinator:
                 finalization.message.inserted,
                 execution.changed,
             }
-            if finalization.delivery is not None:
-                prior_states.add(finalization.delivery.inserted)
-            if finalization.plan is not None:
-                prior_states.add(finalization.plan.inserted)
+            prior_states.update(delivery.inserted for delivery in finalization.deliveries)
             if runtime_session_result is not None:
                 prior_states.add(runtime_session_result.changed)
             if len(prior_states) != 1:

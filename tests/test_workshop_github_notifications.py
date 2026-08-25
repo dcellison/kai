@@ -16,7 +16,10 @@ from kai.workshop.bootstrap import (
     bootstrap_default_workshop,
 )
 from kai.workshop.delivery_outbox import NOTIFICATION_PURPOSE
-from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
+from kai.workshop.delivery_policy import (
+    DeliveryAdapterCapabilities,
+    WorkshopDeliveryBindingPolicy,
+)
 from kai.workshop.domain import ChannelId
 from kai.workshop.integration_notifications import (
     IntegrationNotification,
@@ -174,7 +177,10 @@ class TestWorkshopIntegrationNotificationService:
         )
         await store.connection.commit()
         try:
-            desktop_policy = WorkshopDeliveryBindingPolicy(frozenset({"desktop"}))
+            desktop_policy = WorkshopDeliveryBindingPolicy(
+                frozenset({"desktop"}),
+                (DeliveryAdapterCapabilities(transport="desktop"),),
+            )
             result = await WorkshopIntegrationNotificationService(store, desktop_policy).record_for_channel(
                 _notification(),
                 channel_id,

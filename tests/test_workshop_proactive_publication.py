@@ -23,6 +23,7 @@ from kai.workshop.proactive_publication import (
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.storage_namespaces import WorkshopPrincipalStorageRegistry
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
+from tests.workshop_delivery import TELEGRAM_DELIVERY_POLICY
 from tests.workshop_profiles import profile_id, profile_registry
 
 _NOW = datetime(2026, 8, 24, 12, 0, tzinfo=UTC)
@@ -61,7 +62,11 @@ async def _publication_service(
         store,
         artifacts,
         artifact_storage_root=tmp_path / "files",
-        delivery_policy=WorkshopDeliveryBindingPolicy(delivery_transports),
+        delivery_policy=(
+            TELEGRAM_DELIVERY_POLICY
+            if delivery_transports == frozenset({"telegram"})
+            else WorkshopDeliveryBindingPolicy(delivery_transports)
+        ),
     )
     authority = ProactivePublicationAuthority(
         context.principal_id,

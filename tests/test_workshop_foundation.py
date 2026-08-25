@@ -204,7 +204,7 @@ class TestWorkshopSchema:
         }
 
         assert expected <= await workshop_store.schema_tables()
-        assert await workshop_store.schema_version() == 29
+        assert await workshop_store.schema_version() == 30
         async with workshop_store.connection.execute("PRAGMA index_list(delivery_outbox)") as cursor:
             indexes = {str(row[1]) for row in await cursor.fetchall()}
         assert "delivery_outbox_binding_order_idx" in indexes
@@ -217,13 +217,52 @@ class TestWorkshopSchema:
         await first.close()
 
         second = await WorkshopEventStore.open(path)
-        assert await second.schema_version() == 29
+        assert await second.schema_version() == 30
         async with second.connection.execute(
             "SELECT COUNT(*) FROM workshop_schema_migrations WHERE version = 1"
         ) as cursor:
             row = await cursor.fetchone()
         assert row[0] == 1
         await second.close()
+
+    async def test_version_twenty_nine_authority_lane_migrates_without_losing_epoch(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        from kai.workshop import schema
+
+        path = tmp_path / "workshop.db"
+        epoch_id = "dae_00000000000000000000000000000001"
+        with monkeypatch.context() as migration_context:
+            migration_context.setattr(schema, "WORKSHOP_SCHEMA_VERSION", 29)
+            migration_context.setattr(schema, "_MIGRATIONS", schema._MIGRATIONS[:29])
+            version_twenty_nine = await WorkshopEventStore.open(path)
+            await version_twenty_nine.connection.execute(
+                "INSERT INTO delivery_authority_epochs "
+                "(id, lane, status, activated_at) VALUES "
+                "(?, 'telegram_conversation_streaming_finalization', 'active', ?)",
+                (epoch_id, "2026-08-25T12:00:00.000000Z"),
+            )
+            await version_twenty_nine.connection.commit()
+            await version_twenty_nine.close()
+
+        upgraded = await WorkshopEventStore.open(path)
+        try:
+            assert await upgraded.schema_version() == 30
+            async with upgraded.connection.execute("SELECT id, lane, status FROM delivery_authority_epochs") as cursor:
+                assert tuple(await cursor.fetchone()) == (
+                    epoch_id,
+                    "conversation_streaming_finalization",
+                    "active",
+                )
+            async with upgraded.connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'delivery_fragments'"
+            ) as cursor:
+                table_sql = str((await cursor.fetchone())[0])
+            assert "target_external_message_id TEXT" in table_sql
+        finally:
+            await upgraded.close()
 
     async def test_version_one_database_upgrades_additively(self, tmp_path: Path, monkeypatch):
         from kai.workshop import schema
@@ -238,7 +277,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 29
+            assert await upgraded.schema_version() == 30
             assert {
                 "deliveries",
                 "channel_memberships",
@@ -285,6 +324,7 @@ class TestWorkshopSchema:
                     27,
                     28,
                     29,
+                    30,
                 ]
         finally:
             await upgraded.close()
@@ -307,7 +347,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 29
+            assert await upgraded.schema_version() == 30
             assert {
                 "channel_memberships",
                 "workshop_client_devices",
@@ -348,7 +388,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 29
+            assert await upgraded.schema_version() == 30
             assert {
                 "workshop_client_devices",
                 "workshop_client_enrollment_grants",
@@ -401,7 +441,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 29
+            assert await upgraded.schema_version() == 30
             assert "workshop_client_enrollment_grants" in await upgraded.schema_tables()
             assert "artifacts" in await upgraded.schema_tables()
             assert "delivery_outbox" in await upgraded.schema_tables()
@@ -445,7 +485,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 29
+            assert await upgraded.schema_version() == 30
             assert "artifacts" in await upgraded.schema_tables()
             assert "delivery_outbox" in await upgraded.schema_tables()
             async with upgraded.connection.execute(
@@ -489,7 +529,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 29
+            assert await upgraded.schema_version() == 30
             assert {"delivery_outbox", "delivery_attempts"} <= await upgraded.schema_tables()
             async with upgraded.connection.execute(
                 "SELECT display_name FROM principals WHERE id = ?",
@@ -533,7 +573,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 29
+            assert await upgraded.schema_version() == 30
             assert {"delivery_outbox", "delivery_attempts", "delivery_fragments"} <= await upgraded.schema_tables()
             async with upgraded.connection.execute(
                 "SELECT display_name FROM principals WHERE id = ?",
@@ -637,7 +677,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 29
+            assert await upgraded.schema_version() == 30
             async with upgraded.connection.execute(
                 "SELECT message_id, channel_binding_id, transport, mode, status FROM deliveries WHERE id = ?",
                 (delivery_id,),
@@ -764,7 +804,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 29
+            assert await upgraded.schema_version() == 30
             async with upgraded.connection.execute(
                 "SELECT purpose, status, attempt_count FROM delivery_outbox WHERE id = ?",
                 (delivery_id,),

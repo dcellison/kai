@@ -7,13 +7,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from kai.workshop.delivery_outbox import (
+    CONVERSATION_FINALIZATION_LANE,
     CONVERSATION_REPLY_PURPOSE,
     STREAMING_FINALIZATION_CONTRACT,
 )
 from kai.workshop.domain import DeliveryAuthorityEpochId
 from kai.workshop.store import WorkshopEventStore
-
-TELEGRAM_CONVERSATION_FINALIZATION_LANE = "telegram_conversation_streaming_finalization"
 
 
 class DeliveryAuthorityError(RuntimeError):
@@ -60,11 +59,11 @@ def _parse_timestamp(value: str) -> datetime:
 
 
 class WorkshopConversationDeliveryAuthority:
-    """Own the durable activation boundary for one future Telegram route.
+    """Own the durable activation boundary for conversation finalization.
 
-    Production startup activates or resumes one epoch before Telegram ingress.
+    Production startup activates or resumes one epoch before adapters start.
     The separate service remains usable by operator tooling and tests without
-    implicitly constructing a delivery worker.
+    implicitly constructing a transport worker.
     """
 
     def __init__(
@@ -108,7 +107,7 @@ class WorkshopConversationDeliveryAuthority:
             )
             await connection.execute(
                 "INSERT INTO delivery_authority_epochs (id, lane, status, activated_at) VALUES (?, ?, 'active', ?)",
-                (epoch.epoch_id, TELEGRAM_CONVERSATION_FINALIZATION_LANE, _format_timestamp(now)),
+                (epoch.epoch_id, CONVERSATION_FINALIZATION_LANE, _format_timestamp(now)),
             )
             await connection.commit()
             return DeliveryAuthorityActivationResult(epoch=epoch, inserted=True)
@@ -188,7 +187,7 @@ class WorkshopConversationDeliveryAuthority:
             "SELECT id, status, activated_at, deactivated_at, terminal_failures_acknowledged_at "
             "FROM delivery_authority_epochs "
             "WHERE lane = ? AND status = 'active' ORDER BY activated_at",
-            (TELEGRAM_CONVERSATION_FINALIZATION_LANE,),
+            (CONVERSATION_FINALIZATION_LANE,),
         ) as cursor:
             rows = list(await cursor.fetchall())
         if len(rows) > 1:

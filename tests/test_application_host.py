@@ -16,6 +16,7 @@ from kai.workshop.bootstrap import (
 )
 from kai.workshop.conversation_commands import WorkshopConversationCommandService
 from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
+from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import AgentId, ChannelId, PrincipalId, RunExecutionOwnerId
 from kai.workshop.execution_state import (
     WorkshopExecutionStateNamespace,
@@ -37,6 +38,7 @@ from kai.workshop.storage_namespaces import (
     WorkshopPrincipalStorageRegistry,
 )
 from kai.workshop.store import WorkshopEventStore
+from tests.workshop_delivery import TELEGRAM_DELIVERY_POLICY
 from tests.workshop_profiles import profile_id, profile_registry
 
 
@@ -251,6 +253,7 @@ def _host() -> KaiApplicationHost:
         internal_api_contexts=SimpleNamespace(contexts=()),  # type: ignore[arg-type]
         services_info=[],
         registered_backend_ids=frozenset({"codex"}),
+        delivery_policy=WorkshopDeliveryBindingPolicy.disabled(),
     )
 
 
@@ -456,6 +459,7 @@ async def test_real_core_lifecycle_uses_workshop_identity_without_telegram_appli
         internal_api_contexts=internal_contexts,
         services_info=[],
         registered_backend_ids=frozenset({"codex"}),
+        delivery_policy=WorkshopDeliveryBindingPolicy.disabled(),
     )
 
     services = await host.start()
@@ -563,6 +567,7 @@ async def test_core_activates_delivery_authority_before_recovering_expired_start
         internal_api_contexts=internal_contexts,
         services_info=[],
         registered_backend_ids=frozenset({"codex"}),
+        delivery_policy=TELEGRAM_DELIVERY_POLICY,
     )
 
     services = await host.start()

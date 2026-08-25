@@ -14,12 +14,8 @@ from kai.workshop.artifacts import (
     WorkshopArtifactService,
     record_published_artifact_in_transaction,
 )
-from kai.workshop.delivery_outbox import (
-    NOTIFICATION_PURPOSE,
-    DeliveryRequest,
-    DeliveryRequestResult,
-    WorkshopDeliveryOutbox,
-)
+from kai.workshop.delivery_outbox import NOTIFICATION_PURPOSE, DeliveryRequestResult
+from kai.workshop.delivery_planning import CanonicalDeliveryIntent, WorkshopDeliveryPlanner
 from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import (
     AgentId,
@@ -89,7 +85,7 @@ class WorkshopProactivePublicationService:
         self._store = store
         self._artifacts = artifacts
         self._artifact_storage_root = artifact_storage_root.resolve()
-        self._delivery_policy = delivery_policy
+        self._delivery_planner = WorkshopDeliveryPlanner(store, delivery_policy)
         self._lock = asyncio.Lock()
 
     async def validate_authority(self, authority: ProactivePublicationAuthority) -> None:
@@ -222,22 +218,17 @@ class WorkshopProactivePublicationService:
                     artifact.for_message(message_id),
                     storage_root=self._artifact_storage_root,
                 )
-            binding_ids = await self._delivery_policy.binding_ids(self._store, authority.channel_id)
-            deliveries = tuple(
-                [
-                    await WorkshopDeliveryOutbox(self._store).request_delivery_in_transaction(
-                        DeliveryRequest(
-                            message_id=message_id,
-                            channel_binding_id=binding_id,
-                            mode=mode,
-                            purpose=NOTIFICATION_PURPOSE,
-                            occurred_at=occurred_at,
-                            max_attempts=5,
-                        )
-                    )
-                    for binding_id in binding_ids
-                ]
+            planning = await self._delivery_planner.plan_in_transaction(
+                CanonicalDeliveryIntent(
+                    message_id=message_id,
+                    channel_id=authority.channel_id,
+                    mode=mode,
+                    purpose=NOTIFICATION_PURPOSE,
+                    occurred_at=occurred_at,
+                    content_kind="attachment" if artifact is not None else "text",
+                )
             )
+            deliveries = planning.deliveries
             prior_states = {inserted, *(delivery.inserted for delivery in deliveries)}
             if artifact_result is not None:
                 prior_states.add(artifact_result.inserted)

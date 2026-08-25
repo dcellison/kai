@@ -152,6 +152,7 @@ class KaiApplicationHost:
         internal_api_contexts: WorkshopInternalAPIContextRegistry,
         services_info: list[dict],
         registered_backend_ids: frozenset[str],
+        delivery_policy: WorkshopDeliveryBindingPolicy,
     ) -> None:
         self._config = config
         self._runtime_profiles = runtime_profiles
@@ -160,6 +161,7 @@ class KaiApplicationHost:
         self._internal_api_contexts = internal_api_contexts
         self._services_info = services_info
         self._registered_backend_ids = registered_backend_ids
+        self._delivery_policy = delivery_policy
         self._state = KaiApplicationState.NEW
         self._services: KaiCoreServices | None = None
         self._adapters: dict[str, KaiApplicationAdapter] = {}
@@ -202,9 +204,7 @@ class KaiApplicationHost:
         integration_notifications: WorkshopIntegrationNotificationService | None = None
         github_automation: WorkshopGitHubAutomationService | None = None
         try:
-            delivery_policy = WorkshopDeliveryBindingPolicy(
-                frozenset({"telegram"}) if self._config.telegram_enabled else frozenset()
-            )
+            delivery_policy = self._delivery_policy
             subprocess_pool = SubprocessPool(
                 config=self._config,
                 services_info=self._services_info,

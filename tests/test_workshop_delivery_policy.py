@@ -5,7 +5,10 @@ from pathlib import Path
 import pytest
 
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
-from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
+from kai.workshop.delivery_policy import (
+    DeliveryAdapterCapabilities,
+    WorkshopDeliveryBindingPolicy,
+)
 from kai.workshop.domain import ChannelId
 from kai.workshop.store import WorkshopEventStore
 
@@ -48,6 +51,30 @@ def test_policy_rejects_invalid_transport_identifiers():
         WorkshopDeliveryBindingPolicy({"telegram"})  # type: ignore[arg-type]
 
 
+def test_adapter_capabilities_are_explicit_and_internally_consistent():
+    telegram = DeliveryAdapterCapabilities(
+        transport="telegram",
+        preview_streaming=True,
+        message_editing=True,
+        replies=True,
+        threads=True,
+        attachments=True,
+    )
+    policy = WorkshopDeliveryBindingPolicy(frozenset({"telegram"}), (telegram,))
+
+    assert policy.capabilities_for("telegram") == telegram
+    assert policy.capabilities_for("desktop") is None
+    with pytest.raises(ValueError, match="requires final_text and message_editing"):
+        DeliveryAdapterCapabilities(transport="broken", preview_streaming=True)
+    with pytest.raises(ValueError, match="disabled transport"):
+        WorkshopDeliveryBindingPolicy(
+            frozenset({"desktop"}),
+            (telegram,),
+        )
+    with pytest.raises(ValueError, match="must declare"):
+        WorkshopDeliveryBindingPolicy(frozenset({"telegram"}))
+
+
 async def test_disabled_policy_retains_bindings_without_making_them_eligible(tmp_path: Path):
     store, channel_id = await _store_with_bindings(tmp_path / "kai.db")
     try:
@@ -67,8 +94,13 @@ async def test_disabled_policy_retains_bindings_without_making_them_eligible(tmp
 async def test_policy_selects_only_bindings_for_enabled_transports(tmp_path: Path):
     store, channel_id = await _store_with_bindings(tmp_path / "kai.db")
     try:
-        telegram_only = WorkshopDeliveryBindingPolicy(frozenset({"telegram"}))
-        mixed = WorkshopDeliveryBindingPolicy(frozenset({"desktop", "telegram"}))
+        telegram = DeliveryAdapterCapabilities(transport="telegram")
+        desktop = DeliveryAdapterCapabilities(transport="desktop")
+        telegram_only = WorkshopDeliveryBindingPolicy(frozenset({"telegram"}), (telegram,))
+        mixed = WorkshopDeliveryBindingPolicy(
+            frozenset({"desktop", "telegram"}),
+            (desktop, telegram),
+        )
 
         telegram_bindings = await telegram_only.binding_ids(store, channel_id)
         assert len(telegram_bindings) == 1

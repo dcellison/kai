@@ -6,25 +6,13 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 
-from kai.telegram_utils import chunk_text
-from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
-from kai.workshop.delivery_fragments import (
-    EDIT_OPERATION,
-    SEND_OPERATION,
-    DeliveryFragmentOperation,
-    DeliveryFragmentPlanResult,
-    WorkshopDeliveryFragments,
-)
 from kai.workshop.delivery_outbox import (
     CONVERSATION_REPLY_PURPOSE,
-    STREAMING_FINALIZATION_CONTRACT,
-    DeliveryRequest,
     DeliveryRequestResult,
-    WorkshopDeliveryOutbox,
 )
+from kai.workshop.delivery_planning import CanonicalDeliveryIntent, WorkshopDeliveryPlanner
 from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import (
-    ChannelBindingId,
     ChannelId,
     DeliveryId,
     EventEnvelope,
@@ -36,7 +24,6 @@ from kai.workshop.domain import (
 )
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import AppendResult, IdempotencyConflictError, WorkshopEventStore
-from kai.workshop.streaming_preview import resolve_telegram_finalization_target
 
 _IDENTIFIER_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 
@@ -45,16 +32,8 @@ class OutboundMessageNotFoundError(LookupError):
     """A referenced canonical message or its unique agent binding was not found."""
 
 
-class OutboundDeliveryBindingError(LookupError):
-    """The reply channel does not have exactly one canonical Telegram binding."""
-
-
 class OutboundDeliveryStateConflictError(RuntimeError):
     """Only one half of an atomic outbound message and delivery already exists."""
-
-
-class OutboundStreamingPreviewConflictError(RuntimeError):
-    """A persisted preview no longer matches its canonical routing identities."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,24 +76,37 @@ class _ResolvedOutbound:
     workshop_id: WorkshopId
     channel_id: ChannelId
     agent_principal_id: PrincipalId
+    recipient_principal_id: PrincipalId
 
 
 @dataclass(frozen=True, slots=True)
 class OutboundDeliveryResult:
     message: AppendResult
-    delivery: DeliveryRequestResult
+    deliveries: tuple[DeliveryRequestResult, ...]
+
+    @property
+    def delivery(self) -> DeliveryRequestResult | None:
+        return self.deliveries[0] if len(self.deliveries) == 1 else None
 
 
 @dataclass(frozen=True, slots=True)
 class OutboundStreamingFinalizationResult:
     message: AppendResult
-    delivery: DeliveryRequestResult | None
-    plan: DeliveryFragmentPlanResult | None
+    deliveries: tuple[DeliveryRequestResult, ...]
+
+    @property
+    def delivery(self) -> DeliveryRequestResult | None:
+        return self.deliveries[0] if len(self.deliveries) == 1 else None
+
+    @property
+    def plan(self) -> None:
+        """Adapter operation plans are no longer created by core finalization."""
+        return None
 
 
 async def _resolve_outbound(store: WorkshopEventStore, message_id: MessageId) -> _ResolvedOutbound:
     async with store.connection.execute(
-        "SELECT c.workshop_id, m.channel_id, a.principal_id "
+        "SELECT c.workshop_id, m.channel_id, a.principal_id, m.author_principal_id "
         "FROM messages m "
         "JOIN principals author ON author.id = m.author_principal_id AND author.kind = 'human' "
         "JOIN channels c ON c.id = m.channel_id "
@@ -130,6 +122,7 @@ async def _resolve_outbound(store: WorkshopEventStore, message_id: MessageId) ->
         workshop_id=WorkshopId(str(rows[0][0])),
         channel_id=ChannelId(str(rows[0][1])),
         agent_principal_id=PrincipalId(str(rows[0][2])),
+        recipient_principal_id=PrincipalId(str(rows[0][3])),
     )
 
 
@@ -183,66 +176,6 @@ async def _existing_outbound(
     return AppendResult(event=existing, inserted=False)
 
 
-async def _resolve_telegram_binding(
-    store: WorkshopEventStore,
-    channel_id: ChannelId,
-    delivery_policy: WorkshopDeliveryBindingPolicy,
-) -> ChannelBindingId:
-    binding_ids = await delivery_policy.binding_ids(store, channel_id, transport="telegram")
-    if len(binding_ids) != 1:
-        raise OutboundDeliveryBindingError("Canonical reply channel must have exactly one Telegram binding")
-    return binding_ids[0]
-
-
-async def _confirmed_preview_message_id(
-    store: WorkshopEventStore,
-    *,
-    inbound_message_id: MessageId,
-    workshop_id: WorkshopId,
-    channel_id: ChannelId,
-    channel_binding_id: ChannelBindingId,
-) -> int | None:
-    async with store.connection.execute(
-        "SELECT workshop_id, channel_id, channel_binding_id, external_message_id, state "
-        "FROM telegram_streaming_previews WHERE inbound_message_id = ?",
-        (inbound_message_id,),
-    ) as cursor:
-        row = await cursor.fetchone()
-    if row is None:
-        return None
-    if (
-        str(row[0]) != workshop_id
-        or str(row[1]) != channel_id
-        or str(row[2]) != channel_binding_id
-        or str(row[4]) != "confirmed_non_final"
-    ):
-        raise OutboundStreamingPreviewConflictError(
-            "Confirmed streaming preview does not match the canonical reply target"
-        )
-    external_message_id = int(row[3])
-    if external_message_id <= 0:
-        raise OutboundStreamingPreviewConflictError("Confirmed streaming preview has an invalid message ID")
-    return external_message_id
-
-
-def _streaming_finalization_operations(
-    body: str,
-    *,
-    preview_message_id: int | None,
-) -> tuple[DeliveryFragmentOperation, ...]:
-    bodies = tuple(chunk_text(body, max_len=4096))
-    if preview_message_id is None:
-        return tuple(DeliveryFragmentOperation(SEND_OPERATION, fragment) for fragment in bodies)
-    return (
-        DeliveryFragmentOperation(
-            EDIT_OPERATION,
-            bodies[0],
-            target_external_message_id=preview_message_id,
-        ),
-        *(DeliveryFragmentOperation(SEND_OPERATION, fragment) for fragment in bodies[1:]),
-    )
-
-
 async def record_outbound_message(store: WorkshopEventStore, message: OutboundMessage) -> AppendResult:
     """Append one canonical assistant reply to an existing inbound message."""
     binding = await _resolve_outbound(store, message.in_reply_to_message_id)
@@ -262,7 +195,7 @@ async def record_outbound_message_with_delivery(
     *,
     delivery_policy: WorkshopDeliveryBindingPolicy,
 ) -> OutboundDeliveryResult:
-    """Atomically create one canonical reply and its pending Telegram text delivery.
+    """Atomically create one canonical reply and eligible adapter deliveries.
 
     This service is deliberately production-unused. It accepts no transport or
     destination identity from its caller and does not send or register a worker.
@@ -271,7 +204,6 @@ async def record_outbound_message_with_delivery(
     try:
         await connection.execute("BEGIN IMMEDIATE")
         binding = await _resolve_outbound(store, message.in_reply_to_message_id)
-        channel_binding_id = await _resolve_telegram_binding(store, binding.channel_id, delivery_policy)
         message_result = await _existing_outbound(store, binding, message)
         if message_result is None:
             message_result = await store.append_in_transaction(_outbound_envelope(binding, message))
@@ -281,23 +213,23 @@ async def record_outbound_message_with_delivery(
         message_id = message_result.event.envelope.aggregate_id
         if not isinstance(message_id, MessageId):
             raise RuntimeError("Canonical outbound event did not identify a message")
-        delivery_result = await WorkshopDeliveryOutbox(store).request_delivery_in_transaction(
-            DeliveryRequest(
+        planning = await WorkshopDeliveryPlanner(store, delivery_policy).plan_in_transaction(
+            CanonicalDeliveryIntent(
                 message_id=message_id,
-                channel_binding_id=channel_binding_id,
+                channel_id=binding.channel_id,
                 mode="text",
                 purpose=CONVERSATION_REPLY_PURPOSE,
                 occurred_at=message.occurred_at,
-                max_attempts=5,
+                recipient_principal_id=binding.recipient_principal_id,
             )
         )
-        if message_result.inserted != delivery_result.inserted:
+        if any(message_result.inserted != delivery.inserted for delivery in planning.deliveries):
             raise OutboundDeliveryStateConflictError(
                 "Canonical reply and delivery request did not share one prior state"
             )
         await store.project_pending_in_transaction(projection)
         await connection.commit()
-        return OutboundDeliveryResult(message=message_result, delivery=delivery_result)
+        return OutboundDeliveryResult(message=message_result, deliveries=planning.deliveries)
     except Exception:
         await connection.rollback()
         raise
@@ -309,12 +241,12 @@ async def record_outbound_message_with_streaming_finalization(
     *,
     delivery_policy: WorkshopDeliveryBindingPolicy,
 ) -> OutboundStreamingFinalizationResult:
-    """Atomically persist a reply, delivery request, and immutable operation plan.
+    """Atomically persist a reply and capability-selected delivery requests.
 
     The authenticated private-text route calls this service after agent
-    completion. Its only routing input is the canonical inbound message ID. It
-    resolves the direct Telegram binding and any confirmed non-final preview
-    internally, and it neither sends nor edits Telegram itself.
+    completion. Its only routing input is the canonical inbound message ID.
+    Formatting, chunking, preview resolution, and provider operations belong to
+    the adapter that claims each independently durable request.
     """
     connection = store.connection
     try:
@@ -338,37 +270,12 @@ async def record_outbound_message_with_streaming_finalization_in_transaction(
     delivery_policy: WorkshopDeliveryBindingPolicy,
     request_delivery: bool = True,
 ) -> OutboundStreamingFinalizationResult:
-    """Persist a reply and immutable delivery plan in a caller-owned transaction."""
+    """Persist a reply and adapter delivery intents in a caller-owned transaction."""
     if not store.connection.in_transaction:
         raise RuntimeError(
             "record_outbound_message_with_streaming_finalization_in_transaction requires an active transaction"
         )
     binding = await _resolve_outbound(store, message.in_reply_to_message_id)
-    streaming_target = (
-        await resolve_telegram_finalization_target(
-            store,
-            message.in_reply_to_message_id,
-        )
-        if request_delivery and delivery_policy.is_enabled("telegram")
-        else None
-    )
-    if streaming_target is not None and (
-        streaming_target.workshop_id != binding.workshop_id or streaming_target.channel_id != binding.channel_id
-    ):
-        raise OutboundStreamingPreviewConflictError(
-            "Telegram streaming target does not match the canonical agent reply target"
-        )
-    preview_message_id = (
-        await _confirmed_preview_message_id(
-            store,
-            inbound_message_id=message.in_reply_to_message_id,
-            workshop_id=binding.workshop_id,
-            channel_id=binding.channel_id,
-            channel_binding_id=streaming_target.channel_binding_id,
-        )
-        if streaming_target is not None and streaming_target.preview_eligible
-        else None
-    )
     message_result = await _existing_outbound(store, binding, message)
     if message_result is None:
         message_result = await store.append_in_transaction(_outbound_envelope(binding, message))
@@ -378,46 +285,30 @@ async def record_outbound_message_with_streaming_finalization_in_transaction(
     message_id = message_result.event.envelope.aggregate_id
     if not isinstance(message_id, MessageId):
         raise RuntimeError("Canonical outbound event did not identify a message")
-    delivery_result = None
-    plan_result = None
-    if streaming_target is not None:
-        operations = _streaming_finalization_operations(
-            message.body,
-            preview_message_id=preview_message_id,
-        )
-        authority_epoch = await WorkshopConversationDeliveryAuthority(store).active_epoch_in_transaction()
-        assert authority_epoch is not None
-        delivery_result = await WorkshopDeliveryOutbox(store).request_delivery_in_transaction(
-            DeliveryRequest(
+    planning = (
+        await WorkshopDeliveryPlanner(store, delivery_policy).plan_in_transaction(
+            CanonicalDeliveryIntent(
                 message_id=message_id,
-                channel_binding_id=streaming_target.channel_binding_id,
+                channel_id=binding.channel_id,
                 mode="text",
                 purpose=CONVERSATION_REPLY_PURPOSE,
                 occurred_at=message.occurred_at,
-                execution_contract=STREAMING_FINALIZATION_CONTRACT,
-                authority_epoch_id=authority_epoch.epoch_id,
-                max_attempts=5,
+                recipient_principal_id=binding.recipient_principal_id,
+                preview_eligible=True,
             )
         )
-        plan_result = await WorkshopDeliveryFragments(store).prepare_operations_in_transaction(
-            delivery_result.delivery.delivery_id,
-            operations,
-            occurred_at=message.occurred_at,
-        )
+        if request_delivery
+        else None
+    )
+    deliveries = planning.deliveries if planning is not None else ()
     prior_states = {message_result.inserted}
-    if delivery_result is not None:
-        prior_states.add(delivery_result.inserted)
-    if plan_result is not None:
-        prior_states.add(plan_result.inserted)
+    prior_states.update(delivery.inserted for delivery in deliveries)
     if len(prior_states) != 1:
-        raise OutboundDeliveryStateConflictError(
-            "Canonical reply, delivery request, and operation plan did not share one prior state"
-        )
+        raise OutboundDeliveryStateConflictError("Canonical reply and delivery requests did not share one prior state")
     await store.project_pending_in_transaction(projection)
     return OutboundStreamingFinalizationResult(
         message=message_result,
-        delivery=delivery_result,
-        plan=plan_result,
+        deliveries=deliveries,
     )
 
 

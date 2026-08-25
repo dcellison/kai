@@ -1,10 +1,4 @@
-"""Transport-independent Kai Workshop domain and persistence foundations.
-
-The current production service seeds this state and shadow-records accepted
-inbound text, successful assistant results, and delivery observations. Existing
-Telegram routing, histories, and responses remain authoritative until replay
-and parity evidence supports an explicit cutover.
-"""
+"""Transport-independent Kai Workshop domain and persistence services."""
 
 from kai.workshop.artifacts import (
     ArtifactMessageNotFoundError,

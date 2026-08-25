@@ -49,8 +49,9 @@ from kai.backend_registry import load_backend_registry
 from kai.config import DATA_DIR, PROJECT_ROOT, _read_protected_file, load_config
 from kai.http_adapter import HttpAdapter
 from kai.memory_backup import run_memory_backup
-from kai.telegram_adapter import TelegramAdapter
+from kai.telegram_adapter import TELEGRAM_DELIVERY_CAPABILITIES, TelegramAdapter
 from kai.workshop.bootstrap import BootstrapHuman, BootstrapNotificationChannel
+from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
 
 
@@ -134,6 +135,15 @@ def _workshop_registered_backend_ids(config) -> frozenset[str]:
     configured = {config.default_backend}
     configured.update(user.backend for user in config.user_configs.values() if user.backend)
     return frozenset(configured)
+
+
+def _delivery_policy(config) -> WorkshopDeliveryBindingPolicy:
+    """Compose adapter declarations outside the transport-neutral host."""
+    capabilities = (TELEGRAM_DELIVERY_CAPABILITIES,) if config.telegram_enabled else ()
+    return WorkshopDeliveryBindingPolicy(
+        frozenset(item.transport for item in capabilities),
+        capabilities,
+    )
 
 
 def setup_logging() -> None:
@@ -637,6 +647,7 @@ def _start() -> None:
                 internal_api_contexts=internal_api_contexts,
                 services_info=services.get_available_services(),
                 registered_backend_ids=_workshop_registered_backend_ids(config),
+                delivery_policy=_delivery_policy(config),
             )
             core_services = await core_host.start()
             logging.info("Kai core application host is ready")
