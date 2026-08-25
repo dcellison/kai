@@ -102,7 +102,7 @@ class _FakeStore:
 class _FakeClientCommands:
     ready = False
 
-    def __init__(self, _execution, _compatibility, *, run_previews=None) -> None:
+    def __init__(self, _execution, *, run_previews=None) -> None:
         self.events = _FakeExecutionFactory.events
         self.run_previews = run_previews
 
@@ -134,6 +134,25 @@ class _FakeSchedulerFactory:
         events = _FakeExecutionFactory.events
         events.append("scheduler:start")
         return _FakeScheduler(events)
+
+
+class _FakePostRunEffects:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.ready = True
+
+    @classmethod
+    async def open_and_start(cls, *_args, **_kwargs):
+        events = _FakeExecutionFactory.events
+        events.append("post-run-effects:start")
+        return cls(events)
+
+    async def wait(self) -> None:
+        self.events.append("post-run-effects:wait")
+
+    async def stop(self) -> None:
+        self.events.append("post-run-effects:stop")
+        self.ready = False
 
 
 class _FakeIntegrationNotifications:
@@ -214,6 +233,7 @@ def host_dependencies(monkeypatch):
     monkeypatch.setattr(host_module, "WorkshopConversationDeliveryAuthority", _FakeDeliveryAuthority)
     monkeypatch.setattr(host_module, "WorkshopClientCommandExecutor", _FakeClientCommands)
     monkeypatch.setattr(host_module, "WorkshopCanonicalScheduler", _FakeSchedulerFactory)
+    monkeypatch.setattr(host_module, "WorkshopPostRunEffectService", _FakePostRunEffects)
     monkeypatch.setattr(
         host_module,
         "WorkshopIntegrationNotificationService",
@@ -300,6 +320,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
             "store": True,
             "scheduler": True,
             "github_automation": True,
+            "post_run_effects": True,
         },
     }
     assert services.subprocess_pool is not None
@@ -309,6 +330,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
         "store:open",
         "authority:activate",
         "execution:start",
+        "post-run-effects:start",
         "client:start",
         "scheduler:start",
         "integrations:open",
@@ -320,14 +342,16 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
 
     assert host.readiness.state == KaiApplicationState.STOPPED
     assert host.readiness.ready is False
-    assert host_dependencies[-10:] == [
+    assert host_dependencies[-12:] == [
         "execution:wait",
         "scheduler:wait",
         "github-automation:wait",
+        "post-run-effects:wait",
         "scheduler:stop",
         "github-automation:stop",
         "integrations:close",
         "client:stop",
+        "post-run-effects:stop",
         "store:close",
         "execution:stop",
         "pool:stop",

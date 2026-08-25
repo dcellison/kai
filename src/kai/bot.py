@@ -40,7 +40,6 @@ from kai import github_api, memory_command, review, sessions, webhook
 from kai.application_host import KaiCoreServices
 from kai.config import (
     DATA_DIR,
-    ONESHOT_REASONER_BACKENDS,
     OPEN_ENDED_PROVIDERS,
     PROVIDER_DEFAULTS,
     Config,
@@ -54,9 +53,6 @@ from kai.config import (
 from kai.conversation_compatibility import (
     _pending_memory_tasks as _shared_pending_memory_tasks,
 )
-from kai.conversation_compatibility import (
-    schedule_memory_ingestion,
-)
 from kai.locks import get_stop_event
 from kai.pool import SubprocessPool
 from kai.streaming_text import stream_publishable_prefix as _stream_publishable_prefix
@@ -65,7 +61,7 @@ from kai.telegram_utils import chunk_text
 from kai.transcribe import TranscriptionError, transcribe_voice
 from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
 from kai.workshop.artifacts import StagedArtifact
-from kai.workshop.domain import CanonicalMemoryProvenance, MessageId, PrincipalId, RunId
+from kai.workshop.domain import MessageId, PrincipalId, RunId
 from kai.workshop.execution_coordinator import (
     CanonicalCancellationDisposition,
     CanonicalExecutionDisposition,
@@ -4233,35 +4229,6 @@ async def _handle_workshop_private_text(
         raise RuntimeError("Canonical execution settled without a terminal transaction")
 
     final_text = result.terminal.body
-    if result.session_id and result.selection is not None:
-        await sessions.save_session(chat_id, result.session_id, result.selection.model)
-    if result.disposition == CanonicalExecutionDisposition.COMPLETED and result.workspace is not None:
-        result_message_id = result.terminal.finalization.message.event.envelope.aggregate_id
-        if not isinstance(result_message_id, MessageId):
-            raise RuntimeError("Workshop execution returned a non-message result aggregate")
-        prior_pairs = await execution.prior_conversation_pairs(
-            run_id,
-            limit=config.episode_classifier_context_turns,
-        )
-        schedule_memory_ingestion(
-            prompt=prompt,
-            assistant_text=final_text,
-            chat_id=chat_id,
-            session_id=result.session_id,
-            config=config,
-            workspace=result.workspace,
-            user_log=None,
-            assistant_log=None,
-            canonical_provenance=CanonicalMemoryProvenance(
-                run_id=run_id,
-                source_message_id=inbound_message_id,
-                result_message_id=result_message_id,
-            ),
-            canonical_prior_pairs=prior_pairs,
-            reasoner_backends=ONESHOT_REASONER_BACKENDS,
-            effective_backend=_get_pool(context).get_backend_provider(chat_id)[0],
-        )
-
     if result.disposition == CanonicalExecutionDisposition.COMPLETED and voice_audio is not None:
         try:
             await context.bot.send_voice(chat_id=chat_id, voice=voice_audio)

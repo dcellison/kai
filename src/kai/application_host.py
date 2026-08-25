@@ -25,6 +25,7 @@ from kai.workshop.github_automation import WorkshopGitHubAutomationService
 from kai.workshop.integration_notifications import WorkshopIntegrationNotificationService
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIContextRegistry
 from kai.workshop.memory_queries import WorkshopMemoryQueryService
+from kai.workshop.post_run_effects import WorkshopPostRunEffectService
 from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
 from kai.workshop.proactive_publication import (
     ProactivePublicationAuthority,
@@ -80,6 +81,7 @@ class KaiCoreReadiness:
     store: bool
     scheduler: bool
     github_automation: bool
+    post_run_effects: bool
 
     @property
     def ready(self) -> bool:
@@ -91,6 +93,7 @@ class KaiCoreReadiness:
                 self.store,
                 self.scheduler,
                 self.github_automation,
+                self.post_run_effects,
             )
         )
 
@@ -105,6 +108,7 @@ class KaiCoreReadiness:
                 "store": self.store,
                 "scheduler": self.scheduler,
                 "github_automation": self.github_automation,
+                "post_run_effects": self.post_run_effects,
             },
         }
 
@@ -131,6 +135,7 @@ class KaiCoreServices:
     proactive_publication: WorkshopProactivePublicationService
     integration_notifications: WorkshopIntegrationNotificationService
     github_automation: WorkshopGitHubAutomationService
+    post_run_effects: WorkshopPostRunEffectService
     delivery_policy: WorkshopDeliveryBindingPolicy
 
 
@@ -184,6 +189,7 @@ class KaiApplicationHost:
             store=services is not None,
             scheduler=services is not None and services.scheduler.readiness.ready,
             github_automation=services is not None and services.github_automation.ready,
+            post_run_effects=services is not None and services.post_run_effects.ready,
         )
 
     @property
@@ -203,6 +209,7 @@ class KaiApplicationHost:
         scheduler: WorkshopCanonicalScheduler | None = None
         integration_notifications: WorkshopIntegrationNotificationService | None = None
         github_automation: WorkshopGitHubAutomationService | None = None
+        post_run_effects: WorkshopPostRunEffectService | None = None
         try:
             delivery_policy = self._delivery_policy
             subprocess_pool = SubprocessPool(
@@ -212,6 +219,7 @@ class KaiApplicationHost:
                 internal_api_contexts=self._internal_api_contexts,
             )
             runtime_pool = WorkshopRuntimePool(subprocess_pool, self._runtime_profiles)
+            compatibility_state = WorkshopCompatibilityStateWriter(self._config, runtime_pool)
             conversation_runs = WorkshopConversationRunService(
                 runtime_pool,
                 sessions.resolve_workshop_conversation_run,
@@ -229,18 +237,19 @@ class KaiApplicationHost:
                 registered_backend_ids=self._registered_backend_ids,
                 delivery_policy=delivery_policy,
             )
+            post_run_effects = await WorkshopPostRunEffectService.open_and_start(
+                Path(self._config.session_db_path),
+                compatibility_state,
+            )
             run_previews = WorkshopRunPreviewRegistry()
             client_commands = WorkshopClientCommandExecutor(
                 private_execution,
-                WorkshopCompatibilityStateWriter(self._config, runtime_pool),
                 run_previews=run_previews,
             )
             await client_commands.start()
-            compatibility_state = WorkshopCompatibilityStateWriter(self._config, runtime_pool)
             scheduler = await WorkshopCanonicalScheduler.open_and_start(
                 Path(self._config.session_db_path),
                 private_execution,
-                compatibility_state,
                 delivery_policy,
             )
             artifacts = WorkshopArtifactService(
@@ -308,6 +317,7 @@ class KaiApplicationHost:
                 proactive_publication=proactive_publication,
                 integration_notifications=integration_notifications,
                 github_automation=github_automation,
+                post_run_effects=post_run_effects,
                 delivery_policy=delivery_policy,
             )
             self._state = KaiApplicationState.READY
@@ -322,6 +332,8 @@ class KaiApplicationHost:
                 await integration_notifications.close()
             if client_commands is not None:
                 await client_commands.stop()
+            if post_run_effects is not None:
+                await post_run_effects.stop()
             if client_store is not None:
                 await client_store.close()
             if private_execution is not None:
@@ -355,6 +367,7 @@ class KaiApplicationHost:
             self.services.private_text_execution.wait(),
             self.services.scheduler.wait(),
             self.services.github_automation.wait(),
+            self.services.post_run_effects.wait(),
             *(adapter.wait() for adapter in self._adapters.values()),
         )
 
@@ -380,6 +393,7 @@ class KaiApplicationHost:
             services.github_automation.stop,
             services.integration_notifications.close,
             services.client_commands.stop,
+            services.post_run_effects.stop,
             services.client_store.close,
             services.private_text_execution.stop,
             services.subprocess_pool.shutdown,

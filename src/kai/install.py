@@ -8593,6 +8593,7 @@ def _cmd_status() -> None:
     print(_github_automation_status(Path(data_dir) / "kai.db"))
     print(_integration_route_status(Path(data_dir) / "kai.db"))
     print(_internal_api_authority_status(Path(data_dir) / "kai.db"))
+    print(_post_run_effect_status(Path(data_dir) / "kai.db"))
     if conf_env is None:
         print("Client adapters (install.conf artifact): unavailable")
     else:
@@ -8980,6 +8981,39 @@ def _github_automation_status(db_path: Path) -> str:
         f"{prefix} {status}; pending={pending}, executing={executing}, "
         f"succeeded={succeeded}, failed={failed}, uncertain={uncertain}; "
         "subscription routing=canonical"
+    )
+
+
+def _post_run_effect_status(db_path: Path) -> str:
+    """Report durable common work following successful canonical runs."""
+    prefix = "Workshop post-run effects:"
+    if not db_path.is_file():
+        return f"{prefix} NOT VERIFIED (database unavailable)"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'workshop_post_run_effects'"
+            ).fetchone()
+            if table is None:
+                return f"{prefix} pending; canonical queue unavailable"
+            counts = connection.execute(
+                "SELECT "
+                "SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status = 'executing' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) "
+                "FROM workshop_post_run_effects"
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        return f"{prefix} NOT VERIFIED ({exc})"
+    pending, executing, succeeded, failed = tuple(int(value or 0) for value in (counts or (0, 0, 0, 0)))
+    status = "active" if failed == 0 else "ATTENTION"
+    return (
+        f"{prefix} {status}; pending={pending}, executing={executing}, "
+        f"succeeded={succeeded}, failed={failed}; owner=canonical worker"
     )
 
 

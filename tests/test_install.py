@@ -72,6 +72,7 @@ from kai.install import (
     _migrate_internal_api_instructions,
     _migrate_managed_home_database_paths,
     _optional_file_checksum,
+    _post_run_effect_status,
     _probe_service_readiness,
     _prompt_choice,
     _prompt_optional_choice,
@@ -5062,6 +5063,27 @@ class TestCmdStatus:
     def test_status_reports_unavailable_github_automation_database(self, tmp_path):
         assert _github_automation_status(tmp_path / "missing.db") == (
             "Workshop GitHub automation: NOT VERIFIED (database unavailable)"
+        )
+
+    def test_status_reports_canonical_post_run_effect_queue(self, tmp_path):
+        db_path = tmp_path / "kai.db"
+        connection = sqlite3.connect(db_path)
+        connection.execute("CREATE TABLE workshop_post_run_effects (status TEXT NOT NULL)")
+        connection.executemany(
+            "INSERT INTO workshop_post_run_effects(status) VALUES (?)",
+            [("pending",), ("executing",), ("succeeded",), ("failed",)],
+        )
+        connection.commit()
+        connection.close()
+
+        assert _post_run_effect_status(db_path) == (
+            "Workshop post-run effects: ATTENTION; pending=1, executing=1, "
+            "succeeded=1, failed=1; owner=canonical worker"
+        )
+
+    def test_status_reports_unavailable_post_run_effect_database(self, tmp_path):
+        assert _post_run_effect_status(tmp_path / "missing.db") == (
+            "Workshop post-run effects: NOT VERIFIED (database unavailable)"
         )
 
     def test_status_reports_canonical_generic_integration_route(self, tmp_path):

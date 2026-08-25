@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 from kai.workshop.client_commands import WorkshopClientCommandExecutor
 from kai.workshop.domain import ChannelId, RunId
@@ -120,7 +120,6 @@ async def test_executor_publishes_stable_prefixes_and_clears_at_settlement():
     )
     executor = WorkshopClientCommandExecutor(
         execution,
-        SimpleNamespace(for_profile=Mock()),
         run_previews=registry,
     )
 

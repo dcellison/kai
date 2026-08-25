@@ -3173,6 +3173,7 @@ async def extract_and_store(
     user_log: LogEntry | None = None,
     assistant_log: LogEntry | None = None,
     canonical_provenance: dict[str, object] | None = None,
+    await_episode: bool = False,
 ) -> int:
     """
     Run Haiku extraction on an exchange and store the resulting facts.
@@ -3456,25 +3457,29 @@ async def extract_and_store(
                 # `_pending_episode_tasks` set is the primary
                 # operational tool here; the name is a secondary
                 # affordance for ad-hoc debugging.
-                ep_task = asyncio.create_task(
-                    _generate_episode(
-                        user_text=user_text,
-                        assistant_text=assistant_text,
-                        user_id=user_id,
-                        session_id=session_id,
-                        config=config,
-                        effective_backend=effective_backend,
-                        effective_provider=effective_provider,
-                        os_user=os_user,
-                        active_project=active_project,
-                        user_log=user_log,
-                        assistant_log=assistant_log,
-                        canonical_provenance=canonical_provenance,
-                    ),
-                    name=f"episode-{user_id}",
+                episode = _generate_episode(
+                    user_text=user_text,
+                    assistant_text=assistant_text,
+                    user_id=user_id,
+                    session_id=session_id,
+                    config=config,
+                    effective_backend=effective_backend,
+                    effective_provider=effective_provider,
+                    os_user=os_user,
+                    active_project=active_project,
+                    user_log=user_log,
+                    assistant_log=assistant_log,
+                    canonical_provenance=canonical_provenance,
                 )
-                _pending_episode_tasks.add(ep_task)
-                ep_task.add_done_callback(_pending_episode_tasks.discard)
+                if await_episode:
+                    await episode
+                else:
+                    ep_task = asyncio.create_task(
+                        episode,
+                        name=f"episode-{user_id}",
+                    )
+                    _pending_episode_tasks.add(ep_task)
+                    ep_task.add_done_callback(_pending_episode_tasks.discard)
     except FileNotFoundError:
         # `claude` binary missing on PATH. Graceful degradation: no
         # facts this turn, system continues running. Same outcome as

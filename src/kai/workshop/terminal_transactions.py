@@ -16,6 +16,7 @@ from kai.workshop.outbound import (
     OutboundStreamingFinalizationResult,
     record_outbound_message_with_streaming_finalization_in_transaction,
 )
+from kai.workshop.post_run_effects import enqueue_post_run_effect_in_transaction
 from kai.workshop.run_execution_authority import (
     RunExecutionClaim,
     RunExecutionResult,
@@ -271,7 +272,16 @@ class WorkshopRunTerminalTransactionCoordinator:
                 )
 
             runtime_session_result = None
+            post_run_effect_inserted = None
             if outcome == TerminalOutcome.COMPLETED and runtime_session is not None:
+                post_run_effect_inserted = await enqueue_post_run_effect_in_transaction(
+                    self._store,
+                    run_id=claim.run_id,
+                    source_message_id=run.inbound_message_id,
+                    result_message_id=message_id,
+                    runtime_session=runtime_session,
+                    occurred_at=occurred_at,
+                )
                 await connection.execute("SAVEPOINT runtime_session_settlement")
                 try:
                     runtime_session_result = await settle_runtime_session_in_transaction(
@@ -300,6 +310,8 @@ class WorkshopRunTerminalTransactionCoordinator:
             prior_states.update(delivery.inserted for delivery in finalization.deliveries)
             if runtime_session_result is not None:
                 prior_states.add(runtime_session_result.changed)
+            if post_run_effect_inserted is not None:
+                prior_states.add(post_run_effect_inserted)
             if len(prior_states) != 1:
                 raise TerminalTransactionStateConflictError(
                     "Canonical outcome, delivery plan, and run settlement did not share one prior state"

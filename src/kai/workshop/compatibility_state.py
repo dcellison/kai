@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 
 from kai import sessions
 from kai.config import Config
-from kai.conversation_compatibility import schedule_memory_ingestion
+from kai.conversation_compatibility import ingest_conversation_memory
 from kai.workshop.domain import CanonicalMemoryProvenance, RuntimeProfileId
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 
@@ -40,7 +41,7 @@ class WorkshopProfileCompatibilityState:
         user = self._config.get_user_config(self._runtime_config_id)
         return tuple(user.allowed_triage_projects) if user is not None else ()
 
-    def schedule_memory_ingestion(
+    async def ingest_memory(
         self,
         *,
         prompt: str | list,
@@ -50,7 +51,8 @@ class WorkshopProfileCompatibilityState:
         canonical_provenance: CanonicalMemoryProvenance,
         canonical_prior_pairs: tuple[tuple[str, str], ...],
     ) -> None:
-        schedule_memory_ingestion(
+        """Complete one core-owned canonical post-run memory effect."""
+        await ingest_conversation_memory(
             prompt=prompt,
             assistant_text=assistant_text,
             chat_id=self._runtime_config_id,
@@ -63,6 +65,17 @@ class WorkshopProfileCompatibilityState:
             canonical_prior_pairs=canonical_prior_pairs,
             effective_backend=self._backend,
         )
+
+    async def has_memory_for_run(self, run_id: str) -> bool:
+        """Detect a committed canonical memory effect after interrupted settlement."""
+        from kai import memory
+
+        memories = await asyncio.to_thread(
+            memory.get_all,
+            user_id=str(self._runtime_config_id),
+            limit=None,
+        )
+        return any(str(item.metadata.get(memory.WORKSHOP_RUN_ID_KEY, "")) == run_id for item in memories)
 
 
 class WorkshopCompatibilityStateWriter:

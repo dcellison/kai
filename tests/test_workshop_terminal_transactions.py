@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import aiosqlite
 import pytest
@@ -18,6 +21,7 @@ from kai.workshop.outbound import (
     OutboundMessage,
     record_outbound_message_with_streaming_finalization,
 )
+from kai.workshop.post_run_effects import WorkshopPostRunEffectService
 from kai.workshop.run_execution_authority import (
     RunAttemptStatus,
     RunExecutionClaim,
@@ -214,20 +218,37 @@ async def _terminal_rows(store: WorkshopEventStore) -> tuple[int, int, int]:
     return counts[0] - 1, counts[1], counts[2]
 
 
+async def _post_run_effect_count(store: WorkshopEventStore) -> int:
+    async with store.connection.execute("SELECT COUNT(*) FROM workshop_post_run_effects") as cursor:
+        return int((await cursor.fetchone())[0])
+
+
 class TestAtomicTerminalTransactions:
     async def test_success_commits_result_delivery_plan_and_fenced_settlement(self, tmp_path: Path):
         store, authority, claim = await _started_run(tmp_path / "kai.db")
+        run = await WorkshopRunLifecycle(store).state(claim.run_id)
+        runtime_session = RuntimeSessionSettlement(
+            channel_id=run.channel_id,
+            agent_id=run.agent_id,
+            runtime_profile_id=profile_id(101),
+            selection=RunExecutionSelection("codex", "gpt-5.6-sol"),
+            workspace="/private/tmp/kai-workshop-test-workspace",
+            provider_session_id="provider-session-1",
+            run_id=run.run_id,
+        )
         coordinator = WorkshopRunTerminalTransactionCoordinator(authority)
         try:
             result = await coordinator.complete(
                 claim,
                 body="Canonical result",
                 occurred_at=_NOW + timedelta(seconds=4),
+                runtime_session=runtime_session,
             )
             retry = await coordinator.complete(
                 claim,
                 body="Canonical result",
                 occurred_at=_NOW + timedelta(seconds=30),
+                runtime_session=runtime_session,
             )
 
             assert result.outcome == TerminalOutcome.COMPLETED
@@ -243,6 +264,23 @@ class TestAtomicTerminalTransactions:
             assert retry.finalization.delivery.delivery == result.finalization.delivery.delivery
             assert retry.finalization.plan is None
             assert await _terminal_rows(store) == (1, 1, 0)
+            assert await _post_run_effect_count(store) == 1
+            async with store.connection.execute(
+                "SELECT status, runtime_profile_id, source_message_id, result_message_id, "
+                "workspace, provider_session_id, attempt_count "
+                "FROM workshop_post_run_effects WHERE run_id = ?",
+                (run.run_id,),
+            ) as cursor:
+                effect = await cursor.fetchone()
+            assert tuple(effect) == (
+                "pending",
+                str(profile_id(101)),
+                str(run.inbound_message_id),
+                str(result.execution.run.result_message_id),
+                "/private/tmp/kai-workshop-test-workspace",
+                "provider-session-1",
+                0,
+            )
             async with store.connection.execute(
                 "SELECT event_type FROM event_log WHERE position >= ? ORDER BY position",
                 (result.finalization.message.event.position,),
@@ -401,6 +439,7 @@ class TestAtomicTerminalTransactions:
             assert result.finalization.message.event.envelope.payload["body"] == (
                 "Authentication for the configured agent has expired. Kai did not complete this request."
             )
+            assert await _post_run_effect_count(store) == 0
             with pytest.raises(ValueError, match="TerminalFailureCode"):
                 await WorkshopRunTerminalTransactionCoordinator(authority).fail(
                     claim,
@@ -429,11 +468,129 @@ class TestAtomicTerminalTransactions:
             assert result.execution.attempt.status == RunAttemptStatus.CANCELLED
             assert result.finalization.plan is None
             assert result.finalization.message.event.envelope.payload["body"] == "This request was cancelled."
+            assert await _post_run_effect_count(store) == 0
         finally:
             await store.close()
 
+    async def test_post_run_worker_ingests_one_non_telegram_success_exactly_once(
+        self,
+        tmp_path: Path,
+    ):
+        database = tmp_path / "kai.db"
+        store, authority, claim = await _started_workshop_only_client_run(database)
+        run = await WorkshopRunLifecycle(store).state(claim.run_id)
+        result = await WorkshopRunTerminalTransactionCoordinator(authority).complete(
+            claim,
+            body="Transport-neutral answer",
+            occurred_at=_NOW + timedelta(seconds=4),
+            runtime_session=RuntimeSessionSettlement(
+                channel_id=run.channel_id,
+                agent_id=run.agent_id,
+                runtime_profile_id=profile_id(101),
+                selection=RunExecutionSelection("codex", "gpt-5.6-sol"),
+                workspace="/private/tmp/non-telegram-workspace",
+                provider_session_id="non-telegram-provider-session",
+                run_id=run.run_id,
+            ),
+        )
+        await store.close()
+
+        profile_state = SimpleNamespace(
+            memory_context_turns=8,
+            has_memory_for_run=AsyncMock(return_value=False),
+            ingest_memory=AsyncMock(),
+        )
+        compatibility = SimpleNamespace(for_profile=lambda _profile_id: profile_state)
+        service = await WorkshopPostRunEffectService.open_and_start(
+            database,
+            compatibility,  # type: ignore[arg-type]
+        )
+        try:
+            for _ in range(100):
+                if (await service.readiness()).succeeded == 1:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("post-run effect did not settle")
+        finally:
+            await service.stop()
+
+        profile_state.has_memory_for_run.assert_awaited_once_with(str(run.run_id))
+        profile_state.ingest_memory.assert_awaited_once()
+        call = profile_state.ingest_memory.await_args.kwargs
+        assert call["prompt"] == "Perform one durable unit of work"
+        assert call["assistant_text"] == "Transport-neutral answer"
+        assert call["session_id"] == "non-telegram-provider-session"
+        assert call["workspace"] == "/private/tmp/non-telegram-workspace"
+        assert call["canonical_provenance"].run_id == run.run_id
+        assert call["canonical_provenance"].source_message_id == run.inbound_message_id
+        assert call["canonical_provenance"].result_message_id == result.execution.run.result_message_id
+
+        restarted = await WorkshopPostRunEffectService.open_and_start(
+            database,
+            compatibility,  # type: ignore[arg-type]
+        )
+        try:
+            await asyncio.sleep(0.05)
+            assert (await restarted.readiness()).succeeded == 1
+        finally:
+            await restarted.stop()
+        profile_state.ingest_memory.assert_awaited_once()
+
+    async def test_recovered_post_run_effect_does_not_duplicate_committed_memory(
+        self,
+        tmp_path: Path,
+    ):
+        database = tmp_path / "kai.db"
+        store, authority, claim = await _started_run(database)
+        run = await WorkshopRunLifecycle(store).state(claim.run_id)
+        await WorkshopRunTerminalTransactionCoordinator(authority).complete(
+            claim,
+            body="Committed before interruption",
+            occurred_at=_NOW + timedelta(seconds=4),
+            runtime_session=RuntimeSessionSettlement(
+                channel_id=run.channel_id,
+                agent_id=run.agent_id,
+                runtime_profile_id=profile_id(101),
+                selection=RunExecutionSelection("codex", "gpt-5.6-sol"),
+                workspace="/private/tmp/kai-workshop-test-workspace",
+                provider_session_id="provider-session-before-restart",
+                run_id=run.run_id,
+            ),
+        )
+        await store.connection.execute(
+            "UPDATE workshop_post_run_effects SET status = 'executing' WHERE run_id = ?",
+            (run.run_id,),
+        )
+        await store.connection.commit()
+        await store.close()
+
+        profile_state = SimpleNamespace(
+            memory_context_turns=8,
+            has_memory_for_run=AsyncMock(return_value=True),
+            ingest_memory=AsyncMock(),
+        )
+        compatibility = SimpleNamespace(for_profile=lambda _profile_id: profile_state)
+        service = await WorkshopPostRunEffectService.open_and_start(
+            database,
+            compatibility,  # type: ignore[arg-type]
+        )
+        try:
+            for _ in range(100):
+                if (await service.readiness()).succeeded == 1:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("recovered post-run effect did not settle")
+        finally:
+            await service.stop()
+
+        profile_state.has_memory_for_run.assert_awaited_once_with(str(run.run_id))
+        profile_state.ingest_memory.assert_not_awaited()
+
     async def test_stale_fence_rolls_back_every_visible_outcome_row(self, tmp_path: Path):
         store, authority, stale_claim = await _started_run(tmp_path / "kai.db")
+        run = await WorkshopRunLifecycle(store).state(stale_claim.run_id)
         try:
             renewed = await authority.renew(
                 stale_claim,
@@ -445,9 +602,19 @@ class TestAtomicTerminalTransactions:
                     stale_claim,
                     body="Must roll back",
                     occurred_at=_NOW + timedelta(seconds=5),
+                    runtime_session=RuntimeSessionSettlement(
+                        channel_id=run.channel_id,
+                        agent_id=run.agent_id,
+                        runtime_profile_id=profile_id(101),
+                        selection=RunExecutionSelection("codex", "gpt-5.6-sol"),
+                        workspace="/private/tmp/kai-workshop-test-workspace",
+                        provider_session_id="stale-provider-session",
+                        run_id=run.run_id,
+                    ),
                 )
 
             assert await _terminal_rows(store) == (0, 0, 0)
+            assert await _post_run_effect_count(store) == 0
             assert (await WorkshopRunLifecycle(store).state(stale_claim.run_id)).status == RunStatus.STARTED
             assert (await authority.attempt(renewed.claim.attempt_id)).status == RunAttemptStatus.STARTED
         finally:
@@ -559,6 +726,7 @@ class TestAtomicTerminalTransactions:
 
     async def test_second_commit_resolution_failure_is_explicitly_uncertain(self, tmp_path: Path, monkeypatch):
         store, authority, claim = await _started_run(tmp_path / "kai.db")
+        run = await WorkshopRunLifecycle(store).state(claim.run_id)
         coordinator = WorkshopRunTerminalTransactionCoordinator(authority)
 
         async def unavailable_commit(_connection: aiosqlite.Connection) -> None:
@@ -571,9 +739,19 @@ class TestAtomicTerminalTransactions:
                     claim,
                     body="Never committed",
                     occurred_at=_NOW + timedelta(seconds=4),
+                    runtime_session=RuntimeSessionSettlement(
+                        channel_id=run.channel_id,
+                        agent_id=run.agent_id,
+                        runtime_profile_id=profile_id(101),
+                        selection=RunExecutionSelection("codex", "gpt-5.6-sol"),
+                        workspace="/private/tmp/kai-workshop-test-workspace",
+                        provider_session_id="uncertain-provider-session",
+                        run_id=run.run_id,
+                    ),
                 )
 
             assert await _terminal_rows(store) == (0, 0, 0)
+            assert await _post_run_effect_count(store) == 0
         finally:
             await store.close()
 

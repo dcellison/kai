@@ -8,15 +8,13 @@ from dataclasses import dataclass
 
 from kai.streaming_text import stream_publishable_prefix
 from kai.workshop.artifacts import StagedArtifact
-from kai.workshop.compatibility_state import WorkshopCompatibilityStateWriter
 from kai.workshop.conversation_commands import (
     ClientConversationCommandAcceptance,
     ConversationCommandDisposition,
 )
-from kai.workshop.domain import CanonicalMemoryProvenance, MessageId, RunId, RuntimeProfileId
+from kai.workshop.domain import MessageId, RunId, RuntimeProfileId
 from kai.workshop.execution_coordinator import (
     CanonicalCancellationDisposition,
-    CanonicalExecutionDisposition,
 )
 from kai.workshop.inbound import ClientInboundMessage
 from kai.workshop.private_text_execution import (
@@ -56,12 +54,10 @@ class WorkshopClientCommandExecutor:
     def __init__(
         self,
         execution: WorkshopPrivateTextExecutionService,
-        compatibility_state: WorkshopCompatibilityStateWriter,
         *,
         run_previews: WorkshopRunPreviewRegistry | None = None,
     ) -> None:
         self._execution = execution
-        self._compatibility_state = compatibility_state
         self._run_previews = run_previews
         self._tasks: dict[RunId, asyncio.Task[None]] = {}
         self._task_lock = asyncio.Lock()
@@ -152,33 +148,10 @@ class WorkshopClientCommandExecutor:
     async def _execute(self, context: _ClientRunContext) -> None:
         task = asyncio.current_task()
         try:
-            result = await self._execution.execute(
+            await self._execution.execute(
                 context.run_id,
                 stream_observer=await self._preview_observer(context.run_id),
             )
-            if result.terminal is None:
-                return
-            compatibility_state = self._compatibility_state.for_profile(context.runtime_profile_id)
-            if result.disposition == CanonicalExecutionDisposition.COMPLETED and result.workspace is not None:
-                result_message_id = result.terminal.finalization.message.event.envelope.aggregate_id
-                if not isinstance(result_message_id, MessageId):
-                    raise RuntimeError("Workshop execution did not identify a canonical result message")
-                prior_pairs = await self._execution.prior_conversation_pairs(
-                    context.run_id,
-                    limit=compatibility_state.memory_context_turns,
-                )
-                compatibility_state.schedule_memory_ingestion(
-                    prompt=context.body,
-                    assistant_text=result.terminal.body,
-                    session_id=result.session_id,
-                    workspace=result.workspace,
-                    canonical_provenance=CanonicalMemoryProvenance(
-                        run_id=context.run_id,
-                        source_message_id=context.inbound_message_id,
-                        result_message_id=result_message_id,
-                    ),
-                    canonical_prior_pairs=prior_pairs,
-                )
         except Exception:
             log.exception("Workshop client run task failed for %s", context.run_id)
         finally:
