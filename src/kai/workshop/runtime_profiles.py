@@ -36,6 +36,7 @@ RUNTIME_PROFILES_YAML_ENV = "KAI_RUNTIME_PROFILES_YAML"
 INSTALL_DIR_ENV = "KAI_INSTALL_DIR"
 _OS_USER_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 RUNTIME_KEY_ARCHIVE_REMOVAL_GATE = "canonical_runtime_state_v1"
+DEFAULT_MAXIMUM_TIMEOUT_SECONDS = 600
 
 
 class WorkshopRuntimeProfileError(RuntimeError):
@@ -62,12 +63,23 @@ class ProtectedRuntimeProfile:
     home_workspace: Path | None
     workspace_base: Path | None
     allowed_workspaces: tuple[Path, ...]
+    maximum_timeout_seconds: int = 0
     allowed_models: tuple[str, ...] | None = None
     role_models: tuple[tuple[str, str], ...] = ()
     github_repos: tuple[str, ...] = ()
     pr_review: bool | None = None
     issue_triage: bool | None = None
     allowed_triage_projects: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        maximum_timeout = self.maximum_timeout_seconds
+        if maximum_timeout == 0:
+            maximum_timeout = max(DEFAULT_MAXIMUM_TIMEOUT_SECONDS, self.timeout_seconds)
+        if isinstance(maximum_timeout, bool) or maximum_timeout < self.timeout_seconds:
+            raise WorkshopRuntimeProfileError(
+                "maximum_timeout_seconds must be an integer greater than or equal to timeout_seconds"
+            )
+        object.__setattr__(self, "maximum_timeout_seconds", maximum_timeout)
 
 
 def _compatibility_model(
@@ -277,6 +289,7 @@ class WorkshopRuntimeProfileRegistry:
                 raise WorkshopRuntimeProfileError("Configured-user key does not match its protected user record")
             backend, provider = get_user_backend_and_provider(user, config)
             profile_id = runtime_profile_id_for_config_id(runtime_config_id)
+            timeout_seconds = user.timeout if user.timeout is not None else config.default_timeout
             profiles.append(
                 ProtectedRuntimeProfile(
                     profile_id=profile_id,
@@ -285,11 +298,15 @@ class WorkshopRuntimeProfileRegistry:
                     backend=backend,
                     provider=provider,
                     model=_compatibility_model(user, config, backend=backend, provider=provider),
-                    timeout_seconds=user.timeout if user.timeout is not None else config.default_timeout,
+                    timeout_seconds=timeout_seconds,
                     allowed_services=tuple(user.allowed_services),
                     home_workspace=user.home_workspace,
                     workspace_base=user.workspace_base,
                     allowed_workspaces=tuple(user.allowed_workspaces),
+                    maximum_timeout_seconds=max(
+                        DEFAULT_MAXIMUM_TIMEOUT_SECONDS,
+                        timeout_seconds,
+                    ),
                     role_models=tuple(sorted((user.models or {}).items())),
                     github_repos=tuple(user.github_repos),
                     pr_review=user.pr_review,
@@ -370,6 +387,19 @@ class WorkshopRuntimeProfileRegistry:
             if isinstance(raw_timeout, bool) or not isinstance(raw_timeout, int) or raw_timeout <= 0:
                 raise WorkshopRuntimeProfileError(
                     f"Runtime profile {profile_id}: timeout_seconds must be a positive integer"
+                )
+            raw_maximum_timeout = raw_profile.get(
+                "maximum_timeout_seconds",
+                max(DEFAULT_MAXIMUM_TIMEOUT_SECONDS, raw_timeout),
+            )
+            if (
+                isinstance(raw_maximum_timeout, bool)
+                or not isinstance(raw_maximum_timeout, int)
+                or raw_maximum_timeout < raw_timeout
+            ):
+                raise WorkshopRuntimeProfileError(
+                    f"Runtime profile {profile_id}: maximum_timeout_seconds must be an integer "
+                    "greater than or equal to timeout_seconds"
                 )
             raw_os_user = raw_profile.get("os_user")
             os_user = None if raw_os_user is None else str(raw_os_user).strip() or None
@@ -454,6 +484,7 @@ class WorkshopRuntimeProfileRegistry:
                         raw_profile.get("allowed_workspaces"),
                         profile_id=profile_id,
                     ),
+                    maximum_timeout_seconds=raw_maximum_timeout,
                     allowed_models=allowed_models,
                     role_models=tuple(sorted(role_models)),
                     github_repos=tuple(sorted({item.strip().lower() for item in raw_github_repos})),

@@ -97,6 +97,7 @@ from kai.workshop.initial_provisioning import (
     parse_initial_provisioning,
 )
 from kai.workshop.runtime_profiles import (
+    DEFAULT_MAXIMUM_TIMEOUT_SECONDS,
     WorkshopRuntimeProfileError,
     WorkshopRuntimeProfileRegistry,
     legacy_runtime_key_for_v1_profile_id,
@@ -876,6 +877,7 @@ def _build_fresh_runtime_profile_policy(
                 "provider": provider,
                 "model": model,
                 "timeout_seconds": timeout,
+                "maximum_timeout_seconds": max(DEFAULT_MAXIMUM_TIMEOUT_SECONDS, timeout),
                 "allowed_services": [],
                 "home_workspace": None,
                 "workspace_base": None,
@@ -1213,6 +1215,7 @@ def _build_migrated_runtime_profiles(
             "provider": provider,
             "model": model,
             "timeout_seconds": timeout_seconds,
+            "maximum_timeout_seconds": max(DEFAULT_MAXIMUM_TIMEOUT_SECONDS, timeout_seconds),
             "allowed_services": _migrated_service_scopes(entry),
             "home_workspace": _migrated_workspace_directory(
                 entry.get("home_workspace"),
@@ -1346,6 +1349,15 @@ def _upgrade_runtime_policy_content(
         if "timeout_seconds" not in profile:
             profile["timeout_seconds"] = (
                 expected["timeout_seconds"] if isinstance(expected, dict) else defaults.timeout_seconds
+            )
+            changed = True
+        if "maximum_timeout_seconds" not in profile:
+            timeout_seconds = profile.get("timeout_seconds", defaults.timeout_seconds)
+            if not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool):
+                continue
+            profile["maximum_timeout_seconds"] = max(
+                DEFAULT_MAXIMUM_TIMEOUT_SECONDS,
+                timeout_seconds,
             )
             changed = True
         if "allowed_services" not in profile:

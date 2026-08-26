@@ -3875,6 +3875,21 @@ class TestHandleSettings:
         reply = update.message.reply_text.call_args[0][0]
         assert "300s" in reply
 
+    @pytest.mark.asyncio
+    async def test_protected_timeout_uses_canonical_policy_above_compatibility_cap(self):
+        update = _make_update(text="/settings timeout 1800")
+        ctx = _make_context(args=["timeout", "1800"])
+        authority = SimpleNamespace(runtime_profile_id=profile_id(12345))
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = authority
+        service.set_timeout = AsyncMock()
+        ctx.application.core_services.settings_workspaces = service
+
+        await handle_settings(update, ctx)
+
+        service.set_timeout.assert_awaited_once_with(authority, 1800)
+        assert "1800s" in update.message.reply_text.call_args[0][0]
+
     # ── 7. Reject zero timeout ─────────────────────────────────────
 
     @pytest.mark.asyncio

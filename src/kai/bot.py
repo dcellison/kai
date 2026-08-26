@@ -624,19 +624,22 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except ValueError:
             await update.message.reply_text("Timeout must be a positive integer (seconds).")
             return
-        # Cap at 600s (10 minutes). The timeout is the runaway guard
-        # for a stuck subprocess; this cap prevents a single stuck
-        # request from holding the per-chat lock indefinitely.
-        if timeout > 600:
-            await update.message.reply_text("Timeout cannot exceed 600 seconds.")
-            return
         authority = _canonical_settings_authority(context, chat_id)
         if authority is not None:
-            await _get_core_services(context).settings_workspaces.set_timeout(
-                authority,
-                timeout,
-            )
+            try:
+                await _get_core_services(context).settings_workspaces.set_timeout(
+                    authority,
+                    timeout,
+                )
+            except WorkshopSettingsWorkspaceValidationError as exc:
+                await update.message.reply_text(str(exc))
+                return
             await update.message.reply_text(f"Default timeout set to {timeout}s.")
+            return
+        # Compatibility-only users retain the historical ceiling. Canonical
+        # runtimes derive this bound from their protected runtime profile.
+        if timeout > 600:
+            await update.message.reply_text("Timeout cannot exceed 600 seconds.")
             return
         await sessions.set_user_setting(chat_id, "timeout", str(timeout))
         # Apply to running instance if one exists. Don't use pool.get()

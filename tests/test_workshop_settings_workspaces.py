@@ -38,6 +38,7 @@ class _RuntimePool:
             provider="openai",
             model="gpt-5.6-sol",
             timeout_seconds=120,
+            maximum_timeout_seconds=600,
             allowed_models=None,
         )
 
@@ -461,6 +462,43 @@ async def test_capability_catalog_and_model_validation_share_protected_policy(
         )
     assert replace_calls == []
     assert pool.events == []
+
+
+async def test_timeout_capability_and_validation_follow_protected_runtime_policy(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, pool, authority, _, _ = _service(tmp_path)
+    pool.profile.timeout_seconds = 1800
+    pool.profile.maximum_timeout_seconds = 1800
+    execution, _, replace_calls, _ = _canonical_state(monkeypatch)
+
+    initial = await service.inspect(authority)
+
+    assert initial.timeout_seconds == EffectiveValue(1800, "runtime policy", 1800)
+    assert initial.capabilities[1].maximum == 1800
+    workspace = await service.workspace_config(authority)
+    assert workspace.capabilities[1].maximum == 1800
+
+    changed = await service.set_timeout(
+        authority,
+        1200,
+        expected_revision=initial.revision,
+    )
+    assert changed.timeout_seconds == EffectiveValue(1200, "runtime override", 1800)
+    assert execution == {"timeout": "1200"}
+
+    reset = await service.reset_settings(
+        authority,
+        "timeout",
+        expected_revision=changed.revision,
+    )
+    assert reset.timeout_seconds == EffectiveValue(1800, "runtime policy", 1800)
+    assert execution == {}
+
+    with pytest.raises(WorkshopSettingsWorkspaceValidationError, match="1800"):
+        await service.set_timeout(authority, 1801)
+    assert len(replace_calls) == 2
 
 
 async def test_stale_revision_fails_before_persistent_or_live_mutation(
