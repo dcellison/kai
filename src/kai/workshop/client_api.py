@@ -64,6 +64,19 @@ from kai.workshop.memory_queries import (
     WorkshopMemoryResponseTooLarge,
     WorkshopMemoryValidationError,
 )
+from kai.workshop.preferences import (
+    MAX_PREFERENCE_BYTES,
+    PreferenceAuthority,
+    PreferenceDocument,
+    PreferenceRevisionHistory,
+    WorkshopPreferenceAccessDenied,
+    WorkshopPreferenceConflict,
+    WorkshopPreferenceError,
+    WorkshopPreferenceRevisionNotFound,
+    WorkshopPreferenceService,
+    WorkshopPreferenceStorageError,
+    WorkshopPreferenceValidationError,
+)
 from kai.workshop.run_lifecycle import DurableRun, RunNotFoundError, RunStatus
 from kai.workshop.run_previews import RunPreview, WorkshopRunPreviewRegistry
 from kai.workshop.settings_workspaces import (
@@ -96,6 +109,11 @@ _RUN_CANCELLATION_PATH = "/v1/channels/{channel_id}/runs/{run_id}/cancel"
 _RUNTIME_SETTINGS_PATH = "/v1/channels/{channel_id}/settings"
 _ACTIVE_WORKSPACE_PATH = "/v1/channels/{channel_id}/workspace"
 _WORKSPACE_CONFIG_PATH = "/v1/channels/{channel_id}/workspace-config"
+_PREFERENCES_PATH = "/v1/preferences"
+_PREFERENCE_REVISIONS_PATH = "/v1/preferences/revisions"
+_PREFERENCE_RESTORE_PATH = "/v1/preferences/revisions/{preference_revision}/restore"
+_MAX_PREFERENCE_UPDATE_BODY_BYTES = MAX_PREFERENCE_BYTES * 6 + 1024
+_MAX_PREFERENCE_RESTORE_BODY_BYTES = 512
 _MEMORY_STATS_PATH = "/v1/memory/stats"
 _MEMORY_RECORDS_PATH = "/v1/memory/records"
 _MEMORY_SEARCH_PATH = "/v1/memory/search"
@@ -115,6 +133,8 @@ _SETTINGS_REQUEST_FIELDS = frozenset({"model", "timeout_seconds", "reset"})
 _WORKSPACE_REQUEST_FIELDS = frozenset({"path"})
 _WORKSPACE_CONFIG_REQUEST_FIELDS = frozenset({"field", "value", "path"})
 _WORKSPACE_CONFIG_RESET_FIELDS = frozenset({"reset", "path"})
+_PREFERENCE_UPDATE_FIELDS = frozenset({"content", "revision"})
+_PREFERENCE_RESTORE_FIELDS = frozenset({"revision"})
 _DECIMAL_INTEGER = re.compile(r"^[0-9]+$")
 _CLIENT_MESSAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _EVENT_BATCH_SIZE = 100
@@ -183,6 +203,35 @@ def _serialize_settings_workspace(
                 "home": option.home,
             }
             for option in snapshot.workspaces
+        ],
+    }
+
+
+def _serialize_preference_document(document: PreferenceDocument) -> dict[str, object]:
+    return {
+        "version": 1,
+        "document": {
+            "content": document.content,
+            "revision": document.revision,
+            "updated_at": document.updated_at,
+            "size_bytes": document.size_bytes,
+            "max_bytes": document.max_bytes,
+            "editable": document.editable,
+        },
+    }
+
+
+def _serialize_preference_history(history: PreferenceRevisionHistory) -> dict[str, object]:
+    return {
+        "version": 1,
+        "limit": history.limit,
+        "revisions": [
+            {
+                "revision": item.revision,
+                "updated_at": item.updated_at,
+                "size_bytes": item.size_bytes,
+            }
+            for item in history.revisions
         ],
     }
 
@@ -780,6 +829,208 @@ async def _authenticate_settings_authority(
             message="Access denied",
         )
     return authority, None
+
+
+async def _authenticate_preference_authority(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopPreferenceService,
+) -> tuple[PreferenceAuthority | None, web.Response | None]:
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(
+            status=401,
+            code="authentication_required",
+            message="Authentication required",
+        )
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return None, response
+    try:
+        return service.authority_for_principal(principal_id), None
+    except WorkshopPreferenceAccessDenied:
+        return None, _error_response(
+            status=403,
+            code="access_denied",
+            message="Access denied",
+        )
+
+
+def _preference_error_response(exc: WorkshopPreferenceError) -> web.Response:
+    if isinstance(exc, WorkshopPreferenceConflict):
+        return _json_response(
+            {
+                "error": {
+                    "code": "revision_conflict",
+                    "message": str(exc),
+                    "current_revision": exc.current_revision,
+                }
+            },
+            status=409,
+        )
+    if isinstance(exc, WorkshopPreferenceRevisionNotFound):
+        return _error_response(status=404, code="not_found", message="Preference revision was not found")
+    if isinstance(exc, WorkshopPreferenceValidationError):
+        return _error_response(status=400, code="invalid_request", message=str(exc))
+    if isinstance(exc, WorkshopPreferenceAccessDenied):
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    if isinstance(exc, WorkshopPreferenceStorageError):
+        return _error_response(
+            status=503,
+            code="preferences_unavailable",
+            message="Preferences are temporarily unavailable",
+        )
+    return _error_response(
+        status=503, code="preferences_unavailable", message="Preferences are temporarily unavailable"
+    )
+
+
+async def _preference_json_object(
+    request: web.Request,
+    *,
+    max_bytes: int,
+) -> dict[str, object]:
+    if request.content_type != "application/json":
+        raise WorkshopPreferenceValidationError("Content-Type must be application/json")
+    if request.content_length is not None and request.content_length > max_bytes:
+        raise WorkshopPreferenceValidationError("Preference request is too large")
+    raw = await request.content.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise WorkshopPreferenceValidationError("Preference request is too large")
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise WorkshopPreferenceValidationError("Invalid JSON request") from exc
+    if not isinstance(payload, dict):
+        raise WorkshopPreferenceValidationError("Invalid preference request")
+    return payload
+
+
+async def _handle_preference_document(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopPreferenceService,
+) -> web.Response:
+    authority, error = await _authenticate_preference_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        return error
+    assert authority is not None
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid preference request")
+    try:
+        document = await service.read(authority)
+    except WorkshopPreferenceError as exc:
+        return _preference_error_response(exc)
+    return _json_response(_serialize_preference_document(document), status=200)
+
+
+async def _handle_preference_update(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopPreferenceService,
+) -> web.Response:
+    authority, error = await _authenticate_preference_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        return error
+    assert authority is not None
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid preference request")
+    try:
+        payload = await _preference_json_object(
+            request,
+            max_bytes=_MAX_PREFERENCE_UPDATE_BODY_BYTES,
+        )
+    except WorkshopPreferenceValidationError as exc:
+        return _preference_error_response(exc)
+    if set(payload) != _PREFERENCE_UPDATE_FIELDS:
+        return _error_response(status=400, code="invalid_request", message="Invalid preference request")
+    content = payload.get("content")
+    revision = payload.get("revision")
+    if not isinstance(content, str) or not isinstance(revision, str):
+        return _error_response(status=400, code="invalid_request", message="Invalid preference request")
+    try:
+        document = await service.save(
+            authority,
+            expected_revision=revision,
+            content=content,
+        )
+    except WorkshopPreferenceError as exc:
+        return _preference_error_response(exc)
+    return _json_response(_serialize_preference_document(document), status=200)
+
+
+async def _handle_preference_history(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopPreferenceService,
+) -> web.Response:
+    authority, error = await _authenticate_preference_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        return error
+    assert authority is not None
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid preference history request")
+    try:
+        history = await service.history(authority)
+    except WorkshopPreferenceError as exc:
+        return _preference_error_response(exc)
+    return _json_response(_serialize_preference_history(history), status=200)
+
+
+async def _handle_preference_restore(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopPreferenceService,
+) -> web.Response:
+    authority, error = await _authenticate_preference_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        return error
+    assert authority is not None
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid preference restore request")
+    try:
+        payload = await _preference_json_object(
+            request,
+            max_bytes=_MAX_PREFERENCE_RESTORE_BODY_BYTES,
+        )
+    except WorkshopPreferenceValidationError as exc:
+        return _preference_error_response(exc)
+    if set(payload) != _PREFERENCE_RESTORE_FIELDS:
+        return _error_response(status=400, code="invalid_request", message="Invalid preference restore request")
+    revision = payload.get("revision")
+    if not isinstance(revision, str):
+        return _error_response(status=400, code="invalid_request", message="Invalid preference restore request")
+    try:
+        document = await service.restore(
+            authority,
+            target_revision=request.match_info["preference_revision"],
+            expected_revision=revision,
+        )
+    except (KeyError, WorkshopPreferenceError) as exc:
+        if isinstance(exc, KeyError):
+            return _error_response(status=400, code="invalid_request", message="Invalid preference restore request")
+        return _preference_error_response(exc)
+    return _json_response(_serialize_preference_document(document), status=200)
 
 
 async def _handle_runtime_settings(
@@ -2202,6 +2453,7 @@ def register_workshop_read_routes(
     artifact_service: WorkshopArtifactService | None = None,
     settings_workspaces: WorkshopSettingsWorkspaceService | None = None,
     memory_queries: WorkshopMemoryQueryService | None = None,
+    preference_documents: WorkshopPreferenceService | None = None,
 ) -> None:
     """Register authenticated Workshop client routes on an application."""
     if event_poll_interval <= 0 or event_heartbeat_interval <= 0 or event_authentication_recheck_interval <= 0:
@@ -2248,6 +2500,44 @@ def register_workshop_read_routes(
     app.router.add_get(_CLIENT_NAVIGATION_PATH, handle_client_navigation)
     app.router.add_get(_TIMELINE_PATH, handle_channel_timeline)
     app.router.add_get(_TIMELINE_EVENTS_PATH, handle_channel_event_stream)
+    if preference_documents is not None:
+
+        async def handle_preference_document(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_preference_document(
+                    request,
+                    authenticator=authenticator,
+                    service=preference_documents,
+                )
+
+        async def handle_preference_update(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_preference_update(
+                    request,
+                    authenticator=authenticator,
+                    service=preference_documents,
+                )
+
+        async def handle_preference_history(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_preference_history(
+                    request,
+                    authenticator=authenticator,
+                    service=preference_documents,
+                )
+
+        async def handle_preference_restore(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_preference_restore(
+                    request,
+                    authenticator=authenticator,
+                    service=preference_documents,
+                )
+
+        app.router.add_get(_PREFERENCES_PATH, handle_preference_document)
+        app.router.add_put(_PREFERENCES_PATH, handle_preference_update)
+        app.router.add_get(_PREFERENCE_REVISIONS_PATH, handle_preference_history)
+        app.router.add_post(_PREFERENCE_RESTORE_PATH, handle_preference_restore)
     if artifact_service is not None:
 
         async def handle_artifact_content(request: web.Request) -> web.StreamResponse:

@@ -60,6 +60,7 @@ from kai.install import (
     _generate_launchd_plist,
     _generate_launcher_script,
     _generate_principal_memory_reader,
+    _generate_principal_preference_manager,
     _generate_sudoers,
     _generate_systemd_unit,
     _generate_users_yaml,
@@ -430,6 +431,36 @@ class TestGenerateSudoers:
         assert rule not in _generate_sudoers("kai", ["kai"])
         cat_path = shutil.which("cat") or "/bin/cat"
         assert f"{cat_path} /var/lib" not in _generate_sudoers("kai", ["daniel"])
+
+    def test_principal_preference_manager_rule_requires_foreign_users(self):
+        rule = "kai ALL=(root) NOPASSWD: /etc/kai/manage-principal-preferences *"
+        assert rule in _generate_sudoers("kai", ["daniel"])
+        assert rule not in _generate_sudoers("kai")
+        assert rule not in _generate_sudoers("kai", ["kai"])
+
+
+class TestGeneratePrincipalPreferenceManager:
+    def test_wrapper_pins_interpreter_module_and_data_root(self):
+        script = _generate_principal_preference_manager(
+            "/var/lib/kai",
+            "/opt/kai",
+        )
+        assert script.startswith("#!/usr/bin/python3\n")
+        assert "PYTHON = '/opt/kai/venv/bin/python'" in script
+        assert "DATA_DIR = '/var/lib/kai'" in script
+        assert '"kai.workshop.preferences"' in script
+        assert '"--helper"' in script
+        assert "os.execve(" in script
+        assert "environ" not in script
+        compile(script, "<preference-manager>", "exec")
+
+    def test_paths_are_baked_in_as_literals(self):
+        script = _generate_principal_preference_manager(
+            "/srv/o'dd-data",
+            "/srv/o'dd-install",
+        )
+        assert repr("/srv/o'dd-data") in script
+        assert repr("/srv/o'dd-install/venv/bin/python") in script
 
 
 class TestGeneratePrincipalMemoryReader:

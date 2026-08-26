@@ -25,6 +25,7 @@ from kai.workshop.integration_notifications import WorkshopIntegrationNotificati
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIContextRegistry
 from kai.workshop.memory_queries import WorkshopMemoryQueryService
 from kai.workshop.post_run_effects import WorkshopPostRunEffectService
+from kai.workshop.preferences import WorkshopPreferenceService
 from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
 from kai.workshop.proactive_publication import (
     ProactivePublicationAuthority,
@@ -132,6 +133,7 @@ class KaiCoreServices:
     artifacts: WorkshopArtifactService
     settings_workspaces: WorkshopSettingsWorkspaceService
     memory_queries: WorkshopMemoryQueryService
+    preference_documents: WorkshopPreferenceService
     proactive_publication: WorkshopProactivePublicationService
     integration_notifications: WorkshopIntegrationNotificationService
     github_automation: WorkshopGitHubAutomationService
@@ -273,6 +275,10 @@ class KaiApplicationHost:
                 runtime_pool,
                 self._execution_state,
             )
+            preference_documents = WorkshopPreferenceService(
+                Path(self._config.session_db_path).parent,
+                self._principal_storage,
+            )
             proactive_publication = WorkshopProactivePublicationService(
                 client_store,
                 artifacts,
@@ -318,6 +324,7 @@ class KaiApplicationHost:
                 artifacts=artifacts,
                 settings_workspaces=settings_workspaces,
                 memory_queries=memory_queries,
+                preference_documents=preference_documents,
                 proactive_publication=proactive_publication,
                 integration_notifications=integration_notifications,
                 github_automation=github_automation,

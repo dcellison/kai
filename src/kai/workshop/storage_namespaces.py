@@ -166,6 +166,7 @@ class WorkshopPrincipalStorageRegistry:
     ) -> None:
         by_profile: dict[RuntimeProfileId, WorkshopPrincipalStorageNamespace] = {}
         by_config_id: dict[int, WorkshopPrincipalStorageNamespace] = {}
+        by_principal: dict[PrincipalId, WorkshopPrincipalStorageNamespace] = {}
         for namespace in namespaces:
             if not isinstance(namespace, WorkshopPrincipalStorageNamespace):
                 raise TypeError("namespaces must contain WorkshopPrincipalStorageNamespace values")
@@ -174,12 +175,14 @@ class WorkshopPrincipalStorageRegistry:
             if namespace._legacy_runtime_key is not None and namespace._legacy_runtime_key in by_config_id:
                 raise WorkshopStorageNamespaceError("Duplicate archived runtime storage key")
             by_profile[namespace.runtime_profile_id] = namespace
+            by_principal.setdefault(namespace.principal_id, namespace)
             if namespace._legacy_runtime_key is not None:
                 by_config_id[namespace._legacy_runtime_key] = namespace
         if not by_profile:
             raise WorkshopStorageNamespaceError("At least one principal storage namespace is required")
         self._by_profile = by_profile
         self._by_config_id = by_config_id
+        self._by_principal = by_principal
 
     @classmethod
     async def from_store(
@@ -249,6 +252,20 @@ class WorkshopPrincipalStorageRegistry:
         namespace = self._by_profile.get(normalized)
         if namespace is None:
             raise WorkshopStorageNamespaceError("Runtime profile has no canonical principal storage namespace")
+        return namespace
+
+    def for_principal(
+        self,
+        principal_id: str | PrincipalId,
+    ) -> WorkshopPrincipalStorageNamespace:
+        """Resolve one human principal to its canonical private storage."""
+        try:
+            normalized = principal_id if isinstance(principal_id, PrincipalId) else PrincipalId(principal_id)
+        except (TypeError, ValueError) as exc:
+            raise WorkshopStorageNamespaceError("Principal ID is invalid") from exc
+        namespace = self._by_principal.get(normalized)
+        if namespace is None:
+            raise WorkshopStorageNamespaceError("Principal has no canonical storage namespace")
         return namespace
 
     def for_runtime_config_id(
