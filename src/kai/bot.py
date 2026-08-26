@@ -1144,9 +1144,10 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     chat_id = _chat_id(update)
     execution = _get_core_services(context).private_text_execution
     if execution is not None and chat_id == _user_id(update):
-        disposition = await execution.request_cancellation(
-            telegram_user_id=_user_id(update),
-            telegram_chat_id=chat_id,
+        disposition = await execution.request_transport_cancellation(
+            transport="telegram",
+            sender_subject=str(_user_id(update)),
+            channel_subject=str(chat_id),
         )
         if disposition == CanonicalCancellationDisposition.REQUESTED:
             await update.message.reply_text("Stopping...")
@@ -3044,43 +3045,10 @@ async def _show_github(update: Update, chat_id: int, config: Config) -> None:
     await update.message.reply_text("\n".join(lines))
 
 
-async def _is_notify_chat_used(
-    notify_chat_id: int,
-    exclude_user: int,
-    config: Config,
-) -> bool:
-    """
-    Check if any user other than exclude_user still uses this chat_id
-    as their GitHub notification destination.
-
-    Checks users.yaml (via config) and the database. Returns True if
-    at least one other source references this chat_id.
-
-    Note: this does a linear scan of all users with one DB query per
-    user. Fine for a personal assistant with a handful of users.
-    """
-    for uid, uc in config.user_configs.items():
-        if uid == exclude_user:
-            continue
-        # Check the users.yaml entry for this user
-        if uc.github_notify_chat_id == notify_chat_id:
-            return True
-        # Check DB override for this user
-        val = await sessions.get_setting(f"github_notify_chat:{uid}")
-        if val:
-            try:
-                if int(val) == notify_chat_id:
-                    return True
-            except ValueError:
-                continue
-    return False
-
-
 async def _handle_github_notify(
     update: Update,
     chat_id: int,
     args: list[str],
-    config: Config,
 ) -> None:
     """Handle /github notify <chat_id|reset> - set or clear notification destination."""
     assert update.message is not None
@@ -3092,26 +3060,7 @@ async def _handle_github_notify(
     value = args[0].lower()
 
     if value == "reset":
-        # Read the current notify chat_id before deleting it, so we can
-        # remove it from the live notification-destination registry.
-        old_val = await sessions.get_setting(f"github_notify_chat:{chat_id}")
         await sessions.delete_setting(f"github_notify_chat:{chat_id}")
-        if old_val:
-            try:
-                old_chat_id = int(old_val)
-            except ValueError:
-                old_chat_id = None
-            # Never remove the user's own chat_id from the legacy registry.
-            # The registry is no longer an authorization source, but keeping
-            # this guard preserves its outbound-destination semantics.
-            if old_chat_id is not None and old_chat_id != chat_id:
-                still_used = await _is_notify_chat_used(
-                    old_chat_id,
-                    exclude_user=chat_id,
-                    config=config,
-                )
-                if not still_used:
-                    webhook.remove_notification_chat_id(old_chat_id)
         await update.message.reply_text("Notification destination reset to this chat.")
         return
 
@@ -3122,29 +3071,7 @@ async def _handle_github_notify(
         await update.message.reply_text("Chat ID must be an integer.")
         return
 
-    # If there is an existing notify destination that differs from the
-    # new one, clean it up from the live registry before overwriting.
-    # Without this, the old chat_id would linger until restart.
-    old_val = await sessions.get_setting(f"github_notify_chat:{chat_id}")
-    if old_val:
-        try:
-            old_notify = int(old_val)
-        except ValueError:
-            old_notify = None
-        if old_notify is not None and old_notify != notify_id and old_notify != chat_id:
-            still_used = await _is_notify_chat_used(
-                old_notify,
-                exclude_user=chat_id,
-                config=config,
-            )
-            if not still_used:
-                webhook.remove_notification_chat_id(old_notify)
-
     await sessions.set_setting(f"github_notify_chat:{chat_id}", str(notify_id))
-
-    # Keep the live outbound-destination registry synchronized. This does not
-    # expand Telegram inbound authorization.
-    webhook.add_notification_chat_id(notify_id)
 
     await update.message.reply_text(f"GitHub notifications will go to chat {notify_id}.")
 
@@ -3187,7 +3114,7 @@ async def handle_github(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if subcommand == "notify":
-        await _handle_github_notify(update, chat_id, args[1:], config)
+        await _handle_github_notify(update, chat_id, args[1:])
         return
 
     if subcommand == "reviews":

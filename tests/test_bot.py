@@ -31,7 +31,6 @@ from kai.bot import (
     _handle_workspace_config,
     _handle_workspace_deny,
     _is_authorized,
-    _is_notify_chat_used,
     _models_keyboard,
     _reply_safe,
     _require_auth,
@@ -1261,12 +1260,16 @@ class TestHandleStop:
         update = _make_update(chat_id=1, user_id=1)
         ctx = _make_context(claude=pool, config=_make_config(allowed_user_ids={1}))
         execution = MagicMock()
-        execution.request_cancellation = AsyncMock(return_value=CanonicalCancellationDisposition.REQUESTED)
+        execution.request_transport_cancellation = AsyncMock(return_value=CanonicalCancellationDisposition.REQUESTED)
         ctx.application.core_services.private_text_execution = execution
 
         await handle_stop(update, ctx)
 
-        execution.request_cancellation.assert_awaited_once_with(telegram_user_id=1, telegram_chat_id=1)
+        execution.request_transport_cancellation.assert_awaited_once_with(
+            transport="telegram",
+            sender_subject="1",
+            channel_subject="1",
+        )
         pool.force_kill.assert_not_called()
         assert update.message.reply_text.await_args.args[0] == "Stopping..."
 
@@ -4206,7 +4209,7 @@ class TestHandleGitHub:
 
     @pytest.mark.asyncio
     async def test_notify_set(self):
-        """/github notify 123456 sets notification chat and updates live set."""
+        """/github notify 123456 persists the adapter-owned destination."""
         update = _make_update(text="/github notify 123456")
         config = _make_config()
         ctx = _make_context(config=config, args=["notify", "123456"])
@@ -4218,14 +4221,10 @@ class TestHandleGitHub:
         # No existing notify setting (fresh set)
         mock_sessions.get_setting = AsyncMock(return_value=None)
 
-        with (
-            patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.webhook.add_notification_chat_id") as mock_add,
-        ):
+        with patch("kai.bot.sessions", mock_sessions):
             await handle_github(update, ctx)
 
         mock_sessions.set_setting.assert_called_once_with("github_notify_chat:12345", "123456")
-        mock_add.assert_called_once_with(123456)
         reply = update.message.reply_text.call_args[0][0]
         assert "123456" in reply
         # Fix removes the restart requirement
@@ -4353,230 +4352,6 @@ class TestHandleGitHub:
 
         reply = update.message.reply_text.call_args[0][0]
         assert "unknown subcommand" in reply.lower()
-
-    # ── 11. /github notify - live notification destination updates ────────
-
-    @pytest.mark.asyncio
-    async def test_notify_set_updates_notification_destinations(self):
-        """/github notify -100999 adds the group to notification destinations immediately."""
-        update = _make_update(text="/github notify -100999")
-        config = _make_config()
-        ctx = _make_context(config=config, args=["notify", "-100999"])
-        mock_sessions = AsyncMock()
-        mock_sessions.set_setting = AsyncMock()
-        # No existing notify setting (fresh set)
-        mock_sessions.get_setting = AsyncMock(return_value=None)
-
-        with (
-            patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.webhook.add_notification_chat_id") as mock_add,
-        ):
-            await handle_github(update, ctx)
-
-        mock_sessions.set_setting.assert_called_once_with("github_notify_chat:12345", "-100999")
-        mock_add.assert_called_once_with(-100999)
-        reply = update.message.reply_text.call_args[0][0]
-        assert "restart" not in reply.lower()
-
-    @pytest.mark.asyncio
-    async def test_notify_set_overwrite_cleans_up_old(self):
-        """Overwriting a notify destination removes the old outbound destination.
-
-        Without this cleanup, the old chat_id would linger in the live
-        outbound notification registry until restart.
-        """
-        update = _make_update(text="/github notify -100888")
-        config = _make_config()
-        ctx = _make_context(config=config, args=["notify", "-100888"])
-        mock_sessions = AsyncMock()
-        mock_sessions.set_setting = AsyncMock()
-        # Existing notify setting points to a different group chat
-        mock_sessions.get_setting = AsyncMock(return_value="-100999")
-
-        with (
-            patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.webhook.add_notification_chat_id") as mock_add,
-            patch("kai.bot.webhook.remove_notification_chat_id") as mock_remove,
-            patch("kai.bot._is_notify_chat_used", new_callable=AsyncMock, return_value=False),
-        ):
-            await handle_github(update, ctx)
-
-        # Old destination removed, new one added
-        mock_remove.assert_called_once_with(-100999)
-        mock_add.assert_called_once_with(-100888)
-
-    @pytest.mark.asyncio
-    async def test_notify_set_overwrite_skips_cleanup_when_shared(self):
-        """Overwriting a notify destination keeps the old chat_id if another user uses it."""
-        update = _make_update(text="/github notify -100888")
-        config = _make_config()
-        ctx = _make_context(config=config, args=["notify", "-100888"])
-        mock_sessions = AsyncMock()
-        mock_sessions.set_setting = AsyncMock()
-        mock_sessions.get_setting = AsyncMock(return_value="-100999")
-
-        with (
-            patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.webhook.add_notification_chat_id") as mock_add,
-            patch("kai.bot.webhook.remove_notification_chat_id") as mock_remove,
-            # Another user still uses the old chat_id
-            patch("kai.bot._is_notify_chat_used", new_callable=AsyncMock, return_value=True),
-        ):
-            await handle_github(update, ctx)
-
-        # Old destination kept (still used), new one added
-        mock_remove.assert_not_called()
-        mock_add.assert_called_once_with(-100888)
-
-    @pytest.mark.asyncio
-    async def test_notify_set_overwrite_same_value_no_cleanup(self):
-        """Setting the same notify destination again does not trigger cleanup."""
-        update = _make_update(text="/github notify -100999")
-        config = _make_config()
-        ctx = _make_context(config=config, args=["notify", "-100999"])
-        mock_sessions = AsyncMock()
-        mock_sessions.set_setting = AsyncMock()
-        # Same value already stored
-        mock_sessions.get_setting = AsyncMock(return_value="-100999")
-
-        with (
-            patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.webhook.add_notification_chat_id") as mock_add,
-            patch("kai.bot.webhook.remove_notification_chat_id") as mock_remove,
-        ):
-            await handle_github(update, ctx)
-
-        # No removal needed (same value), just re-add (idempotent)
-        mock_remove.assert_not_called()
-        mock_add.assert_called_once_with(-100999)
-
-    @pytest.mark.asyncio
-    async def test_notify_reset_removes_from_notification_destinations(self):
-        """/github notify reset removes the old outbound notification destination."""
-        update = _make_update(text="/github notify reset")
-        config = _make_config()
-        ctx = _make_context(config=config, args=["notify", "reset"])
-        mock_sessions = AsyncMock()
-        # Simulate an existing notify setting pointing to a group chat
-        mock_sessions.get_setting = AsyncMock(return_value="-100999")
-        mock_sessions.delete_setting = AsyncMock()
-
-        with (
-            patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.webhook.remove_notification_chat_id") as mock_remove,
-            patch("kai.bot._is_notify_chat_used", new_callable=AsyncMock, return_value=False),
-        ):
-            await handle_github(update, ctx)
-
-        mock_sessions.delete_setting.assert_called_once_with("github_notify_chat:12345")
-        mock_remove.assert_called_once_with(-100999)
-
-    @pytest.mark.asyncio
-    async def test_notify_reset_skips_removal_when_shared(self):
-        """/github notify reset does NOT remove a chat_id still used by another user."""
-        update = _make_update(text="/github notify reset")
-        config = _make_config()
-        ctx = _make_context(config=config, args=["notify", "reset"])
-        mock_sessions = AsyncMock()
-        mock_sessions.get_setting = AsyncMock(return_value="-100999")
-        mock_sessions.delete_setting = AsyncMock()
-
-        with (
-            patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.webhook.remove_notification_chat_id") as mock_remove,
-            # Another user still uses this chat_id
-            patch("kai.bot._is_notify_chat_used", new_callable=AsyncMock, return_value=True),
-        ):
-            await handle_github(update, ctx)
-
-        mock_sessions.delete_setting.assert_called_once()
-        mock_remove.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_notify_reset_self_id_skips_removal(self):
-        """/github notify reset does NOT remove the user's own chat_id.
-
-        This guard keeps the user's own authorized chat out of outbound
-        notification cleanup.
-        """
-        update = _make_update(text="/github notify reset")
-        config = _make_config()
-        ctx = _make_context(config=config, args=["notify", "reset"])
-        mock_sessions = AsyncMock()
-        # The user previously set their own telegram_id (12345) as the target
-        mock_sessions.get_setting = AsyncMock(return_value="12345")
-        mock_sessions.delete_setting = AsyncMock()
-
-        with (
-            patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.webhook.remove_notification_chat_id") as mock_remove,
-        ):
-            await handle_github(update, ctx)
-
-        mock_sessions.delete_setting.assert_called_once()
-        # The self-ID guard fires before _is_notify_chat_used is even called
-        mock_remove.assert_not_called()
-
-
-# ── _is_notify_chat_used ──────────────────────────────────────────
-
-
-class TestIsNotifyChatUsed:
-    """Tests for _is_notify_chat_used helper.
-
-    Verifies detection of shared notify chat_ids across users.yaml,
-    database settings, and the global env var fallback.
-    """
-
-    @pytest.mark.asyncio
-    async def test_yaml_match(self):
-        """Returns True when another user in users.yaml uses the chat_id."""
-        from kai.config import UserConfig
-
-        user_a = UserConfig(telegram_id=111, name="alice")
-        user_b = UserConfig(telegram_id=222, name="bob", github_notify_chat_id=-100999)
-        config = _make_config(user_configs={111: user_a, 222: user_b})
-
-        mock_sessions = AsyncMock()
-        mock_sessions.get_setting = AsyncMock(return_value=None)
-
-        with patch("kai.bot.sessions", mock_sessions):
-            result = await _is_notify_chat_used(-100999, exclude_user=111, config=config)
-        assert result is True
-
-    @pytest.mark.asyncio
-    async def test_db_match(self):
-        """Returns True when another user's DB setting uses the chat_id."""
-        from kai.config import UserConfig
-
-        user_a = UserConfig(telegram_id=111, name="alice")
-        user_b = UserConfig(telegram_id=222, name="bob")
-        config = _make_config(user_configs={111: user_a, 222: user_b})
-
-        mock_sessions = AsyncMock()
-        # User B has the notify target in the DB
-        mock_sessions.get_setting = AsyncMock(
-            side_effect=lambda key: "-100999" if key == "github_notify_chat:222" else None
-        )
-
-        with patch("kai.bot.sessions", mock_sessions):
-            result = await _is_notify_chat_used(-100999, exclude_user=111, config=config)
-        assert result is True
-
-    @pytest.mark.asyncio
-    async def test_no_match(self):
-        """Returns False when no other source references the chat_id."""
-        from kai.config import UserConfig
-
-        user_a = UserConfig(telegram_id=111, name="alice")
-        config = _make_config(user_configs={111: user_a})
-
-        mock_sessions = AsyncMock()
-        mock_sessions.get_setting = AsyncMock(return_value=None)
-
-        with patch("kai.bot.sessions", mock_sessions):
-            result = await _is_notify_chat_used(-100999, exclude_user=111, config=config)
-        assert result is False
 
 
 # ── /model persistence ─────────────────────────────────────────────

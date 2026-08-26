@@ -154,17 +154,22 @@ class TestWorkshopPrincipalStorageRegistry:
 
 
 class TestWorkshopChannelHistoryRegistry:
-    async def test_resolves_transport_and_runtime_keys_to_canonical_channel(
+    async def test_resolves_archived_runtime_keys_to_canonical_channel(
         self,
         tmp_path: Path,
     ):
         store = await _store(tmp_path / "kai.db")
         try:
+            expected_channel = await _channel_for_telegram_subject(store, "101")
+            await store.connection.execute(
+                "UPDATE channel_bindings SET external_channel_id = 'dormant-invalid-value' WHERE channel_id = ?",
+                (expected_channel,),
+            )
+            await store.connection.commit()
             registry = await WorkshopChannelHistoryRegistry.from_store(
                 store,
                 profile_registry(101, 202),
             )
-            expected_channel = await _channel_for_telegram_subject(store, "101")
             namespace = registry.for_compatibility_chat_id(101)
 
             assert namespace.channel_id == expected_channel

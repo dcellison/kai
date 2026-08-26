@@ -265,12 +265,11 @@ class TestLoadConfigDefaults:
         assert config.telegram_webhook_url is None
         assert config.telegram_webhook_secret is None
 
-    def test_workshop_only_rejects_a_present_malformed_users_file(self, monkeypatch):
+    def test_workshop_only_ignores_a_present_malformed_users_file(self, monkeypatch):
         monkeypatch.setenv("KAI_ENABLED_ADAPTERS", "workshop")
         _patch_protected_users_yaml(monkeypatch, "users: invalid\n")
 
-        with pytest.raises(SystemExit, match=r"users\.yaml"):
-            load_config()
+        assert load_config().user_configs == {}
 
     def test_telegram_only_does_not_enable_workshop(self, monkeypatch):
         _set_required(monkeypatch)
@@ -916,7 +915,7 @@ class TestDualModeLoading:
 
 
 class TestProtectedUserIsolation:
-    def test_workshop_only_protected_install_rejects_unreadable_users_yaml(self, monkeypatch):
+    def test_workshop_only_protected_install_ignores_unreadable_users_yaml(self, monkeypatch):
         monkeypatch.setenv("KAI_ENABLED_ADAPTERS", "workshop")
 
         def protected_reader(path):
@@ -930,8 +929,7 @@ class TestProtectedUserIsolation:
             lambda path, **kwargs: path == "/etc/kai/users.yaml",
         )
 
-        with pytest.raises(SystemExit, match=r"users\.yaml"):
-            load_config()
+        assert load_config().user_configs == {}
 
     def test_protected_install_requires_os_user(self, monkeypatch):
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake-token")

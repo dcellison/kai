@@ -46,7 +46,6 @@ import hmac
 import json
 import logging
 import os
-import re
 import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import asdict
@@ -124,20 +123,12 @@ log = logging.getLogger(__name__)
 # which cannot express `T | None` at runtime); the variable
 # annotation carries the type narrowing the call sites rely on.
 
-ALLOWED_USER_IDS_KEY: web.AppKey[set[int]] = web.AppKey("allowed_user_ids", set)
 ALLOWED_WORKSPACES_KEY: web.AppKey[list[str]] = web.AppKey("allowed_workspaces", list)
-CHAT_ID_KEY: web.AppKey[int] = web.AppKey("chat_id", int)
 CONFIG_KEY: web.AppKey[Config] = web.AppKey("config", Config)
 CORE_HOST_KEY: web.AppKey[KaiApplicationHost] = web.AppKey("core_host", KaiApplicationHost)
 GENERIC_WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("generic_webhook_secret", str)
 GITHUB_WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("github_webhook_secret", str)
 INTERNAL_API_AUTH_KEY: web.AppKey[InternalAPIAuth] = web.AppKey("internal_api_auth", InternalAPIAuth)
-NOTIFICATION_CHAT_IDS_KEY: web.AppKey[set[int]] = web.AppKey("notification_chat_ids", set)
-# Compatibility-only app keys retained for older API fixtures. The shared HTTP
-# host neither populates nor reads these; Telegram owns its concrete state.
-TELEGRAM_APP_KEY: web.AppKey[object] = web.AppKey("telegram_app", object)
-TELEGRAM_BOT_KEY: web.AppKey[object] = web.AppKey("telegram_bot", object)
-TELEGRAM_WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("telegram_webhook_secret", str)
 WORKSPACE_BASE_KEY: web.AppKey[str | None] = web.AppKey("workspace_base")
 WORKSHOP_PRINCIPAL_STORAGE_KEY: web.AppKey[WorkshopPrincipalStorageRegistry] = web.AppKey(
     "workshop_principal_storage", WorkshopPrincipalStorageRegistry
@@ -199,27 +190,6 @@ async def _resolve_local_repo(repo_full_name: str, app: web.Application) -> str 
             return str(path)
 
     return None
-
-
-def _strip_markdown(text: str) -> str:
-    """
-    Remove markdown syntax so text reads cleanly as plain Telegram text.
-
-    Used as a fallback when Telegram's Markdown parser rejects a message
-    (e.g., unbalanced backticks or brackets). Converts links to "text (url)"
-    format and strips bold, italic, and code markers.
-
-    Args:
-        text: Markdown-formatted string.
-
-    Returns:
-        The same text with markdown syntax removed.
-    """
-    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", text)  # [text](url) → text (url)
-    text = text.replace("**", "").replace("__", "")  # bold
-    text = text.replace("`", "")  # inline code
-    text = re.sub(r"(?<!\w)_(\S.*?\S)_(?!\w)", r"\1", text)  # _italic_ but not snake_case
-    return text
 
 
 def _require_generic_webhook_secret(handler):
@@ -1898,14 +1868,7 @@ async def start(
         raise RuntimeError("Subprocess pool did not provide an internal API credential store")
     _app[INTERNAL_API_AUTH_KEY] = internal_api_auth
 
-    # Keep notification destinations separate from Config.allowed_user_ids,
-    # which is the immutable-at-runtime source for Telegram inbound auth. The
-    # API no longer consults this set for identity; credentials resolve their
-    # principal server-side.
-    _app[ALLOWED_USER_IDS_KEY] = set(config.allowed_user_ids)
-    _app[NOTIFICATION_CHAT_IDS_KEY] = set()
-
-    # Retain the loaded application configuration for compatibility APIs.
+    # Retain loaded configuration for transport-neutral service policy.
     _app[CONFIG_KEY] = config
 
     # Workspace policy lets canonical review work resolve a local checkout for
@@ -1914,25 +1877,6 @@ async def start(
     _app[WORKSPACE_BASE_KEY] = str(config.workspace_base) if config.workspace_base else None
     _app[ALLOWED_WORKSPACES_KEY] = [str(p) for p in config.allowed_workspaces]
 
-    # Maintain the legacy live notification-destination registry from both
-    # users.yaml and DB. This set is intentionally detached from Config's
-    # inbound Telegram principals and is not consulted by internal API auth.
-    for uc in config.user_configs.values():
-        if uc.github_notify_chat_id is not None:
-            _app[NOTIFICATION_CHAT_IDS_KEY].add(uc.github_notify_chat_id)
-    # Also add any DB-stored notify chat IDs (set via /github notify).
-    # webhook.start() is already async so the await is fine.
-    for uid in config.user_configs:
-        val = await sessions.get_setting(f"github_notify_chat:{uid}")
-        if val:
-            try:
-                _app[NOTIFICATION_CHAT_IDS_KEY].add(int(val))
-            except ValueError:
-                log.warning(
-                    "Invalid github_notify_chat for user %s in DB: %s (ignoring)",
-                    uid,
-                    val,
-                )
     _register_routes(_app, config)
     for register_routes in route_registrars:
         register_routes(_app)
@@ -2011,41 +1955,3 @@ def is_running() -> bool:
 def is_workshop_lan_running() -> bool:
     """True if the dedicated Workshop LAN listener is currently running."""
     return _workshop_lan_runner is not None
-
-
-def add_notification_chat_id(chat_id: int) -> None:
-    """
-    Add a chat_id to the live notification-destination registry.
-
-    Called by bot.py when /github notify sets a new notification
-    destination. This registry never grants Telegram or internal API
-    authority; those identities come from users.yaml and API credentials.
-    """
-    if _app is not None:
-        notification_chat_ids = _app.get(NOTIFICATION_CHAT_IDS_KEY)
-        if notification_chat_ids is not None:
-            notification_chat_ids.add(chat_id)
-
-
-def remove_notification_chat_id(chat_id: int) -> None:
-    """
-    Remove a chat_id from the live notification registry, but only
-    if it does not belong to an actual authorized user.
-
-    Called by bot.py when /github notify reset clears a notification
-    destination. A user's own telegram_id must never be removed.
-
-    Config.allowed_user_ids is deliberately a different set object so
-    notification changes cannot mutate inbound Telegram authorization.
-    user_configs remains the immutable source for the preservation guard.
-    """
-    if _app is not None:
-        notification_chat_ids = _app.get(NOTIFICATION_CHAT_IDS_KEY)
-        if notification_chat_ids is None:
-            return
-        # Never remove a chat_id that belongs to an actual user.
-        # user_configs keys are telegram_ids of real users.
-        config = _app.get(CONFIG_KEY)
-        if config and chat_id in config.user_configs:
-            return
-        notification_chat_ids.discard(chat_id)

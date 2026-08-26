@@ -18,16 +18,11 @@ from kai.internal_api_auth import InternalAPIAuth, InternalAPIPrincipal, Interna
 from kai.services import ServiceResponse
 from kai.telegram_http import TelegramWebhookIngress
 from kai.webhook import (
-    ALLOWED_USER_IDS_KEY,
-    CHAT_ID_KEY,
     CONFIG_KEY,
     CORE_HOST_KEY,
     GENERIC_WEBHOOK_SECRET_KEY,
     GITHUB_WEBHOOK_SECRET_KEY,
     INTERNAL_API_AUTH_KEY,
-    TELEGRAM_APP_KEY,
-    TELEGRAM_BOT_KEY,
-    TELEGRAM_WEBHOOK_SECRET_KEY,
     WORKSHOP_GITHUB_AUTOMATION_KEY,
     WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY,
     WORKSHOP_PRINCIPAL_STORAGE_KEY,
@@ -55,6 +50,14 @@ from kai.workshop.storage_namespaces import (
     WorkshopPrincipalStorageRegistry,
 )
 from tests.workshop_profiles import profile_id
+
+# Adapter fixtures own their state. The shared HTTP host deliberately exports
+# no Telegram application or identity keys.
+ALLOWED_USER_IDS_KEY: web.AppKey[set[int]] = web.AppKey("test_allowed_user_ids", set)
+CHAT_ID_KEY: web.AppKey[int] = web.AppKey("test_chat_id", int)
+TELEGRAM_APP_KEY: web.AppKey[object] = web.AppKey("test_telegram_app", object)
+TELEGRAM_BOT_KEY: web.AppKey[object] = web.AppKey("test_telegram_bot", object)
+TELEGRAM_WEBHOOK_SECRET_KEY: web.AppKey[str] = web.AppKey("test_telegram_secret", str)
 
 
 def _make_internal_api_auth() -> InternalAPIAuth:

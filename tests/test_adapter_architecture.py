@@ -80,3 +80,30 @@ def test_composition_root_loads_telegram_adapter_only_when_enabled() -> None:
     assert 'import_module("kai.telegram_adapter")' in main_source
     assert "from kai.telegram_adapter" not in main_source
     assert "import kai.telegram_adapter" not in main_source
+
+
+def test_core_identity_and_cancellation_services_are_transport_generic() -> None:
+    for relative in (
+        "workshop/client_access.py",
+        "workshop/private_text_execution.py",
+        "workshop/storage_namespaces.py",
+    ):
+        source = (SOURCE_ROOT / relative).read_text()
+        assert "telegram" not in source.lower(), relative
+
+
+def test_shared_http_host_exports_no_telegram_application_state() -> None:
+    source = (SOURCE_ROOT / "webhook.py").read_text()
+
+    assert "TELEGRAM_APP_KEY" not in source
+    assert "TELEGRAM_BOT_KEY" not in source
+    assert "TELEGRAM_WEBHOOK_SECRET_KEY" not in source
+    assert "NOTIFICATION_CHAT_IDS_KEY" not in source
+    assert "CHAT_ID_KEY" not in source
+
+
+def test_workshop_package_does_not_export_adapter_preview_types() -> None:
+    source = (SOURCE_ROOT / "workshop" / "__init__.py").read_text()
+
+    assert "streaming_preview" not in source
+    assert "TelegramStreamingPreview" not in source
