@@ -141,6 +141,7 @@ async def bootstrap_default_workshop(
     humans: Iterable[BootstrapHuman],
     *,
     notification_channels: Iterable[BootstrapNotificationChannel] = (),
+    workshop_id: WorkshopId | None = None,
 ) -> BootstrapResult:
     """Seed one Workshop and its configured humans without changing routing."""
     ordered_humans = sorted(humans, key=lambda human: (human.transport, human.external_subject))
@@ -150,6 +151,7 @@ async def bootstrap_default_workshop(
     )
     seen_identities: set[tuple[str, str]] = set()
     seen_channels: set[tuple[str, str]] = set()
+    existing_identity_principals: dict[tuple[str, str], PrincipalId] = {}
     for human in ordered_humans:
         identity = (human.transport, human.external_subject)
         channel = (human.transport, human.external_channel_id)
@@ -165,8 +167,17 @@ async def bootstrap_default_workshop(
             raise ValueError(f"Duplicate bootstrap external channel for transport {channel.transport!r}")
         seen_channels.add(identity)
         for subject in channel.member_external_subjects:
-            if (channel.transport, subject) not in seen_identities:
+            member_identity = (channel.transport, subject)
+            if member_identity in seen_identities:
+                continue
+            async with store.connection.execute(
+                "SELECT principal_id FROM external_identities WHERE provider = ? AND external_subject = ?",
+                member_identity,
+            ) as cursor:
+                identity_rows = list(await cursor.fetchall())
+            if len(identity_rows) != 1:
                 raise ValueError("Notification channel member must reference a configured external identity")
+            existing_identity_principals[member_identity] = PrincipalId(str(identity_rows[0][0]))
 
     created_events = 0
     existing_events = 0
@@ -174,7 +185,7 @@ async def bootstrap_default_workshop(
     workshop_key = _idempotency_key("workshop", "default")
     workshop_event = await store.event_by_idempotency_key(workshop_key)
     if workshop_event is None:
-        workshop_id = WorkshopId.new()
+        workshop_id = workshop_id or WorkshopId.new()
         result = await store.append(
             EventEnvelope.create(
                 event_type=WorkshopEventType.WORKSHOP_CREATED,
@@ -195,7 +206,10 @@ async def bootstrap_default_workshop(
         existing_events += 1
     if not isinstance(workshop_event.envelope.aggregate_id, WorkshopId):
         raise RuntimeError("Default Workshop bootstrap event has the wrong aggregate type")
-    workshop_id = workshop_event.envelope.aggregate_id
+    resolved_workshop_id = workshop_event.envelope.aggregate_id
+    if workshop_id is not None and resolved_workshop_id != workshop_id:
+        raise RuntimeError("Configured initial Workshop ID conflicts with existing canonical state")
+    workshop_id = resolved_workshop_id
 
     async def ensure(**kwargs) -> StoredEvent:
         nonlocal created_events, existing_events
@@ -384,11 +398,15 @@ async def bootstrap_default_workshop(
         )
         for subject in sorted(notification.member_external_subjects):
             human_token = _stable_token(notification.transport, subject)
-            principal_id = bootstrap_human_principal_id(
-                workshop_id,
-                notification.transport,
-                subject,
-            )
+            existing_principal = existing_identity_principals.get((notification.transport, subject))
+            if existing_principal is not None:
+                principal_id = existing_principal
+            else:
+                principal_id = bootstrap_human_principal_id(
+                    workshop_id,
+                    notification.transport,
+                    subject,
+                )
             membership_id = ChannelMembershipId.derived(
                 workshop_id,
                 f"notification-channel-membership:{channel_token}:human:{human_token}",

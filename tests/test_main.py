@@ -85,6 +85,20 @@ class TestWorkshopBootstrapMapping:
         assert humans[0].runtime_profile_id == profile_id(101)
         assert "-999" not in repr(humans)
 
+    def test_explicit_runtime_profile_link_is_not_rebootstrapped_as_a_human(self):
+        config = SimpleNamespace(
+            user_configs={
+                101: UserConfig(
+                    telegram_id=101,
+                    name="Admin",
+                    role="admin",
+                    runtime_profile_id=str(profile_id(101)),
+                )
+            }
+        )
+
+        assert _workshop_bootstrap_humans(config, profile_registry(101)) == ()
+
     async def test_effective_negative_destinations_become_deduplicated_notification_channels(self):
         config = SimpleNamespace(
             user_configs={

@@ -87,12 +87,19 @@ make config
 The client-mode choices are explicit and reversible:
 
 - `hybrid` enables Workshop and Telegram and is the upgrade-safe default;
-- `workshop-only` switches an existing protected installation with canonical humans and runtime profiles to the browser client without constructing a Telegram application, contacting Telegram, or retaining a bot token;
+- `workshop-only` runs the browser client without constructing a Telegram application, contacting Telegram, or requiring a bot token;
 - `telegram-only` runs Telegram without publishing Workshop client routes.
 
 Re-run `make config`, select a different client mode, and apply the installation to change modes. Existing configurations without an explicit client-mode setting remain hybrid. `make install-status` reports both the deployed policy and the current `install.conf` artifact without exposing the Telegram token.
 
-The initial Workshop-only qualification is deliberately an installed-mode switch, not a fresh-host bootstrap path. Fresh protected and single-user Workshop-only provisioning still needs a canonical administration flow for creating the first human and runtime assignment; the wizard refuses those incomplete combinations instead of generating a configuration that cannot start.
+On a fresh Workshop-only configuration, the wizard creates one canonical admin,
+the Kai agent and direct channel, and a protected runtime profile and assignment.
+It prints a one-time browser enrollment token after single-user configuration or
+after a protected install reaches full readiness. The token is shown once; Kai
+stores only its hash. Enabling Telegram later links the configured Telegram
+identity to that same canonical human, channel, and runtime profile rather than
+creating a second account. Disabling Telegram again leaves that canonical state
+intact.
 
 For a `single_user` deployment, `make config` also writes the runtime files under the operator's account. Start Kai from the checkout:
 
@@ -111,12 +118,14 @@ make install-status
 `make install` invokes `sudo` internally and installs source, data, and secrets under separate protected system directories. It also generates the admin-owned `/etc/kai/backends.yaml` registry containing the discovered executable paths, allowed model surfaces, and selected default backend. Runtime configuration names backend identifiers; it cannot redirect a protected backend to an arbitrary executable. After a successful protected install, `install.conf` may be deleted because it can contain secrets; re-run `make config` before a later reconfiguration.
 
 On the first protected install, Kai seeds `/etc/kai/runtime-profiles.yaml`
-from the configured humans. After that file exists, it is the independent
+from the canonical Workshop admin or configured Telegram humans. After that
+file exists, it is the independent
 authority for each Workshop runtime's backend, provider, model baseline,
 timeout, OS execution user, service grants, and workspace policy. Later edits
 to duplicated execution fields in `users.yaml` do not replace or veto the
-protected profile. `users.yaml` remains the Telegram-human bootstrap and
-integration-policy input during the Workshop migration.
+protected profile. `users.yaml` is optional when Telegram is disabled. When
+Telegram is enabled, it defines Telegram authorization and links those external
+identities to canonical Workshop runtime profiles.
 
 Edit an installed runtime profile with `sudoedit`, validate it with
 `make install-status`, then run `make install` to reconcile OS-owned storage

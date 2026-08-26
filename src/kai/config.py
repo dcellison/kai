@@ -16,6 +16,7 @@ import ipaddress
 import logging
 import os
 import pwd
+import re
 import secrets
 import subprocess
 from collections.abc import Callable
@@ -1316,6 +1317,9 @@ class UserConfig:
         role: "admin" or "user". Admins receive unattributed webhooks.
         github: GitHub username for webhook actor routing.
         os_user: OS username for subprocess isolation (Phase 3).
+        runtime_profile_id: Canonical protected runtime profile linked to this
+            external Telegram identity. Set by the installer when Telegram is
+            added to an existing Workshop-only deployment.
         home_workspace: Per-user home workspace directory.
         model: Default model name (e.g., "opus", "sonnet", "haiku").
         timeout: Default timeout in seconds for Claude responses.
@@ -1336,6 +1340,7 @@ class UserConfig:
     role: str = "user"
     github: str | None = None
     os_user: str | None = None
+    runtime_profile_id: str | None = None
     home_workspace: Path | None = None
     model: str | None = None
     timeout: int | None = None
@@ -1421,6 +1426,8 @@ class Config:
             Only used in webhook mode. Generated for the process when not explicitly set.
         allowed_user_ids: Telegram user IDs permitted to interact with the bot;
             empty when the Telegram adapter is disabled and no users file exists.
+        initial_workshop_provisioning: Opaque installer-managed policy for the
+            first canonical Workshop admin and protected runtime profile.
         default_model: Default model name, provider-dependent (e.g. sonnet, gpt-5.5-pro, gemini-2.5-pro)
         default_timeout: Seconds before an agent response is considered timed
             out, on every backend
@@ -1449,6 +1456,7 @@ class Config:
     # Explicit human-facing adapter policy. The default preserves the client
     # surfaces used by installations created before this policy existed.
     enabled_adapters: frozenset[str] = field(default_factory=lambda: DEFAULT_CLIENT_ADAPTERS)
+    initial_workshop_provisioning: str | None = None
 
     # Telegram transport mode: set telegram_webhook_url to use webhook mode,
     # leave as None to fall back to long-polling. The secret is only needed
@@ -2480,13 +2488,12 @@ def _load_user_configs(
     Reads via `_read_users_yaml`, which routes `/etc/kai/users.yaml`
     through the sudo-cat shim and any other path (XDG single-user,
     `KAI_USERS_YAML` override) through a direct `Path.read_text`.
-    users.yaml is mandatory: any failure raises SystemExit with a
-    message naming the resolved path. There is no None return path
-    and no fallback to ALLOWED_USER_IDS at runtime. The fail-closed
-    shape is load-bearing for the daemon's auth contract: a
-    malformed or unreadable users file must not silently degrade to
-    env-only auth, because the wizard and the runtime would then
-    disagree about whose value wins.
+    When this loader is called, users.yaml is required and any failure
+    raises SystemExit with a message naming the resolved path. The
+    caller skips it only when Telegram is disabled and no users file
+    exists. A present malformed or unreadable file still fails closed;
+    it must not silently degrade to env-only auth because the wizard
+    and runtime would then disagree about whose value wins.
 
     Failure cases (each raises SystemExit):
         - File absent: error names the path and points at `make config`.
@@ -2609,6 +2616,13 @@ def _load_user_configs(
         os_user = entry.get("os_user")
         if os_user is not None:
             os_user = str(os_user).strip() or None
+
+        raw_runtime_profile_id = entry.get("runtime_profile_id")
+        runtime_profile_id: str | None = None
+        if raw_runtime_profile_id is not None:
+            runtime_profile_id = str(raw_runtime_profile_id).strip()
+            if re.fullmatch(r"rtp_[0-9a-f]{32}", runtime_profile_id) is None:
+                raise SystemExit(f"users.yaml: user '{name}' has an invalid runtime_profile_id")
 
         # Validate home_workspace. Warn but don't skip the user if
         # the directory doesn't exist - it may be on an unmounted drive
@@ -3023,6 +3037,7 @@ def _load_user_configs(
             role=role,
             github=github,
             os_user=os_user,
+            runtime_profile_id=runtime_profile_id,
             home_workspace=home_workspace,
             model=model,
             timeout=user_timeout,
@@ -3092,6 +3107,17 @@ def load_config() -> Config:
         enabled_adapters = parse_enabled_adapters(os.environ.get("KAI_ENABLED_ADAPTERS"))
     except ValueError as exc:
         raise SystemExit(f"KAI_ENABLED_ADAPTERS {exc}") from None
+    initial_workshop_provisioning = os.environ.get("KAI_WORKSHOP_BOOTSTRAP", "").strip() or None
+    if initial_workshop_provisioning is not None:
+        from kai.workshop.initial_provisioning import (
+            WorkshopInitialProvisioningError,
+            parse_initial_provisioning,
+        )
+
+        try:
+            parse_initial_provisioning(initial_workshop_provisioning)
+        except WorkshopInitialProvisioningError as exc:
+            raise SystemExit(str(exc)) from None
 
     # Telegram credentials are adapter configuration, not host credentials.
     # Keeping a token in protected storage while the adapter is disabled must
@@ -3547,12 +3573,12 @@ def load_config() -> Config:
     # explicit override for tests and ad-hoc development; the operator
     # path is always one of the two resolved defaults.
     users_yaml_path = _resolve_users_yaml_path(bool(protected_env))
-    if telegram_enabled or protected_env:
+    if telegram_enabled:
         user_configs = _load_user_configs(default_backend, default_provider, users_yaml_path)
     else:
-        # Direct development can omit Telegram identities when the adapter is
-        # disabled. Protected installs retain their existing, real identity
-        # mappings during this installed qualification slice.
+        # Telegram identity policy is optional when that adapter is disabled.
+        # A present malformed file still fails closed, regardless of deployment
+        # mode; an absent file leaves canonical Workshop identity untouched.
         raw_users = _read_users_yaml(users_yaml_path)
         if raw_users is None:
             user_configs = {}
@@ -3789,6 +3815,7 @@ def load_config() -> Config:
         telegram_webhook_secret=telegram_webhook_secret,
         allowed_user_ids=allowed_ids,
         enabled_adapters=enabled_adapters,
+        initial_workshop_provisioning=initial_workshop_provisioning,
         default_model=default_model,
         default_models=default_models,
         default_timeout=default_timeout,
