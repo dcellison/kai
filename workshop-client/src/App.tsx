@@ -6,6 +6,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -47,6 +48,7 @@ import type { EarlierHistoryState } from "./useWorkshopTimeline";
 import { MarkdownMessage } from "./MarkdownMessage";
 import { startArtifactDownload } from "./artifactDownload";
 import { MemoryExplorer } from "./MemoryExplorer";
+import { SettingsWorkspace } from "./SettingsWorkspace";
 
 const SESSION_KEY = "kai.workshop.read-session.v1";
 const ACTIVE_RUN_KEY = "kai.workshop.active-run.v1";
@@ -62,10 +64,14 @@ const MEMORY_ID_PATTERN = /^[A-Za-z0-9_-]{1,256}$/;
 
 type WorkshopDestination =
   | { kind: "conversation" }
-  | { kind: "memory"; memoryId: string | null };
+  | { kind: "memory"; memoryId: string | null }
+  | { kind: "settings" };
 
 function destinationFromLocation(): WorkshopDestination {
   const parameters = new URLSearchParams(window.location.search);
+  if (parameters.get("view") === "settings") {
+    return { kind: "settings" };
+  }
   if (parameters.get("view") !== "memory") {
     return { kind: "conversation" };
   }
@@ -88,6 +94,8 @@ function writeDestination(
     if (destination.memoryId) {
       url.searchParams.set("memory", destination.memoryId);
     }
+  } else if (destination.kind === "settings") {
+    url.searchParams.set("view", "settings");
   }
   window.history[mode === "push" ? "pushState" : "replaceState"](
     null,
@@ -780,6 +788,9 @@ function WorkshopView({
   messages,
   memoryDestination,
   memoryToken,
+  settingsDestination,
+  settingsRuntimeLabel,
+  settingsSession,
   navigation,
   runActivity,
   runPreview,
@@ -795,10 +806,13 @@ function WorkshopView({
   onLoadSettingsWorkspace,
   onMemoryAuthenticationFailure,
   onOpenMemory,
+  onOpenSettings,
   onSelectMemory,
   onSelectChannel,
   onSubmitCommand,
   onSwitchWorkspace,
+  onSettingsDirtyChange,
+  onSettingsAccessFailure,
 }: {
   channel: WorkshopChannelSummary;
   connection: ConnectionState;
@@ -806,6 +820,9 @@ function WorkshopView({
   messages: TimelineMessage[];
   memoryDestination: { memoryId: string | null } | null;
   memoryToken: string;
+  settingsDestination: boolean;
+  settingsRuntimeLabel: string;
+  settingsSession: WorkshopSession;
   navigation: WorkshopNavigation;
   runActivity: WorkshopRunActivity | null;
   runPreview: WorkshopRunPreview | null;
@@ -821,6 +838,7 @@ function WorkshopView({
   onLoadSettingsWorkspace: () => Promise<WorkshopSettingsWorkspace>;
   onMemoryAuthenticationFailure: (message: string) => void;
   onOpenMemory: () => void;
+  onOpenSettings: () => void;
   onSelectMemory: (memoryId: string | null) => void;
   onSelectChannel: (channelId: string) => void;
   onSubmitCommand: (
@@ -832,9 +850,13 @@ function WorkshopView({
     path: string,
     revision: string,
   ) => Promise<WorkshopSettingsWorkspace>;
+  onSettingsDirtyChange: (dirty: boolean) => void;
+  onSettingsAccessFailure: (message: string) => void;
 }): React.JSX.Element {
   const channelId = channel.channelId;
   const memoryOpen = memoryDestination !== null;
+  const settingsOpen = settingsDestination;
+  const auxiliaryWorkspaceOpen = memoryOpen || settingsOpen;
   const channelName = channelDisplayName(channel);
   const symbol = channelSymbol(channel);
   const [draft, setDraft] = useState(() => restoreDraft(channelId));
@@ -861,10 +883,12 @@ function WorkshopView({
   const [settingsWorkspaceError, setSettingsWorkspaceError] =
     useState<string | null>(null);
   const [switchingWorkspace, setSwitchingWorkspace] = useState(false);
+  const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const artifactInputRef = useRef<HTMLInputElement | null>(null);
   const sidebarRef = useRef<HTMLElement | null>(null);
+  const profileMenuRef = useRef<HTMLElement | null>(null);
   const sidebarResizeStartRef = useRef({ pointerX: 0, width: 0 });
   const contextResizeStartRef = useRef({ pointerX: 0, width: 0 });
   const timelineChannelRef = useRef(channelId);
@@ -895,6 +919,28 @@ function WorkshopView({
   useEffect(() => {
     storeContextWidth(contextWidth);
   }, [contextWidth]);
+
+  useEffect(() => {
+    if (!profileMenuOpen) {
+      return;
+    }
+    const closeOnPointer = (event: MouseEvent): void => {
+      if (!profileMenuRef.current?.contains(event.target as Node)) {
+        setProfileMenuOpen(false);
+      }
+    };
+    const closeOnEscape = (event: globalThis.KeyboardEvent): void => {
+      if (event.key === "Escape") {
+        setProfileMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", closeOnPointer);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("mousedown", closeOnPointer);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [profileMenuOpen]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1331,7 +1377,7 @@ function WorkshopView({
 
   return (
     <main
-      className={`workshop-app ${memoryOpen ? "memory-open" : ""} ${sidebarLayout.collapsed ? "sidebar-collapsed" : ""} ${resizingSidebar || resizingContext ? "pane-resizing" : ""}`}
+      className={`workshop-app ${memoryOpen ? "memory-open" : ""} ${settingsOpen ? "settings-open" : ""} ${sidebarLayout.collapsed ? "sidebar-collapsed" : ""} ${resizingSidebar || resizingContext ? "pane-resizing" : ""}`}
       style={{
         "--channel-sidebar-width": `${
           sidebarLayout.collapsed
@@ -1387,7 +1433,7 @@ function WorkshopView({
                 .filter((availableChannel) => availableChannel.kind === "direct")
                 .map((availableChannel) => (
                   <button
-                    className={`channel-link ${!memoryOpen && availableChannel.channelId === channelId ? "active" : ""}`}
+                    className={`channel-link ${!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId ? "active" : ""}`}
                     type="button"
                     aria-label={channelDisplayName(availableChannel)}
                     title={channelDisplayName(availableChannel)}
@@ -1396,7 +1442,7 @@ function WorkshopView({
                   >
                     <span>{channelSymbol(availableChannel)}</span>
                     <span>{channelDisplayName(availableChannel)}</span>
-                    {!memoryOpen && availableChannel.channelId === channelId && (
+                    {!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId && (
                       <span className="live-pip" aria-label="Live" />
                     )}
                   </button>
@@ -1413,7 +1459,7 @@ function WorkshopView({
                 .filter((availableChannel) => availableChannel.kind === "group")
                 .map((availableChannel) => (
                   <button
-                    className={`channel-link ${!memoryOpen && availableChannel.channelId === channelId ? "active" : ""}`}
+                    className={`channel-link ${!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId ? "active" : ""}`}
                     type="button"
                     aria-label={channelDisplayName(availableChannel)}
                     title={channelDisplayName(availableChannel)}
@@ -1422,7 +1468,7 @@ function WorkshopView({
                   >
                     <span>{channelSymbol(availableChannel)}</span>
                     <span>{channelDisplayName(availableChannel)}</span>
-                    {!memoryOpen && availableChannel.channelId === channelId && (
+                    {!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId && (
                       <span className="live-pip" aria-label="Live" />
                     )}
                   </button>
@@ -1439,7 +1485,7 @@ function WorkshopView({
                 .filter((availableChannel) => availableChannel.kind === "notification")
                 .map((availableChannel) => (
                   <button
-                    className={`channel-link notification ${!memoryOpen && availableChannel.channelId === channelId ? "active" : ""}`}
+                    className={`channel-link notification ${!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId ? "active" : ""}`}
                     type="button"
                     aria-label={channelDisplayName(availableChannel)}
                     title={channelDisplayName(availableChannel)}
@@ -1448,7 +1494,7 @@ function WorkshopView({
                   >
                     <span>!</span>
                     <span>{channelDisplayName(availableChannel)}</span>
-                    {!memoryOpen && availableChannel.channelId === channelId && (
+                    {!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId && (
                       <span className="live-pip" aria-label="Live" />
                     )}
                   </button>
@@ -1474,14 +1520,44 @@ function WorkshopView({
           )}
         </nav>
 
-        <footer className="sidebar-footer" title={`${humanName} — ${humanRole}`}>
-          <span className="mini-avatar human">
-            {humanName.slice(0, 1).toUpperCase()}
-          </span>
-          <span>
-            <strong>{humanName}</strong>
-            <small>{humanRole}</small>
-          </span>
+        <footer
+          ref={profileMenuRef}
+          className={`sidebar-footer ${settingsOpen ? "active" : ""}`}
+        >
+          {profileMenuOpen && (
+            <div className="profile-menu" role="menu" aria-label="Profile menu">
+              <p className="overline">Personal</p>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setProfileMenuOpen(false);
+                  onOpenSettings();
+                }}
+              >
+                <span aria-hidden="true">⚙</span>
+                <span><strong>Settings</strong><small>Preferences and runtime</small></span>
+              </button>
+            </div>
+          )}
+          <button
+            className="profile-trigger"
+            type="button"
+            aria-haspopup="menu"
+            aria-expanded={profileMenuOpen}
+            aria-label={`${humanName} profile`}
+            title={`${humanName} — ${humanRole}`}
+            onClick={() => setProfileMenuOpen((open) => !open)}
+          >
+            <span className="mini-avatar human">
+              {humanName.slice(0, 1).toUpperCase()}
+            </span>
+            <span className="profile-copy">
+              <strong>{humanName}</strong>
+              <small>{humanRole}</small>
+            </span>
+            <span className="profile-chevron" aria-hidden="true">⌃</span>
+          </button>
         </footer>
 
         {!sidebarLayout.collapsed && (
@@ -1501,7 +1577,18 @@ function WorkshopView({
         )}
       </aside>
 
-      {memoryDestination ? (
+      {settingsOpen ? (
+        <SettingsWorkspace
+          onAuthenticationFailure={onMemoryAuthenticationFailure}
+          onChannelAccessFailure={onSettingsAccessFailure}
+          onClose={() => onSelectChannel(channelId)}
+          onDirtyChange={onSettingsDirtyChange}
+          principalName={humanName}
+          roleLabel={humanRole}
+          runtimeLabel={settingsRuntimeLabel}
+          session={settingsSession}
+        />
+      ) : memoryDestination ? (
         <MemoryExplorer
           initialMemoryId={memoryDestination.memoryId}
           onAuthenticationFailure={onMemoryAuthenticationFailure}
@@ -1526,6 +1613,13 @@ function WorkshopView({
           </div>
           <div className="conversation-actions">
             <ConnectionIndicator connection={connection} />
+            <button
+              className="quiet-button mobile-settings-button"
+              type="button"
+              onClick={onOpenSettings}
+            >
+              Settings
+            </button>
             <button className="quiet-button" type="button" onClick={onForget}>
               Forget session
             </button>
@@ -1912,8 +2006,10 @@ function ActiveWorkshopClient({
   onChannelAccessFailure,
   onForget,
   onOpenMemory,
+  onOpenSettings,
   onSelectChannel,
   onSelectMemory,
+  onSettingsDirtyChange,
 }: {
   destination: WorkshopDestination;
   navigation: WorkshopNavigation;
@@ -1922,10 +2018,24 @@ function ActiveWorkshopClient({
   onChannelAccessFailure: (message: string) => void;
   onForget: () => void;
   onOpenMemory: () => void;
+  onOpenSettings: () => void;
   onSelectChannel: (channelId: string) => void;
   onSelectMemory: (memoryId: string | null) => void;
+  onSettingsDirtyChange: (dirty: boolean) => void;
 }): React.JSX.Element {
   const selected = findNavigationChannel(navigation, session.channelId);
+  const settingsChannel = selected?.channel.canSubmitCommands
+    ? selected.channel
+    : navigation.workshops
+        .flatMap((availableWorkshop) => availableWorkshop.channels)
+        .find((availableChannel) => availableChannel.canSubmitCommands) ?? selected?.channel;
+  const settingsSession = useMemo(
+    () => ({
+      channelId: settingsChannel?.channelId ?? session.channelId,
+      token: session.token,
+    }),
+    [session.channelId, session.token, settingsChannel?.channelId],
+  );
   const { connection, messages, runActivity, runPreview, runTrace, earlier, loadEarlier } =
     useWorkshopTimeline(
       session,
@@ -1998,6 +2108,9 @@ function ActiveWorkshopClient({
       messages={messages}
       memoryDestination={destination.kind === "memory" ? destination : null}
       memoryToken={session.token}
+      settingsDestination={destination.kind === "settings"}
+      settingsRuntimeLabel={settingsChannel ? channelDisplayName(settingsChannel) : "assigned runtime"}
+      settingsSession={settingsSession}
       navigation={navigation}
       onLoadEarlier={loadEarlier}
       onDownloadArtifact={downloadSelectedArtifact}
@@ -2013,10 +2126,13 @@ function ActiveWorkshopClient({
       onLoadSettingsWorkspace={loadSelectedSettingsWorkspace}
       onMemoryAuthenticationFailure={onAuthenticationFailure}
       onOpenMemory={onOpenMemory}
+      onOpenSettings={onOpenSettings}
       onSelectMemory={onSelectMemory}
       onSelectChannel={onSelectChannel}
       onSubmitCommand={submitSelectedCommand}
       onSwitchWorkspace={switchSelectedWorkspace}
+      onSettingsAccessFailure={onChannelAccessFailure}
+      onSettingsDirtyChange={onSettingsDirtyChange}
     />
   );
 }
@@ -2033,14 +2149,25 @@ export default function App(): React.JSX.Element {
   const [destination, setDestination] = useState<WorkshopDestination>(
     destinationFromLocation,
   );
+  const [settingsDirty, setSettingsDirty] = useState(false);
 
   useEffect(() => {
     const restoreDestination = (): void => {
-      setDestination(destinationFromLocation());
+      const restored = destinationFromLocation();
+      if (
+        destination.kind === "settings" &&
+        restored.kind !== "settings" &&
+        settingsDirty &&
+        !window.confirm("Discard unsaved preference changes?")
+      ) {
+        writeDestination({ kind: "settings" }, "push");
+        return;
+      }
+      setDestination(restored);
     };
     window.addEventListener("popstate", restoreDestination);
     return () => window.removeEventListener("popstate", restoreDestination);
-  }, []);
+  }, [destination, settingsDirty]);
 
   const forgetSession = useCallback((message: string | null = null): void => {
     forgetStoredSession();
@@ -2048,6 +2175,7 @@ export default function App(): React.JSX.Element {
     setNavigation(null);
     setNotice(message);
     setView("enrollment");
+    setSettingsDirty(false);
   }, []);
 
   const handleAuthenticationFailure = useCallback(
@@ -2139,9 +2267,22 @@ export default function App(): React.JSX.Element {
       setView("enrollment");
     }
   }, [adoptNavigation, forgetSession, session]);
+  const handleChannelAccessFailure = useCallback(
+    (message: string): void => {
+      void refreshChannelAccess(message);
+    },
+    [refreshChannelAccess],
+  );
 
   const selectChannel = (channelId: string): void => {
     if (!session || !navigation || !findNavigationChannel(navigation, channelId)) {
+      return;
+    }
+    if (
+      destination.kind === "settings" &&
+      settingsDirty &&
+      !window.confirm("Discard unsaved preference changes?")
+    ) {
       return;
     }
     const nextSession = { ...session, channelId };
@@ -2153,7 +2294,20 @@ export default function App(): React.JSX.Element {
   };
 
   const openMemory = (): void => {
+    if (
+      destination.kind === "settings" &&
+      settingsDirty &&
+      !window.confirm("Discard unsaved preference changes?")
+    ) {
+      return;
+    }
     const nextDestination: WorkshopDestination = { kind: "memory", memoryId: null };
+    setDestination(nextDestination);
+    writeDestination(nextDestination, "push");
+  };
+
+  const openSettings = (): void => {
+    const nextDestination: WorkshopDestination = { kind: "settings" };
     setDestination(nextDestination);
     writeDestination(nextDestination, "push");
   };
@@ -2187,11 +2341,13 @@ export default function App(): React.JSX.Element {
       navigation={navigation}
       session={session}
       onAuthenticationFailure={handleAuthenticationFailure}
-      onChannelAccessFailure={(message) => void refreshChannelAccess(message)}
+      onChannelAccessFailure={handleChannelAccessFailure}
       onForget={() => forgetSession()}
       onOpenMemory={openMemory}
+      onOpenSettings={openSettings}
       onSelectChannel={selectChannel}
       onSelectMemory={selectMemory}
+      onSettingsDirtyChange={setSettingsDirty}
     />
   );
 }

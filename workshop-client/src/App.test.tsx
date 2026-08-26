@@ -14,10 +14,13 @@ import {
   loadMemoryRecords,
   loadMemorySource,
   loadMemoryStats,
+  loadPreferenceDocument,
+  loadPreferenceHistory,
   loadRun,
   loadRunTrace,
   loadSettingsWorkspace,
   loadTimeline,
+  loadWorkspaceConfig,
   redeemEnrollment,
   streamTimeline,
   submitCommand,
@@ -44,10 +47,13 @@ vi.mock("./api", async (importOriginal) => {
     loadMemoryRecords: vi.fn(),
     loadMemorySource: vi.fn(),
     loadMemoryStats: vi.fn(),
+    loadPreferenceDocument: vi.fn(),
+    loadPreferenceHistory: vi.fn(),
     loadTimeline: vi.fn(),
     loadRun: vi.fn(),
     loadRunTrace: vi.fn(),
     loadSettingsWorkspace: vi.fn(),
+    loadWorkspaceConfig: vi.fn(),
     redeemEnrollment: vi.fn(),
     streamTimeline: vi.fn(),
     submitCommand: vi.fn(),
@@ -231,6 +237,31 @@ describe("Workshop React client", () => {
     vi.mocked(loadRun).mockResolvedValue(completedRun);
     vi.mocked(loadRunTrace).mockResolvedValue({ entries: [], hasMore: false });
     vi.mocked(loadSettingsWorkspace).mockResolvedValue(settingsWorkspace);
+    vi.mocked(loadPreferenceDocument).mockResolvedValue({
+      content: "# Preferences\n\nBe concise.\n",
+      editable: true,
+      maxBytes: 65536,
+      revision: "pref_current",
+      sizeBytes: 27,
+      updatedAt: "2026-08-26T10:00:00Z",
+    });
+    vi.mocked(loadPreferenceHistory).mockResolvedValue({
+      limit: 20,
+      revisions: [],
+    });
+    vi.mocked(loadWorkspaceConfig).mockResolvedValue({
+      capabilities: [],
+      environmentKeys: ["PROTECTED_KEY"],
+      hasPrompt: false,
+      model: settingsWorkspace.model,
+      mutation: null,
+      overrideFields: [],
+      prompt: null,
+      promptSource: null,
+      revision: "sws_workspace",
+      timeoutSeconds: settingsWorkspace.timeoutSeconds,
+      workspace: settingsWorkspace.workspace,
+    });
     vi.mocked(loadMemoryStats).mockResolvedValue({
       allowedProjects: [],
       byScope: { global: 1 },
@@ -372,6 +403,75 @@ describe("Workshop React client", () => {
     await user.click(screen.getByRole("button", { name: "Memory" }));
     expect(await screen.findByRole("heading", { name: "Memory", level: 1 })).toBeVisible();
     expect(window.location.search).toContain("view=memory");
+  });
+
+  it("opens the personal Settings workspace from the profile menu", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+
+    render(<App />);
+
+    const profile = await screen.findByRole("button", { name: "Daniel profile" });
+    await user.click(profile);
+    const menu = screen.getByRole("menu", { name: "Profile menu" });
+    expect(menu).toBeVisible();
+    await user.click(screen.getByRole("menuitem", { name: /Settings/ }));
+
+    expect(await screen.findByRole("heading", { name: "Settings", level: 1 })).toBeVisible();
+    expect(screen.getByText("Workshop administrator")).toBeVisible();
+    expect(screen.getByText("codex")).toBeVisible();
+    expect(screen.getByText("openai")).toBeVisible();
+    expect(screen.queryByText("PROTECTED_KEY")).not.toBeInTheDocument();
+    expect(screen.queryByText(settingsWorkspace.principalId)).not.toBeInTheDocument();
+    expect(screen.queryByText(settingsWorkspace.runtimeProfileId)).not.toBeInTheDocument();
+    expect(screen.queryByText(settingsWorkspace.workspace)).not.toBeInTheDocument();
+    expect(window.location.search).toBe("?view=settings");
+
+    await user.click(screen.getByRole("button", { name: "Back to conversation" }));
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+    expect(window.location.search).toBe("");
+  });
+
+  it("closes the profile menu with Escape", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "Daniel profile" }));
+    expect(screen.getByRole("menu", { name: "Profile menu" })).toBeVisible();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("menu", { name: "Profile menu" })).toBeNull();
+  });
+
+  it("protects unsaved preferences before leaving Settings", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "Daniel profile" }));
+    await user.click(screen.getByRole("menuitem", { name: /Settings/ }));
+    const editor = await screen.findByLabelText("Preference Markdown");
+    await user.type(editor, "Keep this draft.");
+    await user.click(screen.getByRole("button", { name: "Scott" }));
+
+    expect(confirm).toHaveBeenCalledWith("Discard unsaved preference changes?");
+    expect(screen.getByRole("heading", { name: "Settings", level: 1 })).toBeVisible();
+    expect(window.location.search).toBe("?view=settings");
+
+    confirm.mockReturnValue(true);
+    await user.click(screen.getByRole("button", { name: "Scott" }));
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+    expect(window.location.search).toBe("");
   });
 
   it("shows canonical runtime settings and switches an authorized workspace", async () => {

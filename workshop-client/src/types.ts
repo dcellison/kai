@@ -92,6 +92,49 @@ export interface WorkshopSettingsWorkspace {
   workspaces: WorkshopWorkspaceOption[];
 }
 
+export interface WorkshopWorkspaceConfig {
+  capabilities: WorkshopEditableCapability[];
+  environmentKeys: string[];
+  hasPrompt: boolean;
+  model: { defaultValue: string; source: string; value: string };
+  mutation: WorkshopSettingsMutation | null;
+  overrideFields: string[];
+  prompt: string | null;
+  promptSource: string | null;
+  revision: string;
+  timeoutSeconds: { defaultValue: number; source: string; value: number };
+  workspace: string;
+}
+
+export interface WorkshopPreferenceDocument {
+  content: string;
+  editable: boolean;
+  maxBytes: number;
+  revision: string;
+  sizeBytes: number;
+  updatedAt: string | null;
+}
+
+export interface WorkshopPreferenceRevision {
+  revision: string;
+  sizeBytes: number;
+  updatedAt: string;
+}
+
+export interface WorkshopPreferenceHistory {
+  limit: number;
+  revisions: WorkshopPreferenceRevision[];
+}
+
+export type WorkshopRuntimeSettingsChange =
+  | { field: "model"; value: string }
+  | { field: "timeout"; value: number }
+  | { field: "reset"; value: "all" | "model" | "timeout" };
+
+export type WorkshopWorkspaceSettingChange =
+  | { field: "model" | "prompt" | "timeout"; value: string }
+  | { field: "reset"; value: "all" | "model" | "prompt" | "timeout" };
+
 export interface WorkshopMemoryScope {
   exclusionReason: string | null;
   invalidDefaulted: boolean;

@@ -3,6 +3,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   EventStreamDecoder,
   MemoryRevisionConflictError,
+  PreferenceRevisionConflictError,
+  SettingsRevisionConflictError,
   cancelRun,
   createMemoryFact,
   deleteMemories,
@@ -15,14 +17,21 @@ import {
   loadMemorySource,
   loadMemoryStats,
   loadNavigation,
+  loadPreferenceDocument,
+  loadPreferenceHistory,
   loadRun,
   loadTimeline,
+  loadWorkspaceConfig,
   moveMemoriesScope,
   moveMemoryScope,
   redeemEnrollment,
   searchMemories,
+  restorePreferenceRevision,
+  savePreferenceDocument,
   submitCommand,
   streamTimeline,
+  updateRuntimeSettings,
+  updateWorkspaceConfig,
 } from "./api";
 import type { WorkshopSession } from "./types";
 
@@ -77,6 +86,103 @@ function memoryRecord(): Record<string, unknown> {
       invalid_defaulted: false,
       retrievable: true,
       exclusion_reason: null,
+    },
+  };
+}
+
+function settingsPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    version: 1,
+    channel_id: channelId,
+    principal_id: "prn_00000000000000000000000000000001",
+    runtime_profile_id: "rtp_00000000000000000000000000000001",
+    backend: "claude",
+    provider: "anthropic",
+    model: {
+      value: "claude-sonnet-4-6",
+      source: "runtime policy",
+      default_value: "claude-sonnet-4-6",
+    },
+    model_options: [
+      { model_id: "claude-sonnet-4-6", display_name: "Claude Sonnet 4.6" },
+    ],
+    timeout_seconds: {
+      value: 1800,
+      source: "runtime policy",
+      default_value: 1800,
+    },
+    workspace: "/srv/kai",
+    workspaces: [
+      { path: "/srv/kai", name: "Kai", current: true, home: false },
+    ],
+    revision: "sws_current",
+    capabilities: [
+      {
+        field: "timeout",
+        scope: "runtime",
+        value_type: "integer_seconds",
+        resettable: true,
+        choices: null,
+        minimum: 1,
+        maximum: 1800,
+      },
+    ],
+    mutation: null,
+    ...overrides,
+  };
+}
+
+function workspaceConfigPayload(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    version: 1,
+    workspace: "/srv/kai",
+    model: {
+      value: "claude-sonnet-4-6",
+      source: "runtime policy",
+      default_value: "claude-sonnet-4-6",
+    },
+    timeout_seconds: {
+      value: 1800,
+      source: "runtime policy",
+      default_value: 1800,
+    },
+    environment_keys: ["PROTECTED_KEY"],
+    prompt: null,
+    has_prompt: false,
+    prompt_source: null,
+    override_fields: [],
+    revision: "sws_workspace",
+    capabilities: [
+      {
+        field: "prompt",
+        scope: "workspace",
+        value_type: "text",
+        resettable: true,
+        choices: null,
+        minimum: null,
+        maximum: 4000,
+      },
+    ],
+    mutation: null,
+    ...overrides,
+  };
+}
+
+function preferencePayload(
+  content = "# Preferences\n\nBe concise.\n",
+  revision = "pref_current",
+): Record<string, unknown> {
+  return {
+    version: 1,
+    document: {
+      content,
+      revision,
+      updated_at: "2026-08-26T10:00:00Z",
+      size_bytes: new TextEncoder().encode(content).length,
+      max_bytes: 65536,
+      editable: true,
     },
   };
 }
@@ -257,6 +363,159 @@ describe("Workshop client API", () => {
     expect(fetchMock.mock.calls[2]?.[0]).toBe(
       "/v1/memory/search?tag=preference&scope=project&q=concise+output",
     );
+  });
+
+  it("loads and mutates principal preferences with revision protection", async () => {
+    const responses = [
+      Response.json(preferencePayload()),
+      Response.json({
+        version: 1,
+        limit: 20,
+        revisions: [
+          {
+            revision: "pref_previous",
+            updated_at: "2026-08-25T10:00:00Z",
+            size_bytes: 24,
+          },
+        ],
+      }),
+      Response.json(preferencePayload("# Preferences\n\nUse examples.\n", "pref_next")),
+      Response.json(preferencePayload("# Preferences\n\nBe concise.\n", "pref_restored")),
+    ];
+    const fetchMock = vi.fn().mockImplementation(() => responses.shift());
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(loadPreferenceDocument(session)).resolves.toMatchObject({
+      content: "# Preferences\n\nBe concise.\n",
+      editable: true,
+      revision: "pref_current",
+    });
+    await expect(loadPreferenceHistory(session)).resolves.toEqual({
+      limit: 20,
+      revisions: [
+        {
+          revision: "pref_previous",
+          updatedAt: "2026-08-25T10:00:00Z",
+          sizeBytes: 24,
+        },
+      ],
+    });
+    await expect(
+      savePreferenceDocument(
+        session,
+        "# Preferences\n\nUse examples.\n",
+        "pref_current",
+      ),
+    ).resolves.toMatchObject({ revision: "pref_next" });
+    await expect(
+      restorePreferenceRevision(session, "pref_previous", "pref_next"),
+    ).resolves.toMatchObject({ revision: "pref_restored" });
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      "/v1/preferences",
+      "/v1/preferences/revisions",
+      "/v1/preferences",
+      "/v1/preferences/revisions/pref_previous/restore",
+    ]);
+    expect(JSON.parse((fetchMock.mock.calls[2]?.[1] as RequestInit).body as string)).toEqual({
+      content: "# Preferences\n\nUse examples.\n",
+      revision: "pref_current",
+    });
+    expect(JSON.parse((fetchMock.mock.calls[3]?.[1] as RequestInit).body as string)).toEqual({
+      revision: "pref_next",
+    });
+  });
+
+  it("surfaces preference conflicts with the authoritative revision", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json(
+          {
+            error: {
+              code: "revision_conflict",
+              message: "Preferences changed",
+              current_revision: "pref_latest",
+            },
+          },
+          { status: 409 },
+        ),
+      ),
+    );
+
+    const failure = await savePreferenceDocument(
+      session,
+      "Draft",
+      "pref_stale",
+    ).catch((caught: unknown) => caught);
+
+    expect(failure).toBeInstanceOf(PreferenceRevisionConflictError);
+    expect(failure).toMatchObject({
+      currentRevision: "pref_latest",
+      message: "Preferences changed",
+    });
+  });
+
+  it("loads and mutates policy-bounded runtime and workspace settings", async () => {
+    const responses = [
+      Response.json(settingsPayload()),
+      Response.json(workspaceConfigPayload()),
+    ];
+    const fetchMock = vi.fn().mockImplementation(() => responses.shift());
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      updateRuntimeSettings(session, "sws_current", {
+        field: "timeout",
+        value: 601,
+      }),
+    ).resolves.toMatchObject({
+      backend: "claude",
+      provider: "anthropic",
+      timeoutSeconds: { value: 1800 },
+    });
+    await expect(loadWorkspaceConfig(session)).resolves.toMatchObject({
+      environmentKeys: ["PROTECTED_KEY"],
+      hasPrompt: false,
+      revision: "sws_workspace",
+    });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(`/v1/channels/${channelId}/settings`);
+    expect(JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string)).toEqual({
+      revision: "sws_current",
+      timeout_seconds: 601,
+    });
+  });
+
+  it("uses typed workspace mutations and rejects stale settings", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json(workspaceConfigPayload()))
+      .mockResolvedValueOnce(
+        Response.json(
+          { error: { code: "settings_conflict", message: "Stale settings" } },
+          { status: 409 },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      updateWorkspaceConfig(session, "sws_workspace", {
+        field: "prompt",
+        value: "Use the project conventions.",
+      }),
+    ).resolves.toMatchObject({ revision: "sws_workspace" });
+    expect(JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string)).toEqual({
+      revision: "sws_workspace",
+      field: "prompt",
+      value: "Use the project conventions.",
+    });
+
+    await expect(
+      updateRuntimeSettings(session, "sws_stale", {
+        field: "reset",
+        value: "timeout",
+      }),
+    ).rejects.toBeInstanceOf(SettingsRevisionConflictError);
   });
 
   it("rejects malformed memory records instead of rendering partial data", async () => {
