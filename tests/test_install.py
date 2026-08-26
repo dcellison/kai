@@ -9780,6 +9780,7 @@ class TestIndependentRuntimePolicy:
             "provider": "openai",
             "model": "gpt-5.5",
             "timeout_seconds": 120,
+            "maximum_timeout_seconds": 600,
             "allowed_services": ["perplexity"],
             "home_workspace": None,
             "workspace_base": None,
@@ -9795,6 +9796,7 @@ class TestIndependentRuntimePolicy:
         assert document["runtime_profiles"][scott_id]["provider"] == "anthropic"
         assert document["runtime_profiles"][scott_id]["model"] == "sonnet"
         assert document["runtime_profiles"][scott_id]["timeout_seconds"] == 120
+        assert document["runtime_profiles"][scott_id]["maximum_timeout_seconds"] == 600
         assert document["runtime_profiles"][scott_id]["allowed_services"] == []
         assert document["runtime_profiles"][scott_id]["home_workspace"] is None
         assert document["runtime_profiles"][scott_id]["workspace_base"] is None
@@ -10003,6 +10005,7 @@ backends:
         assert document["runtime_profiles"][profile_id]["display_name"] == "Operator display name"
         assert document["runtime_profiles"][profile_id]["model"] == "gpt-5.6-sol"
         assert document["runtime_profiles"][profile_id]["timeout_seconds"] == 345
+        assert document["runtime_profiles"][profile_id]["maximum_timeout_seconds"] == 600
         assert document["runtime_profiles"][profile_id]["allowed_services"] == ["perplexity"]
         assert profiles.legacy_runtime_key(profile_id) == 101
 

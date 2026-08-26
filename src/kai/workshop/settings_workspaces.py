@@ -46,7 +46,6 @@ class WorkshopSettingsWorkspaceConsistencyError(WorkshopSettingsWorkspaceError):
 
 
 MIN_SELF_SERVICE_TIMEOUT_SECONDS = 1
-MAX_SELF_SERVICE_TIMEOUT_SECONDS = 600
 MAX_SELF_SERVICE_PROMPT_CHARACTERS = 32_000
 
 
@@ -266,7 +265,10 @@ class WorkshopSettingsWorkspaceService:
             model_options=model_options,
             workspaces=tuple(workspace_options),
             revision=revision,
-            capabilities=self._capabilities(model_options),
+            capabilities=self._capabilities(
+                model_options,
+                maximum_timeout_seconds=profile.maximum_timeout_seconds,
+            ),
             mutation=mutation,
         )
 
@@ -305,10 +307,11 @@ class WorkshopSettingsWorkspaceService:
     ) -> SettingsWorkspaceSnapshot:
         if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int):
             raise WorkshopSettingsWorkspaceValidationError("Timeout must be a whole number of seconds")
-        if not MIN_SELF_SERVICE_TIMEOUT_SECONDS <= timeout_seconds <= MAX_SELF_SERVICE_TIMEOUT_SECONDS:
+        profile = self._runtime_pool.runtime_profile(authority.runtime_profile_id)
+        maximum_timeout = profile.maximum_timeout_seconds
+        if not MIN_SELF_SERVICE_TIMEOUT_SECONDS <= timeout_seconds <= maximum_timeout:
             raise WorkshopSettingsWorkspaceValidationError(
-                f"Timeout must be between {MIN_SELF_SERVICE_TIMEOUT_SECONDS} "
-                f"and {MAX_SELF_SERVICE_TIMEOUT_SECONDS} seconds"
+                f"Timeout must be between {MIN_SELF_SERVICE_TIMEOUT_SECONDS} and {maximum_timeout} seconds"
             )
         async with self._lock(authority):
             return await self._mutate_runtime_settings_locked(
@@ -472,7 +475,8 @@ class WorkshopSettingsWorkspaceService:
                     profile.backend,
                     profile.provider,
                     allowed_models=profile.allowed_models,
-                )
+                ),
+                maximum_timeout_seconds=profile.maximum_timeout_seconds,
             ),
             mutation=mutation,
         )
@@ -503,10 +507,10 @@ class WorkshopSettingsWorkspaceService:
                 parsed_timeout = int(value)
             except ValueError as exc:
                 raise WorkshopSettingsWorkspaceValidationError("Timeout must be a whole number of seconds") from exc
-            if not MIN_SELF_SERVICE_TIMEOUT_SECONDS <= parsed_timeout <= MAX_SELF_SERVICE_TIMEOUT_SECONDS:
+            if not MIN_SELF_SERVICE_TIMEOUT_SECONDS <= parsed_timeout <= profile.maximum_timeout_seconds:
                 raise WorkshopSettingsWorkspaceValidationError(
                     f"Timeout must be between {MIN_SELF_SERVICE_TIMEOUT_SECONDS} "
-                    f"and {MAX_SELF_SERVICE_TIMEOUT_SECONDS} seconds"
+                    f"and {profile.maximum_timeout_seconds} seconds"
                 )
             value = str(parsed_timeout)
         elif field == "env":
@@ -1033,6 +1037,8 @@ class WorkshopSettingsWorkspaceService:
     @staticmethod
     def _capabilities(
         model_options: tuple[ModelOption, ...] | None,
+        *,
+        maximum_timeout_seconds: int,
     ) -> tuple[EditableCapability, ...]:
         return (
             EditableCapability(
@@ -1048,7 +1054,7 @@ class WorkshopSettingsWorkspaceService:
                 value_type="integer_seconds",
                 resettable=True,
                 minimum=MIN_SELF_SERVICE_TIMEOUT_SECONDS,
-                maximum=MAX_SELF_SERVICE_TIMEOUT_SECONDS,
+                maximum=maximum_timeout_seconds,
             ),
             EditableCapability(
                 field="workspace",
@@ -1061,6 +1067,8 @@ class WorkshopSettingsWorkspaceService:
     @staticmethod
     def _workspace_capabilities(
         model_options: dict[str, str] | None,
+        *,
+        maximum_timeout_seconds: int,
     ) -> tuple[EditableCapability, ...]:
         return (
             EditableCapability(
@@ -1076,7 +1084,7 @@ class WorkshopSettingsWorkspaceService:
                 "integer_seconds",
                 True,
                 minimum=MIN_SELF_SERVICE_TIMEOUT_SECONDS,
-                maximum=MAX_SELF_SERVICE_TIMEOUT_SECONDS,
+                maximum=maximum_timeout_seconds,
             ),
             EditableCapability(
                 "prompt",
@@ -1140,7 +1148,7 @@ class WorkshopSettingsWorkspaceService:
                 parsed_timeout = int(raw_timeout)
             except (TypeError, ValueError):
                 continue
-            if MIN_SELF_SERVICE_TIMEOUT_SECONDS <= parsed_timeout <= MAX_SELF_SERVICE_TIMEOUT_SECONDS:
+            if MIN_SELF_SERVICE_TIMEOUT_SECONDS <= parsed_timeout <= profile.maximum_timeout_seconds:
                 timeout = EffectiveValue(
                     parsed_timeout,
                     source,

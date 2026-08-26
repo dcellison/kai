@@ -751,6 +751,34 @@ runtime_profiles:
 
     assert profile.model == "gpt-5.5"
     assert profile.timeout_seconds == 999
+    assert profile.maximum_timeout_seconds == 999
+
+
+def test_loaded_policy_rejects_timeout_default_above_protected_ceiling(tmp_path, monkeypatch):
+    profile_id = runtime_profile_id_for_config_id(101)
+    policy = tmp_path / "runtime-profiles.yaml"
+    policy.write_text(
+        f"""version: 2
+runtime_profiles:
+  {profile_id}:
+    display_name: Daniel
+    os_user: daniel
+    backend: codex
+    provider: openai
+    model: gpt-5.5
+    timeout_seconds: 1800
+    maximum_timeout_seconds: 600
+    allowed_services: []
+    allowed_workspaces: []
+"""
+    )
+    monkeypatch.setattr(
+        "kai.workshop.runtime_profiles.load_backend_registry",
+        lambda: {"codex": {}, "claude": {}},
+    )
+
+    with pytest.raises(WorkshopRuntimeProfileError, match="maximum_timeout_seconds"):
+        WorkshopRuntimeProfileRegistry.load(_config(), path=policy)
 
 
 def test_loaded_policy_owns_service_scopes_independently_of_users_yaml(tmp_path, monkeypatch):
