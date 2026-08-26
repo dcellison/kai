@@ -1,4 +1,4 @@
-"""End-to-end contracts for the production-unused Workshop coordinator."""
+"""End-to-end contracts for the Workshop execution coordinator."""
 
 from __future__ import annotations
 

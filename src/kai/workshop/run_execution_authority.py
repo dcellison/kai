@@ -1,4 +1,4 @@
-"""Production-unused fenced execution authority for durable Workshop runs."""
+"""Fenced execution authority for durable Workshop runs."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Contracts for the production-unused Workshop Telegram outbox worker."""
+"""Contracts for the Workshop Telegram outbox worker."""
 
 from __future__ import annotations
 

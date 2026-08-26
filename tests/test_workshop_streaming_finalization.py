@@ -1,4 +1,4 @@
-"""Atomic, production-unused Workshop streaming-finalization contracts."""
+"""Atomic Workshop streaming-finalization contracts."""
 
 from __future__ import annotations
 

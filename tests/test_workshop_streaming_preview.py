@@ -1,4 +1,4 @@
-"""Contracts for durable, production-unused Telegram streaming previews."""
+"""Contracts for durable Telegram adapter streaming previews."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Contracts for the production-unused canonical Workshop timeline reader."""
+"""Contracts for the canonical Workshop timeline reader."""
 
 from __future__ import annotations
 

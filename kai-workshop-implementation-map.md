@@ -2239,7 +2239,39 @@ the removed shadow recorders, crash flags, parity comparator, qualification
 module, and operator commands from returning.
 
 This completes the four source-retirement packages from the #917 completion
-audit. Closing the epic still requires its separate final installed matrix:
-Workshop-only and hybrid operation across Claude, Codex, Goose, OpenCode, and
-Pi, including ordinary execution, restart continuity, and unchanged optional
-Telegram delivery.
+audit. The final adapter-boundary gate and installed qualification are recorded
+in section 48. Earlier sections in this map are chronological records; claims
+such as "production-unused," "shadow," or "JSONL authority" describe their
+implementation date rather than the current system.
+
+## 48. Final Telegram adapter boundary
+
+**Implementation date:** 2026-08-26
+
+Telegram is an optional adapter, not a Kai core authority. The base package has
+no Telegram SDK dependency. CI installs it without the Telegram extra, blocks
+all Telegram SDK imports, and exercises Workshop startup, fresh canonical
+provisioning, command execution, post-run effects, scheduling, proactive
+publication, integration routing, and non-Telegram delivery. A separate CI
+lane installs the Telegram extra and tests its lifecycle and delivery workers.
+
+Static architecture gates prohibit Telegram SDK imports outside the adapter
+implementation and prohibit core or feature-service imports from those
+implementation modules. The composition root loads the adapter dynamically
+only when configured. Delivery capabilities live in an SDK-free adapter
+contract, so transport-neutral tests no longer import the Telegram runtime.
+
+The final reference classification is maintained in
+`home/docs/specs/telegram-adapter-boundary.md`. Remaining Telegram references
+are limited to adapter lifecycle, ingress, authentication, presentation,
+delivery, optional identity/channel binding, deployment configuration,
+retained non-authoritative archives, and adapter tests. Retained bindings are
+ineligible when Telegram is disabled, and multi-adapter delivery outcomes are
+independent.
+
+Installed qualification covers Workshop-only and hybrid operation using the
+backends configured on the qualification host, including ordinary execution,
+restart continuity, memory, scheduling, integration publication, and unchanged
+optional Telegram delivery. Supported backends for which the operator has no
+configured authenticated account are not falsely reported as active and do not
+block this architectural boundary.

@@ -1,4 +1,4 @@
-"""Production-unused durable lifecycle for canonical Workshop runs."""
+"""Durable lifecycle for canonical Workshop runs."""
 
 from __future__ import annotations
 

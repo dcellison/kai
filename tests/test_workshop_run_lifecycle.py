@@ -1,4 +1,4 @@
-"""Contracts for the production-unused durable Workshop run lifecycle."""
+"""Contracts for the durable Workshop run lifecycle."""
 
 from __future__ import annotations
 

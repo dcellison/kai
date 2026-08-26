@@ -30,18 +30,18 @@ Most AI coding tools are either interactive terminals or hosted chat surfaces. K
 | Repo-aware coding | Runs an agent inside local workspaces with shell, filesystem, git, and web access. |
 | Workspaces | Switches between projects by name and keeps per-workspace settings. |
 | Memory | Maintains identity, durable user memory, semantic recall, and searchable conversation history. |
-| Scheduling | Runs reminders, recurring jobs, and condition monitors from Telegram or HTTP. |
+| Scheduling | Runs canonical reminders, recurring jobs, and condition monitors from any authorized client or internal API caller. |
 | GitHub automation | Reviews PRs, triages issues, routes notifications, and reacts to webhook events. |
-| File exchange | Accepts files from Telegram, exposes their local paths to the agent, and can send files back. |
+| File exchange | Accepts artifacts through Workshop or a capable client adapter, exposes authorized local paths to the agent, and publishes results. |
 | Voice | Supports local voice transcription and optional text-to-speech responses. |
 | Multi-user operation | Isolates canonical principals, runtime profiles, workspaces, files, history, jobs, settings, and OS accounts. |
 
 ## How It Works
 
 ```text
-Workshop browser --\
-                    -> Kai service -> per-user agent backend
-Telegram (optional)-/                    -> local workspace, shell, git, files, web, services
+Workshop browser -----\
+Optional adapters -----+-> Kai core -> per-user agent backend
+Webhooks/internal API -/                  -> local workspace, shell, git, files, web, services
 ```
 
 Kai has two layers. The outer Python service owns client adapters, HTTP, scheduling, authentication, persistence, webhooks, file exchange, and per-user routing. The inner agent backend does the thinking and acting inside a local workspace. Backend subprocesses are created lazily per user and evicted after an idle timeout, so resource use follows active users rather than registered users.
@@ -153,7 +153,7 @@ For full installation details, see [Getting Started](https://github.com/dcelliso
 
 Kai has real local authority, so the security model is part of the product rather than an afterthought.
 
-- **Telegram allowlist:** Only configured Telegram user IDs can interact with the bot.
+- **Optional Telegram allowlist:** When the Telegram adapter is enabled, only configured Telegram user IDs can interact with it.
 - **Optional TOTP gate:** Time-based one-time passwords can protect the chat surface after idle timeout.
 - **Local execution:** Kai runs on your machine. Conversations do not pass through a Kai-hosted relay.
 - **Path confinement:** File exchange is constrained to allowed workspace and file-storage paths.
@@ -185,15 +185,15 @@ See [TOTP Authentication](https://github.com/dcellison/kai/wiki/TOTP-Authenticat
 
 ## Common Workflows
 
-- Send a normal Telegram message to have Kai work in the current workspace.
-- Use `/workspace <name>` or `/workspaces` to move between projects.
-- Use `/models` or `/model <name>` to change the active model.
-- Use `/memory`, `/memory search <query>`, and `/memory stats` to inspect durable memory.
+- Send a message in Workshop or an enabled conversational adapter to have Kai work in the current workspace.
+- Use Workshop settings or adapter commands such as `/workspace` to move between projects.
+- Use Workshop settings or adapter commands such as `/model` to change the active model.
+- Use the Workshop memory editor or adapter memory commands to inspect durable memory.
 - Ask Kai to remind you later, run a recurring check, or monitor a condition.
 - Subscribe a GitHub repo so pushes, PRs, issues, comments, and reviews can reach Kai.
 - Enable PR review or issue triage per user when you want background GitHub automation.
-- Send files directly in Telegram so the agent can inspect or transform them locally.
-- Use `/help` in Telegram for the current command reference.
+- Attach files in Workshop or a capable adapter so the agent can inspect or transform them locally.
+- Use each client surface's own help and controls; Telegram commands are adapter presentation, not core APIs.
 
 ## Documentation
 
