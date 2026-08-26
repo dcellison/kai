@@ -2,9 +2,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   EventStreamDecoder,
+  MemoryRevisionConflictError,
   cancelRun,
+  createMemoryFact,
   deleteMemories,
   deleteMemory,
+  editMemory,
   loadArtifactBlob,
   loadEarlierTimeline,
   loadMemoryDetail,
@@ -59,6 +62,7 @@ function memoryRecord(): Record<string, unknown> {
     source: "extracted",
     memory_type: "fact",
     preview: "Daniel prefers concise output.",
+    revision: "mr1_test-revision",
     tags: ["preference"],
     speaker: "user",
     confidence: 1,
@@ -312,6 +316,78 @@ describe("Workshop client API", () => {
       project_id: "kai",
     });
     expect((fetchMock.mock.calls[2]?.[1] as RequestInit).method).toBe("DELETE");
+  });
+
+  it("creates and edits memories through typed revision-bound requests", async () => {
+    const detail = {
+      ...memoryRecord(),
+      content: "Daniel prefers concise output.",
+      compact_recall: '{"record_type":"memory"}',
+      confirmation_quote: null,
+      prompt_version: "v1",
+      episode: null,
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json({ version: 1, created: true, record: detail }, { status: 201 }))
+      .mockResolvedValueOnce(Response.json({
+        version: 1,
+        record: { ...detail, revision: "mr1_updated" },
+        changed_fields: ["content", "tags"],
+        idempotent_replay: false,
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(createMemoryFact("session-secret", {
+      content: "Explicit fact",
+      tags: ["explicit"],
+      target: { scope: "project", projectId: "kai" },
+      requestId: "create-request",
+    })).resolves.toMatchObject({ created: true, record: { memoryId: "memory-1" } });
+    await expect(editMemory("session-secret", {
+      kind: "fact",
+      memoryId: "memory-1",
+      revision: "mr1_test-revision",
+      requestId: "edit-request",
+      content: "Corrected fact",
+      tags: ["corrected"],
+    })).resolves.toMatchObject({ changedFields: ["content", "tags"] });
+
+    expect(JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string)).toEqual({
+      kind: "fact",
+      content: "Explicit fact",
+      tags: ["explicit"],
+      scope: "project",
+      project_id: "kai",
+      request_id: "create-request",
+    });
+    expect(JSON.parse((fetchMock.mock.calls[1]?.[1] as RequestInit).body as string)).toEqual({
+      kind: "fact",
+      revision: "mr1_test-revision",
+      request_id: "edit-request",
+      content: "Corrected fact",
+      tags: ["corrected"],
+    });
+  });
+
+  it("surfaces the current revision when a memory edit conflicts", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({
+      error: {
+        code: "memory_revision_conflict",
+        message: "Memory changed since it was opened",
+        current_revision: "mr1_current",
+      },
+    }, { status: 409 })));
+
+    const failure = editMemory("session-secret", {
+      kind: "fact",
+      memoryId: "memory-1",
+      revision: "mr1_stale",
+      requestId: "edit-request",
+      content: "Correction",
+      tags: [],
+    });
+    await expect(failure).rejects.toBeInstanceOf(MemoryRevisionConflictError);
+    await expect(failure).rejects.toMatchObject({ currentRevision: "mr1_current" });
   });
 
   it("rejects an earlier page whose snapshot bound does not match", async () => {

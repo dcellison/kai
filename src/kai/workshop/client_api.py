@@ -44,6 +44,10 @@ from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.inbound import ClientInboundMessage, InboundBindingNotFoundError
 from kai.workshop.memory_queries import (
     DEFAULT_PAGE_SIZE,
+    MemoryCreationSnapshot,
+    MemoryEditSnapshot,
+    MemoryEpisodeEdit,
+    MemoryFactEdit,
     MemoryMutationBatch,
     MemoryQueryAuthority,
     MemoryQueryFilters,
@@ -52,6 +56,8 @@ from kai.workshop.memory_queries import (
     MemorySourceContext,
     MemorySourceMessage,
     WorkshopMemoryAccessDenied,
+    WorkshopMemoryConflict,
+    WorkshopMemoryMutationFailed,
     WorkshopMemoryNotFound,
     WorkshopMemoryQueryError,
     WorkshopMemoryQueryService,
@@ -215,6 +221,7 @@ def _serialize_memory_record(record: MemoryRecordSummary) -> dict[str, object]:
         "confidence": record.confidence,
         "created_at": record.created_at,
         "updated_at": record.updated_at,
+        "revision": record.revision,
         "scope": {
             "scope": record.scope.scope,
             "project_id": record.scope.project_id,
@@ -292,6 +299,23 @@ def _serialize_memory_mutation(batch: MemoryMutationBatch) -> dict[str, object]:
     }
 
 
+def _serialize_memory_edit(snapshot: MemoryEditSnapshot) -> dict[str, object]:
+    return {
+        "version": 1,
+        "record": _serialize_memory_detail(snapshot.record),
+        "changed_fields": list(snapshot.changed_fields),
+        "idempotent_replay": snapshot.idempotent_replay,
+    }
+
+
+def _serialize_memory_creation(snapshot: MemoryCreationSnapshot) -> dict[str, object]:
+    return {
+        "version": 1,
+        "record": _serialize_memory_detail(snapshot.record),
+        "created": snapshot.created,
+    }
+
+
 def _memory_filters(request: web.Request) -> MemoryQueryFilters:
     values: dict[str, str | None] = {}
     for field in _ALLOWED_MEMORY_FILTERS:
@@ -340,6 +364,19 @@ def _memory_error_response(exc: Exception) -> web.Response:
         return _error_response(status=413, code="response_too_large", message=str(exc))
     if isinstance(exc, WorkshopMemoryAccessDenied):
         return _error_response(status=403, code="access_denied", message="Access denied")
+    if isinstance(exc, WorkshopMemoryConflict):
+        return _json_response(
+            {
+                "error": {
+                    "code": "memory_revision_conflict",
+                    "message": str(exc),
+                    "current_revision": exc.current_revision,
+                }
+            },
+            status=409,
+        )
+    if isinstance(exc, WorkshopMemoryMutationFailed):
+        return _error_response(status=503, code="memory_mutation_failed", message=str(exc))
     if isinstance(exc, WorkshopMemoryValidationError):
         return _error_response(status=400, code="invalid_memory_query", message=str(exc))
     return _error_response(
@@ -484,6 +521,142 @@ async def _handle_memory_detail(
     except (KeyError, WorkshopMemoryQueryError) as exc:
         return _memory_error_response(exc)
     return _json_response(payload, status=200)
+
+
+async def _memory_json_object(request: web.Request) -> dict[str, object]:
+    if request.content_type != "application/json":
+        raise WorkshopMemoryValidationError("Content-Type must be application/json")
+    try:
+        payload = await request.json()
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise WorkshopMemoryValidationError("Invalid memory request") from exc
+    if not isinstance(payload, dict):
+        raise WorkshopMemoryValidationError("Invalid memory request")
+    return payload
+
+
+def _memory_string_list(value: object, *, field: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise WorkshopMemoryValidationError(f"{field} must be a list of strings")
+    return tuple(value)
+
+
+async def _handle_memory_create(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid memory creation request")
+    assert authority is not None
+    try:
+        payload = await _memory_json_object(request)
+        expected = frozenset({"kind", "content", "tags", "scope", "request_id"})
+        if set(payload) not in (expected, expected | {"project_id"}) or payload.get("kind") != "fact":
+            raise WorkshopMemoryValidationError("Invalid memory creation request")
+        content = payload.get("content")
+        scope = payload.get("scope")
+        request_id = payload.get("request_id")
+        project_id = payload.get("project_id")
+        if (
+            not isinstance(content, str)
+            or not isinstance(scope, str)
+            or not isinstance(request_id, str)
+            or (project_id is not None and not isinstance(project_id, str))
+        ):
+            raise WorkshopMemoryValidationError("Invalid memory creation request")
+        snapshot = await service.create_fact(
+            authority,
+            content=content,
+            tags=_memory_string_list(payload.get("tags"), field="Tags"),
+            scope=scope,
+            project_id=project_id,
+            request_id=request_id,
+        )
+    except WorkshopMemoryQueryError as exc:
+        return _memory_error_response(exc)
+    return _json_response(
+        _serialize_memory_creation(snapshot),
+        status=201 if snapshot.created else 200,
+    )
+
+
+async def _handle_memory_edit(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid memory edit request")
+    assert authority is not None
+    try:
+        payload = await _memory_json_object(request)
+        kind = payload.get("kind")
+        revision = payload.get("revision")
+        request_id = payload.get("request_id")
+        if not isinstance(revision, str) or not isinstance(request_id, str):
+            raise WorkshopMemoryValidationError("Invalid memory edit request")
+        if kind == "fact":
+            if set(payload) != {"kind", "revision", "request_id", "content", "tags"}:
+                raise WorkshopMemoryValidationError("Invalid fact edit request")
+            content = payload.get("content")
+            if not isinstance(content, str):
+                raise WorkshopMemoryValidationError("Content must be text")
+            edit: MemoryFactEdit | MemoryEpisodeEdit = MemoryFactEdit(
+                content,
+                _memory_string_list(payload.get("tags"), field="Tags"),
+            )
+        elif kind == "episode":
+            if set(payload) != {"kind", "revision", "request_id", "episode"}:
+                raise WorkshopMemoryValidationError("Invalid episode edit request")
+            episode = payload.get("episode")
+            required = {
+                "goal",
+                "context",
+                "approach",
+                "outcome",
+                "outcome_quality",
+                "tags",
+                "actors",
+            }
+            if not isinstance(episode, dict) or set(episode) not in (required, required | {"lessons"}):
+                raise WorkshopMemoryValidationError("Invalid episode edit request")
+            text_fields = ("goal", "context", "approach", "outcome", "outcome_quality")
+            if any(not isinstance(episode.get(field), str) for field in text_fields):
+                raise WorkshopMemoryValidationError("Episode fields must be text")
+            lessons = episode.get("lessons")
+            if lessons is not None and not isinstance(lessons, str):
+                raise WorkshopMemoryValidationError("Lessons must be text")
+            edit = MemoryEpisodeEdit(
+                goal=episode["goal"],
+                context=episode["context"],
+                approach=episode["approach"],
+                outcome=episode["outcome"],
+                outcome_quality=episode["outcome_quality"],
+                lessons=lessons,
+                tags=_memory_string_list(episode.get("tags"), field="Tags"),
+                actors=_memory_string_list(episode.get("actors"), field="Actors"),
+            )
+        else:
+            raise WorkshopMemoryValidationError("Invalid memory kind")
+        snapshot = await service.edit(
+            authority,
+            request.match_info["memory_id"],
+            revision=revision,
+            request_id=request_id,
+            edit=edit,
+        )
+    except (KeyError, WorkshopMemoryQueryError) as exc:
+        return _memory_error_response(exc)
+    return _json_response(_serialize_memory_edit(snapshot), status=200)
 
 
 async def _memory_mutation_payload(
@@ -2185,6 +2358,22 @@ def register_workshop_read_routes(
                     source=False,
                 )
 
+        async def handle_memory_create(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_create(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                )
+
+        async def handle_memory_edit(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_edit(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                )
+
         async def handle_memory_source(request: web.Request) -> web.Response:
             async with request_lock:
                 return await _handle_memory_detail(
@@ -2232,8 +2421,10 @@ def register_workshop_read_routes(
 
         app.router.add_get(_MEMORY_STATS_PATH, handle_memory_stats)
         app.router.add_get(_MEMORY_RECORDS_PATH, handle_memory_records)
+        app.router.add_post(_MEMORY_RECORDS_PATH, handle_memory_create)
         app.router.add_get(_MEMORY_SEARCH_PATH, handle_memory_search)
         app.router.add_get(_MEMORY_DETAIL_PATH, handle_memory_detail)
+        app.router.add_patch(_MEMORY_DETAIL_PATH, handle_memory_edit)
         app.router.add_get(_MEMORY_SOURCE_PATH, handle_memory_source)
         app.router.add_patch(_MEMORY_SCOPE_PATH, handle_memory_scope_mutation)
         app.router.add_delete(_MEMORY_DETAIL_PATH, handle_memory_delete_mutation)

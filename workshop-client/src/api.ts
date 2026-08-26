@@ -18,6 +18,8 @@ import type {
   WorkshopMemoryFilters,
   WorkshopMemoryListOptions,
   WorkshopMemoryDetail,
+  WorkshopMemoryEditResult,
+  WorkshopMemoryCreationResult,
   WorkshopMemoryMutationBatch,
   WorkshopMemoryRecord,
   WorkshopMemoryScope,
@@ -40,6 +42,14 @@ import {
 export class AuthenticationError extends Error {}
 export class ChannelAccessError extends Error {}
 export class ResynchronizationRequired extends Error {}
+export class MemoryRevisionConflictError extends Error {
+  constructor(
+    message: string,
+    public readonly currentRevision: string,
+  ) {
+    super(message);
+  }
+}
 
 interface StreamEvent {
   data: string;
@@ -470,6 +480,7 @@ function parseMemoryRecord(value: unknown): WorkshopMemoryRecord | null {
     typeof value.source !== "string" ||
     typeof value.memory_type !== "string" ||
     typeof value.preview !== "string" ||
+    typeof value.revision !== "string" ||
     !Array.isArray(value.tags) ||
     !value.tags.every((tag) => typeof tag === "string") ||
     typeof value.speaker !== "string" ||
@@ -487,6 +498,7 @@ function parseMemoryRecord(value: unknown): WorkshopMemoryRecord | null {
     memoryId: value.memory_id,
     memoryType: value.memory_type,
     preview: value.preview,
+    revision: value.revision,
     scope,
     source: value.source,
     speaker: value.speaker,
@@ -763,6 +775,53 @@ export async function searchMemories(
   };
 }
 
+function parseMemoryEpisode(value: unknown): WorkshopMemoryDetail["episode"] | undefined {
+  if (value === null) return null;
+  if (!isRecord(value)) return undefined;
+  const requiredText = ["goal", "context", "approach", "outcome", "outcome_quality"];
+  if (
+    requiredText.some((field) => typeof value[field] !== "string") ||
+    (value.lessons !== undefined && typeof value.lessons !== "string") ||
+    !Array.isArray(value.tags) || !value.tags.every((item) => typeof item === "string") ||
+    !Array.isArray(value.actors) || !value.actors.every((item) => typeof item === "string") ||
+    !["success", "partial", "failure"].includes(String(value.outcome_quality))
+  ) {
+    return undefined;
+  }
+  return {
+    actors: value.actors as string[],
+    approach: value.approach as string,
+    context: value.context as string,
+    goal: value.goal as string,
+    lessons: typeof value.lessons === "string" ? value.lessons : null,
+    outcome: value.outcome as string,
+    outcomeQuality: value.outcome_quality as "success" | "partial" | "failure",
+    tags: value.tags as string[],
+  };
+}
+
+function parseMemoryDetail(value: unknown): WorkshopMemoryDetail | null {
+  if (!isRecord(value)) return null;
+  const record = parseMemoryRecord(value);
+  const episode = parseMemoryEpisode(value.episode);
+  if (
+    !record || episode === undefined || typeof value.content !== "string" ||
+    typeof value.compact_recall !== "string" ||
+    (value.confirmation_quote !== null && typeof value.confirmation_quote !== "string") ||
+    (value.prompt_version !== null && typeof value.prompt_version !== "string")
+  ) {
+    return null;
+  }
+  return {
+    ...record,
+    compactRecall: value.compact_recall,
+    confirmationQuote: value.confirmation_quote,
+    content: value.content,
+    episode,
+    promptVersion: value.prompt_version,
+  };
+}
+
 export async function loadMemoryDetail(
   token: string,
   memoryId: string,
@@ -775,31 +834,126 @@ export async function loadMemoryDetail(
   if (!response.ok) {
     throw new Error(safeErrorMessage(payload, "Could not load this memory."));
   }
-  if (!isRecord(payload) || payload.version !== 1 || !isRecord(payload.record)) {
-    throw new Error("Kai returned an unsupported memory detail.");
-  }
-  const record = parseMemoryRecord(payload.record);
-  const episode = payload.record.episode;
-  if (
-    !record || typeof payload.record.content !== "string" ||
-    typeof payload.record.compact_recall !== "string" ||
-    (payload.record.confirmation_quote !== null &&
-      typeof payload.record.confirmation_quote !== "string") ||
-    (payload.record.prompt_version !== null &&
-      typeof payload.record.prompt_version !== "string") ||
-    (episode !== null &&
-      (!isRecord(episode) ||
-        !Object.values(episode).every((value) => typeof value === "string")))
+  const record = isRecord(payload) && payload.version === 1
+    ? parseMemoryDetail(payload.record)
+    : null;
+  if (!record) throw new Error("Kai returned an unsupported memory detail.");
+  return record;
+}
+
+function mutationRequestId(): string {
+  return typeof globalThis.crypto?.randomUUID === "function"
+    ? globalThis.crypto.randomUUID()
+    : `memory-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+async function memoryContentMutation(
+  token: string,
+  path: string,
+  options: RequestInit,
+): Promise<unknown> {
+  const response = await authorizedFetch({ channelId: "", token }, path, options);
+  const payload = await responsePayload(response);
+  if (response.status === 409 && isRecord(payload) && isRecord(payload.error) &&
+    typeof payload.error.current_revision === "string"
   ) {
-    throw new Error("Kai returned an unsupported memory detail.");
+    throw new MemoryRevisionConflictError(
+      safeErrorMessage(payload, "This memory changed since it was opened."),
+      payload.error.current_revision,
+    );
   }
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not save this memory."));
+  }
+  return payload;
+}
+
+export async function createMemoryFact(
+  token: string,
+  input: {
+    content: string;
+    tags: string[];
+    target: { scope: "global" } | { scope: "project"; projectId: string };
+    requestId?: string;
+  },
+): Promise<WorkshopMemoryCreationResult> {
+  const payload = await memoryContentMutation(token, "/v1/memory/records", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      kind: "fact",
+      content: input.content,
+      tags: input.tags,
+      scope: input.target.scope,
+      ...(input.target.scope === "project" ? { project_id: input.target.projectId } : {}),
+      request_id: input.requestId ?? mutationRequestId(),
+    }),
+  });
+  if (!isRecord(payload) || payload.version !== 1 || typeof payload.created !== "boolean") {
+    throw new Error("Kai returned an unsupported memory creation result.");
+  }
+  const record = parseMemoryDetail(payload.record);
+  if (!record) throw new Error("Kai returned an unsupported memory creation result.");
+  return { created: payload.created, record };
+}
+
+export async function editMemory(
+  token: string,
+  input: {
+    memoryId: string;
+    revision: string;
+    requestId?: string;
+  } & (
+    { kind: "fact"; content: string; tags: string[] } |
+    { kind: "episode"; episode: NonNullable<WorkshopMemoryDetail["episode"]> }
+  ),
+): Promise<WorkshopMemoryEditResult> {
+  const body = input.kind === "fact"
+    ? {
+        kind: "fact",
+        revision: input.revision,
+        request_id: input.requestId ?? mutationRequestId(),
+        content: input.content,
+        tags: input.tags,
+      }
+    : {
+        kind: "episode",
+        revision: input.revision,
+        request_id: input.requestId ?? mutationRequestId(),
+        episode: {
+          goal: input.episode.goal,
+          context: input.episode.context,
+          approach: input.episode.approach,
+          outcome: input.episode.outcome,
+          outcome_quality: input.episode.outcomeQuality,
+          ...(input.episode.lessons ? { lessons: input.episode.lessons } : {}),
+          tags: input.episode.tags,
+          actors: input.episode.actors,
+        },
+      };
+  const payload = await memoryContentMutation(
+    token,
+    `/v1/memory/records/${encodeURIComponent(input.memoryId)}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  if (
+    !isRecord(payload) || payload.version !== 1 ||
+    !Array.isArray(payload.changed_fields) ||
+    !payload.changed_fields.every((field) => typeof field === "string") ||
+    typeof payload.idempotent_replay !== "boolean"
+  ) {
+    throw new Error("Kai returned an unsupported memory edit result.");
+  }
+  const record = parseMemoryDetail(payload.record);
+  if (!record) throw new Error("Kai returned an unsupported memory edit result.");
   return {
-    ...record,
-    compactRecall: payload.record.compact_recall,
-    confirmationQuote: payload.record.confirmation_quote,
-    content: payload.record.content,
-    episode: episode as Record<string, string> | null,
-    promptVersion: payload.record.prompt_version,
+    changedFields: payload.changed_fields as string[],
+    idempotentReplay: payload.idempotent_replay,
+    record,
   };
 }
 

@@ -90,11 +90,23 @@ export interface WorkshopMemoryRecord {
   memoryId: string;
   memoryType: string;
   preview: string;
+  revision: string;
   scope: WorkshopMemoryScope;
   source: string;
   speaker: string;
   tags: string[];
   updatedAt: string;
+}
+
+export interface WorkshopMemoryEpisodeFields {
+  actors: string[];
+  approach: string;
+  context: string;
+  goal: string;
+  lessons: string | null;
+  outcome: string;
+  outcomeQuality: "success" | "partial" | "failure";
+  tags: string[];
 }
 
 export interface WorkshopMemoryPage {
@@ -125,8 +137,19 @@ export interface WorkshopMemoryDetail extends WorkshopMemoryRecord {
   compactRecall: string;
   confirmationQuote: string | null;
   content: string;
-  episode: Record<string, string> | null;
+  episode: WorkshopMemoryEpisodeFields | null;
   promptVersion: string | null;
+}
+
+export interface WorkshopMemoryEditResult {
+  changedFields: string[];
+  idempotentReplay: boolean;
+  record: WorkshopMemoryDetail;
+}
+
+export interface WorkshopMemoryCreationResult {
+  created: boolean;
+  record: WorkshopMemoryDetail;
 }
 
 export interface WorkshopMemorySourceMessage {

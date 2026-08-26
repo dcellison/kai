@@ -35,12 +35,19 @@ MAX_CONTENT_CHARACTERS = 100_000
 MAX_COMPACT_RECALL_CHARACTERS = 120_000
 MAX_SOURCE_BODY_CHARACTERS = 50_000
 MAX_MUTATION_TARGETS = 50
+MAX_MEMORY_TAGS = 32
+MAX_MEMORY_TAG_CHARACTERS = 128
+MAX_EPISODE_FIELD_CHARACTERS = 20_000
+MAX_REQUEST_ID_CHARACTERS = 128
 MEMORY_MANAGEMENT_AUDIT_EVENT = "workshop.memory.mutation"
+MEMORY_CONTENT_AUDIT_EVENT = "workshop.memory.content_mutation"
 _CURSOR_VERSION = 1
+_REVISION_VERSION = 1
 _VALID_KINDS = frozenset({"fact", "episode"})
 _VALID_SCOPES = frozenset({"global", "project", "task"})
 _VALID_ORDERS = frozenset({"newest", "oldest"})
 _VALID_MUTATION_SCOPES = frozenset({memory.SCOPE_GLOBAL, memory.SCOPE_PROJECT})
+_VALID_OUTCOME_QUALITIES = frozenset({"success", "partial", "failure"})
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +74,18 @@ class WorkshopMemoryNotFound(WorkshopMemoryQueryError):
 
 class WorkshopMemoryResponseTooLarge(WorkshopMemoryQueryError):
     """A stored record exceeds the bounded client response contract."""
+
+
+class WorkshopMemoryConflict(WorkshopMemoryQueryError):
+    """An optimistic memory revision no longer matches the stored row."""
+
+    def __init__(self, current_revision: str) -> None:
+        super().__init__("Memory changed since it was opened")
+        self.current_revision = current_revision
+
+
+class WorkshopMemoryMutationFailed(WorkshopMemoryQueryError):
+    """A provider mutation failed without producing a verified result."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +131,7 @@ class MemoryRecordSummary:
     confidence: float
     created_at: str
     updated_at: str
+    revision: str
     scope: MemoryScopeSnapshot
 
 
@@ -122,7 +142,38 @@ class MemoryRecordDetail:
     compact_recall: str
     confirmation_quote: str | None
     prompt_version: str | None
-    episode: dict[str, str] | None
+    episode: dict[str, object] | None
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryFactEdit:
+    content: str
+    tags: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryEpisodeEdit:
+    goal: str
+    context: str
+    approach: str
+    outcome: str
+    outcome_quality: str
+    lessons: str | None
+    tags: tuple[str, ...]
+    actors: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryEditSnapshot:
+    record: MemoryRecordDetail
+    changed_fields: tuple[str, ...]
+    idempotent_replay: bool
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryCreationSnapshot:
+    record: MemoryRecordDetail
+    created: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +268,26 @@ def _tags(result: memory.MemoryResult) -> tuple[str, ...]:
     if not isinstance(raw, list):
         return ()
     return tuple(tag[:128] for tag in raw[:32] if isinstance(tag, str) and tag)
+
+
+def _memory_revision(result: memory.MemoryResult) -> str:
+    """Return an opaque digest covering every client-visible mutable field."""
+    payload = json.dumps(
+        {
+            "version": _REVISION_VERSION,
+            "memory_id": result.id,
+            "content": result.text,
+            "metadata": result.metadata,
+            "created_at": result.created_at,
+            "updated_at": result.updated_at,
+        },
+        default=str,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    digest = base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=").decode()
+    return f"mr{_REVISION_VERSION}_{digest}"
 
 
 def _sort_key(result: memory.MemoryResult) -> tuple[str, str]:
@@ -462,6 +533,7 @@ class WorkshopMemoryQueryService:
             confidence=float(confidence),
             created_at=result.created_at,
             updated_at=result.updated_at,
+            revision=_memory_revision(result),
             scope=cls._scope_snapshot(
                 result,
                 allowed_project_id=allowed_project_id,
@@ -595,6 +667,392 @@ class WorkshopMemoryQueryService:
             )
         except ValueError as exc:
             raise WorkshopMemoryValidationError("Invalid memory scope") from exc
+
+    @staticmethod
+    def _validate_request_id(request_id: str) -> str:
+        if (
+            not isinstance(request_id, str)
+            or not request_id.strip()
+            or len(request_id) > MAX_REQUEST_ID_CHARACTERS
+            or any(character.isspace() for character in request_id)
+        ):
+            raise WorkshopMemoryValidationError("Invalid memory mutation request identifier")
+        return request_id
+
+    @staticmethod
+    def _validate_revision(revision: str) -> str:
+        if not isinstance(revision, str) or not revision.startswith(f"mr{_REVISION_VERSION}_") or len(revision) > 128:
+            raise WorkshopMemoryValidationError("Invalid memory revision")
+        return revision
+
+    @staticmethod
+    def _validate_text(value: str, *, field: str, maximum: int) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise WorkshopMemoryValidationError(f"{field} is required")
+        cleaned = value.strip()
+        if len(cleaned) > maximum:
+            raise WorkshopMemoryValidationError(f"{field} is too long")
+        return cleaned
+
+    @staticmethod
+    def _validate_tags(values: Sequence[str], *, field: str = "Tags") -> tuple[str, ...]:
+        if isinstance(values, (str, bytes)):
+            raise WorkshopMemoryValidationError(f"{field} must be a list")
+        checked = tuple(values)
+        if len(checked) > MAX_MEMORY_TAGS:
+            raise WorkshopMemoryValidationError(f"{field} must contain at most {MAX_MEMORY_TAGS} values")
+        cleaned: list[str] = []
+        for value in checked:
+            if not isinstance(value, str) or not value.strip() or len(value.strip()) > MAX_MEMORY_TAG_CHARACTERS:
+                raise WorkshopMemoryValidationError(f"Invalid {field.lower()} value")
+            normalized = value.strip()
+            if normalized in cleaned:
+                raise WorkshopMemoryValidationError(f"{field} must not contain duplicates")
+            cleaned.append(normalized)
+        return tuple(cleaned)
+
+    @staticmethod
+    def _namespace_for_mutation(authority: MemoryQueryAuthority) -> WorkshopExecutionStateNamespace:
+        namespace = authority.search_namespace
+        if namespace is None:
+            raise WorkshopMemoryAccessDenied("Memory mutation requires one unambiguous runtime profile")
+        return namespace
+
+    def _audit_content_mutation(
+        self,
+        authority: MemoryQueryAuthority,
+        *,
+        operation: Literal["create", "edit"],
+        memory_id: str | None,
+        changed_fields: Sequence[str],
+        outcome: Literal["succeeded", "idempotent", "conflict", "failed"],
+    ) -> None:
+        log.info(
+            "%s %s",
+            MEMORY_CONTENT_AUDIT_EVENT,
+            json.dumps(
+                {
+                    "actor_principal_id": str(authority.principal_id),
+                    "operation": operation,
+                    "memory_id": memory_id,
+                    "changed_fields": sorted(changed_fields),
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "outcome": outcome,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+
+    @staticmethod
+    def _fact_matches(result: memory.MemoryResult, *, content: str, tags: Sequence[str]) -> bool:
+        return (
+            _record_kind(result) == "fact"
+            and result.text == content
+            and tuple(result.metadata.get("tags") or ()) == tuple(tags)
+        )
+
+    @staticmethod
+    def _episode_matches(result: memory.MemoryResult, edit: MemoryEpisodeEdit) -> bool:
+        metadata = result.metadata
+        return (
+            _record_kind(result) == "episode"
+            and result.text == f"{edit.goal}\n\n{edit.context}"
+            and metadata.get("goal") == edit.goal
+            and metadata.get("context") == edit.context
+            and metadata.get("approach") == edit.approach
+            and metadata.get("outcome") == edit.outcome
+            and metadata.get("outcome_quality") == edit.outcome_quality
+            and metadata.get("lessons") == edit.lessons
+            and tuple(metadata.get("tags") or ()) == edit.tags
+            and tuple(metadata.get("actors") or ()) == edit.actors
+        )
+
+    async def create_fact(
+        self,
+        authority: MemoryQueryAuthority,
+        *,
+        content: str,
+        tags: Sequence[str],
+        scope: str,
+        project_id: str | None,
+        request_id: str,
+    ) -> MemoryCreationSnapshot:
+        namespace = self._namespace_for_mutation(authority)
+        cleaned_content = self._validate_text(content, field="Content", maximum=MAX_CONTENT_CHARACTERS)
+        cleaned_tags = self._validate_tags(tags)
+        checked_request_id = self._validate_request_id(request_id)
+        scope_metadata = await self._scope_metadata(authority, scope=scope, project_id=project_id)
+        lock = self._mutation_locks.setdefault(authority.principal_id, asyncio.Lock())
+        async with lock:
+            for existing in await self._all_visible(authority):
+                if existing.metadata.get("operator_creation_request_id") != checked_request_id:
+                    continue
+                if (
+                    existing.metadata.get("source") == "explicit"
+                    and self._fact_matches(existing, content=cleaned_content, tags=cleaned_tags)
+                    and all(existing.metadata.get(key) == value for key, value in scope_metadata.items())
+                ):
+                    self._audit_content_mutation(
+                        authority,
+                        operation="create",
+                        memory_id=existing.id,
+                        changed_fields=("content", "tags", "scope"),
+                        outcome="idempotent",
+                    )
+                    return MemoryCreationSnapshot(await self.detail(authority, existing.id), False)
+                self._audit_content_mutation(
+                    authority,
+                    operation="create",
+                    memory_id=existing.id,
+                    changed_fields=("content", "tags", "scope"),
+                    outcome="conflict",
+                )
+                raise WorkshopMemoryConflict(_memory_revision(existing))
+
+            now = datetime.now(UTC).isoformat()
+            metadata: dict[str, object] = {
+                "source": "explicit",
+                "speaker": "user",
+                "confidence": 1.0,
+                "operator_created_at": now,
+                "operator_created_by_principal_id": str(authority.principal_id),
+                "operator_creation_request_id": checked_request_id,
+                **scope_metadata,
+            }
+            memory_id = await asyncio.to_thread(
+                memory.add_structured,
+                cleaned_content,
+                user_id=str(authority.principal_id),
+                memory_type="fact",
+                tags=list(cleaned_tags),
+                metadata=metadata,
+                runtime_profile_id=str(namespace.runtime_profile_id),
+            )
+            if not isinstance(memory_id, str) or not memory_id:
+                self._audit_content_mutation(
+                    authority,
+                    operation="create",
+                    memory_id=None,
+                    changed_fields=("content", "tags", "scope"),
+                    outcome="failed",
+                )
+                raise WorkshopMemoryMutationFailed("Memory creation failed")
+            stored = await asyncio.to_thread(
+                memory.get_by_id,
+                user_id=str(authority.principal_id),
+                memory_id=memory_id,
+                runtime_profile_id=str(namespace.runtime_profile_id),
+            )
+            if (
+                stored is None
+                or not self._fact_matches(stored, content=cleaned_content, tags=cleaned_tags)
+                or any(stored.metadata.get(key) != value for key, value in scope_metadata.items())
+                or stored.metadata.get("operator_creation_request_id") != checked_request_id
+            ):
+                self._audit_content_mutation(
+                    authority,
+                    operation="create",
+                    memory_id=memory_id,
+                    changed_fields=("content", "tags", "scope"),
+                    outcome="failed",
+                )
+                raise WorkshopMemoryMutationFailed("Memory creation could not be verified")
+            self._audit_content_mutation(
+                authority,
+                operation="create",
+                memory_id=memory_id,
+                changed_fields=("content", "tags", "scope"),
+                outcome="succeeded",
+            )
+            return MemoryCreationSnapshot(await self.detail(authority, memory_id), True)
+
+    async def edit(
+        self,
+        authority: MemoryQueryAuthority,
+        memory_id: str,
+        *,
+        revision: str,
+        request_id: str,
+        edit: MemoryFactEdit | MemoryEpisodeEdit,
+    ) -> MemoryEditSnapshot:
+        if not isinstance(memory_id, str) or not memory_id or len(memory_id) > 256:
+            raise WorkshopMemoryValidationError("Invalid memory identifier")
+        checked_revision = self._validate_revision(revision)
+        checked_request_id = self._validate_request_id(request_id)
+        namespace = self._namespace_for_mutation(authority)
+        if isinstance(edit, MemoryFactEdit):
+            normalized: MemoryFactEdit | MemoryEpisodeEdit = MemoryFactEdit(
+                self._validate_text(edit.content, field="Content", maximum=MAX_CONTENT_CHARACTERS),
+                self._validate_tags(edit.tags),
+            )
+        else:
+            normalized = MemoryEpisodeEdit(
+                goal=self._validate_text(edit.goal, field="Goal", maximum=MAX_EPISODE_FIELD_CHARACTERS),
+                context=self._validate_text(edit.context, field="Context", maximum=MAX_EPISODE_FIELD_CHARACTERS),
+                approach=self._validate_text(edit.approach, field="Approach", maximum=MAX_EPISODE_FIELD_CHARACTERS),
+                outcome=self._validate_text(edit.outcome, field="Outcome", maximum=MAX_EPISODE_FIELD_CHARACTERS),
+                outcome_quality=edit.outcome_quality,
+                lessons=(
+                    self._validate_text(edit.lessons, field="Lessons", maximum=MAX_EPISODE_FIELD_CHARACTERS)
+                    if edit.lessons is not None and edit.lessons.strip()
+                    else None
+                ),
+                tags=self._validate_tags(edit.tags),
+                actors=self._validate_tags(edit.actors, field="Actors"),
+            )
+            if normalized.outcome_quality not in _VALID_OUTCOME_QUALITIES:
+                raise WorkshopMemoryValidationError("Outcome quality must be success, partial, or failure")
+
+        lock = self._mutation_locks.setdefault(authority.principal_id, asyncio.Lock())
+        async with lock:
+            existing = await asyncio.to_thread(
+                memory.get_by_id,
+                user_id=str(authority.principal_id),
+                memory_id=memory_id,
+                runtime_profile_id=str(namespace.runtime_profile_id),
+            )
+            if existing is None:
+                raise WorkshopMemoryNotFound("Memory not found")
+            if isinstance(normalized, MemoryFactEdit) and _record_kind(existing) != "fact":
+                raise WorkshopMemoryValidationError("Memory kind does not match the edit request")
+            if isinstance(normalized, MemoryEpisodeEdit) and _record_kind(existing) != "episode":
+                raise WorkshopMemoryValidationError("Memory kind does not match the edit request")
+
+            matches = (
+                self._fact_matches(existing, content=normalized.content, tags=normalized.tags)
+                if isinstance(normalized, MemoryFactEdit)
+                else self._episode_matches(existing, normalized)
+            )
+            if _memory_revision(existing) != checked_revision:
+                if existing.metadata.get("operator_edit_request_id") == checked_request_id and matches:
+                    self._audit_content_mutation(
+                        authority,
+                        operation="edit",
+                        memory_id=memory_id,
+                        changed_fields=(),
+                        outcome="idempotent",
+                    )
+                    return MemoryEditSnapshot(await self.detail(authority, memory_id), (), True)
+                self._audit_content_mutation(
+                    authority,
+                    operation="edit",
+                    memory_id=memory_id,
+                    changed_fields=(),
+                    outcome="conflict",
+                )
+                raise WorkshopMemoryConflict(_memory_revision(existing))
+
+            merged = dict(existing.metadata)
+            changed_fields: list[str] = []
+            if isinstance(normalized, MemoryFactEdit):
+                data = normalized.content
+                if existing.text != data:
+                    changed_fields.append("content")
+                if tuple(existing.metadata.get("tags") or ()) != normalized.tags:
+                    changed_fields.append("tags")
+                merged["tags"] = list(normalized.tags)
+            else:
+                data = f"{normalized.goal}\n\n{normalized.context}"
+                episode_values: dict[str, object] = {
+                    "goal": normalized.goal,
+                    "context": normalized.context,
+                    "approach": normalized.approach,
+                    "outcome": normalized.outcome,
+                    "outcome_quality": normalized.outcome_quality,
+                    "tags": list(normalized.tags),
+                    "actors": list(normalized.actors),
+                }
+                for field, value in episode_values.items():
+                    current = existing.metadata.get(field)
+                    if field in {"tags", "actors"}:
+                        current = list(current or ())
+                    if current != value:
+                        changed_fields.append(field)
+                    merged[field] = value
+                if normalized.lessons is None:
+                    if "lessons" in merged:
+                        changed_fields.append("lessons")
+                        merged.pop("lessons", None)
+                else:
+                    if merged.get("lessons") != normalized.lessons:
+                        changed_fields.append("lessons")
+                    merged["lessons"] = normalized.lessons
+
+            if not changed_fields:
+                self._audit_content_mutation(
+                    authority,
+                    operation="edit",
+                    memory_id=memory_id,
+                    changed_fields=(),
+                    outcome="idempotent",
+                )
+                return MemoryEditSnapshot(await self.detail(authority, memory_id), (), True)
+
+            now = datetime.now(UTC).isoformat()
+            edit_count = existing.metadata.get("operator_edit_count")
+            merged.update(
+                {
+                    "operator_edited_at": now,
+                    "operator_edited_by_principal_id": str(authority.principal_id),
+                    "operator_edited_fields": sorted(changed_fields),
+                    "operator_edit_count": (edit_count if isinstance(edit_count, int) and edit_count >= 0 else 0) + 1,
+                    "operator_edit_request_id": checked_request_id,
+                }
+            )
+            updated = await asyncio.to_thread(
+                memory.update_metadata,
+                user_id=str(authority.principal_id),
+                memory_id=memory_id,
+                data=data,
+                metadata=merged,
+                runtime_profile_id=str(namespace.runtime_profile_id),
+            )
+            current = await asyncio.to_thread(
+                memory.get_by_id,
+                user_id=str(authority.principal_id),
+                memory_id=memory_id,
+                runtime_profile_id=str(namespace.runtime_profile_id),
+            )
+            current_matches = current is not None and (
+                self._fact_matches(current, content=normalized.content, tags=normalized.tags)
+                if isinstance(normalized, MemoryFactEdit)
+                else self._episode_matches(current, normalized)
+            )
+            if (
+                current_matches
+                and current is not None
+                and current.metadata.get("operator_edit_request_id") == checked_request_id
+            ):
+                self._audit_content_mutation(
+                    authority,
+                    operation="edit",
+                    memory_id=memory_id,
+                    changed_fields=changed_fields,
+                    outcome="succeeded",
+                )
+                return MemoryEditSnapshot(
+                    await self.detail(authority, memory_id),
+                    tuple(sorted(changed_fields)),
+                    not updated,
+                )
+            if current is not None and _memory_revision(current) != checked_revision:
+                self._audit_content_mutation(
+                    authority,
+                    operation="edit",
+                    memory_id=memory_id,
+                    changed_fields=changed_fields,
+                    outcome="conflict",
+                )
+                raise WorkshopMemoryConflict(_memory_revision(current))
+            self._audit_content_mutation(
+                authority,
+                operation="edit",
+                memory_id=memory_id,
+                changed_fields=changed_fields,
+                outcome="failed",
+            )
+            raise WorkshopMemoryMutationFailed("Memory edit failed; the original revision remains current")
 
     def _audit_mutation(
         self,
@@ -785,11 +1243,19 @@ class WorkshopMemoryQueryService:
         speaker, confidence = memory.read_time_memory_speaker(result.metadata)
         episode = None
         if _record_kind(result) == "episode":
-            episode = {
-                key: value
-                for key in ("goal", "approach", "outcome", "lessons", "actors", "outcome_quality")
-                if (value := _bounded_text(result.metadata.get(key), maximum=10_000)) is not None
-            }
+            episode = {}
+            for key in ("goal", "context", "approach", "outcome", "lessons", "outcome_quality"):
+                value = _bounded_text(result.metadata.get(key), maximum=MAX_EPISODE_FIELD_CHARACTERS)
+                if value is not None:
+                    episode[key] = value
+            for key in ("tags", "actors"):
+                value = result.metadata.get(key)
+                if isinstance(value, list):
+                    episode[key] = [
+                        item[:MAX_MEMORY_TAG_CHARACTERS]
+                        for item in value[:MAX_MEMORY_TAGS]
+                        if isinstance(item, str) and item
+                    ]
         return MemoryRecordDetail(
             record=self._summary(
                 result,

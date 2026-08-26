@@ -3923,7 +3923,14 @@ def delete_by_id(
     return True
 
 
-def update_metadata(*, user_id: str, memory_id: str, data: str, metadata: dict[str, Any]) -> bool:
+def update_metadata(
+    *,
+    user_id: str,
+    memory_id: str,
+    data: str,
+    metadata: dict[str, Any],
+    runtime_profile_id: str | None = None,
+) -> bool:
     """Replace the metadata dict for `memory_id` belonging to `user_id`.
 
     IMPORTANT: Mem0's underlying `update` REPLACES the metadata dict
@@ -3967,10 +3974,20 @@ def update_metadata(*, user_id: str, memory_id: str, data: str, metadata: dict[s
     # the gate used by delete_by_id; if get_by_id returns None for any
     # reason (missing, wrong user, source not in USER_VISIBLE_SOURCES,
     # fetch error) we refuse to update.
-    if get_by_id(user_id=user_id, memory_id=memory_id) is None:
+    if (
+        get_by_id(
+            user_id=user_id,
+            memory_id=memory_id,
+            runtime_profile_id=runtime_profile_id,
+        )
+        is None
+    ):
         return False
 
-    _, namespace = _canonical_memory_owner(user_id)
+    _, namespace = _canonical_memory_owner(
+        user_id,
+        runtime_profile_id=runtime_profile_id,
+    )
     try:
         _memory.update(
             memory_id=memory_id,
