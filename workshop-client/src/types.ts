@@ -59,15 +59,35 @@ export interface WorkshopWorkspaceOption {
   path: string;
 }
 
+export interface WorkshopEditableCapability {
+  choices: string[] | null;
+  field: string;
+  maximum: number | null;
+  minimum: number | null;
+  resettable: boolean;
+  scope: "runtime" | "workspace";
+  valueType: "authorized_workspace" | "integer_seconds" | "model_id" | "text";
+}
+
+export interface WorkshopSettingsMutation {
+  changed: boolean;
+  operation: string;
+  providerSessionInvalidated: boolean;
+  runtimeAction: "deferred_until_next_run" | "restarted" | "unchanged";
+}
+
 export interface WorkshopSettingsWorkspace {
   backend: string;
+  capabilities: WorkshopEditableCapability[];
   channelId: string;
-  model: { source: string; value: string };
+  model: { defaultValue: string; source: string; value: string };
   modelOptions: WorkshopModelOption[] | null;
+  mutation: WorkshopSettingsMutation | null;
   principalId: string;
   provider: string;
+  revision: string;
   runtimeProfileId: string;
-  timeoutSeconds: { source: string; value: number };
+  timeoutSeconds: { defaultValue: number; source: string; value: number };
   workspace: string;
   workspaces: WorkshopWorkspaceOption[];
 }

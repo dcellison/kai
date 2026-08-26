@@ -80,9 +80,12 @@ from kai.workshop.preferences import (
 from kai.workshop.run_lifecycle import DurableRun, RunNotFoundError, RunStatus
 from kai.workshop.run_previews import RunPreview, WorkshopRunPreviewRegistry
 from kai.workshop.settings_workspaces import (
+    EditableCapability,
+    SettingsMutationOutcome,
     SettingsWorkspaceAuthority,
     SettingsWorkspaceSnapshot,
     WorkshopSettingsWorkspaceAccessDenied,
+    WorkshopSettingsWorkspaceConflict,
     WorkshopSettingsWorkspaceService,
     WorkshopSettingsWorkspaceValidationError,
     WorkspaceConfigSnapshot,
@@ -129,10 +132,11 @@ _ALLOWED_MEMORY_LIST_PARAMETERS = _ALLOWED_MEMORY_FILTERS | {"cursor", "limit", 
 _ALLOWED_MEMORY_SEARCH_PARAMETERS = _ALLOWED_MEMORY_FILTERS | {"q", "limit"}
 _ENROLLMENT_REQUEST_FIELDS = frozenset({"enrollment_token", "device_display_name"})
 _COMMAND_REQUEST_FIELDS = frozenset({"client_message_id", "body"})
-_SETTINGS_REQUEST_FIELDS = frozenset({"model", "timeout_seconds", "reset"})
-_WORKSPACE_REQUEST_FIELDS = frozenset({"path"})
-_WORKSPACE_CONFIG_REQUEST_FIELDS = frozenset({"field", "value", "path"})
-_WORKSPACE_CONFIG_RESET_FIELDS = frozenset({"reset", "path"})
+_SETTINGS_OPERATION_FIELDS = frozenset({"model", "timeout_seconds", "reset"})
+_SETTINGS_REQUEST_FIELDS = _SETTINGS_OPERATION_FIELDS | {"revision"}
+_WORKSPACE_REQUEST_FIELDS = frozenset({"path", "revision"})
+_WORKSPACE_CONFIG_REQUEST_FIELDS = frozenset({"field", "value", "path", "revision"})
+_WORKSPACE_CONFIG_RESET_FIELDS = frozenset({"reset", "path", "revision"})
 _PREFERENCE_UPDATE_FIELDS = frozenset({"content", "revision"})
 _PREFERENCE_RESTORE_FIELDS = frozenset({"revision"})
 _DECIMAL_INTEGER = re.compile(r"^[0-9]+$")
@@ -178,11 +182,16 @@ def _serialize_settings_workspace(
         "model": {
             "value": snapshot.model.value,
             "source": snapshot.model.source,
+            "default_value": snapshot.model.default_value,
         },
         "timeout_seconds": {
             "value": snapshot.timeout_seconds.value,
             "source": snapshot.timeout_seconds.source,
+            "default_value": snapshot.timeout_seconds.default_value,
         },
+        "revision": snapshot.revision,
+        "capabilities": [_serialize_editable_capability(item) for item in snapshot.capabilities],
+        "mutation": _serialize_settings_mutation(snapshot.mutation),
         "workspace": snapshot.workspace,
         "model_options": (
             [
@@ -204,6 +213,31 @@ def _serialize_settings_workspace(
             }
             for option in snapshot.workspaces
         ],
+    }
+
+
+def _serialize_editable_capability(capability: EditableCapability) -> dict[str, object]:
+    return {
+        "field": capability.field,
+        "scope": capability.scope,
+        "value_type": capability.value_type,
+        "resettable": capability.resettable,
+        "choices": list(capability.choices) if capability.choices is not None else None,
+        "minimum": capability.minimum,
+        "maximum": capability.maximum,
+    }
+
+
+def _serialize_settings_mutation(
+    mutation: SettingsMutationOutcome | None,
+) -> dict[str, object] | None:
+    if mutation is None:
+        return None
+    return {
+        "operation": mutation.operation,
+        "changed": mutation.changed,
+        "runtime_action": mutation.runtime_action,
+        "provider_session_invalidated": mutation.provider_session_invalidated,
     }
 
 
@@ -245,11 +279,16 @@ def _serialize_workspace_config(
         "model": {
             "value": snapshot.model.value,
             "source": snapshot.model.source,
+            "default_value": snapshot.model.default_value,
         },
         "timeout_seconds": {
             "value": snapshot.timeout_seconds.value,
             "source": snapshot.timeout_seconds.source,
+            "default_value": snapshot.timeout_seconds.default_value,
         },
+        "revision": snapshot.revision,
+        "capabilities": [_serialize_editable_capability(item) for item in snapshot.capabilities],
+        "mutation": _serialize_settings_mutation(snapshot.mutation),
         "environment_keys": list(snapshot.environment_keys),
         "prompt": snapshot.prompt,
         "has_prompt": snapshot.has_prompt,
@@ -1085,7 +1124,10 @@ async def _handle_runtime_settings_update(
         return _error_response(status=400, code="invalid_request", message="Invalid JSON request")
     if not isinstance(payload, dict) or not payload or not set(payload).issubset(_SETTINGS_REQUEST_FIELDS):
         return _error_response(status=400, code="invalid_request", message="Invalid settings request")
-    operations = sum(field in payload for field in _SETTINGS_REQUEST_FIELDS)
+    revision = payload.get("revision")
+    if not isinstance(revision, str):
+        return _error_response(status=400, code="invalid_request", message="Settings revision is required")
+    operations = sum(field in payload for field in _SETTINGS_OPERATION_FIELDS)
     if operations != 1:
         return _error_response(
             status=400,
@@ -1096,11 +1138,17 @@ async def _handle_runtime_settings_update(
         if "model" in payload:
             if not isinstance(payload["model"], str):
                 raise WorkshopSettingsWorkspaceValidationError("Model must be text")
-            snapshot = await service.set_model(authority, payload["model"])
+            snapshot = await service.set_model(
+                authority,
+                payload["model"],
+                expected_revision=revision,
+                clear_workspace_override=False,
+            )
         elif "timeout_seconds" in payload:
             snapshot = await service.set_timeout(
                 authority,
                 payload["timeout_seconds"],
+                expected_revision=revision,
             )
         else:
             reset = payload["reset"]
@@ -1109,7 +1157,10 @@ async def _handle_runtime_settings_update(
             snapshot = await service.reset_settings(
                 authority,
                 None if reset == "all" else reset,
+                expected_revision=revision,
             )
+    except WorkshopSettingsWorkspaceConflict as exc:
+        return _error_response(status=409, code="settings_conflict", message=str(exc))
     except WorkshopSettingsWorkspaceValidationError as exc:
         return _error_response(
             status=400,
@@ -1145,10 +1196,17 @@ async def _handle_active_workspace_update(
         not isinstance(payload, dict)
         or set(payload) != _WORKSPACE_REQUEST_FIELDS
         or not isinstance(payload.get("path"), str)
+        or not isinstance(payload.get("revision"), str)
     ):
         return _error_response(status=400, code="invalid_request", message="Invalid workspace request")
     try:
-        snapshot = await service.switch_workspace(authority, payload["path"])
+        snapshot = await service.switch_workspace(
+            authority,
+            payload["path"],
+            expected_revision=payload["revision"],
+        )
+    except WorkshopSettingsWorkspaceConflict as exc:
+        return _error_response(status=409, code="settings_conflict", message=str(exc))
     except WorkshopSettingsWorkspaceAccessDenied:
         return _error_response(status=403, code="access_denied", message="Access denied")
     except WorkshopSettingsWorkspaceValidationError as exc:
@@ -1211,19 +1269,23 @@ async def _handle_workspace_config_update(
         return _error_response(status=400, code="invalid_request", message="Invalid workspace config request")
     keys = set(payload)
     path = payload.get("path")
+    revision = payload.get("revision")
     if path is not None and not isinstance(path, str):
         return _error_response(status=400, code="invalid_request", message="Invalid workspace config request")
+    if not isinstance(revision, str):
+        return _error_response(status=400, code="invalid_request", message="Workspace config revision is required")
     try:
         if "reset" in payload:
             if not keys.issubset(_WORKSPACE_CONFIG_RESET_FIELDS):
                 raise WorkshopSettingsWorkspaceValidationError("Invalid workspace config reset")
             reset = payload["reset"]
-            if reset not in {"model", "timeout", "env", "prompt", "all"}:
+            if reset not in {"model", "timeout", "prompt", "all"}:
                 raise WorkshopSettingsWorkspaceValidationError("Invalid workspace config reset")
-            snapshot = await service.reset_workspace_config(
+            snapshot = await service.reset_self_service_workspace_config(
                 authority,
                 field=None if reset == "all" else reset,
                 workspace_path=path,
+                expected_revision=revision,
             )
         else:
             if (
@@ -1234,12 +1296,17 @@ async def _handle_workspace_config_update(
                 or not isinstance(payload["value"], str)
             ):
                 raise WorkshopSettingsWorkspaceValidationError("Invalid workspace config change")
-            snapshot = await service.set_workspace_config(
+            if payload["field"] not in {"model", "timeout", "prompt"}:
+                raise WorkshopSettingsWorkspaceValidationError("Unsupported self-service workspace setting")
+            snapshot = await service.set_self_service_workspace_config(
                 authority,
                 field=payload["field"],
                 value=payload["value"],
                 workspace_path=path,
+                expected_revision=revision,
             )
+    except WorkshopSettingsWorkspaceConflict as exc:
+        return _error_response(status=409, code="settings_conflict", message=str(exc))
     except WorkshopSettingsWorkspaceAccessDenied:
         return _error_response(status=403, code="access_denied", message="Access denied")
     except WorkshopSettingsWorkspaceValidationError as exc:

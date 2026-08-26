@@ -40,6 +40,36 @@ async def database(tmp_path: Path):
 
 
 class TestCanonicalExecutionStateMigration:
+    async def test_replaces_execution_and_workspace_settings_in_one_canonical_transaction(
+        self,
+        database: Path,
+    ) -> None:
+        registry, _ = await _initialize(database, 101)
+        namespace = registry.namespaces[0]
+        await sessions.set_canonical_execution_setting(namespace, "model", "gpt-5.6-sol")
+        await sessions.set_canonical_workspace_config_setting(
+            namespace,
+            "/projects/kai",
+            "env",
+            '{"SECRET":"preserved"}',
+        )
+
+        await sessions.replace_canonical_settings_state(
+            namespace,
+            {"timeout": "180", "workspace": "/projects/kai"},
+            workspace_path="/projects/kai",
+            workspace_settings={"env": '{"SECRET":"preserved"}', "prompt": "bounded prompt"},
+        )
+
+        assert await sessions.get_canonical_execution_settings(namespace) == {
+            "timeout": "180",
+            "workspace": "/projects/kai",
+        }
+        assert await sessions.get_canonical_workspace_config_settings(namespace, "/projects/kai") == {
+            "env": '{"SECRET":"preserved"}',
+            "prompt": "bounded prompt",
+        }
+
     async def test_version_twenty_database_upgrades_additively(self, tmp_path: Path, monkeypatch):
         from kai.workshop import schema
 

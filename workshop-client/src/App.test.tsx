@@ -166,15 +166,32 @@ const completedRun: WorkshopRun = {
 };
 const settingsWorkspace: WorkshopSettingsWorkspace = {
   backend: "codex",
+  capabilities: [
+    {
+      choices: ["gpt-5.6-sol"],
+      field: "model",
+      maximum: null,
+      minimum: null,
+      resettable: true,
+      scope: "runtime",
+      valueType: "model_id",
+    },
+  ],
   channelId,
-  model: { source: "runtime policy", value: "gpt-5.6-sol" },
+  model: {
+    defaultValue: "gpt-5.6-sol",
+    source: "runtime policy",
+    value: "gpt-5.6-sol",
+  },
   modelOptions: [
     { displayName: "GPT-5.6 Sol", modelId: "gpt-5.6-sol" },
   ],
+  mutation: null,
   principalId: "prn_00000000000000000000000000000001",
   provider: "openai",
+  revision: "sws_current",
   runtimeProfileId: "rtp_00000000000000000000000000000001",
-  timeoutSeconds: { source: "runtime policy", value: 120 },
+  timeoutSeconds: { defaultValue: 120, source: "runtime policy", value: 120 },
   workspace: "/Users/kai/Projects/kai",
   workspaces: [
     {
@@ -380,6 +397,7 @@ describe("Workshop React client", () => {
     expect(switchWorkspace).toHaveBeenCalledWith(
       { channelId, token: "existing-session" },
       "/var/lib/kai/home/principal",
+      "sws_current",
     );
     await waitFor(() =>
       expect(screen.getByLabelText("Workspace")).toHaveValue(

@@ -13,6 +13,8 @@ import type {
   WorkshopRunTraceSignal,
   WorkshopRunTransition,
   WorkshopSession,
+  WorkshopEditableCapability,
+  WorkshopSettingsMutation,
   WorkshopSettingsWorkspace,
   WorkshopMemoryPage,
   WorkshopMemoryFilters,
@@ -377,6 +379,62 @@ export async function loadNavigation(token: string): Promise<WorkshopNavigation>
   };
 }
 
+function parseEditableCapabilities(value: unknown): WorkshopEditableCapability[] {
+  if (!Array.isArray(value)) {
+    throw new Error("Kai returned unsupported settings capabilities.");
+  }
+  return value.map((raw) => {
+    if (
+      !isRecord(raw) ||
+      typeof raw.field !== "string" ||
+      !["runtime", "workspace"].includes(String(raw.scope)) ||
+      !["authorized_workspace", "integer_seconds", "model_id", "text"].includes(
+        String(raw.value_type),
+      ) ||
+      typeof raw.resettable !== "boolean" ||
+      (raw.choices !== null &&
+        (!Array.isArray(raw.choices) ||
+          raw.choices.some((choice) => typeof choice !== "string"))) ||
+      (raw.minimum !== null && !Number.isSafeInteger(raw.minimum)) ||
+      (raw.maximum !== null && !Number.isSafeInteger(raw.maximum))
+    ) {
+      throw new Error("Kai returned unsupported settings capabilities.");
+    }
+    return {
+      choices: raw.choices as string[] | null,
+      field: raw.field,
+      maximum: raw.maximum as number | null,
+      minimum: raw.minimum as number | null,
+      resettable: raw.resettable,
+      scope: raw.scope as "runtime" | "workspace",
+      valueType: raw.value_type as WorkshopEditableCapability["valueType"],
+    };
+  });
+}
+
+function parseSettingsMutation(value: unknown): WorkshopSettingsMutation | null {
+  if (value === null) {
+    return null;
+  }
+  if (
+    !isRecord(value) ||
+    typeof value.operation !== "string" ||
+    typeof value.changed !== "boolean" ||
+    !["deferred_until_next_run", "restarted", "unchanged"].includes(
+      String(value.runtime_action),
+    ) ||
+    typeof value.provider_session_invalidated !== "boolean"
+  ) {
+    throw new Error("Kai returned an unsupported settings mutation result.");
+  }
+  return {
+    changed: value.changed,
+    operation: value.operation,
+    providerSessionInvalidated: value.provider_session_invalidated,
+    runtimeAction: value.runtime_action as WorkshopSettingsMutation["runtimeAction"],
+  };
+}
+
 function parseSettingsWorkspace(
   payload: unknown,
   channelId: string,
@@ -391,12 +449,15 @@ function parseSettingsWorkspace(
     typeof payload.backend !== "string" ||
     typeof payload.provider !== "string" ||
     typeof payload.workspace !== "string" ||
+    typeof payload.revision !== "string" ||
     !isRecord(payload.model) ||
     typeof payload.model.value !== "string" ||
     typeof payload.model.source !== "string" ||
+    typeof payload.model.default_value !== "string" ||
     !isRecord(payload.timeout_seconds) ||
     !Number.isSafeInteger(payload.timeout_seconds.value) ||
     typeof payload.timeout_seconds.source !== "string" ||
+    !Number.isSafeInteger(payload.timeout_seconds.default_value) ||
     !Array.isArray(payload.workspaces) ||
     (payload.model_options !== null && !Array.isArray(payload.model_options))
   ) {
@@ -438,14 +499,19 @@ function parseSettingsWorkspace(
     backend: payload.backend,
     channelId,
     model: {
+      defaultValue: payload.model.default_value,
       source: payload.model.source,
       value: payload.model.value,
     },
     modelOptions,
+    capabilities: parseEditableCapabilities(payload.capabilities),
+    mutation: parseSettingsMutation(payload.mutation),
     principalId: payload.principal_id,
     provider: payload.provider,
+    revision: payload.revision,
     runtimeProfileId: payload.runtime_profile_id,
     timeoutSeconds: {
+      defaultValue: payload.timeout_seconds.default_value as number,
       source: payload.timeout_seconds.source,
       value: payload.timeout_seconds.value as number,
     },
@@ -1041,6 +1107,7 @@ export async function loadSettingsWorkspace(
 export async function switchWorkspace(
   session: WorkshopSession,
   path: string,
+  revision: string,
 ): Promise<WorkshopSettingsWorkspace> {
   const response = await authorizedFetch(
     session,
@@ -1048,7 +1115,7 @@ export async function switchWorkspace(
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path }),
+      body: JSON.stringify({ path, revision }),
     },
   );
   const payload = await responsePayload(response);

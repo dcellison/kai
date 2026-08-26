@@ -1642,6 +1642,24 @@ class TestHandleModelCallback:
         mock_delete.assert_called_once_with(ANY, ANY, "model")
 
     @pytest.mark.asyncio
+    async def test_protected_model_switch_uses_canonical_settings_service(self):
+        from kai.bot import _switch_model
+
+        ctx = _make_context()
+        authority = SimpleNamespace(runtime_profile_id=profile_id(12345))
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = authority
+        service.set_model = AsyncMock()
+        ctx.application.core_services.settings_workspaces = service
+
+        await _switch_model(ctx, 12345, "gpt-5.6-terra")
+
+        service.set_model.assert_awaited_once_with(
+            authority,
+            "gpt-5.6-terra",
+        )
+
+    @pytest.mark.asyncio
     async def test_switch_model_resolver_runs_before_set_model(self, tmp_path):
         """
         /model x against a saved non-home workspace must leave the live
@@ -3441,13 +3459,15 @@ class TestHandleWorkspaceConfig:
         service.set_workspace_config = AsyncMock(
             return_value=WorkspaceConfigSnapshot(
                 workspace="/srv/kai",
-                model=EffectiveValue("opus", "workspace override"),
-                timeout_seconds=EffectiveValue(120, "runtime policy"),
+                model=EffectiveValue("opus", "workspace override", "sonnet"),
+                timeout_seconds=EffectiveValue(120, "runtime policy", 120),
                 environment_keys=(),
                 prompt=None,
                 has_prompt=False,
                 prompt_source=None,
                 override_fields=("model",),
+                revision="sws_test",
+                capabilities=(),
             )
         )
         ctx.application.core_services.settings_workspaces = service
