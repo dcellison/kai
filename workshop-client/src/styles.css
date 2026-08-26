@@ -1742,12 +1742,28 @@ button:disabled {
   margin-bottom: 0.18rem;
 }
 
+.memory-results-controls {
+  display: flex;
+  align-items: end;
+  gap: 0.55rem;
+}
+
+.memory-selection-toggle {
+  min-height: 2.35rem;
+  padding-block: 0.5rem;
+  font-size: 0.72rem;
+}
+
 .memory-record-list {
   display: grid;
   gap: 0.45rem;
 }
 
 .memory-record-row {
+  display: block;
+}
+
+.memory-record-row.selecting {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   gap: 0.55rem;
@@ -1949,6 +1965,36 @@ button:disabled {
   min-height: 0;
   overflow: hidden;
   background: var(--atom-surface);
+}
+
+.memory-selection-summary {
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  height: 100%;
+  padding: 2rem;
+  color: var(--atom-muted);
+  text-align: center;
+}
+
+.memory-selection-summary > span {
+  margin-bottom: 0.75rem;
+  color: var(--atom-purple);
+  font-size: 2rem;
+}
+
+.memory-selection-summary h2 {
+  margin: 0;
+  color: var(--atom-foreground-strong);
+  font-family: var(--serif);
+  font-size: 1.35rem;
+  font-weight: 540;
+}
+
+.memory-selection-summary > p:last-child {
+  max-width: 25rem;
+  font-size: 0.75rem;
+  line-height: 1.6;
 }
 
 .memory-detail-scroll {

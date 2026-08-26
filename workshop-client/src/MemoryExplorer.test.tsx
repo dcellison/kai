@@ -341,6 +341,11 @@ describe("Workshop Memory explorer", () => {
     );
 
     await screen.findByText("Kai deployment episode");
+    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Select memories" }));
+    expect(screen.getByRole("complementary", { name: "Memory selection" })).toHaveTextContent(
+      "Choose memories",
+    );
     await user.click(screen.getByRole("checkbox", { name: /Select Kai deployment episode/ }));
     await user.click(screen.getByRole("checkbox", { name: /Select Daniel prefers concise output/ }));
     await user.selectOptions(screen.getByLabelText("Move selected memories to"), "project:kai");
@@ -362,10 +367,44 @@ describe("Workshop Memory explorer", () => {
     expect(await screen.findByRole("status")).toHaveTextContent("1 succeeded, 1 failed");
     expect(screen.getByText("1 selected")).toBeVisible();
 
+    await user.click(screen.getByRole("button", { name: "Cancel selection" }));
+    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+    expect(screen.getByRole("complementary", { name: "Memory detail" })).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Forget memory…" }));
     expect(screen.getByRole("dialog", { name: "Forget 1 memory?" })).toHaveTextContent(
       "permanently removed",
     );
+  });
+
+  it("uses row activation for batch selection and exits after a successful operation", async () => {
+    const user = userEvent.setup();
+    render(
+      <MemoryExplorer
+        initialMemoryId={null}
+        onAuthenticationFailure={vi.fn()}
+        onClose={vi.fn()}
+        onForget={vi.fn()}
+        onSelectMemory={vi.fn()}
+        token="session-secret"
+      />,
+    );
+
+    const row = await screen.findByRole("option", { name: /Kai deployment episode/ });
+    await user.click(screen.getByRole("button", { name: "Select memories" }));
+    await user.click(row);
+    expect(screen.getByText("1 selected")).toBeVisible();
+    expect(screen.getByRole("checkbox", { name: /Select Kai deployment episode/ })).toBeChecked();
+
+    await user.click(screen.getByRole("button", { name: "Move selected…" }));
+    await user.click(screen.getByRole("button", { name: "Confirm move" }));
+    await waitFor(() => expect(moveMemoryScope).toHaveBeenCalledWith(
+      "session-secret",
+      episode.memoryId,
+      { scope: "global" },
+    ));
+    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Select memories" })).toBeVisible();
+    expect(screen.getByRole("complementary", { name: "Memory detail" })).toBeVisible();
   });
 
   it("creates an explicit fact with typed content, tags, and project scope", async () => {

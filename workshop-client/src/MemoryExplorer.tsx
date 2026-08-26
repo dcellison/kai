@@ -542,6 +542,7 @@ export function MemoryExplorer({
   const [detailLoading, setDetailLoading] = useState(initialMemoryId !== null);
   const [source, setSource] = useState<WorkshopMemorySourceContext | null>(null);
   const [sourceError, setSourceError] = useState<string | null>(null);
+  const [selectionMode, setSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [bulkTarget, setBulkTarget] = useState("global");
   const [pendingMutation, setPendingMutation] = useState<{
@@ -690,6 +691,7 @@ export function MemoryExplorer({
   }, [onSelectMemory]);
 
   const resetSelectionAndResults = (): void => {
+    setSelectionMode(false);
     setSelectedMemoryId(null);
     setRecords([]);
     setSearchHits([]);
@@ -705,6 +707,11 @@ export function MemoryExplorer({
       else next.add(memoryId);
       return next;
     });
+  };
+
+  const cancelSelection = (): void => {
+    setSelectionMode(false);
+    setSelectedIds(new Set());
   };
 
   const mutationSummary = (batch: WorkshopMemoryMutationBatch): string => {
@@ -743,6 +750,10 @@ export function MemoryExplorer({
           .map((result) => result.memoryId),
       );
       setSelectedIds((current) => new Set([...current].filter((id) => !reconciled.has(id))));
+      if (batch.results.every((result) => result.outcome !== "failed")) {
+        setSelectionMode(false);
+        setSelectedIds(new Set());
+      }
       if (pendingMutation.operation === "delete") {
         setRecords((current) => current.filter((record) => !reconciled.has(record.memoryId)));
         setSearchHits((current) => current.filter((hit) => !reconciled.has(hit.record.memoryId)));
@@ -823,7 +834,7 @@ export function MemoryExplorer({
     event.preventDefault();
     const nextRecord = displayedRecords[nextIndex];
     if (nextRecord) {
-      selectMemory(nextRecord.memoryId);
+      if (!selectionMode) selectMemory(nextRecord.memoryId);
       recordRefs.current[nextIndex]?.focus();
     }
   };
@@ -963,26 +974,42 @@ export function MemoryExplorer({
               <p className="overline">{searchQuery ? "Semantic matches" : "Memory corpus"}</p>
               <h2>{loading ? "Loading…" : `${resultCount} ${searchQuery ? "matches" : "loaded"}`}</h2>
             </div>
-            <label>
-              Sort
-              {searchQuery ? (
-                <select value={searchOrder} onChange={(event) => setSearchOrder(event.target.value as typeof searchOrder)}>
-                  <option value="relevance">Relevance</option>
-                  <option value="newest">Newest first</option>
-                  <option value="oldest">Oldest first</option>
-                </select>
-              ) : (
-                <select value={browseOrder} onChange={(event) => setBrowseOrder(event.target.value as typeof browseOrder)}>
-                  <option value="newest">Newest first</option>
-                  <option value="oldest">Oldest first</option>
-                </select>
-              )}
-            </label>
+            <div className="memory-results-controls">
+              <label>
+                Sort
+                {searchQuery ? (
+                  <select value={searchOrder} onChange={(event) => setSearchOrder(event.target.value as typeof searchOrder)}>
+                    <option value="relevance">Relevance</option>
+                    <option value="newest">Newest first</option>
+                    <option value="oldest">Oldest first</option>
+                  </select>
+                ) : (
+                  <select value={browseOrder} onChange={(event) => setBrowseOrder(event.target.value as typeof browseOrder)}>
+                    <option value="newest">Newest first</option>
+                    <option value="oldest">Oldest first</option>
+                  </select>
+                )}
+              </label>
+              <button
+                type="button"
+                className="quiet-button memory-selection-toggle"
+                disabled={loading || displayedRecords.length === 0 || mutationRunning}
+                onClick={() => {
+                  if (selectionMode) cancelSelection();
+                  else {
+                    setSelectedIds(new Set());
+                    setSelectionMode(true);
+                  }
+                }}
+              >
+                {selectionMode ? "Cancel selection" : "Select memories"}
+              </button>
+            </div>
           </div>
 
           {mutationReport && <p className="memory-mutation-report" role="status">{mutationReport}</p>}
 
-          {selectedIds.size > 0 && (
+          {selectionMode && (
             <section className="memory-bulk-actions" aria-label="Selected memory actions">
               <strong>{selectedIds.size} selected</strong>
               <select
@@ -999,6 +1026,7 @@ export function MemoryExplorer({
               </select>
               <button
                 type="button"
+                disabled={selectedIds.size === 0 || mutationRunning}
                 onClick={() => setPendingMutation({
                   ids: [...selectedIds], operation: "move_scope", target: bulkTarget,
                 })}
@@ -1008,6 +1036,7 @@ export function MemoryExplorer({
               <button
                 className="danger"
                 type="button"
+                disabled={selectedIds.size === 0 || mutationRunning}
                 onClick={() => setPendingMutation({ ids: [...selectedIds], operation: "delete" })}
               >
                 Forget selected…
@@ -1030,21 +1059,30 @@ export function MemoryExplorer({
           ) : (
             <div className="memory-record-list" role="listbox" aria-label="Memory results">
               {displayedRecords.map((record, index) => (
-                <div className="memory-record-row" key={record.memoryId}>
-                  <input
-                    type="checkbox"
-                    aria-label={`Select ${record.preview || record.memoryId}`}
-                    checked={selectedIds.has(record.memoryId)}
-                    onChange={() => toggleSelected(record.memoryId)}
-                  />
+                <div className={`memory-record-row ${selectionMode ? "selecting" : ""}`} key={record.memoryId}>
+                  {selectionMode && (
+                    <input
+                      type="checkbox"
+                      aria-label={`Select ${record.preview || record.memoryId}`}
+                      checked={selectedIds.has(record.memoryId)}
+                      onChange={() => toggleSelected(record.memoryId)}
+                    />
+                  )}
                   <button
                   key={record.memoryId}
                   ref={(element) => { recordRefs.current[index] = element; }}
                   type="button"
                   role="option"
-                  aria-selected={selectedMemoryId === record.memoryId}
-                  className={`memory-record ${selectedMemoryId === record.memoryId ? "selected" : ""}`}
-                  onClick={() => selectMemory(record.memoryId)}
+                  aria-selected={selectionMode
+                    ? selectedIds.has(record.memoryId)
+                    : selectedMemoryId === record.memoryId}
+                  className={`memory-record ${(
+                    selectionMode ? selectedIds.has(record.memoryId) : selectedMemoryId === record.memoryId
+                  ) ? "selected" : ""}`}
+                  onClick={() => {
+                    if (selectionMode) toggleSelected(record.memoryId);
+                    else selectMemory(record.memoryId);
+                  }}
                   onKeyDown={(event) => handleRecordKey(event, index)}
                 >
                   <span className={`memory-kind ${record.kind}`}>{record.kind}</span>
@@ -1077,21 +1115,39 @@ export function MemoryExplorer({
         </div>
       </div>
 
-      <aside className="memory-detail-pane" aria-label="Memory detail">
-        <MemoryDetailPane
-          allowedProjects={allowedProjects}
-          busy={mutationRunning}
-          detail={detail}
-          error={detailError}
-          loading={detailLoading}
-          onDelete={(memoryId) => setPendingMutation({ ids: [memoryId], operation: "delete" })}
-          onEdit={(record) => setEditorDetail(record)}
-          onMove={(memoryId, target) => setPendingMutation({
-            ids: [memoryId], operation: "move_scope", target,
-          })}
-          source={source}
-          sourceError={sourceError}
-        />
+      <aside
+        className="memory-detail-pane"
+        aria-label={selectionMode ? "Memory selection" : "Memory detail"}
+      >
+        {selectionMode ? (
+          <div className="memory-selection-summary">
+            <span aria-hidden="true">◇</span>
+            <p className="overline">Batch selection</p>
+            <h2>
+              {selectedIds.size === 0
+                ? "Choose memories"
+                : `${selectedIds.size} ${selectedIds.size === 1 ? "memory" : "memories"} selected`}
+            </h2>
+            <p>
+              Select the memories you want to move or forget. Cancel selection to return to the current memory details.
+            </p>
+          </div>
+        ) : (
+          <MemoryDetailPane
+            allowedProjects={allowedProjects}
+            busy={mutationRunning}
+            detail={detail}
+            error={detailError}
+            loading={detailLoading}
+            onDelete={(memoryId) => setPendingMutation({ ids: [memoryId], operation: "delete" })}
+            onEdit={(record) => setEditorDetail(record)}
+            onMove={(memoryId, target) => setPendingMutation({
+              ids: [memoryId], operation: "move_scope", target,
+            })}
+            source={source}
+            sourceError={sourceError}
+          />
+        )}
       </aside>
 
       {pendingMutation && (
