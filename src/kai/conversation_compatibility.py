@@ -68,7 +68,7 @@ async def ingest_conversation_memory(
     *,
     prompt: str | list,
     assistant_text: str,
-    chat_id: int,
+    chat_id: int | None,
     session_id: str | None,
     config: Config,
     workspace: str,
@@ -78,6 +78,10 @@ async def ingest_conversation_memory(
     canonical_prior_pairs: tuple[tuple[str, str], ...] | None = None,
     reasoner_backends: frozenset[str] = ONESHOT_REASONER_BACKENDS,
     effective_backend: str | None = None,
+    canonical_user_id: str | None = None,
+    runtime_profile_id: str | None = None,
+    os_user_override: str | None = None,
+    effective_provider: str | None = None,
 ) -> None:
     """Run one memory ingestion to completion for a canonical owner.
 
@@ -100,7 +104,7 @@ async def ingest_conversation_memory(
                 )
             if not user_text:
                 return
-            user_config = config.get_user_config(chat_id)
+            user_config = config.get_user_config(chat_id) if chat_id is not None else None
             backend = effective_backend or (
                 user_config.backend if user_config and user_config.backend else config.default_backend
             )
@@ -115,12 +119,14 @@ async def ingest_conversation_memory(
                     else:
                         from kai.history import get_recent_pairs
 
+                        if chat_id is None:
+                            raise RuntimeError("Canonical memory ingestion requires canonical prior pairs")
                         fetched = get_recent_pairs(chat_id, config.episode_classifier_context_turns + 1)
                         prior_pairs = fetched[:-1]
                 await memory_extraction.extract_and_store(
                     user_text=user_text,
                     assistant_text=assistant_text,
-                    user_id=str(chat_id),
+                    user_id=canonical_user_id or str(chat_id),
                     session_id=session_id,
                     config=config,
                     prior_pairs=prior_pairs,
@@ -130,6 +136,10 @@ async def ingest_conversation_memory(
                     canonical_provenance=(
                         canonical_provenance.metadata() if canonical_provenance is not None else None
                     ),
+                    runtime_profile_id=runtime_profile_id,
+                    os_user_override=os_user_override,
+                    effective_backend_override=backend,
+                    effective_provider_override=effective_provider,
                     await_episode=True,
                 )
         except Exception:

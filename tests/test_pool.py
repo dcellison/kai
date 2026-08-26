@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from kai.backend import AgentResponse, StreamEvent
 from kai.config import Config, ModelRole, UserConfig, WorkspaceConfig, get_model_for
 from kai.goose import GooseBackend
 from kai.internal_api_auth import InternalAPIScope
@@ -26,6 +27,7 @@ from kai.workshop.internal_api_contexts import (
     WorkshopInternalAPIContextRegistry,
     WorkshopInternalAPIExecutionContext,
 )
+from kai.workshop.runtime_profiles import ProtectedRuntimeProfile, WorkshopRuntimeProfileRegistry
 from tests.workshop_profiles import profile_id, profile_registry
 
 
@@ -570,6 +572,69 @@ class TestPerUserBackendRouting:
         assert isinstance(instance, OpenCodeBackend)
         assert instance.os_user == "alice-os"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("backend", "provider", "model"),
+        (
+            ("claude", "anthropic", "sonnet"),
+            ("codex", "openai", "gpt-5.6-sol"),
+            ("goose", "openai", "gpt-5.5"),
+            ("opencode", "openai", "openai/gpt-5.5"),
+            ("pi", "openai", "openai/gpt-5.5"),
+        ),
+    )
+    async def test_protected_dispatch_uses_canonical_identity_for_every_backend(
+        self,
+        tmp_path,
+        backend,
+        provider,
+        model,
+    ):
+        runtime_profile_id = profile_id(111)
+        home = tmp_path / backend
+        home.mkdir()
+        profiles = WorkshopRuntimeProfileRegistry(
+            (
+                ProtectedRuntimeProfile(
+                    profile_id=runtime_profile_id,
+                    display_name=f"{backend} protected runtime",
+                    os_user=None,
+                    backend=backend,
+                    provider=provider,
+                    model=model,
+                    timeout_seconds=120,
+                    allowed_services=(),
+                    home_workspace=home,
+                    workspace_base=None,
+                    allowed_workspaces=(),
+                ),
+            ),
+            legacy_runtime_keys={runtime_profile_id: 111},
+        )
+        contexts = _internal_api_contexts(111)
+        pool = SubprocessPool(
+            config=_make_config(allowed_user_ids={111}),
+            services_info=[],
+            runtime_profiles=profiles,
+            internal_api_contexts=contexts,
+        )
+        instance = pool.get(runtime_profile_id)
+
+        async def response_events():
+            yield StreamEvent(
+                text_so_far="done",
+                done=True,
+                response=AgentResponse(text="done", success=True),
+            )
+
+        instance.send = MagicMock(return_value=response_events())
+        pool._prepare_instance = AsyncMock(return_value=instance)
+
+        events = [event async for event in pool.send("test", runtime=runtime_profile_id)]
+
+        assert events[-1].response is not None
+        assert instance.send.call_args.kwargs == {"runtime_identity": contexts.for_runtime_profile(runtime_profile_id)}
+
 
 # ── Per-user actions ────────────────────────────────────────────────
 
@@ -642,7 +707,7 @@ class TestPropertyAccessors:
         profiles = profile_registry(111)
         pool = SubprocessPool(config=config, services_info=[], runtime_profiles=profiles)
 
-        assert pool.get_runtime_profile(111) == profiles.for_config_id(111)
+        assert pool.get_runtime_profile(111) == profiles.profile_for_legacy_runtime_key(111)
         assert pool.get_backend_provider(111) == ("codex", "openai")
         assert pool.get_os_user(111) is None
         assert pool.get_model(111) == "gpt-5.6-sol"
@@ -689,7 +754,7 @@ class TestPropertyAccessors:
 
         expected = get_model_for(ModelRole.PR_REVIEW, "codex", "openai")
         assert pool.get_role_model(111, ModelRole.PR_REVIEW) == expected
-        assert "invalid for codex/openai" in caplog.text
+        assert "invalid for codex/openai" not in caplog.text
         assert pool.get_if_exists(111) is None
 
     @pytest.mark.asyncio
@@ -701,7 +766,7 @@ class TestPropertyAccessors:
         )
 
         with patch(
-            "kai.pool.sessions.get_user_settings",
+            "kai.pool.sessions.get_canonical_execution_settings",
             new_callable=AsyncMock,
             return_value={},
         ):
@@ -716,7 +781,7 @@ class TestPropertyAccessors:
         )
 
         with patch(
-            "kai.pool.sessions.get_user_settings",
+            "kai.pool.sessions.get_canonical_execution_settings",
             new_callable=AsyncMock,
             return_value={"model": "opus"},
         ):

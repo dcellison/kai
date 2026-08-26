@@ -31,7 +31,7 @@ class _RuntimePool:
         self.events: list[str] = []
         self.profile = SimpleNamespace(
             profile_id=profile_id(101),
-            runtime_config_id=101,
+            legacy_runtime_key=101,
             backend="codex",
             provider="openai",
             model="gpt-5.6-sol",
@@ -96,7 +96,7 @@ def _service(tmp_path: Path):
         channel_id=channel_id,
         agent_id=AgentId("agt_" + "3" * 32),
         runtime_profile_id=profile_id(101),
-        runtime_config_id=101,
+        legacy_runtime_key=101,
     )
     pool = _RuntimePool(home, allowed)
     service = WorkshopSettingsWorkspaceService(

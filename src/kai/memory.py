@@ -748,6 +748,7 @@ class ScopedRetrievalContext:
     job_type: str | None = None
     backend_name: str | None = None
     session_id: str | None = None
+    runtime_profile_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -881,8 +882,7 @@ class _CanonicalMemoryNamespace(Protocol):
     @property
     def runtime_profile_id(self) -> object: ...
 
-    @property
-    def runtime_config_id(self) -> int: ...
+    def require_legacy_runtime_key(self) -> int: ...
 
 
 class CanonicalMemoryNamespaceResolver(Protocol):
@@ -947,7 +947,7 @@ def _canonical_memory_owner(
         return user_id, None
     namespace = registry.maybe_for_runtime_config_id(runtime_config_id)
     if namespace is None:
-        return user_id, None
+        raise CanonicalMemoryAuthorityError("Protected integer memory owner has no canonical runtime authority")
     return str(namespace.principal_id), namespace
 
 
@@ -2500,7 +2500,12 @@ async def retrieve_scoped_memories(
     loop = asyncio.get_running_loop()
     results = await loop.run_in_executor(
         None,
-        lambda: search(query, user_id=user_id_str, limit=fetch_limit),
+        lambda: search(
+            query,
+            user_id=user_id_str,
+            limit=fetch_limit,
+            runtime_profile_id=context.runtime_profile_id,
+        ),
     )
     hits_raw = len(results)
 
@@ -2925,6 +2930,7 @@ async def format_scoped_context_with_recall_payload(
     session_id: str | None = None,
     token_budget: int | None = None,
     include_diagnostic_content: bool = False,
+    runtime_profile_id: str | None = None,
 ) -> ScopedRecallResult:
     """
     Run the scoped recall pipeline for LIVE prompt injection.
@@ -2965,6 +2971,7 @@ async def format_scoped_context_with_recall_payload(
             job_type=job_type,
             backend_name=backend_name,
             session_id=session_id,
+            runtime_profile_id=runtime_profile_id,
         )
         budget = token_budget
         if budget is None and _config is not None:
@@ -3611,7 +3618,7 @@ def migrate_memory_namespace(
     """
     if _memory is None:
         raise CanonicalMemoryAuthorityError("Semantic memory is not initialized")
-    legacy_user_id = str(namespace.runtime_config_id)
+    legacy_user_id = str(namespace.require_legacy_runtime_key())
     canonical_user_id = str(namespace.principal_id)
     legacy_rows = _get_all_raw(user_id=legacy_user_id)
     canonical_rows = _get_all_raw(user_id=canonical_user_id)
@@ -3788,7 +3795,12 @@ def get_all_facts(*, user_id: str) -> list[MemoryResult]:
     return matches
 
 
-def get_by_id(*, user_id: str, memory_id: str) -> MemoryResult | None:
+def get_by_id(
+    *,
+    user_id: str,
+    memory_id: str,
+    runtime_profile_id: str | None = None,
+) -> MemoryResult | None:
     """Fetch a single user-visible memory by id, scoped to user.
 
     Used by the /memory fact view and forget-fact confirmation
@@ -3836,7 +3848,10 @@ def get_by_id(*, user_id: str, memory_id: str) -> MemoryResult | None:
     # back onto the result dict). metadata is a dict of any leftover
     # payload keys and may be absent entirely if the row carried no
     # extra payload, so use .get with a default rather than indexing.
-    storage_user_id, namespace = _canonical_memory_owner(user_id)
+    storage_user_id, namespace = _canonical_memory_owner(
+        user_id,
+        runtime_profile_id=runtime_profile_id,
+    )
     if row.get("user_id") != storage_user_id:
         log.warning(
             "get_by_id: ownership mismatch (memory_id=%s, requested_user=%s)",
@@ -3855,7 +3870,12 @@ def get_by_id(*, user_id: str, memory_id: str) -> MemoryResult | None:
     return result if _memory_result_belongs_to_principal(result, namespace) else None
 
 
-def delete_by_id(*, user_id: str, memory_id: str) -> bool:
+def delete_by_id(
+    *,
+    user_id: str,
+    memory_id: str,
+    runtime_profile_id: str | None = None,
+) -> bool:
     """Delete a single memory after verifying ownership and source.
 
     Used by the /memory forget flow (spec 310 §6.4). Mem0's `delete`
@@ -3878,7 +3898,14 @@ def delete_by_id(*, user_id: str, memory_id: str) -> bool:
     # Single source of truth for ownership + source scoping. If
     # get_by_id returns None for any reason (missing, wrong user,
     # non-extracted, fetch error) we refuse to delete.
-    if get_by_id(user_id=user_id, memory_id=memory_id) is None:
+    if (
+        get_by_id(
+            user_id=user_id,
+            memory_id=memory_id,
+            runtime_profile_id=runtime_profile_id,
+        )
+        is None
+    ):
         return False
 
     try:

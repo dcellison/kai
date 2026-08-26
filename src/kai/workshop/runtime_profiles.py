@@ -18,6 +18,7 @@ from kai.config import (
     BACKEND_PROVIDERS,
     VALID_BACKENDS,
     Config,
+    ModelRole,
     UserConfig,
     _read_protected_file,
     canonicalize_model_for_backend,
@@ -29,12 +30,12 @@ from kai.config import (
 from kai.workshop.domain import RuntimeProfileId
 
 _PROFILE_DERIVATION_DOMAIN = b"kai-workshop-runtime-profile:v1\0"
-_COMPATIBILITY_KEY_DERIVATION_DOMAIN = b"kai-workshop-runtime-compatibility-key:v1\0"
-
+_V1_LEGACY_KEY_DERIVATION_DOMAIN = b"kai-workshop-runtime-compatibility-key:v1\0"
 DEFAULT_RUNTIME_PROFILES_YAML = Path("/etc/kai/runtime-profiles.yaml")
 RUNTIME_PROFILES_YAML_ENV = "KAI_RUNTIME_PROFILES_YAML"
 INSTALL_DIR_ENV = "KAI_INSTALL_DIR"
 _OS_USER_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+RUNTIME_KEY_ARCHIVE_REMOVAL_GATE = "canonical_runtime_state_v1"
 
 
 class WorkshopRuntimeProfileError(RuntimeError):
@@ -45,15 +46,12 @@ class WorkshopRuntimeProfileError(RuntimeError):
 class ProtectedRuntimeProfile:
     """One operator-configured execution identity behind an opaque ID.
 
-    ``runtime_config_id`` is deliberately private compatibility state. The
-    current host runtime still stores settings, files, memory, and subprocess
-    instances under an integer key. It is not a transport identity and new
-    profiles derive it from the opaque profile ID. Canonical Workshop callers
-    see only ``profile_id``.
+    Live execution policy contains no transport-shaped identity.  Integer keys
+    retained solely for one-time installed-state migration live in the
+    registry's explicit legacy archive, never on this object.
     """
 
     profile_id: RuntimeProfileId
-    runtime_config_id: int
     display_name: str
     os_user: str | None
     backend: str
@@ -64,6 +62,11 @@ class ProtectedRuntimeProfile:
     home_workspace: Path | None
     workspace_base: Path | None
     allowed_workspaces: tuple[Path, ...]
+    role_models: tuple[tuple[str, str], ...] = ()
+    github_repos: tuple[str, ...] = ()
+    pr_review: bool | None = None
+    issue_triage: bool | None = None
+    allowed_triage_projects: tuple[str, ...] = ()
 
 
 def _compatibility_model(
@@ -184,14 +187,14 @@ def runtime_profile_id_for_config_id(runtime_config_id: int) -> RuntimeProfileId
     return RuntimeProfileId(f"rtp_{digest}")
 
 
-def compatibility_runtime_config_id_for_profile_id(profile_id: RuntimeProfileId) -> int:
-    """Derive non-transport compatibility storage for a new profile.
+def legacy_runtime_key_for_v1_profile_id(profile_id: RuntimeProfileId) -> int:
+    """Derive the state key used by version-1 policies that omitted one.
 
-    The high bit remains clear so the result fits SQLite's signed INTEGER.
-    Existing migrated profiles carry their former positive key explicitly;
-    newly authored profiles need no Telegram-shaped value.
+    This exists only so the installer can preserve access to already-written
+    state while upgrading that historical policy shape into the explicit
+    legacy archive.  Live version-2 policy never derives or consumes it.
     """
-    digest = hashlib.sha256(_COMPATIBILITY_KEY_DERIVATION_DOMAIN + str(profile_id).encode("ascii")).digest()
+    digest = hashlib.sha256(_V1_LEGACY_KEY_DERIVATION_DOMAIN + str(profile_id).encode("ascii")).digest()
     return int.from_bytes(digest[:8], "big") & ((1 << 63) - 1) or 1
 
 
@@ -201,12 +204,12 @@ def runtime_profiles_path() -> Path:
     return Path(override) if override else DEFAULT_RUNTIME_PROFILES_YAML
 
 
-def _positive_compatibility_key(value: object, *, profile_id: RuntimeProfileId) -> int:
+def _positive_legacy_key(value: object, *, profile_id: RuntimeProfileId) -> int:
     if value is None:
-        return compatibility_runtime_config_id_for_profile_id(profile_id)
+        return legacy_runtime_key_for_v1_profile_id(profile_id)
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise WorkshopRuntimeProfileError(
-            f"Runtime profile {profile_id}: compatibility_runtime_config_id must be a positive integer"
+            f"Runtime profile {profile_id}: archived runtime key must be a positive integer"
         )
     return value
 
@@ -228,22 +231,36 @@ def _policy_text(path: Path) -> str:
 class WorkshopRuntimeProfileRegistry:
     """Resolve canonical profiles only through protected operator policy."""
 
-    def __init__(self, profiles: tuple[ProtectedRuntimeProfile, ...]) -> None:
+    def __init__(
+        self,
+        profiles: tuple[ProtectedRuntimeProfile, ...],
+        *,
+        legacy_runtime_keys: Mapping[RuntimeProfileId, int] | None = None,
+        legacy_archive_removal_gate: str | None = None,
+    ) -> None:
         by_id: dict[RuntimeProfileId, ProtectedRuntimeProfile] = {}
-        by_config_id: dict[int, ProtectedRuntimeProfile] = {}
         for profile in profiles:
             if not isinstance(profile, ProtectedRuntimeProfile):
                 raise TypeError("profiles must contain ProtectedRuntimeProfile values")
             if profile.profile_id in by_id:
                 raise WorkshopRuntimeProfileError("Duplicate runtime profile ID")
-            if profile.runtime_config_id in by_config_id:
-                raise WorkshopRuntimeProfileError("Duplicate runtime compatibility configuration ID")
             by_id[profile.profile_id] = profile
-            by_config_id[profile.runtime_config_id] = profile
         if not by_id:
             raise WorkshopRuntimeProfileError("At least one protected runtime profile is required")
+        archived_by_profile: dict[RuntimeProfileId, int] = {}
+        archived_by_key: dict[int, RuntimeProfileId] = {}
+        for profile_id, legacy_key in (legacy_runtime_keys or {}).items():
+            if profile_id not in by_id:
+                raise WorkshopRuntimeProfileError("Legacy runtime archive references an unknown profile")
+            checked = _positive_legacy_key(legacy_key, profile_id=profile_id)
+            if checked in archived_by_key:
+                raise WorkshopRuntimeProfileError("Legacy runtime archive contains a duplicate integer key")
+            archived_by_profile[profile_id] = checked
+            archived_by_key[checked] = profile_id
         self._by_id = by_id
-        self._by_config_id = by_config_id
+        self._legacy_runtime_keys = archived_by_profile
+        self._profiles_by_legacy_key = archived_by_key
+        self._legacy_archive_removal_gate = legacy_archive_removal_gate
 
     @classmethod
     def from_config(cls, config: Config) -> WorkshopRuntimeProfileRegistry:
@@ -253,14 +270,15 @@ class WorkshopRuntimeProfileRegistry:
         for direct/dev runs and focused tests with no installed policy file.
         """
         profiles: list[ProtectedRuntimeProfile] = []
+        legacy_runtime_keys: dict[RuntimeProfileId, int] = {}
         for runtime_config_id, user in sorted(config.user_configs.items()):
             if user.telegram_id != runtime_config_id:
                 raise WorkshopRuntimeProfileError("Configured-user key does not match its protected user record")
             backend, provider = get_user_backend_and_provider(user, config)
+            profile_id = runtime_profile_id_for_config_id(runtime_config_id)
             profiles.append(
                 ProtectedRuntimeProfile(
-                    profile_id=runtime_profile_id_for_config_id(runtime_config_id),
-                    runtime_config_id=runtime_config_id,
+                    profile_id=profile_id,
                     display_name=user.name,
                     os_user=user.os_user,
                     backend=backend,
@@ -271,9 +289,15 @@ class WorkshopRuntimeProfileRegistry:
                     home_workspace=user.home_workspace,
                     workspace_base=user.workspace_base,
                     allowed_workspaces=tuple(user.allowed_workspaces),
+                    role_models=tuple(sorted((user.models or {}).items())),
+                    github_repos=tuple(user.github_repos),
+                    pr_review=user.pr_review,
+                    issue_triage=user.issue_triage,
+                    allowed_triage_projects=tuple(user.allowed_triage_projects),
                 )
             )
-        return cls(tuple(profiles))
+            legacy_runtime_keys[profile_id] = runtime_config_id
+        return cls(tuple(profiles), legacy_runtime_keys=legacy_runtime_keys)
 
     @classmethod
     def from_document(
@@ -285,14 +309,17 @@ class WorkshopRuntimeProfileRegistry:
         """Parse and validate one versioned runtime-policy document."""
         if not isinstance(document, dict):
             raise WorkshopRuntimeProfileError("Runtime policy must be a YAML mapping")
-        if document.get("version") != 1:
-            raise WorkshopRuntimeProfileError("Runtime policy version must be 1")
+        version = document.get("version")
+        if version not in {1, 2}:
+            raise WorkshopRuntimeProfileError("Runtime policy version must be 1 or 2")
         raw_profiles = document.get("runtime_profiles")
         if not isinstance(raw_profiles, dict) or not raw_profiles:
             raise WorkshopRuntimeProfileError("Runtime policy must contain a non-empty runtime_profiles mapping")
 
         installed = backend_registry
         profiles: list[ProtectedRuntimeProfile] = []
+        legacy_runtime_keys: dict[RuntimeProfileId, int] = {}
+        archive_removal_gate: str | None = None
         for raw_profile_id, raw_profile in raw_profiles.items():
             try:
                 profile_id = RuntimeProfileId(str(raw_profile_id))
@@ -347,13 +374,61 @@ class WorkshopRuntimeProfileRegistry:
             os_user = None if raw_os_user is None else str(raw_os_user).strip() or None
             if os_user is not None and _OS_USER_RE.fullmatch(os_user) is None:
                 raise WorkshopRuntimeProfileError(f"Runtime profile {profile_id}: os_user is invalid")
+            raw_role_models = raw_profile.get("models", {})
+            if not isinstance(raw_role_models, dict):
+                raise WorkshopRuntimeProfileError(f"Runtime profile {profile_id}: models must be a mapping")
+            role_models: list[tuple[str, str]] = []
+            for raw_role, raw_role_model in raw_role_models.items():
+                role = str(raw_role).strip().lower()
+                if role not in {item.value for item in ModelRole}:
+                    raise WorkshopRuntimeProfileError(
+                        f"Runtime profile {profile_id}: unsupported model role {raw_role!r}"
+                    )
+                role_model = canonicalize_model_for_backend(str(raw_role_model).strip(), backend)
+                if not validate_model_for_backend_policy(
+                    role_model,
+                    backend,
+                    provider,
+                    allowed_models=allowed_models,
+                ):
+                    raise WorkshopRuntimeProfileError(
+                        f"Runtime profile {profile_id}: role model {role_model!r} is invalid for {backend}/{provider}"
+                    )
+                role_models.append((role, role_model))
+            raw_triage_projects = raw_profile.get("allowed_triage_projects", [])
+            if not isinstance(raw_triage_projects, list):
+                raise WorkshopRuntimeProfileError(
+                    f"Runtime profile {profile_id}: allowed_triage_projects must be a list"
+                )
+            triage_projects: list[str] = []
+            for raw_project in raw_triage_projects:
+                project = str(raw_project).strip()
+                if not project or project == "*":
+                    raise WorkshopRuntimeProfileError(
+                        f"Runtime profile {profile_id}: allowed triage project {raw_project!r} is invalid"
+                    )
+                if project not in triage_projects:
+                    triage_projects.append(project)
+            raw_github_repos = raw_profile.get("github_repos", [])
+            if not isinstance(raw_github_repos, list) or any(
+                not isinstance(item, str) or not item.strip() for item in raw_github_repos
+            ):
+                raise WorkshopRuntimeProfileError(
+                    f"Runtime profile {profile_id}: github_repos must be a list of repositories"
+                )
+            raw_pr_review = raw_profile.get("pr_review")
+            raw_issue_triage = raw_profile.get("issue_triage")
+            if raw_pr_review is not None and not isinstance(raw_pr_review, bool):
+                raise WorkshopRuntimeProfileError(
+                    f"Runtime profile {profile_id}: pr_review must be true, false, or null"
+                )
+            if raw_issue_triage is not None and not isinstance(raw_issue_triage, bool):
+                raise WorkshopRuntimeProfileError(
+                    f"Runtime profile {profile_id}: issue_triage must be true, false, or null"
+                )
             profiles.append(
                 ProtectedRuntimeProfile(
                     profile_id=profile_id,
-                    runtime_config_id=_positive_compatibility_key(
-                        raw_profile.get("compatibility_runtime_config_id"),
-                        profile_id=profile_id,
-                    ),
                     display_name=display_name,
                     os_user=os_user,
                     backend=backend,
@@ -378,9 +453,50 @@ class WorkshopRuntimeProfileRegistry:
                         raw_profile.get("allowed_workspaces"),
                         profile_id=profile_id,
                     ),
+                    role_models=tuple(sorted(role_models)),
+                    github_repos=tuple(sorted({item.strip().lower() for item in raw_github_repos})),
+                    pr_review=raw_pr_review,
+                    issue_triage=raw_issue_triage,
+                    allowed_triage_projects=tuple(triage_projects),
                 )
             )
-        return cls(tuple(profiles))
+            if version == 1:
+                legacy_runtime_keys[profile_id] = _positive_legacy_key(
+                    raw_profile.get("compatibility_runtime_config_id"),
+                    profile_id=profile_id,
+                )
+
+        if version == 2:
+            raw_archive = document.get("legacy_runtime_archive")
+            if raw_archive is not None:
+                if not isinstance(raw_archive, dict):
+                    raise WorkshopRuntimeProfileError("legacy_runtime_archive must be a mapping")
+                if raw_archive.get("version") != 1:
+                    raise WorkshopRuntimeProfileError("legacy_runtime_archive version must be 1")
+                archive_removal_gate = str(raw_archive.get("removal_gate") or "").strip()
+                if archive_removal_gate != RUNTIME_KEY_ARCHIVE_REMOVAL_GATE:
+                    raise WorkshopRuntimeProfileError(
+                        "legacy_runtime_archive removal_gate must be canonical_runtime_state_v1"
+                    )
+                raw_keys = raw_archive.get("runtime_keys")
+                if not isinstance(raw_keys, dict):
+                    raise WorkshopRuntimeProfileError("legacy_runtime_archive.runtime_keys must be a mapping")
+                for raw_profile_id, raw_key in raw_keys.items():
+                    try:
+                        archived_profile_id = RuntimeProfileId(str(raw_profile_id))
+                    except (TypeError, ValueError) as exc:
+                        raise WorkshopRuntimeProfileError(
+                            f"Invalid archived runtime profile ID {raw_profile_id!r}"
+                        ) from exc
+                    legacy_runtime_keys[archived_profile_id] = _positive_legacy_key(
+                        raw_key,
+                        profile_id=archived_profile_id,
+                    )
+        return cls(
+            tuple(profiles),
+            legacy_runtime_keys=legacy_runtime_keys,
+            legacy_archive_removal_gate=archive_removal_gate,
+        )
 
     @classmethod
     def from_yaml(
@@ -438,11 +554,27 @@ class WorkshopRuntimeProfileRegistry:
             raise WorkshopRuntimeProfileError("Runtime profile is not present in protected operator policy")
         return profile
 
-    def for_config_id(self, runtime_config_id: int) -> ProtectedRuntimeProfile:
-        profile = self._by_config_id.get(runtime_config_id)
-        if profile is None:
-            raise WorkshopRuntimeProfileError("Configured user has no protected runtime profile")
-        return profile
+    @property
+    def legacy_runtime_archive(self) -> tuple[tuple[RuntimeProfileId, int], ...]:
+        """Return explicit rollback/migration keys, never live runtime policy."""
+        return tuple(sorted(self._legacy_runtime_keys.items(), key=lambda item: item[0]))
+
+    @property
+    def legacy_archive_removal_gate(self) -> str | None:
+        """Return the explicit operator gate protecting archive removal."""
+        return self._legacy_archive_removal_gate
+
+    def legacy_runtime_key(self, profile_id: str | RuntimeProfileId) -> int | None:
+        """Return one archived pre-canonical key for migration-only callers."""
+        profile = self.resolve(profile_id)
+        return self._legacy_runtime_keys.get(profile.profile_id)
+
+    def profile_for_legacy_runtime_key(self, legacy_key: int) -> ProtectedRuntimeProfile:
+        """Translate an adapter/migration key at the canonical boundary."""
+        profile_id = self._profiles_by_legacy_key.get(legacy_key)
+        if profile_id is None:
+            raise WorkshopRuntimeProfileError("Legacy runtime key has no protected runtime profile")
+        return self._by_id[profile_id]
 
     def validate_protected_os_users(
         self,

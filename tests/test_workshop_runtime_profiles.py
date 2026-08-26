@@ -14,7 +14,6 @@ from kai.workshop.runtime_profiles import (
     ProtectedRuntimeProfile,
     WorkshopRuntimeProfileError,
     WorkshopRuntimeProfileRegistry,
-    compatibility_runtime_config_id_for_profile_id,
     runtime_profile_id_for_config_id,
 )
 
@@ -47,13 +46,13 @@ def test_registry_exposes_opaque_stable_profiles_with_protected_policy():
     first = WorkshopRuntimeProfileRegistry.from_config(_config())
     second = WorkshopRuntimeProfileRegistry.from_config(_config())
 
-    daniel = first.for_config_id(101)
-    scott = first.for_config_id(202)
+    daniel = first.profile_for_legacy_runtime_key(101)
+    scott = first.profile_for_legacy_runtime_key(202)
 
     assert isinstance(daniel.profile_id, RuntimeProfileId)
-    assert daniel.profile_id == second.for_config_id(101).profile_id
+    assert daniel.profile_id == second.profile_for_legacy_runtime_key(101).profile_id
     assert daniel.profile_id != scott.profile_id
-    assert daniel.runtime_config_id == 101
+    assert first.legacy_runtime_key(daniel.profile_id) == 101
     assert daniel.os_user == "daniel"
     assert daniel.backend == "codex"
     assert daniel.provider == "openai"
@@ -81,18 +80,22 @@ def test_registry_rejects_unknown_profile_even_when_it_is_structurally_valid():
 
 def test_registry_rejects_duplicate_configuration_authority():
     profile = ProtectedRuntimeProfile(
-        runtime_profile_id_for_config_id(101),
-        101,
-        "Daniel",
-        "daniel",
-        "codex",
-        "openai",
-        "gpt-5.6-sol",
-        120,
-        (),
-        None,
-        None,
-        (),
+        profile_id=runtime_profile_id_for_config_id(101),
+        display_name="Daniel",
+        os_user="daniel",
+        backend="codex",
+        provider="openai",
+        model="gpt-5.6-sol",
+        timeout_seconds=120,
+        allowed_services=(),
+        home_workspace=None,
+        workspace_base=None,
+        allowed_workspaces=(),
+        role_models=(),
+        github_repos=(),
+        pr_review=None,
+        issue_triage=None,
+        allowed_triage_projects=(),
     )
 
     with pytest.raises(WorkshopRuntimeProfileError, match="Duplicate runtime profile ID"):
@@ -123,7 +126,7 @@ def test_document_preserves_migrated_profile_identity_and_compatibility_key():
 
     profile = registry.resolve(profile_id)
     assert profile.profile_id == profile_id
-    assert profile.runtime_config_id == 101
+    assert registry.legacy_runtime_key(profile.profile_id) == 101
     assert profile.os_user == "daniel"
     assert profile.backend == "codex"
     assert profile.provider == "openai"
@@ -143,18 +146,22 @@ def test_document_preserves_migrated_profile_identity_and_compatibility_key():
 )
 def test_protected_runtime_profiles_reject_unsafe_execution_accounts(os_user, message):
     profile = ProtectedRuntimeProfile(
-        runtime_profile_id_for_config_id(101),
-        101,
-        "Daniel",
-        os_user,
-        "codex",
-        "openai",
-        "gpt-5.6-sol",
-        120,
-        (),
-        None,
-        None,
-        (),
+        profile_id=runtime_profile_id_for_config_id(101),
+        display_name="Daniel",
+        os_user=os_user,
+        backend="codex",
+        provider="openai",
+        model="gpt-5.6-sol",
+        timeout_seconds=120,
+        allowed_services=(),
+        home_workspace=None,
+        workspace_base=None,
+        allowed_workspaces=(),
+        role_models=(),
+        github_repos=(),
+        pr_review=None,
+        issue_triage=None,
+        allowed_triage_projects=(),
     )
     registry = WorkshopRuntimeProfileRegistry((profile,))
 
@@ -341,9 +348,9 @@ def test_non_telegram_profile_derives_stable_private_compatibility_key():
         backend_registry={"pi": {}},
     )
 
-    expected = compatibility_runtime_config_id_for_profile_id(profile_id)
-    assert first.resolve(profile_id).runtime_config_id == expected
-    assert second.resolve(profile_id).runtime_config_id == expected
+    expected = first.legacy_runtime_key(profile_id)
+    assert second.legacy_runtime_key(profile_id) == expected
+    assert expected is not None
     assert expected > 0
 
 
@@ -848,7 +855,7 @@ def test_uninstalled_development_without_policy_uses_compatibility_projection(mo
 
     registry = WorkshopRuntimeProfileRegistry.load(_config())
 
-    assert registry.for_config_id(101).display_name == "Daniel"
+    assert registry.profile_for_legacy_runtime_key(101).display_name == "Daniel"
 
 
 def test_uninstalled_development_ignores_existing_canonical_policy(monkeypatch):
@@ -861,7 +868,7 @@ def test_uninstalled_development_ignores_existing_canonical_policy(monkeypatch):
 
     registry = WorkshopRuntimeProfileRegistry.load(_config())
 
-    assert registry.for_config_id(101).display_name == "Daniel"
+    assert registry.profile_for_legacy_runtime_key(101).display_name == "Daniel"
 
 
 def test_protected_startup_fails_closed_when_policy_is_unreadable(monkeypatch):

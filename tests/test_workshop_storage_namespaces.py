@@ -118,7 +118,7 @@ class TestWorkshopPrincipalStorageRegistry:
     def test_duplicate_runtime_configuration_is_rejected(self):
         with pytest.raises(
             WorkshopStorageNamespaceError,
-            match="Duplicate runtime configuration",
+            match="Duplicate archived runtime storage key",
         ):
             WorkshopPrincipalStorageRegistry(
                 (

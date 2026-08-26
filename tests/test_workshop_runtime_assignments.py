@@ -194,7 +194,8 @@ class TestRuntimeProfileCompatibilityBoundary:
             profile_registry(101).resolve(value)
 
     def test_opaque_profile_does_not_encode_runtime_configuration_key(self):
-        profile = profile_registry(202).resolve(profile_id(202))
+        profiles = profile_registry(202)
+        profile = profiles.resolve(profile_id(202))
 
-        assert profile.profile_id != str(profile.runtime_config_id)
+        assert profile.profile_id != str(profiles.legacy_runtime_key(profile.profile_id))
         assert "202" not in profile.profile_id

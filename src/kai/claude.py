@@ -34,6 +34,7 @@ from kai.backend import (
     TRACE_SUMMARY_MAX_CHARS,
     AgentBackend,
     AgentResponse,
+    AgentRuntimeIdentity,
     ApiContext,
     StreamEvent,
     TraceEntry,
@@ -705,7 +706,13 @@ class ClaudeCodeBackend(AgentBackend):
             except OSError:
                 pass
 
-    async def send(self, prompt: str | list, chat_id: int | None = None) -> AsyncIterator[StreamEvent]:
+    async def send(
+        self,
+        prompt: str | list,
+        chat_id: int | None = None,
+        *,
+        runtime_identity: AgentRuntimeIdentity | None = None,
+    ) -> AsyncIterator[StreamEvent]:
         """
         Send a message to Claude and yield streaming events.
 
@@ -726,10 +733,20 @@ class ClaudeCodeBackend(AgentBackend):
             done=True and includes the complete AgentResponse.
         """
         async with self._lock:
-            async for event in self._send_locked(prompt, chat_id=chat_id):
+            async for event in self._send_locked(
+                prompt,
+                chat_id=chat_id,
+                runtime_identity=runtime_identity,
+            ):
                 yield event
 
-    async def _send_locked(self, prompt: str | list, chat_id: int | None = None) -> AsyncIterator[StreamEvent]:
+    async def _send_locked(
+        self,
+        prompt: str | list,
+        chat_id: int | None = None,
+        *,
+        runtime_identity: AgentRuntimeIdentity | None = None,
+    ) -> AsyncIterator[StreamEvent]:
         """
         Core message-sending logic (must be called while holding self._lock).
 
@@ -820,6 +837,7 @@ class ClaudeCodeBackend(AgentBackend):
                 api=self._api_context,
                 workspace_config=self.workspace_config,
                 chat_id=chat_id,
+                runtime_identity=runtime_identity,
                 data_dir=DATA_DIR,
                 backend_name=self.backend_name,
                 memory_enabled=self.memory_enabled,
@@ -839,6 +857,7 @@ class ClaudeCodeBackend(AgentBackend):
         prompt = await assemble_turn_context(
             prompt,
             chat_id=chat_id,
+            runtime_identity=runtime_identity,
             session_context=session_ctx,
             workspace_reminder=reminder,
             workspace=self.workspace,

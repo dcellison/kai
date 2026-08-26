@@ -417,7 +417,7 @@ class TestTelegramStreamingPreviewMigration:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 32
+            assert await upgraded.schema_version() == 33
             assert "telegram_streaming_previews" in await upgraded.schema_tables()
             async with upgraded.connection.execute(
                 "SELECT name FROM workshop_schema_migrations WHERE version = 12"

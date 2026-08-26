@@ -1600,6 +1600,7 @@ class TestImageForwarding:
         writer.assert_called_once_with(
             _anthropic_image_block(),
             chat_id=24680,
+            principal_id=None,
             reader_user="alice",
         )
 

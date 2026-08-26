@@ -38,6 +38,10 @@ class WorkshopRuntimePool:
         """Resolve the protected profile without exposing compatibility lookup."""
         return self._profiles.resolve(runtime_profile_id)
 
+    def legacy_runtime_key(self, runtime_profile_id: str | RuntimeProfileId) -> int | None:
+        """Return migration-only state for the temporary cutover coordinator."""
+        return self._profiles.legacy_runtime_key(runtime_profile_id)
+
     async def prepare_execution(
         self,
         runtime_profile_id: str | RuntimeProfileId,

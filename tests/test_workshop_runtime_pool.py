@@ -39,7 +39,7 @@ def _contexts_for_profiles(
     return WorkshopInternalAPIContextRegistry(
         tuple(
             WorkshopInternalAPIExecutionContext.for_unprotected_runtime(
-                profile.runtime_config_id,
+                profiles.legacy_runtime_key(profile.profile_id) or 1,
                 profile.profile_id,
             )
             for profile in profiles.profiles
@@ -110,7 +110,6 @@ def test_protected_profile_selects_backend_and_os_user_over_compatibility_config
         (
             ProtectedRuntimeProfile(
                 profile_id=RuntimeProfileId("rtp_11111111111111111111111111111111"),
-                runtime_config_id=111,
                 display_name="Protected coding runtime",
                 os_user="protected-user",
                 backend="codex",
@@ -122,7 +121,8 @@ def test_protected_profile_selects_backend_and_os_user_over_compatibility_config
                 workspace_base=None,
                 allowed_workspaces=(),
             ),
-        )
+        ),
+        legacy_runtime_keys={RuntimeProfileId("rtp_11111111111111111111111111111111"): 111},
     )
 
     pool = SubprocessPool(config=config, services_info=[], runtime_profiles=profiles)
@@ -183,7 +183,6 @@ def test_protected_profile_service_scopes_override_compatibility_config(tmp_path
         (
             ProtectedRuntimeProfile(
                 profile_id=RuntimeProfileId("rtp_15151515151515151515151515151515"),
-                runtime_config_id=111,
                 display_name="Protected coding runtime",
                 os_user=None,
                 backend="codex",
@@ -195,7 +194,8 @@ def test_protected_profile_service_scopes_override_compatibility_config(tmp_path
                 workspace_base=None,
                 allowed_workspaces=(),
             ),
-        )
+        ),
+        legacy_runtime_keys={RuntimeProfileId("rtp_15151515151515151515151515151515"): 111},
     )
 
     pool = SubprocessPool(
@@ -216,20 +216,20 @@ def test_protected_profile_service_scopes_override_compatibility_config(tmp_path
 def test_profile_without_telegram_user_receives_runtime_credential(tmp_path, monkeypatch):
     from kai.pool import SubprocessPool
 
-    runtime_config_id = 987654321012345
+    runtime_profile_id = RuntimeProfileId("rtp_22222222222222222222222222222222")
     monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
     config = Config(
         telegram_bot_token="test",
         allowed_user_ids=set(),
         default_backend="claude",
         default_model="sonnet",
+        session_db_path=tmp_path / "kai.db",
         user_configs={},
     )
     profiles = WorkshopRuntimeProfileRegistry(
         (
             ProtectedRuntimeProfile(
-                profile_id=RuntimeProfileId("rtp_22222222222222222222222222222222"),
-                runtime_config_id=runtime_config_id,
+                profile_id=runtime_profile_id,
                 display_name="Browser-only runtime",
                 os_user=None,
                 backend="codex",
@@ -245,8 +245,14 @@ def test_profile_without_telegram_user_receives_runtime_credential(tmp_path, mon
     )
 
     services_info = [{"name": "perplexity", "method": "POST", "description": "search"}]
-    pool = SubprocessPool(config=config, services_info=services_info, runtime_profiles=profiles)
-    instance = pool.get(runtime_config_id)
+    contexts = _contexts_for_profiles(profiles)
+    pool = SubprocessPool(
+        config=config,
+        services_info=services_info,
+        runtime_profiles=profiles,
+        internal_api_contexts=contexts,
+    )
+    instance = pool.get(runtime_profile_id)
     principal = pool.internal_api_auth.authenticate(instance._api_context.webhook_secret)
 
     assert instance.backend_name == "codex"
@@ -254,7 +260,9 @@ def test_profile_without_telegram_user_receives_runtime_credential(tmp_path, mon
     assert not hasattr(principal, "compatibility_runtime_config_id")
     assert principal.allowed_services == frozenset({"perplexity"})
     assert instance._api_context.services_info == services_info
-    assert instance.workspace == tmp_path / "home" / str(runtime_config_id)
+    assert instance.workspace == (
+        tmp_path / "home" / str(contexts.for_runtime_profile(runtime_profile_id).principal_id)
+    )
 
 
 async def test_protected_workspace_policy_overrides_compatibility_config(tmp_path, monkeypatch):
@@ -301,7 +309,6 @@ async def test_protected_workspace_policy_overrides_compatibility_config(tmp_pat
         (
             ProtectedRuntimeProfile(
                 profile_id=RuntimeProfileId("rtp_56565656565656565656565656565656"),
-                runtime_config_id=111,
                 display_name="Protected runtime",
                 os_user=None,
                 backend="codex",
@@ -313,12 +320,13 @@ async def test_protected_workspace_policy_overrides_compatibility_config(tmp_pat
                 workspace_base=protected_base,
                 allowed_workspaces=(protected_allowed,),
             ),
-        )
+        ),
+        legacy_runtime_keys={RuntimeProfileId("rtp_56565656565656565656565656565656"): 111},
     )
     pool = SubprocessPool(config=config, services_info=[], runtime_profiles=profiles)
     monkeypatch.setattr(
-        "kai.pool.sessions.get_allowed_workspaces",
-        AsyncMock(return_value=[db_allowed]),
+        "kai.pool.sessions.resolve_canonical_workspace_access",
+        AsyncMock(return_value=(protected_base, [db_allowed, protected_allowed, global_allowed])),
     )
 
     instance = pool.get(111)
@@ -343,14 +351,14 @@ def test_unavailable_explicit_profile_home_fails_only_that_runtime(tmp_path, mon
         default_provider="openai",
         default_model="gpt-5.6-sol",
         protected_install=True,
+        session_db_path=tmp_path / "kai.db",
         user_configs={},
     )
-    runtime_config_id = 987654321012347
+    runtime_profile_id = RuntimeProfileId("rtp_57575757575757575757575757575757")
     profiles = WorkshopRuntimeProfileRegistry(
         (
             ProtectedRuntimeProfile(
-                profile_id=RuntimeProfileId("rtp_57575757575757575757575757575757"),
-                runtime_config_id=runtime_config_id,
+                profile_id=runtime_profile_id,
                 display_name="Browser-only runtime",
                 os_user=None,
                 backend="codex",
@@ -372,7 +380,7 @@ def test_unavailable_explicit_profile_home_fails_only_that_runtime(tmp_path, mon
     )
 
     with pytest.raises(RuntimeError, match="Mount or create it, or update the protected runtime profile"):
-        pool.get(runtime_config_id)
+        pool.get(runtime_profile_id)
 
 
 def test_profile_only_canonical_home_error_has_actionable_remediation(tmp_path, monkeypatch):
@@ -388,12 +396,11 @@ def test_profile_only_canonical_home_error_has_actionable_remediation(tmp_path, 
         protected_install=True,
         user_configs={},
     )
-    runtime_config_id = 987654321012348
+    runtime_profile_id = RuntimeProfileId("rtp_58585858585858585858585858585858")
     profiles = WorkshopRuntimeProfileRegistry(
         (
             ProtectedRuntimeProfile(
-                profile_id=RuntimeProfileId("rtp_58585858585858585858585858585858"),
-                runtime_config_id=runtime_config_id,
+                profile_id=runtime_profile_id,
                 display_name="Browser-only runtime",
                 os_user=None,
                 backend="codex",
@@ -414,8 +421,8 @@ def test_profile_only_canonical_home_error_has_actionable_remediation(tmp_path, 
         internal_api_contexts=_contexts_for_profiles(profiles),
     )
 
-    with pytest.raises(RuntimeError, match="profile-only runtimes require an explicit home_workspace"):
-        pool.get(runtime_config_id)
+    with pytest.raises(RuntimeError, match="home is not provisioned"):
+        pool.get(runtime_profile_id)
 
 
 def test_unavailable_protected_service_is_denied_with_warning(tmp_path, monkeypatch, caplog):
@@ -430,12 +437,11 @@ def test_unavailable_protected_service_is_denied_with_warning(tmp_path, monkeypa
         default_model="gpt-5.6-sol",
         user_configs={},
     )
-    runtime_config_id = 987654321012346
+    runtime_profile_id = RuntimeProfileId("rtp_25252525252525252525252525252525")
     profiles = WorkshopRuntimeProfileRegistry(
         (
             ProtectedRuntimeProfile(
-                profile_id=RuntimeProfileId("rtp_25252525252525252525252525252525"),
-                runtime_config_id=runtime_config_id,
+                profile_id=runtime_profile_id,
                 display_name="Browser-only runtime",
                 os_user=None,
                 backend="codex",
@@ -450,14 +456,19 @@ def test_unavailable_protected_service_is_denied_with_warning(tmp_path, monkeypa
         )
     )
 
-    pool = SubprocessPool(config=config, services_info=[], runtime_profiles=profiles)
-    instance = pool.get(runtime_config_id)
+    pool = SubprocessPool(
+        config=config,
+        services_info=[],
+        runtime_profiles=profiles,
+        internal_api_contexts=_contexts_for_profiles(profiles),
+    )
+    instance = pool.get(runtime_profile_id)
     principal = pool.internal_api_auth.authenticate(instance._api_context.webhook_secret)
 
     assert principal is not None
     assert principal.allowed_services == frozenset()
     assert instance._api_context.services_info == []
-    assert "protected runtime profile" in caplog.text
+    assert str(runtime_profile_id) in caplog.text
     assert "unavailable allowed_services: missing; denying them" in caplog.text
 
 
@@ -477,7 +488,6 @@ def test_negative_group_key_retains_legacy_compatibility_runtime(tmp_path, monke
         (
             ProtectedRuntimeProfile(
                 profile_id=RuntimeProfileId("rtp_33333333333333333333333333333333"),
-                runtime_config_id=111,
                 display_name="Alice runtime",
                 os_user=None,
                 backend="codex",
@@ -518,7 +528,6 @@ def test_positive_configuration_key_without_profile_fails_closed(tmp_path, monke
         (
             ProtectedRuntimeProfile(
                 profile_id=RuntimeProfileId("rtp_44444444444444444444444444444444"),
-                runtime_config_id=222,
                 display_name="Different runtime",
                 os_user=None,
                 backend="codex",

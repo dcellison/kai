@@ -87,10 +87,11 @@ from kai.workshop.diagnostics import (
     workshop_transcript_authority_status,
     workshop_transition_tooling_status,
 )
-from kai.workshop.domain import WorkshopId
+from kai.workshop.domain import RuntimeProfileId, WorkshopId
 from kai.workshop.runtime_profiles import (
     WorkshopRuntimeProfileError,
     WorkshopRuntimeProfileRegistry,
+    legacy_runtime_key_for_v1_profile_id,
     runtime_profile_id_for_config_id,
 )
 
@@ -1112,7 +1113,6 @@ def _build_migrated_runtime_profiles(
         profile_id = runtime_profile_id_for_config_id(runtime_config_id)
         profile: dict[str, object] = {
             "display_name": display_name,
-            "compatibility_runtime_config_id": runtime_config_id,
             "backend": backend,
             "provider": provider,
             "model": model,
@@ -1127,13 +1127,48 @@ def _build_migrated_runtime_profiles(
                 field="workspace_base",
             ),
             "allowed_workspaces": _migrated_allowed_workspaces(entry),
+            "models": {
+                str(role).strip().lower(): canonicalize_model_for_backend(str(role_model).strip(), backend)
+                for role, role_model in (
+                    entry.get("models", {}).items() if isinstance(entry.get("models"), dict) else ()
+                )
+                if str(role).strip() and str(role_model).strip()
+            },
+            "github_repos": [
+                str(repo).strip().lower()
+                for repo in (entry.get("github_repos", []) if isinstance(entry.get("github_repos"), list) else ())
+                if str(repo).strip()
+            ],
+            "pr_review": entry.get("pr_review") if isinstance(entry.get("pr_review"), bool) else None,
+            "issue_triage": (entry.get("issue_triage") if isinstance(entry.get("issue_triage"), bool) else None),
+            "allowed_triage_projects": [
+                str(project).strip()
+                for project in (
+                    entry.get("allowed_triage_projects", [])
+                    if isinstance(entry.get("allowed_triage_projects"), list)
+                    else ()
+                )
+                if str(project).strip() and str(project).strip() != "*"
+            ],
         }
         raw_os_user = entry.get("os_user")
         if raw_os_user is not None and str(raw_os_user).strip():
             profile["os_user"] = str(raw_os_user).strip()
         profiles[str(profile_id)] = profile
+    legacy_runtime_keys = {
+        str(runtime_profile_id_for_config_id(runtime_config_id)): runtime_config_id
+        for runtime_config_id in sorted(seen)
+    }
     return yaml.safe_dump(
-        {"version": 1, "runtime_profiles": profiles},
+        {
+            "version": 2,
+            "runtime_profiles": profiles,
+            "legacy_runtime_archive": {
+                "version": 1,
+                "runtime_keys": legacy_runtime_keys,
+                "removal_gate": "canonical_runtime_state_v1",
+            },
+        },
         sort_keys=False,
         default_flow_style=False,
     )
@@ -1155,13 +1190,7 @@ def _upgrade_runtime_policy_content(
     migrated_content: str,
     defaults: _RuntimePolicyDefaults,
 ) -> tuple[str, bool]:
-    """Add execution-policy fields to documents that predate them.
-
-    The major document version remains 1 so older Kai code ignores the new
-    keys during rollback. Existing values are never overwritten. Profiles
-    migrated from users.yaml receive the exact pre-cutover effective values;
-    independently authored profiles receive deterministic backend defaults.
-    """
+    """Upgrade live runtime policy while preserving explicit rollback keys."""
     try:
         document = yaml.safe_load(content)
         migrated = yaml.safe_load(migrated_content)
@@ -1172,16 +1201,35 @@ def _upgrade_runtime_policy_content(
     migrated_profiles = migrated.get("runtime_profiles") if isinstance(migrated, dict) else None
     if not isinstance(migrated_profiles, dict):
         return content, False
-    expected_by_config_id = {
-        profile.get("compatibility_runtime_config_id"): profile
-        for profile in migrated_profiles.values()
-        if isinstance(profile, dict)
+    expected_by_profile_id = {
+        str(profile_id): profile for profile_id, profile in migrated_profiles.items() if isinstance(profile, dict)
     }
     changed = False
-    for profile in document["runtime_profiles"].values():
+    if document.get("version") == 1:
+        archived_keys: dict[str, int] = {}
+        for profile_id, profile in document["runtime_profiles"].items():
+            if not isinstance(profile, dict):
+                continue
+            raw_key = profile.pop("compatibility_runtime_config_id", None)
+            if isinstance(raw_key, int) and not isinstance(raw_key, bool) and raw_key > 0:
+                archived_keys[str(profile_id)] = raw_key
+            elif raw_key is None:
+                try:
+                    canonical_profile_id = RuntimeProfileId(str(profile_id))
+                except (TypeError, ValueError):
+                    continue
+                archived_keys[str(profile_id)] = legacy_runtime_key_for_v1_profile_id(canonical_profile_id)
+        document["version"] = 2
+        document["legacy_runtime_archive"] = {
+            "version": 1,
+            "runtime_keys": archived_keys,
+            "removal_gate": "canonical_runtime_state_v1",
+        }
+        changed = True
+    for profile_id, profile in document["runtime_profiles"].items():
         if not isinstance(profile, dict):
             continue
-        expected = expected_by_config_id.get(profile.get("compatibility_runtime_config_id"))
+        expected = expected_by_profile_id.get(str(profile_id))
         if "model" not in profile:
             if isinstance(expected, dict):
                 profile["model"] = expected["model"]
@@ -1217,6 +1265,19 @@ def _upgrade_runtime_policy_content(
             changed = True
         if "allowed_workspaces" not in profile:
             profile["allowed_workspaces"] = expected["allowed_workspaces"] if isinstance(expected, dict) else []
+            changed = True
+        if "models" not in profile:
+            profile["models"] = expected["models"] if isinstance(expected, dict) else {}
+            changed = True
+        for field in ("github_repos", "pr_review", "issue_triage"):
+            if field not in profile:
+                default: object = [] if field == "github_repos" else None
+                profile[field] = expected[field] if isinstance(expected, dict) else default
+                changed = True
+        if "allowed_triage_projects" not in profile:
+            profile["allowed_triage_projects"] = (
+                expected["allowed_triage_projects"] if isinstance(expected, dict) else []
+            )
             changed = True
     if not changed:
         return content, False
@@ -1271,7 +1332,7 @@ def _runtime_policy_has_config_id(
     runtime_config_id: int,
 ) -> bool:
     try:
-        profiles.for_config_id(runtime_config_id)
+        profiles.profile_for_legacy_runtime_key(runtime_config_id)
     except WorkshopRuntimeProfileError:
         return False
     return True
@@ -4815,12 +4876,17 @@ def _canonical_principal_storage_names(data_path: Path) -> dict[str, str]:
 class _RuntimeStorageTarget:
     """One protected runtime's install-time storage and ownership target."""
 
-    runtime_config_id: int
+    legacy_runtime_key: int | None
     profile_id: str
     storage_name: str
     os_user: str | None
     backend: str
     home_workspace: Path | None
+
+    @property
+    def storage_key(self) -> int | str:
+        """Return the migration key, or the canonical owner for new profiles."""
+        return self.legacy_runtime_key if self.legacy_runtime_key is not None else self.storage_name
 
 
 def _runtime_profile_principal_names(
@@ -4891,7 +4957,10 @@ def _runtime_storage_targets(
     compatibility_ids = set(compatibility_order)
     assignments_initialized, workshop_id, principal_names = _runtime_profile_principal_names(data_path)
     compatibility_principal_names = _canonical_principal_storage_names(data_path)
-    by_config_id = {profile.runtime_config_id: profile for profile in runtime_profiles.profiles}
+    by_config_id = {
+        legacy_key: runtime_profiles.resolve(profile_id)
+        for profile_id, legacy_key in runtime_profiles.legacy_runtime_archive
+    }
     policy_profile_ids = {str(profile.profile_id) for profile in runtime_profiles.profiles}
     stale_assignments = sorted(set(principal_names) - policy_profile_ids)
     if stale_assignments:
@@ -4900,13 +4969,21 @@ def _runtime_storage_targets(
             + ", ".join(stale_assignments)
         )
 
-    ordered_ids = [runtime_id for runtime_id in compatibility_order if runtime_id in by_config_id]
-    ordered_ids.extend(sorted(runtime_id for runtime_id in by_config_id if runtime_id not in compatibility_ids))
+    ordered_profiles = [by_config_id[runtime_id] for runtime_id in compatibility_order if runtime_id in by_config_id]
+    ordered_profile_ids = {profile.profile_id for profile in ordered_profiles}
+    ordered_profiles.extend(
+        sorted(
+            (profile for profile in runtime_profiles.profiles if profile.profile_id not in ordered_profile_ids),
+            key=lambda profile: profile.profile_id,
+        )
+    )
     targets: list[_RuntimeStorageTarget] = []
-    for runtime_config_id in ordered_ids:
-        profile = by_config_id[runtime_config_id]
+    for profile in ordered_profiles:
+        runtime_config_id = runtime_profiles.legacy_runtime_key(profile.profile_id)
         principal_name = principal_names.get(str(profile.profile_id))
-        compatibility_principal = compatibility_principal_names.get(str(runtime_config_id))
+        compatibility_principal = (
+            compatibility_principal_names.get(str(runtime_config_id)) if runtime_config_id is not None else None
+        )
         if (
             principal_name is not None
             and compatibility_principal is not None
@@ -4916,7 +4993,7 @@ def _runtime_storage_targets(
                 f"Protected runtime profile {profile.profile_id} conflicts with its canonical compatibility owner"
             )
         if principal_name is None:
-            if runtime_config_id not in compatibility_ids:
+            if runtime_config_id is None or runtime_config_id not in compatibility_ids:
                 raise RuntimeError(
                     f"Protected runtime profile {profile.profile_id} must map to exactly one canonical human owner"
                 )
@@ -4947,7 +5024,7 @@ def _runtime_storage_targets(
                 ) from exc
         targets.append(
             _RuntimeStorageTarget(
-                runtime_config_id=runtime_config_id,
+                legacy_runtime_key=runtime_config_id,
                 profile_id=str(profile.profile_id),
                 storage_name=principal_name,
                 os_user=profile.os_user,
@@ -5359,16 +5436,14 @@ def _apply_migrate(
         protected_home_overrides: dict[int, Path] | None = None
         protected_backends: dict[int, str | None] | None = None
     else:
-        memory_owners = [(target.runtime_config_id, target.os_user) for target in runtime_storage_targets]
-        protected_storage_names = {
-            str(target.runtime_config_id): target.storage_name for target in runtime_storage_targets
-        }
+        memory_owners = [(target.storage_key, target.os_user) for target in runtime_storage_targets]
+        protected_storage_names = {str(target.storage_key): target.storage_name for target in runtime_storage_targets}
         protected_home_overrides = {
-            target.runtime_config_id: target.home_workspace
+            target.storage_key: target.home_workspace
             for target in runtime_storage_targets
             if target.home_workspace is not None
         }
-        protected_backends = {target.runtime_config_id: target.backend for target in runtime_storage_targets}
+        protected_backends = {target.storage_key: target.backend for target in runtime_storage_targets}
     memory_root = data_path / "memory"
     legacy_global = memory_root / "MEMORY.md"
     template = PROJECT_ROOT / "templates" / ".claude" / "MEMORY.md"
@@ -5419,7 +5494,7 @@ def _apply_migrate(
     # dev), leave memory/MEMORY.md alone - runtime code falls back to
     # that legacy path when chat_id is None. This keeps local `make
     # run` workflows identical to pre-#347 behavior.
-    primary_chat_id: int | None = memory_owners[0][0] if memory_owners else None
+    primary_chat_id: int | str | None = memory_owners[0][0] if memory_owners else None
 
     if primary_chat_id is not None:
         for index, (chat_id, _os_user) in enumerate(memory_owners):
@@ -5687,7 +5762,7 @@ def _apply_migrate(
     home_overrides = (
         _collect_user_home_overrides(users_yaml_path) if protected_home_overrides is None else protected_home_overrides
     )
-    managed_home_migrations: dict[int, tuple[Path, Path]] = {}
+    managed_home_migrations: dict[int | str, tuple[Path, Path]] = {}
     for chat_id, _os_user in memory_owners:
         if chat_id is None or chat_id in home_overrides:
             continue
@@ -8629,6 +8704,7 @@ def _cmd_status() -> None:
     )
     print(workshop_delivery_authority_status(Path(data_dir) / "kai.db"))
     print(workshop_runtime_session_status(Path(data_dir) / "kai.db"))
+    print(_runtime_key_cutover_status(Path(data_dir) / "kai.db", RUNTIME_PROFILES_YAML))
     print(workshop_execution_state_status(Path(data_dir) / "kai.db"))
     print(workshop_operational_state_status(Path(data_dir) / "kai.db"))
     print(
@@ -8694,7 +8770,46 @@ def _runtime_policy_status(policy_path: Path, backend_registry_path: Path) -> st
     except (OSError, yaml.YAMLError, WorkshopRuntimeProfileError) as exc:
         return f"{prefix} INVALID ({type(exc).__name__})"
     backends = ",".join(sorted({profile.backend for profile in profiles.profiles}))
-    return f"{prefix} initialized; profiles={len(profiles.profiles)}, backends={backends}, runtime kernel=canonical"
+    archived = len(profiles.legacy_runtime_archive)
+    removal_gate = profiles.legacy_archive_removal_gate or "not-applicable"
+    return (
+        f"{prefix} initialized; profiles={len(profiles.profiles)}, backends={backends}, "
+        f"runtime kernel=canonical, archived keys={archived}, removal gate={removal_gate}"
+    )
+
+
+def _runtime_key_cutover_status(database_path: Path, policy_path: Path) -> str:
+    """Report immutable transport-shaped-key migration coverage."""
+    prefix = "Workshop runtime-key cutover:"
+    try:
+        profiles = WorkshopRuntimeProfileRegistry.from_yaml(policy_path.read_text(encoding="utf-8"))
+        with sqlite3.connect(database_path) as connection:
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'workshop_runtime_key_cutovers'"
+            ).fetchone()
+            if table is None:
+                return f"{prefix} unavailable"
+            rows = connection.execute(
+                "SELECT runtime_profile_id, legacy_runtime_key, legacy_reads_disabled "
+                "FROM workshop_runtime_key_cutovers"
+            ).fetchall()
+    except (OSError, sqlite3.Error, WorkshopRuntimeProfileError, yaml.YAMLError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    expected = {str(profile.profile_id) for profile in profiles.profiles}
+    observed = {str(row[0]) for row in rows}
+    archived = sum(row[1] is not None for row in rows)
+    disabled = sum(int(row[2]) == 1 for row in rows)
+    missing = len(expected - observed)
+    extra = len(observed - expected)
+    reads_disabled = disabled == len(rows)
+    state = "active" if missing == 0 and extra == 0 and reads_disabled else "INCOMPLETE"
+    gate = profiles.legacy_archive_removal_gate or "not-applicable"
+    legacy_read_status = "disabled" if reads_disabled else "NOT VERIFIED"
+    return (
+        f"{prefix} {state}; profiles={len(expected)}, receipts={len(rows)}, "
+        f"archived keys={archived}, missing={missing}, extra={extra}; "
+        f"legacy reads={legacy_read_status}, removal gate={gate}"
+    )
 
 
 def _runtime_storage_status(

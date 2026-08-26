@@ -100,7 +100,7 @@ def _namespace(runtime_config_id: int = 101) -> WorkshopExecutionStateNamespace:
         channel_id=ChannelId.new(),
         agent_id=AgentId.new(),
         runtime_profile_id=profile_id(runtime_config_id),
-        runtime_config_id=runtime_config_id,
+        legacy_runtime_key=runtime_config_id,
     )
 
 
@@ -123,14 +123,14 @@ class TestCanonicalMemoryNamespace:
             channel_id=ChannelId.new(),
             agent_id=AgentId.new(),
             runtime_profile_id=profile_id(101),
-            runtime_config_id=101,
+            legacy_runtime_key=101,
         )
         second = WorkshopExecutionStateNamespace(
             principal_id=principal_id,
             channel_id=ChannelId.new(),
             agent_id=AgentId.new(),
             runtime_profile_id=profile_id(202),
-            runtime_config_id=202,
+            legacy_runtime_key=202,
         )
 
         registry = WorkshopExecutionStateRegistry((first, second))
@@ -265,14 +265,14 @@ class TestCanonicalMemoryNamespace:
             channel_id=ChannelId.new(),
             agent_id=AgentId.new(),
             runtime_profile_id=profile_id(101),
-            runtime_config_id=101,
+            legacy_runtime_key=101,
         )
         second = WorkshopExecutionStateNamespace(
             principal_id=principal_id,
             channel_id=ChannelId.new(),
             agent_id=AgentId.new(),
             runtime_profile_id=profile_id(202),
-            runtime_config_id=202,
+            legacy_runtime_key=202,
         )
         fake = _FakeMem0(
             [
@@ -298,14 +298,14 @@ class TestCanonicalMemoryNamespace:
             channel_id=ChannelId.new(),
             agent_id=AgentId.new(),
             runtime_profile_id=profile_id(101),
-            runtime_config_id=101,
+            legacy_runtime_key=101,
         )
         second = WorkshopExecutionStateNamespace(
             principal_id=principal_id,
             channel_id=ChannelId.new(),
             agent_id=AgentId.new(),
             runtime_profile_id=profile_id(202),
-            runtime_config_id=202,
+            legacy_runtime_key=202,
         )
         memory._memory = _FakeMem0(
             [{"id": "ambiguous", "memory": "Unknown lane", "user_id": str(principal_id), "metadata": {}}]
@@ -321,14 +321,14 @@ class TestCanonicalMemoryNamespace:
             channel_id=ChannelId.new(),
             agent_id=AgentId.new(),
             runtime_profile_id=profile_id(101),
-            runtime_config_id=101,
+            legacy_runtime_key=101,
         )
         second = WorkshopExecutionStateNamespace(
             principal_id=principal_id,
             channel_id=ChannelId.new(),
             agent_id=AgentId.new(),
             runtime_profile_id=profile_id(202),
-            runtime_config_id=202,
+            legacy_runtime_key=202,
         )
         fake = _FakeMem0(
             [
@@ -485,14 +485,14 @@ class TestCanonicalMemoryAuthorityMigration:
                 channel_id=ChannelId.new(),
                 agent_id=AgentId.new(),
                 runtime_profile_id=profile_id(101),
-                runtime_config_id=101,
+                legacy_runtime_key=101,
             )
             second = WorkshopExecutionStateNamespace(
                 principal_id=principal_id,
                 channel_id=ChannelId.new(),
                 agent_id=AgentId.new(),
                 runtime_profile_id=profile_id(202),
-                runtime_config_id=202,
+                legacy_runtime_key=202,
             )
             fake = _FakeMem0([{"id": "first", "memory": "First", "user_id": "101", "metadata": {}}])
             memory._memory = fake
@@ -521,7 +521,7 @@ class TestCanonicalMemoryAuthorityMigration:
 
         upgraded = await WorkshopEventStore.open(database)
         try:
-            assert await upgraded.schema_version() == 32
+            assert await upgraded.schema_version() == 33
             assert "workshop_memory_authority_migrations" in await upgraded.schema_tables()
         finally:
             await upgraded.close()

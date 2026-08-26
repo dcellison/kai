@@ -57,7 +57,7 @@ class TestCanonicalExecutionStateMigration:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 32
+            assert await upgraded.schema_version() == 33
             tables = await upgraded.schema_tables()
             assert {
                 "channel_agent_execution_settings",
@@ -228,16 +228,15 @@ class TestCanonicalExecutionStateWrites:
         assert await sessions.get_setting("ws_config:101:/projects/alice:model") is None
         assert await sessions.get_setting("ws_config:101:/projects/alice:archive:model") is None
 
-    async def test_unmapped_development_callers_retain_legacy_behavior(self, database: Path):
+    async def test_unmapped_positive_adapter_keys_fail_closed_after_cutover(self, database: Path):
         await _initialize(database, 101)
 
-        await sessions.set_user_setting(999, "model", "development-model")
-        await sessions.set_active_workspace(999, "/tmp/development")
-        await sessions.add_allowed_workspace(999, "/tmp/development")
-
-        assert await sessions.get_user_settings(999) == {"model": "development-model"}
-        assert await sessions.get_active_workspace(999) == "/tmp/development"
-        assert await sessions.get_allowed_workspaces(999) == [Path("/tmp/development")]
+        with pytest.raises(RuntimeError, match="no canonical execution-state owner"):
+            await sessions.set_user_setting(999, "model", "development-model")
+        with pytest.raises(RuntimeError, match="no canonical execution-state owner"):
+            await sessions.set_active_workspace(999, "/tmp/development")
+        with pytest.raises(RuntimeError, match="no canonical execution-state owner"):
+            await sessions.add_allowed_workspace(999, "/tmp/development")
 
 
 class TestCanonicalExecutionStateDiagnostic:
@@ -257,7 +256,11 @@ class TestCanonicalExecutionStateDiagnostic:
     async def test_reports_unmapped_legacy_state_without_exposing_it(self, database: Path):
         await _initialize(database, 101)
         await sessions.set_setting("model:999", "unmapped-secret")
-        await sessions.upsert_workspace_history("/secret/path", 999)
+        await sessions._get_db().execute(
+            "INSERT INTO workspace_history (path, chat_id) VALUES (?, ?)",
+            ("/secret/path", 999),
+        )
+        await sessions._get_db().commit()
 
         status = workshop_execution_state_status(database)
 

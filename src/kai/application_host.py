@@ -13,7 +13,6 @@ from kai.config import Config
 from kai.pool import SubprocessPool
 from kai.workshop.artifacts import WorkshopArtifactService
 from kai.workshop.client_commands import WorkshopClientCommandExecutor
-from kai.workshop.compatibility_state import WorkshopCompatibilityStateWriter
 from kai.workshop.conversation_runs import WorkshopConversationRunService
 from kai.workshop.delivery_authority import (
     DeliveryAuthorityEpoch,
@@ -34,6 +33,7 @@ from kai.workshop.proactive_publication import (
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
+from kai.workshop.runtime_state import WorkshopRuntimeStateWriter
 from kai.workshop.scheduler import WorkshopCanonicalScheduler
 from kai.workshop.settings_workspaces import WorkshopSettingsWorkspaceService
 from kai.workshop.storage_namespaces import WorkshopPrincipalStorageRegistry
@@ -219,7 +219,11 @@ class KaiApplicationHost:
                 internal_api_contexts=self._internal_api_contexts,
             )
             runtime_pool = WorkshopRuntimePool(subprocess_pool, self._runtime_profiles)
-            compatibility_state = WorkshopCompatibilityStateWriter(self._config, runtime_pool)
+            runtime_state = WorkshopRuntimeStateWriter(
+                self._config,
+                runtime_pool,
+                self._execution_state,
+            )
             conversation_runs = WorkshopConversationRunService(
                 runtime_pool,
                 sessions.resolve_workshop_conversation_run,
@@ -239,7 +243,7 @@ class KaiApplicationHost:
             )
             post_run_effects = await WorkshopPostRunEffectService.open_and_start(
                 Path(self._config.session_db_path),
-                compatibility_state,
+                runtime_state,
             )
             run_previews = WorkshopRunPreviewRegistry()
             client_commands = WorkshopClientCommandExecutor(
@@ -292,7 +296,7 @@ class KaiApplicationHost:
                 Path(self._config.session_db_path),
                 runtime_pool,
                 self._execution_state,
-                compatibility_state,
+                runtime_state,
                 integration_notifications,
                 spec_dir=self._config.spec_dir,
                 review_timeout_seconds=self._config.pr_review_timeout_s,

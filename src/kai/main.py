@@ -104,7 +104,7 @@ def _workshop_bootstrap_humans(
             transport="telegram",
             external_subject=str(user.telegram_id),
             external_channel_id=str(user.telegram_id),
-            runtime_profile_id=runtime_profiles.for_config_id(user.telegram_id).profile_id,
+            runtime_profile_id=runtime_profiles.profile_for_legacy_runtime_key(user.telegram_id).profile_id,
         )
         for user in sorted(config.user_configs.values(), key=lambda user: user.telegram_id)
     )
@@ -596,6 +596,7 @@ def _start() -> None:
         operational_migration = await sessions.initialize_workshop_operational_state(
             execution_state,
             config,
+            runtime_profiles,
         )
         logging.info(
             "Workshop canonical operational state ready "
@@ -621,6 +622,7 @@ def _start() -> None:
         # scoped delete primitive) shipped alongside this re-enable in
         # spec §320 / epic #306; Haiku extraction (Phase 2) is gated
         # separately via MEMORY_EXTRACTION_ENABLED.
+        memory_authority_enabled = False
         try:
             from kai.memory import configure_memory_authority, init_memory, is_enabled
 
@@ -629,7 +631,8 @@ def _start() -> None:
         except Exception:
             logging.warning("Could not initialize semantic memory", exc_info=True)
         else:
-            if is_enabled():
+            memory_authority_enabled = is_enabled()
+            if memory_authority_enabled:
                 memory_migration = await sessions.initialize_workshop_memory_authority(execution_state)
                 logging.info(
                     "Workshop canonical memory authority ready "
@@ -655,6 +658,18 @@ def _start() -> None:
                     )
                 except Exception:
                     logging.warning("Could not refresh semantic memory scope census", exc_info=True)
+
+        runtime_key_cutover = await sessions.initialize_workshop_runtime_key_cutover(
+            execution_state,
+            memory_enabled=memory_authority_enabled,
+        )
+        logging.info(
+            "Workshop canonical runtime-key cutover ready "
+            "(profiles=%d, newly_recorded=%d, archived_keys=%d, legacy_reads=disabled)",
+            runtime_key_cutover.profiles,
+            runtime_key_cutover.newly_recorded,
+            runtime_key_cutover.archived_keys,
+        )
 
         try:
             core_host = KaiApplicationHost(
