@@ -54,6 +54,8 @@ from kai.http_adapter import HttpAdapter, HttpIngressAdapter
 from kai.memory_backup import run_memory_backup
 from kai.workshop.bootstrap import BootstrapHuman, BootstrapNotificationChannel
 from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
+from kai.workshop.domain import RuntimeProfileId
+from kai.workshop.initial_provisioning import parse_initial_provisioning
 from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
 
 
@@ -107,6 +109,7 @@ def _workshop_bootstrap_humans(
             runtime_profile_id=runtime_profiles.profile_for_legacy_runtime_key(user.telegram_id).profile_id,
         )
         for user in sorted(config.user_configs.values(), key=lambda user: user.telegram_id)
+        if user.runtime_profile_id is None
     )
 
 
@@ -509,10 +512,37 @@ def _start() -> None:
         # principals but never create an inbound identity or alter live GitHub
         # routing through this migration.
         runtime_profiles = WorkshopRuntimeProfileRegistry.load(config)
+        initial_plan = parse_initial_provisioning(config.initial_workshop_provisioning)
         workshop_bootstrap = await sessions.bootstrap_workshop_foundation(
-            _workshop_bootstrap_humans(config, runtime_profiles),
-            notification_channels=await _workshop_bootstrap_notification_channels(config),
+            (_workshop_bootstrap_humans(config, runtime_profiles) if config.telegram_enabled else ()),
+            workshop_id=initial_plan.workshop_id if initial_plan is not None else None,
         )
+        if initial_plan is not None:
+            await sessions.reconcile_initial_workshop_human(
+                initial_plan,
+                runtime_profiles,
+            )
+        if config.telegram_enabled:
+            for user in sorted(
+                config.user_configs.values(),
+                key=lambda item: item.telegram_id,
+            ):
+                if user.runtime_profile_id is None:
+                    continue
+                await sessions.link_workshop_transport_profile(
+                    runtime_profiles,
+                    runtime_profile_id=RuntimeProfileId(user.runtime_profile_id),
+                    transport="telegram",
+                    external_subject=str(user.telegram_id),
+                    external_channel_id=str(user.telegram_id),
+                )
+            notification_channels = await _workshop_bootstrap_notification_channels(config)
+            if notification_channels:
+                await sessions.bootstrap_workshop_foundation(
+                    (),
+                    notification_channels=notification_channels,
+                    workshop_id=initial_plan.workshop_id if initial_plan is not None else None,
+                )
         logging.info(
             "Workshop bootstrap ready (humans=%d, channels=%d, new_events=%d, existing_events=%d)",
             workshop_bootstrap.human_count,

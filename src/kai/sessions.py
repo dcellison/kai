@@ -50,19 +50,31 @@ from kai.workshop.bootstrap import (
     BootstrapResult,
     bootstrap_default_workshop,
 )
+from kai.workshop.client_access import IssuedClientEnrollment, WorkshopClientAccess
 from kai.workshop.conversation_runs import (
     CanonicalConversationRunResolution,
     resolve_canonical_conversation_run,
 )
 from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
-from kai.workshop.domain import MessageId
+from kai.workshop.domain import (
+    ChannelId,
+    MessageId,
+    PrincipalId,
+    RuntimeProfileId,
+    WorkshopId,
+)
 from kai.workshop.execution_state import (
     WorkshopExecutionStateMigration,
     WorkshopExecutionStateNamespace,
     WorkshopExecutionStateRegistry,
     reconcile_legacy_execution_state,
 )
+from kai.workshop.human_provisioning import (
+    ProvisionedWorkshopHuman,
+    WorkshopHumanProvisioner,
+)
 from kai.workshop.inbound import InboundMessage, record_inbound_message
+from kai.workshop.initial_provisioning import WorkshopInitialProvisioning
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIContextRegistry
 from kai.workshop.memory_authority import (
     WorkshopMemoryAuthorityMigration,
@@ -91,9 +103,11 @@ from kai.workshop.streaming_preview import (
     TelegramStreamingPreviewBinding,
     bind_confirmed_telegram_streaming_preview,
 )
+from kai.workshop.transport_linking import WorkshopTransportLinker
 
 if TYPE_CHECKING:
     from kai.config import Config, WorkspaceConfig
+from kai.workshop.runtime_assignments import WorkshopRuntimeAssignmentService
 from kai.workshop.runtime_key_cutover import (
     WorkshopRuntimeKeyCutover,
     reconcile_workshop_runtime_key_cutover,
@@ -360,6 +374,7 @@ async def bootstrap_workshop_foundation(
     humans: tuple[BootstrapHuman, ...],
     *,
     notification_channels: tuple[BootstrapNotificationChannel, ...] = (),
+    workshop_id: WorkshopId | None = None,
 ) -> BootstrapResult:
     """Seed non-authoritative Workshop records on Kai's initialized DB."""
     if _workshop_event_lock is None:
@@ -370,6 +385,67 @@ async def bootstrap_workshop_foundation(
             store,
             humans,
             notification_channels=notification_channels,
+            workshop_id=workshop_id,
+        )
+
+
+async def reconcile_initial_workshop_human(
+    plan: WorkshopInitialProvisioning,
+    runtime_profiles: WorkshopRuntimeProfileRegistry,
+) -> ProvisionedWorkshopHuman:
+    """Idempotently provision and assign the first transport-free human."""
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    runtime_profiles.resolve(plan.runtime_profile_id)
+    async with _workshop_event_lock:
+        store = WorkshopEventStore.from_initialized_connection(_get_db())
+        provisioned = await WorkshopHumanProvisioner(store).provision(
+            plan.provisioning_key,
+            plan.display_name,
+            plan.role,
+            workshop_id=plan.workshop_id,
+        )
+        await WorkshopRuntimeAssignmentService(store, runtime_profiles).assign(
+            provisioned.principal_id,
+            provisioned.channel_id,
+            plan.runtime_profile_id,
+        )
+        return provisioned
+
+
+async def link_workshop_transport_profile(
+    runtime_profiles: WorkshopRuntimeProfileRegistry,
+    *,
+    runtime_profile_id: RuntimeProfileId,
+    transport: str,
+    external_subject: str,
+    external_channel_id: str,
+) -> None:
+    """Bind adapter routing to an already-assigned canonical runtime profile."""
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        store = WorkshopEventStore.from_initialized_connection(_get_db())
+        await WorkshopTransportLinker(store, runtime_profiles).link_runtime_profile(
+            runtime_profile_id,
+            transport=transport,
+            external_subject=external_subject,
+            external_channel_id=external_channel_id,
+        )
+
+
+async def issue_workshop_enrollment(
+    principal_id: PrincipalId,
+    channel_id: ChannelId,
+) -> IssuedClientEnrollment:
+    """Issue one enrollment for an initialized canonical human/channel."""
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        store = WorkshopEventStore.from_initialized_connection(_get_db())
+        return await WorkshopClientAccess(store).issue_enrollment(
+            principal_id,
+            channel_id,
         )
 
 

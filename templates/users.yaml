@@ -1,5 +1,6 @@
-# Per-user configuration for Kai. users.yaml is mandatory; the
-# daemon fails closed at startup if it cannot find or parse it.
+# Telegram-user configuration for Kai. users.yaml is required when the
+# Telegram adapter is enabled and optional for Workshop-only deployments.
+# When present, the daemon fails closed if it cannot parse it.
 #
 # Canonical paths:
 #   protected installs (`make install`, which invokes sudo): /etc/kai/users.yaml
@@ -9,7 +10,7 @@
 # `make config` writes the correct location for the deployment mode
 # you select. KAI_USERS_YAML can override either for tests/dev.
 #
-# Required fields per user: telegram_id, name.
+# Required fields per Telegram user: telegram_id, name.
 # All other fields are optional. Omitted fields inherit installation
 # defaults from the backend/provider model registry, .env or /etc/kai/env,
 # and the hardcoded defaults documented in the templates/.env header.
@@ -21,6 +22,7 @@ users:
     role: admin              # "admin" or "user" (default: "user")
     github: alice             # GitHub username for webhook routing
     # os_user: alice          # OS user for subprocess isolation
+    # runtime_profile_id: rtp_...  # link Telegram to an existing canonical runtime
     # home_workspace: ~/projects/main  # per-user home workspace
 
     # External services this user's persistent agent may call through

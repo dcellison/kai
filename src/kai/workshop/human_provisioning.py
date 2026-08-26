@@ -39,6 +39,19 @@ class ProvisionedWorkshopHuman:
 _PROVISIONING_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 
 
+def provisioned_human_ids(
+    workshop_id: WorkshopId,
+    provisioning_key: str,
+) -> tuple[PrincipalId, ChannelId]:
+    """Return the stable principal/direct-channel IDs for operator provisioning."""
+    normalized_key = _normalize_provisioning_key(provisioning_key)
+    stable_prefix = f"operator-human:{normalized_key}"
+    return (
+        PrincipalId.derived(workshop_id, stable_prefix),
+        ChannelId.derived(workshop_id, f"{stable_prefix}:direct-channel"),
+    )
+
+
 def _normalize_display_name(value: object) -> str:
     if not isinstance(value, str) or not value.strip() or len(value.strip()) > 200:
         raise WorkshopHumanProvisioningError("Display name must contain 1 through 200 characters")
@@ -86,14 +99,13 @@ class WorkshopHumanProvisioner:
             resolved_workshop_id = await self._resolve_workshop(workshop_id)
             agent_id, agent_principal_id = await self._resolve_kai_agent(resolved_workshop_id)
             stable_prefix = f"operator-human:{normalized_key}"
-            principal_id = PrincipalId.derived(resolved_workshop_id, stable_prefix)
+            principal_id, channel_id = provisioned_human_ids(
+                resolved_workshop_id,
+                normalized_key,
+            )
             membership_id = WorkshopMembershipId.derived(
                 resolved_workshop_id,
                 f"{stable_prefix}:workshop-membership",
-            )
-            channel_id = ChannelId.derived(
-                resolved_workshop_id,
-                f"{stable_prefix}:direct-channel",
             )
             human_channel_membership_id = ChannelMembershipId.derived(
                 resolved_workshop_id,

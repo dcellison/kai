@@ -124,7 +124,7 @@ def _pending_status(expected_humans: int | None) -> str:
     return (
         "Workshop bootstrap: pending; service startup will seed "
         f"1 workshop, {expected_humans} human principal(s), "
-        f"{expected_humans} Telegram direct channel binding(s), and 1 Kai agent"
+        f"{expected_humans} direct channel(s), runtime assignment(s), and 1 Kai agent"
     )
 
 
@@ -173,12 +173,7 @@ def workshop_bootstrap_status(db_path: Path, *, expected_humans: int | None) -> 
 
     expected_memberships = 2 * (human_count if expected_humans is None else expected_humans)
     expected_state_present = (
-        expected_humans is None
-        or (
-            human_count >= expected_humans
-            and telegram_binding_count >= expected_humans
-            and runtime_assignment_count >= expected_humans
-        )
+        expected_humans is None or (human_count >= expected_humans and runtime_assignment_count >= expected_humans)
     ) and channel_membership_count >= expected_memberships
     initialized = workshop_count >= 1 and agent_count >= 1 and projection_count == 1 and expected_state_present
     state = "initialized" if initialized else "pending"

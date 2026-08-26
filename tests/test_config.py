@@ -27,6 +27,7 @@ from kai.config import (
 # All env vars that load_config reads
 _CONFIG_ENV_VARS = [
     "KAI_ENABLED_ADAPTERS",
+    "KAI_WORKSHOP_BOOTSTRAP",
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_WEBHOOK_URL",
     "TELEGRAM_WEBHOOK_SECRET",
@@ -332,6 +333,23 @@ class TestLoadConfigErrors:
         monkeypatch.setenv("KAI_ENABLED_ADAPTERS", "")
 
         with pytest.raises(SystemExit, match="must enable at least one client adapter"):
+            load_config()
+
+    def test_rejects_invalid_initial_workshop_provisioning(self, monkeypatch):
+        monkeypatch.setenv("KAI_ENABLED_ADAPTERS", "workshop")
+        monkeypatch.setenv("KAI_WORKSHOP_BOOTSTRAP", "v1.not-base64")
+
+        with pytest.raises(SystemExit, match="KAI_WORKSHOP_BOOTSTRAP"):
+            load_config()
+
+    def test_rejects_invalid_runtime_profile_link(self, monkeypatch):
+        _set_required(monkeypatch)
+        _patch_protected_users_yaml(
+            monkeypatch,
+            "users:\n  - telegram_id: 123\n    name: Daniel\n    role: admin\n    runtime_profile_id: not-a-profile\n",
+        )
+
+        with pytest.raises(SystemExit, match="invalid runtime_profile_id"):
             load_config()
 
     def test_rejects_workshop_lan_listener_when_workshop_is_disabled(self, monkeypatch):

@@ -21,6 +21,7 @@ The install.conf file bridges the two steps: config writes it, apply reads it.
 It's a JSON file with a version field for forward compatibility.
 """
 
+import asyncio
 import grp
 import hashlib
 import http.client
@@ -88,6 +89,13 @@ from kai.workshop.diagnostics import (
     workshop_transition_tooling_status,
 )
 from kai.workshop.domain import RuntimeProfileId, WorkshopId
+from kai.workshop.human_provisioning import provisioned_human_ids
+from kai.workshop.initial_provisioning import (
+    WORKSHOP_BOOTSTRAP_ENV,
+    WorkshopInitialProvisioning,
+    WorkshopInitialProvisioningError,
+    parse_initial_provisioning,
+)
 from kai.workshop.runtime_profiles import (
     WorkshopRuntimeProfileError,
     WorkshopRuntimeProfileRegistry,
@@ -830,6 +838,82 @@ def _xdg_users_yaml_path() -> Path:
     return base / "kai" / "users.yaml"
 
 
+def _xdg_runtime_profiles_path() -> Path:
+    """Return the operator-owned runtime policy path for single-user mode."""
+    explicit = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    base = Path(explicit).expanduser() if explicit else Path.home() / ".config"
+    return base / "kai" / "runtime-profiles.yaml"
+
+
+def _build_fresh_runtime_profile_policy(
+    plan: WorkshopInitialProvisioning,
+    *,
+    display_name: str,
+    os_user: str,
+    env: dict[str, str],
+) -> str:
+    """Render one canonical runtime profile without any transport identity."""
+    backend = str(env.get("DEFAULT_BACKEND") or "").strip().lower()
+    if backend not in VALID_BACKENDS:
+        raise ValueError("Fresh Workshop runtime policy requires a valid default backend")
+    provider = get_effective_provider(
+        backend,
+        str(env.get("DEFAULT_PROVIDER") or "").strip().lower(),
+    )
+    model = canonicalize_model_for_backend(
+        str(env.get("DEFAULT_MODEL") or "").strip() or get_default_model_for_backend(backend, provider),
+        backend,
+    )
+    timeout = _runtime_policy_default_timeout(env)
+    document = {
+        "version": 2,
+        "runtime_profiles": {
+            str(plan.runtime_profile_id): {
+                "display_name": display_name,
+                "os_user": os_user,
+                "backend": backend,
+                "provider": provider,
+                "model": model,
+                "timeout_seconds": timeout,
+                "allowed_services": [],
+                "home_workspace": None,
+                "workspace_base": None,
+                "allowed_workspaces": [],
+                "models": {},
+                "github_repos": [],
+                "pr_review": None,
+                "issue_triage": None,
+                "allowed_triage_projects": [],
+            }
+        },
+    }
+    return yaml.safe_dump(document, sort_keys=False, default_flow_style=False)
+
+
+async def _provision_single_user_workshop(
+    plan: WorkshopInitialProvisioning,
+    runtime_policy_content: str,
+    data_dir: Path,
+):
+    """Create the initial canonical records and return a one-time enrollment."""
+    from kai import sessions
+
+    runtime_profiles = WorkshopRuntimeProfileRegistry.from_yaml(runtime_policy_content)
+    await sessions.init_db(data_dir / "kai.db")
+    try:
+        await sessions.bootstrap_workshop_foundation((), workshop_id=plan.workshop_id)
+        provisioned = await sessions.reconcile_initial_workshop_human(
+            plan,
+            runtime_profiles,
+        )
+        return await sessions.issue_workshop_enrollment(
+            provisioned.principal_id,
+            provisioned.channel_id,
+        )
+    finally:
+        await sessions.close_db()
+
+
 def _read_users_yaml_text(path: Path) -> str | None:
     """Return the contents of a users.yaml file, falling back to sudo
     for root-owned protected copies.
@@ -1063,6 +1147,7 @@ def _build_migrated_runtime_profiles(
 
     profiles: dict[str, dict[str, object]] = {}
     seen: set[int] = set()
+    legacy_runtime_keys: dict[str, int] = {}
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -1110,7 +1195,17 @@ def _build_migrated_runtime_profiles(
                 raise ValueError
         except (TypeError, ValueError):
             timeout_seconds = defaults.timeout_seconds
-        profile_id = runtime_profile_id_for_config_id(runtime_config_id)
+        raw_profile_id = entry.get("runtime_profile_id")
+        if raw_profile_id is None:
+            profile_id = runtime_profile_id_for_config_id(runtime_config_id)
+            legacy_runtime_keys[str(profile_id)] = runtime_config_id
+        else:
+            try:
+                profile_id = RuntimeProfileId(str(raw_profile_id).strip())
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"users.yaml entry {runtime_config_id} has an invalid runtime_profile_id") from exc
+        if str(profile_id) in profiles:
+            raise ValueError(f"users.yaml maps multiple Telegram identities to runtime profile {profile_id}")
         profile: dict[str, object] = {
             "display_name": display_name,
             "backend": backend,
@@ -1155,20 +1250,18 @@ def _build_migrated_runtime_profiles(
         if raw_os_user is not None and str(raw_os_user).strip():
             profile["os_user"] = str(raw_os_user).strip()
         profiles[str(profile_id)] = profile
-    legacy_runtime_keys = {
-        str(runtime_profile_id_for_config_id(runtime_config_id)): runtime_config_id
-        for runtime_config_id in sorted(seen)
+    document: dict[str, object] = {
+        "version": 2,
+        "runtime_profiles": profiles,
     }
+    if legacy_runtime_keys:
+        document["legacy_runtime_archive"] = {
+            "version": 1,
+            "runtime_keys": legacy_runtime_keys,
+            "removal_gate": "canonical_runtime_state_v1",
+        }
     return yaml.safe_dump(
-        {
-            "version": 2,
-            "runtime_profiles": profiles,
-            "legacy_runtime_archive": {
-                "version": 1,
-                "runtime_keys": legacy_runtime_keys,
-                "removal_gate": "canonical_runtime_state_v1",
-            },
-        },
+        document,
         sort_keys=False,
         default_flow_style=False,
     )
@@ -1287,24 +1380,43 @@ def _upgrade_runtime_policy_content(
 def _runtime_policy_apply_plan(
     service_user: str,
     env: dict[str, str],
-    users_yaml_path: Path,
+    users_yaml_path: Path | None,
+    *,
+    staged_policy_path: Path | None = None,
 ) -> tuple[str, str, WorkshopRuntimeProfileRegistry]:
     """Validate existing policy or prepare the one-time migration before apply."""
     registry_entries = _backend_registry_entries(service_user, env, users_yaml_path)
     defaults = _runtime_policy_defaults(env, registry_entries)
-    migrated_content = _build_migrated_runtime_profiles(
-        users_yaml_path,
-        registry_entries=registry_entries,
-        defaults=defaults,
+    migrated_content = (
+        _build_migrated_runtime_profiles(
+            users_yaml_path,
+            registry_entries=registry_entries,
+            defaults=defaults,
+        )
+        if users_yaml_path is not None
+        else None
     )
-    if RUNTIME_PROFILES_YAML.is_file():
+    if staged_policy_path is not None:
+        try:
+            content = staged_policy_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ValueError(f"Could not read staged runtime policy {staged_policy_path}: {exc}") from exc
+        if RUNTIME_PROFILES_YAML.is_file():
+            raise ValueError("A fresh staged runtime policy cannot replace an existing protected policy")
+        action = "initialize"
+    elif RUNTIME_PROFILES_YAML.is_file():
         try:
             content = RUNTIME_PROFILES_YAML.read_text(encoding="utf-8")
         except OSError as exc:
             raise ValueError(f"Could not read protected runtime policy {RUNTIME_PROFILES_YAML}: {exc}") from exc
-        content, upgraded = _upgrade_runtime_policy_content(content, migrated_content, defaults)
+        if migrated_content is not None:
+            content, upgraded = _upgrade_runtime_policy_content(content, migrated_content, defaults)
+        else:
+            upgraded = False
         action = "upgrade" if upgraded else "preserve"
     else:
+        if migrated_content is None:
+            raise ValueError("No protected runtime policy or Telegram migration source is available")
         content = migrated_content
         action = "initialize"
     try:
@@ -1314,11 +1426,19 @@ def _runtime_policy_apply_plan(
         )
     except WorkshopRuntimeProfileError as exc:
         raise ValueError(f"Protected runtime policy is invalid: {exc}") from exc
-    missing = [
-        runtime_config_id
-        for runtime_config_id, _name, _os_user in _protected_user_assignments(users_yaml_path)
-        if not _runtime_policy_has_config_id(profiles, runtime_config_id)
-    ]
+    explicit_links = _protected_user_runtime_profile_ids(users_yaml_path) if users_yaml_path is not None else {}
+    missing = []
+    for runtime_config_id, _name, _os_user in (
+        _protected_user_assignments(users_yaml_path) if users_yaml_path is not None else ()
+    ):
+        explicit_profile_id = explicit_links.get(runtime_config_id)
+        if explicit_profile_id is not None:
+            try:
+                profiles.resolve(explicit_profile_id)
+            except WorkshopRuntimeProfileError:
+                missing.append(runtime_config_id)
+        elif not _runtime_policy_has_config_id(profiles, runtime_config_id):
+            missing.append(runtime_config_id)
     if missing:
         rendered = ", ".join(str(item) for item in missing)
         raise ValueError(
@@ -1373,6 +1493,38 @@ def _validate_protected_users_yaml(
         account_uid=(lambda name: pwd.getpwnam(name).pw_uid) if require_existing_accounts else None,
         service_uid=service_uid,
     )
+
+
+def _protected_user_runtime_profile_ids(
+    users_yaml_path: Path,
+) -> dict[int, RuntimeProfileId]:
+    """Return explicit canonical runtime links from protected Telegram policy."""
+    raw = _read_users_yaml_text(users_yaml_path)
+    if raw is None:
+        raise ValueError(f"Protected users.yaml is missing or unreadable: {users_yaml_path}")
+    try:
+        document = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Protected users.yaml is malformed: {users_yaml_path}: {exc}") from exc
+    entries = document.get("users") if isinstance(document, dict) else None
+    if not isinstance(entries, list):
+        raise ValueError(f"Protected users.yaml must contain a 'users' list: {users_yaml_path}")
+    result: dict[int, RuntimeProfileId] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("runtime_profile_id") is None:
+            continue
+        try:
+            raw_id = entry.get("telegram_id")
+            if isinstance(raw_id, bool):
+                raise ValueError
+            telegram_id = int(raw_id)
+            if telegram_id <= 0:
+                raise ValueError
+            profile_id = RuntimeProfileId(str(entry["runtime_profile_id"]).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Protected users.yaml contains an invalid explicit runtime-profile link") from exc
+        result[telegram_id] = profile_id
+    return result
 
 
 def _entry_backend(entry: dict) -> object:
@@ -1496,6 +1648,10 @@ def _cmd_config() -> None:
 
     existing_env: dict = existing.get("env", {})
     had_legacy_webhook_secret = bool(str(existing_env.get("WEBHOOK_SECRET", "")).strip())
+    try:
+        existing_initial_plan = parse_initial_provisioning(existing_env.get(WORKSHOP_BOOTSTRAP_ENV))
+    except WorkshopInitialProvisioningError as exc:
+        raise SystemExit(f"install.conf {exc}") from exc
 
     # Auto-detect platform
     if sys.platform == "darwin":
@@ -1665,19 +1821,27 @@ def _cmd_config() -> None:
     else:
         users_yaml_path = _xdg_users_yaml_path()
     users_yaml_exists = users_yaml_path.exists()
-    if not telegram_enabled:
-        if deployment_mode == "single_user":
-            raise SystemExit(
-                "Workshop-only single-user bootstrap is not available yet. "
-                "Use a protected installation with existing canonical runtime policy, "
-                "or keep Telegram enabled for single-user setup."
-            )
-        if not users_yaml_exists or not RUNTIME_PROFILES_YAML.is_file():
-            raise SystemExit(
-                "Workshop-only mode currently requires an existing protected installation "
-                "with users.yaml and runtime-profiles.yaml. Start from the qualified hybrid "
-                "installation path before switching modes."
-            )
+    runtime_profiles_path = RUNTIME_PROFILES_YAML if deployment_mode == "protected" else _xdg_runtime_profiles_path()
+    runtime_policy_exists = runtime_profiles_path.is_file()
+    pending_runtime_policy = existing.get("runtime_profiles_staging_path")
+    fresh_workshop_bootstrap = bool(
+        workshop_enabled
+        and not telegram_enabled
+        and not runtime_policy_exists
+        and not pending_runtime_policy
+        and existing_initial_plan is None
+    )
+    if (
+        workshop_enabled
+        and not telegram_enabled
+        and not runtime_policy_exists
+        and not pending_runtime_policy
+        and not fresh_workshop_bootstrap
+    ):
+        raise SystemExit(
+            "Workshop-only mode has no runtime policy to assign to its canonical human. "
+            "Re-run make config to create a fresh policy."
+        )
     stray_note = (
         f"  Note: {stray_project_users_yaml} is no longer used. Move it to {users_yaml_path} or remove it."
         if stray_project_users_yaml.exists()
@@ -1716,6 +1880,41 @@ def _cmd_config() -> None:
     # the canonical file from a no-longer-current staging artifact.
     users_yaml_staging_path: str | None = None
     protected_yaml_staging_paths: dict[str, str] = {}
+    initial_plan = existing_initial_plan
+    runtime_profiles_staging_path: str | None = None
+
+    if fresh_workshop_bootstrap:
+        print("-- Initial Workshop admin --")
+        while True:
+            admin_name = _prompt(
+                "Admin display name",
+                os.environ.get("USER", "admin"),
+                required=True,
+            ).strip()
+            if _validate_display_name(admin_name):
+                break
+            print("  Name may only contain letters, numbers, spaces, hyphens, and underscores.")
+        if deployment_mode == "protected":
+            print("  Protected mode requires a distinct OS account for the agent runtime.")
+            while True:
+                admin_os_user = _prompt(
+                    "OS user for subprocess isolation",
+                    os.environ.get("USER", ""),
+                    required=True,
+                ).strip()
+                if not _validate_os_user(admin_os_user):
+                    print("  Username may only contain letters, numbers, dots, hyphens, and underscores.")
+                    continue
+                if admin_os_user == service_user:
+                    print(f"  Must differ from the Kai service account {service_user!r}.")
+                    continue
+                break
+        else:
+            admin_os_user = service_user
+        initial_plan = WorkshopInitialProvisioning.create(admin_name)
+        print("  The first human, direct channel, and runtime assignment will be canonical.")
+        print("  Telegram can be linked later without creating another human.")
+        print()
 
     # First-time install only: collect the admin identity and stage a
     # users.yaml. An existing canonical file is left untouched.
@@ -1793,6 +1992,9 @@ def _cmd_config() -> None:
             admin_name,
             os_user=admin_os_user,
             home_workspace=admin_home_workspace,
+            runtime_profile_id=(
+                str(existing_initial_plan.runtime_profile_id) if existing_initial_plan is not None else None
+            ),
         )
         if deployment_mode == "protected":
             users_yaml_path = _install_staging_path("users.yaml")
@@ -2888,6 +3090,31 @@ def _cmd_config() -> None:
         # mislead an operator after the flip.
         env.pop("MEMORY_DUPLICATE_THRESHOLD", None)
 
+    if initial_plan is not None:
+        env[WORKSHOP_BOOTSTRAP_ENV] = initial_plan.to_json()
+        if deployment_mode == "single_user" and not fresh_workshop_bootstrap:
+            env["KAI_RUNTIME_PROFILES_YAML"] = str(runtime_profiles_path)
+
+    if fresh_workshop_bootstrap:
+        assert initial_plan is not None
+        assert admin_os_user is not None
+        runtime_policy_content = _build_fresh_runtime_profile_policy(
+            initial_plan,
+            display_name=admin_name,
+            os_user=admin_os_user,
+            env=env,
+        )
+        if deployment_mode == "protected":
+            staged_policy = _install_staging_path("runtime-profiles.yaml")
+            staged_policy.write_text(runtime_policy_content, encoding="utf-8")
+            os.chmod(staged_policy, 0o600)
+            runtime_profiles_staging_path = str(staged_policy)
+        else:
+            runtime_profiles_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            runtime_profiles_path.write_text(runtime_policy_content, encoding="utf-8")
+            os.chmod(runtime_profiles_path, 0o600)
+            env["KAI_RUNTIME_PROFILES_YAML"] = str(runtime_profiles_path)
+
     # Build and write install.conf
     conf = {
         "version": _CONF_VERSION,
@@ -2915,6 +3142,9 @@ def _cmd_config() -> None:
         conf["users_yaml_staging_path"] = users_yaml_staging_path
     if protected_yaml_staging_paths:
         conf["protected_yaml_staging_paths"] = protected_yaml_staging_paths
+    if runtime_profiles_staging_path:
+        conf["runtime_profiles_staging_path"] = runtime_profiles_staging_path
+        conf["workshop_enrollment_pending"] = True
 
     INSTALL_CONF.write_text(json.dumps(conf, indent=2) + "\n")
     # Restrict permissions since the file contains secrets (bot token, webhook secret)
@@ -2934,7 +3164,24 @@ def _cmd_config() -> None:
         env_path.write_text(_generate_env_file(env))
         os.chmod(env_path, 0o600)
         print(f"Wrote runtime env to {env_path}")
-        print(f"users.yaml is at {users_yaml_path}")
+        if users_yaml_exists or telegram_enabled:
+            print(f"users.yaml is at {users_yaml_path}")
+        if fresh_workshop_bootstrap:
+            assert initial_plan is not None
+            issued = asyncio.run(
+                _provision_single_user_workshop(
+                    initial_plan,
+                    runtime_policy_content,
+                    Path(data_dir),
+                )
+            )
+            print()
+            print("Initial Workshop browser enrollment")
+            print(f"Enrollment: {issued.grant.grant_id}")
+            print(f"Channel: {issued.channel_id}")
+            print(f"Expires: {issued.grant.expires_at.isoformat()}")
+            print(f"Token: {issued.grant.token}")
+            print("The token is shown once; Kai stores only its hash.")
         print()
         print("Single-user mode does not require 'sudo make install'.")
         print("Start the daemon with: make run")
@@ -3240,6 +3487,7 @@ def _generate_users_yaml(
     name: str,
     os_user: str | None = None,
     home_workspace: str | None = None,
+    runtime_profile_id: str | None = None,
 ) -> str:
     """
     Generate a minimal users.yaml with a single admin entry.
@@ -3285,6 +3533,8 @@ def _generate_users_yaml(
     ]
     if os_user:
         lines.append(f"    os_user: {_yaml_scalar(os_user)}")
+    if runtime_profile_id:
+        lines.append(f"    runtime_profile_id: {_yaml_scalar(runtime_profile_id)}")
     if home_workspace:
         lines.append(f"    home_workspace: {_yaml_scalar(home_workspace)}")
     lines.append("")  # trailing newline
@@ -4950,10 +5200,16 @@ def _runtime_profile_principal_names(
 def _runtime_storage_targets(
     data_path: Path,
     runtime_profiles: WorkshopRuntimeProfileRegistry,
-    users_yaml_path: Path,
+    users_yaml_path: Path | None,
+    *,
+    initial_plan: WorkshopInitialProvisioning | None = None,
 ) -> tuple[_RuntimeStorageTarget, ...]:
     """Build profile-authoritative provisioning targets before disk mutation."""
-    compatibility_order = [chat_id for chat_id, _os_user in _collect_user_memory_owners(users_yaml_path)]
+    compatibility_order = (
+        [chat_id for chat_id, _os_user in _collect_user_memory_owners(users_yaml_path)]
+        if users_yaml_path is not None
+        else []
+    )
     compatibility_ids = set(compatibility_order)
     assignments_initialized, workshop_id, principal_names = _runtime_profile_principal_names(data_path)
     compatibility_principal_names = _canonical_principal_storage_names(data_path)
@@ -4993,11 +5249,18 @@ def _runtime_storage_targets(
                 f"Protected runtime profile {profile.profile_id} conflicts with its canonical compatibility owner"
             )
         if principal_name is None:
-            if runtime_config_id is None or runtime_config_id not in compatibility_ids:
+            if initial_plan is not None and profile.profile_id == initial_plan.runtime_profile_id:
+                principal_name = str(
+                    provisioned_human_ids(
+                        initial_plan.workshop_id,
+                        initial_plan.provisioning_key,
+                    )[0]
+                )
+            elif runtime_config_id is None or runtime_config_id not in compatibility_ids:
                 raise RuntimeError(
                     f"Protected runtime profile {profile.profile_id} must map to exactly one canonical human owner"
                 )
-            if compatibility_principal is not None:
+            elif compatibility_principal is not None:
                 principal_name = compatibility_principal
             elif assignments_initialized:
                 assert workshop_id is not None
@@ -6075,6 +6338,53 @@ def _apply_migrate(
                 print(f"  Created {user_tmp}")
 
 
+def _issue_installed_initial_enrollment(
+    plan: WorkshopInitialProvisioning,
+    *,
+    install_dir: str,
+    data_dir: str,
+    service_user: str,
+) -> str:
+    """Issue the staged first browser enrollment as the database owner."""
+    principal_id, channel_id = provisioned_human_ids(
+        plan.workshop_id,
+        plan.provisioning_key,
+    )
+    command = [
+        "sudo",
+        "-H",
+        "-u",
+        service_user,
+        "env",
+        f"KAI_DATA_DIR={data_dir}",
+        f"KAI_INSTALL_DIR={install_dir}",
+        f"{install_dir}/venv/bin/python",
+        "-m",
+        "kai",
+        "workshop",
+        "client-access",
+        "issue-enrollment",
+        "--principal-id",
+        str(principal_id),
+        "--channel-id",
+        str(channel_id),
+    ]
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+        raise RuntimeError(f"Could not issue initial Workshop browser enrollment: {detail}")
+    output = result.stdout.strip()
+    if "Token: kai_ws_enroll_v1." not in output:
+        raise RuntimeError("Initial Workshop enrollment command returned no one-time token")
+    return output
+
+
 def _cmd_apply() -> None:
     """
     Read install.conf and perform the installation. Requires root.
@@ -6179,6 +6489,16 @@ def _cmd_apply() -> None:
     # touching; the protected-mode gate ensures we never reach here
     # with that combination.
     users_yaml_staging_path = conf.get("users_yaml_staging_path", "") or None
+    runtime_profiles_staging_path = conf.get("runtime_profiles_staging_path", "") or None
+    if runtime_profiles_staging_path is not None:
+        if not isinstance(runtime_profiles_staging_path, str):
+            raise SystemExit("install.conf runtime_profiles_staging_path must be an absolute path string.")
+        if not Path(runtime_profiles_staging_path).is_absolute():
+            raise SystemExit("install.conf runtime_profiles_staging_path must be an absolute path.")
+    try:
+        initial_plan = parse_initial_provisioning(env.get(WORKSHOP_BOOTSTRAP_ENV))
+    except WorkshopInitialProvisioningError as exc:
+        raise SystemExit(f"install.conf {exc}") from exc
     raw_protected_yaml_staging_paths = conf.get("protected_yaml_staging_paths", {})
     if raw_protected_yaml_staging_paths is None:
         protected_yaml_staging_paths: dict[str, str] = {}
@@ -6219,20 +6539,25 @@ def _cmd_apply() -> None:
     # file wins on first install; otherwise the canonical protected copy stays
     # authoritative, matching _apply_secrets' copy/skip behavior.
     staged_users_yaml = Path(users_yaml_staging_path) if users_yaml_staging_path else None
-    effective_users_yaml = (
+    candidate_users_yaml = (
         staged_users_yaml if staged_users_yaml is not None and staged_users_yaml.is_file() else USERS_YAML
     )
-    try:
-        _validate_protected_users_yaml(
-            effective_users_yaml,
-            service_user,
-            require_existing_accounts=True,
-            service_uid=svc_uid,
-        )
-    except ValueError as exc:
-        raise SystemExit(
-            f"Protected user isolation preflight failed; no installation changes were made:\n{exc}"
-        ) from exc
+    telegram_enabled = "telegram" in parse_enabled_adapters(env.get("KAI_ENABLED_ADAPTERS"))
+    effective_users_yaml: Path | None = (
+        candidate_users_yaml if candidate_users_yaml.is_file() or telegram_enabled else None
+    )
+    if effective_users_yaml is not None:
+        try:
+            _validate_protected_users_yaml(
+                effective_users_yaml,
+                service_user,
+                require_existing_accounts=True,
+                service_uid=svc_uid,
+            )
+        except ValueError as exc:
+            raise SystemExit(
+                f"Protected user isolation preflight failed; no installation changes were made:\n{exc}"
+            ) from exc
 
     # Defensive validation: refuse to apply an install.conf whose
     # explicit DEFAULT_MODEL would fail load_config's startup check.
@@ -6303,6 +6628,9 @@ def _cmd_apply() -> None:
             service_user,
             env,
             effective_users_yaml,
+            staged_policy_path=(
+                Path(runtime_profiles_staging_path) if runtime_profiles_staging_path is not None else None
+            ),
         )
         runtime_policy.validate_protected_os_users(
             service_user,
@@ -6319,6 +6647,7 @@ def _cmd_apply() -> None:
             Path(data_dir),
             runtime_policy,
             effective_users_yaml,
+            initial_plan=initial_plan,
         )
     except (RuntimeError, ValueError) as exc:
         raise SystemExit(
@@ -6340,7 +6669,11 @@ def _cmd_apply() -> None:
     print()
 
     if dry_run:
-        expected_humans = len(_protected_user_assignments(effective_users_yaml))
+        expected_humans = (
+            len(_protected_user_assignments(effective_users_yaml))
+            if effective_users_yaml is not None
+            else int(initial_plan is not None)
+        )
         print(
             "[DRY RUN] "
             + workshop_bootstrap_status(
@@ -6535,6 +6868,13 @@ def _cmd_apply() -> None:
                 for path in protected_yaml_staging_paths.values():
                     Path(path).unlink(missing_ok=True)
                 _strip_install_conf_keys("protected_yaml_staging_paths")
+        if runtime_profiles_staging_path:
+            if dry_run:
+                print(f"[DRY RUN] Would unlink staging file: {runtime_profiles_staging_path}")
+                print("[DRY RUN] Would strip runtime_profiles_staging_path from install.conf")
+            else:
+                Path(runtime_profiles_staging_path).unlink(missing_ok=True)
+                _strip_install_conf_keys("runtime_profiles_staging_path")
     except Exception:
         print("\nInstallation failed. See error above.")
         print("The installation may be in a partial state.")
@@ -6584,6 +6924,29 @@ def _cmd_apply() -> None:
                 print("Manual recovery: sudo systemctl start kai")
             if apply_succeeded:
                 raise
+
+    if conf.get("workshop_enrollment_pending"):
+        if initial_plan is None:
+            raise SystemExit("install.conf requests an initial Workshop enrollment but has no bootstrap policy")
+        if dry_run:
+            print("[DRY RUN] Would issue one browser enrollment for the initial canonical Workshop admin")
+        else:
+            try:
+                enrollment_output = _issue_installed_initial_enrollment(
+                    initial_plan,
+                    install_dir=install_dir,
+                    data_dir=data_dir,
+                    service_user=service_user,
+                )
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+                raise SystemExit(
+                    "Kai was installed and started, but initial Workshop enrollment failed. "
+                    f"Re-run make install to retry: {exc}"
+                ) from exc
+            print()
+            print("Initial Workshop browser enrollment")
+            print(enrollment_output)
+            _strip_install_conf_keys("workshop_enrollment_pending")
 
     # -- Summary --
     print()
@@ -8692,10 +9055,13 @@ def _cmd_status() -> None:
 
     expected_humans: int | None = None
     if os.geteuid() == 0:
+        configured_humans = 0
         try:
-            expected_humans = len(_protected_user_assignments(USERS_YAML))
+            configured_humans = len(_protected_user_assignments(USERS_YAML))
         except ValueError:
             pass
+        initial_plan = _read_deployed_initial_provisioning(_DEPLOYED_ENV_FILE)
+        expected_humans = max(configured_humans, int(initial_plan is not None))
     print(
         workshop_bootstrap_status(
             Path(data_dir) / "kai.db",
@@ -9019,6 +9385,32 @@ def _read_deployed_memory_enabled(env_path: Path) -> bool | None:
         return False
     except (FileNotFoundError, OSError, UnicodeError, ProtectedConfigError):
         return None
+
+
+def _read_deployed_initial_provisioning(
+    env_path: Path,
+) -> WorkshopInitialProvisioning | None:
+    """Read only non-secret initial Workshop policy from deployed env."""
+    try:
+        validate_protected_file_metadata(env_path, max_mode=0o600, require_root_owner=True)
+        with env_path.open(encoding="utf-8") as env_file:
+            for line in env_file:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                key, separator, raw_value = stripped.partition("=")
+                if separator and key.strip() == WORKSHOP_BOOTSTRAP_ENV:
+                    value = raw_value.strip().strip("\"'")
+                    return parse_initial_provisioning(value)
+    except (
+        FileNotFoundError,
+        OSError,
+        UnicodeError,
+        ProtectedConfigError,
+        WorkshopInitialProvisioningError,
+    ):
+        return None
+    return None
 
 
 def _core_schedule_status(db_path: Path) -> str:

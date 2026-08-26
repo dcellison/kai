@@ -66,6 +66,7 @@ from kai.install import (
     _github_automation_status,
     _integration_route_status,
     _internal_api_authority_status,
+    _issue_installed_initial_enrollment,
     _log_security_status,
     _memory_scope_review_status,
     _migrate_identity_to_claude_md,
@@ -2426,43 +2427,98 @@ class TestCmdConfig:
         assert env["VOICE_ENABLED"] == "true"
         assert env["TTS_ENABLED"] == "true"
 
-    def test_fresh_protected_workshop_only_fails_before_writing_config(self, tmp_path, monkeypatch):
+    def test_enabling_telegram_links_users_yaml_to_existing_canonical_profile(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        plan = kai.install.WorkshopInitialProvisioning.create("Daniel")
+        conf_path = tmp_path / "install.conf"
+        conf_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "deployment_mode": "protected",
+                    "env": {
+                        "KAI_ENABLED_ADAPTERS": "workshop",
+                        "KAI_WORKSHOP_BOOTSTRAP": plan.to_json(),
+                        "DEFAULT_BACKEND": "claude",
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._redirect_staging(monkeypatch, tmp_path)
+        kai.install.RUNTIME_PROFILES_YAML.write_text(
+            f"version: 2\nruntime_profiles:\n  {plan.runtime_profile_id}: {{}}\n"
+        )
+        inputs = iter(self._base_inputs(["false"], client_mode="hybrid"))
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        generated = json.loads(conf_path.read_text())
+        users_path = Path(generated["users_yaml_staging_path"])
+        users = yaml.safe_load(users_path.read_text())["users"]
+        assert users[0]["telegram_id"] == 12345
+        assert users[0]["runtime_profile_id"] == str(plan.runtime_profile_id)
+        assert generated["env"]["KAI_WORKSHOP_BOOTSTRAP"] == plan.to_json()
+
+    def test_fresh_protected_workshop_only_stages_canonical_bootstrap(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         conf_path = tmp_path / "install.conf"
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._redirect_staging(monkeypatch, tmp_path)
-        inputs = iter(
-            [
-                "protected",
-                "workshop-only",
-                "/opt/kai",
-                "/var/lib/kai",
-                "kai",
-                "darwin",
-            ]
-        )
+        answers = self._base_inputs(["false"], client_mode="workshop-only")
+        answers[6:6] = ["Daniel", "testuser"]
+        inputs = iter(answers)
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
 
-        with pytest.raises(SystemExit, match="requires an existing protected installation"):
-            _cmd_config()
+        _cmd_config()
 
-        assert not conf_path.exists()
+        conf = json.loads(conf_path.read_text())
+        assert conf["env"]["KAI_ENABLED_ADAPTERS"] == "workshop"
+        assert conf["env"]["KAI_WORKSHOP_BOOTSTRAP"].startswith("v1.")
+        assert "TELEGRAM_BOT_TOKEN" not in conf["env"]
+        assert "users_yaml_staging_path" not in conf
+        assert conf["workshop_enrollment_pending"] is True
+        staged = Path(conf["runtime_profiles_staging_path"])
+        policy = yaml.safe_load(staged.read_text())
+        assert len(policy["runtime_profiles"]) == 1
+        profile = next(iter(policy["runtime_profiles"].values()))
+        assert profile["display_name"] == "Daniel"
+        assert profile["os_user"] == "testuser"
 
-    def test_single_user_workshop_only_fails_before_writing_config(self, tmp_path, monkeypatch):
+    def test_single_user_workshop_only_provisions_browser_enrollment(
+        self,
+        tmp_path,
+        monkeypatch,
+        capsys,
+    ):
         monkeypatch.chdir(tmp_path)
         conf_path = tmp_path / "install.conf"
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._redirect_staging(monkeypatch, tmp_path)
         monkeypatch.setattr("kai.install._read_protected_file", lambda _path: None)
-        inputs = iter(["single_user", "workshop-only"])
+        monkeypatch.setattr(
+            "kai.install._xdg_runtime_profiles_path",
+            lambda: tmp_path / "config" / "runtime-profiles.yaml",
+        )
+        answers = self._base_inputs(["false"], client_mode="workshop-only")
+        inputs = iter(["single_user", "workshop-only", "Daniel", *answers[6:]])
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
 
-        with pytest.raises(SystemExit, match="single-user bootstrap is not available"):
-            _cmd_config()
+        _cmd_config()
 
-        assert not conf_path.exists()
+        conf = json.loads(conf_path.read_text())
+        assert conf["env"]["KAI_ENABLED_ADAPTERS"] == "workshop"
+        assert conf["env"]["KAI_RUNTIME_PROFILES_YAML"].endswith("config/runtime-profiles.yaml")
+        assert (tmp_path / "kai.db").is_file()
+        assert "Token: kai_ws_enroll_v1." in capsys.readouterr().out
 
     def test_memory_disabled_omits_env_keys(self, tmp_path, monkeypatch):
         """MEMORY_ENABLED=false produces no MEMORY_* env entries."""
@@ -3320,6 +3376,43 @@ class TestCmdConfig:
 # ── Apply subcommand ─────────────────────────────────────────────────
 
 
+class TestInstalledInitialWorkshopEnrollment:
+    def test_issues_as_service_user_for_the_canonical_human(self, monkeypatch):
+        plan = kai.install.WorkshopInitialProvisioning.create("Daniel")
+        principal_id, channel_id = kai.install.provisioned_human_ids(
+            plan.workshop_id,
+            plan.provisioning_key,
+        )
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(f"Enrollment: enr_123\nChannel: {channel_id}\nToken: kai_ws_enroll_v1.enr_123.secret\n"),
+            stderr="",
+        )
+        run = MagicMock(return_value=completed)
+        monkeypatch.setattr("kai.install.subprocess.run", run)
+
+        output = _issue_installed_initial_enrollment(
+            plan,
+            install_dir="/opt/kai",
+            data_dir="/var/lib/kai",
+            service_user="kai",
+        )
+
+        assert "Token: kai_ws_enroll_v1." in output
+        command = run.call_args.args[0]
+        assert command[:5] == ["sudo", "-H", "-u", "kai", "env"]
+        assert "KAI_DATA_DIR=/var/lib/kai" in command
+        assert "KAI_INSTALL_DIR=/opt/kai" in command
+        assert command[-4:] == [
+            "--principal-id",
+            str(principal_id),
+            "--channel-id",
+            str(channel_id),
+        ]
+        assert run.call_args.kwargs["timeout"] == 30
+
+
 class TestCmdApply:
     def test_exits_if_not_root(self, monkeypatch):
         """Apply exits with code 1 if not running as root."""
@@ -3386,6 +3479,66 @@ class TestCmdApply:
         assert not (tmp_path / "opt" / "kai").exists()
         # Secrets reminder should NOT appear during dry run
         assert "contains secrets" not in output
+
+    def test_fresh_workshop_only_dry_run_needs_no_telegram_identity(
+        self,
+        tmp_path,
+        monkeypatch,
+        capsys,
+    ):
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+        monkeypatch.setenv("DRY_RUN", "1")
+        plan = kai.install.WorkshopInitialProvisioning.create("Daniel")
+        staged_policy = tmp_path / "runtime-profiles.yaml"
+        staged_policy.write_text(
+            yaml.safe_dump(
+                {
+                    "version": 2,
+                    "runtime_profiles": {
+                        str(plan.runtime_profile_id): {
+                            "display_name": "Daniel",
+                            "os_user": "root",
+                            "backend": "claude",
+                            "provider": "anthropic",
+                            "model": "sonnet",
+                            "timeout_seconds": 120,
+                            "allowed_services": [],
+                            "allowed_workspaces": [],
+                        }
+                    },
+                },
+                sort_keys=False,
+            )
+        )
+        conf_path = tmp_path / "install.conf"
+        conf_path.write_text(
+            json.dumps(
+                {
+                    "deployment_mode": "protected",
+                    "install_dir": str(tmp_path / "opt" / "kai"),
+                    "data_dir": str(tmp_path / "var" / "lib" / "kai"),
+                    "service_user": "nobody",
+                    "platform": "darwin",
+                    "env": {
+                        "KAI_ENABLED_ADAPTERS": "workshop",
+                        "KAI_WORKSHOP_BOOTSTRAP": plan.to_json(),
+                        "DEFAULT_BACKEND": "claude",
+                    },
+                    "runtime_profiles_staging_path": str(staged_policy),
+                    "workshop_enrollment_pending": True,
+                }
+            )
+        )
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+
+        _cmd_apply()
+
+        output = capsys.readouterr().out
+        assert "1 human principal(s)" in output
+        assert "direct channel(s), runtime assignment(s)" in output
+        assert "Would issue one browser enrollment" in output
+        assert "Telegram direct channel" not in output
+        assert not kai.install.USERS_YAML.exists()
 
     def test_dry_run_flag_reaches_every_apply_helper(self, tmp_path, monkeypatch):
         """The apply orchestrator passes True to every mutation boundary.
