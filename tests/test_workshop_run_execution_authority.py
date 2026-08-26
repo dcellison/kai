@@ -1,4 +1,4 @@
-"""Contracts for production-unused fenced Workshop run execution authority."""
+"""Contracts for fenced Workshop run execution authority."""
 
 from __future__ import annotations
 

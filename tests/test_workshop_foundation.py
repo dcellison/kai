@@ -1,4 +1,4 @@
-"""Contract tests for the production-unused Kai Workshop foundation."""
+"""Contract tests for the Kai Workshop foundation."""
 
 from __future__ import annotations
 

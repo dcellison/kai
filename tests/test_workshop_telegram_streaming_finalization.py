@@ -1,4 +1,4 @@
-"""Production-unused Telegram execution contracts for streaming finalization."""
+"""Telegram adapter execution contracts for streaming finalization."""
 
 from __future__ import annotations
 

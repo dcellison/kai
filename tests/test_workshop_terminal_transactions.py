@@ -1,4 +1,4 @@
-"""Atomic terminal transaction contracts for production-unused Workshop runs."""
+"""Atomic terminal transaction contracts for Workshop runs."""
 
 from __future__ import annotations
 

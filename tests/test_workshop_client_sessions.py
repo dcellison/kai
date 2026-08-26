@@ -1,4 +1,4 @@
-"""Security contracts for production-unused Workshop human-client sessions."""
+"""Security contracts for Workshop human-client sessions."""
 
 from __future__ import annotations
 

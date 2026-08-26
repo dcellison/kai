@@ -1,4 +1,4 @@
-"""Contracts for the production-unused Workshop delivery outbox foundation."""
+"""Contracts for the Workshop delivery outbox."""
 
 from __future__ import annotations
 

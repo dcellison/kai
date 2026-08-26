@@ -49,7 +49,7 @@ jobs:
       - name: Run tests
         run: make BIN= test
 
-  workshop-base:
+  core-workshop:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -66,5 +66,45 @@ jobs:
           python -m pip install --upgrade \
             --constraint requirements/constraints.txt -e '.[dev,totp]'
 
-      - name: Prove the Telegram-free import and runtime boundary
-        run: python -m pytest tests/test_telegram_optional_boundary.py -v
+      - name: Prove the Telegram-free architecture and runtime boundary
+        run: |
+          python -m pytest -v \
+            tests/test_adapter_architecture.py \
+            tests/test_telegram_optional_boundary.py \
+            tests/test_application_host.py \
+            tests/test_workshop_initial_provisioning.py \
+            tests/test_workshop_delivery_planning.py \
+            tests/test_install.py::TestCmdConfig::test_fresh_protected_workshop_only_stages_canonical_bootstrap \
+            tests/test_install.py::TestCmdConfig::test_single_user_workshop_only_provisions_browser_enrollment \
+            tests/test_install.py::TestApplyVenv::test_workshop_only_install_omits_telegram_extra \
+            tests/test_workshop_conversation_commands.py::TestAtomicClientConversationCommandAcceptance::test_disabled_telegram_adapter_does_not_enqueue_for_retained_binding \
+            tests/test_workshop_private_text_execution.py::test_owner_accepts_executes_and_atomically_enqueues_terminal_reply \
+            tests/test_workshop_terminal_transactions.py::TestAtomicTerminalTransactions::test_post_run_worker_ingests_one_non_telegram_success_exactly_once \
+            tests/test_workshop_scheduler.py::test_workshop_only_reminder_fires_canonically_without_delivery \
+            tests/test_workshop_scheduler.py::test_workshop_only_agent_job_uses_canonical_execution \
+            tests/test_workshop_scheduler.py::test_disabled_telegram_adapter_does_not_enqueue_retained_reminder_binding \
+            tests/test_workshop_github_notifications.py::TestWorkshopIntegrationNotificationService::test_route_records_without_resolving_any_transport_binding
+
+  telegram-adapter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install Telegram adapter dependencies
+        run: |
+          python -m pip install --upgrade \
+            --constraint requirements/constraints.txt pip setuptools
+          python -m pip install --upgrade \
+            --constraint requirements/constraints.txt -e '.[dev,telegram,totp]'
+
+      - name: Prove the optional Telegram adapter
+        run: |
+          python -m pytest -v \
+            tests/test_telegram_adapter.py \
+            tests/test_workshop_telegram_delivery.py \
+            tests/test_workshop_telegram_delivery_runtime.py

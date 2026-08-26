@@ -197,8 +197,8 @@ async def record_outbound_message_with_delivery(
 ) -> OutboundDeliveryResult:
     """Atomically create one canonical reply and eligible adapter deliveries.
 
-    This service is deliberately production-unused. It accepts no transport or
-    destination identity from its caller and does not send or register a worker.
+    The service accepts no transport or destination identity from its caller;
+    enabled adapter capabilities and canonical bindings determine delivery.
     """
     connection = store.connection
     try:

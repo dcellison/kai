@@ -1,4 +1,4 @@
-"""Contracts for production-unused atomic Workshop command acceptance."""
+"""Contracts for atomic Workshop command acceptance."""
 
 from __future__ import annotations
 

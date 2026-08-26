@@ -1,4 +1,4 @@
-"""Atomic, production-unused terminal transactions for Workshop runs."""
+"""Atomic terminal transactions for Workshop runs."""
 
 from __future__ import annotations
 

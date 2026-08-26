@@ -1,6 +1,6 @@
 """Shared delivery-policy fixtures for Workshop contract tests."""
 
-from kai.telegram_adapter import TELEGRAM_DELIVERY_CAPABILITIES
+from kai.telegram_contract import TELEGRAM_DELIVERY_CAPABILITIES
 from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 
 TELEGRAM_DELIVERY_POLICY = WorkshopDeliveryBindingPolicy(
