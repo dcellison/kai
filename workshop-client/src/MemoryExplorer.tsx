@@ -98,6 +98,8 @@ function scopeDescription(scope: WorkshopMemoryScope): string {
 
 function sourceReason(reason: string | null): string {
   switch (reason) {
+    case "explicit_creation":
+      return "This memory was saved explicitly, so no source conversation was linked.";
     case "legacy_source":
       return "This memory predates canonical source links.";
     case "canonical_source_missing":

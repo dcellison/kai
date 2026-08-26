@@ -861,6 +861,7 @@ async def test_source_context_requires_canonical_lineage_and_channel_membership(
         row = _result("canonical", "The marker is BLUE-LANTERN.")
         row.metadata.update(
             {
+                "source": "explicit",
                 memory.WORKSHOP_PRINCIPAL_ID_KEY: str(principal_id),
                 memory.WORKSHOP_CHANNEL_ID_KEY: str(channel_id),
                 memory.WORKSHOP_AGENT_ID_KEY: str(agent_id),
@@ -888,6 +889,11 @@ async def test_source_context_requires_canonical_lineage_and_channel_membership(
             "unavailable",
             "canonical_source_missing",
         )
+
+        row.metadata.clear()
+        row.metadata.update({"source": "explicit"})
+        explicit = await service.source_context(authority, row.id)
+        assert (explicit.status, explicit.reason) == ("unavailable", "explicit_creation")
 
         row.metadata.clear()
         row.metadata.update({"source": "extracted"})
