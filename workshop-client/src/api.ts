@@ -16,6 +16,11 @@ import type {
   WorkshopEditableCapability,
   WorkshopSettingsMutation,
   WorkshopSettingsWorkspace,
+  WorkshopWorkspaceConfig,
+  WorkshopPreferenceDocument,
+  WorkshopPreferenceHistory,
+  WorkshopRuntimeSettingsChange,
+  WorkshopWorkspaceSettingChange,
   WorkshopMemoryPage,
   WorkshopMemoryFilters,
   WorkshopMemoryListOptions,
@@ -44,6 +49,15 @@ import {
 export class AuthenticationError extends Error {}
 export class ChannelAccessError extends Error {}
 export class ResynchronizationRequired extends Error {}
+export class PreferenceRevisionConflictError extends Error {
+  constructor(
+    message: string,
+    public readonly currentRevision: string,
+  ) {
+    super(message);
+  }
+}
+export class SettingsRevisionConflictError extends Error {}
 export class MemoryRevisionConflictError extends Error {
   constructor(
     message: string,
@@ -517,6 +531,108 @@ function parseSettingsWorkspace(
     },
     workspace: payload.workspace,
     workspaces,
+  };
+}
+
+function parseWorkspaceConfig(payload: unknown): WorkshopWorkspaceConfig {
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    typeof payload.workspace !== "string" ||
+    typeof payload.revision !== "string" ||
+    !isRecord(payload.model) ||
+    typeof payload.model.value !== "string" ||
+    typeof payload.model.source !== "string" ||
+    typeof payload.model.default_value !== "string" ||
+    !isRecord(payload.timeout_seconds) ||
+    !Number.isSafeInteger(payload.timeout_seconds.value) ||
+    typeof payload.timeout_seconds.source !== "string" ||
+    !Number.isSafeInteger(payload.timeout_seconds.default_value) ||
+    !Array.isArray(payload.environment_keys) ||
+    payload.environment_keys.some((item) => typeof item !== "string") ||
+    (payload.prompt !== null && typeof payload.prompt !== "string") ||
+    typeof payload.has_prompt !== "boolean" ||
+    (payload.prompt_source !== null && typeof payload.prompt_source !== "string") ||
+    !Array.isArray(payload.override_fields) ||
+    payload.override_fields.some((item) => typeof item !== "string")
+  ) {
+    throw new Error("Kai returned unsupported workspace settings state.");
+  }
+  return {
+    capabilities: parseEditableCapabilities(payload.capabilities),
+    environmentKeys: payload.environment_keys as string[],
+    hasPrompt: payload.has_prompt,
+    model: {
+      defaultValue: payload.model.default_value,
+      source: payload.model.source,
+      value: payload.model.value,
+    },
+    mutation: parseSettingsMutation(payload.mutation),
+    overrideFields: payload.override_fields as string[],
+    prompt: payload.prompt as string | null,
+    promptSource: payload.prompt_source as string | null,
+    revision: payload.revision,
+    timeoutSeconds: {
+      defaultValue: payload.timeout_seconds.default_value as number,
+      source: payload.timeout_seconds.source,
+      value: payload.timeout_seconds.value as number,
+    },
+    workspace: payload.workspace,
+  };
+}
+
+function parsePreferenceDocument(payload: unknown): WorkshopPreferenceDocument {
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    !isRecord(payload.document) ||
+    typeof payload.document.content !== "string" ||
+    typeof payload.document.revision !== "string" ||
+    (payload.document.updated_at !== null &&
+      typeof payload.document.updated_at !== "string") ||
+    !Number.isSafeInteger(payload.document.size_bytes) ||
+    !Number.isSafeInteger(payload.document.max_bytes) ||
+    typeof payload.document.editable !== "boolean"
+  ) {
+    throw new Error("Kai returned unsupported preference state.");
+  }
+  return {
+    content: payload.document.content,
+    editable: payload.document.editable,
+    maxBytes: payload.document.max_bytes as number,
+    revision: payload.document.revision,
+    sizeBytes: payload.document.size_bytes as number,
+    updatedAt: payload.document.updated_at as string | null,
+  };
+}
+
+function parsePreferenceHistory(payload: unknown): WorkshopPreferenceHistory {
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    !Number.isSafeInteger(payload.limit) ||
+    !Array.isArray(payload.revisions)
+  ) {
+    throw new Error("Kai returned unsupported preference history.");
+  }
+  const revisions = payload.revisions.map((item) => {
+    if (
+      !isRecord(item) ||
+      typeof item.revision !== "string" ||
+      typeof item.updated_at !== "string" ||
+      !Number.isSafeInteger(item.size_bytes)
+    ) {
+      throw new Error("Kai returned unsupported preference history.");
+    }
+    return {
+      revision: item.revision,
+      sizeBytes: item.size_bytes as number,
+      updatedAt: item.updated_at,
+    };
+  });
+  return {
+    limit: payload.limit as number,
+    revisions,
   };
 }
 
@@ -1104,6 +1220,160 @@ export async function loadSettingsWorkspace(
   return parseSettingsWorkspace(payload, session.channelId);
 }
 
+export async function updateRuntimeSettings(
+  session: WorkshopSession,
+  revision: string,
+  change: WorkshopRuntimeSettingsChange,
+): Promise<WorkshopSettingsWorkspace> {
+  const operation = change.field === "model"
+    ? { model: change.value }
+    : change.field === "timeout"
+      ? { timeout_seconds: change.value }
+      : { reset: change.value };
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/settings`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ revision, ...operation }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (response.status === 409) {
+    throw new SettingsRevisionConflictError(
+      safeErrorMessage(payload, "Settings changed since they were loaded."),
+    );
+  }
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not update runtime settings."));
+  }
+  return parseSettingsWorkspace(payload, session.channelId);
+}
+
+export async function loadWorkspaceConfig(
+  session: WorkshopSession,
+): Promise<WorkshopWorkspaceConfig> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/workspace-config`,
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load workspace settings."));
+  }
+  return parseWorkspaceConfig(payload);
+}
+
+export async function updateWorkspaceConfig(
+  session: WorkshopSession,
+  revision: string,
+  change: WorkshopWorkspaceSettingChange,
+): Promise<WorkshopWorkspaceConfig> {
+  const operation = change.field === "reset"
+    ? { reset: change.value }
+    : { field: change.field, value: change.value };
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/workspace-config`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ revision, ...operation }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (response.status === 409) {
+    throw new SettingsRevisionConflictError(
+      safeErrorMessage(payload, "Workspace settings changed since they were loaded."),
+    );
+  }
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not update workspace settings."));
+  }
+  return parseWorkspaceConfig(payload);
+}
+
+export async function loadPreferenceDocument(
+  session: WorkshopSession,
+): Promise<WorkshopPreferenceDocument> {
+  const response = await authorizedFetch(session, "/v1/preferences");
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load preferences."));
+  }
+  return parsePreferenceDocument(payload);
+}
+
+export async function savePreferenceDocument(
+  session: WorkshopSession,
+  content: string,
+  revision: string,
+): Promise<WorkshopPreferenceDocument> {
+  const response = await authorizedFetch(session, "/v1/preferences", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content, revision }),
+  });
+  const payload = await responsePayload(response);
+  if (response.status === 409) {
+    const currentRevision = isRecord(payload) && isRecord(payload.error) &&
+      typeof payload.error.current_revision === "string"
+      ? payload.error.current_revision
+      : "";
+    throw new PreferenceRevisionConflictError(
+      safeErrorMessage(payload, "Preferences changed since they were opened."),
+      currentRevision,
+    );
+  }
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not save preferences."));
+  }
+  return parsePreferenceDocument(payload);
+}
+
+export async function loadPreferenceHistory(
+  session: WorkshopSession,
+): Promise<WorkshopPreferenceHistory> {
+  const response = await authorizedFetch(session, "/v1/preferences/revisions");
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load preference history."));
+  }
+  return parsePreferenceHistory(payload);
+}
+
+export async function restorePreferenceRevision(
+  session: WorkshopSession,
+  targetRevision: string,
+  currentRevision: string,
+): Promise<WorkshopPreferenceDocument> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/preferences/revisions/${encodeURIComponent(targetRevision)}/restore`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ revision: currentRevision }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (response.status === 409) {
+    const latestRevision = isRecord(payload) && isRecord(payload.error) &&
+      typeof payload.error.current_revision === "string"
+      ? payload.error.current_revision
+      : "";
+    throw new PreferenceRevisionConflictError(
+      safeErrorMessage(payload, "Preferences changed before they could be restored."),
+      latestRevision,
+    );
+  }
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not restore preferences."));
+  }
+  return parsePreferenceDocument(payload);
+}
+
 export async function switchWorkspace(
   session: WorkshopSession,
   path: string,
@@ -1119,6 +1389,11 @@ export async function switchWorkspace(
     },
   );
   const payload = await responsePayload(response);
+  if (response.status === 409) {
+    throw new SettingsRevisionConflictError(
+      safeErrorMessage(payload, "Settings changed since they were loaded."),
+    );
+  }
   if (!response.ok) {
     throw new Error(safeErrorMessage(payload, "Could not switch workspace."));
   }
