@@ -214,6 +214,7 @@ describe("Workshop React client", () => {
     vi.mocked(loadRunTrace).mockResolvedValue({ entries: [], hasMore: false });
     vi.mocked(loadSettingsWorkspace).mockResolvedValue(settingsWorkspace);
     vi.mocked(loadMemoryStats).mockResolvedValue({
+      allowedProjects: [],
       byScope: { global: 1 },
       bySource: { extracted: 1 },
       byType: { fact: 1 },

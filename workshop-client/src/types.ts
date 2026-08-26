@@ -148,12 +148,36 @@ export interface WorkshopMemorySourceContext {
 }
 
 export interface WorkshopMemoryStats {
+  allowedProjects: WorkshopMemoryProjectOption[];
   byScope: Record<string, number>;
   bySource: Record<string, number>;
   byType: Record<string, number>;
   episodes: number;
   facts: number;
   total: number;
+}
+
+export interface WorkshopMemoryProjectOption {
+  displayName: string;
+  projectId: string;
+}
+
+export type WorkshopMemoryMutationOutcome =
+  | "succeeded"
+  | "not_found"
+  | "stale"
+  | "failed";
+
+export interface WorkshopMemoryMutationResult {
+  memoryId: string;
+  newScope: WorkshopMemoryScope | null;
+  outcome: WorkshopMemoryMutationOutcome;
+  priorScope: WorkshopMemoryScope | null;
+}
+
+export interface WorkshopMemoryMutationBatch {
+  operation: "move_scope" | "delete";
+  results: WorkshopMemoryMutationResult[];
 }
 
 export interface WorkshopMemorySearchHit {

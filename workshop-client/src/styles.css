@@ -1735,6 +1735,20 @@ button:disabled {
   gap: 0.45rem;
 }
 
+.memory-record-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.55rem;
+  align-items: center;
+}
+
+.memory-record-row > input {
+  width: 1rem;
+  height: 1rem;
+  accent-color: var(--atom-blue);
+  cursor: pointer;
+}
+
 .memory-record {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
@@ -1853,6 +1867,71 @@ button:disabled {
   margin-top: 0.7rem;
 }
 
+.memory-bulk-actions,
+.memory-mutation-report {
+  margin: 0 0 0.7rem;
+  border: 1px solid rgba(97, 175, 239, 0.35);
+  border-radius: 0.42rem;
+  background: rgba(97, 175, 239, 0.07);
+}
+
+.memory-bulk-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.65rem;
+}
+
+.memory-bulk-actions strong,
+.memory-mutation-report {
+  color: var(--atom-foreground-strong);
+  font-size: 0.7rem;
+}
+
+.memory-bulk-actions select,
+.memory-management select {
+  min-height: 2.15rem;
+  border: 1px solid var(--line-strong);
+  border-radius: 0.35rem;
+  padding: 0.42rem 2.2rem 0.42rem 0.6rem;
+  background-color: var(--atom-bg-dark);
+  color: var(--atom-foreground-strong);
+}
+
+.memory-bulk-actions button,
+.memory-management button,
+.memory-confirm button {
+  min-height: 2.15rem;
+  border: 1px solid rgba(97, 175, 239, 0.55);
+  border-radius: 0.35rem;
+  padding: 0.45rem 0.7rem;
+  background: rgba(97, 175, 239, 0.1);
+  color: var(--atom-blue);
+  font-size: 0.7rem;
+  font-weight: 680;
+  cursor: pointer;
+}
+
+.memory-bulk-actions button.danger,
+.memory-management button.danger,
+.memory-confirm button.danger {
+  border-color: rgba(224, 108, 117, 0.5);
+  background: rgba(224, 108, 117, 0.1);
+  color: var(--atom-red);
+}
+
+.memory-bulk-actions button:disabled,
+.memory-management button:disabled,
+.memory-confirm button:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+.memory-mutation-report {
+  padding: 0.65rem 0.75rem;
+}
+
 .memory-detail-pane {
   min-width: 0;
   min-height: 0;
@@ -1939,6 +2018,67 @@ button:disabled {
 .scope-card > strong {
   color: var(--atom-foreground-strong);
   font-size: 0.82rem;
+}
+
+.memory-management label {
+  display: grid;
+  gap: 0.35rem;
+  color: var(--atom-muted);
+  font-size: 0.68rem;
+}
+
+.memory-management > div {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.65rem;
+}
+
+.memory-confirm-backdrop {
+  position: fixed;
+  z-index: 100;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: rgba(18, 20, 24, 0.78);
+}
+
+.memory-confirm {
+  width: min(34rem, 100%);
+  max-height: min(42rem, calc(100vh - 2rem));
+  overflow: auto;
+  border: 1px solid var(--line-strong);
+  border-radius: 0.55rem;
+  padding: 1.2rem;
+  background: var(--atom-surface);
+  box-shadow: 0 1rem 3rem rgba(0, 0, 0, 0.45);
+}
+
+.memory-confirm h2 {
+  margin: 0.25rem 0 0.65rem;
+  color: var(--atom-foreground-strong);
+  font-family: var(--serif);
+  font-size: 1.2rem;
+}
+
+.memory-confirm > p:not(.overline),
+.memory-confirm li {
+  color: var(--atom-foreground);
+  font-size: 0.75rem;
+  line-height: 1.5;
+}
+
+.memory-confirm ul {
+  max-height: 16rem;
+  overflow: auto;
+  border-block: 1px solid var(--line);
+  padding: 0.7rem 0.7rem 0.7rem 1.8rem;
+}
+
+.memory-confirm > div {
+  display: flex;
+  justify-content: end;
+  gap: 0.55rem;
 }
 
 .scope-card > p:not(.memory-section-label),

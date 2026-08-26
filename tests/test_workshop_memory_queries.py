@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from kai import memory
-from kai.config import Config
+from kai.config import Config, MemoryProjectConfig
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.conversation_commands import WorkshopConversationCommandService
 from kai.workshop.domain import (
@@ -28,6 +29,9 @@ from kai.workshop.execution_state import (
 )
 from kai.workshop.inbound import InboundMessage
 from kai.workshop.memory_queries import (
+    MAX_MUTATION_TARGETS,
+    MEMORY_MANAGEMENT_AUDIT_EVENT,
+    MemoryProjectOption,
     MemoryQueryFilters,
     WorkshopMemoryAccessDenied,
     WorkshopMemoryCursorError,
@@ -115,6 +119,37 @@ def test_authority_is_canonical_and_fails_closed(tmp_path: Path) -> None:
         service.authority_for_principal(PrincipalId("prn_" + "9" * 32))
     with pytest.raises(WorkshopMemoryAccessDenied):
         service.authority_for_principal("101")
+
+
+async def test_management_projects_follow_canonical_workspace_authority(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, authority, _ = _service(tmp_path)
+    allowed_root = (tmp_path / "allowed" / "kai").resolve()
+    blocked_root = (tmp_path / "blocked" / "other").resolve()
+    disabled_root = (tmp_path / "allowed" / "disabled").resolve()
+    service._config = replace(
+        service._config,
+        memory_projects={
+            "kai": MemoryProjectConfig("kai", "Kai", (allowed_root,), True),
+            "other": MemoryProjectConfig("other", "Other", (blocked_root,), True),
+            "disabled": MemoryProjectConfig("disabled", "Disabled", (disabled_root,), False),
+        },
+    )
+    runtime_pool = service._runtime_pool
+    monkeypatch.setattr(runtime_pool, "get_home_workspace", lambda _profile_id: tmp_path / "home", raising=False)
+
+    async def workspace(_profile_id):
+        return allowed_root
+
+    async def access(_profile_id):
+        return None, [allowed_root, disabled_root]
+
+    monkeypatch.setattr(runtime_pool, "get_effective_workspace", workspace)
+    monkeypatch.setattr(runtime_pool, "resolve_workspace_access", access, raising=False)
+
+    assert await service.allowed_projects(authority) == (MemoryProjectOption("kai", "Kai"),)
 
 
 async def test_list_is_visible_filtered_deterministic_and_cursor_bound(
@@ -287,6 +322,110 @@ async def test_scope_interpretation_matches_production_admission(
         ),
     )
     assert [record.memory_id for record in project_only.records] == ["matching"]
+
+
+async def test_scope_management_is_bounded_authorized_partial_and_audited(
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    service, authority, principal_id = _service(tmp_path)
+    secret_text = "Daniel's private memory content"
+    rows = {
+        "ok": _result("ok", secret_text),
+        "stale": _result("stale", "vanishes"),
+        "failed": _result("failed", "remains"),
+    }
+    updates: list[tuple[str, dict[str, object]]] = []
+
+    async def projects(_authority):
+        return (MemoryProjectOption("kai", "Kai"),)
+
+    async def active_project(_authority):
+        return "kai"
+
+    def get_by_id(*, user_id: str, memory_id: str):
+        assert user_id == str(principal_id)
+        return rows.get(memory_id)
+
+    def update_metadata(*, user_id: str, memory_id: str, data: str, metadata):
+        assert user_id == str(principal_id)
+        assert data == rows[memory_id].text
+        updates.append((memory_id, metadata))
+        if memory_id == "stale":
+            rows.pop(memory_id)
+            return False
+        return memory_id == "ok"
+
+    monkeypatch.setattr(service, "allowed_projects", projects)
+    monkeypatch.setattr(service, "_allowed_project_id", active_project)
+    monkeypatch.setattr(memory, "get_by_id", get_by_id)
+    monkeypatch.setattr(memory, "update_metadata", update_metadata)
+    caplog.set_level("INFO", logger="kai.workshop.memory_queries")
+
+    batch = await service.move_scope(
+        authority,
+        ["ok", "failed", "stale", "missing"],
+        scope="project",
+        project_id="kai",
+    )
+
+    assert [result.outcome for result in batch.results] == [
+        "succeeded",
+        "failed",
+        "stale",
+        "not_found",
+    ]
+    assert updates[0][1]["source"] == "extracted"
+    assert updates[0][1]["scope"] == "project"
+    assert updates[0][1]["project_id"] == "kai"
+    assert updates[0][1]["scope_source"] == memory.SCOPE_SOURCE_OPERATOR
+    audit = [record.message for record in caplog.records if record.message.startswith(MEMORY_MANAGEMENT_AUDIT_EVENT)]
+    assert len(audit) == 4
+    assert all(str(principal_id) in line for line in audit)
+    assert secret_text not in "\n".join(audit)
+    assert '"outcome":"stale"' in "\n".join(audit)
+
+    with pytest.raises(WorkshopMemoryAccessDenied):
+        await service.move_scope(authority, ["ok"], scope="project", project_id="foreign")
+    with pytest.raises(WorkshopMemoryValidationError):
+        await service.move_scope(authority, ["ok"], scope="global", project_id="kai")
+    with pytest.raises(WorkshopMemoryValidationError):
+        await service.move_scope(authority, ["ok"] * 2, scope="global")
+    with pytest.raises(WorkshopMemoryValidationError):
+        await service.move_scope(
+            authority,
+            [f"memory-{index}" for index in range(MAX_MUTATION_TARGETS + 1)],
+            scope="global",
+        )
+
+
+async def test_delete_management_restricts_sources_and_reports_stale_targets(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, authority, principal_id = _service(tmp_path)
+    rows = {
+        "ok": _result("ok", "delete me", source="episode"),
+        "stale": _result("stale", "already deleting"),
+    }
+
+    def get_by_id(*, user_id: str, memory_id: str):
+        assert user_id == str(principal_id)
+        return rows.get(memory_id)
+
+    def delete_by_id(*, user_id: str, memory_id: str):
+        assert user_id == str(principal_id)
+        rows.pop(memory_id, None)
+        return memory_id == "ok"
+
+    monkeypatch.setattr(memory, "get_by_id", get_by_id)
+    monkeypatch.setattr(memory, "delete_by_id", delete_by_id)
+
+    batch = await service.delete(authority, ["ok", "missing", "stale"])
+
+    assert [result.outcome for result in batch.results] == ["succeeded", "not_found", "stale"]
+    assert all(memory_id not in rows for memory_id in ("ok", "stale"))
 
 
 async def test_search_uses_live_scoped_retrieval_and_visible_sources(

@@ -1,4 +1,4 @@
-"""Canonical, principal-scoped read service for Workshop semantic memory."""
+"""Canonical, principal-scoped query and management service for memory."""
 
 from __future__ import annotations
 
@@ -6,7 +6,10 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
@@ -20,6 +23,7 @@ from kai.workshop.execution_state import (
 )
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.store import WorkshopEventStore
+from kai.workspace_utils import is_workspace_allowed
 
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 100
@@ -30,10 +34,15 @@ MAX_PREVIEW_CHARACTERS = 500
 MAX_CONTENT_CHARACTERS = 100_000
 MAX_COMPACT_RECALL_CHARACTERS = 120_000
 MAX_SOURCE_BODY_CHARACTERS = 50_000
+MAX_MUTATION_TARGETS = 50
+MEMORY_MANAGEMENT_AUDIT_EVENT = "workshop.memory.mutation"
 _CURSOR_VERSION = 1
 _VALID_KINDS = frozenset({"fact", "episode"})
 _VALID_SCOPES = frozenset({"global", "project", "task"})
 _VALID_ORDERS = frozenset({"newest", "oldest"})
+_VALID_MUTATION_SCOPES = frozenset({memory.SCOPE_GLOBAL, memory.SCOPE_PROJECT})
+
+log = logging.getLogger(__name__)
 
 
 class WorkshopMemoryQueryError(RuntimeError):
@@ -138,6 +147,12 @@ class MemorySearchSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class MemoryProjectOption:
+    project_id: str
+    display_name: str
+
+
+@dataclass(frozen=True, slots=True)
 class MemoryStatsSnapshot:
     total: int
     facts: int
@@ -145,6 +160,21 @@ class MemoryStatsSnapshot:
     by_source: dict[str, int]
     by_type: dict[str, int]
     by_scope: dict[str, int]
+    allowed_projects: tuple[MemoryProjectOption, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryMutationResult:
+    memory_id: str
+    outcome: Literal["succeeded", "not_found", "stale", "failed"]
+    prior_scope: MemoryScopeSnapshot | None
+    new_scope: MemoryScopeSnapshot | None
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryMutationBatch:
+    operation: Literal["move_scope", "delete"]
+    results: tuple[MemoryMutationResult, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,7 +305,7 @@ def _decode_cursor(
 
 
 class WorkshopMemoryQueryService:
-    """Read semantic memory through canonical Workshop authority only."""
+    """Query and mutate semantic memory through canonical authority only."""
 
     def __init__(
         self,
@@ -292,6 +322,7 @@ class WorkshopMemoryQueryService:
         for namespace in execution_state.namespaces:
             by_principal.setdefault(namespace.principal_id, []).append(namespace)
         self._namespaces = {principal_id: tuple(namespaces) for principal_id, namespaces in by_principal.items()}
+        self._mutation_locks: dict[PrincipalId, asyncio.Lock] = {}
 
     def authority_for_principal(
         self,
@@ -352,6 +383,43 @@ class WorkshopMemoryQueryService:
             merged_registry(self._config.memory_projects),
         )
         return active.project_id if active is not None and active.memory_enabled else None
+
+    async def allowed_projects(
+        self,
+        authority: MemoryQueryAuthority,
+    ) -> tuple[MemoryProjectOption, ...]:
+        """Return memory-enabled projects reachable by an owned runtime."""
+        from kai.memory_projects import detect_active_memory_project, merged_registry
+
+        registry = merged_registry(self._config.memory_projects)
+        if not registry:
+            return ()
+        authorized: dict[str, MemoryProjectOption] = {}
+        for namespace in self._namespaces.get(authority.principal_id, ()):
+            profile_id = namespace.runtime_profile_id
+            home = self._runtime_pool.get_home_workspace(profile_id).expanduser().resolve()
+            current = (await self._runtime_pool.get_effective_workspace(profile_id)).expanduser().resolve()
+            base, allowed = await self._runtime_pool.resolve_workspace_access(profile_id)
+            candidates = (home, current, *allowed)
+            for candidate in candidates:
+                active = detect_active_memory_project(candidate, registry)
+                if active is not None and active.memory_enabled:
+                    authorized[active.project_id] = MemoryProjectOption(
+                        active.project_id,
+                        active.display_name,
+                    )
+            for project in registry.values():
+                if not project.memory_enabled:
+                    continue
+                if any(
+                    root == home or root.is_relative_to(home) or is_workspace_allowed(root, base, allowed)
+                    for root in project.workspace_roots
+                ):
+                    authorized[project.project_id] = MemoryProjectOption(
+                        project.project_id,
+                        project.display_name,
+                    )
+        return tuple(sorted(authorized.values(), key=lambda item: (item.display_name.casefold(), item.project_id)))
 
     @staticmethod
     def _scope_snapshot(
@@ -482,7 +550,219 @@ class WorkshopMemoryQueryService:
             by_source=dict(sorted(by_source.items())),
             by_type=dict(sorted(by_type.items())),
             by_scope=dict(sorted(by_scope.items())),
+            allowed_projects=await self.allowed_projects(authority),
         )
+
+    @staticmethod
+    def _validate_memory_ids(memory_ids: Sequence[str]) -> tuple[str, ...]:
+        if isinstance(memory_ids, (str, bytes)):
+            raise WorkshopMemoryValidationError("Memory identifiers must be a list")
+        checked = tuple(memory_ids)
+        if not 1 <= len(checked) <= MAX_MUTATION_TARGETS:
+            raise WorkshopMemoryValidationError(
+                f"A memory mutation must contain between 1 and {MAX_MUTATION_TARGETS} identifiers"
+            )
+        if any(not isinstance(memory_id, str) or not memory_id or len(memory_id) > 256 for memory_id in checked):
+            raise WorkshopMemoryValidationError("Invalid memory identifier")
+        if len(set(checked)) != len(checked):
+            raise WorkshopMemoryValidationError("Memory identifiers must be unique")
+        return checked
+
+    async def _scope_metadata(
+        self,
+        authority: MemoryQueryAuthority,
+        *,
+        scope: str,
+        project_id: str | None,
+    ) -> dict[str, object]:
+        if scope not in _VALID_MUTATION_SCOPES:
+            raise WorkshopMemoryValidationError("Memory scope must be global or project")
+        if scope == memory.SCOPE_GLOBAL:
+            if project_id is not None:
+                raise WorkshopMemoryValidationError("Global memory scope cannot include a project")
+        else:
+            if not isinstance(project_id, str) or not project_id or len(project_id) > 128:
+                raise WorkshopMemoryValidationError("Project memory scope requires a project")
+            allowed = {item.project_id for item in await self.allowed_projects(authority)}
+            if project_id not in allowed:
+                raise WorkshopMemoryAccessDenied("Memory project access denied")
+        try:
+            return memory.build_scope_metadata(
+                scope=scope,
+                project_id=project_id,
+                scope_confidence=1.0,
+                scope_source=memory.SCOPE_SOURCE_OPERATOR,
+            )
+        except ValueError as exc:
+            raise WorkshopMemoryValidationError("Invalid memory scope") from exc
+
+    def _audit_mutation(
+        self,
+        authority: MemoryQueryAuthority,
+        *,
+        operation: str,
+        result: MemoryMutationResult,
+    ) -> None:
+        def serialized_scope(scope: MemoryScopeSnapshot | None) -> dict[str, object] | None:
+            if scope is None:
+                return None
+            return {
+                "scope": scope.scope,
+                "project_id": scope.project_id,
+                "scope_source": scope.scope_source,
+            }
+
+        log.info(
+            "%s %s",
+            MEMORY_MANAGEMENT_AUDIT_EVENT,
+            json.dumps(
+                {
+                    "actor_principal_id": str(authority.principal_id),
+                    "operation": operation,
+                    "memory_id": result.memory_id,
+                    "prior_scope": serialized_scope(result.prior_scope),
+                    "new_scope": serialized_scope(result.new_scope),
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "outcome": result.outcome,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+
+    async def move_scope(
+        self,
+        authority: MemoryQueryAuthority,
+        memory_ids: Sequence[str],
+        *,
+        scope: str,
+        project_id: str | None = None,
+    ) -> MemoryMutationBatch:
+        checked = self._validate_memory_ids(memory_ids)
+        scope_metadata = await self._scope_metadata(
+            authority,
+            scope=scope,
+            project_id=project_id,
+        )
+        allowed_project_id = await self._allowed_project_id(authority)
+        results: list[MemoryMutationResult] = []
+        lock = self._mutation_locks.setdefault(authority.principal_id, asyncio.Lock())
+        async with lock:
+            for memory_id in checked:
+                record = await asyncio.to_thread(
+                    memory.get_by_id,
+                    user_id=str(authority.principal_id),
+                    memory_id=memory_id,
+                )
+                if record is None:
+                    result = MemoryMutationResult(memory_id, "not_found", None, None)
+                else:
+                    prior = self._scope_snapshot(record, allowed_project_id=allowed_project_id)
+                    merged = dict(record.metadata)
+                    merged.update(scope_metadata)
+                    mutation_raised = False
+                    try:
+                        updated = await asyncio.to_thread(
+                            memory.update_metadata,
+                            user_id=str(authority.principal_id),
+                            memory_id=memory_id,
+                            data=record.text,
+                            metadata=merged,
+                        )
+                    except Exception:
+                        log.exception("Workshop memory scope mutation failed for %s", memory_id)
+                        updated = False
+                        mutation_raised = True
+                    if updated:
+                        new_scope = self._scope_snapshot(
+                            memory.MemoryResult(
+                                id=record.id,
+                                text=record.text,
+                                score=record.score,
+                                memory_type=record.memory_type,
+                                metadata=merged,
+                                created_at=record.created_at,
+                                updated_at=record.updated_at,
+                            ),
+                            allowed_project_id=allowed_project_id,
+                        )
+                        result = MemoryMutationResult(memory_id, "succeeded", prior, new_scope)
+                    else:
+                        current = (
+                            record
+                            if mutation_raised
+                            else await asyncio.to_thread(
+                                memory.get_by_id,
+                                user_id=str(authority.principal_id),
+                                memory_id=memory_id,
+                            )
+                        )
+                        result = MemoryMutationResult(
+                            memory_id,
+                            "failed" if mutation_raised else "stale" if current is None else "failed",
+                            prior,
+                            self._scope_snapshot(current, allowed_project_id=allowed_project_id)
+                            if current is not None
+                            else None,
+                        )
+                results.append(result)
+                self._audit_mutation(authority, operation="move_scope", result=result)
+        return MemoryMutationBatch("move_scope", tuple(results))
+
+    async def delete(
+        self,
+        authority: MemoryQueryAuthority,
+        memory_ids: Sequence[str],
+    ) -> MemoryMutationBatch:
+        checked = self._validate_memory_ids(memory_ids)
+        allowed_project_id = await self._allowed_project_id(authority)
+        results: list[MemoryMutationResult] = []
+        lock = self._mutation_locks.setdefault(authority.principal_id, asyncio.Lock())
+        async with lock:
+            for memory_id in checked:
+                record = await asyncio.to_thread(
+                    memory.get_by_id,
+                    user_id=str(authority.principal_id),
+                    memory_id=memory_id,
+                )
+                if record is None:
+                    result = MemoryMutationResult(memory_id, "not_found", None, None)
+                else:
+                    prior = self._scope_snapshot(record, allowed_project_id=allowed_project_id)
+                    mutation_raised = False
+                    try:
+                        deleted = await asyncio.to_thread(
+                            memory.delete_by_id,
+                            user_id=str(authority.principal_id),
+                            memory_id=memory_id,
+                        )
+                    except Exception:
+                        log.exception("Workshop memory deletion failed for %s", memory_id)
+                        deleted = False
+                        mutation_raised = True
+                    if deleted:
+                        result = MemoryMutationResult(memory_id, "succeeded", prior, None)
+                    else:
+                        current = (
+                            record
+                            if mutation_raised
+                            else await asyncio.to_thread(
+                                memory.get_by_id,
+                                user_id=str(authority.principal_id),
+                                memory_id=memory_id,
+                            )
+                        )
+                        result = MemoryMutationResult(
+                            memory_id,
+                            "failed" if mutation_raised else "stale" if current is None else "failed",
+                            prior,
+                            self._scope_snapshot(current, allowed_project_id=allowed_project_id)
+                            if current is not None
+                            else None,
+                        )
+                results.append(result)
+                self._audit_mutation(authority, operation="delete", result=result)
+        return MemoryMutationBatch("delete", tuple(results))
 
     async def detail(
         self,

@@ -4,10 +4,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   AuthenticationError,
+  deleteMemories,
+  deleteMemory,
   loadMemoryDetail,
   loadMemoryRecords,
   loadMemorySource,
   loadMemoryStats,
+  moveMemoriesScope,
+  moveMemoryScope,
   searchMemories,
 } from "./api";
 import { MemoryExplorer } from "./MemoryExplorer";
@@ -25,6 +29,10 @@ vi.mock("./api", async (importOriginal) => {
     loadMemoryRecords: vi.fn(),
     loadMemorySource: vi.fn(),
     loadMemoryStats: vi.fn(),
+    moveMemoryScope: vi.fn(),
+    moveMemoriesScope: vi.fn(),
+    deleteMemory: vi.fn(),
+    deleteMemories: vi.fn(),
     searchMemories: vi.fn(),
   };
 });
@@ -104,6 +112,7 @@ describe("Workshop Memory explorer", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(loadMemoryStats).mockResolvedValue({
+      allowedProjects: [{ displayName: "Kai", projectId: "kai" }],
       byScope: { global: 1, "project:kai": 1 },
       bySource: { episode: 1, extracted: 1 },
       byType: { episode: 1, fact: 1 },
@@ -124,6 +133,22 @@ describe("Workshop Memory explorer", () => {
       hits: [{ adjustedScore: 0.8, compactRecall: "{}", rawScore: 0.9, record: fact }],
       reason: "ok",
     });
+    vi.mocked(moveMemoryScope).mockResolvedValue({
+      operation: "move_scope",
+      results: [{ memoryId: "memory-1", outcome: "succeeded", priorScope: null, newScope: null }],
+    });
+    vi.mocked(moveMemoriesScope).mockResolvedValue({
+      operation: "move_scope",
+      results: [
+        { memoryId: "memory-1", outcome: "succeeded", priorScope: null, newScope: null },
+        { memoryId: "memory-2", outcome: "failed", priorScope: null, newScope: null },
+      ],
+    });
+    vi.mocked(deleteMemory).mockResolvedValue({
+      operation: "delete",
+      results: [{ memoryId: "memory-1", outcome: "succeeded", priorScope: null, newScope: null }],
+    });
+    vi.mocked(deleteMemories).mockResolvedValue({ operation: "delete", results: [] });
   });
 
   it("browses rich detail, source context, and the distinct compact recall safely", async () => {
@@ -252,5 +277,46 @@ describe("Workshop Memory explorer", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("Memory service unavailable");
     await user.click(screen.getByRole("button", { name: "Retry" }));
     await waitFor(() => expect(onAuthenticationFailure).toHaveBeenCalledWith("Session expired"));
+  });
+
+  it("requires confirmation, supports cancellation, and reports partial bulk outcomes", async () => {
+    const user = userEvent.setup();
+    render(
+      <MemoryExplorer
+        initialMemoryId={null}
+        onAuthenticationFailure={vi.fn()}
+        onClose={vi.fn()}
+        onForget={vi.fn()}
+        onSelectMemory={vi.fn()}
+        token="session-secret"
+      />,
+    );
+
+    await screen.findByText("Kai deployment episode");
+    await user.click(screen.getByRole("checkbox", { name: /Select Kai deployment episode/ }));
+    await user.click(screen.getByRole("checkbox", { name: /Select Daniel prefers concise output/ }));
+    await user.selectOptions(screen.getByLabelText("Move selected memories to"), "project:kai");
+    await user.click(screen.getByRole("button", { name: "Move selected…" }));
+    const dialog = screen.getByRole("dialog", { name: "Move 2 memories?" });
+    expect(dialog).toHaveTextContent("project kai");
+    expect(dialog).toHaveTextContent("Daniel prefers concise output.");
+
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(moveMemoriesScope).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Move selected…" }));
+    await user.click(screen.getByRole("button", { name: "Confirm move" }));
+    await waitFor(() => expect(moveMemoriesScope).toHaveBeenCalledWith(
+      "session-secret",
+      expect.arrayContaining(["memory-1", "memory-2"]),
+      { scope: "project", projectId: "kai" },
+    ));
+    expect(await screen.findByRole("status")).toHaveTextContent("1 succeeded, 1 failed");
+    expect(screen.getByText("1 selected")).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "Forget memory…" }));
+    expect(screen.getByRole("dialog", { name: "Forget 1 memory?" })).toHaveTextContent(
+      "permanently removed",
+    );
   });
 });

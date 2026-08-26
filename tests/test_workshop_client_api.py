@@ -48,6 +48,9 @@ from kai.workshop.domain import (
 from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.inbound import ClientInboundMessage, InboundMessage, record_inbound_message
 from kai.workshop.memory_queries import (
+    MemoryMutationBatch,
+    MemoryMutationResult,
+    MemoryProjectOption,
     MemoryQueryAuthority,
     MemoryRecordDetail,
     MemoryRecordPage,
@@ -252,6 +255,7 @@ class _SettingsWorkspaces:
 @dataclass
 class _MemoryQueries:
     principal_id: PrincipalId
+    mutations: list[tuple[str, tuple[str, ...], str | None, str | None]] = field(default_factory=list)
 
     def authority_for_principal(self, principal_id):
         if principal_id != self.principal_id:
@@ -266,6 +270,7 @@ class _MemoryQueries:
             by_source={"extracted": 1},
             by_type={"fact": 1},
             by_scope={"global": 1},
+            allowed_projects=(MemoryProjectOption("kai", "Kai"),),
         )
 
     async def list_records(self, _authority, *, filters, limit, cursor, order):
@@ -344,6 +349,20 @@ class _MemoryQueries:
         if memory_id != "memory-1":
             raise WorkshopMemoryNotFound("missing")
         return MemorySourceContext("unavailable", "legacy_source", None, None, None)
+
+    async def move_scope(self, _authority, memory_ids, *, scope, project_id=None):
+        self.mutations.append(("move_scope", tuple(memory_ids), scope, project_id))
+        return MemoryMutationBatch(
+            "move_scope",
+            tuple(MemoryMutationResult(memory_id, "succeeded", None, None) for memory_id in memory_ids),
+        )
+
+    async def delete(self, _authority, memory_ids):
+        self.mutations.append(("delete", tuple(memory_ids), None, None))
+        return MemoryMutationBatch(
+            "delete",
+            tuple(MemoryMutationResult(memory_id, "succeeded", None, None) for memory_id in memory_ids),
+        )
 
 
 async def _identity_for(store: WorkshopEventStore, subject: str) -> tuple[PrincipalId, ChannelId]:
@@ -528,6 +547,9 @@ async def test_memory_api_uses_bearer_principal_and_stable_read_schema(
                 "by_source": {"extracted": 1},
                 "by_type": {"fact": 1},
                 "by_scope": {"global": 1},
+                "allowed_projects": [
+                    {"project_id": "kai", "display_name": "Kai"},
+                ],
             },
         }
 
@@ -594,6 +616,68 @@ async def test_memory_api_rejects_owner_parameters_and_duplicate_values(
         ):
             response = await client.get(path, headers=headers)
             assert response.status == 400
+    finally:
+        await client.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_api_exposes_typed_individual_and_bulk_mutations(
+    tmp_path: Path,
+) -> None:
+    store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+    service = _MemoryQueries(alice_id)
+    client = await _open_client(
+        store,
+        _Authenticator({"alice-token": alice_id}),
+        memory_queries=service,
+    )
+    headers = {"Authorization": "Bearer alice-token"}
+    try:
+        moved = await client.patch(
+            "/v1/memory/records/memory-1/scope",
+            headers=headers,
+            json={"scope": "project", "project_id": "kai"},
+        )
+        deleted = await client.delete(
+            "/v1/memory/records/memory-1",
+            headers=headers,
+        )
+        bulk_moved = await client.post(
+            "/v1/memory/actions/scope",
+            headers=headers,
+            json={"memory_ids": ["memory-1", "memory-2"], "scope": "global"},
+        )
+        bulk_deleted = await client.post(
+            "/v1/memory/actions/delete",
+            headers=headers,
+            json={"memory_ids": ["memory-1", "memory-2"]},
+        )
+
+        assert [response.status for response in (moved, deleted, bulk_moved, bulk_deleted)] == [200] * 4
+        assert (await bulk_deleted.json())["results"] == [
+            {"memory_id": "memory-1", "outcome": "succeeded", "prior_scope": None, "new_scope": None},
+            {"memory_id": "memory-2", "outcome": "succeeded", "prior_scope": None, "new_scope": None},
+        ]
+        assert service.mutations == [
+            ("move_scope", ("memory-1",), "project", "kai"),
+            ("delete", ("memory-1",), None, None),
+            ("move_scope", ("memory-1", "memory-2"), "global", None),
+            ("delete", ("memory-1", "memory-2"), None, None),
+        ]
+
+        invalid = await client.post(
+            "/v1/memory/actions/delete",
+            headers=headers,
+            json={"memory_ids": ["memory-1"], "principal_id": str(alice_id)},
+        )
+        body_on_delete = await client.delete(
+            "/v1/memory/records/memory-1",
+            headers=headers,
+            json={"confirm": True},
+        )
+        assert invalid.status == 400
+        assert body_on_delete.status == 400
     finally:
         await client.close()
         await store.close()
