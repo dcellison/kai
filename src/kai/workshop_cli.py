@@ -155,6 +155,12 @@ def _channel_id(value: str) -> ChannelId:
         raise WorkshopClientAccessError("Invalid channel ID") from exc
 
 
+def _telegram_subject(value: int) -> str:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 2**63 - 1:
+        raise WorkshopClientAccessError("Telegram user ID must be a positive signed 64-bit integer")
+    return str(value)
+
+
 def _transcript_channel_id(value: str) -> ChannelId:
     try:
         return ChannelId(value)
@@ -290,7 +296,14 @@ async def _run(args: argparse.Namespace) -> int:
                 else:
                     if args.channel_id is not None:
                         raise WorkshopClientAccessError("--channel-id cannot be used with --telegram-user-id")
-                    issued = await access.issue_enrollment_for_telegram(args.telegram_user_id)
+                    subject = _telegram_subject(args.telegram_user_id)
+                    principal_id, channel_id = await access.resolve_external_direct_human(
+                        provider="telegram",
+                        external_subject=subject,
+                        transport="telegram",
+                        external_channel_id=subject,
+                    )
+                    issued = await access.issue_enrollment(principal_id, channel_id)
                 print(f"Enrollment: {issued.grant.grant_id}")
                 print(f"Channel: {issued.channel_id}")
                 print(f"Expires: {issued.grant.expires_at.isoformat()}")
@@ -302,7 +315,14 @@ async def _run(args: argparse.Namespace) -> int:
                 if args.principal_id is not None:
                     await access.revoke_device(_principal_id(args.principal_id), device_id)
                 else:
-                    await access.revoke_device_for_telegram(args.telegram_user_id, device_id)
+                    subject = _telegram_subject(args.telegram_user_id)
+                    principal_id, _ = await access.resolve_external_direct_human(
+                        provider="telegram",
+                        external_subject=subject,
+                        transport="telegram",
+                        external_channel_id=subject,
+                    )
+                    await access.revoke_device(principal_id, device_id)
                 print(f"Device: {device_id}")
                 print("Status: revoked (all device sessions revoked)")
                 return 0
@@ -310,7 +330,14 @@ async def _run(args: argparse.Namespace) -> int:
             if args.principal_id is not None:
                 await access.revoke_enrollment(_principal_id(args.principal_id), grant_id)
             else:
-                await access.revoke_enrollment_for_telegram(args.telegram_user_id, grant_id)
+                subject = _telegram_subject(args.telegram_user_id)
+                principal_id, _ = await access.resolve_external_direct_human(
+                    provider="telegram",
+                    external_subject=subject,
+                    transport="telegram",
+                    external_channel_id=subject,
+                )
+                await access.revoke_enrollment(principal_id, grant_id)
             print(f"Enrollment: {grant_id}")
             print("Status: revoked")
             return 0

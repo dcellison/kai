@@ -3562,9 +3562,10 @@ def load_config() -> Config:
     memory_projects = _load_memory_project_configs()
 
     # Telegram identity and compatibility configuration. users.yaml is
-    # mandatory while Telegram is enabled; a missing file is permitted in a
-    # Workshop-only runtime, while a present malformed file always fails
-    # closed. The legacy ALLOWED_USER_IDS authorization fallback is gone.
+    # mandatory only while the Telegram adapter is enabled. A disabled
+    # adapter cannot veto an otherwise valid Workshop-only deployment merely
+    # because its dormant configuration is stale, unreadable, or malformed.
+    # The legacy ALLOWED_USER_IDS authorization fallback is gone.
     #
     # The path resolves based on whether `/etc/kai/env` had readable
     # content at the top of this load_config call (protected install)
@@ -3576,14 +3577,7 @@ def load_config() -> Config:
     if telegram_enabled:
         user_configs = _load_user_configs(default_backend, default_provider, users_yaml_path)
     else:
-        # Telegram identity policy is optional when that adapter is disabled.
-        # A present malformed file still fails closed, regardless of deployment
-        # mode; an absent file leaves canonical Workshop identity untouched.
-        raw_users = _read_users_yaml(users_yaml_path)
-        if raw_users is None:
-            user_configs = {}
-        else:
-            user_configs = _load_user_configs(default_backend, default_provider, users_yaml_path)
+        user_configs = {}
     if protected_env and user_configs:
         # A protected install gives the outer service account narrowly
         # scoped sudo access to root-owned Kai configuration.  A persistent

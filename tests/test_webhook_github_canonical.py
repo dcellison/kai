@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from aiohttp.test_utils import TestClient, TestServer
 
 from kai.webhook import (
-    TELEGRAM_BOT_KEY,
     WORKSHOP_GITHUB_AUTOMATION_KEY,
     WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY,
 )
@@ -70,7 +69,6 @@ async def test_reviewable_delivery_enqueues_durable_canonical_work():
     assert automation.enqueue.call_args.kwargs["delivery_id"] == "delivery-1"
     assert automation.enqueue.call_args.kwargs["local_repo_path"] == "/resolved/kai"
     notifications.record_for_channel.assert_not_awaited()
-    app[TELEGRAM_BOT_KEY].send_message.assert_not_awaited()
 
 
 async def test_issue_triage_delivery_enqueues_durable_canonical_work():
@@ -93,12 +91,10 @@ async def test_unprivileged_subscription_cannot_trigger_mutation_and_gets_notifi
     automation.enqueue.assert_not_awaited()
     notifications.record_for_channel.assert_awaited_once()
     assert notifications.record_for_channel.call_args.args[1] == route.notification_channel_id
-    app[TELEGRAM_BOT_KEY].send_message.assert_not_awaited()
 
 
 async def test_standard_delivery_records_canonical_notification_without_telegram():
     app, _automation, notifications = _canonical_app(_route())
-    del app[TELEGRAM_BOT_KEY]
     async with TestClient(TestServer(app)) as client:
         response = await _post(client, _make_pr_payload("closed"), "pull_request")
 

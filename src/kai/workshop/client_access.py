@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from kai.workshop.client_sessions import (
@@ -30,14 +31,15 @@ class EnrollableWorkshopHuman:
     direct_channels: tuple[ChannelId, ...]
 
 
-def _telegram_subject(telegram_user_id: int) -> str:
-    if (
-        not isinstance(telegram_user_id, int)
-        or isinstance(telegram_user_id, bool)
-        or not 1 <= telegram_user_id <= 2**63 - 1
-    ):
-        raise WorkshopClientAccessError("Telegram user ID must be a positive signed 64-bit integer")
-    return str(telegram_user_id)
+_EXTERNAL_IDENTITY_KIND = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+
+
+def _external_identity_value(kind: str, value: str) -> str:
+    if not isinstance(kind, str) or _EXTERNAL_IDENTITY_KIND.fullmatch(kind) is None:
+        raise WorkshopClientAccessError("External identity kind is invalid")
+    if not isinstance(value, str) or not value or len(value) > 512:
+        raise WorkshopClientAccessError("External identity value is invalid")
+    return value
 
 
 class WorkshopClientAccess:
@@ -88,24 +90,33 @@ class WorkshopClientAccess:
         if not available:
             raise WorkshopClientAccessError("Canonical human does not own that direct channel in an active Workshop")
 
-    async def _resolve_direct_human(self, telegram_user_id: int) -> tuple[PrincipalId, ChannelId]:
-        subject = _telegram_subject(telegram_user_id)
+    async def resolve_external_direct_human(
+        self,
+        *,
+        provider: str,
+        external_subject: str,
+        transport: str,
+        external_channel_id: str,
+    ) -> tuple[PrincipalId, ChannelId]:
+        """Resolve one adapter identity and channel to a canonical direct human."""
+        subject = _external_identity_value(provider, external_subject)
+        channel_subject = _external_identity_value(transport, external_channel_id)
         async with self._store.connection.execute(
             "SELECT ei.principal_id, c.id FROM external_identities ei "
             "JOIN principals p ON p.id = ei.principal_id AND p.kind = 'human' "
             "JOIN channel_memberships cm ON cm.principal_id = p.id AND cm.role = 'owner' "
             "JOIN channels c ON c.id = cm.channel_id AND c.kind = 'direct' "
             "JOIN workshop_memberships wm ON wm.workshop_id = c.workshop_id AND wm.principal_id = p.id "
-            "JOIN channel_bindings cb ON cb.channel_id = c.id AND cb.transport = 'telegram' "
-            "AND cb.external_channel_id = ei.external_subject "
-            "WHERE ei.provider = 'telegram' AND ei.external_subject = ?",
-            (subject,),
+            "JOIN channel_bindings cb ON cb.channel_id = c.id AND cb.transport = ? "
+            "AND cb.external_channel_id = ? "
+            "WHERE ei.provider = ? AND ei.external_subject = ?",
+            (transport, channel_subject, provider, subject),
         ) as cursor:
             rows = list(await cursor.fetchall())
         if len(rows) != 1:
             raise WorkshopClientAccessError(
-                "Telegram user does not resolve to exactly one canonical human and direct channel; restart Kai "
-                "after configuring the user"
+                "External identity does not resolve to exactly one canonical human and direct channel; restart "
+                "Kai after configuring the adapter binding"
             )
         return PrincipalId(str(rows[0][0])), ChannelId(str(rows[0][1]))
 
@@ -118,17 +129,9 @@ class WorkshopClientAccess:
         grant = await self._enrollment.issue_grant(principal_id)
         return IssuedClientEnrollment(grant, channel_id)
 
-    async def issue_enrollment_for_telegram(self, telegram_user_id: int) -> IssuedClientEnrollment:
-        principal_id, channel_id = await self._resolve_direct_human(telegram_user_id)
-        return await self.issue_enrollment(principal_id, channel_id)
-
     async def revoke_device(self, principal_id: PrincipalId, device_id: DeviceId) -> None:
         if not await self._sessions.revoke_device(principal_id, device_id):
             raise WorkshopClientAccessError("Client device is unavailable for that canonical human")
-
-    async def revoke_device_for_telegram(self, telegram_user_id: int, device_id: DeviceId) -> None:
-        principal_id, _ = await self._resolve_direct_human(telegram_user_id)
-        await self.revoke_device(principal_id, device_id)
 
     async def revoke_enrollment(
         self,
@@ -137,11 +140,3 @@ class WorkshopClientAccess:
     ) -> None:
         if not await self._enrollment.revoke_grant(principal_id, grant_id):
             raise WorkshopClientAccessError("Enrollment grant is unavailable for that canonical human")
-
-    async def revoke_enrollment_for_telegram(
-        self,
-        telegram_user_id: int,
-        grant_id: EnrollmentGrantId,
-    ) -> None:
-        principal_id, _ = await self._resolve_direct_human(telegram_user_id)
-        await self.revoke_enrollment(principal_id, grant_id)

@@ -33,13 +33,7 @@ class WorkshopChannelHistoryNamespace:
 
 
 class WorkshopChannelHistoryRegistry:
-    """Resolve compatibility chat keys to canonical channel histories.
-
-    Telegram chat IDs remain adapter inputs while the compatibility runtime is
-    being retired. They are never used as new directory names once this
-    registry is configured. Runtime configuration IDs are also accepted as
-    aliases for direct-channel execution initiated by a non-Telegram client.
-    """
+    """Resolve archived runtime keys to canonical channel histories."""
 
     def __init__(
         self,
@@ -81,27 +75,7 @@ class WorkshopChannelHistoryRegistry:
         store: WorkshopEventStore,
         runtime_profiles: WorkshopRuntimeProfileRegistry,
     ) -> WorkshopChannelHistoryRegistry:
-        """Resolve transport bindings and protected runtimes to channels."""
-        async with store.connection.execute(
-            "SELECT c.id, cb.external_channel_id "
-            "FROM channels c JOIN channel_bindings cb ON cb.channel_id = c.id "
-            "WHERE cb.transport = 'telegram' ORDER BY c.id"
-        ) as cursor:
-            binding_rows = list(await cursor.fetchall())
-
-        namespaces: list[WorkshopChannelHistoryNamespace] = []
-        for row in binding_rows:
-            try:
-                channel_id = ChannelId(str(row[0]))
-                legacy_chat_id = int(str(row[1]))
-            except (TypeError, ValueError) as exc:
-                raise WorkshopStorageNamespaceError(
-                    "Telegram channel history binding contains an invalid identifier"
-                ) from exc
-            if legacy_chat_id == 0:
-                raise WorkshopStorageNamespaceError("Telegram channel history binding cannot use chat ID zero")
-            namespaces.append(WorkshopChannelHistoryNamespace(channel_id, legacy_chat_id))
-
+        """Resolve protected runtime assignments to canonical channels."""
         async with store.connection.execute(
             "SELECT runtime_profile_id, channel_id FROM channel_agent_runtime_assignments ORDER BY runtime_profile_id"
         ) as cursor:
@@ -120,7 +94,8 @@ class WorkshopChannelHistoryRegistry:
             channel_by_profile[profile_id] = channel_id
 
         runtime_aliases: dict[int, ChannelId] = {}
-        namespace_channels = {namespace.channel_id for namespace in namespaces}
+        namespaces: list[WorkshopChannelHistoryNamespace] = []
+        namespace_channels: set[ChannelId] = set()
         for profile in runtime_profiles.profiles:
             channel_id = channel_by_profile.get(profile.profile_id)
             if channel_id is None:

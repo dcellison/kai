@@ -170,7 +170,11 @@ async def test_owner_routes_stop_to_exact_active_runtime_and_terminal_cancellati
         while not runtime.validated:
             await asyncio.sleep(0)
 
-        cancellation = await service.request_cancellation(telegram_user_id=101, telegram_chat_id=101)
+        cancellation = await service.request_transport_cancellation(
+            transport="telegram",
+            sender_subject="101",
+            channel_subject="101",
+        )
         result = await execution
 
         assert cancellation == CanonicalCancellationDisposition.REQUESTED

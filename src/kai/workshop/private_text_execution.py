@@ -218,14 +218,15 @@ class WorkshopPrivateTextExecutionService:
             raise RuntimeError("Workshop private-text execution service is closed")
         return await self._coordinator.request_cancellation(run_id)
 
-    async def request_cancellation(
+    async def request_transport_cancellation(
         self,
         *,
-        telegram_user_id: int,
-        telegram_chat_id: int,
+        transport: str,
+        sender_subject: str,
+        channel_subject: str,
     ) -> CanonicalCancellationDisposition:
-        """Resolve transport identity to a canonical run before cancellation."""
-        if telegram_user_id <= 0 or telegram_chat_id <= 0 or telegram_user_id != telegram_chat_id:
+        """Resolve an authenticated adapter identity to a canonical run."""
+        if not transport or not sender_subject or not channel_subject:
             return CanonicalCancellationDisposition.NOT_ACTIVE
         async with (
             self._database_lock,
@@ -233,12 +234,12 @@ class WorkshopPrivateTextExecutionService:
                 "SELECT r.id FROM runs r "
                 "JOIN channels c ON c.id = r.channel_id AND c.kind = 'direct' "
                 "JOIN external_identities ei ON ei.principal_id = r.requested_by_principal_id "
-                "AND ei.provider = 'telegram' AND ei.external_subject = ? "
+                "AND ei.provider = ? AND ei.external_subject = ? "
                 "JOIN channel_bindings cb ON cb.channel_id = r.channel_id "
-                "AND cb.transport = 'telegram' AND cb.external_channel_id = ? "
+                "AND cb.transport = ? AND cb.external_channel_id = ? "
                 "WHERE r.status IN ('accepted', 'started') "
                 "ORDER BY r.accepted_at DESC, r.id",
-                (str(telegram_user_id), str(telegram_chat_id)),
+                (transport, sender_subject, transport, channel_subject),
             ) as cursor,
         ):
             rows = list(await cursor.fetchall())

@@ -111,22 +111,64 @@ class TestWorkshopClientAccess:
         finally:
             await store.close()
 
-    async def test_unknown_telegram_identity_cannot_receive_a_grant(self, tmp_path: Path):
+    async def test_unknown_external_identity_cannot_receive_a_grant(self, tmp_path: Path):
         store = await _store(tmp_path / "kai.db")
         try:
             with pytest.raises(WorkshopClientAccessError, match="exactly one canonical human"):
-                await WorkshopClientAccess(store).issue_enrollment_for_telegram(999)
+                await WorkshopClientAccess(store).resolve_external_direct_human(
+                    provider="example",
+                    external_subject="unknown",
+                    transport="example",
+                    external_channel_id="unknown",
+                )
             async with store.connection.execute("SELECT COUNT(*) FROM workshop_client_enrollment_grants") as cursor:
                 assert (await cursor.fetchone())[0] == 0
         finally:
             await store.close()
 
-    @pytest.mark.parametrize("telegram_user_id", [0, -1, True, 2**63])
-    async def test_invalid_telegram_identity_is_bounded(self, tmp_path: Path, telegram_user_id):
+    @pytest.mark.parametrize(
+        ("provider", "subject"),
+        [("Telegram", "101"), ("bad provider", "101"), ("telegram", ""), ("telegram", "x" * 513)],
+    )
+    async def test_invalid_external_identity_is_bounded(self, tmp_path: Path, provider: str, subject: str):
         store = await _store(tmp_path / "kai.db")
         try:
-            with pytest.raises(WorkshopClientAccessError, match="positive signed 64-bit"):
-                await WorkshopClientAccess(store).issue_enrollment_for_telegram(telegram_user_id)
+            with pytest.raises(WorkshopClientAccessError, match="External identity"):
+                await WorkshopClientAccess(store).resolve_external_direct_human(
+                    provider=provider,
+                    external_subject=subject,
+                    transport="telegram",
+                    external_channel_id="101",
+                )
+        finally:
+            await store.close()
+
+    async def test_non_telegram_external_identity_resolves_canonically(self, tmp_path: Path):
+        store = await _store(tmp_path / "kai.db")
+        try:
+            principal_id, channel_id = await _canonical_access_ids(store)
+            await store.connection.execute(
+                "INSERT INTO external_identities "
+                "(id, principal_id, provider, external_subject, created_at) "
+                "VALUES (?, ?, 'example', 'alice', '2026-01-01T00:00:00Z')",
+                ("xid_" + "a" * 32, principal_id),
+            )
+            await store.connection.execute(
+                "INSERT INTO channel_bindings "
+                "(id, channel_id, transport, external_channel_id, created_at) "
+                "VALUES (?, ?, 'example', 'dm-alice', '2026-01-01T00:00:00Z')",
+                ("cbd_" + "b" * 32, channel_id),
+            )
+            await store.connection.commit()
+
+            resolved = await WorkshopClientAccess(store).resolve_external_direct_human(
+                provider="example",
+                external_subject="alice",
+                transport="example",
+                external_channel_id="dm-alice",
+            )
+
+            assert resolved == (principal_id, channel_id)
         finally:
             await store.close()
 

@@ -89,14 +89,6 @@ from kai.workshop.store import (
     StoredEvent,
     WorkshopEventStore,
 )
-from kai.workshop.streaming_preview import (
-    ConfirmedTelegramStreamingPreview,
-    StreamingPreviewBindingError,
-    StreamingPreviewConflictError,
-    StreamingPreviewTargetError,
-    TelegramStreamingPreviewBinding,
-    bind_confirmed_telegram_streaming_preview,
-)
 from kai.workshop.timeline import (
     ChannelTimelineAuthorizer,
     TimelineAccessDeniedError,
@@ -131,7 +123,6 @@ __all__ = [
     "ChannelTimelineAuthorizer",
     "ClientDeviceUnavailableError",
     "ClientSessionId",
-    "ConfirmedTelegramStreamingPreview",
     "DeliveryAttemptId",
     "DeliveryClaim",
     "DeliveryExecutionContract",
@@ -171,10 +162,6 @@ __all__ = [
     "RedeemedWorkshopClient",
     "StaleDeliveryLeaseError",
     "StoredEvent",
-    "StreamingPreviewBindingError",
-    "StreamingPreviewConflictError",
-    "StreamingPreviewTargetError",
-    "TelegramStreamingPreviewBinding",
     "TimelineAccessDeniedError",
     "TimelineCursorError",
     "TimelineMessage",
@@ -194,7 +181,6 @@ __all__ = [
     "WorkshopEventType",
     "WorkshopId",
     "WorkshopMembershipId",
-    "bind_confirmed_telegram_streaming_preview",
     "read_channel_timeline",
     "read_channel_timeline_updates",
     "record_inbound_artifact",
