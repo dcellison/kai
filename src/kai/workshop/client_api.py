@@ -44,6 +44,7 @@ from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.inbound import ClientInboundMessage, InboundBindingNotFoundError
 from kai.workshop.memory_queries import (
     DEFAULT_PAGE_SIZE,
+    MemoryMutationBatch,
     MemoryQueryAuthority,
     MemoryQueryFilters,
     MemoryRecordDetail,
@@ -94,6 +95,9 @@ _MEMORY_RECORDS_PATH = "/v1/memory/records"
 _MEMORY_SEARCH_PATH = "/v1/memory/search"
 _MEMORY_DETAIL_PATH = "/v1/memory/records/{memory_id}"
 _MEMORY_SOURCE_PATH = "/v1/memory/records/{memory_id}/source"
+_MEMORY_SCOPE_PATH = "/v1/memory/records/{memory_id}/scope"
+_MEMORY_BULK_SCOPE_PATH = "/v1/memory/actions/scope"
+_MEMORY_BULK_DELETE_PATH = "/v1/memory/actions/delete"
 _ALLOWED_TIMELINE_QUERY_PARAMETERS = frozenset({"cursor", "limit", "tail"})
 _ALLOWED_EVENT_QUERY_PARAMETERS = frozenset({"after_position"})
 _ALLOWED_MEMORY_FILTERS = frozenset({"kind", "source", "memory_type", "tag", "scope", "project_id"})
@@ -258,6 +262,36 @@ def _serialize_memory_source(context: MemorySourceContext) -> dict[str, object]:
     }
 
 
+def _serialize_memory_mutation(batch: MemoryMutationBatch) -> dict[str, object]:
+    def serialize_scope(scope) -> dict[str, object] | None:
+        if scope is None:
+            return None
+        return {
+            "scope": scope.scope,
+            "project_id": scope.project_id,
+            "scope_confidence": scope.scope_confidence,
+            "scope_source": scope.scope_source,
+            "legacy_defaulted": scope.legacy_defaulted,
+            "invalid_defaulted": scope.invalid_defaulted,
+            "retrievable": scope.retrievable,
+            "exclusion_reason": scope.exclusion_reason,
+        }
+
+    return {
+        "version": 1,
+        "operation": batch.operation,
+        "results": [
+            {
+                "memory_id": result.memory_id,
+                "outcome": result.outcome,
+                "prior_scope": serialize_scope(result.prior_scope),
+                "new_scope": serialize_scope(result.new_scope),
+            }
+            for result in batch.results
+        ],
+    }
+
+
 def _memory_filters(request: web.Request) -> MemoryQueryFilters:
     values: dict[str, str | None] = {}
     for field in _ALLOWED_MEMORY_FILTERS:
@@ -338,6 +372,13 @@ async def _handle_memory_stats(
                 "by_source": stats.by_source,
                 "by_type": stats.by_type,
                 "by_scope": stats.by_scope,
+                "allowed_projects": [
+                    {
+                        "project_id": project.project_id,
+                        "display_name": project.display_name,
+                    }
+                    for project in stats.allowed_projects
+                ],
             },
         },
         status=200,
@@ -443,6 +484,95 @@ async def _handle_memory_detail(
     except (KeyError, WorkshopMemoryQueryError) as exc:
         return _memory_error_response(exc)
     return _json_response(payload, status=200)
+
+
+async def _memory_mutation_payload(
+    request: web.Request,
+    *,
+    allowed_fields: frozenset[str],
+) -> dict[str, object]:
+    if request.content_type != "application/json":
+        raise WorkshopMemoryValidationError("Content-Type must be application/json")
+    try:
+        payload = await request.json()
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise WorkshopMemoryValidationError("Invalid memory mutation request") from exc
+    if not isinstance(payload, dict) or set(payload) not in (
+        allowed_fields,
+        allowed_fields - {"project_id"},
+    ):
+        raise WorkshopMemoryValidationError("Invalid memory mutation request")
+    return payload
+
+
+async def _handle_memory_scope_mutation(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+    bulk: bool,
+) -> web.Response:
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid memory mutation request")
+    assert authority is not None
+    try:
+        payload = await _memory_mutation_payload(
+            request,
+            allowed_fields=(
+                frozenset({"memory_ids", "scope", "project_id"}) if bulk else frozenset({"scope", "project_id"})
+            ),
+        )
+        memory_ids = payload.get("memory_ids") if bulk else [request.match_info["memory_id"]]
+        if not isinstance(memory_ids, list) or not all(isinstance(item, str) for item in memory_ids):
+            raise WorkshopMemoryValidationError("Memory identifiers must be a list")
+        scope = payload.get("scope")
+        project_id = payload.get("project_id")
+        if not isinstance(scope, str) or (project_id is not None and not isinstance(project_id, str)):
+            raise WorkshopMemoryValidationError("Invalid memory scope")
+        batch = await service.move_scope(
+            authority,
+            memory_ids,
+            scope=scope,
+            project_id=project_id,
+        )
+    except (KeyError, WorkshopMemoryQueryError) as exc:
+        return _memory_error_response(exc)
+    return _json_response(_serialize_memory_mutation(batch), status=200)
+
+
+async def _handle_memory_delete_mutation(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+    bulk: bool,
+) -> web.Response:
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid memory mutation request")
+    assert authority is not None
+    try:
+        if bulk:
+            payload = await _memory_mutation_payload(
+                request,
+                allowed_fields=frozenset({"memory_ids"}),
+            )
+            memory_ids = payload.get("memory_ids")
+            if not isinstance(memory_ids, list) or not all(isinstance(item, str) for item in memory_ids):
+                raise WorkshopMemoryValidationError("Memory identifiers must be a list")
+        else:
+            if request.can_read_body:
+                raise WorkshopMemoryValidationError("Delete requests cannot include a body")
+            memory_ids = [request.match_info["memory_id"]]
+        batch = await service.delete(authority, memory_ids)
+    except (KeyError, WorkshopMemoryQueryError) as exc:
+        return _memory_error_response(exc)
+    return _json_response(_serialize_memory_mutation(batch), status=200)
 
 
 async def _authenticate_settings_authority(
@@ -1900,7 +2030,7 @@ def register_workshop_read_routes(
     settings_workspaces: WorkshopSettingsWorkspaceService | None = None,
     memory_queries: WorkshopMemoryQueryService | None = None,
 ) -> None:
-    """Register the read-only contract on an explicitly supplied application."""
+    """Register authenticated Workshop client routes on an application."""
     if event_poll_interval <= 0 or event_heartbeat_interval <= 0 or event_authentication_recheck_interval <= 0:
         raise ValueError("Event-stream intervals must be positive")
     stream_limiter = event_stream_limiter or WorkshopEventStreamLimiter()
@@ -2064,11 +2194,51 @@ def register_workshop_read_routes(
                     source=True,
                 )
 
+        async def handle_memory_scope_mutation(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_scope_mutation(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                    bulk=False,
+                )
+
+        async def handle_memory_bulk_scope_mutation(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_scope_mutation(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                    bulk=True,
+                )
+
+        async def handle_memory_delete_mutation(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_delete_mutation(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                    bulk=False,
+                )
+
+        async def handle_memory_bulk_delete_mutation(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_delete_mutation(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                    bulk=True,
+                )
+
         app.router.add_get(_MEMORY_STATS_PATH, handle_memory_stats)
         app.router.add_get(_MEMORY_RECORDS_PATH, handle_memory_records)
         app.router.add_get(_MEMORY_SEARCH_PATH, handle_memory_search)
         app.router.add_get(_MEMORY_DETAIL_PATH, handle_memory_detail)
         app.router.add_get(_MEMORY_SOURCE_PATH, handle_memory_source)
+        app.router.add_patch(_MEMORY_SCOPE_PATH, handle_memory_scope_mutation)
+        app.router.add_delete(_MEMORY_DETAIL_PATH, handle_memory_delete_mutation)
+        app.router.add_post(_MEMORY_BULK_SCOPE_PATH, handle_memory_bulk_scope_mutation)
+        app.router.add_post(_MEMORY_BULK_DELETE_PATH, handle_memory_bulk_delete_mutation)
 
 
 def register_workshop_enrollment_routes(

@@ -18,7 +18,9 @@ import type {
   WorkshopMemoryFilters,
   WorkshopMemoryListOptions,
   WorkshopMemoryDetail,
+  WorkshopMemoryMutationBatch,
   WorkshopMemoryRecord,
+  WorkshopMemoryScope,
   WorkshopMemorySearch,
   WorkshopMemorySearchOptions,
   WorkshopMemorySourceContext,
@@ -460,7 +462,7 @@ function parseMemoryRecord(value: unknown): WorkshopMemoryRecord | null {
   if (!isRecord(value) || !isRecord(value.scope)) {
     return null;
   }
-  const scope = value.scope;
+  const scope = parseMemoryScope(value.scope);
   if (
     typeof value.memory_id !== "string" ||
     typeof value.kind !== "string" ||
@@ -474,15 +476,7 @@ function parseMemoryRecord(value: unknown): WorkshopMemoryRecord | null {
     typeof value.confidence !== "number" ||
     typeof value.created_at !== "string" ||
     typeof value.updated_at !== "string" ||
-    typeof scope.scope !== "string" ||
-    !["global", "project", "task"].includes(scope.scope) ||
-    (scope.project_id !== null && typeof scope.project_id !== "string") ||
-    typeof scope.scope_confidence !== "number" ||
-    typeof scope.scope_source !== "string" ||
-    typeof scope.legacy_defaulted !== "boolean" ||
-    typeof scope.invalid_defaulted !== "boolean" ||
-    typeof scope.retrievable !== "boolean" ||
-    (scope.exclusion_reason !== null && typeof scope.exclusion_reason !== "string")
+    scope === null
   ) {
     return null;
   }
@@ -493,20 +487,37 @@ function parseMemoryRecord(value: unknown): WorkshopMemoryRecord | null {
     memoryId: value.memory_id,
     memoryType: value.memory_type,
     preview: value.preview,
-    scope: {
-      exclusionReason: scope.exclusion_reason,
-      invalidDefaulted: scope.invalid_defaulted,
-      legacyDefaulted: scope.legacy_defaulted,
-      projectId: scope.project_id,
-      retrievable: scope.retrievable,
-      scope: scope.scope as "global" | "project" | "task",
-      scopeConfidence: scope.scope_confidence,
-      scopeSource: scope.scope_source,
-    },
+    scope,
     source: value.source,
     speaker: value.speaker,
     tags: value.tags as string[],
     updatedAt: value.updated_at,
+  };
+}
+
+function parseMemoryScope(value: unknown): WorkshopMemoryScope | null {
+  if (!isRecord(value) ||
+    typeof value.scope !== "string" ||
+    !["global", "project", "task"].includes(value.scope) ||
+    (value.project_id !== null && typeof value.project_id !== "string") ||
+    typeof value.scope_confidence !== "number" ||
+    typeof value.scope_source !== "string" ||
+    typeof value.legacy_defaulted !== "boolean" ||
+    typeof value.invalid_defaulted !== "boolean" ||
+    typeof value.retrievable !== "boolean" ||
+    (value.exclusion_reason !== null && typeof value.exclusion_reason !== "string")
+  ) {
+    return null;
+  }
+  return {
+    exclusionReason: value.exclusion_reason,
+    invalidDefaulted: value.invalid_defaulted,
+    legacyDefaulted: value.legacy_defaulted,
+    projectId: value.project_id,
+    retrievable: value.retrievable,
+    scope: value.scope as WorkshopMemoryScope["scope"],
+    scopeConfidence: value.scope_confidence,
+    scopeSource: value.scope_source,
   };
 }
 
@@ -523,15 +534,25 @@ export async function loadMemoryStats(token: string): Promise<WorkshopMemoryStat
   const byScope = parseCountMap(stats.by_scope);
   const bySource = parseCountMap(stats.by_source);
   const byType = parseCountMap(stats.by_type);
+  const allowedProjects = Array.isArray(stats.allowed_projects)
+    ? stats.allowed_projects.map((project) => (
+      isRecord(project) && typeof project.project_id === "string" &&
+      typeof project.display_name === "string"
+        ? { projectId: project.project_id, displayName: project.display_name }
+        : null
+    ))
+    : null;
   if (
     !Number.isSafeInteger(stats.total) ||
     !Number.isSafeInteger(stats.facts) ||
     !Number.isSafeInteger(stats.episodes) ||
-    !byScope || !bySource || !byType
+    !byScope || !bySource || !byType || !allowedProjects ||
+    allowedProjects.some((project) => project === null)
   ) {
     throw new Error("Kai returned unsupported memory statistics.");
   }
   return {
+    allowedProjects: allowedProjects as WorkshopMemoryStats["allowedProjects"],
     byScope,
     bySource,
     byType,
@@ -539,6 +560,108 @@ export async function loadMemoryStats(token: string): Promise<WorkshopMemoryStat
     facts: stats.facts as number,
     total: stats.total as number,
   };
+}
+
+function parseMemoryMutation(payload: unknown): WorkshopMemoryMutationBatch | null {
+  if (!isRecord(payload) || payload.version !== 1 ||
+    !["move_scope", "delete"].includes(String(payload.operation)) ||
+    !Array.isArray(payload.results)
+  ) {
+    return null;
+  }
+  const results = payload.results.map((value) => {
+    if (!isRecord(value) || typeof value.memory_id !== "string" ||
+      !["succeeded", "not_found", "stale", "failed"].includes(String(value.outcome))
+    ) {
+      return null;
+    }
+    const priorScope = value.prior_scope === null ? null : parseMemoryScope(value.prior_scope);
+    const newScope = value.new_scope === null ? null : parseMemoryScope(value.new_scope);
+    if ((value.prior_scope !== null && priorScope === null) ||
+      (value.new_scope !== null && newScope === null)) {
+      return null;
+    }
+    return {
+      memoryId: value.memory_id,
+      newScope,
+      outcome: value.outcome as WorkshopMemoryMutationBatch["results"][number]["outcome"],
+      priorScope,
+    };
+  });
+  if (results.some((result) => result === null)) return null;
+  return {
+    operation: payload.operation as WorkshopMemoryMutationBatch["operation"],
+    results: results as WorkshopMemoryMutationBatch["results"],
+  };
+}
+
+async function memoryMutationRequest(
+  token: string,
+  path: string,
+  options: RequestInit,
+): Promise<WorkshopMemoryMutationBatch> {
+  const response = await authorizedFetch({ channelId: "", token }, path, options);
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not update memories."));
+  }
+  const parsed = parseMemoryMutation(payload);
+  if (!parsed) throw new Error("Kai returned an unsupported memory mutation result.");
+  return parsed;
+}
+
+export async function moveMemoryScope(
+  token: string,
+  memoryId: string,
+  target: { scope: "global" } | { scope: "project"; projectId: string },
+): Promise<WorkshopMemoryMutationBatch> {
+  return memoryMutationRequest(
+    token,
+    `/v1/memory/records/${encodeURIComponent(memoryId)}/scope`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(target.scope === "global"
+        ? { scope: "global" }
+        : { scope: "project", project_id: target.projectId }),
+    },
+  );
+}
+
+export async function moveMemoriesScope(
+  token: string,
+  memoryIds: string[],
+  target: { scope: "global" } | { scope: "project"; projectId: string },
+): Promise<WorkshopMemoryMutationBatch> {
+  return memoryMutationRequest(token, "/v1/memory/actions/scope", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(target.scope === "global"
+      ? { memory_ids: memoryIds, scope: "global" }
+      : { memory_ids: memoryIds, scope: "project", project_id: target.projectId }),
+  });
+}
+
+export async function deleteMemory(
+  token: string,
+  memoryId: string,
+): Promise<WorkshopMemoryMutationBatch> {
+  return memoryMutationRequest(
+    token,
+    `/v1/memory/records/${encodeURIComponent(memoryId)}`,
+    { method: "DELETE" },
+  );
+}
+
+export async function deleteMemories(
+  token: string,
+  memoryIds: string[],
+): Promise<WorkshopMemoryMutationBatch> {
+  return memoryMutationRequest(token, "/v1/memory/actions/delete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ memory_ids: memoryIds }),
+  });
 }
 
 function memoryQueryParameters(

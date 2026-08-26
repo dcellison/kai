@@ -10,16 +10,22 @@ import {
 
 import {
   AuthenticationError,
+  deleteMemories,
+  deleteMemory,
   loadMemoryDetail,
   loadMemoryRecords,
   loadMemorySource,
   loadMemoryStats,
+  moveMemoriesScope,
+  moveMemoryScope,
   searchMemories,
 } from "./api";
 import { MarkdownMessage } from "./MarkdownMessage";
 import type {
   WorkshopMemoryDetail,
   WorkshopMemoryFilters,
+  WorkshopMemoryMutationBatch,
+  WorkshopMemoryProjectOption,
   WorkshopMemoryRecord,
   WorkshopMemoryScope,
   WorkshopMemorySearchHit,
@@ -109,18 +115,27 @@ function episodeLabel(key: string): string {
 }
 
 function MemoryDetailPane({
+  allowedProjects,
+  busy,
   detail,
   error,
   loading,
+  onDelete,
+  onMove,
   source,
   sourceError,
 }: {
+  allowedProjects: WorkshopMemoryProjectOption[];
+  busy: boolean;
   detail: WorkshopMemoryDetail | null;
   error: string | null;
   loading: boolean;
+  onDelete: (memoryId: string) => void;
+  onMove: (memoryId: string, target: string) => void;
   source: WorkshopMemorySourceContext | null;
   sourceError: string | null;
 }): React.JSX.Element {
+  const [target, setTarget] = useState("global");
   if (loading) {
     return <p className="memory-detail-state" role="status">Loading memory details…</p>;
   }
@@ -176,6 +191,34 @@ function MemoryDetailPane({
           <div><dt>Source</dt><dd>{detail.source}</dd></div>
           <div><dt>Updated</dt><dd>{formatDate(detail.updatedAt)}</dd></div>
         </dl>
+      </section>
+
+      <section className="memory-detail-section memory-management">
+        <p className="memory-section-label">Manage memory</p>
+        <label>
+          Move to
+          <select value={target} onChange={(event) => setTarget(event.target.value)}>
+            <option value="global">Global scope</option>
+            {allowedProjects.map((project) => (
+              <option key={project.projectId} value={`project:${project.projectId}`}>
+                {project.displayName}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div>
+          <button type="button" disabled={busy} onClick={() => onMove(detail.memoryId, target)}>
+            Move memory…
+          </button>
+          <button
+            className="danger"
+            type="button"
+            disabled={busy}
+            onClick={() => onDelete(detail.memoryId)}
+          >
+            Forget memory…
+          </button>
+        </div>
       </section>
 
       <section className="memory-detail-section recall-preview">
@@ -261,12 +304,22 @@ export function MemoryExplorer({
   const [loadingMore, setLoadingMore] = useState(false);
   const [listError, setListError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [detailRefreshKey, setDetailRefreshKey] = useState(0);
   const [selectedMemoryId, setSelectedMemoryId] = useState<string | null>(initialMemoryId);
   const [detail, setDetail] = useState<WorkshopMemoryDetail | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [detailLoading, setDetailLoading] = useState(initialMemoryId !== null);
   const [source, setSource] = useState<WorkshopMemorySourceContext | null>(null);
   const [sourceError, setSourceError] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [bulkTarget, setBulkTarget] = useState("global");
+  const [pendingMutation, setPendingMutation] = useState<{
+    ids: string[];
+    operation: "move_scope" | "delete";
+    target?: string;
+  } | null>(null);
+  const [mutationRunning, setMutationRunning] = useState(false);
+  const [mutationReport, setMutationReport] = useState<string | null>(null);
   const recordRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
   useEffect(() => {
@@ -386,7 +439,7 @@ export function MemoryExplorer({
       setDetailLoading(false);
     });
     return () => { cancelled = true; };
-  }, [handleError, selectedMemoryId, token]);
+  }, [detailRefreshKey, handleError, selectedMemoryId, token]);
 
   const projectIds = useMemo(() => {
     if (!stats) return [];
@@ -396,6 +449,8 @@ export function MemoryExplorer({
       .filter(Boolean)
       .sort();
   }, [stats]);
+
+  const allowedProjects = stats?.allowedProjects ?? [];
 
   const selectMemory = useCallback((memoryId: string): void => {
     setSelectedMemoryId(memoryId);
@@ -407,8 +462,79 @@ export function MemoryExplorer({
     setRecords([]);
     setSearchHits([]);
     setNextCursor(null);
+    setSelectedIds(new Set());
     onSelectMemory(null);
   };
+
+  const toggleSelected = (memoryId: string): void => {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (next.has(memoryId)) next.delete(memoryId);
+      else next.add(memoryId);
+      return next;
+    });
+  };
+
+  const mutationSummary = (batch: WorkshopMemoryMutationBatch): string => {
+    const counts = { succeeded: 0, not_found: 0, stale: 0, failed: 0 };
+    for (const result of batch.results) counts[result.outcome] += 1;
+    const parts = [`${counts.succeeded} succeeded`];
+    if (counts.stale) parts.push(`${counts.stale} became stale`);
+    if (counts.not_found) parts.push(`${counts.not_found} no longer existed`);
+    if (counts.failed) parts.push(`${counts.failed} failed`);
+    return `${batch.operation === "delete" ? "Forget" : "Scope change"}: ${parts.join(", ")}.`;
+  };
+
+  const runMutation = async (): Promise<void> => {
+    if (!pendingMutation) return;
+    setMutationRunning(true);
+    setMutationReport(null);
+    try {
+      let batch: WorkshopMemoryMutationBatch;
+      if (pendingMutation.operation === "delete") {
+        batch = pendingMutation.ids.length === 1
+          ? await deleteMemory(token, pendingMutation.ids[0]!)
+          : await deleteMemories(token, pendingMutation.ids);
+      } else {
+        const target = pendingMutation.target ?? "global";
+        const parsedTarget = target.startsWith("project:")
+          ? { scope: "project" as const, projectId: target.slice("project:".length) }
+          : { scope: "global" as const };
+        batch = pendingMutation.ids.length === 1
+          ? await moveMemoryScope(token, pendingMutation.ids[0]!, parsedTarget)
+          : await moveMemoriesScope(token, pendingMutation.ids, parsedTarget);
+      }
+      setMutationReport(mutationSummary(batch));
+      const reconciled = new Set(
+        batch.results
+          .filter((result) => result.outcome !== "failed")
+          .map((result) => result.memoryId),
+      );
+      setSelectedIds((current) => new Set([...current].filter((id) => !reconciled.has(id))));
+      if (pendingMutation.operation === "delete") {
+        setRecords((current) => current.filter((record) => !reconciled.has(record.memoryId)));
+        setSearchHits((current) => current.filter((hit) => !reconciled.has(hit.record.memoryId)));
+      }
+      if (selectedMemoryId && reconciled.has(selectedMemoryId) && pendingMutation.operation === "delete") {
+        setSelectedMemoryId(null);
+        onSelectMemory(null);
+      }
+      setPendingMutation(null);
+      setRefreshKey((value) => value + 1);
+      setDetailRefreshKey((value) => value + 1);
+    } catch (caught) {
+      setMutationReport(handleError(caught, "Could not update memories."));
+      setPendingMutation(null);
+    } finally {
+      setMutationRunning(false);
+    }
+  };
+
+  const recordsForConfirmation = pendingMutation?.ids.map((memoryId) => ({
+    memoryId,
+    preview: displayedRecords.find((record) => record.memoryId === memoryId)?.preview
+      ?? (detail?.memoryId === memoryId ? detail.preview : memoryId),
+  })) ?? [];
 
   const loadMore = async (): Promise<void> => {
     if (!nextCursor || loadingMore || searchQuery) return;
@@ -621,6 +747,41 @@ export function MemoryExplorer({
             </label>
           </div>
 
+          {mutationReport && <p className="memory-mutation-report" role="status">{mutationReport}</p>}
+
+          {selectedIds.size > 0 && (
+            <section className="memory-bulk-actions" aria-label="Selected memory actions">
+              <strong>{selectedIds.size} selected</strong>
+              <select
+                aria-label="Move selected memories to"
+                value={bulkTarget}
+                onChange={(event) => setBulkTarget(event.target.value)}
+              >
+                <option value="global">Global scope</option>
+                {allowedProjects.map((project) => (
+                  <option key={project.projectId} value={`project:${project.projectId}`}>
+                    {project.displayName}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                onClick={() => setPendingMutation({
+                  ids: [...selectedIds], operation: "move_scope", target: bulkTarget,
+                })}
+              >
+                Move selected…
+              </button>
+              <button
+                className="danger"
+                type="button"
+                onClick={() => setPendingMutation({ ids: [...selectedIds], operation: "delete" })}
+              >
+                Forget selected…
+              </button>
+            </section>
+          )}
+
           {listError ? (
             <div className="memory-list-state error" role="alert">
               <p>{listError}</p>
@@ -636,7 +797,14 @@ export function MemoryExplorer({
           ) : (
             <div className="memory-record-list" role="listbox" aria-label="Memory results">
               {displayedRecords.map((record, index) => (
-                <button
+                <div className="memory-record-row" key={record.memoryId}>
+                  <input
+                    type="checkbox"
+                    aria-label={`Select ${record.preview || record.memoryId}`}
+                    checked={selectedIds.has(record.memoryId)}
+                    onChange={() => toggleSelected(record.memoryId)}
+                  />
+                  <button
                   key={record.memoryId}
                   ref={(element) => { recordRefs.current[index] = element; }}
                   type="button"
@@ -657,7 +825,8 @@ export function MemoryExplorer({
                     )}
                   </span>
                   <time>{formatDate(record.updatedAt)}</time>
-                </button>
+                  </button>
+                </div>
               ))}
             </div>
           )}
@@ -677,13 +846,57 @@ export function MemoryExplorer({
 
       <aside className="memory-detail-pane" aria-label="Memory detail">
         <MemoryDetailPane
+          allowedProjects={allowedProjects}
+          busy={mutationRunning}
           detail={detail}
           error={detailError}
           loading={detailLoading}
+          onDelete={(memoryId) => setPendingMutation({ ids: [memoryId], operation: "delete" })}
+          onMove={(memoryId, target) => setPendingMutation({
+            ids: [memoryId], operation: "move_scope", target,
+          })}
           source={source}
           sourceError={sourceError}
         />
       </aside>
+
+      {pendingMutation && (
+        <div className="memory-confirm-backdrop">
+          <section className="memory-confirm" role="dialog" aria-modal="true" aria-labelledby="memory-confirm-title">
+            <p className="overline">Confirm memory change</p>
+            <h2 id="memory-confirm-title">
+              {pendingMutation.operation === "delete"
+                ? `Forget ${pendingMutation.ids.length} ${pendingMutation.ids.length === 1 ? "memory" : "memories"}?`
+                : `Move ${pendingMutation.ids.length} ${pendingMutation.ids.length === 1 ? "memory" : "memories"}?`}
+            </h2>
+            <p>
+              {pendingMutation.operation === "delete"
+                ? "These records will be permanently removed from recall and cannot be restored here."
+                : `Their recall scope will change to ${pendingMutation.target?.startsWith("project:")
+                  ? `project ${pendingMutation.target.slice("project:".length)}`
+                  : "global"}.`}
+            </p>
+            <ul>
+              {recordsForConfirmation.map((record) => (
+                <li key={record.memoryId}>{record.preview}</li>
+              ))}
+            </ul>
+            <div>
+              <button type="button" className="quiet-button" disabled={mutationRunning} onClick={() => setPendingMutation(null)}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className={pendingMutation.operation === "delete" ? "danger" : ""}
+                disabled={mutationRunning}
+                onClick={() => void runMutation()}
+              >
+                {mutationRunning ? "Applying…" : pendingMutation.operation === "delete" ? "Forget permanently" : "Confirm move"}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
     </section>
   );
 }

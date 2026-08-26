@@ -3,6 +3,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   EventStreamDecoder,
   cancelRun,
+  deleteMemories,
+  deleteMemory,
   loadArtifactBlob,
   loadEarlierTimeline,
   loadMemoryDetail,
@@ -12,6 +14,8 @@ import {
   loadNavigation,
   loadRun,
   loadTimeline,
+  moveMemoriesScope,
+  moveMemoryScope,
   redeemEnrollment,
   searchMemories,
   submitCommand,
@@ -164,6 +168,7 @@ describe("Workshop client API", () => {
           by_source: { extracted: 1 },
           by_type: { fact: 1 },
           by_scope: { global: 1 },
+          allowed_projects: [{ project_id: "kai", display_name: "Kai" }],
         },
       }),
       Response.json({ version: 1, records: [memoryRecord()], next_cursor: null }),
@@ -265,6 +270,48 @@ describe("Workshop client API", () => {
     await expect(loadMemoryRecords("session-secret")).rejects.toThrow(
       "Kai returned an unsupported memory record.",
     );
+  });
+
+  it("sends typed memory management requests and parses per-target outcomes", async () => {
+    const response = (operation: "move_scope" | "delete", ids: string[]) => Response.json({
+      version: 1,
+      operation,
+      results: ids.map((memoryId) => ({
+        memory_id: memoryId,
+        outcome: "succeeded",
+        prior_scope: null,
+        new_scope: null,
+      })),
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response("move_scope", ["memory-1"]))
+      .mockResolvedValueOnce(response("move_scope", ["memory-1", "memory-2"]))
+      .mockResolvedValueOnce(response("delete", ["memory-1"]))
+      .mockResolvedValueOnce(response("delete", ["memory-1", "memory-2"]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await moveMemoryScope("session-secret", "memory-1", {
+      scope: "project",
+      projectId: "kai",
+    });
+    await moveMemoriesScope("session-secret", ["memory-1", "memory-2"], {
+      scope: "global",
+    });
+    await deleteMemory("session-secret", "memory-1");
+    const deleted = await deleteMemories("session-secret", ["memory-1", "memory-2"]);
+
+    expect(deleted.results.map((result) => result.memoryId)).toEqual(["memory-1", "memory-2"]);
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      "/v1/memory/records/memory-1/scope",
+      "/v1/memory/actions/scope",
+      "/v1/memory/records/memory-1",
+      "/v1/memory/actions/delete",
+    ]);
+    expect(JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string)).toEqual({
+      scope: "project",
+      project_id: "kai",
+    });
+    expect((fetchMock.mock.calls[2]?.[1] as RequestInit).method).toBe("DELETE");
   });
 
   it("rejects an earlier page whose snapshot bound does not match", async () => {
