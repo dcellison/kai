@@ -548,7 +548,7 @@ async def test_agent_firing_completes_through_real_canonical_coordinator(
     try:
         terminal_row = None
         async with asyncio.timeout(5):
-            while terminal_row is None:
+            while terminal_row is None or str(terminal_row[0]) not in {"succeeded", "failed"}:
                 async with source_store.connection.execute(
                     "SELECT f.status, r.status, result.body FROM workshop_schedule_firings f "
                     "JOIN runs r ON r.id = f.run_id "
@@ -557,7 +557,7 @@ async def test_agent_firing_completes_through_real_canonical_coordinator(
                     (job_id,),
                 ) as cursor:
                     terminal_row = await cursor.fetchone()
-                if terminal_row is None:
+                if terminal_row is None or str(terminal_row[0]) not in {"succeeded", "failed"}:
                     await asyncio.sleep(0.02)
         assert tuple(terminal_row) == (
             "succeeded",
