@@ -113,7 +113,9 @@ async def _inventory(
             "AND membership.role = 'owner' AND membership.principal_id = subscription.principal_id",
             (runtime_profile_id,),
         ) as cursor:
-            github = int((await cursor.fetchone())[0])
+            github_row = await cursor.fetchone()
+        assert github_row is not None
+        github = int(github_row[0])
         return (0, 0, 0, 0, 0, github, 0, 0)
 
     async with connection.execute(
@@ -137,7 +139,9 @@ async def _inventory(
             "Canonical execution and operational migrations must complete before runtime-key cutover"
         )
     async with connection.execute("SELECT COUNT(*) FROM sessions WHERE chat_id = ?", (legacy_key,)) as cursor:
-        session_rows = int((await cursor.fetchone())[0])
+        session_row = await cursor.fetchone()
+    assert session_row is not None
+    session_rows = int(session_row[0])
     return (
         int(execution[0]),
         int(execution[1]),

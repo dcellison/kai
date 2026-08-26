@@ -882,7 +882,6 @@ class _CanonicalMemoryNamespace(Protocol):
     @property
     def runtime_profile_id(self) -> object: ...
 
-    @property
     def require_legacy_runtime_key(self) -> int: ...
 
 
