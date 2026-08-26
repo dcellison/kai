@@ -53,6 +53,11 @@ class WorkshopRuntimePool:
         profile_id = self._profiles.resolve(runtime_profile_id).profile_id
         return self._pool.get_model(profile_id)
 
+    def is_running(self, runtime_profile_id: str | RuntimeProfileId) -> bool:
+        """Return whether this protected profile currently has a live backend."""
+        profile_id = self._profiles.resolve(runtime_profile_id).profile_id
+        return self._pool.get_if_exists(profile_id) is not None
+
     def get_role_model(
         self,
         runtime_profile_id: str | RuntimeProfileId,
@@ -122,7 +127,13 @@ class WorkshopRuntimePool:
         model: str,
         timeout_seconds: int,
     ) -> None:
-        """Apply a complete effective configuration without spawning a runtime."""
+        """Apply effective config, restarting an existing runtime exactly once.
+
+        Every backend's ``change_workspace`` contract kills its current
+        subprocess before applying the replacement configuration.  Calling a
+        second explicit restart would therefore be redundant and can add a
+        second shutdown delay.
+        """
         profile_id = self._profiles.resolve(runtime_profile_id).profile_id
         instance = self._pool.get_if_exists(profile_id)
         if instance is None:

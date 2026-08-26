@@ -1073,6 +1073,30 @@ def _resolve_eval_provider(context: str) -> str:
     )
 
 
+def models_for_backend_policy(
+    agent_backend: str,
+    eff_provider: str,
+    *,
+    allowed_models: tuple[str, ...] | None,
+) -> dict[str, str] | None:
+    """Return curated models constrained by an already-resolved policy."""
+    if agent_backend == "codex":
+        models = CODEX_MODELS
+    elif agent_backend in {"opencode", "pi"} or eff_provider in OPEN_ENDED_PROVIDERS:
+        return None
+    else:
+        models = PROVIDER_MODELS.get(eff_provider)
+
+    if models is None or allowed_models is None:
+        return models
+    filtered = {
+        model: label
+        for model, label in models.items()
+        if _model_allowed_by_registry(model, agent_backend, allowed_models)
+    }
+    return filtered or None
+
+
 def models_for_backend(agent_backend: str, eff_provider: str) -> dict[str, str] | None:
     """Curated model list for the given (backend, provider) pair.
 
@@ -1095,25 +1119,11 @@ def models_for_backend(agent_backend: str, eff_provider: str) -> dict[str, str] 
     `claude-*` allow typed full IDs, but they are not rendered as
     literal keyboard choices.
     """
-    if agent_backend == "codex":
-        models = CODEX_MODELS
-    elif agent_backend in {"opencode", "pi"} or eff_provider in OPEN_ENDED_PROVIDERS:
-        return None
-    else:
-        models = PROVIDER_MODELS.get(eff_provider)
-
-    if models is None:
-        return None
-
-    registry_allowed = _backend_registry_allowed_models(agent_backend)
-    if registry_allowed is None:
-        return models
-    filtered = {
-        model: label
-        for model, label in models.items()
-        if _model_allowed_by_registry(model, agent_backend, registry_allowed)
-    }
-    return filtered or None
+    return models_for_backend_policy(
+        agent_backend,
+        eff_provider,
+        allowed_models=_backend_registry_allowed_models(agent_backend),
+    )
 
 
 def get_user_backend_and_provider(user_config: "UserConfig | None", config: "Config") -> tuple[str, str]:

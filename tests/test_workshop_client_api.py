@@ -74,10 +74,12 @@ from kai.workshop.run_lifecycle import (
 )
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
 from kai.workshop.settings_workspaces import (
+    EditableCapability,
     EffectiveValue,
     ModelOption,
     SettingsWorkspaceSnapshot,
     WorkshopSettingsWorkspaceAccessDenied,
+    WorkshopSettingsWorkspaceConflict,
     WorkspaceConfigSnapshot,
     WorkspaceOption,
 )
@@ -181,26 +183,46 @@ class _SettingsWorkspaces:
     channel_id: ChannelId
     switched: list[str] = field(default_factory=list)
     workspace_config_changes: list[tuple[str, str]] = field(default_factory=list)
+    runtime_changes: list[tuple[str, object]] = field(default_factory=list)
 
     def authority_for_principal_channel(self, principal_id, channel_id):
         if principal_id != self.principal_id or channel_id != self.channel_id:
             raise WorkshopSettingsWorkspaceAccessDenied("denied")
         return SimpleNamespace(principal_id=principal_id, channel_id=channel_id)
 
+    @staticmethod
+    def _check_revision(expected, current: str) -> None:
+        if expected != current:
+            raise WorkshopSettingsWorkspaceConflict("stale settings")
+
     async def inspect(self, _authority):
         return self._snapshot()
 
-    async def switch_workspace(self, _authority, path: str):
+    async def switch_workspace(self, _authority, path: str, *, expected_revision=None):
+        self._check_revision(expected_revision, "sws_current")
         self.switched.append(path)
         return self._snapshot(workspace=path)
 
-    async def set_model(self, _authority, _model: str):
+    async def set_model(
+        self,
+        _authority,
+        _model: str,
+        *,
+        expected_revision=None,
+        clear_workspace_override=True,
+    ):
+        self._check_revision(expected_revision, "sws_current")
+        self.runtime_changes.append(("model", _model))
         return self._snapshot()
 
-    async def set_timeout(self, _authority, _timeout: int):
+    async def set_timeout(self, _authority, _timeout: int, *, expected_revision=None):
+        self._check_revision(expected_revision, "sws_current")
+        self.runtime_changes.append(("timeout", _timeout))
         return self._snapshot()
 
-    async def reset_settings(self, _authority, _field=None):
+    async def reset_settings(self, _authority, _field=None, *, expected_revision=None):
+        self._check_revision(expected_revision, "sws_current")
+        self.runtime_changes.append(("reset", _field or "all"))
         return self._snapshot()
 
     async def workspace_config(self, _authority):
@@ -213,7 +235,9 @@ class _SettingsWorkspaces:
         field: str,
         value: str,
         workspace_path: str | None = None,
+        expected_revision: str | None = None,
     ):
+        self._check_revision(expected_revision, "sws_workspace")
         self.workspace_config_changes.append((field, value))
         return self._workspace_config_snapshot()
 
@@ -223,9 +247,17 @@ class _SettingsWorkspaces:
         *,
         field: str | None = None,
         workspace_path: str | None = None,
+        expected_revision: str | None = None,
     ):
+        self._check_revision(expected_revision, "sws_workspace")
         self.workspace_config_changes.append(("reset", field or "all"))
         return self._workspace_config_snapshot()
+
+    async def set_self_service_workspace_config(self, *args, **kwargs):
+        return await self.set_workspace_config(*args, **kwargs)
+
+    async def reset_self_service_workspace_config(self, *args, **kwargs):
+        return await self.reset_workspace_config(*args, **kwargs)
 
     def _snapshot(self, *, workspace: str = "/srv/kai"):
         return SettingsWorkspaceSnapshot(
@@ -234,24 +266,28 @@ class _SettingsWorkspaces:
             runtime_profile_id=profile_id(101),
             backend="codex",
             provider="openai",
-            model=EffectiveValue("gpt-5.6-sol", "runtime policy"),
-            timeout_seconds=EffectiveValue(120, "runtime policy"),
+            model=EffectiveValue("gpt-5.6-sol", "runtime policy", "gpt-5.6-sol"),
+            timeout_seconds=EffectiveValue(120, "runtime policy", 120),
             workspace=workspace,
             model_options=(ModelOption("gpt-5.6-sol", "GPT-5.6 Sol"),),
             workspaces=(WorkspaceOption(workspace, "kai", True, False),),
+            revision="sws_current",
+            capabilities=(EditableCapability("model", "runtime", "model_id", True),),
         )
 
     @staticmethod
     def _workspace_config_snapshot() -> WorkspaceConfigSnapshot:
         return WorkspaceConfigSnapshot(
             workspace="/srv/kai",
-            model=EffectiveValue("gpt-5.6-sol", "runtime policy"),
-            timeout_seconds=EffectiveValue(120, "runtime policy"),
+            model=EffectiveValue("gpt-5.6-sol", "runtime policy", "gpt-5.6-sol"),
+            timeout_seconds=EffectiveValue(120, "runtime policy", 120),
             environment_keys=("SAFE_KEY",),
             prompt=None,
             has_prompt=False,
             prompt_source=None,
             override_fields=(),
+            revision="sws_workspace",
+            capabilities=(EditableCapability("prompt", "workspace", "text", True),),
         )
 
 
@@ -975,17 +1011,42 @@ class TestWorkshopSettingsWorkspaceHTTPContract:
                     "Authorization": "Bearer alice-token",
                     "Content-Type": "application/json",
                 },
-                json={"path": "/srv/other"},
+                json={"path": "/srv/other", "revision": "sws_current"},
+            )
+            changed = await client.patch(
+                f"/v1/channels/{alice_channel}/settings",
+                headers={
+                    "Authorization": "Bearer alice-token",
+                    "Content-Type": "application/json",
+                },
+                json={"timeout_seconds": 180, "revision": "sws_current"},
             )
 
             assert settings.status == 200
-            assert (await settings.json())["model"] == {
+            settings_payload = await settings.json()
+            assert settings_payload["model"] == {
                 "value": "gpt-5.6-sol",
                 "source": "runtime policy",
+                "default_value": "gpt-5.6-sol",
             }
+            assert settings_payload["revision"] == "sws_current"
+            assert settings_payload["capabilities"] == [
+                {
+                    "field": "model",
+                    "scope": "runtime",
+                    "value_type": "model_id",
+                    "resettable": True,
+                    "choices": None,
+                    "minimum": None,
+                    "maximum": None,
+                }
+            ]
+            assert settings_payload["mutation"] is None
             assert switched.status == 200
             assert (await switched.json())["workspace"] == "/srv/other"
+            assert changed.status == 200
             assert service.switched == ["/srv/other"]
+            assert service.runtime_changes == [("timeout", 180)]
         finally:
             await client.close()
             await store.close()
@@ -1012,7 +1073,11 @@ class TestWorkshopSettingsWorkspaceHTTPContract:
                     "Authorization": "Bearer alice-token",
                     "Content-Type": "application/json",
                 },
-                json={"field": "timeout", "value": "180"},
+                json={
+                    "field": "timeout",
+                    "value": "180",
+                    "revision": "sws_workspace",
+                },
             )
 
             assert current.status == 200
@@ -1075,6 +1140,48 @@ class TestWorkshopSettingsWorkspaceHTTPContract:
             assert response.status == 403
             assert (await response.json())["error"]["code"] == "access_denied"
             assert service.switched == []
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_stale_revision_and_environment_edit_fail_without_mutation(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        service = _SettingsWorkspaces(alice_id, alice_channel)
+        client = await _open_client(
+            store,
+            _Authenticator({"alice-token": alice_id}),
+            settings_workspaces=service,
+        )
+        headers = {
+            "Authorization": "Bearer alice-token",
+            "Content-Type": "application/json",
+        }
+        try:
+            stale = await client.patch(
+                f"/v1/channels/{alice_channel}/settings",
+                headers=headers,
+                json={"timeout_seconds": 180, "revision": "sws_stale"},
+            )
+            environment = await client.patch(
+                f"/v1/channels/{alice_channel}/workspace-config",
+                headers=headers,
+                json={
+                    "field": "env",
+                    "value": '{"SECRET":"must-not-be-returned"}',
+                    "revision": "sws_workspace",
+                },
+            )
+
+            assert stale.status == 409
+            assert (await stale.json())["error"]["code"] == "settings_conflict"
+            assert environment.status == 400
+            environment_payload = await environment.json()
+            assert environment_payload["error"]["code"] == "invalid_setting"
+            assert "must-not-be-returned" not in repr(environment_payload)
+            assert service.workspace_config_changes == []
         finally:
             await client.close()
             await store.close()

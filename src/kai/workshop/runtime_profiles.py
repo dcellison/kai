@@ -62,6 +62,7 @@ class ProtectedRuntimeProfile:
     home_workspace: Path | None
     workspace_base: Path | None
     allowed_workspaces: tuple[Path, ...]
+    allowed_models: tuple[str, ...] | None = None
     role_models: tuple[tuple[str, str], ...] = ()
     github_repos: tuple[str, ...] = ()
     pr_review: bool | None = None
@@ -453,6 +454,7 @@ class WorkshopRuntimeProfileRegistry:
                         raw_profile.get("allowed_workspaces"),
                         profile_id=profile_id,
                     ),
+                    allowed_models=allowed_models,
                     role_models=tuple(sorted(role_models)),
                     github_repos=tuple(sorted({item.strip().lower() for item in raw_github_repos})),
                     pr_review=raw_pr_review,

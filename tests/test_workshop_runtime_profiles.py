@@ -578,6 +578,37 @@ def test_document_enforces_loaded_backend_registry_model_ceiling():
         )
 
 
+def test_document_retains_loaded_model_ceiling_for_self_service_policy():
+    profile_id = RuntimeProfileId("rtp_39393939393939393939393939393939")
+    backend = BackendRegistryEntry(
+        id="codex",
+        driver="codex",
+        runtime="local_process",
+        command="/usr/local/bin/codex",
+        allowed_models=("gpt-5.4", "gpt-5.5"),
+    )
+
+    registry = WorkshopRuntimeProfileRegistry.from_document(
+        {
+            "version": 1,
+            "runtime_profiles": {
+                str(profile_id): {
+                    "display_name": "Bounded model policy",
+                    "backend": "codex",
+                    "provider": "openai",
+                    "model": "gpt-5.4",
+                    "timeout_seconds": 120,
+                    "allowed_services": [],
+                    "allowed_workspaces": [],
+                }
+            },
+        },
+        backend_registry={"codex": backend},
+    )
+
+    assert registry.resolve(profile_id).allowed_models == ("gpt-5.4", "gpt-5.5")
+
+
 def test_document_rejects_unknown_backend_registry_entry_type():
     profile_id = RuntimeProfileId("rtp_39393939393939393939393939393939")
 

@@ -1627,6 +1627,75 @@ async def delete_all_canonical_user_settings(
     await _get_db().commit()
 
 
+async def replace_canonical_settings_state(
+    namespace: WorkshopExecutionStateNamespace,
+    execution_settings: dict[str, str],
+    *,
+    workspace_path: str | None = None,
+    workspace_settings: dict[str, str] | None = None,
+) -> None:
+    """Atomically replace one lane's mutable settings state.
+
+    The settings/workspace application service uses this for both forward
+    mutations and compensation after a live-runtime failure.  Keeping the two
+    canonical tables in one SQLite transaction prevents a runtime-level model
+    change and its optional workspace-override removal from becoming partially
+    durable.
+    """
+    if set(execution_settings) - {"model", "timeout", "workspace"}:
+        raise ValueError("Unsupported canonical execution setting")
+    if workspace_settings is not None:
+        if workspace_path is None:
+            raise ValueError("workspace_path is required with workspace_settings")
+        if set(workspace_settings) - {"model", "timeout", "env", "prompt"}:
+            raise ValueError("Unsupported canonical workspace setting")
+
+    db = _get_db()
+    await db.execute("BEGIN IMMEDIATE")
+    try:
+        await db.execute(
+            "DELETE FROM channel_agent_execution_settings WHERE channel_id = ? AND agent_id = ?",
+            (namespace.channel_id, namespace.agent_id),
+        )
+        for field, value in sorted(execution_settings.items()):
+            await db.execute(
+                "INSERT INTO channel_agent_execution_settings "
+                "(channel_id, agent_id, runtime_profile_id, field, value) VALUES (?, ?, ?, ?, ?)",
+                (
+                    namespace.channel_id,
+                    namespace.agent_id,
+                    namespace.runtime_profile_id,
+                    field,
+                    value,
+                ),
+            )
+        if workspace_settings is not None:
+            assert workspace_path is not None
+            await db.execute(
+                "DELETE FROM channel_agent_workspace_settings "
+                "WHERE channel_id = ? AND agent_id = ? AND workspace_path = ?",
+                (namespace.channel_id, namespace.agent_id, workspace_path),
+            )
+            for field, value in sorted(workspace_settings.items()):
+                await db.execute(
+                    "INSERT INTO channel_agent_workspace_settings "
+                    "(channel_id, agent_id, runtime_profile_id, workspace_path, field, value) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        namespace.channel_id,
+                        namespace.agent_id,
+                        namespace.runtime_profile_id,
+                        workspace_path,
+                        field,
+                        value,
+                    ),
+                )
+        await db.commit()
+    except BaseException:
+        await db.rollback()
+        raise
+
+
 async def clear_canonical_runtime_session(
     namespace: WorkshopExecutionStateNamespace,
 ) -> None:

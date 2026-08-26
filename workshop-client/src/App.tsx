@@ -828,7 +828,10 @@ function WorkshopView({
     body: string,
     artifact: File | null,
   ) => Promise<CommandSubmissionResult>;
-  onSwitchWorkspace: (path: string) => Promise<WorkshopSettingsWorkspace>;
+  onSwitchWorkspace: (
+    path: string,
+    revision: string,
+  ) => Promise<WorkshopSettingsWorkspace>;
 }): React.JSX.Element {
   const channelId = channel.channelId;
   const memoryOpen = memoryDestination !== null;
@@ -929,7 +932,9 @@ function WorkshopView({
     setSettingsWorkspaceError(null);
     setSwitchingWorkspace(true);
     try {
-      setSettingsWorkspace(await onSwitchWorkspace(path));
+      setSettingsWorkspace(
+        await onSwitchWorkspace(path, settingsWorkspace.revision),
+      );
       setActiveRun(null);
     } catch (caught) {
       setSettingsWorkspaceError(
@@ -1977,7 +1982,8 @@ function ActiveWorkshopClient({
     [session, withAccessHandling],
   );
   const switchSelectedWorkspace = useCallback(
-    (path: string) => withAccessHandling(() => switchWorkspace(session, path)),
+    (path: string, revision: string) =>
+      withAccessHandling(() => switchWorkspace(session, path, revision)),
     [session, withAccessHandling],
   );
   if (!selected) {
