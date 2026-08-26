@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kai"
-version = "2.0.0"
+version = "2.1.0"
 description = "Personal AI assistant with pluggable clients and coding-agent backends"
 license = "Apache-2.0"
 requires-python = ">=3.13"
