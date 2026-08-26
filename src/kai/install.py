@@ -125,6 +125,7 @@ _DEPLOYED_ENV_FILE = Path("/etc/kai/env")
 # steered outside DATA_DIR/memory/<name>/MEMORY.md. memory_backup.py
 # hardcodes the same path; keep them in sync.
 PRINCIPAL_MEMORY_READER = Path("/etc/kai/read-principal-memory")
+PRINCIPAL_PREFERENCE_MANAGER = Path("/etc/kai/manage-principal-preferences")
 
 # Default installation paths
 _DEFAULT_INSTALL_DIR = "/opt/kai"
@@ -4070,6 +4071,53 @@ def _generate_principal_memory_reader(data_dir: str) -> str:
     """)
 
 
+def _generate_principal_preference_manager(
+    data_dir: str,
+    install_dir: str = "/opt/kai",
+) -> str:
+    """Generate the fixed root wrapper for canonical preference operations.
+
+    The service cannot traverse foreign OS users' mode-0700 preference
+    directories.  This wrapper executes only Kai's installed, root-owned
+    preference module with a fixed data root; the caller can select an opaque
+    principal and one of the module's bounded operations, but never a path or
+    Python entry point.
+    """
+    python = repr(str(Path(install_dir) / "venv" / "bin" / "python"))
+    fixed_data_dir = repr(str(Path(data_dir)))
+    return textwrap.dedent(f"""\
+        #!/usr/bin/python3
+        # Kai - manage one canonical per-principal PREFERENCES.md.
+        # Managed by 'python -m kai install apply'. Do not edit manually.
+        import os
+        import sys
+
+        PYTHON = {python}
+        DATA_DIR = {fixed_data_dir}
+
+
+        def main() -> int:
+            argv = [
+                PYTHON,
+                "-I",
+                "-m",
+                "kai.workshop.preferences",
+                "--helper",
+                DATA_DIR,
+                *sys.argv[1:],
+            ]
+            os.execve(
+                PYTHON,
+                argv,
+                {{"LANG": "C.UTF-8", "PATH": "/usr/bin:/bin"}},
+            )
+            return 1
+
+
+        sys.exit(main())
+    """)
+
+
 def _generate_sudoers(
     service_user: str,
     os_users: Iterable[str] = (),
@@ -4155,6 +4203,7 @@ def _generate_sudoers(
     # OS user, so single-user installs never carry the grant.
     if target_users:
         rules += f"{service_user} ALL=(root) NOPASSWD: {PRINCIPAL_MEMORY_READER} *\n"
+        rules += f"{service_user} ALL=(root) NOPASSWD: {PRINCIPAL_PREFERENCE_MANAGER} *\n"
 
     if target_users:
         # In protected installs, these arguments come from
@@ -6816,6 +6865,7 @@ def _cmd_apply() -> None:
             service_user,
             dry_run,
             data_dir=data_dir,
+            install_dir=install_dir,
             agent_backend=agent_backend,
             runtime_profiles=runtime_policy,
         )
@@ -8548,6 +8598,7 @@ def _apply_sudoers(
     dry_run: bool,
     users_yaml_path: str | Path | None = None,
     data_dir: str | None = None,
+    install_dir: str = "/opt/kai",
     claude_bin: str | None = None,
     codex_bin: str | None = None,
     opencode_bin: str | None = None,
@@ -8573,7 +8624,8 @@ def _apply_sudoers(
     checks. `agent_backend` and users.yaml retain compatibility coverage for
     the global/default runtime path.
 
-    `data_dir` additionally installs the principal-memory reader helper
+    `data_dir` additionally installs the principal-memory reader and preference
+    manager helpers
     when the deployment has foreign os_users (the only case where its
     sudoers rule is emitted); None (direct/dev callers) always skips
     the helper.
@@ -8677,6 +8729,7 @@ def _apply_sudoers(
     if dry_run:
         if install_reader:
             print(f"[DRY RUN] Would write: {PRINCIPAL_MEMORY_READER} (mode 0755)")
+            print(f"[DRY RUN] Would write: {PRINCIPAL_PREFERENCE_MANAGER} (mode 0755)")
         print(f"[DRY RUN] Would write: {sudoers_path} (mode 0440)")
         print("[DRY RUN] Would validate with visudo -cf")
         return
@@ -8698,6 +8751,24 @@ def _apply_sudoers(
         os.chmod(PRINCIPAL_MEMORY_READER, 0o755)
         os.chown(PRINCIPAL_MEMORY_READER, 0, 0)
         print(f"  Wrote {PRINCIPAL_MEMORY_READER}")
+
+        fd, tmp_name = tempfile.mkstemp(prefix="kai-prefmanager-", suffix=".tmp")
+        try:
+            os.write(
+                fd,
+                _generate_principal_preference_manager(
+                    data_dir,
+                    install_dir,
+                ).encode(),
+            )
+            os.close(fd)
+            shutil.move(tmp_name, str(PRINCIPAL_PREFERENCE_MANAGER))
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+        os.chmod(PRINCIPAL_PREFERENCE_MANAGER, 0o755)
+        os.chown(PRINCIPAL_PREFERENCE_MANAGER, 0, 0)
+        print(f"  Wrote {PRINCIPAL_PREFERENCE_MANAGER}")
 
     # Write to a secure temp file first, validate, then move into place.
     # Uses mkstemp (random name, restrictive permissions) instead of a

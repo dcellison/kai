@@ -87,6 +87,7 @@ from kai.workshop.integration_notifications import (
     WorkshopIntegrationNotificationService,
 )
 from kai.workshop.memory_queries import WorkshopMemoryQueryService
+from kai.workshop.preferences import WorkshopPreferenceService
 from kai.workshop.proactive_publication import (
     ProactivePublicationAuthority,
     ProactivePublicationResult,
@@ -1782,6 +1783,7 @@ async def _register_workshop_client_api(
     artifact_service: WorkshopArtifactService | None = None,
     settings_workspaces: WorkshopSettingsWorkspaceService | None = None,
     memory_queries: WorkshopMemoryQueryService | None = None,
+    preference_documents: WorkshopPreferenceService | None = None,
 ) -> Callable[[web.Application], None]:
     """Register the client API against the core-owned canonical store.
 
@@ -1816,6 +1818,7 @@ async def _register_workshop_client_api(
             artifact_service=artifact_service,
             settings_workspaces=settings_workspaces,
             memory_queries=memory_queries,
+            preference_documents=preference_documents,
         )
         if command_submitter is not None:
             register_workshop_command_routes(
@@ -1893,6 +1896,7 @@ async def start(
             artifact_service=core_services.artifacts,
             settings_workspaces=core_services.settings_workspaces,
             memory_queries=core_services.memory_queries,
+            preference_documents=core_services.preference_documents,
         )
 
     _runner = web.AppRunner(

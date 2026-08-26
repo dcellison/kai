@@ -670,6 +670,7 @@ class TestNotificationChatIdMutations:
             artifacts=MagicMock(),
             settings_workspaces=MagicMock(),
             memory_queries=MagicMock(),
+            preference_documents=MagicMock(),
             github_automation=MagicMock(),
         )
         core_host = MagicMock()
@@ -738,6 +739,7 @@ class TestNotificationChatIdMutations:
             artifacts=MagicMock(),
             settings_workspaces=MagicMock(),
             memory_queries=MagicMock(),
+            preference_documents=MagicMock(),
             github_automation=MagicMock(),
         )
         fake_runner = MagicMock()
@@ -807,6 +809,7 @@ class TestNotificationChatIdMutations:
             artifacts=MagicMock(),
             settings_workspaces=MagicMock(),
             memory_queries=MagicMock(),
+            preference_documents=MagicMock(),
             github_automation=MagicMock(),
         )
         core_host = MagicMock()
@@ -867,6 +870,9 @@ class TestNotificationChatIdMutations:
                 "/v1/channels/{channel_id}/settings",
                 "/v1/channels/{channel_id}/workspace",
                 "/v1/channels/{channel_id}/workspace-config",
+                "/v1/preferences",
+                "/v1/preferences/revisions",
+                "/v1/preferences/revisions/{preference_revision}/restore",
                 "/v1/memory/stats",
                 "/v1/memory/records",
                 "/v1/memory/search",
