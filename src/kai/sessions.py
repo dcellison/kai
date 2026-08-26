@@ -94,7 +94,11 @@ from kai.workshop.streaming_preview import (
 
 if TYPE_CHECKING:
     from kai.config import Config, WorkspaceConfig
-    from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
+from kai.workshop.runtime_key_cutover import (
+    WorkshopRuntimeKeyCutover,
+    reconcile_workshop_runtime_key_cutover,
+)
+from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
 
 log = logging.getLogger(__name__)
 
@@ -439,18 +443,43 @@ async def initialize_workshop_memory_authority(
 async def initialize_workshop_operational_state(
     registry: WorkshopExecutionStateRegistry,
     config: Config,
+    runtime_profiles: WorkshopRuntimeProfileRegistry | None = None,
 ) -> WorkshopOperationalStateMigration:
     """Backfill and verify canonical job and GitHub subscription ownership."""
     if _workshop_event_lock is None:
         raise RuntimeError("Database not initialized - call init_db() first")
     async with _workshop_event_lock:
-        return await reconcile_workshop_operational_state(_get_db(), registry, config)
+        return await reconcile_workshop_operational_state(
+            _get_db(),
+            registry,
+            config,
+            runtime_profiles,
+        )
+
+
+async def initialize_workshop_runtime_key_cutover(
+    registry: WorkshopExecutionStateRegistry,
+    *,
+    memory_enabled: bool,
+) -> WorkshopRuntimeKeyCutover:
+    """Record the authoritative legacy-key inventory after migration."""
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        return await reconcile_workshop_runtime_key_cutover(
+            _get_db(),
+            registry,
+            memory_enabled=memory_enabled,
+        )
 
 
 def _execution_state_namespace(chat_id: int) -> WorkshopExecutionStateNamespace | None:
     if _workshop_execution_state is None:
         return None
-    return _workshop_execution_state.maybe_for_runtime_config_id(chat_id)
+    namespace = _workshop_execution_state.maybe_for_legacy_runtime_key(chat_id)
+    if namespace is None and chat_id > 0:
+        raise RuntimeError("Protected adapter identity has no canonical execution-state owner")
+    return namespace
 
 
 def execution_lane_key(chat_id: int) -> int | str:
@@ -2081,6 +2110,29 @@ async def resolve_workspace_access(
     return base, combined
 
 
+async def resolve_canonical_workspace_access(
+    namespace: WorkshopExecutionStateNamespace,
+    config: Config,
+    *,
+    workspace_base: Path | None,
+    static_allowed_workspaces: tuple[Path, ...],
+) -> tuple[Path | None, list[Path]]:
+    """Resolve protected workspace access without a compatibility key."""
+    base = workspace_base or config.workspace_base
+    seen: set[Path] = set()
+    combined: list[Path] = []
+    for path in (
+        *await get_canonical_workspace_grants(namespace),
+        *static_allowed_workspaces,
+        *config.allowed_workspaces,
+    ):
+        resolved = path.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            combined.append(resolved)
+    return base, combined
+
+
 # ── GitHub settings resolution ──────────────────────────────────────
 
 
@@ -2163,6 +2215,49 @@ async def _canonical_github_subscription(chat_id: int) -> aiosqlite.Row | None:
     return row
 
 
+async def get_canonical_github_token(principal_id: str) -> str | None:
+    """Read one protected GitHub credential by canonical principal."""
+    async with _get_db().execute(
+        "SELECT github_token FROM principal_github_subscriptions WHERE principal_id = ?",
+        (principal_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is None:
+        raise RuntimeError("Protected GitHub credential has no canonical principal owner")
+    return str(row[0]) if row[0] else None
+
+
+async def get_github_token(chat_id: int) -> str | None:
+    """Read adapter-facing GitHub credential through canonical ownership."""
+    namespace = _execution_state_namespace(chat_id)
+    if namespace is None:
+        return await get_setting(f"github_token:{chat_id}")
+    return await get_canonical_github_token(str(namespace.principal_id))
+
+
+async def set_github_token(chat_id: int, token: str | None) -> None:
+    """Update an adapter-facing GitHub credential under its canonical principal."""
+    namespace = _execution_state_namespace(chat_id)
+    if namespace is None:
+        if token is None:
+            await delete_setting(f"github_token:{chat_id}")
+        else:
+            await set_setting(f"github_token:{chat_id}", token)
+        return
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        cursor = await _get_db().execute(
+            "UPDATE principal_github_subscriptions SET github_token = ?, "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE principal_id = ?",
+            (token, namespace.principal_id),
+        )
+        if cursor.rowcount != 1:
+            await _get_db().rollback()
+            raise RuntimeError("Canonical GitHub credential update found no unique owner")
+        await _get_db().commit()
+
+
 async def _set_github_repos(
     chat_id: int,
     canonical_column: str,
@@ -2189,10 +2284,6 @@ async def _set_github_repos(
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("Canonical GitHub subscription update found no unique owner")
-            await _get_db().execute(
-                "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (f"{legacy_key}:{chat_id}", encoded),
-            )
             await _get_db().commit()
         except Exception:
             await _get_db().rollback()
@@ -2226,10 +2317,6 @@ async def set_github_toggle(chat_id: int, field: str, enabled: bool) -> None:
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("Canonical GitHub subscription update found no unique owner")
-            await _get_db().execute(
-                "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (f"{field}:{chat_id}", encoded),
-            )
             await _get_db().commit()
         except Exception:
             await _get_db().rollback()

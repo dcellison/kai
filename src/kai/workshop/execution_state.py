@@ -23,7 +23,13 @@ class WorkshopExecutionStateNamespace:
     channel_id: ChannelId
     agent_id: AgentId
     runtime_profile_id: RuntimeProfileId
-    runtime_config_id: int
+    legacy_runtime_key: int | None
+
+    def require_legacy_runtime_key(self) -> int:
+        """Return archived migration state or fail closed."""
+        if self.legacy_runtime_key is None:
+            raise WorkshopExecutionStateError("Canonical runtime has no legacy-state archive")
+        return self.legacy_runtime_key
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,17 +48,18 @@ class WorkshopExecutionStateRegistry:
     """Resolve protected compatibility keys to canonical execution owners."""
 
     def __init__(self, namespaces: tuple[WorkshopExecutionStateNamespace, ...]) -> None:
-        by_config_id: dict[int, WorkshopExecutionStateNamespace] = {}
+        by_legacy_key: dict[int, WorkshopExecutionStateNamespace] = {}
         by_profile: dict[RuntimeProfileId, WorkshopExecutionStateNamespace] = {}
         by_principal: dict[PrincipalId, WorkshopExecutionStateNamespace | None] = {}
         for namespace in namespaces:
             if not isinstance(namespace, WorkshopExecutionStateNamespace):
                 raise TypeError("namespaces must contain WorkshopExecutionStateNamespace values")
-            if namespace.runtime_config_id in by_config_id:
-                raise WorkshopExecutionStateError("Duplicate runtime configuration execution-state owner")
+            if namespace.legacy_runtime_key is not None and namespace.legacy_runtime_key in by_legacy_key:
+                raise WorkshopExecutionStateError("Duplicate archived runtime execution-state key")
             if namespace.runtime_profile_id in by_profile:
                 raise WorkshopExecutionStateError("Duplicate runtime profile execution-state owner")
-            by_config_id[namespace.runtime_config_id] = namespace
+            if namespace.legacy_runtime_key is not None:
+                by_legacy_key[namespace.legacy_runtime_key] = namespace
             by_profile[namespace.runtime_profile_id] = namespace
             # A human may eventually have more than one runtime profile.  A
             # principal-id lookup is therefore available only while it is
@@ -61,9 +68,9 @@ class WorkshopExecutionStateRegistry:
                 by_principal[namespace.principal_id] = None
             else:
                 by_principal[namespace.principal_id] = namespace
-        if not by_config_id:
+        if not by_profile:
             raise WorkshopExecutionStateError("At least one execution-state namespace is required")
-        self._by_config_id = by_config_id
+        self._by_legacy_key = by_legacy_key
         self._by_profile = by_profile
         self._by_principal = by_principal
 
@@ -109,7 +116,7 @@ class WorkshopExecutionStateRegistry:
                     channel_id=channel_id,
                     agent_id=agent_id,
                     runtime_profile_id=profile.profile_id,
-                    runtime_config_id=profile.runtime_config_id,
+                    legacy_runtime_key=runtime_profiles.legacy_runtime_key(profile.profile_id),
                 )
             )
         return cls(tuple(namespaces))
@@ -118,10 +125,14 @@ class WorkshopExecutionStateRegistry:
     def namespaces(self) -> tuple[WorkshopExecutionStateNamespace, ...]:
         return tuple(sorted(self._by_profile.values(), key=lambda item: item.runtime_profile_id))
 
-    def maybe_for_runtime_config_id(self, runtime_config_id: int) -> WorkshopExecutionStateNamespace | None:
-        if isinstance(runtime_config_id, bool) or not isinstance(runtime_config_id, int):
+    def maybe_for_legacy_runtime_key(self, legacy_runtime_key: int) -> WorkshopExecutionStateNamespace | None:
+        if isinstance(legacy_runtime_key, bool) or not isinstance(legacy_runtime_key, int):
             return None
-        return self._by_config_id.get(runtime_config_id)
+        return self._by_legacy_key.get(legacy_runtime_key)
+
+    def maybe_for_runtime_config_id(self, runtime_config_id: int) -> WorkshopExecutionStateNamespace | None:
+        """Deprecated adapter/migration alias; protected core uses canonical lookups."""
+        return self.maybe_for_legacy_runtime_key(runtime_config_id)
 
     def maybe_for_principal_id(self, principal_id: str) -> WorkshopExecutionStateNamespace | None:
         try:
@@ -161,6 +172,16 @@ class WorkshopExecutionStateRegistry:
             return None
         return self._by_profile.get(canonical_id)
 
+    def resolve_profile(
+        self,
+        runtime_profile_id: str | RuntimeProfileId,
+    ) -> WorkshopExecutionStateNamespace:
+        """Resolve an exact protected runtime profile or fail closed."""
+        namespace = self.maybe_for_runtime_profile_id(runtime_profile_id)
+        if namespace is None:
+            raise WorkshopExecutionStateError("Protected runtime profile has no canonical execution-state owner")
+        return namespace
+
 
 async def reconcile_legacy_execution_state(
     connection: aiosqlite.Connection,
@@ -172,6 +193,8 @@ async def reconcile_legacy_execution_state(
     try:
         await connection.execute("BEGIN IMMEDIATE")
         for namespace in registry.namespaces:
+            if namespace.legacy_runtime_key is None:
+                continue
             async with connection.execute(
                 "SELECT runtime_config_id, principal_id, channel_id, agent_id "
                 "FROM workshop_execution_state_migrations WHERE runtime_profile_id = ?",
@@ -186,7 +209,7 @@ async def reconcile_legacy_execution_state(
                         str(migrated["agent_id"]),
                     )
                     current_owner = (
-                        namespace.runtime_config_id,
+                        namespace.legacy_runtime_key,
                         str(namespace.principal_id),
                         str(namespace.channel_id),
                         str(namespace.agent_id),
@@ -209,7 +232,7 @@ async def reconcile_legacy_execution_state(
                 ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     namespace.runtime_profile_id,
-                    namespace.runtime_config_id,
+                    namespace.legacy_runtime_key,
                     namespace.principal_id,
                     namespace.channel_id,
                     namespace.agent_id,
@@ -238,11 +261,14 @@ async def _backfill_namespace(
     connection: aiosqlite.Connection,
     namespace: WorkshopExecutionStateNamespace,
 ) -> dict[str, int]:
+    legacy_runtime_key = namespace.legacy_runtime_key
+    if legacy_runtime_key is None:
+        return {"settings": 0, "workspace_settings": 0, "history": 0, "grants": 0}
     counts = {"settings": 0, "workspace_settings": 0, "history": 0, "grants": 0}
     for field in ("model", "timeout", "workspace"):
         async with connection.execute(
             "SELECT value FROM settings WHERE key = ?",
-            (f"{field}:{namespace.runtime_config_id}",),
+            (f"{field}:{legacy_runtime_key}",),
         ) as cursor:
             row = await cursor.fetchone()
         if row is not None:
@@ -259,7 +285,7 @@ async def _backfill_namespace(
             )
             counts["settings"] += cursor.rowcount
 
-    prefix = f"ws_config:{namespace.runtime_config_id}:"
+    prefix = f"ws_config:{legacy_runtime_key}:"
     async with connection.execute(
         "SELECT key, value FROM settings WHERE SUBSTR(key, 1, ?) = ? ORDER BY key",
         (len(prefix), prefix),
@@ -290,13 +316,13 @@ async def _backfill_namespace(
     cursor = await connection.execute(
         "INSERT OR IGNORE INTO principal_workspace_history (principal_id, path, last_used_at) "
         "SELECT ?, path, last_used_at FROM workspace_history WHERE chat_id = ?",
-        (namespace.principal_id, namespace.runtime_config_id),
+        (namespace.principal_id, legacy_runtime_key),
     )
     counts["history"] += cursor.rowcount
     cursor = await connection.execute(
         "INSERT OR IGNORE INTO principal_workspace_grants (principal_id, path) "
         "SELECT ?, path FROM allowed_workspaces WHERE chat_id = ?",
-        (namespace.principal_id, namespace.runtime_config_id),
+        (namespace.principal_id, legacy_runtime_key),
     )
     counts["grants"] += cursor.rowcount
     return counts

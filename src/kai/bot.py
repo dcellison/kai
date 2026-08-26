@@ -998,7 +998,7 @@ def _scheduled_job_authority(
     runtime_config_id: int,
 ) -> WorkshopScheduledJobAuthority:
     services = _get_core_services(context)
-    runtime_profile = services.runtime_profiles.for_config_id(runtime_config_id)
+    runtime_profile = services.runtime_profiles.profile_for_legacy_runtime_key(runtime_config_id)
     canonical = services.internal_api_contexts.for_runtime_profile(runtime_profile.profile_id)
     return WorkshopScheduledJobAuthority(
         canonical.principal_id,
@@ -2728,13 +2728,13 @@ async def _handle_github_token(
         return
 
     if args[0].lower() == "clear":
-        await sessions.delete_setting(f"github_token:{chat_id}")
+        await sessions.set_github_token(chat_id, None)
         await update.message.reply_text("GitHub token removed.")
         return
 
     # Store the token in owner-only SQLite state, then delete the
     # token-bearing Telegram command where Telegram permits it.
-    await sessions.set_setting(f"github_token:{chat_id}", args[0])
+    await sessions.set_github_token(chat_id, args[0])
     try:
         await update.message.delete()
     except BadRequest as exc:
@@ -2822,7 +2822,7 @@ async def _handle_github_add(
     webhook_url = _derive_webhook_url(config.telegram_webhook_url) if config.telegram_webhook_url else None
 
     # Attempt automatic webhook registration if the user has a token
-    token = await sessions.get_setting(f"github_token:{chat_id}")
+    token = await sessions.get_github_token(chat_id)
     verb = "Re-subscribed" if is_readd else "Subscribed"
 
     if token:
@@ -2926,7 +2926,7 @@ async def _handle_github_remove(
             other_subscribers = True
             break
 
-    token = await sessions.get_setting(f"github_token:{chat_id}")
+    token = await sessions.get_github_token(chat_id)
 
     if other_subscribers:
         await update.message.reply_text(f"Unsubscribed from `{repo}`. Webhook kept (other users are still subscribed).")
@@ -3038,7 +3038,7 @@ async def _show_github(update: Update, chat_id: int, config: Config) -> None:
         lines.append("\nNo repo subscriptions configured.")
 
     # Token status (never show the actual token value)
-    token = await sessions.get_setting(f"github_token:{chat_id}")
+    token = await sessions.get_github_token(chat_id)
     lines.append(f"\nGitHub token: {'stored' if token else 'not set'}")
 
     await update.message.reply_text("\n".join(lines))
@@ -3426,7 +3426,7 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
     claude_user = pool.get_os_user(actor_id)
     agent_backend, provider = pool.get_backend_provider(actor_id)
     model_override = pool.get_role_model(actor_id, ModelRole.PR_REVIEW)
-    github_token = await sessions.get_setting(f"github_token:{actor_id}")
+    github_token = await sessions.get_github_token(actor_id)
     if getattr(config, "protected_install", False) is True and not github_token:
         await update.message.reply_text(
             "PR review requires a stored per-user GitHub token in protected installs. "

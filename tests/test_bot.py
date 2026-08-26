@@ -3780,7 +3780,7 @@ class TestHandleSettings:
         update = _make_update(text="/settings")
         config = _make_config(protected_install=True)
         pool = _make_mock_claude()
-        pool.get_runtime_profile.return_value = profile_registry(12345).for_config_id(12345)
+        pool.get_runtime_profile.return_value = profile_registry(12345).profile_for_legacy_runtime_key(12345)
         pool.get_backend_provider.return_value = ("codex", "openai")
         ctx = _make_context(config=config, pool=pool)
         mock_sessions = self._mock_sessions({"model": "opus"})
@@ -4181,7 +4181,7 @@ class TestHandleGitHub:
         with patch("kai.bot.sessions", mock_sessions):
             await handle_github(update, ctx)
 
-        mock_sessions.set_setting.assert_called_once_with("github_token:12345", "ghp_secret")
+        mock_sessions.set_github_token.assert_called_once_with(12345, "ghp_secret")
         update.message.delete.assert_awaited_once()
         reply = update.message.reply_text.call_args[0][0]
         assert "stored" in reply.lower()
@@ -4194,12 +4194,12 @@ class TestHandleGitHub:
         config = _make_config()
         ctx = _make_context(config=config, args=["token", "ghp_secret"])
         mock_sessions = AsyncMock()
-        mock_sessions.set_setting = AsyncMock()
+        mock_sessions.set_github_token = AsyncMock()
 
         with patch("kai.bot.sessions", mock_sessions):
             await handle_github(update, ctx)
 
-        mock_sessions.set_setting.assert_called_once_with("github_token:12345", "ghp_secret")
+        mock_sessions.set_github_token.assert_called_once_with(12345, "ghp_secret")
         update.message.delete.assert_awaited_once()
         reply = update.message.reply_text.call_args[0][0]
         assert "stored" in reply.lower()

@@ -9367,6 +9367,75 @@ class TestApplySecretsDryRun:
 
 
 class TestIndependentRuntimePolicy:
+    @staticmethod
+    def _version_two_policy(profile_id: str, legacy_key: int) -> dict[str, object]:
+        return {
+            "version": 2,
+            "runtime_profiles": {
+                profile_id: {
+                    "display_name": "Protected runtime",
+                    "backend": "codex",
+                    "provider": "openai",
+                    "model": "gpt-5.6-sol",
+                    "timeout_seconds": 120,
+                    "allowed_services": [],
+                    "home_workspace": None,
+                    "workspace_base": None,
+                    "allowed_workspaces": [],
+                }
+            },
+            "legacy_runtime_archive": {
+                "version": 1,
+                "runtime_keys": {profile_id: legacy_key},
+                "removal_gate": "canonical_runtime_state_v1",
+            },
+        }
+
+    def test_runtime_key_cutover_status_reports_complete_receipt_without_identifiers(self, tmp_path):
+        profile_id = str(kai.install.runtime_profile_id_for_config_id(101))
+        policy = tmp_path / "runtime-profiles.yaml"
+        policy.write_text(yaml.safe_dump(self._version_two_policy(profile_id, 101)))
+        database = tmp_path / "kai.db"
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "CREATE TABLE workshop_runtime_key_cutovers ("
+                "runtime_profile_id TEXT, legacy_runtime_key INTEGER, legacy_reads_disabled INTEGER)"
+            )
+            connection.execute(
+                "INSERT INTO workshop_runtime_key_cutovers VALUES (?, ?, 1)",
+                (profile_id, 101),
+            )
+
+        status = kai.install._runtime_key_cutover_status(database, policy)
+
+        assert status == (
+            "Workshop runtime-key cutover: active; profiles=1, receipts=1, "
+            "archived keys=1, missing=0, extra=0; legacy reads=disabled, "
+            "removal gate=canonical_runtime_state_v1"
+        )
+        assert profile_id not in status
+        assert "101" not in status
+
+    def test_runtime_key_cutover_status_fails_closed_on_unverified_reads(self, tmp_path):
+        profile_id = str(kai.install.runtime_profile_id_for_config_id(101))
+        policy = tmp_path / "runtime-profiles.yaml"
+        policy.write_text(yaml.safe_dump(self._version_two_policy(profile_id, 101)))
+        database = tmp_path / "kai.db"
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "CREATE TABLE workshop_runtime_key_cutovers ("
+                "runtime_profile_id TEXT, legacy_runtime_key INTEGER, legacy_reads_disabled INTEGER)"
+            )
+            connection.execute(
+                "INSERT INTO workshop_runtime_key_cutovers VALUES (?, ?, 0)",
+                (profile_id, 101),
+            )
+
+        status = kai.install._runtime_key_cutover_status(database, policy)
+
+        assert status.startswith("Workshop runtime-key cutover: INCOMPLETE;")
+        assert "legacy reads=NOT VERIFIED" in status
+
     def test_migration_preserves_effective_workspace_policy(self, tmp_path):
         home = tmp_path / "home"
         base = tmp_path / "projects"
@@ -9515,10 +9584,14 @@ class TestIndependentRuntimePolicy:
 
         daniel_id = str(kai.install.runtime_profile_id_for_config_id(101))
         scott_id = str(kai.install.runtime_profile_id_for_config_id(202))
-        assert document["version"] == 1
+        assert document["version"] == 2
+        assert document["legacy_runtime_archive"] == {
+            "version": 1,
+            "runtime_keys": {daniel_id: 101, scott_id: 202},
+            "removal_gate": "canonical_runtime_state_v1",
+        }
         assert document["runtime_profiles"][daniel_id] == {
             "display_name": "Daniel",
-            "compatibility_runtime_config_id": 101,
             "backend": "codex",
             "provider": "openai",
             "model": "gpt-5.5",
@@ -9527,6 +9600,11 @@ class TestIndependentRuntimePolicy:
             "home_workspace": None,
             "workspace_base": None,
             "allowed_workspaces": [],
+            "models": {},
+            "github_repos": [],
+            "pr_review": None,
+            "issue_triage": None,
+            "allowed_triage_projects": [],
             "os_user": "daniel",
         }
         assert document["runtime_profiles"][scott_id]["backend"] == "claude"
@@ -9611,7 +9689,11 @@ backends:
 
         status = _runtime_policy_status(policy, backends)
 
-        assert status == ("Workshop runtime policy: initialized; profiles=1, backends=codex, runtime kernel=canonical")
+        assert status == (
+            "Workshop runtime policy: initialized; profiles=1, backends=codex, "
+            "runtime kernel=canonical, archived keys=1, "
+            "removal gate=not-applicable"
+        )
         assert "Secret display name" not in status
         assert "101" not in status
 
@@ -9738,7 +9820,7 @@ backends:
         assert document["runtime_profiles"][profile_id]["model"] == "gpt-5.6-sol"
         assert document["runtime_profiles"][profile_id]["timeout_seconds"] == 345
         assert document["runtime_profiles"][profile_id]["allowed_services"] == ["perplexity"]
-        assert profiles.resolve(profile_id).runtime_config_id == 101
+        assert profiles.legacy_runtime_key(profile_id) == 101
 
         policy.write_text(content)
         next_action, next_content, next_profiles = _runtime_policy_apply_plan(
@@ -9753,6 +9835,46 @@ backends:
         assert next_action == "preserve"
         assert next_content == content
         assert next_profiles.resolve(profile_id).allowed_services == ("perplexity",)
+
+    def test_upgrade_archives_v1_derived_runtime_key(self):
+        profile_id = RuntimeProfileId("rtp_11111111111111111111111111111111")
+        original = yaml.safe_dump(
+            {
+                "version": 1,
+                "runtime_profiles": {
+                    str(profile_id): {
+                        "display_name": "Browser-only coding",
+                        "backend": "pi",
+                        "provider": "openai-codex",
+                    }
+                },
+            },
+            sort_keys=False,
+        )
+        migrated = yaml.safe_dump(
+            {
+                "version": 2,
+                "runtime_profiles": {},
+            },
+            sort_keys=False,
+        )
+
+        upgraded, changed = kai.install._upgrade_runtime_policy_content(
+            original,
+            migrated,
+            kai.install._RuntimePolicyDefaults(
+                backend="pi",
+                provider="openai-codex",
+                model="openai-codex/gpt-5.5",
+                timeout_seconds=120,
+            ),
+        )
+
+        assert changed is True
+        archive = yaml.safe_load(upgraded)["legacy_runtime_archive"]
+        assert archive["runtime_keys"] == {
+            str(profile_id): kai.install.legacy_runtime_key_for_v1_profile_id(profile_id)
+        }
 
     def test_existing_policy_must_cover_every_migrated_profile(self, tmp_path, monkeypatch):
         users_yaml = tmp_path / "users.yaml"
@@ -9850,8 +9972,8 @@ backends:
             users_yaml,
         )
 
-        assert action == "preserve"
-        assert content == policy.read_text()
+        assert action == "upgrade"
+        assert content != policy.read_text()
         profile = profiles.resolve(profile_id)
         assert profile.display_name == "Protected Daniel runtime"
         assert profile.os_user == "protected-daniel"
@@ -13255,6 +13377,8 @@ class TestWizardPerUserBackendsUseRegistry:
 
 
 class TestProtectedRuntimeStorageProvisioning:
+    LEGACY_RUNTIME_KEY = 987654321
+
     @staticmethod
     def _profile(backend: str, *, os_user: str | None = None) -> ProtectedRuntimeProfile:
         provider = {
@@ -13267,7 +13391,6 @@ class TestProtectedRuntimeStorageProvisioning:
         model = "sonnet" if backend == "claude" else "gpt-5.5"
         return ProtectedRuntimeProfile(
             profile_id=RuntimeProfileId("rtp_" + "f" * 32),
-            runtime_config_id=987654321,
             display_name="Browser-only human",
             os_user=os_user,
             backend=backend,
@@ -13349,7 +13472,7 @@ class TestProtectedRuntimeStorageProvisioning:
             assert claude_adapter.read_text() == "@../AGENTS.md\n"
         else:
             assert not claude_adapter.exists()
-        assert not (data_path / "home" / str(profile.runtime_config_id)).exists()
+        assert not (data_path / "home" / str(self.LEGACY_RUNTIME_KEY)).exists()
 
     @pytest.mark.asyncio
     async def test_initialized_assignments_fail_closed_for_unmapped_profile(self, tmp_path):
@@ -13379,7 +13502,7 @@ class TestProtectedRuntimeStorageProvisioning:
         users_yaml = tmp_path / "users.yaml"
         profile = self._profile("codex")
         users_yaml.write_text(
-            f"users:\n  - telegram_id: {profile.runtime_config_id}\n    name: New Telegram human\n    role: member\n"
+            f"users:\n  - telegram_id: {self.LEGACY_RUNTIME_KEY}\n    name: New Telegram human\n    role: member\n"
         )
         store = await WorkshopEventStore.open(data_path / "kai.db")
         await bootstrap_default_workshop(
@@ -13394,7 +13517,10 @@ class TestProtectedRuntimeStorageProvisioning:
 
         targets = _runtime_storage_targets(
             data_path,
-            WorkshopRuntimeProfileRegistry((profile,)),
+            WorkshopRuntimeProfileRegistry(
+                (profile,),
+                legacy_runtime_keys={profile.profile_id: self.LEGACY_RUNTIME_KEY},
+            ),
             users_yaml,
         )
 
@@ -13402,17 +13528,16 @@ class TestProtectedRuntimeStorageProvisioning:
             bootstrap_human_principal_id(
                 workshop_id,
                 "telegram",
-                str(profile.runtime_config_id),
+                str(self.LEGACY_RUNTIME_KEY),
             )
         )
-        assert targets[0].storage_name != str(profile.runtime_config_id)
+        assert targets[0].storage_name != str(self.LEGACY_RUNTIME_KEY)
 
     def test_profiles_cannot_share_one_canonical_storage_owner(self, tmp_path, monkeypatch):
         first = self._profile("codex")
         second = replace(
             first,
             profile_id=RuntimeProfileId("rtp_" + "e" * 32),
-            runtime_config_id=123456789,
         )
         shared_principal = "prn_" + "a" * 32
         monkeypatch.setattr(
@@ -13484,13 +13609,16 @@ class TestProtectedRuntimeStorageProvisioning:
         )
         monkeypatch.setattr(
             "kai.install._canonical_principal_storage_names",
-            lambda _data_path: {str(profile.runtime_config_id): "prn_" + "b" * 32},
+            lambda _data_path: {str(self.LEGACY_RUNTIME_KEY): "prn_" + "b" * 32},
         )
 
         with pytest.raises(RuntimeError, match="conflicts with its canonical compatibility owner"):
             _runtime_storage_targets(
                 tmp_path / "data",
-                WorkshopRuntimeProfileRegistry((profile,)),
+                WorkshopRuntimeProfileRegistry(
+                    (profile,),
+                    legacy_runtime_keys={profile.profile_id: self.LEGACY_RUNTIME_KEY},
+                ),
                 users_yaml,
             )
 
@@ -13578,11 +13706,10 @@ class TestProtectedRuntimeStorageProvisioning:
         policy.write_text(
             yaml.safe_dump(
                 {
-                    "version": 1,
+                    "version": 2,
                     "runtime_profiles": {
                         str(profile.profile_id): {
                             "display_name": profile.display_name,
-                            "compatibility_runtime_config_id": profile.runtime_config_id,
                             "backend": profile.backend,
                             "provider": profile.provider,
                             "model": profile.model,
@@ -13592,6 +13719,11 @@ class TestProtectedRuntimeStorageProvisioning:
                             "workspace_base": None,
                             "allowed_workspaces": [],
                         }
+                    },
+                    "legacy_runtime_archive": {
+                        "version": 1,
+                        "runtime_keys": {},
+                        "removal_gate": "canonical_runtime_state_v1",
                     },
                 }
             )
@@ -13613,7 +13745,7 @@ class TestProtectedRuntimeStorageProvisioning:
 
         assert status == ("Workshop runtime storage: complete; profiles=1, managed=1, operator-managed=0, incomplete=0")
         assert str(profile.profile_id) not in status
-        assert str(profile.runtime_config_id) not in status
+        assert str(self.LEGACY_RUNTIME_KEY) not in status
 
         (home / "AGENTS.md").chmod(0o644)
         incomplete_status = _runtime_storage_status(
@@ -13630,7 +13762,7 @@ class TestProtectedRuntimeStorageProvisioning:
             "memory=0, preferences=0, temp=0"
         )
         assert str(profile.profile_id) not in incomplete_status
-        assert str(profile.runtime_config_id) not in incomplete_status
+        assert str(self.LEGACY_RUNTIME_KEY) not in incomplete_status
 
     def test_profile_only_os_user_is_included_in_sudoers(self, tmp_path, monkeypatch):
         profile = self._profile("codex", os_user="browser-user")

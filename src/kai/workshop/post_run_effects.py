@@ -8,11 +8,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from kai.workshop.compatibility_state import WorkshopCompatibilityStateWriter
 from kai.workshop.conversation_context import assemble_canonical_prior_pairs
 from kai.workshop.domain import CanonicalMemoryProvenance, MessageId, RunId, RuntimeProfileId
 from kai.workshop.run_lifecycle import RunStatus, WorkshopRunLifecycle
 from kai.workshop.runtime_sessions import RuntimeSessionSettlement
+from kai.workshop.runtime_state import WorkshopRuntimeStateWriter
 from kai.workshop.store import WorkshopEventStore
 
 log = logging.getLogger(__name__)
@@ -89,10 +89,10 @@ class WorkshopPostRunEffectService:
     def __init__(
         self,
         store: WorkshopEventStore,
-        compatibility_state: WorkshopCompatibilityStateWriter,
+        runtime_state: WorkshopRuntimeStateWriter,
     ) -> None:
         self._store = store
-        self._compatibility_state = compatibility_state
+        self._runtime_state = runtime_state
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._closed = False
@@ -101,10 +101,10 @@ class WorkshopPostRunEffectService:
     async def open_and_start(
         cls,
         database_path: Path,
-        compatibility_state: WorkshopCompatibilityStateWriter,
+        runtime_state: WorkshopRuntimeStateWriter,
     ) -> WorkshopPostRunEffectService:
         store = await WorkshopEventStore.open(database_path)
-        service = cls(store, compatibility_state)
+        service = cls(store, runtime_state)
         try:
             await store.connection.execute(
                 "UPDATE workshop_post_run_effects SET status = 'pending', "
@@ -216,7 +216,7 @@ class WorkshopPostRunEffectService:
                 or run.result_message_id != effect.result_message_id
             ):
                 raise RuntimeError("Post-run effect no longer matches one successful canonical run")
-            profile_state = self._compatibility_state.for_profile(effect.runtime_profile_id)
+            profile_state = self._runtime_state.for_profile(effect.runtime_profile_id)
             if await profile_state.has_memory_for_run(str(effect.run_id)):
                 await self._settle(effect.run_id)
                 return

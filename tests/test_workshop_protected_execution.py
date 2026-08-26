@@ -87,8 +87,11 @@ class TestProtectedExecutionPreparation:
         store, run, pool, profiles = await _accepted_run(tmp_path / "kai.db", home)
         try:
             with (
-                patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
-                patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value={}),
+                patch(
+                    "kai.pool.sessions.get_canonical_execution_settings",
+                    new_callable=AsyncMock,
+                    return_value={},
+                ),
             ):
                 prepared = await WorkshopProtectedExecutionPreparationService(
                     store,
@@ -113,8 +116,11 @@ class TestProtectedExecutionPreparation:
         store, run, pool, profiles = await _accepted_run(tmp_path / "kai.db", home)
         try:
             with (
-                patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
-                patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value={}),
+                patch(
+                    "kai.pool.sessions.get_canonical_execution_settings",
+                    new_callable=AsyncMock,
+                    return_value={},
+                ),
                 pytest.raises(ProtectedExecutionPreparationError, match="protected registry"),
             ):
                 await WorkshopProtectedExecutionPreparationService(

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 32
+WORKSHOP_SCHEMA_VERSION = 33
 
 
 @dataclass(frozen=True, slots=True)
@@ -1634,6 +1634,42 @@ _DURABLE_POST_RUN_EFFECT_RECEIPTS_SCHEMA = SchemaMigration(
     ),
 )
 
+_CANONICAL_RUNTIME_KEYS_SCHEMA = SchemaMigration(
+    version=33,
+    name="canonical_runtime_keys",
+    statements=(
+        "ALTER TABLE principal_github_subscriptions ADD COLUMN github_token TEXT",
+        "ALTER TABLE principal_github_subscriptions ADD COLUMN allowed_triage_projects_json TEXT NOT NULL DEFAULT '[]'",
+        """
+        CREATE TABLE workshop_runtime_key_cutovers (
+            runtime_profile_id TEXT PRIMARY KEY CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            legacy_runtime_key INTEGER UNIQUE CHECK (
+                legacy_runtime_key IS NULL OR legacy_runtime_key > 0
+            ),
+            principal_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            settings_rows INTEGER NOT NULL CHECK (settings_rows >= 0),
+            workspace_rows INTEGER NOT NULL CHECK (workspace_rows >= 0),
+            session_rows INTEGER NOT NULL CHECK (session_rows >= 0),
+            lock_rows INTEGER NOT NULL CHECK (lock_rows >= 0),
+            history_rows INTEGER NOT NULL CHECK (history_rows >= 0),
+            grant_rows INTEGER NOT NULL CHECK (grant_rows >= 0),
+            github_rows INTEGER NOT NULL CHECK (github_rows >= 0),
+            memory_rows INTEGER NOT NULL CHECK (memory_rows >= 0),
+            legacy_reads_disabled INTEGER NOT NULL DEFAULT 1 CHECK (
+                legacy_reads_disabled = 1
+            ),
+            cutover_at TEXT NOT NULL DEFAULT (
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            )
+        )
+        """,
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -1667,6 +1703,7 @@ _MIGRATIONS = (
     _ADAPTER_PLUGGABLE_DELIVERY_SCHEMA,
     _CANONICAL_POST_RUN_EFFECTS_SCHEMA,
     _DURABLE_POST_RUN_EFFECT_RECEIPTS_SCHEMA,
+    _CANONICAL_RUNTIME_KEYS_SCHEMA,
 )
 
 

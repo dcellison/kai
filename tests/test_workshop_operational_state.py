@@ -67,6 +67,50 @@ async def database(tmp_path: Path):
 
 
 class TestCanonicalOperationalStateMigration:
+    async def test_existing_receipt_moves_token_once_before_runtime_key_archive_is_sealed(
+        self,
+        database: Path,
+    ):
+        await sessions.set_setting("github_token:101", "legacy-token")
+        registry = await _bootstrap(101)
+        profiles = profile_registry(101)
+        await sessions.initialize_workshop_operational_state(
+            registry,
+            _config(101),
+            profiles,
+        )
+        namespace = registry.namespaces[0]
+        await sessions._get_db().execute(
+            "UPDATE principal_github_subscriptions SET github_token = NULL WHERE principal_id = ?",
+            (namespace.principal_id,),
+        )
+        await sessions._get_db().commit()
+
+        await sessions.initialize_workshop_operational_state(
+            registry,
+            _config(101),
+            profiles,
+        )
+        assert await sessions.get_canonical_github_token(namespace.principal_id) == "legacy-token"
+
+        await sessions.initialize_workshop_runtime_key_cutover(
+            registry,
+            memory_enabled=False,
+        )
+        await sessions._get_db().execute(
+            "UPDATE principal_github_subscriptions SET github_token = NULL WHERE principal_id = ?",
+            (namespace.principal_id,),
+        )
+        await sessions.set_setting("github_token:101", "later-legacy-token")
+        await sessions._get_db().commit()
+
+        await sessions.initialize_workshop_operational_state(
+            registry,
+            _config(101),
+            profiles,
+        )
+        assert await sessions.get_canonical_github_token(namespace.principal_id) is None
+
     async def test_backfills_jobs_and_github_policy_once(self, database: Path):
         await sessions.set_setting("github_repos_added:101", '["owner/added"]')
         await sessions.set_setting("github_repos_removed:101", '["owner/repo-101"]')
@@ -237,7 +281,7 @@ class TestCanonicalOperationalStateMigration:
             channel_id=first.channel_id,
             agent_id=first.agent_id,
             runtime_profile_id=profile_id(202),
-            runtime_config_id=202,
+            legacy_runtime_key=202,
         )
 
         migration = await sessions.initialize_workshop_operational_state(
@@ -271,7 +315,7 @@ class TestCanonicalOperationalStateWrites:
         assert await sessions.delete_job(job_id, 202) is False
         assert await sessions.delete_job(job_id, 101) is True
 
-    async def test_github_mutations_use_canonical_rows_and_dual_write(self, database: Path):
+    async def test_github_mutations_use_only_canonical_rows(self, database: Path):
         registry = await _bootstrap(101)
         await sessions.initialize_workshop_operational_state(registry, _config(101))
 
@@ -281,8 +325,8 @@ class TestCanonicalOperationalStateWrites:
 
         assert await sessions.get_effective_repos(101, []) == ["owner/added"]
         assert (await sessions.resolve_github_settings(101, _config(101)))["issue_triage"] is True
-        assert await sessions.get_setting("github_repos_added:101") == '["owner/added"]'
-        assert await sessions.get_setting("issue_triage:101") == "true"
+        assert await sessions.get_setting("github_repos_added:101") is None
+        assert await sessions.get_setting("issue_triage:101") is None
 
     async def test_operator_policy_resync_preserves_user_toggle_override(self, database: Path):
         registry = await _bootstrap(101)

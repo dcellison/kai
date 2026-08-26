@@ -1,36 +1,29 @@
-"""Tests for profile-addressed compatibility-state writes."""
+"""Tests for canonical profile-addressed runtime state."""
 
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
-from kai.workshop.compatibility_state import WorkshopCompatibilityStateWriter
 from kai.workshop.domain import CanonicalMemoryProvenance, MessageId, RunId
+from kai.workshop.runtime_state import WorkshopRuntimeStateWriter
 from tests.workshop_profiles import profile_id
 
 
-async def test_profile_state_retains_only_non_session_compatibility_boundaries(monkeypatch):
-    config = SimpleNamespace(
-        get_user_config=lambda runtime_config_id: (
-            SimpleNamespace(os_user="daniel") if runtime_config_id == 101 else None
-        )
+async def test_profile_state_ingests_memory_with_only_canonical_authority(monkeypatch):
+    config = SimpleNamespace(episode_classifier_context_turns=4)
+    profile = SimpleNamespace(
+        profile_id=profile_id(101),
+        os_user="daniel",
+        backend="codex",
+        provider="openai",
+        allowed_triage_projects=("Kai",),
     )
-    runtime_pool = SimpleNamespace(
-        runtime_profile=Mock(
-            return_value=SimpleNamespace(
-                runtime_config_id=101,
-                os_user="daniel",
-                backend="codex",
-            )
-        )
-    )
+    runtime_pool = SimpleNamespace(runtime_profile=Mock(return_value=profile))
+    execution_state = SimpleNamespace(resolve_profile=Mock(return_value=SimpleNamespace(principal_id="prn_daniel")))
     ingest = AsyncMock()
-    monkeypatch.setattr(
-        "kai.workshop.compatibility_state.ingest_conversation_memory",
-        ingest,
-    )
+    monkeypatch.setattr("kai.workshop.runtime_state.ingest_conversation_memory", ingest)
 
-    state = WorkshopCompatibilityStateWriter(config, runtime_pool).for_profile(profile_id(101))
+    state = WorkshopRuntimeStateWriter(config, runtime_pool, execution_state).for_profile(profile_id(101))
     provenance = CanonicalMemoryProvenance(RunId.new(), MessageId.new(), MessageId.new())
     assert not hasattr(state, "save_session")
     await state.ingest_memory(
@@ -43,10 +36,13 @@ async def test_profile_state_retains_only_non_session_compatibility_boundaries(m
     )
 
     runtime_pool.runtime_profile.assert_called_once_with(profile_id(101))
+    execution_state.resolve_profile.assert_called_once_with(profile_id(101))
     ingest.assert_awaited_once_with(
         prompt="Hello",
         assistant_text="Hi",
-        chat_id=101,
+        chat_id=None,
+        canonical_user_id="prn_daniel",
+        runtime_profile_id=str(profile_id(101)),
         session_id="session-1",
         config=config,
         workspace="/workspace/project",
@@ -55,6 +51,8 @@ async def test_profile_state_retains_only_non_session_compatibility_boundaries(m
         canonical_provenance=provenance,
         canonical_prior_pairs=(("Earlier", "Exchange"),),
         effective_backend="codex",
+        effective_provider="openai",
+        os_user_override="daniel",
     )
 
 

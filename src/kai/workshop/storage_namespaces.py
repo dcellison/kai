@@ -19,7 +19,7 @@ class WorkshopChannelHistoryNamespace:
     """One canonical channel's transitional transcript namespace."""
 
     channel_id: ChannelId
-    _legacy_chat_id: int = field(repr=False)
+    _legacy_chat_id: int | None = field(repr=False)
 
     def history_directory(self, data_dir: Path) -> Path:
         """Return the transport-independent conversation-history directory."""
@@ -27,6 +27,8 @@ class WorkshopChannelHistoryNamespace:
 
     def legacy_history_directory(self, data_dir: Path) -> Path:
         """Return the prior transport-keyed history directory during migration."""
+        if self._legacy_chat_id is None:
+            raise WorkshopStorageNamespaceError("Channel has no legacy history archive")
         return data_dir / "history" / str(self._legacy_chat_id)
 
 
@@ -52,11 +54,14 @@ class WorkshopChannelHistoryRegistry:
                 raise TypeError("namespaces must contain WorkshopChannelHistoryNamespace values")
             if namespace.channel_id in by_channel:
                 raise WorkshopStorageNamespaceError("Duplicate channel history namespace")
-            existing = by_compatibility_id.get(namespace._legacy_chat_id)
+            existing = (
+                by_compatibility_id.get(namespace._legacy_chat_id) if namespace._legacy_chat_id is not None else None
+            )
             if existing is not None and existing.channel_id != namespace.channel_id:
                 raise WorkshopStorageNamespaceError("Compatibility chat ID maps to multiple channels")
             by_channel[namespace.channel_id] = namespace
-            by_compatibility_id[namespace._legacy_chat_id] = namespace
+            if namespace._legacy_chat_id is not None:
+                by_compatibility_id[namespace._legacy_chat_id] = namespace
         for compatibility_id, channel_id in (runtime_aliases or {}).items():
             namespace = by_channel.get(channel_id)
             if namespace is None:
@@ -120,12 +125,14 @@ class WorkshopChannelHistoryRegistry:
             channel_id = channel_by_profile.get(profile.profile_id)
             if channel_id is None:
                 raise WorkshopStorageNamespaceError("Protected runtime profile has no canonical history channel")
-            runtime_aliases[profile.runtime_config_id] = channel_id
+            legacy_runtime_key = runtime_profiles.legacy_runtime_key(profile.profile_id)
+            if legacy_runtime_key is not None:
+                runtime_aliases[legacy_runtime_key] = channel_id
             if channel_id not in namespace_channels:
                 namespaces.append(
                     WorkshopChannelHistoryNamespace(
                         channel_id,
-                        profile.runtime_config_id,
+                        legacy_runtime_key,
                     )
                 )
                 namespace_channels.add(channel_id)
@@ -150,7 +157,7 @@ class WorkshopPrincipalStorageNamespace:
 
     principal_id: PrincipalId
     runtime_profile_id: RuntimeProfileId
-    _runtime_config_id: int = field(repr=False)
+    _legacy_runtime_key: int | None = field(repr=False)
 
     def files_directory(self, data_dir: Path) -> Path:
         """Return the transport-independent upload directory."""
@@ -158,7 +165,9 @@ class WorkshopPrincipalStorageNamespace:
 
     def legacy_files_directory(self, data_dir: Path) -> Path:
         """Return the prior configured-user directory during migration."""
-        return data_dir / "files" / str(self._runtime_config_id)
+        if self._legacy_runtime_key is None:
+            raise WorkshopStorageNamespaceError("Principal has no legacy files archive")
+        return data_dir / "files" / str(self._legacy_runtime_key)
 
     def home_directory(self, data_dir: Path) -> Path:
         """Return the transport-independent managed home directory."""
@@ -187,10 +196,11 @@ class WorkshopPrincipalStorageRegistry:
                 raise TypeError("namespaces must contain WorkshopPrincipalStorageNamespace values")
             if namespace.runtime_profile_id in by_profile:
                 raise WorkshopStorageNamespaceError("Duplicate runtime profile storage namespace")
-            if namespace._runtime_config_id in by_config_id:
-                raise WorkshopStorageNamespaceError("Duplicate runtime configuration storage namespace")
+            if namespace._legacy_runtime_key is not None and namespace._legacy_runtime_key in by_config_id:
+                raise WorkshopStorageNamespaceError("Duplicate archived runtime storage key")
             by_profile[namespace.runtime_profile_id] = namespace
-            by_config_id[namespace._runtime_config_id] = namespace
+            if namespace._legacy_runtime_key is not None:
+                by_config_id[namespace._legacy_runtime_key] = namespace
         if not by_profile:
             raise WorkshopStorageNamespaceError("At least one principal storage namespace is required")
         self._by_profile = by_profile
@@ -235,7 +245,7 @@ class WorkshopPrincipalStorageRegistry:
                 WorkshopPrincipalStorageNamespace(
                     next(iter(owners)),
                     profile.profile_id,
-                    profile.runtime_config_id,
+                    runtime_profiles.legacy_runtime_key(profile.profile_id),
                 )
             )
         return cls(tuple(namespaces))

@@ -46,7 +46,7 @@ async def scheduled_jobs(tmp_path: Path):
     registry, _ = await sessions.initialize_workshop_execution_state(profile_registry(101, 202))
     store = WorkshopEventStore.from_initialized_connection(sessions._get_db())
     authorities = {
-        namespace.runtime_config_id: WorkshopScheduledJobAuthority(
+        namespace.require_legacy_runtime_key(): WorkshopScheduledJobAuthority(
             namespace.principal_id,
             namespace.channel_id,
             namespace.agent_id,

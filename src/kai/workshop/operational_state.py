@@ -15,6 +15,7 @@ from kai.workshop.execution_state import (
 
 if TYPE_CHECKING:
     from kai.config import Config
+    from kai.workshop.runtime_profiles import ProtectedRuntimeProfile, WorkshopRuntimeProfileRegistry
 
 
 class WorkshopOperationalStateError(RuntimeError):
@@ -40,6 +41,8 @@ class _GitHubSubscriptionSeed:
     issue_triage_enabled: int
     pr_review_source: str
     issue_triage_source: str
+    github_token: str | None
+    allowed_triage_projects_json: str
     has_legacy_policy: bool
 
     def database_values(self) -> tuple[object, ...]:
@@ -51,6 +54,8 @@ class _GitHubSubscriptionSeed:
             self.issue_triage_enabled,
             self.pr_review_source,
             self.issue_triage_source,
+            self.github_token,
+            self.allowed_triage_projects_json,
         )
 
 
@@ -61,6 +66,7 @@ class _OperatorGitHubPolicy:
     issue_triage_enabled: int
     pr_review_source: str
     issue_triage_source: str
+    allowed_triage_projects_json: str
     has_user_config: bool
 
     def database_values(self) -> tuple[object, ...]:
@@ -70,6 +76,7 @@ class _OperatorGitHubPolicy:
             self.issue_triage_enabled,
             self.pr_review_source,
             self.issue_triage_source,
+            self.allowed_triage_projects_json,
         )
 
 
@@ -77,9 +84,12 @@ async def reconcile_workshop_operational_state(
     connection: aiosqlite.Connection,
     registry: WorkshopExecutionStateRegistry,
     config: Config,
+    runtime_profiles: WorkshopRuntimeProfileRegistry | None,
 ) -> WorkshopOperationalStateMigration:
     """Make canonical owners authoritative for protected jobs and GitHub policy."""
-    pending = await _pending_namespaces(connection, registry)
+    pending = tuple(
+        item for item in await _pending_namespaces(connection, registry) if item.legacy_runtime_key is not None
+    )
     seeds: dict[str, _GitHubSubscriptionSeed] = {}
     if pending:
         for namespace in pending:
@@ -100,7 +110,12 @@ async def reconcile_workshop_operational_state(
 
     operator_policies: dict[str, _OperatorGitHubPolicy] = {}
     for namespace in registry.namespaces:
-        policy = _operator_github_policy(namespace, config)
+        if runtime_profiles is None:
+            legacy_key = namespace.require_legacy_runtime_key()
+            user = config.get_user_config(legacy_key)
+            policy = _operator_github_policy_from_user(user)
+        else:
+            policy = _operator_github_policy(runtime_profiles.resolve(namespace.runtime_profile_id))
         principal_id = str(namespace.principal_id)
         existing = operator_policies.get(principal_id)
         if (
@@ -120,6 +135,16 @@ async def reconcile_workshop_operational_state(
     try:
         await connection.execute("BEGIN IMMEDIATE")
         for namespace in registry.namespaces:
+            policy = operator_policies[str(namespace.principal_id)]
+            if namespace.legacy_runtime_key is None:
+                github_subscriptions += await _ensure_canonical_github_subscription(
+                    connection,
+                    namespace,
+                    policy,
+                )
+                await _sync_operator_github_policy(connection, namespace, policy)
+                await _verify_namespace(connection, namespace)
+                continue
             scheduled_jobs_migrated = await _scheduled_job_migration_owner(connection, namespace)
             migrated = await _migration_owner(connection, namespace)
             if migrated:
@@ -128,10 +153,11 @@ async def reconcile_workshop_operational_state(
                     await _verify_legacy_jobs_for_cutover(connection, namespace)
                     await _record_scheduled_job_migration(connection, namespace, job_count)
                     jobs += job_count
+                await _migrate_runtime_key_github_token(connection, namespace)
                 await _sync_operator_github_policy(
                     connection,
                     namespace,
-                    operator_policies[str(namespace.principal_id)],
+                    policy,
                 )
                 await _verify_namespace(connection, namespace)
                 continue
@@ -149,7 +175,7 @@ async def reconcile_workshop_operational_state(
             await _sync_operator_github_policy(
                 connection,
                 namespace,
-                operator_policies[str(namespace.principal_id)],
+                policy,
             )
             await _verify_namespace(connection, namespace)
             await connection.execute(
@@ -159,7 +185,7 @@ async def reconcile_workshop_operational_state(
                 ") VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     namespace.runtime_profile_id,
-                    namespace.runtime_config_id,
+                    namespace.require_legacy_runtime_key(),
                     namespace.principal_id,
                     namespace.channel_id,
                     namespace.agent_id,
@@ -205,7 +231,7 @@ async def _migration_owner(
         return False
     recorded = (int(row[0]), str(row[1]), str(row[2]), str(row[3]))
     current = (
-        namespace.runtime_config_id,
+        namespace.require_legacy_runtime_key(),
         str(namespace.principal_id),
         str(namespace.channel_id),
         str(namespace.agent_id),
@@ -233,7 +259,7 @@ async def _scheduled_job_migration_owner(
         return False
     recorded = (int(row[0]), str(row[1]), str(row[2]), str(row[3]))
     current = (
-        namespace.runtime_config_id,
+        namespace.require_legacy_runtime_key(),
         str(namespace.principal_id),
         str(namespace.channel_id),
         str(namespace.agent_id),
@@ -258,7 +284,7 @@ async def _record_scheduled_job_migration(
         "legacy_jobs_count) VALUES (?, ?, ?, ?, ?, ?)",
         (
             namespace.runtime_profile_id,
-            namespace.runtime_config_id,
+            namespace.require_legacy_runtime_key(),
             namespace.principal_id,
             namespace.channel_id,
             namespace.agent_id,
@@ -304,7 +330,7 @@ async def _github_seed(
     namespace: WorkshopExecutionStateNamespace,
     config: Config,
 ) -> _GitHubSubscriptionSeed:
-    legacy_id = namespace.runtime_config_id
+    legacy_id = namespace.require_legacy_runtime_key()
     user = config.get_user_config(legacy_id)
     baseline = sorted({repo.strip().lower() for repo in (user.github_repos if user else []) if repo.strip()})
     added = await _legacy_setting(connection, f"github_repos_added:{legacy_id}")
@@ -314,6 +340,7 @@ async def _github_seed(
         await _legacy_setting(connection, f"issue_triage:{legacy_id}"),
         key="issue_triage",
     )
+    github_token = await _legacy_setting(connection, f"github_token:{legacy_id}")
     operator_pr_review = user.pr_review if user is not None else None
     operator_issue_triage = user.issue_triage if user is not None else None
     has_legacy_policy = user is not None or any(
@@ -338,24 +365,48 @@ async def _github_seed(
         issue_triage_source=(
             "user" if issue_triage is not None else "operator" if operator_issue_triage is not None else "default"
         ),
+        github_token=github_token,
+        allowed_triage_projects_json=json.dumps(
+            sorted(set(getattr(user, "allowed_triage_projects", []) if user is not None else [])),
+            separators=(",", ":"),
+        ),
         has_legacy_policy=has_legacy_policy,
     )
 
 
 def _operator_github_policy(
-    namespace: WorkshopExecutionStateNamespace,
-    config: Config,
+    profile: ProtectedRuntimeProfile,
 ) -> _OperatorGitHubPolicy:
-    user = config.get_user_config(namespace.runtime_config_id)
-    baseline = sorted({repo.strip().lower() for repo in (user.github_repos if user else []) if repo.strip()})
-    pr_review = user.pr_review if user is not None else None
-    issue_triage = user.issue_triage if user is not None else None
+    baseline = sorted(set(profile.github_repos))
+    pr_review = profile.pr_review
+    issue_triage = profile.issue_triage
     return _OperatorGitHubPolicy(
         baseline_repos_json=json.dumps(baseline, separators=(",", ":")),
         pr_review_enabled=int(pr_review or False),
         issue_triage_enabled=int(issue_triage or False),
         pr_review_source="operator" if pr_review is not None else "default",
         issue_triage_source="operator" if issue_triage is not None else "default",
+        allowed_triage_projects_json=json.dumps(
+            sorted(set(profile.allowed_triage_projects)),
+            separators=(",", ":"),
+        ),
+        has_user_config=True,
+    )
+
+
+def _operator_github_policy_from_user(user: object | None) -> _OperatorGitHubPolicy:
+    """Compatibility only for direct unit/dev callers without protected policy."""
+    repos = getattr(user, "github_repos", []) if user is not None else []
+    pr_review = getattr(user, "pr_review", None) if user is not None else None
+    issue_triage = getattr(user, "issue_triage", None) if user is not None else None
+    allowed = getattr(user, "allowed_triage_projects", []) if user is not None else []
+    return _OperatorGitHubPolicy(
+        baseline_repos_json=json.dumps(sorted({repo.strip().lower() for repo in repos}), separators=(",", ":")),
+        pr_review_enabled=int(pr_review or False),
+        issue_triage_enabled=int(issue_triage or False),
+        pr_review_source="operator" if pr_review is not None else "default",
+        issue_triage_source="operator" if issue_triage is not None else "default",
+        allowed_triage_projects_json=json.dumps(sorted(set(allowed)), separators=(",", ":")),
         has_user_config=user is not None,
     )
 
@@ -373,7 +424,7 @@ async def _backfill_jobs(
             namespace.channel_id,
             namespace.agent_id,
             namespace.runtime_profile_id,
-            namespace.runtime_config_id,
+            namespace.require_legacy_runtime_key(),
         ),
     )
     job_cursor = await connection.execute(
@@ -393,7 +444,7 @@ async def _backfill_jobs(
         "JOIN channel_agent_runtime_assignments ra ON ra.channel_id = c.id "
         "AND ra.agent_id = a.id AND ra.runtime_profile_id = o.runtime_profile_id "
         "WHERE j.chat_id = ?",
-        (namespace.runtime_config_id,),
+        (namespace.require_legacy_runtime_key(),),
     )
     return job_cursor.rowcount
 
@@ -422,14 +473,16 @@ async def _backfill_github_subscription(
     cursor = await connection.execute(
         "INSERT OR IGNORE INTO principal_github_subscriptions ("
         "principal_id, baseline_repos_json, added_repos_json, removed_repos_json, "
-        "pr_review_enabled, issue_triage_enabled, pr_review_source, issue_triage_source"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "pr_review_enabled, issue_triage_enabled, pr_review_source, issue_triage_source, "
+        "github_token, allowed_triage_projects_json"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (namespace.principal_id, *seed.database_values()),
     )
     if cursor.rowcount == 0:
         async with connection.execute(
             "SELECT baseline_repos_json, added_repos_json, removed_repos_json, "
-            "pr_review_enabled, issue_triage_enabled, pr_review_source, issue_triage_source "
+            "pr_review_enabled, issue_triage_enabled, pr_review_source, issue_triage_source, "
+            "github_token, allowed_triage_projects_json "
             "FROM principal_github_subscriptions WHERE principal_id = ?",
             (namespace.principal_id,),
         ) as result_cursor:
@@ -438,6 +491,23 @@ async def _backfill_github_subscription(
             raise WorkshopOperationalStateError(
                 "Canonical GitHub subscription state conflicts with unmigrated legacy policy"
             )
+    return cursor.rowcount
+
+
+async def _ensure_canonical_github_subscription(
+    connection: aiosqlite.Connection,
+    namespace: WorkshopExecutionStateNamespace,
+    policy: _OperatorGitHubPolicy,
+) -> int:
+    """Provision canonical state for a profile that has no legacy archive."""
+    cursor = await connection.execute(
+        "INSERT OR IGNORE INTO principal_github_subscriptions ("
+        "principal_id, baseline_repos_json, added_repos_json, removed_repos_json, "
+        "pr_review_enabled, issue_triage_enabled, pr_review_source, issue_triage_source, "
+        "allowed_triage_projects_json"
+        ") VALUES (?, ?, '[]', '[]', ?, ?, ?, ?, ?)",
+        (namespace.principal_id, *policy.database_values()),
+    )
     return cursor.rowcount
 
 
@@ -456,6 +526,7 @@ async def _sync_operator_github_policy(
         "THEN pr_review_source ELSE ? END, "
         "issue_triage_source = CASE WHEN issue_triage_source = 'user' "
         "THEN issue_triage_source ELSE ? END, "
+        "allowed_triage_projects_json = ?, "
         "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
         "WHERE principal_id = ?",
         (*policy.database_values(), namespace.principal_id),
@@ -464,6 +535,36 @@ async def _sync_operator_github_policy(
         raise WorkshopOperationalStateError(
             "Protected GitHub subscription policy has no unique canonical principal owner"
         )
+
+
+async def _migrate_runtime_key_github_token(
+    connection: aiosqlite.Connection,
+    namespace: WorkshopExecutionStateNamespace,
+) -> None:
+    """Carry the mutable token across schema v33 before sealing the archive.
+
+    Operational-state receipts predate the canonical token column. Existing
+    installations therefore need one final archived read on their first v33
+    startup. The immutable runtime-key cutover receipt is the removal gate:
+    once present, later legacy changes are never re-imported.
+    """
+    async with connection.execute(
+        "SELECT 1 FROM workshop_runtime_key_cutovers WHERE runtime_profile_id = ?",
+        (namespace.runtime_profile_id,),
+    ) as cursor:
+        if await cursor.fetchone() is not None:
+            return
+    legacy_token = await _legacy_setting(
+        connection,
+        f"github_token:{namespace.require_legacy_runtime_key()}",
+    )
+    if legacy_token is None:
+        return
+    await connection.execute(
+        "UPDATE principal_github_subscriptions SET github_token = COALESCE(github_token, ?), "
+        "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE principal_id = ?",
+        (legacy_token, namespace.principal_id),
+    )
 
 
 async def _verify_namespace(
@@ -490,7 +591,7 @@ async def _verify_legacy_jobs_for_cutover(
         "WHERE j.chat_id = ? AND (o.job_id IS NULL OR o.principal_id != ? OR o.channel_id != ? "
         "OR o.agent_id != ? OR o.runtime_profile_id != ?) ORDER BY j.id LIMIT 5",
         (
-            namespace.runtime_config_id,
+            namespace.require_legacy_runtime_key(),
             namespace.principal_id,
             namespace.channel_id,
             namespace.agent_id,
@@ -515,7 +616,7 @@ async def _verify_legacy_jobs_for_cutover(
         "OR c.schedule_type != j.schedule_type OR c.schedule_data != j.schedule_data "
         "OR c.active != j.active OR c.auto_remove != j.auto_remove "
         "OR c.notify_on_check != j.notify_on_check) ORDER BY j.id LIMIT 5",
-        (namespace.runtime_config_id,),
+        (namespace.require_legacy_runtime_key(),),
     ) as cursor:
         canonical_rows = await cursor.fetchall()
     if canonical_rows:

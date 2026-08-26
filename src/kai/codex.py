@@ -58,6 +58,7 @@ from kai.backend import (
     TRACE_SUMMARY_MAX_CHARS,
     AgentBackend,
     AgentResponse,
+    AgentRuntimeIdentity,
     ApiContext,
     StreamEvent,
     TraceEntry,
@@ -168,6 +169,7 @@ def write_turn_image_file(
     block: dict,
     *,
     chat_id: int | None,
+    principal_id: str | None = None,
     reader_user: str | None,
 ) -> Path | None:
     """
@@ -212,7 +214,9 @@ def write_turn_image_file(
     # the filename.
     subtype = media_type.split("/", 1)[-1]
     suffix = f".{subtype}" if subtype.isalnum() else ".img"
-    principal = "unscoped" if chat_id is None else principal_storage_name(chat_id)
+    principal = (
+        principal_id if principal_id is not None else "unscoped" if chat_id is None else principal_storage_name(chat_id)
+    )
     principal_dir = _TURN_IMAGE_DIR / principal
     path: Path | None = None
     try:
@@ -798,7 +802,13 @@ class CodexBackend(AgentBackend):
 
     # ── Sending prompts ────────────────────────────────────────────
 
-    async def send(self, prompt: str | list, chat_id: int | None = None) -> AsyncIterator[StreamEvent]:
+    async def send(
+        self,
+        prompt: str | list,
+        chat_id: int | None = None,
+        *,
+        runtime_identity: AgentRuntimeIdentity | None = None,
+    ) -> AsyncIterator[StreamEvent]:
         """
         Send a message to codex and yield streaming events.
 
@@ -817,10 +827,16 @@ class CodexBackend(AgentBackend):
             has done=True and includes the complete AgentResponse.
         """
         async with self._lock:
-            async for event in self._send_locked(prompt, chat_id):
+            async for event in self._send_locked(prompt, chat_id, runtime_identity=runtime_identity):
                 yield event
 
-    async def _send_locked(self, prompt: str | list, chat_id: int | None = None) -> AsyncIterator[StreamEvent]:
+    async def _send_locked(
+        self,
+        prompt: str | list,
+        chat_id: int | None = None,
+        *,
+        runtime_identity: AgentRuntimeIdentity | None = None,
+    ) -> AsyncIterator[StreamEvent]:
         """
         Core send logic (must be called while holding self._lock).
 
@@ -877,6 +893,7 @@ class CodexBackend(AgentBackend):
                 api=self._api_context,
                 workspace_config=self.workspace_config,
                 chat_id=chat_id,
+                runtime_identity=runtime_identity,
                 data_dir=DATA_DIR,
                 backend_name=self.backend_name,
                 memory_enabled=self.memory_enabled,
@@ -920,6 +937,7 @@ class CodexBackend(AgentBackend):
                     image_path = write_turn_image_file(
                         block,
                         chat_id=chat_id,
+                        principal_id=(str(runtime_identity.principal_id) if runtime_identity is not None else None),
                         reader_user=self._effective_codex_user,
                     )
                     if image_path is not None:
@@ -946,6 +964,7 @@ class CodexBackend(AgentBackend):
         prompt = await assemble_turn_context(
             prompt,
             chat_id=recall_chat_id,
+            runtime_identity=runtime_identity if had_user_text else None,
             session_context=session_ctx,
             workspace_reminder=reminder,
             workspace=self.workspace,

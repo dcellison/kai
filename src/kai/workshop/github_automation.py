@@ -13,7 +13,6 @@ from typing import Any
 
 from kai import review, triage
 from kai.config import ModelRole
-from kai.workshop.compatibility_state import WorkshopCompatibilityStateWriter
 from kai.workshop.domain import ChannelId, MessageId, PrincipalId, RuntimeProfileId
 from kai.workshop.execution_state import WorkshopExecutionStateRegistry
 from kai.workshop.integration_notifications import (
@@ -21,6 +20,7 @@ from kai.workshop.integration_notifications import (
     WorkshopIntegrationNotificationService,
 )
 from kai.workshop.runtime_pool import WorkshopRuntimePool
+from kai.workshop.runtime_state import WorkshopRuntimeStateWriter
 from kai.workshop.store import WorkshopEventStore
 
 log = logging.getLogger(__name__)
@@ -77,7 +77,7 @@ class WorkshopGitHubAutomationService:
         store: WorkshopEventStore,
         runtime_pool: WorkshopRuntimePool,
         execution_state: WorkshopExecutionStateRegistry,
-        compatibility_state: WorkshopCompatibilityStateWriter,
+        runtime_state: WorkshopRuntimeStateWriter,
         notifications: WorkshopIntegrationNotificationService,
         *,
         spec_dir: str,
@@ -86,7 +86,7 @@ class WorkshopGitHubAutomationService:
         self._store = store
         self._runtime_pool = runtime_pool
         self._execution_state = execution_state
-        self._compatibility_state = compatibility_state
+        self._runtime_state = runtime_state
         self._notifications = notifications
         self._spec_dir = spec_dir
         self._review_timeout_seconds = review_timeout_seconds
@@ -102,7 +102,7 @@ class WorkshopGitHubAutomationService:
         database_path: Path,
         runtime_pool: WorkshopRuntimePool,
         execution_state: WorkshopExecutionStateRegistry,
-        compatibility_state: WorkshopCompatibilityStateWriter,
+        runtime_state: WorkshopRuntimeStateWriter,
         notifications: WorkshopIntegrationNotificationService,
         *,
         spec_dir: str,
@@ -112,7 +112,7 @@ class WorkshopGitHubAutomationService:
             await WorkshopEventStore.open(database_path),
             runtime_pool,
             execution_state,
-            compatibility_state,
+            runtime_state,
             notifications,
             spec_dir=spec_dir,
             review_timeout_seconds=review_timeout_seconds,
@@ -375,8 +375,8 @@ class WorkshopGitHubAutomationService:
             await self._mark(item.work_id, "failed", "runtime_authority_changed")
             return
         profile = self._runtime_pool.runtime_profile(item.runtime_profile_id)
-        compatibility = self._compatibility_state.for_profile(item.runtime_profile_id)
-        token = await compatibility.github_token()
+        runtime_state = self._runtime_state.for_profile(item.runtime_profile_id)
+        token = await runtime_state.github_token()
         if not token:
             await self._notify(
                 item,
@@ -427,7 +427,7 @@ class WorkshopGitHubAutomationService:
                         item.runtime_profile_id,
                         ModelRole.ISSUE_TRIAGE,
                     ),
-                    allowed_triage_projects=list(compatibility.allowed_triage_projects),
+                    allowed_triage_projects=list(runtime_state.allowed_triage_projects),
                     github_token=token,
                     notification_sink=sink,
                 )

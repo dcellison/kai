@@ -240,7 +240,11 @@ def host_dependencies(monkeypatch):
         _FakeIntegrationNotifications,
     )
     monkeypatch.setattr(host_module, "WorkshopGitHubAutomationService", _FakeGitHubAutomation)
-    monkeypatch.setattr(host_module, "WorkshopCompatibilityStateWriter", lambda config, pool: (config, pool))
+    monkeypatch.setattr(
+        host_module,
+        "WorkshopRuntimeStateWriter",
+        lambda config, pool, execution_state: (config, pool, execution_state),
+    )
     monkeypatch.setattr(
         host_module,
         "WorkshopSettingsWorkspaceService",
@@ -285,7 +289,7 @@ def _execution_state(principal_id: PrincipalId, runtime_config_id: int):
                 channel_id=ChannelId(f"chn_{runtime_config_id:032x}"),
                 agent_id=AgentId(f"agt_{runtime_config_id:032x}"),
                 runtime_profile_id=profile_id(runtime_config_id),
-                runtime_config_id=runtime_config_id,
+                legacy_runtime_key=runtime_config_id,
             ),
         )
     )
@@ -475,7 +479,7 @@ async def test_real_core_lifecycle_uses_workshop_identity_without_telegram_appli
                     channel_id=context.channel_id,
                     agent_id=context.agent_id,
                     runtime_profile_id=context.runtime_profile_id,
-                    runtime_config_id=101,
+                    legacy_runtime_key=101,
                 ),
             )
         ),
@@ -575,7 +579,7 @@ async def test_core_activates_delivery_authority_before_recovering_expired_start
                     channel_id=context.channel_id,
                     agent_id=context.agent_id,
                     runtime_profile_id=context.runtime_profile_id,
-                    runtime_config_id=101,
+                    legacy_runtime_key=101,
                 ),
             )
         ),

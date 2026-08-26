@@ -73,7 +73,7 @@ def memory_authority_registry_from_database(
                 channel_id=ChannelId(str(row[3])),
                 agent_id=AgentId(str(row[4])),
                 runtime_profile_id=RuntimeProfileId(str(row[0])),
-                runtime_config_id=int(row[1]),
+                legacy_runtime_key=int(row[1]),
             )
             for row in rows
         )
@@ -103,7 +103,7 @@ async def reconcile_workshop_memory_authority(
         ) as cursor:
             migrated = await cursor.fetchone()
         current_owner = (
-            namespace.runtime_config_id,
+            namespace.require_legacy_runtime_key(),
             str(namespace.principal_id),
             str(namespace.channel_id),
             str(namespace.agent_id),
@@ -147,7 +147,7 @@ async def reconcile_workshop_memory_authority(
                 ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     namespace.runtime_profile_id,
-                    namespace.runtime_config_id,
+                    namespace.require_legacy_runtime_key(),
                     namespace.principal_id,
                     namespace.channel_id,
                     namespace.agent_id,

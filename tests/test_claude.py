@@ -2299,10 +2299,14 @@ class TestSendLock:
             # Wrap _send_locked to check if the lock is held when it runs
             original = claude._send_locked
 
-            async def checking_send(prompt, chat_id=None):
+            async def checking_send(prompt, chat_id=None, *, runtime_identity=None):
                 nonlocal lock_was_held
                 lock_was_held = claude._lock.locked()
-                async for event in original(prompt, chat_id=chat_id):
+                async for event in original(
+                    prompt,
+                    chat_id=chat_id,
+                    runtime_identity=runtime_identity,
+                ):
                     yield event
 
             with patch.object(claude, "_send_locked", checking_send):

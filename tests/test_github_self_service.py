@@ -104,10 +104,10 @@ class TestHandleGithubToken:
         update = _make_update()
         mock_set = AsyncMock()
 
-        with patch("kai.bot.sessions.set_setting", mock_set):
+        with patch("kai.bot.sessions.set_github_token", mock_set):
             await _handle_github_token(update, 12345, ["ghp_abc123"])
 
-        mock_set.assert_called_once_with("github_token:12345", "ghp_abc123")
+        mock_set.assert_called_once_with(12345, "ghp_abc123")
         reply = update.message.reply_text.call_args[0][0]
         assert "stored" in reply.lower()
         # Token value must never appear in the reply
@@ -119,10 +119,10 @@ class TestHandleGithubToken:
         update = _make_update()
         mock_delete = AsyncMock()
 
-        with patch("kai.bot.sessions.delete_setting", mock_delete):
+        with patch("kai.bot.sessions.set_github_token", mock_delete):
             await _handle_github_token(update, 12345, ["clear"])
 
-        mock_delete.assert_called_once_with("github_token:12345")
+        mock_delete.assert_called_once_with(12345, None)
         reply = update.message.reply_text.call_args[0][0]
         assert "removed" in reply.lower()
 
@@ -132,7 +132,7 @@ class TestHandleGithubToken:
         update = _make_update()
         mock_delete = AsyncMock()
 
-        with patch("kai.bot.sessions.delete_setting", mock_delete):
+        with patch("kai.bot.sessions.set_github_token", mock_delete):
             await _handle_github_token(update, 12345, ["CLEAR"])
 
         mock_delete.assert_called_once()
@@ -167,7 +167,7 @@ class TestHandleGithubAdd:
             "get_github_removed_repos": AsyncMock(return_value=list(removed or [])),
             "set_github_added_repos": AsyncMock(),
             "set_github_removed_repos": AsyncMock(),
-            "get_setting": AsyncMock(return_value=token),
+            "get_github_token": AsyncMock(return_value=token),
         }
 
     @pytest.mark.asyncio
@@ -420,7 +420,7 @@ class TestHandleGithubRemove:
             "get_github_removed_repos": AsyncMock(return_value=list(removed or [])),
             "set_github_added_repos": AsyncMock(),
             "set_github_removed_repos": AsyncMock(),
-            "get_setting": AsyncMock(return_value=token),
+            "get_github_token": AsyncMock(return_value=token),
         }
 
     @pytest.mark.asyncio

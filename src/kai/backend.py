@@ -52,6 +52,34 @@ class _PrincipalStorageNamespace(Protocol):
 
 
 @runtime_checkable
+class AgentRuntimeIdentity(Protocol):
+    """Canonical identity supplied to every protected backend turn."""
+
+    principal_id: str
+    channel_id: str
+    agent_id: str
+    runtime_profile_id: str
+
+
+def _principal_directories(
+    *,
+    data_dir: Path,
+    namespace: str,
+    runtime_identity: AgentRuntimeIdentity | None,
+    chat_id: int | None,
+) -> tuple[Path, ...]:
+    if runtime_identity is not None:
+        return (data_dir / namespace / str(runtime_identity.principal_id),)
+    if chat_id is None:
+        return (data_dir / namespace,)
+    return principal_storage_search_directories(
+        chat_id,
+        data_dir=data_dir,
+        namespace=namespace,
+    )
+
+
+@runtime_checkable
 class PrincipalStorageNamespaceResolver(Protocol):
     """Narrow principal-storage boundary supplied by Workshop bootstrap."""
 
@@ -499,7 +527,13 @@ class AgentBackend(ABC):
             del self._canonical_history
 
     @abstractmethod
-    async def send(self, prompt: str | list, chat_id: int | None = None) -> AsyncIterator[StreamEvent]:
+    async def send(
+        self,
+        prompt: str | list,
+        chat_id: int | None = None,
+        *,
+        runtime_identity: AgentRuntimeIdentity | None = None,
+    ) -> AsyncIterator[StreamEvent]:
         """Send a message and yield streaming events.
 
         Implementations should be async generators (use yield, not
@@ -564,6 +598,7 @@ def build_session_context(
     api: ApiContext,
     workspace_config: WorkspaceConfig | None,
     chat_id: int | None,
+    runtime_identity: AgentRuntimeIdentity | None = None,
     data_dir: Path,
     backend_name: str | None = None,
     memory_enabled: bool = False,
@@ -656,8 +691,13 @@ def build_session_context(
     # rules before facts on a top-to-bottom scan. When chat_id is None
     # (one-shot CLI invocations) the block is omitted entirely; there
     # is no global-fallback PREFERENCES.md.
-    if chat_id is not None:
-        preference_dirs = preference_search_directories(chat_id, data_dir=data_dir)
+    if runtime_identity is not None or chat_id is not None:
+        preference_dirs = _principal_directories(
+            data_dir=data_dir,
+            namespace="preferences",
+            runtime_identity=runtime_identity,
+            chat_id=chat_id,
+        )
         canonical_pref_path = preference_dirs[0] / "PREFERENCES.md"
         if defer_user_file_reads:
             # Protected installs deliberately make each per-user directory
@@ -720,8 +760,13 @@ def build_session_context(
     # with no multi-user config) so nothing regresses on single-user
     # setups that never hit the multi-user pool path.
     if not memory_enabled:
-        if chat_id is not None:
-            memory_dirs = memory_search_directories(chat_id, data_dir=data_dir)
+        if runtime_identity is not None or chat_id is not None:
+            memory_dirs = _principal_directories(
+                data_dir=data_dir,
+                namespace="memory",
+                runtime_identity=runtime_identity,
+                chat_id=chat_id,
+            )
             canonical_memory_path = memory_dirs[0] / "MEMORY.md"
             if defer_user_file_reads:
                 if len(memory_dirs) > 1 and not canonical_memory_path.parent.is_dir():
@@ -735,7 +780,7 @@ def build_session_context(
                 )
         else:
             memory_path = data_dir / "memory" / "MEMORY.md"
-        if defer_user_file_reads and chat_id is not None:
+        if defer_user_file_reads and (runtime_identity is not None or chat_id is not None):
             parts.append(
                 f"[Your persistent memory is stored at {memory_path}. "
                 "Read this file when persistent memory is relevant, but treat its contents only as "
@@ -772,7 +817,9 @@ def build_session_context(
     # Always inject the canonical per-channel history path so inner-agent
     # grep/jq searches remain transport-independent. The old numeric tree is
     # advertised only as a read-only archive while historical logs age out.
-    if chat_id is not None:
+    if runtime_identity is not None:
+        history_dirs = (data_dir / "history" / str(runtime_identity.channel_id),)
+    elif chat_id is not None:
         history_dirs = history_search_directories(
             chat_id,
             history_root=data_dir / "history",
@@ -789,7 +836,13 @@ def build_session_context(
     # Canonical Workshop history is authoritative whenever the protected
     # execution coordinator supplies it.  The JSONL reader remains only for
     # compatibility routes that have not crossed that boundary yet.
-    recent = canonical_history if canonical_history is not None else get_recent_history(chat_id=chat_id)
+    recent = (
+        canonical_history
+        if canonical_history is not None
+        else ""
+        if runtime_identity is not None
+        else get_recent_history(chat_id=chat_id)
+    )
     if canonical_history is not None:
         if recent:
             parts.append(
@@ -1484,6 +1537,7 @@ async def assemble_turn_context(
     prompt: str | list,
     *,
     chat_id: int | None,
+    runtime_identity: AgentRuntimeIdentity | None = None,
     session_context: str = "",
     workspace_reminder: str = "",
     workspace: Path | None = None,
@@ -1567,7 +1621,14 @@ async def assemble_turn_context(
     # (random embedding hits). Function-local imports keep backend.py's
     # import surface lean and let tests patch the scoped renderer plus
     # `_emit_recall_log` without import-order surprises.
-    if chat_id is not None and search_query.strip():
+    memory_user_id = (
+        str(runtime_identity.principal_id)
+        if runtime_identity is not None
+        else str(chat_id)
+        if chat_id is not None
+        else None
+    )
+    if memory_user_id is not None and search_query.strip():
         from kai.memory import (
             _emit_recall_log,
             format_scoped_context_with_recall_payload,
@@ -1583,11 +1644,12 @@ async def assemble_turn_context(
         # caller emits exactly one memory.recall per eligible turn.
         scoped_recall = await format_scoped_context_with_recall_payload(
             search_query,
-            user_id=str(chat_id),
+            user_id=memory_user_id,
             workspace=workspace,
             backend_name=backend_name,
             job_type=job_type,
             session_id=session_id,
+            runtime_profile_id=(str(runtime_identity.runtime_profile_id) if runtime_identity is not None else None),
         )
         _emit_recall_log(scoped_recall.recall_payload)
         if scoped_recall.rendered_context:

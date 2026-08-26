@@ -90,7 +90,7 @@ def _service(tmp_path: Path):
         channel_id=ChannelId("chn_" + "2" * 32),
         agent_id=AgentId("agt_" + "3" * 32),
         runtime_profile_id=profile_id(101),
-        runtime_config_id=101,
+        legacy_runtime_key=101,
     )
     runtime_pool = _RuntimePool(tmp_path)
     service = WorkshopMemoryQueryService(
@@ -369,7 +369,7 @@ async def test_source_context_requires_canonical_lineage_and_channel_membership(
             channel_id=channel_id,
             agent_id=agent_id,
             runtime_profile_id=profile_id(101),
-            runtime_config_id=101,
+            legacy_runtime_key=101,
         )
         service = WorkshopMemoryQueryService(
             Config(

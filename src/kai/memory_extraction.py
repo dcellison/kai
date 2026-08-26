@@ -1908,6 +1908,7 @@ def _paraphrase_neighbor(
     user_id: str,
     threshold: float,
     active_project: ActiveMemoryProject | None = None,
+    runtime_profile_id: str | None = None,
 ) -> MemoryResult | None:
     """
     Nearest-admissible-neighbor semantic-search dedup gate.
@@ -1953,7 +1954,13 @@ def _paraphrase_neighbor(
         # at the public-API layer; this helper is called from inside
         # the semaphore block of `extract_and_store` which already
         # runs off the hot path, so a direct sync call is fine here.
-        results = memory.search(content, user_id=user_id, limit=_DEDUP_NEIGHBOR_FETCH_N)
+        search_kwargs: dict[str, object] = {
+            "user_id": user_id,
+            "limit": _DEDUP_NEIGHBOR_FETCH_N,
+        }
+        if runtime_profile_id is not None:
+            search_kwargs["runtime_profile_id"] = runtime_profile_id
+        results = memory.search(content, **search_kwargs)
     except Exception:
         log.debug("_paraphrase_neighbor: search failed; treating as non-duplicate", exc_info=True)
         return None
@@ -2490,6 +2497,7 @@ async def _generate_episode(
     user_log: LogEntry | None = None,
     assistant_log: LogEntry | None = None,
     canonical_provenance: dict[str, object] | None = None,
+    runtime_profile_id: str | None = None,
 ) -> None:
     """
     Stage-2 task body: generate one episode record and store it.
@@ -2662,15 +2670,18 @@ async def _generate_episode(
                     # block other stage-2 tasks queued behind this
                     # user's semaphore.
                     loop = asyncio.get_running_loop()
+                    add_kwargs: dict[str, object] = {
+                        "content": content,
+                        "user_id": user_id,
+                        "memory_type": "episode",
+                        "tags": episode["tags"],
+                        "metadata": extra,
+                    }
+                    if runtime_profile_id is not None:
+                        add_kwargs["runtime_profile_id"] = runtime_profile_id
                     mem_id = await loop.run_in_executor(
                         None,
-                        lambda: memory.add_structured(
-                            content=content,
-                            user_id=user_id,
-                            memory_type="episode",
-                            tags=episode["tags"],
-                            metadata=extra,
-                        ),
+                        lambda: memory.add_structured(**add_kwargs),
                     )
                     # add_structured returns the new memory ID on
                     # success or None when the underlying Mem0 call
@@ -2863,6 +2874,7 @@ def _store_facts(
     user_log: LogEntry | None = None,
     assistant_log: LogEntry | None = None,
     canonical_provenance: dict[str, object] | None = None,
+    runtime_profile_id: str | None = None,
 ) -> tuple[int, int, int]:
     """
     Persist validated facts via memory.add_structured, branching on intent.
@@ -3028,13 +3040,20 @@ def _store_facts(
             # production, raise N rather than re-introducing the
             # _paraphrase_neighbor gate here (which would silently drop
             # the consolidation and leave the stale fact in place).
-            delete_ok = memory.delete_by_id(user_id=user_id, memory_id=existing_id)
+            delete_kwargs: dict[str, object] = {
+                "user_id": user_id,
+                "memory_id": existing_id,
+            }
+            if runtime_profile_id is not None:
+                delete_kwargs["runtime_profile_id"] = runtime_profile_id
+            delete_ok = memory.delete_by_id(**delete_kwargs)
             memory_id = memory.add_structured(
                 content,
                 user_id=user_id,
                 memory_type="fact",
                 tags=fact.get("tags"),
                 metadata=extra,
+                runtime_profile_id=runtime_profile_id,
             )
             if memory_id is None:
                 # Worst case: old fact gone (if delete succeeded), new
@@ -3078,6 +3097,7 @@ def _store_facts(
             user_id,
             threshold=config.memory_duplicate_threshold,
             active_project=active_project,
+            runtime_profile_id=runtime_profile_id,
         )
         if neighbor is not None:
             log.debug("_store_facts: skipping duplicate %r", content[:80])
@@ -3112,6 +3132,7 @@ def _store_facts(
             memory_type="fact",
             tags=fact.get("tags"),
             metadata=extra,
+            runtime_profile_id=runtime_profile_id,
         )
         if memory_id is not None:
             _emit_intent_log(
@@ -3169,10 +3190,13 @@ async def extract_and_store(
     config: Config | None = None,
     prior_pairs: list[tuple[str, str]] | None = None,
     os_user_override: str | None = None,
+    effective_backend_override: str | None = None,
+    effective_provider_override: str | None = None,
     workspace: str | None = None,
     user_log: LogEntry | None = None,
     assistant_log: LogEntry | None = None,
     canonical_provenance: dict[str, object] | None = None,
+    runtime_profile_id: str | None = None,
     await_episode: bool = False,
 ) -> int:
     """
@@ -3258,8 +3282,8 @@ async def extract_and_store(
     # site because `bot.py`'s extraction gate filters them out
     # upstream; the cascade here
     # mirrors `_resolve_effective_backend`.
-    effective_backend = _resolve_effective_backend(user_id, config)
-    effective_provider = _resolve_effective_provider(user_id, config)
+    effective_backend = effective_backend_override or _resolve_effective_backend(user_id, config)
+    effective_provider = effective_provider_override or _resolve_effective_provider(user_id, config)
 
     # Active-project detection, ONCE per run, threaded into both
     # stages like os_user and the backend triple above so a single
@@ -3313,8 +3337,15 @@ async def extract_and_store(
                         None,
                         lambda: memory.search(
                             assistant_capped,
-                            user_id=user_id,
-                            limit=n_candidates,
+                            **(
+                                {
+                                    "user_id": user_id,
+                                    "limit": n_candidates,
+                                    "runtime_profile_id": runtime_profile_id,
+                                }
+                                if runtime_profile_id is not None
+                                else {"user_id": user_id, "limit": n_candidates}
+                            ),
                         ),
                     )
                 except Exception:
@@ -3430,6 +3461,7 @@ async def extract_and_store(
                         user_log=user_log,
                         assistant_log=assistant_log,
                         canonical_provenance=canonical_provenance,
+                        runtime_profile_id=runtime_profile_id,
                     ),
                 )
             else:
@@ -3470,6 +3502,7 @@ async def extract_and_store(
                     user_log=user_log,
                     assistant_log=assistant_log,
                     canonical_provenance=canonical_provenance,
+                    runtime_profile_id=runtime_profile_id,
                 )
                 if await_episode:
                     await episode

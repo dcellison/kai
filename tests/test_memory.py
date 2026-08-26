@@ -3910,7 +3910,7 @@ class TestPrincipalOwnershipPredicate:
             channel_id=ChannelId.new(),
             agent_id=AgentId.new(),
             runtime_profile_id=RuntimeProfileId.new(),
-            runtime_config_id=config_id,
+            legacy_runtime_key=config_id,
         )
 
     @staticmethod
@@ -4093,9 +4093,9 @@ class TestMemoryIntegration:
             channel_id=ChannelId.new(),
             agent_id=AgentId.new(),
             runtime_profile_id=RuntimeProfileId.new(),
-            runtime_config_id=8675309,
+            legacy_runtime_key=8675309,
         )
-        legacy_user_id = str(namespace.runtime_config_id)
+        legacy_user_id = str(namespace.require_legacy_runtime_key())
         canonical_user_id = str(namespace.principal_id)
         mem_mod._memory = real_memory_instance
         mem_mod._config = _make_config()
@@ -4172,7 +4172,7 @@ class TestMemoryIntegration:
                 channel_id=ChannelId.new(),
                 agent_id=AgentId.new(),
                 runtime_profile_id=RuntimeProfileId.new(),
-                runtime_config_id=config_id,
+                legacy_runtime_key=config_id,
             )
 
         profile_a, profile_b = profile(910001), profile(910002)
@@ -4182,7 +4182,7 @@ class TestMemoryIntegration:
             channel_id=ChannelId.new(),
             agent_id=AgentId.new(),
             runtime_profile_id=RuntimeProfileId.new(),
-            runtime_config_id=910003,
+            legacy_runtime_key=910003,
         )
 
         mem_mod._memory = real_memory_instance
@@ -4193,7 +4193,7 @@ class TestMemoryIntegration:
             mem_mod.configure_memory_authority(WorkshopExecutionStateRegistry((profile_a, profile_b)))
             memory_id = mem_mod.add_structured(
                 "User prefers dark roast coffee",
-                user_id=str(profile_a.runtime_config_id),
+                user_id=str(profile_a.require_legacy_runtime_key()),
                 memory_type="fact",
             )
             assert memory_id is not None
@@ -4208,13 +4208,13 @@ class TestMemoryIntegration:
             )
 
             # Read through the OTHER profile: visible.
-            visible = mem_mod.get_all(user_id=str(profile_b.runtime_config_id))
+            visible = mem_mod.get_all(user_id=str(profile_b.require_legacy_runtime_key()))
             assert [item.id for item in visible] == [memory_id]
 
             # Wipe through the other profile: the principal's row
             # goes, the foreign-stamped row stays.
-            mem_mod.delete_all(user_id=str(profile_b.runtime_config_id))
-            assert mem_mod.get_all(user_id=str(profile_a.runtime_config_id)) == []
+            mem_mod.delete_all(user_id=str(profile_b.require_legacy_runtime_key()))
+            assert mem_mod.get_all(user_id=str(profile_a.require_legacy_runtime_key())) == []
             leftover = mem_mod._get_all_raw(user_id=canonical_user_id)
             assert [row.text for row in leftover] == ["Foreign principal's fact"]
         finally:
@@ -6946,14 +6946,14 @@ class TestNeverRaiseContracts:
             channel_id=ChannelId.new(),
             agent_id=AgentId.new(),
             runtime_profile_id=RuntimeProfileId.new(),
-            runtime_config_id=424242,
+            legacy_runtime_key=424242,
         )
         mem_mod._memory = MagicMock()
         try:
             mem_mod.configure_memory_authority(WorkshopExecutionStateRegistry((namespace,)))
             result = add_structured(
                 "conflicting fact",
-                user_id=str(namespace.runtime_config_id),
+                user_id=str(namespace.require_legacy_runtime_key()),
                 metadata={WORKSHOP_PRINCIPAL_ID_KEY: "prn_" + "f" * 32},
             )
         finally:
