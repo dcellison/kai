@@ -281,6 +281,30 @@ describe("Workshop Memory explorer", () => {
     expect(await screen.findByText("This memory predates canonical source links.")).toBeVisible();
   });
 
+  it("explains that explicitly saved memories intentionally have no source conversation", async () => {
+    vi.mocked(loadMemorySource).mockResolvedValue({
+      reason: "explicit_creation",
+      result: null,
+      runId: null,
+      source: null,
+      status: "unavailable",
+    });
+    render(
+      <MemoryExplorer
+        initialMemoryId={fact.memoryId}
+        onAuthenticationFailure={vi.fn()}
+        onClose={vi.fn()}
+        onForget={vi.fn()}
+        onSelectMemory={vi.fn()}
+        token="session-secret"
+      />,
+    );
+
+    expect(await screen.findByText(
+      "This memory was saved explicitly, so no source conversation was linked.",
+    )).toBeVisible();
+  });
+
   it("reports loading failures with retry and expires the existing session boundary", async () => {
     const user = userEvent.setup();
     const onAuthenticationFailure = vi.fn();

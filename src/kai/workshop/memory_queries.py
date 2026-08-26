@@ -1353,6 +1353,8 @@ class WorkshopMemoryQueryService:
         if provenance.malformed:
             return MemorySourceContext("unavailable", "invalid_provenance", None, None, None)
         if not provenance.canonical_present:
+            if result.metadata.get("source") == "explicit":
+                return MemorySourceContext("unavailable", "explicit_creation", None, None, None)
             return MemorySourceContext("unavailable", "legacy_source", None, None, None)
         if provenance.principal_id != str(authority.principal_id):
             return MemorySourceContext("unavailable", "source_not_authorized", None, None, None)
