@@ -136,6 +136,7 @@ const memoryRecord: WorkshopMemoryRecord = {
   memoryId: "memory-1",
   memoryType: "fact",
   preview: "Workshop memory navigation works.",
+  revision: "mr1_test",
   scope: {
     exclusionReason: null,
     invalidDefaulted: false,

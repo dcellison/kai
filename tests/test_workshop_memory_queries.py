@@ -30,11 +30,16 @@ from kai.workshop.execution_state import (
 from kai.workshop.inbound import InboundMessage
 from kai.workshop.memory_queries import (
     MAX_MUTATION_TARGETS,
+    MEMORY_CONTENT_AUDIT_EVENT,
     MEMORY_MANAGEMENT_AUDIT_EVENT,
+    MemoryEpisodeEdit,
+    MemoryFactEdit,
     MemoryProjectOption,
     MemoryQueryFilters,
     WorkshopMemoryAccessDenied,
+    WorkshopMemoryConflict,
     WorkshopMemoryCursorError,
+    WorkshopMemoryMutationFailed,
     WorkshopMemoryNotFound,
     WorkshopMemoryQueryService,
     WorkshopMemoryResponseTooLarge,
@@ -252,7 +257,11 @@ async def test_stats_and_detail_expose_only_bounded_stable_fields(
 
     detail = await service.detail(authority, episode.id)
     assert detail.content == "Deploy succeeded."
-    assert detail.episode == {"goal": "Deploy Kai", "outcome": "Succeeded"}
+    assert detail.episode == {
+        "goal": "Deploy Kai",
+        "outcome": "Succeeded",
+        "tags": [],
+    }
     assert "private_unknown_field" not in detail.compact_recall
     assert '"record_type":"memory"' in detail.compact_recall
     with pytest.raises(WorkshopMemoryNotFound):
@@ -426,6 +435,293 @@ async def test_delete_management_restricts_sources_and_reports_stale_targets(
 
     assert [result.outcome for result in batch.results] == ["succeeded", "not_found", "stale"]
     assert all(memory_id not in rows for memory_id in ("ok", "stale"))
+
+
+async def test_explicit_fact_creation_is_scoped_idempotent_and_content_free_in_audit(
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    service, authority, principal_id = _service(tmp_path)
+    rows: dict[str, memory.MemoryResult] = {}
+    secret = "Q1055 private explicit fact"
+
+    monkeypatch.setattr(memory, "get_all", lambda **_kwargs: list(rows.values()))
+    monkeypatch.setattr(memory, "get_by_id", lambda **kwargs: rows.get(kwargs["memory_id"]))
+
+    def add_structured(content: str, **kwargs):
+        metadata = dict(kwargs["metadata"])
+        metadata.update({"type": kwargs["memory_type"], "tags": kwargs["tags"]})
+        rows["created"] = _result("created", content, source="explicit")
+        rows["created"].metadata.clear()
+        rows["created"].metadata.update(metadata)
+        return "created"
+
+    monkeypatch.setattr(memory, "add_structured", add_structured)
+    caplog.set_level("INFO", logger="kai.workshop.memory_queries")
+
+    created = await service.create_fact(
+        authority,
+        content=secret,
+        tags=["qualification"],
+        scope="global",
+        project_id=None,
+        request_id="create-request-1",
+    )
+    replay = await service.create_fact(
+        authority,
+        content=secret,
+        tags=["qualification"],
+        scope="global",
+        project_id=None,
+        request_id="create-request-1",
+    )
+
+    assert created.created is True
+    assert replay.created is False
+    assert created.record.record.source == "explicit"
+    assert rows["created"].metadata["operator_created_by_principal_id"] == str(principal_id)
+    assert rows["created"].metadata["scope_source"] == memory.SCOPE_SOURCE_OPERATOR
+    audit = "\n".join(
+        record.message for record in caplog.records if record.message.startswith(MEMORY_CONTENT_AUDIT_EVENT)
+    )
+    assert '"outcome":"succeeded"' in audit
+    assert '"outcome":"idempotent"' in audit
+    assert secret not in audit
+
+
+async def test_fact_edit_preserves_provenance_reindexes_and_replays_safely(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, authority, principal_id = _service(tmp_path)
+    original = _result("fact", "Old searchable wording", tags=["old"])
+    original.metadata["confirmation_quote"] = "immutable source quote"
+    rows = {original.id: original}
+    writes: list[tuple[str, dict[str, object]]] = []
+
+    monkeypatch.setattr(memory, "get_by_id", lambda **kwargs: rows.get(kwargs["memory_id"]))
+
+    def update_metadata(*, memory_id: str, data: str, metadata, **_kwargs):
+        writes.append((data, metadata))
+        previous = rows[memory_id]
+        rows[memory_id] = memory.MemoryResult(
+            id=previous.id,
+            text=data,
+            score=previous.score,
+            memory_type=previous.memory_type,
+            metadata=dict(metadata),
+            created_at=previous.created_at,
+            updated_at="2026-08-26T12:00:00Z",
+        )
+        return True
+
+    monkeypatch.setattr(memory, "update_metadata", update_metadata)
+    revision = (await service.detail(authority, original.id)).record.revision
+    edit = MemoryFactEdit("New searchable wording", ("new",))
+
+    saved = await service.edit(
+        authority,
+        original.id,
+        revision=revision,
+        request_id="edit-request-1",
+        edit=edit,
+    )
+    replay = await service.edit(
+        authority,
+        original.id,
+        revision=revision,
+        request_id="edit-request-1",
+        edit=edit,
+    )
+
+    assert saved.changed_fields == ("content", "tags")
+    assert saved.idempotent_replay is False
+    assert replay.idempotent_replay is True
+    assert len(writes) == 1
+    assert writes[0][0] == "New searchable wording"
+    assert writes[0][1]["source"] == "extracted"
+    assert writes[0][1]["confirmation_quote"] == "immutable source quote"
+    assert writes[0][1]["operator_edited_by_principal_id"] == str(principal_id)
+    assert saved.record.record.revision != revision
+
+
+async def test_episode_edit_rebuilds_canonical_search_text_and_schema(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, authority, _ = _service(tmp_path)
+    row = _result("episode", "Old goal\n\nOld context", source="episode")
+    row.metadata.update(
+        {
+            "goal": "Old goal",
+            "context": "Old context",
+            "approach": "Old approach",
+            "outcome": "Old outcome",
+            "outcome_quality": "partial",
+            "tags": ["old"],
+            "actors": ["Daniel"],
+        }
+    )
+    rows = {row.id: row}
+    monkeypatch.setattr(memory, "get_by_id", lambda **kwargs: rows.get(kwargs["memory_id"]))
+
+    def update_metadata(*, memory_id: str, data: str, metadata, **_kwargs):
+        previous = rows[memory_id]
+        rows[memory_id] = memory.MemoryResult(
+            previous.id,
+            data,
+            previous.score,
+            previous.memory_type,
+            dict(metadata),
+            previous.created_at,
+            "2026-08-26T12:00:00Z",
+        )
+        return True
+
+    monkeypatch.setattr(memory, "update_metadata", update_metadata)
+    revision = (await service.detail(authority, row.id)).record.revision
+    edit = MemoryEpisodeEdit(
+        goal="New semantic goal",
+        context="New semantic context",
+        approach="New approach",
+        outcome="New outcome",
+        outcome_quality="success",
+        lessons="Keep the canonical representation aligned.",
+        tags=("new",),
+        actors=("Daniel", "Kai"),
+    )
+
+    saved = await service.edit(
+        authority,
+        row.id,
+        revision=revision,
+        request_id="episode-edit-1",
+        edit=edit,
+    )
+
+    assert rows[row.id].text == "New semantic goal\n\nNew semantic context"
+    assert saved.record.episode == {
+        "goal": "New semantic goal",
+        "context": "New semantic context",
+        "approach": "New approach",
+        "outcome": "New outcome",
+        "lessons": "Keep the canonical representation aligned.",
+        "outcome_quality": "success",
+        "tags": ["new"],
+        "actors": ["Daniel", "Kai"],
+    }
+
+
+async def test_edit_rejects_stale_revision_and_reports_unchanged_provider_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, authority, _ = _service(tmp_path)
+    row = _result("fact", "Original")
+    rows = {row.id: row}
+    monkeypatch.setattr(memory, "get_by_id", lambda **kwargs: rows.get(kwargs["memory_id"]))
+    monkeypatch.setattr(memory, "update_metadata", lambda **_kwargs: False)
+    revision = (await service.detail(authority, row.id)).record.revision
+
+    with pytest.raises(WorkshopMemoryMutationFailed):
+        await service.edit(
+            authority,
+            row.id,
+            revision=revision,
+            request_id="failed-edit",
+            edit=MemoryFactEdit("Changed", ()),
+        )
+
+    rows[row.id] = memory.MemoryResult(
+        row.id,
+        "External correction",
+        row.score,
+        row.memory_type,
+        dict(row.metadata),
+        row.created_at,
+        "2026-08-26T12:00:00Z",
+    )
+    with pytest.raises(WorkshopMemoryConflict):
+        await service.edit(
+            authority,
+            row.id,
+            revision=revision,
+            request_id="stale-edit",
+            edit=MemoryFactEdit("Changed", ()),
+        )
+
+
+async def test_edit_recovers_when_provider_reports_failure_after_committing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, authority, _ = _service(tmp_path)
+    row = _result("fact", "Original", tags=["old"])
+    rows = {row.id: row}
+    monkeypatch.setattr(memory, "get_by_id", lambda **kwargs: rows.get(kwargs["memory_id"]))
+
+    def update_then_report_failure(*, memory_id: str, data: str, metadata, **_kwargs):
+        previous = rows[memory_id]
+        rows[memory_id] = memory.MemoryResult(
+            previous.id,
+            data,
+            previous.score,
+            previous.memory_type,
+            dict(metadata),
+            previous.created_at,
+            "2026-08-26T12:00:00Z",
+        )
+        return False
+
+    monkeypatch.setattr(memory, "update_metadata", update_then_report_failure)
+    revision = (await service.detail(authority, row.id)).record.revision
+
+    saved = await service.edit(
+        authority,
+        row.id,
+        revision=revision,
+        request_id="commit-before-failure",
+        edit=MemoryFactEdit("Committed correction", ("new",)),
+    )
+
+    assert saved.idempotent_replay is True
+    assert saved.record.content == "Committed correction"
+    assert saved.record.record.tags == ("new",)
+
+
+async def test_content_mutations_reject_invalid_typed_fields(
+    tmp_path: Path,
+) -> None:
+    service, authority, _ = _service(tmp_path)
+
+    with pytest.raises(WorkshopMemoryValidationError, match="at most 32"):
+        await service.create_fact(
+            authority,
+            content="Bounded fact",
+            tags=[f"tag-{index}" for index in range(33)],
+            scope="global",
+            project_id=None,
+            request_id="too-many-tags",
+        )
+
+    with pytest.raises(WorkshopMemoryValidationError, match="Outcome quality"):
+        await service.edit(
+            authority,
+            "episode",
+            revision="mr1_valid",
+            request_id="bad-outcome-quality",
+            edit=MemoryEpisodeEdit(
+                goal="Goal",
+                context="Context",
+                approach="Approach",
+                outcome="Outcome",
+                outcome_quality="unknown",
+                lessons=None,
+                tags=(),
+                actors=(),
+            ),
+        )
 
 
 async def test_search_uses_live_scoped_retrieval_and_visible_sources(

@@ -10,8 +10,11 @@ import {
 
 import {
   AuthenticationError,
+  MemoryRevisionConflictError,
+  createMemoryFact,
   deleteMemories,
   deleteMemory,
+  editMemory,
   loadMemoryDetail,
   loadMemoryRecords,
   loadMemorySource,
@@ -23,6 +26,7 @@ import {
 import { MarkdownMessage } from "./MarkdownMessage";
 import type {
   WorkshopMemoryDetail,
+  WorkshopMemoryEpisodeFields,
   WorkshopMemoryFilters,
   WorkshopMemoryMutationBatch,
   WorkshopMemoryProjectOption,
@@ -114,6 +118,226 @@ function episodeLabel(key: string): string {
     .join(" ");
 }
 
+function splitEditorValues(value: string): string[] {
+  return value
+    .split(/[,\n]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function editorRequestId(): string {
+  return typeof globalThis.crypto?.randomUUID === "function"
+    ? globalThis.crypto.randomUUID()
+    : `memory-editor-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function MemoryEditorDialog({
+  allowedProjects,
+  detail,
+  onAuthenticationFailure,
+  onClose,
+  onReload,
+  onSaved,
+  token,
+}: {
+  allowedProjects: WorkshopMemoryProjectOption[];
+  detail: WorkshopMemoryDetail | null;
+  onAuthenticationFailure: (message: string) => void;
+  onClose: () => void;
+  onReload: () => void;
+  onSaved: (record: WorkshopMemoryDetail, message: string) => void;
+  token: string;
+}): React.JSX.Element {
+  const episode = detail?.episode;
+  const [content, setContent] = useState(detail?.content ?? "");
+  const [tags, setTags] = useState((episode?.tags ?? detail?.tags ?? []).join(", "));
+  const [target, setTarget] = useState("global");
+  const [goal, setGoal] = useState(episode?.goal ?? "");
+  const [context, setContext] = useState(episode?.context ?? "");
+  const [approach, setApproach] = useState(episode?.approach ?? "");
+  const [outcome, setOutcome] = useState(episode?.outcome ?? "");
+  const [outcomeQuality, setOutcomeQuality] = useState<WorkshopMemoryEpisodeFields["outcomeQuality"]>(
+    episode?.outcomeQuality ?? "success",
+  );
+  const [lessons, setLessons] = useState(episode?.lessons ?? "");
+  const [actors, setActors] = useState((episode?.actors ?? []).join(", "));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [conflict, setConflict] = useState(false);
+  const [requestId] = useState(editorRequestId);
+  const editing = detail !== null;
+  const isEpisode = detail?.kind === "episode";
+  const dirty = editing
+    ? isEpisode
+      ? goal !== (episode?.goal ?? "") || context !== (episode?.context ?? "") ||
+        approach !== (episode?.approach ?? "") || outcome !== (episode?.outcome ?? "") ||
+        outcomeQuality !== (episode?.outcomeQuality ?? "success") ||
+        lessons !== (episode?.lessons ?? "") || actors !== (episode?.actors ?? []).join(", ") ||
+        tags !== (episode?.tags ?? []).join(", ")
+      : content !== detail.content || tags !== detail.tags.join(", ")
+    : Boolean(content.trim() || tags.trim() || target !== "global");
+
+  useEffect(() => {
+    if (!dirty) return;
+    const warn = (event: BeforeUnloadEvent): void => {
+      event.preventDefault();
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [dirty]);
+
+  const closeSafely = (): void => {
+    if (dirty && !window.confirm("Discard your unsaved memory changes?")) return;
+    onClose();
+  };
+
+  const submit = async (event: FormEvent): Promise<void> => {
+    event.preventDefault();
+    setSaving(true);
+    setError(null);
+    setConflict(false);
+    try {
+      if (!detail) {
+        const parsedTarget = target.startsWith("project:")
+          ? { scope: "project" as const, projectId: target.slice("project:".length) }
+          : { scope: "global" as const };
+        const result = await createMemoryFact(token, {
+          content,
+          tags: splitEditorValues(tags),
+          target: parsedTarget,
+          requestId,
+        });
+        onSaved(result.record, result.created ? "Explicit memory created." : "Memory was already created.");
+      } else if (isEpisode) {
+        const result = await editMemory(token, {
+          kind: "episode",
+          memoryId: detail.memoryId,
+          revision: detail.revision,
+          requestId,
+          episode: {
+            actors: splitEditorValues(actors),
+            approach,
+            context,
+            goal,
+            lessons: lessons.trim() || null,
+            outcome,
+            outcomeQuality,
+            tags: splitEditorValues(tags),
+          },
+        });
+        onSaved(result.record, result.idempotentReplay ? "Memory was already saved." : "Episode updated and re-indexed.");
+      } else {
+        const result = await editMemory(token, {
+          kind: "fact",
+          memoryId: detail.memoryId,
+          revision: detail.revision,
+          requestId,
+          content,
+          tags: splitEditorValues(tags),
+        });
+        onSaved(result.record, result.idempotentReplay ? "Memory was already saved." : "Fact updated and re-indexed.");
+      }
+    } catch (caught) {
+      if (caught instanceof MemoryRevisionConflictError) {
+        setConflict(true);
+        setError("This memory changed after you opened it. Reload the latest revision before saving again.");
+      } else if (caught instanceof AuthenticationError) {
+        onAuthenticationFailure(caught.message);
+        setError(caught.message);
+      } else {
+        setError(caught instanceof Error ? caught.message : "Could not save this memory.");
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="memory-confirm-backdrop memory-editor-backdrop">
+      <section className="memory-editor" role="dialog" aria-modal="true" aria-labelledby="memory-editor-title">
+        <header>
+          <div>
+            <p className="overline">{editing ? "Edit memory" : "New explicit memory"}</p>
+            <h2 id="memory-editor-title">
+              {editing ? `Correct ${isEpisode ? "episode" : "fact"}` : "Create fact"}
+            </h2>
+          </div>
+          <button type="button" className="quiet-button" disabled={saving} onClick={closeSafely}>Close</button>
+        </header>
+        <form onSubmit={(event) => void submit(event)}>
+          {isEpisode ? (
+            <>
+              <label>Goal <span>affects semantic retrieval</span>
+                <textarea required maxLength={20000} value={goal} onChange={(event) => setGoal(event.target.value)} />
+              </label>
+              <label>Context <span>affects semantic retrieval</span>
+                <textarea required maxLength={20000} value={context} onChange={(event) => setContext(event.target.value)} />
+              </label>
+              <label>Approach
+                <textarea required maxLength={20000} value={approach} onChange={(event) => setApproach(event.target.value)} />
+              </label>
+              <label>Outcome
+                <textarea required maxLength={20000} value={outcome} onChange={(event) => setOutcome(event.target.value)} />
+              </label>
+              <div className="memory-editor-grid">
+                <label>Outcome quality
+                  <select value={outcomeQuality} onChange={(event) => setOutcomeQuality(
+                    event.target.value as WorkshopMemoryEpisodeFields["outcomeQuality"],
+                  )}>
+                    <option value="success">Success</option>
+                    <option value="partial">Partial</option>
+                    <option value="failure">Failure</option>
+                  </select>
+                </label>
+                <label>Actors <span>comma-separated</span>
+                  <input maxLength={4096} value={actors} onChange={(event) => setActors(event.target.value)} />
+                </label>
+              </div>
+              <label>Lessons <span>optional</span>
+                <textarea maxLength={20000} value={lessons} onChange={(event) => setLessons(event.target.value)} />
+              </label>
+            </>
+          ) : (
+            <label>Content <span>affects semantic retrieval</span>
+              <textarea required maxLength={100000} value={content} onChange={(event) => setContent(event.target.value)} />
+            </label>
+          )}
+          <label>Tags <span>comma- or line-separated</span>
+            <input maxLength={4096} value={tags} onChange={(event) => setTags(event.target.value)} />
+          </label>
+          {!editing && (
+            <label>Recall scope
+              <select value={target} onChange={(event) => setTarget(event.target.value)}>
+                <option value="global">Global scope</option>
+                {allowedProjects.map((project) => (
+                  <option key={project.projectId} value={`project:${project.projectId}`}>
+                    {project.displayName}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          {editing && (
+            <p className="memory-editor-provenance">
+              Source provenance and authority fields remain immutable. Saving regenerates the searchable vector.
+            </p>
+          )}
+          {error && <p className="memory-editor-error" role="alert">{error}</p>}
+          <footer>
+            {conflict && (
+              <button type="button" className="quiet-button" onClick={onReload}>Reload latest</button>
+            )}
+            <button type="button" className="quiet-button" disabled={saving} onClick={closeSafely}>Cancel</button>
+            <button type="submit" disabled={saving || (editing && !dirty)}>
+              {saving ? "Saving…" : editing ? "Save correction" : "Create memory"}
+            </button>
+          </footer>
+        </form>
+      </section>
+    </div>
+  );
+}
+
 function MemoryDetailPane({
   allowedProjects,
   busy,
@@ -121,6 +345,7 @@ function MemoryDetailPane({
   error,
   loading,
   onDelete,
+  onEdit,
   onMove,
   source,
   sourceError,
@@ -131,6 +356,7 @@ function MemoryDetailPane({
   error: string | null;
   loading: boolean;
   onDelete: (memoryId: string) => void;
+  onEdit: (detail: WorkshopMemoryDetail) => void;
   onMove: (memoryId: string, target: string) => void;
   source: WorkshopMemorySourceContext | null;
   sourceError: string | null;
@@ -174,7 +400,7 @@ function MemoryDetailPane({
             {Object.entries(detail.episode).map(([key, value]) => (
               <div key={key}>
                 <dt>{episodeLabel(key)}</dt>
-                <dd><MarkdownMessage body={value} /></dd>
+                <dd><MarkdownMessage body={Array.isArray(value) ? value.join(", ") : value ?? ""} /></dd>
               </div>
             ))}
           </dl>
@@ -207,6 +433,9 @@ function MemoryDetailPane({
           </select>
         </label>
         <div>
+          <button type="button" disabled={busy} onClick={() => onEdit(detail)}>
+            Edit memory…
+          </button>
           <button type="button" disabled={busy} onClick={() => onMove(detail.memoryId, target)}>
             Move memory…
           </button>
@@ -320,6 +549,7 @@ export function MemoryExplorer({
   } | null>(null);
   const [mutationRunning, setMutationRunning] = useState(false);
   const [mutationReport, setMutationReport] = useState<string | null>(null);
+  const [editorDetail, setEditorDetail] = useState<WorkshopMemoryDetail | "create" | null>(null);
   const recordRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
   useEffect(() => {
@@ -607,6 +837,7 @@ export function MemoryExplorer({
             <h1>Memory</h1>
           </div>
           <div className="memory-header-actions">
+            <button type="button" onClick={() => setEditorDetail("create")}>Add fact…</button>
             <button className="quiet-button memory-mobile-back" type="button" onClick={onClose}>
               Back to conversation
             </button>
@@ -852,6 +1083,7 @@ export function MemoryExplorer({
           error={detailError}
           loading={detailLoading}
           onDelete={(memoryId) => setPendingMutation({ ids: [memoryId], operation: "delete" })}
+          onEdit={(record) => setEditorDetail(record)}
           onMove={(memoryId, target) => setPendingMutation({
             ids: [memoryId], operation: "move_scope", target,
           })}
@@ -896,6 +1128,29 @@ export function MemoryExplorer({
             </div>
           </section>
         </div>
+      )}
+      {editorDetail && (
+        <MemoryEditorDialog
+          allowedProjects={allowedProjects}
+          detail={editorDetail === "create" ? null : editorDetail}
+          onAuthenticationFailure={onAuthenticationFailure}
+          onClose={() => setEditorDetail(null)}
+          onReload={() => {
+            setEditorDetail(null);
+            setDetailRefreshKey((value) => value + 1);
+            setRefreshKey((value) => value + 1);
+          }}
+          onSaved={(record, message) => {
+            setEditorDetail(null);
+            setDetail(record);
+            setSelectedMemoryId(record.memoryId);
+            onSelectMemory(record.memoryId);
+            setMutationReport(message);
+            setDetailRefreshKey((value) => value + 1);
+            setRefreshKey((value) => value + 1);
+          }}
+          token={token}
+        />
       )}
     </section>
   );

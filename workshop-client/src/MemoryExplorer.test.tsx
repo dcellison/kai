@@ -4,8 +4,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   AuthenticationError,
+  MemoryRevisionConflictError,
+  createMemoryFact,
   deleteMemories,
   deleteMemory,
+  editMemory,
   loadMemoryDetail,
   loadMemoryRecords,
   loadMemorySource,
@@ -33,6 +36,8 @@ vi.mock("./api", async (importOriginal) => {
     moveMemoriesScope: vi.fn(),
     deleteMemory: vi.fn(),
     deleteMemories: vi.fn(),
+    createMemoryFact: vi.fn(),
+    editMemory: vi.fn(),
     searchMemories: vi.fn(),
   };
 });
@@ -49,6 +54,7 @@ function record(
     memoryId,
     memoryType: kind,
     preview,
+    revision: `mr1_${memoryId}`,
     scope: {
       exclusionReason: null,
       invalidDefaulted: false,
@@ -75,7 +81,16 @@ function detail(item: WorkshopMemoryRecord): WorkshopMemoryDetail {
     confirmationQuote: null,
     content: `${item.preview}\n\n<script>window.bad = true</script>`,
     episode: item.kind === "episode"
-      ? { goal: "Deploy Kai", outcome: "Succeeded" }
+      ? {
+          actors: ["Daniel", "Kai"],
+          approach: "Install and verify.",
+          context: "A production qualification.",
+          goal: "Deploy Kai",
+          lessons: null,
+          outcome: "Succeeded",
+          outcomeQuality: "success",
+          tags: ["deployment"],
+        }
       : null,
     promptVersion: "v1",
   };
@@ -149,6 +164,15 @@ describe("Workshop Memory explorer", () => {
       results: [{ memoryId: "memory-1", outcome: "succeeded", priorScope: null, newScope: null }],
     });
     vi.mocked(deleteMemories).mockResolvedValue({ operation: "delete", results: [] });
+    vi.mocked(createMemoryFact).mockResolvedValue({
+      created: true,
+      record: detail(fact),
+    });
+    vi.mocked(editMemory).mockResolvedValue({
+      changedFields: ["content", "tags"],
+      idempotentReplay: false,
+      record: detail(fact),
+    });
   });
 
   it("browses rich detail, source context, and the distinct compact recall safely", async () => {
@@ -318,5 +342,99 @@ describe("Workshop Memory explorer", () => {
     expect(screen.getByRole("dialog", { name: "Forget 1 memory?" })).toHaveTextContent(
       "permanently removed",
     );
+  });
+
+  it("creates an explicit fact with typed content, tags, and project scope", async () => {
+    const user = userEvent.setup();
+    render(
+      <MemoryExplorer
+        initialMemoryId={null}
+        onAuthenticationFailure={vi.fn()}
+        onClose={vi.fn()}
+        onForget={vi.fn()}
+        onSelectMemory={vi.fn()}
+        token="session-secret"
+      />,
+    );
+
+    await screen.findByText("Kai deployment episode");
+    await user.click(screen.getByRole("button", { name: "Add fact…" }));
+    const dialog = screen.getByRole("dialog", { name: "Create fact" });
+    await user.type(screen.getByLabelText(/Content/), "A deliberately explicit fact.");
+    await user.type(screen.getByLabelText(/Tags/), "qualification, explicit");
+    await user.selectOptions(screen.getByLabelText("Recall scope"), "project:kai");
+    await user.click(screen.getByRole("button", { name: "Create memory" }));
+
+    await waitFor(() => expect(createMemoryFact).toHaveBeenCalledWith(
+      "session-secret",
+      expect.objectContaining({
+        content: "A deliberately explicit fact.",
+        tags: ["qualification", "explicit"],
+        target: { scope: "project", projectId: "kai" },
+      }),
+    ));
+    expect(await screen.findByRole("status")).toHaveTextContent("Explicit memory created.");
+  });
+
+  it("edits a fact explicitly and requires confirmation before discarding dirty fields", async () => {
+    const user = userEvent.setup();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    render(
+      <MemoryExplorer
+        initialMemoryId={fact.memoryId}
+        onAuthenticationFailure={vi.fn()}
+        onClose={vi.fn()}
+        onForget={vi.fn()}
+        onSelectMemory={vi.fn()}
+        token="session-secret"
+      />,
+    );
+
+    await screen.findByText("Manage memory");
+    await user.click(screen.getByRole("button", { name: "Edit memory…" }));
+    const content = screen.getByLabelText(/Content/);
+    await user.clear(content);
+    await user.type(content, "Corrected semantic wording.");
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(screen.getByRole("dialog", { name: "Correct fact" })).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "Save correction" }));
+    await waitFor(() => expect(editMemory).toHaveBeenCalledWith(
+      "session-secret",
+      expect.objectContaining({
+        kind: "fact",
+        memoryId: fact.memoryId,
+        revision: fact.revision,
+        content: "Corrected semantic wording.",
+      }),
+    ));
+    expect(screen.queryByRole("dialog", { name: "Correct fact" })).not.toBeInTheDocument();
+  });
+
+  it("keeps conflicting episode edits open and offers a latest-revision reload", async () => {
+    const user = userEvent.setup();
+    vi.mocked(editMemory).mockRejectedValue(
+      new MemoryRevisionConflictError("Memory changed since it was opened", "mr1_current"),
+    );
+    render(
+      <MemoryExplorer
+        initialMemoryId={episode.memoryId}
+        onAuthenticationFailure={vi.fn()}
+        onClose={vi.fn()}
+        onForget={vi.fn()}
+        onSelectMemory={vi.fn()}
+        token="session-secret"
+      />,
+    );
+
+    await screen.findByText("Episode structure");
+    await user.click(screen.getByRole("button", { name: "Edit memory…" }));
+    await user.clear(screen.getByLabelText(/Goal/));
+    await user.type(screen.getByLabelText(/Goal/), "Corrected deployment goal");
+    await user.click(screen.getByRole("button", { name: "Save correction" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("changed after you opened it");
+    expect(screen.getByRole("button", { name: "Reload latest" })).toBeVisible();
   });
 });

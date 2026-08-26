@@ -1564,6 +1564,18 @@ button:disabled {
   gap: 0.5rem;
 }
 
+.memory-header-actions > button:not(.quiet-button) {
+  min-height: 2.3rem;
+  border: 1px solid var(--atom-blue);
+  border-radius: 0.35rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--atom-blue);
+  color: var(--atom-bg-dark);
+  font-size: 0.72rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
 .memory-mobile-back {
   display: none;
 }
@@ -2081,6 +2093,122 @@ button:disabled {
   gap: 0.55rem;
 }
 
+.memory-editor-backdrop {
+  align-items: start;
+  overflow-y: auto;
+  padding-block: 2rem;
+}
+
+.memory-editor {
+  width: min(48rem, 100%);
+  border: 1px solid var(--line-strong);
+  border-radius: 0.6rem;
+  background: var(--atom-surface);
+  box-shadow: 0 1.4rem 4rem rgba(0, 0, 0, 0.5);
+}
+
+.memory-editor > header {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 1px solid var(--line);
+  padding: 1.15rem 1.3rem;
+}
+
+.memory-editor h2 {
+  margin: 0;
+  color: var(--atom-foreground-strong);
+  font-family: var(--serif);
+  font-size: 1.35rem;
+  font-weight: 550;
+}
+
+.memory-editor form {
+  display: grid;
+  gap: 0.9rem;
+  padding: 1.2rem 1.3rem 1.3rem;
+}
+
+.memory-editor label {
+  display: grid;
+  gap: 0.35rem;
+  color: var(--atom-foreground-strong);
+  font-size: 0.72rem;
+  font-weight: 650;
+}
+
+.memory-editor label > span {
+  color: var(--atom-cyan);
+  font-size: 0.62rem;
+  font-weight: 520;
+}
+
+.memory-editor input,
+.memory-editor textarea,
+.memory-editor select {
+  width: 100%;
+  border: 1px solid var(--line-strong);
+  border-radius: 0.38rem;
+  padding: 0.62rem 0.7rem;
+  background: var(--atom-bg-dark);
+  color: var(--atom-foreground-strong);
+  font-size: 0.76rem;
+  line-height: 1.5;
+}
+
+.memory-editor textarea {
+  min-height: 6.5rem;
+  resize: vertical;
+}
+
+.memory-editor-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.45fr) minmax(0, 1fr);
+  gap: 0.8rem;
+}
+
+.memory-editor-provenance {
+  margin: 0;
+  border-left: 2px solid var(--atom-purple);
+  padding: 0.55rem 0.7rem;
+  background: rgba(198, 120, 221, 0.07);
+  color: var(--atom-muted);
+  font-size: 0.68rem;
+  line-height: 1.55;
+}
+
+.memory-editor-error {
+  margin: 0;
+  color: var(--atom-red);
+  font-size: 0.72rem;
+}
+
+.memory-editor footer {
+  display: flex;
+  justify-content: end;
+  gap: 0.55rem;
+  border-top: 1px solid var(--line);
+  padding-top: 0.9rem;
+}
+
+.memory-editor footer button {
+  min-height: 2.35rem;
+  border: 1px solid var(--atom-blue);
+  border-radius: 0.35rem;
+  padding: 0.5rem 0.8rem;
+  background: rgba(97, 175, 239, 0.12);
+  color: var(--atom-blue);
+  font-size: 0.72rem;
+  font-weight: 680;
+  cursor: pointer;
+}
+
+.memory-editor footer button:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
 .scope-card > p:not(.memory-section-label),
 .recall-preview > p:not(.memory-section-label) {
   margin: 0.35rem 0 0;
@@ -2283,6 +2411,10 @@ button:disabled {
   }
 
   .workshop-app {
+    grid-template-columns: 1fr;
+  }
+
+  .memory-editor-grid {
     grid-template-columns: 1fr;
   }
 

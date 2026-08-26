@@ -48,6 +48,8 @@ from kai.workshop.domain import (
 from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.inbound import ClientInboundMessage, InboundMessage, record_inbound_message
 from kai.workshop.memory_queries import (
+    MemoryCreationSnapshot,
+    MemoryEditSnapshot,
     MemoryMutationBatch,
     MemoryMutationResult,
     MemoryProjectOption,
@@ -61,6 +63,7 @@ from kai.workshop.memory_queries import (
     MemorySourceContext,
     MemoryStatsSnapshot,
     WorkshopMemoryAccessDenied,
+    WorkshopMemoryConflict,
     WorkshopMemoryNotFound,
 )
 from kai.workshop.run_lifecycle import (
@@ -256,6 +259,7 @@ class _SettingsWorkspaces:
 class _MemoryQueries:
     principal_id: PrincipalId
     mutations: list[tuple[str, tuple[str, ...], str | None, str | None]] = field(default_factory=list)
+    content_mutations: list[tuple[str, object]] = field(default_factory=list)
 
     def authority_for_principal(self, principal_id):
         if principal_id != self.principal_id:
@@ -291,6 +295,7 @@ class _MemoryQueries:
                     confidence=1.0,
                     created_at="2026-08-24T10:00:00Z",
                     updated_at="2026-08-24T10:00:00Z",
+                    revision="mr1_test-revision",
                     scope=MemoryScopeSnapshot(
                         scope="global",
                         project_id=None,
@@ -325,6 +330,18 @@ class _MemoryQueries:
             confirmation_quote=None,
             prompt_version="v1",
             episode=None,
+        )
+
+    async def create_fact(self, authority, **kwargs):
+        self.content_mutations.append(("create", kwargs))
+        return MemoryCreationSnapshot(await self.detail(authority, "memory-1"), True)
+
+    async def edit(self, authority, memory_id, **kwargs):
+        self.content_mutations.append(("edit", {"memory_id": memory_id, **kwargs}))
+        return MemoryEditSnapshot(
+            await self.detail(authority, memory_id),
+            ("content", "tags"),
+            False,
         )
 
     async def search(self, _authority, query, *, filters, limit):
@@ -592,6 +609,103 @@ async def test_memory_api_uses_bearer_principal_and_stable_read_schema(
         )
         assert foreign.status == 404
         assert await foreign.json() == {"error": {"code": "memory_not_found", "message": "Memory not found"}}
+    finally:
+        await client.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_api_creates_and_edits_only_typed_content(
+    tmp_path: Path,
+) -> None:
+    store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+    queries = _MemoryQueries(alice_id)
+    client = await _open_client(store, _Authenticator({"alice-token": alice_id}), memory_queries=queries)
+    headers = {"Authorization": "Bearer alice-token", "Content-Type": "application/json"}
+    try:
+        created = await client.post(
+            "/v1/memory/records",
+            headers=headers,
+            json={
+                "kind": "fact",
+                "content": "An explicit fact",
+                "tags": ["explicit"],
+                "scope": "project",
+                "project_id": "kai",
+                "request_id": "create-1",
+            },
+        )
+        assert created.status == 201
+        created_payload = await created.json()
+        assert created_payload["created"] is True
+        assert created_payload["record"]["revision"] == "mr1_test-revision"
+
+        edited = await client.patch(
+            "/v1/memory/records/memory-1",
+            headers=headers,
+            json={
+                "kind": "fact",
+                "revision": "mr1_test-revision",
+                "request_id": "edit-1",
+                "content": "Corrected fact",
+                "tags": ["corrected"],
+            },
+        )
+        assert edited.status == 200
+        assert (await edited.json())["changed_fields"] == ["content", "tags"]
+        assert [operation for operation, _ in queries.content_mutations] == ["create", "edit"]
+
+        arbitrary = await client.patch(
+            "/v1/memory/records/memory-1",
+            headers=headers,
+            json={
+                "kind": "fact",
+                "revision": "mr1_test-revision",
+                "request_id": "edit-2",
+                "content": "Attack",
+                "tags": [],
+                "metadata": {"user_id": "someone-else"},
+            },
+        )
+        assert arbitrary.status == 400
+        assert len(queries.content_mutations) == 2
+    finally:
+        await client.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_api_returns_current_revision_on_edit_conflict(
+    tmp_path: Path,
+) -> None:
+    store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+    queries = _MemoryQueries(alice_id)
+
+    async def conflict(*_args, **_kwargs):
+        raise WorkshopMemoryConflict("mr1_current")
+
+    queries.edit = conflict  # type: ignore[method-assign]
+    client = await _open_client(store, _Authenticator({"alice-token": alice_id}), memory_queries=queries)
+    try:
+        response = await client.patch(
+            "/v1/memory/records/memory-1",
+            headers={"Authorization": "Bearer alice-token", "Content-Type": "application/json"},
+            json={
+                "kind": "fact",
+                "revision": "mr1_stale",
+                "request_id": "edit-1",
+                "content": "Correction",
+                "tags": [],
+            },
+        )
+        assert response.status == 409
+        assert await response.json() == {
+            "error": {
+                "code": "memory_revision_conflict",
+                "message": "Memory changed since it was opened",
+                "current_revision": "mr1_current",
+            }
+        }
     finally:
         await client.close()
         await store.close()
