@@ -87,6 +87,16 @@ from kai.workshop.notification_preferences import (
     NotificationPreferenceAuthority,
     WorkshopNotificationPreferenceService,
 )
+from kai.workshop.preferences import (
+    PreferenceAuthority,
+    WorkshopPreferenceAccessDenied,
+    WorkshopPreferenceConflict,
+    WorkshopPreferenceError,
+    WorkshopPreferenceRevisionNotFound,
+    WorkshopPreferenceService,
+    WorkshopPreferenceStorageError,
+    WorkshopPreferenceValidationError,
+)
 from kai.workshop.scheduled_jobs import WorkshopScheduledJobAuthority
 from kai.workshop.settings_workspaces import (
     SettingsWorkspaceAuthority,
@@ -353,6 +363,23 @@ def _canonical_notification_preference_authority(
         storage.principal_id,
         storage.runtime_profile_id,
     )
+
+
+def _canonical_preference_document_authority(
+    context: ContextTypes.DEFAULT_TYPE,
+    runtime_config_id: int,
+) -> tuple[WorkshopPreferenceService, PreferenceAuthority] | None:
+    """Resolve a Telegram binding to its principal-owned preference document."""
+    services = _get_core_services(context)
+    service = getattr(services, "preference_documents", None)
+    if service is None:
+        return None
+    try:
+        storage = services.principal_storage.for_runtime_config_id(runtime_config_id)
+        authority = service.authority_for_principal(storage.principal_id)
+    except (WorkshopStorageNamespaceError, WorkshopPreferenceAccessDenied):
+        return None
+    return service, authority
 
 
 # ── Basic command handlers ───────────────────────────────────────────
@@ -3484,6 +3511,150 @@ async def handle_notifications(
     )
 
 
+_PREFERENCE_HISTORY_CHOICES_KEY = "preference_history_choices"
+
+
+def _preference_set_content(text: str) -> str | None:
+    """Extract exact `/preferences set` content after one command separator."""
+    match = re.fullmatch(
+        r"/preferences(?:@[A-Za-z0-9_]+)?[ \t]+set(?:[ \t]|\r?\n)([\s\S]*)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return match.group(1) if match is not None else None
+
+
+async def _reply_preference_error(message: Message, exc: WorkshopPreferenceError) -> None:
+    """Render canonical preference failures without exposing private storage."""
+    if isinstance(exc, WorkshopPreferenceConflict):
+        await message.reply_text(
+            "Preferences changed since they were displayed. Run /preferences history and try again."
+        )
+    elif isinstance(exc, WorkshopPreferenceRevisionNotFound):
+        await message.reply_text("That preference revision is no longer available. Run /preferences history again.")
+    elif isinstance(exc, WorkshopPreferenceValidationError):
+        await message.reply_text(str(exc))
+    elif isinstance(exc, (WorkshopPreferenceAccessDenied, WorkshopPreferenceStorageError)):
+        await message.reply_text("Preferences are temporarily unavailable.")
+    else:
+        await message.reply_text("Preferences are temporarily unavailable.")
+
+
+@_require_auth
+async def handle_preferences(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """View and revise the authenticated principal's canonical preference document."""
+    assert update.message is not None
+    canonical = _canonical_preference_document_authority(context, _chat_id(update))
+    if canonical is None:
+        await update.message.reply_text("Canonical preferences are unavailable.")
+        return
+    service, authority = canonical
+    args = context.args or []
+    subcommand = args[0].lower() if args else "show"
+
+    try:
+        if subcommand == "show":
+            if len(args) > 1:
+                await update.message.reply_text("Usage: /preferences [show|set|history|restore]")
+                return
+            document = await service.read(authority)
+            if not document.content:
+                await update.message.reply_text("Preferences are empty.")
+                return
+            await update.message.reply_text("Preferences:")
+            for chunk in chunk_text(document.content):
+                await update.message.reply_text(chunk)
+            return
+
+        if subcommand == "set":
+            content = _preference_set_content(update.message.text or "")
+            if content is None or not content:
+                await update.message.reply_text("Usage: /preferences set <text>")
+                return
+            current = await service.read(authority)
+            saved = await service.save(
+                authority,
+                expected_revision=current.revision,
+                content=content,
+            )
+            context.user_data.pop(_PREFERENCE_HISTORY_CHOICES_KEY, None)
+            await update.message.reply_text(f"Preferences saved ({saved.size_bytes} bytes).")
+            return
+
+        if subcommand == "history":
+            if len(args) > 1:
+                await update.message.reply_text("Usage: /preferences history")
+                return
+            current = await service.read(authority)
+            history = await service.history(authority)
+            if not history.revisions:
+                context.user_data.pop(_PREFERENCE_HISTORY_CHOICES_KEY, None)
+                await update.message.reply_text("No previous preference revisions are available.")
+                return
+            choices = tuple(item.revision for item in history.revisions)
+            context.user_data[_PREFERENCE_HISTORY_CHOICES_KEY] = (
+                str(authority.principal_id),
+                current.revision,
+                choices,
+            )
+            lines = ["Previous preference revisions:"]
+            lines.extend(
+                f"{index}. {item.updated_at} ({item.size_bytes} bytes)"
+                for index, item in enumerate(history.revisions, start=1)
+            )
+            lines.extend(["", "Use /preferences restore <number> to restore a displayed revision."])
+            await update.message.reply_text("\n".join(lines))
+            return
+
+        if subcommand == "restore":
+            if len(args) != 2:
+                await update.message.reply_text("Usage: /preferences restore <number>")
+                return
+            displayed = context.user_data.get(_PREFERENCE_HISTORY_CHOICES_KEY)
+            if (
+                not isinstance(displayed, tuple)
+                or len(displayed) != 3
+                or not isinstance(displayed[0], str)
+                or displayed[0] != str(authority.principal_id)
+                or not isinstance(displayed[1], str)
+                or not isinstance(displayed[2], tuple)
+                or not all(isinstance(item, str) for item in displayed[2])
+            ):
+                await update.message.reply_text("Run /preferences history before restoring a revision.")
+                return
+            try:
+                selected_index = int(args[1])
+            except ValueError:
+                selected_index = 0
+            _principal_id, expected_revision, choices = displayed
+            if selected_index < 1 or selected_index > len(choices):
+                await update.message.reply_text("Choose a revision number from /preferences history.")
+                return
+            target_revision = choices[selected_index - 1]
+            current_history = await service.history(authority)
+            if target_revision not in {item.revision for item in current_history.revisions}:
+                context.user_data.pop(_PREFERENCE_HISTORY_CHOICES_KEY, None)
+                await update.message.reply_text(
+                    "That preference revision is no longer available. Run /preferences history again."
+                )
+                return
+            restored = await service.restore(
+                authority,
+                target_revision=target_revision,
+                expected_revision=expected_revision,
+            )
+            context.user_data.pop(_PREFERENCE_HISTORY_CHOICES_KEY, None)
+            await update.message.reply_text(f"Preferences restored ({restored.size_bytes} bytes).")
+            return
+
+        await update.message.reply_text("Usage: /preferences [show|set|history|restore]")
+    except WorkshopPreferenceError as exc:
+        await _reply_preference_error(update.message, exc)
+
+
 async def _handle_github_toggle(
     update: Update,
     chat_id: int,
@@ -3960,6 +4131,10 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/memory search <q> - Semantic search over memories\n"
         "/memory stats - Counts and confidence distribution\n"
         "/memory help - /memory subcommand reference\n"
+        "/preferences - Show your preference document\n"
+        "/preferences set <text> - Replace your preference document\n"
+        "/preferences history - List previous preference revisions\n"
+        "/preferences restore <number> - Restore a displayed revision\n"
         "\n"
         "/voice - Toggle voice off / voice-only\n"
         "/voice only - Voice only (no text)\n"
@@ -4765,6 +4940,7 @@ def create_bot(
         ("webhooks", handle_webhooks),
         ("github", handle_github),
         ("notifications", handle_notifications),
+        ("preferences", handle_preferences),
         ("review", handle_review_command),
         ("memory", memory_command.handle_memory_command),
         ("stop", handle_stop),

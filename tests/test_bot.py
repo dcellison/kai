@@ -60,6 +60,7 @@ from kai.bot import (
     handle_new,
     handle_notifications,
     handle_photo,
+    handle_preferences,
     handle_review_command,
     handle_settings,
     handle_start,
@@ -108,6 +109,13 @@ from kai.workshop.execution_coordinator import (
     CanonicalExecutionDisposition,
 )
 from kai.workshop.inbound import InboundMessage
+from kai.workshop.preferences import (
+    PreferenceDocument,
+    PreferenceRevision,
+    PreferenceRevisionHistory,
+    WorkshopPreferenceConflict,
+    WorkshopPreferenceStorageError,
+)
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.settings_workspaces import (
     EffectiveValue,
@@ -1279,6 +1287,8 @@ class TestHandleHelp:
         assert "/github notify [number|reset]" in reply
         assert "/github notify [on|off]" not in reply
         assert "/notifications <github|generic> [number|reset]" in reply
+        assert "/preferences set <text>" in reply
+        assert "/preferences restore <number>" in reply
 
         # /memory browses facts and episodes; the tag-browse axis was
         # retired when the dashboard was redesigned as Facts/Episodes/
@@ -4832,6 +4842,208 @@ class TestHandleNotifications:
         assert "<github|generic>" in update.message.reply_text.call_args[0][0]
 
 
+# ── /preferences command ────────────────────────────────────────────
+
+
+class TestHandlePreferences:
+    @staticmethod
+    def _document(content: str = "# Preferences\n\nKeep answers concise.\n", revision: str = "pref_current"):
+        return PreferenceDocument(
+            content=content,
+            revision=revision,
+            updated_at="2026-08-27T10:00:00Z",
+            size_bytes=len(content.encode("utf-8")),
+        )
+
+    @classmethod
+    def _context(cls, args: list[str], *, content: str = "# Preferences\n\nKeep answers concise.\n"):
+        ctx = _make_context(config=_make_config(), args=args)
+        service = MagicMock()
+        service.authority_for_principal.return_value = SimpleNamespace(
+            principal_id=PrincipalId("prn_00000000000000000000000000003039")
+        )
+        service.read = AsyncMock(return_value=cls._document(content))
+        service.history = AsyncMock(return_value=PreferenceRevisionHistory(()))
+        ctx.application.core_services.preference_documents = service
+        return ctx, service
+
+    @pytest.mark.asyncio
+    async def test_show_uses_bound_principal_and_plain_telegram_chunks(self):
+        content = "x" * 5000
+        update = _make_update(text="/preferences")
+        ctx, service = self._context([], content=content)
+        bound_principal = ctx.application.core_services.principal_storage.for_runtime_config_id(12345).principal_id
+
+        await handle_preferences(update, ctx)
+
+        service.authority_for_principal.assert_called_once_with(bound_principal)
+        service.read.assert_awaited_once_with(service.authority_for_principal.return_value)
+        replies = [call.args[0] for call in update.message.reply_text.await_args_list]
+        assert replies[0] == "Preferences:"
+        assert "".join(replies[1:]) == content
+        assert all(len(reply) <= 4096 for reply in replies)
+        assert all(call.kwargs.get("parse_mode") is None for call in update.message.reply_text.await_args_list)
+
+    @pytest.mark.asyncio
+    async def test_set_preserves_multiline_content_and_uses_current_revision(self):
+        content = "First line\n  indented line\nLast line\n"
+        update = _make_update(text=f"/preferences set {content}")
+        ctx, service = self._context(["set", "First", "line"])
+        authority = service.authority_for_principal.return_value
+        service.save = AsyncMock(return_value=self._document(content, "pref_saved"))
+        ctx.user_data["preference_history_choices"] = (
+            str(authority.principal_id),
+            "old",
+            ("target",),
+        )
+
+        await handle_preferences(update, ctx)
+
+        service.save.assert_awaited_once_with(
+            authority,
+            expected_revision="pref_current",
+            content=content,
+        )
+        assert "preference_history_choices" not in ctx.user_data
+        assert update.message.reply_text.await_args.args[0] == "Preferences saved (37 bytes)."
+
+    @pytest.mark.asyncio
+    async def test_set_preserves_additional_leading_space_after_separator(self):
+        update = _make_update(text="/preferences set  keep this indent")
+        ctx, service = self._context(["set", "keep", "this", "indent"])
+        service.save = AsyncMock(return_value=self._document(" keep this indent", "pref_saved"))
+
+        await handle_preferences(update, ctx)
+
+        assert service.save.await_args.kwargs["content"] == " keep this indent"
+
+    @pytest.mark.asyncio
+    async def test_set_requires_content_without_mutation(self):
+        update = _make_update(text="/preferences set")
+        ctx, service = self._context(["set"])
+        service.save = AsyncMock()
+
+        await handle_preferences(update, ctx)
+
+        service.read.assert_not_awaited()
+        service.save.assert_not_awaited()
+        assert update.message.reply_text.await_args.args[0] == "Usage: /preferences set <text>"
+
+    @pytest.mark.asyncio
+    async def test_history_lists_numbered_private_choices_without_identifiers(self):
+        update = _make_update(text="/preferences history")
+        ctx, service = self._context(["history"])
+        service.history.return_value = PreferenceRevisionHistory(
+            (
+                PreferenceRevision("pref_private_one", "2026-08-26T10:00:00Z", 120),
+                PreferenceRevision("pref_private_two", "2026-08-25T09:00:00Z", 80),
+            )
+        )
+
+        await handle_preferences(update, ctx)
+
+        reply = update.message.reply_text.await_args.args[0]
+        assert "1. 2026-08-26T10:00:00Z (120 bytes)" in reply
+        assert "2. 2026-08-25T09:00:00Z (80 bytes)" in reply
+        assert "pref_private" not in reply
+        assert "PREFERENCES.md" not in reply
+        assert ctx.user_data["preference_history_choices"] == (
+            "prn_00000000000000000000000000003039",
+            "pref_current",
+            ("pref_private_one", "pref_private_two"),
+        )
+
+    @pytest.mark.asyncio
+    async def test_restore_uses_displayed_choice_and_displayed_current_revision(self):
+        update = _make_update(text="/preferences restore 2")
+        ctx, service = self._context(["restore", "2"])
+        authority = service.authority_for_principal.return_value
+        ctx.user_data["preference_history_choices"] = (
+            str(authority.principal_id),
+            "pref_expected",
+            ("pref_private_one", "pref_private_two"),
+        )
+        service.history.return_value = PreferenceRevisionHistory(
+            (
+                PreferenceRevision("pref_private_one", "2026-08-26T10:00:00Z", 120),
+                PreferenceRevision("pref_private_two", "2026-08-25T09:00:00Z", 80),
+            )
+        )
+        service.restore = AsyncMock(return_value=self._document("Restored.\n", "pref_restored"))
+
+        await handle_preferences(update, ctx)
+
+        service.restore.assert_awaited_once_with(
+            authority,
+            target_revision="pref_private_two",
+            expected_revision="pref_expected",
+        )
+        assert "preference_history_choices" not in ctx.user_data
+        assert update.message.reply_text.await_args.args[0] == "Preferences restored (10 bytes)."
+
+    @pytest.mark.asyncio
+    async def test_restore_requires_server_displayed_choice(self):
+        update = _make_update(text="/preferences restore pref_forged")
+        ctx, service = self._context(["restore", "pref_forged"])
+        service.restore = AsyncMock()
+
+        await handle_preferences(update, ctx)
+
+        service.history.assert_not_awaited()
+        service.restore.assert_not_awaited()
+        assert update.message.reply_text.await_args.args[0] == ("Run /preferences history before restoring a revision.")
+
+    @pytest.mark.asyncio
+    async def test_restore_conflict_does_not_expose_revision(self):
+        update = _make_update(text="/preferences restore 1")
+        ctx, service = self._context(["restore", "1"])
+        authority = service.authority_for_principal.return_value
+        ctx.user_data["preference_history_choices"] = (
+            str(authority.principal_id),
+            "pref_expected",
+            ("pref_private",),
+        )
+        service.history.return_value = PreferenceRevisionHistory(
+            (PreferenceRevision("pref_private", "2026-08-26T10:00:00Z", 120),)
+        )
+        service.restore = AsyncMock(side_effect=WorkshopPreferenceConflict("pref_secret_current"))
+
+        await handle_preferences(update, ctx)
+
+        reply = update.message.reply_text.await_args.args[0]
+        assert "changed since" in reply
+        assert "pref_secret_current" not in reply
+
+    @pytest.mark.asyncio
+    async def test_restore_rejects_choices_bound_to_another_principal(self):
+        update = _make_update(text="/preferences restore 1")
+        ctx, service = self._context(["restore", "1"])
+        ctx.user_data["preference_history_choices"] = (
+            "prn_ffffffffffffffffffffffffffffffff",
+            "pref_expected",
+            ("pref_private",),
+        )
+        service.restore = AsyncMock()
+
+        await handle_preferences(update, ctx)
+
+        service.history.assert_not_awaited()
+        service.restore.assert_not_awaited()
+        assert update.message.reply_text.await_args.args[0] == ("Run /preferences history before restoring a revision.")
+
+    @pytest.mark.asyncio
+    async def test_storage_failure_is_safe(self):
+        update = _make_update(text="/preferences")
+        ctx, service = self._context([])
+        service.read.side_effect = WorkshopPreferenceStorageError("/private/path failed")
+
+        await handle_preferences(update, ctx)
+
+        reply = update.message.reply_text.await_args.args[0]
+        assert reply == "Preferences are temporarily unavailable."
+        assert "/private/path" not in reply
+
+
 # ── /model persistence ─────────────────────────────────────────────
 
 
@@ -4908,6 +5120,7 @@ EXPECTED_MENU_COMMANDS = {
     "models",
     "new",
     "notifications",
+    "preferences",
     "settings",
     "stats",
     "stop",
