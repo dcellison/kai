@@ -6,6 +6,7 @@ import {
   ChannelAccessError,
   loadGitHubSettings,
   loadNotificationPreferences,
+  loadClientPreferences,
   loadPreferenceDocument,
   loadPreferenceHistory,
   loadSettingsWorkspace,
@@ -16,6 +17,7 @@ import {
   switchWorkspace,
   updateGitHubSettings,
   updateNotificationPreference,
+  updateClientPreference,
   updateRuntimeSettings,
   updateWorkspaceConfig,
 } from "./api";
@@ -24,6 +26,7 @@ import type {
   WorkshopPreferenceDocument,
   WorkshopGitHubSettings,
   WorkshopNotificationPreferences,
+  WorkshopClientPreferences,
   WorkshopSettingsWorkspace,
   WorkshopWorkspaceConfig,
 } from "./types";
@@ -35,6 +38,7 @@ vi.mock("./api", async (importOriginal) => {
     loadPreferenceDocument: vi.fn(),
     loadGitHubSettings: vi.fn(),
     loadNotificationPreferences: vi.fn(),
+    loadClientPreferences: vi.fn(),
     loadPreferenceHistory: vi.fn(),
     loadSettingsWorkspace: vi.fn(),
     loadWorkspaceConfig: vi.fn(),
@@ -43,6 +47,7 @@ vi.mock("./api", async (importOriginal) => {
     switchWorkspace: vi.fn(),
     updateGitHubSettings: vi.fn(),
     updateNotificationPreference: vi.fn(),
+    updateClientPreference: vi.fn(),
     updateRuntimeSettings: vi.fn(),
     updateWorkspaceConfig: vi.fn(),
   };
@@ -220,6 +225,30 @@ const notificationPreferences: WorkshopNotificationPreferences = {
   revision: "nps_current",
 };
 
+const clientPreferences: WorkshopClientPreferences = {
+  mutation: null,
+  revision: "cvp_current",
+  voiceOutput: {
+    available: true,
+    unavailableReason: null,
+    modes: ["off", "text_and_voice", "voice_only"],
+    voices: [
+      { value: "alan", displayName: "Alan" },
+      { value: "jenny", displayName: "Jenny" },
+    ],
+    bindings: [
+      {
+        choiceId: "cbd_telegram",
+        clientName: "Telegram",
+        mode: "off",
+        voice: "alan",
+        voiceName: "Alan",
+        editable: true,
+      },
+    ],
+  },
+};
+
 function renderSettings(
   onDirtyChange = vi.fn(),
   runActive = false,
@@ -257,6 +286,7 @@ describe("Settings workspace", () => {
     vi.mocked(loadSettingsWorkspace).mockResolvedValue(runtime);
     vi.mocked(loadGitHubSettings).mockResolvedValue(githubSettings);
     vi.mocked(loadNotificationPreferences).mockResolvedValue(notificationPreferences);
+    vi.mocked(loadClientPreferences).mockResolvedValue(clientPreferences);
     vi.mocked(loadWorkspaceConfig).mockResolvedValue(workspaceConfig);
     vi.mocked(savePreferenceDocument).mockResolvedValue({
       ...preference,
@@ -270,6 +300,7 @@ describe("Settings workspace", () => {
     vi.mocked(updateRuntimeSettings).mockResolvedValue(runtime);
     vi.mocked(updateGitHubSettings).mockResolvedValue(githubSettings);
     vi.mocked(updateNotificationPreference).mockResolvedValue(notificationPreferences);
+    vi.mocked(updateClientPreference).mockResolvedValue(clientPreferences);
     vi.mocked(updateWorkspaceConfig).mockResolvedValue(workspaceConfig);
     vi.mocked(switchWorkspace).mockResolvedValue({
       ...runtime,
@@ -601,5 +632,59 @@ describe("Settings workspace", () => {
     ).toHaveTextContent(
       "Effective: Home · personal override",
     ));
+  });
+
+  it("edits voice output for the authenticated client binding", async () => {
+    const user = userEvent.setup();
+    vi.mocked(updateClientPreference).mockResolvedValue({
+      ...clientPreferences,
+      mutation: { changed: true, operation: "set_client_voice_mode" },
+      revision: "cvp_changed",
+      voiceOutput: {
+        ...clientPreferences.voiceOutput,
+        bindings: [
+          { ...clientPreferences.voiceOutput.bindings[0], mode: "text_and_voice" },
+        ],
+      },
+    });
+    renderSettings();
+
+    const mode = await screen.findByLabelText("Response format");
+    expect(screen.getByRole("heading", { name: "Telegram voice output" })).toBeVisible();
+    expect(mode).toHaveValue("off");
+    await user.selectOptions(mode, "text_and_voice");
+
+    expect(updateClientPreference).toHaveBeenCalledWith(
+      session,
+      "cvp_current",
+      {
+        field: "mode",
+        bindingChoiceId: "cbd_telegram",
+        value: "text_and_voice",
+      },
+    );
+    await waitFor(() => expect(mode).toHaveValue("text_and_voice"));
+  });
+
+  it("shows unavailable voice capability without editable controls", async () => {
+    vi.mocked(loadClientPreferences).mockResolvedValue({
+      ...clientPreferences,
+      voiceOutput: {
+        ...clientPreferences.voiceOutput,
+        available: false,
+        unavailableReason: "Voice output is not enabled for an eligible client.",
+        bindings: clientPreferences.voiceOutput.bindings.map((binding) => ({
+          ...binding,
+          editable: false,
+        })),
+      },
+    });
+    renderSettings();
+
+    expect(await screen.findByText(
+      "Voice output is not enabled for an eligible client.",
+    )).toBeVisible();
+    expect(screen.getByLabelText("Response format")).toBeDisabled();
+    expect(screen.getByLabelText("Voice")).toBeDisabled();
   });
 });

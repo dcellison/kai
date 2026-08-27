@@ -90,6 +90,15 @@ from kai.workshop.artifacts import (
     StagedArtifact,
     canonical_artifact_media_type,
 )
+from kai.workshop.client_preferences import (
+    VOICE_MODE_OFF,
+    VOICE_MODE_TEXT_AND_VOICE,
+    VOICE_MODE_VOICE_ONLY,
+    ClientBindingVoicePreference,
+    ClientPreferenceMutation,
+    ClientPreferenceSnapshot,
+    VoiceChoice,
+)
 from kai.workshop.conversation_commands import ConversationCommandDisposition
 from kai.workshop.conversation_runs import WorkshopConversationRunService
 from kai.workshop.domain import AgentId, ChannelId, MessageId, PrincipalId, RunId
@@ -702,6 +711,7 @@ def _bot_core_services(config):
         ),
         private_text_execution=MagicMock(),
         principal_storage=principal_storage,
+        client_preferences=MagicMock(),
     )
 
 
@@ -954,6 +964,61 @@ def _make_context(config=None, claude=None, pool=None, args=None, user_data=None
         agent_id=AgentId("agt_" + "a" * 32),
         runtime_profile_id=runtime_profile_id,
     )
+    voice_authority = SimpleNamespace(
+        principal_id=PrincipalId("prn_00000000000000000000000000012345"),
+        binding_id="cbd_test",
+    )
+    voice_preference = ClientBindingVoicePreference(
+        "cbd_test",
+        "Telegram",
+        VOICE_MODE_OFF,
+        DEFAULT_VOICE,
+        VOICES[DEFAULT_VOICE],
+        True,
+    )
+    client_preferences = MagicMock()
+    client_preferences.authority_for_transport_binding = AsyncMock(return_value=voice_authority)
+    client_preferences.inspect_binding = AsyncMock(return_value=voice_preference)
+
+    async def set_voice_mode(_authority, mode, **_kwargs):
+        changed = ClientBindingVoicePreference(
+            "cbd_test",
+            "Telegram",
+            mode,
+            DEFAULT_VOICE,
+            VOICES[DEFAULT_VOICE],
+            True,
+        )
+        return ClientPreferenceSnapshot(
+            True,
+            None,
+            (changed,),
+            tuple(VoiceChoice(key, label) for key, label in VOICES.items()),
+            "cvp_changed",
+            ClientPreferenceMutation("set_client_voice_mode", True),
+        )
+
+    async def set_voice_name(_authority, voice, **kwargs):
+        mode = VOICE_MODE_VOICE_ONLY if kwargs.get("enable_if_off") else VOICE_MODE_OFF
+        changed = ClientBindingVoicePreference(
+            "cbd_test",
+            "Telegram",
+            mode,
+            voice,
+            VOICES[voice],
+            True,
+        )
+        return ClientPreferenceSnapshot(
+            True,
+            None,
+            (changed,),
+            tuple(VoiceChoice(key, label) for key, label in VOICES.items()),
+            "cvp_changed",
+            ClientPreferenceMutation("set_client_voice", True),
+        )
+
+    client_preferences.set_mode = AsyncMock(side_effect=set_voice_mode)
+    client_preferences.set_voice = AsyncMock(side_effect=set_voice_name)
     application.core_services = SimpleNamespace(
         subprocess_pool=mock_pool,
         runtime_profiles=profile_registry(*sorted(runtime_config_ids)),
@@ -967,6 +1032,7 @@ def _make_context(config=None, claude=None, pool=None, args=None, user_data=None
             get_job=AsyncMock(return_value=None),
             delete_job=AsyncMock(return_value=False),
         ),
+        client_preferences=client_preferences,
     )
     ctx.application = application
     ctx.args = args or []
@@ -1729,13 +1795,11 @@ class TestHandleVoiceCommand:
         """No args when mode is off: toggles to 'only'."""
         update = _make_update()
         ctx = _make_context(config=_make_config(tts_enabled=True))
-        with (
-            patch("kai.bot.sessions.get_setting", new_callable=AsyncMock, return_value=None),
-            patch("kai.bot.sessions.set_setting", new_callable=AsyncMock) as mock_set,
-        ):
-            await handle_voice_command(update, ctx)
-        # Should set to "only" (toggling from default "off")
-        mock_set.assert_called_once_with("voice_mode:12345", "only")
+        await handle_voice_command(update, ctx)
+        ctx.application.core_services.client_preferences.set_mode.assert_awaited_once_with(
+            ANY,
+            VOICE_MODE_VOICE_ONLY,
+        )
 
     @pytest.mark.asyncio
     async def test_toggle_only_to_off(self):
@@ -1743,28 +1807,30 @@ class TestHandleVoiceCommand:
         update = _make_update()
         ctx = _make_context(config=_make_config(tts_enabled=True))
 
-        async def _get(key):
-            if "voice_mode" in key:
-                return "only"
-            return None
-
-        with (
-            patch("kai.bot.sessions.get_setting", side_effect=_get),
-            patch("kai.bot.sessions.set_setting", new_callable=AsyncMock) as mock_set,
-        ):
-            await handle_voice_command(update, ctx)
-        mock_set.assert_called_once_with("voice_mode:12345", "off")
+        preference = ctx.application.core_services.client_preferences.inspect_binding
+        preference.return_value = ClientBindingVoicePreference(
+            "cbd_test",
+            "Telegram",
+            VOICE_MODE_VOICE_ONLY,
+            DEFAULT_VOICE,
+            VOICES[DEFAULT_VOICE],
+            True,
+        )
+        await handle_voice_command(update, ctx)
+        ctx.application.core_services.client_preferences.set_mode.assert_awaited_once_with(
+            ANY,
+            VOICE_MODE_OFF,
+        )
 
     @pytest.mark.asyncio
     async def test_set_mode_on(self):
         update = _make_update()
         ctx = _make_context(config=_make_config(tts_enabled=True), args=["on"])
-        with (
-            patch("kai.bot.sessions.get_setting", new_callable=AsyncMock, return_value=None),
-            patch("kai.bot.sessions.set_setting", new_callable=AsyncMock) as mock_set,
-        ):
-            await handle_voice_command(update, ctx)
-        mock_set.assert_called_once_with("voice_mode:12345", "on")
+        await handle_voice_command(update, ctx)
+        ctx.application.core_services.client_preferences.set_mode.assert_awaited_once_with(
+            ANY,
+            VOICE_MODE_TEXT_AND_VOICE,
+        )
 
     @pytest.mark.asyncio
     async def test_set_voice_name_enables_if_off(self):
@@ -1774,27 +1840,18 @@ class TestHandleVoiceCommand:
         voice_key = next(iter(VOICES.keys()))
         ctx = _make_context(config=_make_config(tts_enabled=True), args=[voice_key])
 
-        async def _get(key):
-            if "voice_mode" in key:
-                return "off"
-            return DEFAULT_VOICE
-
-        with (
-            patch("kai.bot.sessions.get_setting", side_effect=_get),
-            patch("kai.bot.sessions.set_setting", new_callable=AsyncMock) as mock_set,
-        ):
-            await handle_voice_command(update, ctx)
-        # Should set both voice name and mode
-        calls = {c[0] for c in mock_set.call_args_list}
-        assert ("voice_name:12345", voice_key) in calls
-        assert ("voice_mode:12345", "only") in calls
+        await handle_voice_command(update, ctx)
+        ctx.application.core_services.client_preferences.set_voice.assert_awaited_once_with(
+            ANY,
+            voice_key,
+            enable_if_off=True,
+        )
 
     @pytest.mark.asyncio
     async def test_invalid_voice_name(self):
         update = _make_update()
         ctx = _make_context(config=_make_config(tts_enabled=True), args=["badname"])
-        with patch("kai.bot.sessions.get_setting", new_callable=AsyncMock, return_value=None):
-            await handle_voice_command(update, ctx)
+        await handle_voice_command(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "Unknown" in reply or "Usage" in reply
 
@@ -1815,8 +1872,7 @@ class TestHandleVoices:
     async def test_sends_keyboard(self):
         update = _make_update()
         ctx = _make_context(config=_make_config(tts_enabled=True))
-        with patch("kai.bot.sessions.get_setting", new_callable=AsyncMock, return_value=None):
-            await handle_voices(update, ctx)
+        await handle_voices(update, ctx)
         call = update.message.reply_text.call_args
         assert call[1]["reply_markup"] is not None
 
@@ -1843,8 +1899,7 @@ class TestHandleVoiceCallback:
     async def test_same_voice_no_change(self):
         update = _make_callback_update(data=f"voice:{DEFAULT_VOICE}")
         ctx = _make_context()
-        with patch("kai.bot.sessions.get_setting", new_callable=AsyncMock, return_value=None):
-            await handle_voice_callback(update, ctx)
+        await handle_voice_callback(update, ctx)
         edit_text = update.callback_query.edit_message_text.call_args[0][0]
         assert "No change" in edit_text
 
@@ -1854,11 +1909,7 @@ class TestHandleVoiceCallback:
         new_voice = "jenny" if DEFAULT_VOICE != "jenny" else "alan"
         update = _make_callback_update(data=f"voice:{new_voice}")
         ctx = _make_context()
-        with (
-            patch("kai.bot.sessions.get_setting", new_callable=AsyncMock, return_value=None),
-            patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
-        ):
-            await handle_voice_callback(update, ctx)
+        await handle_voice_callback(update, ctx)
         edit_text = update.callback_query.edit_message_text.call_args[0][0]
         assert VOICES[new_voice] in edit_text
 
@@ -1869,18 +1920,12 @@ class TestHandleVoiceCallback:
         update = _make_callback_update(data=f"voice:{new_voice}")
         ctx = _make_context()
 
-        async def _get(key):
-            if "voice_mode" in key:
-                return "off"
-            return None  # default voice
-
-        with (
-            patch("kai.bot.sessions.get_setting", side_effect=_get),
-            patch("kai.bot.sessions.set_setting", new_callable=AsyncMock) as mock_set,
-        ):
-            await handle_voice_callback(update, ctx)
-        calls = {c[0] for c in mock_set.call_args_list}
-        assert ("voice_mode:12345", "only") in calls
+        await handle_voice_callback(update, ctx)
+        ctx.application.core_services.client_preferences.set_voice.assert_awaited_once_with(
+            ANY,
+            new_voice,
+            enable_if_off=True,
+        )
 
 
 # ── handle_webhooks ──────────────────────────────────────────────────
@@ -2898,6 +2943,7 @@ class TestHandleMessage:
             inbound_message_id=inbound_id,
             prompt="canonical input",
             voice_mode="off",
+            voice_name=DEFAULT_VOICE,
         )
 
     @pytest.mark.asyncio
@@ -2906,9 +2952,16 @@ class TestHandleMessage:
         ctx = _make_context(config=_make_config(allowed_user_ids={1}, tts_enabled=True))
         execution, _, _ = _configure_canonical_media_execution(ctx)
 
+        ctx.application.core_services.client_preferences.inspect_binding.return_value = ClientBindingVoicePreference(
+            "cbd_test",
+            "Telegram",
+            VOICE_MODE_VOICE_ONLY,
+            DEFAULT_VOICE,
+            VOICES[DEFAULT_VOICE],
+            True,
+        )
         with (
             patch("kai.bot.is_totp_configured", return_value=False),
-            patch("kai.bot.sessions.get_setting", new_callable=AsyncMock, return_value="only"),
             patch("kai.bot._handle_workshop_private_text", new_callable=AsyncMock) as canonical_execute,
         ):
             await handle_message(update, ctx)
@@ -3354,10 +3407,7 @@ class TestCanonicalTelegramVoiceRendering:
         execution.execute = AsyncMock(side_effect=execute)
         ctx.application.core_services.private_text_execution = execution
 
-        with (
-            patch("kai.bot.sessions.get_setting", new_callable=AsyncMock, return_value=DEFAULT_VOICE),
-            patch("kai.bot.synthesize_speech", new_callable=AsyncMock, return_value=b"voice"),
-        ):
+        with patch("kai.bot.synthesize_speech", new_callable=AsyncMock, return_value=b"voice"):
             await _handle_workshop_private_text(
                 update,
                 ctx,
@@ -3396,7 +3446,6 @@ class TestCanonicalTelegramVoiceRendering:
         ctx.application.core_services.private_text_execution = execution
 
         with (
-            patch("kai.bot.sessions.get_setting", new_callable=AsyncMock, return_value=DEFAULT_VOICE),
             patch("kai.bot.synthesize_speech", new_callable=AsyncMock, side_effect=TTSError("unavailable")),
             patch("kai.bot._send_response", new_callable=AsyncMock) as direct_fallback,
         ):

@@ -181,6 +181,37 @@ export type WorkshopNotificationPreferenceChange =
       integrationClass: "generic" | "github";
     };
 
+export interface WorkshopClientPreferences {
+  mutation: { changed: boolean; operation: string } | null;
+  revision: string;
+  voiceOutput: {
+    available: boolean;
+    unavailableReason: string | null;
+    modes: ("off" | "text_and_voice" | "voice_only")[];
+    voices: { value: string; displayName: string }[];
+    bindings: {
+      choiceId: string;
+      clientName: string;
+      mode: "off" | "text_and_voice" | "voice_only";
+      voice: string;
+      voiceName: string;
+      editable: boolean;
+    }[];
+  };
+}
+
+export type WorkshopClientPreferenceChange =
+  | {
+      field: "mode";
+      bindingChoiceId: string;
+      value: "off" | "text_and_voice" | "voice_only";
+    }
+  | {
+      field: "voice";
+      bindingChoiceId: string;
+      value: string;
+    };
+
 export type WorkshopRuntimeSettingsChange =
   | { field: "backend"; value: string }
   | { field: "model"; value: string }

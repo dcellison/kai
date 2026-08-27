@@ -13,6 +13,10 @@ from kai.config import Config
 from kai.pool import SubprocessPool
 from kai.workshop.artifacts import WorkshopArtifactService
 from kai.workshop.client_commands import WorkshopClientCommandExecutor
+from kai.workshop.client_preferences import (
+    ClientVoiceCapability,
+    WorkshopClientPreferenceService,
+)
 from kai.workshop.conversation_runs import WorkshopConversationRunService
 from kai.workshop.delivery_authority import (
     DeliveryAuthorityEpoch,
@@ -138,6 +142,7 @@ class KaiCoreServices:
     preference_documents: WorkshopPreferenceService
     github_settings: WorkshopGitHubSettingsService
     notification_preferences: WorkshopNotificationPreferenceService
+    client_preferences: WorkshopClientPreferenceService
     proactive_publication: WorkshopProactivePublicationService
     integration_notifications: WorkshopIntegrationNotificationService
     github_automation: WorkshopGitHubAutomationService
@@ -164,6 +169,7 @@ class KaiApplicationHost:
         services_info: list[dict],
         registered_backend_ids: frozenset[str],
         delivery_policy: WorkshopDeliveryBindingPolicy,
+        client_voice_capabilities: tuple[ClientVoiceCapability, ...] = (),
     ) -> None:
         self._config = config
         self._runtime_profiles = runtime_profiles
@@ -173,6 +179,7 @@ class KaiApplicationHost:
         self._services_info = services_info
         self._registered_backend_ids = registered_backend_ids
         self._delivery_policy = delivery_policy
+        self._client_voice_capabilities = client_voice_capabilities
         self._state = KaiApplicationState.NEW
         self._services: KaiCoreServices | None = None
         self._adapters: dict[str, KaiApplicationAdapter] = {}
@@ -218,6 +225,7 @@ class KaiApplicationHost:
         post_run_effects: WorkshopPostRunEffectService | None = None
         github_settings: WorkshopGitHubSettingsService | None = None
         notification_preferences: WorkshopNotificationPreferenceService | None = None
+        client_preferences: WorkshopClientPreferenceService | None = None
         try:
             delivery_policy = self._delivery_policy
             subprocess_pool = SubprocessPool(
@@ -295,6 +303,10 @@ class KaiApplicationHost:
                 Path(self._config.session_db_path),
                 self._execution_state,
             )
+            client_preferences = await WorkshopClientPreferenceService.open(
+                Path(self._config.session_db_path),
+                self._client_voice_capabilities,
+            )
             proactive_publication = WorkshopProactivePublicationService(
                 client_store,
                 artifacts,
@@ -345,6 +357,7 @@ class KaiApplicationHost:
                 preference_documents=preference_documents,
                 github_settings=github_settings,
                 notification_preferences=notification_preferences,
+                client_preferences=client_preferences,
                 proactive_publication=proactive_publication,
                 integration_notifications=integration_notifications,
                 github_automation=github_automation,
@@ -365,6 +378,8 @@ class KaiApplicationHost:
                 await github_settings.close()
             if notification_preferences is not None:
                 await notification_preferences.close()
+            if client_preferences is not None:
+                await client_preferences.close()
             if client_commands is not None:
                 await client_commands.stop()
             if post_run_effects is not None:
@@ -429,6 +444,7 @@ class KaiApplicationHost:
             services.integration_notifications.close,
             services.github_settings.close,
             services.notification_preferences.close,
+            services.client_preferences.close,
             services.client_commands.stop,
             services.post_run_effects.stop,
             services.client_store.close,

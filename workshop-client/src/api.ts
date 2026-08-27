@@ -23,6 +23,8 @@ import type {
   WorkshopGitHubSettingsChange,
   WorkshopNotificationPreferences,
   WorkshopNotificationPreferenceChange,
+  WorkshopClientPreferences,
+  WorkshopClientPreferenceChange,
   WorkshopRuntimeSettingsChange,
   WorkshopWorkspaceSettingChange,
   WorkshopMemoryPage,
@@ -693,6 +695,75 @@ function parseNotificationPreferences(
         },
     preferences,
     revision: payload.revision,
+  };
+}
+
+function parseClientPreferences(payload: unknown): WorkshopClientPreferences {
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    !isRecord(payload.voice_output) ||
+    typeof payload.voice_output.available !== "boolean" ||
+    (payload.voice_output.unavailable_reason !== null &&
+      typeof payload.voice_output.unavailable_reason !== "string") ||
+    !Array.isArray(payload.voice_output.modes) ||
+    !Array.isArray(payload.voice_output.voices) ||
+    !Array.isArray(payload.voice_output.bindings) ||
+    typeof payload.revision !== "string" ||
+    (payload.mutation !== null &&
+      (!isRecord(payload.mutation) ||
+        typeof payload.mutation.operation !== "string" ||
+        typeof payload.mutation.changed !== "boolean"))
+  ) {
+    throw new Error("Kai returned unsupported client preferences.");
+  }
+  const modes = payload.voice_output.modes;
+  if (modes.some((value) =>
+    value !== "off" && value !== "text_and_voice" && value !== "voice_only")) {
+    throw new Error("Kai returned an unsupported client voice mode.");
+  }
+  const voices = payload.voice_output.voices.map((value) => {
+    if (!isRecord(value) || typeof value.value !== "string" || typeof value.display_name !== "string") {
+      throw new Error("Kai returned an unsupported client voice.");
+    }
+    return { value: value.value, displayName: value.display_name };
+  });
+  const bindings = payload.voice_output.bindings.map((value) => {
+    if (
+      !isRecord(value) ||
+      typeof value.choice_id !== "string" ||
+      typeof value.client_name !== "string" ||
+      (value.mode !== "off" && value.mode !== "text_and_voice" && value.mode !== "voice_only") ||
+      typeof value.voice !== "string" ||
+      typeof value.voice_name !== "string" ||
+      typeof value.editable !== "boolean"
+    ) {
+      throw new Error("Kai returned unsupported client-binding preferences.");
+    }
+    return {
+      choiceId: value.choice_id,
+      clientName: value.client_name,
+      mode: value.mode as "off" | "text_and_voice" | "voice_only",
+      voice: value.voice,
+      voiceName: value.voice_name,
+      editable: value.editable,
+    };
+  });
+  return {
+    mutation: payload.mutation === null
+      ? null
+      : {
+          changed: payload.mutation.changed as boolean,
+          operation: payload.mutation.operation as string,
+        },
+    revision: payload.revision,
+    voiceOutput: {
+      available: payload.voice_output.available,
+      unavailableReason: payload.voice_output.unavailable_reason,
+      modes: modes as ("off" | "text_and_voice" | "voice_only")[],
+      voices,
+      bindings,
+    },
   };
 }
 
@@ -1459,6 +1530,46 @@ export async function updateNotificationPreference(
     throw new Error(safeErrorMessage(payload, "Could not update notification preferences."));
   }
   return parseNotificationPreferences(payload);
+}
+
+export async function loadClientPreferences(
+  session: WorkshopSession,
+): Promise<WorkshopClientPreferences> {
+  const response = await authorizedFetch(session, "/v1/settings/clients");
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load client preferences."));
+  }
+  return parseClientPreferences(payload);
+}
+
+export async function updateClientPreference(
+  session: WorkshopSession,
+  revision: string,
+  change: WorkshopClientPreferenceChange,
+): Promise<WorkshopClientPreferences> {
+  const operation = change.field === "mode"
+    ? { mode: change.value }
+    : { voice: change.value };
+  const response = await authorizedFetch(session, "/v1/settings/clients", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      revision,
+      binding_choice_id: change.bindingChoiceId,
+      ...operation,
+    }),
+  });
+  const payload = await responsePayload(response);
+  if (response.status === 409) {
+    throw new SettingsRevisionConflictError(
+      safeErrorMessage(payload, "Client preferences changed since they were loaded."),
+    );
+  }
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not update client preferences."));
+  }
+  return parseClientPreferences(payload);
 }
 
 export async function updateRuntimeSettings(

@@ -12,9 +12,9 @@ into four tables:
    Jobs have a schedule_type (once/daily/interval) and can be deactivated
    without deletion to preserve history.
 
-3. **settings** - Generic key-value store for persistent config. Used for
-   workspace path, voice mode/name preferences, and future extensibility.
-   Keys are namespaced strings like "voice_mode:{chat_id}".
+3. **settings** - Generic compatibility key-value store. Canonical runtime and
+   client-binding preferences live in typed Workshop tables; legacy voice
+   keys remain here only as rollback mirrors during their retirement window.
 
 4. **telegram_update_queue** - Durable inbound Telegram webhook updates.
    Webhook mode persists accepted updates before acknowledging them, then a
@@ -1276,7 +1276,7 @@ async def get_setting(key: str) -> str | None:
     """
     Get a setting value by key, or None if not set.
 
-    Common keys: "workspace", "voice_mode:{chat_id}", "voice_name:{chat_id}".
+    Canonical authorities must not use this helper for live preference reads.
     """
     async with _get_db().execute("SELECT value FROM settings WHERE key = ?", (key,)) as cursor:
         row = await cursor.fetchone()
@@ -1560,8 +1560,7 @@ def _build_workspace_config_from_settings(
 
 # ── Per-user settings ──────────────────────────────────────────────
 # User-level defaults stored in the generic settings table. Keys are
-# namespaced as {field}:{chat_id} (e.g., "model:12345"), matching the
-# existing voice_mode:{chat_id} convention. These form the "user DB
+# namespaced as {field}:{chat_id} (e.g., "model:12345"). These form the "user DB
 # override" layer in the six-tier precedence model:
 #   workspace DB > workspace YAML > user DB > users.yaml > env > hardcoded
 

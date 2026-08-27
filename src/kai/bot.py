@@ -61,6 +61,15 @@ from kai.telegram_utils import chunk_text
 from kai.transcribe import TranscriptionError, transcribe_voice
 from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
 from kai.workshop.artifacts import StagedArtifact
+from kai.workshop.client_preferences import (
+    VOICE_MODE_OFF,
+    VOICE_MODE_TEXT_AND_VOICE,
+    VOICE_MODE_VOICE_ONLY,
+    ClientBindingPreferenceAuthority,
+    ClientBindingVoicePreference,
+    WorkshopClientPreferenceError,
+    WorkshopClientPreferenceService,
+)
 from kai.workshop.domain import MessageId, PrincipalId, RunId
 from kai.workshop.execution_coordinator import (
     CanonicalCancellationDisposition,
@@ -1023,6 +1032,37 @@ def _voices_keyboard(current: str) -> InlineKeyboardMarkup:
 # Voice mode options: "off" (text only), "on" (text + voice), "only" (voice only)
 _VOICE_MODES = {"off", "on", "only"}
 _VOICE_MODE_LABELS = {"off": "OFF", "on": "ON (text + voice)", "only": "ONLY (voice only)"}
+_TELEGRAM_TO_CANONICAL_VOICE_MODE = {
+    "off": VOICE_MODE_OFF,
+    "on": VOICE_MODE_TEXT_AND_VOICE,
+    "only": VOICE_MODE_VOICE_ONLY,
+}
+_CANONICAL_TO_TELEGRAM_VOICE_MODE = {value: key for key, value in _TELEGRAM_TO_CANONICAL_VOICE_MODE.items()}
+
+
+async def _telegram_voice_authority(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> tuple[WorkshopClientPreferenceService, ClientBindingPreferenceAuthority]:
+    service = _get_core_services(context).client_preferences
+    authority = await service.authority_for_transport_binding(
+        transport="telegram",
+        external_subject=str(_user_id(update)),
+        external_channel_id=str(_chat_id(update)),
+    )
+    return service, authority
+
+
+async def _telegram_voice_preference(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> tuple[
+    WorkshopClientPreferenceService,
+    ClientBindingPreferenceAuthority,
+    ClientBindingVoicePreference,
+]:
+    service, authority = await _telegram_voice_authority(update, context)
+    return service, authority, await service.inspect_binding(authority)
 
 
 @_require_auth
@@ -1043,22 +1083,26 @@ async def handle_voice_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("TTS is not enabled. Set TTS_ENABLED=true in .env")
         return
 
-    chat_id = _chat_id(update)
-    current_mode = await sessions.get_setting(f"voice_mode:{chat_id}") or "off"
-    current_voice = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
+    try:
+        service, authority, preference = await _telegram_voice_preference(update, context)
+    except WorkshopClientPreferenceError:
+        log.exception("Canonical Telegram voice preferences are unavailable")
+        await update.message.reply_text("Voice preferences are temporarily unavailable.")
+        return
+    current_mode = _CANONICAL_TO_TELEGRAM_VOICE_MODE[preference.mode]
+    current_voice = preference.voice
 
     if context.args:
         arg = context.args[0].lower()
         if arg in _VOICE_MODES:
             # /voice on|only|off — set mode directly
-            await sessions.set_setting(f"voice_mode:{chat_id}", arg)
+            await service.set_mode(authority, _TELEGRAM_TO_CANONICAL_VOICE_MODE[arg])
             await update.message.reply_text(f"Voice mode: {_VOICE_MODE_LABELS[arg]} (voice: {VOICES[current_voice]})")
         elif arg in VOICES:
             # /voice <name> — set voice (enable in current mode, or default to "only")
-            await sessions.set_setting(f"voice_name:{chat_id}", arg)
-            if current_mode == "off":
-                await sessions.set_setting(f"voice_mode:{chat_id}", "only")
-                current_mode = "only"
+            changed = await service.set_voice(authority, arg, enable_if_off=True)
+            changed_preference = next(item for item in changed.bindings if item.choice_id == preference.choice_id)
+            current_mode = _CANONICAL_TO_TELEGRAM_VOICE_MODE[changed_preference.mode]
             await update.message.reply_text(
                 f"Voice set to {VOICES[arg]}. Voice mode: {_VOICE_MODE_LABELS[current_mode]}"
             )
@@ -1075,7 +1119,7 @@ async def handle_voice_command(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         # /voice — toggle: off → only → off
         new_mode = "off" if current_mode != "off" else "only"
-        await sessions.set_setting(f"voice_mode:{chat_id}", new_mode)
+        await service.set_mode(authority, _TELEGRAM_TO_CANONICAL_VOICE_MODE[new_mode])
         await update.message.reply_text(f"Voice mode: {_VOICE_MODE_LABELS[new_mode]} (voice: {VOICES[current_voice]})")
 
 
@@ -1088,8 +1132,13 @@ async def handle_voices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("TTS is not enabled. Set TTS_ENABLED=true in .env")
         return
 
-    chat_id = _chat_id(update)
-    current_voice = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
+    try:
+        _service, _authority, preference = await _telegram_voice_preference(update, context)
+    except WorkshopClientPreferenceError:
+        log.exception("Canonical Telegram voice preferences are unavailable")
+        await update.message.reply_text("Voice preferences are temporarily unavailable.")
+        return
+    current_voice = preference.voice
     await update.message.reply_text(
         "Choose a voice:",
         reply_markup=_voices_keyboard(current_voice),
@@ -1116,20 +1165,22 @@ async def handle_voice_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("Invalid voice.")
         return
 
-    chat_id = _chat_id(update)
-    current_voice = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
+    try:
+        service, authority, preference = await _telegram_voice_preference(update, context)
+    except WorkshopClientPreferenceError:
+        log.exception("Canonical Telegram voice preferences are unavailable")
+        await query.answer("Voice preferences are unavailable.")
+        return
+    current_voice = preference.voice
 
     if voice == current_voice:
         await query.answer()
         await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
         return
 
-    current_mode = await sessions.get_setting(f"voice_mode:{chat_id}") or "off"
-    await sessions.set_setting(f"voice_name:{chat_id}", voice)
-    # Auto-enable voice if it was off
-    if current_mode == "off":
-        await sessions.set_setting(f"voice_mode:{chat_id}", "only")
-        current_mode = "only"
+    changed = await service.set_voice(authority, voice, enable_if_off=True)
+    changed_preference = next(item for item in changed.bindings if item.choice_id == preference.choice_id)
+    current_mode = _CANONICAL_TO_TELEGRAM_VOICE_MODE[changed_preference.mode]
     await query.answer()
     await query.edit_message_text(
         f"Voice set to {VOICES[voice]}. Voice mode: {_VOICE_MODE_LABELS[current_mode]}",
@@ -4380,6 +4431,7 @@ async def _handle_workshop_private_text(
     inbound_message_id: MessageId,
     prompt: str,
     voice_mode: str = "off",
+    voice_name: str = DEFAULT_VOICE,
 ) -> None:
     """Render streaming previews while Workshop owns execution and final delivery."""
     assert update.message is not None
@@ -4418,7 +4470,6 @@ async def _handle_workshop_private_text(
 
     success_transformer = None
     if voice_mode in {"on", "only"}:
-        voice_name = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
 
         async def transform_success(response):
             nonlocal voice_audio
@@ -4511,8 +4562,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     prompt = update.message.text
     config: Config = context.bot_data["config"]
     voice_mode = "off"
+    voice_name = DEFAULT_VOICE
     if config.tts_enabled:
-        voice_mode = await sessions.get_setting(f"voice_mode:{chat_id}") or "off"
+        try:
+            _service, _authority, preference = await _telegram_voice_preference(update, context)
+        except WorkshopClientPreferenceError:
+            log.exception("Canonical Telegram voice preferences are unavailable")
+            await _reply_safe(update.message, "Voice preferences are temporarily unavailable. Please try again.")
+            return
+        voice_mode = _CANONICAL_TO_TELEGRAM_VOICE_MODE[preference.mode]
+        voice_name = preference.voice
 
     execution = _get_core_services(context).private_text_execution
     if execution is None:
@@ -4551,6 +4610,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         inbound_message_id=inbound_message_id,
         prompt=prompt,
         voice_mode=voice_mode,
+        voice_name=voice_name,
     )
 
 

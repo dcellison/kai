@@ -1184,6 +1184,94 @@ def workshop_transition_tooling_status() -> str:
     )
 
 
+def workshop_client_preference_status(
+    db_path: Path,
+    *,
+    telegram_enabled: bool | None = True,
+    tts_enabled: bool | None = True,
+) -> str:
+    """Report canonical client-binding voice authority without transport IDs."""
+    prefix = "Workshop client preferences:"
+    if not db_path.is_file():
+        return f"{prefix} pending; canonical client preference schema unavailable"
+    required = {
+        "channels",
+        "channel_bindings",
+        "channel_memberships",
+        "external_identities",
+        "client_binding_voice_preferences",
+        "client_binding_voice_migrations",
+    }
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if not tables >= required:
+                return f"{prefix} pending; canonical client preference schema unavailable"
+            eligible = (
+                _scalar(
+                    connection,
+                    "SELECT COUNT(DISTINCT cb.id) FROM external_identities ei "
+                    "JOIN channel_bindings cb ON cb.transport = ei.provider "
+                    "AND cb.external_channel_id = ei.external_subject "
+                    "JOIN channels c ON c.id = cb.channel_id AND c.kind = 'direct' "
+                    "JOIN channel_memberships cm ON cm.channel_id = cb.channel_id "
+                    "AND cm.principal_id = ei.principal_id WHERE cb.transport = 'telegram'",
+                )
+                if telegram_enabled is not False
+                else 0
+            )
+            preferences = _scalar(connection, "SELECT COUNT(*) FROM client_binding_voice_preferences")
+            migrations = _scalar(connection, "SELECT COUNT(*) FROM client_binding_voice_migrations")
+            missing = (
+                _scalar(
+                    connection,
+                    "SELECT COUNT(DISTINCT cb.id) FROM external_identities ei "
+                    "JOIN channel_bindings cb ON cb.transport = ei.provider "
+                    "AND cb.external_channel_id = ei.external_subject "
+                    "JOIN channels c ON c.id = cb.channel_id AND c.kind = 'direct' "
+                    "JOIN channel_memberships cm ON cm.channel_id = cb.channel_id "
+                    "AND cm.principal_id = ei.principal_id "
+                    "LEFT JOIN client_binding_voice_preferences p ON p.channel_binding_id = cb.id "
+                    "LEFT JOIN client_binding_voice_migrations m ON m.channel_binding_id = cb.id "
+                    "WHERE cb.transport = 'telegram' "
+                    "AND (p.channel_binding_id IS NULL OR m.channel_binding_id IS NULL)",
+                )
+                if telegram_enabled is not False
+                else 0
+            )
+            stale = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM client_binding_voice_preferences p "
+                "JOIN client_binding_voice_migrations m ON m.channel_binding_id = p.channel_binding_id "
+                "WHERE p.principal_id != m.principal_id OR m.legacy_reads_disabled != 1 "
+                "OR m.rollback_dual_writes != 1",
+            )
+        finally:
+            connection.close()
+    except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    if telegram_enabled is False:
+        state = "inactive" if stale == 0 else "INCOMPLETE"
+        capability = "adapter disabled"
+    else:
+        state = "active" if eligible == preferences == migrations and missing == 0 and stale == 0 else "INCOMPLETE"
+        if telegram_enabled is None or tts_enabled is None:
+            capability = "not verified"
+        else:
+            capability = "enabled" if tts_enabled else "TTS disabled"
+    return (
+        f"{prefix} {state}; eligible bindings={eligible}, preferences={preferences}, "
+        f"migrations={migrations}, missing={missing}, stale={stale}; "
+        f"voice capability={capability}, authority=canonical, legacy reads=disabled, rollback dual writes=active"
+    )
+
+
 def _classified_legacy_archive(
     connection: sqlite3.Connection,
     replayed: _ReplayState,
