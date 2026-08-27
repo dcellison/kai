@@ -100,6 +100,7 @@ export function SettingsWorkspace({
   const [runtimeLoading, setRuntimeLoading] = useState(true);
   const [runtimeBusy, setRuntimeBusy] = useState(false);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
+  const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [runtimeNotice, setRuntimeNotice] = useState<string | null>(null);
   const [runtimeBackend, setRuntimeBackend] = useState("");
   const [runtimeModel, setRuntimeModel] = useState("");
@@ -172,21 +173,36 @@ export function SettingsWorkspace({
   const refreshRuntime = useCallback(async (): Promise<void> => {
     setRuntimeLoading(true);
     setRuntimeError(null);
+    setWorkspaceError(null);
     try {
-      const [settings, workspace] = await Promise.all([
-        loadSettingsWorkspace(session),
-        loadWorkspaceConfig(session),
-      ]);
+      const settings = await loadSettingsWorkspace(session);
       adoptRuntime(settings);
-      adoptWorkspace(workspace);
     } catch (caught) {
       if (!handleAccessFailure(caught)) {
         setRuntimeError(errorText(caught, "Could not load runtime settings."));
       }
+      setRuntime(null);
+      setWorkspaceConfig(null);
+      setRuntimeLoading(false);
+      return;
+    }
+    try {
+      adoptWorkspace(await loadWorkspaceConfig(session));
+    } catch (caught) {
+      if (caught instanceof AuthenticationError) {
+        onAuthenticationFailure(caught.message);
+      } else {
+        // A valid runtime snapshot proves this session owns the channel. Keep
+        // those settings visible if the narrower workspace-override surface
+        // is unavailable instead of treating its 403 as lost channel access
+        // and starting a navigation-refresh loop.
+        setWorkspaceConfig(null);
+        setWorkspaceError(errorText(caught, "Could not load workspace settings."));
+      }
     } finally {
       setRuntimeLoading(false);
     }
-  }, [adoptRuntime, adoptWorkspace, handleAccessFailure, session]);
+  }, [adoptRuntime, adoptWorkspace, handleAccessFailure, onAuthenticationFailure, session]);
 
   useEffect(() => {
     void refreshPreferences();
@@ -710,6 +726,19 @@ export function SettingsWorkspace({
                   <div className="settings-actions"><button className="primary-button" type="submit" disabled={runtimeBusy || workspacePrompt === (workspaceConfig.prompt ?? "")}>Apply</button><button className="quiet-button" type="button" disabled={runtimeBusy || !workspaceConfig.overrideFields.includes("prompt")} onClick={() => void mutateWorkspace({ field: "reset", value: "prompt" }, "Remove this workspace prompt override?")}>Reset</button></div>
                 </form>
               )}
+            </div>
+          </section>
+        )}
+        {runtime && !workspaceConfig && !runtimeLoading && (
+          <section className="settings-section">
+            <div>
+              <p className="section-number">03</p>
+              <h2>Workspace settings</h2>
+              <p>Runtime settings remain available, but workspace-specific overrides could not be loaded.</p>
+            </div>
+            <div className="settings-failure">
+              <p role="alert">{workspaceError ?? "Workspace settings are unavailable."}</p>
+              <button className="quiet-button" type="button" onClick={() => void refreshRuntime()}>Retry</button>
             </div>
           </section>
         )}

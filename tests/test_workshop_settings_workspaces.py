@@ -285,6 +285,35 @@ async def test_inspection_reports_workspace_precedence(
     assert pool.events == []
 
 
+async def test_active_workspace_config_uses_pool_authority_but_explicit_path_rechecks_grants(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, pool, authority, _, _ = _service(tmp_path)
+    active = tmp_path / "runtime-owned-home"
+    active.mkdir()
+    pool.workspace = active
+
+    async def get_settings(_namespace):
+        return {}
+
+    async def workspace_settings(_namespace, _workspace):
+        return {}
+
+    monkeypatch.setattr(sessions, "get_canonical_execution_settings", get_settings)
+    monkeypatch.setattr(
+        sessions,
+        "get_canonical_workspace_config_settings",
+        workspace_settings,
+    )
+
+    snapshot = await service.workspace_config(authority)
+
+    assert snapshot.workspace == str(active.resolve())
+    with pytest.raises(WorkshopSettingsWorkspaceAccessDenied):
+        await service.workspace_config(authority, str(active))
+
+
 async def test_workspace_policy_precedes_runtime_override_with_default_attribution(
     tmp_path: Path,
     monkeypatch,
