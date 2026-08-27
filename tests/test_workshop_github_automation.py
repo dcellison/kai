@@ -20,6 +20,7 @@ from kai.workshop.github_automation import (
     GitHubAutomationRoutingError,
     WorkshopGitHubAutomationService,
 )
+from kai.workshop.notification_preferences import WorkshopNotificationPreferenceService
 from kai.workshop.store import WorkshopEventStore
 from tests.workshop_profiles import profile_id, profile_registry
 
@@ -60,6 +61,7 @@ def _service(store, registry):
         registry,
         MagicMock(),
         MagicMock(),
+        WorkshopNotificationPreferenceService(store.connection, registry),
         spec_dir="specs",
         review_timeout_seconds=900,
     )
@@ -145,6 +147,7 @@ class TestDurableGitHubAutomation:
             MagicMock(),
             MagicMock(),
             MagicMock(),
+            MagicMock(),
             spec_dir="specs",
             review_timeout_seconds=900,
         )
@@ -224,6 +227,7 @@ class TestDurableGitHubAutomation:
         compatibility.for_profile.return_value = profile_state
         notifications = MagicMock()
         notifications.record_for_channel = AsyncMock(return_value=SimpleNamespace(message_id=MessageId.new()))
+        notification_preferences = await WorkshopNotificationPreferenceService.open(path, registry)
 
         service = await WorkshopGitHubAutomationService.open_and_start(
             path,
@@ -231,6 +235,7 @@ class TestDurableGitHubAutomation:
             registry,
             compatibility,
             notifications,
+            notification_preferences,
             spec_dir="specs",
             review_timeout_seconds=777,
         )
@@ -268,6 +273,7 @@ class TestDurableGitHubAutomation:
             notifications.record_for_channel.assert_awaited_once()
         finally:
             await service.stop()
+            await notification_preferences.close()
 
     async def test_restart_marks_in_flight_work_uncertain_instead_of_retrying(self, tmp_path: Path):
         path = tmp_path / "kai.db"

@@ -1017,6 +1017,7 @@ class TestHandleGithubDispatcher:
 
         with (
             patch("kai.bot._canonical_github_settings_authority", return_value=None),
+            patch("kai.bot._canonical_notification_preference_authority", return_value=None),
             patch("kai.bot._handle_github_token", new_callable=AsyncMock) as mock_handler,
         ):
             await handle_github(update, ctx)
@@ -1032,6 +1033,7 @@ class TestHandleGithubDispatcher:
 
         with (
             patch("kai.bot._canonical_github_settings_authority", return_value=None),
+            patch("kai.bot._canonical_notification_preference_authority", return_value=None),
             patch("kai.bot._handle_github_add", new_callable=AsyncMock) as mock_handler,
         ):
             await handle_github(update, ctx)
@@ -1047,6 +1049,7 @@ class TestHandleGithubDispatcher:
 
         with (
             patch("kai.bot._canonical_github_settings_authority", return_value=None),
+            patch("kai.bot._canonical_notification_preference_authority", return_value=None),
             patch("kai.bot._handle_github_remove", new_callable=AsyncMock) as mock_handler,
         ):
             await handle_github(update, ctx)
@@ -1063,6 +1066,7 @@ class TestHandleGithubDispatcher:
 
         with (
             patch("kai.bot._canonical_github_settings_authority", return_value=None),
+            patch("kai.bot._canonical_notification_preference_authority", return_value=None),
             patch("kai.bot.sessions", mock_sessions),
         ):
             await handle_github(update, ctx)
@@ -1129,6 +1133,19 @@ class TestCanonicalGithubParity:
             )
         )
         authority = MagicMock()
+        notification_service = MagicMock()
+        notification_service.inspect = AsyncMock(
+            return_value=SimpleNamespace(
+                preferences=(
+                    SimpleNamespace(
+                        integration_class="github",
+                        destination_name="GitHub alerts",
+                        source="personal override",
+                    ),
+                ),
+            )
+        )
+        notification_authority = MagicMock()
 
         with (
             patch(
@@ -1145,11 +1162,22 @@ class TestCanonicalGithubParity:
             patch("kai.bot.sessions.get_github_db_settings", AsyncMock(return_value={})),
             patch("kai.bot.sessions.get_github_added_repos", AsyncMock(return_value=[])),
         ):
-            await _show_github(update, 12345, config, canonical=(service, authority))
+            await _show_github(
+                update,
+                12345,
+                config,
+                canonical=(service, authority),
+                notification_preferences=(
+                    notification_service,
+                    notification_authority,
+                ),
+            )
 
         output = update.message.reply_text.call_args.args[0]
         assert "owner/repo  (operator)" in output
         assert "personal/repo  (user)" in output
         assert "ignored/legacy" not in output
+        assert "Notifications: GitHub alerts (personal override)" in output
+        assert "Notifications: 12345" not in output
         assert "GitHub token: stored" in output
         assert "ghp_" not in output

@@ -19,6 +19,7 @@ from kai.workshop.integration_notifications import (
     IntegrationNotification,
     WorkshopIntegrationNotificationService,
 )
+from kai.workshop.notification_preferences import WorkshopNotificationPreferenceService
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.runtime_state import WorkshopRuntimeStateWriter
 from kai.workshop.store import WorkshopEventStore
@@ -79,6 +80,7 @@ class WorkshopGitHubAutomationService:
         execution_state: WorkshopExecutionStateRegistry,
         runtime_state: WorkshopRuntimeStateWriter,
         notifications: WorkshopIntegrationNotificationService,
+        notification_preferences: WorkshopNotificationPreferenceService,
         *,
         spec_dir: str,
         review_timeout_seconds: int,
@@ -88,6 +90,7 @@ class WorkshopGitHubAutomationService:
         self._execution_state = execution_state
         self._runtime_state = runtime_state
         self._notifications = notifications
+        self._notification_preferences = notification_preferences
         self._spec_dir = spec_dir
         self._review_timeout_seconds = review_timeout_seconds
         self._wake = asyncio.Event()
@@ -104,6 +107,7 @@ class WorkshopGitHubAutomationService:
         execution_state: WorkshopExecutionStateRegistry,
         runtime_state: WorkshopRuntimeStateWriter,
         notifications: WorkshopIntegrationNotificationService,
+        notification_preferences: WorkshopNotificationPreferenceService,
         *,
         spec_dir: str,
         review_timeout_seconds: int,
@@ -114,6 +118,7 @@ class WorkshopGitHubAutomationService:
             execution_state,
             runtime_state,
             notifications,
+            notification_preferences,
             spec_dir=spec_dir,
             review_timeout_seconds=review_timeout_seconds,
         )
@@ -161,9 +166,9 @@ class WorkshopGitHubAutomationService:
             namespace = self._execution_state.maybe_for_principal_id(principal_id)
             if namespace is None:
                 raise GitHubAutomationRoutingError("Canonical GitHub subscriber does not resolve one protected runtime")
-            notification_channel_id = await self._notification_channel(
+            notification_channel_id = await self._notification_preferences.effective_channel(
                 principal_id,
-                namespace.channel_id,
+                "github",
             )
             routes.append(
                 GitHubSubscriptionRoute(
@@ -274,25 +279,6 @@ class WorkshopGitHubAutomationService:
         self._closed = True
         self._task = None
         await self._store.close()
-
-    async def _notification_channel(
-        self,
-        principal_id: PrincipalId,
-        direct_channel_id: ChannelId,
-    ) -> ChannelId:
-        async with self._store.connection.execute(
-            "SELECT c.id FROM channels c "
-            "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.principal_id = ? "
-            "JOIN channel_agents ca ON ca.channel_id = c.id "
-            "WHERE c.kind = 'notification' ORDER BY c.id",
-            (principal_id,),
-        ) as cursor:
-            rows = tuple(await cursor.fetchall())
-        if not rows:
-            return direct_channel_id
-        if len(rows) != 1:
-            raise GitHubAutomationRoutingError("Canonical GitHub subscriber has multiple notification destinations")
-        return ChannelId(str(rows[0][0]))
 
     async def _recover_interrupted(self) -> None:
         await self._store.connection.execute(

@@ -72,6 +72,10 @@ from kai.workshop.github_settings import (
     WorkshopGitHubSettingsService,
 )
 from kai.workshop.inbound import InboundMessage
+from kai.workshop.notification_preferences import (
+    NotificationPreferenceAuthority,
+    WorkshopNotificationPreferenceService,
+)
 from kai.workshop.scheduled_jobs import WorkshopScheduledJobAuthority
 from kai.workshop.settings_workspaces import (
     SettingsWorkspaceAuthority,
@@ -309,6 +313,25 @@ def _canonical_github_settings_authority(
     """Resolve a Telegram binding to principal-owned GitHub settings."""
     services = _get_core_services(context)
     service = getattr(services, "github_settings", None)
+    if service is None:
+        return None
+    try:
+        storage = services.principal_storage.for_runtime_config_id(runtime_config_id)
+    except WorkshopStorageNamespaceError:
+        return None
+    return service, service.authority_for_principal_profile(
+        storage.principal_id,
+        storage.runtime_profile_id,
+    )
+
+
+def _canonical_notification_preference_authority(
+    context: ContextTypes.DEFAULT_TYPE,
+    runtime_config_id: int,
+) -> tuple[WorkshopNotificationPreferenceService, NotificationPreferenceAuthority] | None:
+    """Resolve a Telegram binding to principal-owned delivery preferences."""
+    services = _get_core_services(context)
+    service = getattr(services, "notification_preferences", None)
     if service is None:
         return None
     try:
@@ -3146,6 +3169,11 @@ async def _show_github(
     config: Config,
     *,
     canonical: tuple[WorkshopGitHubSettingsService, GitHubSettingsAuthority] | None = None,
+    notification_preferences: tuple[
+        WorkshopNotificationPreferenceService,
+        NotificationPreferenceAuthority,
+    ]
+    | None = None,
 ) -> None:
     """Display the user's effective GitHub notification settings with source attribution."""
     assert update.message is not None
@@ -3171,11 +3199,17 @@ async def _show_github(
         lines.append("GitHub: not configured")
 
     # Notification destination
-    notify = effective["notify_chat_id"]
-    if notify and notify != chat_id:
-        lines.append(f"Notifications: {notify}")
+    if notification_preferences is not None:
+        preference_service, preference_authority = notification_preferences
+        preference_snapshot = await preference_service.inspect(preference_authority)
+        github_delivery = next(item for item in preference_snapshot.preferences if item.integration_class == "github")
+        lines.append(f"Notifications: {github_delivery.destination_name} ({github_delivery.source})")
     else:
-        lines.append("Notifications: this chat")
+        notify = effective["notify_chat_id"]
+        if notify and notify != chat_id:
+            lines.append(f"Notifications: {notify}")
+        else:
+            lines.append("Notifications: this chat")
 
     # Feature toggles with source attribution. Read DB settings directly
     # so we can tell the user where each value comes from.
@@ -3258,31 +3292,74 @@ async def _handle_github_notify(
     update: Update,
     chat_id: int,
     args: list[str],
+    *,
+    canonical: tuple[
+        WorkshopNotificationPreferenceService,
+        NotificationPreferenceAuthority,
+    ]
+    | None = None,
 ) -> None:
-    """Handle /github notify <chat_id|reset> - set or clear notification destination."""
+    """Select a canonical GitHub notification destination by displayed number."""
     assert update.message is not None
 
+    if canonical is None:
+        await update.message.reply_text("Canonical notification destinations are unavailable.")
+        return
+
+    service, authority = canonical
+    snapshot = await service.inspect(authority)
+    github_preference = next(item for item in snapshot.preferences if item.integration_class == "github")
+    github_destinations = [item for item in snapshot.destinations if "github" in item.supported_classes]
     if not args:
-        await update.message.reply_text("Usage: /github notify <chat_id> or /github notify reset")
+        lines = [
+            f"GitHub notifications: {github_preference.destination_name} ({github_preference.source})",
+            "",
+            "Available destinations:",
+        ]
+        lines.extend(
+            f"{index}. {item.display_name} ({item.kind})" for index, item in enumerate(github_destinations, start=1)
+        )
+        lines.extend(
+            [
+                "",
+                "Use /github notify <number> to select a destination.",
+                "Use /github notify reset to restore protected policy.",
+            ]
+        )
+        await update.message.reply_text("\n".join(lines))
         return
 
     value = args[0].lower()
 
     if value == "reset":
-        await sessions.delete_setting(f"github_notify_chat:{chat_id}")
-        await update.message.reply_text("Notification destination reset to this chat.")
+        changed = await service.reset(
+            authority,
+            "github",
+            expected_revision=snapshot.revision,
+        )
+        preference = next(item for item in changed.preferences if item.integration_class == "github")
+        await update.message.reply_text(
+            f"GitHub notification destination reset to {preference.destination_name} ({preference.source})."
+        )
         return
 
-    # Validate chat_id is a valid integer (can be negative for groups)
     try:
-        notify_id = int(value)
+        selected_index = int(value)
     except ValueError:
-        await update.message.reply_text("Chat ID must be an integer.")
+        await update.message.reply_text("Destination must be a number from /github notify, or reset.")
         return
-
-    await sessions.set_setting(f"github_notify_chat:{chat_id}", str(notify_id))
-
-    await update.message.reply_text(f"GitHub notifications will go to chat {notify_id}.")
+    if selected_index < 1 or selected_index > len(github_destinations):
+        await update.message.reply_text("Destination must be a number from /github notify, or reset.")
+        return
+    selected = github_destinations[selected_index - 1]
+    changed = await service.select(
+        authority,
+        "github",
+        selected.choice_id,
+        expected_revision=snapshot.revision,
+    )
+    preference = next(item for item in changed.preferences if item.integration_class == "github")
+    await update.message.reply_text(f"GitHub notifications will go to {preference.destination_name}.")
 
 
 async def _handle_github_toggle(
@@ -3323,14 +3400,29 @@ async def handle_github(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     args = context.args or []
     subcommand = args[0].lower() if args else None
     canonical = _canonical_github_settings_authority(context, chat_id)
+    notification_preferences = _canonical_notification_preference_authority(
+        context,
+        chat_id,
+    )
 
     # No subcommand: display current settings
     if subcommand is None:
-        await _show_github(update, chat_id, config, canonical=canonical)
+        await _show_github(
+            update,
+            chat_id,
+            config,
+            canonical=canonical,
+            notification_preferences=notification_preferences,
+        )
         return
 
     if subcommand == "notify":
-        await _handle_github_notify(update, chat_id, args[1:])
+        await _handle_github_notify(
+            update,
+            chat_id,
+            args[1:],
+            canonical=notification_preferences,
+        )
         return
 
     if subcommand == "reviews":
@@ -3732,7 +3824,7 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/workspaces - Switch workspace (inline buttons)\n"
         "\n"
         "/github - Show GitHub settings\n"
-        "/github notify <chat_id|reset> - Route or reset notifications\n"
+        "/github notify [number|reset] - View, route, or reset notifications\n"
         "/github reviews [on|off] - Toggle PR reviews\n"
         "/github triage [on|off] - Toggle issue triage\n"
         "/github token [<token>] - Manage access token\n"

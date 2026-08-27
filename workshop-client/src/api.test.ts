@@ -18,6 +18,7 @@ import {
   loadMemoryStats,
   loadNavigation,
   loadGitHubSettings,
+  loadNotificationPreferences,
   loadPreferenceDocument,
   loadPreferenceHistory,
   loadRun,
@@ -33,6 +34,7 @@ import {
   streamTimeline,
   updateRuntimeSettings,
   updateGitHubSettings,
+  updateNotificationPreference,
   updateWorkspaceConfig,
 } from "./api";
 import type { WorkshopSession } from "./types";
@@ -195,6 +197,43 @@ function githubSettingsPayload(
     issue_triage: { enabled: false, source: "user", resettable: true },
     token_stored: true,
     revision: "ghs_current",
+    mutation: null,
+    ...overrides,
+  };
+}
+
+function notificationPreferencesPayload(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    version: 1,
+    destinations: [
+      {
+        choice_id: "ndst_home",
+        display_name: "Home",
+        kind: "direct",
+        supported_classes: ["github", "generic"],
+      },
+      {
+        choice_id: "ndst_notifications",
+        display_name: "Notifications",
+        kind: "notification",
+        supported_classes: ["github", "generic"],
+      },
+    ],
+    preferences: [
+      {
+        integration_class: "github",
+        display_name: "GitHub",
+        destination_choice_id: "ndst_notifications",
+        destination_name: "Notifications",
+        destination_kind: "notification",
+        source: "protected policy",
+        editable: true,
+        resettable: false,
+      },
+    ],
+    revision: "nps_current",
     mutation: null,
     ...overrides,
   };
@@ -597,6 +636,47 @@ describe("Workshop client API", () => {
         subscribed: false,
       }),
     ).rejects.toBeInstanceOf(SettingsRevisionConflictError);
+  });
+
+  it("loads and mutates opaque notification destinations", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json(notificationPreferencesPayload()))
+      .mockResolvedValueOnce(Response.json(notificationPreferencesPayload({
+        mutation: {
+          operation: "select_github_notification_destination",
+          changed: true,
+        },
+      })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const loaded = await loadNotificationPreferences(session);
+    expect(loaded).toMatchObject({
+      destinations: [
+        { choiceId: "ndst_home", displayName: "Home" },
+        { choiceId: "ndst_notifications", displayName: "Notifications" },
+      ],
+      preferences: [{ integrationClass: "github", destinationName: "Notifications" }],
+    });
+    await expect(
+      updateNotificationPreference(session, "nps_current", {
+        field: "destination",
+        integrationClass: "github",
+        choiceId: "ndst_home",
+      }),
+    ).resolves.toMatchObject({
+      mutation: {
+        operation: "select_github_notification_destination",
+        changed: true,
+      },
+    });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/v1/settings/notifications");
+    expect(JSON.parse((fetchMock.mock.calls[1]?.[1] as RequestInit).body as string)).toEqual({
+      revision: "nps_current",
+      destination_choice_id: "ndst_home",
+      integration_class: "github",
+    });
+    expect(JSON.stringify(loaded)).not.toContain("telegram");
   });
 
   it("rejects malformed memory records instead of rendering partial data", async () => {

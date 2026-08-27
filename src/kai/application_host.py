@@ -25,6 +25,7 @@ from kai.workshop.github_settings import WorkshopGitHubSettingsService
 from kai.workshop.integration_notifications import WorkshopIntegrationNotificationService
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIContextRegistry
 from kai.workshop.memory_queries import WorkshopMemoryQueryService
+from kai.workshop.notification_preferences import WorkshopNotificationPreferenceService
 from kai.workshop.post_run_effects import WorkshopPostRunEffectService
 from kai.workshop.preferences import WorkshopPreferenceService
 from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
@@ -136,6 +137,7 @@ class KaiCoreServices:
     memory_queries: WorkshopMemoryQueryService
     preference_documents: WorkshopPreferenceService
     github_settings: WorkshopGitHubSettingsService
+    notification_preferences: WorkshopNotificationPreferenceService
     proactive_publication: WorkshopProactivePublicationService
     integration_notifications: WorkshopIntegrationNotificationService
     github_automation: WorkshopGitHubAutomationService
@@ -215,6 +217,7 @@ class KaiApplicationHost:
         github_automation: WorkshopGitHubAutomationService | None = None
         post_run_effects: WorkshopPostRunEffectService | None = None
         github_settings: WorkshopGitHubSettingsService | None = None
+        notification_preferences: WorkshopNotificationPreferenceService | None = None
         try:
             delivery_policy = self._delivery_policy
             subprocess_pool = SubprocessPool(
@@ -288,6 +291,10 @@ class KaiApplicationHost:
                 self._execution_state,
                 self._runtime_profiles,
             )
+            notification_preferences = await WorkshopNotificationPreferenceService.open(
+                Path(self._config.session_db_path),
+                self._execution_state,
+            )
             proactive_publication = WorkshopProactivePublicationService(
                 client_store,
                 artifacts,
@@ -306,6 +313,7 @@ class KaiApplicationHost:
             integration_notifications = await WorkshopIntegrationNotificationService.open(
                 Path(self._config.session_db_path),
                 delivery_policy,
+                notification_preferences,
             )
             github_automation = await WorkshopGitHubAutomationService.open_and_start(
                 Path(self._config.session_db_path),
@@ -313,6 +321,7 @@ class KaiApplicationHost:
                 self._execution_state,
                 runtime_state,
                 integration_notifications,
+                notification_preferences,
                 spec_dir=self._config.spec_dir,
                 review_timeout_seconds=self._config.pr_review_timeout_s,
             )
@@ -335,6 +344,7 @@ class KaiApplicationHost:
                 memory_queries=memory_queries,
                 preference_documents=preference_documents,
                 github_settings=github_settings,
+                notification_preferences=notification_preferences,
                 proactive_publication=proactive_publication,
                 integration_notifications=integration_notifications,
                 github_automation=github_automation,
@@ -353,6 +363,8 @@ class KaiApplicationHost:
                 await integration_notifications.close()
             if github_settings is not None:
                 await github_settings.close()
+            if notification_preferences is not None:
+                await notification_preferences.close()
             if client_commands is not None:
                 await client_commands.stop()
             if post_run_effects is not None:
@@ -416,6 +428,7 @@ class KaiApplicationHost:
             services.github_automation.stop,
             services.integration_notifications.close,
             services.github_settings.close,
+            services.notification_preferences.close,
             services.client_commands.stop,
             services.post_run_effects.stop,
             services.client_store.close,

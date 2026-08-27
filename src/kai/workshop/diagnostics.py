@@ -609,6 +609,14 @@ def workshop_operational_state_status(db_path: Path) -> str:
                 "SELECT 1 FROM principal_github_subscriptions g "
                 "WHERE g.principal_id = m.principal_id)",
             )
+            notification_overrides = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM principal_notification_delivery_preferences",
+            )
+            integration_route_owners = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM workshop_integration_route_owners",
+            )
         finally:
             connection.close()
     except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
@@ -635,6 +643,9 @@ def workshop_operational_state_status(db_path: Path) -> str:
         f"unmigrated jobs={unmigrated_jobs}, conflicting jobs={conflicting_jobs}, "
         f"GitHub principals={github_subscriptions}, "
         f"missing subscriptions={missing_subscriptions}; personal GitHub settings=canonical, "
+        f"notification overrides={notification_overrides}, "
+        f"integration route owners={integration_route_owners}, "
+        "personal notification delivery=canonical, "
         "protected legacy ownership "
         "reads=disabled, compatibility job writes=disabled"
     )

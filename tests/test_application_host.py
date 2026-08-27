@@ -163,7 +163,7 @@ class _FakeIntegrationNotifications:
         self.events = events
 
     @classmethod
-    async def open(cls, _path: Path, _delivery_policy):
+    async def open(cls, _path: Path, _delivery_policy, _notification_preferences):
         events = _FakeExecutionFactory.events
         events.append("integrations:open")
         return cls(events)
@@ -184,6 +184,20 @@ class _FakeGitHubSettings:
 
     async def close(self) -> None:
         self.events.append("github-settings:close")
+
+
+class _FakeNotificationPreferences:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    @classmethod
+    async def open(cls, *_args, **_kwargs):
+        events = _FakeExecutionFactory.events
+        events.append("notification-preferences:open")
+        return cls(events)
+
+    async def close(self) -> None:
+        self.events.append("notification-preferences:close")
 
 
 class _FakeGitHubAutomation:
@@ -257,6 +271,11 @@ def host_dependencies(monkeypatch):
         _FakeIntegrationNotifications,
     )
     monkeypatch.setattr(host_module, "WorkshopGitHubSettingsService", _FakeGitHubSettings)
+    monkeypatch.setattr(
+        host_module,
+        "WorkshopNotificationPreferenceService",
+        _FakeNotificationPreferences,
+    )
     monkeypatch.setattr(host_module, "WorkshopGitHubAutomationService", _FakeGitHubAutomation)
     monkeypatch.setattr(
         host_module,
@@ -356,6 +375,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
         "client:start",
         "scheduler:start",
         "github-settings:open",
+        "notification-preferences:open",
         "integrations:open",
         "github-automation:start",
     ]
@@ -365,7 +385,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
 
     assert host.readiness.state == KaiApplicationState.STOPPED
     assert host.readiness.ready is False
-    assert host_dependencies[-13:] == [
+    assert host_dependencies[-14:] == [
         "execution:wait",
         "scheduler:wait",
         "github-automation:wait",
@@ -374,6 +394,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
         "github-automation:stop",
         "integrations:close",
         "github-settings:close",
+        "notification-preferences:close",
         "client:stop",
         "post-run-effects:stop",
         "store:close",
