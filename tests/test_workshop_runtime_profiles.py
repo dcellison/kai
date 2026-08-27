@@ -31,6 +31,7 @@ def _config() -> Config:
                 name="Daniel",
                 os_user="daniel",
                 backend="codex",
+                github="dcellison",
             ),
             202: UserConfig(
                 telegram_id=202,
@@ -58,6 +59,7 @@ def test_registry_exposes_opaque_stable_profiles_with_protected_policy():
     assert daniel.provider == "openai"
     assert daniel.model == "gpt-5.6-sol"
     assert daniel.timeout_seconds == 120
+    assert daniel.github_login == "dcellison"
     assert scott.os_user == "sellison"
     assert scott.backend == "claude"
     assert scott.provider == "anthropic"
@@ -116,6 +118,7 @@ def test_document_preserves_migrated_profile_identity_and_compatibility_key():
                     "provider": "openai",
                     "model": "gpt-5.6-sol",
                     "timeout_seconds": 240,
+                    "github_login": "dcellison",
                     "allowed_services": ["perplexity", "weather"],
                     "allowed_workspaces": [],
                 }
@@ -132,7 +135,33 @@ def test_document_preserves_migrated_profile_identity_and_compatibility_key():
     assert profile.provider == "openai"
     assert profile.model == "gpt-5.6-sol"
     assert profile.timeout_seconds == 240
+    assert profile.github_login == "dcellison"
     assert profile.allowed_services == ("perplexity", "weather")
+
+
+@pytest.mark.parametrize("login", ("", "-invalid", "invalid-", "invalid--name", "x" * 40, 42))
+def test_document_rejects_invalid_github_login(login):
+    profile_id = runtime_profile_id_for_config_id(101)
+    with pytest.raises(WorkshopRuntimeProfileError, match="github_login"):
+        WorkshopRuntimeProfileRegistry.from_document(
+            {
+                "version": 2,
+                "runtime_profiles": {
+                    str(profile_id): {
+                        "display_name": "Daniel coding",
+                        "os_user": "daniel",
+                        "backend": "codex",
+                        "provider": "openai",
+                        "model": "gpt-5.6-sol",
+                        "timeout_seconds": 120,
+                        "allowed_services": [],
+                        "allowed_workspaces": [],
+                        "github_login": login,
+                    }
+                },
+            },
+            backend_registry={"codex": {}},
+        )
 
 
 def test_document_builds_explicit_backend_choices_from_protected_allowlist():

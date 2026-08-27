@@ -8,6 +8,7 @@ and the updated _show_github display with source attribution and token status.
 All GitHub API calls are mocked - no real HTTP requests are made.
 """
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
@@ -20,6 +21,7 @@ from kai.bot import (
     _github_api_remove_webhook,
     _handle_github_add,
     _handle_github_remove,
+    _handle_github_toggle,
     _handle_github_token,
     _show_github,
     handle_github,
@@ -1013,10 +1015,13 @@ class TestHandleGithubDispatcher:
         config = _make_config()
         ctx = _make_context(config=config, args=["token", "ghp_test"])
 
-        with patch("kai.bot._handle_github_token", new_callable=AsyncMock) as mock_handler:
+        with (
+            patch("kai.bot._canonical_github_settings_authority", return_value=None),
+            patch("kai.bot._handle_github_token", new_callable=AsyncMock) as mock_handler,
+        ):
             await handle_github(update, ctx)
 
-        mock_handler.assert_called_once_with(update, 12345, ["ghp_test"])
+        mock_handler.assert_called_once_with(update, 12345, ["ghp_test"], canonical=None)
 
     @pytest.mark.asyncio
     async def test_add_routes_to_handler(self):
@@ -1025,10 +1030,13 @@ class TestHandleGithubDispatcher:
         config = _make_config()
         ctx = _make_context(config=config, args=["add", "alice/repo"])
 
-        with patch("kai.bot._handle_github_add", new_callable=AsyncMock) as mock_handler:
+        with (
+            patch("kai.bot._canonical_github_settings_authority", return_value=None),
+            patch("kai.bot._handle_github_add", new_callable=AsyncMock) as mock_handler,
+        ):
             await handle_github(update, ctx)
 
-        mock_handler.assert_called_once_with(update, 12345, ["alice/repo"], config)
+        mock_handler.assert_called_once_with(update, 12345, ["alice/repo"], config, canonical=None)
 
     @pytest.mark.asyncio
     async def test_remove_routes_to_handler(self):
@@ -1037,10 +1045,13 @@ class TestHandleGithubDispatcher:
         config = _make_config()
         ctx = _make_context(config=config, args=["remove", "alice/repo"])
 
-        with patch("kai.bot._handle_github_remove", new_callable=AsyncMock) as mock_handler:
+        with (
+            patch("kai.bot._canonical_github_settings_authority", return_value=None),
+            patch("kai.bot._handle_github_remove", new_callable=AsyncMock) as mock_handler,
+        ):
             await handle_github(update, ctx)
 
-        mock_handler.assert_called_once_with(update, 12345, ["alice/repo"], config)
+        mock_handler.assert_called_once_with(update, 12345, ["alice/repo"], config, canonical=None)
 
     @pytest.mark.asyncio
     async def test_unknown_subcommand_lists_all(self):
@@ -1050,7 +1061,10 @@ class TestHandleGithubDispatcher:
         ctx = _make_context(config=config, args=["bogus"])
         mock_sessions = AsyncMock()
 
-        with patch("kai.bot.sessions", mock_sessions):
+        with (
+            patch("kai.bot._canonical_github_settings_authority", return_value=None),
+            patch("kai.bot.sessions", mock_sessions),
+        ):
             await handle_github(update, ctx)
 
         reply = update.message.reply_text.call_args[0][0]
@@ -1058,3 +1072,84 @@ class TestHandleGithubDispatcher:
         # All subcommands should be listed
         for cmd in ("notify", "reviews", "triage", "add", "remove", "token"):
             assert cmd in reply.lower()
+
+
+class TestCanonicalGithubParity:
+    """Telegram delegates personal GitHub state to the shared canonical authority."""
+
+    @pytest.mark.asyncio
+    async def test_token_and_toggle_use_canonical_service(self):
+        update = _make_update()
+        service = MagicMock()
+        service.set_token = AsyncMock()
+        service.set_toggle = AsyncMock()
+        authority = MagicMock()
+
+        await _handle_github_token(
+            update,
+            12345,
+            ["ghp_secret"],
+            canonical=(service, authority),
+        )
+        await _handle_github_toggle(
+            update,
+            12345,
+            "issue_triage",
+            ["on"],
+            canonical=(service, authority),
+        )
+
+        service.set_token.assert_awaited_once_with(authority, "ghp_secret")
+        service.set_toggle.assert_awaited_once_with(authority, "issue_triage", True)
+
+    @pytest.mark.asyncio
+    async def test_show_uses_redacted_canonical_snapshot(self):
+        update = _make_update()
+        config = _make_config(
+            user_configs={
+                12345: UserConfig(
+                    telegram_id=12345,
+                    name="Daniel",
+                    github="daniel",
+                    github_repos=["ignored/legacy"],
+                )
+            }
+        )
+        service = MagicMock()
+        service.inspect = AsyncMock(
+            return_value=SimpleNamespace(
+                github_login="daniel",
+                repositories=(
+                    SimpleNamespace(repository="owner/repo", source="operator"),
+                    SimpleNamespace(repository="personal/repo", source="user"),
+                ),
+                pr_review=SimpleNamespace(enabled=True, source="operator"),
+                issue_triage=SimpleNamespace(enabled=False, source="user"),
+                token_stored=True,
+            )
+        )
+        authority = MagicMock()
+
+        with (
+            patch(
+                "kai.bot.sessions.resolve_github_settings",
+                AsyncMock(
+                    return_value={
+                        "notify_chat_id": 12345,
+                        "pr_review": False,
+                        "issue_triage": True,
+                        "repos": ["ignored/legacy"],
+                    }
+                ),
+            ),
+            patch("kai.bot.sessions.get_github_db_settings", AsyncMock(return_value={})),
+            patch("kai.bot.sessions.get_github_added_repos", AsyncMock(return_value=[])),
+        ):
+            await _show_github(update, 12345, config, canonical=(service, authority))
+
+        output = update.message.reply_text.call_args.args[0]
+        assert "owner/repo  (operator)" in output
+        assert "personal/repo  (user)" in output
+        assert "ignored/legacy" not in output
+        assert "GitHub token: stored" in output
+        assert "ghp_" not in output

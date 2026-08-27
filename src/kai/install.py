@@ -884,6 +884,7 @@ def _build_fresh_runtime_profile_policy(
                 "workspace_base": None,
                 "allowed_workspaces": [],
                 "models": {},
+                "github_login": None,
                 "github_repos": [],
                 "pr_review": None,
                 "issue_triage": None,
@@ -1234,6 +1235,11 @@ def _build_migrated_runtime_profiles(
                 )
                 if str(role).strip() and str(role_model).strip()
             },
+            "github_login": (
+                str(entry.get("github")).strip()
+                if entry.get("github") is not None and str(entry.get("github")).strip()
+                else None
+            ),
             "github_repos": [
                 str(repo).strip().lower()
                 for repo in (entry.get("github_repos", []) if isinstance(entry.get("github_repos"), list) else ())
@@ -1430,10 +1436,10 @@ def _upgrade_runtime_policy_content(
         if "models" not in profile:
             profile["models"] = expected["models"] if isinstance(expected, dict) else {}
             changed = True
-        for field in ("github_repos", "pr_review", "issue_triage"):
+        for field in ("github_login", "github_repos", "pr_review", "issue_triage"):
             if field not in profile:
                 default: object = [] if field == "github_repos" else None
-                profile[field] = expected[field] if isinstance(expected, dict) else default
+                profile[field] = expected.get(field, default) if isinstance(expected, dict) else default
                 changed = True
         if "allowed_triage_projects" not in profile:
             profile["allowed_triage_projects"] = (

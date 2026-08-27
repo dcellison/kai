@@ -5,6 +5,7 @@ import {
   ChannelAccessError,
   loadPreferenceDocument,
   loadPreferenceHistory,
+  loadGitHubSettings,
   loadSettingsWorkspace,
   loadWorkspaceConfig,
   PreferenceRevisionConflictError,
@@ -13,12 +14,15 @@ import {
   SettingsRevisionConflictError,
   switchWorkspace,
   updateRuntimeSettings,
+  updateGitHubSettings,
   updateWorkspaceConfig,
 } from "./api";
 import type {
   WorkshopEditableCapability,
   WorkshopPreferenceDocument,
   WorkshopPreferenceHistory,
+  WorkshopGitHubSettings,
+  WorkshopGitHubSettingsChange,
   WorkshopRuntimeSettingsChange,
   WorkshopSession,
   WorkshopSettingsMutation,
@@ -108,6 +112,14 @@ export function SettingsWorkspace({
   const [workspaceModel, setWorkspaceModel] = useState("");
   const [workspaceTimeout, setWorkspaceTimeout] = useState("");
   const [workspacePrompt, setWorkspacePrompt] = useState("");
+
+  const [github, setGitHub] = useState<WorkshopGitHubSettings | null>(null);
+  const [githubLoading, setGitHubLoading] = useState(true);
+  const [githubBusy, setGitHubBusy] = useState(false);
+  const [githubError, setGitHubError] = useState<string | null>(null);
+  const [githubNotice, setGitHubNotice] = useState<string | null>(null);
+  const [githubRepository, setGitHubRepository] = useState("");
+  const [githubToken, setGitHubToken] = useState("");
 
   const preferenceDirty = preference !== null && preferenceDraft !== preference.content;
   const preferenceBytes = useMemo(
@@ -204,10 +216,25 @@ export function SettingsWorkspace({
     }
   }, [adoptRuntime, adoptWorkspace, handleAccessFailure, onAuthenticationFailure, session]);
 
+  const refreshGitHub = useCallback(async (): Promise<void> => {
+    setGitHubLoading(true);
+    setGitHubError(null);
+    try {
+      setGitHub(await loadGitHubSettings(session));
+    } catch (caught) {
+      if (!handleAccessFailure(caught)) {
+        setGitHubError(errorText(caught, "Could not load GitHub settings."));
+      }
+    } finally {
+      setGitHubLoading(false);
+    }
+  }, [handleAccessFailure, session]);
+
   useEffect(() => {
     void refreshPreferences();
     void refreshRuntime();
-  }, [refreshPreferences, refreshRuntime]);
+    void refreshGitHub();
+  }, [refreshGitHub, refreshPreferences, refreshRuntime]);
 
   useEffect(() => {
     onDirtyChange(preferenceDirty);
@@ -356,6 +383,36 @@ export function SettingsWorkspace({
       }
     } finally {
       setRuntimeBusy(false);
+    }
+  };
+
+  const mutateGitHub = async (
+    change: WorkshopGitHubSettingsChange,
+    confirmation: string | null = null,
+  ): Promise<boolean> => {
+    if (!github || (confirmation !== null && !window.confirm(confirmation))) {
+      return false;
+    }
+    setGitHubBusy(true);
+    setGitHubError(null);
+    setGitHubNotice(null);
+    try {
+      const changed = await updateGitHubSettings(session, github.revision, change);
+      setGitHub(changed);
+      setGitHubToken("");
+      setGitHubNotice(changed.mutation?.changed ? "GitHub settings saved." : "No change was needed.");
+      return true;
+    } catch (caught) {
+      setGitHubToken("");
+      if (caught instanceof SettingsRevisionConflictError) {
+        await refreshGitHub();
+        setGitHubError("GitHub settings changed elsewhere. The latest values have been reloaded.");
+      } else if (!handleAccessFailure(caught)) {
+        setGitHubError(errorText(caught, "Could not update GitHub settings."));
+      }
+      return false;
+    } finally {
+      setGitHubBusy(false);
     }
   };
 
@@ -742,6 +799,245 @@ export function SettingsWorkspace({
             </div>
           </section>
         )}
+
+        <section className="settings-section">
+          <div>
+            <p className="section-number">04</p>
+            <h2>GitHub</h2>
+            <p>
+              Personal notification subscriptions, automation choices, and a
+              write-only access token. Repository execution authority remains
+              operator controlled.
+            </p>
+          </div>
+          {githubLoading ? (
+            <p role="status">Loading GitHub settings…</p>
+          ) : github ? (
+            <div className="settings-card-grid github-settings-grid">
+              <article className="settings-card policy-card">
+                <p className="settings-card-label">Protected identity</p>
+                <dl>
+                  <div>
+                    <dt>GitHub login</dt>
+                    <dd>{github.githubLogin ?? "Not configured"}</dd>
+                  </div>
+                </dl>
+                <p>This identity is operator managed and is used for GitHub actor routing.</p>
+              </article>
+
+              <article className="settings-card">
+                <p className="settings-card-label">Automation</p>
+                <div className="github-toggle-row">
+                  <div>
+                    <strong>PR reviews</strong>
+                    <p>{github.prReview.enabled ? "On" : "Off"} · {github.prReview.source}</p>
+                  </div>
+                  <div className="settings-actions">
+                    <button
+                      className="primary-button"
+                      type="button"
+                      disabled={githubBusy}
+                      onClick={() => void mutateGitHub({
+                        field: "toggle",
+                        name: "pr_review",
+                        enabled: !github.prReview.enabled,
+                      })}
+                    >
+                      Turn {github.prReview.enabled ? "off" : "on"}
+                    </button>
+                    {github.prReview.resettable && (
+                      <button
+                        className="quiet-button"
+                        type="button"
+                        disabled={githubBusy}
+                        onClick={() => void mutateGitHub(
+                          { field: "toggle", name: "pr_review", enabled: null },
+                          "Reset PR reviews to protected policy?",
+                        )}
+                      >
+                        Reset
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div className="github-toggle-row">
+                  <div>
+                    <strong>Issue triage</strong>
+                    <p>{github.issueTriage.enabled ? "On" : "Off"} · {github.issueTriage.source}</p>
+                  </div>
+                  <div className="settings-actions">
+                    <button
+                      className="primary-button"
+                      type="button"
+                      disabled={githubBusy}
+                      onClick={() => void mutateGitHub({
+                        field: "toggle",
+                        name: "issue_triage",
+                        enabled: !github.issueTriage.enabled,
+                      })}
+                    >
+                      Turn {github.issueTriage.enabled ? "off" : "on"}
+                    </button>
+                    {github.issueTriage.resettable && (
+                      <button
+                        className="quiet-button"
+                        type="button"
+                        disabled={githubBusy}
+                        onClick={() => void mutateGitHub(
+                          { field: "toggle", name: "issue_triage", enabled: null },
+                          "Reset issue triage to protected policy?",
+                        )}
+                      >
+                        Reset
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </article>
+
+              <article className="settings-card github-repositories-card">
+                <p className="settings-card-label">Subscribed repositories</p>
+                {github.repositories.length > 0 ? (
+                  <ul className="github-repository-list">
+                    {github.repositories.map((item) => (
+                      <li key={item.repository}>
+                        <span>
+                          <strong>{item.repository}</strong>
+                          <small>
+                            {item.source} · {item.automationAuthorized
+                              ? "automation authorized"
+                              : "notifications only"}
+                          </small>
+                        </span>
+                        <button
+                          className="quiet-button"
+                          type="button"
+                          disabled={githubBusy}
+                          onClick={() => void mutateGitHub(
+                            { field: "repository", name: item.repository, subscribed: false },
+                            `Unsubscribe from ${item.repository}?`,
+                          )}
+                        >
+                          Remove
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p>No repository subscriptions.</p>
+                )}
+                <form
+                  className="github-add-repository"
+                  onSubmit={(event: FormEvent) => {
+                    event.preventDefault();
+                    const repository = githubRepository.trim();
+                    if (!repository) {
+                      return;
+                    }
+                    void mutateGitHub({ field: "repository", name: repository, subscribed: true })
+                      .then((changed) => {
+                        if (changed) {
+                          setGitHubRepository("");
+                        }
+                      });
+                  }}
+                >
+                  <label htmlFor="github-repository">Add notification subscription</label>
+                  <div className="settings-inline-input">
+                    <input
+                      id="github-repository"
+                      type="text"
+                      value={githubRepository}
+                      disabled={githubBusy}
+                      placeholder="owner/repository"
+                      autoCapitalize="none"
+                      autoCorrect="off"
+                      onChange={(event) => setGitHubRepository(event.target.value)}
+                    />
+                    <button
+                      className="primary-button"
+                      type="submit"
+                      disabled={githubBusy || !githubRepository.trim()}
+                    >
+                      Add
+                    </button>
+                  </div>
+                  <p>Subscriptions outside protected repository policy receive notifications only.</p>
+                </form>
+                {github.repositoriesResettable && (
+                  <div className="settings-actions">
+                    <button
+                      className="quiet-button"
+                      type="button"
+                      disabled={githubBusy}
+                      onClick={() => void mutateGitHub(
+                        { field: "repository_reset" },
+                        "Reset all repository subscriptions to protected policy?",
+                      )}
+                    >
+                      Reset subscriptions
+                    </button>
+                  </div>
+                )}
+              </article>
+
+              <form
+                className="settings-card github-token-card"
+                onSubmit={(event: FormEvent) => {
+                  event.preventDefault();
+                  if (githubToken.trim()) {
+                    void mutateGitHub(
+                      { field: "token", token: githubToken },
+                      github.tokenStored ? "Replace the stored GitHub token?" : null,
+                    );
+                  }
+                }}
+              >
+                <label htmlFor="github-token">GitHub access token</label>
+                <p>Status: <strong>{github.tokenStored ? "Stored" : "Not set"}</strong></p>
+                <input
+                  id="github-token"
+                  type="password"
+                  value={githubToken}
+                  disabled={githubBusy}
+                  autoComplete="new-password"
+                  placeholder={github.tokenStored ? "Enter a replacement token" : "Enter a token"}
+                  onChange={(event) => setGitHubToken(event.target.value)}
+                />
+                <p>The existing token is never returned to this browser.</p>
+                <div className="settings-actions">
+                  <button
+                    className="primary-button"
+                    type="submit"
+                    disabled={githubBusy || !githubToken.trim()}
+                  >
+                    {github.tokenStored ? "Replace token" : "Store token"}
+                  </button>
+                  {github.tokenStored && (
+                    <button
+                      className="quiet-button"
+                      type="button"
+                      disabled={githubBusy}
+                      onClick={() => void mutateGitHub(
+                        { field: "token", token: null },
+                        "Remove the stored GitHub token? Automated GitHub actions may stop working.",
+                      )}
+                    >
+                      Remove token
+                    </button>
+                  )}
+                </div>
+              </form>
+            </div>
+          ) : (
+            <div className="settings-failure">
+              <p role="alert">{githubError ?? "GitHub settings are unavailable."}</p>
+              <button className="quiet-button" type="button" onClick={() => void refreshGitHub()}>Retry</button>
+            </div>
+          )}
+          {githubNotice && <p className="settings-notice" role="status">{githubNotice}</p>}
+          {githubError && github && <p className="settings-error" role="alert">{githubError}</p>}
+        </section>
       </div>
     </section>
   );

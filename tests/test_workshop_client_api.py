@@ -46,6 +46,15 @@ from kai.workshop.domain import (
     RunId,
 )
 from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
+from kai.workshop.github_settings import (
+    GitHubRepositorySetting,
+    GitHubSettingsAuthority,
+    GitHubSettingsMutation,
+    GitHubSettingsSnapshot,
+    GitHubToggleSetting,
+    WorkshopGitHubSettingsAccessDenied,
+    WorkshopGitHubSettingsConflict,
+)
 from kai.workshop.inbound import ClientInboundMessage, InboundMessage, record_inbound_message
 from kai.workshop.memory_queries import (
     MemoryCreationSnapshot,
@@ -429,6 +438,60 @@ class _MemoryQueries:
         )
 
 
+@dataclass
+class _GitHubSettings:
+    principal_id: PrincipalId
+    calls: list[tuple[str, object]] = field(default_factory=list)
+
+    def authority_for_principal(self, principal_id):
+        if principal_id != self.principal_id:
+            raise WorkshopGitHubSettingsAccessDenied("denied")
+        return GitHubSettingsAuthority(principal_id, profile_id(101))
+
+    @staticmethod
+    def _snapshot(mutation=None):
+        return GitHubSettingsSnapshot(
+            github_login="alice",
+            repositories=(GitHubRepositorySetting("owner/repo", "operator", True),),
+            repositories_resettable=True,
+            pr_review=GitHubToggleSetting(True, "operator", False),
+            issue_triage=GitHubToggleSetting(False, "user", True),
+            token_stored=True,
+            revision="ghs_current",
+            mutation=mutation,
+        )
+
+    async def inspect(self, authority):
+        self.calls.append(("inspect", authority))
+        return self._snapshot()
+
+    async def set_repository_subscription(
+        self,
+        authority,
+        repository,
+        *,
+        subscribed,
+        expected_revision,
+    ):
+        self.calls.append(("repository", (authority, repository, subscribed, expected_revision)))
+        return self._snapshot(GitHubSettingsMutation("subscribe_github_repository", True))
+
+    async def set_toggle(self, authority, setting, enabled, *, expected_revision):
+        if expected_revision == "ghs_stale":
+            raise WorkshopGitHubSettingsConflict("GitHub settings changed in another session")
+        self.calls.append(("toggle", (authority, setting, enabled, expected_revision)))
+        return self._snapshot(GitHubSettingsMutation("set_github_issue_triage", True))
+
+    async def reset_repository_subscriptions(self, authority, *, expected_revision):
+        self.calls.append(("repository_reset", (authority, expected_revision)))
+        return self._snapshot(GitHubSettingsMutation("reset_github_repositories", True))
+
+    async def set_token(self, authority, token, *, expected_revision):
+        assert token == "new-secret"
+        self.calls.append(("token", (authority, "redacted", expected_revision)))
+        return self._snapshot(GitHubSettingsMutation("replace_github_token", True))
+
+
 async def _identity_for(store: WorkshopEventStore, subject: str) -> tuple[PrincipalId, ChannelId]:
     async with store.connection.execute(
         "SELECT e.principal_id, b.channel_id FROM external_identities e "
@@ -499,6 +562,7 @@ async def _open_client(
     artifact_service: WorkshopArtifactService | None = None,
     settings_workspaces=None,
     memory_queries=None,
+    github_settings=None,
 ) -> TestClient:
     app = web.Application()
     register_workshop_read_routes(
@@ -514,6 +578,7 @@ async def _open_client(
         artifact_service=artifact_service,
         settings_workspaces=settings_workspaces,
         memory_queries=memory_queries,
+        github_settings=github_settings,
     )
     client = TestClient(TestServer(app))
     await client.start_server()
@@ -2498,3 +2563,143 @@ class TestWorkshopRunTraceEventStream:
         finally:
             await client.close()
             await store.close()
+
+
+@pytest.mark.asyncio
+async def test_github_settings_api_binds_principal_and_redacts_token(tmp_path: Path) -> None:
+    store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+    service = _GitHubSettings(alice_id)
+    client = await _open_client(
+        store,
+        _Authenticator({"alice-token": alice_id}),
+        github_settings=service,
+    )
+    try:
+        response = await client.get(
+            "/v1/settings/github",
+            headers={"Authorization": "Bearer alice-token"},
+        )
+        payload = await response.json()
+
+        assert response.status == 200
+        assert payload == {
+            "version": 1,
+            "github_login": "alice",
+            "repositories_resettable": True,
+            "repositories": [
+                {
+                    "repository": "owner/repo",
+                    "source": "operator",
+                    "automation_authorized": True,
+                }
+            ],
+            "pr_review": {"enabled": True, "source": "operator", "resettable": False},
+            "issue_triage": {"enabled": False, "source": "user", "resettable": True},
+            "token_stored": True,
+            "revision": "ghs_current",
+            "mutation": None,
+        }
+        assert "secret" not in json.dumps(payload)
+        assert service.calls[0][0] == "inspect"
+    finally:
+        await client.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_github_settings_api_accepts_one_strict_write_at_a_time(tmp_path: Path) -> None:
+    store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+    service = _GitHubSettings(alice_id)
+    client = await _open_client(
+        store,
+        _Authenticator({"alice-token": alice_id}),
+        github_settings=service,
+    )
+    headers = {"Authorization": "Bearer alice-token"}
+    try:
+        repository = await client.patch(
+            "/v1/settings/github",
+            headers=headers,
+            json={
+                "revision": "ghs_current",
+                "repository": {"name": "other/repo", "subscribed": True},
+            },
+        )
+        toggle = await client.patch(
+            "/v1/settings/github",
+            headers=headers,
+            json={
+                "revision": "ghs_current",
+                "toggle": {"field": "issue_triage", "enabled": None},
+            },
+        )
+        token = await client.patch(
+            "/v1/settings/github",
+            headers=headers,
+            json={"revision": "ghs_current", "token": "new-secret"},
+        )
+        reset = await client.patch(
+            "/v1/settings/github",
+            headers=headers,
+            json={"revision": "ghs_current", "reset_repositories": True},
+        )
+
+        assert repository.status == toggle.status == token.status == reset.status == 200
+        assert service.calls[0][0] == "repository"
+        assert service.calls[1][0] == "toggle"
+        assert service.calls[2] == (
+            "token",
+            (GitHubSettingsAuthority(alice_id, profile_id(101)), "redacted", "ghs_current"),
+        )
+        assert service.calls[3] == (
+            "repository_reset",
+            (GitHubSettingsAuthority(alice_id, profile_id(101)), "ghs_current"),
+        )
+        assert "new-secret" not in json.dumps(await token.json())
+    finally:
+        await client.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_github_settings_api_rejects_unauthorized_invalid_and_stale_writes(
+    tmp_path: Path,
+) -> None:
+    store, alice_id, _, bob_id, _ = await _open_store(tmp_path / "kai.db")
+    service = _GitHubSettings(alice_id)
+    client = await _open_client(
+        store,
+        _Authenticator({"alice-token": alice_id, "bob-token": bob_id}),
+        github_settings=service,
+    )
+    try:
+        unauthorized = await client.get("/v1/settings/github")
+        cross_principal = await client.get(
+            "/v1/settings/github",
+            headers={"Authorization": "Bearer bob-token"},
+        )
+        invalid = await client.patch(
+            "/v1/settings/github",
+            headers={"Authorization": "Bearer alice-token"},
+            json={
+                "revision": "ghs_current",
+                "token": "new-secret",
+                "toggle": {"field": "issue_triage", "enabled": True},
+            },
+        )
+        stale = await client.patch(
+            "/v1/settings/github",
+            headers={"Authorization": "Bearer alice-token"},
+            json={
+                "revision": "ghs_stale",
+                "toggle": {"field": "issue_triage", "enabled": True},
+            },
+        )
+
+        assert unauthorized.status == 401
+        assert cross_principal.status == 403
+        assert invalid.status == 400
+        assert stale.status == 409
+    finally:
+        await client.close()
+        await store.close()

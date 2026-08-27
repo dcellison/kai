@@ -17,6 +17,7 @@ import {
   loadMemorySource,
   loadMemoryStats,
   loadNavigation,
+  loadGitHubSettings,
   loadPreferenceDocument,
   loadPreferenceHistory,
   loadRun,
@@ -31,6 +32,7 @@ import {
   submitCommand,
   streamTimeline,
   updateRuntimeSettings,
+  updateGitHubSettings,
   updateWorkspaceConfig,
 } from "./api";
 import type { WorkshopSession } from "./types";
@@ -170,6 +172,29 @@ function workspaceConfigPayload(
         maximum: 4000,
       },
     ],
+    mutation: null,
+    ...overrides,
+  };
+}
+
+function githubSettingsPayload(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    version: 1,
+    github_login: "dcellison",
+    repositories_resettable: true,
+    repositories: [
+      {
+        repository: "owner/repo",
+        source: "operator",
+        automation_authorized: true,
+      },
+    ],
+    pr_review: { enabled: true, source: "operator", resettable: false },
+    issue_triage: { enabled: false, source: "user", resettable: true },
+    token_stored: true,
+    revision: "ghs_current",
     mutation: null,
     ...overrides,
   };
@@ -519,6 +544,57 @@ describe("Workshop client API", () => {
       updateRuntimeSettings(session, "sws_stale", {
         field: "reset",
         value: "timeout",
+      }),
+    ).rejects.toBeInstanceOf(SettingsRevisionConflictError);
+  });
+
+  it("loads and mutates redacted personal GitHub settings", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json(githubSettingsPayload()))
+      .mockResolvedValueOnce(Response.json(githubSettingsPayload({
+        mutation: { operation: "replace_github_token", changed: true },
+      })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const loaded = await loadGitHubSettings(session);
+    expect(loaded).toMatchObject({
+      repositories: [{ repository: "owner/repo", automationAuthorized: true }],
+      tokenStored: true,
+    });
+    const updated = await updateGitHubSettings(session, "ghs_current", {
+      field: "token",
+      token: "new-secret",
+    });
+    expect(updated).toMatchObject({
+      mutation: { operation: "replace_github_token", changed: true },
+      tokenStored: true,
+    });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/v1/settings/github");
+    expect(JSON.parse((fetchMock.mock.calls[1]?.[1] as RequestInit).body as string)).toEqual({
+      revision: "ghs_current",
+      token: "new-secret",
+    });
+    expect(JSON.stringify(loaded)).not.toContain("new-secret");
+    expect(JSON.stringify(updated)).not.toContain("new-secret");
+  });
+
+  it("rejects stale GitHub settings mutations", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json(
+          { error: { code: "settings_conflict", message: "Stale GitHub settings" } },
+          { status: 409 },
+        ),
+      ),
+    );
+
+    await expect(
+      updateGitHubSettings(session, "ghs_stale", {
+        field: "repository",
+        name: "owner/repo",
+        subscribed: false,
       }),
     ).rejects.toBeInstanceOf(SettingsRevisionConflictError);
   });

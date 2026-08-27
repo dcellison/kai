@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ChannelAccessError,
+  loadGitHubSettings,
   loadPreferenceDocument,
   loadPreferenceHistory,
   loadSettingsWorkspace,
@@ -12,12 +13,14 @@ import {
   restorePreferenceRevision,
   savePreferenceDocument,
   switchWorkspace,
+  updateGitHubSettings,
   updateRuntimeSettings,
   updateWorkspaceConfig,
 } from "./api";
 import { SettingsWorkspace } from "./SettingsWorkspace";
 import type {
   WorkshopPreferenceDocument,
+  WorkshopGitHubSettings,
   WorkshopSettingsWorkspace,
   WorkshopWorkspaceConfig,
 } from "./types";
@@ -27,12 +30,14 @@ vi.mock("./api", async (importOriginal) => {
   return {
     ...original,
     loadPreferenceDocument: vi.fn(),
+    loadGitHubSettings: vi.fn(),
     loadPreferenceHistory: vi.fn(),
     loadSettingsWorkspace: vi.fn(),
     loadWorkspaceConfig: vi.fn(),
     restorePreferenceRevision: vi.fn(),
     savePreferenceDocument: vi.fn(),
     switchWorkspace: vi.fn(),
+    updateGitHubSettings: vi.fn(),
     updateRuntimeSettings: vi.fn(),
     updateWorkspaceConfig: vi.fn(),
   };
@@ -157,6 +162,28 @@ const workspaceConfig: WorkshopWorkspaceConfig = {
   workspace: runtime.workspace,
 };
 
+const githubSettings: WorkshopGitHubSettings = {
+  githubLogin: "dcellison",
+  issueTriage: { enabled: false, resettable: true, source: "user" },
+  mutation: null,
+  prReview: { enabled: true, resettable: false, source: "operator" },
+  repositories: [
+    {
+      automationAuthorized: true,
+      repository: "dcellison/kai",
+      source: "operator",
+    },
+    {
+      automationAuthorized: false,
+      repository: "dcellison/notes",
+      source: "user",
+    },
+  ],
+  repositoriesResettable: true,
+  revision: "ghs_current",
+  tokenStored: true,
+};
+
 function renderSettings(
   onDirtyChange = vi.fn(),
   runActive = false,
@@ -192,6 +219,7 @@ describe("Settings workspace", () => {
       ],
     });
     vi.mocked(loadSettingsWorkspace).mockResolvedValue(runtime);
+    vi.mocked(loadGitHubSettings).mockResolvedValue(githubSettings);
     vi.mocked(loadWorkspaceConfig).mockResolvedValue(workspaceConfig);
     vi.mocked(savePreferenceDocument).mockResolvedValue({
       ...preference,
@@ -203,6 +231,7 @@ describe("Settings workspace", () => {
       revision: "pref_restored",
     });
     vi.mocked(updateRuntimeSettings).mockResolvedValue(runtime);
+    vi.mocked(updateGitHubSettings).mockResolvedValue(githubSettings);
     vi.mocked(updateWorkspaceConfig).mockResolvedValue(workspaceConfig);
     vi.mocked(switchWorkspace).mockResolvedValue({
       ...runtime,
@@ -421,5 +450,70 @@ describe("Settings workspace", () => {
     expect(onChannelAccessFailure).not.toHaveBeenCalled();
     expect(loadSettingsWorkspace).toHaveBeenCalledTimes(1);
     expect(loadWorkspaceConfig).toHaveBeenCalledTimes(1);
+  });
+
+  it("manages redacted principal-owned GitHub settings", async () => {
+    const user = userEvent.setup();
+    vi.mocked(updateGitHubSettings)
+      .mockResolvedValueOnce({
+        ...githubSettings,
+        issueTriage: { enabled: true, resettable: true, source: "user" },
+        mutation: { changed: true, operation: "set_github_issue_triage" },
+        revision: "ghs_toggle",
+      })
+      .mockResolvedValueOnce({
+        ...githubSettings,
+        mutation: { changed: true, operation: "subscribe_github_repository" },
+        repositories: [
+          ...githubSettings.repositories,
+          {
+            automationAuthorized: false,
+            repository: "dcellison/new-repo",
+            source: "user",
+          },
+        ],
+        revision: "ghs_repo",
+      })
+      .mockResolvedValueOnce({
+        ...githubSettings,
+        mutation: { changed: true, operation: "replace_github_token" },
+        revision: "ghs_token",
+      });
+    renderSettings();
+
+    expect(await screen.findByRole("heading", { name: "GitHub" })).toBeVisible();
+    expect(screen.getByText("dcellison")).toBeVisible();
+    expect(screen.getByText("dcellison/kai")).toBeVisible();
+    expect(screen.getByText("operator · automation authorized")).toBeVisible();
+    expect(screen.getByText("user · notifications only")).toBeVisible();
+    expect(screen.queryByDisplayValue(/token/i)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Turn on" }));
+    expect(updateGitHubSettings).toHaveBeenNthCalledWith(
+      1,
+      session,
+      "ghs_current",
+      { field: "toggle", name: "issue_triage", enabled: true },
+    );
+
+    await user.type(screen.getByLabelText("Add notification subscription"), "dcellison/new-repo");
+    await user.click(screen.getByRole("button", { name: "Add" }));
+    expect(updateGitHubSettings).toHaveBeenNthCalledWith(
+      2,
+      session,
+      "ghs_toggle",
+      { field: "repository", name: "dcellison/new-repo", subscribed: true },
+    );
+
+    await user.type(screen.getByLabelText("GitHub access token"), "replacement-secret");
+    await user.click(screen.getByRole("button", { name: "Replace token" }));
+    expect(window.confirm).toHaveBeenCalledWith("Replace the stored GitHub token?");
+    expect(updateGitHubSettings).toHaveBeenNthCalledWith(
+      3,
+      session,
+      "ghs_repo",
+      { field: "token", token: "replacement-secret" },
+    );
+    expect(screen.getByLabelText("GitHub access token")).toHaveValue("");
   });
 });

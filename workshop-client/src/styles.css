@@ -2020,6 +2020,103 @@ button:disabled {
   grid-column: 1 / -1;
 }
 
+.github-settings-grid {
+  align-items: start;
+}
+
+.github-toggle-row,
+.github-repository-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.github-toggle-row + .github-toggle-row {
+  margin-top: 0.75rem;
+  border-top: 1px solid var(--line);
+  padding-top: 0.75rem;
+}
+
+.github-toggle-row > div:first-child,
+.github-repository-list li > span {
+  min-width: 0;
+}
+
+.github-toggle-row strong,
+.github-repository-list strong,
+.github-repository-list small {
+  display: block;
+}
+
+.github-toggle-row strong,
+.github-repository-list strong {
+  color: var(--atom-foreground-strong);
+  font-size: 0.7rem;
+  overflow-wrap: anywhere;
+}
+
+.github-toggle-row .settings-actions {
+  flex: 0 0 auto;
+  margin-top: 0;
+}
+
+.github-repositories-card {
+  grid-row: span 2;
+}
+
+.github-repository-list {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.github-repository-list li {
+  border-bottom: 1px solid var(--line);
+  padding: 0.65rem 0;
+}
+
+.github-repository-list li:first-child {
+  padding-top: 0;
+}
+
+.github-repository-list small {
+  margin-top: 0.18rem;
+  color: var(--atom-muted);
+  font-size: 0.62rem;
+}
+
+.github-repository-list .quiet-button {
+  flex: 0 0 auto;
+  min-height: 2rem;
+  padding: 0.35rem 0.55rem;
+  font-size: 0.66rem;
+}
+
+.github-add-repository {
+  margin-top: 0.9rem;
+}
+
+.github-add-repository > label {
+  display: block;
+  margin-bottom: 0.45rem;
+  color: var(--atom-foreground-strong);
+  font-size: 0.7rem;
+  font-weight: 680;
+}
+
+.settings-inline-input {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.55rem;
+}
+
+.settings-inline-input .primary-button {
+  min-height: 2.45rem;
+}
+
 @media (max-width: 1120px) {
   .workshop-app.settings-open {
     grid-template-columns: var(--channel-sidebar-width, 15rem) minmax(0, 1fr);
@@ -2056,6 +2153,22 @@ button:disabled {
 
   .workspace-overrides {
     margin-top: 0.8rem;
+  }
+
+  .github-repositories-card {
+    grid-row: auto;
+  }
+}
+
+@media (max-width: 560px) {
+  .github-toggle-row,
+  .github-repository-list li {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .settings-inline-input {
+    grid-template-columns: 1fr;
   }
 }
 

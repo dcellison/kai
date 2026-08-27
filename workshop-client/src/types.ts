@@ -128,6 +128,27 @@ export interface WorkshopPreferenceHistory {
   revisions: WorkshopPreferenceRevision[];
 }
 
+export interface WorkshopGitHubSettings {
+  githubLogin: string | null;
+  issueTriage: { enabled: boolean; resettable: boolean; source: string };
+  mutation: { changed: boolean; operation: string } | null;
+  prReview: { enabled: boolean; resettable: boolean; source: string };
+  repositories: {
+    automationAuthorized: boolean;
+    repository: string;
+    source: string;
+  }[];
+  repositoriesResettable: boolean;
+  revision: string;
+  tokenStored: boolean;
+}
+
+export type WorkshopGitHubSettingsChange =
+  | { field: "repository"; name: string; subscribed: boolean }
+  | { field: "repository_reset" }
+  | { field: "toggle"; name: "issue_triage" | "pr_review"; enabled: boolean | null }
+  | { field: "token"; token: string | null };
+
 export type WorkshopRuntimeSettingsChange =
   | { field: "backend"; value: string }
   | { field: "model"; value: string }
