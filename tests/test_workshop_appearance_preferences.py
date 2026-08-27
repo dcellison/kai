@@ -38,6 +38,55 @@ async def _seed(path: Path) -> tuple[WorkshopEventStore, str, str]:
 
 
 @pytest.mark.asyncio
+async def test_version_thirty_seven_preferences_upgrade_without_data_loss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kai.workshop import schema
+
+    path = tmp_path / "kai.db"
+    principal_id = "prn_00000000000000000000000000000001"
+    with monkeypatch.context() as migration_context:
+        migration_context.setattr(schema, "WORKSHOP_SCHEMA_VERSION", 37)
+        migration_context.setattr(schema, "_MIGRATIONS", schema._MIGRATIONS[:37])
+        version_thirty_seven = await WorkshopEventStore.open(path)
+        await version_thirty_seven.connection.execute(
+            "INSERT INTO principals (id, kind, display_name, created_at) "
+            "VALUES (?, 'human', 'Daniel', '2026-08-27T12:00:00Z')",
+            (principal_id,),
+        )
+        await version_thirty_seven.connection.execute(
+            "INSERT INTO principal_appearance_preferences "
+            "(principal_id, theme_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (
+                principal_id,
+                "github-dark-dimmed",
+                "2026-08-27T12:01:00Z",
+                "2026-08-27T12:02:00Z",
+            ),
+        )
+        await version_thirty_seven.connection.commit()
+        await version_thirty_seven.close()
+
+    upgraded = await WorkshopEventStore.open(path)
+    try:
+        assert await upgraded.schema_version() == 38
+        async with upgraded.connection.execute(
+            "SELECT principal_id, theme_id, created_at, updated_at FROM principal_appearance_preferences"
+        ) as cursor:
+            assert tuple(await cursor.fetchone()) == (
+                principal_id,
+                "github-dark-dimmed",
+                "2026-08-27T12:01:00Z",
+                "2026-08-27T12:02:00Z",
+            )
+        async with upgraded.connection.execute("PRAGMA foreign_key_list(principal_appearance_preferences)") as cursor:
+            assert await cursor.fetchall() == []
+    finally:
+        await upgraded.close()
+
+
+@pytest.mark.asyncio
 async def test_defaults_are_principal_scoped_and_survive_restart(tmp_path: Path) -> None:
     path = tmp_path / "kai.db"
     store, daniel_id, scott_id = await _seed(path)
@@ -113,12 +162,22 @@ async def test_non_default_light_and_dark_themes_are_isolated_and_survive_restar
     assert len(WORKSHOP_APPEARANCE_THEMES) == 11
     await store.close()
 
-    reopened = await WorkshopAppearancePreferenceService.open(path)
+    # Application startup bootstraps canonical conversations by deleting and
+    # replaying the collaboration projection. Appearance state must survive
+    # that full lifecycle, not merely a database close/reopen.
+    restarted_store, restarted_daniel_id, restarted_scott_id = await _seed(path)
+    assert restarted_daniel_id == daniel_id
+    assert restarted_scott_id == scott_id
+    reopened = WorkshopAppearancePreferenceService(restarted_store.connection)
     try:
         assert (await reopened.inspect(reopened.authority_for_principal(daniel_id))).theme_id == "github-light-default"
         assert (await reopened.inspect(reopened.authority_for_principal(scott_id))).theme_id == "catppuccin-mocha"
+        assert workshop_appearance_preference_status(path) == (
+            "Workshop appearance preferences: active; principals=2, explicit=2, "
+            "defaulted=0, invalid=0; authority=canonical"
+        )
     finally:
-        await reopened.close()
+        await restarted_store.close()
 
 
 @pytest.mark.asyncio
