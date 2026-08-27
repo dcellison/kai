@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -39,6 +39,7 @@ from kai.config import (
     get_user_backend_and_provider,
     resolve_user_model,
     validate_model_for_backend,
+    validate_model_for_backend_policy,
 )
 from kai.goose import GooseBackend
 from kai.internal_api_auth import InternalAPIAuth
@@ -156,10 +157,9 @@ class SubprocessPool:
     compatibility keys until their adapter paths are retired.
 
     Thread safety: send() for a given runtime is serialized by the
-    per-channel execution lane. The pool does not add its own
-    locking because the callers already guarantee single-writer-per-user.
-    If a future caller bypasses the per-chat lock, add an asyncio.Lock
-    per runtime key here.
+    per-channel execution lane. A short per-runtime transition lock also
+    serializes execution preparation with backend replacement. The lock is
+    not held while an agent streams, and unrelated runtimes remain independent.
     """
 
     def __init__(
@@ -288,7 +288,59 @@ class SubprocessPool:
         self._pending_workspace_restore: set[RuntimePoolKey] = set()
         self._pending_settings_restore: set[RuntimePoolKey] = set()
         self._in_flight: set[RuntimePoolKey] = set()
+        # Canonical backend selection is hydrated from execution state at
+        # startup and updated only by the settings authority.  The protected
+        # profile remains the policy boundary; this cache merely makes the
+        # async persisted choice available to synchronous construction and
+        # role-model resolution paths.
+        self._selected_backends: dict[RuntimePoolKey, str] = {}
+        # Serialize the brief prepare/dispatch boundary with targeted backend
+        # replacement.  The lock is released as soon as a send is marked
+        # in-flight, so unrelated runtimes and the remainder of the active
+        # stream are never held behind a settings mutation.
+        self._backend_transition_locks: dict[RuntimePoolKey, asyncio.Lock] = {}
         self._eviction_task: asyncio.Task | None = None
+
+    async def hydrate_backend_selections(self) -> None:
+        """Load every protected profile's canonical backend selection."""
+        if self._runtime_profiles is None:
+            return
+        from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError
+
+        for profile in self._runtime_profiles.profiles:
+            namespace = self._canonical_namespace(profile.profile_id)
+            if namespace is None:
+                raise RuntimeError("Protected runtime has no canonical execution namespace")
+            selected = (
+                (
+                    await sessions.read_canonical_execution_settings(
+                        Path(self._config.session_db_path),
+                        namespace,
+                    )
+                )
+                .get("backend", "")
+                .strip()
+            )
+            if selected:
+                try:
+                    profile.backend_option(selected)
+                except WorkshopRuntimeProfileError:
+                    log.error(
+                        "Ignoring unauthorized canonical backend %r for runtime profile %s",
+                        selected,
+                        profile.profile_id,
+                    )
+                    selected = ""
+            self._selected_backends[profile.profile_id] = selected or profile.backend
+
+    def _backend_option(self, runtime: RuntimeSelector):
+        runtime_key, _legacy_key, profile = self._resolve_runtime(runtime)
+        if profile is None:
+            return None
+        return profile.backend_option(self._selected_backends.get(runtime_key, profile.backend))
+
+    def _backend_transition_lock(self, runtime_key: RuntimePoolKey) -> asyncio.Lock:
+        return self._backend_transition_locks.setdefault(runtime_key, asyncio.Lock())
 
     def _resolve_runtime(
         self,
@@ -354,7 +406,9 @@ class SubprocessPool:
         """Resolve the active route without creating a backend process."""
         _, runtime_config_id, profile = self._resolve_runtime(runtime)
         if profile is not None:
-            return profile.backend, profile.provider
+            option = self._backend_option(runtime)
+            assert option is not None
+            return option.backend, option.provider
         assert runtime_config_id is not None
         instance = self.get_if_exists(runtime)
         if instance is not None:
@@ -378,13 +432,20 @@ class SubprocessPool:
         _, runtime_config_id, profile = self._resolve_runtime(runtime)
         backend, provider = self.get_backend_provider(runtime)
         if profile is not None:
-            profile_models = dict(profile.role_models)
+            option = self._backend_option(runtime)
+            assert option is not None
+            profile_models = dict(option.role_models)
             raw_model = profile_models.get(role.value) or self._config.default_models.get(role.value)
             model = canonicalize_model_for_backend(
                 raw_model or get_model_for(role, backend, provider),
                 backend,
             )
-            if validate_model_for_backend(model, backend, provider):
+            if validate_model_for_backend_policy(
+                model,
+                backend,
+                provider,
+                allowed_models=option.allowed_models,
+            ):
                 return model
             fallback = get_model_for(role, backend, provider)
             log.warning(
@@ -543,8 +604,10 @@ class SubprocessPool:
         # this, a per-user backend differing from the global backend can
         # inherit an incompatible global model.
         if protected_profile is not None:
-            backend = protected_profile.backend
-            effective_provider = protected_profile.provider
+            option = self._backend_option(runtime)
+            assert option is not None
+            backend = option.backend
+            effective_provider = option.provider
         else:
             backend, effective_provider = get_user_backend_and_provider(user, self._config)
         if backend not in VALID_BACKENDS:
@@ -559,7 +622,9 @@ class SubprocessPool:
         # The compatibility cascade remains only for Telegram groups and
         # uninstalled/dev runs that do not resolve a protected profile.
         if protected_profile is not None:
-            model = protected_profile.model
+            option = self._backend_option(runtime)
+            assert option is not None
+            model = option.model
         else:
             # Per-user model. When the user's effective backend differs
             # from the global one, the global default_model may not be
@@ -770,11 +835,18 @@ class SubprocessPool:
     async def prepare_execution(self, runtime: RuntimeSelector) -> PreparedBackendExecution:
         """Bind the effective selection to the exact runtime that may dispatch later."""
         runtime_key, _, _ = self._resolve_runtime(runtime)
-        return PreparedBackendExecution(
-            self,
-            runtime_key,
-            await self._prepare_instance(runtime),
-        )
+        async with self._backend_transition_lock(runtime_key):
+            prepared = PreparedBackendExecution(
+                self,
+                runtime_key,
+                await self._prepare_instance(runtime),
+            )
+            # Preparation is already part of an accepted canonical run.  Hold
+            # the runtime's active marker across the short stage-before-send
+            # window so a concurrent settings request cannot invalidate the
+            # prepared handle or interrupt that run.
+            self._in_flight.add(runtime_key)
+            return prepared
 
     async def send(
         self,
@@ -804,9 +876,10 @@ class SubprocessPool:
             assert chat_id is not None
             selector = chat_id
         runtime_key, runtime_config_id, profile = self._resolve_runtime(selector)
-        instance = await self._prepare_instance(selector)
-        self._last_activity[runtime_key] = time.monotonic()
-        self._in_flight.add(runtime_key)
+        async with self._backend_transition_lock(runtime_key):
+            instance = await self._prepare_instance(selector)
+            self._last_activity[runtime_key] = time.monotonic()
+            self._in_flight.add(runtime_key)
         try:
             if profile is not None:
                 runtime_identity = self._contexts_by_runtime.get(runtime_key)
@@ -876,6 +949,7 @@ class SubprocessPool:
             if self._pool.get(runtime_key) is instance:
                 self._pool.pop(runtime_key, None)
                 self._last_activity.pop(runtime_key, None)
+            self._in_flight.discard(runtime_key)
 
     async def _attempt_workspace_restore(self, runtime: RuntimeSelector, instance: AgentBackend) -> Path:
         """Restore the saved workspace into a live instance.
@@ -1003,7 +1077,22 @@ class SubprocessPool:
         if not ws_model_applied and "model" in db_settings:
             stored_model_raw = db_settings["model"]
             stored_model = canonicalize_model_for_backend(stored_model_raw, instance_backend)
-            if validate_model_for_backend(stored_model, instance_backend, instance.provider):
+            option = self._backend_option(runtime)
+            model_is_valid = (
+                validate_model_for_backend_policy(
+                    stored_model,
+                    instance_backend,
+                    instance.provider,
+                    allowed_models=option.allowed_models,
+                )
+                if option is not None
+                else validate_model_for_backend(
+                    stored_model,
+                    instance_backend,
+                    instance.provider,
+                )
+            )
+            if model_is_valid:
                 if stored_model != stored_model_raw:
                     if namespace is not None:
                         await sessions.set_canonical_execution_setting(namespace, "model", stored_model)
@@ -1091,6 +1180,40 @@ class SubprocessPool:
             # (a BaseException, not caught by except Exception) propagates.
             self._pool.pop(runtime_key, None)
             self._last_activity.pop(runtime_key, None)
+            self._pending_workspace_restore.discard(runtime_key)
+            self._pending_settings_restore.discard(runtime_key)
+
+    def is_in_flight(self, runtime: RuntimeSelector) -> bool:
+        """Return whether this one runtime currently owns an active send."""
+        runtime_key, _, _ = self._resolve_runtime(runtime)
+        return runtime_key in self._in_flight
+
+    async def select_backend(
+        self,
+        runtime: RuntimeSelector,
+        backend: str,
+        *,
+        commit_selection: Callable[[], Awaitable[None]] | None = None,
+    ) -> bool:
+        """Atomically replace one idle runtime's backend.
+
+        Return false without running ``commit_selection`` when a canonical run
+        already owns the runtime.  The callback lets the settings authority
+        persist the selected backend and invalidate its provider session under
+        the same transition lock that guards execution preparation.
+        """
+        runtime_key, _, profile = self._resolve_runtime(runtime)
+        if profile is None:
+            raise RuntimeError("Backend selection requires a protected runtime profile")
+        profile.backend_option(backend)
+        async with self._backend_transition_lock(runtime_key):
+            if runtime_key in self._in_flight:
+                return False
+            await self.force_kill(runtime)
+            if commit_selection is not None:
+                await commit_selection()
+            self._selected_backends[runtime_key] = backend
+            return True
 
     async def change_workspace(
         self,
@@ -1124,7 +1247,11 @@ class SubprocessPool:
         if instance is not None:
             return instance.model
         profile = self._protected_profile(runtime)
-        return profile.model if profile is not None else self._config.default_model
+        if profile is not None:
+            option = self._backend_option(runtime)
+            assert option is not None
+            return option.model
+        return self._config.default_model
 
     async def get_effective_model(self, runtime: RuntimeSelector) -> str:
         """Get the effective model, checking persisted settings if no instance exists.
@@ -1149,13 +1276,20 @@ class SubprocessPool:
             if namespace is not None
             else await sessions.get_user_settings(chat_id)
         )
+        option = self._backend_option(runtime)
+        assert option is not None
         raw_model = db_settings.get("model", "").strip()
         if not raw_model:
-            return profile.model
-        model = canonicalize_model_for_backend(raw_model, profile.backend)
-        if validate_model_for_backend(model, profile.backend, profile.provider):
+            return option.model
+        model = canonicalize_model_for_backend(raw_model, option.backend)
+        if validate_model_for_backend_policy(
+            model,
+            option.backend,
+            option.provider,
+            allowed_models=option.allowed_models,
+        ):
             return model
-        return profile.model
+        return option.model
 
     def set_model(self, runtime: RuntimeSelector, model: str) -> None:
         """Set the model for a user's subprocess."""

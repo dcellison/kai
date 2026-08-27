@@ -72,6 +72,7 @@ from kai.workshop.scheduled_jobs import WorkshopScheduledJobAuthority
 from kai.workshop.settings_workspaces import (
     SettingsWorkspaceAuthority,
     WorkshopSettingsWorkspaceAccessDenied,
+    WorkshopSettingsWorkspaceConflict,
     WorkshopSettingsWorkspaceService,
     WorkshopSettingsWorkspaceValidationError,
     WorkspaceConfigSnapshot,
@@ -582,6 +583,31 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _handle_settings_reset(update, context, chat_id, config, value)
         return
 
+    # /settings backend [name]
+    if field == "backend":
+        authority = _canonical_settings_authority(context, chat_id)
+        if authority is None:
+            await update.message.reply_text("Backend switching requires a canonical Workshop runtime.")
+            return
+        service = _get_core_services(context).settings_workspaces
+        if not value:
+            snapshot = await service.inspect(authority)
+            choices = ", ".join(option.backend for option in snapshot.backend_options)
+            await update.message.reply_text(
+                f"Current backend: {snapshot.backend}\nAvailable: {choices}\nUsage: /settings backend <name>"
+            )
+            return
+        try:
+            snapshot = await service.set_backend(authority, value)
+        except (WorkshopSettingsWorkspaceValidationError, WorkshopSettingsWorkspaceConflict) as exc:
+            await update.message.reply_text(str(exc))
+            return
+        await update.message.reply_text(
+            f"Backend switched to {snapshot.backend}. "
+            "Your next message will start a new provider session; Kai and other users were not restarted."
+        )
+        return
+
     # /settings model <name>
     if field == "model":
         pool = _get_pool(context)
@@ -651,7 +677,7 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(f"Default timeout set to {timeout}s.")
         return
 
-    await update.message.reply_text(f"Unknown setting: {field}\nSettings: model, timeout, reset")
+    await update.message.reply_text(f"Unknown setting: {field}\nSettings: backend, model, timeout, reset")
 
 
 async def _show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, config: Config) -> None:
@@ -662,6 +688,7 @@ async def _show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
         snapshot = await _get_core_services(context).settings_workspaces.inspect(authority)
         await update.message.reply_text(
             "Your settings:\n"
+            f"  Backend: {snapshot.backend}\n"
             f"  Model: {snapshot.model.value} ({snapshot.model.source})\n"
             f"  Provider: {snapshot.provider}\n"
             f"  Timeout: {snapshot.timeout_seconds.value}s "

@@ -1254,6 +1254,16 @@ def _build_migrated_runtime_profiles(
         if raw_os_user is not None and str(raw_os_user).strip():
             profile["os_user"] = str(raw_os_user).strip()
         profiles[str(profile_id)] = profile
+    # A generated allowlist may infer only choices the operator has already
+    # assigned as protected defaults somewhere in this policy.  Merely being
+    # installed in backends.yaml does not authorize self-service use.  Only
+    # single-provider defaults can be shared without inventing provider
+    # policy; each profile's own default is always retained.
+    shared_backends = {
+        str(profile["backend"]) for profile in profiles.values() if len(BACKEND_PROVIDERS[str(profile["backend"])]) == 1
+    }
+    for profile in profiles.values():
+        profile["allowed_backends"] = sorted({str(profile["backend"]), *shared_backends})
     document: dict[str, object] = {
         "version": 2,
         "runtime_profiles": profiles,
@@ -1358,6 +1368,16 @@ def _upgrade_runtime_policy_content(
             profile["maximum_timeout_seconds"] = max(
                 DEFAULT_MAXIMUM_TIMEOUT_SECONDS,
                 timeout_seconds,
+            )
+            changed = True
+        if "allowed_backends" not in profile:
+            protected_default = str(profile.get("backend") or "").strip().lower()
+            migrated_choices = expected.get("allowed_backends", []) if isinstance(expected, dict) else []
+            profile["allowed_backends"] = sorted(
+                {
+                    protected_default,
+                    *(str(candidate).strip().lower() for candidate in migrated_choices if str(candidate).strip()),
+                }
             )
             changed = True
         if "allowed_services" not in profile:
@@ -5352,7 +5372,15 @@ def _runtime_storage_targets(
                 profile_id=str(profile.profile_id),
                 storage_name=principal_name,
                 os_user=profile.os_user,
-                backend=profile.backend,
+                # Claude is the only backend that needs an adapter alongside
+                # canonical AGENTS.md.  Keep it provisioned whenever Claude
+                # is an authorized self-service choice, not merely when it is
+                # the protected default.
+                backend=(
+                    "claude"
+                    if any(option.backend == "claude" for option in profile.backend_options)
+                    else profile.backend
+                ),
                 home_workspace=profile.home_workspace,
             )
         )
@@ -8510,7 +8538,9 @@ def _apply_goose_config(
     # is canonical at /etc/kai by this step (the secrets step deploys
     # any staged copy first).
     profile_backends = (
-        {profile.backend for profile in runtime_profiles.profiles} if runtime_profiles is not None else set()
+        {option.backend for profile in runtime_profiles.profiles for option in profile.backend_options}
+        if runtime_profiles is not None
+        else set()
     )
     if (
         agent_backend != "goose"
@@ -8542,7 +8572,7 @@ def _apply_goose_config(
         goose_os_users.extend(
             profile.os_user
             for profile in runtime_profiles.profiles
-            if profile.backend == "goose" and profile.os_user is not None
+            if any(option.backend == "goose" for option in profile.backend_options) and profile.os_user is not None
         )
     for name in dict.fromkeys(goose_os_users):
         # An os_user matching the service user is already covered by
@@ -8698,7 +8728,9 @@ def _apply_sudoers(
     if os_users:
         backends_in_use = {agent_backend} | _collect_backends_from_yaml(users_yaml_path)
         if runtime_profiles is not None:
-            backends_in_use.update(profile.backend for profile in runtime_profiles.profiles)
+            backends_in_use.update(
+                option.backend for profile in runtime_profiles.profiles for option in profile.backend_options
+            )
         # Each entry's path must resolve to exactly what _generate_sudoers
         # pins for that backend's rule (including the fallbacks); a new
         # backend with a sudoers rule needs an entry in both places.
@@ -9219,11 +9251,15 @@ def _runtime_policy_status(policy_path: Path, backend_registry_path: Path) -> st
     except (OSError, yaml.YAMLError, WorkshopRuntimeProfileError) as exc:
         return f"{prefix} INVALID ({type(exc).__name__})"
     backends = ",".join(sorted({profile.backend for profile in profiles.profiles}))
+    selectable_backends = ",".join(
+        sorted({option.backend for profile in profiles.profiles for option in profile.backend_options})
+    )
     archived = len(profiles.legacy_runtime_archive)
     removal_gate = profiles.legacy_archive_removal_gate or "not-applicable"
     return (
         f"{prefix} initialized; profiles={len(profiles.profiles)}, backends={backends}, "
-        f"runtime kernel=canonical, archived keys={archived}, removal gate={removal_gate}"
+        f"runtime kernel=canonical, backend selection=canonical "
+        f"({selectable_backends}), archived keys={archived}, removal gate={removal_gate}"
     )
 
 

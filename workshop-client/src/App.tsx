@@ -1586,6 +1586,7 @@ function WorkshopView({
           principalName={humanName}
           roleLabel={humanRole}
           runtimeLabel={settingsRuntimeLabel}
+          runActive={isRunActive(activeRun)}
           session={settingsSession}
         />
       ) : memoryDestination ? (

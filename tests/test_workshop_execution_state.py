@@ -56,12 +56,17 @@ class TestCanonicalExecutionStateMigration:
 
         await sessions.replace_canonical_settings_state(
             namespace,
-            {"timeout": "180", "workspace": "/projects/kai"},
+            {
+                "backend": "codex",
+                "timeout": "180",
+                "workspace": "/projects/kai",
+            },
             workspace_path="/projects/kai",
             workspace_settings={"env": '{"SECRET":"preserved"}', "prompt": "bounded prompt"},
         )
 
         assert await sessions.get_canonical_execution_settings(namespace) == {
+            "backend": "codex",
             "timeout": "180",
             "workspace": "/projects/kai",
         }
@@ -87,7 +92,7 @@ class TestCanonicalExecutionStateMigration:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 33
+            assert await upgraded.schema_version() == 34
             tables = await upgraded.schema_tables()
             assert {
                 "channel_agent_execution_settings",
@@ -98,6 +103,44 @@ class TestCanonicalExecutionStateMigration:
             } <= tables
             async with upgraded.connection.execute("SELECT name FROM workshops") as cursor:
                 assert (await cursor.fetchone())[0] == "Preserved"
+        finally:
+            await upgraded.close()
+
+    async def test_version_thirty_three_preserves_settings_and_allows_backend_selection(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        from kai.workshop import schema
+
+        path = tmp_path / "pre-backend-selection.db"
+        with monkeypatch.context() as migration_context:
+            migration_context.setattr(schema, "WORKSHOP_SCHEMA_VERSION", 33)
+            migration_context.setattr(schema, "_MIGRATIONS", schema._MIGRATIONS[:33])
+            old_store = await WorkshopEventStore.open(path)
+            await old_store.connection.execute(
+                "INSERT INTO channel_agent_execution_settings "
+                "(channel_id, agent_id, runtime_profile_id, field, value) "
+                "VALUES (?, ?, ?, 'timeout', '180')",
+                ("chn_" + "1" * 32, "agt_" + "2" * 32, str(profile_id(101))),
+            )
+            await old_store.connection.commit()
+            await old_store.close()
+
+        upgraded = await WorkshopEventStore.open(path)
+        try:
+            assert await upgraded.schema_version() == 34
+            async with upgraded.connection.execute(
+                "SELECT field, value FROM channel_agent_execution_settings"
+            ) as cursor:
+                assert tuple(await cursor.fetchone()) == ("timeout", "180")
+            await upgraded.connection.execute(
+                "INSERT INTO channel_agent_execution_settings "
+                "(channel_id, agent_id, runtime_profile_id, field, value) "
+                "VALUES (?, ?, ?, 'backend', 'codex')",
+                ("chn_" + "1" * 32, "agt_" + "2" * 32, str(profile_id(101))),
+            )
+            await upgraded.connection.commit()
         finally:
             await upgraded.close()
 

@@ -375,6 +375,7 @@ class WorkshopGitHubAutomationService:
             await self._mark(item.work_id, "failed", "runtime_authority_changed")
             return
         profile = self._runtime_pool.runtime_profile(item.runtime_profile_id)
+        effective_backend, effective_provider = self._runtime_pool.get_backend_provider(item.runtime_profile_id)
         runtime_state = self._runtime_state.for_profile(item.runtime_profile_id)
         token = await runtime_state.github_token()
         if not token:
@@ -402,11 +403,11 @@ class WorkshopGitHubAutomationService:
                     item.payload,
                     0,
                     "",
-                    agent_backend=profile.backend,
+                    agent_backend=effective_backend,
                     claude_user=profile.os_user,
                     local_repo_path=item.local_repo_path or None,
                     spec_dir=self._spec_dir,
-                    provider=profile.provider,
+                    provider=effective_provider,
                     timeout_s=self._review_timeout_seconds,
                     model_override=self._runtime_pool.get_role_model(
                         item.runtime_profile_id,
@@ -420,9 +421,9 @@ class WorkshopGitHubAutomationService:
                     item.payload,
                     0,
                     "",
-                    agent_backend=profile.backend,
+                    agent_backend=effective_backend,
                     claude_user=profile.os_user,
-                    provider=profile.provider,
+                    provider=effective_provider,
                     model_override=self._runtime_pool.get_role_model(
                         item.runtime_profile_id,
                         ModelRole.ISSUE_TRIAGE,

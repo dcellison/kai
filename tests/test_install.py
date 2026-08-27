@@ -9699,6 +9699,27 @@ class TestIndependentRuntimePolicy:
         assert profile["workspace_base"] == str(unavailable)
         assert profile["allowed_workspaces"] == [str(unavailable)]
 
+    def test_migration_does_not_authorize_merely_installed_backend(self, tmp_path):
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - telegram_id: 101\n    name: Daniel\n    role: admin\n    backend: codex\n")
+
+        rendered = _build_migrated_runtime_profiles(
+            users_yaml,
+            registry_entries={
+                "codex": {"allowed_models": ["gpt-5.6-sol"]},
+                "claude": {"allowed_models": ["sonnet"]},
+            },
+            defaults=kai.install._RuntimePolicyDefaults(
+                backend="codex",
+                provider="openai",
+                model="gpt-5.6-sol",
+                timeout_seconds=120,
+            ),
+        )
+
+        profile = next(iter(yaml.safe_load(rendered)["runtime_profiles"].values()))
+        assert profile["allowed_backends"] == ["codex"]
+
     def test_migration_rejects_relative_workspace_paths(self, tmp_path):
         users_yaml = tmp_path / "users.yaml"
         users_yaml.write_text(
@@ -9781,6 +9802,7 @@ class TestIndependentRuntimePolicy:
             "model": "gpt-5.5",
             "timeout_seconds": 120,
             "maximum_timeout_seconds": 600,
+            "allowed_backends": ["claude", "codex"],
             "allowed_services": ["perplexity"],
             "home_workspace": None,
             "workspace_base": None,
@@ -9877,7 +9899,8 @@ backends:
 
         assert status == (
             "Workshop runtime policy: initialized; profiles=1, backends=codex, "
-            "runtime kernel=canonical, archived keys=1, "
+            "runtime kernel=canonical, backend selection=canonical (codex), "
+            "archived keys=1, "
             "removal gate=not-applicable"
         )
         assert "Secret display name" not in status
@@ -10006,6 +10029,7 @@ backends:
         assert document["runtime_profiles"][profile_id]["model"] == "gpt-5.6-sol"
         assert document["runtime_profiles"][profile_id]["timeout_seconds"] == 345
         assert document["runtime_profiles"][profile_id]["maximum_timeout_seconds"] == 600
+        assert document["runtime_profiles"][profile_id]["allowed_backends"] == ["codex"]
         assert document["runtime_profiles"][profile_id]["allowed_services"] == ["perplexity"]
         assert profiles.legacy_runtime_key(profile_id) == 101
 
@@ -10168,6 +10192,10 @@ backends:
         assert profile.model == "opus"
         assert profile.timeout_seconds == 999
         assert profile.allowed_services == ("weather",)
+        assert tuple(option.backend for option in profile.backend_options) == (
+            "claude",
+            "codex",
+        )
 
 
 class TestApplyBackendRegistry:

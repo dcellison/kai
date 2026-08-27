@@ -71,6 +71,7 @@ export function SettingsWorkspace({
   principalName,
   roleLabel,
   runtimeLabel,
+  runActive,
   session,
 }: {
   onAuthenticationFailure: (message: string) => void;
@@ -80,6 +81,7 @@ export function SettingsWorkspace({
   principalName: string;
   roleLabel: string;
   runtimeLabel: string;
+  runActive: boolean;
   session: WorkshopSession;
 }): React.JSX.Element {
   const [preference, setPreference] = useState<WorkshopPreferenceDocument | null>(null);
@@ -99,6 +101,7 @@ export function SettingsWorkspace({
   const [runtimeBusy, setRuntimeBusy] = useState(false);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
   const [runtimeNotice, setRuntimeNotice] = useState<string | null>(null);
+  const [runtimeBackend, setRuntimeBackend] = useState("");
   const [runtimeModel, setRuntimeModel] = useState("");
   const [runtimeTimeout, setRuntimeTimeout] = useState("");
   const [workspaceModel, setWorkspaceModel] = useState("");
@@ -154,6 +157,7 @@ export function SettingsWorkspace({
 
   const adoptRuntime = useCallback((snapshot: WorkshopSettingsWorkspace): void => {
     setRuntime(snapshot);
+    setRuntimeBackend(snapshot.backend);
     setRuntimeModel(snapshot.model.value);
     setRuntimeTimeout(String(snapshot.timeoutSeconds.value));
   }, []);
@@ -294,6 +298,9 @@ export function SettingsWorkspace({
       adoptWorkspace(await loadWorkspaceConfig(session));
       setRuntimeNotice(mutationMessage(changed.mutation));
     } catch (caught) {
+      if (change.field === "backend") {
+        setRuntimeBackend(runtime.backend);
+      }
       if (caught instanceof SettingsRevisionConflictError) {
         await refreshRuntime();
         setRuntimeError("Runtime settings changed elsewhere. The latest values have been reloaded.");
@@ -362,6 +369,9 @@ export function SettingsWorkspace({
     }
   };
 
+  const runtimeBackendCapability = runtime
+    ? capability(runtime.capabilities, "backend")
+    : null;
   const runtimeModelCapability = runtime
     ? capability(runtime.capabilities, "model")
     : null;
@@ -545,13 +555,54 @@ export function SettingsWorkspace({
             <p role="status">Loading runtime policy…</p>
           ) : runtime ? (
             <div className="settings-card-grid">
+              {runtimeBackendCapability && (
+                <form
+                  className="settings-card"
+                  onSubmit={(event: FormEvent) => {
+                    event.preventDefault();
+                    void mutateRuntime(
+                      { field: "backend", value: runtimeBackend },
+                      "Switch backend? Your current provider session will end. Your next message will start on the selected backend; other people and Kai itself will not restart.",
+                    );
+                  }}
+                >
+                  <label htmlFor="runtime-backend">Backend</label>
+                  <select
+                    id="runtime-backend"
+                    value={runtimeBackend}
+                    disabled={runtimeBusy || runActive}
+                    onChange={(event) => setRuntimeBackend(event.target.value)}
+                  >
+                    {runtime.backendOptions.map((option) => (
+                      <option key={option.backend} value={option.backend}>
+                        {option.backend} · {option.provider}
+                      </option>
+                    ))}
+                  </select>
+                  <p>Active: <strong>{runtime.backend}</strong> · {runtime.provider}</p>
+                  <p>
+                    {runActive
+                      ? "Finish or stop the active run before switching."
+                      : "Only your runtime lane and provider session are replaced. If sign-in is required, your next message will explain how; you can switch back here immediately."}
+                  </p>
+                  <div className="settings-actions">
+                    <button
+                      className="primary-button"
+                      type="submit"
+                      disabled={runtimeBusy || runActive || runtimeBackend === runtime.backend}
+                    >
+                      Switch backend
+                    </button>
+                  </div>
+                </form>
+              )}
+
               <article className="settings-card policy-card">
                 <p className="settings-card-label">Policy-controlled</p>
                 <dl>
-                  <div><dt>Backend</dt><dd>{runtime.backend}</dd></div>
-                  <div><dt>Provider</dt><dd>{runtime.provider}</dd></div>
+                  <div><dt>Authorized choices</dt><dd>{runtime.backendOptions.length}</dd></div>
                 </dl>
-                <p>Assignments, credentials, identity mappings, and workspace grants are managed by the operator.</p>
+                <p>Credentials, identity mappings, executable paths, assignments, and workspace grants remain operator managed.</p>
               </article>
 
               {runtimeModelCapability && (

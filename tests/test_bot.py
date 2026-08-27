@@ -98,6 +98,7 @@ from kai.workshop.inbound import InboundMessage
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.settings_workspaces import (
     EffectiveValue,
+    WorkshopSettingsWorkspaceConflict,
     WorkspaceConfigSnapshot,
 )
 from kai.workshop.storage_namespaces import (
@@ -3545,6 +3546,37 @@ class TestHandleWorkspaceConfig:
         # Should confirm to the user
         reply = update.message.reply_text.call_args[0][0]
         assert "opus" in reply.lower()
+
+    @pytest.mark.asyncio
+    async def test_protected_backend_switch_uses_canonical_settings_service(self):
+        update = _make_update(text="/settings backend codex")
+        ctx = _make_context(args=["backend", "codex"])
+        authority = SimpleNamespace(runtime_profile_id=profile_id(12345))
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = authority
+        service.set_backend = AsyncMock(return_value=SimpleNamespace(backend="codex"))
+        ctx.application.core_services.settings_workspaces = service
+
+        await handle_settings(update, ctx)
+
+        service.set_backend.assert_awaited_once_with(authority, "codex")
+        reply = update.message.reply_text.call_args[0][0]
+        assert "Backend switched to codex" in reply
+        assert "other users were not restarted" in reply
+
+    @pytest.mark.asyncio
+    async def test_backend_switch_conflict_is_reported_without_success(self):
+        update = _make_update(text="/settings backend codex")
+        ctx = _make_context(args=["backend", "codex"])
+        authority = SimpleNamespace(runtime_profile_id=profile_id(12345))
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = authority
+        service.set_backend = AsyncMock(side_effect=WorkshopSettingsWorkspaceConflict("active run"))
+        ctx.application.core_services.settings_workspaces = service
+
+        await handle_settings(update, ctx)
+
+        assert update.message.reply_text.call_args[0][0] == "active run"
 
     # ── 5. Set timeout ──────────────────────────────────────────────
 

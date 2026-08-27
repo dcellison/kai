@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from kai.backend import StreamEvent
 from kai.config import ModelRole, WorkspaceConfig
 from kai.workshop.domain import RuntimeProfileId
-from kai.workshop.runtime_profiles import ProtectedRuntimeProfile, WorkshopRuntimeProfileRegistry
+from kai.workshop.runtime_profiles import (
+    ProtectedRuntimeBackend,
+    ProtectedRuntimeProfile,
+    WorkshopRuntimeProfileRegistry,
+)
 
 # Type-only: kai.pool imports kai.sessions, which imports this package, so
 # a runtime import here would close an import cycle. The pool arrives as a
@@ -52,6 +56,38 @@ class WorkshopRuntimePool:
     def get_model(self, runtime_profile_id: str | RuntimeProfileId) -> str:
         profile_id = self._profiles.resolve(runtime_profile_id).profile_id
         return self._pool.get_model(profile_id)
+
+    def get_backend_provider(
+        self,
+        runtime_profile_id: str | RuntimeProfileId,
+    ) -> tuple[str, str]:
+        profile_id = self._profiles.resolve(runtime_profile_id).profile_id
+        return self._pool.get_backend_provider(profile_id)
+
+    def backend_option(
+        self,
+        runtime_profile_id: str | RuntimeProfileId,
+        backend: str,
+    ) -> ProtectedRuntimeBackend:
+        return self._profiles.resolve(runtime_profile_id).backend_option(backend)
+
+    def is_in_flight(self, runtime_profile_id: str | RuntimeProfileId) -> bool:
+        profile_id = self._profiles.resolve(runtime_profile_id).profile_id
+        return self._pool.is_in_flight(profile_id)
+
+    async def select_backend(
+        self,
+        runtime_profile_id: str | RuntimeProfileId,
+        backend: str,
+        *,
+        commit_selection: Callable[[], Awaitable[None]] | None = None,
+    ) -> bool:
+        profile_id = self._profiles.resolve(runtime_profile_id).profile_id
+        return await self._pool.select_backend(
+            profile_id,
+            backend,
+            commit_selection=commit_selection,
+        )
 
     def is_running(self, runtime_profile_id: str | RuntimeProfileId) -> bool:
         """Return whether this protected profile currently has a live backend."""

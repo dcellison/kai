@@ -27,7 +27,11 @@ from kai.workshop.internal_api_contexts import (
     WorkshopInternalAPIContextRegistry,
     WorkshopInternalAPIExecutionContext,
 )
-from kai.workshop.runtime_profiles import ProtectedRuntimeProfile, WorkshopRuntimeProfileRegistry
+from kai.workshop.runtime_profiles import (
+    ProtectedRuntimeBackend,
+    ProtectedRuntimeProfile,
+    WorkshopRuntimeProfileRegistry,
+)
 from tests.workshop_profiles import profile_id, profile_registry
 
 
@@ -640,6 +644,151 @@ class TestPerUserBackendRouting:
 
 
 class TestPerUserActions:
+    @pytest.mark.asyncio
+    async def test_backend_selection_replaces_only_target_profile(self, tmp_path):
+        first_id = profile_id(111)
+        second_id = profile_id(222)
+        options = (
+            ProtectedRuntimeBackend("codex", "openai", "gpt-5.6-sol"),
+            ProtectedRuntimeBackend("claude", "anthropic", "sonnet"),
+        )
+        profiles = WorkshopRuntimeProfileRegistry(
+            tuple(
+                ProtectedRuntimeProfile(
+                    profile_id=runtime_id,
+                    display_name=name,
+                    os_user=None,
+                    backend="codex",
+                    provider="openai",
+                    model="gpt-5.6-sol",
+                    timeout_seconds=120,
+                    allowed_services=(),
+                    home_workspace=tmp_path / name,
+                    workspace_base=None,
+                    allowed_workspaces=(),
+                    backend_options=options,
+                )
+                for runtime_id, name in ((first_id, "first"), (second_id, "second"))
+            ),
+            legacy_runtime_keys={first_id: 111, second_id: 222},
+        )
+        pool = SubprocessPool(
+            config=_make_config(),
+            services_info=[],
+            runtime_profiles=profiles,
+            internal_api_contexts=WorkshopInternalAPIContextRegistry(
+                (
+                    *_internal_api_contexts(111).contexts,
+                    *_internal_api_contexts(222).contexts,
+                )
+            ),
+        )
+        first = MagicMock()
+        first.shutdown = AsyncMock()
+        second = MagicMock()
+        second.shutdown = AsyncMock()
+        pool._pool[first_id] = first
+        pool._pool[second_id] = second
+
+        assert await pool.select_backend(first_id, "claude")
+
+        first.shutdown.assert_awaited_once()
+        second.shutdown.assert_not_awaited()
+        assert first_id not in pool._pool
+        assert pool._pool[second_id] is second
+        assert pool.get_backend_provider(first_id) == ("claude", "anthropic")
+        assert pool.get_backend_provider(second_id) == ("codex", "openai")
+
+    @pytest.mark.asyncio
+    async def test_backend_selection_hydrates_from_canonical_state(self, tmp_path):
+        runtime_id = profile_id(111)
+        profiles = WorkshopRuntimeProfileRegistry(
+            (
+                ProtectedRuntimeProfile(
+                    profile_id=runtime_id,
+                    display_name="protected",
+                    os_user=None,
+                    backend="codex",
+                    provider="openai",
+                    model="gpt-5.6-sol",
+                    timeout_seconds=120,
+                    allowed_services=(),
+                    home_workspace=tmp_path,
+                    workspace_base=None,
+                    allowed_workspaces=(),
+                    backend_options=(
+                        ProtectedRuntimeBackend("codex", "openai", "gpt-5.6-sol"),
+                        ProtectedRuntimeBackend("claude", "anthropic", "sonnet"),
+                    ),
+                ),
+            ),
+            legacy_runtime_keys={runtime_id: 111},
+        )
+        pool = SubprocessPool(
+            config=_make_config(),
+            services_info=[],
+            runtime_profiles=profiles,
+            internal_api_contexts=_internal_api_contexts(111),
+        )
+
+        with patch(
+            "kai.pool.sessions.read_canonical_execution_settings",
+            new_callable=AsyncMock,
+            return_value={"backend": "claude"},
+        ):
+            await pool.hydrate_backend_selections()
+
+        assert pool.get_backend_provider(runtime_id) == ("claude", "anthropic")
+
+    @pytest.mark.asyncio
+    async def test_prepared_run_blocks_backend_selection(self, tmp_path):
+        runtime_id = profile_id(111)
+        profiles = WorkshopRuntimeProfileRegistry(
+            (
+                ProtectedRuntimeProfile(
+                    profile_id=runtime_id,
+                    display_name="protected",
+                    os_user=None,
+                    backend="codex",
+                    provider="openai",
+                    model="gpt-5.6-sol",
+                    timeout_seconds=120,
+                    allowed_services=(),
+                    home_workspace=tmp_path,
+                    workspace_base=None,
+                    allowed_workspaces=(),
+                    backend_options=(
+                        ProtectedRuntimeBackend("codex", "openai", "gpt-5.6-sol"),
+                        ProtectedRuntimeBackend("claude", "anthropic", "sonnet"),
+                    ),
+                ),
+            ),
+            legacy_runtime_keys={runtime_id: 111},
+        )
+        pool = SubprocessPool(
+            config=_make_config(),
+            services_info=[],
+            runtime_profiles=profiles,
+            internal_api_contexts=_internal_api_contexts(111),
+        )
+        instance = pool.get(runtime_id)
+        instance.shutdown = AsyncMock()
+        pool._pending_workspace_restore.clear()
+        pool._pending_settings_restore.clear()
+        pool._prepare_instance = AsyncMock(return_value=instance)
+        prepared = await pool.prepare_execution(runtime_id)
+
+        committed = AsyncMock()
+        assert not await pool.select_backend(
+            runtime_id,
+            "claude",
+            commit_selection=committed,
+        )
+        committed.assert_not_awaited()
+
+        await prepared.cancel()
+        assert not pool.is_in_flight(runtime_id)
+
     @pytest.mark.asyncio
     async def test_force_kill_specific_user(self):
         """force_kill(A) shuts down A's process, B's is unaffected."""

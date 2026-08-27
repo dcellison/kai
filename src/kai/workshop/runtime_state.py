@@ -19,6 +19,7 @@ class WorkshopProfileRuntimeState:
     """Canonical state and policy for one protected runtime profile."""
 
     _profile: ProtectedRuntimeProfile = field(repr=False)
+    _runtime_pool: WorkshopRuntimePool = field(repr=False)
     _principal_id: str = field(repr=False)
     _config: Config = field(repr=False)
 
@@ -43,6 +44,7 @@ class WorkshopProfileRuntimeState:
         canonical_provenance: CanonicalMemoryProvenance,
         canonical_prior_pairs: tuple[tuple[str, str], ...],
     ) -> None:
+        effective_backend, effective_provider = self._runtime_pool.get_backend_provider(self._profile.profile_id)
         await ingest_conversation_memory(
             prompt=prompt,
             assistant_text=assistant_text,
@@ -56,8 +58,8 @@ class WorkshopProfileRuntimeState:
             assistant_log=None,
             canonical_provenance=canonical_provenance,
             canonical_prior_pairs=canonical_prior_pairs,
-            effective_backend=self._profile.backend,
-            effective_provider=self._profile.provider,
+            effective_backend=effective_backend,
+            effective_provider=effective_provider,
             os_user_override=self._profile.os_user,
         )
 
@@ -94,6 +96,7 @@ class WorkshopRuntimeStateWriter:
         namespace = self._execution_state.resolve_profile(profile.profile_id)
         return WorkshopProfileRuntimeState(
             profile,
+            self._runtime_pool,
             str(namespace.principal_id),
             self._config,
         )

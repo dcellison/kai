@@ -22,6 +22,7 @@ from kai.workshop.execution_state import (
     WorkshopExecutionStateRegistry,
 )
 from kai.workshop.runtime_pool import WorkshopRuntimePool
+from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError
 from kai.workspace_utils import is_workspace_allowed
 
 
@@ -39,6 +40,10 @@ class WorkshopSettingsWorkspaceValidationError(WorkshopSettingsWorkspaceError):
 
 class WorkshopSettingsWorkspaceConflict(WorkshopSettingsWorkspaceError):
     """The caller based a mutation on stale settings state."""
+
+
+class WorkshopSettingsWorkspaceBusy(WorkshopSettingsWorkspaceConflict):
+    """The principal-local runtime is actively executing and cannot cut over."""
 
 
 class WorkshopSettingsWorkspaceConsistencyError(WorkshopSettingsWorkspaceError):
@@ -82,6 +87,13 @@ class ModelOption:
 
 
 @dataclass(frozen=True, slots=True)
+class BackendOption:
+    backend: str
+    provider: str
+    current: bool
+
+
+@dataclass(frozen=True, slots=True)
 class WorkspaceOption:
     path: str
     name: str
@@ -103,6 +115,7 @@ class SettingsWorkspaceSnapshot:
     workspaces: tuple[WorkspaceOption, ...]
     revision: str
     capabilities: tuple[EditableCapability, ...]
+    backend_options: tuple[BackendOption, ...] = ()
     mutation: SettingsMutationOutcome | None = None
 
 
@@ -208,6 +221,8 @@ class WorkshopSettingsWorkspaceService:
         mutation: SettingsMutationOutcome | None = None,
     ) -> SettingsWorkspaceSnapshot:
         profile = self._runtime_pool.runtime_profile(authority.runtime_profile_id)
+        effective_backend, effective_provider = self._runtime_pool.get_backend_provider(authority.runtime_profile_id)
+        effective_option = profile.backend_option(effective_backend)
         namespace = self._namespace(authority)
         workspace = await self._runtime_pool.get_effective_workspace(authority.runtime_profile_id)
         model, timeout_value = await self._effective_values(
@@ -243,9 +258,9 @@ class WorkshopSettingsWorkspaceService:
             )
 
         curated_models = models_for_backend_policy(
-            profile.backend,
-            profile.provider,
-            allowed_models=profile.allowed_models,
+            effective_option.backend,
+            effective_option.provider,
+            allowed_models=effective_option.allowed_models,
         )
         model_options = (
             tuple(ModelOption(model_id, display_name) for model_id, display_name in curated_models.items())
@@ -257,8 +272,12 @@ class WorkshopSettingsWorkspaceService:
             principal_id=authority.principal_id,
             channel_id=authority.channel_id,
             runtime_profile_id=authority.runtime_profile_id,
-            backend=profile.backend,
-            provider=profile.provider,
+            backend=effective_backend,
+            provider=effective_provider,
+            backend_options=tuple(
+                BackendOption(option.backend, option.provider, option.backend == effective_backend)
+                for option in profile.backend_options
+            ),
             model=model,
             timeout_seconds=timeout_value,
             workspace=str(workspace.resolve()),
@@ -268,6 +287,7 @@ class WorkshopSettingsWorkspaceService:
             capabilities=self._capabilities(
                 model_options,
                 maximum_timeout_seconds=profile.maximum_timeout_seconds,
+                backend_choices=tuple(option.backend for option in profile.backend_options),
             ),
             mutation=mutation,
         )
@@ -281,12 +301,14 @@ class WorkshopSettingsWorkspaceService:
         clear_workspace_override: bool = True,
     ) -> SettingsWorkspaceSnapshot:
         profile = self._runtime_pool.runtime_profile(authority.runtime_profile_id)
-        normalized = canonicalize_model_for_backend(model.strip(), profile.backend)
+        backend, _provider = self._runtime_pool.get_backend_provider(authority.runtime_profile_id)
+        option = profile.backend_option(backend)
+        normalized = canonicalize_model_for_backend(model.strip(), option.backend)
         if not normalized or not validate_model_for_backend_policy(
             normalized,
-            profile.backend,
-            profile.provider,
-            allowed_models=profile.allowed_models,
+            option.backend,
+            option.provider,
+            allowed_models=option.allowed_models,
         ):
             raise WorkshopSettingsWorkspaceValidationError("The model is not allowed by this runtime profile")
         async with self._lock(authority):
@@ -296,6 +318,86 @@ class WorkshopSettingsWorkspaceService:
                 expected_revision=expected_revision,
                 updates={"model": normalized},
                 clear_workspace_field="model" if clear_workspace_override else None,
+            )
+
+    async def set_backend(
+        self,
+        authority: SettingsWorkspaceAuthority,
+        backend: str,
+        *,
+        expected_revision: str | None = None,
+    ) -> SettingsWorkspaceSnapshot:
+        requested = backend.strip().lower()
+        profile = self._runtime_pool.runtime_profile(authority.runtime_profile_id)
+        try:
+            profile.backend_option(requested)
+        except WorkshopRuntimeProfileError as exc:
+            raise WorkshopSettingsWorkspaceValidationError(
+                "The backend is not allowed by this runtime profile"
+            ) from exc
+        async with self._lock(authority):
+            current = await self._inspect_locked(authority)
+            self._check_revision(current.revision, expected_revision)
+            if requested == current.backend:
+                return await self._inspect_locked(
+                    authority,
+                    mutation=SettingsMutationOutcome(
+                        operation="set_runtime_backend",
+                        changed=False,
+                        runtime_action="unchanged",
+                        provider_session_invalidated=False,
+                    ),
+                )
+            if self._runtime_pool.is_in_flight(authority.runtime_profile_id):
+                raise WorkshopSettingsWorkspaceBusy(
+                    "The backend cannot be changed while this runtime has an active run"
+                )
+            namespace = self._namespace(authority)
+            prior_settings = await sessions.get_canonical_execution_settings(namespace)
+            desired_settings = dict(prior_settings)
+            desired_settings["backend"] = requested
+            # Model overrides remain canonical state but are applied only when
+            # valid for the selected backend.  This neither carries an
+            # incompatible model into the new process nor discards a useful
+            # choice when the principal later switches back.
+            was_running = self._runtime_pool.is_running(authority.runtime_profile_id)
+
+            async def commit_selection() -> None:
+                await sessions.replace_canonical_settings_state(namespace, desired_settings)
+                await sessions.clear_canonical_runtime_session(namespace)
+
+            try:
+                selected = await self._runtime_pool.select_backend(
+                    authority.runtime_profile_id,
+                    requested,
+                    commit_selection=commit_selection,
+                )
+            except BaseException:
+                try:
+                    await sessions.replace_canonical_settings_state(namespace, prior_settings)
+                    active_backend, _provider = self._runtime_pool.get_backend_provider(authority.runtime_profile_id)
+                    if active_backend != current.backend:
+                        await self._runtime_pool.select_backend(
+                            authority.runtime_profile_id,
+                            current.backend,
+                        )
+                except BaseException as rollback_exc:
+                    raise WorkshopSettingsWorkspaceConsistencyError(
+                        "Backend switch failed and the prior selection could not be restored"
+                    ) from rollback_exc
+                raise
+            if not selected:
+                raise WorkshopSettingsWorkspaceBusy(
+                    "The backend cannot be changed while this runtime has an active run"
+                )
+            return await self._inspect_locked(
+                authority,
+                mutation=SettingsMutationOutcome(
+                    operation="set_runtime_backend",
+                    changed=True,
+                    runtime_action="restarted" if was_running else "deferred_until_next_run",
+                    provider_session_invalidated=True,
+                ),
             )
 
     async def set_timeout(
@@ -425,6 +527,8 @@ class WorkshopSettingsWorkspaceService:
     ) -> WorkspaceConfigSnapshot:
         namespace = self._namespace(authority)
         profile = self._runtime_pool.runtime_profile(authority.runtime_profile_id)
+        backend, _provider = self._runtime_pool.get_backend_provider(authority.runtime_profile_id)
+        backend_option = profile.backend_option(backend)
         workspace = await self._authorized_workspace(authority, workspace_path)
         yaml_config = self._config.get_workspace_config(workspace)
         overrides = await sessions.get_canonical_workspace_config_settings(
@@ -472,9 +576,9 @@ class WorkshopSettingsWorkspaceService:
             ),
             capabilities=self._workspace_capabilities(
                 models_for_backend_policy(
-                    profile.backend,
-                    profile.provider,
-                    allowed_models=profile.allowed_models,
+                    backend_option.backend,
+                    backend_option.provider,
+                    allowed_models=backend_option.allowed_models,
                 ),
                 maximum_timeout_seconds=profile.maximum_timeout_seconds,
             ),
@@ -493,13 +597,15 @@ class WorkshopSettingsWorkspaceService:
         if field not in {"model", "timeout", "env", "prompt"}:
             raise WorkshopSettingsWorkspaceValidationError("Unsupported workspace setting")
         profile = self._runtime_pool.runtime_profile(authority.runtime_profile_id)
+        backend, _provider = self._runtime_pool.get_backend_provider(authority.runtime_profile_id)
+        backend_option = profile.backend_option(backend)
         if field == "model":
-            value = canonicalize_model_for_backend(value.strip(), profile.backend)
+            value = canonicalize_model_for_backend(value.strip(), backend_option.backend)
             if not validate_model_for_backend_policy(
                 value,
-                profile.backend,
-                profile.provider,
-                allowed_models=profile.allowed_models,
+                backend_option.backend,
+                backend_option.provider,
+                allowed_models=backend_option.allowed_models,
             ):
                 raise WorkshopSettingsWorkspaceValidationError("The model is not allowed by this runtime profile")
         elif field == "timeout":
@@ -1039,8 +1145,16 @@ class WorkshopSettingsWorkspaceService:
         model_options: tuple[ModelOption, ...] | None,
         *,
         maximum_timeout_seconds: int,
+        backend_choices: tuple[str, ...],
     ) -> tuple[EditableCapability, ...]:
         return (
+            EditableCapability(
+                field="backend",
+                scope="runtime",
+                value_type="backend_id",
+                resettable=False,
+                choices=backend_choices,
+            ),
             EditableCapability(
                 field="model",
                 scope="runtime",
@@ -1101,6 +1215,8 @@ class WorkshopSettingsWorkspaceService:
         workspace: Path,
     ) -> tuple[EffectiveValue, EffectiveValue]:
         profile = self._runtime_pool.runtime_profile(authority.runtime_profile_id)
+        backend, _provider = self._runtime_pool.get_backend_provider(authority.runtime_profile_id)
+        backend_option = profile.backend_option(backend)
         namespace = self._namespace(authority)
         user = await sessions.get_canonical_execution_settings(namespace)
         workspace_overrides = await sessions.get_canonical_workspace_config_settings(
@@ -1109,7 +1225,7 @@ class WorkshopSettingsWorkspaceService:
         )
         yaml_config = self._config.get_workspace_config(workspace)
 
-        model = EffectiveValue(profile.model, "runtime policy", profile.model)
+        model = EffectiveValue(backend_option.model, "runtime policy", backend_option.model)
         model_candidates = (
             (workspace_overrides.get("model"), "workspace override"),
             (yaml_config.model if yaml_config else None, "workspace policy"),
@@ -1120,15 +1236,15 @@ class WorkshopSettingsWorkspaceService:
                 continue
             candidate = canonicalize_model_for_backend(
                 raw_model,
-                profile.backend,
+                backend_option.backend,
             )
             if validate_model_for_backend_policy(
                 candidate,
-                profile.backend,
-                profile.provider,
-                allowed_models=profile.allowed_models,
+                backend_option.backend,
+                backend_option.provider,
+                allowed_models=backend_option.allowed_models,
             ):
-                model = EffectiveValue(candidate, source, profile.model)
+                model = EffectiveValue(candidate, source, backend_option.model)
                 break
 
         timeout = EffectiveValue(

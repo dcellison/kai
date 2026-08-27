@@ -98,6 +98,10 @@ function settingsPayload(overrides: Record<string, unknown> = {}): Record<string
     runtime_profile_id: "rtp_00000000000000000000000000000001",
     backend: "claude",
     provider: "anthropic",
+    backend_options: [
+      { backend: "claude", provider: "anthropic", current: true },
+      { backend: "codex", provider: "openai", current: false },
+    ],
     model: {
       value: "claude-sonnet-4-6",
       source: "runtime policy",

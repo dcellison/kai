@@ -85,6 +85,7 @@ from kai.workshop.settings_workspaces import (
     SettingsWorkspaceAuthority,
     SettingsWorkspaceSnapshot,
     WorkshopSettingsWorkspaceAccessDenied,
+    WorkshopSettingsWorkspaceBusy,
     WorkshopSettingsWorkspaceConflict,
     WorkshopSettingsWorkspaceService,
     WorkshopSettingsWorkspaceValidationError,
@@ -132,7 +133,7 @@ _ALLOWED_MEMORY_LIST_PARAMETERS = _ALLOWED_MEMORY_FILTERS | {"cursor", "limit", 
 _ALLOWED_MEMORY_SEARCH_PARAMETERS = _ALLOWED_MEMORY_FILTERS | {"q", "limit"}
 _ENROLLMENT_REQUEST_FIELDS = frozenset({"enrollment_token", "device_display_name"})
 _COMMAND_REQUEST_FIELDS = frozenset({"client_message_id", "body"})
-_SETTINGS_OPERATION_FIELDS = frozenset({"model", "timeout_seconds", "reset"})
+_SETTINGS_OPERATION_FIELDS = frozenset({"backend", "model", "timeout_seconds", "reset"})
 _SETTINGS_REQUEST_FIELDS = _SETTINGS_OPERATION_FIELDS | {"revision"}
 _WORKSPACE_REQUEST_FIELDS = frozenset({"path", "revision"})
 _WORKSPACE_CONFIG_REQUEST_FIELDS = frozenset({"field", "value", "path", "revision"})
@@ -179,6 +180,14 @@ def _serialize_settings_workspace(
         "runtime_profile_id": str(snapshot.runtime_profile_id),
         "backend": snapshot.backend,
         "provider": snapshot.provider,
+        "backend_options": [
+            {
+                "backend": option.backend,
+                "provider": option.provider,
+                "current": option.current,
+            }
+            for option in snapshot.backend_options
+        ],
         "model": {
             "value": snapshot.model.value,
             "source": snapshot.model.source,
@@ -1135,7 +1144,15 @@ async def _handle_runtime_settings_update(
             message="Change exactly one setting at a time",
         )
     try:
-        if "model" in payload:
+        if "backend" in payload:
+            if not isinstance(payload["backend"], str):
+                raise WorkshopSettingsWorkspaceValidationError("Backend must be text")
+            snapshot = await service.set_backend(
+                authority,
+                payload["backend"],
+                expected_revision=revision,
+            )
+        elif "model" in payload:
             if not isinstance(payload["model"], str):
                 raise WorkshopSettingsWorkspaceValidationError("Model must be text")
             snapshot = await service.set_model(
@@ -1159,6 +1176,8 @@ async def _handle_runtime_settings_update(
                 None if reset == "all" else reset,
                 expected_revision=revision,
             )
+    except WorkshopSettingsWorkspaceBusy as exc:
+        return _error_response(status=409, code="runtime_busy", message=str(exc))
     except WorkshopSettingsWorkspaceConflict as exc:
         return _error_response(status=409, code="settings_conflict", message=str(exc))
     except WorkshopSettingsWorkspaceValidationError as exc:
