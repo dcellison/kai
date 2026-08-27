@@ -45,6 +45,9 @@ from kai.bot import (
     _workspace_config_suffix,
     _workspaces_keyboard,
     create_bot,
+    handle_backend,
+    handle_backend_callback,
+    handle_backends,
     handle_document,
     handle_github,
     handle_help,
@@ -3565,6 +3568,107 @@ class TestHandleWorkspaceConfig:
         assert "other users were not restarted" in reply
 
     @pytest.mark.asyncio
+    async def test_backend_alias_lists_canonical_options(self):
+        update = _make_update(text="/backend")
+        ctx = _make_context(args=[])
+        authority = SimpleNamespace(runtime_profile_id=profile_id(12345))
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = authority
+        service.inspect = AsyncMock(
+            return_value=SimpleNamespace(
+                backend_option_id="claude:anthropic",
+                backend_options=(
+                    SimpleNamespace(
+                        option_id="claude:anthropic",
+                        backend="claude",
+                        provider="anthropic",
+                    ),
+                    SimpleNamespace(
+                        option_id="opencode:deepseek",
+                        backend="opencode",
+                        provider="deepseek",
+                    ),
+                ),
+            )
+        )
+        ctx.application.core_services.settings_workspaces = service
+
+        await handle_backend(update, ctx)
+
+        service.inspect.assert_awaited_once_with(authority)
+        reply = update.message.reply_text.call_args[0][0]
+        assert "Current backend: claude:anthropic" in reply
+        assert "opencode:deepseek" in reply
+        assert "Usage: /backend <backend:provider>" in reply
+
+    @pytest.mark.asyncio
+    async def test_backend_alias_switches_through_canonical_service(self):
+        update = _make_update(text="/backend opencode:deepseek")
+        ctx = _make_context(args=["opencode:deepseek"])
+        authority = SimpleNamespace(runtime_profile_id=profile_id(12345))
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = authority
+        service.set_backend = AsyncMock(return_value=SimpleNamespace(backend_option_id="opencode:deepseek"))
+        ctx.application.core_services.settings_workspaces = service
+
+        await handle_backend(update, ctx)
+
+        service.set_backend.assert_awaited_once_with(authority, "opencode:deepseek")
+        assert "Backend switched to opencode:deepseek" in update.message.reply_text.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_backends_command_shows_authorized_options_as_buttons(self):
+        update = _make_update(text="/backends")
+        ctx = _make_context()
+        authority = SimpleNamespace(runtime_profile_id=profile_id(12345))
+        snapshot = SimpleNamespace(
+            backend_option_id="claude:anthropic",
+            backend_options=(
+                SimpleNamespace(
+                    option_id="claude:anthropic",
+                    backend="claude",
+                    provider="anthropic",
+                ),
+                SimpleNamespace(
+                    option_id="opencode:deepseek",
+                    backend="opencode",
+                    provider="deepseek",
+                ),
+            ),
+        )
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = authority
+        service.inspect = AsyncMock(return_value=snapshot)
+        ctx.application.core_services.settings_workspaces = service
+
+        await handle_backends(update, ctx)
+
+        markup = update.message.reply_text.call_args.kwargs["reply_markup"]
+        buttons = [row[0] for row in markup.inline_keyboard]
+        assert [button.callback_data for button in buttons] == [
+            "backend:claude:anthropic",
+            "backend:opencode:deepseek",
+        ]
+        assert buttons[0].text.endswith("\U0001f7e2")
+
+    @pytest.mark.asyncio
+    async def test_backend_callback_switches_through_canonical_service(self):
+        update = _make_callback_update(data="backend:opencode:deepseek")
+        ctx = _make_context()
+        authority = SimpleNamespace(runtime_profile_id=profile_id(12345))
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = authority
+        service.inspect = AsyncMock(return_value=SimpleNamespace(backend_option_id="claude:anthropic"))
+        service.set_backend = AsyncMock(return_value=SimpleNamespace(backend_option_id="opencode:deepseek"))
+        ctx.application.core_services.settings_workspaces = service
+
+        await handle_backend_callback(update, ctx)
+
+        service.set_backend.assert_awaited_once_with(authority, "opencode:deepseek")
+        update.callback_query.answer.assert_awaited_once_with()
+        assert "Switched to opencode:deepseek" in update.callback_query.edit_message_text.call_args[0][0]
+
+    @pytest.mark.asyncio
     async def test_backend_switch_conflict_is_reported_without_success(self):
         update = _make_update(text="/settings backend codex")
         ctx = _make_context(args=["backend", "codex"])
@@ -4487,6 +4591,8 @@ class TestModelPersistence:
 #   - ws: alias for /workspace, would be redundant in the menu
 #   - jobs: alias for /job list, would be redundant in the menu
 EXPECTED_MENU_COMMANDS = {
+    "backend",
+    "backends",
     "github",
     "help",
     "job",
@@ -4570,7 +4676,7 @@ class TestCommandMenu:
             if isinstance(handler, CQH)
         ]
 
-        assert len(callbacks) == 4
+        assert len(callbacks) == 5
         assert all(getattr(callback, "_kai_totp_sensitive", False) for callback in callbacks)
 
     def test_menu_matches_expected_set(self):
