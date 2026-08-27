@@ -42,6 +42,7 @@ import {
   updateWorkspaceConfig,
 } from "./api";
 import type { WorkshopSession } from "./types";
+import { WORKSHOP_THEME_CATALOG } from "./theme";
 
 const channelId = "chn_d3dfdfd7df9151ba8a1742b92403faa5";
 const session: WorkshopSession = { channelId, token: "session-secret" };
@@ -750,13 +751,11 @@ describe("Workshop client API", () => {
     const payload = {
       version: 1,
       theme_id: "atom-one-dark",
-      themes: [
-        {
-          theme_id: "atom-one-dark",
-          display_name: "Atom One Dark",
-          color_scheme: "dark",
-        },
-      ],
+      themes: WORKSHOP_THEME_CATALOG.map((theme) => ({
+        theme_id: theme.themeId,
+        display_name: theme.displayName,
+        color_scheme: theme.colorScheme,
+      })),
       revision: "apr_current",
       mutation: null,
     };
@@ -768,10 +767,11 @@ describe("Workshop client API", () => {
       }));
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(loadAppearancePreferences(session)).resolves.toMatchObject({
+    const loaded = await loadAppearancePreferences(session);
+    expect(loaded).toMatchObject({
       themeId: "atom-one-dark",
-      themes: [{ displayName: "Atom One Dark", colorScheme: "dark" }],
     });
+    expect(loaded.themes).toHaveLength(11);
     await expect(
       updateAppearancePreference(session, "apr_current", "atom-one-dark"),
     ).resolves.toMatchObject({

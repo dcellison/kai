@@ -6,6 +6,56 @@ export const WORKSHOP_THEME_CATALOG = [
     displayName: "Atom One Dark",
     themeId: DEFAULT_WORKSHOP_THEME_ID,
   },
+  {
+    colorScheme: "light",
+    displayName: "Atom One Light",
+    themeId: "atom-one-light",
+  },
+  {
+    colorScheme: "dark",
+    displayName: "Dracula",
+    themeId: "dracula",
+  },
+  {
+    colorScheme: "dark",
+    displayName: "Nord",
+    themeId: "nord",
+  },
+  {
+    colorScheme: "dark",
+    displayName: "Solarized Dark",
+    themeId: "solarized-dark",
+  },
+  {
+    colorScheme: "light",
+    displayName: "Solarized Light",
+    themeId: "solarized-light",
+  },
+  {
+    colorScheme: "dark",
+    displayName: "Catppuccin Mocha",
+    themeId: "catppuccin-mocha",
+  },
+  {
+    colorScheme: "light",
+    displayName: "Catppuccin Latte",
+    themeId: "catppuccin-latte",
+  },
+  {
+    colorScheme: "light",
+    displayName: "GitHub Light Default",
+    themeId: "github-light-default",
+  },
+  {
+    colorScheme: "dark",
+    displayName: "GitHub Dark Default",
+    themeId: "github-dark-default",
+  },
+  {
+    colorScheme: "dark",
+    displayName: "GitHub Dark Dimmed",
+    themeId: "github-dark-dimmed",
+  },
 ] as const;
 
 export type WorkshopThemeId = (typeof WORKSHOP_THEME_CATALOG)[number]["themeId"];
