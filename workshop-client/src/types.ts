@@ -200,6 +200,17 @@ export interface WorkshopClientPreferences {
   };
 }
 
+export interface WorkshopAppearancePreferences {
+  mutation: { changed: boolean; operation: string } | null;
+  revision: string;
+  themeId: string;
+  themes: {
+    colorScheme: "dark" | "light";
+    displayName: string;
+    themeId: string;
+  }[];
+}
+
 export type WorkshopClientPreferenceChange =
   | {
       field: "mode";

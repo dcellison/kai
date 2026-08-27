@@ -1965,6 +1965,15 @@ button:disabled {
   gap: 0.75rem;
 }
 
+.settings-client-preferences {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.settings-appearance-card {
+  margin-bottom: 0.35rem;
+}
+
 .notification-preference-grid .settings-card select {
   width: 100%;
 }

@@ -3,6 +3,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import {
   AuthenticationError,
   ChannelAccessError,
+  loadAppearancePreferences,
   loadPreferenceDocument,
   loadPreferenceHistory,
   loadGitHubSettings,
@@ -19,6 +20,7 @@ import {
   updateGitHubSettings,
   updateNotificationPreference,
   updateClientPreference,
+  updateAppearancePreference,
   updateWorkspaceConfig,
 } from "./api";
 import type {
@@ -31,6 +33,7 @@ import type {
   WorkshopNotificationPreferenceChange,
   WorkshopClientPreferences,
   WorkshopClientPreferenceChange,
+  WorkshopAppearancePreferences,
   WorkshopRuntimeSettingsChange,
   WorkshopSession,
   WorkshopSettingsMutation,
@@ -38,6 +41,7 @@ import type {
   WorkshopWorkspaceConfig,
   WorkshopWorkspaceSettingChange,
 } from "./types";
+import { applyWorkshopTheme } from "./theme";
 
 const VOICE_MODE_LABELS = {
   off: "Text only",
@@ -158,6 +162,13 @@ export function SettingsWorkspace({
   const [clientBusy, setClientBusy] = useState(false);
   const [clientError, setClientError] = useState<string | null>(null);
   const [clientNotice, setClientNotice] = useState<string | null>(null);
+
+  const [appearance, setAppearance] = useState<WorkshopAppearancePreferences | null>(null);
+  const [appearanceDraft, setAppearanceDraft] = useState("");
+  const [appearanceLoading, setAppearanceLoading] = useState(true);
+  const [appearanceBusy, setAppearanceBusy] = useState(false);
+  const [appearanceError, setAppearanceError] = useState<string | null>(null);
+  const [appearanceNotice, setAppearanceNotice] = useState<string | null>(null);
 
   const settingsScrollRef = useRef<HTMLDivElement>(null);
   const [activeSection, setActiveSection] = useState<SettingsSectionId>(
@@ -342,13 +353,38 @@ export function SettingsWorkspace({
     }
   }, [handleAccessFailure, session]);
 
+  const refreshAppearance = useCallback(async (): Promise<void> => {
+    setAppearanceLoading(true);
+    setAppearanceError(null);
+    try {
+      const snapshot = await loadAppearancePreferences(session);
+      setAppearance(snapshot);
+      setAppearanceDraft(snapshot.themeId);
+      applyWorkshopTheme(snapshot.themeId);
+    } catch (caught) {
+      if (!handleAccessFailure(caught)) {
+        setAppearanceError(errorText(caught, "Could not load appearance preferences."));
+      }
+    } finally {
+      setAppearanceLoading(false);
+    }
+  }, [handleAccessFailure, session]);
+
   useEffect(() => {
     void refreshPreferences();
     void refreshRuntime();
     void refreshGitHub();
     void refreshNotifications();
     void refreshClients();
-  }, [refreshClients, refreshGitHub, refreshNotifications, refreshPreferences, refreshRuntime]);
+    void refreshAppearance();
+  }, [
+    refreshAppearance,
+    refreshClients,
+    refreshGitHub,
+    refreshNotifications,
+    refreshPreferences,
+    refreshRuntime,
+  ]);
 
   useEffect(() => {
     onDirtyChange(preferenceDirty);
@@ -600,6 +636,48 @@ export function SettingsWorkspace({
       }
     } finally {
       setClientBusy(false);
+    }
+  };
+
+  const mutateAppearance = async (themeId: string): Promise<void> => {
+    if (!appearance) {
+      return;
+    }
+    const previousTheme = appearance.themeId;
+    setAppearanceDraft(themeId);
+    applyWorkshopTheme(themeId);
+    setAppearanceBusy(true);
+    setAppearanceError(null);
+    setAppearanceNotice(null);
+    try {
+      const changed = await updateAppearancePreference(
+        session,
+        appearance.revision,
+        themeId,
+      );
+      setAppearance(changed);
+      setAppearanceDraft(changed.themeId);
+      applyWorkshopTheme(changed.themeId);
+      setAppearanceNotice(
+        changed.mutation?.changed
+          ? "Workshop appearance saved."
+          : "No change was needed.",
+      );
+    } catch (caught) {
+      if (caught instanceof SettingsRevisionConflictError) {
+        await refreshAppearance();
+        setAppearanceError(
+          "Appearance preferences changed elsewhere. The latest value has been reloaded.",
+        );
+      } else {
+        setAppearanceDraft(previousTheme);
+        applyWorkshopTheme(previousTheme);
+        if (!handleAccessFailure(caught)) {
+          setAppearanceError(errorText(caught, "Could not update appearance preferences."));
+        }
+      }
+    } finally {
+      setAppearanceBusy(false);
     }
   };
 
@@ -1335,6 +1413,41 @@ export function SettingsWorkspace({
               how your other Kai clients behave.
             </p>
           </div>
+          <div className="settings-client-preferences">
+          {appearanceLoading ? (
+            <p role="status">Loading Workshop appearance…</p>
+          ) : appearance ? (
+            <article className="settings-card settings-appearance-card">
+              <h3>Workshop appearance</h3>
+              <p>
+                This theme follows your Workshop account across enrolled browsers.
+              </p>
+              <label htmlFor="workshop-theme">Theme</label>
+              <select
+                id="workshop-theme"
+                value={appearanceDraft}
+                disabled={appearanceBusy}
+                onChange={(event) => void mutateAppearance(event.target.value)}
+              >
+                {appearance.themes.map((theme) => (
+                  <option key={theme.themeId} value={theme.themeId}>
+                    {theme.displayName}
+                  </option>
+                ))}
+              </select>
+            </article>
+          ) : (
+            <div className="settings-failure">
+              <p role="alert">
+                {appearanceError ?? "Appearance preferences are unavailable."}
+              </p>
+              <button className="quiet-button" type="button" onClick={() => void refreshAppearance()}>
+                Retry
+              </button>
+            </div>
+          )}
+          {appearanceNotice && <p className="settings-notice" role="status">{appearanceNotice}</p>}
+          {appearanceError && appearance && <p className="settings-error" role="alert">{appearanceError}</p>}
           {clientLoading ? (
             <p role="status">Loading client preferences…</p>
           ) : clients ? (
@@ -1392,6 +1505,7 @@ export function SettingsWorkspace({
           )}
           {clientNotice && <p className="settings-notice" role="status">{clientNotice}</p>}
           {clientError && clients && <p className="settings-error" role="alert">{clientError}</p>}
+          </div>
         </section>
       </div>
     </section>

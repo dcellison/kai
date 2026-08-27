@@ -16,6 +16,16 @@ from urllib.parse import quote
 
 from aiohttp import BodyPartReader, web
 
+from kai.workshop.appearance_preferences import (
+    AppearancePreferenceAuthority,
+    AppearancePreferenceSnapshot,
+    WorkshopAppearancePreferenceAccessDenied,
+    WorkshopAppearancePreferenceConflict,
+    WorkshopAppearancePreferenceError,
+    WorkshopAppearancePreferenceService,
+    WorkshopAppearancePreferenceStorageError,
+    WorkshopAppearancePreferenceValidationError,
+)
 from kai.workshop.artifacts import (
     MAX_ARTIFACT_BYTES,
     ArtifactAccessDeniedError,
@@ -149,6 +159,7 @@ _PREFERENCE_RESTORE_PATH = "/v1/preferences/revisions/{preference_revision}/rest
 _GITHUB_SETTINGS_PATH = "/v1/settings/github"
 _NOTIFICATION_PREFERENCES_PATH = "/v1/settings/notifications"
 _CLIENT_PREFERENCES_PATH = "/v1/settings/clients"
+_APPEARANCE_PREFERENCES_PATH = "/v1/settings/appearance"
 _MAX_PREFERENCE_UPDATE_BODY_BYTES = MAX_PREFERENCE_BYTES * 6 + 1024
 _MAX_PREFERENCE_RESTORE_BODY_BYTES = 512
 _MEMORY_STATS_PATH = "/v1/memory/stats"
@@ -181,6 +192,8 @@ _NOTIFICATION_PREFERENCE_REQUEST_FIELDS = frozenset({"revision", "integration_cl
 _MAX_NOTIFICATION_PREFERENCE_BODY_BYTES = 2_048
 _CLIENT_PREFERENCE_REQUEST_FIELDS = frozenset({"revision", "binding_choice_id", "mode", "voice"})
 _MAX_CLIENT_PREFERENCE_BODY_BYTES = 2_048
+_APPEARANCE_PREFERENCE_REQUEST_FIELDS = frozenset({"revision", "theme_id"})
+_MAX_APPEARANCE_PREFERENCE_BODY_BYTES = 1_024
 _DECIMAL_INTEGER = re.compile(r"^[0-9]+$")
 _CLIENT_MESSAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _EVENT_BATCH_SIZE = 100
@@ -402,6 +415,32 @@ def _serialize_client_preferences(snapshot: ClientPreferenceSnapshot) -> dict[st
                 for item in snapshot.bindings
             ],
         },
+        "revision": snapshot.revision,
+        "mutation": (
+            {
+                "operation": snapshot.mutation.operation,
+                "changed": snapshot.mutation.changed,
+            }
+            if snapshot.mutation is not None
+            else None
+        ),
+    }
+
+
+def _serialize_appearance_preferences(
+    snapshot: AppearancePreferenceSnapshot,
+) -> dict[str, object]:
+    return {
+        "version": 1,
+        "theme_id": snapshot.theme_id,
+        "themes": [
+            {
+                "theme_id": item.theme_id,
+                "display_name": item.display_name,
+                "color_scheme": item.color_scheme,
+            }
+            for item in snapshot.themes
+        ],
         "revision": snapshot.revision,
         "mutation": (
             {
@@ -1679,6 +1718,124 @@ async def _handle_client_preference_update(
     except WorkshopClientPreferenceError as exc:
         return _client_preference_error_response(exc)
     return _json_response(_serialize_client_preferences(snapshot), status=200)
+
+
+async def _authenticate_appearance_preference_authority(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopAppearancePreferenceService,
+) -> tuple[AppearancePreferenceAuthority | None, web.Response | None]:
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(
+            status=401,
+            code="authentication_required",
+            message="Authentication required",
+        )
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return None, response
+    try:
+        return service.authority_for_principal(principal_id), None
+    except WorkshopAppearancePreferenceAccessDenied:
+        return None, _error_response(status=403, code="access_denied", message="Access denied")
+
+
+def _appearance_preference_error_response(
+    exc: WorkshopAppearancePreferenceError,
+) -> web.Response:
+    if isinstance(exc, WorkshopAppearancePreferenceConflict):
+        return _error_response(status=409, code="settings_conflict", message=str(exc))
+    if isinstance(exc, WorkshopAppearancePreferenceValidationError):
+        return _error_response(status=400, code="invalid_setting", message=str(exc))
+    if isinstance(exc, WorkshopAppearancePreferenceAccessDenied):
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    if isinstance(exc, WorkshopAppearancePreferenceStorageError):
+        return _error_response(
+            status=503,
+            code="appearance_preferences_unavailable",
+            message="Appearance preferences are temporarily unavailable",
+        )
+    return _error_response(
+        status=503,
+        code="appearance_preferences_unavailable",
+        message="Appearance preferences are temporarily unavailable",
+    )
+
+
+async def _handle_appearance_preferences(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopAppearancePreferenceService,
+) -> web.Response:
+    authority, error = await _authenticate_appearance_preference_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        return error
+    assert authority is not None
+    if request.query or request.can_read_body:
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid appearance preference request",
+        )
+    try:
+        snapshot = await service.inspect(authority)
+    except WorkshopAppearancePreferenceError as exc:
+        return _appearance_preference_error_response(exc)
+    return _json_response(_serialize_appearance_preferences(snapshot), status=200)
+
+
+async def _handle_appearance_preference_update(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopAppearancePreferenceService,
+) -> web.Response:
+    authority, error = await _authenticate_appearance_preference_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        return error
+    assert authority is not None
+    if request.query:
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid appearance preference request",
+        )
+    try:
+        if request.content_type != "application/json":
+            raise WorkshopAppearancePreferenceValidationError("Content-Type must be application/json")
+        if request.content_length is not None and request.content_length > _MAX_APPEARANCE_PREFERENCE_BODY_BYTES:
+            raise WorkshopAppearancePreferenceValidationError("Appearance preference request is too large")
+        raw = await request.content.read(_MAX_APPEARANCE_PREFERENCE_BODY_BYTES + 1)
+        if len(raw) > _MAX_APPEARANCE_PREFERENCE_BODY_BYTES:
+            raise WorkshopAppearancePreferenceValidationError("Appearance preference request is too large")
+        try:
+            payload = json.loads(raw)
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise WorkshopAppearancePreferenceValidationError("Invalid JSON request") from exc
+        if not isinstance(payload, dict) or set(payload) != _APPEARANCE_PREFERENCE_REQUEST_FIELDS:
+            raise WorkshopAppearancePreferenceValidationError("Invalid appearance preference request")
+        revision = payload.get("revision")
+        theme_id = payload.get("theme_id")
+        if not isinstance(revision, str) or not isinstance(theme_id, str):
+            raise WorkshopAppearancePreferenceValidationError("Appearance preference revision and theme are required")
+        snapshot = await service.set_theme(
+            authority,
+            theme_id,
+            expected_revision=revision,
+        )
+    except WorkshopAppearancePreferenceError as exc:
+        return _appearance_preference_error_response(exc)
+    return _json_response(_serialize_appearance_preferences(snapshot), status=200)
 
 
 async def _handle_runtime_settings(
@@ -3143,6 +3300,7 @@ def register_workshop_read_routes(
     github_settings: WorkshopGitHubSettingsService | None = None,
     notification_preferences: WorkshopNotificationPreferenceService | None = None,
     client_preferences: WorkshopClientPreferenceService | None = None,
+    appearance_preferences: WorkshopAppearancePreferenceService | None = None,
 ) -> None:
     """Register authenticated Workshop client routes on an application."""
     if event_poll_interval <= 0 or event_heartbeat_interval <= 0 or event_authentication_recheck_interval <= 0:
@@ -3293,6 +3451,29 @@ def register_workshop_read_routes(
 
         app.router.add_get(_CLIENT_PREFERENCES_PATH, handle_client_preferences)
         app.router.add_patch(_CLIENT_PREFERENCES_PATH, handle_client_preference_update)
+    if appearance_preferences is not None:
+
+        async def handle_appearance_preferences(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_appearance_preferences(
+                    request,
+                    authenticator=authenticator,
+                    service=appearance_preferences,
+                )
+
+        async def handle_appearance_preference_update(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_appearance_preference_update(
+                    request,
+                    authenticator=authenticator,
+                    service=appearance_preferences,
+                )
+
+        app.router.add_get(_APPEARANCE_PREFERENCES_PATH, handle_appearance_preferences)
+        app.router.add_patch(
+            _APPEARANCE_PREFERENCES_PATH,
+            handle_appearance_preference_update,
+        )
     if artifact_service is not None:
 
         async def handle_artifact_content(request: web.Request) -> web.StreamResponse:

@@ -11,6 +11,7 @@ from typing import Protocol
 from kai import sessions
 from kai.config import Config
 from kai.pool import SubprocessPool
+from kai.workshop.appearance_preferences import WorkshopAppearancePreferenceService
 from kai.workshop.artifacts import WorkshopArtifactService
 from kai.workshop.client_commands import WorkshopClientCommandExecutor
 from kai.workshop.client_preferences import (
@@ -143,6 +144,7 @@ class KaiCoreServices:
     github_settings: WorkshopGitHubSettingsService
     notification_preferences: WorkshopNotificationPreferenceService
     client_preferences: WorkshopClientPreferenceService
+    appearance_preferences: WorkshopAppearancePreferenceService
     proactive_publication: WorkshopProactivePublicationService
     integration_notifications: WorkshopIntegrationNotificationService
     github_automation: WorkshopGitHubAutomationService
@@ -226,6 +228,7 @@ class KaiApplicationHost:
         github_settings: WorkshopGitHubSettingsService | None = None
         notification_preferences: WorkshopNotificationPreferenceService | None = None
         client_preferences: WorkshopClientPreferenceService | None = None
+        appearance_preferences: WorkshopAppearancePreferenceService | None = None
         try:
             delivery_policy = self._delivery_policy
             subprocess_pool = SubprocessPool(
@@ -307,6 +310,7 @@ class KaiApplicationHost:
                 Path(self._config.session_db_path),
                 self._client_voice_capabilities,
             )
+            appearance_preferences = await WorkshopAppearancePreferenceService.open(Path(self._config.session_db_path))
             proactive_publication = WorkshopProactivePublicationService(
                 client_store,
                 artifacts,
@@ -358,6 +362,7 @@ class KaiApplicationHost:
                 github_settings=github_settings,
                 notification_preferences=notification_preferences,
                 client_preferences=client_preferences,
+                appearance_preferences=appearance_preferences,
                 proactive_publication=proactive_publication,
                 integration_notifications=integration_notifications,
                 github_automation=github_automation,
@@ -380,6 +385,8 @@ class KaiApplicationHost:
                 await notification_preferences.close()
             if client_preferences is not None:
                 await client_preferences.close()
+            if appearance_preferences is not None:
+                await appearance_preferences.close()
             if client_commands is not None:
                 await client_commands.stop()
             if post_run_effects is not None:
@@ -445,6 +452,7 @@ class KaiApplicationHost:
             services.github_settings.close,
             services.notification_preferences.close,
             services.client_preferences.close,
+            services.appearance_preferences.close,
             services.client_commands.stop,
             services.post_run_effects.stop,
             services.client_store.close,

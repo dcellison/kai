@@ -2,8 +2,11 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 
 import App from "./App";
+import { restoreWorkshopThemeHint } from "./theme";
 import "./themes.css";
 import "./styles.css";
+
+restoreWorkshopThemeHint();
 
 const root = document.getElementById("root");
 if (!root) {

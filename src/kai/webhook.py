@@ -62,6 +62,7 @@ from kai.config import (
 )
 from kai.internal_api_auth import InternalAPIAuth, InternalAPIPrincipal, InternalAPIScope
 from kai.job_types import CANONICAL_JOB_TYPES, normalize_job_type
+from kai.workshop.appearance_preferences import WorkshopAppearancePreferenceService
 from kai.workshop.artifacts import MAX_ARTIFACT_BYTES, WorkshopArtifactService
 from kai.workshop.client_api import (
     WorkshopClientCommandSubmitter,
@@ -1790,6 +1791,7 @@ async def _register_workshop_client_api(
     github_settings: WorkshopGitHubSettingsService | None = None,
     notification_preferences: WorkshopNotificationPreferenceService | None = None,
     client_preferences: WorkshopClientPreferenceService | None = None,
+    appearance_preferences: WorkshopAppearancePreferenceService | None = None,
 ) -> Callable[[web.Application], None]:
     """Register the client API against the core-owned canonical store.
 
@@ -1828,6 +1830,7 @@ async def _register_workshop_client_api(
             github_settings=github_settings,
             notification_preferences=notification_preferences,
             client_preferences=client_preferences,
+            appearance_preferences=appearance_preferences,
         )
         if command_submitter is not None:
             register_workshop_command_routes(
@@ -1909,6 +1912,7 @@ async def start(
             github_settings=getattr(core_services, "github_settings", None),
             notification_preferences=getattr(core_services, "notification_preferences", None),
             client_preferences=getattr(core_services, "client_preferences", None),
+            appearance_preferences=getattr(core_services, "appearance_preferences", None),
         )
 
     _runner = web.AppRunner(

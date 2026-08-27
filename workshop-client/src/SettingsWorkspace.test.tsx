@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ChannelAccessError,
+  loadAppearancePreferences,
   loadGitHubSettings,
   loadNotificationPreferences,
   loadClientPreferences,
@@ -18,6 +19,7 @@ import {
   updateGitHubSettings,
   updateNotificationPreference,
   updateClientPreference,
+  updateAppearancePreference,
   updateRuntimeSettings,
   updateWorkspaceConfig,
 } from "./api";
@@ -27,6 +29,7 @@ import type {
   WorkshopGitHubSettings,
   WorkshopNotificationPreferences,
   WorkshopClientPreferences,
+  WorkshopAppearancePreferences,
   WorkshopSettingsWorkspace,
   WorkshopWorkspaceConfig,
 } from "./types";
@@ -39,6 +42,7 @@ vi.mock("./api", async (importOriginal) => {
     loadGitHubSettings: vi.fn(),
     loadNotificationPreferences: vi.fn(),
     loadClientPreferences: vi.fn(),
+    loadAppearancePreferences: vi.fn(),
     loadPreferenceHistory: vi.fn(),
     loadSettingsWorkspace: vi.fn(),
     loadWorkspaceConfig: vi.fn(),
@@ -48,6 +52,7 @@ vi.mock("./api", async (importOriginal) => {
     updateGitHubSettings: vi.fn(),
     updateNotificationPreference: vi.fn(),
     updateClientPreference: vi.fn(),
+    updateAppearancePreference: vi.fn(),
     updateRuntimeSettings: vi.fn(),
     updateWorkspaceConfig: vi.fn(),
   };
@@ -56,6 +61,19 @@ vi.mock("./api", async (importOriginal) => {
 const session = {
   channelId: "chn_d3dfdfd7df9151ba8a1742b92403faa5",
   token: "session-secret",
+};
+
+const appearancePreferences: WorkshopAppearancePreferences = {
+  mutation: null,
+  revision: "apr_current",
+  themeId: "atom-one-dark",
+  themes: [
+    {
+      colorScheme: "dark",
+      displayName: "Atom One Dark",
+      themeId: "atom-one-dark",
+    },
+  ],
 };
 
 const preference: WorkshopPreferenceDocument = {
@@ -287,6 +305,7 @@ describe("Settings workspace", () => {
     vi.mocked(loadGitHubSettings).mockResolvedValue(githubSettings);
     vi.mocked(loadNotificationPreferences).mockResolvedValue(notificationPreferences);
     vi.mocked(loadClientPreferences).mockResolvedValue(clientPreferences);
+    vi.mocked(loadAppearancePreferences).mockResolvedValue(appearancePreferences);
     vi.mocked(loadWorkspaceConfig).mockResolvedValue(workspaceConfig);
     vi.mocked(savePreferenceDocument).mockResolvedValue({
       ...preference,
@@ -301,6 +320,7 @@ describe("Settings workspace", () => {
     vi.mocked(updateGitHubSettings).mockResolvedValue(githubSettings);
     vi.mocked(updateNotificationPreference).mockResolvedValue(notificationPreferences);
     vi.mocked(updateClientPreference).mockResolvedValue(clientPreferences);
+    vi.mocked(updateAppearancePreference).mockResolvedValue(appearancePreferences);
     vi.mocked(updateWorkspaceConfig).mockResolvedValue(workspaceConfig);
     vi.mocked(switchWorkspace).mockResolvedValue({
       ...runtime,
@@ -742,6 +762,15 @@ describe("Settings workspace", () => {
       },
     );
     await waitFor(() => expect(mode).toHaveValue("text_and_voice"));
+  });
+
+  it("loads the principal-scoped Workshop appearance", async () => {
+    renderSettings();
+
+    const selector = await screen.findByLabelText("Theme");
+    expect(selector).toHaveValue("atom-one-dark");
+    expect(screen.getByRole("option", { name: "Atom One Dark" })).toBeVisible();
+    expect(document.documentElement.dataset.workshopTheme).toBe("atom-one-dark");
   });
 
   it("shows unavailable voice capability without editable controls", async () => {

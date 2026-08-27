@@ -15,6 +15,7 @@ import {
   AuthenticationError,
   cancelRun,
   ChannelAccessError,
+  loadAppearancePreferences,
   loadNavigation,
   loadNotificationPreferences,
   loadArtifactBlob,
@@ -41,6 +42,7 @@ import type {
   WorkshopSettingsWorkspace,
   WorkshopSummary,
   WorkshopArtifactSummary,
+  WorkshopAppearancePreferences,
 } from "./types";
 import { CHANNEL_PATTERN } from "./types";
 import { RunTraceCard } from "./RunTraceCard";
@@ -51,6 +53,7 @@ import { MarkdownMessage } from "./MarkdownMessage";
 import { startArtifactDownload } from "./artifactDownload";
 import { MemoryExplorer } from "./MemoryExplorer";
 import { SettingsWorkspace } from "./SettingsWorkspace";
+import { applyWorkshopTheme, clearWorkshopThemeHint } from "./theme";
 
 const SESSION_KEY = "kai.workshop.read-session.v1";
 const ACTIVE_RUN_KEY = "kai.workshop.active-run.v1";
@@ -2205,6 +2208,7 @@ export default function App(): React.JSX.Element {
 
   const forgetSession = useCallback((message: string | null = null): void => {
     forgetStoredSession();
+    clearWorkshopThemeHint();
     setSession(null);
     setNavigation(null);
     setNotice(message);
@@ -2222,6 +2226,7 @@ export default function App(): React.JSX.Element {
       token: string,
       discovered: WorkshopNavigation,
       preferredChannelId: string | null,
+      appearance: WorkshopAppearancePreferences,
     ): void => {
       const selected = preferredNavigationChannel(discovered, preferredChannelId);
       if (!selected) {
@@ -2231,6 +2236,7 @@ export default function App(): React.JSX.Element {
       storeSession(nextSession);
       setSession(nextSession);
       setNavigation(discovered);
+      applyWorkshopTheme(appearance.themeId);
       setNotice(null);
       setView("workshop");
     },
@@ -2242,10 +2248,13 @@ export default function App(): React.JSX.Element {
       return;
     }
     let cancelled = false;
-    void loadNavigation(session.token)
-      .then((discovered) => {
+    void Promise.all([
+      loadNavigation(session.token),
+      loadAppearancePreferences({ token: session.token }),
+    ])
+      .then(([discovered, appearance]) => {
         if (!cancelled) {
-          adoptNavigation(session.token, discovered, session.channelId);
+          adoptNavigation(session.token, discovered, session.channelId, appearance);
         }
       })
       .catch((caught: unknown) => {
@@ -2278,8 +2287,11 @@ export default function App(): React.JSX.Element {
     const token =
       session?.token ??
       (await redeemEnrollment(enrollmentToken, deviceDisplayName));
-    const discovered = await loadNavigation(token);
-    adoptNavigation(token, discovered, session?.channelId ?? null);
+    const [discovered, appearance] = await Promise.all([
+      loadNavigation(token),
+      loadAppearancePreferences({ token }),
+    ]);
+    adoptNavigation(token, discovered, session?.channelId ?? null, appearance);
   };
 
   const refreshChannelAccess = useCallback(async (message: string): Promise<void> => {
@@ -2287,8 +2299,11 @@ export default function App(): React.JSX.Element {
       return;
     }
     try {
-      const discovered = await loadNavigation(session.token);
-      adoptNavigation(session.token, discovered, session.channelId);
+      const [discovered, appearance] = await Promise.all([
+        loadNavigation(session.token),
+        loadAppearancePreferences({ token: session.token }),
+      ]);
+      adoptNavigation(session.token, discovered, session.channelId, appearance);
     } catch (caught) {
       if (caught instanceof AuthenticationError) {
         forgetSession(caught.message);

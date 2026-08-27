@@ -13,6 +13,7 @@ import pytest
 from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 
+from kai.workshop.appearance_preferences import WorkshopAppearancePreferenceService
 from kai.workshop.artifacts import (
     StagedArtifact,
     WorkshopArtifactService,
@@ -571,6 +572,7 @@ async def _open_client(
     github_settings=None,
     notification_preferences=None,
     client_preferences=None,
+    appearance_preferences=None,
 ) -> TestClient:
     app = web.Application()
     register_workshop_read_routes(
@@ -589,6 +591,7 @@ async def _open_client(
         github_settings=github_settings,
         notification_preferences=notification_preferences,
         client_preferences=client_preferences,
+        appearance_preferences=appearance_preferences,
     )
     client = TestClient(TestServer(app))
     await client.start_server()
@@ -2847,7 +2850,14 @@ async def test_client_voice_preferences_api_is_binding_scoped_and_revision_check
         assert payload["voice_output"]["available"] is True
         assert payload["voice_output"]["bindings"][0]["client_name"] == "Telegram"
         assert payload["voice_output"]["bindings"][0]["choice_id"].startswith("cbd_")
-        assert "101" not in json.dumps(payload)
+        assert set(payload["voice_output"]["bindings"][0]) == {
+            "choice_id",
+            "client_name",
+            "mode",
+            "voice",
+            "voice_name",
+            "editable",
+        }
 
         binding_choice = payload["voice_output"]["bindings"][0]["choice_id"]
         changed = await client.patch(
@@ -2885,6 +2895,63 @@ async def test_client_voice_preferences_api_is_binding_scoped_and_revision_check
         )
         assert stale.status == 409
         assert forged.status == 403
+    finally:
+        await client.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_appearance_preferences_api_is_principal_scoped_and_revision_checked(
+    tmp_path: Path,
+) -> None:
+    store, alice_id, _, bob_id, _ = await _open_store(tmp_path / "kai.db")
+    service = WorkshopAppearancePreferenceService(store.connection)
+    client = await _open_client(
+        store,
+        _Authenticator({"alice-token": alice_id, "bob-token": bob_id}),
+        appearance_preferences=service,
+    )
+    alice_headers = {"Authorization": "Bearer alice-token"}
+    bob_headers = {"Authorization": "Bearer bob-token"}
+    try:
+        loaded = await client.get("/v1/settings/appearance", headers=alice_headers)
+        payload = await loaded.json()
+        assert loaded.status == 200
+        assert payload["theme_id"] == "atom-one-dark"
+        assert payload["themes"] == [
+            {
+                "theme_id": "atom-one-dark",
+                "display_name": "Atom One Dark",
+                "color_scheme": "dark",
+            }
+        ]
+
+        unchanged = await client.patch(
+            "/v1/settings/appearance",
+            headers=alice_headers,
+            json={"revision": payload["revision"], "theme_id": "atom-one-dark"},
+        )
+        assert unchanged.status == 200
+        assert (await unchanged.json())["mutation"] == {
+            "operation": "set_theme",
+            "changed": False,
+        }
+
+        invalid = await client.patch(
+            "/v1/settings/appearance",
+            headers=alice_headers,
+            json={"revision": payload["revision"], "theme_id": "../../custom.css"},
+        )
+        stale_principal = await client.patch(
+            "/v1/settings/appearance",
+            headers=bob_headers,
+            json={"revision": payload["revision"], "theme_id": "atom-one-dark"},
+        )
+        anonymous = await client.get("/v1/settings/appearance")
+        assert invalid.status == 400
+        assert stale_principal.status == 409
+        assert anonymous.status == 401
+        assert anonymous.headers["WWW-Authenticate"] == "Bearer"
     finally:
         await client.close()
         await store.close()

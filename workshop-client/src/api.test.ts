@@ -11,6 +11,7 @@ import {
   deleteMemory,
   editMemory,
   loadArtifactBlob,
+  loadAppearancePreferences,
   loadEarlierTimeline,
   loadMemoryDetail,
   loadMemoryRecords,
@@ -37,6 +38,7 @@ import {
   updateGitHubSettings,
   updateNotificationPreference,
   updateClientPreference,
+  updateAppearancePreference,
   updateWorkspaceConfig,
 } from "./api";
 import type { WorkshopSession } from "./types";
@@ -742,6 +744,45 @@ describe("Workshop client API", () => {
       mode: "text_and_voice",
     });
     expect(JSON.stringify(loaded)).not.toContain("12345");
+  });
+
+  it("loads and mutates allowlisted appearance preferences", async () => {
+    const payload = {
+      version: 1,
+      theme_id: "atom-one-dark",
+      themes: [
+        {
+          theme_id: "atom-one-dark",
+          display_name: "Atom One Dark",
+          color_scheme: "dark",
+        },
+      ],
+      revision: "apr_current",
+      mutation: null,
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json(payload))
+      .mockResolvedValueOnce(Response.json({
+        ...payload,
+        mutation: { operation: "set_theme", changed: false },
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(loadAppearancePreferences(session)).resolves.toMatchObject({
+      themeId: "atom-one-dark",
+      themes: [{ displayName: "Atom One Dark", colorScheme: "dark" }],
+    });
+    await expect(
+      updateAppearancePreference(session, "apr_current", "atom-one-dark"),
+    ).resolves.toMatchObject({
+      mutation: { operation: "set_theme", changed: false },
+    });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/v1/settings/appearance");
+    expect(JSON.parse((fetchMock.mock.calls[1]?.[1] as RequestInit).body as string)).toEqual({
+      revision: "apr_current",
+      theme_id: "atom-one-dark",
+    });
   });
 
   it("rejects malformed memory records instead of rendering partial data", async () => {

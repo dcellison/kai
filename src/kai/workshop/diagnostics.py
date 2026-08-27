@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from kai.workshop.appearance_preferences import WORKSHOP_APPEARANCE_THEMES
 from kai.workshop.domain import (
     ChannelId,
     EventEnvelope,
@@ -1269,6 +1270,42 @@ def workshop_client_preference_status(
         f"{prefix} {state}; eligible bindings={eligible}, preferences={preferences}, "
         f"migrations={migrations}, missing={missing}, stale={stale}; "
         f"voice capability={capability}, authority=canonical, legacy reads=disabled, rollback dual writes=active"
+    )
+
+
+def workshop_appearance_preference_status(db_path: Path) -> str:
+    """Report principal-scoped Workshop appearance authority."""
+    prefix = "Workshop appearance preferences:"
+    if not db_path.is_file():
+        return f"{prefix} pending; canonical appearance preference schema unavailable"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if not tables >= {"principals", "principal_appearance_preferences"}:
+                return f"{prefix} pending; canonical appearance preference schema unavailable"
+            principals = _scalar(connection, "SELECT COUNT(*) FROM principals WHERE kind = 'human'")
+            stored_themes = [
+                str(row[0])
+                for row in connection.execute("SELECT theme_id FROM principal_appearance_preferences").fetchall()
+            ]
+        finally:
+            connection.close()
+    except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    known = {item.theme_id for item in WORKSHOP_APPEARANCE_THEMES}
+    invalid = sum(theme_id not in known for theme_id in stored_themes)
+    explicit = len(stored_themes)
+    defaulted = max(0, principals - explicit)
+    state = "active" if explicit <= principals and invalid == 0 else "INCOMPLETE"
+    return (
+        f"{prefix} {state}; principals={principals}, explicit={explicit}, "
+        f"defaulted={defaulted}, invalid={invalid}; authority=canonical"
     )
 
 
