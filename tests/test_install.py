@@ -9720,6 +9720,165 @@ class TestIndependentRuntimePolicy:
         profile = next(iter(yaml.safe_load(rendered)["runtime_profiles"].values()))
         assert profile["allowed_backends"] == ["codex"]
 
+    def test_runtime_access_grant_and_revoke_are_scoped_to_one_profile(self):
+        first_id = str(kai.install.runtime_profile_id_for_config_id(101))
+        second_id = str(kai.install.runtime_profile_id_for_config_id(202))
+        document: dict[str, object] = {
+            "version": 2,
+            "runtime_profiles": {
+                first_id: {
+                    "display_name": "Daniel",
+                    "backend": "claude",
+                    "provider": "anthropic",
+                    "allowed_backends": ["claude"],
+                },
+                second_id: {
+                    "display_name": "Scott",
+                    "backend": "codex",
+                    "provider": "openai",
+                    "allowed_backends": ["codex"],
+                },
+            },
+        }
+        untouched = json.loads(json.dumps(document["runtime_profiles"][second_id]))
+
+        assert kai.install._update_runtime_access_document(
+            document,
+            profile_id=first_id,
+            backend="opencode",
+            provider="openai",
+            grant=True,
+        )
+        assert kai.install._update_runtime_access_document(
+            document,
+            profile_id=first_id,
+            backend="opencode",
+            provider="anthropic",
+            grant=True,
+        )
+        assert not kai.install._update_runtime_access_document(
+            document,
+            profile_id=first_id,
+            backend="opencode",
+            provider="openai",
+            grant=True,
+        )
+        assert kai.install._update_runtime_access_document(
+            document,
+            profile_id=first_id,
+            backend="opencode",
+            provider="anthropic",
+            grant=False,
+        )
+
+        profiles = document["runtime_profiles"]
+        assert isinstance(profiles, dict)
+        first = profiles[first_id]
+        assert isinstance(first, dict)
+        assert first["backend_options"] == [
+            {"backend": "claude", "provider": "anthropic"},
+            {"backend": "opencode", "provider": "openai"},
+        ]
+        assert "allowed_backends" not in first
+        assert profiles[second_id] == untouched
+
+    def test_runtime_access_cannot_revoke_protected_default(self):
+        profile_id = str(kai.install.runtime_profile_id_for_config_id(101))
+        document: dict[str, object] = {
+            "version": 2,
+            "runtime_profiles": {
+                profile_id: {
+                    "display_name": "Daniel",
+                    "backend": "claude",
+                    "provider": "anthropic",
+                    "allowed_backends": ["claude"],
+                }
+            },
+        }
+
+        with pytest.raises(ValueError, match="protected default"):
+            kai.install._update_runtime_access_document(
+                document,
+                profile_id=profile_id,
+                backend="claude",
+                provider="anthropic",
+                grant=False,
+            )
+
+    def test_runtime_access_command_writes_valid_explicit_policy(
+        self,
+        tmp_path,
+        monkeypatch,
+        capsys,
+    ):
+        profile_id = str(kai.install.runtime_profile_id_for_config_id(101))
+        policy = tmp_path / "runtime-profiles.yaml"
+        policy.write_text(
+            yaml.safe_dump(
+                {
+                    "version": 2,
+                    "runtime_profiles": {
+                        profile_id: {
+                            "display_name": "Daniel",
+                            "backend": "claude",
+                            "provider": "anthropic",
+                            "model": "sonnet",
+                            "timeout_seconds": 120,
+                            "allowed_backends": ["claude"],
+                            "allowed_services": [],
+                            "home_workspace": None,
+                            "workspace_base": None,
+                            "allowed_workspaces": [],
+                        }
+                    },
+                },
+                sort_keys=False,
+            )
+        )
+        written: list[str] = []
+        answers = iter(["1", "grant", "opencode", "openai", "done"])
+        monkeypatch.setattr("kai.install.RUNTIME_PROFILES_YAML", policy)
+        monkeypatch.setattr("kai.install.os.geteuid", lambda: 0)
+        monkeypatch.setattr("kai.install.validate_protected_file_metadata", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            "kai.install.load_backend_registry",
+            lambda _path: {"claude": {}, "opencode": {}},
+        )
+        monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+        monkeypatch.setattr(
+            "kai.install._write_runtime_access_policy",
+            lambda _path, content: written.append(content),
+        )
+
+        kai.install._cmd_runtime_access()
+
+        assert len(written) == 1
+        updated = yaml.safe_load(written[0])
+        assert updated["runtime_profiles"][profile_id]["backend_options"] == [
+            {"backend": "claude", "provider": "anthropic"},
+            {"backend": "opencode", "provider": "openai"},
+        ]
+        assert "allowed_backends" not in updated["runtime_profiles"][profile_id]
+        assert "Run `make install`" in capsys.readouterr().out
+
+    def test_runtime_access_command_requires_root(self, monkeypatch):
+        monkeypatch.setattr("kai.install.os.geteuid", lambda: 501)
+
+        with pytest.raises(SystemExit, match="make runtime-access"):
+            kai.install._cmd_runtime_access()
+
+    def test_runtime_access_policy_write_is_atomic_and_private(self, tmp_path, monkeypatch):
+        policy = tmp_path / "runtime-profiles.yaml"
+        policy.write_text("old\n")
+        monkeypatch.setattr("kai.install.validate_protected_file_metadata", lambda *args, **kwargs: None)
+        monkeypatch.setattr("kai.install.os.chown", lambda *args: None)
+
+        kai.install._write_runtime_access_policy(policy, "new\n")
+
+        assert policy.read_text() == "new\n"
+        assert stat.S_IMODE(policy.stat().st_mode) == 0o600
+        assert list(tmp_path.iterdir()) == [policy]
+
     def test_migration_rejects_relative_workspace_paths(self, tmp_path):
         users_yaml = tmp_path / "users.yaml"
         users_yaml.write_text(
@@ -9790,6 +9949,7 @@ class TestIndependentRuntimePolicy:
         daniel_id = str(kai.install.runtime_profile_id_for_config_id(101))
         scott_id = str(kai.install.runtime_profile_id_for_config_id(202))
         assert document["version"] == 2
+        assert document["backend_selection_policy_version"] == 1
         assert document["legacy_runtime_archive"] == {
             "version": 1,
             "runtime_keys": {daniel_id: 101, scott_id: 202},
@@ -9960,6 +10120,89 @@ backends:
         _apply_runtime_policy("upgrade", "enriched-policy\n", dry_run=False)
 
         assert policy.read_text() == "enriched-policy\n"
+
+    def test_upgrade_shares_live_operator_assigned_backend_defaults_once(self):
+        first_id = str(kai.install.runtime_profile_id_for_config_id(101))
+        qualification_id = str(kai.install.runtime_profile_id_for_config_id(202))
+        original = yaml.safe_dump(
+            {
+                "version": 2,
+                "runtime_profiles": {
+                    first_id: {
+                        "display_name": "Daniel",
+                        "backend": "claude",
+                        "provider": "anthropic",
+                        "allowed_backends": ["claude"],
+                    },
+                    qualification_id: {
+                        "display_name": "Codex qualification",
+                        "backend": "codex",
+                        "provider": "openai",
+                        "allowed_backends": ["codex"],
+                    },
+                },
+            },
+            sort_keys=False,
+        )
+        migrated = yaml.safe_dump(
+            {
+                "version": 2,
+                "backend_selection_policy_version": 1,
+                "runtime_profiles": {
+                    first_id: {
+                        "display_name": "Daniel",
+                        "backend": "claude",
+                        "provider": "anthropic",
+                        "model": "sonnet",
+                        "timeout_seconds": 120,
+                        "maximum_timeout_seconds": 600,
+                        "allowed_backends": ["claude"],
+                        "allowed_services": [],
+                        "home_workspace": None,
+                        "workspace_base": None,
+                        "allowed_workspaces": [],
+                        "models": {},
+                        "github_repos": [],
+                        "pr_review": None,
+                        "issue_triage": None,
+                        "allowed_triage_projects": [],
+                    }
+                },
+            },
+            sort_keys=False,
+        )
+        defaults = kai.install._RuntimePolicyDefaults(
+            backend="claude",
+            provider="anthropic",
+            model="sonnet",
+            timeout_seconds=120,
+        )
+
+        upgraded, changed = kai.install._upgrade_runtime_policy_content(
+            original,
+            migrated,
+            defaults,
+        )
+        document = yaml.safe_load(upgraded)
+
+        assert changed
+        assert document["backend_selection_policy_version"] == 1
+        assert document["runtime_profiles"][first_id]["allowed_backends"] == [
+            "claude",
+            "codex",
+        ]
+        assert document["runtime_profiles"][qualification_id]["allowed_backends"] == [
+            "claude",
+            "codex",
+        ]
+
+        repeated, repeated_change = kai.install._upgrade_runtime_policy_content(
+            upgraded,
+            migrated,
+            defaults,
+        )
+        assert not repeated_change
+        assert repeated == upgraded
 
     def test_apply_plan_enriches_existing_policy_without_replacing_profile_identity(
         self,

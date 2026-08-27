@@ -78,7 +78,8 @@ export interface WorkshopSettingsMutation {
 
 export interface WorkshopSettingsWorkspace {
   backend: string;
-  backendOptions: { backend: string; current: boolean; provider: string }[];
+  backendOptionId: string;
+  backendOptions: { backend: string; current: boolean; optionId: string; provider: string }[];
   capabilities: WorkshopEditableCapability[];
   channelId: string;
   model: { defaultValue: string; source: string; value: string };

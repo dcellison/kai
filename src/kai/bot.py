@@ -592,9 +592,12 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         service = _get_core_services(context).settings_workspaces
         if not value:
             snapshot = await service.inspect(authority)
-            choices = ", ".join(option.backend for option in snapshot.backend_options)
+            choices = ", ".join(
+                f"{option.option_id} ({option.backend}/{option.provider})" for option in snapshot.backend_options
+            )
             await update.message.reply_text(
-                f"Current backend: {snapshot.backend}\nAvailable: {choices}\nUsage: /settings backend <name>"
+                f"Current backend: {snapshot.backend_option_id}\n"
+                f"Available: {choices}\nUsage: /settings backend <backend:provider>"
             )
             return
         try:
@@ -603,7 +606,7 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await update.message.reply_text(str(exc))
             return
         await update.message.reply_text(
-            f"Backend switched to {snapshot.backend}. "
+            f"Backend switched to {snapshot.backend_option_id}. "
             "Your next message will start a new provider session; Kai and other users were not restarted."
         )
         return

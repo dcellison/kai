@@ -167,6 +167,55 @@ def test_document_builds_explicit_backend_choices_from_protected_allowlist():
         profile.backend_option("goose")
 
 
+def test_document_authorizes_all_five_backends_with_explicit_provider_options():
+    profile_id = runtime_profile_id_for_config_id(101)
+    registry = WorkshopRuntimeProfileRegistry.from_document(
+        {
+            "version": 2,
+            "runtime_profiles": {
+                str(profile_id): {
+                    "display_name": "Daniel coding",
+                    "os_user": "daniel",
+                    "backend": "claude",
+                    "provider": "anthropic",
+                    "model": "sonnet",
+                    "timeout_seconds": 120,
+                    "backend_options": [
+                        {"backend": "claude", "provider": "anthropic"},
+                        {"backend": "codex", "provider": "openai"},
+                        {"backend": "goose", "provider": "openrouter"},
+                        {"backend": "opencode", "provider": "anthropic"},
+                        {"backend": "opencode", "provider": "openai"},
+                        {"backend": "pi", "provider": "openai-codex"},
+                    ],
+                    "allowed_services": [],
+                    "allowed_workspaces": [],
+                }
+            },
+        },
+        backend_registry={
+            "claude": {},
+            "codex": {},
+            "goose": {},
+            "opencode": {},
+            "pi": {},
+        },
+    )
+
+    profile = registry.resolve(profile_id)
+    assert [option.option_id for option in profile.backend_options] == [
+        "claude:anthropic",
+        "codex:openai",
+        "goose:openrouter",
+        "opencode:anthropic",
+        "opencode:openai",
+        "pi:openai-codex",
+    ]
+    assert profile.backend_option("opencode:openai").provider == "openai"
+    with pytest.raises(WorkshopRuntimeProfileError, match="not authorized"):
+        profile.backend_option("opencode")
+
+
 @pytest.mark.parametrize(
     ("os_user", "message"),
     (

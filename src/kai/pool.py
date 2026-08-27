@@ -323,7 +323,7 @@ class SubprocessPool:
             )
             if selected:
                 try:
-                    profile.backend_option(selected)
+                    selected = profile.backend_option(selected).option_id
                 except WorkshopRuntimeProfileError:
                     log.error(
                         "Ignoring unauthorized canonical backend %r for runtime profile %s",
@@ -331,13 +331,15 @@ class SubprocessPool:
                         profile.profile_id,
                     )
                     selected = ""
-            self._selected_backends[profile.profile_id] = selected or profile.backend
+            self._selected_backends[profile.profile_id] = selected or profile.default_backend_option.option_id
 
     def _backend_option(self, runtime: RuntimeSelector):
         runtime_key, _legacy_key, profile = self._resolve_runtime(runtime)
         if profile is None:
             return None
-        return profile.backend_option(self._selected_backends.get(runtime_key, profile.backend))
+        return profile.backend_option(
+            self._selected_backends.get(runtime_key, profile.default_backend_option.option_id)
+        )
 
     def _backend_transition_lock(self, runtime_key: RuntimePoolKey) -> asyncio.Lock:
         return self._backend_transition_locks.setdefault(runtime_key, asyncio.Lock())
@@ -1191,7 +1193,7 @@ class SubprocessPool:
     async def select_backend(
         self,
         runtime: RuntimeSelector,
-        backend: str,
+        backend_option_id: str,
         *,
         commit_selection: Callable[[], Awaitable[None]] | None = None,
     ) -> bool:
@@ -1205,14 +1207,14 @@ class SubprocessPool:
         runtime_key, _, profile = self._resolve_runtime(runtime)
         if profile is None:
             raise RuntimeError("Backend selection requires a protected runtime profile")
-        profile.backend_option(backend)
+        option = profile.backend_option(backend_option_id)
         async with self._backend_transition_lock(runtime_key):
             if runtime_key in self._in_flight:
                 return False
             await self.force_kill(runtime)
             if commit_selection is not None:
                 await commit_selection()
-            self._selected_backends[runtime_key] = backend
+            self._selected_backends[runtime_key] = option.option_id
             return True
 
     async def change_workspace(

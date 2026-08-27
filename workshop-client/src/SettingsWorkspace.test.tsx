@@ -53,13 +53,14 @@ const preference: WorkshopPreferenceDocument = {
 
 const runtime: WorkshopSettingsWorkspace = {
   backend: "claude",
+  backendOptionId: "claude:anthropic",
   backendOptions: [
-    { backend: "claude", provider: "anthropic", current: true },
-    { backend: "codex", provider: "openai", current: false },
+    { optionId: "claude:anthropic", backend: "claude", provider: "anthropic", current: true },
+    { optionId: "codex:openai", backend: "codex", provider: "openai", current: false },
   ],
   capabilities: [
     {
-      choices: ["claude", "codex"],
+      choices: ["claude:anthropic", "codex:openai"],
       field: "backend",
       maximum: null,
       minimum: null,
@@ -220,7 +221,7 @@ describe("Settings workspace", () => {
     expect(await screen.findByLabelText("Preference Markdown")).toHaveValue(
       preference.content,
     );
-    expect(screen.getByLabelText("Backend")).toHaveValue("claude");
+    expect(screen.getByLabelText("Backend")).toHaveValue("claude:anthropic");
     expect(screen.getByRole("option", { name: "claude · anthropic" })).toBeVisible();
     expect(screen.getByRole("option", { name: "Kai" })).toBeVisible();
     expect(screen.getByRole("option", { name: "Home" })).toBeVisible();
@@ -364,10 +365,11 @@ describe("Settings workspace", () => {
     vi.mocked(updateRuntimeSettings).mockResolvedValue({
       ...runtime,
       backend: "codex",
+      backendOptionId: "codex:openai",
       provider: "openai",
       backendOptions: runtime.backendOptions.map((option) => ({
         ...option,
-        current: option.backend === "codex",
+        current: option.optionId === "codex:openai",
       })),
       mutation: {
         changed: true,
@@ -380,14 +382,14 @@ describe("Settings workspace", () => {
     renderSettings();
     const backend = await screen.findByLabelText("Backend");
 
-    await user.selectOptions(backend, "codex");
+    await user.selectOptions(backend, "codex:openai");
     await user.click(screen.getByRole("button", { name: "Switch backend" }));
 
     expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining("other people and Kai itself will not restart"));
     expect(updateRuntimeSettings).toHaveBeenCalledWith(
       session,
       "sws_current",
-      { field: "backend", value: "codex" },
+      { field: "backend", value: "codex:openai" },
     );
     expect(await screen.findByText(/provider-session continuity was cleared/)).toBeVisible();
   });

@@ -157,7 +157,7 @@ export function SettingsWorkspace({
 
   const adoptRuntime = useCallback((snapshot: WorkshopSettingsWorkspace): void => {
     setRuntime(snapshot);
-    setRuntimeBackend(snapshot.backend);
+    setRuntimeBackend(snapshot.backendOptionId);
     setRuntimeModel(snapshot.model.value);
     setRuntimeTimeout(String(snapshot.timeoutSeconds.value));
   }, []);
@@ -299,7 +299,7 @@ export function SettingsWorkspace({
       setRuntimeNotice(mutationMessage(changed.mutation));
     } catch (caught) {
       if (change.field === "backend") {
-        setRuntimeBackend(runtime.backend);
+        setRuntimeBackend(runtime.backendOptionId);
       }
       if (caught instanceof SettingsRevisionConflictError) {
         await refreshRuntime();
@@ -574,7 +574,7 @@ export function SettingsWorkspace({
                     onChange={(event) => setRuntimeBackend(event.target.value)}
                   >
                     {runtime.backendOptions.map((option) => (
-                      <option key={option.backend} value={option.backend}>
+                      <option key={option.optionId} value={option.optionId}>
                         {option.backend} · {option.provider}
                       </option>
                     ))}
@@ -589,7 +589,7 @@ export function SettingsWorkspace({
                     <button
                       className="primary-button"
                       type="submit"
-                      disabled={runtimeBusy || runActive || runtimeBackend === runtime.backend}
+                      disabled={runtimeBusy || runActive || runtimeBackend === runtime.backendOptionId}
                     >
                       Switch backend
                     </button>

@@ -178,10 +178,12 @@ def _serialize_settings_workspace(
         "principal_id": str(snapshot.principal_id),
         "channel_id": str(snapshot.channel_id),
         "runtime_profile_id": str(snapshot.runtime_profile_id),
+        "backend_option_id": snapshot.backend_option_id,
         "backend": snapshot.backend,
         "provider": snapshot.provider,
         "backend_options": [
             {
+                "option_id": option.option_id,
                 "backend": option.backend,
                 "provider": option.provider,
                 "current": option.current,

@@ -53,6 +53,11 @@ class ProtectedRuntimeBackend:
     allowed_models: tuple[str, ...] | None = None
     role_models: tuple[tuple[str, str], ...] = ()
 
+    @property
+    def option_id(self) -> str:
+        """Stable canonical selector for this backend/provider pair."""
+        return f"{self.backend}:{self.provider}"
+
 
 @dataclass(frozen=True, slots=True)
 class ProtectedRuntimeProfile:
@@ -104,18 +109,30 @@ class ProtectedRuntimeProfile:
                 ),
             )
             object.__setattr__(self, "backend_options", options)
-        by_backend = {option.backend: option for option in options}
-        if len(by_backend) != len(options) or self.backend not in by_backend:
+        by_option = {option.option_id: option for option in options}
+        default_option_id = f"{self.backend}:{self.provider}"
+        if len(by_option) != len(options) or default_option_id not in by_option:
             raise WorkshopRuntimeProfileError(
-                "backend_options must contain each backend exactly once, including the protected default"
+                "backend_options must contain unique backend/provider pairs, including the protected default"
             )
 
-    def backend_option(self, backend: str) -> ProtectedRuntimeBackend:
-        """Resolve one explicitly authorized backend or fail closed."""
+    @property
+    def default_backend_option(self) -> ProtectedRuntimeBackend:
+        """Return the profile's protected default backend/provider pair."""
+        return self.backend_option(f"{self.backend}:{self.provider}")
+
+    def backend_option(self, selector: str) -> ProtectedRuntimeBackend:
+        """Resolve an authorized option ID, accepting an unambiguous legacy backend."""
+        normalized = selector.strip().lower()
         for option in self.backend_options:
-            if option.backend == backend:
+            if option.option_id == normalized:
                 return option
-        raise WorkshopRuntimeProfileError(f"Runtime profile {self.profile_id}: backend {backend!r} is not authorized")
+        legacy_matches = [option for option in self.backend_options if option.backend == normalized]
+        if len(legacy_matches) == 1:
+            return legacy_matches[0]
+        raise WorkshopRuntimeProfileError(
+            f"Runtime profile {self.profile_id}: backend option {selector!r} is not authorized"
+        )
 
 
 def _compatibility_model(
@@ -462,20 +479,58 @@ class WorkshopRuntimeProfileRegistry:
                         f"Runtime profile {profile_id}: role model {role_model!r} is invalid for {backend}/{provider}"
                     )
                 role_models.append((role, role_model))
-            raw_allowed_backends = raw_profile.get("allowed_backends", [backend])
-            if not isinstance(raw_allowed_backends, list) or any(
-                not isinstance(item, str) or not item.strip() for item in raw_allowed_backends
-            ):
+            raw_backend_options = raw_profile.get("backend_options")
+            authorized_pairs: list[tuple[str, str]] = []
+            if raw_backend_options is not None:
+                if not isinstance(raw_backend_options, list) or any(
+                    not isinstance(item, dict) for item in raw_backend_options
+                ):
+                    raise WorkshopRuntimeProfileError(
+                        f"Runtime profile {profile_id}: backend_options must be a list of mappings"
+                    )
+                for item in raw_backend_options:
+                    assert isinstance(item, dict)
+                    option_backend = str(item.get("backend") or "").strip().lower()
+                    if option_backend not in VALID_BACKENDS:
+                        raise WorkshopRuntimeProfileError(
+                            f"Runtime profile {profile_id}: unsupported backend option {option_backend!r}"
+                        )
+                    option_provider = str(item.get("provider") or "").strip().lower()
+                    option_providers = BACKEND_PROVIDERS[option_backend]
+                    if not option_provider and len(option_providers) == 1:
+                        option_provider = option_providers[0]
+                    if option_provider not in option_providers:
+                        allowed = ", ".join(option_providers)
+                        raise WorkshopRuntimeProfileError(
+                            f"Runtime profile {profile_id}: provider {option_provider!r} is not valid for "
+                            f"backend option {option_backend!r}; expected one of: {allowed}"
+                        )
+                    authorized_pairs.append((option_backend, option_provider))
+            else:
+                raw_allowed_backends = raw_profile.get("allowed_backends", [backend])
+                if not isinstance(raw_allowed_backends, list) or any(
+                    not isinstance(item, str) or not item.strip() for item in raw_allowed_backends
+                ):
+                    raise WorkshopRuntimeProfileError(
+                        f"Runtime profile {profile_id}: allowed_backends must be a list of backend identifiers"
+                    )
+                for item in raw_allowed_backends:
+                    option_backend = item.strip().lower()
+                    option_provider = (
+                        provider if option_backend == backend else get_effective_provider(option_backend, provider)
+                    )
+                    authorized_pairs.append((option_backend, option_provider))
+            if (backend, provider) not in authorized_pairs:
                 raise WorkshopRuntimeProfileError(
-                    f"Runtime profile {profile_id}: allowed_backends must be a list of backend identifiers"
+                    f"Runtime profile {profile_id}: backend options must include protected default "
+                    f"{backend!r}/{provider!r}"
                 )
-            allowed_backends = tuple(dict.fromkeys(item.strip().lower() for item in raw_allowed_backends))
-            if backend not in allowed_backends:
+            if len(set(authorized_pairs)) != len(authorized_pairs):
                 raise WorkshopRuntimeProfileError(
-                    f"Runtime profile {profile_id}: allowed_backends must include protected default {backend!r}"
+                    f"Runtime profile {profile_id}: backend_options contains a duplicate backend/provider pair"
                 )
             backend_options: list[ProtectedRuntimeBackend] = []
-            for allowed_backend in allowed_backends:
+            for allowed_backend, option_provider in authorized_pairs:
                 if allowed_backend not in VALID_BACKENDS:
                     raise WorkshopRuntimeProfileError(
                         f"Runtime profile {profile_id}: unsupported allowed backend {allowed_backend!r}"
@@ -485,9 +540,6 @@ class WorkshopRuntimeProfileRegistry:
                         f"Runtime profile {profile_id}: allowed backend {allowed_backend!r} "
                         "is not present in the backend registry"
                     )
-                option_provider = (
-                    provider if allowed_backend == backend else get_effective_provider(allowed_backend, provider)
-                )
                 option_providers = BACKEND_PROVIDERS[allowed_backend]
                 if option_provider not in option_providers:
                     raise WorkshopRuntimeProfileError(
