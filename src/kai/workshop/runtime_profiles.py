@@ -82,6 +82,7 @@ class ProtectedRuntimeProfile:
     maximum_timeout_seconds: int = 0
     allowed_models: tuple[str, ...] | None = None
     role_models: tuple[tuple[str, str], ...] = ()
+    github_login: str | None = None
     github_repos: tuple[str, ...] = ()
     pr_review: bool | None = None
     issue_triage: bool | None = None
@@ -361,6 +362,7 @@ class WorkshopRuntimeProfileRegistry:
                         timeout_seconds,
                     ),
                     role_models=tuple(sorted((user.models or {}).items())),
+                    github_login=user.github,
                     github_repos=tuple(user.github_repos),
                     pr_review=user.pr_review,
                     issue_triage=user.issue_triage,
@@ -597,6 +599,20 @@ class WorkshopRuntimeProfileRegistry:
                 raise WorkshopRuntimeProfileError(
                     f"Runtime profile {profile_id}: github_repos must be a list of repositories"
                 )
+            raw_github_login = raw_profile.get("github_login")
+            if raw_github_login is not None and (
+                not isinstance(raw_github_login, str)
+                or not raw_github_login.strip()
+                or len(raw_github_login.strip()) > 39
+                or re.fullmatch(
+                    r"(?!.*--)[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?",
+                    raw_github_login.strip(),
+                )
+                is None
+            ):
+                raise WorkshopRuntimeProfileError(
+                    f"Runtime profile {profile_id}: github_login must be a valid GitHub login or null"
+                )
             raw_pr_review = raw_profile.get("pr_review")
             raw_issue_triage = raw_profile.get("issue_triage")
             if raw_pr_review is not None and not isinstance(raw_pr_review, bool):
@@ -637,6 +653,7 @@ class WorkshopRuntimeProfileRegistry:
                     maximum_timeout_seconds=raw_maximum_timeout,
                     allowed_models=allowed_models,
                     role_models=tuple(sorted(role_models)),
+                    github_login=raw_github_login.strip() if raw_github_login is not None else None,
                     github_repos=tuple(sorted({item.strip().lower() for item in raw_github_repos})),
                     pr_review=raw_pr_review,
                     issue_triage=raw_issue_triage,

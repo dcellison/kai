@@ -81,6 +81,7 @@ from kai.workshop.github_automation import (
     GitHubSubscriptionRoute,
     WorkshopGitHubAutomationService,
 )
+from kai.workshop.github_settings import WorkshopGitHubSettingsService
 from kai.workshop.integration_notifications import (
     DEFAULT_INTEGRATION_ROUTE,
     IntegrationNotification,
@@ -1784,6 +1785,7 @@ async def _register_workshop_client_api(
     settings_workspaces: WorkshopSettingsWorkspaceService | None = None,
     memory_queries: WorkshopMemoryQueryService | None = None,
     preference_documents: WorkshopPreferenceService | None = None,
+    github_settings: WorkshopGitHubSettingsService | None = None,
 ) -> Callable[[web.Application], None]:
     """Register the client API against the core-owned canonical store.
 
@@ -1819,6 +1821,7 @@ async def _register_workshop_client_api(
             settings_workspaces=settings_workspaces,
             memory_queries=memory_queries,
             preference_documents=preference_documents,
+            github_settings=github_settings,
         )
         if command_submitter is not None:
             register_workshop_command_routes(
@@ -1897,6 +1900,7 @@ async def start(
             settings_workspaces=core_services.settings_workspaces,
             memory_queries=core_services.memory_queries,
             preference_documents=core_services.preference_documents,
+            github_settings=getattr(core_services, "github_settings", None),
         )
 
     _runner = web.AppRunner(

@@ -19,6 +19,8 @@ import type {
   WorkshopWorkspaceConfig,
   WorkshopPreferenceDocument,
   WorkshopPreferenceHistory,
+  WorkshopGitHubSettings,
+  WorkshopGitHubSettingsChange,
   WorkshopRuntimeSettingsChange,
   WorkshopWorkspaceSettingChange,
   WorkshopMemoryPage,
@@ -552,6 +554,71 @@ function parseSettingsWorkspace(
     },
     workspace: payload.workspace,
     workspaces,
+  };
+}
+
+function parseGitHubSettings(payload: unknown): WorkshopGitHubSettings {
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    (payload.github_login !== null && typeof payload.github_login !== "string") ||
+    typeof payload.repositories_resettable !== "boolean" ||
+    !Array.isArray(payload.repositories) ||
+    !isRecord(payload.pr_review) ||
+    typeof payload.pr_review.enabled !== "boolean" ||
+    typeof payload.pr_review.source !== "string" ||
+    typeof payload.pr_review.resettable !== "boolean" ||
+    !isRecord(payload.issue_triage) ||
+    typeof payload.issue_triage.enabled !== "boolean" ||
+    typeof payload.issue_triage.source !== "string" ||
+    typeof payload.issue_triage.resettable !== "boolean" ||
+    typeof payload.token_stored !== "boolean" ||
+    typeof payload.revision !== "string" ||
+    (payload.mutation !== null &&
+      (!isRecord(payload.mutation) ||
+        typeof payload.mutation.operation !== "string" ||
+        typeof payload.mutation.changed !== "boolean"))
+  ) {
+    throw new Error("Kai returned unsupported GitHub settings.");
+  }
+  const repositories = payload.repositories.map((value) => {
+    if (
+      !isRecord(value) ||
+      typeof value.repository !== "string" ||
+      typeof value.source !== "string" ||
+      typeof value.automation_authorized !== "boolean"
+    ) {
+      throw new Error("Kai returned unsupported GitHub repository settings.");
+    }
+    return {
+      automationAuthorized: value.automation_authorized,
+      repository: value.repository,
+      source: value.source,
+    };
+  });
+  const mutation = payload.mutation === null
+    ? null
+    : {
+        changed: payload.mutation.changed as boolean,
+        operation: payload.mutation.operation as string,
+      };
+  return {
+    githubLogin: payload.github_login as string | null,
+    issueTriage: {
+      enabled: payload.issue_triage.enabled,
+      resettable: payload.issue_triage.resettable,
+      source: payload.issue_triage.source,
+    },
+    mutation,
+    prReview: {
+      enabled: payload.pr_review.enabled,
+      resettable: payload.pr_review.resettable,
+      source: payload.pr_review.source,
+    },
+    repositories,
+    repositoriesResettable: payload.repositories_resettable as boolean,
+    revision: payload.revision,
+    tokenStored: payload.token_stored,
   };
 }
 
@@ -1239,6 +1306,46 @@ export async function loadSettingsWorkspace(
     );
   }
   return parseSettingsWorkspace(payload, session.channelId);
+}
+
+export async function loadGitHubSettings(
+  session: WorkshopSession,
+): Promise<WorkshopGitHubSettings> {
+  const response = await authorizedFetch(session, "/v1/settings/github");
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load GitHub settings."));
+  }
+  return parseGitHubSettings(payload);
+}
+
+export async function updateGitHubSettings(
+  session: WorkshopSession,
+  revision: string,
+  change: WorkshopGitHubSettingsChange,
+): Promise<WorkshopGitHubSettings> {
+  const operation = change.field === "repository"
+    ? { repository: { name: change.name, subscribed: change.subscribed } }
+    : change.field === "repository_reset"
+      ? { reset_repositories: true }
+    : change.field === "toggle"
+      ? { toggle: { field: change.name, enabled: change.enabled } }
+      : { token: change.token };
+  const response = await authorizedFetch(session, "/v1/settings/github", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ revision, ...operation }),
+  });
+  const payload = await responsePayload(response);
+  if (response.status === 409) {
+    throw new SettingsRevisionConflictError(
+      safeErrorMessage(payload, "GitHub settings changed since they were loaded."),
+    );
+  }
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not update GitHub settings."));
+  }
+  return parseGitHubSettings(payload);
 }
 
 export async function updateRuntimeSettings(

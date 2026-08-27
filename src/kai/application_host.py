@@ -21,6 +21,7 @@ from kai.workshop.delivery_authority import (
 from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.execution_state import WorkshopExecutionStateRegistry
 from kai.workshop.github_automation import WorkshopGitHubAutomationService
+from kai.workshop.github_settings import WorkshopGitHubSettingsService
 from kai.workshop.integration_notifications import WorkshopIntegrationNotificationService
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIContextRegistry
 from kai.workshop.memory_queries import WorkshopMemoryQueryService
@@ -134,6 +135,7 @@ class KaiCoreServices:
     settings_workspaces: WorkshopSettingsWorkspaceService
     memory_queries: WorkshopMemoryQueryService
     preference_documents: WorkshopPreferenceService
+    github_settings: WorkshopGitHubSettingsService
     proactive_publication: WorkshopProactivePublicationService
     integration_notifications: WorkshopIntegrationNotificationService
     github_automation: WorkshopGitHubAutomationService
@@ -212,6 +214,7 @@ class KaiApplicationHost:
         integration_notifications: WorkshopIntegrationNotificationService | None = None
         github_automation: WorkshopGitHubAutomationService | None = None
         post_run_effects: WorkshopPostRunEffectService | None = None
+        github_settings: WorkshopGitHubSettingsService | None = None
         try:
             delivery_policy = self._delivery_policy
             subprocess_pool = SubprocessPool(
@@ -280,6 +283,11 @@ class KaiApplicationHost:
                 Path(self._config.session_db_path).parent,
                 self._principal_storage,
             )
+            github_settings = await WorkshopGitHubSettingsService.open(
+                Path(self._config.session_db_path),
+                self._execution_state,
+                self._runtime_profiles,
+            )
             proactive_publication = WorkshopProactivePublicationService(
                 client_store,
                 artifacts,
@@ -326,6 +334,7 @@ class KaiApplicationHost:
                 settings_workspaces=settings_workspaces,
                 memory_queries=memory_queries,
                 preference_documents=preference_documents,
+                github_settings=github_settings,
                 proactive_publication=proactive_publication,
                 integration_notifications=integration_notifications,
                 github_automation=github_automation,
@@ -342,6 +351,8 @@ class KaiApplicationHost:
                 await github_automation.stop()
             if integration_notifications is not None:
                 await integration_notifications.close()
+            if github_settings is not None:
+                await github_settings.close()
             if client_commands is not None:
                 await client_commands.stop()
             if post_run_effects is not None:
@@ -404,6 +415,7 @@ class KaiApplicationHost:
             services.scheduler.stop,
             services.github_automation.stop,
             services.integration_notifications.close,
+            services.github_settings.close,
             services.client_commands.stop,
             services.post_run_effects.stop,
             services.client_store.close,

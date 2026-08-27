@@ -41,6 +41,16 @@ from kai.workshop.client_sessions import EnrollmentGrantUnavailableError, Worksh
 from kai.workshop.conversation_commands import ConversationCommandAcceptanceError
 from kai.workshop.domain import ArtifactId, ChannelId, PrincipalId, RunId
 from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
+from kai.workshop.github_settings import (
+    GitHubSettingsAuthority,
+    GitHubSettingsSnapshot,
+    WorkshopGitHubSettingsAccessDenied,
+    WorkshopGitHubSettingsConflict,
+    WorkshopGitHubSettingsError,
+    WorkshopGitHubSettingsService,
+    WorkshopGitHubSettingsStorageError,
+    WorkshopGitHubSettingsValidationError,
+)
 from kai.workshop.inbound import ClientInboundMessage, InboundBindingNotFoundError
 from kai.workshop.memory_queries import (
     DEFAULT_PAGE_SIZE,
@@ -116,6 +126,7 @@ _WORKSPACE_CONFIG_PATH = "/v1/channels/{channel_id}/workspace-config"
 _PREFERENCES_PATH = "/v1/preferences"
 _PREFERENCE_REVISIONS_PATH = "/v1/preferences/revisions"
 _PREFERENCE_RESTORE_PATH = "/v1/preferences/revisions/{preference_revision}/restore"
+_GITHUB_SETTINGS_PATH = "/v1/settings/github"
 _MAX_PREFERENCE_UPDATE_BODY_BYTES = MAX_PREFERENCE_BYTES * 6 + 1024
 _MAX_PREFERENCE_RESTORE_BODY_BYTES = 512
 _MEMORY_STATS_PATH = "/v1/memory/stats"
@@ -140,6 +151,10 @@ _WORKSPACE_CONFIG_REQUEST_FIELDS = frozenset({"field", "value", "path", "revisio
 _WORKSPACE_CONFIG_RESET_FIELDS = frozenset({"reset", "path", "revision"})
 _PREFERENCE_UPDATE_FIELDS = frozenset({"content", "revision"})
 _PREFERENCE_RESTORE_FIELDS = frozenset({"revision"})
+_GITHUB_SETTINGS_REQUEST_FIELDS = frozenset({"revision", "repository", "reset_repositories", "toggle", "token"})
+_GITHUB_REPOSITORY_FIELDS = frozenset({"name", "subscribed"})
+_GITHUB_TOGGLE_FIELDS = frozenset({"field", "enabled"})
+_MAX_GITHUB_SETTINGS_BODY_BYTES = 10_240
 _DECIMAL_INTEGER = re.compile(r"^[0-9]+$")
 _CLIENT_MESSAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _EVENT_BATCH_SIZE = 100
@@ -263,6 +278,42 @@ def _serialize_preference_document(document: PreferenceDocument) -> dict[str, ob
             "max_bytes": document.max_bytes,
             "editable": document.editable,
         },
+    }
+
+
+def _serialize_github_settings(snapshot: GitHubSettingsSnapshot) -> dict[str, object]:
+    return {
+        "version": 1,
+        "github_login": snapshot.github_login,
+        "repositories_resettable": snapshot.repositories_resettable,
+        "repositories": [
+            {
+                "repository": item.repository,
+                "source": item.source,
+                "automation_authorized": item.automation_authorized,
+            }
+            for item in snapshot.repositories
+        ],
+        "pr_review": {
+            "enabled": snapshot.pr_review.enabled,
+            "source": snapshot.pr_review.source,
+            "resettable": snapshot.pr_review.resettable,
+        },
+        "issue_triage": {
+            "enabled": snapshot.issue_triage.enabled,
+            "source": snapshot.issue_triage.source,
+            "resettable": snapshot.issue_triage.resettable,
+        },
+        "token_stored": snapshot.token_stored,
+        "revision": snapshot.revision,
+        "mutation": (
+            {
+                "operation": snapshot.mutation.operation,
+                "changed": snapshot.mutation.changed,
+            }
+            if snapshot.mutation is not None
+            else None
+        ),
     }
 
 
@@ -1081,6 +1132,162 @@ async def _handle_preference_restore(
             return _error_response(status=400, code="invalid_request", message="Invalid preference restore request")
         return _preference_error_response(exc)
     return _json_response(_serialize_preference_document(document), status=200)
+
+
+async def _authenticate_github_settings_authority(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopGitHubSettingsService,
+) -> tuple[GitHubSettingsAuthority | None, web.Response | None]:
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(
+            status=401,
+            code="authentication_required",
+            message="Authentication required",
+        )
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return None, response
+    try:
+        return service.authority_for_principal(principal_id), None
+    except WorkshopGitHubSettingsAccessDenied:
+        return None, _error_response(status=403, code="access_denied", message="Access denied")
+
+
+def _github_settings_error_response(exc: WorkshopGitHubSettingsError) -> web.Response:
+    if isinstance(exc, WorkshopGitHubSettingsConflict):
+        return _error_response(status=409, code="settings_conflict", message=str(exc))
+    if isinstance(exc, WorkshopGitHubSettingsValidationError):
+        return _error_response(status=400, code="invalid_setting", message=str(exc))
+    if isinstance(exc, WorkshopGitHubSettingsAccessDenied):
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    if isinstance(exc, WorkshopGitHubSettingsStorageError):
+        return _error_response(
+            status=503,
+            code="github_settings_unavailable",
+            message="GitHub settings are temporarily unavailable",
+        )
+    return _error_response(
+        status=503,
+        code="github_settings_unavailable",
+        message="GitHub settings are temporarily unavailable",
+    )
+
+
+async def _github_settings_json_object(request: web.Request) -> dict[str, object]:
+    if request.content_type != "application/json":
+        raise WorkshopGitHubSettingsValidationError("Content-Type must be application/json")
+    if request.content_length is not None and request.content_length > _MAX_GITHUB_SETTINGS_BODY_BYTES:
+        raise WorkshopGitHubSettingsValidationError("GitHub settings request is too large")
+    raw = await request.content.read(_MAX_GITHUB_SETTINGS_BODY_BYTES + 1)
+    if len(raw) > _MAX_GITHUB_SETTINGS_BODY_BYTES:
+        raise WorkshopGitHubSettingsValidationError("GitHub settings request is too large")
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise WorkshopGitHubSettingsValidationError("Invalid JSON request") from exc
+    if not isinstance(payload, dict):
+        raise WorkshopGitHubSettingsValidationError("Invalid GitHub settings request")
+    return payload
+
+
+async def _handle_github_settings(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopGitHubSettingsService,
+) -> web.Response:
+    authority, error = await _authenticate_github_settings_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        return error
+    assert authority is not None
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid GitHub settings request")
+    try:
+        snapshot = await service.inspect(authority)
+    except WorkshopGitHubSettingsError as exc:
+        return _github_settings_error_response(exc)
+    return _json_response(_serialize_github_settings(snapshot), status=200)
+
+
+async def _handle_github_settings_update(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopGitHubSettingsService,
+) -> web.Response:
+    authority, error = await _authenticate_github_settings_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        return error
+    assert authority is not None
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid GitHub settings request")
+    try:
+        payload = await _github_settings_json_object(request)
+        if not set(payload).issubset(_GITHUB_SETTINGS_REQUEST_FIELDS):
+            raise WorkshopGitHubSettingsValidationError("Invalid GitHub settings request")
+        revision = payload.get("revision")
+        if not isinstance(revision, str):
+            raise WorkshopGitHubSettingsValidationError("GitHub settings revision is required")
+        operations = sum(field in payload for field in ("repository", "reset_repositories", "toggle", "token"))
+        if operations != 1 or len(payload) != 2:
+            raise WorkshopGitHubSettingsValidationError("Change exactly one GitHub setting at a time")
+        if "repository" in payload:
+            repository = payload["repository"]
+            if not isinstance(repository, dict) or set(repository) != _GITHUB_REPOSITORY_FIELDS:
+                raise WorkshopGitHubSettingsValidationError("Invalid repository subscription request")
+            name = repository.get("name")
+            subscribed = repository.get("subscribed")
+            if not isinstance(name, str) or not isinstance(subscribed, bool):
+                raise WorkshopGitHubSettingsValidationError("Invalid repository subscription request")
+            snapshot = await service.set_repository_subscription(
+                authority,
+                name,
+                subscribed=subscribed,
+                expected_revision=revision,
+            )
+        elif "reset_repositories" in payload:
+            if payload["reset_repositories"] is not True:
+                raise WorkshopGitHubSettingsValidationError("Invalid repository reset request")
+            snapshot = await service.reset_repository_subscriptions(
+                authority,
+                expected_revision=revision,
+            )
+        elif "toggle" in payload:
+            toggle = payload["toggle"]
+            if not isinstance(toggle, dict) or set(toggle) != _GITHUB_TOGGLE_FIELDS:
+                raise WorkshopGitHubSettingsValidationError("Invalid GitHub automation request")
+            field = toggle.get("field")
+            enabled = toggle.get("enabled")
+            if not isinstance(field, str) or (enabled is not None and not isinstance(enabled, bool)):
+                raise WorkshopGitHubSettingsValidationError("Invalid GitHub automation request")
+            snapshot = await service.set_toggle(
+                authority,
+                field,
+                enabled,
+                expected_revision=revision,
+            )
+        else:
+            token = payload["token"]
+            if token is not None and not isinstance(token, str):
+                raise WorkshopGitHubSettingsValidationError("GitHub token must be text or null")
+            snapshot = await service.set_token(
+                authority,
+                token,
+                expected_revision=revision,
+            )
+    except WorkshopGitHubSettingsError as exc:
+        return _github_settings_error_response(exc)
+    return _json_response(_serialize_github_settings(snapshot), status=200)
 
 
 async def _handle_runtime_settings(
@@ -2542,6 +2749,7 @@ def register_workshop_read_routes(
     settings_workspaces: WorkshopSettingsWorkspaceService | None = None,
     memory_queries: WorkshopMemoryQueryService | None = None,
     preference_documents: WorkshopPreferenceService | None = None,
+    github_settings: WorkshopGitHubSettingsService | None = None,
 ) -> None:
     """Register authenticated Workshop client routes on an application."""
     if event_poll_interval <= 0 or event_heartbeat_interval <= 0 or event_authentication_recheck_interval <= 0:
@@ -2626,6 +2834,26 @@ def register_workshop_read_routes(
         app.router.add_put(_PREFERENCES_PATH, handle_preference_update)
         app.router.add_get(_PREFERENCE_REVISIONS_PATH, handle_preference_history)
         app.router.add_post(_PREFERENCE_RESTORE_PATH, handle_preference_restore)
+    if github_settings is not None:
+
+        async def handle_github_settings(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_github_settings(
+                    request,
+                    authenticator=authenticator,
+                    service=github_settings,
+                )
+
+        async def handle_github_settings_update(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_github_settings_update(
+                    request,
+                    authenticator=authenticator,
+                    service=github_settings,
+                )
+
+        app.router.add_get(_GITHUB_SETTINGS_PATH, handle_github_settings)
+        app.router.add_patch(_GITHUB_SETTINGS_PATH, handle_github_settings_update)
     if artifact_service is not None:
 
         async def handle_artifact_content(request: web.Request) -> web.StreamResponse:

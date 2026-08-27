@@ -172,6 +172,20 @@ class _FakeIntegrationNotifications:
         self.events.append("integrations:close")
 
 
+class _FakeGitHubSettings:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    @classmethod
+    async def open(cls, *_args, **_kwargs):
+        events = _FakeExecutionFactory.events
+        events.append("github-settings:open")
+        return cls(events)
+
+    async def close(self) -> None:
+        self.events.append("github-settings:close")
+
+
 class _FakeGitHubAutomation:
     def __init__(self, events: list[str]) -> None:
         self.events = events
@@ -242,6 +256,7 @@ def host_dependencies(monkeypatch):
         "WorkshopIntegrationNotificationService",
         _FakeIntegrationNotifications,
     )
+    monkeypatch.setattr(host_module, "WorkshopGitHubSettingsService", _FakeGitHubSettings)
     monkeypatch.setattr(host_module, "WorkshopGitHubAutomationService", _FakeGitHubAutomation)
     monkeypatch.setattr(
         host_module,
@@ -340,6 +355,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
         "post-run-effects:start",
         "client:start",
         "scheduler:start",
+        "github-settings:open",
         "integrations:open",
         "github-automation:start",
     ]
@@ -349,7 +365,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
 
     assert host.readiness.state == KaiApplicationState.STOPPED
     assert host.readiness.ready is False
-    assert host_dependencies[-12:] == [
+    assert host_dependencies[-13:] == [
         "execution:wait",
         "scheduler:wait",
         "github-automation:wait",
@@ -357,6 +373,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
         "scheduler:stop",
         "github-automation:stop",
         "integrations:close",
+        "github-settings:close",
         "client:stop",
         "post-run-effects:stop",
         "store:close",

@@ -634,7 +634,8 @@ def workshop_operational_state_status(db_path: Path) -> str:
         f"stale job migrations={stale_job_migrations}, "
         f"unmigrated jobs={unmigrated_jobs}, conflicting jobs={conflicting_jobs}, "
         f"GitHub principals={github_subscriptions}, "
-        f"missing subscriptions={missing_subscriptions}; protected legacy ownership "
+        f"missing subscriptions={missing_subscriptions}; personal GitHub settings=canonical, "
+        "protected legacy ownership "
         "reads=disabled, compatibility job writes=disabled"
     )
 

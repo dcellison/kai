@@ -9968,6 +9968,7 @@ class TestIndependentRuntimePolicy:
             "workspace_base": None,
             "allowed_workspaces": [],
             "models": {},
+            "github_login": None,
             "github_repos": [],
             "pr_review": None,
             "issue_triage": None,

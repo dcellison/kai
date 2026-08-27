@@ -67,6 +67,10 @@ from kai.workshop.execution_coordinator import (
     CanonicalExecutionDisposition,
     CanonicalSuccessOutcome,
 )
+from kai.workshop.github_settings import (
+    GitHubSettingsAuthority,
+    WorkshopGitHubSettingsService,
+)
 from kai.workshop.inbound import InboundMessage
 from kai.workshop.scheduled_jobs import WorkshopScheduledJobAuthority
 from kai.workshop.settings_workspaces import (
@@ -293,6 +297,25 @@ def _canonical_settings_authority(
     except WorkshopStorageNamespaceError:
         return None
     return service.authority_for_principal_profile(
+        storage.principal_id,
+        storage.runtime_profile_id,
+    )
+
+
+def _canonical_github_settings_authority(
+    context: ContextTypes.DEFAULT_TYPE,
+    runtime_config_id: int,
+) -> tuple[WorkshopGitHubSettingsService, GitHubSettingsAuthority] | None:
+    """Resolve a Telegram binding to principal-owned GitHub settings."""
+    services = _get_core_services(context)
+    service = getattr(services, "github_settings", None)
+    if service is None:
+        return None
+    try:
+        storage = services.principal_storage.for_runtime_config_id(runtime_config_id)
+    except WorkshopStorageNamespaceError:
+        return None
+    return service, service.authority_for_principal_profile(
         storage.principal_id,
         storage.runtime_profile_id,
     )
@@ -2847,6 +2870,8 @@ async def _handle_github_token(
     update: Update,
     chat_id: int,
     args: list[str],
+    *,
+    canonical: tuple[WorkshopGitHubSettingsService, GitHubSettingsAuthority] | None = None,
 ) -> None:
     """
     Handle /github token <ghp_...> and /github token clear.
@@ -2863,13 +2888,21 @@ async def _handle_github_token(
         return
 
     if args[0].lower() == "clear":
-        await sessions.set_github_token(chat_id, None)
+        if canonical is None:
+            await sessions.set_github_token(chat_id, None)
+        else:
+            service, authority = canonical
+            await service.set_token(authority, None)
         await update.message.reply_text("GitHub token removed.")
         return
 
     # Store the token in owner-only SQLite state, then delete the
     # token-bearing Telegram command where Telegram permits it.
-    await sessions.set_github_token(chat_id, args[0])
+    if canonical is None:
+        await sessions.set_github_token(chat_id, args[0])
+    else:
+        service, authority = canonical
+        await service.set_token(authority, args[0])
     try:
         await update.message.delete()
     except BadRequest as exc:
@@ -2907,6 +2940,8 @@ async def _handle_github_add(
     chat_id: int,
     args: list[str],
     config: Config,
+    *,
+    canonical: tuple[WorkshopGitHubSettingsService, GitHubSettingsAuthority] | None = None,
 ) -> None:
     """
     Handle /github add <owner/repo> - subscribe to a repo's notifications.
@@ -2929,12 +2964,18 @@ async def _handle_github_add(
 
     repo = raw_repo.lower()
 
-    # Get the user's yaml baseline for effective computation
     user_config = config.get_user_config(chat_id)
     yaml_repos = user_config.github_repos if user_config else []
-    effective = await sessions.get_effective_repos(chat_id, yaml_repos)
-    added = await sessions.get_github_added_repos(chat_id)
-    removed = await sessions.get_github_removed_repos(chat_id)
+    if canonical is None:
+        effective = await sessions.get_effective_repos(chat_id, yaml_repos)
+        added = await sessions.get_github_added_repos(chat_id)
+        removed = await sessions.get_github_removed_repos(chat_id)
+    else:
+        service, authority = canonical
+        current = await service.inspect(authority)
+        effective = [item.repository for item in current.repositories]
+        added = []
+        removed = []
 
     # Check if already subscribed
     if repo in effective:
@@ -2943,7 +2984,10 @@ async def _handle_github_add(
 
     # Determine if this is a re-add (cancels a previous remove)
     is_readd = repo in removed
-    if is_readd:
+    if canonical is not None:
+        service, authority = canonical
+        await service.set_repository_subscription(authority, repo, subscribed=True)
+    elif is_readd:
         # Remove from the removed list (the add cancels the remove).
         # Don't skip webhook registration - it may have been deregistered.
         removed = [r for r in removed if r != repo]
@@ -2981,7 +3025,10 @@ async def _handle_github_add(
                 return
             if e.status == 404:
                 # Repo not found - roll back the subscription
-                if is_readd:
+                if canonical is not None:
+                    service, authority = canonical
+                    await service.set_repository_subscription(authority, repo, subscribed=False)
+                elif is_readd:
                     removed.append(repo)
                     await sessions.set_github_removed_repos(chat_id, removed)
                 else:
@@ -3007,6 +3054,8 @@ async def _handle_github_remove(
     chat_id: int,
     args: list[str],
     config: Config,
+    *,
+    canonical: tuple[WorkshopGitHubSettingsService, GitHubSettingsAuthority] | None = None,
 ) -> None:
     """
     Handle /github remove <owner/repo> - unsubscribe from repo notifications.
@@ -3029,10 +3078,13 @@ async def _handle_github_remove(
 
     repo = raw_repo.lower()
 
-    # Get the user's current effective repos
     user_config = config.get_user_config(chat_id)
     yaml_repos = user_config.github_repos if user_config else []
-    effective = await sessions.get_effective_repos(chat_id, yaml_repos)
+    if canonical is None:
+        effective = await sessions.get_effective_repos(chat_id, yaml_repos)
+    else:
+        service, authority = canonical
+        effective = [item.repository for item in (await service.inspect(authority)).repositories]
 
     if repo not in effective:
         await update.message.reply_text(f"Not subscribed to `{repo}`.")
@@ -3041,8 +3093,11 @@ async def _handle_github_remove(
     # Remove the subscription. If repo is in the DB-added list, remove
     # it from there. Otherwise, add it to the removed list (to override
     # the yaml baseline).
-    added = await sessions.get_github_added_repos(chat_id)
-    if repo in added:
+    added = await sessions.get_github_added_repos(chat_id) if canonical is None else []
+    if canonical is not None:
+        service, authority = canonical
+        await service.set_repository_subscription(authority, repo, subscribed=False)
+    elif repo in added:
         added = [r for r in added if r != repo]
         await sessions.set_github_added_repos(chat_id, added)
     else:
@@ -3085,16 +3140,29 @@ async def _handle_github_remove(
         )
 
 
-async def _show_github(update: Update, chat_id: int, config: Config) -> None:
+async def _show_github(
+    update: Update,
+    chat_id: int,
+    config: Config,
+    *,
+    canonical: tuple[WorkshopGitHubSettingsService, GitHubSettingsAuthority] | None = None,
+) -> None:
     """Display the user's effective GitHub notification settings with source attribution."""
     assert update.message is not None
     user_config = config.get_user_config(chat_id)
 
-    # GitHub identity (from users.yaml only, not user-settable)
-    github_user = user_config.github if user_config else None
-
-    # Resolve effective settings using the same precedence as webhook routing
     effective = await sessions.resolve_github_settings(chat_id, config)
+    canonical_snapshot = None
+    if canonical is not None:
+        service, authority = canonical
+        canonical_snapshot = await service.inspect(authority)
+    github_user = (
+        canonical_snapshot.github_login
+        if canonical_snapshot is not None
+        else user_config.github
+        if user_config
+        else None
+    )
 
     lines = []
     if github_user:
@@ -3111,7 +3179,7 @@ async def _show_github(update: Update, chat_id: int, config: Config) -> None:
 
     # Feature toggles with source attribution. Read DB settings directly
     # so we can tell the user where each value comes from.
-    db_settings = await sessions.get_github_db_settings(chat_id)
+    db_settings = await sessions.get_github_db_settings(chat_id) if canonical_snapshot is None else {}
 
     def _toggle_line(
         label: str,
@@ -3132,30 +3200,26 @@ async def _show_github(update: Update, chat_id: int, config: Config) -> None:
     yaml_pr = user_config.pr_review if user_config else None
     yaml_triage = user_config.issue_triage if user_config else None
 
-    lines.append(
-        _toggle_line(
-            "PR reviews",
-            "pr_review",
-            yaml_pr,
-            effective["pr_review"],
-        )
-    )
-    lines.append(
-        _toggle_line(
-            "Issue triage",
-            "issue_triage",
-            yaml_triage,
-            effective["issue_triage"],
-        )
-    )
+    if canonical_snapshot is not None:
+        pr_state = "on" if canonical_snapshot.pr_review.enabled else "off"
+        triage_state = "on" if canonical_snapshot.issue_triage.enabled else "off"
+        lines.append(f"PR reviews: {pr_state} ({canonical_snapshot.pr_review.source})")
+        lines.append(f"Issue triage: {triage_state} ({canonical_snapshot.issue_triage.source})")
+    else:
+        lines.append(_toggle_line("PR reviews", "pr_review", yaml_pr, effective["pr_review"]))
+        lines.append(_toggle_line("Issue triage", "issue_triage", yaml_triage, effective["issue_triage"]))
 
     # Subscribed repos with source attribution. Build sets from each
     # source so we can label each repo's origin in the display.
     yaml_repos_set = set(r.lower() for r in (user_config.github_repos if user_config else []))
-    db_added = await sessions.get_github_added_repos(chat_id)
+    db_added = await sessions.get_github_added_repos(chat_id) if canonical_snapshot is None else []
     db_added_set = set(db_added)
 
-    repos = effective["repos"]
+    repos = (
+        [item.repository for item in canonical_snapshot.repositories]
+        if canonical_snapshot is not None
+        else effective["repos"]
+    )
     if repos:
         lines.append("")
         lines.append("Subscribed repos:")
@@ -3163,7 +3227,14 @@ async def _show_github(update: Update, chat_id: int, config: Config) -> None:
             # A repo in the DB-added set was added via /github add.
             # Everything else comes from users.yaml (DB-removed repos
             # are already excluded from the effective list).
-            if repo in db_added_set:
+            canonical_repo = (
+                next((item for item in canonical_snapshot.repositories if item.repository == repo), None)
+                if canonical_snapshot is not None
+                else None
+            )
+            if canonical_repo is not None:
+                lines.append(f"  {repo}  ({canonical_repo.source})")
+            elif repo in db_added_set:
                 lines.append(f"  {repo}  (added via /github add)")
             elif repo.lower() in yaml_repos_set:
                 lines.append(f"  {repo}  (users.yaml)")
@@ -3173,8 +3244,12 @@ async def _show_github(update: Update, chat_id: int, config: Config) -> None:
         lines.append("\nNo repo subscriptions configured.")
 
     # Token status (never show the actual token value)
-    token = await sessions.get_github_token(chat_id)
-    lines.append(f"\nGitHub token: {'stored' if token else 'not set'}")
+    token_stored = (
+        canonical_snapshot.token_stored
+        if canonical_snapshot is not None
+        else bool(await sessions.get_github_token(chat_id))
+    )
+    lines.append(f"\nGitHub token: {'stored' if token_stored else 'not set'}")
 
     await update.message.reply_text("\n".join(lines))
 
@@ -3215,6 +3290,8 @@ async def _handle_github_toggle(
     chat_id: int,
     field: str,
     args: list[str],
+    *,
+    canonical: tuple[WorkshopGitHubSettingsService, GitHubSettingsAuthority] | None = None,
 ) -> None:
     """Handle /github reviews on|off and /github triage on|off."""
     assert update.message is not None
@@ -3227,7 +3304,11 @@ async def _handle_github_toggle(
         return
 
     value = args[0].lower() == "on"
-    await sessions.set_github_toggle(chat_id, field, value)
+    if canonical is None:
+        await sessions.set_github_toggle(chat_id, field, value)
+    else:
+        service, authority = canonical
+        await service.set_toggle(authority, field, value)
     state = "enabled" if value else "disabled"
     await update.message.reply_text(f"{label} {state}.")
 
@@ -3241,10 +3322,11 @@ async def handle_github(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     args = context.args or []
     subcommand = args[0].lower() if args else None
+    canonical = _canonical_github_settings_authority(context, chat_id)
 
     # No subcommand: display current settings
     if subcommand is None:
-        await _show_github(update, chat_id, config)
+        await _show_github(update, chat_id, config, canonical=canonical)
         return
 
     if subcommand == "notify":
@@ -3252,23 +3334,23 @@ async def handle_github(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if subcommand == "reviews":
-        await _handle_github_toggle(update, chat_id, "pr_review", args[1:])
+        await _handle_github_toggle(update, chat_id, "pr_review", args[1:], canonical=canonical)
         return
 
     if subcommand == "triage":
-        await _handle_github_toggle(update, chat_id, "issue_triage", args[1:])
+        await _handle_github_toggle(update, chat_id, "issue_triage", args[1:], canonical=canonical)
         return
 
     if subcommand == "token":
-        await _handle_github_token(update, chat_id, args[1:])
+        await _handle_github_token(update, chat_id, args[1:], canonical=canonical)
         return
 
     if subcommand == "add":
-        await _handle_github_add(update, chat_id, args[1:], config)
+        await _handle_github_add(update, chat_id, args[1:], config, canonical=canonical)
         return
 
     if subcommand == "remove":
-        await _handle_github_remove(update, chat_id, args[1:], config)
+        await _handle_github_remove(update, chat_id, args[1:], config, canonical=canonical)
         return
 
     await update.message.reply_text(
