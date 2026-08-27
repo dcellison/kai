@@ -1,0 +1,27 @@
+/* Atom One Dark is Kai Workshop's original palette and remains the default. */
+:root,
+:root[data-workshop-theme="atom-one-dark"] {
+  color-scheme: dark;
+  --color-canvas: #282c34;
+  --color-panel: #21252b;
+  --color-canvas-inset: #1d2026;
+  --color-surface: #2c313c;
+  --color-surface-raised: #333842;
+  --color-text: #abb2bf;
+  --color-text-strong: #d7dae0;
+  --color-text-muted: #5c6370;
+  --color-danger: #e06c75;
+  --color-success: #98c379;
+  --color-warning: #e5c07b;
+  --color-accent: #61afef;
+  --color-accent-hover: #82c4f7;
+  --color-special: #c678dd;
+  --color-info: #56b6c2;
+  --color-code-inline: #d19a66;
+  --color-border: rgba(171, 178, 191, 0.13);
+  --color-border-strong: rgba(171, 178, 191, 0.24);
+  --color-shadow-base: #080a0d;
+  --color-backdrop: #121418;
+  --color-overlay-shadow: #000000;
+  --shadow-elevation-page: 0 28px 80px rgba(8, 10, 13, 0.35);
+}
