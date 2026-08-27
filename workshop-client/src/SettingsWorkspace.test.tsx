@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  ChannelAccessError,
   loadPreferenceDocument,
   loadPreferenceHistory,
   loadSettingsWorkspace,
@@ -156,11 +157,15 @@ const workspaceConfig: WorkshopWorkspaceConfig = {
   workspace: runtime.workspace,
 };
 
-function renderSettings(onDirtyChange = vi.fn(), runActive = false): void {
+function renderSettings(
+  onDirtyChange = vi.fn(),
+  runActive = false,
+  onChannelAccessFailure = vi.fn(),
+): void {
   render(
     <SettingsWorkspace
       onAuthenticationFailure={vi.fn()}
-      onChannelAccessFailure={vi.fn()}
+      onChannelAccessFailure={onChannelAccessFailure}
       onClose={vi.fn()}
       onDirtyChange={onDirtyChange}
       principalName="Daniel"
@@ -400,5 +405,21 @@ describe("Settings workspace", () => {
     expect(await screen.findByLabelText("Backend")).toBeDisabled();
     expect(screen.getByRole("button", { name: "Switch backend" })).toBeDisabled();
     expect(screen.getByText("Finish or stop the active run before switching.")).toBeVisible();
+  });
+
+  it("keeps valid runtime settings when workspace overrides are unavailable", async () => {
+    const onChannelAccessFailure = vi.fn();
+    vi.mocked(loadWorkspaceConfig).mockRejectedValue(
+      new ChannelAccessError("This session cannot access that Workshop channel."),
+    );
+
+    renderSettings(vi.fn(), false, onChannelAccessFailure);
+
+    expect(await screen.findByLabelText("Backend")).toHaveValue("claude:anthropic");
+    expect(screen.getByRole("heading", { name: "Workspace settings" })).toBeVisible();
+    expect(screen.getByText("This session cannot access that Workshop channel.")).toBeVisible();
+    expect(onChannelAccessFailure).not.toHaveBeenCalled();
+    expect(loadSettingsWorkspace).toHaveBeenCalledTimes(1);
+    expect(loadWorkspaceConfig).toHaveBeenCalledTimes(1);
   });
 });

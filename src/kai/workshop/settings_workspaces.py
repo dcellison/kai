@@ -986,11 +986,18 @@ class WorkshopSettingsWorkspaceService:
         authority: SettingsWorkspaceAuthority,
         workspace_path: str | None,
     ) -> Path:
-        workspace = (
-            Path(workspace_path).expanduser().resolve()
-            if workspace_path is not None
-            else await self._runtime_pool.get_effective_workspace(authority.runtime_profile_id)
-        )
+        if workspace_path is None:
+            # The runtime pool owns canonical active-workspace restoration and
+            # validates a saved selection against this profile's grants before
+            # returning it. Reapplying the static grant check here creates a
+            # second, subtly different authority path for protected homes
+            # owned by another OS user (for example Scott's installed runtime).
+            workspace = (await self._runtime_pool.get_effective_workspace(authority.runtime_profile_id)).resolve()
+            if not workspace.is_dir():
+                raise WorkshopSettingsWorkspaceValidationError("Workspace directory is unavailable")
+            return workspace
+
+        workspace = Path(workspace_path).expanduser().resolve()
         home = self._runtime_pool.get_home_workspace(authority.runtime_profile_id).resolve()
         base, allowed = await self._runtime_pool.resolve_workspace_access(authority.runtime_profile_id)
         if not workspace.is_dir():
