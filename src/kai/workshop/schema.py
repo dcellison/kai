@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 36
+WORKSHOP_SCHEMA_VERSION = 37
 
 
 @dataclass(frozen=True, slots=True)
@@ -1795,6 +1795,25 @@ _CLIENT_BINDING_VOICE_PREFERENCES_SCHEMA = SchemaMigration(
     ),
 )
 
+_PRINCIPAL_APPEARANCE_PREFERENCES_SCHEMA = SchemaMigration(
+    version=37,
+    name="principal_appearance_preferences",
+    statements=(
+        """
+        CREATE TABLE principal_appearance_preferences (
+            principal_id TEXT PRIMARY KEY REFERENCES principals(id) ON DELETE CASCADE,
+            theme_id TEXT NOT NULL CHECK (length(trim(theme_id)) > 0),
+            created_at TEXT NOT NULL DEFAULT (
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            ),
+            updated_at TEXT NOT NULL DEFAULT (
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            )
+        )
+        """,
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -1832,6 +1851,7 @@ _MIGRATIONS = (
     _CANONICAL_BACKEND_SELECTION_SCHEMA,
     _PRINCIPAL_NOTIFICATION_PREFERENCES_SCHEMA,
     _CLIENT_BINDING_VOICE_PREFERENCES_SCHEMA,
+    _PRINCIPAL_APPEARANCE_PREFERENCES_SCHEMA,
 )
 
 

@@ -214,6 +214,20 @@ class _FakeClientPreferences:
         self.events.append("client-preferences:close")
 
 
+class _FakeAppearancePreferences:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    @classmethod
+    async def open(cls, *_args, **_kwargs):
+        events = _FakeExecutionFactory.events
+        events.append("appearance-preferences:open")
+        return cls(events)
+
+    async def close(self) -> None:
+        self.events.append("appearance-preferences:close")
+
+
 class _FakeGitHubAutomation:
     def __init__(self, events: list[str]) -> None:
         self.events = events
@@ -294,6 +308,11 @@ def host_dependencies(monkeypatch):
         host_module,
         "WorkshopClientPreferenceService",
         _FakeClientPreferences,
+    )
+    monkeypatch.setattr(
+        host_module,
+        "WorkshopAppearancePreferenceService",
+        _FakeAppearancePreferences,
     )
     monkeypatch.setattr(host_module, "WorkshopGitHubAutomationService", _FakeGitHubAutomation)
     monkeypatch.setattr(
@@ -396,6 +415,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
         "github-settings:open",
         "notification-preferences:open",
         "client-preferences:open",
+        "appearance-preferences:open",
         "integrations:open",
         "github-automation:start",
     ]
@@ -405,7 +425,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
 
     assert host.readiness.state == KaiApplicationState.STOPPED
     assert host.readiness.ready is False
-    assert host_dependencies[-15:] == [
+    assert host_dependencies[-16:] == [
         "execution:wait",
         "scheduler:wait",
         "github-automation:wait",
@@ -416,6 +436,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
         "github-settings:close",
         "notification-preferences:close",
         "client-preferences:close",
+        "appearance-preferences:close",
         "client:stop",
         "post-run-effects:stop",
         "store:close",

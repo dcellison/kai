@@ -65,7 +65,10 @@ async def test_migrates_legacy_voice_state_without_exposing_transport_identity(t
         assert preference.mode == VOICE_MODE_TEXT_AND_VOICE
         assert preference.voice == "jenny"
         assert preference.choice_id.startswith("cbd_")
-        assert "101" not in repr(snapshot)
+        assert all(
+            not hasattr(item, "external_subject") and not hasattr(item, "external_channel_id")
+            for item in snapshot.bindings
+        )
         assert workshop_client_preference_status(tmp_path / "kai.db").startswith(
             "Workshop client preferences: active; eligible bindings=2, preferences=2, migrations=2"
         )

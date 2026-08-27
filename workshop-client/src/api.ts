@@ -25,6 +25,7 @@ import type {
   WorkshopNotificationPreferenceChange,
   WorkshopClientPreferences,
   WorkshopClientPreferenceChange,
+  WorkshopAppearancePreferences,
   WorkshopRuntimeSettingsChange,
   WorkshopWorkspaceSettingChange,
   WorkshopMemoryPage,
@@ -44,6 +45,7 @@ import type {
   WorkshopArtifactKind,
   WorkshopArtifactSummary,
 } from "./types";
+import { isWorkshopThemeId } from "./theme";
 import {
   AGENT_PATTERN,
   ARTIFACT_PATTERN,
@@ -764,6 +766,48 @@ function parseClientPreferences(payload: unknown): WorkshopClientPreferences {
       voices,
       bindings,
     },
+  };
+}
+
+function parseAppearancePreferences(payload: unknown): WorkshopAppearancePreferences {
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    !isWorkshopThemeId(payload.theme_id) ||
+    !Array.isArray(payload.themes) ||
+    typeof payload.revision !== "string" ||
+    (payload.mutation !== null &&
+      (!isRecord(payload.mutation) ||
+        typeof payload.mutation.operation !== "string" ||
+        typeof payload.mutation.changed !== "boolean"))
+  ) {
+    throw new Error("Kai returned unsupported appearance preferences.");
+  }
+  const themes = payload.themes.map((value) => {
+    if (
+      !isRecord(value) ||
+      !isWorkshopThemeId(value.theme_id) ||
+      typeof value.display_name !== "string" ||
+      (value.color_scheme !== "dark" && value.color_scheme !== "light")
+    ) {
+      throw new Error("Kai returned an unsupported Workshop theme.");
+    }
+    return {
+      colorScheme: value.color_scheme as "dark" | "light",
+      displayName: value.display_name,
+      themeId: value.theme_id,
+    };
+  });
+  return {
+    mutation: payload.mutation === null
+      ? null
+      : {
+          changed: payload.mutation.changed as boolean,
+          operation: payload.mutation.operation as string,
+        },
+    revision: payload.revision,
+    themeId: payload.theme_id,
+    themes,
   };
 }
 
@@ -1541,6 +1585,42 @@ export async function loadClientPreferences(
     throw new Error(safeErrorMessage(payload, "Could not load client preferences."));
   }
   return parseClientPreferences(payload);
+}
+
+export async function loadAppearancePreferences(
+  session: Pick<WorkshopSession, "token">,
+): Promise<WorkshopAppearancePreferences> {
+  const response = await authorizedFetch(
+    { channelId: "", token: session.token },
+    "/v1/settings/appearance",
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load appearance preferences."));
+  }
+  return parseAppearancePreferences(payload);
+}
+
+export async function updateAppearancePreference(
+  session: WorkshopSession,
+  revision: string,
+  themeId: string,
+): Promise<WorkshopAppearancePreferences> {
+  const response = await authorizedFetch(session, "/v1/settings/appearance", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ revision, theme_id: themeId }),
+  });
+  const payload = await responsePayload(response);
+  if (response.status === 409) {
+    throw new SettingsRevisionConflictError(
+      safeErrorMessage(payload, "Appearance preferences changed since they were loaded."),
+    );
+  }
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not update appearance preferences."));
+  }
+  return parseAppearancePreferences(payload);
 }
 
 export async function updateClientPreference(

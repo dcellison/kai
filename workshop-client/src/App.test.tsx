@@ -7,6 +7,7 @@ import {
   AuthenticationError,
   cancelRun,
   ChannelAccessError,
+  loadAppearancePreferences,
   loadEarlierTimeline,
   loadArtifactBlob,
   loadNavigation,
@@ -43,6 +44,7 @@ vi.mock("./api", async (importOriginal) => {
     cancelRun: vi.fn(),
     loadEarlierTimeline: vi.fn(),
     loadArtifactBlob: vi.fn(),
+    loadAppearancePreferences: vi.fn(),
     loadNavigation: vi.fn(),
     loadNotificationPreferences: vi.fn(),
     loadMemoryDetail: vi.fn(),
@@ -245,6 +247,18 @@ describe("Workshop React client", () => {
     failStream = null;
     vi.mocked(redeemEnrollment).mockResolvedValue("redeemed-session-token");
     vi.mocked(loadNavigation).mockResolvedValue(navigation);
+    vi.mocked(loadAppearancePreferences).mockResolvedValue({
+      mutation: null,
+      revision: "apr_current",
+      themeId: "atom-one-dark",
+      themes: [
+        {
+          colorScheme: "dark",
+          displayName: "Atom One Dark",
+          themeId: "atom-one-dark",
+        },
+      ],
+    });
     vi.mocked(loadNotificationPreferences).mockResolvedValue({
       destinations: [
         {

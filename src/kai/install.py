@@ -77,6 +77,7 @@ from kai.protected_config import ProtectedConfigError, validate_protected_file_m
 from kai.user_isolation import validate_protected_user_isolation
 from kai.workshop.bootstrap import bootstrap_human_principal_id
 from kai.workshop.diagnostics import (
+    workshop_appearance_preference_status,
     workshop_bootstrap_status,
     workshop_canonical_message_integrity_status,
     workshop_client_preference_status,
@@ -9443,6 +9444,7 @@ def _cmd_status() -> None:
             tts_enabled=_read_deployed_tts_enabled(_DEPLOYED_ENV_FILE),
         )
     )
+    print(workshop_appearance_preference_status(Path(data_dir) / "kai.db"))
     print(
         workshop_memory_authority_status(
             Path(data_dir) / "kai.db",
