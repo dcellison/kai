@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -316,6 +316,84 @@ describe("Settings workspace", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it("navigates all six settings sections without discarding a preference draft", async () => {
+    const user = userEvent.setup();
+    renderSettings();
+    const editor = await screen.findByLabelText("Preference Markdown");
+    const navigation = screen.getByRole("navigation", { name: "Settings sections" });
+    const sectionLabels = [
+      "Personal preferences",
+      "Runtime settings",
+      "Workspace settings",
+      "GitHub",
+      "Notification delivery",
+      "Client preferences",
+    ];
+
+    for (const label of sectionLabels) {
+      expect(within(navigation).getByRole("button", { name: label })).toBeVisible();
+    }
+    expect(
+      within(navigation).getByRole("button", { name: "Personal preferences" }),
+    ).toHaveAttribute("aria-current", "location");
+
+    await user.type(editor, "Unsaved navigation draft");
+    const githubSection = document.getElementById("settings-section-github");
+    expect(githubSection).not.toBeNull();
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(githubSection as HTMLElement, "scrollIntoView", {
+      configurable: true,
+      value: scrollIntoView,
+    });
+    await user.click(within(navigation).getByRole("button", { name: "GitHub" }));
+
+    expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "start" });
+    expect(within(navigation).getByRole("button", { name: "GitHub" })).toHaveAttribute(
+      "aria-current",
+      "location",
+    );
+    expect(editor).toHaveValue(`${preference.content}Unsaved navigation draft`);
+  });
+
+  it("updates the current settings destination during manual scrolling", async () => {
+    renderSettings();
+    await screen.findByLabelText("Preference Markdown");
+    await screen.findByRole("heading", { name: "Client preferences" });
+    const navigation = screen.getByRole("navigation", { name: "Settings sections" });
+    const scroll = document.querySelector<HTMLElement>(".settings-scroll");
+    expect(scroll).not.toBeNull();
+    Object.defineProperties(scroll as HTMLElement, {
+      clientHeight: { configurable: true, value: 500 },
+      scrollHeight: { configurable: true, value: 1600 },
+      scrollTop: { configurable: true, value: 420 },
+    });
+    vi.spyOn(scroll as HTMLElement, "getBoundingClientRect").mockReturnValue({
+      top: 100,
+    } as DOMRect);
+    const positions: Record<string, number> = {
+      "settings-section-personal-preferences": -500,
+      "settings-section-runtime": -300,
+      "settings-section-workspace": -100,
+      "settings-section-github": 110,
+      "settings-section-notifications": 400,
+      "settings-section-clients": 700,
+    };
+    for (const [id, top] of Object.entries(positions)) {
+      const section = document.getElementById(id);
+      expect(section).not.toBeNull();
+      vi.spyOn(section as HTMLElement, "getBoundingClientRect").mockReturnValue({
+        top,
+      } as DOMRect);
+    }
+
+    fireEvent.scroll(scroll as HTMLElement);
+
+    expect(within(navigation).getByRole("button", { name: "GitHub" })).toHaveAttribute(
+      "aria-current",
+      "location",
+    );
   });
 
   it("shows private preferences and policy-bounded settings without protected details", async () => {
