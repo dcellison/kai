@@ -9790,6 +9790,7 @@ class TestIndependentRuntimePolicy:
         daniel_id = str(kai.install.runtime_profile_id_for_config_id(101))
         scott_id = str(kai.install.runtime_profile_id_for_config_id(202))
         assert document["version"] == 2
+        assert document["backend_selection_policy_version"] == 1
         assert document["legacy_runtime_archive"] == {
             "version": 1,
             "runtime_keys": {daniel_id: 101, scott_id: 202},
@@ -9960,6 +9961,89 @@ backends:
         _apply_runtime_policy("upgrade", "enriched-policy\n", dry_run=False)
 
         assert policy.read_text() == "enriched-policy\n"
+
+    def test_upgrade_shares_live_operator_assigned_backend_defaults_once(self):
+        first_id = str(kai.install.runtime_profile_id_for_config_id(101))
+        qualification_id = str(kai.install.runtime_profile_id_for_config_id(202))
+        original = yaml.safe_dump(
+            {
+                "version": 2,
+                "runtime_profiles": {
+                    first_id: {
+                        "display_name": "Daniel",
+                        "backend": "claude",
+                        "provider": "anthropic",
+                        "allowed_backends": ["claude"],
+                    },
+                    qualification_id: {
+                        "display_name": "Codex qualification",
+                        "backend": "codex",
+                        "provider": "openai",
+                        "allowed_backends": ["codex"],
+                    },
+                },
+            },
+            sort_keys=False,
+        )
+        migrated = yaml.safe_dump(
+            {
+                "version": 2,
+                "backend_selection_policy_version": 1,
+                "runtime_profiles": {
+                    first_id: {
+                        "display_name": "Daniel",
+                        "backend": "claude",
+                        "provider": "anthropic",
+                        "model": "sonnet",
+                        "timeout_seconds": 120,
+                        "maximum_timeout_seconds": 600,
+                        "allowed_backends": ["claude"],
+                        "allowed_services": [],
+                        "home_workspace": None,
+                        "workspace_base": None,
+                        "allowed_workspaces": [],
+                        "models": {},
+                        "github_repos": [],
+                        "pr_review": None,
+                        "issue_triage": None,
+                        "allowed_triage_projects": [],
+                    }
+                },
+            },
+            sort_keys=False,
+        )
+        defaults = kai.install._RuntimePolicyDefaults(
+            backend="claude",
+            provider="anthropic",
+            model="sonnet",
+            timeout_seconds=120,
+        )
+
+        upgraded, changed = kai.install._upgrade_runtime_policy_content(
+            original,
+            migrated,
+            defaults,
+        )
+        document = yaml.safe_load(upgraded)
+
+        assert changed
+        assert document["backend_selection_policy_version"] == 1
+        assert document["runtime_profiles"][first_id]["allowed_backends"] == [
+            "claude",
+            "codex",
+        ]
+        assert document["runtime_profiles"][qualification_id]["allowed_backends"] == [
+            "claude",
+            "codex",
+        ]
+
+        repeated, repeated_change = kai.install._upgrade_runtime_policy_content(
+            upgraded,
+            migrated,
+            defaults,
+        )
+        assert not repeated_change
+        assert repeated == upgraded
 
     def test_apply_plan_enriches_existing_policy_without_replacing_profile_identity(
         self,

@@ -132,6 +132,7 @@ PRINCIPAL_PREFERENCE_MANAGER = Path("/etc/kai/manage-principal-preferences")
 _DEFAULT_INSTALL_DIR = "/opt/kai"
 _DEFAULT_DATA_DIR = "/var/lib/kai"
 _DEFAULT_SERVICE_USER = "kai"
+_BACKEND_SELECTION_POLICY_VERSION = 1
 
 # Current install.conf schema version
 _CONF_VERSION = 1
@@ -1266,6 +1267,7 @@ def _build_migrated_runtime_profiles(
         profile["allowed_backends"] = sorted({str(profile["backend"]), *shared_backends})
     document: dict[str, object] = {
         "version": 2,
+        "backend_selection_policy_version": _BACKEND_SELECTION_POLICY_VERSION,
         "runtime_profiles": profiles,
     }
     if legacy_runtime_keys:
@@ -1332,6 +1334,39 @@ def _upgrade_runtime_policy_content(
             "runtime_keys": archived_keys,
             "removal_gate": "canonical_runtime_state_v1",
         }
+        changed = True
+    if document.get("backend_selection_policy_version") != _BACKEND_SELECTION_POLICY_VERSION:
+        # #1139 introduced per-profile backend choices. Its first upgrade
+        # considered only users.yaml-derived profiles, which omitted protected
+        # profiles that exist solely in the live policy. Complete that
+        # one-time migration from every operator-assigned protected default.
+        # Installed registry entries remain insufficient on their own.
+        shared_backends: set[str] = set()
+        for policy_profiles in (document["runtime_profiles"], migrated_profiles):
+            for candidate in policy_profiles.values():
+                if not isinstance(candidate, dict):
+                    continue
+                candidate_backend = str(candidate.get("backend") or "").strip().lower()
+                if candidate_backend in BACKEND_PROVIDERS and len(BACKEND_PROVIDERS[candidate_backend]) == 1:
+                    shared_backends.add(candidate_backend)
+        for profile in document["runtime_profiles"].values():
+            if not isinstance(profile, dict):
+                continue
+            protected_default = str(profile.get("backend") or "").strip().lower()
+            raw_choices = profile.get("allowed_backends", [])
+            current_choices = (
+                {str(candidate).strip().lower() for candidate in raw_choices if str(candidate).strip()}
+                if isinstance(raw_choices, list)
+                else set()
+            )
+            profile["allowed_backends"] = sorted(
+                {
+                    protected_default,
+                    *current_choices,
+                    *shared_backends,
+                }
+            )
+        document["backend_selection_policy_version"] = _BACKEND_SELECTION_POLICY_VERSION
         changed = True
     for profile_id, profile in document["runtime_profiles"].items():
         if not isinstance(profile, dict):
