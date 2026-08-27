@@ -75,6 +75,8 @@ _TELEGRAM_COMMANDS = (
     BotCommand("new", "Start a fresh session"),
     BotCommand("models", "Choose a model"),
     BotCommand("model", "Switch model directly"),
+    BotCommand("backends", "Choose a backend"),
+    BotCommand("backend", "Show or switch backend"),
     BotCommand("settings", "Show or change your settings"),
     BotCommand("memory", "Browse, search, and manage remembered facts"),
     BotCommand("workspace", "Switch working directory"),

@@ -71,6 +71,7 @@ from kai.workshop.inbound import InboundMessage
 from kai.workshop.scheduled_jobs import WorkshopScheduledJobAuthority
 from kai.workshop.settings_workspaces import (
     SettingsWorkspaceAuthority,
+    SettingsWorkspaceSnapshot,
     WorkshopSettingsWorkspaceAccessDenied,
     WorkshopSettingsWorkspaceConflict,
     WorkshopSettingsWorkspaceService,
@@ -398,6 +399,24 @@ def _models_keyboard(current: str, models: dict[str, str]) -> InlineKeyboardMark
     return InlineKeyboardMarkup(buttons)
 
 
+def _backends_keyboard(snapshot: SettingsWorkspaceSnapshot) -> InlineKeyboardMarkup:
+    """Build an inline keyboard from one principal's authorized options."""
+    buttons = []
+    for option in snapshot.backend_options:
+        label = f"{option.backend} · {option.provider}"
+        if option.option_id == snapshot.backend_option_id:
+            label += " \U0001f7e2"
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"backend:{option.option_id}",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(buttons)
+
+
 @_require_auth
 async def handle_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /models - show model selection UI appropriate for the user's provider."""
@@ -556,6 +575,105 @@ async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ── Per-user settings ──────────────────────────────────────────────
 
 
+async def _handle_backend_setting(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    value: str | None,
+    *,
+    usage: str,
+) -> None:
+    """Show or change the canonical backend through one shared command path."""
+    assert update.message is not None
+    authority = _canonical_settings_authority(context, chat_id)
+    if authority is None:
+        await update.message.reply_text("Backend switching requires a canonical Workshop runtime.")
+        return
+    service = _get_core_services(context).settings_workspaces
+    if not value:
+        snapshot = await service.inspect(authority)
+        choices = ", ".join(
+            f"{option.option_id} ({option.backend}/{option.provider})" for option in snapshot.backend_options
+        )
+        await update.message.reply_text(
+            f"Current backend: {snapshot.backend_option_id}\nAvailable: {choices}\nUsage: {usage}"
+        )
+        return
+    try:
+        snapshot = await service.set_backend(authority, value)
+    except (WorkshopSettingsWorkspaceValidationError, WorkshopSettingsWorkspaceConflict) as exc:
+        await update.message.reply_text(str(exc))
+        return
+    await update.message.reply_text(
+        f"Backend switched to {snapshot.backend_option_id}. "
+        "Your next message will start a new provider session; Kai and other users were not restarted."
+    )
+
+
+@_require_auth
+async def handle_backend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /backend [backend:provider] as the direct backend selector."""
+    assert update.message is not None
+    args = context.args or []
+    await _handle_backend_setting(
+        update,
+        context,
+        _chat_id(update),
+        args[0] if args else None,
+        usage="/backend <backend:provider>",
+    )
+
+
+@_require_auth
+async def handle_backends(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /backends with an inline keyboard of authorized options."""
+    assert update.message is not None
+    authority = _canonical_settings_authority(context, _chat_id(update))
+    if authority is None:
+        await update.message.reply_text("Backend switching requires a canonical Workshop runtime.")
+        return
+    snapshot = await _get_core_services(context).settings_workspaces.inspect(authority)
+    await update.message.reply_text(
+        "Choose a backend:",
+        reply_markup=_backends_keyboard(snapshot),
+    )
+
+
+async def handle_backend_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Switch one canonical runtime from the /backends inline keyboard."""
+    assert update.callback_query is not None
+    query = update.callback_query
+    config: Config = context.bot_data["config"]
+    if not _is_authorized(config, _user_id(update)):
+        await query.answer("Not authorized.")
+        return
+    authority = _canonical_settings_authority(context, _chat_id(update))
+    if authority is None:
+        await query.answer("Backend switching is unavailable.")
+        return
+    assert query.data is not None
+    requested = query.data.removeprefix("backend:")
+    service = _get_core_services(context).settings_workspaces
+    current = await service.inspect(authority)
+    if requested == current.backend_option_id:
+        await query.answer()
+        await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
+        return
+    try:
+        snapshot = await service.set_backend(authority, requested)
+    except WorkshopSettingsWorkspaceValidationError:
+        await query.answer("Invalid backend.")
+        return
+    except WorkshopSettingsWorkspaceConflict as exc:
+        await query.answer(str(exc), show_alert=True)
+        return
+    await query.answer()
+    await query.edit_message_text(
+        f"Switched to {snapshot.backend_option_id}. Your next message will start a new provider session.",
+        reply_markup=InlineKeyboardMarkup([]),
+    )
+
+
 @_require_auth
 async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -585,29 +703,12 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # /settings backend [name]
     if field == "backend":
-        authority = _canonical_settings_authority(context, chat_id)
-        if authority is None:
-            await update.message.reply_text("Backend switching requires a canonical Workshop runtime.")
-            return
-        service = _get_core_services(context).settings_workspaces
-        if not value:
-            snapshot = await service.inspect(authority)
-            choices = ", ".join(
-                f"{option.option_id} ({option.backend}/{option.provider})" for option in snapshot.backend_options
-            )
-            await update.message.reply_text(
-                f"Current backend: {snapshot.backend_option_id}\n"
-                f"Available: {choices}\nUsage: /settings backend <backend:provider>"
-            )
-            return
-        try:
-            snapshot = await service.set_backend(authority, value)
-        except (WorkshopSettingsWorkspaceValidationError, WorkshopSettingsWorkspaceConflict) as exc:
-            await update.message.reply_text(str(exc))
-            return
-        await update.message.reply_text(
-            f"Backend switched to {snapshot.backend_option_id}. "
-            "Your next message will start a new provider session; Kai and other users were not restarted."
+        await _handle_backend_setting(
+            update,
+            context,
+            chat_id,
+            value,
+            usage="/settings backend <backend:provider>",
         )
         return
 
@@ -3523,6 +3624,8 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "\n"
         "/models - Choose a model\n"
         "/model <name> - Switch model directly\n"
+        "/backends - Choose a backend\n"
+        "/backend [backend:provider] - Show or switch backend\n"
         "\n"
         "/settings - Show your settings\n"
         "/settings model <name> - Default model\n"
@@ -4340,6 +4443,8 @@ def create_bot(
         ("new", handle_new),
         ("models", handle_models),
         ("model", handle_model),
+        ("backends", handle_backends),
+        ("backend", handle_backend),
         ("stats", handle_stats),
         ("help", handle_help),
         ("job", handle_job),
@@ -4367,6 +4472,12 @@ def create_bot(
     # Every callback either discloses user state or mutates it, so all callback
     # families share the same authorization/TOTP middleware.
     app.add_handler(CallbackQueryHandler(_require_sensitive_authentication(handle_model_callback), pattern=r"^model:"))
+    app.add_handler(
+        CallbackQueryHandler(
+            _require_sensitive_authentication(handle_backend_callback),
+            pattern=r"^backend:",
+        )
+    )
     app.add_handler(CallbackQueryHandler(_require_sensitive_authentication(handle_voice_callback), pattern=r"^voice:"))
     app.add_handler(CallbackQueryHandler(_require_sensitive_authentication(handle_workspace_callback), pattern=r"^ws:"))
     app.add_handler(
