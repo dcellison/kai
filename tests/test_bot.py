@@ -58,6 +58,7 @@ from kai.bot import (
     handle_model_callback,
     handle_models,
     handle_new,
+    handle_notifications,
     handle_photo,
     handle_review_command,
     handle_settings,
@@ -1277,6 +1278,7 @@ class TestHandleHelp:
         # routing notifications.
         assert "/github notify [number|reset]" in reply
         assert "/github notify [on|off]" not in reply
+        assert "/notifications <github|generic> [number|reset]" in reply
 
         # /memory browses facts and episodes; the tag-browse axis was
         # retired when the dashboard was redesigned as Facts/Episodes/
@@ -4695,6 +4697,141 @@ class TestHandleGitHub:
         assert "unknown subcommand" in reply.lower()
 
 
+# ── /notifications command ──────────────────────────────────────────
+
+
+class TestHandleNotifications:
+    @staticmethod
+    def _snapshot():
+        return SimpleNamespace(
+            revision="revision-1",
+            preferences=(
+                SimpleNamespace(
+                    integration_class="github",
+                    display_name="GitHub",
+                    destination_name="Notifications",
+                    source="protected policy",
+                ),
+                SimpleNamespace(
+                    integration_class="generic",
+                    display_name="Generic webhooks",
+                    destination_name="Home",
+                    source="protected policy",
+                ),
+            ),
+            destinations=(
+                SimpleNamespace(
+                    choice_id="ndst_home",
+                    display_name="Home",
+                    kind="direct",
+                    supported_classes=("github", "generic"),
+                ),
+                SimpleNamespace(
+                    choice_id="ndst_notifications",
+                    display_name="Notifications",
+                    kind="notification",
+                    supported_classes=("github",),
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _context(args: list[str]):
+        ctx = _make_context(config=_make_config(), args=args)
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = object()
+        service.inspect = AsyncMock(return_value=TestHandleNotifications._snapshot())
+        ctx.application.core_services.notification_preferences = service
+        return ctx, service
+
+    @pytest.mark.asyncio
+    async def test_reports_both_effective_destinations(self):
+        update = _make_update(text="/notifications")
+        ctx, _service = self._context([])
+
+        await handle_notifications(update, ctx)
+
+        reply = update.message.reply_text.call_args[0][0]
+        assert "GitHub: Notifications (protected policy)" in reply
+        assert "Generic webhooks: Home (protected policy)" in reply
+        assert "ndst_" not in reply
+        assert "telegram" not in reply.lower()
+
+    @pytest.mark.asyncio
+    async def test_lists_only_generic_authorized_destinations(self):
+        update = _make_update(text="/notifications generic")
+        ctx, _service = self._context(["generic"])
+
+        await handle_notifications(update, ctx)
+
+        reply = update.message.reply_text.call_args[0][0]
+        assert "1. Home (direct)" in reply
+        assert "Notifications (notification)" not in reply
+        assert "/notifications generic <number>" in reply
+
+    @pytest.mark.asyncio
+    async def test_selects_generic_destination_through_canonical_service(self):
+        update = _make_update(text="/notifications generic 1")
+        ctx, service = self._context(["generic", "1"])
+        authority = service.authority_for_principal_profile.return_value
+        service.select = AsyncMock(
+            return_value=SimpleNamespace(
+                preferences=(
+                    SimpleNamespace(
+                        integration_class="generic",
+                        destination_name="Home",
+                    ),
+                ),
+            )
+        )
+
+        await handle_notifications(update, ctx)
+
+        service.select.assert_awaited_once_with(
+            authority,
+            "generic",
+            "ndst_home",
+            expected_revision="revision-1",
+        )
+        assert "Generic webhook notifications will go to Home" in (update.message.reply_text.call_args[0][0])
+
+    @pytest.mark.asyncio
+    async def test_resets_generic_destination_through_canonical_service(self):
+        update = _make_update(text="/notifications generic reset")
+        ctx, service = self._context(["generic", "reset"])
+        authority = service.authority_for_principal_profile.return_value
+        service.reset = AsyncMock(
+            return_value=SimpleNamespace(
+                preferences=(
+                    SimpleNamespace(
+                        integration_class="generic",
+                        destination_name="Home",
+                        source="protected policy",
+                    ),
+                ),
+            )
+        )
+
+        await handle_notifications(update, ctx)
+
+        service.reset.assert_awaited_once_with(
+            authority,
+            "generic",
+            expected_revision="revision-1",
+        )
+        assert "reset to Home (protected policy)" in (update.message.reply_text.call_args[0][0])
+
+    @pytest.mark.asyncio
+    async def test_rejects_unknown_integration_class_without_inspection(self):
+        update = _make_update(text="/notifications telegram 1")
+        ctx, service = self._context(["telegram", "1"])
+
+        await handle_notifications(update, ctx)
+
+        service.inspect.assert_not_awaited()
+        assert "<github|generic>" in update.message.reply_text.call_args[0][0]
+
+
 # ── /model persistence ─────────────────────────────────────────────
 
 
@@ -4770,6 +4907,7 @@ EXPECTED_MENU_COMMANDS = {
     "model",
     "models",
     "new",
+    "notifications",
     "settings",
     "stats",
     "stop",
