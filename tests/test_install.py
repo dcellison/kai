@@ -5016,6 +5016,7 @@ class TestCmdStatus:
         assert "Workshop conversation continuity:" in output
         assert "Workshop memory authority:" in output
         assert "Workshop operational state:" in output
+        assert "Workshop client preferences:" in output
         assert "Workshop canonical message integrity:" in output
         assert "Workshop transcript authority:" in output
         assert "Workshop legacy JSONL archive:" in output

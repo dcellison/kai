@@ -71,6 +71,7 @@ from kai.workshop.client_api import (
     register_workshop_enrollment_routes,
     register_workshop_read_routes,
 )
+from kai.workshop.client_preferences import WorkshopClientPreferenceService
 from kai.workshop.client_sessions import (
     WorkshopBearerSessionAuthenticator,
     WorkshopClientEnrollmentManager,
@@ -1788,6 +1789,7 @@ async def _register_workshop_client_api(
     preference_documents: WorkshopPreferenceService | None = None,
     github_settings: WorkshopGitHubSettingsService | None = None,
     notification_preferences: WorkshopNotificationPreferenceService | None = None,
+    client_preferences: WorkshopClientPreferenceService | None = None,
 ) -> Callable[[web.Application], None]:
     """Register the client API against the core-owned canonical store.
 
@@ -1825,6 +1827,7 @@ async def _register_workshop_client_api(
             preference_documents=preference_documents,
             github_settings=github_settings,
             notification_preferences=notification_preferences,
+            client_preferences=client_preferences,
         )
         if command_submitter is not None:
             register_workshop_command_routes(
@@ -1905,6 +1908,7 @@ async def start(
             preference_documents=core_services.preference_documents,
             github_settings=getattr(core_services, "github_settings", None),
             notification_preferences=getattr(core_services, "notification_preferences", None),
+            client_preferences=getattr(core_services, "client_preferences", None),
         )
 
     _runner = web.AppRunner(

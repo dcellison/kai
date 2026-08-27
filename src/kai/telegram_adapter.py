@@ -17,12 +17,25 @@ from kai.config import Config
 from kai.telegram_context import KaiTelegramApplication
 from kai.telegram_contract import TELEGRAM_DELIVERY_CAPABILITIES as TELEGRAM_DELIVERY_CAPABILITIES
 from kai.telegram_http import TelegramWebhookIngress
+from kai.tts import DEFAULT_VOICE, VOICES
+from kai.workshop.client_preferences import ClientVoiceCapability
 from kai.workshop.telegram_delivery_runtime import (
     WorkshopTelegramConversationDeliveryService,
     WorkshopTelegramNotificationService,
 )
 
 log = logging.getLogger(__name__)
+
+
+def voice_capability(config: Config) -> ClientVoiceCapability:
+    """Declare Telegram's existing output-voice surface to the core host."""
+    return ClientVoiceCapability(
+        transport="telegram",
+        display_name="Telegram",
+        enabled=config.tts_enabled,
+        voices=tuple(VOICES.items()),
+        default_voice=DEFAULT_VOICE,
+    )
 
 
 class TelegramAdapterState(StrEnum):

@@ -79,6 +79,7 @@ from kai.workshop.bootstrap import bootstrap_human_principal_id
 from kai.workshop.diagnostics import (
     workshop_bootstrap_status,
     workshop_canonical_message_integrity_status,
+    workshop_client_preference_status,
     workshop_delivery_authority_status,
     workshop_execution_state_status,
     workshop_legacy_jsonl_archive_status,
@@ -9436,6 +9437,13 @@ def _cmd_status() -> None:
     print(workshop_execution_state_status(Path(data_dir) / "kai.db"))
     print(workshop_operational_state_status(Path(data_dir) / "kai.db"))
     print(
+        workshop_client_preference_status(
+            Path(data_dir) / "kai.db",
+            telegram_enabled=_read_deployed_telegram_enabled(_DEPLOYED_ENV_FILE),
+            tts_enabled=_read_deployed_tts_enabled(_DEPLOYED_ENV_FILE),
+        )
+    )
+    print(
         workshop_memory_authority_status(
             Path(data_dir) / "kai.db",
             memory_enabled=_read_deployed_memory_enabled(_DEPLOYED_ENV_FILE),
@@ -9729,11 +9737,36 @@ def _read_deployed_adapter_configuration(env_path: Path) -> dict[str, str]:
                 continue
             key, separator, raw_value = stripped.partition("=")
             key = key.strip()
-            if not separator or key not in {"KAI_ENABLED_ADAPTERS", "TELEGRAM_BOT_TOKEN"}:
+            if not separator or key not in {
+                "KAI_ENABLED_ADAPTERS",
+                "TELEGRAM_BOT_TOKEN",
+                "TTS_ENABLED",
+            }:
                 continue
             value = raw_value.strip().strip("\"'")
-            configured[key] = value if key == "KAI_ENABLED_ADAPTERS" else ("configured" if value else "")
+            if key == "TELEGRAM_BOT_TOKEN":
+                configured[key] = "configured" if value else ""
+            else:
+                configured[key] = value
     return configured
+
+
+def _read_deployed_telegram_enabled(env_path: Path) -> bool | None:
+    """Read only whether the deployed adapter policy enables Telegram."""
+    try:
+        configured = _read_deployed_adapter_configuration(env_path)
+        return "telegram" in parse_enabled_adapters(configured.get("KAI_ENABLED_ADAPTERS"))
+    except (FileNotFoundError, OSError, UnicodeError, ValueError, ProtectedConfigError):
+        return None
+
+
+def _read_deployed_tts_enabled(env_path: Path) -> bool | None:
+    """Read only whether deployed Telegram output speech is enabled."""
+    try:
+        configured = _read_deployed_adapter_configuration(env_path)
+        return configured.get("TTS_ENABLED", "").lower() in {"1", "true", "yes"}
+    except (FileNotFoundError, OSError, UnicodeError, ProtectedConfigError):
+        return None
 
 
 def _read_deployed_memory_enabled(env_path: Path) -> bool | None:

@@ -19,6 +19,7 @@ import {
   loadNavigation,
   loadGitHubSettings,
   loadNotificationPreferences,
+  loadClientPreferences,
   loadPreferenceDocument,
   loadPreferenceHistory,
   loadRun,
@@ -35,6 +36,7 @@ import {
   updateRuntimeSettings,
   updateGitHubSettings,
   updateNotificationPreference,
+  updateClientPreference,
   updateWorkspaceConfig,
 } from "./api";
 import type { WorkshopSession } from "./types";
@@ -234,6 +236,36 @@ function notificationPreferencesPayload(
       },
     ],
     revision: "nps_current",
+    mutation: null,
+    ...overrides,
+  };
+}
+
+function clientPreferencesPayload(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    version: 1,
+    voice_output: {
+      available: true,
+      unavailable_reason: null,
+      modes: ["off", "text_and_voice", "voice_only"],
+      voices: [
+        { value: "alan", display_name: "Alan" },
+        { value: "jenny", display_name: "Jenny" },
+      ],
+      bindings: [
+        {
+          choice_id: "cbd_telegram",
+          client_name: "Telegram",
+          mode: "off",
+          voice: "alan",
+          voice_name: "Alan",
+          editable: true,
+        },
+      ],
+    },
+    revision: "cvp_current",
     mutation: null,
     ...overrides,
   };
@@ -677,6 +709,39 @@ describe("Workshop client API", () => {
       integration_class: "github",
     });
     expect(JSON.stringify(loaded)).not.toContain("telegram");
+  });
+
+  it("loads and mutates opaque client-binding voice preferences", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json(clientPreferencesPayload()))
+      .mockResolvedValueOnce(Response.json(clientPreferencesPayload({
+        mutation: { operation: "set_client_voice_mode", changed: true },
+      })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const loaded = await loadClientPreferences(session);
+    expect(loaded.voiceOutput.bindings).toEqual([
+      expect.objectContaining({
+        choiceId: "cbd_telegram",
+        clientName: "Telegram",
+        mode: "off",
+      }),
+    ]);
+    await expect(updateClientPreference(session, "cvp_current", {
+      field: "mode",
+      bindingChoiceId: "cbd_telegram",
+      value: "text_and_voice",
+    })).resolves.toMatchObject({
+      mutation: { operation: "set_client_voice_mode", changed: true },
+    });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/v1/settings/clients");
+    expect(JSON.parse((fetchMock.mock.calls[1]?.[1] as RequestInit).body as string)).toEqual({
+      revision: "cvp_current",
+      binding_choice_id: "cbd_telegram",
+      mode: "text_and_voice",
+    });
+    expect(JSON.stringify(loaded)).not.toContain("12345");
   });
 
   it("rejects malformed memory records instead of rendering partial data", async () => {

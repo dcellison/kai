@@ -7,6 +7,7 @@ import {
   loadPreferenceHistory,
   loadGitHubSettings,
   loadNotificationPreferences,
+  loadClientPreferences,
   loadSettingsWorkspace,
   loadWorkspaceConfig,
   PreferenceRevisionConflictError,
@@ -17,6 +18,7 @@ import {
   updateRuntimeSettings,
   updateGitHubSettings,
   updateNotificationPreference,
+  updateClientPreference,
   updateWorkspaceConfig,
 } from "./api";
 import type {
@@ -27,6 +29,8 @@ import type {
   WorkshopGitHubSettingsChange,
   WorkshopNotificationPreferences,
   WorkshopNotificationPreferenceChange,
+  WorkshopClientPreferences,
+  WorkshopClientPreferenceChange,
   WorkshopRuntimeSettingsChange,
   WorkshopSession,
   WorkshopSettingsMutation,
@@ -34,6 +38,12 @@ import type {
   WorkshopWorkspaceConfig,
   WorkshopWorkspaceSettingChange,
 } from "./types";
+
+const VOICE_MODE_LABELS = {
+  off: "Text only",
+  text_and_voice: "Text and voice",
+  voice_only: "Voice only",
+} as const;
 
 function formatDate(value: string | null): string {
   if (!value) {
@@ -131,6 +141,12 @@ export function SettingsWorkspace({
   const [notificationBusy, setNotificationBusy] = useState(false);
   const [notificationError, setNotificationError] = useState<string | null>(null);
   const [notificationNotice, setNotificationNotice] = useState<string | null>(null);
+
+  const [clients, setClients] = useState<WorkshopClientPreferences | null>(null);
+  const [clientLoading, setClientLoading] = useState(true);
+  const [clientBusy, setClientBusy] = useState(false);
+  const [clientError, setClientError] = useState<string | null>(null);
+  const [clientNotice, setClientNotice] = useState<string | null>(null);
 
   const preferenceDirty = preference !== null && preferenceDraft !== preference.content;
   const preferenceBytes = useMemo(
@@ -255,12 +271,27 @@ export function SettingsWorkspace({
     }
   }, [handleAccessFailure, session]);
 
+  const refreshClients = useCallback(async (): Promise<void> => {
+    setClientLoading(true);
+    setClientError(null);
+    try {
+      setClients(await loadClientPreferences(session));
+    } catch (caught) {
+      if (!handleAccessFailure(caught)) {
+        setClientError(errorText(caught, "Could not load client preferences."));
+      }
+    } finally {
+      setClientLoading(false);
+    }
+  }, [handleAccessFailure, session]);
+
   useEffect(() => {
     void refreshPreferences();
     void refreshRuntime();
     void refreshGitHub();
     void refreshNotifications();
-  }, [refreshGitHub, refreshNotifications, refreshPreferences, refreshRuntime]);
+    void refreshClients();
+  }, [refreshClients, refreshGitHub, refreshNotifications, refreshPreferences, refreshRuntime]);
 
   useEffect(() => {
     onDirtyChange(preferenceDirty);
@@ -477,6 +508,41 @@ export function SettingsWorkspace({
       }
     } finally {
       setNotificationBusy(false);
+    }
+  };
+
+  const mutateClientPreference = async (
+    change: WorkshopClientPreferenceChange,
+  ): Promise<void> => {
+    if (!clients) {
+      return;
+    }
+    setClientBusy(true);
+    setClientError(null);
+    setClientNotice(null);
+    try {
+      const changed = await updateClientPreference(
+        session,
+        clients.revision,
+        change,
+      );
+      setClients(changed);
+      setClientNotice(
+        changed.mutation?.changed
+          ? "Client preference saved."
+          : "No change was needed.",
+      );
+    } catch (caught) {
+      if (caught instanceof SettingsRevisionConflictError) {
+        await refreshClients();
+        setClientError(
+          "Client preferences changed elsewhere. The latest values have been reloaded.",
+        );
+      } else if (!handleAccessFailure(caught)) {
+        setClientError(errorText(caught, "Could not update client preferences."));
+      }
+    } finally {
+      setClientBusy(false);
     }
   };
 
@@ -1186,6 +1252,74 @@ export function SettingsWorkspace({
           {notificationError && notifications && (
             <p className="settings-error" role="alert">{notificationError}</p>
           )}
+        </section>
+
+        <section className="settings-section">
+          <div>
+            <p className="section-number">06</p>
+            <h2>Client preferences</h2>
+            <p>
+              Control presentation on each connected client without changing
+              how your other Kai clients behave.
+            </p>
+          </div>
+          {clientLoading ? (
+            <p role="status">Loading client preferences…</p>
+          ) : clients ? (
+            clients.voiceOutput.bindings.length > 0 ? (
+              <div className="settings-card-grid">
+                {clients.voiceOutput.bindings.map((binding) => (
+                  <article className="settings-card" key={binding.choiceId}>
+                    <h3>{binding.clientName} voice output</h3>
+                    {!clients.voiceOutput.available && (
+                      <p>{clients.voiceOutput.unavailableReason}</p>
+                    )}
+                    <label htmlFor={`client-mode-${binding.choiceId}`}>Response format</label>
+                    <select
+                      id={`client-mode-${binding.choiceId}`}
+                      value={binding.mode}
+                      disabled={clientBusy || !binding.editable}
+                      onChange={(event) => void mutateClientPreference({
+                        field: "mode",
+                        bindingChoiceId: binding.choiceId,
+                        value: event.target.value as "off" | "text_and_voice" | "voice_only",
+                      })}
+                    >
+                      {clients.voiceOutput.modes.map((mode) => (
+                        <option key={mode} value={mode}>{VOICE_MODE_LABELS[mode]}</option>
+                      ))}
+                    </select>
+                    <label htmlFor={`client-voice-${binding.choiceId}`}>Voice</label>
+                    <select
+                      id={`client-voice-${binding.choiceId}`}
+                      value={binding.voice}
+                      disabled={clientBusy || !binding.editable}
+                      onChange={(event) => void mutateClientPreference({
+                        field: "voice",
+                        bindingChoiceId: binding.choiceId,
+                        value: event.target.value,
+                      })}
+                    >
+                      {clients.voiceOutput.voices.map((voice) => (
+                        <option key={voice.value} value={voice.value}>{voice.displayName}</option>
+                      ))}
+                    </select>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <p>No voice-capable client binding is available for this account.</p>
+            )
+          ) : (
+            <div className="settings-failure">
+              <p role="alert">{clientError ?? "Client preferences are unavailable."}</p>
+              <button className="quiet-button" type="button" onClick={() => void refreshClients()}>
+                Retry
+              </button>
+            </div>
+          )}
+          {clientNotice && <p className="settings-notice" role="status">{clientNotice}</p>}
+          {clientError && clients && <p className="settings-error" role="alert">{clientError}</p>}
         </section>
       </div>
     </section>

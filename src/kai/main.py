@@ -711,6 +711,9 @@ def _start() -> None:
                 services_info=services.get_available_services(),
                 registered_backend_ids=_workshop_registered_backend_ids(config),
                 delivery_policy=_delivery_policy(config, telegram_adapter_module),
+                client_voice_capabilities=(
+                    (telegram_adapter_module.voice_capability(config),) if telegram_adapter_module is not None else ()
+                ),
             )
             core_services = await core_host.start()
             logging.info("Kai core application host is ready")

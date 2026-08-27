@@ -37,6 +37,16 @@ from kai.workshop.client_events import (
     ClientTimelineMessageEvent,
     read_client_channel_events,
 )
+from kai.workshop.client_preferences import (
+    ClientPreferenceAuthority,
+    ClientPreferenceSnapshot,
+    WorkshopClientPreferenceAccessDenied,
+    WorkshopClientPreferenceConflict,
+    WorkshopClientPreferenceError,
+    WorkshopClientPreferenceService,
+    WorkshopClientPreferenceStorageError,
+    WorkshopClientPreferenceValidationError,
+)
 from kai.workshop.client_sessions import EnrollmentGrantUnavailableError, WorkshopClientEnrollmentManager
 from kai.workshop.conversation_commands import ConversationCommandAcceptanceError
 from kai.workshop.domain import ArtifactId, ChannelId, PrincipalId, RunId
@@ -138,6 +148,7 @@ _PREFERENCE_REVISIONS_PATH = "/v1/preferences/revisions"
 _PREFERENCE_RESTORE_PATH = "/v1/preferences/revisions/{preference_revision}/restore"
 _GITHUB_SETTINGS_PATH = "/v1/settings/github"
 _NOTIFICATION_PREFERENCES_PATH = "/v1/settings/notifications"
+_CLIENT_PREFERENCES_PATH = "/v1/settings/clients"
 _MAX_PREFERENCE_UPDATE_BODY_BYTES = MAX_PREFERENCE_BYTES * 6 + 1024
 _MAX_PREFERENCE_RESTORE_BODY_BYTES = 512
 _MEMORY_STATS_PATH = "/v1/memory/stats"
@@ -168,6 +179,8 @@ _GITHUB_TOGGLE_FIELDS = frozenset({"field", "enabled"})
 _MAX_GITHUB_SETTINGS_BODY_BYTES = 10_240
 _NOTIFICATION_PREFERENCE_REQUEST_FIELDS = frozenset({"revision", "integration_class", "destination_choice_id", "reset"})
 _MAX_NOTIFICATION_PREFERENCE_BODY_BYTES = 2_048
+_CLIENT_PREFERENCE_REQUEST_FIELDS = frozenset({"revision", "binding_choice_id", "mode", "voice"})
+_MAX_CLIENT_PREFERENCE_BODY_BYTES = 2_048
 _DECIMAL_INTEGER = re.compile(r"^[0-9]+$")
 _CLIENT_MESSAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _EVENT_BATCH_SIZE = 100
@@ -357,6 +370,38 @@ def _serialize_notification_preferences(
             }
             for item in snapshot.preferences
         ],
+        "revision": snapshot.revision,
+        "mutation": (
+            {
+                "operation": snapshot.mutation.operation,
+                "changed": snapshot.mutation.changed,
+            }
+            if snapshot.mutation is not None
+            else None
+        ),
+    }
+
+
+def _serialize_client_preferences(snapshot: ClientPreferenceSnapshot) -> dict[str, object]:
+    return {
+        "version": 1,
+        "voice_output": {
+            "available": snapshot.available,
+            "unavailable_reason": snapshot.unavailable_reason,
+            "modes": ["off", "text_and_voice", "voice_only"],
+            "voices": [{"value": item.value, "display_name": item.display_name} for item in snapshot.voices],
+            "bindings": [
+                {
+                    "choice_id": item.choice_id,
+                    "client_name": item.client_name,
+                    "mode": item.mode,
+                    "voice": item.voice,
+                    "voice_name": item.voice_name,
+                    "editable": item.editable,
+                }
+                for item in snapshot.bindings
+            ],
+        },
         "revision": snapshot.revision,
         "mutation": (
             {
@@ -1488,6 +1533,152 @@ async def _handle_notification_preference_update(
     except WorkshopNotificationPreferenceError as exc:
         return _notification_preference_error_response(exc)
     return _json_response(_serialize_notification_preferences(snapshot), status=200)
+
+
+async def _authenticate_client_preference_authority(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopClientPreferenceService,
+) -> tuple[ClientPreferenceAuthority | None, web.Response | None]:
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(
+            status=401,
+            code="authentication_required",
+            message="Authentication required",
+        )
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return None, response
+    try:
+        return service.authority_for_principal(principal_id), None
+    except WorkshopClientPreferenceAccessDenied:
+        return None, _error_response(status=403, code="access_denied", message="Access denied")
+
+
+def _client_preference_error_response(exc: WorkshopClientPreferenceError) -> web.Response:
+    if isinstance(exc, WorkshopClientPreferenceConflict):
+        return _error_response(status=409, code="settings_conflict", message=str(exc))
+    if isinstance(exc, WorkshopClientPreferenceValidationError):
+        return _error_response(status=400, code="invalid_setting", message=str(exc))
+    if isinstance(exc, WorkshopClientPreferenceAccessDenied):
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    if isinstance(exc, WorkshopClientPreferenceStorageError):
+        return _error_response(
+            status=503,
+            code="client_preferences_unavailable",
+            message="Client preferences are temporarily unavailable",
+        )
+    return _error_response(
+        status=503,
+        code="client_preferences_unavailable",
+        message="Client preferences are temporarily unavailable",
+    )
+
+
+async def _client_preference_json_object(request: web.Request) -> dict[str, object]:
+    if request.content_type != "application/json":
+        raise WorkshopClientPreferenceValidationError("Content-Type must be application/json")
+    if request.content_length is not None and request.content_length > _MAX_CLIENT_PREFERENCE_BODY_BYTES:
+        raise WorkshopClientPreferenceValidationError("Client preference request is too large")
+    raw = await request.content.read(_MAX_CLIENT_PREFERENCE_BODY_BYTES + 1)
+    if len(raw) > _MAX_CLIENT_PREFERENCE_BODY_BYTES:
+        raise WorkshopClientPreferenceValidationError("Client preference request is too large")
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise WorkshopClientPreferenceValidationError("Invalid JSON request") from exc
+    if not isinstance(payload, dict):
+        raise WorkshopClientPreferenceValidationError("Invalid client preference request")
+    return payload
+
+
+async def _handle_client_preferences(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopClientPreferenceService,
+) -> web.Response:
+    authority, error = await _authenticate_client_preference_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        return error
+    assert authority is not None
+    if request.query or request.can_read_body:
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid client preference request",
+        )
+    try:
+        snapshot = await service.inspect(authority)
+    except WorkshopClientPreferenceError as exc:
+        return _client_preference_error_response(exc)
+    return _json_response(_serialize_client_preferences(snapshot), status=200)
+
+
+async def _handle_client_preference_update(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopClientPreferenceService,
+) -> web.Response:
+    authority, error = await _authenticate_client_preference_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        return error
+    assert authority is not None
+    if request.query:
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid client preference request",
+        )
+    try:
+        payload = await _client_preference_json_object(request)
+        if not set(payload).issubset(_CLIENT_PREFERENCE_REQUEST_FIELDS):
+            raise WorkshopClientPreferenceValidationError("Invalid client preference request")
+        revision = payload.get("revision")
+        choice_id = payload.get("binding_choice_id")
+        if not isinstance(revision, str) or not isinstance(choice_id, str):
+            raise WorkshopClientPreferenceValidationError("Client preference revision and binding choice are required")
+        has_mode = "mode" in payload
+        has_voice = "voice" in payload
+        if has_mode == has_voice:
+            raise WorkshopClientPreferenceValidationError("Change exactly one client preference at a time")
+        if has_mode:
+            if set(payload) != {"revision", "binding_choice_id", "mode"}:
+                raise WorkshopClientPreferenceValidationError("Invalid client voice mode request")
+            mode = payload["mode"]
+            if not isinstance(mode, str):
+                raise WorkshopClientPreferenceValidationError("Invalid client voice mode request")
+            snapshot = await service.set_choice_mode(
+                authority,
+                choice_id,
+                mode,
+                expected_revision=revision,
+            )
+        else:
+            if set(payload) != {"revision", "binding_choice_id", "voice"}:
+                raise WorkshopClientPreferenceValidationError("Invalid client voice request")
+            voice = payload["voice"]
+            if not isinstance(voice, str):
+                raise WorkshopClientPreferenceValidationError("Invalid client voice request")
+            snapshot = await service.set_choice_voice(
+                authority,
+                choice_id,
+                voice,
+                expected_revision=revision,
+            )
+    except WorkshopClientPreferenceError as exc:
+        return _client_preference_error_response(exc)
+    return _json_response(_serialize_client_preferences(snapshot), status=200)
 
 
 async def _handle_runtime_settings(
@@ -2951,6 +3142,7 @@ def register_workshop_read_routes(
     preference_documents: WorkshopPreferenceService | None = None,
     github_settings: WorkshopGitHubSettingsService | None = None,
     notification_preferences: WorkshopNotificationPreferenceService | None = None,
+    client_preferences: WorkshopClientPreferenceService | None = None,
 ) -> None:
     """Register authenticated Workshop client routes on an application."""
     if event_poll_interval <= 0 or event_heartbeat_interval <= 0 or event_authentication_recheck_interval <= 0:
@@ -3081,6 +3273,26 @@ def register_workshop_read_routes(
             _NOTIFICATION_PREFERENCES_PATH,
             handle_notification_preference_update,
         )
+    if client_preferences is not None:
+
+        async def handle_client_preferences(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_client_preferences(
+                    request,
+                    authenticator=authenticator,
+                    service=client_preferences,
+                )
+
+        async def handle_client_preference_update(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_client_preference_update(
+                    request,
+                    authenticator=authenticator,
+                    service=client_preferences,
+                )
+
+        app.router.add_get(_CLIENT_PREFERENCES_PATH, handle_client_preferences)
+        app.router.add_patch(_CLIENT_PREFERENCES_PATH, handle_client_preference_update)
     if artifact_service is not None:
 
         async def handle_artifact_content(request: web.Request) -> web.StreamResponse:

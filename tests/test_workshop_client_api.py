@@ -33,6 +33,10 @@ from kai.workshop.client_events import (
     ClientTimelineMessageEvent,
     read_client_channel_events,
 )
+from kai.workshop.client_preferences import (
+    ClientVoiceCapability,
+    WorkshopClientPreferenceService,
+)
 from kai.workshop.client_sessions import (
     WorkshopBearerSessionAuthenticator,
     WorkshopClientSessionManager,
@@ -566,6 +570,7 @@ async def _open_client(
     memory_queries=None,
     github_settings=None,
     notification_preferences=None,
+    client_preferences=None,
 ) -> TestClient:
     app = web.Application()
     register_workshop_read_routes(
@@ -583,6 +588,7 @@ async def _open_client(
         memory_queries=memory_queries,
         github_settings=github_settings,
         notification_preferences=notification_preferences,
+        client_preferences=client_preferences,
     )
     client = TestClient(TestServer(app))
     await client.start_server()
@@ -2803,6 +2809,82 @@ async def test_notification_preferences_api_uses_opaque_authorized_choices(
         assert stale.status == 409
         assert forged.status == 403
         assert raw_authority.status == 400
+    finally:
+        await client.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_client_voice_preferences_api_is_binding_scoped_and_revision_checked(
+    tmp_path: Path,
+) -> None:
+    store, alice_id, _, bob_id, _ = await _open_store(tmp_path / "kai.db")
+    await store.connection.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    service = WorkshopClientPreferenceService(
+        store.connection,
+        (
+            ClientVoiceCapability(
+                "telegram",
+                "Telegram",
+                True,
+                (("alan", "Alan"), ("jenny", "Jenny")),
+                "alan",
+            ),
+        ),
+    )
+    await service.reconcile_legacy_preferences()
+    client = await _open_client(
+        store,
+        _Authenticator({"alice-token": alice_id, "bob-token": bob_id}),
+        client_preferences=service,
+    )
+    alice_headers = {"Authorization": "Bearer alice-token"}
+    bob_headers = {"Authorization": "Bearer bob-token"}
+    try:
+        loaded = await client.get("/v1/settings/clients", headers=alice_headers)
+        payload = await loaded.json()
+        assert loaded.status == 200
+        assert payload["voice_output"]["available"] is True
+        assert payload["voice_output"]["bindings"][0]["client_name"] == "Telegram"
+        assert payload["voice_output"]["bindings"][0]["choice_id"].startswith("cbd_")
+        assert "101" not in json.dumps(payload)
+
+        binding_choice = payload["voice_output"]["bindings"][0]["choice_id"]
+        changed = await client.patch(
+            "/v1/settings/clients",
+            headers=alice_headers,
+            json={
+                "revision": payload["revision"],
+                "binding_choice_id": binding_choice,
+                "mode": "text_and_voice",
+            },
+        )
+        changed_payload = await changed.json()
+        assert changed.status == 200
+        assert changed_payload["voice_output"]["bindings"][0]["mode"] == "text_and_voice"
+
+        stale = await client.patch(
+            "/v1/settings/clients",
+            headers=alice_headers,
+            json={
+                "revision": payload["revision"],
+                "binding_choice_id": binding_choice,
+                "voice": "jenny",
+            },
+        )
+        bob_loaded = await client.get("/v1/settings/clients", headers=bob_headers)
+        bob_payload = await bob_loaded.json()
+        forged = await client.patch(
+            "/v1/settings/clients",
+            headers=alice_headers,
+            json={
+                "revision": changed_payload["revision"],
+                "binding_choice_id": bob_payload["voice_output"]["bindings"][0]["choice_id"],
+                "voice": "jenny",
+            },
+        )
+        assert stale.status == 409
+        assert forged.status == 403
     finally:
         await client.close()
         await store.close()

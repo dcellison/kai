@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 35
+WORKSHOP_SCHEMA_VERSION = 36
 
 
 @dataclass(frozen=True, slots=True)
@@ -1749,6 +1749,52 @@ _PRINCIPAL_NOTIFICATION_PREFERENCES_SCHEMA = SchemaMigration(
     ),
 )
 
+_CLIENT_BINDING_VOICE_PREFERENCES_SCHEMA = SchemaMigration(
+    version=36,
+    name="client_binding_voice_preferences",
+    statements=(
+        """
+        CREATE TABLE client_binding_voice_preferences (
+            channel_binding_id TEXT PRIMARY KEY
+                REFERENCES channel_bindings(id) ON DELETE CASCADE,
+            principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+            mode TEXT NOT NULL CHECK (
+                mode IN ('off', 'text_and_voice', 'voice_only')
+            ),
+            voice_name TEXT NOT NULL CHECK (length(trim(voice_name)) > 0),
+            created_at TEXT NOT NULL DEFAULT (
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            ),
+            updated_at TEXT NOT NULL DEFAULT (
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            )
+        )
+        """,
+        "CREATE INDEX client_binding_voice_preferences_principal_idx "
+        "ON client_binding_voice_preferences (principal_id, channel_binding_id)",
+        """
+        CREATE TABLE client_binding_voice_migrations (
+            channel_binding_id TEXT PRIMARY KEY
+                REFERENCES channel_bindings(id) ON DELETE CASCADE,
+            principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+            mode_migrated INTEGER NOT NULL CHECK (mode_migrated IN (0, 1)),
+            voice_migrated INTEGER NOT NULL CHECK (voice_migrated IN (0, 1)),
+            legacy_reads_disabled INTEGER NOT NULL DEFAULT 1 CHECK (
+                legacy_reads_disabled = 1
+            ),
+            rollback_dual_writes INTEGER NOT NULL DEFAULT 1 CHECK (
+                rollback_dual_writes = 1
+            ),
+            migrated_at TEXT NOT NULL DEFAULT (
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            )
+        )
+        """,
+        "CREATE INDEX client_binding_voice_migrations_principal_idx "
+        "ON client_binding_voice_migrations (principal_id, channel_binding_id)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -1785,6 +1831,7 @@ _MIGRATIONS = (
     _CANONICAL_RUNTIME_KEYS_SCHEMA,
     _CANONICAL_BACKEND_SELECTION_SCHEMA,
     _PRINCIPAL_NOTIFICATION_PREFERENCES_SCHEMA,
+    _CLIENT_BINDING_VOICE_PREFERENCES_SCHEMA,
 )
 
 
