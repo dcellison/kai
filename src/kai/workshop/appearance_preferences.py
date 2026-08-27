@@ -41,7 +41,19 @@ class AppearanceThemeChoice:
     color_scheme: str
 
 
-WORKSHOP_APPEARANCE_THEMES = (AppearanceThemeChoice(DEFAULT_WORKSHOP_THEME, "Atom One Dark", "dark"),)
+WORKSHOP_APPEARANCE_THEMES = (
+    AppearanceThemeChoice(DEFAULT_WORKSHOP_THEME, "Atom One Dark", "dark"),
+    AppearanceThemeChoice("atom-one-light", "Atom One Light", "light"),
+    AppearanceThemeChoice("dracula", "Dracula", "dark"),
+    AppearanceThemeChoice("nord", "Nord", "dark"),
+    AppearanceThemeChoice("solarized-dark", "Solarized Dark", "dark"),
+    AppearanceThemeChoice("solarized-light", "Solarized Light", "light"),
+    AppearanceThemeChoice("catppuccin-mocha", "Catppuccin Mocha", "dark"),
+    AppearanceThemeChoice("catppuccin-latte", "Catppuccin Latte", "light"),
+    AppearanceThemeChoice("github-light-default", "GitHub Light Default", "light"),
+    AppearanceThemeChoice("github-dark-default", "GitHub Dark Default", "dark"),
+    AppearanceThemeChoice("github-dark-dimmed", "GitHub Dark Dimmed", "dark"),
+)
 _THEMES_BY_ID = {item.theme_id: item for item in WORKSHOP_APPEARANCE_THEMES}
 
 

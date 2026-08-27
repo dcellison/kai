@@ -8,6 +8,7 @@ import pytest
 
 from kai.workshop.appearance_preferences import (
     DEFAULT_WORKSHOP_THEME,
+    WORKSHOP_APPEARANCE_THEMES,
     WorkshopAppearancePreferenceAccessDenied,
     WorkshopAppearancePreferenceConflict,
     WorkshopAppearancePreferenceService,
@@ -49,7 +50,19 @@ async def test_defaults_are_principal_scoped_and_survive_restart(tmp_path: Path)
     assert daniel_snapshot.theme_id == DEFAULT_WORKSHOP_THEME
     assert scott_snapshot.theme_id == DEFAULT_WORKSHOP_THEME
     assert daniel_snapshot.revision != scott_snapshot.revision
-    assert [item.theme_id for item in daniel_snapshot.themes] == [DEFAULT_WORKSHOP_THEME]
+    assert [item.theme_id for item in daniel_snapshot.themes] == [
+        "atom-one-dark",
+        "atom-one-light",
+        "dracula",
+        "nord",
+        "solarized-dark",
+        "solarized-light",
+        "catppuccin-mocha",
+        "catppuccin-latte",
+        "github-light-default",
+        "github-dark-default",
+        "github-dark-dimmed",
+    ]
     assert workshop_appearance_preference_status(path) == (
         "Workshop appearance preferences: active; principals=2, explicit=0, defaulted=2, invalid=0; authority=canonical"
     )
@@ -71,6 +84,39 @@ async def test_defaults_are_principal_scoped_and_survive_restart(tmp_path: Path)
     reopened = await WorkshopAppearancePreferenceService.open(path)
     try:
         assert (await reopened.inspect(reopened.authority_for_principal(daniel_id))).theme_id == DEFAULT_WORKSHOP_THEME
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_non_default_light_and_dark_themes_are_isolated_and_survive_restart(tmp_path: Path) -> None:
+    path = tmp_path / "kai.db"
+    store, daniel_id, scott_id = await _seed(path)
+    service = WorkshopAppearancePreferenceService(store.connection)
+    daniel = service.authority_for_principal(daniel_id)
+    scott = service.authority_for_principal(scott_id)
+
+    daniel_before = await service.inspect(daniel)
+    scott_before = await service.inspect(scott)
+    daniel_changed = await service.set_theme(
+        daniel,
+        "github-light-default",
+        expected_revision=daniel_before.revision,
+    )
+    scott_changed = await service.set_theme(
+        scott,
+        "catppuccin-mocha",
+        expected_revision=scott_before.revision,
+    )
+    assert daniel_changed.theme_id == "github-light-default"
+    assert scott_changed.theme_id == "catppuccin-mocha"
+    assert len(WORKSHOP_APPEARANCE_THEMES) == 11
+    await store.close()
+
+    reopened = await WorkshopAppearancePreferenceService.open(path)
+    try:
+        assert (await reopened.inspect(reopened.authority_for_principal(daniel_id))).theme_id == "github-light-default"
+        assert (await reopened.inspect(reopened.authority_for_principal(scott_id))).theme_id == "catppuccin-mocha"
     finally:
         await reopened.close()
 

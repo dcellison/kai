@@ -13,7 +13,10 @@ import pytest
 from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 
-from kai.workshop.appearance_preferences import WorkshopAppearancePreferenceService
+from kai.workshop.appearance_preferences import (
+    WORKSHOP_APPEARANCE_THEMES,
+    WorkshopAppearancePreferenceService,
+)
 from kai.workshop.artifacts import (
     StagedArtifact,
     WorkshopArtifactService,
@@ -2920,10 +2923,11 @@ async def test_appearance_preferences_api_is_principal_scoped_and_revision_check
         assert payload["theme_id"] == "atom-one-dark"
         assert payload["themes"] == [
             {
-                "theme_id": "atom-one-dark",
-                "display_name": "Atom One Dark",
-                "color_scheme": "dark",
+                "theme_id": item.theme_id,
+                "display_name": item.display_name,
+                "color_scheme": item.color_scheme,
             }
+            for item in WORKSHOP_APPEARANCE_THEMES
         ]
 
         unchanged = await client.patch(

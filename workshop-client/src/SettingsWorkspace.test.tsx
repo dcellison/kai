@@ -24,6 +24,7 @@ import {
   updateWorkspaceConfig,
 } from "./api";
 import { SettingsWorkspace } from "./SettingsWorkspace";
+import { WORKSHOP_THEME_CATALOG } from "./theme";
 import type {
   WorkshopPreferenceDocument,
   WorkshopGitHubSettings,
@@ -67,13 +68,7 @@ const appearancePreferences: WorkshopAppearancePreferences = {
   mutation: null,
   revision: "apr_current",
   themeId: "atom-one-dark",
-  themes: [
-    {
-      colorScheme: "dark",
-      displayName: "Atom One Dark",
-      themeId: "atom-one-dark",
-    },
-  ],
+  themes: WORKSHOP_THEME_CATALOG.map((theme) => ({ ...theme })),
 };
 
 const preference: WorkshopPreferenceDocument = {
@@ -770,6 +765,9 @@ describe("Settings workspace", () => {
     const selector = await screen.findByLabelText("Theme");
     expect(selector).toHaveValue("atom-one-dark");
     expect(screen.getByRole("option", { name: "Atom One Dark" })).toBeVisible();
+    expect(screen.getByRole("option", { name: "GitHub Light Default" })).toBeVisible();
+    expect(screen.getByRole("option", { name: "GitHub Dark Dimmed" })).toBeVisible();
+    expect((selector as HTMLSelectElement).options).toHaveLength(11);
     expect(document.documentElement.dataset.workshopTheme).toBe("atom-one-dark");
   });
 

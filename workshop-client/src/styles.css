@@ -7,10 +7,17 @@
   font-family: var(--sans);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
+  accent-color: var(--color-accent);
+  scrollbar-color: var(--color-text-muted) var(--color-canvas-inset);
 }
 
 * {
   box-sizing: border-box;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--color-accent) 38%, transparent);
+  color: var(--color-text-strong);
 }
 
 html,
