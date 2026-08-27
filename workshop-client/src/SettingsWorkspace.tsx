@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   AuthenticationError,
@@ -44,6 +44,17 @@ const VOICE_MODE_LABELS = {
   text_and_voice: "Text and voice",
   voice_only: "Voice only",
 } as const;
+
+const SETTINGS_SECTIONS = [
+  { id: "settings-section-personal-preferences", label: "Personal preferences" },
+  { id: "settings-section-runtime", label: "Runtime settings" },
+  { id: "settings-section-workspace", label: "Workspace settings" },
+  { id: "settings-section-github", label: "GitHub" },
+  { id: "settings-section-notifications", label: "Notification delivery" },
+  { id: "settings-section-clients", label: "Client preferences" },
+] as const;
+
+type SettingsSectionId = (typeof SETTINGS_SECTIONS)[number]["id"];
 
 function formatDate(value: string | null): string {
   if (!value) {
@@ -148,11 +159,57 @@ export function SettingsWorkspace({
   const [clientError, setClientError] = useState<string | null>(null);
   const [clientNotice, setClientNotice] = useState<string | null>(null);
 
+  const settingsScrollRef = useRef<HTMLDivElement>(null);
+  const [activeSection, setActiveSection] = useState<SettingsSectionId>(
+    SETTINGS_SECTIONS[0].id,
+  );
+
   const preferenceDirty = preference !== null && preferenceDraft !== preference.content;
   const preferenceBytes = useMemo(
     () => new TextEncoder().encode(preferenceDraft).length,
     [preferenceDraft],
   );
+
+  const navigateToSection = (sectionId: SettingsSectionId): void => {
+    const section = document.getElementById(sectionId);
+    if (!section) {
+      return;
+    }
+    const reduceMotion = typeof window.matchMedia === "function"
+      && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    setActiveSection(sectionId);
+    section.scrollIntoView({
+      behavior: reduceMotion ? "auto" : "smooth",
+      block: "start",
+    });
+  };
+
+  const updateActiveSection = (): void => {
+    const scroll = settingsScrollRef.current;
+    if (!scroll) {
+      return;
+    }
+    const available = SETTINGS_SECTIONS.flatMap((item) => {
+      const element = document.getElementById(item.id);
+      return element ? [{ item, element }] : [];
+    });
+    if (available.length === 0) {
+      return;
+    }
+    if (scroll.scrollTop + scroll.clientHeight >= scroll.scrollHeight - 2) {
+      setActiveSection(available[available.length - 1].item.id);
+      return;
+    }
+    const threshold = scroll.getBoundingClientRect().top + 32;
+    let current = available[0].item.id;
+    for (const candidate of available) {
+      if (candidate.element.getBoundingClientRect().top > threshold) {
+        break;
+      }
+      current = candidate.item.id;
+    }
+    setActiveSection(current);
+  };
 
   const handleAccessFailure = useCallback((caught: unknown): boolean => {
     if (caught instanceof AuthenticationError) {
@@ -623,8 +680,23 @@ export function SettingsWorkspace({
         </button>
       </header>
 
-      <div className="settings-scroll">
-        <section className="settings-intro">
+      <nav className="settings-section-navigation" aria-label="Settings sections">
+        <div>
+          {SETTINGS_SECTIONS.map((section) => (
+            <button
+              key={section.id}
+              type="button"
+              aria-current={activeSection === section.id ? "location" : undefined}
+              onClick={() => navigateToSection(section.id)}
+            >
+              {section.label}
+            </button>
+          ))}
+        </div>
+      </nav>
+
+      <div className="settings-scroll" ref={settingsScrollRef} onScroll={updateActiveSection}>
+        <section className="settings-intro" id="settings-section-personal-preferences">
           <div>
             <p className="section-number">01</p>
             <h2>Personal preferences</h2>
@@ -745,7 +817,7 @@ export function SettingsWorkspace({
           )}
         </section>
 
-        <section className="settings-section">
+        <section className="settings-section" id="settings-section-runtime">
           <div>
             <p className="section-number">02</p>
             <h2>Runtime settings</h2>
@@ -864,7 +936,7 @@ export function SettingsWorkspace({
         </section>
 
         {runtime && workspaceConfig && (
-          <section className="settings-section">
+          <section className="settings-section" id="settings-section-workspace">
             <div>
               <p className="section-number">03</p>
               <h2>Workspace settings</h2>
@@ -917,7 +989,7 @@ export function SettingsWorkspace({
           </section>
         )}
         {runtime && !workspaceConfig && !runtimeLoading && (
-          <section className="settings-section">
+          <section className="settings-section" id="settings-section-workspace">
             <div>
               <p className="section-number">03</p>
               <h2>Workspace settings</h2>
@@ -930,7 +1002,7 @@ export function SettingsWorkspace({
           </section>
         )}
 
-        <section className="settings-section">
+        <section className="settings-section" id="settings-section-github">
           <div>
             <p className="section-number">04</p>
             <h2>GitHub</h2>
@@ -1169,7 +1241,7 @@ export function SettingsWorkspace({
           {githubError && github && <p className="settings-error" role="alert">{githubError}</p>}
         </section>
 
-        <section className="settings-section">
+        <section className="settings-section" id="settings-section-notifications">
           <div>
             <p className="section-number">05</p>
             <h2>Notification delivery</h2>
@@ -1254,7 +1326,7 @@ export function SettingsWorkspace({
           )}
         </section>
 
-        <section className="settings-section">
+        <section className="settings-section" id="settings-section-clients">
           <div>
             <p className="section-number">06</p>
             <h2>Client preferences</h2>
