@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 37
+WORKSHOP_SCHEMA_VERSION = 38
 
 
 @dataclass(frozen=True, slots=True)
@@ -1814,6 +1814,36 @@ _PRINCIPAL_APPEARANCE_PREFERENCES_SCHEMA = SchemaMigration(
     ),
 )
 
+_DURABLE_PRINCIPAL_APPEARANCE_PREFERENCES_SCHEMA = SchemaMigration(
+    version=38,
+    name="isolate_principal_appearance_preferences_from_projection_rebuilds",
+    statements=(
+        """
+        CREATE TABLE principal_appearance_preferences_v38 (
+            -- principal_id is deliberately not a foreign key. Principals are
+            -- replayed collaboration projections, while appearance choices
+            -- are mutable principal state that must survive projection reset.
+            principal_id TEXT PRIMARY KEY,
+            theme_id TEXT NOT NULL CHECK (length(trim(theme_id)) > 0),
+            created_at TEXT NOT NULL DEFAULT (
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            ),
+            updated_at TEXT NOT NULL DEFAULT (
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            )
+        )
+        """,
+        """
+        INSERT INTO principal_appearance_preferences_v38 (
+            principal_id, theme_id, created_at, updated_at
+        ) SELECT principal_id, theme_id, created_at, updated_at
+          FROM principal_appearance_preferences
+        """,
+        "DROP TABLE principal_appearance_preferences",
+        "ALTER TABLE principal_appearance_preferences_v38 RENAME TO principal_appearance_preferences",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -1852,6 +1882,7 @@ _MIGRATIONS = (
     _PRINCIPAL_NOTIFICATION_PREFERENCES_SCHEMA,
     _CLIENT_BINDING_VOICE_PREFERENCES_SCHEMA,
     _PRINCIPAL_APPEARANCE_PREFERENCES_SCHEMA,
+    _DURABLE_PRINCIPAL_APPEARANCE_PREFERENCES_SCHEMA,
 )
 
 

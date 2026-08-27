@@ -382,7 +382,7 @@ class TestAtomicTerminalTransactions:
 
         upgraded = await WorkshopEventStore.open(database)
         try:
-            assert await upgraded.schema_version() == 37
+            assert await upgraded.schema_version() == 38
             assert await _post_run_effect_count(upgraded) == 1
             async with upgraded.connection.execute(
                 "SELECT status, source_message_id, result_message_id FROM workshop_post_run_effects WHERE run_id = ?",
