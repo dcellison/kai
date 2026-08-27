@@ -96,6 +96,7 @@ _TELEGRAM_COMMANDS = (
     BotCommand("workspaces", "List recent workspaces"),
     BotCommand("github", "Show GitHub settings"),
     BotCommand("notifications", "Route personal notifications"),
+    BotCommand("preferences", "View or edit your preferences"),
     BotCommand("voice", "Toggle voice or set voice name"),
     BotCommand("voices", "Choose a voice"),
     BotCommand("stats", "Show session info and cost"),
