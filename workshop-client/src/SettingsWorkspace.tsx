@@ -6,6 +6,7 @@ import {
   loadPreferenceDocument,
   loadPreferenceHistory,
   loadGitHubSettings,
+  loadNotificationPreferences,
   loadSettingsWorkspace,
   loadWorkspaceConfig,
   PreferenceRevisionConflictError,
@@ -15,6 +16,7 @@ import {
   switchWorkspace,
   updateRuntimeSettings,
   updateGitHubSettings,
+  updateNotificationPreference,
   updateWorkspaceConfig,
 } from "./api";
 import type {
@@ -23,6 +25,8 @@ import type {
   WorkshopPreferenceHistory,
   WorkshopGitHubSettings,
   WorkshopGitHubSettingsChange,
+  WorkshopNotificationPreferences,
+  WorkshopNotificationPreferenceChange,
   WorkshopRuntimeSettingsChange,
   WorkshopSession,
   WorkshopSettingsMutation,
@@ -120,6 +124,13 @@ export function SettingsWorkspace({
   const [githubNotice, setGitHubNotice] = useState<string | null>(null);
   const [githubRepository, setGitHubRepository] = useState("");
   const [githubToken, setGitHubToken] = useState("");
+
+  const [notifications, setNotifications] =
+    useState<WorkshopNotificationPreferences | null>(null);
+  const [notificationLoading, setNotificationLoading] = useState(true);
+  const [notificationBusy, setNotificationBusy] = useState(false);
+  const [notificationError, setNotificationError] = useState<string | null>(null);
+  const [notificationNotice, setNotificationNotice] = useState<string | null>(null);
 
   const preferenceDirty = preference !== null && preferenceDraft !== preference.content;
   const preferenceBytes = useMemo(
@@ -230,11 +241,26 @@ export function SettingsWorkspace({
     }
   }, [handleAccessFailure, session]);
 
+  const refreshNotifications = useCallback(async (): Promise<void> => {
+    setNotificationLoading(true);
+    setNotificationError(null);
+    try {
+      setNotifications(await loadNotificationPreferences(session));
+    } catch (caught) {
+      if (!handleAccessFailure(caught)) {
+        setNotificationError(errorText(caught, "Could not load notification preferences."));
+      }
+    } finally {
+      setNotificationLoading(false);
+    }
+  }, [handleAccessFailure, session]);
+
   useEffect(() => {
     void refreshPreferences();
     void refreshRuntime();
     void refreshGitHub();
-  }, [refreshGitHub, refreshPreferences, refreshRuntime]);
+    void refreshNotifications();
+  }, [refreshGitHub, refreshNotifications, refreshPreferences, refreshRuntime]);
 
   useEffect(() => {
     onDirtyChange(preferenceDirty);
@@ -413,6 +439,44 @@ export function SettingsWorkspace({
       return false;
     } finally {
       setGitHubBusy(false);
+    }
+  };
+
+  const mutateNotificationPreference = async (
+    change: WorkshopNotificationPreferenceChange,
+    confirmation: string | null = null,
+  ): Promise<void> => {
+    if (!notifications || (confirmation !== null && !window.confirm(confirmation))) {
+      return;
+    }
+    setNotificationBusy(true);
+    setNotificationError(null);
+    setNotificationNotice(null);
+    try {
+      const changed = await updateNotificationPreference(
+        session,
+        notifications.revision,
+        change,
+      );
+      setNotifications(changed);
+      setNotificationNotice(
+        changed.mutation?.changed
+          ? "Notification destination saved."
+          : "No change was needed.",
+      );
+    } catch (caught) {
+      if (caught instanceof SettingsRevisionConflictError) {
+        await refreshNotifications();
+        setNotificationError(
+          "Notification preferences changed elsewhere. The latest values have been reloaded.",
+        );
+      } else if (!handleAccessFailure(caught)) {
+        setNotificationError(
+          errorText(caught, "Could not update notification preferences."),
+        );
+      }
+    } finally {
+      setNotificationBusy(false);
     }
   };
 
@@ -1037,6 +1101,91 @@ export function SettingsWorkspace({
           )}
           {githubNotice && <p className="settings-notice" role="status">{githubNotice}</p>}
           {githubError && github && <p className="settings-error" role="alert">{githubError}</p>}
+        </section>
+
+        <section className="settings-section">
+          <div>
+            <p className="section-number">05</p>
+            <h2>Notification delivery</h2>
+            <p>
+              Choose where personal integration notifications appear. Only
+              canonical destinations authorized for your Workshop identity are listed.
+            </p>
+          </div>
+          {notificationLoading ? (
+            <p role="status">Loading notification destinations…</p>
+          ) : notifications ? (
+            <div className="settings-card-grid notification-preference-grid">
+              {notifications.preferences.map((preference) => {
+                const choices = notifications.destinations.filter((destination) =>
+                  destination.supportedClasses.includes(preference.integrationClass));
+                return (
+                  <article className="settings-card" key={preference.integrationClass}>
+                    <label htmlFor={`notification-${preference.integrationClass}`}>
+                      {preference.displayName}
+                    </label>
+                    <select
+                      id={`notification-${preference.integrationClass}`}
+                      value={preference.destinationChoiceId}
+                      disabled={notificationBusy || !preference.editable}
+                      onChange={(event) => void mutateNotificationPreference({
+                        field: "destination",
+                        integrationClass: preference.integrationClass,
+                        choiceId: event.target.value,
+                      })}
+                    >
+                      {choices.map((destination) => (
+                        <option key={destination.choiceId} value={destination.choiceId}>
+                          {destination.displayName} · {destination.kind}
+                        </option>
+                      ))}
+                    </select>
+                    <p>
+                      Effective: <strong>{preference.destinationName}</strong>
+                      {` · ${preference.source}`}
+                    </p>
+                    {preference.resettable && (
+                      <div className="settings-actions">
+                        <button
+                          className="quiet-button"
+                          type="button"
+                          disabled={notificationBusy}
+                          onClick={() => void mutateNotificationPreference(
+                            {
+                              field: "reset",
+                              integrationClass: preference.integrationClass,
+                            },
+                            `Reset ${preference.displayName} delivery to protected policy?`,
+                          )}
+                        >
+                          Reset
+                        </button>
+                      </div>
+                    )}
+                  </article>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="settings-failure">
+              <p role="alert">
+                {notificationError ?? "Notification preferences are unavailable."}
+              </p>
+              <button
+                className="quiet-button"
+                type="button"
+                onClick={() => void refreshNotifications()}
+              >
+                Retry
+              </button>
+            </div>
+          )}
+          {notificationNotice && (
+            <p className="settings-notice" role="status">{notificationNotice}</p>
+          )}
+          {notificationError && notifications && (
+            <p className="settings-error" role="alert">{notificationError}</p>
+          )}
         </section>
       </div>
     </section>

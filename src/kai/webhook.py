@@ -88,6 +88,7 @@ from kai.workshop.integration_notifications import (
     WorkshopIntegrationNotificationService,
 )
 from kai.workshop.memory_queries import WorkshopMemoryQueryService
+from kai.workshop.notification_preferences import WorkshopNotificationPreferenceService
 from kai.workshop.preferences import WorkshopPreferenceService
 from kai.workshop.proactive_publication import (
     ProactivePublicationAuthority,
@@ -1786,6 +1787,7 @@ async def _register_workshop_client_api(
     memory_queries: WorkshopMemoryQueryService | None = None,
     preference_documents: WorkshopPreferenceService | None = None,
     github_settings: WorkshopGitHubSettingsService | None = None,
+    notification_preferences: WorkshopNotificationPreferenceService | None = None,
 ) -> Callable[[web.Application], None]:
     """Register the client API against the core-owned canonical store.
 
@@ -1822,6 +1824,7 @@ async def _register_workshop_client_api(
             memory_queries=memory_queries,
             preference_documents=preference_documents,
             github_settings=github_settings,
+            notification_preferences=notification_preferences,
         )
         if command_submitter is not None:
             register_workshop_command_routes(
@@ -1901,6 +1904,7 @@ async def start(
             memory_queries=core_services.memory_queries,
             preference_documents=core_services.preference_documents,
             github_settings=getattr(core_services, "github_settings", None),
+            notification_preferences=getattr(core_services, "notification_preferences", None),
         )
 
     _runner = web.AppRunner(

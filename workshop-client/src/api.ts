@@ -21,6 +21,8 @@ import type {
   WorkshopPreferenceHistory,
   WorkshopGitHubSettings,
   WorkshopGitHubSettingsChange,
+  WorkshopNotificationPreferences,
+  WorkshopNotificationPreferenceChange,
   WorkshopRuntimeSettingsChange,
   WorkshopWorkspaceSettingChange,
   WorkshopMemoryPage,
@@ -619,6 +621,78 @@ function parseGitHubSettings(payload: unknown): WorkshopGitHubSettings {
     repositoriesResettable: payload.repositories_resettable as boolean,
     revision: payload.revision,
     tokenStored: payload.token_stored,
+  };
+}
+
+function parseNotificationPreferences(
+  payload: unknown,
+): WorkshopNotificationPreferences {
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    !Array.isArray(payload.destinations) ||
+    !Array.isArray(payload.preferences) ||
+    typeof payload.revision !== "string" ||
+    (payload.mutation !== null &&
+      (!isRecord(payload.mutation) ||
+        typeof payload.mutation.operation !== "string" ||
+        typeof payload.mutation.changed !== "boolean"))
+  ) {
+    throw new Error("Kai returned unsupported notification preferences.");
+  }
+  const destinations = payload.destinations.map((value) => {
+    if (
+      !isRecord(value) ||
+      typeof value.choice_id !== "string" ||
+      typeof value.display_name !== "string" ||
+      (value.kind !== "direct" && value.kind !== "notification") ||
+      !Array.isArray(value.supported_classes) ||
+      value.supported_classes.some((item) => item !== "github" && item !== "generic")
+    ) {
+      throw new Error("Kai returned an unsupported notification destination.");
+    }
+    return {
+      choiceId: value.choice_id,
+      displayName: value.display_name,
+      kind: value.kind as "direct" | "notification",
+      supportedClasses: value.supported_classes as ("generic" | "github")[],
+    };
+  });
+  const preferences = payload.preferences.map((value) => {
+    if (
+      !isRecord(value) ||
+      (value.integration_class !== "github" && value.integration_class !== "generic") ||
+      typeof value.display_name !== "string" ||
+      typeof value.destination_choice_id !== "string" ||
+      typeof value.destination_name !== "string" ||
+      (value.destination_kind !== "direct" && value.destination_kind !== "notification") ||
+      typeof value.source !== "string" ||
+      typeof value.editable !== "boolean" ||
+      typeof value.resettable !== "boolean"
+    ) {
+      throw new Error("Kai returned an unsupported integration preference.");
+    }
+    return {
+      destinationChoiceId: value.destination_choice_id,
+      destinationKind: value.destination_kind as "direct" | "notification",
+      destinationName: value.destination_name,
+      displayName: value.display_name,
+      editable: value.editable,
+      integrationClass: value.integration_class as "generic" | "github",
+      resettable: value.resettable,
+      source: value.source,
+    };
+  });
+  return {
+    destinations,
+    mutation: payload.mutation === null
+      ? null
+      : {
+          changed: payload.mutation.changed as boolean,
+          operation: payload.mutation.operation as string,
+        },
+    preferences,
+    revision: payload.revision,
   };
 }
 
@@ -1346,6 +1420,45 @@ export async function updateGitHubSettings(
     throw new Error(safeErrorMessage(payload, "Could not update GitHub settings."));
   }
   return parseGitHubSettings(payload);
+}
+
+export async function loadNotificationPreferences(
+  session: WorkshopSession,
+): Promise<WorkshopNotificationPreferences> {
+  const response = await authorizedFetch(session, "/v1/settings/notifications");
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load notification preferences."));
+  }
+  return parseNotificationPreferences(payload);
+}
+
+export async function updateNotificationPreference(
+  session: WorkshopSession,
+  revision: string,
+  change: WorkshopNotificationPreferenceChange,
+): Promise<WorkshopNotificationPreferences> {
+  const operation = change.field === "destination"
+    ? {
+        destination_choice_id: change.choiceId,
+        integration_class: change.integrationClass,
+      }
+    : { integration_class: change.integrationClass, reset: true };
+  const response = await authorizedFetch(session, "/v1/settings/notifications", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ revision, ...operation }),
+  });
+  const payload = await responsePayload(response);
+  if (response.status === 409) {
+    throw new SettingsRevisionConflictError(
+      safeErrorMessage(payload, "Notification preferences changed since they were loaded."),
+    );
+  }
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not update notification preferences."));
+  }
+  return parseNotificationPreferences(payload);
 }
 
 export async function updateRuntimeSettings(

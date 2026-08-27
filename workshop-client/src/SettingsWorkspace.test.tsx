@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ChannelAccessError,
   loadGitHubSettings,
+  loadNotificationPreferences,
   loadPreferenceDocument,
   loadPreferenceHistory,
   loadSettingsWorkspace,
@@ -14,6 +15,7 @@ import {
   savePreferenceDocument,
   switchWorkspace,
   updateGitHubSettings,
+  updateNotificationPreference,
   updateRuntimeSettings,
   updateWorkspaceConfig,
 } from "./api";
@@ -21,6 +23,7 @@ import { SettingsWorkspace } from "./SettingsWorkspace";
 import type {
   WorkshopPreferenceDocument,
   WorkshopGitHubSettings,
+  WorkshopNotificationPreferences,
   WorkshopSettingsWorkspace,
   WorkshopWorkspaceConfig,
 } from "./types";
@@ -31,6 +34,7 @@ vi.mock("./api", async (importOriginal) => {
     ...original,
     loadPreferenceDocument: vi.fn(),
     loadGitHubSettings: vi.fn(),
+    loadNotificationPreferences: vi.fn(),
     loadPreferenceHistory: vi.fn(),
     loadSettingsWorkspace: vi.fn(),
     loadWorkspaceConfig: vi.fn(),
@@ -38,6 +42,7 @@ vi.mock("./api", async (importOriginal) => {
     savePreferenceDocument: vi.fn(),
     switchWorkspace: vi.fn(),
     updateGitHubSettings: vi.fn(),
+    updateNotificationPreference: vi.fn(),
     updateRuntimeSettings: vi.fn(),
     updateWorkspaceConfig: vi.fn(),
   };
@@ -184,6 +189,37 @@ const githubSettings: WorkshopGitHubSettings = {
   tokenStored: true,
 };
 
+const notificationPreferences: WorkshopNotificationPreferences = {
+  destinations: [
+    {
+      choiceId: "ndst_home",
+      displayName: "Home",
+      kind: "direct",
+      supportedClasses: ["github", "generic"],
+    },
+    {
+      choiceId: "ndst_notifications",
+      displayName: "Notifications",
+      kind: "notification",
+      supportedClasses: ["github", "generic"],
+    },
+  ],
+  mutation: null,
+  preferences: [
+    {
+      destinationChoiceId: "ndst_notifications",
+      destinationKind: "notification",
+      destinationName: "Notifications",
+      displayName: "GitHub",
+      editable: true,
+      integrationClass: "github",
+      resettable: false,
+      source: "protected policy",
+    },
+  ],
+  revision: "nps_current",
+};
+
 function renderSettings(
   onDirtyChange = vi.fn(),
   runActive = false,
@@ -220,6 +256,7 @@ describe("Settings workspace", () => {
     });
     vi.mocked(loadSettingsWorkspace).mockResolvedValue(runtime);
     vi.mocked(loadGitHubSettings).mockResolvedValue(githubSettings);
+    vi.mocked(loadNotificationPreferences).mockResolvedValue(notificationPreferences);
     vi.mocked(loadWorkspaceConfig).mockResolvedValue(workspaceConfig);
     vi.mocked(savePreferenceDocument).mockResolvedValue({
       ...preference,
@@ -232,6 +269,7 @@ describe("Settings workspace", () => {
     });
     vi.mocked(updateRuntimeSettings).mockResolvedValue(runtime);
     vi.mocked(updateGitHubSettings).mockResolvedValue(githubSettings);
+    vi.mocked(updateNotificationPreference).mockResolvedValue(notificationPreferences);
     vi.mocked(updateWorkspaceConfig).mockResolvedValue(workspaceConfig);
     vi.mocked(switchWorkspace).mockResolvedValue({
       ...runtime,
@@ -515,5 +553,53 @@ describe("Settings workspace", () => {
       { field: "token", token: "replacement-secret" },
     );
     expect(screen.getByLabelText("GitHub access token")).toHaveValue("");
+  });
+
+  it("selects an authorized personal notification destination", async () => {
+    const user = userEvent.setup();
+    vi.mocked(updateNotificationPreference).mockResolvedValue({
+      ...notificationPreferences,
+      mutation: {
+        changed: true,
+        operation: "select_github_notification_destination",
+      },
+      preferences: [
+        {
+          ...notificationPreferences.preferences[0],
+          destinationChoiceId: "ndst_home",
+          destinationKind: "direct",
+          destinationName: "Home",
+          resettable: true,
+          source: "personal override",
+        },
+      ],
+      revision: "nps_selected",
+    });
+    renderSettings();
+
+    const selector = await screen.findByLabelText("GitHub");
+    const card = selector.closest("article");
+    expect(card).not.toBeNull();
+    expect(selector).toHaveValue("ndst_notifications");
+    expect(within(card as HTMLElement).getByText(/Effective:/)).toHaveTextContent(
+      "Effective: Notifications · protected policy",
+    );
+
+    await user.selectOptions(selector, "ndst_home");
+
+    expect(updateNotificationPreference).toHaveBeenCalledWith(
+      session,
+      "nps_current",
+      {
+        field: "destination",
+        integrationClass: "github",
+        choiceId: "ndst_home",
+      },
+    );
+    await waitFor(() => expect(
+      within(card as HTMLElement).getByText(/Effective:/),
+    ).toHaveTextContent(
+      "Effective: Home · personal override",
+    ));
   });
 });

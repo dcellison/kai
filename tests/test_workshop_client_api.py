@@ -46,6 +46,7 @@ from kai.workshop.domain import (
     RunId,
 )
 from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
+from kai.workshop.execution_state import WorkshopExecutionStateRegistry
 from kai.workshop.github_settings import (
     GitHubRepositorySetting,
     GitHubSettingsAuthority,
@@ -75,6 +76,7 @@ from kai.workshop.memory_queries import (
     WorkshopMemoryConflict,
     WorkshopMemoryNotFound,
 )
+from kai.workshop.notification_preferences import WorkshopNotificationPreferenceService
 from kai.workshop.run_lifecycle import (
     DurableRun,
     RunNotFoundError,
@@ -563,6 +565,7 @@ async def _open_client(
     settings_workspaces=None,
     memory_queries=None,
     github_settings=None,
+    notification_preferences=None,
 ) -> TestClient:
     app = web.Application()
     register_workshop_read_routes(
@@ -579,6 +582,7 @@ async def _open_client(
         settings_workspaces=settings_workspaces,
         memory_queries=memory_queries,
         github_settings=github_settings,
+        notification_preferences=notification_preferences,
     )
     client = TestClient(TestServer(app))
     await client.start_server()
@@ -2700,6 +2704,105 @@ async def test_github_settings_api_rejects_unauthorized_invalid_and_stale_writes
         assert cross_principal.status == 403
         assert invalid.status == 400
         assert stale.status == 409
+    finally:
+        await client.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_notification_preferences_api_uses_opaque_authorized_choices(
+    tmp_path: Path,
+) -> None:
+    store, alice_id, _, bob_id, _ = await _open_store(tmp_path / "kai.db")
+    registry = await WorkshopExecutionStateRegistry.from_store(
+        store,
+        profile_registry(101, 202),
+    )
+    service = WorkshopNotificationPreferenceService(store.connection, registry)
+    client = await _open_client(
+        store,
+        _Authenticator({"alice-token": alice_id, "bob-token": bob_id}),
+        notification_preferences=service,
+    )
+    alice_headers = {"Authorization": "Bearer alice-token"}
+    bob_headers = {"Authorization": "Bearer bob-token"}
+    try:
+        loaded = await client.get(
+            "/v1/settings/notifications",
+            headers=alice_headers,
+        )
+        payload = await loaded.json()
+
+        assert loaded.status == 200
+        assert payload["version"] == 1
+        assert [item["kind"] for item in payload["destinations"]] == [
+            "direct",
+            "notification",
+        ]
+        assert all(item["choice_id"].startswith("ndst_") for item in payload["destinations"])
+        encoded = json.dumps(payload)
+        assert "-100123" not in encoded
+        assert '"101"' not in encoded
+        assert "telegram" not in encoded.lower()
+
+        shared = next(item for item in payload["destinations"] if item["kind"] == "notification")
+        selected = await client.patch(
+            "/v1/settings/notifications",
+            headers=alice_headers,
+            json={
+                "revision": payload["revision"],
+                "integration_class": "github",
+                "destination_choice_id": shared["choice_id"],
+            },
+        )
+        selected_payload = await selected.json()
+
+        assert selected.status == 200
+        assert selected_payload["preferences"][0]["destination_name"] == "Notifications"
+        assert selected_payload["preferences"][0]["source"] == "personal override"
+        assert selected_payload["mutation"] == {
+            "operation": "select_github_notification_destination",
+            "changed": True,
+        }
+
+        stale = await client.patch(
+            "/v1/settings/notifications",
+            headers=alice_headers,
+            json={
+                "revision": payload["revision"],
+                "integration_class": "github",
+                "reset": True,
+            },
+        )
+        forged = await client.patch(
+            "/v1/settings/notifications",
+            headers=bob_headers,
+            json={
+                "revision": (
+                    await (
+                        await client.get(
+                            "/v1/settings/notifications",
+                            headers=bob_headers,
+                        )
+                    ).json()
+                )["revision"],
+                "integration_class": "github",
+                "destination_choice_id": shared["choice_id"],
+            },
+        )
+        raw_authority = await client.patch(
+            "/v1/settings/notifications",
+            headers=alice_headers,
+            json={
+                "revision": selected_payload["revision"],
+                "integration_class": "github",
+                "channel_id": "-100123",
+            },
+        )
+
+        assert stale.status == 409
+        assert forged.status == 403
+        assert raw_authority.status == 400
     finally:
         await client.close()
         await store.close()

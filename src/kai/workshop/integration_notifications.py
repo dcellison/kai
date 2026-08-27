@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from kai.workshop.delivery_outbox import NOTIFICATION_PURPOSE, DeliveryRequestResult
 from kai.workshop.delivery_planning import CanonicalDeliveryIntent, WorkshopDeliveryPlanner
@@ -23,6 +24,9 @@ from kai.workshop.domain import (
 )
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
+
+if TYPE_CHECKING:
+    from kai.workshop.notification_preferences import WorkshopNotificationPreferenceService
 
 _DELIVERY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SOURCE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
@@ -90,9 +94,15 @@ class IntegrationRouteStatus:
 class WorkshopIntegrationNotificationService:
     """Own canonical integration recording independently of client adapters."""
 
-    def __init__(self, store: WorkshopEventStore, delivery_policy: WorkshopDeliveryBindingPolicy) -> None:
+    def __init__(
+        self,
+        store: WorkshopEventStore,
+        delivery_policy: WorkshopDeliveryBindingPolicy,
+        notification_preferences: WorkshopNotificationPreferenceService | None = None,
+    ) -> None:
         self._store = store
         self._delivery_planner = WorkshopDeliveryPlanner(store, delivery_policy)
+        self._notification_preferences = notification_preferences
         self._lock = asyncio.Lock()
         self._closed = False
 
@@ -101,10 +111,17 @@ class WorkshopIntegrationNotificationService:
         cls,
         database_path: Path,
         delivery_policy: WorkshopDeliveryBindingPolicy,
+        notification_preferences: WorkshopNotificationPreferenceService | None = None,
     ) -> WorkshopIntegrationNotificationService:
-        service = cls(await WorkshopEventStore.open(database_path), delivery_policy)
+        service = cls(
+            await WorkshopEventStore.open(database_path),
+            delivery_policy,
+            notification_preferences,
+        )
         try:
             await service.reconcile_default_generic_route()
+            if notification_preferences is not None:
+                await notification_preferences.reconcile_protected_routes()
         except BaseException:
             await service.close()
             raise
@@ -156,7 +173,7 @@ class WorkshopIntegrationNotificationService:
         async with self._lock:
             self._ensure_open()
             async with self._store.connection.execute(
-                "SELECT DISTINCT c.id FROM channels c "
+                "SELECT DISTINCT p.id, c.id FROM channels c "
                 "JOIN channel_memberships cm ON cm.channel_id = c.id "
                 "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
                 "JOIN workshop_memberships wm ON wm.workshop_id = c.workshop_id "
@@ -168,7 +185,13 @@ class WorkshopIntegrationNotificationService:
                 raise AmbiguousIntegrationNotificationDestinationError(
                     "Generic webhook delivery requires exactly one canonical admin direct channel"
                 )
-            return await self._record_locked(notification, ChannelId(str(rows[0][0])))
+            channel_id = ChannelId(str(rows[0][1]))
+            if self._notification_preferences is not None:
+                channel_id = await self._notification_preferences.effective_channel(
+                    PrincipalId(str(rows[0][0])),
+                    "github",
+                )
+            return await self._record_locked(notification, channel_id)
 
     async def reconcile_default_generic_route(self) -> IntegrationRouteStatus:
         """Seed the default generic route from canonical policy when unambiguous."""
@@ -276,7 +299,13 @@ class WorkshopIntegrationNotificationService:
                 raise IntegrationNotificationError(
                     f"Integration route {notification.source}/{route_name} is {status.state}: {status.detail}"
                 )
-            return await self._record_locked(notification, status.channel_id)
+            channel_id = status.channel_id
+            if self._notification_preferences is not None:
+                channel_id = await self._notification_preferences.effective_channel_for_route(
+                    source=notification.source,
+                    route_name=route_name,
+                )
+            return await self._record_locked(notification, channel_id)
 
     async def record_for_channel(
         self,

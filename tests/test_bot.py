@@ -1205,11 +1205,11 @@ class TestHandleHelp:
         await handle_help(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
 
-        # /github notify accepts <chat_id|reset>, not [on|off]. The
+        # /github notify accepts <number|reset>, not [on|off]. The
         # [on|off] shape belongs to /github reviews and /github triage;
         # confusing them sent operators down the wrong path when
         # routing notifications.
-        assert "/github notify <chat_id|reset>" in reply
+        assert "/github notify [number|reset]" in reply
         assert "/github notify [on|off]" not in reply
 
         # /memory browses facts and episodes; the tag-browse axis was
@@ -4341,7 +4341,49 @@ class TestHandleGitHub:
         assert "(users.yaml)" in reply
         assert "GitHub token: stored" in reply
 
-    # ── 3. /github notify <chat_id> ───────────────────────────────
+    # ── 3. /github notify <number> ───────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_notify_lists_only_canonical_display_choices(self):
+        update = _make_update(text="/github notify")
+        ctx = _make_context(config=_make_config(), args=["notify"])
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = object()
+        service.inspect = AsyncMock(
+            return_value=SimpleNamespace(
+                revision="revision-1",
+                preferences=(
+                    SimpleNamespace(
+                        integration_class="github",
+                        destination_name="Notifications",
+                        source="protected policy",
+                    ),
+                ),
+                destinations=(
+                    SimpleNamespace(
+                        choice_id="ndst_home",
+                        display_name="Home",
+                        kind="direct",
+                        supported_classes=("github",),
+                    ),
+                    SimpleNamespace(
+                        choice_id="ndst_notifications",
+                        display_name="Notifications",
+                        kind="notification",
+                        supported_classes=("github",),
+                    ),
+                ),
+            )
+        )
+        ctx.application.core_services.notification_preferences = service
+
+        await handle_github(update, ctx)
+
+        reply = update.message.reply_text.call_args[0][0]
+        assert "1. Home (direct)" in reply
+        assert "2. Notifications (notification)" in reply
+        assert "ndst_" not in reply
+        assert "telegram" not in reply.lower()
 
     @pytest.mark.asyncio
     async def test_token_store_deletes_source_message(self):
@@ -4380,63 +4422,142 @@ class TestHandleGitHub:
 
     @pytest.mark.asyncio
     async def test_notify_set(self):
-        """/github notify 123456 persists the adapter-owned destination."""
-        update = _make_update(text="/github notify 123456")
+        """/github notify 2 selects a server-authorized canonical destination."""
+        update = _make_update(text="/github notify 2")
         config = _make_config()
-        ctx = _make_context(config=config, args=["notify", "123456"])
+        ctx = _make_context(config=config, args=["notify", "2"])
         mock_sessions = AsyncMock()
-        mock_sessions.set_setting = AsyncMock()
-        mock_sessions.delete_setting = AsyncMock()
-        mock_sessions.resolve_github_settings = AsyncMock()
-        mock_sessions.get_github_db_settings = AsyncMock(return_value={})
-        # No existing notify setting (fresh set)
-        mock_sessions.get_setting = AsyncMock(return_value=None)
+        authority = object()
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = authority
+        snapshot = SimpleNamespace(
+            revision="revision-1",
+            preferences=(
+                SimpleNamespace(
+                    integration_class="github",
+                    destination_name="Home",
+                    source="protected policy",
+                ),
+            ),
+            destinations=(
+                SimpleNamespace(
+                    choice_id="ndst_home",
+                    display_name="Home",
+                    kind="direct",
+                    supported_classes=("github",),
+                ),
+                SimpleNamespace(
+                    choice_id="ndst_notifications",
+                    display_name="Notifications",
+                    kind="notification",
+                    supported_classes=("github",),
+                ),
+            ),
+        )
+        selected = SimpleNamespace(
+            preferences=(
+                SimpleNamespace(
+                    integration_class="github",
+                    destination_name="Notifications",
+                ),
+            ),
+        )
+        service.inspect = AsyncMock(return_value=snapshot)
+        service.select = AsyncMock(return_value=selected)
+        ctx.application.core_services.notification_preferences = service
 
         with patch("kai.bot.sessions", mock_sessions):
             await handle_github(update, ctx)
 
-        mock_sessions.set_setting.assert_called_once_with("github_notify_chat:12345", "123456")
+        service.select.assert_awaited_once_with(
+            authority,
+            "github",
+            "ndst_notifications",
+            expected_revision="revision-1",
+        )
         reply = update.message.reply_text.call_args[0][0]
-        assert "123456" in reply
-        # Fix removes the restart requirement
-        assert "restart" not in reply.lower()
+        assert "Notifications" in reply
 
     # ── 4. /github notify reset ───────────────────────────────────
 
     @pytest.mark.asyncio
     async def test_notify_reset(self):
-        """/github notify reset clears the override."""
+        """/github notify reset restores protected canonical policy."""
         update = _make_update(text="/github notify reset")
         config = _make_config()
         ctx = _make_context(config=config, args=["notify", "reset"])
         mock_sessions = AsyncMock()
-        mock_sessions.get_setting = AsyncMock(return_value=None)
-        mock_sessions.delete_setting = AsyncMock()
-        mock_sessions.resolve_github_settings = AsyncMock()
-        mock_sessions.get_github_db_settings = AsyncMock(return_value={})
+        authority = object()
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = authority
+        service.inspect = AsyncMock(
+            return_value=SimpleNamespace(
+                revision="revision-1",
+                preferences=(
+                    SimpleNamespace(
+                        integration_class="github",
+                        destination_name="Notifications",
+                        source="personal override",
+                    ),
+                ),
+                destinations=(),
+            )
+        )
+        service.reset = AsyncMock(
+            return_value=SimpleNamespace(
+                preferences=(
+                    SimpleNamespace(
+                        integration_class="github",
+                        destination_name="Home",
+                        source="protected policy",
+                    ),
+                ),
+            )
+        )
+        ctx.application.core_services.notification_preferences = service
 
         with patch("kai.bot.sessions", mock_sessions):
             await handle_github(update, ctx)
 
-        mock_sessions.delete_setting.assert_called_once_with("github_notify_chat:12345")
+        service.reset.assert_awaited_once_with(
+            authority,
+            "github",
+            expected_revision="revision-1",
+        )
         reply = update.message.reply_text.call_args[0][0]
-        assert "reset" in reply.lower()
+        assert "reset to Home" in reply
 
     # ── 5. /github notify abc (invalid) ───────────────────────────
 
     @pytest.mark.asyncio
     async def test_notify_invalid(self):
-        """/github notify abc is rejected (not an integer)."""
+        """/github notify abc is rejected because it is not a displayed number."""
         update = _make_update(text="/github notify abc")
         config = _make_config()
         ctx = _make_context(config=config, args=["notify", "abc"])
         mock_sessions = AsyncMock()
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = object()
+        service.inspect = AsyncMock(
+            return_value=SimpleNamespace(
+                revision="revision-1",
+                preferences=(
+                    SimpleNamespace(
+                        integration_class="github",
+                        destination_name="Home",
+                        source="protected policy",
+                    ),
+                ),
+                destinations=(),
+            )
+        )
+        ctx.application.core_services.notification_preferences = service
 
         with patch("kai.bot.sessions", mock_sessions):
             await handle_github(update, ctx)
 
         reply = update.message.reply_text.call_args[0][0]
-        assert "integer" in reply.lower()
+        assert "number" in reply.lower()
 
     # ── 6. /github reviews on ─────────────────────────────────────
 

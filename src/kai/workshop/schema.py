@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 34
+WORKSHOP_SCHEMA_VERSION = 35
 
 
 @dataclass(frozen=True, slots=True)
@@ -1707,6 +1707,48 @@ _CANONICAL_BACKEND_SELECTION_SCHEMA = SchemaMigration(
     ),
 )
 
+_PRINCIPAL_NOTIFICATION_PREFERENCES_SCHEMA = SchemaMigration(
+    version=35,
+    name="principal_notification_delivery_preferences",
+    statements=(
+        """
+        CREATE TABLE principal_notification_delivery_preferences (
+            principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+            integration_class TEXT NOT NULL CHECK (
+                integration_class IN ('github', 'generic')
+            ),
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL DEFAULT (
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            ),
+            updated_at TEXT NOT NULL DEFAULT (
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            ),
+            PRIMARY KEY (principal_id, integration_class)
+        )
+        """,
+        "CREATE INDEX principal_notification_preferences_channel_idx "
+        "ON principal_notification_delivery_preferences (channel_id, principal_id)",
+        """
+        CREATE TABLE workshop_integration_route_owners (
+            source TEXT NOT NULL,
+            route_name TEXT NOT NULL,
+            principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+            protected_channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL DEFAULT (
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            ),
+            PRIMARY KEY (source, route_name),
+            FOREIGN KEY (source, route_name)
+                REFERENCES workshop_integration_routes(source, route_name)
+                ON DELETE CASCADE
+        )
+        """,
+        "CREATE INDEX workshop_integration_route_owners_principal_idx "
+        "ON workshop_integration_route_owners (principal_id, source, route_name)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -1742,6 +1784,7 @@ _MIGRATIONS = (
     _DURABLE_POST_RUN_EFFECT_RECEIPTS_SCHEMA,
     _CANONICAL_RUNTIME_KEYS_SCHEMA,
     _CANONICAL_BACKEND_SELECTION_SCHEMA,
+    _PRINCIPAL_NOTIFICATION_PREFERENCES_SCHEMA,
 )
 
 

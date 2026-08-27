@@ -149,6 +149,38 @@ export type WorkshopGitHubSettingsChange =
   | { field: "toggle"; name: "issue_triage" | "pr_review"; enabled: boolean | null }
   | { field: "token"; token: string | null };
 
+export interface WorkshopNotificationPreferences {
+  destinations: {
+    choiceId: string;
+    displayName: string;
+    kind: "direct" | "notification";
+    supportedClasses: ("generic" | "github")[];
+  }[];
+  mutation: { changed: boolean; operation: string } | null;
+  preferences: {
+    destinationChoiceId: string;
+    destinationKind: "direct" | "notification";
+    destinationName: string;
+    displayName: string;
+    editable: boolean;
+    integrationClass: "generic" | "github";
+    resettable: boolean;
+    source: string;
+  }[];
+  revision: string;
+}
+
+export type WorkshopNotificationPreferenceChange =
+  | {
+      field: "destination";
+      integrationClass: "generic" | "github";
+      choiceId: string;
+    }
+  | {
+      field: "reset";
+      integrationClass: "generic" | "github";
+    };
+
 export type WorkshopRuntimeSettingsChange =
   | { field: "backend"; value: string }
   | { field: "model"; value: string }

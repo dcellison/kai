@@ -10,6 +10,7 @@ import {
   loadEarlierTimeline,
   loadArtifactBlob,
   loadNavigation,
+  loadNotificationPreferences,
   loadMemoryDetail,
   loadMemoryRecords,
   loadMemorySource,
@@ -43,6 +44,7 @@ vi.mock("./api", async (importOriginal) => {
     loadEarlierTimeline: vi.fn(),
     loadArtifactBlob: vi.fn(),
     loadNavigation: vi.fn(),
+    loadNotificationPreferences: vi.fn(),
     loadMemoryDetail: vi.fn(),
     loadMemoryRecords: vi.fn(),
     loadMemorySource: vi.fn(),
@@ -243,6 +245,30 @@ describe("Workshop React client", () => {
     failStream = null;
     vi.mocked(redeemEnrollment).mockResolvedValue("redeemed-session-token");
     vi.mocked(loadNavigation).mockResolvedValue(navigation);
+    vi.mocked(loadNotificationPreferences).mockResolvedValue({
+      destinations: [
+        {
+          choiceId: "ndst_notifications",
+          displayName: "GitHub notifications",
+          kind: "notification",
+          supportedClasses: ["github"],
+        },
+      ],
+      mutation: null,
+      preferences: [
+        {
+          destinationChoiceId: "ndst_notifications",
+          destinationKind: "notification",
+          destinationName: "GitHub notifications",
+          displayName: "GitHub",
+          editable: true,
+          integrationClass: "github",
+          resettable: false,
+          source: "protected policy",
+        },
+      ],
+      revision: "nps_current",
+    });
     vi.mocked(loadTimeline).mockResolvedValue({
       messages: [historyMessage],
       throughPosition: 25,
@@ -1079,6 +1105,9 @@ describe("Workshop React client", () => {
     ).toBeVisible();
     expect(screen.getByText("GitHub")).toBeVisible();
     expect(screen.getByText("Durable notification feed")).toBeVisible();
+    expect(
+      screen.getByText("Active delivery: GitHub → GitHub notifications"),
+    ).toBeVisible();
     expect(document.querySelector(".notification-row")).not.toBeNull();
     expect(screen.queryByLabelText("Message Kai")).toBeNull();
     expect(screen.getByText(/outbound-only/)).toBeVisible();

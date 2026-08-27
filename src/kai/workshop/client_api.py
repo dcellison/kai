@@ -74,6 +74,16 @@ from kai.workshop.memory_queries import (
     WorkshopMemoryResponseTooLarge,
     WorkshopMemoryValidationError,
 )
+from kai.workshop.notification_preferences import (
+    NotificationPreferenceAuthority,
+    NotificationPreferenceSnapshot,
+    WorkshopNotificationPreferenceAccessDenied,
+    WorkshopNotificationPreferenceConflict,
+    WorkshopNotificationPreferenceError,
+    WorkshopNotificationPreferenceService,
+    WorkshopNotificationPreferenceStorageError,
+    WorkshopNotificationPreferenceValidationError,
+)
 from kai.workshop.preferences import (
     MAX_PREFERENCE_BYTES,
     PreferenceAuthority,
@@ -127,6 +137,7 @@ _PREFERENCES_PATH = "/v1/preferences"
 _PREFERENCE_REVISIONS_PATH = "/v1/preferences/revisions"
 _PREFERENCE_RESTORE_PATH = "/v1/preferences/revisions/{preference_revision}/restore"
 _GITHUB_SETTINGS_PATH = "/v1/settings/github"
+_NOTIFICATION_PREFERENCES_PATH = "/v1/settings/notifications"
 _MAX_PREFERENCE_UPDATE_BODY_BYTES = MAX_PREFERENCE_BYTES * 6 + 1024
 _MAX_PREFERENCE_RESTORE_BODY_BYTES = 512
 _MEMORY_STATS_PATH = "/v1/memory/stats"
@@ -155,6 +166,8 @@ _GITHUB_SETTINGS_REQUEST_FIELDS = frozenset({"revision", "repository", "reset_re
 _GITHUB_REPOSITORY_FIELDS = frozenset({"name", "subscribed"})
 _GITHUB_TOGGLE_FIELDS = frozenset({"field", "enabled"})
 _MAX_GITHUB_SETTINGS_BODY_BYTES = 10_240
+_NOTIFICATION_PREFERENCE_REQUEST_FIELDS = frozenset({"revision", "integration_class", "destination_choice_id", "reset"})
+_MAX_NOTIFICATION_PREFERENCE_BODY_BYTES = 2_048
 _DECIMAL_INTEGER = re.compile(r"^[0-9]+$")
 _CLIENT_MESSAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _EVENT_BATCH_SIZE = 100
@@ -305,6 +318,45 @@ def _serialize_github_settings(snapshot: GitHubSettingsSnapshot) -> dict[str, ob
             "resettable": snapshot.issue_triage.resettable,
         },
         "token_stored": snapshot.token_stored,
+        "revision": snapshot.revision,
+        "mutation": (
+            {
+                "operation": snapshot.mutation.operation,
+                "changed": snapshot.mutation.changed,
+            }
+            if snapshot.mutation is not None
+            else None
+        ),
+    }
+
+
+def _serialize_notification_preferences(
+    snapshot: NotificationPreferenceSnapshot,
+) -> dict[str, object]:
+    return {
+        "version": 1,
+        "destinations": [
+            {
+                "choice_id": item.choice_id,
+                "display_name": item.display_name,
+                "kind": item.kind,
+                "supported_classes": list(item.supported_classes),
+            }
+            for item in snapshot.destinations
+        ],
+        "preferences": [
+            {
+                "integration_class": item.integration_class,
+                "display_name": item.display_name,
+                "destination_choice_id": item.destination_choice_id,
+                "destination_name": item.destination_name,
+                "destination_kind": item.destination_kind,
+                "source": item.source,
+                "editable": item.editable,
+                "resettable": item.resettable,
+            }
+            for item in snapshot.preferences
+        ],
         "revision": snapshot.revision,
         "mutation": (
             {
@@ -1288,6 +1340,154 @@ async def _handle_github_settings_update(
     except WorkshopGitHubSettingsError as exc:
         return _github_settings_error_response(exc)
     return _json_response(_serialize_github_settings(snapshot), status=200)
+
+
+async def _authenticate_notification_preference_authority(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopNotificationPreferenceService,
+) -> tuple[NotificationPreferenceAuthority | None, web.Response | None]:
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(
+            status=401,
+            code="authentication_required",
+            message="Authentication required",
+        )
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return None, response
+    try:
+        return service.authority_for_principal(principal_id), None
+    except WorkshopNotificationPreferenceAccessDenied:
+        return None, _error_response(status=403, code="access_denied", message="Access denied")
+
+
+def _notification_preference_error_response(
+    exc: WorkshopNotificationPreferenceError,
+) -> web.Response:
+    if isinstance(exc, WorkshopNotificationPreferenceConflict):
+        return _error_response(status=409, code="settings_conflict", message=str(exc))
+    if isinstance(exc, WorkshopNotificationPreferenceValidationError):
+        return _error_response(status=400, code="invalid_setting", message=str(exc))
+    if isinstance(exc, WorkshopNotificationPreferenceAccessDenied):
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    if isinstance(exc, WorkshopNotificationPreferenceStorageError):
+        return _error_response(
+            status=503,
+            code="notification_preferences_unavailable",
+            message="Notification preferences are temporarily unavailable",
+        )
+    return _error_response(
+        status=503,
+        code="notification_preferences_unavailable",
+        message="Notification preferences are temporarily unavailable",
+    )
+
+
+async def _notification_preference_json_object(
+    request: web.Request,
+) -> dict[str, object]:
+    if request.content_type != "application/json":
+        raise WorkshopNotificationPreferenceValidationError("Content-Type must be application/json")
+    if request.content_length is not None and request.content_length > _MAX_NOTIFICATION_PREFERENCE_BODY_BYTES:
+        raise WorkshopNotificationPreferenceValidationError("Notification preference request is too large")
+    raw = await request.content.read(_MAX_NOTIFICATION_PREFERENCE_BODY_BYTES + 1)
+    if len(raw) > _MAX_NOTIFICATION_PREFERENCE_BODY_BYTES:
+        raise WorkshopNotificationPreferenceValidationError("Notification preference request is too large")
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise WorkshopNotificationPreferenceValidationError("Invalid JSON request") from exc
+    if not isinstance(payload, dict):
+        raise WorkshopNotificationPreferenceValidationError("Invalid notification preference request")
+    return payload
+
+
+async def _handle_notification_preferences(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopNotificationPreferenceService,
+) -> web.Response:
+    authority, error = await _authenticate_notification_preference_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        return error
+    assert authority is not None
+    if request.query or request.can_read_body:
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid notification preference request",
+        )
+    try:
+        snapshot = await service.inspect(authority)
+    except WorkshopNotificationPreferenceError as exc:
+        return _notification_preference_error_response(exc)
+    return _json_response(_serialize_notification_preferences(snapshot), status=200)
+
+
+async def _handle_notification_preference_update(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopNotificationPreferenceService,
+) -> web.Response:
+    authority, error = await _authenticate_notification_preference_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        return error
+    assert authority is not None
+    if request.query:
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid notification preference request",
+        )
+    try:
+        payload = await _notification_preference_json_object(request)
+        if not set(payload).issubset(_NOTIFICATION_PREFERENCE_REQUEST_FIELDS):
+            raise WorkshopNotificationPreferenceValidationError("Invalid notification preference request")
+        revision = payload.get("revision")
+        integration_class = payload.get("integration_class")
+        if not isinstance(revision, str) or not isinstance(integration_class, str):
+            raise WorkshopNotificationPreferenceValidationError(
+                "Notification preference revision and integration class are required"
+            )
+        has_destination = "destination_choice_id" in payload
+        has_reset = "reset" in payload
+        if has_destination == has_reset:
+            raise WorkshopNotificationPreferenceValidationError("Change exactly one notification preference at a time")
+        if has_destination:
+            if set(payload) != {"revision", "integration_class", "destination_choice_id"}:
+                raise WorkshopNotificationPreferenceValidationError("Invalid notification destination request")
+            choice_id = payload["destination_choice_id"]
+            if not isinstance(choice_id, str):
+                raise WorkshopNotificationPreferenceValidationError("Invalid notification destination request")
+            snapshot = await service.select(
+                authority,
+                integration_class,
+                choice_id,
+                expected_revision=revision,
+            )
+        else:
+            if set(payload) != {"revision", "integration_class", "reset"} or payload["reset"] is not True:
+                raise WorkshopNotificationPreferenceValidationError("Invalid notification preference reset request")
+            snapshot = await service.reset(
+                authority,
+                integration_class,
+                expected_revision=revision,
+            )
+    except WorkshopNotificationPreferenceError as exc:
+        return _notification_preference_error_response(exc)
+    return _json_response(_serialize_notification_preferences(snapshot), status=200)
 
 
 async def _handle_runtime_settings(
@@ -2750,6 +2950,7 @@ def register_workshop_read_routes(
     memory_queries: WorkshopMemoryQueryService | None = None,
     preference_documents: WorkshopPreferenceService | None = None,
     github_settings: WorkshopGitHubSettingsService | None = None,
+    notification_preferences: WorkshopNotificationPreferenceService | None = None,
 ) -> None:
     """Register authenticated Workshop client routes on an application."""
     if event_poll_interval <= 0 or event_heartbeat_interval <= 0 or event_authentication_recheck_interval <= 0:
@@ -2854,6 +3055,32 @@ def register_workshop_read_routes(
 
         app.router.add_get(_GITHUB_SETTINGS_PATH, handle_github_settings)
         app.router.add_patch(_GITHUB_SETTINGS_PATH, handle_github_settings_update)
+    if notification_preferences is not None:
+
+        async def handle_notification_preferences(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_notification_preferences(
+                    request,
+                    authenticator=authenticator,
+                    service=notification_preferences,
+                )
+
+        async def handle_notification_preference_update(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_notification_preference_update(
+                    request,
+                    authenticator=authenticator,
+                    service=notification_preferences,
+                )
+
+        app.router.add_get(
+            _NOTIFICATION_PREFERENCES_PATH,
+            handle_notification_preferences,
+        )
+        app.router.add_patch(
+            _NOTIFICATION_PREFERENCES_PATH,
+            handle_notification_preference_update,
+        )
     if artifact_service is not None:
 
         async def handle_artifact_content(request: web.Request) -> web.StreamResponse:

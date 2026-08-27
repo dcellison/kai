@@ -16,6 +16,7 @@ import {
   cancelRun,
   ChannelAccessError,
   loadNavigation,
+  loadNotificationPreferences,
   loadArtifactBlob,
   loadRun,
   loadRunTrace,
@@ -35,6 +36,7 @@ import type {
   WorkshopRunTraceSignal,
   WorkshopChannelSummary,
   WorkshopNavigation,
+  WorkshopNotificationPreferences,
   WorkshopSession,
   WorkshopSettingsWorkspace,
   WorkshopSummary,
@@ -884,6 +886,8 @@ function WorkshopView({
     useState<string | null>(null);
   const [switchingWorkspace, setSwitchingWorkspace] = useState(false);
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
+  const [notificationPreferences, setNotificationPreferences] =
+    useState<WorkshopNotificationPreferences | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const artifactInputRef = useRef<HTMLInputElement | null>(null);
@@ -902,6 +906,28 @@ function WorkshopView({
   const latestRunActivityRef = useRef<WorkshopRunActivity | null>(runActivity);
   const humanName = navigation.principal.displayName || "You";
   const humanRole = workshopRoleLabel(workshop.role);
+
+  useEffect(() => {
+    if (channel.kind !== "notification") {
+      setNotificationPreferences(null);
+      return;
+    }
+    let active = true;
+    void loadNotificationPreferences(settingsSession)
+      .then((snapshot) => {
+        if (active) {
+          setNotificationPreferences(snapshot);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setNotificationPreferences(null);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [channel.kind, settingsSession]);
   // The inspected run: the channel's active run when one exists, else
   // the most recently settled run (activeRun keeps its terminal value
   // and is seeded from replayed lifecycle events on mount).
@@ -1649,6 +1675,13 @@ function WorkshopView({
                   ? "Authenticated GitHub activity appears here live and is delivered to every configured client."
                   : "Messages below come from Kai’s durable conversation history across every connected client."}
               </p>
+              {channel.kind === "notification" && notificationPreferences && (
+                <p className="notification-routing-summary">
+                  Active delivery: {notificationPreferences.preferences
+                    .map((item) => `${item.displayName} → ${item.destinationName}`)
+                    .join(" · ")}
+                </p>
+              )}
             </div>
           </div>
 
