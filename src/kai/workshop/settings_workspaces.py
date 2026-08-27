@@ -88,6 +88,7 @@ class ModelOption:
 
 @dataclass(frozen=True, slots=True)
 class BackendOption:
+    option_id: str
     backend: str
     provider: str
     current: bool
@@ -106,6 +107,7 @@ class SettingsWorkspaceSnapshot:
     principal_id: PrincipalId
     channel_id: ChannelId
     runtime_profile_id: RuntimeProfileId
+    backend_option_id: str
     backend: str
     provider: str
     model: EffectiveValue
@@ -222,7 +224,7 @@ class WorkshopSettingsWorkspaceService:
     ) -> SettingsWorkspaceSnapshot:
         profile = self._runtime_pool.runtime_profile(authority.runtime_profile_id)
         effective_backend, effective_provider = self._runtime_pool.get_backend_provider(authority.runtime_profile_id)
-        effective_option = profile.backend_option(effective_backend)
+        effective_option = profile.backend_option(f"{effective_backend}:{effective_provider}")
         namespace = self._namespace(authority)
         workspace = await self._runtime_pool.get_effective_workspace(authority.runtime_profile_id)
         model, timeout_value = await self._effective_values(
@@ -272,10 +274,16 @@ class WorkshopSettingsWorkspaceService:
             principal_id=authority.principal_id,
             channel_id=authority.channel_id,
             runtime_profile_id=authority.runtime_profile_id,
+            backend_option_id=effective_option.option_id,
             backend=effective_backend,
             provider=effective_provider,
             backend_options=tuple(
-                BackendOption(option.backend, option.provider, option.backend == effective_backend)
+                BackendOption(
+                    option.option_id,
+                    option.backend,
+                    option.provider,
+                    option.option_id == effective_option.option_id,
+                )
                 for option in profile.backend_options
             ),
             model=model,
@@ -287,7 +295,7 @@ class WorkshopSettingsWorkspaceService:
             capabilities=self._capabilities(
                 model_options,
                 maximum_timeout_seconds=profile.maximum_timeout_seconds,
-                backend_choices=tuple(option.backend for option in profile.backend_options),
+                backend_choices=tuple(option.option_id for option in profile.backend_options),
             ),
             mutation=mutation,
         )
@@ -302,7 +310,7 @@ class WorkshopSettingsWorkspaceService:
     ) -> SettingsWorkspaceSnapshot:
         profile = self._runtime_pool.runtime_profile(authority.runtime_profile_id)
         backend, _provider = self._runtime_pool.get_backend_provider(authority.runtime_profile_id)
-        option = profile.backend_option(backend)
+        option = profile.backend_option(f"{backend}:{_provider}")
         normalized = canonicalize_model_for_backend(model.strip(), option.backend)
         if not normalized or not validate_model_for_backend_policy(
             normalized,
@@ -323,14 +331,14 @@ class WorkshopSettingsWorkspaceService:
     async def set_backend(
         self,
         authority: SettingsWorkspaceAuthority,
-        backend: str,
+        backend_option_id: str,
         *,
         expected_revision: str | None = None,
     ) -> SettingsWorkspaceSnapshot:
-        requested = backend.strip().lower()
+        requested = backend_option_id.strip().lower()
         profile = self._runtime_pool.runtime_profile(authority.runtime_profile_id)
         try:
-            profile.backend_option(requested)
+            requested_option = profile.backend_option(requested)
         except WorkshopRuntimeProfileError as exc:
             raise WorkshopSettingsWorkspaceValidationError(
                 "The backend is not allowed by this runtime profile"
@@ -338,7 +346,7 @@ class WorkshopSettingsWorkspaceService:
         async with self._lock(authority):
             current = await self._inspect_locked(authority)
             self._check_revision(current.revision, expected_revision)
-            if requested == current.backend:
+            if requested_option.option_id == current.backend_option_id:
                 return await self._inspect_locked(
                     authority,
                     mutation=SettingsMutationOutcome(
@@ -355,7 +363,7 @@ class WorkshopSettingsWorkspaceService:
             namespace = self._namespace(authority)
             prior_settings = await sessions.get_canonical_execution_settings(namespace)
             desired_settings = dict(prior_settings)
-            desired_settings["backend"] = requested
+            desired_settings["backend"] = requested_option.option_id
             # Model overrides remain canonical state but are applied only when
             # valid for the selected backend.  This neither carries an
             # incompatible model into the new process nor discards a useful
@@ -369,17 +377,19 @@ class WorkshopSettingsWorkspaceService:
             try:
                 selected = await self._runtime_pool.select_backend(
                     authority.runtime_profile_id,
-                    requested,
+                    requested_option.option_id,
                     commit_selection=commit_selection,
                 )
             except BaseException:
                 try:
                     await sessions.replace_canonical_settings_state(namespace, prior_settings)
-                    active_backend, _provider = self._runtime_pool.get_backend_provider(authority.runtime_profile_id)
-                    if active_backend != current.backend:
+                    active_backend, active_provider = self._runtime_pool.get_backend_provider(
+                        authority.runtime_profile_id
+                    )
+                    if f"{active_backend}:{active_provider}" != current.backend_option_id:
                         await self._runtime_pool.select_backend(
                             authority.runtime_profile_id,
-                            current.backend,
+                            current.backend_option_id,
                         )
                 except BaseException as rollback_exc:
                     raise WorkshopSettingsWorkspaceConsistencyError(
@@ -528,7 +538,7 @@ class WorkshopSettingsWorkspaceService:
         namespace = self._namespace(authority)
         profile = self._runtime_pool.runtime_profile(authority.runtime_profile_id)
         backend, _provider = self._runtime_pool.get_backend_provider(authority.runtime_profile_id)
-        backend_option = profile.backend_option(backend)
+        backend_option = profile.backend_option(f"{backend}:{_provider}")
         workspace = await self._authorized_workspace(authority, workspace_path)
         yaml_config = self._config.get_workspace_config(workspace)
         overrides = await sessions.get_canonical_workspace_config_settings(
@@ -598,7 +608,7 @@ class WorkshopSettingsWorkspaceService:
             raise WorkshopSettingsWorkspaceValidationError("Unsupported workspace setting")
         profile = self._runtime_pool.runtime_profile(authority.runtime_profile_id)
         backend, _provider = self._runtime_pool.get_backend_provider(authority.runtime_profile_id)
-        backend_option = profile.backend_option(backend)
+        backend_option = profile.backend_option(f"{backend}:{_provider}")
         if field == "model":
             value = canonicalize_model_for_backend(value.strip(), backend_option.backend)
             if not validate_model_for_backend_policy(
@@ -1216,7 +1226,7 @@ class WorkshopSettingsWorkspaceService:
     ) -> tuple[EffectiveValue, EffectiveValue]:
         profile = self._runtime_pool.runtime_profile(authority.runtime_profile_id)
         backend, _provider = self._runtime_pool.get_backend_provider(authority.runtime_profile_id)
-        backend_option = profile.backend_option(backend)
+        backend_option = profile.backend_option(f"{backend}:{_provider}")
         namespace = self._namespace(authority)
         user = await sessions.get_canonical_execution_settings(namespace)
         workspace_overrides = await sessions.get_canonical_workspace_config_settings(

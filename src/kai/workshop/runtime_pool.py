@@ -78,14 +78,14 @@ class WorkshopRuntimePool:
     async def select_backend(
         self,
         runtime_profile_id: str | RuntimeProfileId,
-        backend: str,
+        backend_option_id: str,
         *,
         commit_selection: Callable[[], Awaitable[None]] | None = None,
     ) -> bool:
         profile_id = self._profiles.resolve(runtime_profile_id).profile_id
         return await self._pool.select_backend(
             profile_id,
-            backend,
+            backend_option_id,
             commit_selection=commit_selection,
         )
 

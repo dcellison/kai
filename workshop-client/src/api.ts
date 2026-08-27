@@ -461,6 +461,7 @@ function parseSettingsWorkspace(
     !PRINCIPAL_PATTERN.test(payload.principal_id) ||
     typeof payload.runtime_profile_id !== "string" ||
     typeof payload.backend !== "string" ||
+    typeof payload.backend_option_id !== "string" ||
     typeof payload.provider !== "string" ||
     !Array.isArray(payload.backend_options) ||
     typeof payload.workspace !== "string" ||
@@ -498,6 +499,7 @@ function parseSettingsWorkspace(
   const backendOptions = payload.backend_options.map((rawBackend) => {
     if (
       !isRecord(rawBackend) ||
+      typeof rawBackend.option_id !== "string" ||
       typeof rawBackend.backend !== "string" ||
       typeof rawBackend.provider !== "string" ||
       typeof rawBackend.current !== "boolean"
@@ -507,6 +509,7 @@ function parseSettingsWorkspace(
     return {
       backend: rawBackend.backend,
       current: rawBackend.current,
+      optionId: rawBackend.option_id,
       provider: rawBackend.provider,
     };
   });
@@ -527,6 +530,7 @@ function parseSettingsWorkspace(
       });
   return {
     backend: payload.backend,
+    backendOptionId: payload.backend_option_id,
     backendOptions,
     channelId,
     model: {

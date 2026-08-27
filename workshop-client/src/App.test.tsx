@@ -172,9 +172,10 @@ const completedRun: WorkshopRun = {
 };
 const settingsWorkspace: WorkshopSettingsWorkspace = {
   backend: "codex",
+  backendOptionId: "codex:openai",
   backendOptions: [
-    { backend: "claude", provider: "anthropic", current: false },
-    { backend: "codex", provider: "openai", current: true },
+    { optionId: "claude:anthropic", backend: "claude", provider: "anthropic", current: false },
+    { optionId: "codex:openai", backend: "codex", provider: "openai", current: true },
   ],
   capabilities: [
     {
@@ -435,7 +436,7 @@ describe("Workshop React client", () => {
 
     expect(await screen.findByRole("heading", { name: "Settings", level: 1 })).toBeVisible();
     expect(screen.getByText("Workshop administrator")).toBeVisible();
-    expect(screen.getByLabelText("Backend")).toHaveValue("codex");
+    expect(screen.getByLabelText("Backend")).toHaveValue("codex:openai");
     expect(screen.getByRole("option", { name: "codex · openai" })).toBeVisible();
     expect(screen.queryByText("PROTECTED_KEY")).not.toBeInTheDocument();
     expect(screen.queryByText(settingsWorkspace.principalId)).not.toBeInTheDocument();

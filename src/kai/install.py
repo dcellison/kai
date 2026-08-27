@@ -46,7 +46,7 @@ from pathlib import Path
 
 import yaml
 
-from kai.backend_registry import BackendRegistryError, render_backend_registry
+from kai.backend_registry import BackendRegistryError, load_backend_registry, render_backend_registry
 from kai.config import (
     _VALID_ROLES,
     BACKEND_PROVIDERS,
@@ -1443,6 +1443,212 @@ def _upgrade_runtime_policy_content(
     if not changed:
         return content, False
     return yaml.safe_dump(document, sort_keys=False, default_flow_style=False), True
+
+
+def _runtime_access_options(raw_profile: dict[str, object]) -> list[dict[str, str]]:
+    """Normalize explicit or legacy backend authorization into option mappings."""
+    raw_options = raw_profile.get("backend_options")
+    if raw_options is not None:
+        if not isinstance(raw_options, list) or any(not isinstance(item, dict) for item in raw_options):
+            raise ValueError("backend_options must be a list of mappings")
+        options: list[dict[str, str]] = []
+        for raw_option in raw_options:
+            assert isinstance(raw_option, dict)
+            backend = str(raw_option.get("backend") or "").strip().lower()
+            provider = str(raw_option.get("provider") or "").strip().lower()
+            options.append({"backend": backend, "provider": provider})
+        return options
+
+    default_backend = str(raw_profile.get("backend") or "").strip().lower()
+    default_provider = str(raw_profile.get("provider") or "").strip().lower()
+    raw_backends = raw_profile.get("allowed_backends", [default_backend])
+    if not isinstance(raw_backends, list) or any(not isinstance(item, str) for item in raw_backends):
+        raise ValueError("allowed_backends must be a list of backend identifiers")
+    options = []
+    for raw_backend in raw_backends:
+        backend = raw_backend.strip().lower()
+        provider = default_provider if backend == default_backend else get_effective_provider(backend, default_provider)
+        options.append({"backend": backend, "provider": provider})
+    return options
+
+
+def _update_runtime_access_document(
+    document: dict[str, object],
+    *,
+    profile_id: str,
+    backend: str,
+    provider: str,
+    grant: bool,
+) -> bool:
+    """Grant or revoke one backend/provider pair without touching peer profiles."""
+    raw_profiles = document.get("runtime_profiles")
+    if not isinstance(raw_profiles, dict):
+        raise ValueError("Runtime policy must contain a runtime_profiles mapping")
+    raw_profile = raw_profiles.get(profile_id)
+    if not isinstance(raw_profile, dict):
+        raise ValueError(f"Unknown runtime profile: {profile_id}")
+    normalized_backend = backend.strip().lower()
+    normalized_provider = provider.strip().lower()
+    if normalized_backend not in VALID_BACKENDS:
+        raise ValueError(f"Unsupported backend: {normalized_backend}")
+    if normalized_provider not in BACKEND_PROVIDERS[normalized_backend]:
+        raise ValueError(
+            f"Provider {normalized_provider!r} is not valid for {normalized_backend}; "
+            f"expected one of: {', '.join(BACKEND_PROVIDERS[normalized_backend])}"
+        )
+    options = _runtime_access_options(raw_profile)
+    pair = {"backend": normalized_backend, "provider": normalized_provider}
+    if grant:
+        if pair in options:
+            return False
+        options.append(pair)
+    else:
+        default_pair = {
+            "backend": str(raw_profile.get("backend") or "").strip().lower(),
+            "provider": str(raw_profile.get("provider") or "").strip().lower(),
+        }
+        if pair == default_pair:
+            raise ValueError("The protected default backend/provider option cannot be revoked")
+        if pair not in options:
+            return False
+        options.remove(pair)
+    raw_profile["backend_options"] = sorted(
+        options,
+        key=lambda option: (option["backend"], option["provider"]),
+    )
+    raw_profile.pop("allowed_backends", None)
+    return True
+
+
+def _write_runtime_access_policy(path: Path, content: str) -> None:
+    """Atomically replace root-owned runtime policy without following links."""
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"Refusing unsafe runtime policy path: {path}")
+    validate_protected_file_metadata(path, max_mode=0o600, require_root_owner=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.chown(temporary, 0, 0)
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _prompt_runtime_profile(document: dict[str, object]) -> str:
+    """Prompt for exactly one canonical runtime profile without exposing secrets."""
+    raw_profiles = document.get("runtime_profiles")
+    if not isinstance(raw_profiles, dict) or not raw_profiles:
+        raise SystemExit("Runtime policy contains no profiles")
+    profiles = [
+        (str(profile_id), str(profile.get("display_name") or profile_id))
+        for profile_id, profile in raw_profiles.items()
+        if isinstance(profile, dict)
+    ]
+    if not profiles:
+        raise SystemExit("Runtime policy contains no valid profiles")
+    print("Protected runtime profiles:")
+    for index, (profile_id, display_name) in enumerate(profiles, start=1):
+        print(f"  {index}. {display_name} ({profile_id})")
+    while True:
+        raw = input("Principal number: ").strip()
+        try:
+            index = int(raw)
+        except ValueError:
+            index = 0
+        if 1 <= index <= len(profiles):
+            return profiles[index - 1][0]
+        print(f"  Choose a number from 1 to {len(profiles)}.")
+
+
+def _cmd_runtime_access() -> None:
+    """Interactively manage per-principal backend/provider authorization."""
+    if os.geteuid() != 0:
+        raise SystemExit("Runtime access policy must be managed as root; use `make runtime-access`")
+    try:
+        validate_protected_file_metadata(
+            RUNTIME_PROFILES_YAML,
+            max_mode=0o600,
+            require_root_owner=True,
+        )
+        document = yaml.safe_load(RUNTIME_PROFILES_YAML.read_text(encoding="utf-8"))
+        registry = load_backend_registry(BACKENDS_YAML)
+    except (OSError, yaml.YAMLError, ProtectedConfigError, BackendRegistryError) as exc:
+        raise SystemExit(f"Could not load protected runtime access policy: {exc}") from exc
+    if not isinstance(document, dict):
+        raise SystemExit("Runtime policy must be a YAML mapping")
+    # Refuse to edit a policy that the canonical runtime cannot already parse.
+    try:
+        WorkshopRuntimeProfileRegistry.from_document(document, backend_registry=registry)
+    except WorkshopRuntimeProfileError as exc:
+        raise SystemExit(f"Protected runtime access policy is invalid: {exc}") from exc
+    profile_id = _prompt_runtime_profile(document)
+    raw_profiles = document["runtime_profiles"]
+    assert isinstance(raw_profiles, dict)
+    raw_profile = raw_profiles[profile_id]
+    assert isinstance(raw_profile, dict)
+    changed = False
+    while True:
+        options = _runtime_access_options(raw_profile)
+        display_name = str(raw_profile.get("display_name") or profile_id)
+        print(f"\nAuthorized runtime options for {display_name}:")
+        for option in options:
+            print(f"  - {option['backend']}:{option['provider']}")
+        action = _prompt_choice("Action", ["grant", "revoke", "done"], "done")
+        if action == "done":
+            break
+        if action == "grant":
+            backend = _prompt_choice("Backend", sorted(registry))
+            providers = list(BACKEND_PROVIDERS[backend])
+            provider = providers[0] if len(providers) == 1 else _prompt_choice("Provider", providers)
+            changed |= _update_runtime_access_document(
+                document,
+                profile_id=profile_id,
+                backend=backend,
+                provider=provider,
+                grant=True,
+            )
+            continue
+        removable = [
+            f"{option['backend']}:{option['provider']}"
+            for option in options
+            if (
+                option["backend"],
+                option["provider"],
+            )
+            != (
+                str(raw_profile.get("backend") or "").strip().lower(),
+                str(raw_profile.get("provider") or "").strip().lower(),
+            )
+        ]
+        if not removable:
+            print("  No non-default runtime option can be revoked.")
+            continue
+        selected = _prompt_choice("Runtime option", removable)
+        backend, provider = selected.split(":", 1)
+        changed |= _update_runtime_access_document(
+            document,
+            profile_id=profile_id,
+            backend=backend,
+            provider=provider,
+            grant=False,
+        )
+    if not changed:
+        print("\nRuntime access policy unchanged.")
+        return
+    content = yaml.safe_dump(document, sort_keys=False, default_flow_style=False)
+    try:
+        WorkshopRuntimeProfileRegistry.from_yaml(content, backend_registry=registry)
+    except WorkshopRuntimeProfileError as exc:
+        raise SystemExit(f"Updated runtime access policy is invalid: {exc}") from exc
+    _write_runtime_access_policy(RUNTIME_PROFILES_YAML, content)
+    print(f"\nUpdated runtime access policy for {raw_profile.get('display_name') or profile_id}.")
+    print("Run `make install` to load the changed authorization policy.")
 
 
 def _runtime_policy_apply_plan(
@@ -9809,15 +10015,17 @@ def cli(args: list[str]) -> None:
         python -m kai install config              -- interactive Q&A, writes install.conf
         python -m kai install apply [--dry-run]    -- reads install.conf, creates /opt layout
         python -m kai install status               -- shows current installation state
+        python -m kai install runtime-access       -- manage per-principal backend authorization
     """
     subcommands = {
         "config": _cmd_config,
         "apply": _cmd_apply,
+        "runtime-access": _cmd_runtime_access,
         "status": _cmd_status,
     }
 
     if not args or args[0] not in subcommands:
-        raise SystemExit("Usage: python -m kai install {config|apply|status}")
+        raise SystemExit("Usage: python -m kai install {config|apply|runtime-access|status}")
 
     subcmd = args[0]
     remaining = args[1:]

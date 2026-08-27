@@ -97,10 +97,11 @@ function settingsPayload(overrides: Record<string, unknown> = {}): Record<string
     principal_id: "prn_00000000000000000000000000000001",
     runtime_profile_id: "rtp_00000000000000000000000000000001",
     backend: "claude",
+    backend_option_id: "claude:anthropic",
     provider: "anthropic",
     backend_options: [
-      { backend: "claude", provider: "anthropic", current: true },
-      { backend: "codex", provider: "openai", current: false },
+      { option_id: "claude:anthropic", backend: "claude", provider: "anthropic", current: true },
+      { option_id: "codex:openai", backend: "codex", provider: "openai", current: false },
     ],
     model: {
       value: "claude-sonnet-4-6",

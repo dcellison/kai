@@ -2,7 +2,7 @@
 # where tools are installed globally (no .venv).
 BIN = .venv/bin/
 
-.PHONY: run lint format check typecheck client-check audit-deps check-install-constraints module-sizes test setup config install install-status tts-model refresh-models
+.PHONY: run lint format check typecheck client-check audit-deps check-install-constraints module-sizes test setup config install install-status runtime-access tts-model refresh-models
 
 run:
 	$(BIN)python -m kai
@@ -55,6 +55,9 @@ install:
 
 install-status:
 	sudo $(BIN)python -m kai install status
+
+runtime-access:
+	sudo $(BIN)python -m kai install runtime-access
 
 # Refresh helper for PROVIDER_MODELS. Queries each curated provider's
 # /v1/models endpoint and prints a diff against the in-tree list;

@@ -45,18 +45,36 @@ class _RuntimePool:
             allowed_models=None,
         )
         self.profile.backend_options = (
-            SimpleNamespace(backend="codex", provider="openai"),
-            SimpleNamespace(backend="claude", provider="anthropic"),
+            SimpleNamespace(option_id="codex:openai", backend="codex", provider="openai"),
+            SimpleNamespace(option_id="claude:anthropic", backend="claude", provider="anthropic"),
+            SimpleNamespace(option_id="opencode:anthropic", backend="opencode", provider="anthropic"),
+            SimpleNamespace(option_id="opencode:openai", backend="opencode", provider="openai"),
         )
 
-        def backend_option(backend: str):
-            if backend not in {"claude", "codex"}:
+        def backend_option(selector: str):
+            aliases = {
+                "claude": ("claude", "anthropic"),
+                "claude:anthropic": ("claude", "anthropic"),
+                "codex": ("codex", "openai"),
+                "codex:openai": ("codex", "openai"),
+                "opencode:anthropic": ("opencode", "anthropic"),
+                "opencode:openai": ("opencode", "openai"),
+            }
+            if selector not in aliases:
                 raise WorkshopRuntimeProfileError("not authorized")
+            backend, provider = aliases[selector]
             return SimpleNamespace(
+                option_id=f"{backend}:{provider}",
                 backend=backend,
-                provider="anthropic" if backend == "claude" else "openai",
-                model=("claude-sonnet-4-6" if backend == "claude" else self.profile.model),
-                allowed_models=(None if backend == "claude" else self.profile.allowed_models),
+                provider=provider,
+                model=(
+                    "claude-sonnet-4-6"
+                    if backend == "claude"
+                    else "openai/gpt-5.5"
+                    if backend == "opencode"
+                    else self.profile.model
+                ),
+                allowed_models=(None if backend in {"claude", "opencode"} else self.profile.allowed_models),
                 role_models=(),
             )
 
@@ -71,14 +89,16 @@ class _RuntimePool:
     def is_in_flight(self, _profile_id) -> bool:
         return self.in_flight
 
-    async def select_backend(self, _profile_id, backend: str, *, commit_selection=None) -> bool:
+    async def select_backend(self, _profile_id, selector: str, *, commit_selection=None) -> bool:
         if self.reject_switch:
             return False
         if commit_selection is not None:
             await commit_selection()
+        option = self.profile.backend_option(selector)
+        backend = option.backend
         self.profile.backend = backend
-        self.profile.provider = "anthropic" if backend == "claude" else "openai"
-        self.events.append(f"backend:{backend}")
+        self.profile.provider = option.provider
+        self.events.append(f"backend:{option.option_id}")
         return True
 
     def is_running(self, _profile_id) -> bool:
@@ -493,13 +513,13 @@ async def test_backend_switch_is_canonical_targeted_and_rejects_active_run(
         "claude-sonnet-4-6",
     )
     assert execution == {
-        "backend": "claude",
+        "backend": "claude:anthropic",
         "model": "gpt-5.6-terra",
         "timeout": "180",
     }
     assert replace_calls[-1][0] == execution
     assert clear_calls == ["clear"]
-    assert pool.events == ["backend:claude"]
+    assert pool.events == ["backend:claude:anthropic"]
 
     pool.in_flight = True
     with pytest.raises(WorkshopSettingsWorkspaceConflict, match="active run"):
@@ -508,13 +528,35 @@ async def test_backend_switch_is_canonical_targeted_and_rejects_active_run(
             "codex",
             expected_revision=switched.revision,
         )
-    assert execution["backend"] == "claude"
+    assert execution["backend"] == "claude:anthropic"
 
     pool.in_flight = False
     with pytest.raises(WorkshopSettingsWorkspaceValidationError, match="not allowed"):
         await service.set_backend(authority, "goose")
-    assert execution["backend"] == "claude"
-    assert pool.events == ["backend:claude"]
+    assert execution["backend"] == "claude:anthropic"
+    assert pool.events == ["backend:claude:anthropic"]
+
+
+async def test_backend_switch_distinguishes_multiple_providers_for_one_backend(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, pool, authority, _, _ = _service(tmp_path)
+    execution, _, _, _ = _canonical_state(monkeypatch)
+    initial = await service.inspect(authority)
+
+    switched = await service.set_backend(
+        authority,
+        "opencode:openai",
+        expected_revision=initial.revision,
+    )
+
+    assert switched.backend_option_id == "opencode:openai"
+    assert (switched.backend, switched.provider) == ("opencode", "openai")
+    assert execution["backend"] == "opencode:openai"
+    assert pool.events == ["backend:opencode:openai"]
+    with pytest.raises(WorkshopSettingsWorkspaceValidationError, match="not allowed"):
+        await service.set_backend(authority, "opencode")
 
 
 async def test_backend_switch_race_rejection_is_mutation_free(
