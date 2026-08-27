@@ -82,6 +82,8 @@ from kai.workshop.github_settings import (
 )
 from kai.workshop.inbound import InboundMessage
 from kai.workshop.notification_preferences import (
+    GENERIC_INTEGRATION_CLASS,
+    GITHUB_INTEGRATION_CLASS,
     NotificationPreferenceAuthority,
     WorkshopNotificationPreferenceService,
 )
@@ -3339,18 +3341,19 @@ async def _show_github(
     await update.message.reply_text("\n".join(lines))
 
 
-async def _handle_github_notify(
+async def _handle_notification_destination(
     update: Update,
-    chat_id: int,
     args: list[str],
     *,
+    integration_class: str,
+    command: str,
     canonical: tuple[
         WorkshopNotificationPreferenceService,
         NotificationPreferenceAuthority,
     ]
     | None = None,
 ) -> None:
-    """Select a canonical GitHub notification destination by displayed number."""
+    """Select one canonical integration destination by displayed number."""
     assert update.message is not None
 
     if canonical is None:
@@ -3359,22 +3362,23 @@ async def _handle_github_notify(
 
     service, authority = canonical
     snapshot = await service.inspect(authority)
-    github_preference = next(item for item in snapshot.preferences if item.integration_class == "github")
-    github_destinations = [item for item in snapshot.destinations if "github" in item.supported_classes]
+    preference = next(item for item in snapshot.preferences if item.integration_class == integration_class)
+    destinations = [item for item in snapshot.destinations if integration_class in item.supported_classes]
+    notification_label = (
+        "GitHub notification" if integration_class == GITHUB_INTEGRATION_CLASS else "Generic webhook notification"
+    )
     if not args:
         lines = [
-            f"GitHub notifications: {github_preference.destination_name} ({github_preference.source})",
+            f"{notification_label}s: {preference.destination_name} ({preference.source})",
             "",
             "Available destinations:",
         ]
-        lines.extend(
-            f"{index}. {item.display_name} ({item.kind})" for index, item in enumerate(github_destinations, start=1)
-        )
+        lines.extend(f"{index}. {item.display_name} ({item.kind})" for index, item in enumerate(destinations, start=1))
         lines.extend(
             [
                 "",
-                "Use /github notify <number> to select a destination.",
-                "Use /github notify reset to restore protected policy.",
+                f"Use {command} <number> to select a destination.",
+                f"Use {command} reset to restore protected policy.",
             ]
         )
         await update.message.reply_text("\n".join(lines))
@@ -3385,32 +3389,99 @@ async def _handle_github_notify(
     if value == "reset":
         changed = await service.reset(
             authority,
-            "github",
+            integration_class,
             expected_revision=snapshot.revision,
         )
-        preference = next(item for item in changed.preferences if item.integration_class == "github")
+        preference = next(item for item in changed.preferences if item.integration_class == integration_class)
         await update.message.reply_text(
-            f"GitHub notification destination reset to {preference.destination_name} ({preference.source})."
+            f"{notification_label} destination reset to {preference.destination_name} ({preference.source})."
         )
         return
 
     try:
         selected_index = int(value)
     except ValueError:
-        await update.message.reply_text("Destination must be a number from /github notify, or reset.")
+        await update.message.reply_text(f"Destination must be a number from {command}, or reset.")
         return
-    if selected_index < 1 or selected_index > len(github_destinations):
-        await update.message.reply_text("Destination must be a number from /github notify, or reset.")
+    if selected_index < 1 or selected_index > len(destinations):
+        await update.message.reply_text(f"Destination must be a number from {command}, or reset.")
         return
-    selected = github_destinations[selected_index - 1]
+    selected = destinations[selected_index - 1]
     changed = await service.select(
         authority,
-        "github",
+        integration_class,
         selected.choice_id,
         expected_revision=snapshot.revision,
     )
-    preference = next(item for item in changed.preferences if item.integration_class == "github")
-    await update.message.reply_text(f"GitHub notifications will go to {preference.destination_name}.")
+    preference = next(item for item in changed.preferences if item.integration_class == integration_class)
+    await update.message.reply_text(f"{notification_label}s will go to {preference.destination_name}.")
+
+
+async def _handle_github_notify(
+    update: Update,
+    args: list[str],
+    *,
+    canonical: tuple[
+        WorkshopNotificationPreferenceService,
+        NotificationPreferenceAuthority,
+    ]
+    | None = None,
+) -> None:
+    """Keep `/github notify` as the GitHub-specific compatibility surface."""
+    await _handle_notification_destination(
+        update,
+        args,
+        integration_class=GITHUB_INTEGRATION_CLASS,
+        command="/github notify",
+        canonical=canonical,
+    )
+
+
+@_require_auth
+async def handle_notifications(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Show or change canonical personal integration destinations."""
+    assert update.message is not None
+    canonical = _canonical_notification_preference_authority(
+        context,
+        _chat_id(update),
+    )
+    if canonical is None:
+        await update.message.reply_text("Canonical notification destinations are unavailable.")
+        return
+
+    args = context.args or []
+    if not args:
+        service, authority = canonical
+        snapshot = await service.inspect(authority)
+        lines = ["Notification delivery:"]
+        lines.extend(f"{item.display_name}: {item.destination_name} ({item.source})" for item in snapshot.preferences)
+        lines.extend(
+            [
+                "",
+                "Use /notifications github to view GitHub destinations.",
+                "Use /notifications generic to view generic-webhook destinations.",
+            ]
+        )
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    integration_class = args[0].strip().lower()
+    if integration_class not in {
+        GITHUB_INTEGRATION_CLASS,
+        GENERIC_INTEGRATION_CLASS,
+    }:
+        await update.message.reply_text("Usage: /notifications <github|generic> [number|reset]")
+        return
+    await _handle_notification_destination(
+        update,
+        args[1:],
+        integration_class=integration_class,
+        command=f"/notifications {integration_class}",
+        canonical=canonical,
+    )
 
 
 async def _handle_github_toggle(
@@ -3470,7 +3541,6 @@ async def handle_github(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if subcommand == "notify":
         await _handle_github_notify(
             update,
-            chat_id,
             args[1:],
             canonical=notification_preferences,
         )
@@ -3881,6 +3951,8 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/github token [<token>] - Manage access token\n"
         "/github add <repo> - Watch a repo\n"
         "/github remove <repo> - Unwatch a repo\n"
+        "/notifications - Show personal notification destinations\n"
+        "/notifications <github|generic> [number|reset] - Route notifications\n"
         "/review <pr-number> - Review a PR on the inferred repo\n"
         "/review <owner/repo> <pr-number> - Review an explicit PR\n"
         "\n"
@@ -4692,6 +4764,7 @@ def create_bot(
         ("voices", handle_voices),
         ("webhooks", handle_webhooks),
         ("github", handle_github),
+        ("notifications", handle_notifications),
         ("review", handle_review_command),
         ("memory", memory_command.handle_memory_command),
         ("stop", handle_stop),
