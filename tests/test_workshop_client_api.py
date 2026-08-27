@@ -74,6 +74,7 @@ from kai.workshop.run_lifecycle import (
 )
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
 from kai.workshop.settings_workspaces import (
+    BackendOption,
     EditableCapability,
     EffectiveValue,
     ModelOption,
@@ -215,6 +216,11 @@ class _SettingsWorkspaces:
         self.runtime_changes.append(("model", _model))
         return self._snapshot()
 
+    async def set_backend(self, _authority, backend: str, *, expected_revision=None):
+        self._check_revision(expected_revision, "sws_current")
+        self.runtime_changes.append(("backend", backend))
+        return self._snapshot()
+
     async def set_timeout(self, _authority, _timeout: int, *, expected_revision=None):
         self._check_revision(expected_revision, "sws_current")
         self.runtime_changes.append(("timeout", _timeout))
@@ -266,6 +272,10 @@ class _SettingsWorkspaces:
             runtime_profile_id=profile_id(101),
             backend="codex",
             provider="openai",
+            backend_options=(
+                BackendOption("codex", "openai", True),
+                BackendOption("claude", "anthropic", False),
+            ),
             model=EffectiveValue("gpt-5.6-sol", "runtime policy", "gpt-5.6-sol"),
             timeout_seconds=EffectiveValue(120, "runtime policy", 120),
             workspace=workspace,
@@ -1021,6 +1031,14 @@ class TestWorkshopSettingsWorkspaceHTTPContract:
                 },
                 json={"timeout_seconds": 180, "revision": "sws_current"},
             )
+            backend_changed = await client.patch(
+                f"/v1/channels/{alice_channel}/settings",
+                headers={
+                    "Authorization": "Bearer alice-token",
+                    "Content-Type": "application/json",
+                },
+                json={"backend": "claude", "revision": "sws_current"},
+            )
 
             assert settings.status == 200
             settings_payload = await settings.json()
@@ -1045,8 +1063,12 @@ class TestWorkshopSettingsWorkspaceHTTPContract:
             assert switched.status == 200
             assert (await switched.json())["workspace"] == "/srv/other"
             assert changed.status == 200
+            assert backend_changed.status == 200
             assert service.switched == ["/srv/other"]
-            assert service.runtime_changes == [("timeout", 180)]
+            assert service.runtime_changes == [
+                ("timeout", 180),
+                ("backend", "claude"),
+            ]
         finally:
             await client.close()
             await store.close()
@@ -1100,18 +1122,19 @@ class TestWorkshopSettingsWorkspaceHTTPContract:
             settings_workspaces=service,
         )
         try:
-            response = await client.post(
-                f"/v1/channels/{alice_channel}/workspace",
+            response = await client.patch(
+                f"/v1/channels/{alice_channel}/settings",
                 headers={
                     "Authorization": "Bearer bob-token",
                     "Content-Type": "application/json",
                 },
-                json={"path": "/srv/other"},
+                json={"backend": "claude", "revision": "sws_current"},
             )
 
             assert response.status == 403
             assert (await response.json())["error"]["code"] == "access_denied"
             assert service.switched == []
+            assert service.runtime_changes == []
         finally:
             await client.close()
             await store.close()

@@ -18,7 +18,10 @@ async def test_profile_state_ingests_memory_with_only_canonical_authority(monkey
         provider="openai",
         allowed_triage_projects=("Kai",),
     )
-    runtime_pool = SimpleNamespace(runtime_profile=Mock(return_value=profile))
+    runtime_pool = SimpleNamespace(
+        runtime_profile=Mock(return_value=profile),
+        get_backend_provider=Mock(return_value=("codex", "openai")),
+    )
     execution_state = SimpleNamespace(resolve_profile=Mock(return_value=SimpleNamespace(principal_id="prn_daniel")))
     ingest = AsyncMock()
     monkeypatch.setattr("kai.workshop.runtime_state.ingest_conversation_memory", ingest)

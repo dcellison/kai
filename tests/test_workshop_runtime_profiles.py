@@ -135,6 +135,38 @@ def test_document_preserves_migrated_profile_identity_and_compatibility_key():
     assert profile.allowed_services == ("perplexity", "weather")
 
 
+def test_document_builds_explicit_backend_choices_from_protected_allowlist():
+    profile_id = runtime_profile_id_for_config_id(101)
+    registry = WorkshopRuntimeProfileRegistry.from_document(
+        {
+            "version": 2,
+            "runtime_profiles": {
+                str(profile_id): {
+                    "display_name": "Daniel coding",
+                    "os_user": "daniel",
+                    "backend": "codex",
+                    "provider": "openai",
+                    "model": "gpt-5.6-sol",
+                    "timeout_seconds": 120,
+                    "allowed_backends": ["codex", "claude"],
+                    "allowed_services": [],
+                    "allowed_workspaces": [],
+                }
+            },
+        },
+        backend_registry={"codex": {}, "claude": {}},
+    )
+
+    profile = registry.resolve(profile_id)
+    assert [(item.backend, item.provider) for item in profile.backend_options] == [
+        ("codex", "openai"),
+        ("claude", "anthropic"),
+    ]
+    assert profile.backend_option("claude").model == "sonnet"
+    with pytest.raises(WorkshopRuntimeProfileError, match="not authorized"):
+        profile.backend_option("goose")
+
+
 @pytest.mark.parametrize(
     ("os_user", "message"),
     (

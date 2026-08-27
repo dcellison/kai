@@ -49,6 +49,9 @@ class _FakePool:
     def start(self) -> None:
         self.events.append("pool:start")
 
+    async def hydrate_backend_selections(self) -> None:
+        return None
+
     async def shutdown(self) -> None:
         self.events.append("pool:stop")
 

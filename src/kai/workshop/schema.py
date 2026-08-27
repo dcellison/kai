@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 33
+WORKSHOP_SCHEMA_VERSION = 34
 
 
 @dataclass(frozen=True, slots=True)
@@ -1670,6 +1670,43 @@ _CANONICAL_RUNTIME_KEYS_SCHEMA = SchemaMigration(
     ),
 )
 
+
+_CANONICAL_BACKEND_SELECTION_SCHEMA = SchemaMigration(
+    version=34,
+    name="canonical_backend_selection",
+    statements=(
+        "ALTER TABLE channel_agent_execution_settings RENAME TO channel_agent_execution_settings_v33",
+        """
+        CREATE TABLE channel_agent_execution_settings (
+            channel_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            runtime_profile_id TEXT NOT NULL CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            field TEXT NOT NULL CHECK (
+                field IN ('backend', 'model', 'timeout', 'workspace')
+            ),
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            ),
+            PRIMARY KEY (channel_id, agent_id, field)
+        )
+        """,
+        """
+        INSERT INTO channel_agent_execution_settings (
+            channel_id, agent_id, runtime_profile_id, field, value, updated_at
+        )
+        SELECT
+            channel_id, agent_id, runtime_profile_id, field, value, updated_at
+        FROM channel_agent_execution_settings_v33
+        """,
+        "DROP TABLE channel_agent_execution_settings_v33",
+        "CREATE INDEX channel_agent_execution_settings_profile_idx "
+        "ON channel_agent_execution_settings (runtime_profile_id)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -1704,6 +1741,7 @@ _MIGRATIONS = (
     _CANONICAL_POST_RUN_EFFECTS_SCHEMA,
     _DURABLE_POST_RUN_EFFECT_RECEIPTS_SCHEMA,
     _CANONICAL_RUNTIME_KEYS_SCHEMA,
+    _CANONICAL_BACKEND_SELECTION_SCHEMA,
 )
 
 

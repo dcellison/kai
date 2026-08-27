@@ -66,7 +66,7 @@ export interface WorkshopEditableCapability {
   minimum: number | null;
   resettable: boolean;
   scope: "runtime" | "workspace";
-  valueType: "authorized_workspace" | "integer_seconds" | "model_id" | "text";
+  valueType: "authorized_workspace" | "backend_id" | "integer_seconds" | "model_id" | "text";
 }
 
 export interface WorkshopSettingsMutation {
@@ -78,6 +78,7 @@ export interface WorkshopSettingsMutation {
 
 export interface WorkshopSettingsWorkspace {
   backend: string;
+  backendOptions: { backend: string; current: boolean; provider: string }[];
   capabilities: WorkshopEditableCapability[];
   channelId: string;
   model: { defaultValue: string; source: string; value: string };
@@ -127,6 +128,7 @@ export interface WorkshopPreferenceHistory {
 }
 
 export type WorkshopRuntimeSettingsChange =
+  | { field: "backend"; value: string }
   | { field: "model"; value: string }
   | { field: "timeout"; value: number }
   | { field: "reset"; value: "all" | "model" | "timeout" };

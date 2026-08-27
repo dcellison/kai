@@ -27,8 +27,10 @@ into four tables:
    /workspace allow and /workspace deny. Unioned with global ALLOWED_WORKSPACES
    env var for the effective access list.
 
-All functions use a module-level aiosqlite connection initialized by init_db()
-at startup. The database file is kai.db at the project root.
+Most functions use a module-level aiosqlite connection initialized by init_db()
+at startup. Explicitly database-scoped readers are provided for core runtime
+startup paths that must not depend on module initialization order. The database
+file is kai.db at the project root.
 """
 
 from __future__ import annotations
@@ -1581,12 +1583,39 @@ async def get_canonical_execution_settings(
     return {str(row["field"]): str(row["value"]) for row in rows}
 
 
+async def read_canonical_execution_settings(
+    db_path: Path,
+    namespace: WorkshopExecutionStateNamespace,
+) -> dict[str, str]:
+    """Read one canonical lane without relying on the process-global DB handle.
+
+    Core-host construction is independently testable and may occur before the
+    compatibility sessions module is initialized.  Backend selection is a
+    startup input, so it uses this bounded connection rather than inheriting a
+    hidden initialization-order dependency.
+    """
+    if not db_path.is_file():
+        raise RuntimeError(f"Canonical execution database does not exist: {db_path}")
+    connection = await aiosqlite.connect(str(db_path))
+    connection.row_factory = aiosqlite.Row
+    try:
+        async with connection.execute(
+            "SELECT field, value FROM channel_agent_execution_settings "
+            "WHERE channel_id = ? AND agent_id = ? ORDER BY field",
+            (namespace.channel_id, namespace.agent_id),
+        ) as cursor:
+            rows = await cursor.fetchall()
+    finally:
+        await connection.close()
+    return {str(row["field"]): str(row["value"]) for row in rows}
+
+
 async def set_canonical_execution_setting(
     namespace: WorkshopExecutionStateNamespace,
     field: str,
     value: str,
 ) -> None:
-    if field not in {"model", "timeout", "workspace"}:
+    if field not in {"backend", "model", "timeout", "workspace"}:
         raise ValueError(f"Unsupported execution setting field: {field}")
     await _get_db().execute(
         "INSERT INTO channel_agent_execution_settings "
@@ -1642,7 +1671,7 @@ async def replace_canonical_settings_state(
     change and its optional workspace-override removal from becoming partially
     durable.
     """
-    if set(execution_settings) - {"model", "timeout", "workspace"}:
+    if set(execution_settings) - {"backend", "model", "timeout", "workspace"}:
         raise ValueError("Unsupported canonical execution setting")
     if workspace_settings is not None:
         if workspace_path is None:

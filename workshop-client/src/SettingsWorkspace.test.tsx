@@ -53,7 +53,20 @@ const preference: WorkshopPreferenceDocument = {
 
 const runtime: WorkshopSettingsWorkspace = {
   backend: "claude",
+  backendOptions: [
+    { backend: "claude", provider: "anthropic", current: true },
+    { backend: "codex", provider: "openai", current: false },
+  ],
   capabilities: [
+    {
+      choices: ["claude", "codex"],
+      field: "backend",
+      maximum: null,
+      minimum: null,
+      resettable: false,
+      scope: "runtime",
+      valueType: "backend_id",
+    },
     {
       choices: ["claude-sonnet-4-6", "claude-opus-4-1"],
       field: "model",
@@ -142,7 +155,7 @@ const workspaceConfig: WorkshopWorkspaceConfig = {
   workspace: runtime.workspace,
 };
 
-function renderSettings(onDirtyChange = vi.fn()): void {
+function renderSettings(onDirtyChange = vi.fn(), runActive = false): void {
   render(
     <SettingsWorkspace
       onAuthenticationFailure={vi.fn()}
@@ -152,6 +165,7 @@ function renderSettings(onDirtyChange = vi.fn()): void {
       principalName="Daniel"
       roleLabel="Workshop administrator"
       runtimeLabel="Kai"
+      runActive={runActive}
       session={session}
     />,
   );
@@ -206,8 +220,8 @@ describe("Settings workspace", () => {
     expect(await screen.findByLabelText("Preference Markdown")).toHaveValue(
       preference.content,
     );
-    expect(screen.getByText("claude")).toBeVisible();
-    expect(screen.getByText("anthropic")).toBeVisible();
+    expect(screen.getByLabelText("Backend")).toHaveValue("claude");
+    expect(screen.getByRole("option", { name: "claude · anthropic" })).toBeVisible();
     expect(screen.getByRole("option", { name: "Kai" })).toBeVisible();
     expect(screen.getByRole("option", { name: "Home" })).toBeVisible();
     expect(screen.getByRole("option", { name: "Kai" })).toHaveValue("0");
@@ -343,5 +357,46 @@ describe("Settings workspace", () => {
       { field: "prompt", value: "Use the project conventions." },
     );
     expect(window.confirm).toHaveBeenCalled();
+  });
+
+  it("switches only the authenticated principal's backend after confirmation", async () => {
+    const user = userEvent.setup();
+    vi.mocked(updateRuntimeSettings).mockResolvedValue({
+      ...runtime,
+      backend: "codex",
+      provider: "openai",
+      backendOptions: runtime.backendOptions.map((option) => ({
+        ...option,
+        current: option.backend === "codex",
+      })),
+      mutation: {
+        changed: true,
+        operation: "set_runtime_backend",
+        providerSessionInvalidated: true,
+        runtimeAction: "restarted",
+      },
+      revision: "sws_backend",
+    });
+    renderSettings();
+    const backend = await screen.findByLabelText("Backend");
+
+    await user.selectOptions(backend, "codex");
+    await user.click(screen.getByRole("button", { name: "Switch backend" }));
+
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining("other people and Kai itself will not restart"));
+    expect(updateRuntimeSettings).toHaveBeenCalledWith(
+      session,
+      "sws_current",
+      { field: "backend", value: "codex" },
+    );
+    expect(await screen.findByText(/provider-session continuity was cleared/)).toBeVisible();
+  });
+
+  it("disables backend switching while this principal has an active run", async () => {
+    renderSettings(vi.fn(), true);
+
+    expect(await screen.findByLabelText("Backend")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Switch backend" })).toBeDisabled();
+    expect(screen.getByText("Finish or stop the active run before switching.")).toBeVisible();
   });
 });

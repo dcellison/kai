@@ -44,6 +44,17 @@ class WorkshopRuntimeProfileError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class ProtectedRuntimeBackend:
+    """One operator-authorized backend configuration for a runtime profile."""
+
+    backend: str
+    provider: str
+    model: str
+    allowed_models: tuple[str, ...] | None = None
+    role_models: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class ProtectedRuntimeProfile:
     """One operator-configured execution identity behind an opaque ID.
 
@@ -70,6 +81,7 @@ class ProtectedRuntimeProfile:
     pr_review: bool | None = None
     issue_triage: bool | None = None
     allowed_triage_projects: tuple[str, ...] = ()
+    backend_options: tuple[ProtectedRuntimeBackend, ...] = ()
 
     def __post_init__(self) -> None:
         maximum_timeout = self.maximum_timeout_seconds
@@ -80,6 +92,30 @@ class ProtectedRuntimeProfile:
                 "maximum_timeout_seconds must be an integer greater than or equal to timeout_seconds"
             )
         object.__setattr__(self, "maximum_timeout_seconds", maximum_timeout)
+        options = self.backend_options
+        if not options:
+            options = (
+                ProtectedRuntimeBackend(
+                    self.backend,
+                    self.provider,
+                    self.model,
+                    self.allowed_models,
+                    self.role_models,
+                ),
+            )
+            object.__setattr__(self, "backend_options", options)
+        by_backend = {option.backend: option for option in options}
+        if len(by_backend) != len(options) or self.backend not in by_backend:
+            raise WorkshopRuntimeProfileError(
+                "backend_options must contain each backend exactly once, including the protected default"
+            )
+
+    def backend_option(self, backend: str) -> ProtectedRuntimeBackend:
+        """Resolve one explicitly authorized backend or fail closed."""
+        for option in self.backend_options:
+            if option.backend == backend:
+                return option
+        raise WorkshopRuntimeProfileError(f"Runtime profile {self.profile_id}: backend {backend!r} is not authorized")
 
 
 def _compatibility_model(
@@ -426,6 +462,68 @@ class WorkshopRuntimeProfileRegistry:
                         f"Runtime profile {profile_id}: role model {role_model!r} is invalid for {backend}/{provider}"
                     )
                 role_models.append((role, role_model))
+            raw_allowed_backends = raw_profile.get("allowed_backends", [backend])
+            if not isinstance(raw_allowed_backends, list) or any(
+                not isinstance(item, str) or not item.strip() for item in raw_allowed_backends
+            ):
+                raise WorkshopRuntimeProfileError(
+                    f"Runtime profile {profile_id}: allowed_backends must be a list of backend identifiers"
+                )
+            allowed_backends = tuple(dict.fromkeys(item.strip().lower() for item in raw_allowed_backends))
+            if backend not in allowed_backends:
+                raise WorkshopRuntimeProfileError(
+                    f"Runtime profile {profile_id}: allowed_backends must include protected default {backend!r}"
+                )
+            backend_options: list[ProtectedRuntimeBackend] = []
+            for allowed_backend in allowed_backends:
+                if allowed_backend not in VALID_BACKENDS:
+                    raise WorkshopRuntimeProfileError(
+                        f"Runtime profile {profile_id}: unsupported allowed backend {allowed_backend!r}"
+                    )
+                if installed is not None and allowed_backend not in installed:
+                    raise WorkshopRuntimeProfileError(
+                        f"Runtime profile {profile_id}: allowed backend {allowed_backend!r} "
+                        "is not present in the backend registry"
+                    )
+                option_provider = (
+                    provider if allowed_backend == backend else get_effective_provider(allowed_backend, provider)
+                )
+                option_providers = BACKEND_PROVIDERS[allowed_backend]
+                if option_provider not in option_providers:
+                    raise WorkshopRuntimeProfileError(
+                        f"Runtime profile {profile_id}: provider {option_provider!r} cannot authorize "
+                        f"alternate backend {allowed_backend!r}"
+                    )
+                option_models = _registry_model_ceiling(
+                    allowed_backend,
+                    installed,
+                    profile_id=profile_id,
+                )
+                option_model = (
+                    model
+                    if allowed_backend == backend
+                    else get_default_model_for_backend(allowed_backend, option_provider)
+                )
+                option_model = canonicalize_model_for_backend(option_model, allowed_backend)
+                if not validate_model_for_backend_policy(
+                    option_model,
+                    allowed_backend,
+                    option_provider,
+                    allowed_models=option_models,
+                ):
+                    raise WorkshopRuntimeProfileError(
+                        f"Runtime profile {profile_id}: default model {option_model!r} is not valid "
+                        f"for allowed backend {allowed_backend!r}"
+                    )
+                backend_options.append(
+                    ProtectedRuntimeBackend(
+                        backend=allowed_backend,
+                        provider=option_provider,
+                        model=option_model,
+                        allowed_models=option_models,
+                        role_models=tuple(sorted(role_models)) if allowed_backend == backend else (),
+                    )
+                )
             raw_triage_projects = raw_profile.get("allowed_triage_projects", [])
             if not isinstance(raw_triage_projects, list):
                 raise WorkshopRuntimeProfileError(
@@ -491,6 +589,7 @@ class WorkshopRuntimeProfileRegistry:
                     pr_review=raw_pr_review,
                     issue_triage=raw_issue_triage,
                     allowed_triage_projects=tuple(triage_projects),
+                    backend_options=tuple(backend_options),
                 )
             )
             if version == 1:

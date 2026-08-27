@@ -221,6 +221,7 @@ class KaiApplicationHost:
                 internal_api_contexts=self._internal_api_contexts,
             )
             runtime_pool = WorkshopRuntimePool(subprocess_pool, self._runtime_profiles)
+            await subprocess_pool.hydrate_backend_selections()
             runtime_state = WorkshopRuntimeStateWriter(
                 self._config,
                 runtime_pool,

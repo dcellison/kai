@@ -402,7 +402,7 @@ function parseEditableCapabilities(value: unknown): WorkshopEditableCapability[]
       !isRecord(raw) ||
       typeof raw.field !== "string" ||
       !["runtime", "workspace"].includes(String(raw.scope)) ||
-      !["authorized_workspace", "integer_seconds", "model_id", "text"].includes(
+      !["authorized_workspace", "backend_id", "integer_seconds", "model_id", "text"].includes(
         String(raw.value_type),
       ) ||
       typeof raw.resettable !== "boolean" ||
@@ -462,6 +462,7 @@ function parseSettingsWorkspace(
     typeof payload.runtime_profile_id !== "string" ||
     typeof payload.backend !== "string" ||
     typeof payload.provider !== "string" ||
+    !Array.isArray(payload.backend_options) ||
     typeof payload.workspace !== "string" ||
     typeof payload.revision !== "string" ||
     !isRecord(payload.model) ||
@@ -494,6 +495,21 @@ function parseSettingsWorkspace(
       path: rawWorkspace.path,
     };
   });
+  const backendOptions = payload.backend_options.map((rawBackend) => {
+    if (
+      !isRecord(rawBackend) ||
+      typeof rawBackend.backend !== "string" ||
+      typeof rawBackend.provider !== "string" ||
+      typeof rawBackend.current !== "boolean"
+    ) {
+      throw new Error("Kai returned unsupported backend policy.");
+    }
+    return {
+      backend: rawBackend.backend,
+      current: rawBackend.current,
+      provider: rawBackend.provider,
+    };
+  });
   const modelOptions = payload.model_options === null
     ? null
     : payload.model_options.map((rawModel) => {
@@ -511,6 +527,7 @@ function parseSettingsWorkspace(
       });
   return {
     backend: payload.backend,
+    backendOptions,
     channelId,
     model: {
       defaultValue: payload.model.default_value,
@@ -1227,9 +1244,11 @@ export async function updateRuntimeSettings(
 ): Promise<WorkshopSettingsWorkspace> {
   const operation = change.field === "model"
     ? { model: change.value }
-    : change.field === "timeout"
-      ? { timeout_seconds: change.value }
-      : { reset: change.value };
+    : change.field === "backend"
+      ? { backend: change.value }
+      : change.field === "timeout"
+        ? { timeout_seconds: change.value }
+        : { reset: change.value };
   const response = await authorizedFetch(
     session,
     `/v1/channels/${encodeURIComponent(session.channelId)}/settings`,
@@ -1241,6 +1260,15 @@ export async function updateRuntimeSettings(
   );
   const payload = await responsePayload(response);
   if (response.status === 409) {
+    if (
+      isRecord(payload) &&
+      isRecord(payload.error) &&
+      payload.error.code === "runtime_busy"
+    ) {
+      throw new Error(
+        safeErrorMessage(payload, "Finish or stop the active run before switching backends."),
+      );
+    }
     throw new SettingsRevisionConflictError(
       safeErrorMessage(payload, "Settings changed since they were loaded."),
     );

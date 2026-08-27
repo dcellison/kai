@@ -13,6 +13,7 @@ from kai.workshop.execution_state import (
     WorkshopExecutionStateNamespace,
     WorkshopExecutionStateRegistry,
 )
+from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError
 from kai.workshop.settings_workspaces import (
     EffectiveValue,
     WorkshopSettingsWorkspaceAccessDenied,
@@ -31,6 +32,8 @@ class _RuntimePool:
         self.timeout = 120
         self.workspace = home
         self.events: list[str] = []
+        self.in_flight = False
+        self.reject_switch = False
         self.profile = SimpleNamespace(
             profile_id=profile_id(101),
             legacy_runtime_key=101,
@@ -41,9 +44,42 @@ class _RuntimePool:
             maximum_timeout_seconds=600,
             allowed_models=None,
         )
+        self.profile.backend_options = (
+            SimpleNamespace(backend="codex", provider="openai"),
+            SimpleNamespace(backend="claude", provider="anthropic"),
+        )
+
+        def backend_option(backend: str):
+            if backend not in {"claude", "codex"}:
+                raise WorkshopRuntimeProfileError("not authorized")
+            return SimpleNamespace(
+                backend=backend,
+                provider="anthropic" if backend == "claude" else "openai",
+                model=("claude-sonnet-4-6" if backend == "claude" else self.profile.model),
+                allowed_models=(None if backend == "claude" else self.profile.allowed_models),
+                role_models=(),
+            )
+
+        self.profile.backend_option = backend_option
 
     def runtime_profile(self, _profile_id):
         return self.profile
+
+    def get_backend_provider(self, _profile_id):
+        return self.profile.backend, self.profile.provider
+
+    def is_in_flight(self, _profile_id) -> bool:
+        return self.in_flight
+
+    async def select_backend(self, _profile_id, backend: str, *, commit_selection=None) -> bool:
+        if self.reject_switch:
+            return False
+        if commit_selection is not None:
+            await commit_selection()
+        self.profile.backend = backend
+        self.profile.provider = "anthropic" if backend == "claude" else "openai"
+        self.events.append(f"backend:{backend}")
+        return True
 
     def is_running(self, _profile_id) -> bool:
         return True
@@ -432,6 +468,109 @@ def _canonical_state(monkeypatch, *, execution=None, workspace=None):
     return stored_execution, stored_workspace, replace_calls, clear_calls
 
 
+async def test_backend_switch_is_canonical_targeted_and_rejects_active_run(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, pool, authority, _, _ = _service(tmp_path)
+    execution, _, replace_calls, clear_calls = _canonical_state(
+        monkeypatch,
+        execution={"model": "gpt-5.6-terra", "timeout": "180"},
+    )
+    initial = await service.inspect(authority)
+
+    switched = await service.set_backend(
+        authority,
+        "claude",
+        expected_revision=initial.revision,
+    )
+
+    assert switched.backend == "claude"
+    assert switched.provider == "anthropic"
+    assert switched.model == EffectiveValue(
+        "claude-sonnet-4-6",
+        "runtime policy",
+        "claude-sonnet-4-6",
+    )
+    assert execution == {
+        "backend": "claude",
+        "model": "gpt-5.6-terra",
+        "timeout": "180",
+    }
+    assert replace_calls[-1][0] == execution
+    assert clear_calls == ["clear"]
+    assert pool.events == ["backend:claude"]
+
+    pool.in_flight = True
+    with pytest.raises(WorkshopSettingsWorkspaceConflict, match="active run"):
+        await service.set_backend(
+            authority,
+            "codex",
+            expected_revision=switched.revision,
+        )
+    assert execution["backend"] == "claude"
+
+    pool.in_flight = False
+    with pytest.raises(WorkshopSettingsWorkspaceValidationError, match="not allowed"):
+        await service.set_backend(authority, "goose")
+    assert execution["backend"] == "claude"
+    assert pool.events == ["backend:claude"]
+
+
+async def test_backend_switch_race_rejection_is_mutation_free(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, pool, authority, _, _ = _service(tmp_path)
+    execution, _, replace_calls, clear_calls = _canonical_state(
+        monkeypatch,
+        execution={"model": "gpt-5.6-terra", "timeout": "180"},
+    )
+    initial = await service.inspect(authority)
+    # Simulate a run winning the pool's transition lock immediately after the
+    # service's advisory idle check.
+    pool.reject_switch = True
+
+    with pytest.raises(WorkshopSettingsWorkspaceConflict, match="active run"):
+        await service.set_backend(
+            authority,
+            "claude",
+            expected_revision=initial.revision,
+        )
+
+    assert execution == {"model": "gpt-5.6-terra", "timeout": "180"}
+    assert replace_calls == []
+    assert clear_calls == []
+    assert pool.events == []
+
+
+async def test_backend_switch_failure_restores_canonical_selection(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, pool, authority, _, _ = _service(tmp_path)
+    execution, _, replace_calls, clear_calls = _canonical_state(
+        monkeypatch,
+        execution={"model": "gpt-5.6-terra", "timeout": "180"},
+    )
+    pool.select_backend = AsyncMock(side_effect=OSError("shutdown failed"))
+    initial = await service.inspect(authority)
+
+    with pytest.raises(OSError, match="shutdown failed"):
+        await service.set_backend(
+            authority,
+            "claude",
+            expected_revision=initial.revision,
+        )
+
+    assert execution == {"model": "gpt-5.6-terra", "timeout": "180"}
+    assert replace_calls == [
+        ({"model": "gpt-5.6-terra", "timeout": "180"}, None),
+    ]
+    assert clear_calls == []
+    assert pool.profile.backend == "codex"
+
+
 async def test_capability_catalog_and_model_validation_share_protected_policy(
     tmp_path: Path,
     monkeypatch,
@@ -447,11 +586,12 @@ async def test_capability_catalog_and_model_validation_share_protected_policy(
     assert snapshot.model_options is not None
     assert tuple(option.model_id for option in snapshot.model_options) == ("gpt-5.6-sol",)
     assert [(item.scope, item.field) for item in snapshot.capabilities] == [
+        ("runtime", "backend"),
         ("runtime", "model"),
         ("runtime", "timeout"),
         ("runtime", "workspace"),
     ]
-    timeout = snapshot.capabilities[1]
+    timeout = snapshot.capabilities[2]
     assert (timeout.minimum, timeout.maximum) == (1, 600)
 
     with pytest.raises(WorkshopSettingsWorkspaceValidationError, match="not allowed"):
@@ -476,7 +616,7 @@ async def test_timeout_capability_and_validation_follow_protected_runtime_policy
     initial = await service.inspect(authority)
 
     assert initial.timeout_seconds == EffectiveValue(1800, "runtime policy", 1800)
-    assert initial.capabilities[1].maximum == 1800
+    assert initial.capabilities[2].maximum == 1800
     workspace = await service.workspace_config(authority)
     assert workspace.capabilities[1].maximum == 1800
 

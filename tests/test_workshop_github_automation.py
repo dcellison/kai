@@ -215,6 +215,7 @@ class TestDurableGitHubAutomation:
             provider="openai",
             os_user="daniel",
         )
+        runtime_pool.get_backend_provider.return_value = ("codex", "openai")
         runtime_pool.get_role_model.return_value = "gpt-5.6-sol"
         profile_state = MagicMock()
         profile_state.github_token = AsyncMock(return_value="ghp_secret")
