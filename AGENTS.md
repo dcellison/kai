@@ -33,4 +33,4 @@ Follow the existing pattern exactly:
 - Don't add features or refactor beyond what was asked.
 - Spec files go in `home/docs/specs/`, not the project root.
 - Kai (the inner agent, on any backend) must NEVER modify source files in this repo. Read, review, and report only.
-- Don't push follow-up commits without waiting for CI and the review bot to finish their cooldown period.
+- Don't push follow-up commits until the current CI run has completed.
