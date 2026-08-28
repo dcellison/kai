@@ -116,13 +116,16 @@ async def load_durable_run(store: WorkshopEventStore, run_id: RunId) -> DurableR
 async def _load_run_by_inbound_message(
     store: WorkshopEventStore,
     inbound_message_id: MessageId,
+    agent_id: AgentId | None = None,
 ) -> DurableRun | None:
     async with store.connection.execute(
-        "SELECT id FROM runs WHERE inbound_message_id = ?",
-        (inbound_message_id,),
+        "SELECT id FROM runs WHERE inbound_message_id = ? AND (? IS NULL OR agent_id = ?) ORDER BY id",
+        (inbound_message_id, agent_id, agent_id),
     ) as cursor:
-        row = await cursor.fetchone()
-    return None if row is None else await load_durable_run(store, RunId(str(row[0])))
+        rows = list(await cursor.fetchall())
+    if len(rows) > 1:
+        raise RunLifecycleConflictError("Inbound message has multiple runs; an agent_id is required")
+    return None if not rows else await load_durable_run(store, RunId(str(rows[0][0])))
 
 
 def _event_key(run_id: RunId, status: RunStatus) -> str:
@@ -184,14 +187,24 @@ class WorkshopRunLifecycle:
             raise RunNotFoundError("Durable Workshop run was not found")
         return run
 
-    async def accept(self, inbound_message_id: MessageId, *, occurred_at: datetime) -> RunLifecycleResult:
+    async def accept(
+        self,
+        inbound_message_id: MessageId,
+        *,
+        occurred_at: datetime,
+        agent_id: AgentId | None = None,
+    ) -> RunLifecycleResult:
         if not isinstance(inbound_message_id, MessageId):
             raise ValueError("inbound_message_id must be a MessageId")
         occurred_at = _require_timestamp(occurred_at)
         connection = self._store.connection
         try:
             await connection.execute("BEGIN IMMEDIATE")
-            result = await self.accept_in_transaction(inbound_message_id, occurred_at=occurred_at)
+            result = await self.accept_in_transaction(
+                inbound_message_id,
+                occurred_at=occurred_at,
+                agent_id=agent_id,
+            )
             await connection.commit()
             return result
         except Exception:
@@ -203,6 +216,7 @@ class WorkshopRunLifecycle:
         inbound_message_id: MessageId,
         *,
         occurred_at: datetime,
+        agent_id: AgentId | None = None,
     ) -> RunLifecycleResult:
         """Accept one run inside a caller-owned transaction."""
         if not isinstance(inbound_message_id, MessageId):
@@ -213,7 +227,11 @@ class WorkshopRunLifecycle:
 
         projection = CanonicalConversationProjection()
         await self._store.project_pending_in_transaction(projection)
-        existing_run = await _load_run_by_inbound_message(self._store, inbound_message_id)
+        existing_run = await _load_run_by_inbound_message(
+            self._store,
+            inbound_message_id,
+            agent_id,
+        )
         if existing_run is not None:
             existing_payload: dict[str, object] = {
                 "inbound_message_id": existing_run.inbound_message_id,
@@ -232,8 +250,15 @@ class WorkshopRunLifecycle:
                 raise RunLifecycleConflictError("Durable run is missing its acceptance event")
             return RunLifecycleResult(run=existing_run, event=existing_event, changed=False)
 
-        target = await resolve_canonical_conversation_target(self._store, inbound_message_id)
-        run_id = RunId.derived(target.workshop_id, f"conversation:{inbound_message_id}")
+        target = await resolve_canonical_conversation_target(
+            self._store,
+            inbound_message_id,
+            agent_id,
+        )
+        run_id = RunId.derived(
+            target.workshop_id,
+            f"conversation:{inbound_message_id}:{target.agent_id}",
+        )
         payload: dict[str, object] = {
             "inbound_message_id": target.inbound_message_id,
             "channel_id": target.channel_id,

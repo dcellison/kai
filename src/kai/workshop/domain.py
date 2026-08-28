@@ -30,6 +30,7 @@ class WorkshopEventType(StrEnum):
     TRANSPORT_CHANNEL_BOUND = "transport.channel_bound"
     AGENT_CREATED = "agent.created"
     CHANNEL_AGENT_ATTACHED = "channel.agent_attached"
+    CHANNEL_AGENT_DISMISSED = "channel.agent_dismissed"
     RUNTIME_PROFILE_ASSIGNED = "runtime_profile.assigned"
     RUNTIME_PROFILE_REASSIGNED = "runtime_profile.reassigned"
     MESSAGE_CREATED = "message.created"

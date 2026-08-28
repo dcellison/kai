@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 
@@ -10,7 +11,7 @@ from kai.workshop.artifacts import StagedArtifact, record_inbound_artifact_in_tr
 from kai.workshop.delivery_outbox import CONVERSATION_REPLY_PURPOSE, DeliveryRequestResult
 from kai.workshop.delivery_planning import CanonicalDeliveryIntent, WorkshopDeliveryPlanner
 from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
-from kai.workshop.domain import MessageId, RuntimeProfileId
+from kai.workshop.domain import ChannelId, MessageId, RuntimeProfileId
 from kai.workshop.inbound import (
     ClientInboundMessage,
     InboundMessage,
@@ -25,6 +26,7 @@ from kai.workshop.runtime_assignments import (
     resolve_channel_runtime_profile,
 )
 from kai.workshop.store import AppendResult, WorkshopEventStore
+from kai.workshop.wake_policy import resolve_message_wake_targets
 
 
 class ConversationCommandAcceptanceError(RuntimeError):
@@ -43,13 +45,25 @@ class ConversationCommandDisposition(StrEnum):
     ACTIVE_REPLAY = "active_replay"
     CANCELLATION_PENDING_REPLAY = "cancellation_pending_replay"
     TERMINAL_REPLAY = "terminal_replay"
+    MESSAGE_ONLY = "message_only"
 
 
 @dataclass(frozen=True, slots=True)
 class ConversationCommandAcceptance:
     message: AppendResult
-    lifecycle: RunLifecycleResult
+    lifecycles: tuple[RunLifecycleResult, ...]
+    run_dispositions: tuple[ConversationCommandDisposition, ...]
     disposition: ConversationCommandDisposition
+
+    @property
+    def lifecycle(self) -> RunLifecycleResult:
+        if len(self.lifecycles) != 1:
+            raise ConversationCommandStateConflictError("Command did not accept exactly one run")
+        return self.lifecycles[0]
+
+    @property
+    def runs(self) -> tuple[DurableRun, ...]:
+        return tuple(item.run for item in self.lifecycles)
 
     @property
     def run(self) -> DurableRun:
@@ -62,7 +76,7 @@ class ClientConversationCommandAcceptance:
 
     command: ConversationCommandAcceptance
     deliveries: tuple[DeliveryRequestResult, ...]
-    runtime_profile_id: RuntimeProfileId
+    runtime_profile_ids: tuple[RuntimeProfileId, ...]
 
     @property
     def delivery(self) -> DeliveryRequestResult | None:
@@ -72,6 +86,12 @@ class ClientConversationCommandAcceptance:
     @property
     def run(self) -> DurableRun:
         return self.command.run
+
+    @property
+    def runtime_profile_id(self) -> RuntimeProfileId:
+        if len(self.runtime_profile_ids) != 1:
+            raise ConversationCommandStateConflictError("Command did not resolve exactly one runtime profile")
+        return self.runtime_profile_ids[0]
 
 
 class WorkshopConversationCommandService:
@@ -117,26 +137,24 @@ class WorkshopConversationCommandService:
                     artifact.for_message(inbound_message_id),
                     storage_root=self._artifact_storage_root,
                 )
-            lifecycle = await WorkshopRunLifecycle(self._store).accept_in_transaction(
+            lifecycles = await self._accept_woken_runs(
                 inbound_message_id,
                 occurred_at=inbound.event.envelope.occurred_at,
             )
-            prior_states = {inbound.inserted, lifecycle.changed}
+            prior_states = {inbound.inserted, *(item.changed for item in lifecycles)}
             if artifact_result is not None:
                 prior_states.add(artifact_result.inserted)
             if len(prior_states) != 1:
                 raise ConversationCommandStateConflictError(
                     "Canonical inbound, artifact, and run acceptance did not share one prior state"
                 )
-            disposition = (
-                ConversationCommandDisposition.NEWLY_ACCEPTED
-                if inbound.inserted
-                else await self._replay_disposition(lifecycle.run)
-            )
+            run_dispositions = await self._run_dispositions(inbound.inserted, lifecycles)
+            disposition = self._aggregate_disposition(run_dispositions)
             await connection.commit()
             return ConversationCommandAcceptance(
                 message=inbound,
-                lifecycle=lifecycle,
+                lifecycles=lifecycles,
+                run_dispositions=run_dispositions,
                 disposition=disposition,
             )
         except Exception:
@@ -170,17 +188,11 @@ class WorkshopConversationCommandService:
                     artifact.for_message(inbound_message_id),
                     storage_root=self._artifact_storage_root,
                 )
-            lifecycle = await WorkshopRunLifecycle(self._store).accept_in_transaction(
+            lifecycles = await self._accept_woken_runs(
                 inbound_message_id,
                 occurred_at=inbound.event.envelope.occurred_at,
             )
-            try:
-                _, runtime_profile_id = await resolve_channel_runtime_profile(
-                    self._store,
-                    message.channel_id,
-                )
-            except WorkshopRuntimeAssignmentError as exc:
-                raise ConversationCommandStateConflictError(str(exc)) from exc
+            runtime_profile_ids = await self._resolve_runtime_profiles(message.channel_id, lifecycles)
             planning = await self._delivery_planner.plan_in_transaction(
                 CanonicalDeliveryIntent(
                     message_id=inbound_message_id,
@@ -191,7 +203,7 @@ class WorkshopConversationCommandService:
                     recipient_principal_id=message.principal_id,
                 )
             )
-            prior_states = {inbound.inserted, lifecycle.changed}
+            prior_states = {inbound.inserted, *(item.changed for item in lifecycles)}
             if artifact_result is not None:
                 prior_states.add(artifact_result.inserted)
             prior_states.update(delivery.inserted for delivery in planning.deliveries)
@@ -199,16 +211,18 @@ class WorkshopConversationCommandService:
                 raise ConversationCommandStateConflictError(
                     "Canonical inbound, run acceptance, and delivery request did not share one prior state"
                 )
-            disposition = (
-                ConversationCommandDisposition.NEWLY_ACCEPTED
-                if inbound.inserted
-                else await self._replay_disposition(lifecycle.run)
-            )
+            run_dispositions = await self._run_dispositions(inbound.inserted, lifecycles)
+            disposition = self._aggregate_disposition(run_dispositions)
             await connection.commit()
             return ClientConversationCommandAcceptance(
-                command=ConversationCommandAcceptance(inbound, lifecycle, disposition),
+                command=ConversationCommandAcceptance(
+                    inbound,
+                    lifecycles,
+                    run_dispositions,
+                    disposition,
+                ),
                 deliveries=planning.deliveries,
-                runtime_profile_id=runtime_profile_id,
+                runtime_profile_ids=runtime_profile_ids,
             )
         except Exception:
             await connection.rollback()
@@ -250,9 +264,14 @@ class WorkshopConversationCommandService:
             )
             await connection.commit()
             return ClientConversationCommandAcceptance(
-                command=ConversationCommandAcceptance(inbound, lifecycle, disposition),
+                command=ConversationCommandAcceptance(
+                    inbound,
+                    (lifecycle,),
+                    (disposition,),
+                    disposition,
+                ),
                 deliveries=(),
-                runtime_profile_id=runtime_profile_id,
+                runtime_profile_ids=(runtime_profile_id,),
             )
         except Exception:
             await connection.rollback()
@@ -280,3 +299,73 @@ class WorkshopConversationCommandService:
         if run.status != RunStatus.ACCEPTED:
             raise ConversationCommandStateConflictError("Nonterminal run has an unsupported durable state")
         return ConversationCommandDisposition.READY_REPLAY
+
+    async def _accept_woken_runs(
+        self,
+        message_id: MessageId,
+        *,
+        occurred_at: datetime,
+    ) -> tuple[RunLifecycleResult, ...]:
+        decision = await resolve_message_wake_targets(
+            self._store,
+            message_id,
+            scope=None,
+        )
+        lifecycle = WorkshopRunLifecycle(self._store)
+        accepted: list[RunLifecycleResult] = []
+        for agent_id in decision.agent_ids:
+            accepted.append(
+                await lifecycle.accept_in_transaction(
+                    message_id,
+                    occurred_at=occurred_at,
+                    agent_id=agent_id,
+                )
+            )
+        return tuple(accepted)
+
+    async def _resolve_runtime_profiles(
+        self,
+        channel_id: ChannelId,
+        lifecycles: tuple[RunLifecycleResult, ...],
+    ) -> tuple[RuntimeProfileId, ...]:
+        profiles: list[RuntimeProfileId] = []
+        for lifecycle in lifecycles:
+            try:
+                _, profile_id = await resolve_channel_runtime_profile(
+                    self._store,
+                    channel_id,
+                    lifecycle.run.agent_id,
+                )
+            except WorkshopRuntimeAssignmentError as exc:
+                raise ConversationCommandStateConflictError(str(exc)) from exc
+            profiles.append(profile_id)
+        return tuple(profiles)
+
+    async def _run_dispositions(
+        self,
+        inserted: bool,
+        lifecycles: tuple[RunLifecycleResult, ...],
+    ) -> tuple[ConversationCommandDisposition, ...]:
+        if not lifecycles:
+            return ()
+        if inserted:
+            return (ConversationCommandDisposition.NEWLY_ACCEPTED,) * len(lifecycles)
+        return tuple([await self._replay_disposition(item.run) for item in lifecycles])
+
+    @staticmethod
+    def _aggregate_disposition(
+        dispositions: tuple[ConversationCommandDisposition, ...],
+    ) -> ConversationCommandDisposition:
+        if not dispositions:
+            return ConversationCommandDisposition.MESSAGE_ONLY
+        if len(set(dispositions)) == 1:
+            return dispositions[0]
+        for candidate in (
+            ConversationCommandDisposition.CANCELLATION_PENDING_REPLAY,
+            ConversationCommandDisposition.ACTIVE_REPLAY,
+            ConversationCommandDisposition.READY_REPLAY,
+            ConversationCommandDisposition.TERMINAL_REPLAY,
+        ):
+            if candidate in dispositions:
+                return candidate
+        raise ConversationCommandStateConflictError("Woken runs have unsupported replay states")

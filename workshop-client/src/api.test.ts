@@ -1191,6 +1191,49 @@ describe("Workshop client API", () => {
     });
   });
 
+  it("accepts message-only and multi-agent group command responses", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        Response.json({
+          version: 3,
+          acceptance: "message_only",
+          message_id: "msg_00000000000000000000000000000001",
+          runs: [],
+        }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({
+          version: 3,
+          acceptance: "newly_accepted",
+          message_id: "msg_00000000000000000000000000000002",
+          runs: [
+            run(),
+            {
+              ...run(),
+              run_id: "run_00000000000000000000000000000002",
+            },
+          ],
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      submitCommand(session, "browser-command-2", "Hello group"),
+    ).resolves.toEqual({
+      acceptance: "message_only",
+      messageId: "msg_00000000000000000000000000000001",
+      run: null,
+    });
+    await expect(
+      submitCommand(session, "browser-command-3", "@Kai and @Nova hello"),
+    ).resolves.toMatchObject({
+      acceptance: "newly_accepted",
+      messageId: "msg_00000000000000000000000000000002",
+      run: { runId: "run_00000000000000000000000000000001" },
+    });
+  });
+
   it("submits one attachment as ordered multipart data under bearer authority", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       Response.json({

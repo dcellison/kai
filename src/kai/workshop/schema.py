@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 41
+WORKSHOP_SCHEMA_VERSION = 42
 
 
 @dataclass(frozen=True, slots=True)
@@ -1978,6 +1978,128 @@ _MESSAGE_MENTIONS_SCHEMA = SchemaMigration(
     ),
 )
 
+_GROUP_WAKE_POLICY_SCHEMA = SchemaMigration(
+    version=42,
+    name="group_agent_wake_policy",
+    statements=(
+        """
+        CREATE TABLE runs_v42 (
+            id TEXT PRIMARY KEY,
+            workshop_id TEXT NOT NULL REFERENCES workshops(id) ON DELETE CASCADE,
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            requested_by_principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+            agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
+            inbound_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE RESTRICT,
+            status TEXT NOT NULL CHECK (
+                status IN ('accepted', 'started', 'completed', 'failed', 'cancelled')
+            ),
+            accepted_at TEXT NOT NULL,
+            started_at TEXT,
+            terminal_at TEXT,
+            terminal_code TEXT,
+            last_event_position INTEGER NOT NULL UNIQUE REFERENCES event_log(position) ON DELETE RESTRICT,
+            cancellation_requested_at TEXT,
+            cancellation_code TEXT,
+            result_message_id TEXT REFERENCES messages(id) ON DELETE RESTRICT,
+            UNIQUE (inbound_message_id, agent_id),
+            CHECK (
+                (status = 'accepted' AND started_at IS NULL
+                    AND terminal_at IS NULL AND terminal_code IS NULL)
+                OR (status = 'started' AND started_at IS NOT NULL
+                    AND terminal_at IS NULL AND terminal_code IS NULL)
+                OR (status = 'completed' AND started_at IS NOT NULL
+                    AND terminal_at IS NOT NULL AND terminal_code IS NULL)
+                OR (status = 'failed' AND started_at IS NOT NULL
+                    AND terminal_at IS NOT NULL AND terminal_code IS NOT NULL)
+                OR (status = 'cancelled' AND terminal_at IS NOT NULL
+                    AND terminal_code IS NOT NULL)
+            )
+        )
+        """,
+        """
+        INSERT INTO runs_v42 (
+            id, workshop_id, channel_id, requested_by_principal_id, agent_id,
+            inbound_message_id, status, accepted_at, started_at, terminal_at,
+            terminal_code, last_event_position, cancellation_requested_at,
+            cancellation_code, result_message_id
+        ) SELECT
+            id, workshop_id, channel_id, requested_by_principal_id, agent_id,
+            inbound_message_id, status, accepted_at, started_at, terminal_at,
+            terminal_code, last_event_position, cancellation_requested_at,
+            cancellation_code, result_message_id
+          FROM runs
+        """,
+        """
+        CREATE TABLE run_attempts_v42 (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES runs_v42(id) ON DELETE CASCADE,
+            attempt_sequence INTEGER NOT NULL CHECK (attempt_sequence > 0),
+            owner_id TEXT NOT NULL,
+            fence_token INTEGER NOT NULL CHECK (fence_token > 0),
+            status TEXT NOT NULL CHECK (
+                status IN ('granted', 'started', 'expired', 'interrupted',
+                    'completed', 'failed', 'cancelled')
+            ),
+            backend TEXT NOT NULL,
+            provider TEXT,
+            model TEXT NOT NULL,
+            execution_contract TEXT NOT NULL,
+            lease_version INTEGER NOT NULL DEFAULT 1 CHECK (lease_version > 0),
+            granted_at TEXT NOT NULL,
+            lease_expires_at TEXT NOT NULL,
+            started_at TEXT,
+            terminal_at TEXT,
+            terminal_code TEXT,
+            last_event_position INTEGER NOT NULL UNIQUE REFERENCES event_log(position) ON DELETE RESTRICT,
+            UNIQUE (run_id, attempt_sequence),
+            UNIQUE (run_id, fence_token),
+            CHECK (
+                (status = 'granted' AND started_at IS NULL AND terminal_at IS NULL AND terminal_code IS NULL)
+                OR (status = 'started' AND started_at IS NOT NULL AND terminal_at IS NULL AND terminal_code IS NULL)
+                OR (status = 'expired' AND started_at IS NULL AND terminal_at IS NOT NULL AND terminal_code IS NOT NULL)
+                OR (status IN ('interrupted', 'failed') AND started_at IS NOT NULL AND terminal_at IS NOT NULL AND terminal_code IS NOT NULL)
+                OR (status = 'cancelled' AND terminal_at IS NOT NULL AND terminal_code IS NOT NULL)
+                OR (status = 'completed' AND started_at IS NOT NULL AND terminal_at IS NOT NULL AND terminal_code IS NULL)
+            )
+        )
+        """,
+        """
+        INSERT INTO run_attempts_v42 (
+            id, run_id, attempt_sequence, owner_id, fence_token, status,
+            backend, provider, model, execution_contract, lease_version,
+            granted_at, lease_expires_at, started_at, terminal_at,
+            terminal_code, last_event_position
+        ) SELECT
+            id, run_id, attempt_sequence, owner_id, fence_token, status,
+            backend, provider, model, execution_contract, lease_version,
+            granted_at, lease_expires_at, started_at, terminal_at,
+            terminal_code, last_event_position
+          FROM run_attempts
+        """,
+        "DROP TABLE run_attempts",
+        "DROP TABLE runs",
+        "ALTER TABLE runs_v42 RENAME TO runs",
+        "ALTER TABLE run_attempts_v42 RENAME TO run_attempts",
+        "CREATE INDEX runs_channel_status_idx ON runs (channel_id, status, accepted_at)",
+        "CREATE INDEX runs_agent_status_idx ON runs (agent_id, status, accepted_at)",
+        "CREATE UNIQUE INDEX run_attempts_active_run_idx ON run_attempts (run_id) WHERE status IN ('granted', 'started')",
+        "CREATE INDEX run_attempts_lease_idx ON run_attempts (status, lease_expires_at)",
+        "CREATE INDEX run_attempts_owner_idx ON run_attempts (owner_id, fence_token, status)",
+        """
+        CREATE TABLE channel_agent_dismissals (
+            id TEXT PRIMARY KEY,
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+            dismissed_by_principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+            thread_root_message_id TEXT REFERENCES messages(id) ON DELETE CASCADE,
+            dismissed_at TEXT NOT NULL,
+            created_event_position INTEGER NOT NULL UNIQUE REFERENCES event_log(position) ON DELETE RESTRICT
+        )
+        """,
+        "CREATE INDEX channel_agent_dismissals_scope_idx ON channel_agent_dismissals (channel_id, agent_id, thread_root_message_id, dismissed_at)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2020,6 +2142,7 @@ _MIGRATIONS = (
     _CANONICAL_MODEL_CATALOGUE_SCHEMA,
     _REUSABLE_GROUP_RUNTIME_ASSIGNMENT_SCHEMA,
     _MESSAGE_MENTIONS_SCHEMA,
+    _GROUP_WAKE_POLICY_SCHEMA,
 )
 
 
