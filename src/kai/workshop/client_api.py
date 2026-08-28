@@ -3081,6 +3081,9 @@ async def _handle_channel_event_stream(
         last_trace_sent: tuple[str, int] | None = None
         await response.write(f": connected\nretry: {_SSE_RETRY_MILLISECONDS}\n\n".encode())
         while True:
+            transport = request.transport
+            if transport is None or transport.is_closing():
+                break
             if run_previews is not None:
                 preview = run_previews.channel_preview(channel_id)
                 if preview is not None:

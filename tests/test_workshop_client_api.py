@@ -2589,7 +2589,9 @@ class TestWorkshopTimelineEventStreamHTTPContract:
             store,
             _Authenticator({"alice-token": alice_id}),
             event_poll_interval=0.005,
-            event_heartbeat_interval=0.01,
+            # A disconnected client must release its claim during ordinary
+            # polling, without relying on a heartbeat write to discover it.
+            event_heartbeat_interval=30.0,
             event_stream_limiter=limiter,
         )
         first_response = None
