@@ -37,6 +37,14 @@ from kai.workshop.artifacts import (
     WorkshopArtifactService,
 )
 from kai.workshop.authorization import CanonicalChannelAuthorizer
+from kai.workshop.channel_lifecycle import (
+    CreatedWorkshopChannel,
+    WorkshopChannelLifecycleAccessDenied,
+    WorkshopChannelLifecycleError,
+    WorkshopChannelLifecycleService,
+    WorkshopChannelLifecycleStorageError,
+    WorkshopChannelLifecycleValidationError,
+)
 from kai.workshop.client_commands import (
     ClientCommandExecutorUnavailableError,
     ClientCommandSubmission,
@@ -149,6 +157,7 @@ from kai.workshop.timeline import (
 _TIMELINE_PATH = "/v1/channels/{channel_id}/timeline"
 _TIMELINE_EVENTS_PATH = "/v1/channels/{channel_id}/events"
 _CLIENT_NAVIGATION_PATH = "/v1/client/navigation"
+_CHANNEL_CREATION_PATH = "/v1/channels"
 _ENROLLMENT_REDEMPTION_PATH = "/v1/client/enrollment/redeem"
 _COMMAND_SUBMISSION_PATH = "/v1/channels/{channel_id}/commands"
 _ARTIFACT_CONTENT_PATH = "/v1/channels/{channel_id}/artifacts/{artifact_id}/content"
@@ -204,6 +213,8 @@ _CLIENT_PREFERENCE_REQUEST_FIELDS = frozenset({"revision", "binding_choice_id", 
 _MAX_CLIENT_PREFERENCE_BODY_BYTES = 2_048
 _APPEARANCE_PREFERENCE_REQUEST_FIELDS = frozenset({"revision", "theme_id"})
 _MAX_APPEARANCE_PREFERENCE_BODY_BYTES = 1_024
+_CHANNEL_CREATION_REQUEST_FIELDS = frozenset({"name", "agent_ids", "origin_channel_id"})
+_MAX_CHANNEL_CREATION_BODY_BYTES = 8_192
 _DECIMAL_INTEGER = re.compile(r"^[0-9]+$")
 _CLIENT_MESSAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _EVENT_BATCH_SIZE = 100
@@ -516,6 +527,24 @@ def _serialize_appearance_preferences(
             if snapshot.mutation is not None
             else None
         ),
+    }
+
+
+def _serialize_created_channel(
+    channel: CreatedWorkshopChannel,
+) -> dict[str, object]:
+    return {
+        "version": 1,
+        "channel": {
+            "channel_id": str(channel.channel_id),
+            "workshop_id": str(channel.workshop_id),
+            "name": channel.name,
+            "kind": "group",
+            "visibility": channel.visibility,
+            "origin_channel_id": (str(channel.origin_channel_id) if channel.origin_channel_id is not None else None),
+            "role": "owner",
+            "agent_ids": [str(agent_id) for agent_id in channel.agent_ids],
+        },
     }
 
 
@@ -2690,6 +2719,89 @@ async def _handle_client_navigation(
     )
 
 
+async def _handle_channel_creation(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopChannelLifecycleService,
+) -> web.Response:
+    """Create one private canonical group channel for the authenticated human."""
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(
+            status=401,
+            code="authentication_required",
+            message="Authentication required",
+        )
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    if request.query or request.content_type != "application/json":
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid channel creation request",
+        )
+    if request.content_length is not None and request.content_length > _MAX_CHANNEL_CREATION_BODY_BYTES:
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Channel creation request is too large",
+        )
+    raw = await request.content.read(_MAX_CHANNEL_CREATION_BODY_BYTES + 1)
+    if len(raw) > _MAX_CHANNEL_CREATION_BODY_BYTES:
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Channel creation request is too large",
+        )
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, ValueError):
+        payload = None
+    if (
+        not isinstance(payload, dict)
+        or not {"name", "agent_ids"}.issubset(payload)
+        or not set(payload).issubset(_CHANNEL_CREATION_REQUEST_FIELDS)
+    ):
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid channel creation request",
+        )
+    try:
+        created = await service.create_group(
+            principal_id,
+            name=payload["name"],
+            agent_ids=payload["agent_ids"],
+            origin_channel_id=payload.get("origin_channel_id"),
+        )
+    except WorkshopChannelLifecycleAccessDenied:
+        return _error_response(
+            status=403,
+            code="access_denied",
+            message="Access denied",
+        )
+    except WorkshopChannelLifecycleValidationError as exc:
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message=str(exc),
+        )
+    except WorkshopChannelLifecycleStorageError:
+        return _error_response(
+            status=503,
+            code="channel_creation_unavailable",
+            message="Channel creation is temporarily unavailable",
+        )
+    except WorkshopChannelLifecycleError:
+        return _error_response(
+            status=409,
+            code="channel_creation_conflict",
+            message="Channel creation conflicted with current state",
+        )
+    return _json_response(_serialize_created_channel(created), status=201)
+
+
 async def _handle_channel_timeline(
     request: web.Request,
     *,
@@ -3540,6 +3652,7 @@ def register_workshop_read_routes(
     if event_poll_interval <= 0 or event_heartbeat_interval <= 0 or event_authentication_recheck_interval <= 0:
         raise ValueError("Event-stream intervals must be positive")
     stream_limiter = event_stream_limiter or WorkshopEventStreamLimiter()
+    channel_lifecycle = WorkshopChannelLifecycleService(store)
     shutdown_event = asyncio.Event()
 
     async def stop_event_streams(_app: web.Application) -> None:
@@ -3564,6 +3677,14 @@ def register_workshop_read_routes(
                 authenticator=authenticator,
             )
 
+    async def handle_channel_creation(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_channel_creation(
+                request,
+                authenticator=authenticator,
+                service=channel_lifecycle,
+            )
+
     async def handle_channel_event_stream(request: web.Request) -> web.StreamResponse:
         return await _handle_channel_event_stream(
             request,
@@ -3579,6 +3700,7 @@ def register_workshop_read_routes(
         )
 
     app.router.add_get(_CLIENT_NAVIGATION_PATH, handle_client_navigation)
+    app.router.add_post(_CHANNEL_CREATION_PATH, handle_channel_creation)
     app.router.add_get(_TIMELINE_PATH, handle_channel_timeline)
     app.router.add_get(_TIMELINE_EVENTS_PATH, handle_channel_event_stream)
     if preference_documents is not None:

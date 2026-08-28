@@ -77,10 +77,14 @@ class WorkshopChannelHistoryRegistry:
     ) -> WorkshopChannelHistoryRegistry:
         """Resolve protected runtime assignments to canonical channels."""
         async with store.connection.execute(
-            "SELECT runtime_profile_id, channel_id FROM channel_agent_runtime_assignments ORDER BY runtime_profile_id"
+            "SELECT ra.runtime_profile_id, ra.channel_id, c.kind "
+            "FROM channel_agent_runtime_assignments ra "
+            "JOIN channels c ON c.id = ra.channel_id "
+            "ORDER BY ra.runtime_profile_id, "
+            "CASE c.kind WHEN 'direct' THEN 0 ELSE 1 END, ra.channel_id"
         ) as cursor:
             assignment_rows = list(await cursor.fetchall())
-        channel_by_profile: dict[RuntimeProfileId, ChannelId] = {}
+        channels_by_profile: dict[RuntimeProfileId, list[tuple[ChannelId, str]]] = {}
         for row in assignment_rows:
             try:
                 profile_id = RuntimeProfileId(str(row[0]))
@@ -89,28 +93,29 @@ class WorkshopChannelHistoryRegistry:
                 raise WorkshopStorageNamespaceError(
                     "Runtime history assignment contains an invalid opaque identifier"
                 ) from exc
-            if profile_id in channel_by_profile and channel_by_profile[profile_id] != channel_id:
-                raise WorkshopStorageNamespaceError("Runtime profile maps to multiple history channels")
-            channel_by_profile[profile_id] = channel_id
+            channels_by_profile.setdefault(profile_id, []).append((channel_id, str(row[2])))
 
         runtime_aliases: dict[int, ChannelId] = {}
-        namespaces: list[WorkshopChannelHistoryNamespace] = []
-        namespace_channels: set[ChannelId] = set()
+        legacy_key_by_channel: dict[ChannelId, int | None] = {}
         for profile in runtime_profiles.profiles:
-            channel_id = channel_by_profile.get(profile.profile_id)
-            if channel_id is None:
+            assignments = channels_by_profile.get(profile.profile_id, [])
+            direct_channels = {channel_id for channel_id, kind in assignments if kind == "direct"}
+            if len(direct_channels) != 1:
                 raise WorkshopStorageNamespaceError("Protected runtime profile has no canonical history channel")
+            direct_channel_id = next(iter(direct_channels))
             legacy_runtime_key = runtime_profiles.legacy_runtime_key(profile.profile_id)
             if legacy_runtime_key is not None:
-                runtime_aliases[legacy_runtime_key] = channel_id
-            if channel_id not in namespace_channels:
-                namespaces.append(
-                    WorkshopChannelHistoryNamespace(
-                        channel_id,
-                        legacy_runtime_key,
-                    )
-                )
-                namespace_channels.add(channel_id)
+                runtime_aliases[legacy_runtime_key] = direct_channel_id
+            for channel_id, _kind in assignments:
+                channel_legacy_key = legacy_runtime_key if channel_id == direct_channel_id else None
+                existing = legacy_key_by_channel.get(channel_id)
+                if existing is not None and existing != channel_legacy_key:
+                    raise WorkshopStorageNamespaceError("Channel history namespace has conflicting runtime aliases")
+                legacy_key_by_channel[channel_id] = channel_legacy_key
+        namespaces = [
+            WorkshopChannelHistoryNamespace(channel_id, legacy_key)
+            for channel_id, legacy_key in legacy_key_by_channel.items()
+        ]
         return cls(tuple(namespaces), runtime_aliases=runtime_aliases)
 
     @property

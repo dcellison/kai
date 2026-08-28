@@ -47,11 +47,13 @@ from kai.workshop.client_sessions import (
 )
 from kai.workshop.conversation_commands import ConversationCommandDisposition
 from kai.workshop.domain import (
+    AgentId,
     ChannelId,
     ChannelMembershipId,
     MessageId,
     PrincipalId,
     RunId,
+    WorkshopEventType,
 )
 from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.execution_state import WorkshopExecutionStateRegistry
@@ -112,7 +114,10 @@ from kai.workshop.settings_workspaces import (
     WorkspaceConfigSnapshot,
     WorkspaceOption,
 )
-from kai.workshop.storage_namespaces import WorkshopPrincipalStorageRegistry
+from kai.workshop.storage_namespaces import (
+    WorkshopChannelHistoryRegistry,
+    WorkshopPrincipalStorageRegistry,
+)
 from kai.workshop.store import WorkshopEventStore
 from tests.workshop_profiles import profile_id, profile_registry
 
@@ -1161,6 +1166,237 @@ class TestWorkshopNavigationHTTPContract:
             ]
             assert direct["agents"] == []
             assert direct["can_submit_commands"] is False
+        finally:
+            await client.close()
+            await store.close()
+
+
+class TestWorkshopChannelLifecycleHTTPContract:
+    async def test_creates_one_private_canonical_group_without_transport_binding(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        async with store.connection.execute(
+            "SELECT ca.agent_id FROM channel_agents ca WHERE ca.channel_id = ?",
+            (alice_channel,),
+        ) as cursor:
+            agent_row = await cursor.fetchone()
+        assert agent_row is not None
+        agent_id = AgentId(str(agent_row[0]))
+        async with store.connection.execute("SELECT * FROM event_log ORDER BY position") as cursor:
+            bootstrap_events = [tuple(row) for row in await cursor.fetchall()]
+        async with store.connection.execute("SELECT * FROM channels ORDER BY id") as cursor:
+            bootstrap_channels = {str(row[0]): tuple(row) for row in await cursor.fetchall()}
+        async with store.connection.execute("SELECT * FROM channel_memberships ORDER BY id") as cursor:
+            bootstrap_memberships = {str(row[0]): tuple(row) for row in await cursor.fetchall()}
+        async with store.connection.execute(
+            "SELECT * FROM channels WHERE id = ?",
+            (alice_channel,),
+        ) as cursor:
+            origin_before = tuple(await cursor.fetchone())
+
+        client = await _open_client(
+            store,
+            _Authenticator({"alice": alice_id}),
+        )
+        try:
+            response = await client.post(
+                "/v1/channels",
+                headers={"Authorization": "Bearer alice"},
+                json={
+                    "name": "  Release planning  ",
+                    "agent_ids": [agent_id],
+                    "origin_channel_id": alice_channel,
+                },
+            )
+
+            assert response.status == 201
+            payload = await response.json()
+            channel = payload["channel"]
+            channel_id = ChannelId(channel["channel_id"])
+            assert channel == {
+                "channel_id": channel_id,
+                "workshop_id": payload["channel"]["workshop_id"],
+                "name": "Release planning",
+                "kind": "group",
+                "visibility": "private",
+                "origin_channel_id": alice_channel,
+                "role": "owner",
+                "agent_ids": [agent_id],
+            }
+
+            async with store.connection.execute(
+                "SELECT event_type, payload_json FROM event_log WHERE position > ? ORDER BY position",
+                (len(bootstrap_events),),
+            ) as cursor:
+                created_events = list(await cursor.fetchall())
+            assert [str(row[0]) for row in created_events] == [
+                WorkshopEventType.CHANNEL_CREATED,
+                WorkshopEventType.CHANNEL_MEMBER_ADDED,
+                WorkshopEventType.CHANNEL_MEMBER_ADDED,
+                WorkshopEventType.CHANNEL_AGENT_ATTACHED,
+                WorkshopEventType.RUNTIME_PROFILE_ASSIGNED,
+            ]
+            assert json.loads(str(created_events[0][1])) == {
+                "kind": "group",
+                "name": "Release planning",
+                "origin_channel_id": alice_channel,
+                "visibility": "private",
+            }
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM channel_bindings WHERE channel_id = ?",
+                (channel_id,),
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 0
+            async with store.connection.execute(
+                "SELECT * FROM event_log WHERE position <= ? ORDER BY position",
+                (len(bootstrap_events),),
+            ) as cursor:
+                assert [tuple(row) for row in await cursor.fetchall()] == bootstrap_events
+            async with store.connection.execute(
+                "SELECT * FROM channels WHERE id = ?",
+                (alice_channel,),
+            ) as cursor:
+                assert tuple(await cursor.fetchone()) == origin_before
+            async with store.connection.execute("SELECT * FROM channels ORDER BY id") as cursor:
+                current_channels = {str(row[0]): tuple(row) for row in await cursor.fetchall()}
+            assert {
+                channel_key: current_channels[channel_key] for channel_key in bootstrap_channels
+            } == bootstrap_channels
+            async with store.connection.execute("SELECT * FROM channel_memberships ORDER BY id") as cursor:
+                current_memberships = {str(row[0]): tuple(row) for row in await cursor.fetchall()}
+            assert {
+                membership_key: current_memberships[membership_key] for membership_key in bootstrap_memberships
+            } == bootstrap_memberships
+
+            navigation_response = await client.get(
+                "/v1/client/navigation",
+                headers={"Authorization": "Bearer alice"},
+            )
+            assert navigation_response.status == 200
+            navigation = await navigation_response.json()
+            visible = next(item for item in navigation["workshops"][0]["channels"] if item["channel_id"] == channel_id)
+            assert visible["kind"] == "group"
+            assert visible["name"] == "Release planning"
+            assert visible["role"] == "owner"
+            assert visible["agents"] == [{"agent_id": agent_id, "name": "Kai"}]
+            assert visible["can_submit_commands"] is True
+
+            history = await WorkshopChannelHistoryRegistry.from_store(
+                store,
+                profile_registry(101, 202),
+            )
+            assert channel_id in {namespace.channel_id for namespace in history.namespaces}
+            assert history.for_compatibility_chat_id(101).channel_id == alice_channel
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_unknown_agent_rejects_the_entire_event_set(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        async with store.connection.execute("SELECT COUNT(*) FROM event_log") as cursor:
+            event_count = int((await cursor.fetchone())[0])
+        async with store.connection.execute("SELECT COUNT(*) FROM channels") as cursor:
+            channel_count = int((await cursor.fetchone())[0])
+        client = await _open_client(
+            store,
+            _Authenticator({"alice": alice_id}),
+        )
+        try:
+            response = await client.post(
+                "/v1/channels",
+                headers={"Authorization": "Bearer alice"},
+                json={
+                    "name": "Must not exist",
+                    "agent_ids": [AgentId.new()],
+                    "origin_channel_id": alice_channel,
+                },
+            )
+
+            assert response.status == 400
+            assert (await response.json())["error"]["code"] == "invalid_request"
+            async with store.connection.execute("SELECT COUNT(*) FROM event_log") as cursor:
+                assert int((await cursor.fetchone())[0]) == event_count
+            async with store.connection.execute("SELECT COUNT(*) FROM channels") as cursor:
+                assert int((await cursor.fetchone())[0]) == channel_count
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_projection_failure_rolls_back_every_creation_event(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        async with store.connection.execute(
+            "SELECT agent_id FROM channel_agents WHERE channel_id = ?",
+            (alice_channel,),
+        ) as cursor:
+            agent_id = AgentId(str((await cursor.fetchone())[0]))
+        async with store.connection.execute("SELECT COUNT(*) FROM event_log") as cursor:
+            event_count = int((await cursor.fetchone())[0])
+        async with store.connection.execute("SELECT COUNT(*) FROM channels") as cursor:
+            channel_count = int((await cursor.fetchone())[0])
+        await store.connection.execute(
+            "CREATE TRIGGER reject_new_channel_agent "
+            "BEFORE INSERT ON channel_agents "
+            "BEGIN SELECT RAISE(ABORT, 'forced projection failure'); END"
+        )
+        await store.connection.commit()
+        client = await _open_client(
+            store,
+            _Authenticator({"alice": alice_id}),
+        )
+        try:
+            response = await client.post(
+                "/v1/channels",
+                headers={"Authorization": "Bearer alice"},
+                json={
+                    "name": "Must roll back",
+                    "agent_ids": [agent_id],
+                    "origin_channel_id": alice_channel,
+                },
+            )
+
+            assert response.status == 503
+            assert (await response.json())["error"] == {
+                "code": "channel_creation_unavailable",
+                "message": "Channel creation is temporarily unavailable",
+            }
+            async with store.connection.execute("SELECT COUNT(*) FROM event_log") as cursor:
+                assert int((await cursor.fetchone())[0]) == event_count
+            async with store.connection.execute("SELECT COUNT(*) FROM channels") as cursor:
+                assert int((await cursor.fetchone())[0]) == channel_count
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_authentication_precedes_channel_request_validation(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+        client = await _open_client(
+            store,
+            _Authenticator({"alice": alice_id}),
+        )
+        try:
+            unauthenticated = await client.post(
+                "/v1/channels?unsupported=1",
+                data="not-json",
+            )
+            malformed = await client.post(
+                "/v1/channels?unsupported=1",
+                headers={"Authorization": "Bearer alice"},
+                data="not-json",
+            )
+
+            assert unauthenticated.status == 401
+            assert malformed.status == 400
         finally:
             await client.close()
             await store.close()
