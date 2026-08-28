@@ -474,6 +474,33 @@ class TestBuildSessionContext:
         assert "an exact incoming-file path previously supplied by Kai" in result
         assert f"{data_dir}/files/123/" not in result
 
+    def test_file_api_docs_name_canonical_writable_outbox(self, tmp_path):
+        workspace = tmp_path / "read-only-workspace"
+        workspace.mkdir()
+        data_dir = tmp_path / "data"
+        (data_dir / "memory").mkdir(parents=True)
+        identity = MagicMock(
+            principal_id="prn_" + "a" * 32,
+            channel_id="chn_" + "b" * 32,
+            agent_id="agt_" + "c" * 32,
+            runtime_profile_id="rtp_" + "d" * 32,
+        )
+
+        with patch("kai.backend.get_recent_history", return_value=""):
+            result = build_session_context(
+                workspace=workspace,
+                home_workspace=workspace,
+                api=self._api(),
+                workspace_config=None,
+                chat_id=None,
+                runtime_identity=identity,
+                data_dir=data_dir,
+            )
+
+        expected = data_dir / "files" / str(identity.principal_id) / "outbox"
+        assert f"private writable outbox {expected}" in result
+        assert "even when the current workspace is read-only" in result
+
     def test_services_included(self, tmp_path):
         """External services block is injected when services are configured."""
         workspace = tmp_path / "ws"

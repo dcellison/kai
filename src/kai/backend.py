@@ -884,6 +884,23 @@ def build_session_context(
     # proactively send text or files to the user (e.g., when a
     # background task completes or a scheduled job has results).
     if api.webhook_secret:
+        outbox_path: Path | None = None
+        if runtime_identity is not None:
+            outbox_path = (
+                _principal_directories(
+                    data_dir=data_dir,
+                    namespace="files",
+                    runtime_identity=runtime_identity,
+                    chat_id=None,
+                )[0]
+                / "outbox"
+            )
+        outbox_guidance = (
+            f"For files you create, stage them in your private writable outbox {outbox_path}; "
+            f"this path remains sendable even when the current workspace is read-only. "
+            if outbox_path is not None
+            else ""
+        )
         parts.append(
             f"[Messaging API: To send a text message to the user proactively "
             f"(e.g., background task results), use curl (NEVER WebFetch) to POST JSON to "
@@ -898,6 +915,7 @@ def build_session_context(
             f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
             f'Required: "path" (absolute file path within the current workspace {workspace} '
             f"or an exact incoming-file path previously supplied by Kai). "
+            f"{outbox_guidance}"
             f'Optional: "caption" and "idempotency_key" for safe retries. '
             f"Success records a canonical artifact before optional client delivery.\n"
             f"Incoming files from the user are auto-saved and their exact paths "

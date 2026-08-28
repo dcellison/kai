@@ -1,4 +1,4 @@
-"""Platform-specific named read access for service-owned private files."""
+"""Platform-specific named access for private Kai runtime files."""
 
 from __future__ import annotations
 
@@ -70,3 +70,57 @@ def replace_named_read_access(
     _run(clear_command, action=f"could not clear stale access for {path}")
     if reader_user:
         grant_named_read_access(path, reader_user, directory=directory)
+
+
+def replace_named_inherited_read_access(path: Path, reader_user: str) -> None:
+    """Grant one reader access to a private directory and future children.
+
+    Principal-owned outbound staging directories need a two-sided boundary:
+    the agent OS user creates files, while Kai's service user must be able to
+    read those files for canonical artifact publication.  A directory-only
+    access ACL is insufficient because newly created ``0600`` files would
+    still be unreadable.  Replace the complete extended ACL and install an
+    inheritable read/traversal entry for the service user.
+    """
+    if not reader_user:
+        raise ValueError("reader_user must be non-empty")
+    if sys.platform == "darwin":
+        clear_command = ["/bin/chmod", "-N", str(path)]
+        grant_commands = [
+            [
+                "/bin/chmod",
+                "+a#",
+                "0",
+                (f"user:{reader_user} allow list,search,readattr,readextattr,readsecurity,directory_inherit"),
+                str(path),
+            ],
+            [
+                "/bin/chmod",
+                "+a#",
+                "1",
+                (f"user:{reader_user} allow read,readattr,readextattr,readsecurity,file_inherit,directory_inherit"),
+                str(path),
+            ],
+        ]
+    elif sys.platform.startswith("linux"):
+        setfacl = shutil.which("setfacl")
+        if setfacl is None:
+            raise OSError("setfacl is required for isolated named-file access on Linux")
+        clear_command = [setfacl, "-b", "-k", str(path)]
+        grant_commands = [
+            [
+                setfacl,
+                "-m",
+                f"u:{reader_user}:r-x,d:u:{reader_user}:r-x",
+                str(path),
+            ]
+        ]
+    else:
+        raise OSError(f"isolated named-file access is unsupported on {sys.platform}")
+
+    _run(clear_command, action=f"could not clear stale access for {path}")
+    for grant_command in grant_commands:
+        _run(
+            grant_command,
+            action=f"could not grant inherited access to {reader_user} for {path}",
+        )

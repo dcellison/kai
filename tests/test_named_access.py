@@ -82,6 +82,55 @@ def test_linux_directory_replacement_removes_default_acl(monkeypatch, tmp_path):
     ]
 
 
+def test_macos_inherited_read_access_covers_future_outbox_children(monkeypatch, tmp_path):
+    run = MagicMock(return_value=_completed())
+    monkeypatch.setattr(named_access.sys, "platform", "darwin")
+    monkeypatch.setattr(named_access.subprocess, "run", run)
+    path = tmp_path / "outbox"
+
+    named_access.replace_named_inherited_read_access(path, "kai")
+
+    assert [call.args[0] for call in run.call_args_list] == [
+        ["/bin/chmod", "-N", str(path)],
+        [
+            "/bin/chmod",
+            "+a#",
+            "0",
+            ("user:kai allow list,search,readattr,readextattr,readsecurity,directory_inherit"),
+            str(path),
+        ],
+        [
+            "/bin/chmod",
+            "+a#",
+            "1",
+            ("user:kai allow read,readattr,readextattr,readsecurity,file_inherit,directory_inherit"),
+            str(path),
+        ],
+    ]
+
+
+def test_linux_inherited_read_access_sets_access_and_default_acl(monkeypatch, tmp_path):
+    run = MagicMock(return_value=_completed())
+    monkeypatch.setattr(named_access.sys, "platform", "linux")
+    monkeypatch.setattr(named_access.shutil, "which", lambda _name: "/usr/bin/setfacl")
+    monkeypatch.setattr(named_access.subprocess, "run", run)
+    path = tmp_path / "outbox"
+
+    named_access.replace_named_inherited_read_access(path, "kai")
+
+    assert [call.args[0] for call in run.call_args_list] == [
+        ["/usr/bin/setfacl", "-b", "-k", str(path)],
+        ["/usr/bin/setfacl", "-m", "u:kai:r-x,d:u:kai:r-x", str(path)],
+    ]
+
+
+def test_inherited_read_access_requires_reader(monkeypatch, tmp_path):
+    monkeypatch.setattr(named_access.sys, "platform", "darwin")
+
+    with pytest.raises(ValueError, match="reader_user must be non-empty"):
+        named_access.replace_named_inherited_read_access(tmp_path / "outbox", "")
+
+
 def test_replacement_without_reader_only_clears_acl(monkeypatch, tmp_path):
     run = MagicMock(return_value=_completed())
     monkeypatch.setattr(named_access.sys, "platform", "darwin")

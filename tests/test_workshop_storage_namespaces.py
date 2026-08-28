@@ -93,6 +93,7 @@ class TestWorkshopPrincipalStorageRegistry:
             )
             assert registry.for_runtime_profile(profile_id(101)) is alice
             assert alice.files_directory(tmp_path) == (tmp_path / "files" / str(alice.principal_id))
+            assert alice.outbox_directory(tmp_path) == (tmp_path / "files" / str(alice.principal_id) / "outbox")
             assert alice.legacy_files_directory(tmp_path) == (tmp_path / "files" / "101")
             assert alice.files_directory(tmp_path).name != "101"
             assert alice.home_directory(tmp_path) == (tmp_path / "home" / str(alice.principal_id))

@@ -6180,6 +6180,106 @@ class TestSecureCodexTurnImageStaging:
 
 
 class TestSecureUploadDirectories:
+    def test_provisions_agent_owned_outbox_with_inherited_service_read_access(
+        self,
+        tmp_path,
+        monkeypatch,
+        capsys,
+    ):
+        files_root = tmp_path / "data" / "files"
+        files_root.mkdir(parents=True)
+        chown = MagicMock()
+        inherited = MagicMock()
+        replace = MagicMock()
+        monkeypatch.setattr("kai.install.os.chown", chown)
+        monkeypatch.setattr("kai.install.replace_named_inherited_read_access", inherited)
+        monkeypatch.setattr("kai.install.replace_named_read_access", replace)
+
+        _secure_upload_directories(
+            tmp_path / "data",
+            {"prn_alice"},
+            svc_uid=500,
+            svc_gid=20,
+            dry_run=False,
+            reader_users={"prn_alice": "alice"},
+            outbox_owners={"prn_alice": (501, 20)},
+            service_reader_user="kai",
+        )
+
+        user_dir = files_root / "prn_alice"
+        outbox = user_dir / "outbox"
+        assert outbox.is_dir()
+        assert stat.S_IMODE(outbox.stat().st_mode) == 0o700
+        chown.assert_any_call(outbox, 501, 20)
+        inherited.assert_called_once_with(outbox, "kai")
+        assert "Provisioned private outbound staging" in capsys.readouterr().out
+
+    def test_outbox_contents_remain_agent_owned_and_kai_readable(self, tmp_path, monkeypatch):
+        outbox = tmp_path / "data" / "files" / "prn_alice" / "outbox"
+        nested = outbox / "reports"
+        nested.mkdir(parents=True)
+        report = nested / "report.md"
+        report.write_text("keep")
+        chown = MagicMock()
+        inherited = MagicMock()
+        replace = MagicMock()
+        monkeypatch.setattr("kai.install.os.chown", chown)
+        monkeypatch.setattr("kai.install.replace_named_inherited_read_access", inherited)
+        monkeypatch.setattr("kai.install.replace_named_read_access", replace)
+
+        _secure_upload_directories(
+            tmp_path / "data",
+            {"prn_alice"},
+            svc_uid=500,
+            svc_gid=20,
+            dry_run=False,
+            outbox_owners={"prn_alice": (501, 20)},
+            service_reader_user="kai",
+        )
+
+        chown.assert_any_call(nested, 501, 20)
+        chown.assert_any_call(report, 501, 20)
+        assert stat.S_IMODE(report.stat().st_mode) == 0o600
+        assert inherited.call_count == 2
+        replace.assert_any_call(report, "kai", directory=False)
+
+    def test_dry_run_reports_outbox_without_creating_storage(self, tmp_path, capsys):
+        _secure_upload_directories(
+            tmp_path / "data",
+            {"prn_alice"},
+            svc_uid=500,
+            svc_gid=20,
+            dry_run=True,
+            outbox_owners={"prn_alice": (501, 20)},
+            service_reader_user="kai",
+        )
+
+        output = capsys.readouterr().out
+        assert "Would provision outbound staging" in output
+        assert not (tmp_path / "data" / "files").exists()
+
+    def test_refuses_symlinked_outbox_before_any_repair(self, tmp_path, monkeypatch):
+        user_dir = tmp_path / "data" / "files" / "prn_alice"
+        user_dir.mkdir(parents=True)
+        target = tmp_path / "attacker-controlled"
+        target.mkdir()
+        (user_dir / "outbox").symlink_to(target, target_is_directory=True)
+        chown = MagicMock()
+        monkeypatch.setattr("kai.install.os.chown", chown)
+
+        with pytest.raises(RuntimeError, match="unsafe outbound staging path"):
+            _secure_upload_directories(
+                tmp_path / "data",
+                {"prn_alice"},
+                svc_uid=500,
+                svc_gid=20,
+                dry_run=False,
+                outbox_owners={"prn_alice": (501, 20)},
+                service_reader_user="kai",
+            )
+
+        chown.assert_not_called()
+
     def test_repairs_managed_directories_and_secures_existing_files(self, tmp_path, monkeypatch, capsys):
         files_root = tmp_path / "data" / "files"
         user_dir = files_root / "12345"
@@ -6436,6 +6536,10 @@ class TestApplyMigrate:
             lambda *a, **kw: subprocess.CompletedProcess(args=[], returncode=0, stdout="ok\n"),
         )
         monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+        monkeypatch.setattr(
+            "kai.install.pwd.getpwuid",
+            lambda uid: (_ for _ in ()).throw(AssertionError(f"unexpected UID lookup: {uid}")),
+        )
 
         _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
@@ -13925,7 +14029,10 @@ class TestProtectedRuntimeStorageProvisioning:
 
         principal_name = targets[0].storage_name
         home = data_path / "home" / principal_name
+        outbox = data_path / "files" / principal_name / "outbox"
         assert (home / "AGENTS.md").read_text() == "# Canonical identity\n"
+        assert outbox.is_dir()
+        assert stat.S_IMODE(outbox.stat().st_mode) == 0o700
         assert (data_path / "memory" / principal_name / "MEMORY.md").is_file()
         assert (data_path / "preferences" / principal_name / "PREFERENCES.md").is_file()
         claude_adapter = home / ".claude" / "CLAUDE.md"
