@@ -1374,8 +1374,39 @@ describe("Workshop client API", () => {
     const headers = new Headers(request[1].headers);
     expect(headers.get("Authorization")).toBe("Bearer session-secret");
     expect(headers.get("Last-Event-ID")).toBe("30");
-    expect(headers.get("X-Kai-Stream-ID")).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    expect(headers.get("X-Kai-Stream-ID")).toMatch(/^[0-9a-f]{32}$/);
+  });
+
+  it("creates the stream identity without secure-context randomUUID", async () => {
+    sessionStorage.removeItem("kai.workshop.event-stream-id.v1");
+    const availableCrypto = globalThis.crypto;
+    vi.stubGlobal("crypto", {
+      getRandomValues: availableCrypto.getRandomValues.bind(availableCrypto),
+    });
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.close();
+      },
+    });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(stream, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await streamTimeline(
+      session,
+      "30",
+      {
+        onConnected: vi.fn(),
+        onMessage: vi.fn(),
+        onRunActivity: vi.fn(),
+        onRunPreview: vi.fn(),
+        onRunTrace: vi.fn(),
+      },
+      new AbortController().signal,
+    );
+
+    const request = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(new Headers(request[1].headers).get("X-Kai-Stream-ID")).toMatch(
+      /^[0-9a-f]{32}$/,
     );
   });
 
