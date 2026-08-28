@@ -109,6 +109,14 @@ from kai.workshop.execution_coordinator import (
     CanonicalExecutionDisposition,
 )
 from kai.workshop.inbound import InboundMessage
+from kai.workshop.model_catalogue import (
+    ModelCatalogueEntry,
+    ModelCatalogueEntryStatus,
+    ModelCatalogueProvenance,
+    ModelCatalogueRefreshState,
+    ModelCatalogueRefreshStatus,
+    ModelCatalogueSnapshot,
+)
 from kai.workshop.preferences import (
     PreferenceDocument,
     PreferenceRevision,
@@ -1614,6 +1622,71 @@ class TestHandleJob:
 
 
 class TestHandleModels:
+    @staticmethod
+    def _canonical_context(*, args=None):
+        ctx = _make_context(args=args)
+        service = MagicMock()
+        authority = SimpleNamespace(
+            principal_id=PrincipalId(f"prn_{12345:032x}"),
+            runtime_profile_id=profile_id(12345),
+        )
+        service.authority_for_principal_profile.return_value = authority
+        service.inspect = AsyncMock(return_value=SimpleNamespace(model=SimpleNamespace(value="current-model")))
+        refresh = ModelCatalogueRefreshState(
+            ModelCatalogueRefreshStatus.SUCCEEDED,
+            1,
+            datetime(2026, 8, 28, 10, 0, tzinfo=UTC),
+            datetime(2026, 8, 28, 10, 0, tzinfo=UTC),
+            None,
+            None,
+            None,
+        )
+        provenance = ModelCatalogueProvenance(
+            "discovered:fixture",
+            ModelCatalogueEntryStatus.AVAILABLE,
+            "Current Model",
+            {},
+        )
+        service.inspect_model_catalogue = AsyncMock(
+            return_value=ModelCatalogueSnapshot(
+                authority.principal_id,
+                authority.runtime_profile_id,
+                "claude:anthropic",
+                "cache-key",
+                (
+                    ModelCatalogueEntry(
+                        "current-model",
+                        "Current Model",
+                        ModelCatalogueEntryStatus.AVAILABLE,
+                        True,
+                        True,
+                        (provenance,),
+                    ),
+                    ModelCatalogueEntry(
+                        "retained-model",
+                        "Retained Model",
+                        ModelCatalogueEntryStatus.NOT_ADVERTISED,
+                        False,
+                        True,
+                        (
+                            ModelCatalogueProvenance(
+                                "retained_selection",
+                                ModelCatalogueEntryStatus.NOT_ADVERTISED,
+                                "Retained Model",
+                                {},
+                            ),
+                        ),
+                    ),
+                ),
+                refresh,
+                False,
+                False,
+            )
+        )
+        service.refresh_model_catalogue = AsyncMock()
+        ctx.application.core_services.settings_workspaces = service
+        return ctx, service
+
     @pytest.mark.asyncio
     async def test_sends_keyboard(self):
         update = _make_update()
@@ -1637,6 +1710,31 @@ class TestHandleModels:
         assert "/model" in reply
         # No keyboard for open-ended providers
         assert "reply_markup" not in call[1] or call[1].get("reply_markup") is None
+
+    @pytest.mark.asyncio
+    async def test_canonical_catalogue_matches_workshop_and_supports_explicit_refresh(self):
+        update = _make_update(text="/models refresh", chat_id=12345)
+        ctx, service = self._canonical_context(args=["refresh"])
+
+        await handle_models(update, ctx)
+
+        service.refresh_model_catalogue.assert_awaited_once()
+        service.inspect_model_catalogue.assert_awaited_once()
+        reply = update.message.reply_text.await_args
+        assert "Catalogue: succeeded" in reply.args[0]
+        callbacks = [button.callback_data for row in reply.kwargs["reply_markup"].inline_keyboard for button in row]
+        assert callbacks == ["model:current-model", "models:refresh"]
+
+    @pytest.mark.asyncio
+    async def test_retained_but_unadvertised_model_is_not_offered_as_selectable(self):
+        update = _make_update(text="/model retained-model", chat_id=12345)
+        ctx, service = self._canonical_context(args=["retained-model"])
+
+        await handle_model(update, ctx)
+
+        assert update.message.reply_text.await_args.args[0] == "Choose: current-model"
+        service.inspect_model_catalogue.assert_awaited_once()
+        ctx.application.core_services.subprocess_pool.restart.assert_not_called()
 
 
 # ── handle_model ─────────────────────────────────────────────────────
@@ -5197,7 +5295,7 @@ class TestCommandMenu:
             if isinstance(handler, CQH)
         ]
 
-        assert len(callbacks) == 5
+        assert len(callbacks) == 6
         assert all(getattr(callback, "_kai_totp_sensitive", False) for callback in callbacks)
 
     def test_menu_matches_expected_set(self):

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from kai import workshop_cli
 from kai.backend_registry import BackendRegistryEntry
 from kai.workshop.domain import AgentId, ChannelId, PrincipalId, RuntimeProfileId
 from kai.workshop.execution_state import (
@@ -33,6 +34,7 @@ from kai.workshop.runtime_profiles import (
     ProtectedRuntimeProfile,
     WorkshopRuntimeProfileRegistry,
 )
+from kai.workshop.store import WorkshopEventStore
 
 
 def _id(identifier_type, value: int):
@@ -468,3 +470,154 @@ async def test_operator_can_refresh_all_contexts_with_unforgeable_authority(tmp_
 
     assert len(results) == 2
     assert all(result.status == ModelCatalogueRefreshStatus.SUCCEEDED for result in results)
+
+
+async def test_refresh_all_contains_one_lane_failure_and_continues(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path, count=2)
+    service = await _open(
+        fixture,
+        adapter=_QueueAdapter([RuntimeError("first lane fails"), _batch("second-model")]),
+    )
+    try:
+        results = await service.refresh_all(service.operator_authority())
+        second = await service.inspect(
+            service.authority_for_principal(_id(PrincipalId, 2)),
+            _id(RuntimeProfileId, 2),
+            "claude:anthropic",
+        )
+    finally:
+        await service.close()
+
+    assert [result.status for result in results] == [
+        ModelCatalogueRefreshStatus.FAILED,
+        ModelCatalogueRefreshStatus.SUCCEEDED,
+    ]
+    assert _entry(second, "second-model").status == ModelCatalogueEntryStatus.AVAILABLE
+
+
+async def test_periodic_refresh_waits_until_after_startup_interval(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    adapter = _QueueAdapter([_batch("periodic-model"), _batch("periodic-model")])
+    service = await _open(fixture, adapter=adapter)
+    try:
+        await service.start_periodic_refresh(
+            service.operator_authority(),
+            interval_seconds=0.01,
+        )
+        assert adapter.calls == 0
+        for _ in range(20):
+            if adapter.calls:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await service.close()
+
+    assert adapter.calls >= 1
+
+
+def test_operator_cli_exposes_complete_model_catalogue_surface() -> None:
+    parser = workshop_cli._parser()
+    lane = [
+        "--runtime-profile-id",
+        str(_id(RuntimeProfileId, 1)),
+        "--option-id",
+        "claude:anthropic",
+    ]
+
+    assert parser.parse_args(["model-catalogue", "status"]).action == "status"
+    assert parser.parse_args(["model-catalogue", "list", *lane]).action == "list"
+    assert parser.parse_args(["model-catalogue", "refresh", *lane]).action == "refresh"
+    assert parser.parse_args(["model-catalogue", "refresh-all"]).action == "refresh-all"
+    assert (
+        parser.parse_args(
+            [
+                "model-catalogue",
+                "upsert",
+                *lane,
+                "--model-id",
+                "operator-model",
+                "--display-label",
+                "Operator Model",
+            ]
+        ).action
+        == "upsert"
+    )
+    assert (
+        parser.parse_args(
+            [
+                "model-catalogue",
+                "deactivate",
+                *lane,
+                "--model-id",
+                "operator-model",
+            ]
+        ).action
+        == "deactivate"
+    )
+
+
+async def test_operator_cli_status_is_diagnostic_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = _fixture(tmp_path)
+    adapter = _QueueAdapter([_batch("must-not-be-discovered")])
+    service = await _open(fixture, adapter=adapter)
+    store = await WorkshopEventStore.open(fixture.database)
+
+    async def opened(_database, _store):
+        return service, fixture.inventory
+
+    monkeypatch.setattr(workshop_cli, "_open_operator_model_catalogue", opened)
+    try:
+        result = await workshop_cli._run_model_catalogue(
+            workshop_cli._parser().parse_args(["model-catalogue", "status"]),
+            fixture.database,
+            store,
+        )
+    finally:
+        await store.close()
+
+    assert result == 0
+    assert adapter.calls == 0
+    assert "Discovery invoked: no" in capsys.readouterr().out
+
+
+async def test_operator_cli_scoped_refresh_invokes_only_the_requested_lane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = _fixture(tmp_path)
+    adapter = _QueueAdapter([_batch("new-model")])
+    service = await _open(fixture, adapter=adapter)
+    store = await WorkshopEventStore.open(fixture.database)
+
+    async def opened(_database, _store):
+        return service, fixture.inventory
+
+    monkeypatch.setattr(workshop_cli, "_open_operator_model_catalogue", opened)
+    try:
+        result = await workshop_cli._run_model_catalogue(
+            workshop_cli._parser().parse_args(
+                [
+                    "model-catalogue",
+                    "refresh",
+                    "--runtime-profile-id",
+                    str(_id(RuntimeProfileId, 1)),
+                    "--option-id",
+                    "claude:anthropic",
+                ]
+            ),
+            fixture.database,
+            store,
+        )
+    finally:
+        await store.close()
+
+    assert result == 0
+    assert adapter.calls == 1
+    output = capsys.readouterr().out
+    assert "Status: succeeded" in output
+    assert "Discovered models: 1" in output

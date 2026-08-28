@@ -9,6 +9,7 @@ import {
   createMemoryFact,
   deleteMemories,
   deleteMemory,
+  deactivateOperatorModel,
   editMemory,
   loadArtifactBlob,
   loadAppearancePreferences,
@@ -17,6 +18,7 @@ import {
   loadMemoryRecords,
   loadMemorySource,
   loadMemoryStats,
+  loadModelCatalogue,
   loadNavigation,
   loadGitHubSettings,
   loadNotificationPreferences,
@@ -29,6 +31,8 @@ import {
   moveMemoriesScope,
   moveMemoryScope,
   redeemEnrollment,
+  refreshAllModelCatalogues,
+  refreshModelCatalogue,
   searchMemories,
   restorePreferenceRevision,
   savePreferenceDocument,
@@ -40,6 +44,7 @@ import {
   updateClientPreference,
   updateAppearancePreference,
   updateWorkspaceConfig,
+  upsertOperatorModel,
 } from "./api";
 import type { WorkshopSession } from "./types";
 import { WORKSHOP_THEME_CATALOG } from "./theme";
@@ -118,8 +123,23 @@ function settingsPayload(overrides: Record<string, unknown> = {}): Record<string
       default_value: "claude-sonnet-4-6",
     },
     model_options: [
-      { model_id: "claude-sonnet-4-6", display_name: "Claude Sonnet 4.6" },
+      {
+        model_id: "claude-sonnet-4-6",
+        display_name: "Claude Sonnet 4.6",
+        status: "available",
+        selectable: true,
+        retained: true,
+      },
     ],
+    model_catalogue: {
+      status: "succeeded",
+      stale: false,
+      last_known_good: false,
+      last_attempt_at: "2026-08-28T10:00:00Z",
+      last_successful_refresh_at: "2026-08-28T10:00:00Z",
+      error_code: null,
+      error_detail: null,
+    },
     timeout_seconds: {
       value: 1800,
       source: "runtime policy",
@@ -143,6 +163,36 @@ function settingsPayload(overrides: Record<string, unknown> = {}): Record<string
     ],
     mutation: null,
     ...overrides,
+  };
+}
+
+function modelCataloguePayload(): Record<string, unknown> {
+  return {
+    version: 1,
+    principal_id: "prn_00000000000000000000000000000001",
+    runtime_profile_id: "rtp_00000000000000000000000000000001",
+    option_id: "claude:anthropic",
+    stale: false,
+    last_known_good: false,
+    refresh: {
+      status: "succeeded",
+      generation: 2,
+      last_attempt_at: "2026-08-28T10:00:00Z",
+      last_successful_refresh_at: "2026-08-28T10:00:00Z",
+      expires_at: "2026-08-29T10:00:00Z",
+      error_code: null,
+      error_detail: null,
+    },
+    models: [
+      {
+        model_id: "claude-sonnet-4-6",
+        display_name: "Claude Sonnet 4.6",
+        status: "available",
+        selectable: true,
+        retained: true,
+        sources: ["discovered:claude"],
+      },
+    ],
   };
 }
 
@@ -589,6 +639,50 @@ describe("Workshop client API", () => {
       revision: "sws_current",
       timeout_seconds: 601,
     });
+  });
+
+  it("uses the canonical catalogue for principal refresh and operator actions", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json(modelCataloguePayload()))
+      .mockResolvedValueOnce(Response.json(modelCataloguePayload()))
+      .mockResolvedValueOnce(
+        Response.json({
+          version: 1,
+          contexts: 2,
+          statuses: { succeeded: 2 },
+          selection_changed: false,
+        }),
+      )
+      .mockResolvedValueOnce(Response.json(modelCataloguePayload()))
+      .mockResolvedValueOnce(Response.json(modelCataloguePayload()));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(loadModelCatalogue(session, "claude:anthropic")).resolves.toMatchObject({
+      optionId: "claude:anthropic",
+      stale: false,
+      models: [{ modelId: "claude-sonnet-4-6", selectable: true }],
+    });
+    await expect(refreshModelCatalogue(session, "claude:anthropic")).resolves.toMatchObject({
+      refresh: { status: "succeeded" },
+    });
+    await expect(refreshAllModelCatalogues(session)).resolves.toEqual({
+      contexts: 2,
+      statuses: { succeeded: 2 },
+    });
+    await expect(
+      upsertOperatorModel(session, "claude:anthropic", "new-model", "New Model"),
+    ).resolves.toMatchObject({ optionId: "claude:anthropic" });
+    await expect(
+      deactivateOperatorModel(session, "claude:anthropic", "new-model"),
+    ).resolves.toMatchObject({ optionId: "claude:anthropic" });
+
+    expect(fetchMock.mock.calls.map((call) => [call[0], (call[1] as RequestInit).method ?? "GET"])).toEqual([
+      [`/v1/channels/${channelId}/models?option_id=claude%3Aanthropic`, "GET"],
+      [`/v1/channels/${channelId}/models`, "POST"],
+      ["/v1/settings/model-catalogue/refresh-all", "POST"],
+      [`/v1/channels/${channelId}/models`, "PUT"],
+      [`/v1/channels/${channelId}/models`, "DELETE"],
+    ]);
   });
 
   it("uses typed workspace mutations and rejects stale settings", async () => {

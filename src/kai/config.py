@@ -1596,6 +1596,12 @@ class Config:
     # canonical resolved path. Empty dict if no config file exists.
     workspace_configs: dict[Path, WorkspaceConfig] = field(default_factory=dict)
 
+    # Canonical model-catalogue refresh is disabled by default. A positive
+    # interval enables the background worker after readiness; manual refresh
+    # remains available regardless.
+    model_catalogue_refresh_interval_s: int = 0
+    model_catalogue_refresh_timeout_s: int = 30
+
     # Memory project registry from memory-projects.yaml. Keyed by
     # project_id. Empty dict if no config file exists. The detector
     # in kai.memory_projects consumes this; no retrieval or write
@@ -3349,6 +3355,19 @@ def load_config() -> Config:
         raise SystemExit("PR_REVIEW_TIMEOUT_S must be an integer") from None
 
     try:
+        model_catalogue_refresh_interval_s = int(os.environ.get("MODEL_CATALOGUE_REFRESH_INTERVAL_S", "0"))
+        if model_catalogue_refresh_interval_s < 0:
+            raise ValueError
+    except ValueError:
+        raise SystemExit("MODEL_CATALOGUE_REFRESH_INTERVAL_S must be a non-negative integer") from None
+    try:
+        model_catalogue_refresh_timeout_s = int(os.environ.get("MODEL_CATALOGUE_REFRESH_TIMEOUT_S", "30"))
+        if model_catalogue_refresh_timeout_s <= 0:
+            raise ValueError
+    except ValueError:
+        raise SystemExit("MODEL_CATALOGUE_REFRESH_TIMEOUT_S must be a positive integer") from None
+
+    try:
         totp_session_minutes = int(os.environ.get("TOTP_SESSION_MINUTES", "30"))
         if totp_session_minutes <= 0:
             raise SystemExit("TOTP_SESSION_MINUTES must be a positive integer")
@@ -3859,6 +3878,8 @@ def load_config() -> Config:
         workspace_base=workspace_base,
         allowed_workspaces=allowed_workspaces,
         workspace_configs=workspace_configs,
+        model_catalogue_refresh_interval_s=model_catalogue_refresh_interval_s,
+        model_catalogue_refresh_timeout_s=model_catalogue_refresh_timeout_s,
         memory_projects=memory_projects,
         pr_review_cooldown=pr_review_cooldown,
         pr_review_timeout_s=pr_review_timeout_s,

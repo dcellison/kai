@@ -333,6 +333,12 @@ class KaiApplicationHost:
                     ),
                 },
             )
+            if self._config.model_catalogue_refresh_interval_s > 0:
+                await model_catalogue.start_periodic_refresh(
+                    model_catalogue.operator_authority(),
+                    interval_seconds=self._config.model_catalogue_refresh_interval_s,
+                    timeout_seconds=self._config.model_catalogue_refresh_timeout_s,
+                )
             delivery_authority_epoch = (await WorkshopConversationDeliveryAuthority(client_store).activate()).epoch
             private_execution = await WorkshopPrivateTextExecutionService.open_and_start(
                 Path(self._config.session_db_path),
@@ -365,6 +371,7 @@ class KaiApplicationHost:
                 self._config,
                 runtime_pool,
                 self._execution_state,
+                model_catalogue,
             )
             memory_queries = WorkshopMemoryQueryService(
                 self._config,

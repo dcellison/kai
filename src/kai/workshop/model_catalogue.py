@@ -237,6 +237,28 @@ class WorkshopModelCatalogueService:
         lane = self._principal_lane(authority, runtime_profile_id, option_id)
         return await self._snapshot(lane)
 
+    async def inspect_as_operator(
+        self,
+        authority: ModelCatalogueOperatorAuthority,
+        runtime_profile_id: str | RuntimeProfileId,
+        option_id: str,
+    ) -> ModelCatalogueSnapshot:
+        """Inspect one protected lane without weakening principal APIs."""
+        self._require_operator(authority)
+        return await self._snapshot(self._operator_lane(runtime_profile_id, option_id))
+
+    async def inspect_all_as_operator(
+        self,
+        authority: ModelCatalogueOperatorAuthority,
+    ) -> tuple[ModelCatalogueSnapshot, ...]:
+        """Return every protected lane to a trusted local operator surface."""
+        self._require_operator(authority)
+        snapshots: list[ModelCatalogueSnapshot] = []
+        for profile in self._inventory.inventories:
+            for lane in profile.backends:
+                snapshots.append(await self._snapshot(lane))
+        return tuple(snapshots)
+
     async def refresh(
         self,
         authority: ModelCatalogueAuthority,

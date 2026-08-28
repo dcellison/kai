@@ -84,6 +84,15 @@ from kai.workshop.memory_queries import (
     WorkshopMemoryConflict,
     WorkshopMemoryNotFound,
 )
+from kai.workshop.model_catalogue import (
+    ModelCatalogueEntry,
+    ModelCatalogueEntryStatus,
+    ModelCatalogueProvenance,
+    ModelCatalogueRefreshResult,
+    ModelCatalogueRefreshState,
+    ModelCatalogueRefreshStatus,
+    ModelCatalogueSnapshot,
+)
 from kai.workshop.notification_preferences import WorkshopNotificationPreferenceService
 from kai.workshop.run_lifecycle import (
     DurableRun,
@@ -204,6 +213,7 @@ class _SettingsWorkspaces:
     switched: list[str] = field(default_factory=list)
     workspace_config_changes: list[tuple[str, str]] = field(default_factory=list)
     runtime_changes: list[tuple[str, object]] = field(default_factory=list)
+    catalogue_calls: list[tuple[str, str | None]] = field(default_factory=list)
 
     def authority_for_principal_channel(self, principal_id, channel_id):
         if principal_id != self.principal_id or channel_id != self.channel_id:
@@ -217,6 +227,33 @@ class _SettingsWorkspaces:
 
     async def inspect(self, _authority):
         return self._snapshot()
+
+    async def inspect_model_catalogue(self, _authority, option_id=None):
+        self.catalogue_calls.append(("inspect", option_id))
+        return self._catalogue_snapshot(option_id)
+
+    async def refresh_model_catalogue(self, _authority, option_id=None):
+        self.catalogue_calls.append(("refresh", option_id))
+        return self._refresh_result(option_id)
+
+    async def refresh_all_model_catalogues_as_operator(self):
+        self.catalogue_calls.append(("refresh_all", None))
+        return (self._refresh_result("codex:openai"),)
+
+    async def upsert_operator_model(
+        self,
+        _authority,
+        option_id,
+        *,
+        model_id,
+        display_label,
+    ):
+        self.catalogue_calls.append((f"upsert:{model_id}:{display_label}", option_id))
+        return self._catalogue_snapshot(option_id)
+
+    async def deactivate_operator_model(self, _authority, option_id, *, model_id):
+        self.catalogue_calls.append((f"deactivate:{model_id}", option_id))
+        return self._catalogue_snapshot(option_id)
 
     async def switch_workspace(self, _authority, path: str, *, expected_revision=None):
         self._check_revision(expected_revision, "sws_current")
@@ -303,6 +340,55 @@ class _SettingsWorkspaces:
             workspaces=(WorkspaceOption(workspace, "kai", True, False),),
             revision="sws_current",
             capabilities=(EditableCapability("model", "runtime", "model_id", True),),
+        )
+
+    def _catalogue_snapshot(self, option_id: str | None = None) -> ModelCatalogueSnapshot:
+        refresh = ModelCatalogueRefreshState(
+            ModelCatalogueRefreshStatus.SUCCEEDED,
+            2,
+            _NOW,
+            _NOW,
+            _NOW + timedelta(hours=1),
+            None,
+            None,
+        )
+        return ModelCatalogueSnapshot(
+            principal_id=self.principal_id,
+            runtime_profile_id=profile_id(101),
+            option_id=option_id or "codex:openai",
+            cache_key="catalogue-cache-key",
+            entries=(
+                ModelCatalogueEntry(
+                    "gpt-5.6-sol",
+                    "GPT-5.6 Sol",
+                    ModelCatalogueEntryStatus.AVAILABLE,
+                    True,
+                    True,
+                    (
+                        ModelCatalogueProvenance(
+                            "discovered:fixture",
+                            ModelCatalogueEntryStatus.AVAILABLE,
+                            "GPT-5.6 Sol",
+                            {},
+                        ),
+                    ),
+                ),
+            ),
+            refresh=refresh,
+            stale=False,
+            last_known_good=False,
+        )
+
+    @staticmethod
+    def _refresh_result(option_id: str | None = None) -> ModelCatalogueRefreshResult:
+        return ModelCatalogueRefreshResult(
+            profile_id(101),
+            option_id or "codex:openai",
+            "catalogue-cache-key",
+            ModelCatalogueRefreshStatus.SUCCEEDED,
+            2,
+            1,
+            False,
         )
 
     @staticmethod
@@ -1081,6 +1167,128 @@ class TestWorkshopNavigationHTTPContract:
 
 
 class TestWorkshopSettingsWorkspaceHTTPContract:
+    async def test_model_catalogue_read_refresh_and_operator_actions_are_canonical(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        service = _SettingsWorkspaces(alice_id, alice_channel)
+        client = await _open_client(
+            store,
+            _Authenticator({"alice-token": alice_id}),
+            settings_workspaces=service,
+        )
+        headers = {"Authorization": "Bearer alice-token"}
+        path = f"/v1/channels/{alice_channel}/models"
+        try:
+            loaded = await client.get(
+                path,
+                headers=headers,
+                params={"option_id": "codex:openai"},
+            )
+            refreshed = await client.post(
+                path,
+                headers=headers,
+                json={"option_id": "codex:openai"},
+            )
+            upserted = await client.put(
+                path,
+                headers=headers,
+                json={
+                    "option_id": "codex:openai",
+                    "model_id": "gpt-5.6-sol",
+                    "display_label": "GPT-5.6 Sol",
+                },
+            )
+            deactivated = await client.delete(
+                path,
+                headers=headers,
+                json={"option_id": "codex:openai", "model_id": "gpt-5.6-sol"},
+            )
+            all_refreshed = await client.post(
+                "/v1/settings/model-catalogue/refresh-all",
+                headers=headers,
+            )
+
+            assert [response.status for response in (loaded, refreshed, upserted, deactivated, all_refreshed)] == [
+                200,
+                200,
+                200,
+                200,
+                200,
+            ]
+            payload = await loaded.json()
+            assert payload["principal_id"] == str(alice_id)
+            assert payload["option_id"] == "codex:openai"
+            assert payload["models"] == [
+                {
+                    "model_id": "gpt-5.6-sol",
+                    "display_name": "GPT-5.6 Sol",
+                    "status": "available",
+                    "selectable": True,
+                    "retained": True,
+                    "sources": ["discovered:fixture"],
+                }
+            ]
+            assert await all_refreshed.json() == {
+                "version": 1,
+                "contexts": 1,
+                "statuses": {"succeeded": 1},
+                "selection_changed": False,
+            }
+            assert service.runtime_changes == []
+            assert service.catalogue_calls == [
+                ("inspect", "codex:openai"),
+                ("refresh", "codex:openai"),
+                ("inspect", "codex:openai"),
+                ("upsert:gpt-5.6-sol:GPT-5.6 Sol", "codex:openai"),
+                ("deactivate:gpt-5.6-sol", "codex:openai"),
+                ("refresh_all", None),
+            ]
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_model_catalogue_isolation_and_admin_boundary_precede_discovery(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_channel, bob_id, bob_channel = await _open_store(tmp_path / "kai.db")
+        service = _SettingsWorkspaces(alice_id, alice_channel)
+        client = await _open_client(
+            store,
+            _Authenticator({"bob-token": bob_id}),
+            settings_workspaces=service,
+        )
+        headers = {"Authorization": "Bearer bob-token"}
+        try:
+            foreign = await client.get(
+                f"/v1/channels/{alice_channel}/models",
+                headers=headers,
+            )
+            own_operator_write = await client.put(
+                f"/v1/channels/{bob_channel}/models",
+                headers=headers,
+                json={
+                    "option_id": "codex:openai",
+                    "model_id": "forbidden",
+                    "display_label": "Forbidden",
+                },
+            )
+            refresh_all = await client.post(
+                "/v1/settings/model-catalogue/refresh-all",
+                headers=headers,
+            )
+
+            assert foreign.status == 403
+            assert own_operator_write.status == 403
+            assert refresh_all.status == 403
+            assert service.catalogue_calls == []
+            assert service.runtime_changes == []
+        finally:
+            await client.close()
+            await store.close()
+
     async def test_owner_reads_and_switches_canonical_runtime_workspace(
         self,
         tmp_path: Path,

@@ -3,19 +3,24 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import {
   AuthenticationError,
   ChannelAccessError,
+  deactivateOperatorModel,
   loadAppearancePreferences,
   loadPreferenceDocument,
   loadPreferenceHistory,
   loadGitHubSettings,
   loadNotificationPreferences,
   loadClientPreferences,
+  loadModelCatalogue,
   loadSettingsWorkspace,
   loadWorkspaceConfig,
   PreferenceRevisionConflictError,
+  refreshAllModelCatalogues,
   restorePreferenceRevision,
+  refreshModelCatalogue,
   savePreferenceDocument,
   SettingsRevisionConflictError,
   switchWorkspace,
+  upsertOperatorModel,
   updateRuntimeSettings,
   updateGitHubSettings,
   updateNotificationPreference,
@@ -29,6 +34,7 @@ import type {
   WorkshopPreferenceHistory,
   WorkshopGitHubSettings,
   WorkshopGitHubSettingsChange,
+  WorkshopModelCatalogue,
   WorkshopNotificationPreferences,
   WorkshopNotificationPreferenceChange,
   WorkshopClientPreferences,
@@ -101,6 +107,7 @@ export function SettingsWorkspace({
   onChannelAccessFailure,
   onClose,
   onDirtyChange,
+  isAdministrator,
   principalName,
   roleLabel,
   runtimeLabel,
@@ -111,6 +118,7 @@ export function SettingsWorkspace({
   onChannelAccessFailure: (message: string) => void;
   onClose: () => void;
   onDirtyChange: (dirty: boolean) => void;
+  isAdministrator: boolean;
   principalName: string;
   roleLabel: string;
   runtimeLabel: string;
@@ -135,6 +143,12 @@ export function SettingsWorkspace({
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [runtimeNotice, setRuntimeNotice] = useState<string | null>(null);
+  const [modelCatalogue, setModelCatalogue] = useState<WorkshopModelCatalogue | null>(null);
+  const [modelCatalogueLoading, setModelCatalogueLoading] = useState(false);
+  const [modelCatalogueBusy, setModelCatalogueBusy] = useState(false);
+  const [modelCatalogueError, setModelCatalogueError] = useState<string | null>(null);
+  const [operatorModelId, setOperatorModelId] = useState("");
+  const [operatorModelLabel, setOperatorModelLabel] = useState("");
   const [runtimeBackend, setRuntimeBackend] = useState("");
   const [runtimeModel, setRuntimeModel] = useState("");
   const [runtimeTimeout, setRuntimeTimeout] = useState("");
@@ -310,6 +324,113 @@ export function SettingsWorkspace({
       setRuntimeLoading(false);
     }
   }, [adoptRuntime, adoptWorkspace, handleAccessFailure, onAuthenticationFailure, session]);
+
+  useEffect(() => {
+    if (!runtime || !runtimeBackend) {
+      setModelCatalogue(null);
+      return;
+    }
+    let cancelled = false;
+    setModelCatalogueLoading(true);
+    setModelCatalogueError(null);
+    void loadModelCatalogue(session, runtimeBackend)
+      .then((snapshot) => {
+        if (!cancelled) {
+          setModelCatalogue(snapshot);
+        }
+      })
+      .catch((caught) => {
+        if (!cancelled && !handleAccessFailure(caught)) {
+          setModelCatalogueError(errorText(caught, "Could not load the model catalogue."));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setModelCatalogueLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [handleAccessFailure, runtime, runtimeBackend, session]);
+
+  const refreshSelectedModelCatalogue = async (): Promise<void> => {
+    if (!runtimeBackend) {
+      return;
+    }
+    setModelCatalogueBusy(true);
+    setModelCatalogueError(null);
+    try {
+      const snapshot = await refreshModelCatalogue(session, runtimeBackend);
+      setModelCatalogue(snapshot);
+      if (runtimeBackend === runtime?.backendOptionId) {
+        adoptRuntime(await loadSettingsWorkspace(session));
+      }
+    } catch (caught) {
+      if (!handleAccessFailure(caught)) {
+        setModelCatalogueError(errorText(caught, "Could not refresh the model catalogue."));
+      }
+    } finally {
+      setModelCatalogueBusy(false);
+    }
+  };
+
+  const refreshEveryModelCatalogue = async (): Promise<void> => {
+    setModelCatalogueBusy(true);
+    setModelCatalogueError(null);
+    try {
+      const result = await refreshAllModelCatalogues(session);
+      setRuntimeNotice(`Refreshed ${result.contexts} authorized model-catalogue contexts.`);
+      setModelCatalogue(await loadModelCatalogue(session, runtimeBackend));
+    } catch (caught) {
+      if (!handleAccessFailure(caught)) {
+        setModelCatalogueError(errorText(caught, "Could not refresh all model catalogues."));
+      }
+    } finally {
+      setModelCatalogueBusy(false);
+    }
+  };
+
+  const saveOperatorModel = async (): Promise<void> => {
+    if (!operatorModelId.trim() || !operatorModelLabel.trim()) {
+      return;
+    }
+    setModelCatalogueBusy(true);
+    setModelCatalogueError(null);
+    try {
+      setModelCatalogue(await upsertOperatorModel(
+        session,
+        runtimeBackend,
+        operatorModelId.trim(),
+        operatorModelLabel.trim(),
+      ));
+      setOperatorModelId("");
+      setOperatorModelLabel("");
+    } catch (caught) {
+      if (!handleAccessFailure(caught)) {
+        setModelCatalogueError(errorText(caught, "Could not save the operator model."));
+      }
+    } finally {
+      setModelCatalogueBusy(false);
+    }
+  };
+
+  const removeOperatorModel = async (modelId: string): Promise<void> => {
+    if (!window.confirm(`Deactivate operator model ${modelId}?`)) {
+      return;
+    }
+    setModelCatalogueBusy(true);
+    setModelCatalogueError(null);
+    try {
+      setModelCatalogue(await deactivateOperatorModel(session, runtimeBackend, modelId));
+    } catch (caught) {
+      if (!handleAccessFailure(caught)) {
+        setModelCatalogueError(errorText(caught, "Could not deactivate the operator model."));
+      }
+    } finally {
+      setModelCatalogueBusy(false);
+    }
+  };
 
   const refreshGitHub = useCallback(async (): Promise<void> => {
     setGitHubLoading(true);
@@ -737,8 +858,13 @@ export function SettingsWorkspace({
   ): React.JSX.Element => choices ? (
     <select id={id} value={value} onChange={(event) => onChange(event.target.value)}>
       {choices.map((choice) => {
-        const display = runtime?.modelOptions?.find((item) => item.modelId === choice)?.displayName;
-        return <option key={choice} value={choice}>{display ?? choice}</option>;
+        const option = runtime?.modelOptions?.find((item) => item.modelId === choice);
+        const suffix = option?.retained && !option.selectable ? " · not currently advertised" : "";
+        return (
+          <option key={choice} value={choice} disabled={option ? !option.selectable : false}>
+            {option?.displayName ?? choice}{suffix}
+          </option>
+        );
       })}
     </select>
   ) : (
@@ -956,6 +1082,111 @@ export function SettingsWorkspace({
                   <div><dt>Authorized choices</dt><dd>{runtime.backendOptions.length}</dd></div>
                 </dl>
                 <p>Credentials, identity mappings, executable paths, assignments, and workspace grants remain operator managed.</p>
+              </article>
+
+              <article className="settings-card model-catalogue-card">
+                <p className="settings-card-label">Model catalogue</p>
+                <p>
+                  Refreshes inspect provider metadata only. They never run a model,
+                  change your selected model, or interrupt active work.
+                </p>
+                {modelCatalogueLoading ? (
+                  <p role="status">Loading catalogue…</p>
+                ) : modelCatalogue ? (
+                  <>
+                    <dl>
+                      <div><dt>Backend</dt><dd>{modelCatalogue.optionId}</dd></div>
+                      <div><dt>Models</dt><dd>{modelCatalogue.models.length}</dd></div>
+                      <div>
+                        <dt>Status</dt>
+                        <dd>{modelCatalogue.refresh?.status ?? "Not refreshed"}{modelCatalogue.stale ? " · stale" : ""}</dd>
+                      </div>
+                      <div>
+                        <dt>Last successful refresh</dt>
+                        <dd>{formatDate(modelCatalogue.refresh?.lastSuccessfulRefreshAt ?? null)}</dd>
+                      </div>
+                    </dl>
+                    <ul className="model-catalogue-list">
+                      {modelCatalogue.models.map((model) => (
+                        <li key={model.modelId}>
+                          <span>{model.displayName}</span>
+                          <code>{model.modelId}</code>
+                          <small>
+                            {model.status.replaceAll("_", " ")}
+                            {model.retained ? " · retained selection" : ""}
+                          </small>
+                          {isAdministrator && model.sources.includes("operator") && (
+                            <button
+                              className="model-catalogue-remove"
+                              type="button"
+                              disabled={modelCatalogueBusy}
+                              onClick={() => void removeOperatorModel(model.modelId)}
+                            >
+                              Deactivate operator entry
+                            </button>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                    {modelCatalogue.refresh?.errorDetail && (
+                      <p className="settings-error" role="alert">{modelCatalogue.refresh.errorDetail}</p>
+                    )}
+                  </>
+                ) : null}
+                <div className="settings-actions">
+                  <button
+                    className="quiet-button"
+                    type="button"
+                    disabled={modelCatalogueBusy || modelCatalogueLoading}
+                    onClick={() => void refreshSelectedModelCatalogue()}
+                  >
+                    {modelCatalogueBusy ? "Refreshing…" : "Refresh models"}
+                  </button>
+                  {isAdministrator && (
+                    <button
+                      className="quiet-button"
+                      type="button"
+                      disabled={modelCatalogueBusy || modelCatalogueLoading}
+                      onClick={() => void refreshEveryModelCatalogue()}
+                    >
+                      Refresh all contexts
+                    </button>
+                  )}
+                </div>
+                {isAdministrator && (
+                  <form
+                    className="model-catalogue-operator-form"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      void saveOperatorModel();
+                    }}
+                  >
+                    <label htmlFor="operator-model-id">Operator-managed model ID</label>
+                    <input
+                      id="operator-model-id"
+                      type="text"
+                      value={operatorModelId}
+                      onChange={(event) => setOperatorModelId(event.target.value)}
+                    />
+                    <label htmlFor="operator-model-label">Display label</label>
+                    <input
+                      id="operator-model-label"
+                      type="text"
+                      value={operatorModelLabel}
+                      onChange={(event) => setOperatorModelLabel(event.target.value)}
+                    />
+                    <button
+                      className="quiet-button"
+                      type="submit"
+                      disabled={modelCatalogueBusy || !operatorModelId.trim() || !operatorModelLabel.trim()}
+                    >
+                      Add or update
+                    </button>
+                  </form>
+                )}
+                {modelCatalogueError && (
+                  <p className="settings-error" role="alert">{modelCatalogueError}</p>
+                )}
               </article>
 
               {runtimeModelCapability && (

@@ -94,6 +94,11 @@ from kai.workshop.memory_queries import (
     WorkshopMemoryResponseTooLarge,
     WorkshopMemoryValidationError,
 )
+from kai.workshop.model_catalogue import (
+    ModelCatalogueAccessDenied,
+    ModelCatalogueError,
+    ModelCatalogueSnapshot,
+)
 from kai.workshop.notification_preferences import (
     NotificationPreferenceAuthority,
     NotificationPreferenceSnapshot,
@@ -127,6 +132,7 @@ from kai.workshop.settings_workspaces import (
     WorkshopSettingsWorkspaceAccessDenied,
     WorkshopSettingsWorkspaceBusy,
     WorkshopSettingsWorkspaceConflict,
+    WorkshopSettingsWorkspaceError,
     WorkshopSettingsWorkspaceService,
     WorkshopSettingsWorkspaceValidationError,
     WorkspaceConfigSnapshot,
@@ -151,6 +157,8 @@ _RUN_STATE_PATH = "/v1/channels/{channel_id}/runs/{run_id}"
 _RUN_TRACE_PATH = "/v1/channels/{channel_id}/runs/{run_id}/trace"
 _RUN_CANCELLATION_PATH = "/v1/channels/{channel_id}/runs/{run_id}/cancel"
 _RUNTIME_SETTINGS_PATH = "/v1/channels/{channel_id}/settings"
+_MODEL_CATALOGUE_PATH = "/v1/channels/{channel_id}/models"
+_MODEL_CATALOGUE_ADMIN_REFRESH_PATH = "/v1/settings/model-catalogue/refresh-all"
 _ACTIVE_WORKSPACE_PATH = "/v1/channels/{channel_id}/workspace"
 _WORKSPACE_CONFIG_PATH = "/v1/channels/{channel_id}/workspace-config"
 _PREFERENCES_PATH = "/v1/preferences"
@@ -179,6 +187,8 @@ _ENROLLMENT_REQUEST_FIELDS = frozenset({"enrollment_token", "device_display_name
 _COMMAND_REQUEST_FIELDS = frozenset({"client_message_id", "body"})
 _SETTINGS_OPERATION_FIELDS = frozenset({"backend", "model", "timeout_seconds", "reset"})
 _SETTINGS_REQUEST_FIELDS = _SETTINGS_OPERATION_FIELDS | {"revision"}
+_MODEL_CATALOGUE_REFRESH_FIELDS = frozenset({"option_id"})
+_MODEL_CATALOGUE_OPERATOR_FIELDS = frozenset({"option_id", "model_id", "display_label"})
 _WORKSPACE_REQUEST_FIELDS = frozenset({"path", "revision"})
 _WORKSPACE_CONFIG_REQUEST_FIELDS = frozenset({"field", "value", "path", "revision"})
 _WORKSPACE_CONFIG_RESET_FIELDS = frozenset({"reset", "path", "revision"})
@@ -263,10 +273,26 @@ def _serialize_settings_workspace(
                 {
                     "model_id": option.model_id,
                     "display_name": option.display_name,
+                    "status": option.status,
+                    "selectable": option.selectable,
+                    "retained": option.retained,
                 }
                 for option in snapshot.model_options
             ]
             if snapshot.model_options is not None
+            else None
+        ),
+        "model_catalogue": (
+            {
+                "status": snapshot.model_catalogue.status,
+                "stale": snapshot.model_catalogue.stale,
+                "last_known_good": snapshot.model_catalogue.last_known_good,
+                "last_attempt_at": snapshot.model_catalogue.last_attempt_at,
+                "last_successful_refresh_at": snapshot.model_catalogue.last_successful_refresh_at,
+                "error_code": snapshot.model_catalogue.error_code,
+                "error_detail": snapshot.model_catalogue.error_detail,
+            }
+            if snapshot.model_catalogue is not None
             else None
         ),
         "workspaces": [
@@ -303,6 +329,46 @@ def _serialize_settings_mutation(
         "changed": mutation.changed,
         "runtime_action": mutation.runtime_action,
         "provider_session_invalidated": mutation.provider_session_invalidated,
+    }
+
+
+def _serialize_model_catalogue(snapshot: ModelCatalogueSnapshot) -> dict[str, object]:
+    refresh = snapshot.refresh
+    return {
+        "version": 1,
+        "principal_id": str(snapshot.principal_id),
+        "runtime_profile_id": str(snapshot.runtime_profile_id),
+        "option_id": snapshot.option_id,
+        "stale": snapshot.stale,
+        "last_known_good": snapshot.last_known_good,
+        "refresh": (
+            {
+                "status": refresh.status.value,
+                "generation": refresh.generation,
+                "last_attempt_at": refresh.last_attempt_at.isoformat(),
+                "last_successful_refresh_at": (
+                    refresh.last_successful_refresh_at.isoformat()
+                    if refresh.last_successful_refresh_at is not None
+                    else None
+                ),
+                "expires_at": refresh.expires_at.isoformat() if refresh.expires_at is not None else None,
+                "error_code": refresh.error_code,
+                "error_detail": refresh.error_detail,
+            }
+            if refresh is not None
+            else None
+        ),
+        "models": [
+            {
+                "model_id": entry.model_id,
+                "display_name": entry.display_label,
+                "status": entry.status.value,
+                "selectable": entry.selectable,
+                "retained": entry.retained,
+                "sources": [provenance.source for provenance in entry.provenances],
+            }
+            for entry in snapshot.entries
+        ],
     }
 
 
@@ -1946,6 +2012,174 @@ async def _handle_runtime_settings_update(
     return _json_response(_serialize_settings_workspace(snapshot), status=200)
 
 
+async def _handle_model_catalogue(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopSettingsWorkspaceService,
+) -> web.Response:
+    authority, error = await _authenticate_settings_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        return error
+    assert authority is not None
+    if request.can_read_body or any(key != "option_id" for key in request.query):
+        return _error_response(status=400, code="invalid_request", message="Invalid model catalogue request")
+    option_id = request.query.get("option_id")
+    try:
+        snapshot = await service.inspect_model_catalogue(authority, option_id)
+    except (WorkshopSettingsWorkspaceAccessDenied, ModelCatalogueAccessDenied):
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except (WorkshopSettingsWorkspaceError, ModelCatalogueError):
+        return _error_response(
+            status=503,
+            code="model_catalogue_unavailable",
+            message="Model catalogue is temporarily unavailable",
+        )
+    return _json_response(_serialize_model_catalogue(snapshot), status=200)
+
+
+async def _handle_model_catalogue_refresh(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopSettingsWorkspaceService,
+) -> web.Response:
+    authority, error = await _authenticate_settings_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        return error
+    assert authority is not None
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid model refresh request")
+    try:
+        payload = await request.json()
+    except (UnicodeDecodeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid JSON request")
+    if not isinstance(payload, dict) or not set(payload).issubset(_MODEL_CATALOGUE_REFRESH_FIELDS):
+        return _error_response(status=400, code="invalid_request", message="Invalid model refresh request")
+    option_id = payload.get("option_id")
+    if option_id is not None and not isinstance(option_id, str):
+        return _error_response(status=400, code="invalid_request", message="Invalid backend option")
+    try:
+        await service.refresh_model_catalogue(authority, option_id)
+        snapshot = await service.inspect_model_catalogue(authority, option_id)
+    except (WorkshopSettingsWorkspaceAccessDenied, ModelCatalogueAccessDenied):
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except (WorkshopSettingsWorkspaceError, ModelCatalogueError):
+        return _error_response(
+            status=503,
+            code="model_catalogue_unavailable",
+            message="Model catalogue refresh is temporarily unavailable",
+        )
+    return _json_response(_serialize_model_catalogue(snapshot), status=200)
+
+
+async def _principal_is_workshop_admin(
+    store: WorkshopEventStore,
+    principal_id: PrincipalId,
+) -> bool:
+    async with store.connection.execute(
+        "SELECT 1 FROM workshop_memberships WHERE principal_id = ? AND role = 'admin' LIMIT 1",
+        (principal_id,),
+    ) as cursor:
+        return await cursor.fetchone() is not None
+
+
+async def _handle_model_catalogue_operator_entry(
+    request: web.Request,
+    *,
+    store: WorkshopEventStore,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopSettingsWorkspaceService,
+    deactivate: bool,
+) -> web.Response:
+    authority, error = await _authenticate_settings_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        return error
+    assert authority is not None
+    if not await _principal_is_workshop_admin(store, authority.principal_id):
+        return _error_response(status=403, code="access_denied", message="Administrator access required")
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid operator model request")
+    try:
+        payload = await request.json()
+    except (UnicodeDecodeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid JSON request")
+    expected_fields = {"option_id", "model_id"} if deactivate else _MODEL_CATALOGUE_OPERATOR_FIELDS
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != set(expected_fields)
+        or any(not isinstance(payload.get(field), str) for field in expected_fields)
+    ):
+        return _error_response(status=400, code="invalid_request", message="Invalid operator model request")
+    try:
+        if deactivate:
+            snapshot = await service.deactivate_operator_model(
+                authority,
+                payload["option_id"],
+                model_id=payload["model_id"],
+            )
+        else:
+            snapshot = await service.upsert_operator_model(
+                authority,
+                payload["option_id"],
+                model_id=payload["model_id"],
+                display_label=payload["display_label"],
+            )
+    except (WorkshopSettingsWorkspaceAccessDenied, ModelCatalogueAccessDenied):
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except ModelCatalogueError as exc:
+        return _error_response(status=400, code="invalid_model_entry", message=str(exc))
+    return _json_response(_serialize_model_catalogue(snapshot), status=200)
+
+
+async def _handle_model_catalogue_refresh_all(
+    request: web.Request,
+    *,
+    store: WorkshopEventStore,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopSettingsWorkspaceService,
+) -> web.Response:
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        return _error_response(status=401, code="authentication_required", message="Authentication required")
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid model refresh request")
+    if not await _principal_is_workshop_admin(store, principal_id):
+        return _error_response(status=403, code="access_denied", message="Administrator access required")
+    try:
+        results = await service.refresh_all_model_catalogues_as_operator()
+    except ModelCatalogueError:
+        return _error_response(
+            status=503,
+            code="model_catalogue_unavailable",
+            message="Model catalogue refresh is temporarily unavailable",
+        )
+    counts: dict[str, int] = {}
+    for result in results:
+        counts[result.status.value] = counts.get(result.status.value, 0) + 1
+    return _json_response(
+        {
+            "version": 1,
+            "contexts": len(results),
+            "statuses": counts,
+            "selection_changed": False,
+        },
+        status=200,
+    )
+
+
 async def _handle_active_workspace_update(
     request: web.Request,
     *,
@@ -3512,6 +3746,51 @@ def register_workshop_read_routes(
                     service=settings_workspaces,
                 )
 
+        async def handle_model_catalogue(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_model_catalogue(
+                    request,
+                    authenticator=authenticator,
+                    service=settings_workspaces,
+                )
+
+        async def handle_model_catalogue_refresh(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_model_catalogue_refresh(
+                    request,
+                    authenticator=authenticator,
+                    service=settings_workspaces,
+                )
+
+        async def handle_model_catalogue_operator_upsert(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_model_catalogue_operator_entry(
+                    request,
+                    store=store,
+                    authenticator=authenticator,
+                    service=settings_workspaces,
+                    deactivate=False,
+                )
+
+        async def handle_model_catalogue_operator_deactivate(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_model_catalogue_operator_entry(
+                    request,
+                    store=store,
+                    authenticator=authenticator,
+                    service=settings_workspaces,
+                    deactivate=True,
+                )
+
+        async def handle_model_catalogue_refresh_all(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_model_catalogue_refresh_all(
+                    request,
+                    store=store,
+                    authenticator=authenticator,
+                    service=settings_workspaces,
+                )
+
         async def handle_active_workspace_update(request: web.Request) -> web.Response:
             async with request_lock:
                 return await _handle_active_workspace_update(
@@ -3542,6 +3821,14 @@ def register_workshop_read_routes(
         app.router.add_patch(
             _RUNTIME_SETTINGS_PATH,
             handle_runtime_settings_update,
+        )
+        app.router.add_get(_MODEL_CATALOGUE_PATH, handle_model_catalogue)
+        app.router.add_post(_MODEL_CATALOGUE_PATH, handle_model_catalogue_refresh)
+        app.router.add_put(_MODEL_CATALOGUE_PATH, handle_model_catalogue_operator_upsert)
+        app.router.add_delete(_MODEL_CATALOGUE_PATH, handle_model_catalogue_operator_deactivate)
+        app.router.add_post(
+            _MODEL_CATALOGUE_ADMIN_REFRESH_PATH,
+            handle_model_catalogue_refresh_all,
         )
         app.router.add_post(_ACTIVE_WORKSPACE_PATH, handle_active_workspace_update)
         app.router.add_get(_WORKSPACE_CONFIG_PATH, handle_workspace_config)

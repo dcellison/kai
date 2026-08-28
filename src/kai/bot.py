@@ -474,13 +474,29 @@ def _get_user_models(pool: SubprocessPool, chat_id: int, config: Config) -> dict
     return models
 
 
-def _models_keyboard(current: str, models: dict[str, str]) -> InlineKeyboardMarkup:
+def _models_keyboard(
+    current: str,
+    models: dict[str, str],
+    *,
+    include_refresh: bool = False,
+) -> InlineKeyboardMarkup:
     """Build an inline keyboard with model choices, highlighting the current model."""
     buttons = []
     for key, name in models.items():
         label = f"{name} \U0001f7e2" if key == current else name
         buttons.append([InlineKeyboardButton(label, callback_data=f"model:{key}")])
+    if include_refresh:
+        buttons.append([InlineKeyboardButton("Refresh models", callback_data="models:refresh")])
     return InlineKeyboardMarkup(buttons)
+
+
+def _model_catalogue_status(snapshot: object) -> str:
+    refresh = getattr(snapshot, "refresh", None)
+    status = getattr(refresh, "status", None)
+    status_text = status.value if status is not None else "not refreshed"
+    stale = " · stale fallback" if bool(getattr(snapshot, "stale", False)) else ""
+    detail = getattr(refresh, "error_detail", None)
+    return f"Catalogue: {status_text}{stale}" + (f"\n{detail}" if detail else "")
 
 
 def _backends_keyboard(snapshot: SettingsWorkspaceSnapshot) -> InlineKeyboardMarkup:
@@ -510,16 +526,30 @@ async def handle_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     config: Config = context.bot_data["config"]
     authority = _canonical_settings_authority(context, chat_id)
     if authority is not None:
-        snapshot = await _get_core_services(context).settings_workspaces.inspect(authority)
-        if snapshot.model_options is None:
+        service = _get_core_services(context).settings_workspaces
+        args = context.args or []
+        if args and args[0].lower() not in {"refresh"}:
+            await update.message.reply_text("Usage: /models [refresh]")
+            return
+        if args:
+            await service.refresh_model_catalogue(authority)
+        settings = await service.inspect(authority)
+        catalogue = await service.inspect_model_catalogue(authority)
+        models = {entry.model_id: entry.display_label for entry in catalogue.entries if entry.selectable}
+        if not models:
             await update.message.reply_text(
-                f"Current model: {snapshot.model.value}\nUse /model <id> to switch to any model your provider supports."
+                f"Current model: {settings.model.value}\n{_model_catalogue_status(catalogue)}\n"
+                "No selectable models are currently advertised.",
+                reply_markup=_models_keyboard("", {}, include_refresh=True),
             )
             return
-        models = {option.model_id: option.display_name for option in snapshot.model_options}
         await update.message.reply_text(
-            "Choose a model:",
-            reply_markup=_models_keyboard(str(snapshot.model.value), models),
+            f"Choose a model:\n{_model_catalogue_status(catalogue)}",
+            reply_markup=_models_keyboard(
+                str(settings.model.value),
+                models,
+                include_refresh=True,
+            ),
         )
         return
     models = _get_user_models(pool, chat_id, config)
@@ -538,6 +568,33 @@ async def handle_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(
         "Choose a model:",
         reply_markup=_models_keyboard(await pool.get_effective_model(chat_id), models),
+    )
+
+
+async def handle_models_refresh_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Refresh and redraw the caller's canonical model catalogue."""
+    assert update.callback_query is not None
+    query = update.callback_query
+    authority = _canonical_settings_authority(context, _chat_id(update))
+    if authority is None:
+        await query.answer("Model refresh requires a canonical runtime.", show_alert=True)
+        return
+    service = _get_core_services(context).settings_workspaces
+    await query.answer("Refreshing models…")
+    await service.refresh_model_catalogue(authority)
+    settings = await service.inspect(authority)
+    catalogue = await service.inspect_model_catalogue(authority)
+    models = {entry.model_id: entry.display_label for entry in catalogue.entries if entry.selectable}
+    await query.edit_message_text(
+        f"Choose a model:\n{_model_catalogue_status(catalogue)}",
+        reply_markup=_models_keyboard(
+            str(settings.model.value),
+            models,
+            include_refresh=True,
+        ),
     )
 
 
@@ -598,6 +655,30 @@ async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
     pool = _get_pool(context)
     chat_id = _chat_id(update)
 
+    authority = _canonical_settings_authority(context, chat_id)
+    if authority is not None:
+        service = _get_core_services(context).settings_workspaces
+        settings = await service.inspect(authority)
+        catalogue = await service.inspect_model_catalogue(authority)
+        option = next(
+            (entry for entry in catalogue.entries if entry.model_id == model),
+            None,
+        )
+        if option is None or not option.selectable:
+            await query.answer("This model is not currently selectable.", show_alert=True)
+            return
+        if model == settings.model.value:
+            await query.answer()
+            await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
+            return
+        await query.answer()
+        await _switch_model(context, chat_id, model)
+        await query.edit_message_text(
+            f"Switched to {option.display_label}. Session restarted.",
+            reply_markup=InlineKeyboardMarkup([]),
+        )
+        return
+
     # Validate against the user's effective backend - codex installs
     # check CODEX_MODELS only, no fallback to PROVIDER_MODELS["openai"].
     backend, provider = _get_user_backend_provider(pool, chat_id, config)
@@ -640,6 +721,22 @@ async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     model = context.args[0].lower()
+
+    authority = _canonical_settings_authority(context, chat_id)
+    if authority is not None:
+        service = _get_core_services(context).settings_workspaces
+        catalogue = await service.inspect_model_catalogue(authority)
+        selected = next(
+            (entry for entry in catalogue.entries if entry.model_id == model and entry.selectable),
+            None,
+        )
+        if selected is None:
+            valid = sorted(entry.model_id for entry in catalogue.entries if entry.selectable)
+            await update.message.reply_text(f"Choose: {', '.join(valid)}")
+            return
+        await _switch_model(context, chat_id, model)
+        await update.message.reply_text(f"Model set to {selected.display_label}. Session restarted.")
+        return
 
     # Backend-aware validation: codex installs use CODEX_MODELS only;
     # goose / claude delegate to the provider surface.
@@ -800,6 +897,14 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if field == "model":
         pool = _get_pool(context)
         if not value:
+            authority = _canonical_settings_authority(context, chat_id)
+            if authority is not None:
+                catalogue = await _get_core_services(context).settings_workspaces.inspect_model_catalogue(authority)
+                opts = " | ".join(sorted(entry.model_id for entry in catalogue.entries if entry.selectable))
+                await update.message.reply_text(
+                    f"Usage: /settings model <{opts}>" if opts else "No selectable models are advertised."
+                )
+                return
             user_models = _get_user_models(pool, chat_id, config)
             if user_models:
                 opts = " | ".join(sorted(user_models.keys()))
@@ -809,6 +914,21 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         model_key = value.lower()
+        authority = _canonical_settings_authority(context, chat_id)
+        if authority is not None:
+            service = _get_core_services(context).settings_workspaces
+            catalogue = await service.inspect_model_catalogue(authority)
+            selected = next(
+                (entry for entry in catalogue.entries if entry.model_id == model_key and entry.selectable),
+                None,
+            )
+            if selected is None:
+                valid = sorted(entry.model_id for entry in catalogue.entries if entry.selectable)
+                await update.message.reply_text(f"Unknown model. Choose from: {', '.join(valid)}")
+                return
+            await _switch_model(context, chat_id, model_key)
+            await update.message.reply_text(f"Default model set to {selected.display_label}. Session restarted.")
+            return
         # Backend-aware validation
         backend, provider = _get_user_backend_provider(pool, chat_id, config)
         if not validate_model_for_backend(model_key, backend, provider):
@@ -4954,6 +5074,12 @@ def create_bot(
 
     # Every callback either discloses user state or mutates it, so all callback
     # families share the same authorization/TOTP middleware.
+    app.add_handler(
+        CallbackQueryHandler(
+            _require_sensitive_authentication(handle_models_refresh_callback),
+            pattern=r"^models:refresh$",
+        )
+    )
     app.add_handler(CallbackQueryHandler(_require_sensitive_authentication(handle_model_callback), pattern=r"^model:"))
     app.add_handler(
         CallbackQueryHandler(
