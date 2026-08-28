@@ -228,6 +228,20 @@ class _FakeAppearancePreferences:
         self.events.append("appearance-preferences:close")
 
 
+class _FakeModelCatalogue:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    @classmethod
+    async def open(cls, *_args, **_kwargs):
+        events = _FakeExecutionFactory.events
+        events.append("model-catalogue:open")
+        return cls(events)
+
+    async def close(self) -> None:
+        self.events.append("model-catalogue:close")
+
+
 class _FakeGitHubAutomation:
     def __init__(self, events: list[str]) -> None:
         self.events = events
@@ -314,6 +328,7 @@ def host_dependencies(monkeypatch):
         "WorkshopAppearancePreferenceService",
         _FakeAppearancePreferences,
     )
+    monkeypatch.setattr(host_module, "WorkshopModelCatalogueService", _FakeModelCatalogue)
     monkeypatch.setattr(host_module, "WorkshopGitHubAutomationService", _FakeGitHubAutomation)
     monkeypatch.setattr(
         host_module,
@@ -407,6 +422,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
     assert host_dependencies == [
         "pool:start",
         "store:open",
+        "model-catalogue:open",
         "authority:activate",
         "execution:start",
         "post-run-effects:start",
@@ -425,7 +441,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
 
     assert host.readiness.state == KaiApplicationState.STOPPED
     assert host.readiness.ready is False
-    assert host_dependencies[-16:] == [
+    assert host_dependencies[-17:] == [
         "execution:wait",
         "scheduler:wait",
         "github-automation:wait",
@@ -437,6 +453,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
         "notification-preferences:close",
         "client-preferences:close",
         "appearance-preferences:close",
+        "model-catalogue:close",
         "client:stop",
         "post-run-effects:stop",
         "store:close",

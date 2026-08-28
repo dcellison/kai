@@ -17,7 +17,7 @@ from kai.backend_registry import (
     load_backend_registry,
     resolve_backend_command,
 )
-from kai.config import Config
+from kai.config import Config, models_for_backend_policy
 from kai.pool import SubprocessPool
 from kai.workshop.appearance_preferences import WorkshopAppearancePreferenceService
 from kai.workshop.artifacts import WorkshopArtifactService
@@ -38,6 +38,7 @@ from kai.workshop.github_settings import WorkshopGitHubSettingsService
 from kai.workshop.integration_notifications import WorkshopIntegrationNotificationService
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIContextRegistry
 from kai.workshop.memory_queries import WorkshopMemoryQueryService
+from kai.workshop.model_catalogue import WorkshopModelCatalogueService
 from kai.workshop.model_discovery_inventory import WorkshopModelDiscoveryInventoryService
 from kai.workshop.notification_preferences import WorkshopNotificationPreferenceService
 from kai.workshop.post_run_effects import WorkshopPostRunEffectService
@@ -166,6 +167,7 @@ class KaiCoreServices:
     runtime_profiles: WorkshopRuntimeProfileRegistry
     runtime_pool: WorkshopRuntimePool
     model_discovery_inventory: WorkshopModelDiscoveryInventoryService
+    model_catalogue: WorkshopModelCatalogueService
     conversation_runs: WorkshopConversationRunService
     private_text_execution: WorkshopPrivateTextExecutionService
     client_commands: WorkshopClientCommandExecutor
@@ -267,6 +269,7 @@ class KaiApplicationHost:
         notification_preferences: WorkshopNotificationPreferenceService | None = None
         client_preferences: WorkshopClientPreferenceService | None = None
         appearance_preferences: WorkshopAppearancePreferenceService | None = None
+        model_catalogue: WorkshopModelCatalogueService | None = None
         try:
             delivery_policy = self._delivery_policy
             subprocess_pool = SubprocessPool(
@@ -300,6 +303,16 @@ class KaiApplicationHost:
             # with the active authority epoch. Resume or create that durable,
             # transport-neutral authority before either recovery owner starts.
             client_store = await WorkshopEventStore.open(Path(self._config.session_db_path))
+            model_catalogue = await WorkshopModelCatalogueService.open(
+                Path(self._config.session_db_path),
+                model_discovery_inventory,
+                selected_model=lambda profile_id: runtime_pool.get_effective_model(profile_id),
+                curated_models=lambda lane: models_for_backend_policy(
+                    lane.backend,
+                    lane.provider,
+                    allowed_models=lane.allowed_models,
+                ),
+            )
             delivery_authority_epoch = (await WorkshopConversationDeliveryAuthority(client_store).activate()).epoch
             private_execution = await WorkshopPrivateTextExecutionService.open_and_start(
                 Path(self._config.session_db_path),
@@ -393,6 +406,7 @@ class KaiApplicationHost:
                 runtime_profiles=self._runtime_profiles,
                 runtime_pool=runtime_pool,
                 model_discovery_inventory=model_discovery_inventory,
+                model_catalogue=model_catalogue,
                 conversation_runs=conversation_runs,
                 private_text_execution=private_execution,
                 client_commands=client_commands,
@@ -434,6 +448,8 @@ class KaiApplicationHost:
                 await client_preferences.close()
             if appearance_preferences is not None:
                 await appearance_preferences.close()
+            if model_catalogue is not None:
+                await model_catalogue.close()
             if client_commands is not None:
                 await client_commands.stop()
             if post_run_effects is not None:
@@ -500,6 +516,7 @@ class KaiApplicationHost:
             services.notification_preferences.close,
             services.client_preferences.close,
             services.appearance_preferences.close,
+            services.model_catalogue.close,
             services.client_commands.stop,
             services.post_run_effects.stop,
             services.client_store.close,

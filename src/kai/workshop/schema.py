@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 38
+WORKSHOP_SCHEMA_VERSION = 39
 
 
 @dataclass(frozen=True, slots=True)
@@ -1844,6 +1844,95 @@ _DURABLE_PRINCIPAL_APPEARANCE_PREFERENCES_SCHEMA = SchemaMigration(
     ),
 )
 
+_CANONICAL_MODEL_CATALOGUE_SCHEMA = SchemaMigration(
+    version=39,
+    name="canonical_model_catalogue",
+    statements=(
+        """
+        CREATE TABLE workshop_model_catalogue_refreshes (
+            cache_key TEXT PRIMARY KEY CHECK (length(cache_key) = 64),
+            principal_id TEXT NOT NULL CHECK (length(principal_id) BETWEEN 1 AND 128),
+            runtime_profile_id TEXT NOT NULL CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            backend TEXT NOT NULL CHECK (length(trim(backend)) > 0),
+            provider TEXT NOT NULL CHECK (length(trim(provider)) > 0),
+            auth_fingerprint TEXT NOT NULL CHECK (length(auth_fingerprint) = 64),
+            executable_fingerprint TEXT NOT NULL CHECK (
+                length(executable_fingerprint) = 64
+            ),
+            status TEXT NOT NULL CHECK (
+                status IN (
+                    'refreshing', 'succeeded', 'failed', 'unsupported',
+                    'malformed', 'timed_out', 'invalidated'
+                )
+            ),
+            generation INTEGER NOT NULL CHECK (generation > 0),
+            active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+            discovery_source TEXT,
+            last_error_code TEXT,
+            last_error_detail TEXT,
+            refresh_started_at TEXT NOT NULL,
+            last_attempt_at TEXT NOT NULL,
+            last_successful_refresh_at TEXT,
+            expires_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """,
+        "CREATE UNIQUE INDEX workshop_model_catalogue_active_lane_idx "
+        "ON workshop_model_catalogue_refreshes (runtime_profile_id, backend, provider) "
+        "WHERE active = 1",
+        "CREATE INDEX workshop_model_catalogue_refresh_status_idx "
+        "ON workshop_model_catalogue_refreshes (status, active, updated_at)",
+        """
+        CREATE TABLE workshop_model_catalogue_discovered_entries (
+            cache_key TEXT NOT NULL REFERENCES workshop_model_catalogue_refreshes(cache_key)
+                ON DELETE CASCADE,
+            model_id TEXT NOT NULL CHECK (length(trim(model_id)) BETWEEN 1 AND 512),
+            display_label TEXT NOT NULL CHECK (
+                length(trim(display_label)) BETWEEN 1 AND 512
+            ),
+            discovery_source TEXT NOT NULL CHECK (
+                length(trim(discovery_source)) BETWEEN 1 AND 128
+            ),
+            capabilities_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL CHECK (
+                status IN ('available', 'not_advertised', 'unavailable', 'unknown')
+            ),
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            last_successful_refresh_at TEXT NOT NULL,
+            expires_at TEXT,
+            PRIMARY KEY (cache_key, model_id)
+        )
+        """,
+        "CREATE INDEX workshop_model_catalogue_discovered_status_idx "
+        "ON workshop_model_catalogue_discovered_entries (cache_key, status, model_id)",
+        """
+        CREATE TABLE workshop_model_catalogue_operator_entries (
+            runtime_profile_id TEXT NOT NULL CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            backend TEXT NOT NULL CHECK (length(trim(backend)) > 0),
+            provider TEXT NOT NULL CHECK (length(trim(provider)) > 0),
+            model_id TEXT NOT NULL CHECK (length(trim(model_id)) BETWEEN 1 AND 512),
+            display_label TEXT NOT NULL CHECK (
+                length(trim(display_label)) BETWEEN 1 AND 512
+            ),
+            capabilities_json TEXT NOT NULL DEFAULT '{}',
+            active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (runtime_profile_id, backend, provider, model_id)
+        )
+        """,
+        "CREATE INDEX workshop_model_catalogue_operator_active_idx "
+        "ON workshop_model_catalogue_operator_entries "
+        "(runtime_profile_id, backend, provider, active, model_id)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -1883,6 +1972,7 @@ _MIGRATIONS = (
     _CLIENT_BINDING_VOICE_PREFERENCES_SCHEMA,
     _PRINCIPAL_APPEARANCE_PREFERENCES_SCHEMA,
     _DURABLE_PRINCIPAL_APPEARANCE_PREFERENCES_SCHEMA,
+    _CANONICAL_MODEL_CATALOGUE_SCHEMA,
 )
 
 
