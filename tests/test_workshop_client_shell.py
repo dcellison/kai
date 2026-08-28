@@ -82,7 +82,9 @@ class TestWorkshopClientShell:
                 assert response.headers["X-Content-Type-Options"] == "nosniff"
 
             assert "sessionStorage" in script_body
-            assert "localStorage" not in script_body
+            assert "localStorage" in script_body
+            assert "kai.workshop.client-credential.v1" in script_body
+            assert "kai.workshop.active-channel.v1" in script_body
             assert "Authorization" in script_body
             assert "Last-Event-ID" in script_body
             assert "EventSource(" not in script_body

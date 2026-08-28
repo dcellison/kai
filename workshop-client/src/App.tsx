@@ -56,7 +56,9 @@ import { SettingsWorkspace } from "./SettingsWorkspace";
 import { applyWorkshopTheme, clearWorkshopThemeHint } from "./theme";
 import { ConfirmationProvider, useConfirmation } from "./ConfirmationDialog";
 
-const SESSION_KEY = "kai.workshop.read-session.v1";
+const BROWSER_CREDENTIAL_KEY = "kai.workshop.client-credential.v1";
+const TAB_CHANNEL_KEY = "kai.workshop.active-channel.v1";
+const LEGACY_SESSION_KEY = "kai.workshop.read-session.v1";
 const ACTIVE_RUN_KEY = "kai.workshop.active-run.v1";
 const DRAFTS_KEY = "kai.workshop.drafts.v1";
 const VIEWPORTS_KEY = "kai.workshop.timeline-viewports.v1";
@@ -187,9 +189,14 @@ function storeContextWidth(width: number): void {
   sessionStorage.setItem(CONTEXT_LAYOUT_KEY, JSON.stringify({ width }));
 }
 
-function restoreSession(): WorkshopSession | null {
+interface RestoredWorkshopAccess {
+  channelId: string | null;
+  token: string;
+}
+
+function parseLegacySession(value: string | null): WorkshopSession | null {
   try {
-    const stored: unknown = JSON.parse(sessionStorage.getItem(SESSION_KEY) ?? "null");
+    const stored: unknown = JSON.parse(value ?? "null");
     if (
       typeof stored === "object" &&
       stored !== null &&
@@ -203,21 +210,101 @@ function restoreSession(): WorkshopSession | null {
       return { channelId: stored.channelId, token: stored.token };
     }
   } catch {
-    // Malformed tab-local state has no authority.
+    // Malformed legacy state has no authority.
   }
-  sessionStorage.removeItem(SESSION_KEY);
   return null;
 }
 
-function storeSession(session: WorkshopSession): void {
-  sessionStorage.setItem(SESSION_KEY, JSON.stringify(session));
+function restoreBrowserCredential(value: string | null): string | null {
+  try {
+    const stored: unknown = JSON.parse(value ?? "null");
+    if (
+      typeof stored === "object" &&
+      stored !== null &&
+      "token" in stored &&
+      typeof stored.token === "string" &&
+      stored.token.length > 0
+    ) {
+      return stored.token;
+    }
+  } catch {
+    // Malformed browser-scoped credentials have no authority.
+  }
+  return null;
 }
 
-function forgetStoredSession(): void {
-  sessionStorage.removeItem(SESSION_KEY);
+function restoreTabChannel(): string | null {
+  try {
+    const stored: unknown = JSON.parse(
+      sessionStorage.getItem(TAB_CHANNEL_KEY) ?? "null",
+    );
+    if (
+      typeof stored === "object" &&
+      stored !== null &&
+      "channelId" in stored &&
+      typeof stored.channelId === "string" &&
+      CHANNEL_PATTERN.test(stored.channelId)
+    ) {
+      return stored.channelId;
+    }
+  } catch {
+    // Malformed tab-local channel state has no authority.
+  }
+  sessionStorage.removeItem(TAB_CHANNEL_KEY);
+  return null;
+}
+
+function restoreWorkshopAccess(): RestoredWorkshopAccess | null {
+  let token = restoreBrowserCredential(
+    localStorage.getItem(BROWSER_CREDENTIAL_KEY),
+  );
+  let channelId = restoreTabChannel();
+  const legacy = parseLegacySession(
+    sessionStorage.getItem(LEGACY_SESSION_KEY),
+  );
+
+  if (!token && legacy) {
+    token = legacy.token;
+    channelId ??= legacy.channelId;
+    localStorage.setItem(
+      BROWSER_CREDENTIAL_KEY,
+      JSON.stringify({ token: legacy.token }),
+    );
+  } else if (token && legacy?.token === token) {
+    channelId ??= legacy.channelId;
+  }
+
+  if (localStorage.getItem(BROWSER_CREDENTIAL_KEY) && !token) {
+    localStorage.removeItem(BROWSER_CREDENTIAL_KEY);
+  }
+  sessionStorage.removeItem(LEGACY_SESSION_KEY);
+
+  return token ? { channelId, token } : null;
+}
+
+function storeWorkshopAccess(session: WorkshopSession): void {
+  localStorage.setItem(
+    BROWSER_CREDENTIAL_KEY,
+    JSON.stringify({ token: session.token }),
+  );
+  sessionStorage.setItem(
+    TAB_CHANNEL_KEY,
+    JSON.stringify({ channelId: session.channelId }),
+  );
+  sessionStorage.removeItem(LEGACY_SESSION_KEY);
+}
+
+function clearTabSessionState(): void {
+  sessionStorage.removeItem(TAB_CHANNEL_KEY);
+  sessionStorage.removeItem(LEGACY_SESSION_KEY);
   sessionStorage.removeItem(ACTIVE_RUN_KEY);
   sessionStorage.removeItem(DRAFTS_KEY);
   sessionStorage.removeItem(VIEWPORTS_KEY);
+}
+
+function forgetStoredSession(): void {
+  localStorage.removeItem(BROWSER_CREDENTIAL_KEY);
+  clearTabSessionState();
 }
 
 function restoreActiveRunId(channelId: string): string | null {
@@ -511,13 +598,13 @@ function EnrollmentView({
 
           {existingSession ? (
             <p className="session-hint">
-              Enrollment is complete for this tab. Retry Workshop discovery,
-              or forget the session and enroll again.
+              Enrollment is complete for this browser profile. Retry Workshop
+              discovery, or forget the session and enroll again.
             </p>
           ) : (
             <p className="card-copy">
-              The session credential remains in this tab only and is never
-              written to the URL or permanent browser storage.
+              The session credential remains in this browser profile for this
+              Kai origin and is never written to the URL.
             </p>
           )}
 
@@ -2200,18 +2287,54 @@ function ActiveWorkshopClient({
 
 function WorkshopApp(): React.JSX.Element {
   const confirm = useConfirmation();
-  const [session, setSession] = useState<WorkshopSession | null>(() =>
-    restoreSession(),
+  const [access, setAccess] = useState<RestoredWorkshopAccess | null>(() =>
+    restoreWorkshopAccess(),
   );
+  const [session, setSession] = useState<WorkshopSession | null>(null);
   const [navigation, setNavigation] = useState<WorkshopNavigation | null>(null);
   const [view, setView] = useState<"enrollment" | "workshop">(() =>
-    sessionStorage.getItem(SESSION_KEY) ? "workshop" : "enrollment",
+    access ? "workshop" : "enrollment",
   );
   const [notice, setNotice] = useState<string | null>(null);
   const [destination, setDestination] = useState<WorkshopDestination>(
     destinationFromLocation,
   );
   const [settingsDirty, setSettingsDirty] = useState(false);
+
+  useEffect(() => {
+    const synchronizeBrowserCredential = (event: StorageEvent): void => {
+      if (
+        event.storageArea !== localStorage ||
+        event.key !== BROWSER_CREDENTIAL_KEY
+      ) {
+        return;
+      }
+      const token = restoreBrowserCredential(event.newValue);
+      if (!token) {
+        clearTabSessionState();
+        clearWorkshopThemeHint();
+        setAccess(null);
+        setSession(null);
+        setNavigation(null);
+        setNotice("Workshop session was forgotten in another tab.");
+        setView("enrollment");
+        setSettingsDirty(false);
+        return;
+      }
+      if (token === access?.token) {
+        return;
+      }
+      setAccess({ channelId: restoreTabChannel(), token });
+      setSession(null);
+      setNavigation(null);
+      setNotice(null);
+      setView("workshop");
+      setSettingsDirty(false);
+    };
+    window.addEventListener("storage", synchronizeBrowserCredential);
+    return () =>
+      window.removeEventListener("storage", synchronizeBrowserCredential);
+  }, [access?.token]);
 
   useEffect(() => {
     const restoreDestination = async (): Promise<void> => {
@@ -2235,6 +2358,7 @@ function WorkshopApp(): React.JSX.Element {
   const forgetSession = useCallback((message: string | null = null): void => {
     forgetStoredSession();
     clearWorkshopThemeHint();
+    setAccess(null);
     setSession(null);
     setNavigation(null);
     setNotice(message);
@@ -2259,7 +2383,8 @@ function WorkshopApp(): React.JSX.Element {
         throw new Error("This Workshop account has no accessible channels.");
       }
       const nextSession = { channelId: selected.channel.channelId, token };
-      storeSession(nextSession);
+      storeWorkshopAccess(nextSession);
+      setAccess({ channelId: nextSession.channelId, token });
       setSession(nextSession);
       setNavigation(discovered);
       applyWorkshopTheme(appearance.themeId);
@@ -2270,17 +2395,22 @@ function WorkshopApp(): React.JSX.Element {
   );
 
   useEffect(() => {
-    if (view !== "workshop" || !session || navigation) {
+    if (view !== "workshop" || !access || navigation) {
       return;
     }
     let cancelled = false;
     void Promise.all([
-      loadNavigation(session.token),
-      loadAppearancePreferences({ token: session.token }),
+      loadNavigation(access.token),
+      loadAppearancePreferences({ token: access.token }),
     ])
       .then(([discovered, appearance]) => {
         if (!cancelled) {
-          adoptNavigation(session.token, discovered, session.channelId, appearance);
+          adoptNavigation(
+            access.token,
+            discovered,
+            access.channelId,
+            appearance,
+          );
         }
       })
       .catch((caught: unknown) => {
@@ -2301,7 +2431,7 @@ function WorkshopApp(): React.JSX.Element {
     return () => {
       cancelled = true;
     };
-  }, [adoptNavigation, forgetSession, navigation, session, view]);
+  }, [access, adoptNavigation, forgetSession, navigation, view]);
 
   const openChannel = async ({
     deviceDisplayName,
@@ -2311,13 +2441,13 @@ function WorkshopApp(): React.JSX.Element {
     enrollmentToken: string;
   }): Promise<void> => {
     const token =
-      session?.token ??
+      access?.token ??
       (await redeemEnrollment(enrollmentToken, deviceDisplayName));
     const [discovered, appearance] = await Promise.all([
       loadNavigation(token),
       loadAppearancePreferences({ token }),
     ]);
-    adoptNavigation(token, discovered, session?.channelId ?? null, appearance);
+    adoptNavigation(token, discovered, access?.channelId ?? null, appearance);
   };
 
   const refreshChannelAccess = useCallback(async (message: string): Promise<void> => {
@@ -2361,7 +2491,7 @@ function WorkshopApp(): React.JSX.Element {
       return;
     }
     const nextSession = { ...session, channelId };
-    storeSession(nextSession);
+    storeWorkshopAccess(nextSession);
     setSession(nextSession);
     const nextDestination: WorkshopDestination = { kind: "conversation" };
     setDestination(nextDestination);
@@ -2396,8 +2526,8 @@ function WorkshopApp(): React.JSX.Element {
   if (view === "enrollment") {
     return (
       <EnrollmentView
-        key={`${session ? "correction" : "fresh"}:${notice ?? ""}`}
-        existingSession={session !== null}
+        key={`${access ? "correction" : "fresh"}:${notice ?? ""}`}
+        existingSession={access !== null}
         notice={notice}
         onForget={() => forgetSession()}
         onOpen={openChannel}

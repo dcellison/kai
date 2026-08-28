@@ -258,6 +258,7 @@ describe("Workshop React client", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
     sessionStorage.clear();
     window.history.replaceState(null, "", "/workshop/");
     handlers = null;
@@ -427,9 +428,13 @@ describe("Workshop React client", () => {
       "Workshop browser",
     );
     expect(loadNavigation).toHaveBeenCalledWith("redeemed-session-token");
-    expect(sessionStorage.getItem("kai.workshop.read-session.v1")).toContain(
+    expect(localStorage.getItem("kai.workshop.client-credential.v1")).toContain(
       "redeemed-session-token",
     );
+    expect(sessionStorage.getItem("kai.workshop.active-channel.v1")).toContain(
+      channelId,
+    );
+    expect(sessionStorage.getItem("kai.workshop.read-session.v1")).toBeNull();
 
     const liveMessage: TimelineMessage = {
       ...historyMessage,
@@ -443,6 +448,72 @@ describe("Workshop React client", () => {
 
     expect(await screen.findByText(liveMessage.body)).toBeVisible();
     expect(container.querySelector("img")).toBeNull();
+  });
+
+  it("opens a new tab from the browser-scoped credential", async () => {
+    localStorage.setItem(
+      "kai.workshop.client-credential.v1",
+      JSON.stringify({ token: "browser-session" }),
+    );
+
+    render(<App />);
+
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+    expect(loadNavigation).toHaveBeenCalledWith("browser-session");
+    expect(loadTimeline).toHaveBeenCalledWith(
+      { channelId, token: "browser-session" },
+      expect.anything(),
+    );
+    expect(sessionStorage.getItem("kai.workshop.active-channel.v1")).toContain(
+      channelId,
+    );
+    expect(redeemEnrollment).not.toHaveBeenCalled();
+  });
+
+  it("migrates the legacy tab credential without re-enrollment", async () => {
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "legacy-session" }),
+    );
+
+    render(<App />);
+
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+    expect(localStorage.getItem("kai.workshop.client-credential.v1")).toContain(
+      "legacy-session",
+    );
+    expect(sessionStorage.getItem("kai.workshop.active-channel.v1")).toContain(
+      channelId,
+    );
+    expect(sessionStorage.getItem("kai.workshop.read-session.v1")).toBeNull();
+    expect(redeemEnrollment).not.toHaveBeenCalled();
+  });
+
+  it("forgets the browser credential across open tabs", async () => {
+    localStorage.setItem(
+      "kai.workshop.client-credential.v1",
+      JSON.stringify({ token: "browser-session" }),
+    );
+    render(<App />);
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+
+    localStorage.removeItem("kai.workshop.client-credential.v1");
+    act(() =>
+      window.dispatchEvent(
+        new StorageEvent("storage", {
+          key: "kai.workshop.client-credential.v1",
+          newValue: null,
+          oldValue: JSON.stringify({ token: "browser-session" }),
+          storageArea: localStorage,
+        }),
+      ),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Workshop session was forgotten in another tab.",
+    );
+    expect(screen.getByLabelText("Enrollment token")).toBeVisible();
+    expect(sessionStorage.getItem("kai.workshop.active-channel.v1")).toBeNull();
   });
 
   it("restores a credential-free Memory deep link and returns to conversations", async () => {
@@ -1067,7 +1138,9 @@ describe("Workshop React client", () => {
     act(() => failStream?.(new AuthenticationError("Session revoked.")));
 
     expect(await screen.findByRole("alert")).toHaveTextContent("Session revoked.");
+    expect(localStorage.getItem("kai.workshop.client-credential.v1")).toBeNull();
     expect(sessionStorage.getItem("kai.workshop.read-session.v1")).toBeNull();
+    expect(sessionStorage.getItem("kai.workshop.active-channel.v1")).toBeNull();
     expect(screen.getByLabelText("Enrollment token")).toBeVisible();
   });
 
@@ -1103,10 +1176,10 @@ describe("Workshop React client", () => {
       (await screen.findAllByRole("heading", { name: /Replacement channel/ })).length,
     ).toBeGreaterThan(0);
     expect(screen.queryByLabelText("Enrollment token")).toBeNull();
-    expect(sessionStorage.getItem("kai.workshop.read-session.v1")).toContain(
+    expect(localStorage.getItem("kai.workshop.client-credential.v1")).toContain(
       "existing-session",
     );
-    expect(sessionStorage.getItem("kai.workshop.read-session.v1")).toContain(
+    expect(sessionStorage.getItem("kai.workshop.active-channel.v1")).toContain(
       secondChannelId,
     );
   });
@@ -1147,7 +1220,7 @@ describe("Workshop React client", () => {
     expect(document.querySelector(".notification-row")).not.toBeNull();
     expect(screen.queryByLabelText("Message Kai")).toBeNull();
     expect(screen.getByText(/outbound-only/)).toBeVisible();
-    expect(sessionStorage.getItem("kai.workshop.read-session.v1")).toContain(
+    expect(sessionStorage.getItem("kai.workshop.active-channel.v1")).toContain(
       notificationChannelId,
     );
 
