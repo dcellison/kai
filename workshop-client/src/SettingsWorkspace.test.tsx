@@ -335,6 +335,15 @@ function renderSettings(
   );
 }
 
+async function acceptConfirmation(
+  user: ReturnType<typeof userEvent.setup>,
+  message: string | RegExp,
+): Promise<void> {
+  const dialog = await screen.findByRole("dialog", { name: "Continue?" });
+  expect(within(dialog).getByText(message)).toBeVisible();
+  await user.click(within(dialog).getByRole("button", { name: "Continue" }));
+}
+
 describe("Settings workspace", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -574,12 +583,16 @@ describe("Settings workspace", () => {
     expect(within(comparison as HTMLElement).getByText("My reviewed draft")).toBeVisible();
     expect(within(comparison as HTMLElement).getByText(/Latest elsewhere/)).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Reapply my draft…" }));
+    await acceptConfirmation(
+      user,
+      "Replace the latest saved preferences with your reviewed draft?",
+    );
 
-    expect(savePreferenceDocument).toHaveBeenLastCalledWith(
+    await waitFor(() => expect(savePreferenceDocument).toHaveBeenLastCalledWith(
       session,
       "My reviewed draft",
       "pref_latest",
-    );
+    ));
   });
 
   it("confirms and restores a private preference revision", async () => {
@@ -588,8 +601,8 @@ describe("Settings workspace", () => {
     await screen.findByLabelText("Preference Markdown");
     await user.click(screen.getByText("Private revision history (1)"));
     await user.click(screen.getByRole("button", { name: "Restore…" }));
-
-    expect(window.confirm).toHaveBeenCalledWith(
+    await acceptConfirmation(
+      user,
       "Restore this private preference revision? The current text will be retained in revision history.",
     );
     expect(restorePreferenceRevision).toHaveBeenCalledWith(
@@ -623,6 +636,7 @@ describe("Settings workspace", () => {
     const runtimeForm = runtimeTimeout.closest("form");
     expect(runtimeForm).not.toBeNull();
     await user.click(within(runtimeForm as HTMLFormElement).getByRole("button", { name: "Apply" }));
+    await acceptConfirmation(user, /Change the response timeout/);
 
     expect(updateRuntimeSettings).toHaveBeenCalledWith(
       session,
@@ -632,6 +646,7 @@ describe("Settings workspace", () => {
     expect(await screen.findByText(/provider-session continuity was cleared/)).toBeVisible();
 
     await user.selectOptions(screen.getByLabelText("Active workspace"), "1");
+    await acceptConfirmation(user, /Switch the active workspace/);
     expect(switchWorkspace).toHaveBeenCalledWith(session, "/srv/home", "sws_timeout");
 
     const prompt = screen.getByLabelText("Workspace system prompt");
@@ -639,12 +654,12 @@ describe("Settings workspace", () => {
     const promptForm = prompt.closest("form");
     expect(promptForm).not.toBeNull();
     await user.click(within(promptForm as HTMLFormElement).getByRole("button", { name: "Apply" }));
+    await acceptConfirmation(user, /Apply this system prompt/);
     expect(updateWorkspaceConfig).toHaveBeenCalledWith(
       session,
       "sws_workspace",
       { field: "prompt", value: "Use the project conventions." },
     );
-    expect(window.confirm).toHaveBeenCalled();
   });
 
   it("switches only the authenticated principal's backend after confirmation", async () => {
@@ -671,8 +686,8 @@ describe("Settings workspace", () => {
 
     await user.selectOptions(backend, "codex:openai");
     await user.click(screen.getByRole("button", { name: "Switch backend" }));
-
-    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining("other people and Kai itself will not restart"));
+    await acceptConfirmation(user, /other people and Kai itself will not restart/);
+    expect(window.confirm).not.toHaveBeenCalled();
     expect(updateRuntimeSettings).toHaveBeenCalledWith(
       session,
       "sws_current",
@@ -760,7 +775,7 @@ describe("Settings workspace", () => {
 
     await user.type(screen.getByLabelText("GitHub access token"), "replacement-secret");
     await user.click(screen.getByRole("button", { name: "Replace token" }));
-    expect(window.confirm).toHaveBeenCalledWith("Replace the stored GitHub token?");
+    await acceptConfirmation(user, "Replace the stored GitHub token?");
     expect(updateGitHubSettings).toHaveBeenNthCalledWith(
       3,
       session,

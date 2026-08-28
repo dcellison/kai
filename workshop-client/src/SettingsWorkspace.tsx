@@ -48,6 +48,7 @@ import type {
   WorkshopWorkspaceSettingChange,
 } from "./types";
 import { applyWorkshopTheme } from "./theme";
+import { ConfirmationProvider, useConfirmation } from "./ConfirmationDialog";
 
 const VOICE_MODE_LABELS = {
   off: "Text only",
@@ -128,7 +129,7 @@ function errorText(caught: unknown, fallback: string): string {
   return caught instanceof Error ? caught.message : fallback;
 }
 
-export function SettingsWorkspace({
+function SettingsWorkspaceContent({
   onAuthenticationFailure,
   onChannelAccessFailure,
   onClose,
@@ -151,6 +152,7 @@ export function SettingsWorkspace({
   runActive: boolean;
   session: WorkshopSession;
 }): React.JSX.Element {
+  const confirm = useConfirmation();
   const [preference, setPreference] = useState<WorkshopPreferenceDocument | null>(null);
   const [preferenceDraft, setPreferenceDraft] = useState("");
   const [preferenceHistory, setPreferenceHistory] =
@@ -442,7 +444,7 @@ export function SettingsWorkspace({
   };
 
   const removeOperatorModel = async (modelId: string): Promise<void> => {
-    if (!window.confirm(`Deactivate operator model ${modelId}?`)) {
+    if (!await confirm(`Deactivate operator model ${modelId}?`)) {
       return;
     }
     setModelCatalogueBusy(true);
@@ -590,7 +592,7 @@ export function SettingsWorkspace({
   };
 
   const restoreRevision = async (targetRevision: string): Promise<void> => {
-    if (!preference || !window.confirm(
+    if (!preference || !await confirm(
       "Restore this private preference revision? The current text will be retained in revision history.",
     )) {
       return;
@@ -622,7 +624,7 @@ export function SettingsWorkspace({
     change: WorkshopRuntimeSettingsChange,
     confirmation: string,
   ): Promise<void> => {
-    if (!runtime || !window.confirm(confirmation)) {
+    if (!runtime || !await confirm(confirmation)) {
       return;
     }
     setRuntimeBusy(true);
@@ -656,7 +658,7 @@ export function SettingsWorkspace({
     change: WorkshopWorkspaceSettingChange,
     confirmation: string,
   ): Promise<void> => {
-    if (!workspaceConfig || !window.confirm(confirmation)) {
+    if (!workspaceConfig || !await confirm(confirmation)) {
       return;
     }
     setRuntimeBusy(true);
@@ -687,7 +689,7 @@ export function SettingsWorkspace({
     change: WorkshopGitHubSettingsChange,
     confirmation: string | null = null,
   ): Promise<boolean> => {
-    if (!github || (confirmation !== null && !window.confirm(confirmation))) {
+    if (!github || (confirmation !== null && !await confirm(confirmation))) {
       return false;
     }
     setGitHubBusy(true);
@@ -717,7 +719,7 @@ export function SettingsWorkspace({
     change: WorkshopNotificationPreferenceChange,
     confirmation: string | null = null,
   ): Promise<void> => {
-    if (!notifications || (confirmation !== null && !window.confirm(confirmation))) {
+    if (!notifications || (confirmation !== null && !await confirm(confirmation))) {
       return;
     }
     setNotificationBusy(true);
@@ -829,7 +831,7 @@ export function SettingsWorkspace({
   };
 
   const selectWorkspace = async (path: string): Promise<void> => {
-    if (!runtime || path === runtime.workspace || !window.confirm(
+    if (!runtime || path === runtime.workspace || !await confirm(
       "Switch the active workspace? An active runtime may restart and provider-session continuity may be cleared.",
     )) {
       return;
@@ -1013,11 +1015,11 @@ export function SettingsWorkspace({
                   className="primary-button"
                   type="button"
                   disabled={preferenceBusy}
-                  onClick={() => {
-                    if (window.confirm("Replace the latest saved preferences with your reviewed draft?")) {
+                  onClick={() => void (async () => {
+                    if (await confirm("Replace the latest saved preferences with your reviewed draft?")) {
                       void savePreferences(conflictDocument.revision);
                     }
-                  }}
+                  })()}
                 >
                   Reapply my draft…
                 </button>
@@ -1766,5 +1768,15 @@ export function SettingsWorkspace({
         </section>
       </div>
     </section>
+  );
+}
+
+export function SettingsWorkspace(
+  props: React.ComponentProps<typeof SettingsWorkspaceContent>,
+): React.JSX.Element {
+  return (
+    <ConfirmationProvider>
+      <SettingsWorkspaceContent {...props} />
+    </ConfirmationProvider>
   );
 }

@@ -2893,6 +2893,45 @@ button:disabled {
   background: color-mix(in srgb, var(--color-backdrop) 78%, transparent);
 }
 
+.confirmation-backdrop {
+  position: fixed;
+  z-index: 200;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: color-mix(in srgb, var(--color-backdrop) 78%, transparent);
+}
+
+.confirmation-dialog {
+  width: min(32rem, 100%);
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.55rem;
+  padding: 1.2rem;
+  background: var(--color-surface);
+  box-shadow: 0 1rem 3rem color-mix(in srgb, var(--color-overlay-shadow) 45%, transparent);
+}
+
+.confirmation-dialog h2 {
+  margin: 0.25rem 0 0.65rem;
+  color: var(--color-text-strong);
+  font-family: var(--serif);
+  font-size: 1.2rem;
+}
+
+.confirmation-dialog > p:not(.overline) {
+  color: var(--color-text);
+  font-size: 0.8rem;
+  line-height: 1.55;
+}
+
+.confirmation-dialog > div {
+  display: flex;
+  justify-content: end;
+  gap: 0.55rem;
+  margin-top: 1rem;
+}
+
 .memory-confirm {
   width: min(34rem, 100%);
   max-height: min(42rem, calc(100vh - 2rem));
