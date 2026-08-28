@@ -367,8 +367,8 @@ describe("Settings workspace", () => {
     });
     vi.mocked(refreshModelCatalogue).mockResolvedValue(modelCatalogue);
     vi.mocked(refreshAllModelCatalogues).mockResolvedValue({
-      contexts: 2,
-      statuses: { succeeded: 2 },
+      contexts: 7,
+      statuses: { unsupported: 3, succeeded: 3, timed_out: 1 },
     });
     vi.mocked(upsertOperatorModel).mockResolvedValue(modelCatalogue);
     vi.mocked(deactivateOperatorModel).mockResolvedValue(modelCatalogue);
@@ -455,6 +455,11 @@ describe("Settings workspace", () => {
     await waitFor(() => {
       expect(refreshAllModelCatalogues).toHaveBeenCalledWith(session);
     });
+    expect(
+      screen.getByText(
+        "Model catalogue refresh completed across 7 authorized contexts: 3 succeeded, 3 unsupported, 1 timed out.",
+      ),
+    ).toBeVisible();
     expect(updateRuntimeSettings).not.toHaveBeenCalled();
   });
 
