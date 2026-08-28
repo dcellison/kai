@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 40
+WORKSHOP_SCHEMA_VERSION = 41
 
 
 @dataclass(frozen=True, slots=True)
@@ -1969,6 +1969,15 @@ _REUSABLE_GROUP_RUNTIME_ASSIGNMENT_SCHEMA = SchemaMigration(
     ),
 )
 
+_MESSAGE_MENTIONS_SCHEMA = SchemaMigration(
+    version=41,
+    name="canonical_message_mentions",
+    statements=(
+        "ALTER TABLE messages ADD COLUMN mentions_json TEXT NOT NULL DEFAULT '[]' "
+        "CHECK (json_valid(mentions_json) AND json_type(mentions_json) = 'array')",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2010,6 +2019,7 @@ _MIGRATIONS = (
     _DURABLE_PRINCIPAL_APPEARANCE_PREFERENCES_SCHEMA,
     _CANONICAL_MODEL_CATALOGUE_SCHEMA,
     _REUSABLE_GROUP_RUNTIME_ASSIGNMENT_SCHEMA,
+    _MESSAGE_MENTIONS_SCHEMA,
 )
 
 

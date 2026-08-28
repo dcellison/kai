@@ -140,6 +140,26 @@ class MessageId(OpaqueId):
     prefix = "msg"
 
 
+@dataclass(frozen=True, slots=True)
+class MessageMention:
+    """One principal mention resolved when a canonical message is accepted."""
+
+    principal_id: PrincipalId
+    kind: str
+    start: int
+    length: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.principal_id, PrincipalId):
+            raise ValueError("principal_id must be a PrincipalId")
+        if self.kind not in {"human", "agent"}:
+            raise ValueError("kind must be human or agent")
+        if not isinstance(self.start, int) or isinstance(self.start, bool) or self.start < 0:
+            raise ValueError("start must be a non-negative integer")
+        if not isinstance(self.length, int) or isinstance(self.length, bool) or self.length <= 1:
+            raise ValueError("length must include @ and a non-empty display name")
+
+
 class ArtifactId(OpaqueId):
     prefix = "art"
 

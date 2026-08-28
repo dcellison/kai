@@ -2540,6 +2540,15 @@ def _serialize_message(message: TimelineMessage) -> dict[str, object]:
         "body": message.body,
         "event_position": message.event_position,
         "created_at": _format_timestamp(message.created_at),
+        "mentions": [
+            {
+                "principal_id": str(mention.principal_id),
+                "kind": mention.kind,
+                "start": mention.start,
+                "length": mention.length,
+            }
+            for mention in message.mentions
+        ],
         "artifacts": [_serialize_artifact(artifact) for artifact in message.artifacts],
     }
 

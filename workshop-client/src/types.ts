@@ -415,7 +415,15 @@ export interface TimelineMessage {
   channelId: string;
   createdAt: string;
   eventPosition: number;
+  mentions: WorkshopMessageMention[];
   messageId: string;
+}
+
+export interface WorkshopMessageMention {
+  kind: "human" | "agent";
+  length: number;
+  principalId: string;
+  start: number;
 }
 
 export type WorkshopArtifactKind = "photo" | "document" | "voice";

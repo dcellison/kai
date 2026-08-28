@@ -61,6 +61,7 @@ function message(position: number, body = `Message ${position}`): Record<string,
     created_at: "2026-08-13T09:00:00Z",
     event_position: position,
     message_id: `msg_${position.toString().padStart(32, "0")}`,
+    mentions: [],
   };
 }
 
@@ -392,6 +393,42 @@ describe("Workshop client API", () => {
     expect(new Headers(options.headers).get("Authorization")).toBe(
       "Bearer session-secret",
     );
+  });
+
+  it("accepts canonical mention spans without reparsing display names", async () => {
+    const rawMessage = message(10, "Ask @kAi");
+    rawMessage.mentions = [
+      {
+        principal_id: "prn_00000000000000000000000000000002",
+        kind: "agent",
+        start: 4,
+        length: 4,
+      },
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json({
+          version: 1,
+          channel_id: channelId,
+          messages: [rawMessage],
+          next_cursor: null,
+          previous_cursor: null,
+          through_position: 10,
+        }),
+      ),
+    );
+
+    const snapshot = await loadTimeline(session, new AbortController().signal);
+
+    expect(snapshot.messages[0]?.mentions).toEqual([
+      {
+        principalId: "prn_00000000000000000000000000000002",
+        kind: "agent",
+        start: 4,
+        length: 4,
+      },
+    ]);
   });
 
   it("loads an earlier page from the same snapshot via its cursor", async () => {

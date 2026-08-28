@@ -15,6 +15,7 @@ from kai.workshop.timeline import (
     TimelineMessage,
     TimelineResumeError,
     is_internal_scheduled_invocation,
+    parse_message_mentions_json,
 )
 
 _MAX_BATCH_SIZE = 100
@@ -160,6 +161,7 @@ async def read_client_channel_events(
         "m.id AS message_id, m.channel_id AS message_channel_id, "
         "m.author_principal_id, p.kind AS author_kind, p.display_name AS author_display_name, "
         "m.reply_to_message_id, m.body, m.created_at AS message_created_at, "
+        "m.mentions_json, "
         "e.metadata_json AS message_metadata_json, r.id AS run_id "
         "FROM event_log e "
         "LEFT JOIN messages m ON m.created_event_position = e.position "
@@ -206,6 +208,7 @@ async def read_client_channel_events(
                         body=str(row["body"]),
                         event_position=position,
                         created_at=_parse_timestamp(row["message_created_at"]),
+                        mentions=parse_message_mentions_json(row["mentions_json"]),
                         artifacts=artifact_map.get(message_id, ()),
                     )
                 )
