@@ -54,6 +54,7 @@ import { startArtifactDownload } from "./artifactDownload";
 import { MemoryExplorer } from "./MemoryExplorer";
 import { SettingsWorkspace } from "./SettingsWorkspace";
 import { applyWorkshopTheme, clearWorkshopThemeHint } from "./theme";
+import { ConfirmationProvider, useConfirmation } from "./ConfirmationDialog";
 
 const SESSION_KEY = "kai.workshop.read-session.v1";
 const ACTIVE_RUN_KEY = "kai.workshop.active-run.v1";
@@ -2175,7 +2176,8 @@ function ActiveWorkshopClient({
   );
 }
 
-export default function App(): React.JSX.Element {
+function WorkshopApp(): React.JSX.Element {
+  const confirm = useConfirmation();
   const [session, setSession] = useState<WorkshopSession | null>(() =>
     restoreSession(),
   );
@@ -2190,22 +2192,23 @@ export default function App(): React.JSX.Element {
   const [settingsDirty, setSettingsDirty] = useState(false);
 
   useEffect(() => {
-    const restoreDestination = (): void => {
+    const restoreDestination = async (): Promise<void> => {
       const restored = destinationFromLocation();
       if (
         destination.kind === "settings" &&
         restored.kind !== "settings" &&
         settingsDirty &&
-        !window.confirm("Discard unsaved preference changes?")
+        !await confirm("Discard unsaved preference changes?")
       ) {
         writeDestination({ kind: "settings" }, "push");
         return;
       }
       setDestination(restored);
     };
-    window.addEventListener("popstate", restoreDestination);
-    return () => window.removeEventListener("popstate", restoreDestination);
-  }, [destination, settingsDirty]);
+    const handlePopState = (): void => { void restoreDestination(); };
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, [confirm, destination, settingsDirty]);
 
   const forgetSession = useCallback((message: string | null = null): void => {
     forgetStoredSession();
@@ -2324,14 +2327,14 @@ export default function App(): React.JSX.Element {
     [refreshChannelAccess],
   );
 
-  const selectChannel = (channelId: string): void => {
+  const selectChannel = async (channelId: string): Promise<void> => {
     if (!session || !navigation || !findNavigationChannel(navigation, channelId)) {
       return;
     }
     if (
       destination.kind === "settings" &&
       settingsDirty &&
-      !window.confirm("Discard unsaved preference changes?")
+      !await confirm("Discard unsaved preference changes?")
     ) {
       return;
     }
@@ -2343,11 +2346,11 @@ export default function App(): React.JSX.Element {
     writeDestination(nextDestination, "push");
   };
 
-  const openMemory = (): void => {
+  const openMemory = async (): Promise<void> => {
     if (
       destination.kind === "settings" &&
       settingsDirty &&
-      !window.confirm("Discard unsaved preference changes?")
+      !await confirm("Discard unsaved preference changes?")
     ) {
       return;
     }
@@ -2393,11 +2396,19 @@ export default function App(): React.JSX.Element {
       onAuthenticationFailure={handleAuthenticationFailure}
       onChannelAccessFailure={handleChannelAccessFailure}
       onForget={() => forgetSession()}
-      onOpenMemory={openMemory}
+      onOpenMemory={() => void openMemory()}
       onOpenSettings={openSettings}
-      onSelectChannel={selectChannel}
+      onSelectChannel={(channelId) => void selectChannel(channelId)}
       onSelectMemory={selectMemory}
       onSettingsDirtyChange={setSettingsDirty}
     />
+  );
+}
+
+export default function App(): React.JSX.Element {
+  return (
+    <ConfirmationProvider>
+      <WorkshopApp />
+    </ConfirmationProvider>
   );
 }

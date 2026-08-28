@@ -24,6 +24,7 @@ import {
   searchMemories,
 } from "./api";
 import { MarkdownMessage } from "./MarkdownMessage";
+import { ConfirmationProvider, useConfirmation } from "./ConfirmationDialog";
 import type {
   WorkshopMemoryDetail,
   WorkshopMemoryEpisodeFields,
@@ -150,6 +151,7 @@ function MemoryEditorDialog({
   onSaved: (record: WorkshopMemoryDetail, message: string) => void;
   token: string;
 }): React.JSX.Element {
+  const confirm = useConfirmation();
   const episode = detail?.episode;
   const [content, setContent] = useState(detail?.content ?? "");
   const [tags, setTags] = useState((episode?.tags ?? detail?.tags ?? []).join(", "));
@@ -188,8 +190,8 @@ function MemoryEditorDialog({
     return () => window.removeEventListener("beforeunload", warn);
   }, [dirty]);
 
-  const closeSafely = (): void => {
-    if (dirty && !window.confirm("Discard your unsaved memory changes?")) return;
+  const closeSafely = async (): Promise<void> => {
+    if (dirty && !await confirm("Discard your unsaved memory changes?")) return;
     onClose();
   };
 
@@ -264,7 +266,7 @@ function MemoryEditorDialog({
               {editing ? `Correct ${isEpisode ? "episode" : "fact"}` : "Create fact"}
             </h2>
           </div>
-          <button type="button" className="quiet-button" disabled={saving} onClick={closeSafely}>Close</button>
+          <button type="button" className="quiet-button" disabled={saving} onClick={() => void closeSafely()}>Close</button>
         </header>
         <form onSubmit={(event) => void submit(event)}>
           {isEpisode ? (
@@ -329,7 +331,7 @@ function MemoryEditorDialog({
             {conflict && (
               <button type="button" className="quiet-button" onClick={onReload}>Reload latest</button>
             )}
-            <button type="button" className="quiet-button" disabled={saving} onClick={closeSafely}>Cancel</button>
+            <button type="button" className="quiet-button" disabled={saving} onClick={() => void closeSafely()}>Cancel</button>
             <button type="submit" disabled={saving || (editing && !dirty)}>
               {saving ? "Saving…" : editing ? "Save correction" : "Create memory"}
             </button>
@@ -505,7 +507,7 @@ function MemoryDetailPane({
   );
 }
 
-export function MemoryExplorer({
+function MemoryExplorerContent({
   initialMemoryId,
   onAuthenticationFailure,
   onClose,
@@ -1211,5 +1213,15 @@ export function MemoryExplorer({
         />
       )}
     </section>
+  );
+}
+
+export function MemoryExplorer(
+  props: React.ComponentProps<typeof MemoryExplorerContent>,
+): React.JSX.Element {
+  return (
+    <ConfirmationProvider>
+      <MemoryExplorerContent {...props} />
+    </ConfirmationProvider>
   );
 }

@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -534,12 +534,17 @@ describe("Workshop React client", () => {
     await user.type(editor, "Keep this draft.");
     await user.click(screen.getByRole("button", { name: "Scott" }));
 
-    expect(confirm).toHaveBeenCalledWith("Discard unsaved preference changes?");
+    const cancellation = screen.getByRole("dialog", { name: "Continue?" });
+    expect(cancellation).toHaveTextContent("Discard unsaved preference changes?");
+    expect(confirm).not.toHaveBeenCalled();
+    await user.click(within(cancellation).getByRole("button", { name: "Cancel" }));
     expect(screen.getByRole("heading", { name: "Settings", level: 1 })).toBeVisible();
     expect(window.location.search).toBe("?view=settings");
 
-    confirm.mockReturnValue(true);
     await user.click(screen.getByRole("button", { name: "Scott" }));
+    await user.click(within(
+      screen.getByRole("dialog", { name: "Continue?" }),
+    ).getByRole("button", { name: "Continue" }));
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
     expect(window.location.search).toBe("");
   });

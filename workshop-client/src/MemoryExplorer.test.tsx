@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -459,7 +459,10 @@ describe("Workshop Memory explorer", () => {
     await user.clear(content);
     await user.type(content, "Corrected semantic wording.");
     await user.click(screen.getByRole("button", { name: "Cancel" }));
-    expect(confirm).toHaveBeenCalledOnce();
+    const confirmation = screen.getByRole("dialog", { name: "Continue?" });
+    expect(confirmation).toHaveTextContent("Discard your unsaved memory changes?");
+    expect(confirm).not.toHaveBeenCalled();
+    await user.click(within(confirmation).getByRole("button", { name: "Cancel" }));
     expect(screen.getByRole("dialog", { name: "Correct fact" })).toBeVisible();
 
     await user.click(screen.getByRole("button", { name: "Save correction" }));
