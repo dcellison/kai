@@ -79,6 +79,32 @@ function formatDate(value: string | null): string {
       }).format(parsed);
 }
 
+const MODEL_REFRESH_STATUS_ORDER = [
+  "succeeded",
+  "unsupported",
+  "failed",
+  "timed_out",
+  "malformed",
+  "invalidated",
+  "refreshing",
+] as const;
+
+function modelRefreshNotice(contexts: number, statuses: Record<string, number>): string {
+  const order = new Map<string, number>(
+    MODEL_REFRESH_STATUS_ORDER.map((status, index) => [status, index]),
+  );
+  const summary = Object.entries(statuses)
+    .filter(([, count]) => count > 0)
+    .sort(([left], [right]) => (
+      (order.get(left) ?? MODEL_REFRESH_STATUS_ORDER.length)
+      - (order.get(right) ?? MODEL_REFRESH_STATUS_ORDER.length)
+      || left.localeCompare(right)
+    ))
+    .map(([status, count]) => `${count} ${status.replaceAll("_", " ")}`)
+    .join(", ");
+  return `Model catalogue refresh completed across ${contexts} authorized contexts${summary ? `: ${summary}` : ""}.`;
+}
+
 function capability(
   capabilities: WorkshopEditableCapability[],
   field: string,
@@ -380,7 +406,7 @@ export function SettingsWorkspace({
     setModelCatalogueError(null);
     try {
       const result = await refreshAllModelCatalogues(session);
-      setRuntimeNotice(`Refreshed ${result.contexts} authorized model-catalogue contexts.`);
+      setRuntimeNotice(modelRefreshNotice(result.contexts, result.statuses));
       setModelCatalogue(await loadModelCatalogue(session, runtimeBackend));
     } catch (caught) {
       if (!handleAccessFailure(caught)) {
