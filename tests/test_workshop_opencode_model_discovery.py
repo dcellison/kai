@@ -92,23 +92,45 @@ def _lane(
     )
 
 
-def _model(model_id: str, *, name: str = "Claude Sonnet") -> dict[str, object]:
-    return {
-        "id": model_id,
-        "name": name,
-        "release_date": "2026-08-01",
-        "attachment": True,
-        "reasoning": True,
-        "temperature": True,
-        "tool_call": True,
-        "cost": {"input": 1, "output": 2},
-        "limit": {"context": 200_000, "output": 64_000},
-        "modalities": {"input": ["text", "image"], "output": ["text"]},
-        "status": "active",
-        "experimental": False,
-        "options": {"apiKey": "provider-secret"},
-        "headers": {"authorization": "Bearer provider-secret"},
-    }
+def _fake_command(
+    tmp_path: Path,
+    *,
+    stdout: bytes = b"",
+    stderr: bytes = b"",
+    returncode: int = 0,
+) -> tuple[Path, Path]:
+    executable = tmp_path / "opencode-fixture"
+    invocation_log = tmp_path / "invocation.json"
+    stdout_value = base64.b64encode(stdout).decode("ascii")
+    stderr_value = base64.b64encode(stderr).decode("ascii")
+    script = f"""#!{sys.executable}
+import base64
+import json
+import os
+import sys
+from pathlib import Path
+
+Path({str(invocation_log)!r}).write_text(json.dumps({{
+    "argv": sys.argv[1:],
+    "environment": {{
+        key: os.environ.get(key)
+        for key in (
+            "NO_COLOR",
+            "OPENROUTER_API_KEY",
+            "OPENCODE_CONFIG_CONTENT",
+            "TELEGRAM_BOT_TOKEN",
+        )
+    }},
+}}), encoding="utf-8")
+sys.stdout.buffer.write(base64.b64decode({stdout_value!r}))
+sys.stdout.buffer.flush()
+sys.stderr.buffer.write(base64.b64decode({stderr_value!r}))
+sys.stderr.buffer.flush()
+raise SystemExit({returncode})
+"""
+    executable.write_text(script, encoding="utf-8")
+    executable.chmod(0o700)
+    return executable, invocation_log
 
 
 def test_registered_adapter_sources_are_valid_canonical_catalogue_ids() -> None:
@@ -123,155 +145,106 @@ def test_registered_adapter_sources_are_valid_canonical_catalogue_ids() -> None:
         assert normalized.source == source
 
 
-def _fake_server(
-    tmp_path: Path,
-    payload: object,
-) -> tuple[Path, Path]:
-    executable = tmp_path / "opencode-fixture"
-    request_log = tmp_path / "requests.jsonl"
-    encoded_payload = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
-    script = f"""#!{sys.executable}
-import argparse
-import base64
-import json
-import os
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
-parser = argparse.ArgumentParser()
-parser.add_argument("command")
-parser.add_argument("--hostname", required=True)
-parser.add_argument("--port", required=True, type=int)
-args = parser.parse_args()
-payload = base64.b64decode({encoded_payload!r})
-request_log = {str(request_log)!r}
-expected = "Basic " + base64.b64encode(
-    (os.environ["OPENCODE_SERVER_USERNAME"] + ":" + os.environ["OPENCODE_SERVER_PASSWORD"]).encode()
-).decode()
-
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        with open(request_log, "a", encoding="utf-8") as output:
-            output.write(json.dumps({{
-                "path": self.path,
-                "authenticated": self.headers.get("Authorization") == expected,
-            }}) + "\\n")
-        if self.headers.get("Authorization") != expected:
-            self.send_response(401)
-            self.end_headers()
-            return
-        if self.path == "/global/health":
-            body = b'{{"healthy":true,"version":"fixture"}}'
-        elif self.path.startswith("/provider?"):
-            body = payload
-        else:
-            self.send_response(404)
-            self.end_headers()
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format, *args):
-        pass
-
-HTTPServer((args.hostname, args.port), Handler).serve_forever()
-"""
-    executable.write_text(script, encoding="utf-8")
-    executable.chmod(0o700)
-    return executable, request_log
-
-
-async def test_adapter_reads_connected_provider_without_generation_and_preserves_nested_ids(
+async def test_adapter_uses_documented_metadata_command_and_preserves_nested_ids(
     tmp_path: Path,
 ) -> None:
-    model_id = "anthropic/claude-sonnet-4-6"
-    payload = {
-        "all": [
-            {
-                "id": "openrouter",
-                "name": "OpenRouter",
-                "models": {model_id: _model(model_id)},
-                "options": {"apiKey": "provider-secret"},
-            }
-        ],
-        "default": {"openrouter": model_id},
-        "connected": ["openrouter"],
-    }
-    executable, request_log = _fake_server(tmp_path, payload)
+    executable, invocation_log = _fake_command(
+        tmp_path,
+        stdout=(b"openrouter/anthropic/claude-sonnet-4-6\nopenrouter/meta/llama/3\n"),
+    )
     current_user = pwd.getpwuid(os.getuid()).pw_name
     adapter = OpenCodeModelDiscoveryAdapter(service_os_user=current_user, environment={})
 
     batch = await adapter.discover(_lane(executable, os_user=current_user))
 
-    assert batch.source == "opencode-server-provider"
+    assert batch.source == "opencode-cli-models"
     assert batch.ttl_seconds == 21_600
-    assert [candidate.model_id for candidate in batch.models] == ["openrouter/anthropic/claude-sonnet-4-6"]
-    assert batch.models[0].display_label == "Claude Sonnet"
-    assert batch.models[0].capabilities == {
-        "attachment": True,
-        "experimental": False,
-        "limits": {"context": 200_000, "output": 64_000},
-        "modalities": {"input": ["text", "image"], "output": ["text"]},
-        "provider_name": "OpenRouter",
-        "reasoning": True,
-        "release_date": "2026-08-01",
-        "status": "active",
-        "temperature": True,
-        "tool_call": True,
-    }
-    assert "provider-secret" not in repr(batch)
-    requests = [json.loads(line) for line in request_log.read_text(encoding="utf-8").splitlines()]
-    assert [request["path"].split("?", 1)[0] for request in requests] == [
-        "/global/health",
-        "/provider",
+    assert [candidate.model_id for candidate in batch.models] == [
+        "openrouter/anthropic/claude-sonnet-4-6",
+        "openrouter/meta/llama/3",
     ]
-    assert all(request["authenticated"] is True for request in requests)
-    assert "directory=" in requests[1]["path"]
-    assert not any("session" in request["path"] for request in requests)
+    assert [candidate.display_label for candidate in batch.models] == [
+        "openrouter/anthropic/claude-sonnet-4-6",
+        "openrouter/meta/llama/3",
+    ]
+    assert all(candidate.capabilities == {"provider_id": "openrouter"} for candidate in batch.models)
+    invocation = json.loads(invocation_log.read_text(encoding="utf-8"))
+    assert invocation["argv"] == ["models", "openrouter", "--refresh"]
+    assert not {"run", "session", "serve"} & set(invocation["argv"])
+    assert invocation["environment"]["NO_COLOR"] == "1"
 
 
-def test_parser_distinguishes_unavailable_auth_from_unsupported_provider() -> None:
-    model = _model("model")
-    payload = json.dumps(
-        {
-            "all": [{"id": "openrouter", "name": "OpenRouter", "models": {"model": model}}],
-            "connected": [],
-        }
-    ).encode()
-    with pytest.raises(ModelDiscoveryAuthenticationError):
-        discovery_module._parse_provider_catalogue(payload, "openrouter")
-    with pytest.raises(ModelDiscoveryUnsupported):
-        discovery_module._parse_provider_catalogue(payload, "deepseek")
+def test_parser_accepts_empty_inventory_and_nested_model_ids() -> None:
+    assert discovery_module._parse_models_output(b"\n", "deepseek") == ()
+
+    models = discovery_module._parse_models_output(
+        b"deepseek/vendor/family/model\n",
+        "deepseek",
+    )
+
+    assert [model.model_id for model in models] == [
+        "deepseek/vendor/family/model",
+    ]
 
 
-def test_parser_accepts_empty_inventory_and_rejects_malformed_or_mismatched_models() -> None:
-    empty = json.dumps(
-        {
-            "all": [{"id": "openrouter", "name": "OpenRouter", "models": {}}],
-            "connected": ["openrouter"],
-        }
-    ).encode()
-    assert discovery_module._parse_provider_catalogue(empty, "openrouter") == ()
+@pytest.mark.parametrize(
+    ("body", "match"),
+    [
+        (b"\xff", "not UTF-8"),
+        (b"openrouter-model\n", "invalid provider/model"),
+        (b"deepseek/model\n", "invalid provider/model"),
+        (b"openrouter/model\nopenrouter/model\n", "duplicate"),
+    ],
+)
+def test_parser_rejects_malformed_mismatched_and_duplicate_output(
+    body: bytes,
+    match: str,
+) -> None:
+    with pytest.raises(ModelCatalogueValidationError, match=match):
+        discovery_module._parse_models_output(body, "openrouter")
 
-    with pytest.raises(ModelCatalogueValidationError, match="malformed JSON"):
-        discovery_module._parse_provider_catalogue(b"not json", "openrouter")
 
-    mismatched = json.dumps(
-        {
-            "all": [
-                {
-                    "id": "openrouter",
-                    "name": "OpenRouter",
-                    "models": {"catalogue-key": _model("different-id")},
-                }
-            ],
-            "connected": ["openrouter"],
-        }
-    ).encode()
-    with pytest.raises(ModelCatalogueValidationError, match="do not match"):
-        discovery_module._parse_provider_catalogue(mismatched, "openrouter")
+def test_parser_enforces_model_identifier_and_catalogue_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    oversized = b"openrouter/" + (b"x" * 512)
+    with pytest.raises(ModelCatalogueValidationError, match="oversized"):
+        discovery_module._parse_models_output(oversized, "openrouter")
+
+    monkeypatch.setattr(discovery_module, "_MAX_MODELS", 1)
+    with pytest.raises(ModelCatalogueValidationError, match="safety limit"):
+        discovery_module._parse_models_output(
+            b"openrouter/one\nopenrouter/two\n",
+            "openrouter",
+        )
+
+
+@pytest.mark.parametrize(
+    ("detail", "error_type"),
+    [
+        (b"Provider not found: openrouter", ModelDiscoveryAuthenticationError),
+        (b"Unknown command: models", ModelDiscoveryUnsupported),
+        (b"unexpected backend failure", discovery_module._OpenCodeDiscoveryError),
+    ],
+)
+async def test_command_failures_are_classified_without_leaking_output(
+    tmp_path: Path,
+    detail: bytes,
+    error_type: type[Exception],
+) -> None:
+    executable, _invocation_log = _fake_command(
+        tmp_path,
+        stderr=detail,
+        returncode=1,
+    )
+    current_user = pwd.getpwuid(os.getuid()).pw_name
+    adapter = OpenCodeModelDiscoveryAdapter(service_os_user=current_user, environment={})
+
+    with pytest.raises(error_type) as caught:
+        await adapter.discover(_lane(executable, os_user=current_user))
+
+    assert detail.decode() not in str(caught.value)
+    assert detail.decode() not in repr(caught.value)
 
 
 def test_launch_uses_canonical_user_auth_context_and_scrubs_control_plane(
@@ -296,79 +269,71 @@ def test_launch_uses_canonical_user_auth_context_and_scrubs_control_plane(
 
     launch = discovery_module._build_launch(
         _lane(executable, os_user="alice"),
-        port=43123,
         service_os_user="kai",
         environment=environment,
     )
 
-    assert launch.argv[:6] == ("sudo", "-H", "-D", str(alice_home), "-u", "alice")
-    assert launch.argv[-6:] == (
+    assert launch.argv[:6] == (
+        "sudo",
+        "-H",
+        "-D",
+        str(alice_home),
+        "-u",
+        "alice",
+    )
+    assert launch.argv[-4:] == (
         str(executable),
-        "serve",
-        "--hostname",
-        "127.0.0.1",
-        "--port",
-        "43123",
+        "models",
+        "openrouter",
+        "--refresh",
     )
     assert launch.cwd is None
-    assert launch.directory == alice_home
+    assert launch.target_user == "alice"
     assert launch.environment["OPENROUTER_API_KEY"] == "provider-key"
+    assert launch.environment["NO_COLOR"] == "1"
     assert "OPENCODE_CONFIG_CONTENT" not in launch.environment
     assert "TELEGRAM_BOT_TOKEN" not in launch.environment
-    assert launch.environment["OPENCODE_SERVER_USERNAME"] == "kai-model-discovery"
-    assert launch.environment["OPENCODE_SERVER_PASSWORD"] == launch.password
     assert launch.environment["TMPDIR"].endswith("/tmp/alice")
     preserve_arg = next(arg for arg in launch.argv if arg.startswith("--preserve-env="))
-    assert "OPENCODE_SERVER_PASSWORD" in preserve_arg
+    assert "OPENROUTER_API_KEY" in preserve_arg
+    assert "NO_COLOR" in preserve_arg
     assert "TELEGRAM_BOT_TOKEN" not in preserve_arg
 
 
-async def test_startup_timeout_reaps_metadata_server(
+async def test_output_limit_is_enforced_while_streams_are_drained(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    executable = tmp_path / "opencode-hung-fixture"
-    pid_file = tmp_path / "pid"
-    script = f"""#!{sys.executable}
-import os
-import time
-from pathlib import Path
-Path({str(pid_file)!r}).write_text(str(os.getpid()), encoding="utf-8")
-time.sleep(60)
-"""
-    executable.write_text(script, encoding="utf-8")
-    executable.chmod(0o700)
-    monkeypatch.setattr(discovery_module, "_STARTUP_TIMEOUT_SECONDS", 0.5)
+    executable, _invocation_log = _fake_command(
+        tmp_path,
+        stdout=b"openrouter/model-that-is-too-long\n",
+    )
+    monkeypatch.setattr(discovery_module, "_MAX_OUTPUT_BYTES", 8)
     current_user = pwd.getpwuid(os.getuid()).pw_name
     adapter = OpenCodeModelDiscoveryAdapter(service_os_user=current_user, environment={})
 
-    with pytest.raises(discovery_module._OpenCodeDiscoveryError, match="did not become ready"):
+    with pytest.raises(ModelCatalogueValidationError, match="output exceeds"):
         await adapter.discover(_lane(executable, os_user=current_user))
 
-    pid = int(pid_file.read_text(encoding="utf-8"))
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
 
-
-async def test_cancellation_reaps_metadata_server(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_cancellation_reaps_metadata_command(tmp_path: Path) -> None:
     executable = tmp_path / "opencode-cancel-fixture"
     pid_file = tmp_path / "pid"
     script = f"""#!{sys.executable}
 import os
 import time
 from pathlib import Path
+
 Path({str(pid_file)!r}).write_text(str(os.getpid()), encoding="utf-8")
 time.sleep(60)
 """
     executable.write_text(script, encoding="utf-8")
     executable.chmod(0o700)
-    monkeypatch.setattr(discovery_module, "_STARTUP_TIMEOUT_SECONDS", 60.0)
     current_user = pwd.getpwuid(os.getuid()).pw_name
     adapter = OpenCodeModelDiscoveryAdapter(service_os_user=current_user, environment={})
-    task = asyncio.create_task(adapter.discover(_lane(executable, os_user=current_user)))
+    task = asyncio.create_task(
+        adapter.discover(_lane(executable, os_user=current_user)),
+    )
     for _ in range(100):
         if pid_file.exists():
             break
