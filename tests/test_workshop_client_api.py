@@ -1082,7 +1082,10 @@ class TestWorkshopNavigationHTTPContract:
                 "agents": [
                     {
                         "agent_id": direct["agents"][0]["agent_id"],
+                        "principal_id": direct["agents"][0]["principal_id"],
                         "name": "Kai",
+                        "engaged": False,
+                        "engaged_until": None,
                     }
                 ],
                 "participants": [
@@ -1280,7 +1283,15 @@ class TestWorkshopChannelLifecycleHTTPContract:
             assert visible["kind"] == "group"
             assert visible["name"] == "Release planning"
             assert visible["role"] == "owner"
-            assert visible["agents"] == [{"agent_id": agent_id, "name": "Kai"}]
+            assert visible["agents"] == [
+                {
+                    "agent_id": agent_id,
+                    "principal_id": visible["agents"][0]["principal_id"],
+                    "name": "Kai",
+                    "engaged": False,
+                    "engaged_until": None,
+                }
+            ]
             assert visible["can_submit_commands"] is True
 
             history = await WorkshopChannelHistoryRegistry.from_store(

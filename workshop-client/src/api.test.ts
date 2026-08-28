@@ -6,10 +6,12 @@ import {
   PreferenceRevisionConflictError,
   SettingsRevisionConflictError,
   cancelRun,
+  createChannel,
   createMemoryFact,
   deleteMemories,
   deleteMemory,
   deactivateOperatorModel,
+  dismissChannelAgent,
   editMemory,
   loadArtifactBlob,
   loadAppearancePreferences,
@@ -56,6 +58,9 @@ function message(position: number, body = `Message ${position}`): Record<string,
   return {
     author_display_name: position % 2 ? "Daniel" : "Kai",
     author_kind: position % 2 ? "human" : "agent",
+    author_principal_id: position % 2
+      ? "prn_00000000000000000000000000000001"
+      : "prn_00000000000000000000000000000002",
     body,
     channel_id: channelId,
     created_at: "2026-08-13T09:00:00Z",
@@ -1090,6 +1095,9 @@ describe("Workshop client API", () => {
                 agents: [
                   {
                     agent_id: "agt_00000000000000000000000000000001",
+                    principal_id: "prn_00000000000000000000000000000002",
+                    engaged: false,
+                    engaged_until: null,
                     name: "Kai",
                   },
                 ],
@@ -1120,7 +1128,10 @@ describe("Workshop client API", () => {
               agents: [
                 {
                   agentId: "agt_00000000000000000000000000000001",
+                  engaged: false,
+                  engagedUntil: null,
                   name: "Kai",
+                  principalId: "prn_00000000000000000000000000000002",
                 },
               ],
               canSubmitCommands: true,
@@ -1149,6 +1160,60 @@ describe("Workshop client API", () => {
         "Authorization",
       ),
     ).toBe("Bearer session-secret");
+  });
+
+  it("creates a channel with canonical agents and an optional origin", async () => {
+    const createdChannelId = "chn_22222222222222222222222222222222";
+    const fetchMock = vi.fn().mockResolvedValue(
+      Response.json({
+        version: 1,
+        channel: { channel_id: createdChannelId },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      createChannel("session-secret", {
+        agentIds: ["agt_00000000000000000000000000000001"],
+        name: "Release planning",
+        originChannelId: channelId,
+      }),
+    ).resolves.toBe(createdChannelId);
+
+    const [path, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(path).toBe("/v1/channels");
+    expect(new Headers(options.headers).get("Authorization")).toBe(
+      "Bearer session-secret",
+    );
+    expect(JSON.parse(options.body as string)).toEqual({
+      agent_ids: ["agt_00000000000000000000000000000001"],
+      name: "Release planning",
+      origin_channel_id: channelId,
+    });
+  });
+
+  it("dismisses an engaged channel agent under session authority", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      Response.json({ version: 1, dismissed: true, replayed: false }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      dismissChannelAgent(
+        session,
+        "agt_00000000000000000000000000000001",
+        "browser-dismissal-1",
+      ),
+    ).resolves.toBeUndefined();
+
+    const [path, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(path).toBe(
+      `/v1/channels/${channelId}/agents/` +
+        "agt_00000000000000000000000000000001/dismiss",
+    );
+    expect(JSON.parse(options.body as string)).toEqual({
+      client_dismissal_id: "browser-dismissal-1",
+    });
   });
 
   it("submits only the opaque id and body under bearer authority", async () => {

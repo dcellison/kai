@@ -60,4 +60,35 @@ describe("Workshop Markdown messages", () => {
     expect(container.querySelector("a")).toBeNull();
     expect(screen.getByText("unsafe")).toHaveClass("markdown-unsafe-link");
   });
+
+  it("highlights only server-resolved mention offsets", () => {
+    const body = "🧭 @Kai coordinate with @Daniel; leave @Unknown plain.";
+    const { container } = render(
+      <MarkdownMessage
+        body={body}
+        mentions={[
+          {
+            kind: "agent",
+            length: 4,
+            principalId: "prn_00000000000000000000000000000002",
+            start: 2,
+          },
+          {
+            kind: "human",
+            length: 7,
+            principalId: "prn_00000000000000000000000000000001",
+            start: 23,
+          },
+        ]}
+      />,
+    );
+
+    const mentions = container.querySelectorAll(".message-mention");
+    expect(mentions).toHaveLength(2);
+    expect(mentions[0]).toHaveTextContent("@Kai");
+    expect(mentions[0]).toHaveClass("message-mention-agent");
+    expect(mentions[1]).toHaveTextContent("@Daniel");
+    expect(mentions[1]).toHaveClass("message-mention-human");
+    expect(screen.getByText(/@Unknown plain/)).toBeVisible();
+  });
 });

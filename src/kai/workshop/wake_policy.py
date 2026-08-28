@@ -39,6 +39,110 @@ class WakeDecision:
     agent_ids: tuple[AgentId, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class AgentEngagement:
+    agent_id: AgentId
+    engaged_at: datetime
+    expires_at: datetime
+
+
+async def resolve_agent_engagements(
+    store: WorkshopEventStore,
+    scope: EngagementScope,
+    *,
+    current_at: datetime,
+    before_event_position: int | None = None,
+) -> tuple[AgentEngagement, ...]:
+    """Derive the agents currently engaged in one supported conversation scope."""
+    if scope.thread_root_message_id is not None:
+        raise WakePolicyError("Thread-scoped engagement is not available yet")
+    if current_at.tzinfo is None or current_at.utcoffset() is None:
+        raise ValueError("current_at must be timezone-aware")
+    if before_event_position is not None and before_event_position < 1:
+        raise ValueError("before_event_position must be positive")
+    current_at = current_at.astimezone(UTC)
+    async with store.connection.execute(
+        "SELECT c.kind, ca.agent_id, a.principal_id FROM channels c "
+        "LEFT JOIN channel_agents ca ON ca.channel_id = c.id "
+        "LEFT JOIN agents a ON a.id = ca.agent_id WHERE c.id = ? "
+        "ORDER BY ca.agent_id",
+        (scope.channel_id,),
+    ) as cursor:
+        rows = list(await cursor.fetchall())
+    if not rows:
+        raise WakePolicyError("Engagement scope channel is unavailable")
+    if str(rows[0][0]) != "group":
+        return ()
+
+    window_start = current_at - timedelta(seconds=GROUP_AGENT_ENGAGEMENT_WINDOW_SECONDS)
+    engaged: list[AgentEngagement] = []
+    for row in rows:
+        if row[1] is None or row[2] is None:
+            continue
+        agent_id = AgentId(str(row[1]))
+        agent_principal_id = PrincipalId(str(row[2]))
+        position_clause = "AND m.created_event_position < ? " if before_event_position is not None else ""
+        parameters: tuple[object, ...] = (
+            (scope.channel_id, before_event_position) if before_event_position is not None else (scope.channel_id,)
+        ) + (
+            window_start.isoformat(),
+            current_at.isoformat(),
+            agent_principal_id,
+            agent_principal_id,
+        )
+        async with store.connection.execute(
+            "SELECT m.created_at FROM messages m WHERE m.channel_id = ? "
+            + position_clause
+            + "AND m.created_at >= ? AND m.created_at <= ? "
+            "AND (m.author_principal_id = ? OR EXISTS ("
+            "SELECT 1 FROM json_each(m.mentions_json) mention "
+            "WHERE json_extract(mention.value, '$.kind') = 'agent' "
+            "AND json_extract(mention.value, '$.principal_id') = ?)) "
+            "ORDER BY m.created_at DESC, m.created_event_position DESC LIMIT 1",
+            parameters,
+        ) as cursor:
+            engagement_row = await cursor.fetchone()
+        if engagement_row is None:
+            continue
+        engaged_at = str(engagement_row[0])
+        async with store.connection.execute(
+            "SELECT 1 FROM channel_agent_dismissals WHERE channel_id = ? "
+            "AND agent_id = ? AND thread_root_message_id IS NULL "
+            "AND dismissed_at >= ? AND dismissed_at <= ? LIMIT 1",
+            (scope.channel_id, agent_id, engaged_at, current_at.isoformat()),
+        ) as cursor:
+            dismissed = await cursor.fetchone()
+        if dismissed is None:
+            engaged_at_value = datetime.fromisoformat(engaged_at.replace("Z", "+00:00")).astimezone(UTC)
+            engaged.append(
+                AgentEngagement(
+                    agent_id=agent_id,
+                    engaged_at=engaged_at_value,
+                    expires_at=engaged_at_value + timedelta(seconds=GROUP_AGENT_ENGAGEMENT_WINDOW_SECONDS),
+                )
+            )
+    return tuple(engaged)
+
+
+async def resolve_engaged_agents(
+    store: WorkshopEventStore,
+    scope: EngagementScope,
+    *,
+    current_at: datetime,
+    before_event_position: int | None = None,
+) -> tuple[AgentId, ...]:
+    """Return only the engaged agent identities for wake routing."""
+    return tuple(
+        engagement.agent_id
+        for engagement in await resolve_agent_engagements(
+            store,
+            scope,
+            current_at=current_at,
+            before_event_position=before_event_position,
+        )
+    )
+
+
 async def resolve_message_wake_targets(
     store: WorkshopEventStore,
     message_id: MessageId,
@@ -95,42 +199,14 @@ async def resolve_message_wake_targets(
         return WakeDecision(explicitly_mentioned)
 
     current_at = datetime.fromisoformat(str(row[5]).replace("Z", "+00:00")).astimezone(UTC)
-    window_start = current_at - timedelta(seconds=GROUP_AGENT_ENGAGEMENT_WINDOW_SECONDS)
-    current_position = int(row[6])
-    engaged: list[AgentId] = []
-    for agent_id, agent_principal_id in attached:
-        async with store.connection.execute(
-            "SELECT m.created_at FROM messages m "
-            "WHERE m.channel_id = ? AND m.created_event_position < ? "
-            "AND m.created_at >= ? AND m.created_at <= ? "
-            "AND (m.author_principal_id = ? OR EXISTS ("
-            "SELECT 1 FROM json_each(m.mentions_json) mention "
-            "WHERE json_extract(mention.value, '$.kind') = 'agent' "
-            "AND json_extract(mention.value, '$.principal_id') = ?)) "
-            "ORDER BY m.created_at DESC, m.created_event_position DESC LIMIT 1",
-            (
-                channel_id,
-                current_position,
-                window_start.isoformat(),
-                current_at.isoformat(),
-                agent_principal_id,
-                agent_principal_id,
-            ),
-        ) as cursor:
-            engagement_row = await cursor.fetchone()
-        if engagement_row is None:
-            continue
-        engaged_at = str(engagement_row[0])
-        async with store.connection.execute(
-            "SELECT 1 FROM channel_agent_dismissals WHERE channel_id = ? "
-            "AND agent_id = ? AND thread_root_message_id IS NULL "
-            "AND dismissed_at >= ? AND dismissed_at <= ? LIMIT 1",
-            (channel_id, agent_id, engaged_at, current_at.isoformat()),
-        ) as cursor:
-            dismissed = await cursor.fetchone()
-        if dismissed is None:
-            engaged.append(agent_id)
-    return WakeDecision(tuple(engaged))
+    return WakeDecision(
+        await resolve_engaged_agents(
+            store,
+            scope,
+            current_at=current_at,
+            before_event_position=int(row[6]),
+        )
+    )
 
 
 async def dismiss_channel_agent(

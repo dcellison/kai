@@ -28,7 +28,12 @@ from kai.workshop.domain import (
 from kai.workshop.inbound import ClientInboundMessage
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import WorkshopEventStore
-from kai.workshop.wake_policy import EngagementScope, dismiss_channel_agent, resolve_message_wake_targets
+from kai.workshop.wake_policy import (
+    EngagementScope,
+    dismiss_channel_agent,
+    resolve_agent_engagements,
+    resolve_message_wake_targets,
+)
 from tests.workshop_profiles import profile_id
 
 _NOW = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
@@ -215,6 +220,15 @@ async def test_unmentioned_message_wakes_only_engaged_and_dismissal_clears_it(tm
     try:
         service = WorkshopConversationCommandService(store)
         await service.accept_client(_message(human_id, group_id, "engage", "@Kai stay", _NOW))
+        engagement = await resolve_agent_engagements(
+            store,
+            EngagementScope(group_id),
+            current_at=_NOW + timedelta(seconds=1),
+        )
+        assert len(engagement) == 1
+        assert engagement[0].agent_id == agent_ids[0]
+        assert engagement[0].engaged_at == _NOW
+        assert engagement[0].expires_at == _NOW + timedelta(seconds=900)
         engaged = await service.accept_client(
             _message(human_id, group_id, "plain-engaged", "@Daniel continue", _NOW + timedelta(seconds=1))
         )
@@ -227,6 +241,14 @@ async def test_unmentioned_message_wakes_only_engaged_and_dismissal_clears_it(tm
             agent_id=agent_ids[0],
             client_dismissal_id="dismiss-1",
             occurred_at=_NOW + timedelta(seconds=2),
+        )
+        assert (
+            await resolve_agent_engagements(
+                store,
+                EngagementScope(group_id),
+                current_at=_NOW + timedelta(seconds=3),
+            )
+            == ()
         )
         dismissed = await service.accept_client(
             _message(human_id, group_id, "plain-dismissed", "Anyone?", _NOW + timedelta(seconds=3))
