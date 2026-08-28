@@ -5997,6 +5997,7 @@ def _apply_migrate(
     svc_uid: int,
     svc_gid: int,
     dry_run: bool,
+    service_user: str = _DEFAULT_SERVICE_USER,
     users_yaml_path: Path | None = None,
     default_backend: str | None = None,
     runtime_storage_targets: tuple[_RuntimeStorageTarget, ...] | None = None,
@@ -6015,6 +6016,8 @@ def _apply_migrate(
         svc_uid: Numeric UID for file ownership.
         svc_gid: Numeric GID for file ownership.
         dry_run: If True, print actions without executing.
+        service_user: OS account that runs the Kai service and must be able
+            to read files staged by protected runtime users.
         users_yaml_path: Path to the installed users.yaml. None means
             the module-level USERS_YAML (the post-_apply_secrets
             location); tests redirect it by patching that attribute.
@@ -6292,7 +6295,7 @@ def _apply_migrate(
         dry_run,
         reader_users=reader_users,
         outbox_owners=outbox_owners,
-        service_reader_user=(pwd.getpwuid(svc_uid).pw_name if outbox_owners else None),
+        service_reader_user=(service_user if outbox_owners else None),
     )
     _secure_history_directories(
         data_path,
@@ -7254,6 +7257,7 @@ def _cmd_apply() -> None:
             svc_uid,
             svc_gid,
             dry_run,
+            service_user=service_user,
             default_backend=agent_backend,
             runtime_storage_targets=runtime_storage_targets,
         )
