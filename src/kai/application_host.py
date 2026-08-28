@@ -26,6 +26,7 @@ from kai.workshop.client_preferences import (
     ClientVoiceCapability,
     WorkshopClientPreferenceService,
 )
+from kai.workshop.codex_model_discovery import CodexModelDiscoveryAdapter
 from kai.workshop.conversation_runs import WorkshopConversationRunService
 from kai.workshop.delivery_authority import (
     DeliveryAuthorityEpoch,
@@ -312,6 +313,11 @@ class KaiApplicationHost:
                     lane.provider,
                     allowed_models=lane.allowed_models,
                 ),
+                adapters={
+                    "codex": CodexModelDiscoveryAdapter(
+                        service_os_user=pwd.getpwuid(os.geteuid()).pw_name,
+                    )
+                },
             )
             delivery_authority_epoch = (await WorkshopConversationDeliveryAuthority(client_store).activate()).epoch
             private_execution = await WorkshopPrivateTextExecutionService.open_and_start(

@@ -14,6 +14,7 @@ from kai.workshop.bootstrap import (
     bootstrap_default_workshop,
     bootstrap_human_principal_id,
 )
+from kai.workshop.codex_model_discovery import CodexModelDiscoveryAdapter
 from kai.workshop.conversation_commands import WorkshopConversationCommandService
 from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
 from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
@@ -229,13 +230,16 @@ class _FakeAppearancePreferences:
 
 
 class _FakeModelCatalogue:
+    adapters = None
+
     def __init__(self, events: list[str]) -> None:
         self.events = events
 
     @classmethod
-    async def open(cls, *_args, **_kwargs):
+    async def open(cls, *_args, **kwargs):
         events = _FakeExecutionFactory.events
         events.append("model-catalogue:open")
+        cls.adapters = kwargs.get("adapters")
         return cls(events)
 
     async def close(self) -> None:
@@ -418,6 +422,9 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
         },
     }
     assert services.subprocess_pool is not None
+    assert _FakeModelCatalogue.adapters is not None
+    assert set(_FakeModelCatalogue.adapters) == {"codex"}
+    assert isinstance(_FakeModelCatalogue.adapters["codex"], CodexModelDiscoveryAdapter)
     assert services.delivery_policy.enabled_transports == frozenset()
     assert host_dependencies == [
         "pool:start",
