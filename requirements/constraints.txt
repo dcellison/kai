@@ -24,7 +24,7 @@ pyotp==2.9.0
 qrcode==8.2
 
 # Development and audit tooling.
-ruff==0.15.1
+ruff==0.16.4
 pyright==1.1.411
 pip-audit==2.10.1
 pytest==9.0.3
