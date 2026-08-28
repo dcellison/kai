@@ -6292,7 +6292,7 @@ def _apply_migrate(
         dry_run,
         reader_users=reader_users,
         outbox_owners=outbox_owners,
-        service_reader_user=pwd.getpwuid(svc_uid).pw_name,
+        service_reader_user=(pwd.getpwuid(svc_uid).pw_name if outbox_owners else None),
     )
     _secure_history_directories(
         data_path,

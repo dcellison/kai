@@ -6536,6 +6536,10 @@ class TestApplyMigrate:
             lambda *a, **kw: subprocess.CompletedProcess(args=[], returncode=0, stdout="ok\n"),
         )
         monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+        monkeypatch.setattr(
+            "kai.install.pwd.getpwuid",
+            lambda uid: (_ for _ in ()).throw(AssertionError(f"unexpected UID lookup: {uid}")),
+        )
 
         _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
