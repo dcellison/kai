@@ -1157,6 +1157,62 @@ describe("Workshop React client", () => {
     expect(redeemEnrollment).not.toHaveBeenCalled();
   });
 
+  it("keeps a group channel live when direct-runtime settings are unavailable", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    const groupChannel = {
+      ...navigation.workshops[0].channels[0],
+      channelId: secondChannelId,
+      kind: "group" as const,
+      name: "Wake policy qualification",
+    };
+    vi.mocked(loadNavigation).mockResolvedValue({
+      ...navigation,
+      workshops: [
+        {
+          ...navigation.workshops[0],
+          channels: [...navigation.workshops[0].channels, groupChannel],
+        },
+      ],
+    });
+    vi.mocked(loadTimeline).mockImplementation(async (selectedSession) => ({
+      messages: [
+        {
+          ...historyMessage,
+          body: `History for ${selectedSession.channelId}`,
+          channelId: selectedSession.channelId,
+        },
+      ],
+      throughPosition: 25,
+      previousCursor: null,
+    }));
+    vi.mocked(loadSettingsWorkspace).mockImplementation(async (selectedSession) => {
+      if (selectedSession.channelId === secondChannelId) {
+        throw new ChannelAccessError("Runtime settings are unavailable.");
+      }
+      return settingsWorkspace;
+    });
+
+    render(<App />);
+    expect(await screen.findByText(`History for ${channelId}`)).toBeVisible();
+    await user.click(
+      screen.getByRole("button", { name: "Wake policy qualification" }),
+    );
+
+    expect(
+      await screen.findByText(`History for ${secondChannelId}`),
+    ).toBeVisible();
+    expect(await screen.findByText("Runtime settings are unavailable.")).toBeVisible();
+    await waitFor(() => expect(loadNavigation).toHaveBeenCalledTimes(1));
+    expect((await screen.findAllByText("Live")).length).toBeGreaterThanOrEqual(1);
+
+    await user.click(screen.getByRole("button", { name: "Kai" }));
+    expect(await screen.findByText(`History for ${channelId}`)).toBeVisible();
+  });
+
   it("groups direct messages and names agent and human conversations by participant", async () => {
     const user = userEvent.setup();
     sessionStorage.setItem(

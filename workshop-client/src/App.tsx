@@ -2065,11 +2065,22 @@ function ActiveWorkshopClient({
   onSettingsDirtyChange: (dirty: boolean) => void;
 }): React.JSX.Element {
   const selected = findNavigationChannel(navigation, session.channelId);
-  const settingsChannel = selected?.channel.canSubmitCommands
-    ? selected.channel
-    : navigation.workshops
-        .flatMap((availableWorkshop) => availableWorkshop.channels)
-        .find((availableChannel) => availableChannel.canSubmitCommands) ?? selected?.channel;
+  const availableChannels = navigation.workshops.flatMap(
+    (availableWorkshop) => availableWorkshop.channels,
+  );
+  // Personal settings belong to the principal's direct runtime lane. A
+  // mention-gated group may accept commands without exposing that channel
+  // through the direct-runtime settings API.
+  const settingsChannel =
+    availableChannels.find(
+      (availableChannel) =>
+        availableChannel.kind === "direct" &&
+        availableChannel.canSubmitCommands,
+    ) ??
+    availableChannels.find(
+      (availableChannel) => availableChannel.canSubmitCommands,
+    ) ??
+    selected?.channel;
   const settingsSession = useMemo(
     () => ({
       channelId: settingsChannel?.channelId ?? session.channelId,
@@ -2128,10 +2139,19 @@ function ActiveWorkshopClient({
     (artifactId: string) => startArtifactDownload(session, artifactId),
     [session],
   );
-  const loadSelectedSettingsWorkspace = useCallback(
-    () => withAccessHandling(() => loadSettingsWorkspace(session)),
-    [session, withAccessHandling],
-  );
+  const loadSelectedSettingsWorkspace = useCallback(async () => {
+    try {
+      return await loadSettingsWorkspace(session);
+    } catch (caught) {
+      // Runtime settings are auxiliary channel context. A canonical channel
+      // can remain readable and live even when it has no direct-runtime
+      // settings authority, so only authentication failure is global here.
+      if (caught instanceof AuthenticationError) {
+        onAuthenticationFailure(caught.message);
+      }
+      throw caught;
+    }
+  }, [onAuthenticationFailure, session]);
   const switchSelectedWorkspace = useCallback(
     (path: string, revision: string) =>
       withAccessHandling(() => switchWorkspace(session, path, revision)),
