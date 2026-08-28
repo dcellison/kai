@@ -12,7 +12,7 @@ from typing import Protocol
 import aiosqlite
 
 from kai.workshop.artifacts import ArtifactSummary, artifacts_for_messages
-from kai.workshop.domain import ChannelId, MessageId, PrincipalId
+from kai.workshop.domain import ChannelId, MessageId, MessageMention, PrincipalId
 from kai.workshop.store import WorkshopEventStore
 
 _CURSOR_PREFIX = "v1."
@@ -55,6 +55,7 @@ class TimelineMessage:
     body: str
     event_position: int
     created_at: datetime
+    mentions: tuple[MessageMention, ...] = ()
     artifacts: tuple[ArtifactSummary, ...] = ()
 
 
@@ -192,6 +193,32 @@ def is_internal_scheduled_invocation(metadata_json: object, author_kind: object)
     return isinstance(metadata, dict) and metadata.get("source") == "scheduled_job"
 
 
+def parse_message_mentions_json(value: object) -> tuple[MessageMention, ...]:
+    """Decode mentions persisted by the canonical message projection."""
+    try:
+        raw_mentions = json.loads(str(value))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Canonical message mentions are malformed") from exc
+    if not isinstance(raw_mentions, list):
+        raise RuntimeError("Canonical message mentions are malformed")
+    mentions: list[MessageMention] = []
+    for raw in raw_mentions:
+        if not isinstance(raw, dict) or set(raw) != {"principal_id", "kind", "start", "length"}:
+            raise RuntimeError("Canonical message mention is malformed")
+        try:
+            mentions.append(
+                MessageMention(
+                    principal_id=PrincipalId(raw["principal_id"]),
+                    kind=raw["kind"],
+                    start=raw["start"],
+                    length=raw["length"],
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Canonical message mention is malformed") from exc
+    return tuple(mentions)
+
+
 def _validate_request(principal_id: PrincipalId, channel_id: ChannelId, limit: int) -> None:
     if not isinstance(principal_id, PrincipalId):
         raise ValueError("principal_id must be a PrincipalId")
@@ -238,7 +265,7 @@ async def _latest_event_position(store: WorkshopEventStore) -> int:
 def _messages_from_rows(rows: list[aiosqlite.Row]) -> tuple[TimelineMessage, ...]:
     messages: list[TimelineMessage] = []
     for row in rows:
-        if is_internal_scheduled_invocation(row[9], row[3]):
+        if is_internal_scheduled_invocation(row[10], row[3]):
             continue
         messages.append(
             TimelineMessage(
@@ -251,6 +278,7 @@ def _messages_from_rows(rows: list[aiosqlite.Row]) -> tuple[TimelineMessage, ...
                 body=str(row[6]),
                 event_position=int(row[7]),
                 created_at=_parse_timestamp(str(row[8])),
+                mentions=parse_message_mentions_json(row[9]),
             )
         )
     return tuple(messages)
@@ -275,7 +303,8 @@ async def _read_forward_page(
 ) -> TimelinePage:
     async with store.connection.execute(
         "SELECT m.id, m.channel_id, m.author_principal_id, p.kind, p.display_name, "
-        "m.reply_to_message_id, m.body, m.created_event_position, m.created_at, e.metadata_json "
+        "m.reply_to_message_id, m.body, m.created_event_position, m.created_at, "
+        "m.mentions_json, e.metadata_json "
         "FROM messages m JOIN principals p ON p.id = m.author_principal_id "
         "JOIN event_log e ON e.position = m.created_event_position "
         "WHERE m.channel_id = ? AND m.created_event_position > ? "
@@ -314,7 +343,8 @@ async def _read_tail_page(
     # in event order.
     async with store.connection.execute(
         "SELECT m.id, m.channel_id, m.author_principal_id, p.kind, p.display_name, "
-        "m.reply_to_message_id, m.body, m.created_event_position, m.created_at, e.metadata_json "
+        "m.reply_to_message_id, m.body, m.created_event_position, m.created_at, "
+        "m.mentions_json, e.metadata_json "
         "FROM messages m JOIN principals p ON p.id = m.author_principal_id "
         "JOIN event_log e ON e.position = m.created_event_position "
         "WHERE m.channel_id = ? AND m.created_event_position < ? "
@@ -422,7 +452,8 @@ async def read_channel_timeline_updates(
 
     async with store.connection.execute(
         "SELECT m.id, m.channel_id, m.author_principal_id, p.kind, p.display_name, "
-        "m.reply_to_message_id, m.body, m.created_event_position, m.created_at, e.metadata_json "
+        "m.reply_to_message_id, m.body, m.created_event_position, m.created_at, "
+        "m.mentions_json, e.metadata_json "
         "FROM messages m JOIN principals p ON p.id = m.author_principal_id "
         "JOIN event_log e ON e.position = m.created_event_position "
         "WHERE m.channel_id = ? AND m.created_event_position > ? "

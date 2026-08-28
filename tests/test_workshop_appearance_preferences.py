@@ -70,7 +70,7 @@ async def test_version_thirty_seven_preferences_upgrade_without_data_loss(
 
     upgraded = await WorkshopEventStore.open(path)
     try:
-        assert await upgraded.schema_version() == 40
+        assert await upgraded.schema_version() == 41
         async with upgraded.connection.execute(
             "SELECT principal_id, theme_id, created_at, updated_at FROM principal_appearance_preferences"
         ) as cursor:

@@ -521,7 +521,7 @@ class TestCanonicalMemoryAuthorityMigration:
 
         upgraded = await WorkshopEventStore.open(database)
         try:
-            assert await upgraded.schema_version() == 40
+            assert await upgraded.schema_version() == 41
             assert "workshop_memory_authority_migrations" in await upgraded.schema_tables()
         finally:
             await upgraded.close()

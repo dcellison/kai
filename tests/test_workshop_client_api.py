@@ -2142,6 +2142,7 @@ class TestWorkshopTimelineHTTPContract:
                         "body": "Message 1",
                         "event_position": payload["messages"][0]["event_position"],
                         "created_at": "2026-08-11T14:00:01Z",
+                        "mentions": [],
                         "artifacts": [],
                     }
                 ],
@@ -2461,6 +2462,7 @@ class TestWorkshopTimelineEventStreamHTTPContract:
                     "body": "Message 1",
                     "event_position": int(str(first["id"])),
                     "created_at": "2026-08-11T14:00:01Z",
+                    "mentions": [],
                     "artifacts": [],
                 },
             }

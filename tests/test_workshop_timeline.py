@@ -85,6 +85,26 @@ async def _record_user_message(
 
 
 class TestCanonicalTimelineQuery:
+    async def test_returns_server_resolved_mentions_without_client_reparsing(self, tmp_path: Path):
+        store, principal_id, channel_id, _, _ = await _open_store(tmp_path / "kai.db")
+        try:
+            await _record_user_message(store, ordinal=1, body="Please ask @kAi about this")
+
+            page = await read_channel_timeline(
+                store,
+                principal_id=principal_id,
+                channel_id=channel_id,
+                authorizer=_Authorizer({(principal_id, channel_id)}),
+            )
+
+            assert len(page.messages) == 1
+            assert [(mention.kind, mention.start, mention.length) for mention in page.messages[0].mentions] == [
+                ("agent", 11, 4)
+            ]
+            assert page.messages[0].body[11:15] == "@kAi"
+        finally:
+            await store.close()
+
     async def test_authorized_reader_returns_canonical_messages_in_event_order(self, tmp_path: Path):
         store, principal_id, channel_id, _, _ = await _open_store(tmp_path / "kai.db")
         try:

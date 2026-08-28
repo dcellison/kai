@@ -137,6 +137,7 @@ const historyMessage: TimelineMessage = {
   channelId,
   createdAt: "2026-08-13T09:00:00Z",
   eventPosition: 25,
+  mentions: [],
   messageId: "msg_00000000000000000000000000000025",
 };
 const memoryRecord: WorkshopMemoryRecord = {

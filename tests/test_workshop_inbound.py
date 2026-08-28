@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -10,7 +12,17 @@ import pytest
 
 from kai import sessions
 from kai.workshop.bootstrap import BootstrapHuman, BootstrapNotificationChannel, bootstrap_default_workshop
+from kai.workshop.domain import (
+    ChannelMembershipId,
+    EventEnvelope,
+    EventId,
+    MessageId,
+    PrincipalId,
+    WorkshopEventType,
+    WorkshopId,
+)
 from kai.workshop.inbound import InboundBindingNotFoundError, InboundMessage, record_inbound_message
+from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
 
 
@@ -47,6 +59,48 @@ async def _open_bootstrapped_store(path: Path) -> WorkshopEventStore:
     store = await WorkshopEventStore.open(path)
     await bootstrap_default_workshop(store, [_human(101)])
     return store
+
+
+async def _add_channel_member(
+    store: WorkshopEventStore,
+    *,
+    display_name: str,
+    channel_id: str,
+    workshop_id: str,
+    actor_principal_id: str,
+) -> PrincipalId:
+    principal_id = PrincipalId.new()
+    occurred_at = datetime(2026, 8, 11, 11, 59, tzinfo=UTC)
+    await store.append(
+        EventEnvelope.create(
+            event_type=WorkshopEventType.PRINCIPAL_CREATED,
+            event_version=1,
+            workshop_id=WorkshopId(workshop_id),
+            aggregate_type="principal",
+            aggregate_id=principal_id,
+            actor_principal_id=PrincipalId(actor_principal_id),
+            occurred_at=occurred_at,
+            payload={"kind": "agent", "display_name": display_name},
+        )
+    )
+    await store.append(
+        EventEnvelope.create(
+            event_type=WorkshopEventType.CHANNEL_MEMBER_ADDED,
+            event_version=1,
+            workshop_id=WorkshopId(workshop_id),
+            aggregate_type="channel_membership",
+            aggregate_id=ChannelMembershipId.new(),
+            actor_principal_id=PrincipalId(actor_principal_id),
+            occurred_at=occurred_at,
+            payload={
+                "channel_id": channel_id,
+                "principal_id": principal_id,
+                "role": "participant",
+            },
+        )
+    )
+    await store.project_pending(CanonicalConversationProjection())
+    return principal_id
 
 
 class TestInboundMessage:
@@ -90,6 +144,78 @@ class TestInboundMessage:
 
 
 class TestInboundShadowRecording:
+    async def test_resolves_member_mentions_at_acceptance_and_survives_rebuild(self, tmp_path: Path):
+        store = await _open_bootstrapped_store(tmp_path / "kai.db")
+        try:
+            async with store.connection.execute(
+                "SELECT c.workshop_id, c.id, e.principal_id FROM channel_bindings b "
+                "JOIN channels c ON c.id = b.channel_id "
+                "JOIN external_identities e ON e.provider = b.transport "
+                "AND e.external_subject = b.external_channel_id "
+                "WHERE b.transport = 'telegram' AND b.external_channel_id = '101'"
+            ) as cursor:
+                context = await cursor.fetchone()
+            assert context is not None
+            workshop_id, channel_id, author_principal_id = map(str, context)
+            kai_smith_id = await _add_channel_member(
+                store,
+                display_name="Kai Smith",
+                channel_id=channel_id,
+                workshop_id=workshop_id,
+                actor_principal_id=author_principal_id,
+            )
+            outsider_id = PrincipalId.new()
+            await store.append(
+                EventEnvelope.create(
+                    event_type=WorkshopEventType.PRINCIPAL_CREATED,
+                    event_version=1,
+                    workshop_id=WorkshopId(workshop_id),
+                    aggregate_type="principal",
+                    aggregate_id=outsider_id,
+                    actor_principal_id=PrincipalId(author_principal_id),
+                    occurred_at=datetime(2026, 8, 11, 11, 59, tzinfo=UTC),
+                    payload={"kind": "human", "display_name": "Outsider"},
+                )
+            )
+            await store.project_pending(CanonicalConversationProjection())
+
+            body = "Ask @kai smith, then @KAI; ignore @Outsider and @Unknown."
+            result = await record_inbound_message(store, _message(body=body))
+            mentions = result.event.envelope.payload["mentions"]
+
+            assert mentions == [
+                {
+                    "principal_id": kai_smith_id,
+                    "kind": "agent",
+                    "start": body.index("@kai smith"),
+                    "length": len("@kai smith"),
+                },
+                {
+                    "principal_id": mentions[1]["principal_id"],
+                    "kind": "agent",
+                    "start": body.index("@KAI"),
+                    "length": len("@KAI"),
+                },
+            ]
+            assert mentions[1]["principal_id"] not in {kai_smith_id, outsider_id}
+
+            async with store.connection.execute(
+                "SELECT mentions_json FROM messages WHERE id = ?",
+                (result.event.envelope.aggregate_id,),
+            ) as cursor:
+                projected_before = str((await cursor.fetchone())[0])
+            assert json.loads(projected_before) == mentions
+
+            await store.rebuild_projection(CanonicalConversationProjection())
+            async with store.connection.execute(
+                "SELECT mentions_json FROM messages WHERE id = ?",
+                (result.event.envelope.aggregate_id,),
+            ) as cursor:
+                projected_after = str((await cursor.fetchone())[0])
+            assert projected_after == projected_before
+        finally:
+            await store.close()
+
     async def test_records_canonical_author_channel_and_message(self, tmp_path: Path):
         store = await _open_bootstrapped_store(tmp_path / "kai.db")
         try:
@@ -164,6 +290,53 @@ class TestInboundShadowRecording:
             assert checkpoint[0] == maximum[0]
         finally:
             await second_store.close()
+
+    async def test_retry_of_pre_mentions_event_remains_idempotent(self, tmp_path: Path):
+        store = await _open_bootstrapped_store(tmp_path / "kai.db")
+        try:
+            message = _message(body="Ask @Kai")
+            async with store.connection.execute(
+                "SELECT c.workshop_id, c.id, e.principal_id FROM channel_bindings b "
+                "JOIN channels c ON c.id = b.channel_id "
+                "JOIN external_identities e ON e.provider = b.transport "
+                "AND e.external_subject = b.external_channel_id "
+                "WHERE b.transport = 'telegram' AND b.external_channel_id = '101'"
+            ) as cursor:
+                context = await cursor.fetchone()
+            assert context is not None
+            workshop_id = WorkshopId(str(context[0]))
+            token = hashlib.sha256("\0".join(("telegram", "9001", "101", "42")).encode()).hexdigest()
+            legacy = EventEnvelope.create(
+                event_id=EventId.derived(workshop_id, f"inbound-message-event:{token}"),
+                event_type=WorkshopEventType.MESSAGE_CREATED,
+                event_version=1,
+                workshop_id=workshop_id,
+                aggregate_type="message",
+                aggregate_id=MessageId.derived(workshop_id, f"inbound-message:{token}"),
+                actor_principal_id=PrincipalId(str(context[2])),
+                occurred_at=message.occurred_at,
+                idempotency_key=f"workshop-inbound:v1:telegram:{token}",
+                payload={
+                    "channel_id": str(context[1]),
+                    "author_principal_id": str(context[2]),
+                    "body": message.body,
+                },
+                metadata={
+                    "source": "telegram",
+                    "transport_update_id": "9001",
+                    "transport_message_id": "42",
+                },
+            )
+            first = await store.append(legacy)
+            await store.project_pending(CanonicalConversationProjection())
+
+            retried = await record_inbound_message(store, message)
+
+            assert first.inserted is True
+            assert retried.inserted is False
+            assert retried.event == first.event
+        finally:
+            await store.close()
 
     async def test_same_transport_identity_with_changed_content_is_rejected(self, tmp_path: Path):
         store = await _open_bootstrapped_store(tmp_path / "kai.db")

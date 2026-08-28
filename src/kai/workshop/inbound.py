@@ -12,6 +12,7 @@ from kai.workshop.domain import (
     EventEnvelope,
     EventId,
     MessageId,
+    MessageMention,
     PrincipalId,
     WorkshopEventType,
     WorkshopId,
@@ -117,6 +118,97 @@ class _ResolvedInboundBinding:
     channel_id: ChannelId
 
 
+def _mention_payload(mentions: tuple[MessageMention, ...]) -> list[dict[str, object]]:
+    return [
+        {
+            "principal_id": mention.principal_id,
+            "kind": mention.kind,
+            "start": mention.start,
+            "length": mention.length,
+        }
+        for mention in mentions
+    ]
+
+
+async def resolve_message_mentions(
+    store: WorkshopEventStore,
+    channel_id: ChannelId,
+    body: str,
+) -> tuple[MessageMention, ...]:
+    """Resolve channel-member display names against one accepted message body."""
+    async with store.connection.execute(
+        "SELECT p.id, p.kind, p.display_name FROM channel_memberships cm "
+        "JOIN principals p ON p.id = cm.principal_id "
+        "WHERE cm.channel_id = ? AND p.kind IN ('human', 'agent') "
+        "ORDER BY length(p.display_name) DESC, p.display_name, p.id",
+        (channel_id,),
+    ) as cursor:
+        rows = list(await cursor.fetchall())
+
+    # A duplicated case-insensitive display name is ambiguous and therefore
+    # cannot safely identify either principal.
+    candidates: list[tuple[PrincipalId, str, str]] = []
+    grouped: dict[str, list[tuple[PrincipalId, str, str]]] = {}
+    for row in rows:
+        candidate = (PrincipalId(str(row[0])), str(row[1]), str(row[2]))
+        grouped.setdefault(candidate[2].casefold(), []).append(candidate)
+    for matches in grouped.values():
+        if len(matches) == 1:
+            candidates.append(matches[0])
+    candidates.sort(key=lambda item: (-len(item[2]), item[2].casefold(), item[0]))
+
+    mentions: list[MessageMention] = []
+    cursor_position = 0
+    while True:
+        start = body.find("@", cursor_position)
+        if start < 0:
+            break
+        if start > 0 and (body[start - 1].isalnum() or body[start - 1] == "_"):
+            cursor_position = start + 1
+            continue
+        matched: MessageMention | None = None
+        for principal_id, kind, display_name in candidates:
+            end = start + 1 + len(display_name)
+            if end > len(body):
+                continue
+            if body[start + 1 : end].casefold() != display_name.casefold():
+                continue
+            if end < len(body) and (body[end].isalnum() or body[end] == "_"):
+                continue
+            matched = MessageMention(principal_id, kind, start, end - start)
+            break
+        if matched is None:
+            cursor_position = start + 1
+            continue
+        mentions.append(matched)
+        cursor_position = matched.start + matched.length
+    return tuple(mentions)
+
+
+def _existing_mentions(envelope: EventEnvelope) -> tuple[MessageMention, ...] | None:
+    raw_mentions = envelope.payload.get("mentions")
+    if raw_mentions is None:
+        return None
+    if not isinstance(raw_mentions, list):
+        raise RuntimeError("Stored message mentions are malformed")
+    mentions: list[MessageMention] = []
+    for value in raw_mentions:
+        if not isinstance(value, dict):
+            raise RuntimeError("Stored message mention is malformed")
+        try:
+            mentions.append(
+                MessageMention(
+                    principal_id=PrincipalId(value["principal_id"]),
+                    kind=value["kind"],
+                    start=value["start"],
+                    length=value["length"],
+                )
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("Stored message mention is malformed") from exc
+    return tuple(mentions)
+
+
 def _stable_token(message: InboundMessage) -> str:
     identity = "\0".join(
         (
@@ -161,7 +253,11 @@ async def _resolve_binding(store: WorkshopEventStore, message: InboundMessage) -
     )
 
 
-def _inbound_envelope(binding: _ResolvedInboundBinding, message: InboundMessage) -> EventEnvelope:
+def _inbound_envelope(
+    binding: _ResolvedInboundBinding,
+    message: InboundMessage,
+    mentions: tuple[MessageMention, ...] | None,
+) -> EventEnvelope:
     token = _stable_token(message)
     return EventEnvelope.create(
         event_id=EventId.derived(binding.workshop_id, f"inbound-message-event:{token}"),
@@ -177,6 +273,7 @@ def _inbound_envelope(binding: _ResolvedInboundBinding, message: InboundMessage)
             "channel_id": binding.channel_id,
             "author_principal_id": binding.principal_id,
             "body": message.body,
+            **({"mentions": _mention_payload(mentions)} if mentions is not None else {}),
         },
         metadata={
             "source": message.transport,
@@ -233,6 +330,7 @@ async def _resolve_scheduled_binding(
 def _client_inbound_envelope(
     binding: _ResolvedInboundBinding,
     message: ClientInboundMessage,
+    mentions: tuple[MessageMention, ...] | None,
 ) -> EventEnvelope:
     stable_name = f"client-message:{message.principal_id}:{message.channel_id}:{message.client_message_id}"
     message_id = MessageId.derived(binding.workshop_id, stable_name)
@@ -256,6 +354,7 @@ def _client_inbound_envelope(
             "channel_id": binding.channel_id,
             "author_principal_id": binding.principal_id,
             "body": message.body,
+            **({"mentions": _mention_payload(mentions)} if mentions is not None else {}),
         },
         metadata=metadata,
     )
@@ -264,6 +363,7 @@ def _client_inbound_envelope(
 def _scheduled_inbound_envelope(
     binding: _ResolvedInboundBinding,
     message: ScheduledInboundMessage,
+    mentions: tuple[MessageMention, ...] | None,
 ) -> EventEnvelope:
     stable_name = f"scheduled-job:{message.job_id}:{message.occurrence_id}"
     message_id = MessageId.derived(binding.workshop_id, stable_name)
@@ -281,6 +381,7 @@ def _scheduled_inbound_envelope(
             "channel_id": binding.channel_id,
             "author_principal_id": binding.principal_id,
             "body": message.body,
+            **({"mentions": _mention_payload(mentions)} if mentions is not None else {}),
         },
         metadata={
             "source": "scheduled_job",
@@ -298,7 +399,16 @@ async def record_inbound_message_in_transaction(
     if not store.connection.in_transaction:
         raise RuntimeError("record_inbound_message_in_transaction requires an active transaction")
     binding = await _resolve_binding(store, message)
-    result = await store.append_in_transaction(_inbound_envelope(binding, message))
+    candidate = _inbound_envelope(binding, message, ())
+    if candidate.idempotency_key is None:
+        raise RuntimeError("Inbound message envelope did not define an idempotency key")
+    existing = await store.event_by_idempotency_key(candidate.idempotency_key)
+    if existing is None:
+        mentions = await resolve_message_mentions(store, binding.channel_id, message.body)
+    else:
+        mentions = _existing_mentions(existing.envelope)
+        message = replace(message, occurred_at=existing.envelope.occurred_at)
+    result = await store.append_in_transaction(_inbound_envelope(binding, message, mentions))
     await store.project_pending_in_transaction(CanonicalConversationProjection())
     return result
 
@@ -311,15 +421,16 @@ async def record_client_inbound_message_in_transaction(
     if not store.connection.in_transaction:
         raise RuntimeError("record_client_inbound_message_in_transaction requires an active transaction")
     binding = await _resolve_client_binding(store, message)
-    envelope = _client_inbound_envelope(binding, message)
+    envelope = _client_inbound_envelope(binding, message, ())
     if envelope.idempotency_key is None:
         raise RuntimeError("Client message envelope did not define an idempotency key")
     existing = await store.event_by_idempotency_key(envelope.idempotency_key)
-    if existing is not None:
-        envelope = _client_inbound_envelope(
-            binding,
-            replace(message, occurred_at=existing.envelope.occurred_at),
-        )
+    if existing is None:
+        mentions = await resolve_message_mentions(store, binding.channel_id, message.body)
+    else:
+        mentions = _existing_mentions(existing.envelope)
+        message = replace(message, occurred_at=existing.envelope.occurred_at)
+    envelope = _client_inbound_envelope(binding, message, mentions)
     result = await store.append_in_transaction(envelope)
     await store.project_pending_in_transaction(CanonicalConversationProjection())
     return result
@@ -333,15 +444,16 @@ async def record_scheduled_inbound_message_in_transaction(
     if not store.connection.in_transaction:
         raise RuntimeError("record_scheduled_inbound_message_in_transaction requires an active transaction")
     binding = await _resolve_scheduled_binding(store, message)
-    envelope = _scheduled_inbound_envelope(binding, message)
+    envelope = _scheduled_inbound_envelope(binding, message, ())
     if envelope.idempotency_key is None:
         raise RuntimeError("Scheduled message envelope did not define an idempotency key")
     existing = await store.event_by_idempotency_key(envelope.idempotency_key)
-    if existing is not None:
-        envelope = _scheduled_inbound_envelope(
-            binding,
-            replace(message, occurred_at=existing.envelope.occurred_at),
-        )
+    if existing is None:
+        mentions = await resolve_message_mentions(store, binding.channel_id, message.body)
+    else:
+        mentions = _existing_mentions(existing.envelope)
+        message = replace(message, occurred_at=existing.envelope.occurred_at)
+    envelope = _scheduled_inbound_envelope(binding, message, mentions)
     result = await store.append_in_transaction(envelope)
     await store.project_pending_in_transaction(CanonicalConversationProjection())
     return result
@@ -350,6 +462,15 @@ async def record_scheduled_inbound_message_in_transaction(
 async def record_inbound_message(store: WorkshopEventStore, message: InboundMessage) -> AppendResult:
     """Append and project one authenticated inbound transport message."""
     binding = await _resolve_binding(store, message)
-    result = await store.append(_inbound_envelope(binding, message))
+    candidate = _inbound_envelope(binding, message, ())
+    if candidate.idempotency_key is None:
+        raise RuntimeError("Inbound message envelope did not define an idempotency key")
+    existing = await store.event_by_idempotency_key(candidate.idempotency_key)
+    if existing is None:
+        mentions = await resolve_message_mentions(store, binding.channel_id, message.body)
+    else:
+        mentions = _existing_mentions(existing.envelope)
+        message = replace(message, occurred_at=existing.envelope.occurred_at)
+    result = await store.append(_inbound_envelope(binding, message, mentions))
     await store.project_pending(CanonicalConversationProjection())
     return result

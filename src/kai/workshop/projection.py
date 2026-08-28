@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,6 +45,57 @@ def _parse_projection_timestamp(value: object) -> datetime:
 def _require_exact_payload(payload: dict[str, Any], keys: set[str]) -> None:
     if set(payload) != keys:
         raise ValueError(f"Workshop event payload must contain exactly {sorted(keys)!r}")
+
+
+async def _message_mentions_json(
+    connection: aiosqlite.Connection,
+    channel_id: ChannelId,
+    body: str,
+    raw_mentions: object,
+) -> str:
+    if not isinstance(raw_mentions, list):
+        raise ValueError("Workshop message mentions must be a list")
+    if not raw_mentions:
+        return "[]"
+    async with connection.execute(
+        "SELECT p.id, p.kind, p.display_name FROM channel_memberships cm "
+        "JOIN principals p ON p.id = cm.principal_id WHERE cm.channel_id = ?",
+        (channel_id,),
+    ) as cursor:
+        members = {PrincipalId(str(row[0])): (str(row[1]), str(row[2])) for row in await cursor.fetchall()}
+    normalized: list[dict[str, object]] = []
+    previous_end = 0
+    for raw in raw_mentions:
+        if not isinstance(raw, dict) or set(raw) != {"principal_id", "kind", "start", "length"}:
+            raise ValueError("Workshop message mention must have the canonical fields")
+        principal_id = PrincipalId(_required_text(raw, "principal_id"))
+        kind = _required_text(raw, "kind")
+        start = raw.get("start")
+        length = raw.get("length")
+        if kind not in {"human", "agent"}:
+            raise ValueError("Workshop message mention kind must be human or agent")
+        if not isinstance(start, int) or isinstance(start, bool) or start < previous_end:
+            raise ValueError("Workshop message mentions must be ordered and non-overlapping")
+        if not isinstance(length, int) or isinstance(length, bool) or length <= 1:
+            raise ValueError("Workshop message mention length is invalid")
+        end = start + length
+        if end > len(body) or body[start : start + 1] != "@":
+            raise ValueError("Workshop message mention span is outside the body")
+        member = members.get(principal_id)
+        if member is None or member[0] != kind:
+            raise ValueError("Workshop message mention must resolve to a channel member")
+        if body[start + 1 : end].casefold() != member[1].casefold():
+            raise ValueError("Workshop message mention span must match the member display name")
+        normalized.append(
+            {
+                "kind": kind,
+                "length": length,
+                "principal_id": principal_id,
+                "start": start,
+            }
+        )
+        previous_end = end
+    return json.dumps(normalized, separators=(",", ":"), sort_keys=True)
 
 
 async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent) -> None:
@@ -500,7 +552,7 @@ class CanonicalConversationProjection:
 
     name = "canonical_conversations"
     # Runtime-profile assignments can migrate to stable protected profiles.
-    version = 8
+    version = 9
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -690,20 +742,36 @@ class CanonicalConversationProjection:
             reply_to = payload.get("reply_to_message_id")
             if reply_to is not None and not isinstance(reply_to, str):
                 raise ValueError("Workshop reply_to_message_id must be a string or null")
+            channel_id = ChannelId(_required_text(payload, "channel_id"))
+            body = _required_text(payload, "body")
+            mentions_json = await _message_mentions_json(
+                connection,
+                channel_id,
+                body,
+                payload.get("mentions", []),
+            )
             await connection.execute(
                 "INSERT INTO messages "
                 "(id, channel_id, author_principal_id, reply_to_message_id, body, "
                 "created_event_position, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     envelope.aggregate_id,
-                    _required_text(payload, "channel_id"),
+                    channel_id,
                     _required_text(payload, "author_principal_id"),
                     reply_to,
-                    _required_text(payload, "body"),
+                    body,
                     event.position,
                     occurred_at,
                 ),
             )
+            # Empty mentions use the column default, which keeps the current
+            # projection executable in migration tests frozen before schema
+            # v41. Accepted mention spans require the v41 authority column.
+            if mentions_json != "[]":
+                await connection.execute(
+                    "UPDATE messages SET mentions_json = ? WHERE id = ?",
+                    (mentions_json, envelope.aggregate_id),
+                )
         elif envelope.event_type == WorkshopEventType.ARTIFACT_CREATED:
             if envelope.event_version not in {1, 2}:
                 raise ValueError("Unsupported Workshop artifact event version")

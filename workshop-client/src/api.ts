@@ -149,6 +149,7 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
     created_at: createdAt,
     event_position: eventPosition,
     message_id: messageId,
+    mentions: suppliedMentions,
     artifacts: suppliedArtifacts,
   } = value;
   const rawArtifacts = suppliedArtifacts ?? [];
@@ -160,6 +161,7 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
     typeof createdAt !== "string" ||
     !Number.isSafeInteger(eventPosition) ||
     typeof messageId !== "string" ||
+    !Array.isArray(suppliedMentions) ||
     !Array.isArray(rawArtifacts)
   ) {
     return null;
@@ -202,6 +204,32 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
       originalFilename,
     });
   }
+  const mentions = [];
+  let previousEnd = 0;
+  for (const rawMention of suppliedMentions) {
+    if (!isRecord(rawMention)) {
+      return null;
+    }
+    const { kind, length, principal_id: principalId, start } = rawMention;
+    if (
+      !["human", "agent"].includes(String(kind)) ||
+      !Number.isSafeInteger(length) ||
+      (length as number) <= 1 ||
+      typeof principalId !== "string" ||
+      !PRINCIPAL_PATTERN.test(principalId) ||
+      !Number.isSafeInteger(start) ||
+      (start as number) < previousEnd
+    ) {
+      return null;
+    }
+    mentions.push({
+      kind: kind as "human" | "agent",
+      length: length as number,
+      principalId,
+      start: start as number,
+    });
+    previousEnd = (start as number) + (length as number);
+  }
   return {
     artifacts,
     authorDisplayName,
@@ -210,6 +238,7 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
     channelId,
     createdAt,
     eventPosition: eventPosition as number,
+    mentions,
     messageId,
   };
 }
