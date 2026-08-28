@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import pwd
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
 from kai import sessions
+from kai.backend_registry import (
+    BackendRegistryEntry,
+    BackendRegistryError,
+    load_backend_registry,
+    resolve_backend_command,
+)
 from kai.config import Config
 from kai.pool import SubprocessPool
 from kai.workshop.appearance_preferences import WorkshopAppearancePreferenceService
@@ -30,6 +38,7 @@ from kai.workshop.github_settings import WorkshopGitHubSettingsService
 from kai.workshop.integration_notifications import WorkshopIntegrationNotificationService
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIContextRegistry
 from kai.workshop.memory_queries import WorkshopMemoryQueryService
+from kai.workshop.model_discovery_inventory import WorkshopModelDiscoveryInventoryService
 from kai.workshop.notification_preferences import WorkshopNotificationPreferenceService
 from kai.workshop.post_run_effects import WorkshopPostRunEffectService
 from kai.workshop.preferences import WorkshopPreferenceService
@@ -76,6 +85,34 @@ class KaiApplicationAdapter(Protocol):
     async def wait(self) -> None: ...
 
     async def stop(self) -> None: ...
+
+
+def _model_discovery_backend_registry(
+    registered_backend_ids: frozenset[str],
+) -> dict[str, BackendRegistryEntry]:
+    """Resolve installed commands without invoking them.
+
+    Protected installations always return their authoritative registry.  A
+    direct development run may instead resolve its already-registered
+    backends through the same environment/PATH compatibility used by the
+    subprocess pool.
+    """
+    registry = load_backend_registry()
+    if registry:
+        return registry
+    resolved: dict[str, BackendRegistryEntry] = {}
+    for backend in sorted(registered_backend_ids):
+        try:
+            command = resolve_backend_command(backend)
+        except (BackendRegistryError, ValueError):
+            continue
+        resolved[backend] = BackendRegistryEntry(
+            id=backend,
+            driver=backend,
+            runtime="local_process",
+            command=command,
+        )
+    return resolved
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +165,7 @@ class KaiCoreServices:
     subprocess_pool: SubprocessPool
     runtime_profiles: WorkshopRuntimeProfileRegistry
     runtime_pool: WorkshopRuntimePool
+    model_discovery_inventory: WorkshopModelDiscoveryInventoryService
     conversation_runs: WorkshopConversationRunService
     private_text_execution: WorkshopPrivateTextExecutionService
     client_commands: WorkshopClientCommandExecutor
@@ -239,6 +277,14 @@ class KaiApplicationHost:
             )
             runtime_pool = WorkshopRuntimePool(subprocess_pool, self._runtime_profiles)
             await subprocess_pool.hydrate_backend_selections()
+            model_discovery_inventory = WorkshopModelDiscoveryInventoryService(
+                config=self._config,
+                runtime_profiles=self._runtime_profiles,
+                execution_state=self._execution_state,
+                backend_registry=_model_discovery_backend_registry(self._registered_backend_ids),
+                selected_backend=lambda profile_id: runtime_pool.get_backend_provider(profile_id),
+                service_os_user=pwd.getpwuid(os.geteuid()).pw_name,
+            )
             runtime_state = WorkshopRuntimeStateWriter(
                 self._config,
                 runtime_pool,
@@ -346,6 +392,7 @@ class KaiApplicationHost:
                 subprocess_pool=subprocess_pool,
                 runtime_profiles=self._runtime_profiles,
                 runtime_pool=runtime_pool,
+                model_discovery_inventory=model_discovery_inventory,
                 conversation_runs=conversation_runs,
                 private_text_execution=private_execution,
                 client_commands=client_commands,
