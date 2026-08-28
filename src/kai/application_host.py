@@ -37,6 +37,7 @@ from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.execution_state import WorkshopExecutionStateRegistry
 from kai.workshop.github_automation import WorkshopGitHubAutomationService
 from kai.workshop.github_settings import WorkshopGitHubSettingsService
+from kai.workshop.goose_model_discovery import GooseModelDiscoveryAdapter
 from kai.workshop.integration_notifications import WorkshopIntegrationNotificationService
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIContextRegistry
 from kai.workshop.memory_queries import WorkshopMemoryQueryService
@@ -318,6 +319,9 @@ class KaiApplicationHost:
                 adapters={
                     "claude": ClaudeModelDiscoveryAdapter(),
                     "codex": CodexModelDiscoveryAdapter(
+                        service_os_user=pwd.getpwuid(os.geteuid()).pw_name,
+                    ),
+                    "goose": GooseModelDiscoveryAdapter(
                         service_os_user=pwd.getpwuid(os.geteuid()).pw_name,
                     ),
                     "opencode": OpenCodeModelDiscoveryAdapter(
