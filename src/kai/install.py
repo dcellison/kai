@@ -72,7 +72,7 @@ from kai.config import (
     validate_model_for_backend,
     validate_model_for_backend_policy,
 )
-from kai.named_access import replace_named_read_access
+from kai.named_access import replace_named_inherited_read_access, replace_named_read_access
 from kai.protected_config import ProtectedConfigError, validate_protected_file_metadata
 from kai.user_isolation import validate_protected_user_isolation
 from kai.workshop.bootstrap import bootstrap_human_principal_id
@@ -5230,8 +5230,10 @@ def _secure_upload_directories(
     svc_gid: int,
     dry_run: bool,
     reader_users: dict[str, str] | None = None,
+    outbox_owners: dict[str, tuple[int, int]] | None = None,
+    service_reader_user: str | None = None,
 ) -> None:
-    """Reconcile service-owned upload directories and historical uploads.
+    """Reconcile private inbound uploads and principal-owned outboxes.
 
     Kai writes Telegram uploads before handing their exact paths to an agent
     OS user.  The service therefore owns the shared upload root and each
@@ -5240,22 +5242,32 @@ def _secure_upload_directories(
     per-user directory owned by that agent user, which prevents Kai from
     enforcing the traversal-only directory mode at upload time.
 
-    Validate every managed tree before changing any of it. Historical files
-    become service-owned and private, with a named read ACL for only the
-    configured agent OS user. Unknown directories remain untouched.
+    Each canonical principal also receives an ``outbox`` owned by its agent OS
+    user. Kai's service user gets inheritable read/traversal access so files
+    created with a private umask can be copied into canonical artifact storage.
+
+    Validate every managed tree before changing any of it. Historical inbound
+    files become service-owned and private, with a named read ACL for only the
+    configured agent OS user. Outbox contents remain agent-owned. Unknown
+    directories remain untouched.
     """
     reader_users = reader_users or {}
+    outbox_owners = outbox_owners or {}
+    if outbox_owners and not service_reader_user:
+        raise ValueError("service_reader_user is required when provisioning outbound staging")
     files_root = data_path / "files"
     if files_root.is_symlink():
         raise RuntimeError(f"Refusing unsafe upload path: {files_root}")
-    if not files_root.exists():
+    if not files_root.exists() and not outbox_owners:
         return
-    if not files_root.is_dir():
+    if files_root.exists() and not files_root.is_dir():
         raise RuntimeError(f"Refusing unsafe upload path: {files_root}")
 
-    managed_paths = [files_root]
+    managed_paths = [files_root] if files_root.exists() else []
     managed_trees: dict[str, tuple[list[Path], list[Path]]] = {}
-    for name in sorted(known_user_dir_names):
+    outbound_trees: dict[str, tuple[list[Path], list[Path]]] = {}
+    managed_names = known_user_dir_names | set(outbox_owners)
+    for name in sorted(managed_names):
         user_dir = files_root / name
         if user_dir.is_symlink():
             raise RuntimeError(f"Refusing unsafe upload path: {user_dir}")
@@ -5264,7 +5276,19 @@ def _secure_upload_directories(
         if not user_dir.is_dir():
             raise RuntimeError(f"Refusing unsafe upload path: {user_dir}")
         managed_paths.append(user_dir)
-        managed_trees[name] = _validate_regular_tree(user_dir, label="upload")
+        outbox = user_dir / "outbox"
+        if outbox.is_symlink():
+            raise RuntimeError(f"Refusing unsafe outbound staging path: {outbox}")
+        if outbox.exists() and not outbox.is_dir():
+            raise RuntimeError(f"Refusing unsafe outbound staging path: {outbox}")
+        excluded = frozenset((outbox,)) if name in outbox_owners and outbox.exists() else frozenset()
+        managed_trees[name] = _validate_regular_tree(
+            user_dir,
+            label="upload",
+            excluded_directories=excluded,
+        )
+        if name in outbox_owners and outbox.exists():
+            outbound_trees[name] = _validate_regular_tree(outbox, label="outbound staging")
 
     repairs: list[Path] = []
     for path in managed_paths:
@@ -5277,6 +5301,8 @@ def _secure_upload_directories(
             repairs.append(path)
 
     if dry_run:
+        if not files_root.exists():
+            print(f"[DRY RUN] Would create upload directory: {files_root} ({svc_uid}:{svc_gid}, mode 0711)")
         for path in repairs:
             print(f"[DRY RUN] Would secure upload directory: {path} ({svc_uid}:{svc_gid}, mode 0711)")
         for name, (directories, files) in managed_trees.items():
@@ -5284,7 +5310,33 @@ def _secure_upload_directories(
                 f"[DRY RUN] Would secure {len(files)} upload file(s) and "
                 f"{len(directories)} nested directory entry/entries under {files_root / name}"
             )
+        for name, owner in sorted(outbox_owners.items()):
+            user_dir = files_root / name
+            outbox = user_dir / "outbox"
+            if not user_dir.exists():
+                print(f"[DRY RUN] Would create upload directory: {user_dir} ({svc_uid}:{svc_gid}, mode 0711)")
+            directories, files = outbound_trees.get(name, ([], []))
+            print(
+                f"[DRY RUN] Would provision outbound staging: {outbox} "
+                f"({owner[0]}:{owner[1]}, mode 0700; Kai-readable; "
+                f"{len(files)} file(s), {len(directories)} nested directory entry/entries)"
+            )
         return
+
+    files_root.mkdir(parents=True, exist_ok=True)
+    for name in sorted(outbox_owners):
+        (files_root / name).mkdir(exist_ok=True)
+
+    managed_paths = [files_root, *(files_root / name for name in sorted(managed_names) if (files_root / name).is_dir())]
+    repairs = []
+    for path in managed_paths:
+        current = path.stat()
+        if (
+            current.st_uid != svc_uid
+            or current.st_gid != svc_gid
+            or stat.S_IMODE(current.st_mode) != _PRIVATE_USER_ROOT_MODE
+        ):
+            repairs.append(path)
 
     for path in repairs:
         _set_ownership(path, svc_uid, svc_gid, recursive=False)
@@ -5307,8 +5359,36 @@ def _secure_upload_directories(
         if files or directories:
             print(f"  Secured historical uploads under {user_dir}")
 
+    assert service_reader_user is not None or not outbox_owners
+    for name, (owner_uid, owner_gid) in sorted(outbox_owners.items()):
+        outbox = files_root / name / "outbox"
+        outbox.mkdir(exist_ok=True)
+        directories, files = _validate_regular_tree(outbox, label="outbound staging")
+        for directory in [outbox, *directories]:
+            os.chown(directory, owner_uid, owner_gid)
+            os.chmod(directory, _PRIVATE_USER_DIR_MODE)
+            if owner_uid == svc_uid:
+                replace_named_read_access(directory, None, directory=True)
+            else:
+                assert service_reader_user is not None
+                replace_named_inherited_read_access(directory, service_reader_user)
+        for path in files:
+            os.chown(path, owner_uid, owner_gid)
+            os.chmod(path, _PRIVATE_USER_FILE_MODE)
+            replace_named_read_access(
+                path,
+                None if owner_uid == svc_uid else service_reader_user,
+                directory=False,
+            )
+        print(f"  Provisioned private outbound staging under {outbox}")
 
-def _validate_regular_tree(root: Path, *, label: str) -> tuple[list[Path], list[Path]]:
+
+def _validate_regular_tree(
+    root: Path,
+    *,
+    label: str,
+    excluded_directories: frozenset[Path] = frozenset(),
+) -> tuple[list[Path], list[Path]]:
     """Return nested directories/files after rejecting every unsafe entry."""
     directories: list[Path] = []
     files: list[Path] = []
@@ -5316,6 +5396,10 @@ def _validate_regular_tree(root: Path, *, label: str) -> tuple[list[Path], list[
     while pending:
         current = pending.pop()
         for entry in current.iterdir():
+            if entry in excluded_directories:
+                if entry.is_symlink() or not entry.is_dir():
+                    raise RuntimeError(f"Refusing unsafe {label} path: {entry}")
+                continue
             if entry.is_symlink():
                 raise RuntimeError(f"Refusing unsafe {label} path: {entry}")
             if entry.is_dir():
@@ -6089,6 +6173,8 @@ def _apply_migrate(
         owner = per_user_ids.get(legacy_name)
         if owner is not None:
             per_user_ids[principal_name] = owner
+    outbox_names = set(canonical_principal_names.values())
+    outbox_owners = {name: per_user_ids.get(name, (svc_uid, svc_gid)) for name in outbox_names}
 
     # Resolve the primary operator's chat_id (first yaml entry). When
     # users.yaml is absent or empty (first-ever install, single-user
@@ -6205,6 +6291,8 @@ def _apply_migrate(
         svc_gid,
         dry_run,
         reader_users=reader_users,
+        outbox_owners=outbox_owners,
+        service_reader_user=pwd.getpwuid(svc_uid).pw_name,
     )
     _secure_history_directories(
         data_path,

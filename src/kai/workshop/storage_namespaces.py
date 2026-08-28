@@ -138,6 +138,10 @@ class WorkshopPrincipalStorageNamespace:
         """Return the transport-independent upload directory."""
         return data_dir / "files" / str(self.principal_id)
 
+    def outbox_directory(self, data_dir: Path) -> Path:
+        """Return the principal-owned outbound artifact staging directory."""
+        return self.files_directory(data_dir) / "outbox"
+
     def legacy_files_directory(self, data_dir: Path) -> Path:
         """Return the prior configured-user directory during migration."""
         if self._legacy_runtime_key is None:
