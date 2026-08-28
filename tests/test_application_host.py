@@ -24,6 +24,7 @@ from kai.workshop.execution_state import (
     WorkshopExecutionStateNamespace,
     WorkshopExecutionStateRegistry,
 )
+from kai.workshop.goose_model_discovery import GooseModelDiscoveryAdapter
 from kai.workshop.inbound import InboundMessage
 from kai.workshop.internal_api_contexts import (
     WorkshopInternalAPIContextRegistry,
@@ -425,9 +426,10 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
     }
     assert services.subprocess_pool is not None
     assert _FakeModelCatalogue.adapters is not None
-    assert set(_FakeModelCatalogue.adapters) == {"claude", "codex", "opencode"}
+    assert set(_FakeModelCatalogue.adapters) == {"claude", "codex", "goose", "opencode"}
     assert isinstance(_FakeModelCatalogue.adapters["claude"], ClaudeModelDiscoveryAdapter)
     assert isinstance(_FakeModelCatalogue.adapters["codex"], CodexModelDiscoveryAdapter)
+    assert isinstance(_FakeModelCatalogue.adapters["goose"], GooseModelDiscoveryAdapter)
     assert isinstance(_FakeModelCatalogue.adapters["opencode"], OpenCodeModelDiscoveryAdapter)
     assert services.delivery_policy.enabled_transports == frozenset()
     assert host_dependencies == [
