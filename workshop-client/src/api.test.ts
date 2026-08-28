@@ -1374,6 +1374,9 @@ describe("Workshop client API", () => {
     const headers = new Headers(request[1].headers);
     expect(headers.get("Authorization")).toBe("Bearer session-secret");
     expect(headers.get("Last-Event-ID")).toBe("30");
+    expect(headers.get("X-Kai-Stream-ID")).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
   });
 
   it("parses run preview frames without an id and rejects malformed or foreign ones", async () => {

@@ -2625,6 +2625,60 @@ class TestWorkshopTimelineEventStreamHTTPContract:
             await client.close()
             await store.close()
 
+    async def test_same_browser_stream_replaces_stale_claim_without_consuming_capacity(self, tmp_path: Path):
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        limiter = WorkshopEventStreamLimiter(per_principal_limit=1, global_limit=1)
+        client = await _open_client(
+            store,
+            _Authenticator({"alice-token": alice_id}),
+            event_poll_interval=0.005,
+            event_heartbeat_interval=30.0,
+            event_stream_limiter=limiter,
+        )
+        first_response = None
+        replacement_response = None
+        distinct_response = None
+        try:
+            path = f"/v1/channels/{alice_channel}/events"
+            headers = {
+                "Authorization": "Bearer alice-token",
+                "X-Kai-Stream-ID": "browser-tab-one",
+            }
+            first_response = await client.get(path, headers=headers)
+            replacement_response = await client.get(path, headers=headers)
+
+            assert first_response.status == replacement_response.status == 200
+            await asyncio.sleep(0.05)
+            rejected = await client.get(
+                path,
+                headers={
+                    "Authorization": "Bearer alice-token",
+                    "X-Kai-Stream-ID": "browser-tab-two",
+                },
+            )
+            assert rejected.status == 429
+
+            replacement_response.close()
+            replacement_response = None
+            await asyncio.sleep(0.05)
+            distinct_response = await client.get(
+                path,
+                headers={
+                    "Authorization": "Bearer alice-token",
+                    "X-Kai-Stream-ID": "browser-tab-two",
+                },
+            )
+            assert distinct_response.status == 200
+        finally:
+            if first_response is not None:
+                first_response.close()
+            if replacement_response is not None:
+                replacement_response.close()
+            if distinct_response is not None:
+                distinct_response.close()
+            await client.close()
+            await store.close()
+
     async def test_server_shutdown_closes_an_open_event_stream_promptly(self, tmp_path: Path):
         store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
         limiter = WorkshopEventStreamLimiter(per_principal_limit=1, global_limit=1)
@@ -2645,8 +2699,9 @@ class TestWorkshopTimelineEventStreamHTTPContract:
 
             await asyncio.wait_for(client.server.close(), timeout=1.0)
 
-            assert limiter.acquire(alice_id) is True
-            limiter.release(alice_id)
+            claim = limiter.acquire(alice_id, b"shutdown-verification")
+            assert claim is not None
+            limiter.release(claim)
         finally:
             if response is not None:
                 response.close()

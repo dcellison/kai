@@ -112,6 +112,25 @@ async function responsePayload(response: Response): Promise<unknown> {
   }
 }
 
+const EVENT_STREAM_ID_KEY = "kai.workshop.event-stream-id.v1";
+const EVENT_STREAM_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+let cachedEventStreamId: string | null = null;
+
+function eventStreamId(): string {
+  if (cachedEventStreamId !== null) {
+    return cachedEventStreamId;
+  }
+  const stored = sessionStorage.getItem(EVENT_STREAM_ID_KEY);
+  if (stored !== null && EVENT_STREAM_ID_PATTERN.test(stored)) {
+    cachedEventStreamId = stored;
+    return stored;
+  }
+  const created = crypto.randomUUID();
+  sessionStorage.setItem(EVENT_STREAM_ID_KEY, created);
+  cachedEventStreamId = created;
+  return created;
+}
+
 async function authorizedFetch(
   session: WorkshopSession,
   path: string,
@@ -2396,6 +2415,7 @@ export async function streamTimeline(
   signal: AbortSignal,
 ): Promise<void> {
   const headers = new Headers({ "Last-Event-ID": lastEventId });
+  headers.set("X-Kai-Stream-ID", eventStreamId());
   const response = await authorizedFetch(
     session,
     `/v1/channels/${encodeURIComponent(session.channelId)}/events`,

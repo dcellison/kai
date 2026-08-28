@@ -8,7 +8,7 @@ Personal AI assistant accessed via Telegram. Python package at src/kai/.
 - Test: `make test` (pytest, ~1200 tests)
 - Lint: `make check` (ruff check + ruff format)
 - Config wizard: `make config`
-- Install: `sudo make install`
+- Install: `make install` (the Makefile invokes `sudo`; never prefix this command with `sudo`)
 
 ## Adding a New Env Var
 
