@@ -30,7 +30,7 @@ from kai.workshop.model_discovery_inventory import (
     ModelDiscoveryReadiness,
 )
 
-_SOURCE = "anthropic-models-api:v1/models"
+_SOURCE = "anthropic-models-api-v1-models"
 _DEFAULT_BASE_URL = "https://api.anthropic.com"
 _ANTHROPIC_VERSION = "2023-06-01"
 _TTL_SECONDS = 21_600
