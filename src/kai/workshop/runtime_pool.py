@@ -57,6 +57,11 @@ class WorkshopRuntimePool:
         profile_id = self._profiles.resolve(runtime_profile_id).profile_id
         return self._pool.get_model(profile_id)
 
+    async def get_effective_model(self, runtime_profile_id: str | RuntimeProfileId) -> str:
+        """Return canonical persisted selection without starting a backend."""
+        profile_id = self._profiles.resolve(runtime_profile_id).profile_id
+        return await self._pool.get_effective_model(profile_id)
+
     def get_backend_provider(
         self,
         runtime_profile_id: str | RuntimeProfileId,
