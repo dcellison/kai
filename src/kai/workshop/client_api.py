@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 import math
 import re
+import secrets
 import time
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 from urllib.parse import quote
@@ -219,6 +222,7 @@ _CHANNEL_CREATION_REQUEST_FIELDS = frozenset({"name", "agent_ids", "origin_chann
 _MAX_CHANNEL_CREATION_BODY_BYTES = 8_192
 _DECIMAL_INTEGER = re.compile(r"^[0-9]+$")
 _CLIENT_MESSAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_EVENT_STREAM_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _EVENT_BATCH_SIZE = 100
 _SSE_RETRY_MILLISECONDS = 2000
 # Trace entries served per /trace response; the client pages with
@@ -2428,6 +2432,12 @@ class WorkshopEnrollmentRateLimiter:
         return None
 
 
+@dataclass(frozen=True, slots=True)
+class _WorkshopEventStreamClaim:
+    principal_id: PrincipalId
+    stream_key: bytes
+
+
 class WorkshopEventStreamLimiter:
     """Bound concurrent long-lived streams per principal and process."""
 
@@ -2438,18 +2448,33 @@ class WorkshopEventStreamLimiter:
         self._global_limit = global_limit
         self._active_total = 0
         self._active_by_principal: dict[PrincipalId, int] = {}
+        self._active_by_stream: dict[tuple[PrincipalId, bytes], _WorkshopEventStreamClaim] = {}
 
-    def acquire(self, principal_id: PrincipalId) -> bool:
-        if not isinstance(principal_id, PrincipalId):
-            return False
+    def acquire(self, principal_id: PrincipalId, stream_key: bytes) -> _WorkshopEventStreamClaim | None:
+        if not isinstance(principal_id, PrincipalId) or not isinstance(stream_key, bytes) or not stream_key:
+            return None
+        identity = (principal_id, stream_key)
+        claim = _WorkshopEventStreamClaim(principal_id, stream_key)
+        if identity in self._active_by_stream:
+            self._active_by_stream[identity] = claim
+            return claim
         active_for_principal = self._active_by_principal.get(principal_id, 0)
         if self._active_total >= self._global_limit or active_for_principal >= self._per_principal_limit:
-            return False
+            return None
         self._active_total += 1
         self._active_by_principal[principal_id] = active_for_principal + 1
-        return True
+        self._active_by_stream[identity] = claim
+        return claim
 
-    def release(self, principal_id: PrincipalId) -> None:
+    def is_current(self, claim: _WorkshopEventStreamClaim) -> bool:
+        return self._active_by_stream.get((claim.principal_id, claim.stream_key)) is claim
+
+    def release(self, claim: _WorkshopEventStreamClaim) -> None:
+        identity = (claim.principal_id, claim.stream_key)
+        if self._active_by_stream.get(identity) is not claim:
+            return
+        del self._active_by_stream[identity]
+        principal_id = claim.principal_id
         active_for_principal = self._active_by_principal.get(principal_id, 0)
         if active_for_principal < 1 or self._active_total < 1:
             raise RuntimeError("Event-stream capacity was released without an active claim")
@@ -2525,6 +2550,21 @@ def _parse_event_stream_request(request: web.Request) -> tuple[ChannelId, int | 
     if not _DECIMAL_INTEGER.fullmatch(value):
         raise ValueError("Invalid timeline resume position")
     return channel_id, int(value)
+
+
+def _event_stream_key(request: web.Request) -> bytes:
+    stream_ids = request.headers.getall("X-Kai-Stream-ID", [])
+    if len(stream_ids) > 1:
+        raise ValueError("Duplicate event-stream identity header")
+    if not stream_ids:
+        # Old clients remain compatible, but each connection consumes an
+        # independent slot because it cannot safely supersede another one.
+        return secrets.token_bytes(32)
+    stream_id = stream_ids[0]
+    if not _EVENT_STREAM_ID_PATTERN.fullmatch(stream_id):
+        raise ValueError("Invalid event-stream identity header")
+    authorization = request.headers.get("Authorization", "")
+    return hashlib.sha256(f"{authorization}\0{stream_id}".encode()).digest()
 
 
 def _format_timestamp(value: datetime) -> str:
@@ -3028,6 +3068,7 @@ async def _handle_channel_event_stream(
                 response.headers["WWW-Authenticate"] = "Bearer"
                 return response
             channel_id, after_position = _parse_event_stream_request(request)
+            stream_key = _event_stream_key(request)
             initial_batch = await read_client_channel_events(
                 store,
                 principal_id=principal_id,
@@ -3051,7 +3092,8 @@ async def _handle_channel_event_stream(
             message="Invalid event-stream request",
         )
 
-    if not stream_limiter.acquire(principal_id):
+    claim = stream_limiter.acquire(principal_id, stream_key)
+    if claim is None:
         response = _error_response(
             status=429,
             code="stream_capacity_exceeded",
@@ -3081,6 +3123,8 @@ async def _handle_channel_event_stream(
         last_trace_sent: tuple[str, int] | None = None
         await response.write(f": connected\nretry: {_SSE_RETRY_MILLISECONDS}\n\n".encode())
         while True:
+            if not stream_limiter.is_current(claim):
+                break
             transport = request.transport
             if transport is None or transport.is_closing():
                 break
@@ -3138,7 +3182,7 @@ async def _handle_channel_event_stream(
     except (BrokenPipeError, ConnectionResetError):
         pass
     finally:
-        stream_limiter.release(principal_id)
+        stream_limiter.release(claim)
     return response
 
 
