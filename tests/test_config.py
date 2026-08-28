@@ -3190,9 +3190,9 @@ class TestModelsForBackend:
         assert models_for_backend("goose", "openai") is PROVIDER_MODELS["openai"]
 
     def test_claude_returns_anthropic_provider_models(self):
-        from kai.config import PROVIDER_MODELS, models_for_backend
+        from kai.config import CLAUDE_MODELS, models_for_backend
 
-        assert models_for_backend("claude", "anthropic") is PROVIDER_MODELS["anthropic"]
+        assert models_for_backend("claude", "anthropic") is CLAUDE_MODELS
 
     def test_open_ended_provider_returns_none(self):
         from kai.config import models_for_backend

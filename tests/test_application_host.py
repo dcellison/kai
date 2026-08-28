@@ -14,6 +14,7 @@ from kai.workshop.bootstrap import (
     bootstrap_default_workshop,
     bootstrap_human_principal_id,
 )
+from kai.workshop.claude_model_discovery import ClaudeModelDiscoveryAdapter
 from kai.workshop.codex_model_discovery import CodexModelDiscoveryAdapter
 from kai.workshop.conversation_commands import WorkshopConversationCommandService
 from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
@@ -423,7 +424,8 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
     }
     assert services.subprocess_pool is not None
     assert _FakeModelCatalogue.adapters is not None
-    assert set(_FakeModelCatalogue.adapters) == {"codex"}
+    assert set(_FakeModelCatalogue.adapters) == {"claude", "codex"}
+    assert isinstance(_FakeModelCatalogue.adapters["claude"], ClaudeModelDiscoveryAdapter)
     assert isinstance(_FakeModelCatalogue.adapters["codex"], CodexModelDiscoveryAdapter)
     assert services.delivery_policy.enabled_transports == frozenset()
     assert host_dependencies == [

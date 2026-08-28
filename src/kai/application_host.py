@@ -21,6 +21,7 @@ from kai.config import Config, models_for_backend_policy
 from kai.pool import SubprocessPool
 from kai.workshop.appearance_preferences import WorkshopAppearancePreferenceService
 from kai.workshop.artifacts import WorkshopArtifactService
+from kai.workshop.claude_model_discovery import ClaudeModelDiscoveryAdapter
 from kai.workshop.client_commands import WorkshopClientCommandExecutor
 from kai.workshop.client_preferences import (
     ClientVoiceCapability,
@@ -314,9 +315,10 @@ class KaiApplicationHost:
                     allowed_models=lane.allowed_models,
                 ),
                 adapters={
+                    "claude": ClaudeModelDiscoveryAdapter(),
                     "codex": CodexModelDiscoveryAdapter(
                         service_os_user=pwd.getpwuid(os.geteuid()).pw_name,
-                    )
+                    ),
                 },
             )
             delivery_authority_epoch = (await WorkshopConversationDeliveryAuthority(client_store).activate()).epoch
