@@ -165,7 +165,7 @@ class TestDurableRunReplay:
             checkpoint = await store.rebuild_projection(CanonicalConversationProjection())
             after = await lifecycle.state(before.run_id)
 
-            assert checkpoint.version == 9
+            assert checkpoint.version == 10
             assert after == before
         finally:
             await store.close()
@@ -220,7 +220,7 @@ class TestDurableRunMigration:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 41
+            assert await upgraded.schema_version() == 42
             assert "runs" in await upgraded.schema_tables()
             assert "run_attempts" in await upgraded.schema_tables()
             async with upgraded.connection.execute("SELECT name FROM workshops") as cursor:

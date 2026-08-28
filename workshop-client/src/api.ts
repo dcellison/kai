@@ -2112,6 +2112,23 @@ export async function submitCommand(
     throw new Error(safeErrorMessage(payload, "Kai could not run this command."));
   }
   if (
+    isRecord(payload) &&
+    payload.version === 3 &&
+    typeof payload.acceptance === "string" &&
+    typeof payload.message_id === "string" &&
+    Array.isArray(payload.runs)
+  ) {
+    const runs = payload.runs.map((item) => parseRun(item, session.channelId));
+    if (runs.some((run) => run === null)) {
+      throw new Error("Kai returned an unsupported command response.");
+    }
+    return {
+      acceptance: payload.acceptance,
+      messageId: payload.message_id,
+      run: (runs as WorkshopRun[])[0] ?? null,
+    };
+  }
+  if (
     !isRecord(payload) ||
     payload.version !== 2 ||
     typeof payload.acceptance !== "string" ||

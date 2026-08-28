@@ -449,7 +449,7 @@ export interface TimelineSnapshot {
 export interface CommandSubmissionResult {
   acceptance: string;
   messageId: string;
-  run: WorkshopRun;
+  run: WorkshopRun | null;
 }
 
 export type WorkshopRunStatus =

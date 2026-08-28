@@ -121,10 +121,10 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
             "JOIN channels c ON c.id = m.channel_id "
             "JOIN channel_memberships cm ON cm.channel_id = m.channel_id "
             "AND cm.principal_id = m.author_principal_id "
-            "JOIN channel_agents ca ON ca.channel_id = m.channel_id "
+            "JOIN channel_agents ca ON ca.channel_id = m.channel_id AND ca.agent_id = ? "
             "JOIN agents a ON a.id = ca.agent_id AND a.workshop_id = c.workshop_id "
             "WHERE m.id = ?",
-            (inbound_message_id,),
+            (agent_id, inbound_message_id),
         ) as cursor:
             rows = list(await cursor.fetchall())
         expected = (envelope.workshop_id, channel_id, requested_by, agent_id)
@@ -552,7 +552,7 @@ class CanonicalConversationProjection:
 
     name = "canonical_conversations"
     # Runtime-profile assignments can migrate to stable protected profiles.
-    version = 9
+    version = 10
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -563,6 +563,7 @@ class CanonicalConversationProjection:
             "run_attempts",
             "runs",
             "messages",
+            "channel_agent_dismissals",
             "channel_agent_runtime_assignments",
             "channel_agents",
             "channel_bindings",
@@ -705,6 +706,40 @@ class CanonicalConversationProjection:
                     _required_text(payload, "channel_id"),
                     _required_text(payload, "agent_id"),
                     occurred_at,
+                ),
+            )
+        elif envelope.event_type == WorkshopEventType.CHANNEL_AGENT_DISMISSED:
+            _require_exact_payload(payload, {"agent_id", "thread_root_message_id"})
+            agent_id = AgentId(_required_text(payload, "agent_id"))
+            thread_root = payload.get("thread_root_message_id")
+            if thread_root is not None:
+                MessageId(str(thread_root))
+            if envelope.actor_principal_id is None:
+                raise ValueError("Workshop agent dismissal requires a human actor")
+            async with connection.execute(
+                "SELECT c.kind, c.workshop_id FROM channels c "
+                "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.principal_id = ? "
+                "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
+                "JOIN channel_agents ca ON ca.channel_id = c.id AND ca.agent_id = ? "
+                "WHERE c.id = ?",
+                (envelope.actor_principal_id, agent_id, envelope.aggregate_id),
+            ) as cursor:
+                dismissal_row = await cursor.fetchone()
+            if dismissal_row is None or tuple(dismissal_row) != ("group", envelope.workshop_id):
+                raise ValueError("Workshop agent dismissal must target an attached group agent")
+            await connection.execute(
+                "INSERT INTO channel_agent_dismissals "
+                "(id, channel_id, agent_id, dismissed_by_principal_id, "
+                "thread_root_message_id, dismissed_at, created_event_position) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    envelope.event_id,
+                    envelope.aggregate_id,
+                    agent_id,
+                    envelope.actor_principal_id,
+                    thread_root,
+                    occurred_at,
+                    event.position,
                 ),
             )
         elif envelope.event_type == WorkshopEventType.RUNTIME_PROFILE_ASSIGNED:

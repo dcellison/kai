@@ -37,7 +37,13 @@ class ClientCommandSubmission:
     """Durable acceptance returned before protected execution completes."""
 
     acceptance: ClientConversationCommandAcceptance
-    run: DurableRun
+    runs: tuple[DurableRun, ...]
+
+    @property
+    def run(self) -> DurableRun:
+        if len(self.runs) != 1:
+            raise RuntimeError("Client command did not accept exactly one run")
+        return self.runs[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,25 +96,42 @@ class WorkshopClientCommandExecutor:
         if not self.ready:
             raise ClientCommandExecutorUnavailableError("Workshop client command executor is unavailable")
         accepted = await self._execution.accept_client(message, artifact=artifact)
-        if accepted.command.disposition in {
-            ConversationCommandDisposition.NEWLY_ACCEPTED,
-            ConversationCommandDisposition.READY_REPLAY,
-        }:
-            inbound_message_id = accepted.command.message.event.envelope.aggregate_id
-            if not isinstance(inbound_message_id, MessageId):
-                raise RuntimeError("Workshop client command did not identify a canonical message")
-            await self._schedule(
-                _ClientRunContext(
-                    accepted.run.run_id,
-                    accepted.runtime_profile_id,
-                    inbound_message_id,
-                    message.body,
+        lifecycles = getattr(accepted.command, "lifecycles", None)
+        if lifecycles is None:
+            run_profiles = ((accepted.run, accepted.runtime_profile_id, accepted.command.disposition),)
+        else:
+            run_profiles = tuple(
+                (lifecycle.run, runtime_profile_id, disposition)
+                for lifecycle, runtime_profile_id, disposition in zip(
+                    lifecycles,
+                    accepted.runtime_profile_ids,
+                    accepted.command.run_dispositions,
+                    strict=True,
                 )
             )
-        return ClientCommandSubmission(
-            accepted,
-            await self._execution.run_state(accepted.run.run_id),
-        )
+        inbound_message_id: MessageId | None = None
+        for accepted_run, runtime_profile_id, disposition in run_profiles:
+            if disposition in {
+                ConversationCommandDisposition.NEWLY_ACCEPTED,
+                ConversationCommandDisposition.READY_REPLAY,
+            }:
+                if inbound_message_id is None:
+                    candidate = accepted.command.message.event.envelope.aggregate_id
+                    if not isinstance(candidate, MessageId):
+                        raise RuntimeError("Workshop client command did not identify a canonical message")
+                    inbound_message_id = candidate
+                await self._schedule(
+                    _ClientRunContext(
+                        accepted_run.run_id,
+                        runtime_profile_id,
+                        inbound_message_id,
+                        message.body,
+                    )
+                )
+        runs: list[DurableRun] = []
+        for accepted_run, _, _ in run_profiles:
+            runs.append(await self._execution.run_state(accepted_run.run_id))
+        return ClientCommandSubmission(accepted, tuple(runs))
 
     async def state(self, run_id: RunId) -> DurableRun:
         return await self._execution.run_state(run_id)

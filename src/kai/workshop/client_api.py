@@ -67,7 +67,7 @@ from kai.workshop.client_preferences import (
 )
 from kai.workshop.client_sessions import EnrollmentGrantUnavailableError, WorkshopClientEnrollmentManager
 from kai.workshop.conversation_commands import ConversationCommandAcceptanceError
-from kai.workshop.domain import ArtifactId, ChannelId, PrincipalId, RunId
+from kai.workshop.domain import AgentId, ArtifactId, ChannelId, PrincipalId, RunId
 from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.github_settings import (
     GitHubSettingsAuthority,
@@ -153,6 +153,7 @@ from kai.workshop.timeline import (
     TimelineResumeError,
     read_channel_timeline,
 )
+from kai.workshop.wake_policy import EngagementScope, WakePolicyError, dismiss_channel_agent
 
 _TIMELINE_PATH = "/v1/channels/{channel_id}/timeline"
 _TIMELINE_EVENTS_PATH = "/v1/channels/{channel_id}/events"
@@ -160,6 +161,7 @@ _CLIENT_NAVIGATION_PATH = "/v1/client/navigation"
 _CHANNEL_CREATION_PATH = "/v1/channels"
 _ENROLLMENT_REDEMPTION_PATH = "/v1/client/enrollment/redeem"
 _COMMAND_SUBMISSION_PATH = "/v1/channels/{channel_id}/commands"
+_AGENT_DISMISSAL_PATH = "/v1/channels/{channel_id}/agents/{agent_id}/dismiss"
 _ARTIFACT_CONTENT_PATH = "/v1/channels/{channel_id}/artifacts/{artifact_id}/content"
 _ARTIFACT_DOWNLOAD_PATH = "/v1/channels/{channel_id}/artifacts/{artifact_id}/download"
 _RUN_STATE_PATH = "/v1/channels/{channel_id}/runs/{run_id}"
@@ -2703,7 +2705,10 @@ async def _handle_client_navigation(
             if not isinstance(assignments, list) or not isinstance(agents, list):
                 raise RuntimeError("Workshop navigation capability assembly failed")
             channel["can_submit_commands"] = (
-                channel["kind"] in {"direct", "group"} and len(agents) == 1 and assignments == [True]
+                channel["kind"] in {"direct", "group"}
+                and len(agents) >= 1
+                and len(assignments) == len(agents)
+                and all(assignments)
             )
             visible_channels.append(channel)
         workshops.append(
@@ -3358,6 +3363,25 @@ async def _handle_command_submission(
         response.headers["Retry-After"] = "2"
         return response
 
+    result_runs = getattr(result, "runs", None)
+    if result_runs is None:
+        result_runs = (result.run,)
+    if len(result_runs) != 1:
+        runs = [_serialize_run(run) for run in result_runs]
+        terminal = bool(result_runs) and all(
+            run.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED} for run in result_runs
+        )
+        return _json_response(
+            {
+                "version": 3,
+                "message_id": str(result.acceptance.command.message.event.envelope.aggregate_id),
+                "acceptance": result.acceptance.command.disposition.value,
+                "runs": runs,
+                "run_acceptances": [disposition.value for disposition in result.acceptance.command.run_dispositions],
+            },
+            status=200 if not result_runs or terminal else 202,
+        )
+
     terminal = result.run.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}
     return _json_response(
         {
@@ -3634,6 +3658,46 @@ async def _handle_run_cancellation(
             and current.status not in {RunStatus.CANCELLED, RunStatus.COMPLETED, RunStatus.FAILED}
             else 200
         ),
+    )
+
+
+async def _handle_agent_dismissal(
+    request: web.Request,
+    *,
+    store: WorkshopEventStore,
+    authenticator: WorkshopClientAuthenticator,
+    request_lock: asyncio.Lock,
+) -> web.Response:
+    if request.query or request.content_type != "application/json":
+        return _error_response(status=400, code="invalid_request", message="Invalid dismissal request")
+    async with request_lock:
+        principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        return _error_response(status=401, code="authentication_required", message="Authentication required")
+    try:
+        channel_id = ChannelId(request.match_info["channel_id"])
+        agent_id = AgentId(request.match_info["agent_id"])
+        payload = await request.json()
+        if not isinstance(payload, dict) or set(payload) != {"client_dismissal_id"}:
+            raise ValueError
+        client_dismissal_id = payload["client_dismissal_id"]
+        if not isinstance(client_dismissal_id, str):
+            raise ValueError
+        result = await dismiss_channel_agent(
+            store,
+            principal_id=principal_id,
+            scope=EngagementScope(channel_id),
+            agent_id=agent_id,
+            client_dismissal_id=client_dismissal_id,
+            occurred_at=datetime.now(UTC),
+        )
+    except (TypeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid dismissal request")
+    except WakePolicyError:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    return _json_response(
+        {"version": 1, "dismissed": True, "replayed": not result.inserted},
+        status=200,
     )
 
 
@@ -4142,7 +4206,16 @@ def register_workshop_command_routes(
             request_lock=request_lock,
         )
 
+    async def handle_agent_dismissal(request: web.Request) -> web.Response:
+        return await _handle_agent_dismissal(
+            request,
+            store=store,
+            authenticator=authenticator,
+            request_lock=request_lock,
+        )
+
     app.router.add_post(_COMMAND_SUBMISSION_PATH, handle_command_submission)
     app.router.add_get(_RUN_STATE_PATH, handle_run_state)
     app.router.add_get(_RUN_TRACE_PATH, handle_run_trace)
     app.router.add_post(_RUN_CANCELLATION_PATH, handle_run_cancellation)
+    app.router.add_post(_AGENT_DISMISSAL_PATH, handle_agent_dismissal)

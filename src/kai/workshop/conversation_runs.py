@@ -63,8 +63,9 @@ class ConversationPool(Protocol):
 async def resolve_canonical_conversation_target(
     store: WorkshopEventStore,
     inbound_message_id: MessageId,
+    agent_id: AgentId | None = None,
 ) -> CanonicalConversationRunTarget:
-    """Resolve a human-authored message to exactly one canonical channel agent."""
+    """Resolve a human-authored message to one selected canonical channel agent."""
     if not isinstance(inbound_message_id, MessageId):
         raise ValueError("inbound_message_id must be a MessageId")
 
@@ -76,8 +77,8 @@ async def resolve_canonical_conversation_target(
         "JOIN channel_memberships cm ON cm.channel_id = m.channel_id "
         "AND cm.principal_id = m.author_principal_id "
         "JOIN channel_agents ca ON ca.channel_id = m.channel_id "
-        "WHERE m.id = ?",
-        (inbound_message_id,),
+        "WHERE m.id = ? AND (? IS NULL OR ca.agent_id = ?)",
+        (inbound_message_id, agent_id, agent_id),
     ) as cursor:
         target_rows = list(await cursor.fetchall())
     if len(target_rows) != 1:
@@ -97,6 +98,7 @@ async def resolve_canonical_conversation_target(
 async def resolve_canonical_conversation_run(
     store: WorkshopEventStore,
     inbound_message_id: MessageId,
+    agent_id: AgentId | None = None,
 ) -> CanonicalConversationRunResolution:
     """Resolve a canonical target plus its assigned opaque runtime profile.
 
@@ -105,7 +107,7 @@ async def resolve_canonical_conversation_run(
     only execution identity. Protected pool policy validates and resolves that
     profile later; human or transport identities are not execution authority.
     """
-    target = await resolve_canonical_conversation_target(store, inbound_message_id)
+    target = await resolve_canonical_conversation_target(store, inbound_message_id, agent_id)
     try:
         _, runtime_profile_id = await resolve_channel_runtime_profile(
             store,

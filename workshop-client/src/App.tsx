@@ -1376,9 +1376,11 @@ function WorkshopView({
         artifactInputRef.current.value = "";
       }
       const streamed = latestRunActivityRef.current;
-      setActiveRun(
-        streamed?.run.runId === result.run.runId ? streamed.run : result.run,
-      );
+      if (result.run) {
+        setActiveRun(
+          streamed?.run.runId === result.run.runId ? streamed.run : result.run,
+        );
+      }
     } catch (caught) {
       setSubmissionError(
         caught instanceof Error ? caught.message : "Kai could not run this command.",
