@@ -73,6 +73,13 @@ class TestPiModelParsing:
     def test_provider_model_and_thinking_suffix(self):
         assert _split_pi_model("openai/gpt-5.6-sol:xhigh") == ("openai", "gpt-5.6-sol", "xhigh")
 
+    def test_max_thinking_suffix(self):
+        assert _split_pi_model("anthropic/claude-opus-4-6:max") == (
+            "anthropic",
+            "claude-opus-4-6",
+            "max",
+        )
+
     def test_ollama_tag_is_part_of_model_id(self):
         assert _split_pi_model("ollama/llama4:70b") == ("ollama", "llama4:70b", None)
 
