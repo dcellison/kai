@@ -31,6 +31,7 @@ from kai.workshop.internal_api_contexts import (
     WorkshopInternalAPIExecutionContext,
 )
 from kai.workshop.opencode_model_discovery import OpenCodeModelDiscoveryAdapter
+from kai.workshop.pi_model_discovery import PiModelDiscoveryAdapter
 from kai.workshop.run_execution_authority import (
     RunAttemptStatus,
     RunExecutionSelection,
@@ -426,11 +427,12 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
     }
     assert services.subprocess_pool is not None
     assert _FakeModelCatalogue.adapters is not None
-    assert set(_FakeModelCatalogue.adapters) == {"claude", "codex", "goose", "opencode"}
+    assert set(_FakeModelCatalogue.adapters) == {"claude", "codex", "goose", "opencode", "pi"}
     assert isinstance(_FakeModelCatalogue.adapters["claude"], ClaudeModelDiscoveryAdapter)
     assert isinstance(_FakeModelCatalogue.adapters["codex"], CodexModelDiscoveryAdapter)
     assert isinstance(_FakeModelCatalogue.adapters["goose"], GooseModelDiscoveryAdapter)
     assert isinstance(_FakeModelCatalogue.adapters["opencode"], OpenCodeModelDiscoveryAdapter)
+    assert isinstance(_FakeModelCatalogue.adapters["pi"], PiModelDiscoveryAdapter)
     assert services.delivery_policy.enabled_transports == frozenset()
     assert host_dependencies == [
         "pool:start",

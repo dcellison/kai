@@ -47,7 +47,7 @@ from kai.subprocess_identity import subprocess_spawn_cwd, wrap_command_for_targe
 
 log = logging.getLogger(__name__)
 
-_PI_THINKING_LEVELS = frozenset({"off", "minimal", "low", "medium", "high", "xhigh"})
+_PI_THINKING_LEVELS = frozenset({"off", "minimal", "low", "medium", "high", "xhigh", "max"})
 _PI_PROVIDER_ENV_VARS: dict[str, tuple[str, ...]] = {
     "anthropic": ("ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"),
     "deepseek": ("DEEPSEEK_API_KEY",),
