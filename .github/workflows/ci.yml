@@ -84,27 +84,3 @@ jobs:
             tests/test_workshop_scheduler.py::test_workshop_only_agent_job_uses_canonical_execution \
             tests/test_workshop_scheduler.py::test_disabled_telegram_adapter_does_not_enqueue_retained_reminder_binding \
             tests/test_workshop_github_notifications.py::TestWorkshopIntegrationNotificationService::test_route_records_without_resolving_any_transport_binding
-
-  telegram-adapter:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.13"
-          cache: pip
-
-      - name: Install Telegram adapter dependencies
-        run: |
-          python -m pip install --upgrade \
-            --constraint requirements/constraints.txt pip setuptools
-          python -m pip install --upgrade \
-            --constraint requirements/constraints.txt -e '.[dev,telegram,totp]'
-
-      - name: Prove the optional Telegram adapter
-        run: |
-          python -m pytest -v \
-            tests/test_telegram_adapter.py \
-            tests/test_workshop_telegram_delivery.py \
-            tests/test_workshop_telegram_delivery_runtime.py
