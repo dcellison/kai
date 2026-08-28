@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 39
+WORKSHOP_SCHEMA_VERSION = 40
 
 
 @dataclass(frozen=True, slots=True)
@@ -1933,6 +1933,42 @@ _CANONICAL_MODEL_CATALOGUE_SCHEMA = SchemaMigration(
     ),
 )
 
+_REUSABLE_GROUP_RUNTIME_ASSIGNMENT_SCHEMA = SchemaMigration(
+    version=40,
+    name="reusable_group_runtime_assignments",
+    statements=(
+        """
+        CREATE TABLE channel_agent_runtime_assignments_v40 (
+            id TEXT PRIMARY KEY,
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+            runtime_profile_id TEXT NOT NULL CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            created_at TEXT NOT NULL,
+            created_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            UNIQUE (channel_id, agent_id)
+        )
+        """,
+        """
+        INSERT INTO channel_agent_runtime_assignments_v40 (
+            id, channel_id, agent_id, runtime_profile_id, created_at,
+            created_event_position
+        ) SELECT
+            id, channel_id, agent_id, runtime_profile_id, created_at,
+            created_event_position
+          FROM channel_agent_runtime_assignments
+        """,
+        "DROP TABLE channel_agent_runtime_assignments",
+        "ALTER TABLE channel_agent_runtime_assignments_v40 RENAME TO channel_agent_runtime_assignments",
+        "CREATE INDEX channel_agent_runtime_profile_idx ON channel_agent_runtime_assignments (runtime_profile_id)",
+        "CREATE UNIQUE INDEX channel_agent_runtime_assignment_tuple_idx "
+        "ON channel_agent_runtime_assignments "
+        "(channel_id, agent_id, runtime_profile_id)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -1973,6 +2009,7 @@ _MIGRATIONS = (
     _PRINCIPAL_APPEARANCE_PREFERENCES_SCHEMA,
     _DURABLE_PRINCIPAL_APPEARANCE_PREFERENCES_SCHEMA,
     _CANONICAL_MODEL_CATALOGUE_SCHEMA,
+    _REUSABLE_GROUP_RUNTIME_ASSIGNMENT_SCHEMA,
 )
 
 

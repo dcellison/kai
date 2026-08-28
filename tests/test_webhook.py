@@ -859,6 +859,7 @@ class TestNotificationChatIdMutations:
             assert lan_paths == {
                 "/v1/client/enrollment/redeem",
                 "/v1/client/navigation",
+                "/v1/channels",
                 "/v1/channels/{channel_id}/timeline",
                 "/v1/channels/{channel_id}/events",
                 "/v1/channels/{channel_id}/artifacts/{artifact_id}/content",
