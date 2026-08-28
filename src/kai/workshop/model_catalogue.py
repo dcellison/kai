@@ -43,6 +43,10 @@ class ModelDiscoveryUnsupported(ModelCatalogueError):
     """A backend/auth context does not support model enumeration."""
 
 
+class ModelDiscoveryAuthenticationError(ModelCatalogueError):
+    """The backend account cannot authenticate metadata discovery."""
+
+
 class ModelCatalogueEntryStatus(StrEnum):
     AVAILABLE = "available"
     NOT_ADVERTISED = "not_advertised"
@@ -466,6 +470,15 @@ class WorkshopModelCatalogueService:
                     ModelCatalogueRefreshStatus.UNSUPPORTED,
                     "enumeration_unsupported",
                     "This backend context does not support model enumeration",
+                )
+            except ModelDiscoveryAuthenticationError:
+                return await self._complete_failure(
+                    lane,
+                    generation,
+                    ModelCatalogueRefreshStatus.FAILED,
+                    "authentication_required",
+                    f"{lane.backend.title()} authentication is unavailable; "
+                    "log in again or verify the configured API key",
                 )
             except ModelCatalogueValidationError:
                 return await self._complete_failure(

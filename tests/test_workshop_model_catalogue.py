@@ -21,6 +21,7 @@ from kai.workshop.model_catalogue import (
     ModelCatalogueOperatorAuthority,
     ModelCatalogueRefreshStatus,
     ModelCatalogueValidationError,
+    ModelDiscoveryAuthenticationError,
     ModelDiscoveryBatch,
     ModelDiscoveryCandidate,
     ModelDiscoveryUnsupported,
@@ -218,6 +219,7 @@ async def test_failures_preserve_last_known_good_and_sanitize_diagnostics(tmp_pa
             object(),
             RuntimeError("secret-bearing raw response"),
             ModelDiscoveryUnsupported(),
+            ModelDiscoveryAuthenticationError("raw secret must not persist"),
         ]
     )
     service = await _open(fixture, adapter=adapter)
@@ -229,6 +231,7 @@ async def test_failures_preserve_last_known_good_and_sanitize_diagnostics(tmp_pa
         malformed = await service.refresh(authority, _id(RuntimeProfileId, 1), "claude:anthropic")
         failed = await service.refresh(authority, _id(RuntimeProfileId, 1), "claude:anthropic")
         unsupported = await service.refresh(authority, _id(RuntimeProfileId, 1), "claude:anthropic")
+        authentication = await service.refresh(authority, _id(RuntimeProfileId, 1), "claude:anthropic")
         snapshot = await service.inspect(authority, _id(RuntimeProfileId, 1), "claude:anthropic")
     finally:
         await service.close()
@@ -236,14 +239,20 @@ async def test_failures_preserve_last_known_good_and_sanitize_diagnostics(tmp_pa
     assert malformed.status == ModelCatalogueRefreshStatus.MALFORMED
     assert failed.status == ModelCatalogueRefreshStatus.FAILED
     assert unsupported.status == ModelCatalogueRefreshStatus.UNSUPPORTED
-    assert all(result.preserved_last_known_good for result in (malformed, failed, unsupported))
+    assert authentication.status == ModelCatalogueRefreshStatus.FAILED
+    assert all(result.preserved_last_known_good for result in (malformed, failed, unsupported, authentication))
+    assert snapshot.refresh is not None
+    assert snapshot.refresh.error_code == "authentication_required"
+    assert snapshot.refresh.error_detail == (
+        "Claude authentication is unavailable; log in again or verify the configured API key"
+    )
+    assert "raw secret" not in repr(snapshot)
     assert _entry(snapshot, "known-good").status == ModelCatalogueEntryStatus.AVAILABLE
     assert snapshot.stale is True
-    assert snapshot.refresh is not None
-    assert snapshot.refresh.error_detail == "This backend context does not support model enumeration"
     assert "secret-bearing" not in repr(snapshot)
     raw_database = fixture.database.read_bytes()
     assert b"secret-bearing" not in raw_database
+    assert b"raw secret" not in raw_database
 
 
 async def test_timeout_and_missing_adapter_preserve_catalogue(tmp_path: Path) -> None:
