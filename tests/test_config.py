@@ -55,6 +55,8 @@ _CONFIG_ENV_VARS = [
     "PR_REVIEW_ENABLED",
     "PR_REVIEW_COOLDOWN",
     "PR_REVIEW_TIMEOUT_S",
+    "MODEL_CATALOGUE_REFRESH_INTERVAL_S",
+    "MODEL_CATALOGUE_REFRESH_TIMEOUT_S",
     "PR_REVIEW_BUDGET_USD",
     "GITHUB_REPO",
     "SPEC_DIR",
@@ -229,6 +231,8 @@ class TestLoadConfigDefaults:
         assert config.agent_max_session_hours == 0
         assert config.webhook_port == 8080
         assert config.workshop_lan_host == ""
+        assert config.model_catalogue_refresh_interval_s == 0
+        assert config.model_catalogue_refresh_timeout_s == 30
         # Without TELEGRAM_WEBHOOK_URL, defaults to polling mode
         assert config.telegram_webhook_url is None
         assert config.telegram_webhook_secret is None
@@ -401,6 +405,32 @@ class TestLoadConfigErrors:
         monkeypatch.setenv("AGENT_MAX_SESSION_HOURS", "4.5")
         config = load_config()
         assert config.agent_max_session_hours == 4.5
+
+    def test_model_catalogue_refresh_policy_from_env(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MODEL_CATALOGUE_REFRESH_INTERVAL_S", "86400")
+        monkeypatch.setenv("MODEL_CATALOGUE_REFRESH_TIMEOUT_S", "45")
+
+        config = load_config()
+
+        assert config.model_catalogue_refresh_interval_s == 86400
+        assert config.model_catalogue_refresh_timeout_s == 45
+
+    @pytest.mark.parametrize(
+        ("name", "value", "message"),
+        [
+            ("MODEL_CATALOGUE_REFRESH_INTERVAL_S", "-1", "non-negative integer"),
+            ("MODEL_CATALOGUE_REFRESH_INTERVAL_S", "daily", "non-negative integer"),
+            ("MODEL_CATALOGUE_REFRESH_TIMEOUT_S", "0", "positive integer"),
+            ("MODEL_CATALOGUE_REFRESH_TIMEOUT_S", "slow", "positive integer"),
+        ],
+    )
+    def test_invalid_model_catalogue_refresh_policy(self, monkeypatch, name, value, message):
+        _set_required(monkeypatch)
+        monkeypatch.setenv(name, value)
+
+        with pytest.raises(SystemExit, match=message):
+            load_config()
 
     def test_invalid_autocompact_pct(self, monkeypatch):
         _set_required(monkeypatch)

@@ -50,6 +50,27 @@ export interface WorkshopNavigation {
 export interface WorkshopModelOption {
   displayName: string;
   modelId: string;
+  retained: boolean;
+  selectable: boolean;
+  sources: string[];
+  status: "available" | "not_advertised" | "unavailable" | "unknown";
+}
+
+export interface WorkshopModelCatalogue {
+  lastKnownGood: boolean;
+  models: WorkshopModelOption[];
+  optionId: string;
+  refresh: {
+    errorCode: string | null;
+    errorDetail: string | null;
+    expiresAt: string | null;
+    generation: number;
+    lastAttemptAt: string;
+    lastSuccessfulRefreshAt: string | null;
+    status: string;
+  } | null;
+  runtimeProfileId: string;
+  stale: boolean;
 }
 
 export interface WorkshopWorkspaceOption {
@@ -83,6 +104,15 @@ export interface WorkshopSettingsWorkspace {
   capabilities: WorkshopEditableCapability[];
   channelId: string;
   model: { defaultValue: string; source: string; value: string };
+  modelCatalogue: {
+    errorCode: string | null;
+    errorDetail: string | null;
+    lastAttemptAt: string | null;
+    lastKnownGood: boolean;
+    lastSuccessfulRefreshAt: string | null;
+    stale: boolean;
+    status: string | null;
+  } | null;
   modelOptions: WorkshopModelOption[] | null;
   mutation: WorkshopSettingsMutation | null;
   principalId: string;

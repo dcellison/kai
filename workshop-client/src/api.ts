@@ -15,6 +15,7 @@ import type {
   WorkshopSession,
   WorkshopEditableCapability,
   WorkshopSettingsMutation,
+  WorkshopModelCatalogue,
   WorkshopSettingsWorkspace,
   WorkshopWorkspaceConfig,
   WorkshopPreferenceDocument,
@@ -527,15 +528,39 @@ function parseSettingsWorkspace(
         if (
           !isRecord(rawModel) ||
           typeof rawModel.model_id !== "string" ||
-          typeof rawModel.display_name !== "string"
+          typeof rawModel.display_name !== "string" ||
+          !["available", "not_advertised", "unavailable", "unknown"].includes(
+            String(rawModel.status),
+          ) ||
+          typeof rawModel.selectable !== "boolean" ||
+          typeof rawModel.retained !== "boolean"
         ) {
           throw new Error("Kai returned unsupported model options.");
         }
         return {
           displayName: rawModel.display_name,
           modelId: rawModel.model_id,
+          retained: rawModel.retained,
+          selectable: rawModel.selectable,
+          sources: [],
+          status: rawModel.status as "available" | "not_advertised" | "unavailable" | "unknown",
         };
       });
+  const rawCatalogue = payload.model_catalogue;
+  if (
+    rawCatalogue !== null &&
+    (!isRecord(rawCatalogue) ||
+      (rawCatalogue.status !== null && typeof rawCatalogue.status !== "string") ||
+      typeof rawCatalogue.stale !== "boolean" ||
+      typeof rawCatalogue.last_known_good !== "boolean" ||
+      (rawCatalogue.last_attempt_at !== null && typeof rawCatalogue.last_attempt_at !== "string") ||
+      (rawCatalogue.last_successful_refresh_at !== null &&
+        typeof rawCatalogue.last_successful_refresh_at !== "string") ||
+      (rawCatalogue.error_code !== null && typeof rawCatalogue.error_code !== "string") ||
+      (rawCatalogue.error_detail !== null && typeof rawCatalogue.error_detail !== "string"))
+  ) {
+    throw new Error("Kai returned unsupported model catalogue status.");
+  }
   return {
     backend: payload.backend,
     backendOptionId: payload.backend_option_id,
@@ -545,6 +570,15 @@ function parseSettingsWorkspace(
       defaultValue: payload.model.default_value,
       source: payload.model.source,
       value: payload.model.value,
+    },
+    modelCatalogue: rawCatalogue === null ? null : {
+      errorCode: rawCatalogue.error_code as string | null,
+      errorDetail: rawCatalogue.error_detail as string | null,
+      lastAttemptAt: rawCatalogue.last_attempt_at as string | null,
+      lastKnownGood: rawCatalogue.last_known_good as boolean,
+      lastSuccessfulRefreshAt: rawCatalogue.last_successful_refresh_at as string | null,
+      stale: rawCatalogue.stale as boolean,
+      status: rawCatalogue.status as string | null,
     },
     modelOptions,
     capabilities: parseEditableCapabilities(payload.capabilities),
@@ -560,6 +594,76 @@ function parseSettingsWorkspace(
     },
     workspace: payload.workspace,
     workspaces,
+  };
+}
+
+function parseModelCatalogue(payload: unknown): WorkshopModelCatalogue {
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    typeof payload.runtime_profile_id !== "string" ||
+    typeof payload.option_id !== "string" ||
+    typeof payload.stale !== "boolean" ||
+    typeof payload.last_known_good !== "boolean" ||
+    !Array.isArray(payload.models) ||
+    (payload.refresh !== null && !isRecord(payload.refresh))
+  ) {
+    throw new Error("Kai returned an unsupported model catalogue.");
+  }
+  const models = payload.models.map((rawModel) => {
+    if (
+      !isRecord(rawModel) ||
+      typeof rawModel.model_id !== "string" ||
+      typeof rawModel.display_name !== "string" ||
+      !["available", "not_advertised", "unavailable", "unknown"].includes(
+        String(rawModel.status),
+      ) ||
+      typeof rawModel.selectable !== "boolean" ||
+      typeof rawModel.retained !== "boolean"
+      || !Array.isArray(rawModel.sources)
+      || rawModel.sources.some((source) => typeof source !== "string")
+    ) {
+      throw new Error("Kai returned unsupported model catalogue entries.");
+    }
+    return {
+      displayName: rawModel.display_name,
+      modelId: rawModel.model_id,
+      retained: rawModel.retained,
+      selectable: rawModel.selectable,
+      sources: rawModel.sources as string[],
+      status: rawModel.status as "available" | "not_advertised" | "unavailable" | "unknown",
+    };
+  });
+  const refresh = payload.refresh;
+  if (
+    refresh !== null &&
+    (!isRecord(refresh) ||
+      typeof refresh.status !== "string" ||
+      !Number.isSafeInteger(refresh.generation) ||
+      typeof refresh.last_attempt_at !== "string" ||
+      (refresh.last_successful_refresh_at !== null &&
+        typeof refresh.last_successful_refresh_at !== "string") ||
+      (refresh.expires_at !== null && typeof refresh.expires_at !== "string") ||
+      (refresh.error_code !== null && typeof refresh.error_code !== "string") ||
+      (refresh.error_detail !== null && typeof refresh.error_detail !== "string"))
+  ) {
+    throw new Error("Kai returned unsupported model refresh status.");
+  }
+  return {
+    lastKnownGood: payload.last_known_good,
+    models,
+    optionId: payload.option_id,
+    refresh: refresh === null ? null : {
+      errorCode: refresh.error_code as string | null,
+      errorDetail: refresh.error_detail as string | null,
+      expiresAt: refresh.expires_at as string | null,
+      generation: refresh.generation as number,
+      lastAttemptAt: refresh.last_attempt_at as string,
+      lastSuccessfulRefreshAt: refresh.last_successful_refresh_at as string | null,
+      status: refresh.status as string,
+    },
+    runtimeProfileId: payload.runtime_profile_id,
+    stale: payload.stale,
   };
 }
 
@@ -1495,6 +1599,113 @@ export async function loadSettingsWorkspace(
     );
   }
   return parseSettingsWorkspace(payload, session.channelId);
+}
+
+export async function loadModelCatalogue(
+  session: WorkshopSession,
+  optionId: string,
+): Promise<WorkshopModelCatalogue> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/models?option_id=${encodeURIComponent(optionId)}`,
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load the model catalogue."));
+  }
+  return parseModelCatalogue(payload);
+}
+
+export async function refreshModelCatalogue(
+  session: WorkshopSession,
+  optionId: string,
+): Promise<WorkshopModelCatalogue> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/models`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ option_id: optionId }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not refresh the model catalogue."));
+  }
+  return parseModelCatalogue(payload);
+}
+
+export async function refreshAllModelCatalogues(
+  session: WorkshopSession,
+): Promise<{ contexts: number; statuses: Record<string, number> }> {
+  const response = await authorizedFetch(
+    session,
+    "/v1/settings/model-catalogue/refresh-all",
+    { method: "POST" },
+  );
+  const payload = await responsePayload(response);
+  if (
+    !response.ok ||
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    !Number.isSafeInteger(payload.contexts) ||
+    !isRecord(payload.statuses) ||
+    Object.values(payload.statuses).some((count) => !Number.isSafeInteger(count))
+  ) {
+    throw new Error(safeErrorMessage(payload, "Could not refresh all model catalogues."));
+  }
+  return {
+    contexts: payload.contexts as number,
+    statuses: payload.statuses as Record<string, number>,
+  };
+}
+
+export async function upsertOperatorModel(
+  session: WorkshopSession,
+  optionId: string,
+  modelId: string,
+  displayLabel: string,
+): Promise<WorkshopModelCatalogue> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/models`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        option_id: optionId,
+        model_id: modelId,
+        display_label: displayLabel,
+      }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not save the operator model."));
+  }
+  return parseModelCatalogue(payload);
+}
+
+export async function deactivateOperatorModel(
+  session: WorkshopSession,
+  optionId: string,
+  modelId: string,
+): Promise<WorkshopModelCatalogue> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/models`,
+    {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ option_id: optionId, model_id: modelId }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not deactivate the operator model."));
+  }
+  return parseModelCatalogue(payload);
 }
 
 export async function loadGitHubSettings(

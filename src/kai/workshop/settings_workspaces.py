@@ -21,6 +21,12 @@ from kai.workshop.execution_state import (
     WorkshopExecutionStateNamespace,
     WorkshopExecutionStateRegistry,
 )
+from kai.workshop.model_catalogue import (
+    ModelCatalogueEntryStatus,
+    ModelCatalogueRefreshResult,
+    ModelCatalogueSnapshot,
+    WorkshopModelCatalogueService,
+)
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError
 from kai.workspace_utils import is_workspace_allowed
@@ -84,6 +90,20 @@ class SettingsMutationOutcome:
 class ModelOption:
     model_id: str
     display_name: str
+    status: str = ModelCatalogueEntryStatus.AVAILABLE.value
+    selectable: bool = True
+    retained: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCatalogueSummary:
+    status: str | None
+    stale: bool
+    last_known_good: bool
+    last_attempt_at: str | None
+    last_successful_refresh_at: str | None
+    error_code: str | None
+    error_detail: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +138,7 @@ class SettingsWorkspaceSnapshot:
     revision: str
     capabilities: tuple[EditableCapability, ...]
     backend_options: tuple[BackendOption, ...] = ()
+    model_catalogue: ModelCatalogueSummary | None = None
     mutation: SettingsMutationOutcome | None = None
 
 
@@ -158,10 +179,12 @@ class WorkshopSettingsWorkspaceService:
         config: Config,
         runtime_pool: WorkshopRuntimePool,
         execution_state: WorkshopExecutionStateRegistry,
+        model_catalogue: WorkshopModelCatalogueService | None = None,
     ) -> None:
         self._config = config
         self._runtime_pool = runtime_pool
         self._execution_state = execution_state
+        self._model_catalogue = model_catalogue
         self._locks: dict[RuntimeProfileId, asyncio.Lock] = {}
 
     def authority_for_principal_channel(
@@ -216,6 +239,99 @@ class WorkshopSettingsWorkspaceService:
         async with self._lock(authority):
             return await self._inspect_locked(authority)
 
+    async def inspect_model_catalogue(
+        self,
+        authority: SettingsWorkspaceAuthority,
+        option_id: str | None = None,
+    ) -> ModelCatalogueSnapshot:
+        """Inspect one principal-owned backend lane through canonical authority."""
+        catalogue = self._require_model_catalogue()
+        profile = self._runtime_pool.runtime_profile(authority.runtime_profile_id)
+        requested = option_id or self._runtime_pool.get_backend_provider(authority.runtime_profile_id)
+        resolved_option_id = f"{requested[0]}:{requested[1]}" if isinstance(requested, tuple) else requested
+        try:
+            profile.backend_option(resolved_option_id)
+        except WorkshopRuntimeProfileError as exc:
+            raise WorkshopSettingsWorkspaceAccessDenied("The principal does not own this model catalogue") from exc
+        return await catalogue.inspect(
+            catalogue.authority_for_principal(authority.principal_id),
+            authority.runtime_profile_id,
+            resolved_option_id,
+        )
+
+    async def refresh_model_catalogue(
+        self,
+        authority: SettingsWorkspaceAuthority,
+        option_id: str | None = None,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> ModelCatalogueRefreshResult:
+        """Refresh one owned catalogue without touching runtime selection."""
+        catalogue = self._require_model_catalogue()
+        snapshot = await self.inspect_model_catalogue(authority, option_id)
+        return await catalogue.refresh(
+            catalogue.authority_for_principal(authority.principal_id),
+            authority.runtime_profile_id,
+            snapshot.option_id,
+            timeout_seconds=(
+                self._config.model_catalogue_refresh_timeout_s if timeout_seconds is None else timeout_seconds
+            ),
+        )
+
+    async def refresh_all_model_catalogues_as_operator(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> tuple[ModelCatalogueRefreshResult, ...]:
+        catalogue = self._require_model_catalogue()
+        return await catalogue.refresh_all(
+            catalogue.operator_authority(),
+            timeout_seconds=(
+                self._config.model_catalogue_refresh_timeout_s if timeout_seconds is None else timeout_seconds
+            ),
+        )
+
+    async def upsert_operator_model(
+        self,
+        authority: SettingsWorkspaceAuthority,
+        option_id: str,
+        *,
+        model_id: str,
+        display_label: str,
+    ) -> ModelCatalogueSnapshot:
+        catalogue = self._require_model_catalogue()
+        snapshot = await self.inspect_model_catalogue(authority, option_id)
+        await catalogue.upsert_operator_entry(
+            catalogue.operator_authority(),
+            authority.runtime_profile_id,
+            snapshot.option_id,
+            model_id=model_id,
+            display_label=display_label,
+        )
+        return await self.inspect_model_catalogue(authority, option_id)
+
+    async def deactivate_operator_model(
+        self,
+        authority: SettingsWorkspaceAuthority,
+        option_id: str,
+        *,
+        model_id: str,
+    ) -> ModelCatalogueSnapshot:
+        catalogue = self._require_model_catalogue()
+        snapshot = await self.inspect_model_catalogue(authority, option_id)
+        await catalogue.deactivate_operator_entry(
+            catalogue.operator_authority(),
+            authority.runtime_profile_id,
+            snapshot.option_id,
+            model_id=model_id,
+        )
+        return await self.inspect_model_catalogue(authority, option_id)
+
+    def _require_model_catalogue(self) -> WorkshopModelCatalogueService:
+        if self._model_catalogue is None:
+            raise WorkshopSettingsWorkspaceError("Model catalogue is unavailable")
+        return self._model_catalogue
+
     async def _inspect_locked(
         self,
         authority: SettingsWorkspaceAuthority,
@@ -259,16 +375,35 @@ class WorkshopSettingsWorkspaceService:
                 )
             )
 
-        curated_models = models_for_backend_policy(
-            effective_option.backend,
-            effective_option.provider,
-            allowed_models=effective_option.allowed_models,
-        )
-        model_options = (
-            tuple(ModelOption(model_id, display_name) for model_id, display_name in curated_models.items())
-            if curated_models is not None
+        catalogue_snapshot = (
+            await self.inspect_model_catalogue(authority, effective_option.option_id)
+            if self._model_catalogue is not None
             else None
         )
+        if catalogue_snapshot is not None:
+            model_options = tuple(
+                ModelOption(
+                    entry.model_id,
+                    entry.display_label,
+                    entry.status.value,
+                    entry.selectable,
+                    entry.retained,
+                )
+                for entry in catalogue_snapshot.entries
+            )
+            catalogue_summary = self._catalogue_summary(catalogue_snapshot)
+        else:
+            curated_models = models_for_backend_policy(
+                effective_option.backend,
+                effective_option.provider,
+                allowed_models=effective_option.allowed_models,
+            )
+            model_options = (
+                tuple(ModelOption(model_id, display_name) for model_id, display_name in curated_models.items())
+                if curated_models is not None
+                else None
+            )
+            catalogue_summary = None
         revision = await self._revision(authority, workspace)
         return SettingsWorkspaceSnapshot(
             principal_id=authority.principal_id,
@@ -297,6 +432,7 @@ class WorkshopSettingsWorkspaceService:
                 maximum_timeout_seconds=profile.maximum_timeout_seconds,
                 backend_choices=tuple(option.option_id for option in profile.backend_options),
             ),
+            model_catalogue=catalogue_summary,
             mutation=mutation,
         )
 
@@ -312,10 +448,12 @@ class WorkshopSettingsWorkspaceService:
         backend, _provider = self._runtime_pool.get_backend_provider(authority.runtime_profile_id)
         option = profile.backend_option(f"{backend}:{_provider}")
         normalized = canonicalize_model_for_backend(model.strip(), option.backend)
-        if not normalized or not validate_model_for_backend_policy(
+        if not normalized or not await self._model_is_selectable(
+            authority,
+            option.option_id,
             normalized,
-            option.backend,
-            option.provider,
+            backend=option.backend,
+            provider=option.provider,
             allowed_models=option.allowed_models,
         ):
             raise WorkshopSettingsWorkspaceValidationError("The model is not allowed by this runtime profile")
@@ -569,6 +707,22 @@ class WorkshopSettingsWorkspaceService:
             elif yaml_config.system_prompt_file:
                 prompt_source = "workspaces.yaml file"
                 has_prompt = True
+        catalogue_options: tuple[ModelOption, ...] | None = None
+        if self._model_catalogue is not None:
+            catalogue_snapshot = await self.inspect_model_catalogue(
+                authority,
+                backend_option.option_id,
+            )
+            catalogue_options = tuple(
+                ModelOption(
+                    entry.model_id,
+                    entry.display_label,
+                    entry.status.value,
+                    entry.selectable,
+                    entry.retained,
+                )
+                for entry in catalogue_snapshot.entries
+            )
         return WorkspaceConfigSnapshot(
             workspace=str(workspace),
             model=model,
@@ -585,7 +739,9 @@ class WorkshopSettingsWorkspaceService:
                 overrides,
             ),
             capabilities=self._workspace_capabilities(
-                models_for_backend_policy(
+                catalogue_options
+                if catalogue_options is not None
+                else models_for_backend_policy(
                     backend_option.backend,
                     backend_option.provider,
                     allowed_models=backend_option.allowed_models,
@@ -611,10 +767,12 @@ class WorkshopSettingsWorkspaceService:
         backend_option = profile.backend_option(f"{backend}:{_provider}")
         if field == "model":
             value = canonicalize_model_for_backend(value.strip(), backend_option.backend)
-            if not validate_model_for_backend_policy(
+            if not await self._model_is_selectable(
+                authority,
+                backend_option.option_id,
                 value,
-                backend_option.backend,
-                backend_option.provider,
+                backend=backend_option.backend,
+                provider=backend_option.provider,
                 allowed_models=backend_option.allowed_models,
             ):
                 raise WorkshopSettingsWorkspaceValidationError("The model is not allowed by this runtime profile")
@@ -1157,6 +1315,43 @@ class WorkshopSettingsWorkspaceService:
         if expected is not None and expected != current:
             raise WorkshopSettingsWorkspaceConflict("Settings changed since they were loaded; reload and try again")
 
+    async def _model_is_selectable(
+        self,
+        authority: SettingsWorkspaceAuthority,
+        option_id: str,
+        model_id: str,
+        *,
+        backend: str,
+        provider: str,
+        allowed_models: tuple[str, ...] | None,
+    ) -> bool:
+        if self._model_catalogue is not None:
+            snapshot = await self.inspect_model_catalogue(authority, option_id)
+            return any(entry.model_id == model_id and entry.selectable for entry in snapshot.entries)
+        return validate_model_for_backend_policy(
+            model_id,
+            backend,
+            provider,
+            allowed_models=allowed_models,
+        )
+
+    @staticmethod
+    def _catalogue_summary(snapshot: ModelCatalogueSnapshot) -> ModelCatalogueSummary:
+        refresh = snapshot.refresh
+        return ModelCatalogueSummary(
+            status=refresh.status.value if refresh is not None else None,
+            stale=snapshot.stale,
+            last_known_good=snapshot.last_known_good,
+            last_attempt_at=(refresh.last_attempt_at.isoformat() if refresh is not None else None),
+            last_successful_refresh_at=(
+                refresh.last_successful_refresh_at.isoformat()
+                if refresh is not None and refresh.last_successful_refresh_at is not None
+                else None
+            ),
+            error_code=refresh.error_code if refresh is not None else None,
+            error_detail=refresh.error_detail if refresh is not None else None,
+        )
+
     @staticmethod
     def _capabilities(
         model_options: tuple[ModelOption, ...] | None,
@@ -1177,7 +1372,11 @@ class WorkshopSettingsWorkspaceService:
                 scope="runtime",
                 value_type="model_id",
                 resettable=True,
-                choices=tuple(option.model_id for option in model_options) if model_options is not None else None,
+                choices=(
+                    tuple(option.model_id for option in model_options if option.selectable or option.retained)
+                    if model_options is not None
+                    else None
+                ),
             ),
             EditableCapability(
                 field="timeout",
@@ -1197,7 +1396,7 @@ class WorkshopSettingsWorkspaceService:
 
     @staticmethod
     def _workspace_capabilities(
-        model_options: dict[str, str] | None,
+        model_options: dict[str, str] | tuple[ModelOption, ...] | None,
         *,
         maximum_timeout_seconds: int,
     ) -> tuple[EditableCapability, ...]:
@@ -1207,7 +1406,13 @@ class WorkshopSettingsWorkspaceService:
                 "workspace",
                 "model_id",
                 True,
-                choices=tuple(model_options) if model_options is not None else None,
+                choices=(
+                    tuple(option.model_id for option in model_options if option.selectable or option.retained)
+                    if isinstance(model_options, tuple)
+                    else tuple(model_options)
+                    if model_options is not None
+                    else None
+                ),
             ),
             EditableCapability(
                 "timeout",

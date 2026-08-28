@@ -346,7 +346,12 @@ def host_dependencies(monkeypatch):
     monkeypatch.setattr(
         host_module,
         "WorkshopSettingsWorkspaceService",
-        lambda config, pool, execution_state: (config, pool, execution_state),
+        lambda config, pool, execution_state, model_catalogue: (
+            config,
+            pool,
+            execution_state,
+            model_catalogue,
+        ),
     )
     monkeypatch.setattr(
         host_module,
@@ -368,6 +373,8 @@ def _host() -> KaiApplicationHost:
             spec_dir="specs",
             pr_review_timeout_s=900,
             telegram_enabled=False,
+            model_catalogue_refresh_interval_s=0,
+            model_catalogue_refresh_timeout_s=30,
         ),  # type: ignore[arg-type]
         runtime_profiles=SimpleNamespace(),  # type: ignore[arg-type]
         execution_state=SimpleNamespace(),  # type: ignore[arg-type]

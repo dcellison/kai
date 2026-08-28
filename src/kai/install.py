@@ -2822,6 +2822,26 @@ def _cmd_config() -> None:
     )
     print()
 
+    # -- Model catalogue --
+    print("-- Model catalogue --")
+    while True:
+        model_catalogue_refresh_interval_s = _prompt(
+            "Periodic refresh interval in seconds (0 disables)",
+            existing_env.get("MODEL_CATALOGUE_REFRESH_INTERVAL_S", "0"),
+        )
+        if _validate_non_negative_int(model_catalogue_refresh_interval_s):
+            break
+        print("  Must be a non-negative integer.")
+    while True:
+        model_catalogue_refresh_timeout_s = _prompt(
+            "Per-backend refresh timeout in seconds",
+            existing_env.get("MODEL_CATALOGUE_REFRESH_TIMEOUT_S", "30"),
+        )
+        if _validate_positive_int(model_catalogue_refresh_timeout_s):
+            break
+        print("  Must be a positive integer.")
+    print()
+
     # -- PR review agent --
     # PR_REVIEW_COOLDOWN and PR_REVIEW_TIMEOUT_S are global resource
     # controls for the review subprocess: any review by any user
@@ -3266,6 +3286,11 @@ def _cmd_config() -> None:
     # ALLOWED_WORKSPACES is an inheritable installation default.
     if allowed_workspaces:
         env["ALLOWED_WORKSPACES"] = allowed_workspaces
+
+    if model_catalogue_refresh_interval_s != "0":
+        env["MODEL_CATALOGUE_REFRESH_INTERVAL_S"] = model_catalogue_refresh_interval_s
+    if model_catalogue_refresh_timeout_s != "30":
+        env["MODEL_CATALOGUE_REFRESH_TIMEOUT_S"] = model_catalogue_refresh_timeout_s
 
     # Review subprocess resource limits. They apply globally to any
     # review, regardless of which user opted in.
@@ -9500,6 +9525,7 @@ def _cmd_status() -> None:
         print(_webhook_secret_migration_status(conf_env, source="install.conf artifact"))
 
     print(_runtime_policy_status(RUNTIME_PROFILES_YAML, BACKENDS_YAML))
+    print(_model_catalogue_status(Path(data_dir) / "kai.db", RUNTIME_PROFILES_YAML))
     print(
         _runtime_storage_status(
             Path(data_dir),
@@ -9610,6 +9636,46 @@ def _runtime_policy_status(policy_path: Path, backend_registry_path: Path) -> st
         f"{prefix} initialized; profiles={len(profiles.profiles)}, backends={backends}, "
         f"runtime kernel=canonical, backend selection=canonical "
         f"({selectable_backends}), archived keys={archived}, removal gate={removal_gate}"
+    )
+
+
+def _model_catalogue_status(database_path: Path, policy_path: Path) -> str:
+    """Report durable catalogue state without invoking discovery."""
+    prefix = "Workshop model catalogue:"
+    try:
+        profiles = WorkshopRuntimeProfileRegistry.from_yaml(policy_path.read_text(encoding="utf-8"))
+        expected = sum(len(profile.backend_options) for profile in profiles.profiles)
+        with sqlite3.connect(database_path) as connection:
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'workshop_model_catalogue_refreshes'"
+            ).fetchone()
+            if table is None:
+                return f"{prefix} unavailable"
+            rows = connection.execute(
+                "SELECT status, last_successful_refresh_at FROM workshop_model_catalogue_refreshes WHERE active = 1"
+            ).fetchall()
+            entries = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM workshop_model_catalogue_discovered_entries "
+                    "WHERE status IN ('available', 'not_advertised')"
+                ).fetchone()[0]
+            )
+            operator_entries = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM workshop_model_catalogue_operator_entries WHERE active = 1"
+                ).fetchone()[0]
+            )
+    except (OSError, sqlite3.Error, WorkshopRuntimeProfileError, yaml.YAMLError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    active = len(rows)
+    succeeded = sum(str(row[0]) == "succeeded" for row in rows)
+    failed = sum(str(row[0]) not in {"succeeded", "refreshing"} for row in rows)
+    refreshed = sum(row[1] is not None for row in rows)
+    state = "active" if active <= expected and failed == 0 else "DEGRADED"
+    return (
+        f"{prefix} {state}; contexts={expected}, active={active}, refreshed={refreshed}, "
+        f"succeeded={succeeded}, failed={failed}, discovered entries={entries}, "
+        f"operator entries={operator_entries}; diagnostic discovery=disabled"
     )
 
 

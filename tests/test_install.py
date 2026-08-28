@@ -73,6 +73,7 @@ from kai.install import (
     _migrate_identity_to_claude_md,
     _migrate_internal_api_instructions,
     _migrate_managed_home_database_paths,
+    _model_catalogue_status,
     _optional_file_checksum,
     _post_run_effect_status,
     _probe_service_readiness,
@@ -1676,6 +1677,8 @@ class TestCmdConfig:
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
                 "",  # allowed workspaces (empty)
+                "0",  # periodic model-catalogue refresh disabled
+                "30",  # model-catalogue refresh timeout
                 "false",  # pr review enabled
                 "300",  # pr review cooldown (global resource control)
                 "900",  # pr review timeout (seconds)
@@ -1777,6 +1780,8 @@ class TestCmdConfig:
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
                 "",  # allowed workspaces (empty)
+                "0",  # periodic model-catalogue refresh disabled
+                "30",  # model-catalogue refresh timeout
                 "false",  # pr review enabled
                 "300",  # pr review cooldown (global resource control)
                 "900",  # pr review timeout (seconds)
@@ -1861,6 +1866,8 @@ class TestCmdConfig:
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
                 "",  # allowed workspaces
+                "0",  # periodic model-catalogue refresh disabled
+                "30",  # model-catalogue refresh timeout
                 "false",  # pr review enabled
                 "300",  # pr review cooldown (global resource control)
                 "900",  # pr review timeout
@@ -1933,6 +1940,8 @@ class TestCmdConfig:
                 "test-secret",
                 "~/Projects",
                 "",
+                "0",  # periodic model-catalogue refresh disabled
+                "30",  # model-catalogue refresh timeout
                 "false",
                 "300",  # pr review cooldown (global resource control)
                 "900",
@@ -1996,6 +2005,8 @@ class TestCmdConfig:
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
                 "",  # allowed workspaces (empty)
+                "0",  # periodic model-catalogue refresh disabled
+                "30",  # model-catalogue refresh timeout
                 "false",  # pr review enabled
                 "300",  # pr review cooldown (global resource control)
                 "900",  # pr review timeout (seconds)
@@ -2132,6 +2143,8 @@ class TestCmdConfig:
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
                 "",  # allowed workspaces (empty)
+                "0",  # periodic model-catalogue refresh disabled
+                "30",  # model-catalogue refresh timeout
                 "false",  # pr review enabled
                 "300",  # pr review cooldown (global resource control)
                 "900",  # pr review timeout (seconds)
@@ -2270,6 +2283,8 @@ class TestCmdConfig:
         llm_provider: str = "anthropic",
         llm_api_key: str = "sk-ant-test-key",
         client_mode: str = "hybrid",
+        model_catalogue_refresh_interval: str = "0",
+        model_catalogue_refresh_timeout: str = "30",
     ) -> list[str]:
         """Default wizard inputs with swappable memory block, effort, and backend.
 
@@ -2366,12 +2381,34 @@ class TestCmdConfig:
             "test-secret",  # webhook secret
             "~/Projects",  # workspace base
             "",  # allowed workspaces
+            model_catalogue_refresh_interval,
+            model_catalogue_refresh_timeout,
             "300",  # pr review cooldown (global resource control)
             "900",  # pr review timeout
             *telegram_features,
             *memory_block,
             "",  # perplexity key
         ]
+
+    def test_model_catalogue_periodic_refresh_policy_is_configurable(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._redirect_staging(monkeypatch, tmp_path)
+        inputs = iter(
+            self._base_inputs(
+                ["false"],
+                model_catalogue_refresh_interval="86400",
+                model_catalogue_refresh_timeout="45",
+            )
+        )
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        env = json.loads((tmp_path / "install.conf").read_text())["env"]
+        assert env["MODEL_CATALOGUE_REFRESH_INTERVAL_S"] == "86400"
+        assert env["MODEL_CATALOGUE_REFRESH_TIMEOUT_S"] == "45"
 
     @pytest.mark.parametrize(
         ("client_mode", "expected_adapters", "telegram_configured"),
@@ -2983,6 +3020,8 @@ class TestCmdConfig:
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
                 "",  # allowed workspaces
+                "0",  # periodic model-catalogue refresh disabled
+                "30",  # model-catalogue refresh timeout
                 "300",  # pr review cooldown (global resource control)
                 "900",  # pr review timeout
                 "false",  # voice
@@ -3327,6 +3366,8 @@ class TestCmdConfig:
                 "test-secret",  # webhook secret
                 "",  # workspace base
                 "",  # allowed workspaces
+                "0",  # periodic model-catalogue refresh disabled
+                "30",  # model-catalogue refresh timeout
                 "300",  # pr review cooldown (global resource control)
                 "900",  # pr review timeout
                 "false",  # voice
@@ -3952,6 +3993,8 @@ class TestCmdConfigDefaultModelDispatch:
             "test-secret",  # webhook secret
             "~/Projects",  # workspace base (global default)
             "",  # allowed workspaces (global default, empty)
+            "0",  # periodic model-catalogue refresh disabled
+            "30",  # model-catalogue refresh timeout
             "300",  # pr review cooldown (global resource control)
             "900",  # pr review subprocess timeout
             "false",  # voice
@@ -3997,6 +4040,8 @@ class TestCmdConfigDefaultModelDispatch:
             "test-secret",  # webhook secret
             "~/Projects",  # workspace base (global default)
             "",  # allowed workspaces (global default, empty)
+            "0",  # periodic model-catalogue refresh disabled
+            "30",  # model-catalogue refresh timeout
             "300",  # pr review cooldown (global resource control)
             "900",  # pr review subprocess timeout
             "false",  # voice
@@ -4034,6 +4079,8 @@ class TestCmdConfigDefaultModelDispatch:
             "test-secret",  # webhook secret
             "~/Projects",  # workspace base (global default)
             "",  # allowed workspaces (global default, empty)
+            "0",  # periodic model-catalogue refresh disabled
+            "30",  # model-catalogue refresh timeout
             "300",  # pr review cooldown (global resource control)
             "900",  # pr review subprocess timeout
             "false",  # voice
@@ -10196,6 +10243,53 @@ backends:
 
         assert _runtime_policy_status(policy, backends).startswith("Workshop runtime policy: INVALID")
 
+    def test_model_catalogue_status_is_read_only_and_reports_durable_counts(self, tmp_path):
+        profile_id = str(kai.install.runtime_profile_id_for_config_id(101))
+        policy = tmp_path / "runtime-profiles.yaml"
+        policy.write_text(
+            yaml.safe_dump(
+                {
+                    "version": 1,
+                    "runtime_profiles": {
+                        profile_id: {
+                            "display_name": "Daniel",
+                            "compatibility_runtime_config_id": 101,
+                            "backend": "codex",
+                            "provider": "openai",
+                            "model": "gpt-5.6-sol",
+                            "timeout_seconds": 120,
+                            "allowed_services": [],
+                            "home_workspace": None,
+                            "workspace_base": None,
+                            "allowed_workspaces": [],
+                        }
+                    },
+                }
+            )
+        )
+        database = tmp_path / "kai.db"
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "CREATE TABLE workshop_model_catalogue_refreshes "
+                "(status TEXT, last_successful_refresh_at TEXT, active INTEGER)"
+            )
+            connection.execute("CREATE TABLE workshop_model_catalogue_discovered_entries (status TEXT)")
+            connection.execute("CREATE TABLE workshop_model_catalogue_operator_entries (active INTEGER)")
+            connection.execute("INSERT INTO workshop_model_catalogue_refreshes VALUES ('succeeded', '2026-08-28', 1)")
+            connection.executemany(
+                "INSERT INTO workshop_model_catalogue_discovered_entries VALUES (?)",
+                (("available",), ("not_advertised",), ("unavailable",)),
+            )
+            connection.execute("INSERT INTO workshop_model_catalogue_operator_entries VALUES (1)")
+
+        status = _model_catalogue_status(database, policy)
+
+        assert status == (
+            "Workshop model catalogue: active; contexts=1, active=1, refreshed=1, "
+            "succeeded=1, failed=0, discovered entries=2, operator entries=1; "
+            "diagnostic discovery=disabled"
+        )
+
     def test_apply_initializes_root_private_policy(self, tmp_path, monkeypatch):
         policy = tmp_path / "runtime-profiles.yaml"
         monkeypatch.setattr("kai.install.RUNTIME_PROFILES_YAML", policy)
@@ -11148,6 +11242,8 @@ class TestCmdConfigCanonicalUsersYaml:
             "test-secret",
             "~/Projects",
             "",
+            "0",  # periodic model-catalogue refresh disabled
+            "30",  # model-catalogue refresh timeout
             "false",
             "300",  # pr review cooldown (global resource control)
             "900",
@@ -11615,6 +11711,8 @@ class TestCmdConfigSingleUserMode:
             "test-secret",  # webhook secret
             "~/Projects",  # workspace_base
             "",  # allowed_workspaces
+            "0",  # periodic model-catalogue refresh disabled
+            "30",  # model-catalogue refresh timeout
             "false",  # pr_review_enabled
             "300",  # pr_review_cooldown
             "900",  # pr_review_timeout_s
@@ -13113,6 +13211,8 @@ class TestOpenCodeConfigWizard:
             "test-secret",  # webhook secret
             "",  # workspace base
             "",  # allowed workspaces
+            "0",  # periodic model-catalogue refresh disabled
+            "30",  # model-catalogue refresh timeout
             "300",  # pr review cooldown (global resource control)
             "900",  # pr review timeout
             "false",  # voice

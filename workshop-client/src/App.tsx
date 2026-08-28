@@ -1612,6 +1612,7 @@ function WorkshopView({
           onChannelAccessFailure={onSettingsAccessFailure}
           onClose={() => onSelectChannel(channelId)}
           onDirtyChange={onSettingsDirtyChange}
+          isAdministrator={workshop.role === "admin"}
           principalName={humanName}
           roleLabel={humanRole}
           runtimeLabel={settingsRuntimeLabel}

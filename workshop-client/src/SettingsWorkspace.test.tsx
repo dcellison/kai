@@ -4,18 +4,23 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ChannelAccessError,
+  deactivateOperatorModel,
   loadAppearancePreferences,
   loadGitHubSettings,
   loadNotificationPreferences,
   loadClientPreferences,
+  loadModelCatalogue,
   loadPreferenceDocument,
   loadPreferenceHistory,
   loadSettingsWorkspace,
   loadWorkspaceConfig,
   PreferenceRevisionConflictError,
+  refreshAllModelCatalogues,
+  refreshModelCatalogue,
   restorePreferenceRevision,
   savePreferenceDocument,
   switchWorkspace,
+  upsertOperatorModel,
   updateGitHubSettings,
   updateNotificationPreference,
   updateClientPreference,
@@ -28,6 +33,7 @@ import { WORKSHOP_THEME_CATALOG } from "./theme";
 import type {
   WorkshopPreferenceDocument,
   WorkshopGitHubSettings,
+  WorkshopModelCatalogue,
   WorkshopNotificationPreferences,
   WorkshopClientPreferences,
   WorkshopAppearancePreferences,
@@ -43,13 +49,18 @@ vi.mock("./api", async (importOriginal) => {
     loadGitHubSettings: vi.fn(),
     loadNotificationPreferences: vi.fn(),
     loadClientPreferences: vi.fn(),
+    loadModelCatalogue: vi.fn(),
     loadAppearancePreferences: vi.fn(),
     loadPreferenceHistory: vi.fn(),
     loadSettingsWorkspace: vi.fn(),
     loadWorkspaceConfig: vi.fn(),
     restorePreferenceRevision: vi.fn(),
+    refreshAllModelCatalogues: vi.fn(),
+    refreshModelCatalogue: vi.fn(),
     savePreferenceDocument: vi.fn(),
     switchWorkspace: vi.fn(),
+    upsertOperatorModel: vi.fn(),
+    deactivateOperatorModel: vi.fn(),
     updateGitHubSettings: vi.fn(),
     updateNotificationPreference: vi.fn(),
     updateClientPreference: vi.fn(),
@@ -122,9 +133,32 @@ const runtime: WorkshopSettingsWorkspace = {
     source: "runtime policy",
     value: "claude-sonnet-4-6",
   },
+  modelCatalogue: {
+    errorCode: null,
+    errorDetail: null,
+    lastAttemptAt: "2026-08-28T10:00:00Z",
+    lastKnownGood: false,
+    lastSuccessfulRefreshAt: "2026-08-28T10:00:00Z",
+    stale: false,
+    status: "succeeded",
+  },
   modelOptions: [
-    { displayName: "Claude Sonnet 4.6", modelId: "claude-sonnet-4-6" },
-    { displayName: "Claude Opus 4.1", modelId: "claude-opus-4-1" },
+    {
+      displayName: "Claude Sonnet 4.6",
+      modelId: "claude-sonnet-4-6",
+      retained: true,
+      selectable: true,
+      sources: ["curated"],
+      status: "available",
+    },
+    {
+      displayName: "Claude Opus 4.1",
+      modelId: "claude-opus-4-1",
+      retained: false,
+      selectable: true,
+      sources: ["curated"],
+      status: "available",
+    },
   ],
   mutation: null,
   principalId: "prn_00000000000000000000000000000001",
@@ -141,6 +175,23 @@ const runtime: WorkshopSettingsWorkspace = {
     { current: true, home: false, name: "Kai", path: "/srv/kai" },
     { current: false, home: true, name: "Home", path: "/srv/home" },
   ],
+};
+
+const modelCatalogue: WorkshopModelCatalogue = {
+  lastKnownGood: false,
+  models: runtime.modelOptions ?? [],
+  optionId: "claude:anthropic",
+  refresh: {
+    errorCode: null,
+    errorDetail: null,
+    expiresAt: "2026-08-29T10:00:00Z",
+    generation: 1,
+    lastAttemptAt: "2026-08-28T10:00:00Z",
+    lastSuccessfulRefreshAt: "2026-08-28T10:00:00Z",
+    status: "succeeded",
+  },
+  runtimeProfileId: runtime.runtimeProfileId,
+  stale: false,
 };
 
 const workspaceConfig: WorkshopWorkspaceConfig = {
@@ -266,6 +317,7 @@ function renderSettings(
   onDirtyChange = vi.fn(),
   runActive = false,
   onChannelAccessFailure = vi.fn(),
+  isAdministrator = true,
 ): void {
   render(
     <SettingsWorkspace
@@ -273,6 +325,7 @@ function renderSettings(
       onChannelAccessFailure={onChannelAccessFailure}
       onClose={vi.fn()}
       onDirtyChange={onDirtyChange}
+      isAdministrator={isAdministrator}
       principalName="Daniel"
       roleLabel="Workshop administrator"
       runtimeLabel="Kai"
@@ -297,6 +350,7 @@ describe("Settings workspace", () => {
       ],
     });
     vi.mocked(loadSettingsWorkspace).mockResolvedValue(runtime);
+    vi.mocked(loadModelCatalogue).mockResolvedValue(modelCatalogue);
     vi.mocked(loadGitHubSettings).mockResolvedValue(githubSettings);
     vi.mocked(loadNotificationPreferences).mockResolvedValue(notificationPreferences);
     vi.mocked(loadClientPreferences).mockResolvedValue(clientPreferences);
@@ -311,6 +365,13 @@ describe("Settings workspace", () => {
       ...preference,
       revision: "pref_restored",
     });
+    vi.mocked(refreshModelCatalogue).mockResolvedValue(modelCatalogue);
+    vi.mocked(refreshAllModelCatalogues).mockResolvedValue({
+      contexts: 2,
+      statuses: { succeeded: 2 },
+    });
+    vi.mocked(upsertOperatorModel).mockResolvedValue(modelCatalogue);
+    vi.mocked(deactivateOperatorModel).mockResolvedValue(modelCatalogue);
     vi.mocked(updateRuntimeSettings).mockResolvedValue(runtime);
     vi.mocked(updateGitHubSettings).mockResolvedValue(githubSettings);
     vi.mocked(updateNotificationPreference).mockResolvedValue(notificationPreferences);
@@ -370,6 +431,31 @@ describe("Settings workspace", () => {
       "location",
     );
     expect(editor).toHaveValue(`${preference.content}Unsaved navigation draft`);
+  });
+
+  it("keeps principal refresh visible while hiding operator actions from members", async () => {
+    renderSettings(vi.fn(), false, vi.fn(), false);
+
+    expect(await screen.findByRole("button", { name: "Refresh models" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Refresh all contexts" })).toBeNull();
+    expect(screen.queryByLabelText("Operator-managed model ID")).toBeNull();
+  });
+
+  it("refreshes one catalogue or every context without changing runtime settings", async () => {
+    const user = userEvent.setup();
+    renderSettings();
+
+    await user.click(await screen.findByRole("button", { name: "Refresh models" }));
+    await waitFor(() => {
+      expect(refreshModelCatalogue).toHaveBeenCalledWith(session, "claude:anthropic");
+    });
+    expect(updateRuntimeSettings).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Refresh all contexts" }));
+    await waitFor(() => {
+      expect(refreshAllModelCatalogues).toHaveBeenCalledWith(session);
+    });
+    expect(updateRuntimeSettings).not.toHaveBeenCalled();
   });
 
   it("updates the current settings destination during manual scrolling", async () => {
