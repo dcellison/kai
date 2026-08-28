@@ -163,7 +163,7 @@ async def test_adapter_uses_paginated_metadata_only_model_list(tmp_path: Path) -
 
     batch = await adapter.discover(_lane(executable, os_user=current_user))
 
-    assert batch.source == "codex-app-server:model/list"
+    assert batch.source == "codex-app-server-model-list"
     assert batch.ttl_seconds == 21_600
     assert [candidate.model_id for candidate in batch.models] == ["gpt-alpha", "gpt-beta"]
     assert batch.models[0].display_label == "GPT Alpha"

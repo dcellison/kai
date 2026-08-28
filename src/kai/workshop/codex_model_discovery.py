@@ -34,7 +34,7 @@ from kai.workshop.model_discovery_inventory import (
     ModelDiscoveryReadiness,
 )
 
-_SOURCE = "codex-app-server:model/list"
+_SOURCE = "codex-app-server-model-list"
 _TTL_SECONDS = 21_600
 _PAGE_LIMIT = 100
 _MAX_PAGES = 20

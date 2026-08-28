@@ -147,7 +147,7 @@ async def test_api_key_discovery_uses_paginated_metadata_only_models_api(tmp_pat
     with patch.object(discovery_module.aiohttp, "ClientSession", return_value=session_context):
         batch = await adapter.discover(_lane(executable))
 
-    assert batch.source == "anthropic-models-api:v1/models"
+    assert batch.source == "anthropic-models-api-v1-models"
     assert batch.ttl_seconds == 21_600
     assert [candidate.model_id for candidate in batch.models] == ["claude-opus-5", "claude-sonnet-5"]
     assert batch.models[0].capabilities == {

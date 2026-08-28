@@ -43,6 +43,7 @@ from kai.workshop.memory_queries import WorkshopMemoryQueryService
 from kai.workshop.model_catalogue import WorkshopModelCatalogueService
 from kai.workshop.model_discovery_inventory import WorkshopModelDiscoveryInventoryService
 from kai.workshop.notification_preferences import WorkshopNotificationPreferenceService
+from kai.workshop.opencode_model_discovery import OpenCodeModelDiscoveryAdapter
 from kai.workshop.post_run_effects import WorkshopPostRunEffectService
 from kai.workshop.preferences import WorkshopPreferenceService
 from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
@@ -317,6 +318,9 @@ class KaiApplicationHost:
                 adapters={
                     "claude": ClaudeModelDiscoveryAdapter(),
                     "codex": CodexModelDiscoveryAdapter(
+                        service_os_user=pwd.getpwuid(os.geteuid()).pw_name,
+                    ),
+                    "opencode": OpenCodeModelDiscoveryAdapter(
                         service_os_user=pwd.getpwuid(os.geteuid()).pw_name,
                     ),
                 },
