@@ -217,11 +217,9 @@ PROVIDER_KEY_VARS: dict[str, str] = {
 # Goose passes model IDs through verbatim to the provider API - no
 # aliasing layer - so these must be the exact strings the APIs accept.
 PROVIDER_MODELS: dict[str, dict[str, str]] = {
-    # Claude Code accepts short aliases that auto-resolve to the
-    # current SKU. Listing the aliases here keeps the registry stable
-    # across Anthropic version bumps; the CLI handles the resolution.
-    # Verified 2026-08-10 against Claude Code CLI docs and local
-    # `claude --help`.
+    # These rolling aliases are accepted by both the Anthropic provider
+    # surface and Claude Code. Claude-Code-only selectors live in
+    # CLAUDE_MODELS below so they never leak into Goose's API model list.
     "anthropic": {
         "fable": "\U0001f52e Fable",
         "opus": "\U0001f9e0 Opus",
@@ -264,6 +262,21 @@ PROVIDER_MODELS: dict[str, dict[str, str]] = {
         "deepseek-v4-pro": "DeepSeek V4 Pro",
         "deepseek-v4-flash": "DeepSeek V4 Flash",
     },
+}
+
+# Claude Code's complete curated alias fallback. ``default`` is deliberately
+# absent: in Kai it means clear the principal's model override through the
+# settings reset operation, never store a literal provider model. The
+# documented ``[1m]`` forms are runtime selectors, represented explicitly
+# instead of scraping labels from the interactive picker. Verified 2026-08-28
+# against Claude Code's official model-configuration reference. ``fable``
+# remains a Kai-supported rolling alias from the installed Claude surface.
+CLAUDE_MODELS: dict[str, str] = {
+    **PROVIDER_MODELS["anthropic"],
+    "best": "\U0001f3c6 Best available",
+    "opus[1m]": "\U0001f9e0 Opus · 1M context",
+    "opusplan": "\U0001f9e0 Opus plan / Sonnet execution",
+    "sonnet[1m]": "\u26a1 Sonnet · 1M context",
 }
 
 # Strongest curated model for provider-only callers such as the model
@@ -338,6 +351,7 @@ OPEN_ENDED_PROVIDERS: frozenset[str] = frozenset({"openrouter", "ollama"})
 # remain loadable for one release and are canonicalized at apply time.
 _ALL_CURATED_MODELS: frozenset[str] = frozenset(
     list(model for models in PROVIDER_MODELS.values() for model in models)
+    + list(CLAUDE_MODELS.keys())
     + list(CODEX_MODELS.keys())
     + list(_LEGACY_CODEX_MODEL_ALIASES.keys())
 )
@@ -911,11 +925,13 @@ def validate_model_for_backend_policy(
     """
     if backend == "codex":
         base_allowed = model in CODEX_MODELS
+    elif backend == "claude" and eff_provider == "anthropic":
+        base_allowed = model in CLAUDE_MODELS or model.startswith("claude-")
     elif backend == "opencode":
         base_allowed = is_opencode_model_shape(model)
     elif backend == "pi":
         base_allowed = is_pi_model_shape(model, eff_provider)
-    elif (backend == "claude" or (backend == "goose" and eff_provider == "anthropic")) and model.startswith("claude-"):
+    elif backend == "goose" and eff_provider == "anthropic" and model.startswith("claude-"):
         base_allowed = True
     else:
         base_allowed = validate_model_for_provider(model, eff_provider)
@@ -1082,6 +1098,8 @@ def models_for_backend_policy(
     """Return curated models constrained by an already-resolved policy."""
     if agent_backend == "codex":
         models = CODEX_MODELS
+    elif agent_backend == "claude" and eff_provider == "anthropic":
+        models = CLAUDE_MODELS
     elif agent_backend in {"opencode", "pi"} or eff_provider in OPEN_ENDED_PROVIDERS:
         return None
     else:

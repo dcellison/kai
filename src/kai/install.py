@@ -51,6 +51,7 @@ from kai.config import (
     _VALID_ROLES,
     BACKEND_PROVIDERS,
     BACKENDS_NEEDING_PROVIDER_PROMPT,
+    CLAUDE_MODELS,
     CODEX_EFFORT_LEVELS,
     CODEX_MODELS,
     EFFORT_LEVELS,
@@ -8629,7 +8630,7 @@ def _backend_registry_entries(
                 "driver": "claude",
                 "runtime": "local_process",
                 "command": command,
-                "allowed_models": sorted((*PROVIDER_MODELS["anthropic"].keys(), "claude-*")),
+                "allowed_models": sorted((*CLAUDE_MODELS.keys(), "claude-*")),
             }
         elif backend == "codex":
             entries[backend] = {
