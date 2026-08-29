@@ -1497,6 +1497,7 @@ button:disabled {
   /* Height is driven by the auto-grow effect in App.tsx: one line at rest,
      expanding with the draft until this cap, after which it scrolls. */
   max-height: 12rem;
+  min-width: 0;
   overflow-y: auto;
   flex: 1;
   resize: none;
@@ -1531,6 +1532,20 @@ button:disabled {
     border-color 140ms ease,
     color 140ms ease,
     transform 80ms ease;
+}
+
+.composer-form .composer-icon-button {
+  display: inline-grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 2.65rem;
+  min-width: 2.65rem;
+  padding: 0;
+}
+
+.composer-icon-button svg {
+  width: 1.08rem;
+  height: 1.08rem;
 }
 
 .composer-form .send-button {
@@ -1678,43 +1693,9 @@ button:disabled {
 }
 
 .thread-composer {
-  display: grid;
-  gap: 0.55rem;
   border-top: 1px solid var(--color-border);
   padding: 0.8rem 1rem;
   background: var(--color-canvas);
-}
-
-.thread-composer textarea {
-  width: 100%;
-  resize: vertical;
-  border: 1px solid var(--color-border-strong);
-  border-radius: 0.4rem;
-  padding: 0.65rem;
-  background: var(--color-surface);
-  color: var(--color-text);
-  font: 0.78rem/1.5 var(--sans);
-}
-
-.thread-composer textarea:focus {
-  border-color: var(--color-accent);
-  outline: none;
-}
-
-.thread-composer button {
-  justify-self: end;
-  border: 1px solid var(--color-accent);
-  border-radius: 0.4rem;
-  padding: 0.45rem 0.8rem;
-  background: var(--color-accent);
-  color: var(--color-canvas);
-  font: 700 0.72rem var(--sans);
-  cursor: pointer;
-}
-
-.thread-composer button:disabled {
-  cursor: default;
-  opacity: 0.5;
 }
 
 .context-scroll {

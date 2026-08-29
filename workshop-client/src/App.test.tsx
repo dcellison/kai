@@ -1470,7 +1470,12 @@ describe("Workshop React client", () => {
     const context = screen.getByLabelText("Channel context");
     expect(await within(context).findByText("Existing thread reply")).toBeVisible();
     const composer = within(context).getByLabelText("Reply in Wake policy qualification");
-    await user.type(composer, "@Kai continue here{Enter}");
+    expect(composer).toHaveAttribute("rows", "1");
+    await user.type(composer, "@Kai continue here");
+    const sendReply = within(context).getByRole("button", { name: "Send reply" });
+    expect(sendReply).toHaveTextContent("");
+    expect(sendReply.querySelector("svg")).not.toBeNull();
+    await user.click(sendReply);
 
     await waitFor(() => expect(submitCommand).toHaveBeenCalledOnce());
     expect(submitCommand).toHaveBeenCalledWith(
@@ -1671,8 +1676,12 @@ describe("Workshop React client", () => {
     const sendButton = screen.getByRole("button", { name: "Send" });
     expect(attachButton).toBeEnabled();
     expect(attachButton).toHaveClass("attach-button");
+    expect(attachButton).toHaveTextContent("");
+    expect(attachButton.querySelector("svg")).not.toBeNull();
     expect(sendButton).toBeDisabled();
     expect(sendButton).toHaveClass("send-button");
+    expect(sendButton).toHaveTextContent("");
+    expect(sendButton.querySelector("svg")).not.toBeNull();
 
     await user.upload(screen.getByLabelText("Attach a file"), artifact);
     expect(screen.getByText("notes.txt")).toBeVisible();

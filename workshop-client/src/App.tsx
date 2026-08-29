@@ -1021,6 +1021,51 @@ function ChannelCreationDialog({
   );
 }
 
+function PaperclipIcon(): React.JSX.Element {
+  return (
+    <svg
+      aria-hidden="true"
+      fill="none"
+      focusable="false"
+      viewBox="0 0 24 24"
+    >
+      <path
+        d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="2"
+      />
+    </svg>
+  );
+}
+
+function SendIcon(): React.JSX.Element {
+  return (
+    <svg
+      aria-hidden="true"
+      fill="none"
+      focusable="false"
+      viewBox="0 0 24 24"
+    >
+      <path
+        d="m22 2-7 20-4-9-9-4Z"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="2"
+      />
+      <path
+        d="M22 2 11 13"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="2"
+      />
+    </svg>
+  );
+}
+
 function ThreadPane({
   channelName,
   liveMessages,
@@ -1048,6 +1093,7 @@ function ThreadPane({
   const [draft, setDraft] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [pendingMessageId, setPendingMessageId] = useState<string | null>(null);
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -1063,6 +1109,16 @@ function ThreadPane({
     );
     return () => controller.abort();
   }, [onLoadThread, rootMessage.messageId]);
+
+  useLayoutEffect(() => {
+    const composer = composerRef.current;
+    if (!composer) {
+      return;
+    }
+    const borderHeight = composer.offsetHeight - composer.clientHeight;
+    composer.style.height = "auto";
+    composer.style.height = `${composer.scrollHeight + borderHeight}px`;
+  }, [draft, rootMessage.messageId]);
 
   const replies = useMemo(() => {
     const byId = new Map<string, TimelineMessage>();
@@ -1157,12 +1213,13 @@ function ThreadPane({
           </button>
         )}
       </div>
-      <form className="thread-composer" onSubmit={(event) => void submitReply(event)}>
+      <form className="composer-form thread-composer" onSubmit={(event) => void submitReply(event)}>
         <textarea
+          ref={composerRef}
           aria-label={`Reply in ${channelName}`}
           maxLength={50000}
           placeholder="Reply… Use @name to mention an agent or person."
-          rows={3}
+          rows={1}
           value={draft}
           disabled={submitting || runActive}
           onChange={(event) => {
@@ -1178,8 +1235,15 @@ function ThreadPane({
             }
           }}
         />
-        <button type="submit" disabled={!draft.trim() || submitting || runActive}>
-          {submitting ? "Sending…" : "Reply"}
+        <button
+          className="composer-icon-button send-button"
+          type="submit"
+          aria-busy={submitting}
+          aria-label={submitting ? "Sending reply…" : "Send reply"}
+          title={submitting ? "Sending reply…" : "Send reply"}
+          disabled={!draft.trim() || submitting || runActive}
+        >
+          <SendIcon />
         </button>
       </form>
       {error && <p className="thread-error" role="alert">{error}</p>}
@@ -2411,12 +2475,14 @@ function WorkshopView({
                 }}
               />
               <button
-                className="attach-button"
+                className="attach-button composer-icon-button"
                 type="button"
+                aria-label="Attach"
+                title="Attach a file"
                 disabled={submitting || isRunActive(activeRun)}
                 onClick={() => artifactInputRef.current?.click()}
               >
-                Attach
+                <PaperclipIcon />
               </button>
               <textarea
                 ref={composerRef}
@@ -2509,16 +2575,18 @@ function WorkshopView({
                 </div>
               )}
               <button
-                className="send-button"
+                className="send-button composer-icon-button"
                 type="submit"
                 aria-busy={submitting}
+                aria-label={submitting ? "Sending…" : "Send"}
+                title={submitting ? "Sending…" : "Send"}
                 disabled={
                   submitting ||
                   isRunActive(activeRun) ||
                   (!draft.trim() && !selectedArtifact)
                 }
               >
-                {submitting ? "Sending…" : "Send"}
+                <SendIcon />
               </button>
               {isRunActive(activeRun) && (
                 <button
