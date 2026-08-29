@@ -60,6 +60,7 @@ class ClientInboundMessage:
     client_message_id: str
     body: str
     occurred_at: datetime
+    thread_root_id: MessageId | None = None
     artifact_source_unique_id: str | None = None
 
     def __post_init__(self) -> None:
@@ -73,6 +74,8 @@ class ClientInboundMessage:
             raise ValueError("body must contain non-whitespace text")
         if len(self.body) > 50_000:
             raise ValueError("body must be at most 50000 characters")
+        if self.thread_root_id is not None and not isinstance(self.thread_root_id, MessageId):
+            raise ValueError("thread_root_id must be a MessageId or None")
         if self.artifact_source_unique_id is not None and (
             not isinstance(self.artifact_source_unique_id, str)
             or not self.artifact_source_unique_id
@@ -354,6 +357,7 @@ def _client_inbound_envelope(
             "channel_id": binding.channel_id,
             "author_principal_id": binding.principal_id,
             "body": message.body,
+            **({"thread_root_id": message.thread_root_id} if message.thread_root_id is not None else {}),
             **({"mentions": _mention_payload(mentions)} if mentions is not None else {}),
         },
         metadata=metadata,

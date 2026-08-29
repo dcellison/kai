@@ -1003,6 +1003,25 @@ button:disabled {
   white-space: nowrap;
 }
 
+.thread-summary {
+  margin-top: 0.65rem;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--color-accent);
+  font: 700 0.68rem var(--sans);
+  cursor: pointer;
+}
+
+.thread-summary:hover {
+  text-decoration: underline;
+}
+
+.thread-summary span {
+  color: var(--color-text-muted);
+  font-weight: 500;
+}
+
 .message-artifact {
   margin-top: 0.8rem;
   overflow: hidden;
@@ -1588,6 +1607,114 @@ button:disabled {
   overflow: hidden;
   border-left: 1px solid var(--color-border);
   background: var(--color-panel);
+}
+
+.thread-pane {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  min-width: 0;
+  height: 100%;
+}
+
+.thread-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.8rem;
+  border-bottom: 1px solid var(--color-border);
+  padding: 1.25rem 1.1rem 1rem;
+}
+
+.thread-header h2 {
+  margin: 0.25rem 0 0;
+  color: var(--color-text-strong);
+  font-size: 1rem;
+}
+
+.thread-scroll {
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: 0.8rem;
+}
+
+.thread-message-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.thread-message-list .message-row {
+  grid-template-columns: 1.8rem minmax(0, 1fr);
+  gap: 0.65rem;
+  padding: 0.9rem 1rem;
+}
+
+.thread-message-list .message-row:first-child {
+  border-left: 2px solid var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent) 5%, transparent);
+}
+
+.thread-message-list .message-avatar {
+  width: 1.8rem;
+  height: 1.8rem;
+  font-size: 0.74rem;
+}
+
+.thread-state,
+.thread-error {
+  margin: 0;
+  padding: 0.7rem 1rem;
+  color: var(--color-text-muted);
+  font-size: 0.72rem;
+}
+
+.thread-error {
+  color: var(--color-danger);
+}
+
+.thread-scroll > .timeline-earlier-button {
+  display: block;
+  margin: 0.8rem auto 0;
+}
+
+.thread-composer {
+  display: grid;
+  gap: 0.55rem;
+  border-top: 1px solid var(--color-border);
+  padding: 0.8rem 1rem;
+  background: var(--color-canvas);
+}
+
+.thread-composer textarea {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.4rem;
+  padding: 0.65rem;
+  background: var(--color-surface);
+  color: var(--color-text);
+  font: 0.78rem/1.5 var(--sans);
+}
+
+.thread-composer textarea:focus {
+  border-color: var(--color-accent);
+  outline: none;
+}
+
+.thread-composer button {
+  justify-self: end;
+  border: 1px solid var(--color-accent);
+  border-radius: 0.4rem;
+  padding: 0.45rem 0.8rem;
+  background: var(--color-accent);
+  color: var(--color-canvas);
+  font-weight: 720;
+  cursor: pointer;
+}
+
+.thread-composer button:disabled {
+  cursor: default;
+  opacity: 0.5;
 }
 
 .context-scroll {

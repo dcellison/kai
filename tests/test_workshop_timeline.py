@@ -11,14 +11,32 @@ from pathlib import Path
 import pytest
 
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
-from kai.workshop.domain import ChannelId, MessageId, PrincipalId
-from kai.workshop.inbound import InboundMessage, record_inbound_message
+from kai.workshop.channel_lifecycle import WorkshopChannelLifecycleService
+from kai.workshop.domain import (
+    AgentId,
+    ChannelId,
+    EventEnvelope,
+    MessageId,
+    PrincipalId,
+    RuntimeAssignmentId,
+    RuntimeProfileId,
+    WorkshopEventType,
+    WorkshopId,
+)
+from kai.workshop.inbound import (
+    ClientInboundMessage,
+    InboundMessage,
+    record_client_inbound_message_in_transaction,
+    record_inbound_message,
+)
 from kai.workshop.outbound import OutboundMessage, record_outbound_message
+from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.timeline import (
     TimelineAccessDeniedError,
     TimelineCursorError,
     read_channel_timeline,
+    read_thread_timeline,
 )
 
 _NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
@@ -82,6 +100,184 @@ async def _record_user_message(
             _NOW + timedelta(seconds=ordinal),
         ),
     )
+
+
+async def _create_group_channel(
+    store: WorkshopEventStore,
+    principal_id: PrincipalId,
+    direct_channel_id: ChannelId,
+) -> ChannelId:
+    async with store.connection.execute(
+        "SELECT ca.agent_id, c.workshop_id FROM channel_agents ca "
+        "JOIN channels c ON c.id = ca.channel_id WHERE ca.channel_id = ?",
+        (direct_channel_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    agent_id = AgentId(str(row[0]))
+    workshop_id = WorkshopId(str(row[1]))
+    await store.append(
+        EventEnvelope.create(
+            event_type=WorkshopEventType.RUNTIME_PROFILE_ASSIGNED,
+            event_version=1,
+            workshop_id=workshop_id,
+            aggregate_type="runtime_assignment",
+            aggregate_id=RuntimeAssignmentId.derived(direct_channel_id, f"runtime-profile:{agent_id}"),
+            occurred_at=_NOW,
+            idempotency_key=f"thread-test:runtime:{direct_channel_id}",
+            payload={
+                "channel_id": direct_channel_id,
+                "agent_id": agent_id,
+                "runtime_profile_id": RuntimeProfileId.new(),
+            },
+            metadata={"source": "test"},
+        )
+    )
+    await store.project_pending(CanonicalConversationProjection())
+    created = await WorkshopChannelLifecycleService(store).create_group(
+        principal_id,
+        name="Thread tests",
+        agent_ids=[agent_id],
+        origin_channel_id=direct_channel_id,
+    )
+    return created.channel_id
+
+
+async def _record_client_message(
+    store: WorkshopEventStore,
+    principal_id: PrincipalId,
+    channel_id: ChannelId,
+    client_message_id: str,
+    body: str,
+    *,
+    thread_root_id: MessageId | None = None,
+    occurred_at: datetime = _NOW,
+) -> MessageId:
+    await store.connection.execute("BEGIN IMMEDIATE")
+    try:
+        result = await record_client_inbound_message_in_transaction(
+            store,
+            ClientInboundMessage(
+                principal_id,
+                channel_id,
+                client_message_id,
+                body,
+                occurred_at,
+                thread_root_id=thread_root_id,
+            ),
+        )
+        await store.connection.commit()
+    except Exception:
+        await store.connection.rollback()
+        raise
+    return MessageId(str(result.event.envelope.aggregate_id))
+
+
+class TestThreadTimelineQuery:
+    async def test_channel_summary_and_thread_pages_preserve_structure_and_order(self, tmp_path: Path):
+        store, principal_id, direct_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        try:
+            channel_id = await _create_group_channel(store, principal_id, direct_channel)
+            root_id = await _record_client_message(store, principal_id, channel_id, "root", "Root message")
+            reply_id = await _record_client_message(
+                store,
+                principal_id,
+                channel_id,
+                "reply-one",
+                "Human reply",
+                thread_root_id=root_id,
+                occurred_at=_NOW + timedelta(seconds=1),
+            )
+            await record_outbound_message(
+                store,
+                OutboundMessage(reply_id, "Agent reply", _NOW + timedelta(seconds=2)),
+            )
+            authorizer = _Authorizer({(principal_id, channel_id)})
+
+            channel_page = await read_channel_timeline(
+                store,
+                principal_id=principal_id,
+                channel_id=channel_id,
+                authorizer=authorizer,
+            )
+            first = await read_thread_timeline(
+                store,
+                principal_id=principal_id,
+                channel_id=channel_id,
+                thread_root_id=root_id,
+                authorizer=authorizer,
+                limit=1,
+            )
+            assert [message.body for message in channel_page.messages] == ["Root message"]
+            assert channel_page.messages[0].reply_count == 2
+            assert channel_page.messages[0].latest_reply_at == _NOW + timedelta(seconds=2)
+            assert first.root.message_id == root_id
+            assert [message.body for message in first.messages] == ["Human reply"]
+            assert first.next_cursor is not None
+            second = await read_thread_timeline(
+                store,
+                principal_id=principal_id,
+                channel_id=channel_id,
+                thread_root_id=root_id,
+                authorizer=authorizer,
+                cursor=first.next_cursor,
+                limit=1,
+            )
+            assert [message.body for message in second.messages] == ["Agent reply"]
+            assert all(message.thread_root_id == root_id for message in (*first.messages, *second.messages))
+            assert second.messages[0].reply_to_message_id == reply_id
+            assert second.next_cursor is None
+            await store.rebuild_projection(CanonicalConversationProjection())
+            rebuilt = await read_thread_timeline(
+                store,
+                principal_id=principal_id,
+                channel_id=channel_id,
+                thread_root_id=root_id,
+                authorizer=authorizer,
+            )
+            assert [message.body for message in rebuilt.messages] == ["Human reply", "Agent reply"]
+            assert rebuilt.root.reply_count == 2
+        finally:
+            await store.close()
+
+    async def test_rejects_foreign_or_nested_roots_without_mutation(self, tmp_path: Path):
+        store, principal_id, direct_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        try:
+            channel_id = await _create_group_channel(store, principal_id, direct_channel)
+            root_id = await _record_client_message(store, principal_id, channel_id, "root", "Root")
+            reply_id = await _record_client_message(
+                store,
+                principal_id,
+                channel_id,
+                "reply",
+                "Reply",
+                thread_root_id=root_id,
+            )
+            with pytest.raises(ValueError, match="top-level message"):
+                await _record_client_message(
+                    store,
+                    principal_id,
+                    channel_id,
+                    "nested",
+                    "Nested",
+                    thread_root_id=reply_id,
+                )
+            with pytest.raises(ValueError, match="top-level message"):
+                await _record_client_message(
+                    store,
+                    principal_id,
+                    channel_id,
+                    "foreign",
+                    "Foreign",
+                    thread_root_id=MessageId.new(),
+                )
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM messages WHERE channel_id = ?",
+                (channel_id,),
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 2
+        finally:
+            await store.close()
 
 
 class TestCanonicalTimelineQuery:

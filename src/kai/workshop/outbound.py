@@ -77,6 +77,7 @@ class _ResolvedOutbound:
     channel_id: ChannelId
     agent_principal_id: PrincipalId
     recipient_principal_id: PrincipalId
+    thread_root_id: MessageId | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,7 +107,13 @@ class OutboundStreamingFinalizationResult:
 
 async def _resolve_outbound(store: WorkshopEventStore, message_id: MessageId) -> _ResolvedOutbound:
     async with store.connection.execute(
-        "SELECT c.workshop_id, m.channel_id, a.principal_id, m.author_principal_id "
+        "SELECT 1 FROM pragma_table_info('messages') WHERE name = 'thread_root_id'"
+    ) as schema_cursor:
+        has_thread_root = await schema_cursor.fetchone() is not None
+    thread_root_expression = "m.thread_root_id" if has_thread_root else "NULL"
+    async with store.connection.execute(
+        "SELECT c.workshop_id, m.channel_id, a.principal_id, m.author_principal_id, "
+        f"{thread_root_expression} "
         "FROM messages m "
         "JOIN principals author ON author.id = m.author_principal_id AND author.kind = 'human' "
         "JOIN channels c ON c.id = m.channel_id "
@@ -123,6 +130,7 @@ async def _resolve_outbound(store: WorkshopEventStore, message_id: MessageId) ->
         channel_id=ChannelId(str(rows[0][1])),
         agent_principal_id=PrincipalId(str(rows[0][2])),
         recipient_principal_id=PrincipalId(str(rows[0][3])),
+        thread_root_id=(MessageId(str(rows[0][4])) if rows[0][4] is not None else None),
     )
 
 
@@ -136,6 +144,7 @@ def _outbound_payload(binding: _ResolvedOutbound, message: OutboundMessage) -> d
         "author_principal_id": binding.agent_principal_id,
         "reply_to_message_id": message.in_reply_to_message_id,
         "body": message.body,
+        **({"thread_root_id": binding.thread_root_id} if binding.thread_root_id is not None else {}),
     }
 
 

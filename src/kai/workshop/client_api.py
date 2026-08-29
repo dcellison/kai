@@ -70,7 +70,7 @@ from kai.workshop.client_preferences import (
 )
 from kai.workshop.client_sessions import EnrollmentGrantUnavailableError, WorkshopClientEnrollmentManager
 from kai.workshop.conversation_commands import ConversationCommandAcceptanceError
-from kai.workshop.domain import AgentId, ArtifactId, ChannelId, PrincipalId, RunId
+from kai.workshop.domain import AgentId, ArtifactId, ChannelId, MessageId, PrincipalId, RunId
 from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.github_settings import (
     GitHubSettingsAuthority,
@@ -155,6 +155,7 @@ from kai.workshop.timeline import (
     TimelineMessage,
     TimelineResumeError,
     read_channel_timeline,
+    read_thread_timeline,
 )
 from kai.workshop.wake_policy import (
     EngagementScope,
@@ -164,6 +165,7 @@ from kai.workshop.wake_policy import (
 )
 
 _TIMELINE_PATH = "/v1/channels/{channel_id}/timeline"
+_THREAD_TIMELINE_PATH = "/v1/channels/{channel_id}/threads/{root_message_id}"
 _TIMELINE_EVENTS_PATH = "/v1/channels/{channel_id}/events"
 _CLIENT_NAVIGATION_PATH = "/v1/client/navigation"
 _CHANNEL_CREATION_PATH = "/v1/channels"
@@ -203,7 +205,8 @@ _ALLOWED_MEMORY_FILTERS = frozenset({"kind", "source", "memory_type", "tag", "sc
 _ALLOWED_MEMORY_LIST_PARAMETERS = _ALLOWED_MEMORY_FILTERS | {"cursor", "limit", "order"}
 _ALLOWED_MEMORY_SEARCH_PARAMETERS = _ALLOWED_MEMORY_FILTERS | {"q", "limit"}
 _ENROLLMENT_REQUEST_FIELDS = frozenset({"enrollment_token", "device_display_name"})
-_COMMAND_REQUEST_FIELDS = frozenset({"client_message_id", "body"})
+_COMMAND_REQUIRED_FIELDS = frozenset({"client_message_id", "body"})
+_COMMAND_OPTIONAL_FIELDS = frozenset({"thread_root_id"})
 _SETTINGS_OPERATION_FIELDS = frozenset({"backend", "model", "timeout_seconds", "reset"})
 _SETTINGS_REQUEST_FIELDS = _SETTINGS_OPERATION_FIELDS | {"revision"}
 _MODEL_CATALOGUE_REFRESH_FIELDS = frozenset({"option_id"})
@@ -2584,9 +2587,14 @@ def _serialize_message(message: TimelineMessage) -> dict[str, object]:
         "author_kind": message.author_kind,
         "author_display_name": message.author_display_name,
         "reply_to_message_id": (str(message.reply_to_message_id) if message.reply_to_message_id is not None else None),
+        "thread_root_id": (str(message.thread_root_id) if message.thread_root_id is not None else None),
         "body": message.body,
         "event_position": message.event_position,
         "created_at": _format_timestamp(message.created_at),
+        "reply_count": message.reply_count,
+        "latest_reply_at": (
+            _format_timestamp(message.latest_reply_at) if message.latest_reply_at is not None else None
+        ),
         "mentions": [
             {
                 "principal_id": str(mention.principal_id),
@@ -2928,6 +2936,52 @@ async def _handle_channel_timeline(
             "messages": [_serialize_message(message) for message in page.messages],
             "next_cursor": page.next_cursor,
             "previous_cursor": page.previous_cursor,
+            "through_position": page.through_position,
+        },
+        status=200,
+    )
+
+
+async def _handle_thread_timeline(
+    request: web.Request,
+    *,
+    store: WorkshopEventStore,
+    authenticator: WorkshopClientAuthenticator,
+) -> web.Response:
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(status=401, code="authentication_required", message="Authentication required")
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    try:
+        if not set(request.query).issubset({"cursor", "limit"}):
+            raise ValueError("Unsupported query parameter")
+        channel_id = ChannelId(request.match_info["channel_id"])
+        root_message_id = MessageId(request.match_info["root_message_id"])
+        cursor = _single_query_value(request, "cursor")
+        raw_limit = _single_query_value(request, "limit")
+        limit = 50 if raw_limit is None else int(raw_limit)
+        page = await read_thread_timeline(
+            store,
+            principal_id=principal_id,
+            channel_id=channel_id,
+            thread_root_id=root_message_id,
+            authorizer=CanonicalChannelAuthorizer(store),
+            cursor=cursor,
+            limit=limit,
+        )
+    except TimelineAccessDeniedError:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except (TimelineCursorError, TypeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid thread request")
+    return _json_response(
+        {
+            "version": 1,
+            "channel_id": str(channel_id),
+            "thread_root_id": str(root_message_id),
+            "root": _serialize_message(page.root),
+            "messages": [_serialize_message(message) for message in page.messages],
+            "next_cursor": page.next_cursor,
             "through_position": page.through_position,
         },
         status=200,
@@ -3333,11 +3387,17 @@ async def _handle_command_submission(
             payload = await request.json()
         except (UnicodeDecodeError, ValueError):
             payload = None
-        if not isinstance(payload, dict) or set(payload) != _COMMAND_REQUEST_FIELDS:
+        if (
+            not isinstance(payload, dict)
+            or not _COMMAND_REQUIRED_FIELDS.issubset(payload)
+            or not set(payload).issubset(_COMMAND_REQUIRED_FIELDS | _COMMAND_OPTIONAL_FIELDS)
+        ):
             return _error_response(status=400, code="invalid_request", message="Invalid command request")
         client_message_id = payload["client_message_id"]
         body = payload["body"]
+        raw_thread_root_id = payload.get("thread_root_id")
     elif request.content_type == "multipart/form-data" and artifact_service is not None:
+        raw_thread_root_id = None
         try:
             reader = await request.multipart()
             first = await reader.next()
@@ -3397,12 +3457,14 @@ async def _handle_command_submission(
         return _error_response(status=400, code="invalid_request", message="Invalid command request")
 
     try:
+        thread_root_id = MessageId(raw_thread_root_id) if raw_thread_root_id is not None else None
         command = ClientInboundMessage(
             principal_id=principal_id,
             channel_id=channel_id,
             client_message_id=client_message_id,
             body=body,
             occurred_at=datetime.now(UTC),
+            thread_root_id=thread_root_id,
             artifact_source_unique_id=(artifact.source_unique_id if artifact is not None else None),
         )
     except (TypeError, ValueError):
@@ -3818,6 +3880,14 @@ def register_workshop_read_routes(
                 authenticator=authenticator,
             )
 
+    async def handle_thread_timeline(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_thread_timeline(
+                request,
+                store=store,
+                authenticator=authenticator,
+            )
+
     async def handle_client_navigation(request: web.Request) -> web.Response:
         async with request_lock:
             return await _handle_client_navigation(
@@ -3851,6 +3921,7 @@ def register_workshop_read_routes(
     app.router.add_get(_CLIENT_NAVIGATION_PATH, handle_client_navigation)
     app.router.add_post(_CHANNEL_CREATION_PATH, handle_channel_creation)
     app.router.add_get(_TIMELINE_PATH, handle_channel_timeline)
+    app.router.add_get(_THREAD_TIMELINE_PATH, handle_thread_timeline)
     app.router.add_get(_TIMELINE_EVENTS_PATH, handle_channel_event_stream)
     if preference_documents is not None:
 

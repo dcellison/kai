@@ -777,7 +777,19 @@ class CanonicalConversationProjection:
             reply_to = payload.get("reply_to_message_id")
             if reply_to is not None and not isinstance(reply_to, str):
                 raise ValueError("Workshop reply_to_message_id must be a string or null")
+            thread_root = payload.get("thread_root_id")
+            if thread_root is not None and not isinstance(thread_root, str):
+                raise ValueError("Workshop thread_root_id must be a string or null")
             channel_id = ChannelId(_required_text(payload, "channel_id"))
+            if thread_root is not None:
+                async with connection.execute(
+                    "SELECT m.channel_id, m.thread_root_id, c.kind FROM messages m "
+                    "JOIN channels c ON c.id = m.channel_id WHERE m.id = ?",
+                    (thread_root,),
+                ) as cursor:
+                    root_row = await cursor.fetchone()
+                if root_row is None or tuple(root_row) != (channel_id, None, "group"):
+                    raise ValueError("Workshop thread root must be a top-level message in the same group channel")
             body = _required_text(payload, "body")
             mentions_json = await _message_mentions_json(
                 connection,
@@ -806,6 +818,14 @@ class CanonicalConversationProjection:
                 await connection.execute(
                     "UPDATE messages SET mentions_json = ? WHERE id = ?",
                     (mentions_json, envelope.aggregate_id),
+                )
+            # Like mentions, the nullable thread field is updated separately
+            # so old events remain projectable in migration tests frozen
+            # before the v43 column exists.
+            if thread_root is not None:
+                await connection.execute(
+                    "UPDATE messages SET thread_root_id = ? WHERE id = ?",
+                    (thread_root, envelope.aggregate_id),
                 )
         elif envelope.event_type == WorkshopEventType.ARTIFACT_CREATED:
             if envelope.event_version not in {1, 2}:

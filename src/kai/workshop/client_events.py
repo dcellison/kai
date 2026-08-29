@@ -160,7 +160,7 @@ async def read_client_channel_events(
         "SELECT e.position, e.event_type, e.occurred_at, "
         "m.id AS message_id, m.channel_id AS message_channel_id, "
         "m.author_principal_id, p.kind AS author_kind, p.display_name AS author_display_name, "
-        "m.reply_to_message_id, m.body, m.created_at AS message_created_at, "
+        "m.reply_to_message_id, m.thread_root_id, m.body, m.created_at AS message_created_at, "
         "m.mentions_json, "
         "e.metadata_json AS message_metadata_json, r.id AS run_id "
         "FROM event_log e "
@@ -205,11 +205,16 @@ async def read_client_channel_events(
                             if row["reply_to_message_id"] is not None
                             else None
                         ),
+                        thread_root_id=(
+                            MessageId(str(row["thread_root_id"])) if row["thread_root_id"] is not None else None
+                        ),
                         body=str(row["body"]),
                         event_position=position,
                         created_at=_parse_timestamp(row["message_created_at"]),
                         mentions=parse_message_mentions_json(row["mentions_json"]),
                         artifacts=artifact_map.get(message_id, ()),
+                        reply_count=0,
+                        latest_reply_at=None,
                     )
                 )
             )

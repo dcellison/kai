@@ -24,6 +24,7 @@ import {
   loadRun,
   loadRunTrace,
   loadSettingsWorkspace,
+  loadThreadTimeline,
   redeemEnrollment,
   submitCommand,
   switchWorkspace,
@@ -32,6 +33,7 @@ import type {
   CommandSubmissionResult,
   ConnectionState,
   TimelineMessage,
+  ThreadTimelineSnapshot,
   WorkshopRun,
   WorkshopRunActivity,
   WorkshopRunPreview,
@@ -687,11 +689,13 @@ function MessageItem({
   notification = false,
   onDownloadArtifact,
   onLoadArtifact,
+  onOpenThread,
 }: {
   message: TimelineMessage;
   notification?: boolean;
   onDownloadArtifact: (artifactId: string) => void;
   onLoadArtifact: (artifactId: string) => Promise<Blob>;
+  onOpenThread?: (messageId: string) => void;
 }): React.JSX.Element {
   const isAgent = message.authorKind === "agent";
   const displayName = message.authorDisplayName || "Unknown author";
@@ -740,6 +744,20 @@ function MessageItem({
             onLoad={onLoadArtifact}
           />
         ))}
+        {onOpenThread && (
+          <button
+            className="thread-summary"
+            type="button"
+            onClick={() => onOpenThread(message.messageId)}
+          >
+            {message.replyCount === 0
+              ? "Reply"
+              : `${message.replyCount} ${message.replyCount === 1 ? "reply" : "replies"}`}
+            {message.latestReplyAt && (
+              <span> · latest {formatTimestamp(message.latestReplyAt)}</span>
+            )}
+          </button>
+        )}
       </article>
     </li>
   );
@@ -1003,11 +1021,178 @@ function ChannelCreationDialog({
   );
 }
 
+function ThreadPane({
+  channelName,
+  liveMessages,
+  onClose,
+  onDownloadArtifact,
+  onLoadArtifact,
+  onLoadThread,
+  onSubmitCommand,
+  rootMessage,
+  runActive,
+}: {
+  channelName: string;
+  liveMessages: TimelineMessage[];
+  onClose: () => void;
+  onDownloadArtifact: (artifactId: string) => void;
+  onLoadArtifact: (artifactId: string) => Promise<Blob>;
+  onLoadThread: (rootMessageId: string, cursor: string | null, signal?: AbortSignal) => Promise<ThreadTimelineSnapshot>;
+  onSubmitCommand: (clientMessageId: string, body: string, artifact: File | null, threadRootId: string | null) => Promise<CommandSubmissionResult>;
+  rootMessage: TimelineMessage;
+  runActive: boolean;
+}): React.JSX.Element {
+  const [snapshot, setSnapshot] = useState<ThreadTimelineSnapshot | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [pendingMessageId, setPendingMessageId] = useState<string | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setSnapshot(null);
+    setError(null);
+    void onLoadThread(rootMessage.messageId, null, controller.signal).then(
+      setSnapshot,
+      (caught: unknown) => {
+        if (!controller.signal.aborted) {
+          setError(caught instanceof Error ? caught.message : "Could not load this thread.");
+        }
+      },
+    );
+    return () => controller.abort();
+  }, [onLoadThread, rootMessage.messageId]);
+
+  const replies = useMemo(() => {
+    const byId = new Map<string, TimelineMessage>();
+    for (const message of snapshot?.messages ?? []) {
+      byId.set(message.messageId, message);
+    }
+    for (const message of liveMessages) {
+      if (message.threadRootId === rootMessage.messageId) {
+        byId.set(message.messageId, message);
+      }
+    }
+    return Array.from(byId.values()).sort(
+      (left, right) => left.eventPosition - right.eventPosition,
+    );
+  }, [liveMessages, rootMessage.messageId, snapshot?.messages]);
+
+  const loadMore = async (): Promise<void> => {
+    if (!snapshot?.nextCursor || loadingMore) {
+      return;
+    }
+    setLoadingMore(true);
+    setError(null);
+    try {
+      const page = await onLoadThread(rootMessage.messageId, snapshot.nextCursor);
+      setSnapshot((current) => current && ({
+        ...current,
+        messages: [...current.messages, ...page.messages],
+        nextCursor: page.nextCursor,
+      }));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not load more replies.");
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
+  const submitReply = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
+    event.preventDefault();
+    const body = draft.trim();
+    if (!body || submitting || runActive) {
+      return;
+    }
+    setSubmitting(true);
+    setError(null);
+    try {
+      const clientMessageId = pendingMessageId ?? createClientMessageId();
+      setPendingMessageId(clientMessageId);
+      await onSubmitCommand(clientMessageId, body, null, rootMessage.messageId);
+      setDraft("");
+      setPendingMessageId(null);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Kai could not send this reply.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="thread-pane">
+      <header className="thread-header">
+        <div>
+          <p className="overline">Thread in {channelName}</p>
+          <h2>{replies.length} {replies.length === 1 ? "reply" : "replies"}</h2>
+        </div>
+        <button className="quiet-button" type="button" onClick={onClose}>Close</button>
+      </header>
+      <div className="thread-scroll">
+        <ol className="thread-message-list">
+          <MessageItem
+            message={snapshot?.root ?? rootMessage}
+            onDownloadArtifact={onDownloadArtifact}
+            onLoadArtifact={onLoadArtifact}
+          />
+          {replies.map((message) => (
+            <MessageItem
+              key={message.messageId}
+              message={message}
+              onDownloadArtifact={onDownloadArtifact}
+              onLoadArtifact={onLoadArtifact}
+            />
+          ))}
+        </ol>
+        {!snapshot && !error && <p className="thread-state">Loading replies…</p>}
+        {snapshot?.nextCursor && (
+          <button
+            className="timeline-earlier-button"
+            type="button"
+            disabled={loadingMore}
+            onClick={() => void loadMore()}
+          >
+            {loadingMore ? "Loading…" : "Load more replies"}
+          </button>
+        )}
+      </div>
+      <form className="thread-composer" onSubmit={(event) => void submitReply(event)}>
+        <textarea
+          aria-label={`Reply in ${channelName}`}
+          maxLength={50000}
+          placeholder="Reply… Use @name to mention an agent or person."
+          rows={3}
+          value={draft}
+          disabled={submitting || runActive}
+          onChange={(event) => {
+            setDraft(event.target.value);
+            if (!submitting) {
+              setPendingMessageId(null);
+            }
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+              event.preventDefault();
+              event.currentTarget.form?.requestSubmit();
+            }
+          }}
+        />
+        <button type="submit" disabled={!draft.trim() || submitting || runActive}>
+          {submitting ? "Sending…" : "Reply"}
+        </button>
+      </form>
+      {error && <p className="thread-error" role="alert">{error}</p>}
+    </div>
+  );
+}
+
 function WorkshopView({
   channel,
   connection,
   earlier,
   messages,
+  threadMessages,
   memoryDestination,
   memoryToken,
   settingsDestination,
@@ -1028,6 +1213,7 @@ function WorkshopView({
   onLoadRun,
   onLoadRunTrace,
   onLoadSettingsWorkspace,
+  onLoadThread,
   onMemoryAuthenticationFailure,
   onOpenMemory,
   onOpenSettings,
@@ -1042,6 +1228,7 @@ function WorkshopView({
   connection: ConnectionState;
   earlier: EarlierHistoryState;
   messages: TimelineMessage[];
+  threadMessages: TimelineMessage[];
   memoryDestination: { memoryId: string | null } | null;
   memoryToken: string;
   settingsDestination: boolean;
@@ -1062,6 +1249,11 @@ function WorkshopView({
   onLoadRun: (runId: string) => Promise<WorkshopRun>;
   onLoadRunTrace: (runId: string, afterSeq: number) => Promise<WorkshopRunTracePage>;
   onLoadSettingsWorkspace: () => Promise<WorkshopSettingsWorkspace>;
+  onLoadThread: (
+    rootMessageId: string,
+    cursor: string | null,
+    signal?: AbortSignal,
+  ) => Promise<ThreadTimelineSnapshot>;
   onMemoryAuthenticationFailure: (message: string) => void;
   onOpenMemory: () => void;
   onOpenSettings: () => void;
@@ -1071,6 +1263,7 @@ function WorkshopView({
     clientMessageId: string,
     body: string,
     artifact: File | null,
+    threadRootId: string | null,
   ) => Promise<CommandSubmissionResult>;
   onSwitchWorkspace: (
     path: string,
@@ -1122,6 +1315,7 @@ function WorkshopView({
   const [mentionSelection, setMentionSelection] = useState(0);
   const [notificationPreferences, setNotificationPreferences] =
     useState<WorkshopNotificationPreferences | null>(null);
+  const [threadRootMessageId, setThreadRootMessageId] = useState<string | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const pendingComposerCaretRef = useRef<number | null>(null);
@@ -1141,6 +1335,30 @@ function WorkshopView({
   const latestRunActivityRef = useRef<WorkshopRunActivity | null>(runActivity);
   const humanName = navigation.principal.displayName || "You";
   const humanRole = workshopRoleLabel(workshop.role);
+  const threadRootMessage = useMemo(
+    () => messages.find((message) => message.messageId === threadRootMessageId) ?? null,
+    [messages, threadRootMessageId],
+  );
+  const displayedMessages = useMemo(
+    () => messages.map((message) => {
+      const liveReplies = threadMessages.filter(
+        (candidate) => candidate.threadRootId === message.messageId,
+      );
+      if (liveReplies.length === 0) {
+        return message;
+      }
+      return {
+        ...message,
+        replyCount: message.replyCount + liveReplies.length,
+        latestReplyAt: liveReplies[liveReplies.length - 1].createdAt,
+      };
+    }),
+    [messages, threadMessages],
+  );
+
+  useEffect(() => {
+    setThreadRootMessageId(null);
+  }, [channelId]);
   const availableAgents = useMemo(() => {
     const unique = new Map<string, WorkshopAgentSummary>();
     for (const availableChannel of workshop.channels) {
@@ -1730,7 +1948,7 @@ function WorkshopView({
     try {
       const clientMessageId = pendingMessageId ?? createClientMessageId();
       setPendingMessageId(clientMessageId);
-      const result = await onSubmitCommand(clientMessageId, body, selectedArtifact);
+      const result = await onSubmitCommand(clientMessageId, body, selectedArtifact, null);
       setDraft("");
       storeDraft(channelId, "");
       setPendingMessageId(null);
@@ -2112,13 +2330,16 @@ function WorkshopView({
               className={`message-list ${channel.kind === "notification" ? "notification-feed" : ""}`}
               aria-live="polite"
             >
-              {messages.map((message) => (
+              {displayedMessages.map((message) => (
                 <MessageItem
                   key={message.messageId}
                   message={message}
                   notification={channel.kind === "notification"}
                   onDownloadArtifact={onDownloadArtifact}
                   onLoadArtifact={onLoadArtifact}
+                  onOpenThread={
+                    channel.kind === "group" ? setThreadRootMessageId : undefined
+                  }
                 />
               ))}
               {runPreview && channel.kind !== "notification" && (
@@ -2357,6 +2578,19 @@ function WorkshopView({
           onPointerDown={beginContextResize}
           onPointerMove={resizeContext}
         />
+        {threadRootMessage ? (
+          <ThreadPane
+            channelName={channelName}
+            liveMessages={threadMessages}
+            onClose={() => setThreadRootMessageId(null)}
+            onDownloadArtifact={onDownloadArtifact}
+            onLoadArtifact={onLoadArtifact}
+            onLoadThread={onLoadThread}
+            onSubmitCommand={onSubmitCommand}
+            rootMessage={threadRootMessage}
+            runActive={isRunActive(activeRun)}
+          />
+        ) : (
         <div className="context-scroll">
           <header>
             <p className="overline">Channel context</p>
@@ -2480,6 +2714,7 @@ function WorkshopView({
           </section>
 
         </div>
+        )}
       </aside>
       {channelCreation && (
         <ChannelCreationDialog
@@ -2592,7 +2827,16 @@ function ActiveWorkshopClient({
     }),
     [session.channelId, session.token, settingsChannel?.channelId],
   );
-  const { connection, messages, runActivity, runPreview, runTrace, earlier, loadEarlier } =
+  const {
+    connection,
+    messages,
+    threadMessages,
+    runActivity,
+    runPreview,
+    runTrace,
+    earlier,
+    loadEarlier,
+  } =
     useWorkshopTimeline(
       session,
       selected !== null,
@@ -2628,9 +2872,21 @@ function ActiveWorkshopClient({
     [session, withAccessHandling],
   );
   const submitSelectedCommand = useCallback(
-    (clientMessageId: string, body: string, artifact: File | null) =>
+    (
+      clientMessageId: string,
+      body: string,
+      artifact: File | null,
+      threadRootId: string | null,
+    ) =>
       withAccessHandling(() =>
-        submitCommand(session, clientMessageId, body, artifact)
+        submitCommand(session, clientMessageId, body, artifact, threadRootId)
+      ),
+    [session, withAccessHandling],
+  );
+  const loadSelectedThread = useCallback(
+    (rootMessageId: string, cursor: string | null, signal?: AbortSignal) =>
+      withAccessHandling(() =>
+        loadThreadTimeline(session, rootMessageId, cursor, signal)
       ),
     [session, withAccessHandling],
   );
@@ -2678,6 +2934,7 @@ function ActiveWorkshopClient({
       connection={connection}
       earlier={earlier}
       messages={messages}
+      threadMessages={threadMessages}
       memoryDestination={destination.kind === "memory" ? destination : null}
       memoryToken={session.token}
       settingsDestination={destination.kind === "settings"}
@@ -2698,6 +2955,7 @@ function ActiveWorkshopClient({
       onLoadRun={loadSelectedRun}
       onLoadRunTrace={loadSelectedRunTrace}
       onLoadSettingsWorkspace={loadSelectedSettingsWorkspace}
+      onLoadThread={loadSelectedThread}
       onMemoryAuthenticationFailure={onAuthenticationFailure}
       onOpenMemory={onOpenMemory}
       onOpenSettings={onOpenSettings}

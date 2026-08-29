@@ -52,11 +52,14 @@ class TimelineMessage:
     author_kind: str
     author_display_name: str
     reply_to_message_id: MessageId | None
+    thread_root_id: MessageId | None
     body: str
     event_position: int
     created_at: datetime
     mentions: tuple[MessageMention, ...] = ()
     artifacts: tuple[ArtifactSummary, ...] = ()
+    reply_count: int = 0
+    latest_reply_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +86,16 @@ class TimelineUpdateBatch:
 
 
 @dataclass(frozen=True, slots=True)
+class ThreadTimelinePage:
+    """One stable page of replies beneath an authorized root message."""
+
+    root: TimelineMessage
+    messages: tuple[TimelineMessage, ...]
+    next_cursor: str | None
+    through_position: int
+
+
+@dataclass(frozen=True, slots=True)
 class _CursorState:
     channel_id: ChannelId
     after_position: int
@@ -93,6 +106,14 @@ class _CursorState:
 class _TailCursorState:
     channel_id: ChannelId
     before_position: int
+    through_position: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ThreadCursorState:
+    channel_id: ChannelId
+    thread_root_id: MessageId
+    after_position: int
     through_position: int
 
 
@@ -122,6 +143,17 @@ def _encode_tail_cursor(state: _TailCursorState) -> str:
     )
 
 
+def _encode_thread_cursor(state: _ThreadCursorState) -> str:
+    return _encode_payload(
+        {
+            "after_position": state.after_position,
+            "channel_id": state.channel_id,
+            "thread_root_id": state.thread_root_id,
+            "through_position": state.through_position,
+        }
+    )
+
+
 def _cursor_position(payload: dict[str, object], key: str) -> int:
     value = payload[key]
     if not isinstance(value, int) or isinstance(value, bool):
@@ -129,7 +161,7 @@ def _cursor_position(payload: dict[str, object], key: str) -> int:
     return value
 
 
-def _decode_cursor(cursor: str) -> _CursorState | _TailCursorState:
+def _decode_cursor(cursor: str) -> _CursorState | _TailCursorState | _ThreadCursorState:
     if not isinstance(cursor, str) or not cursor.startswith(_CURSOR_PREFIX) or len(cursor) > _MAX_CURSOR_LENGTH:
         raise TimelineCursorError("Invalid timeline cursor")
     encoded = cursor.removeprefix(_CURSOR_PREFIX)
@@ -147,7 +179,12 @@ def _decode_cursor(cursor: str) -> _CursorState | _TailCursorState:
     if not isinstance(payload, dict):
         raise TimelineCursorError("Invalid timeline cursor")
     keys = set(payload)
-    if keys == {"after_position", "channel_id", "through_position"}:
+    if keys == {"after_position", "channel_id", "through_position"} or keys == {
+        "after_position",
+        "channel_id",
+        "thread_root_id",
+        "through_position",
+    }:
         boundary_key = "after_position"
     elif keys == {"before_position", "channel_id", "through_position"}:
         boundary_key = "before_position"
@@ -161,6 +198,12 @@ def _decode_cursor(cursor: str) -> _CursorState | _TailCursorState:
         channel_id = ChannelId(payload["channel_id"])
     except (TypeError, ValueError) as exc:
         raise TimelineCursorError("Invalid timeline cursor") from exc
+    if "thread_root_id" in payload:
+        try:
+            thread_root_id = MessageId(payload["thread_root_id"])
+        except (TypeError, ValueError) as exc:
+            raise TimelineCursorError("Invalid timeline cursor") from exc
+        return _ThreadCursorState(channel_id, thread_root_id, boundary, through_position)
     if boundary_key == "after_position":
         return _CursorState(channel_id, boundary, through_position)
     # A tail cursor's boundary is the position of a message already
@@ -265,7 +308,7 @@ async def _latest_event_position(store: WorkshopEventStore) -> int:
 def _messages_from_rows(rows: list[aiosqlite.Row]) -> tuple[TimelineMessage, ...]:
     messages: list[TimelineMessage] = []
     for row in rows:
-        if is_internal_scheduled_invocation(row[10], row[3]):
+        if is_internal_scheduled_invocation(row[11], row[3]):
             continue
         messages.append(
             TimelineMessage(
@@ -275,10 +318,13 @@ def _messages_from_rows(rows: list[aiosqlite.Row]) -> tuple[TimelineMessage, ...
                 author_kind=str(row[3]),
                 author_display_name=str(row[4]),
                 reply_to_message_id=MessageId(str(row[5])) if row[5] is not None else None,
-                body=str(row[6]),
-                event_position=int(row[7]),
-                created_at=_parse_timestamp(str(row[8])),
-                mentions=parse_message_mentions_json(row[9]),
+                thread_root_id=MessageId(str(row[6])) if row[6] is not None else None,
+                body=str(row[7]),
+                event_position=int(row[8]),
+                created_at=_parse_timestamp(str(row[9])),
+                mentions=parse_message_mentions_json(row[10]),
+                reply_count=int(row[12]),
+                latest_reply_at=(_parse_timestamp(str(row[13])) if row[13] is not None else None),
             )
         )
     return tuple(messages)
@@ -303,14 +349,25 @@ async def _read_forward_page(
 ) -> TimelinePage:
     async with store.connection.execute(
         "SELECT m.id, m.channel_id, m.author_principal_id, p.kind, p.display_name, "
-        "m.reply_to_message_id, m.body, m.created_event_position, m.created_at, "
-        "m.mentions_json, e.metadata_json "
+        "m.reply_to_message_id, m.thread_root_id, m.body, m.created_event_position, m.created_at, "
+        "m.mentions_json, e.metadata_json, "
+        "(SELECT COUNT(*) FROM messages tr WHERE tr.thread_root_id = m.id "
+        "AND tr.created_event_position <= ?), "
+        "(SELECT MAX(tr.created_at) FROM messages tr WHERE tr.thread_root_id = m.id "
+        "AND tr.created_event_position <= ?) "
         "FROM messages m JOIN principals p ON p.id = m.author_principal_id "
         "JOIN event_log e ON e.position = m.created_event_position "
-        "WHERE m.channel_id = ? AND m.created_event_position > ? "
+        "WHERE m.channel_id = ? AND m.thread_root_id IS NULL AND m.created_event_position > ? "
         f"AND m.created_event_position <= ? AND {_VISIBLE_MESSAGE_PREDICATE} "
         "ORDER BY m.created_event_position ASC LIMIT ?",
-        (channel_id, state.after_position, state.through_position, limit + 1),
+        (
+            state.through_position,
+            state.through_position,
+            channel_id,
+            state.after_position,
+            state.through_position,
+            limit + 1,
+        ),
     ) as query_cursor:
         rows = list(await query_cursor.fetchall())
 
@@ -343,13 +400,17 @@ async def _read_tail_page(
     # in event order.
     async with store.connection.execute(
         "SELECT m.id, m.channel_id, m.author_principal_id, p.kind, p.display_name, "
-        "m.reply_to_message_id, m.body, m.created_event_position, m.created_at, "
-        "m.mentions_json, e.metadata_json "
+        "m.reply_to_message_id, m.thread_root_id, m.body, m.created_event_position, m.created_at, "
+        "m.mentions_json, e.metadata_json, "
+        "(SELECT COUNT(*) FROM messages tr WHERE tr.thread_root_id = m.id "
+        "AND tr.created_event_position <= ?), "
+        "(SELECT MAX(tr.created_at) FROM messages tr WHERE tr.thread_root_id = m.id "
+        "AND tr.created_event_position <= ?) "
         "FROM messages m JOIN principals p ON p.id = m.author_principal_id "
         "JOIN event_log e ON e.position = m.created_event_position "
-        "WHERE m.channel_id = ? AND m.created_event_position < ? "
+        "WHERE m.channel_id = ? AND m.thread_root_id IS NULL AND m.created_event_position < ? "
         f"AND {_VISIBLE_MESSAGE_PREDICATE} ORDER BY m.created_event_position DESC LIMIT ?",
-        (channel_id, state.before_position, limit + 1),
+        (state.through_position, state.through_position, channel_id, state.before_position, limit + 1),
     ) as query_cursor:
         rows = list(await query_cursor.fetchall())
 
@@ -398,6 +459,8 @@ async def read_channel_timeline(
         state = _decode_cursor(cursor)
         if state.channel_id != channel_id:
             raise TimelineCursorError("Timeline cursor belongs to another channel")
+        if isinstance(state, _ThreadCursorState):
+            raise TimelineCursorError("Thread cursor cannot page a channel timeline")
         if isinstance(state, _TailCursorState):
             return await _read_tail_page(store, channel_id, state, limit)
         return await _read_forward_page(store, channel_id, state, limit)
@@ -413,6 +476,92 @@ async def read_channel_timeline(
             limit,
         )
     return await _read_forward_page(store, channel_id, _CursorState(channel_id, 0, through_position), limit)
+
+
+async def _read_thread_root(
+    store: WorkshopEventStore,
+    channel_id: ChannelId,
+    thread_root_id: MessageId,
+    through_position: int,
+) -> TimelineMessage:
+    async with store.connection.execute(
+        "SELECT m.id, m.channel_id, m.author_principal_id, p.kind, p.display_name, "
+        "m.reply_to_message_id, m.thread_root_id, m.body, m.created_event_position, m.created_at, "
+        "m.mentions_json, e.metadata_json, "
+        "(SELECT COUNT(*) FROM messages tr WHERE tr.thread_root_id = m.id "
+        "AND tr.created_event_position <= ?), "
+        "(SELECT MAX(tr.created_at) FROM messages tr WHERE tr.thread_root_id = m.id "
+        "AND tr.created_event_position <= ?) "
+        "FROM messages m JOIN principals p ON p.id = m.author_principal_id "
+        "JOIN event_log e ON e.position = m.created_event_position "
+        "JOIN channels c ON c.id = m.channel_id "
+        "WHERE m.id = ? AND m.channel_id = ? AND m.thread_root_id IS NULL "
+        "AND c.kind = 'group' AND m.created_event_position <= ?",
+        (through_position, through_position, thread_root_id, channel_id, through_position),
+    ) as cursor:
+        rows = list(await cursor.fetchall())
+    messages = await attach_message_artifacts(store, _messages_from_rows(rows))
+    if len(messages) != 1:
+        raise TimelineAccessDeniedError("Thread access denied")
+    return messages[0]
+
+
+async def read_thread_timeline(
+    store: WorkshopEventStore,
+    *,
+    principal_id: PrincipalId,
+    channel_id: ChannelId,
+    thread_root_id: MessageId,
+    authorizer: ChannelTimelineAuthorizer,
+    cursor: str | None = None,
+    limit: int = 50,
+) -> ThreadTimelinePage:
+    """Read one authorized, stable, forward-paged group-channel thread."""
+    _validate_request(principal_id, channel_id, limit)
+    if not isinstance(thread_root_id, MessageId):
+        raise ValueError("thread_root_id must be a MessageId")
+    await _authorize(authorizer, principal_id, channel_id)
+    if not await _channel_exists(store, channel_id):
+        raise TimelineAccessDeniedError("Thread access denied")
+
+    if cursor is None:
+        through_position = await _latest_message_position(store, channel_id)
+        state = _ThreadCursorState(channel_id, thread_root_id, 0, through_position)
+    else:
+        decoded = _decode_cursor(cursor)
+        if not isinstance(decoded, _ThreadCursorState):
+            raise TimelineCursorError("Channel cursor cannot page a thread timeline")
+        if decoded.channel_id != channel_id or decoded.thread_root_id != thread_root_id:
+            raise TimelineCursorError("Thread cursor belongs to another thread")
+        state = decoded
+
+    root = await _read_thread_root(store, channel_id, thread_root_id, state.through_position)
+    async with store.connection.execute(
+        "SELECT m.id, m.channel_id, m.author_principal_id, p.kind, p.display_name, "
+        "m.reply_to_message_id, m.thread_root_id, m.body, m.created_event_position, m.created_at, "
+        "m.mentions_json, e.metadata_json, 0, NULL "
+        "FROM messages m JOIN principals p ON p.id = m.author_principal_id "
+        "JOIN event_log e ON e.position = m.created_event_position "
+        "WHERE m.channel_id = ? AND m.thread_root_id = ? "
+        "AND m.created_event_position > ? AND m.created_event_position <= ? "
+        f"AND {_VISIBLE_MESSAGE_PREDICATE} "
+        "ORDER BY m.created_event_position ASC LIMIT ?",
+        (channel_id, thread_root_id, state.after_position, state.through_position, limit + 1),
+    ) as query_cursor:
+        rows = list(await query_cursor.fetchall())
+    has_more = len(rows) > limit
+    messages = await attach_message_artifacts(store, _messages_from_rows(rows[:limit]))
+    next_cursor = None
+    if has_more:
+        next_cursor = _encode_thread_cursor(
+            _ThreadCursorState(
+                channel_id,
+                thread_root_id,
+                messages[-1].event_position,
+                state.through_position,
+            )
+        )
+    return ThreadTimelinePage(root, messages, next_cursor, state.through_position)
 
 
 async def read_channel_timeline_updates(
@@ -452,8 +601,10 @@ async def read_channel_timeline_updates(
 
     async with store.connection.execute(
         "SELECT m.id, m.channel_id, m.author_principal_id, p.kind, p.display_name, "
-        "m.reply_to_message_id, m.body, m.created_event_position, m.created_at, "
-        "m.mentions_json, e.metadata_json "
+        "m.reply_to_message_id, m.thread_root_id, m.body, m.created_event_position, m.created_at, "
+        "m.mentions_json, e.metadata_json, "
+        "(SELECT COUNT(*) FROM messages tr WHERE tr.thread_root_id = m.id), "
+        "(SELECT MAX(tr.created_at) FROM messages tr WHERE tr.thread_root_id = m.id) "
         "FROM messages m JOIN principals p ON p.id = m.author_principal_id "
         "JOIN event_log e ON e.position = m.created_event_position "
         "WHERE m.channel_id = ? AND m.created_event_position > ? "
@@ -463,5 +614,5 @@ async def read_channel_timeline_updates(
         rows = list(await query_cursor.fetchall())
 
     messages = await attach_message_artifacts(store, _messages_from_rows(rows))
-    next_position = int(rows[-1][7]) if rows else after_position
+    next_position = int(rows[-1][8]) if rows else after_position
     return TimelineUpdateBatch(messages, next_position)
