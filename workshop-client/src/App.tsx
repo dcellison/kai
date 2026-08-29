@@ -67,12 +67,13 @@ const LEGACY_SESSION_KEY = "kai.workshop.read-session.v1";
 const ACTIVE_RUN_KEY = "kai.workshop.active-run.v1";
 const DRAFTS_KEY = "kai.workshop.drafts.v1";
 const VIEWPORTS_KEY = "kai.workshop.timeline-viewports.v1";
-const SIDEBAR_LAYOUT_KEY = "kai.workshop.sidebar-layout.v1";
+const SIDEBAR_LAYOUT_KEY = "kai.workshop.sidebar-layout.v2";
 const TIMELINE_FOLLOW_DISTANCE_PX = 96;
-const DEFAULT_SIDEBAR_WIDTH_PX = 264;
-const MIN_SIDEBAR_WIDTH_PX = 176;
-const MAX_SIDEBAR_WIDTH_PX = 420;
-const COLLAPSED_SIDEBAR_WIDTH_PX = 56;
+const UI_SCALE = 2;
+const DEFAULT_SIDEBAR_WIDTH_PX = 264 * UI_SCALE;
+const MIN_SIDEBAR_WIDTH_PX = 176 * UI_SCALE;
+const MAX_SIDEBAR_WIDTH_PX = 420 * UI_SCALE;
+const COLLAPSED_SIDEBAR_WIDTH_PX = 56 * UI_SCALE;
 const MEMORY_ID_PATTERN = /^[A-Za-z0-9_-]{1,256}$/;
 
 type WorkshopDestination =
@@ -158,10 +159,10 @@ function storeSidebarLayout(layout: StoredSidebarLayout): void {
   sessionStorage.setItem(SIDEBAR_LAYOUT_KEY, JSON.stringify(layout));
 }
 
-const CONTEXT_LAYOUT_KEY = "kai.workshop.context-layout.v1";
-const DEFAULT_CONTEXT_WIDTH_PX = 304;
-const MIN_CONTEXT_WIDTH_PX = 240;
-const MAX_CONTEXT_WIDTH_PX = 560;
+const CONTEXT_LAYOUT_KEY = "kai.workshop.context-layout.v2";
+const DEFAULT_CONTEXT_WIDTH_PX = 304 * UI_SCALE;
+const MIN_CONTEXT_WIDTH_PX = 240 * UI_SCALE;
+const MAX_CONTEXT_WIDTH_PX = 560 * UI_SCALE;
 
 function clampContextWidth(width: number): number {
   return Math.min(
@@ -1749,7 +1750,7 @@ function WorkshopView({
           ? MIN_SIDEBAR_WIDTH_PX
           : event.key === "End"
             ? MAX_SIDEBAR_WIDTH_PX
-            : clampSidebarWidth(layout.width + direction * 16),
+            : clampSidebarWidth(layout.width + direction * 16 * UI_SCALE),
     }));
   };
 
@@ -1793,7 +1794,7 @@ function WorkshopView({
         ? MIN_CONTEXT_WIDTH_PX
         : event.key === "End"
           ? MAX_CONTEXT_WIDTH_PX
-          : clampContextWidth(width + direction * 16),
+          : clampContextWidth(width + direction * 16 * UI_SCALE),
     );
   };
 
