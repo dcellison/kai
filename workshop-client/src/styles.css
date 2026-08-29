@@ -499,7 +499,7 @@ button:disabled {
   place-items: center;
   width: 1.5rem;
   height: 1.5rem;
-  margin-right: 0.35rem;
+  margin-right: 0.1rem;
   padding: 0;
   border: 1px solid transparent;
   border-radius: 0.3rem;

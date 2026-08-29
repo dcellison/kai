@@ -1559,12 +1559,14 @@ describe("Workshop React client", () => {
     expect(navigationPanel).toHaveClass("collapsed");
     expect(screen.getByRole("button", { name: "Kai" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Scott" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Create channel" })).toBeNull();
     expect(sessionStorage.getItem("kai.workshop.sidebar-layout.v1")).toContain(
       '"collapsed":true',
     );
 
     await user.click(screen.getByRole("button", { name: "Expand navigation" }));
     expect(navigationPanel).not.toHaveClass("collapsed");
+    expect(screen.getByRole("button", { name: "Create channel" })).toBeVisible();
   });
 
   it("resizes navigation with an accessible separator", async () => {
