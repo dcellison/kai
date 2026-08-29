@@ -115,7 +115,12 @@ from kai.workshop.routing_eligibility import (
     RuntimeEligibilityCandidate,
     RuntimeEligibilityReport,
 )
-from kai.workshop.routing_policy import WorkshopRoutingPolicyService
+from kai.workshop.routing_policy import (
+    RoutingDecisionDisposition,
+    RunRoutingDecision,
+    WorkshopRoutingPolicyService,
+)
+from kai.workshop.run_execution_authority import RunExecutionSelection
 from kai.workshop.run_lifecycle import (
     DurableRun,
     RunNotFoundError,
@@ -224,6 +229,26 @@ class _CommandSubmitter:
             cancellation_code="requested_by_human",
         )
         return CanonicalCancellationDisposition.REQUESTED
+
+
+class _RoutingPolicy(WorkshopRoutingPolicyService):
+    def __init__(self) -> None:
+        pass
+
+    async def load_decision(self, run_id: RunId) -> RunRoutingDecision:
+        return RunRoutingDecision(
+            run_id=run_id,
+            runtime_profile_id=profile_id(101),
+            requested_task_class=RoutingTaskClass.CODING,
+            requested_backend_option_id="opencode:deepseek",
+            selected_backend_option_id="opencode:deepseek",
+            disposition=RoutingDecisionDisposition.ROUTED,
+            reason_code="configured_route_eligible",
+            policy_revision=1,
+            selection=RunExecutionSelection("opencode", "deepseek-chat", "deepseek"),
+            evidence_version=1,
+            decided_at=_NOW,
+        )
 
 
 class _AllowChannelRead:
@@ -826,6 +851,7 @@ async def _open_command_client(
     authenticator: _Authenticator,
     submitter: _CommandSubmitter,
     artifact_service: WorkshopArtifactService | None = None,
+    routing_policy: WorkshopRoutingPolicyService | None = None,
 ) -> TestClient:
     app = web.Application(client_max_size=21 * 1024 * 1024)
     register_workshop_command_routes(
@@ -835,6 +861,7 @@ async def _open_command_client(
         submitter=submitter,
         request_lock=asyncio.Lock(),
         artifact_service=artifact_service,
+        routing_policy=routing_policy,
     )
     client = TestClient(TestServer(app))
     await client.start_server()
@@ -2076,6 +2103,7 @@ class TestWorkshopCommandHTTPContract:
             store,
             _Authenticator({"alice-token": alice_id}),
             submitter,
+            routing_policy=_RoutingPolicy(),
         )
         try:
             response = await client.post(
@@ -2094,6 +2122,9 @@ class TestWorkshopCommandHTTPContract:
             assert payload["acceptance"] == "newly_accepted"
             assert payload["run"]["status"] == "accepted"
             assert payload["run"]["channel_id"] == alice_channel
+            assert payload["run"]["routing_decision"] == payload["routing_decision"]
+            assert payload["routing_decision"]["requested_task_class"] == "coding"
+            assert payload["routing_decision"]["selected_backend_option_id"] == "opencode:deepseek"
             assert str(payload["message_id"]).startswith("msg_")
             assert str(payload["run_id"]).startswith("run_")
             assert len(submitter.messages) == 1

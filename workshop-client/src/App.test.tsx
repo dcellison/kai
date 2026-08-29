@@ -1740,9 +1740,9 @@ describe("Workshop React client", () => {
       agentId: "agt_00000000000000000000000000000001",
       channelId,
       entries: (["conversation", "coding", "vision"] as const).map((taskClass) => ({
-        authorizedOptionIds: ["claude:anthropic", "codex:openai"],
-        backendOptionId: taskClass === "coding" ? "codex:openai" : null,
-        eligibleOptionIds: ["claude:anthropic", "codex:openai"],
+        authorizedOptionIds: ["claude:anthropic", "opencode:deepseek"],
+        backendOptionId: taskClass === "coding" ? "opencode:deepseek" : null,
+        eligibleOptionIds: ["claude:anthropic", "opencode:deepseek"],
         fallback: "selected" as const,
         revision: taskClass === "coding" ? 1 : 0,
         taskClass,
@@ -1750,6 +1750,26 @@ describe("Workshop React client", () => {
       principalId: navigation.principal.principalId,
       runtimeProfileId: "rtp_00000000000000000000000000000001",
       version: 1,
+    });
+    vi.mocked(submitCommand).mockResolvedValueOnce({
+      acceptance: "newly_accepted",
+      messageId: "msg_00000000000000000000000000000030",
+      run: {
+        ...completedRun,
+        routingDecision: {
+          backend: "opencode",
+          decidedAt: "2026-08-13T09:00:00Z",
+          disposition: "routed",
+          evidenceVersion: 1,
+          model: "deepseek-chat",
+          policyRevision: 1,
+          provider: "deepseek",
+          reasonCode: "configured_route_eligible",
+          requestedBackendOptionId: "opencode:deepseek",
+          requestedTaskClass: "coding",
+          selectedBackendOptionId: "opencode:deepseek",
+        },
+      },
     });
 
     render(<App />);
@@ -1770,6 +1790,9 @@ describe("Workshop React client", () => {
       "coding",
     );
     expect(route).toHaveValue("");
+    expect(
+      await screen.findByText("Route: routed · coding · opencode:deepseek"),
+    ).toBeVisible();
   });
 
   it("submits a file-only command and clears the selected attachment on success", async () => {

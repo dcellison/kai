@@ -92,6 +92,22 @@ function run(status = "accepted"): Record<string, unknown> {
   };
 }
 
+function routingDecision(): Record<string, unknown> {
+  return {
+    backend: "opencode",
+    decided_at: "2026-08-13T09:00:00Z",
+    disposition: "routed",
+    evidence_version: 1,
+    model: "deepseek-chat",
+    policy_revision: 1,
+    provider: "deepseek",
+    reason_code: "configured_route_eligible",
+    requested_backend_option_id: "opencode:deepseek",
+    requested_task_class: "coding",
+    selected_backend_option_id: "opencode:deepseek",
+  };
+}
+
 function memoryRecord(): Record<string, unknown> {
   return {
     memory_id: "memory-1",
@@ -1410,7 +1426,8 @@ describe("Workshop client API", () => {
         acceptance: "newly_accepted",
         message_id: "msg_00000000000000000000000000000001",
         run_id: "run_00000000000000000000000000000001",
-        run: run(),
+        routing_decision: routingDecision(),
+        run: { ...run(), routing_decision: routingDecision() },
       }),
     );
     vi.stubGlobal("fetch", fetchMock);
@@ -1425,6 +1442,19 @@ describe("Workshop client API", () => {
         cancellationRequestedAt: null,
         channelId,
         resultMessageId: null,
+        routingDecision: {
+          backend: "opencode",
+          decidedAt: "2026-08-13T09:00:00Z",
+          disposition: "routed",
+          evidenceVersion: 1,
+          model: "deepseek-chat",
+          policyRevision: 1,
+          provider: "deepseek",
+          reasonCode: "configured_route_eligible",
+          requestedBackendOptionId: "opencode:deepseek",
+          requestedTaskClass: "coding",
+          selectedBackendOptionId: "opencode:deepseek",
+        },
         runId: "run_00000000000000000000000000000001",
         startedAt: null,
         status: "accepted",

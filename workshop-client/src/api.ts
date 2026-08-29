@@ -325,6 +325,10 @@ function parseRun(value: unknown, channelId: string): WorkshopRun | null {
     terminal_at: terminalAt,
     terminal_code: terminalCode,
   } = value;
+  const routingDecision =
+    "routing_decision" in value
+      ? parseRoutingDecision(value.routing_decision)
+      : undefined;
   if (
     typeof acceptedAt !== "string" ||
     (cancellationRequestedAt !== null && typeof cancellationRequestedAt !== "string") ||
@@ -339,7 +343,7 @@ function parseRun(value: unknown, channelId: string): WorkshopRun | null {
   ) {
     return null;
   }
-  return {
+  const run: WorkshopRun = {
     acceptedAt,
     cancellationRequestedAt,
     channelId,
@@ -350,6 +354,10 @@ function parseRun(value: unknown, channelId: string): WorkshopRun | null {
     terminalAt,
     terminalCode,
   };
+  if (routingDecision !== undefined) {
+    run.routingDecision = routingDecision;
+  }
+  return run;
 }
 
 export async function redeemEnrollment(
@@ -2522,10 +2530,19 @@ export async function submitCommand(
   if (!run || run.runId !== payload.run_id) {
     throw new Error("Kai returned an unsupported command response.");
   }
+  const routingDecision =
+    "routing_decision" in payload
+      ? parseRoutingDecision(payload.routing_decision)
+      : undefined;
   return {
     acceptance: payload.acceptance,
     messageId: payload.message_id,
-    run,
+    run:
+      run.routingDecision !== undefined
+        ? run
+        : routingDecision !== undefined
+          ? { ...run, routingDecision }
+          : run,
   };
 }
 
@@ -2652,7 +2669,8 @@ export async function cancelRun(
   if (!isRecord(payload) || payload.version !== 1 || !run || run.runId !== runId) {
     throw new Error("Kai returned an unsupported cancellation response.");
   }
-  return run;
+  const routingDecision = parseRoutingDecision(payload.routing_decision);
+  return { ...run, routingDecision: run.routingDecision ?? routingDecision };
 }
 
 function parseTimelinePage(payload: unknown, channelId: string): TimelineSnapshot {
@@ -2947,7 +2965,10 @@ export async function streamTimeline(
           {
             eventPosition,
             occurredAt: payload.occurred_at,
-            run: { ...run, routingDecision },
+            run: {
+              ...run,
+              routingDecision: run.routingDecision ?? routingDecision,
+            },
             transition: transition as WorkshopRunTransition,
           },
           event.eventId,

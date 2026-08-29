@@ -2846,6 +2846,17 @@ def _serialize_routing_decision(decision: RunRoutingDecision | None) -> dict[str
     }
 
 
+def _serialize_run_with_routing_decision(
+    run: DurableRun,
+    decision: RunRoutingDecision | None,
+) -> dict[str, object]:
+    """Keep a run's durable routing evidence attached on every client path."""
+    return {
+        **_serialize_run(run),
+        "routing_decision": _serialize_routing_decision(decision),
+    }
+
+
 async def _handle_client_navigation(
     request: web.Request,
     *,
@@ -3577,6 +3588,7 @@ async def _handle_command_submission(
     submitter: WorkshopClientCommandSubmitter,
     request_lock: asyncio.Lock,
     artifact_service: WorkshopArtifactService | None = None,
+    routing_policy: WorkshopRoutingPolicyService | None = None,
 ) -> web.Response:
     """Authenticate, authorize, and durably enqueue one canonical command."""
     async with request_lock:
@@ -3728,8 +3740,15 @@ async def _handle_command_submission(
     result_runs = getattr(result, "runs", None)
     if result_runs is None:
         result_runs = (result.run,)
+    decisions_list: list[RunRoutingDecision | None] = []
+    for run in result_runs:
+        decisions_list.append(await routing_policy.load_decision(run.run_id) if routing_policy is not None else None)
+    decisions = tuple(decisions_list)
     if len(result_runs) != 1:
-        runs = [_serialize_run(run) for run in result_runs]
+        runs = [
+            _serialize_run_with_routing_decision(run, decision)
+            for run, decision in zip(result_runs, decisions, strict=True)
+        ]
         terminal = bool(result_runs) and all(
             run.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED} for run in result_runs
         )
@@ -3751,7 +3770,8 @@ async def _handle_command_submission(
             "message_id": str(result.acceptance.command.message.event.envelope.aggregate_id),
             "run_id": str(result.acceptance.run.run_id),
             "acceptance": result.acceptance.command.disposition.value,
-            "run": _serialize_run(result.run),
+            "run": _serialize_run_with_routing_decision(result.run, decisions[0]),
+            "routing_decision": _serialize_routing_decision(decisions[0]),
         },
         status=200 if terminal else 202,
     )
@@ -3920,7 +3940,7 @@ async def _handle_run_state(
     return _json_response(
         {
             "version": 1,
-            "run": _serialize_run(authorized[2]),
+            "run": _serialize_run_with_routing_decision(authorized[2], decision),
             "routing_decision": _serialize_routing_decision(decision),
         },
         status=200,
@@ -4003,6 +4023,7 @@ async def _handle_run_cancellation(
     authenticator: WorkshopClientAuthenticator,
     submitter: WorkshopClientCommandSubmitter,
     request_lock: asyncio.Lock,
+    routing_policy: WorkshopRoutingPolicyService | None = None,
 ) -> web.Response:
     if request.query or request.can_read_body:
         return _error_response(status=400, code="invalid_request", message="Invalid cancellation request")
@@ -4017,11 +4038,12 @@ async def _handle_run_cancellation(
     _, _, run = authorized
     disposition = await submitter.cancel(run.run_id)
     current = await submitter.state(run.run_id)
+    decision = await routing_policy.load_decision(current.run_id) if routing_policy is not None else None
     return _json_response(
         {
             "version": 1,
             "cancellation": disposition.value,
-            "run": _serialize_run(current),
+            "run": _serialize_run_with_routing_decision(current, decision),
         },
         status=(
             202
@@ -4596,6 +4618,7 @@ def register_workshop_command_routes(
             submitter=submitter,
             request_lock=request_lock,
             artifact_service=artifact_service,
+            routing_policy=routing_policy,
         )
 
     async def handle_run_state(request: web.Request) -> web.Response:
@@ -4622,6 +4645,7 @@ def register_workshop_command_routes(
             authenticator=authenticator,
             submitter=submitter,
             request_lock=request_lock,
+            routing_policy=routing_policy,
         )
 
     async def handle_agent_dismissal(request: web.Request) -> web.Response:
