@@ -9,6 +9,10 @@
   text-rendering: optimizeLegibility;
   accent-color: var(--color-accent);
   scrollbar-color: var(--color-text-muted) var(--color-canvas-inset);
+  /* Match the readable density of a desktop collaboration client. Because
+     component dimensions use rem, this scales type, icons, controls, and
+     spacing together instead of enlarging labels in isolation. */
+  font-size: 200%;
 }
 
 * {
@@ -354,13 +358,16 @@ button:disabled {
   display: grid;
   grid-template-columns:
     var(--channel-sidebar-width, 16.5rem)
-    minmax(24rem, 1fr)
+    minmax(8rem, 1fr)
     /* The pane never exceeds what the viewport leaves after the sidebar
        and the timeline's minimum, so a wide stored width cannot push the
        grid past the window and silently clip the pane's right edge. */
     min(
       var(--context-pane-width, 19rem),
-      calc(100vw - var(--channel-sidebar-width, 16.5rem) - 24rem)
+      max(
+        10rem,
+        calc(100vw - var(--channel-sidebar-width, 16.5rem) - 8rem)
+      )
     );
   grid-template-rows: minmax(0, 1fr);
   height: 100vh;
@@ -3503,11 +3510,13 @@ button:disabled {
 
 @media (max-width: 1120px) {
   .workshop-app {
-    grid-template-columns: var(--channel-sidebar-width, 15rem) minmax(24rem, 1fr);
-  }
-
-  .context-pane {
-    display: none;
+    /* Browser zoom reduces the effective viewport width. Keep all three
+       collaboration panes present and let the resizable side panes yield
+       space to the timeline instead of dropping channel context. */
+    grid-template-columns:
+      min(var(--channel-sidebar-width, 30rem), 32vw)
+      minmax(0, 1fr)
+      min(var(--context-pane-width, 34rem), 36vw);
   }
 
   .workshop-app.memory-open {
@@ -3565,7 +3574,9 @@ button:disabled {
   }
 
   .workshop-app {
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns:
+      minmax(0, 1fr)
+      min(var(--context-pane-width, 34rem), 44vw);
   }
 
   .workshop-app.memory-open {
@@ -3614,7 +3625,9 @@ button:disabled {
   }
 
   .workshop-app {
-    grid-template-columns: 1fr;
+    grid-template-columns:
+      minmax(0, 1fr)
+      min(var(--context-pane-width, 34rem), 44vw);
   }
 
   .memory-editor-grid {

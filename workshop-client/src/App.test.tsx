@@ -1566,7 +1566,7 @@ describe("Workshop React client", () => {
     expect(screen.getByRole("button", { name: "Kai" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Scott" })).toBeVisible();
     expect(screen.queryByRole("button", { name: "Create channel" })).toBeNull();
-    expect(sessionStorage.getItem("kai.workshop.sidebar-layout.v1")).toContain(
+    expect(sessionStorage.getItem("kai.workshop.sidebar-layout.v2")).toContain(
       '"collapsed":true',
     );
 
@@ -1587,9 +1587,9 @@ describe("Workshop React client", () => {
     fireEvent.keyDown(resizeHandle, { key: "ArrowRight" });
 
     expect(container.querySelector(".workshop-app")).toHaveStyle(
-      "--channel-sidebar-width: 280px",
+      "--channel-sidebar-width: 560px",
     );
-    expect(resizeHandle).toHaveAttribute("aria-valuenow", "280");
+    expect(resizeHandle).toHaveAttribute("aria-valuenow", "560");
   });
 
   it("resizes the context pane with an accessible separator", async () => {
@@ -1606,12 +1606,12 @@ describe("Workshop React client", () => {
     fireEvent.keyDown(resizeHandle, { key: "ArrowLeft" });
 
     expect(container.querySelector(".workshop-app")).toHaveStyle(
-      "--context-pane-width: 320px",
+      "--context-pane-width: 640px",
     );
-    expect(resizeHandle).toHaveAttribute("aria-valuenow", "320");
+    expect(resizeHandle).toHaveAttribute("aria-valuenow", "640");
     expect(
-      JSON.parse(sessionStorage.getItem("kai.workshop.context-layout.v1") ?? "null"),
-    ).toEqual({ width: 320 });
+      JSON.parse(sessionStorage.getItem("kai.workshop.context-layout.v2") ?? "null"),
+    ).toEqual({ width: 640 });
   });
 
   it("submits over LAN HTTP and reuses the command identity on retry", async () => {
