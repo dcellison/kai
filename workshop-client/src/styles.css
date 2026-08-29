@@ -505,8 +505,35 @@ button:disabled {
   border-radius: 0.3rem;
   background: transparent;
   color: var(--color-text-muted);
-  font: 700 1rem/1 var(--sans);
   cursor: pointer;
+}
+
+.nav-add-button span {
+  position: relative;
+  display: block;
+  width: 0.72rem;
+  height: 0.72rem;
+}
+
+.nav-add-button span::before,
+.nav-add-button span::after {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  border-radius: 999px;
+  background: currentColor;
+  content: "";
+  transform: translate(-50%, -50%);
+}
+
+.nav-add-button span::before {
+  width: 0.72rem;
+  height: 0.1rem;
+}
+
+.nav-add-button span::after {
+  width: 0.1rem;
+  height: 0.72rem;
 }
 
 .nav-add-button:hover,

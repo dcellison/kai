@@ -1860,7 +1860,7 @@ function WorkshopView({
                 })
               }
             >
-              +
+              <span aria-hidden="true" />
             </button>
           </div>
           {workshop.channels
