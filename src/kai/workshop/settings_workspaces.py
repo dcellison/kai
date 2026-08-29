@@ -21,6 +21,7 @@ from kai.workshop.execution_state import (
     WorkshopExecutionStateNamespace,
     WorkshopExecutionStateRegistry,
 )
+from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
 from kai.workshop.model_catalogue import (
     ModelCatalogueEntryStatus,
     ModelCatalogueRefreshResult,
@@ -185,7 +186,7 @@ class WorkshopSettingsWorkspaceService:
         self._runtime_pool = runtime_pool
         self._execution_state = execution_state
         self._model_catalogue = model_catalogue
-        self._locks: dict[RuntimeProfileId, asyncio.Lock] = {}
+        self._locks: dict[tuple[ChannelId, AgentId], asyncio.Lock] = {}
 
     def authority_for_principal_channel(
         self,
@@ -218,7 +219,10 @@ class WorkshopSettingsWorkspaceService:
         self,
         authority: SettingsWorkspaceAuthority,
     ) -> WorkshopExecutionStateNamespace:
-        namespace = self._execution_state.maybe_for_runtime_profile_id(authority.runtime_profile_id)
+        namespace = self._execution_state.maybe_for_principal_channel(
+            authority.principal_id,
+            authority.channel_id,
+        )
         if namespace is None:
             raise WorkshopSettingsWorkspaceAccessDenied("Runtime profile has no canonical execution state")
         if (
@@ -230,7 +234,18 @@ class WorkshopSettingsWorkspaceService:
         return namespace
 
     def _lock(self, authority: SettingsWorkspaceAuthority) -> asyncio.Lock:
-        return self._locks.setdefault(authority.runtime_profile_id, asyncio.Lock())
+        return self._locks.setdefault((authority.channel_id, authority.agent_id), asyncio.Lock())
+
+    @staticmethod
+    def _runtime_authority(
+        authority: SettingsWorkspaceAuthority,
+    ) -> WorkshopInternalAPIExecutionContext:
+        return WorkshopInternalAPIExecutionContext(
+            authority.principal_id,
+            authority.channel_id,
+            authority.agent_id,
+            authority.runtime_profile_id,
+        )
 
     async def inspect(
         self,
@@ -246,8 +261,9 @@ class WorkshopSettingsWorkspaceService:
     ) -> ModelCatalogueSnapshot:
         """Inspect one principal-owned backend lane through canonical authority."""
         catalogue = self._require_model_catalogue()
-        profile = self._runtime_pool.runtime_profile(authority.runtime_profile_id)
-        requested = option_id or self._runtime_pool.get_backend_provider(authority.runtime_profile_id)
+        runtime = self._runtime_authority(authority)
+        profile = self._runtime_pool.runtime_profile(runtime)
+        requested = option_id or self._runtime_pool.get_backend_provider(runtime)
         resolved_option_id = f"{requested[0]}:{requested[1]}" if isinstance(requested, tuple) else requested
         try:
             profile.backend_option(resolved_option_id)
@@ -338,18 +354,19 @@ class WorkshopSettingsWorkspaceService:
         *,
         mutation: SettingsMutationOutcome | None = None,
     ) -> SettingsWorkspaceSnapshot:
-        profile = self._runtime_pool.runtime_profile(authority.runtime_profile_id)
-        effective_backend, effective_provider = self._runtime_pool.get_backend_provider(authority.runtime_profile_id)
+        runtime = self._runtime_authority(authority)
+        profile = self._runtime_pool.runtime_profile(runtime)
+        effective_backend, effective_provider = self._runtime_pool.get_backend_provider(runtime)
         effective_option = profile.backend_option(f"{effective_backend}:{effective_provider}")
         namespace = self._namespace(authority)
-        workspace = await self._runtime_pool.get_effective_workspace(authority.runtime_profile_id)
+        workspace = await self._runtime_pool.get_effective_workspace(runtime)
         model, timeout_value = await self._effective_values(
             authority,
             workspace,
         )
-        home = self._runtime_pool.get_home_workspace(authority.runtime_profile_id)
+        home = self._runtime_pool.get_home_workspace(runtime)
         home_resolved = home.resolve()
-        base, allowed = await self._runtime_pool.resolve_workspace_access(authority.runtime_profile_id)
+        base, allowed = await self._runtime_pool.resolve_workspace_access(runtime)
         history = await sessions.get_canonical_workspace_history(namespace)
         candidates: list[Path] = [home, workspace, *allowed]
         candidates.extend(Path(str(item["path"])) for item in history)
@@ -444,8 +461,8 @@ class WorkshopSettingsWorkspaceService:
         expected_revision: str | None = None,
         clear_workspace_override: bool = True,
     ) -> SettingsWorkspaceSnapshot:
-        profile = self._runtime_pool.runtime_profile(authority.runtime_profile_id)
-        backend, _provider = self._runtime_pool.get_backend_provider(authority.runtime_profile_id)
+        profile = self._runtime_pool.runtime_profile(self._runtime_authority(authority))
+        backend, _provider = self._runtime_pool.get_backend_provider(self._runtime_authority(authority))
         option = profile.backend_option(f"{backend}:{_provider}")
         normalized = canonicalize_model_for_backend(model.strip(), option.backend)
         if not normalized or not await self._model_is_selectable(
@@ -474,7 +491,7 @@ class WorkshopSettingsWorkspaceService:
         expected_revision: str | None = None,
     ) -> SettingsWorkspaceSnapshot:
         requested = backend_option_id.strip().lower()
-        profile = self._runtime_pool.runtime_profile(authority.runtime_profile_id)
+        profile = self._runtime_pool.runtime_profile(self._runtime_authority(authority))
         try:
             requested_option = profile.backend_option(requested)
         except WorkshopRuntimeProfileError as exc:
@@ -494,7 +511,7 @@ class WorkshopSettingsWorkspaceService:
                         provider_session_invalidated=False,
                     ),
                 )
-            if self._runtime_pool.is_in_flight(authority.runtime_profile_id):
+            if self._runtime_pool.is_in_flight(self._runtime_authority(authority)):
                 raise WorkshopSettingsWorkspaceBusy(
                     "The backend cannot be changed while this runtime has an active run"
                 )
@@ -506,7 +523,7 @@ class WorkshopSettingsWorkspaceService:
             # valid for the selected backend.  This neither carries an
             # incompatible model into the new process nor discards a useful
             # choice when the principal later switches back.
-            was_running = self._runtime_pool.is_running(authority.runtime_profile_id)
+            was_running = self._runtime_pool.is_running(self._runtime_authority(authority))
 
             async def commit_selection() -> None:
                 await sessions.replace_canonical_settings_state(namespace, desired_settings)
@@ -514,7 +531,7 @@ class WorkshopSettingsWorkspaceService:
 
             try:
                 selected = await self._runtime_pool.select_backend(
-                    authority.runtime_profile_id,
+                    self._runtime_authority(authority),
                     requested_option.option_id,
                     commit_selection=commit_selection,
                 )
@@ -522,11 +539,11 @@ class WorkshopSettingsWorkspaceService:
                 try:
                     await sessions.replace_canonical_settings_state(namespace, prior_settings)
                     active_backend, active_provider = self._runtime_pool.get_backend_provider(
-                        authority.runtime_profile_id
+                        self._runtime_authority(authority)
                     )
                     if f"{active_backend}:{active_provider}" != current.backend_option_id:
                         await self._runtime_pool.select_backend(
-                            authority.runtime_profile_id,
+                            self._runtime_authority(authority),
                             current.backend_option_id,
                         )
                 except BaseException as rollback_exc:
@@ -557,7 +574,7 @@ class WorkshopSettingsWorkspaceService:
     ) -> SettingsWorkspaceSnapshot:
         if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int):
             raise WorkshopSettingsWorkspaceValidationError("Timeout must be a whole number of seconds")
-        profile = self._runtime_pool.runtime_profile(authority.runtime_profile_id)
+        profile = self._runtime_pool.runtime_profile(self._runtime_authority(authority))
         maximum_timeout = profile.maximum_timeout_seconds
         if not MIN_SELF_SERVICE_TIMEOUT_SECONDS <= timeout_seconds <= maximum_timeout:
             raise WorkshopSettingsWorkspaceValidationError(
@@ -599,8 +616,8 @@ class WorkshopSettingsWorkspaceService:
             raise WorkshopSettingsWorkspaceValidationError("Workspace path must be absolute")
         requested = Path(workspace_path).expanduser().resolve()
         async with self._lock(authority):
-            home = self._runtime_pool.get_home_workspace(authority.runtime_profile_id).resolve()
-            base, allowed = await self._runtime_pool.resolve_workspace_access(authority.runtime_profile_id)
+            home = self._runtime_pool.get_home_workspace(self._runtime_authority(authority)).resolve()
+            base, allowed = await self._runtime_pool.resolve_workspace_access(self._runtime_authority(authority))
             if not requested.is_dir():
                 raise WorkshopSettingsWorkspaceValidationError("Workspace directory is unavailable")
             if requested != home and not is_workspace_allowed(
@@ -611,10 +628,10 @@ class WorkshopSettingsWorkspaceService:
                 raise WorkshopSettingsWorkspaceAccessDenied("Workspace is outside this runtime profile's grants")
             current = await self._inspect_locked(authority)
             self._check_revision(current.revision, expected_revision)
-            was_running = self._runtime_pool.is_running(authority.runtime_profile_id)
+            was_running = self._runtime_pool.is_running(self._runtime_authority(authority))
             namespace = self._namespace(authority)
             prior_settings = await sessions.get_canonical_execution_settings(namespace)
-            prior_workspace = await self._runtime_pool.get_effective_workspace(authority.runtime_profile_id)
+            prior_workspace = await self._runtime_pool.get_effective_workspace(self._runtime_authority(authority))
             desired_settings = dict(prior_settings)
             if requested == home:
                 desired_settings.pop("workspace", None)
@@ -674,8 +691,8 @@ class WorkshopSettingsWorkspaceService:
         mutation: SettingsMutationOutcome | None = None,
     ) -> WorkspaceConfigSnapshot:
         namespace = self._namespace(authority)
-        profile = self._runtime_pool.runtime_profile(authority.runtime_profile_id)
-        backend, _provider = self._runtime_pool.get_backend_provider(authority.runtime_profile_id)
+        profile = self._runtime_pool.runtime_profile(self._runtime_authority(authority))
+        backend, _provider = self._runtime_pool.get_backend_provider(self._runtime_authority(authority))
         backend_option = profile.backend_option(f"{backend}:{_provider}")
         workspace = await self._authorized_workspace(authority, workspace_path)
         yaml_config = self._config.get_workspace_config(workspace)
@@ -762,8 +779,8 @@ class WorkshopSettingsWorkspaceService:
     ) -> WorkspaceConfigSnapshot:
         if field not in {"model", "timeout", "env", "prompt"}:
             raise WorkshopSettingsWorkspaceValidationError("Unsupported workspace setting")
-        profile = self._runtime_pool.runtime_profile(authority.runtime_profile_id)
-        backend, _provider = self._runtime_pool.get_backend_provider(authority.runtime_profile_id)
+        profile = self._runtime_pool.runtime_profile(self._runtime_authority(authority))
+        backend, _provider = self._runtime_pool.get_backend_provider(self._runtime_authority(authority))
         backend_option = profile.backend_option(f"{backend}:{_provider}")
         if field == "model":
             value = canonicalize_model_for_backend(value.strip(), backend_option.backend)
@@ -814,7 +831,7 @@ class WorkshopSettingsWorkspaceService:
                 self._namespace(authority),
                 str(workspace),
             )
-            was_running = self._runtime_pool.is_running(authority.runtime_profile_id)
+            was_running = self._runtime_pool.is_running(self._runtime_authority(authority))
             if prior.get(field) == value:
                 return await self._workspace_config_locked(
                     authority,
@@ -864,7 +881,7 @@ class WorkshopSettingsWorkspaceService:
                 self._namespace(authority),
                 str(workspace),
             )
-            was_running = self._runtime_pool.is_running(authority.runtime_profile_id)
+            was_running = self._runtime_pool.is_running(self._runtime_authority(authority))
             reset_fields = set(prior) if field is None else {field} & set(prior)
             if not reset_fields:
                 return await self._workspace_config_locked(
@@ -1018,7 +1035,7 @@ class WorkshopSettingsWorkspaceService:
             str(workspace),
         )
         prior_execution = await sessions.get_canonical_execution_settings(namespace)
-        active = await self._runtime_pool.get_effective_workspace(authority.runtime_profile_id)
+        active = await self._runtime_pool.get_effective_workspace(self._runtime_authority(authority))
         desired = dict(prior)
         desired[field] = value
         await sessions.replace_canonical_settings_state(
@@ -1056,7 +1073,7 @@ class WorkshopSettingsWorkspaceService:
             str(workspace),
         )
         prior_execution = await sessions.get_canonical_execution_settings(namespace)
-        active = await self._runtime_pool.get_effective_workspace(authority.runtime_profile_id)
+        active = await self._runtime_pool.get_effective_workspace(self._runtime_authority(authority))
         desired = {} if field is None else {key: value for key, value in prior.items() if key != field}
         await sessions.replace_canonical_settings_state(
             namespace,
@@ -1093,7 +1110,7 @@ class WorkshopSettingsWorkspaceService:
             self._check_revision(current.revision, expected_revision)
             namespace = self._namespace(authority)
             prior = await sessions.get_canonical_workspace_config_settings(namespace, str(workspace))
-            was_running = self._runtime_pool.is_running(authority.runtime_profile_id)
+            was_running = self._runtime_pool.is_running(self._runtime_authority(authority))
             desired = {field: value for field, value in prior.items() if field not in {"model", "timeout", "prompt"}}
             if desired == prior:
                 return await self._workspace_config_locked(
@@ -1107,7 +1124,7 @@ class WorkshopSettingsWorkspaceService:
                     ),
                 )
             prior_execution = await sessions.get_canonical_execution_settings(namespace)
-            active = await self._runtime_pool.get_effective_workspace(authority.runtime_profile_id)
+            active = await self._runtime_pool.get_effective_workspace(self._runtime_authority(authority))
             await sessions.replace_canonical_settings_state(
                 namespace,
                 prior_execution,
@@ -1150,14 +1167,14 @@ class WorkshopSettingsWorkspaceService:
             # returning it. Reapplying the static grant check here creates a
             # second, subtly different authority path for protected homes
             # owned by another OS user (for example Scott's installed runtime).
-            workspace = (await self._runtime_pool.get_effective_workspace(authority.runtime_profile_id)).resolve()
+            workspace = (await self._runtime_pool.get_effective_workspace(self._runtime_authority(authority))).resolve()
             if not workspace.is_dir():
                 raise WorkshopSettingsWorkspaceValidationError("Workspace directory is unavailable")
             return workspace
 
         workspace = Path(workspace_path).expanduser().resolve()
-        home = self._runtime_pool.get_home_workspace(authority.runtime_profile_id).resolve()
-        base, allowed = await self._runtime_pool.resolve_workspace_access(authority.runtime_profile_id)
+        home = self._runtime_pool.get_home_workspace(self._runtime_authority(authority)).resolve()
+        base, allowed = await self._runtime_pool.resolve_workspace_access(self._runtime_authority(authority))
         if not workspace.is_dir():
             raise WorkshopSettingsWorkspaceValidationError("Workspace directory is unavailable")
         if workspace != home and not is_workspace_allowed(workspace, base, allowed):
@@ -1176,9 +1193,9 @@ class WorkshopSettingsWorkspaceService:
     ) -> SettingsWorkspaceSnapshot:
         current = await self._inspect_locked(authority)
         self._check_revision(current.revision, expected_revision)
-        was_running = self._runtime_pool.is_running(authority.runtime_profile_id)
+        was_running = self._runtime_pool.is_running(self._runtime_authority(authority))
         namespace = self._namespace(authority)
-        workspace = await self._runtime_pool.get_effective_workspace(authority.runtime_profile_id)
+        workspace = await self._runtime_pool.get_effective_workspace(self._runtime_authority(authority))
         prior_execution = await sessions.get_canonical_execution_settings(namespace)
         prior_workspace = await sessions.get_canonical_workspace_config_settings(namespace, str(workspace))
         desired_execution = dict(prior_execution)
@@ -1240,7 +1257,7 @@ class WorkshopSettingsWorkspaceService:
         )
         model, timeout = await self._effective_values(authority, workspace)
         await self._runtime_pool.apply_workspace_config_if_running(
-            authority.runtime_profile_id,
+            self._runtime_authority(authority),
             workspace,
             workspace_config=config,
             model=str(model.value),
@@ -1436,8 +1453,8 @@ class WorkshopSettingsWorkspaceService:
         authority: SettingsWorkspaceAuthority,
         workspace: Path,
     ) -> tuple[EffectiveValue, EffectiveValue]:
-        profile = self._runtime_pool.runtime_profile(authority.runtime_profile_id)
-        backend, _provider = self._runtime_pool.get_backend_provider(authority.runtime_profile_id)
+        profile = self._runtime_pool.runtime_profile(self._runtime_authority(authority))
+        backend, _provider = self._runtime_pool.get_backend_provider(self._runtime_authority(authority))
         backend_option = profile.backend_option(f"{backend}:{_provider}")
         namespace = self._namespace(authority)
         user = await sessions.get_canonical_execution_settings(namespace)

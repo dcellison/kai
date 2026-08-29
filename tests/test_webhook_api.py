@@ -656,7 +656,7 @@ class TestSendFile:
         assert body["status"] == "recorded"
         send_file_request.app[CORE_HOST_KEY].services.proactive_publication.publish_file.assert_awaited_once()
         send_file_request.app[CORE_HOST_KEY].services.runtime_pool.get_effective_workspace.assert_awaited_once_with(
-            profile_id(123)
+            _internal_api_context(123)
         )
 
     async def test_caption_forwarded_to_canonical_publication(self, tmp_path, send_file_request):
@@ -2704,7 +2704,7 @@ class TestMemoryAdd:
         body = json.loads(resp.body.decode())
         assert body == {"id": "mem-uuid-123"}
         mock_request.app[CORE_HOST_KEY].services.runtime_pool.get_effective_workspace.assert_awaited_once_with(
-            profile_id(123)
+            _internal_api_context(123)
         )
 
     async def test_returns_503_when_memory_disabled(self, mock_request):

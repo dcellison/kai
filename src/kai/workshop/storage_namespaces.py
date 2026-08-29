@@ -77,11 +77,11 @@ class WorkshopChannelHistoryRegistry:
     ) -> WorkshopChannelHistoryRegistry:
         """Resolve protected runtime assignments to canonical channels."""
         async with store.connection.execute(
-            "SELECT ra.runtime_profile_id, ra.channel_id, c.kind "
+            "SELECT ra.runtime_profile_id, ra.channel_id, c.kind, ra.created_event_position "
             "FROM channel_agent_runtime_assignments ra "
             "JOIN channels c ON c.id = ra.channel_id "
             "ORDER BY ra.runtime_profile_id, "
-            "CASE c.kind WHEN 'direct' THEN 0 ELSE 1 END, ra.channel_id"
+            "CASE c.kind WHEN 'direct' THEN 0 ELSE 1 END, ra.created_event_position, ra.channel_id"
         ) as cursor:
             assignment_rows = list(await cursor.fetchall())
         channels_by_profile: dict[RuntimeProfileId, list[tuple[ChannelId, str]]] = {}
@@ -99,10 +99,12 @@ class WorkshopChannelHistoryRegistry:
         legacy_key_by_channel: dict[ChannelId, int | None] = {}
         for profile in runtime_profiles.profiles:
             assignments = channels_by_profile.get(profile.profile_id, [])
-            direct_channels = {channel_id for channel_id, kind in assignments if kind == "direct"}
-            if len(direct_channels) != 1:
+            direct_channels = [channel_id for channel_id, kind in assignments if kind == "direct"]
+            if not direct_channels:
                 raise WorkshopStorageNamespaceError("Protected runtime profile has no canonical history channel")
-            direct_channel_id = next(iter(direct_channels))
+            # The oldest direct lane is the sole compatibility-history alias.
+            # Additional enabled agents are independent canonical histories.
+            direct_channel_id = direct_channels[0]
             legacy_runtime_key = runtime_profiles.legacy_runtime_key(profile.profile_id)
             if legacy_runtime_key is not None:
                 runtime_aliases[legacy_runtime_key] = direct_channel_id

@@ -13,6 +13,7 @@ import pytest
 from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 
+from kai.workshop.agent_enablement import EligibleAgentRuntime, PrincipalAgentEnablement
 from kai.workshop.appearance_preferences import (
     WORKSHOP_APPEARANCE_THEMES,
     WorkshopAppearancePreferenceService,
@@ -672,6 +673,59 @@ class _GitHubSettings:
         return self._snapshot(GitHubSettingsMutation("replace_github_token", True))
 
 
+@dataclass
+class _AgentEnablement:
+    principal_id: PrincipalId
+    definition_id: AgentDefinitionId = field(default_factory=lambda: AgentDefinitionId("adf_" + "a" * 32))
+    calls: list[tuple[str, object]] = field(default_factory=list)
+
+    def _snapshot(self, state: str = "available") -> PrincipalAgentEnablement:
+        enabled = state in {"enabled", "disabled"}
+        return PrincipalAgentEnablement(
+            None,
+            self.definition_id,
+            AgentId("agt_" + "b" * 32),
+            "specialist",
+            "Specialist",
+            state,
+            ChannelId("chn_" + "c" * 32) if enabled else None,
+            profile_id(101) if enabled else None,
+            42 if enabled else None,
+            (EligibleAgentRuntime(profile_id(101), "Daniel", ("claude:anthropic",)),),
+        )
+
+    async def list_for_principal(self, principal_id):
+        assert principal_id == self.principal_id
+        self.calls.append(("list", principal_id))
+        return (self._snapshot(),)
+
+    async def inspect(self, principal_id, definition_id):
+        assert principal_id == self.principal_id
+        assert definition_id == self.definition_id
+        self.calls.append(("inspect", definition_id))
+        return self._snapshot()
+
+    async def enable(
+        self,
+        principal_id,
+        definition_id,
+        runtime_profile_id,
+        *,
+        idempotency_key,
+        expected_version=None,
+    ):
+        assert principal_id == self.principal_id
+        assert definition_id == self.definition_id
+        self.calls.append(("enable", (runtime_profile_id, idempotency_key, expected_version)))
+        return self._snapshot("enabled")
+
+    async def disable(self, principal_id, definition_id, *, idempotency_key, expected_version):
+        assert principal_id == self.principal_id
+        assert definition_id == self.definition_id
+        self.calls.append(("disable", (idempotency_key, expected_version)))
+        return self._snapshot("disabled")
+
+
 async def _identity_for(store: WorkshopEventStore, subject: str) -> tuple[PrincipalId, ChannelId]:
     async with store.connection.execute(
         "SELECT e.principal_id, b.channel_id FROM external_identities e "
@@ -797,6 +851,7 @@ async def _open_client(
     notification_preferences=None,
     client_preferences=None,
     appearance_preferences=None,
+    agent_enablement=None,
 ) -> TestClient:
     app = web.Application()
     register_workshop_read_routes(
@@ -818,6 +873,7 @@ async def _open_client(
         notification_preferences=notification_preferences,
         client_preferences=client_preferences,
         appearance_preferences=appearance_preferences,
+        agent_enablement=agent_enablement,
     )
     client = TestClient(TestServer(app))
     await client.start_server()
@@ -1603,6 +1659,81 @@ class TestWorkshopAgentLifecycleHTTPContract:
                 first_revision_id,
                 second_revision_id,
             }
+        finally:
+            await client.close()
+            await store.close()
+
+
+class TestWorkshopAgentEnablementHTTPContract:
+    async def test_authenticated_principal_lists_enables_and_disables_agent(self, tmp_path: Path) -> None:
+        store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+        service = _AgentEnablement(alice_id)
+        client = await _open_client(
+            store,
+            _Authenticator({"alice": alice_id}),
+            agent_enablement=service,
+        )
+        try:
+            listed = await client.get(
+                "/v1/client/agent-enablement",
+                headers={"Authorization": "Bearer alice"},
+            )
+            assert listed.status == 200
+            listing = await listed.json()
+            assert listing["agents"][0]["lifecycle_state"] == "available"
+            assert listing["agents"][0]["eligible_runtimes"] == [
+                {
+                    "runtime_profile_id": str(profile_id(101)),
+                    "display_name": "Daniel",
+                    "backend_options": ["claude:anthropic"],
+                }
+            ]
+
+            enabled = await client.post(
+                f"/v1/client/agents/{service.definition_id}/enable",
+                headers={"Authorization": "Bearer alice"},
+                json={
+                    "idempotency_key": "enable-specialist",
+                    "runtime_profile_id": str(profile_id(101)),
+                },
+            )
+            assert enabled.status == 200
+            assert (await enabled.json())["agent"]["lifecycle_state"] == "enabled"
+
+            disabled = await client.post(
+                f"/v1/client/agents/{service.definition_id}/disable",
+                headers={"Authorization": "Bearer alice"},
+                json={"idempotency_key": "disable-specialist", "expected_version": 42},
+            )
+            assert disabled.status == 200
+            assert (await disabled.json())["agent"]["lifecycle_state"] == "disabled"
+            assert [item[0] for item in service.calls] == ["list", "enable", "disable"]
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_enablement_routes_require_authentication_and_exact_payloads(self, tmp_path: Path) -> None:
+        store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+        service = _AgentEnablement(alice_id)
+        client = await _open_client(
+            store,
+            _Authenticator({"alice": alice_id}),
+            agent_enablement=service,
+        )
+        try:
+            unauthenticated = await client.get("/v1/client/agent-enablement")
+            assert unauthenticated.status == 401
+            malformed = await client.post(
+                f"/v1/client/agents/{service.definition_id}/enable",
+                headers={"Authorization": "Bearer alice"},
+                json={
+                    "idempotency_key": "bad-extra",
+                    "runtime_profile_id": str(profile_id(101)),
+                    "principal_id": str(alice_id),
+                },
+            )
+            assert malformed.status == 400
+            assert service.calls == []
         finally:
             await client.close()
             await store.close()

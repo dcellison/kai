@@ -23,6 +23,7 @@ from kai.workshop.agent_definitions import (
 from kai.workshop.domain import (
     AgentDefinitionId,
     AgentDefinitionRevisionId,
+    AgentEnablementId,
     AgentId,
     ChannelId,
     MessageId,
@@ -608,7 +609,7 @@ class CanonicalConversationProjection:
 
     name = "canonical_conversations"
     # Agent definitions project durable draft, active, and archived lifecycle state.
-    version = 13
+    version = 14
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -624,6 +625,7 @@ class CanonicalConversationProjection:
             "runs",
             "message_reactions",
             "messages",
+            "principal_agent_enablements",
             "channel_agent_dismissals",
             "channel_agent_runtime_assignments",
             "channel_agents",
@@ -907,6 +909,119 @@ class CanonicalConversationProjection:
                 "UPDATE agent_definitions SET lifecycle_state = 'archived' WHERE id = ?",
                 (envelope.aggregate_id,),
             )
+        elif envelope.event_type == WorkshopEventType.PRINCIPAL_AGENT_ENABLED:
+            if not isinstance(envelope.aggregate_id, AgentEnablementId):
+                raise ValueError("Workshop agent enablement requires a typed enablement aggregate")
+            _require_exact_payload(
+                payload,
+                {
+                    "principal_id",
+                    "agent_definition_id",
+                    "agent_id",
+                    "direct_channel_id",
+                    "runtime_profile_id",
+                },
+            )
+            principal_id = _required_text(payload, "principal_id")
+            definition_id = _required_text(payload, "agent_definition_id")
+            agent_id = _required_text(payload, "agent_id")
+            channel_id = _required_text(payload, "direct_channel_id")
+            runtime_profile_id = _required_text(payload, "runtime_profile_id")
+            async with connection.execute(
+                "SELECT d.workshop_id, d.agent_id, d.lifecycle_state, a.principal_id, "
+                "c.workshop_id, c.kind, ra.runtime_profile_id FROM agent_definitions d "
+                "JOIN agents a ON a.id = d.agent_id JOIN channels c ON c.id = ? "
+                "JOIN channel_memberships hm ON hm.channel_id = c.id AND hm.principal_id = ? "
+                "AND hm.role = 'owner' JOIN channel_agents ca ON ca.channel_id = c.id "
+                "AND ca.agent_id = ? JOIN channel_agent_runtime_assignments ra "
+                "ON ra.channel_id = c.id AND ra.agent_id = ca.agent_id WHERE d.id = ?",
+                (channel_id, principal_id, agent_id, definition_id),
+            ) as cursor:
+                authority = await cursor.fetchone()
+            if (
+                authority is None
+                or tuple(authority[:3])
+                != (
+                    envelope.workshop_id,
+                    agent_id,
+                    "active",
+                )
+                or tuple(authority[4:])
+                != (
+                    envelope.workshop_id,
+                    "direct",
+                    runtime_profile_id,
+                )
+            ):
+                raise ValueError("Workshop agent enablement authority is invalid")
+            agent_principal_id = str(authority[3])
+            async with connection.execute(
+                "SELECT COUNT(*), SUM(CASE WHEN principal_id = ? THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN principal_id = ? THEN 1 ELSE 0 END) "
+                "FROM channel_memberships WHERE channel_id = ?",
+                (principal_id, agent_principal_id, channel_id),
+            ) as cursor:
+                membership_counts = await cursor.fetchone()
+            if membership_counts is None or tuple(membership_counts) != (2, 1, 1):
+                raise ValueError("Workshop agent enablement direct channel must have exactly two members")
+            await connection.execute(
+                "INSERT INTO principal_agent_enablements "
+                "(id, workshop_id, principal_id, agent_definition_id, agent_id, "
+                "direct_channel_id, runtime_profile_id, lifecycle_state, created_at, "
+                "updated_at, created_event_position, last_event_position) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'enabled', ?, ?, ?, ?) "
+                "ON CONFLICT(principal_id, agent_definition_id) DO UPDATE SET "
+                "lifecycle_state = 'enabled', updated_at = excluded.updated_at, "
+                "last_event_position = excluded.last_event_position",
+                (
+                    envelope.aggregate_id,
+                    envelope.workshop_id,
+                    principal_id,
+                    definition_id,
+                    agent_id,
+                    channel_id,
+                    runtime_profile_id,
+                    occurred_at,
+                    occurred_at,
+                    event.position,
+                    event.position,
+                ),
+            )
+        elif envelope.event_type == WorkshopEventType.PRINCIPAL_AGENT_DISABLED:
+            if not isinstance(envelope.aggregate_id, AgentEnablementId):
+                raise ValueError("Workshop agent disablement requires a typed enablement aggregate")
+            _require_exact_payload(payload, set())
+            cursor = await connection.execute(
+                "UPDATE principal_agent_enablements SET lifecycle_state = 'disabled', "
+                "updated_at = ?, last_event_position = ? WHERE id = ? "
+                "AND workshop_id = ? AND lifecycle_state = 'enabled'",
+                (occurred_at, event.position, envelope.aggregate_id, envelope.workshop_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Workshop agent disablement has no enabled principal agent")
+        elif envelope.event_type == WorkshopEventType.PRINCIPAL_AGENT_RUNTIME_CHANGED:
+            if not isinstance(envelope.aggregate_id, AgentEnablementId):
+                raise ValueError("Workshop agent runtime change requires a typed enablement aggregate")
+            _require_exact_payload(payload, {"runtime_profile_id"})
+            runtime_profile_id = _required_text(payload, "runtime_profile_id")
+            async with connection.execute(
+                "SELECT e.direct_channel_id, e.agent_id, ra.runtime_profile_id "
+                "FROM principal_agent_enablements e "
+                "JOIN channel_agent_runtime_assignments ra "
+                "ON ra.channel_id = e.direct_channel_id AND ra.agent_id = e.agent_id "
+                "WHERE e.id = ? AND e.workshop_id = ?",
+                (envelope.aggregate_id, envelope.workshop_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None or str(row[2]) != runtime_profile_id:
+                raise ValueError("Workshop agent runtime change does not match its channel assignment")
+            cursor = await connection.execute(
+                "UPDATE principal_agent_enablements SET runtime_profile_id = ?, "
+                "updated_at = ?, last_event_position = ? WHERE id = ?",
+                (runtime_profile_id, occurred_at, event.position, envelope.aggregate_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Workshop agent runtime change has no principal agent")
         elif envelope.event_type == WorkshopEventType.CHANNEL_AGENT_ATTACHED:
             await connection.execute(
                 "INSERT INTO channel_agents (id, channel_id, agent_id, created_at) VALUES (?, ?, ?, ?)",

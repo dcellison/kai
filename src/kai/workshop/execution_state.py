@@ -51,28 +51,36 @@ class WorkshopExecutionStateRegistry:
         by_legacy_key: dict[int, WorkshopExecutionStateNamespace] = {}
         by_profile: dict[RuntimeProfileId, WorkshopExecutionStateNamespace] = {}
         by_principal: dict[PrincipalId, WorkshopExecutionStateNamespace | None] = {}
+        by_principal_channel: dict[tuple[PrincipalId, ChannelId], WorkshopExecutionStateNamespace | None] = {}
+        lanes: list[WorkshopExecutionStateNamespace] = []
         for namespace in namespaces:
             if not isinstance(namespace, WorkshopExecutionStateNamespace):
                 raise TypeError("namespaces must contain WorkshopExecutionStateNamespace values")
             if namespace.legacy_runtime_key is not None and namespace.legacy_runtime_key in by_legacy_key:
                 raise WorkshopExecutionStateError("Duplicate archived runtime execution-state key")
-            if namespace.runtime_profile_id in by_profile:
-                raise WorkshopExecutionStateError("Duplicate runtime profile execution-state owner")
+            lane_key = (namespace.principal_id, namespace.channel_id)
+            primary = by_profile.get(namespace.runtime_profile_id)
+            if primary is not None and primary.principal_id != namespace.principal_id:
+                raise WorkshopExecutionStateError("Runtime profile cannot cross canonical human owners")
             if namespace.legacy_runtime_key is not None:
                 by_legacy_key[namespace.legacy_runtime_key] = namespace
-            by_profile[namespace.runtime_profile_id] = namespace
-            # A human may eventually have more than one runtime profile.  A
-            # principal-id lookup is therefore available only while it is
-            # unambiguous; exact protected-runtime lookups remain authoritative.
+            by_profile.setdefault(namespace.runtime_profile_id, namespace)
             if namespace.principal_id in by_principal:
                 by_principal[namespace.principal_id] = None
             else:
                 by_principal[namespace.principal_id] = namespace
+            if lane_key in by_principal_channel:
+                by_principal_channel[lane_key] = None
+            else:
+                by_principal_channel[lane_key] = namespace
+            lanes.append(namespace)
         if not by_profile:
             raise WorkshopExecutionStateError("At least one execution-state namespace is required")
         self._by_legacy_key = by_legacy_key
         self._by_profile = by_profile
         self._by_principal = by_principal
+        self._by_principal_channel = by_principal_channel
+        self._lanes = lanes
 
     @classmethod
     async def from_store(
@@ -82,16 +90,17 @@ class WorkshopExecutionStateRegistry:
     ) -> WorkshopExecutionStateRegistry:
         """Resolve every protected profile through its direct-channel owner."""
         async with store.connection.execute(
-            "SELECT ra.runtime_profile_id, ra.channel_id, ra.agent_id, cm.principal_id "
+            "SELECT ra.runtime_profile_id, ra.channel_id, ra.agent_id, cm.principal_id, "
+            "ra.created_event_position "
             "FROM channel_agent_runtime_assignments ra "
             "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' "
             "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.role = 'owner' "
             "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
-            "ORDER BY ra.runtime_profile_id, cm.principal_id"
+            "ORDER BY ra.runtime_profile_id, ra.created_event_position, cm.principal_id"
         ) as cursor:
             rows = list(await cursor.fetchall())
 
-        resolved: dict[RuntimeProfileId, set[tuple[ChannelId, AgentId, PrincipalId]]] = {}
+        resolved: dict[RuntimeProfileId, list[tuple[ChannelId, AgentId, PrincipalId]]] = {}
         for row in rows:
             try:
                 profile_id = RuntimeProfileId(str(row[0]))
@@ -100,30 +109,76 @@ class WorkshopExecutionStateRegistry:
                 raise WorkshopExecutionStateError(
                     "Canonical execution-state ownership contains an invalid opaque identifier"
                 ) from exc
-            resolved.setdefault(profile_id, set()).add(identities)
+            if identities not in resolved.setdefault(profile_id, []):
+                resolved[profile_id].append(identities)
 
         namespaces: list[WorkshopExecutionStateNamespace] = []
         for profile in runtime_profiles.profiles:
-            identities = resolved.get(profile.profile_id, set())
-            if len(identities) != 1:
-                raise WorkshopExecutionStateError(
-                    "Protected runtime profile must map to exactly one canonical execution-state owner"
+            identities = resolved.get(profile.profile_id, [])
+            if not identities or len({item[2] for item in identities}) != 1:
+                raise WorkshopExecutionStateError("Protected runtime profile must map to one canonical human owner")
+            for index, (channel_id, agent_id, principal_id) in enumerate(identities):
+                namespaces.append(
+                    WorkshopExecutionStateNamespace(
+                        principal_id=principal_id,
+                        channel_id=channel_id,
+                        agent_id=agent_id,
+                        runtime_profile_id=profile.profile_id,
+                        legacy_runtime_key=(
+                            runtime_profiles.legacy_runtime_key(profile.profile_id) if index == 0 else None
+                        ),
+                    )
                 )
-            channel_id, agent_id, principal_id = next(iter(identities))
-            namespaces.append(
-                WorkshopExecutionStateNamespace(
-                    principal_id=principal_id,
-                    channel_id=channel_id,
-                    agent_id=agent_id,
-                    runtime_profile_id=profile.profile_id,
-                    legacy_runtime_key=runtime_profiles.legacy_runtime_key(profile.profile_id),
-                )
-            )
         return cls(tuple(namespaces))
 
     @property
     def namespaces(self) -> tuple[WorkshopExecutionStateNamespace, ...]:
+        """Return the primary legacy-compatible owner for each protected profile."""
         return tuple(sorted(self._by_profile.values(), key=lambda item: item.runtime_profile_id))
+
+    @property
+    def lanes(self) -> tuple[WorkshopExecutionStateNamespace, ...]:
+        """Return every isolated canonical channel-agent execution lane."""
+        return tuple(self._lanes)
+
+    def register_lane(self, namespace: WorkshopExecutionStateNamespace) -> None:
+        """Register a newly enabled lane without replacing profile-level defaults."""
+        if not isinstance(namespace, WorkshopExecutionStateNamespace):
+            raise TypeError("namespace must be a WorkshopExecutionStateNamespace")
+        key = (namespace.principal_id, namespace.channel_id)
+        existing = self._by_principal_channel.get(key)
+        if existing is not None:
+            if existing != namespace:
+                raise WorkshopExecutionStateError("Canonical execution-state lane conflicts")
+            return
+        primary = self._by_profile.get(namespace.runtime_profile_id)
+        if primary is None or primary.principal_id != namespace.principal_id:
+            raise WorkshopExecutionStateError("Runtime profile is not owned by the canonical principal")
+        if namespace.legacy_runtime_key is not None:
+            raise WorkshopExecutionStateError("New execution lanes cannot claim archived runtime state")
+        self._by_principal_channel[key] = namespace
+        self._lanes.append(namespace)
+
+    def replace_lane(
+        self,
+        prior: WorkshopExecutionStateNamespace,
+        replacement: WorkshopExecutionStateNamespace,
+    ) -> None:
+        """Replace a lane's protected profile without changing its identity."""
+        key = (prior.principal_id, prior.channel_id)
+        if (
+            self._by_principal_channel.get(key) != prior
+            or replacement.principal_id != prior.principal_id
+            or replacement.channel_id != prior.channel_id
+            or replacement.agent_id != prior.agent_id
+            or replacement.legacy_runtime_key is not None
+        ):
+            raise WorkshopExecutionStateError("Canonical execution-state lane replacement conflicts")
+        primary = self._by_profile.get(replacement.runtime_profile_id)
+        if primary is None or primary.principal_id != replacement.principal_id:
+            raise WorkshopExecutionStateError("Replacement runtime profile is not owned by the principal")
+        self._by_principal_channel[key] = replacement
+        self._lanes[self._lanes.index(prior)] = replacement
 
     def maybe_for_legacy_runtime_key(self, legacy_runtime_key: int) -> WorkshopExecutionStateNamespace | None:
         if isinstance(legacy_runtime_key, bool) or not isinstance(legacy_runtime_key, int):
@@ -152,10 +207,7 @@ class WorkshopExecutionStateRegistry:
             canonical_channel = channel_id if isinstance(channel_id, ChannelId) else ChannelId(channel_id)
         except (TypeError, ValueError):
             return None
-        namespace = self._by_principal.get(canonical_principal)
-        if namespace is None or namespace.channel_id != canonical_channel:
-            return None
-        return namespace
+        return self._by_principal_channel.get((canonical_principal, canonical_channel))
 
     def maybe_for_runtime_profile_id(
         self,

@@ -10172,11 +10172,15 @@ def _internal_api_authority_status(db_path: Path) -> str:
     try:
         connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
         try:
-            profiles = int(connection.execute("SELECT COUNT(*) FROM channel_agent_runtime_assignments").fetchone()[0])
+            profiles = int(
+                connection.execute(
+                    "SELECT COUNT(DISTINCT runtime_profile_id) FROM channel_agent_runtime_assignments"
+                ).fetchone()[0]
+            )
             contexts = int(
                 connection.execute(
                     "SELECT COUNT(*) FROM ("
-                    "SELECT ra.runtime_profile_id "
+                    "SELECT ra.runtime_profile_id, ra.channel_id, ra.agent_id, cm.principal_id "
                     "FROM channel_agent_runtime_assignments ra "
                     "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' "
                     "JOIN agents a ON a.id = ra.agent_id AND a.workshop_id = c.workshop_id "
@@ -10185,7 +10189,8 @@ def _internal_api_authority_status(db_path: Path) -> str:
                     "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
                     "JOIN workshop_memberships wm ON wm.principal_id = p.id "
                     "AND wm.workshop_id = c.workshop_id "
-                    "GROUP BY ra.runtime_profile_id HAVING COUNT(DISTINCT cm.principal_id) = 1"
+                    "GROUP BY ra.runtime_profile_id, ra.channel_id, ra.agent_id "
+                    "HAVING COUNT(DISTINCT cm.principal_id) = 1"
                     ")"
                 ).fetchone()[0]
             )
@@ -10206,10 +10211,10 @@ def _internal_api_authority_status(db_path: Path) -> str:
         "artifacts",
         "delivery_outbox",
     }
-    status = "active" if profiles > 0 and profiles == contexts and publication_ready else "INCOMPLETE"
+    status = "active" if profiles > 0 and contexts >= profiles and publication_ready else "INCOMPLETE"
     return (
         f"{prefix} {status}; profiles={profiles}, canonical contexts={contexts}, "
-        f"missing={profiles - contexts}; caller identity selectors=disabled, "
+        f"missing={max(0, profiles - contexts)}; caller identity selectors=disabled, "
         f"compatibility adapter=retired, proactive publication="
         f"{'canonical/outbox' if publication_ready else 'unavailable'}"
     )

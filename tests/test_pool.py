@@ -23,6 +23,7 @@ from kai.config import Config, ModelRole, UserConfig, WorkspaceConfig, get_model
 from kai.goose import GooseBackend
 from kai.internal_api_auth import InternalAPIScope
 from kai.pool import SubprocessPool
+from kai.workshop.domain import AgentId, ChannelId
 from kai.workshop.internal_api_contexts import (
     WorkshopInternalAPIContextRegistry,
     WorkshopInternalAPIExecutionContext,
@@ -106,6 +107,50 @@ class TestInstanceCreation:
         b = pool.get(222)
         assert a is not b
         assert a._api_context.webhook_secret != b._api_context.webhook_secret
+
+    def test_same_profile_uses_distinct_channel_agent_runtime_lanes(self, tmp_path):
+        runtime_id = profile_id(111)
+        primary = WorkshopInternalAPIExecutionContext.for_unprotected_runtime(111, runtime_id)
+        secondary = WorkshopInternalAPIExecutionContext(
+            primary.principal_id,
+            ChannelId("chn_" + "a" * 32),
+            AgentId("agt_" + "b" * 32),
+            runtime_id,
+        )
+        profiles = WorkshopRuntimeProfileRegistry(
+            (
+                ProtectedRuntimeProfile(
+                    profile_id=runtime_id,
+                    display_name="shared policy",
+                    os_user=None,
+                    backend="codex",
+                    provider="openai",
+                    model="gpt-5.6-sol",
+                    timeout_seconds=120,
+                    allowed_services=(),
+                    home_workspace=tmp_path,
+                    workspace_base=None,
+                    allowed_workspaces=(),
+                ),
+            ),
+            legacy_runtime_keys={runtime_id: 111},
+        )
+        pool = SubprocessPool(
+            config=_make_config(allowed_user_ids={111}),
+            services_info=[],
+            runtime_profiles=profiles,
+            internal_api_contexts=WorkshopInternalAPIContextRegistry((primary, secondary)),
+        )
+
+        first = pool.get(primary)
+        second = pool.get(secondary)
+
+        assert first is not second
+        assert first._api_context.webhook_secret != second._api_context.webhook_secret
+        assert pool.internal_api_auth.authenticate(first._api_context.webhook_secret).channel_id == primary.channel_id
+        assert (
+            pool.internal_api_auth.authenticate(second._api_context.webhook_secret).channel_id == secondary.channel_id
+        )
 
     def test_internal_api_credential_exists_without_external_webhooks(self):
         """Disabling public ingress must not remove the agent's scoped API."""

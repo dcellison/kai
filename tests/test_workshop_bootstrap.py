@@ -251,7 +251,7 @@ class TestDefaultWorkshopBootstrap:
         )
 
         assert first.created_events == 15
-        assert upgraded.created_events == 1
+        assert upgraded.created_events == 2
         assert upgraded.existing_events == 15
         async with store.connection.execute(
             "SELECT provider, external_subject FROM external_identities ORDER BY provider"
@@ -306,8 +306,9 @@ class TestDefaultWorkshopBootstrap:
             ],
         )
 
-        assert migrated.created_events == 1
-        assert (await store.read_events())[-1].envelope.event_type == WorkshopEventType.RUNTIME_PROFILE_REASSIGNED
+        assert migrated.created_events == 2
+        assert (await store.read_events())[-2].envelope.event_type == WorkshopEventType.RUNTIME_PROFILE_REASSIGNED
+        assert (await store.read_events())[-1].envelope.event_type == WorkshopEventType.PRINCIPAL_AGENT_ENABLED
         async with store.connection.execute(
             "SELECT runtime_profile_id FROM channel_agent_runtime_assignments"
         ) as cursor:

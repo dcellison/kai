@@ -12,6 +12,7 @@ from typing import Any
 from kai.workshop.domain import (
     AgentDefinitionId,
     AgentDefinitionRevisionId,
+    AgentEnablementId,
     AgentId,
     ChannelAgentId,
     ChannelBindingId,
@@ -248,11 +249,15 @@ async def bootstrap_default_workshop(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_definitions'"
     ) as cursor:
         definitions_supported = await cursor.fetchone() is not None
+    async with store.connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'principal_agent_enablements'"
+    ) as cursor:
+        enablements_supported = await cursor.fetchone() is not None
+    definition_id = AgentDefinitionId.derived(agent_id, "definition")
     # Historical-schema migration tests exercise bootstrap at the simulated
     # old version. The current installer opens/migrates to the latest schema
     # before bootstrap, so production always takes this branch.
     if definitions_supported:
-        definition_id = AgentDefinitionId.derived(agent_id, "definition")
         revision_id = AgentDefinitionRevisionId.derived(definition_id, "revision:1")
         await ensure(
             idempotency_key=_idempotency_key("agent-definition", "kai"),
@@ -420,6 +425,24 @@ async def bootstrap_default_workshop(
                     payload={
                         "channel_id": channel_id,
                         "agent_id": agent_id,
+                        "runtime_profile_id": human.runtime_profile_id,
+                    },
+                )
+            if definitions_supported and enablements_supported:
+                enablement_id = AgentEnablementId.derived(
+                    definition_id,
+                    f"principal:{principal_id}",
+                )
+                await ensure(
+                    idempotency_key=_idempotency_key("agent-enablement", channel_token),
+                    event_type=WorkshopEventType.PRINCIPAL_AGENT_ENABLED,
+                    aggregate_type="agent_enablement",
+                    aggregate_id=enablement_id,
+                    payload={
+                        "principal_id": principal_id,
+                        "agent_definition_id": definition_id,
+                        "agent_id": agent_id,
+                        "direct_channel_id": channel_id,
                         "runtime_profile_id": human.runtime_profile_id,
                     },
                 )

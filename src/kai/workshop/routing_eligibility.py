@@ -9,6 +9,7 @@ from pathlib import Path
 from kai.backend import AgentBackend
 from kai.workshop.domain import AgentId, ChannelId, PrincipalId, RuntimeProfileId
 from kai.workshop.execution_state import WorkshopExecutionStateRegistry
+from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
 from kai.workshop.model_catalogue import (
     ModelCatalogueEntry,
     ModelCatalogueEntryStatus,
@@ -172,7 +173,10 @@ class WorkshopRoutingEligibilityService:
         additional_required: tuple[RuntimeCapability, ...] = (),
     ) -> RuntimeEligibilityReport:
         canonical_task = _task_class(task_class)
-        namespace = self._execution_state.maybe_for_runtime_profile_id(authority.runtime_profile_id)
+        namespace = self._execution_state.maybe_for_principal_channel(
+            authority.principal_id,
+            authority.channel_id,
+        )
         if (
             namespace is None
             or namespace.principal_id != authority.principal_id
@@ -185,15 +189,17 @@ class WorkshopRoutingEligibilityService:
             (item for item in profiles if item.runtime_profile_id == authority.runtime_profile_id),
             None,
         )
-        if (
-            profile is None
-            or profile.channel_id != str(authority.channel_id)
-            or profile.agent_id != str(authority.agent_id)
-        ):
+        if profile is None:
             raise RoutingEligibilityAccessDenied("Routing eligibility access denied")
 
-        workspace = await self._runtime_pool.get_effective_workspace(authority.runtime_profile_id)
-        selected_model = await self._runtime_pool.get_effective_model(authority.runtime_profile_id)
+        runtime_authority = WorkshopInternalAPIExecutionContext(
+            authority.principal_id,
+            authority.channel_id,
+            authority.agent_id,
+            authority.runtime_profile_id,
+        )
+        workspace = await self._runtime_pool.get_effective_workspace(runtime_authority)
+        selected_model = await self._runtime_pool.get_effective_model(runtime_authority)
         allowed_services = self._runtime_pool.runtime_profile(authority.runtime_profile_id).allowed_services
         catalogue_authority = self._catalogue.authority_for_principal(authority.principal_id)
         if any(not isinstance(capability, RuntimeCapability) for capability in additional_required):
