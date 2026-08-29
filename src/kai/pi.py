@@ -450,6 +450,7 @@ class PiBackend(AgentBackend):
             chat_id=chat_id if had_user_text else None,
             runtime_identity=runtime_identity if had_user_text else None,
             session_context=session_context,
+            agent_definition_context=self.consume_canonical_agent_context(),
             workspace_reminder=reminder,
             workspace=self.workspace,
             backend_name=self.backend_name,

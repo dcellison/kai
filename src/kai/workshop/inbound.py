@@ -147,10 +147,26 @@ async def resolve_message_mentions(
 ) -> tuple[MessageMention, ...]:
     """Resolve channel-member display names against one accepted message body."""
     async with store.connection.execute(
-        "SELECT p.id, p.kind, p.display_name FROM channel_memberships cm "
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_definitions'"
+    ) as cursor:
+        definitions_supported = await cursor.fetchone() is not None
+    member_query = (
+        "SELECT p.id, p.kind, COALESCE(ad.handle, p.display_name) "
+        "FROM channel_memberships cm "
+        "JOIN principals p ON p.id = cm.principal_id "
+        "LEFT JOIN agents a ON a.principal_id = p.id "
+        "LEFT JOIN agent_definitions ad ON ad.agent_id = a.id "
+        "WHERE cm.channel_id = ? AND p.kind IN ('human', 'agent') "
+        "ORDER BY length(COALESCE(ad.handle, p.display_name)) DESC, "
+        "COALESCE(ad.handle, p.display_name), p.id"
+        if definitions_supported
+        else "SELECT p.id, p.kind, p.display_name FROM channel_memberships cm "
         "JOIN principals p ON p.id = cm.principal_id "
         "WHERE cm.channel_id = ? AND p.kind IN ('human', 'agent') "
-        "ORDER BY length(p.display_name) DESC, p.display_name, p.id",
+        "ORDER BY length(p.display_name) DESC, p.display_name, p.id"
+    )
+    async with store.connection.execute(
+        member_query,
         (channel_id,),
     ) as cursor:
         rows = list(await cursor.fetchall())

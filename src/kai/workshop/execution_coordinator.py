@@ -13,6 +13,10 @@ from typing import Protocol
 
 from kai.agent_failure import AgentFailureKind
 from kai.backend import AgentResponse, StreamEvent
+from kai.workshop.agent_definitions import (
+    load_agent_definition_revision,
+    render_agent_definition_context,
+)
 from kai.workshop.artifacts import ArtifactMessageNotFoundError, build_agent_prompt_for_message
 from kai.workshop.conversation_context import assemble_canonical_conversation_context
 from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
@@ -496,6 +500,12 @@ class WorkshopCanonicalExecutionCoordinator:
         prompt = await self._prompt(prepared.run)
         async with self._database_lock:
             context = await assemble_canonical_conversation_context(self._store, prepared.run)
+            revision_id = prepared.run.agent_definition_revision_id
+            if revision_id is None:
+                raise RuntimeError("Canonical run has no bound agent definition revision")
+            definition_revision = await load_agent_definition_revision(self._store, revision_id)
+            if definition_revision is None or definition_revision.agent_id != prepared.run.agent_id:
+                raise RuntimeError("Canonical run agent definition revision is unavailable")
         history = context.text
         if self._transcript_projection is not None:
             try:
@@ -512,6 +522,7 @@ class WorkshopCanonicalExecutionCoordinator:
             else:
                 history = _history_with_transcript_pointer(history, transcript_path)
         prepared.stage_canonical_history(history)
+        prepared.stage_agent_definition_context(render_agent_definition_context(definition_revision))
         response: AgentResponse | None = None
         traces_truncated = False
         async for event in prepared.stream(prompt):

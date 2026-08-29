@@ -115,6 +115,9 @@ class _CanonicalRuntime:
     def stage_canonical_history(self, _history: str) -> None:
         pass
 
+    def stage_canonical_agent_context(self, _context: str) -> None:
+        pass
+
     def validate_current(self) -> None:
         pass
 
@@ -138,7 +141,8 @@ class _CanonicalRoutingEligibility:
         assert runtime_profile_id == self.authority.runtime_profile_id
         return self.authority
 
-    async def inspect(self, authority, task_class):
+    async def inspect(self, authority, task_class, *, additional_required=()):
+        assert not additional_required or additional_required[0].value == "text_generation"
         assert authority == self.authority
         return RuntimeEligibilityReport(
             version=1,

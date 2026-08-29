@@ -78,6 +78,7 @@ from kai.protected_config import ProtectedConfigError, validate_protected_file_m
 from kai.user_isolation import validate_protected_user_isolation
 from kai.workshop.bootstrap import bootstrap_human_principal_id
 from kai.workshop.diagnostics import (
+    workshop_agent_definition_status,
     workshop_appearance_preference_status,
     workshop_bootstrap_status,
     workshop_canonical_message_integrity_status,
@@ -9552,6 +9553,7 @@ def _cmd_status() -> None:
             expected_humans=expected_humans,
         )
     )
+    print(workshop_agent_definition_status(Path(data_dir) / "kai.db"))
     print(workshop_delivery_authority_status(Path(data_dir) / "kai.db"))
     print(workshop_runtime_session_status(Path(data_dir) / "kai.db"))
     print(_runtime_key_cutover_status(Path(data_dir) / "kai.db", RUNTIME_PROFILES_YAML))

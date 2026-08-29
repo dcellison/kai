@@ -859,6 +859,7 @@ class ClaudeCodeBackend(AgentBackend):
             chat_id=chat_id,
             runtime_identity=runtime_identity,
             session_context=session_ctx,
+            agent_definition_context=self.consume_canonical_agent_context(),
             workspace_reminder=reminder,
             workspace=self.workspace,
             backend_name=self.backend_name,

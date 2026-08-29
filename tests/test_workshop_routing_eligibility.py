@@ -251,6 +251,36 @@ async def test_vision_fails_closed_for_stale_unknown_and_unsupported_evidence(tm
 
 
 @pytest.mark.asyncio
+async def test_agent_definition_requirements_only_constrain_runtime_authority(tmp_path: Path) -> None:
+    namespace = _namespace(1)
+    supported = _lane("claude", "anthropic", selected=True)
+    unsupported = _lane("codex", "openai")
+    lanes = (supported, unsupported)
+    service, authority, *_ = _service(
+        tmp_path,
+        lanes,
+        {
+            supported.option_id: _snapshot(namespace, supported, image_input=True),
+            unsupported.option_id: _snapshot(namespace, unsupported, image_input=False),
+        },
+    )
+
+    report = await service.inspect(
+        authority,
+        RoutingTaskClass.CONVERSATION,
+        additional_required=(RuntimeCapability.IMAGE_INPUT,),
+    )
+
+    assert report.required_capabilities == (
+        RuntimeCapability.TEXT_GENERATION,
+        RuntimeCapability.IMAGE_INPUT,
+    )
+    assert report.candidates[0].eligible is True
+    assert report.candidates[1].eligible is False
+    assert report.candidates[1].reasons[-1].code == "capability_unsupported"
+
+
+@pytest.mark.asyncio
 async def test_unavailable_runtime_and_workspace_are_rejected(tmp_path: Path) -> None:
     namespace = _namespace(1)
     lane = _lane("claude", "anthropic", selected=True, readiness=ModelDiscoveryReadiness.UNAVAILABLE)

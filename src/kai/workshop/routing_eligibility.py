@@ -168,6 +168,8 @@ class WorkshopRoutingEligibilityService:
         self,
         authority: RoutingEligibilityAuthority,
         task_class: str | RoutingTaskClass,
+        *,
+        additional_required: tuple[RuntimeCapability, ...] = (),
     ) -> RuntimeEligibilityReport:
         canonical_task = _task_class(task_class)
         namespace = self._execution_state.maybe_for_runtime_profile_id(authority.runtime_profile_id)
@@ -194,7 +196,9 @@ class WorkshopRoutingEligibilityService:
         selected_model = await self._runtime_pool.get_effective_model(authority.runtime_profile_id)
         allowed_services = self._runtime_pool.runtime_profile(authority.runtime_profile_id).allowed_services
         catalogue_authority = self._catalogue.authority_for_principal(authority.principal_id)
-        required = _TASK_REQUIREMENTS[canonical_task]
+        if any(not isinstance(capability, RuntimeCapability) for capability in additional_required):
+            raise ValueError("additional_required must contain RuntimeCapability values")
+        required = tuple(dict.fromkeys((*_TASK_REQUIREMENTS[canonical_task], *additional_required)))
         candidates: list[RuntimeEligibilityCandidate] = []
         for lane in profile.backends:
             model_id = selected_model if lane.selected else lane.default_model

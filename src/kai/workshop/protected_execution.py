@@ -57,6 +57,9 @@ class PreparedWorkshopExecution:
     def stage_canonical_history(self, history: str) -> None:
         self._runtime.stage_canonical_history(history)
 
+    def stage_agent_definition_context(self, context: str) -> None:
+        self._runtime.stage_canonical_agent_context(context)
+
     def validate_current(self) -> None:
         """Verify the exact runtime immediately before the started boundary."""
         self._runtime.validate_current()

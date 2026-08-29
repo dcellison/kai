@@ -10,6 +10,8 @@ from datetime import UTC, datetime
 from typing import Any
 
 from kai.workshop.domain import (
+    AgentDefinitionId,
+    AgentDefinitionRevisionId,
     AgentId,
     ChannelAgentId,
     ChannelBindingId,
@@ -242,6 +244,54 @@ async def bootstrap_default_workshop(
         aggregate_id=agent_id,
         payload={"principal_id": agent_principal_id, "name": "Kai"},
     )
+    async with store.connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_definitions'"
+    ) as cursor:
+        definitions_supported = await cursor.fetchone() is not None
+    # Historical-schema migration tests exercise bootstrap at the simulated
+    # old version. The current installer opens/migrates to the latest schema
+    # before bootstrap, so production always takes this branch.
+    if definitions_supported:
+        definition_id = AgentDefinitionId.derived(agent_id, "definition")
+        revision_id = AgentDefinitionRevisionId.derived(definition_id, "revision:1")
+        await ensure(
+            idempotency_key=_idempotency_key("agent-definition", "kai"),
+            event_type=WorkshopEventType.AGENT_DEFINITION_CREATED,
+            aggregate_type="agent_definition",
+            aggregate_id=definition_id,
+            payload={
+                "agent_id": agent_id,
+                "handle": "kai",
+                "display_name": "Kai",
+                "description": "Kai's general-purpose Workshop agent.",
+                "presentation": {"avatar": "K"},
+                "lifecycle_state": "active",
+            },
+        )
+        await ensure(
+            idempotency_key=_idempotency_key("agent-definition-revision", "kai:1"),
+            event_type=WorkshopEventType.AGENT_DEFINITION_REVISION_ADDED,
+            aggregate_type="agent_definition_revision",
+            aggregate_id=revision_id,
+            payload={
+                "definition_id": definition_id,
+                "revision_number": 1,
+                "purpose": "Serve as a general-purpose personal AI assistant in Kai Workshop.",
+                "instructions": (
+                    "Act as Kai. Help the current principal with the task in the current "
+                    "Workshop conversation while following all higher-priority host, "
+                    "operator, workspace, and principal instructions."
+                ),
+                "capabilities": ["text_generation"],
+            },
+        )
+        await ensure(
+            idempotency_key=_idempotency_key("agent-definition-activation", "kai:1"),
+            event_type=WorkshopEventType.AGENT_DEFINITION_REVISION_ACTIVATED,
+            aggregate_type="agent_definition",
+            aggregate_id=definition_id,
+            payload={"revision_id": revision_id},
+        )
 
     for human in ordered_humans:
         token = _stable_token(human.transport, human.external_subject)

@@ -188,6 +188,42 @@ def workshop_bootstrap_status(db_path: Path, *, expected_humans: int | None) -> 
     )
 
 
+def workshop_agent_definition_status(db_path: Path) -> str:
+    """Describe versioned agent-definition completeness without exposing content."""
+    prefix = "Workshop agent definitions:"
+    if not db_path.is_file():
+        return f"{prefix} pending; canonical schema unavailable"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if not {"agents", "agent_definitions", "agent_definition_revisions"} <= tables:
+                return f"{prefix} pending; canonical schema unavailable"
+            agents = _scalar(connection, "SELECT COUNT(*) FROM agents")
+            definitions = _scalar(connection, "SELECT COUNT(*) FROM agent_definitions")
+            revisions = _scalar(connection, "SELECT COUNT(*) FROM agent_definition_revisions")
+            active = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM agent_definitions d "
+                "JOIN agent_definition_revisions r ON r.id = d.active_revision_id "
+                "AND r.agent_definition_id = d.id WHERE d.lifecycle_state = 'active'",
+            )
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    missing = max(agents - definitions, 0)
+    invalid_active = max(definitions - active, 0)
+    state = "active" if agents > 0 and missing == 0 and invalid_active == 0 else "INCOMPLETE"
+    return (
+        f"{prefix} {state}; agents={agents}, definitions={definitions}, revisions={revisions}, "
+        f"active={active}, missing={missing}, invalid active={invalid_active}; authority=versioned"
+    )
+
+
 def workshop_delivery_authority_status(db_path: Path) -> str:
     """Describe delivery-authority readiness using aggregate, non-secret state."""
     prefix = "Workshop delivery authority:"

@@ -9,10 +9,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 
+from kai.workshop.agent_definitions import load_agent_definition_revision
 from kai.workshop.domain import RunId, RuntimeProfileId
 from kai.workshop.routing_eligibility import (
     RoutingEligibilityAuthority,
     RoutingTaskClass,
+    RuntimeCapability,
     RuntimeEligibilityCandidate,
     RuntimeEligibilityReport,
     WorkshopRoutingEligibilityService,
@@ -188,9 +190,19 @@ class WorkshopRoutingPolicyService:
         )
         if authority.agent_id != run.agent_id:
             raise RoutingPolicyError("Run does not match canonical routing authority")
+        agent_requirements: tuple[RuntimeCapability, ...] = ()
+        if run.agent_definition_revision_id is not None:
+            revision = await load_agent_definition_revision(self._store, run.agent_definition_revision_id)
+            if revision is None or revision.agent_id != run.agent_id:
+                raise RoutingPolicyError("Run agent definition revision is unavailable")
+            agent_requirements = tuple(RuntimeCapability(value) for value in revision.capabilities)
 
         if requested_task is None:
-            report = await self._eligibility.inspect(authority, RoutingTaskClass.CONVERSATION)
+            report = await self._eligibility.inspect(
+                authority,
+                RoutingTaskClass.CONVERSATION,
+                additional_required=agent_requirements,
+            )
             selected = self._selected_candidate(report)
             decision = self._decision(
                 run,
@@ -206,7 +218,11 @@ class WorkshopRoutingPolicyService:
             )
             return await self._store_decision(decision)
 
-        report = await self._eligibility.inspect(authority, requested_task)
+        report = await self._eligibility.inspect(
+            authority,
+            requested_task,
+            additional_required=agent_requirements,
+        )
         policy = (await self._load_policy_entries(runtime_profile_id)).get(requested_task)
         if policy is None or policy.backend_option_id is None:
             selected = self._selected_candidate(report)

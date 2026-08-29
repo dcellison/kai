@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 45
+WORKSHOP_SCHEMA_VERSION = 46
 
 
 @dataclass(frozen=True, slots=True)
@@ -2189,6 +2189,59 @@ _MESSAGE_REACTIONS_SCHEMA = SchemaMigration(
     ),
 )
 
+_VERSIONED_AGENT_DEFINITION_SCHEMA = SchemaMigration(
+    version=46,
+    name="versioned_agent_definitions",
+    statements=(
+        """
+        CREATE TABLE agent_definitions (
+            id TEXT PRIMARY KEY,
+            workshop_id TEXT NOT NULL REFERENCES workshops(id) ON DELETE CASCADE,
+            agent_id TEXT NOT NULL UNIQUE REFERENCES agents(id) ON DELETE CASCADE,
+            handle TEXT NOT NULL COLLATE NOCASE,
+            display_name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            presentation_json TEXT NOT NULL CHECK (
+                json_valid(presentation_json)
+                AND json_type(presentation_json) = 'object'
+            ),
+            lifecycle_state TEXT NOT NULL CHECK (
+                lifecycle_state IN ('draft', 'active', 'archived')
+            ),
+            active_revision_id TEXT
+                REFERENCES agent_definition_revisions(id) ON DELETE RESTRICT,
+            created_at TEXT NOT NULL,
+            created_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            UNIQUE (workshop_id, handle)
+        )
+        """,
+        """
+        CREATE TABLE agent_definition_revisions (
+            id TEXT PRIMARY KEY,
+            agent_definition_id TEXT NOT NULL
+                REFERENCES agent_definitions(id) ON DELETE CASCADE,
+            revision_number INTEGER NOT NULL CHECK (revision_number > 0),
+            purpose TEXT NOT NULL,
+            instructions TEXT NOT NULL,
+            capabilities_json TEXT NOT NULL CHECK (
+                json_valid(capabilities_json)
+                AND json_type(capabilities_json) = 'array'
+            ),
+            created_at TEXT NOT NULL,
+            created_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            UNIQUE (agent_definition_id, revision_number)
+        )
+        """,
+        "CREATE UNIQUE INDEX agent_definitions_active_revision_idx "
+        "ON agent_definitions (active_revision_id) WHERE active_revision_id IS NOT NULL",
+        "ALTER TABLE runs ADD COLUMN agent_definition_revision_id TEXT "
+        "REFERENCES agent_definition_revisions(id) ON DELETE RESTRICT",
+        "CREATE INDEX runs_agent_definition_revision_idx ON runs (agent_definition_revision_id, accepted_at)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2235,6 +2288,7 @@ _MIGRATIONS = (
     _MESSAGE_THREADS_SCHEMA,
     _EXPLICIT_TASK_ROUTING_SCHEMA,
     _MESSAGE_REACTIONS_SCHEMA,
+    _VERSIONED_AGENT_DEFINITION_SCHEMA,
 )
 
 
