@@ -1286,7 +1286,7 @@ describe("Workshop React client", () => {
     expect(redeemEnrollment).not.toHaveBeenCalled();
   });
 
-  it("keeps a group channel live when direct-runtime settings are unavailable", async () => {
+  it("uses the principal's direct runtime settings from a group channel", async () => {
     const user = userEvent.setup();
     sessionStorage.setItem(
       "kai.workshop.read-session.v1",
@@ -1318,13 +1318,6 @@ describe("Workshop React client", () => {
       throughPosition: 25,
       previousCursor: null,
     }));
-    vi.mocked(loadSettingsWorkspace).mockImplementation(async (selectedSession) => {
-      if (selectedSession.channelId === secondChannelId) {
-        throw new ChannelAccessError("Runtime settings are unavailable.");
-      }
-      return settingsWorkspace;
-    });
-
     render(<App />);
     expect(await screen.findByText(`History for ${channelId}`)).toBeVisible();
     await user.click(
@@ -1334,7 +1327,20 @@ describe("Workshop React client", () => {
     expect(
       await screen.findByText(`History for ${secondChannelId}`),
     ).toBeVisible();
-    expect(await screen.findByText("Runtime settings are unavailable.")).toBeVisible();
+    expect(await screen.findByText("gpt-5.6-sol")).toBeVisible();
+    expect(loadSettingsWorkspace).toHaveBeenLastCalledWith({
+      channelId,
+      token: "existing-session",
+    });
+    await user.selectOptions(
+      screen.getByLabelText("Workspace"),
+      "/var/lib/kai/home/principal",
+    );
+    expect(switchWorkspace).toHaveBeenCalledWith(
+      { channelId, token: "existing-session" },
+      "/var/lib/kai/home/principal",
+      "sws_current",
+    );
     await waitFor(() => expect(loadNavigation).toHaveBeenCalledTimes(1));
     expect((await screen.findAllByText("Live")).length).toBeGreaterThanOrEqual(1);
 

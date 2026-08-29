@@ -2645,7 +2645,7 @@ function ActiveWorkshopClient({
   );
   const loadSelectedSettingsWorkspace = useCallback(async () => {
     try {
-      return await loadSettingsWorkspace(session);
+      return await loadSettingsWorkspace(settingsSession);
     } catch (caught) {
       // Runtime settings are auxiliary channel context. A canonical channel
       // can remain readable and live even when it has no direct-runtime
@@ -2655,11 +2655,11 @@ function ActiveWorkshopClient({
       }
       throw caught;
     }
-  }, [onAuthenticationFailure, session]);
+  }, [onAuthenticationFailure, settingsSession]);
   const switchSelectedWorkspace = useCallback(
     (path: string, revision: string) =>
-      withAccessHandling(() => switchWorkspace(session, path, revision)),
-    [session, withAccessHandling],
+      withAccessHandling(() => switchWorkspace(settingsSession, path, revision)),
+    [settingsSession, withAccessHandling],
   );
   const dismissSelectedAgent = useCallback(
     (agentId: string, clientDismissalId: string) =>
