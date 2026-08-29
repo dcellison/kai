@@ -854,46 +854,50 @@ function MessageItem({
             onLoad={onLoadArtifact}
           />
         ))}
-        {reactions.length > 0 && (
-          <div className="message-reactions" aria-label="Message reactions">
-            {reactions.map((reaction) => {
-              const option = MESSAGE_REACTIONS.find(
-                (candidate) => candidate.reaction === reaction.reaction,
-              );
-              if (!option) {
-                return null;
-              }
-              return (
-                <button
-                  className={reaction.reactedByViewer ? "active" : ""}
-                  type="button"
-                  aria-label={`${option.label}: ${reaction.count}. ${reaction.reactedByViewer ? "Remove your reaction" : "Add your reaction"}`}
-                  aria-pressed={reaction.reactedByViewer}
-                  disabled={!onSetReaction || reactionPending !== null}
-                  key={reaction.reaction}
-                  onClick={() => void setReaction(reaction.reaction, !reaction.reactedByViewer)}
-                >
-                  <span aria-hidden="true">{option.symbol}</span>
-                  <span>{reaction.count}</span>
-                </button>
-              );
-            })}
+        {(reactions.length > 0 || (onOpenThread && message.replyCount > 0)) && (
+          <div className="message-engagement" role="group" aria-label="Message engagement">
+            {reactions.length > 0 && (
+              <div className="message-reactions" aria-label="Message reactions">
+                {reactions.map((reaction) => {
+                  const option = MESSAGE_REACTIONS.find(
+                    (candidate) => candidate.reaction === reaction.reaction,
+                  );
+                  if (!option) {
+                    return null;
+                  }
+                  return (
+                    <button
+                      className={reaction.reactedByViewer ? "active" : ""}
+                      type="button"
+                      aria-label={`${option.label}: ${reaction.count}. ${reaction.reactedByViewer ? "Remove your reaction" : "Add your reaction"}`}
+                      aria-pressed={reaction.reactedByViewer}
+                      disabled={!onSetReaction || reactionPending !== null}
+                      key={reaction.reaction}
+                      onClick={() => void setReaction(reaction.reaction, !reaction.reactedByViewer)}
+                    >
+                      <span aria-hidden="true">{option.symbol}</span>
+                      <span>{reaction.count}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+            {onOpenThread && message.replyCount > 0 && (
+              <button
+                className="thread-summary"
+                type="button"
+                aria-label={`Open thread with ${message.replyCount} ${message.replyCount === 1 ? "reply" : "replies"}`}
+                title="Open thread"
+                onClick={() => onOpenThread(message.messageId)}
+              >
+                <span>
+                  {message.replyCount} {message.replyCount === 1 ? "reply" : "replies"}
+                </span>
+              </button>
+            )}
           </div>
         )}
         {reactionError && <p className="reaction-error" role="alert">{reactionError}</p>}
-        {onOpenThread && message.replyCount > 0 && (
-          <button
-            className="thread-summary"
-            type="button"
-            aria-label={`Open thread with ${message.replyCount} ${message.replyCount === 1 ? "reply" : "replies"}`}
-            title="Open thread"
-            onClick={() => onOpenThread(message.messageId)}
-          >
-            <span>
-              {message.replyCount} {message.replyCount === 1 ? "reply" : "replies"}
-            </span>
-          </button>
-        )}
       </article>
     </li>
   );

@@ -1551,7 +1551,11 @@ describe("Workshop React client", () => {
     );
     vi.mocked(loadNavigation).mockResolvedValue(navigationWithGroup());
     vi.mocked(loadTimeline).mockResolvedValue({
-      messages: [{ ...historyMessage, channelId: secondChannelId }],
+      messages: [{
+        ...historyMessage,
+        channelId: secondChannelId,
+        replyCount: 2,
+      }],
       throughPosition: 25,
       previousCursor: null,
     });
@@ -1586,6 +1590,14 @@ describe("Workshop React client", () => {
     const reactionChip = await screen.findByRole("button", {
       name: "Eyes: 1. Remove your reaction",
     });
+    const engagement = screen.getByRole("group", { name: "Message engagement" });
+    expect(engagement).toHaveClass("message-engagement");
+    expect(within(engagement).getByRole("button", {
+      name: "Open thread with 2 replies",
+    })).toBeVisible();
+    expect(within(engagement).getByRole("button", {
+      name: "Eyes: 1. Remove your reaction",
+    })).toBe(reactionChip);
     await user.click(reactionChip);
     expect(setMessageReaction).toHaveBeenLastCalledWith(
       { channelId: secondChannelId, token: "existing-session" },
