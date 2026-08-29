@@ -749,13 +749,19 @@ function MessageItem({
           <button
             className="thread-summary"
             type="button"
+            aria-label={
+              message.replyCount === 0
+                ? "Reply to message"
+                : `Open thread with ${message.replyCount} ${message.replyCount === 1 ? "reply" : "replies"}`
+            }
+            title={message.replyCount === 0 ? "Reply" : "Open thread"}
             onClick={() => onOpenThread(message.messageId)}
           >
-            {message.replyCount === 0
-              ? "Reply"
-              : `${message.replyCount} ${message.replyCount === 1 ? "reply" : "replies"}`}
-            {message.latestReplyAt && (
-              <span> · latest {formatTimestamp(message.latestReplyAt)}</span>
+            <ReplyIcon />
+            {message.replyCount > 0 && (
+              <span>
+                {message.replyCount} {message.replyCount === 1 ? "reply" : "replies"}
+              </span>
             )}
           </button>
         )}
@@ -1067,6 +1073,32 @@ function SendIcon(): React.JSX.Element {
   );
 }
 
+function ReplyIcon(): React.JSX.Element {
+  return (
+    <svg
+      aria-hidden="true"
+      fill="none"
+      focusable="false"
+      viewBox="0 0 24 24"
+    >
+      <path
+        d="m9 7-5 5 5 5"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="2"
+      />
+      <path
+        d="M4 12h9a7 7 0 0 1 7 7"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="2"
+      />
+    </svg>
+  );
+}
+
 function ThreadPane({
   channelName,
   liveMessages,
@@ -1337,6 +1369,7 @@ function WorkshopView({
   onSettingsDirtyChange: (dirty: boolean) => void;
   onSettingsAccessFailure: (message: string) => void;
 }): React.JSX.Element {
+  const confirm = useConfirmation();
   const channelId = channel.channelId;
   const memoryOpen = memoryDestination !== null;
   const settingsOpen = settingsDestination;
@@ -1565,6 +1598,13 @@ function WorkshopView({
       );
     } finally {
       setDismissingAgentId(null);
+    }
+  };
+
+  const forgetCurrentSession = async (): Promise<void> => {
+    setProfileMenuOpen(false);
+    if (await confirm("Forget this browser session? You will need to enroll again.")) {
+      onForget();
     }
   };
 
@@ -2239,6 +2279,16 @@ function WorkshopView({
                 <span aria-hidden="true">⚙</span>
                 <span><strong>Settings</strong><small>Preferences and runtime</small></span>
               </button>
+              <div className="profile-menu-separator" />
+              <button
+                className="forget-session-menu-item"
+                type="button"
+                role="menuitem"
+                onClick={() => void forgetCurrentSession()}
+              >
+                <span aria-hidden="true">↪</span>
+                <span><strong>Forget session</strong><small>Enroll this browser again</small></span>
+              </button>
             </div>
           )}
           <button
@@ -2296,7 +2346,6 @@ function WorkshopView({
           initialMemoryId={memoryDestination.memoryId}
           onAuthenticationFailure={onMemoryAuthenticationFailure}
           onClose={() => onSelectChannel(channelId)}
-          onForget={onForget}
           onSelectMemory={onSelectMemory}
           token={memoryToken}
         />
@@ -2316,30 +2365,12 @@ function WorkshopView({
           </div>
           <div className="conversation-actions">
             <ConnectionIndicator connection={connection} />
-            {channel.kind !== "notification" && (
-              <button
-                className="quiet-button"
-                type="button"
-                onClick={() =>
-                  setChannelCreation({
-                    initialAgentIds: channel.agents.map((agent) => agent.agentId),
-                    originChannelId: channel.channelId,
-                    originName: channelName,
-                  })
-                }
-              >
-                Start channel
-              </button>
-            )}
             <button
               className="quiet-button mobile-settings-button"
               type="button"
               onClick={onOpenSettings}
             >
               Settings
-            </button>
-            <button className="quiet-button" type="button" onClick={onForget}>
-              Forget session
             </button>
           </div>
         </header>

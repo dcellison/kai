@@ -727,6 +727,16 @@ button:disabled {
   color: var(--color-accent);
 }
 
+.profile-menu-separator {
+  height: 1px;
+  margin: 0.35rem 0.45rem;
+  background: var(--color-border);
+}
+
+.profile-menu .forget-session-menu-item > span:first-child {
+  color: var(--color-warning);
+}
+
 .channel-sidebar.collapsed .sidebar-header {
   justify-content: center;
   padding-inline: 0.55rem;
@@ -1011,17 +1021,33 @@ button:disabled {
 }
 
 .thread-summary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  width: fit-content;
+  min-width: 2rem;
+  min-height: 2rem;
   margin-top: 0.65rem;
+  margin-left: auto;
   border: 0;
-  padding: 0;
+  border-radius: 0.35rem;
+  padding: 0.3rem 0.45rem;
   background: transparent;
   color: var(--color-accent);
   font: 700 0.68rem var(--sans);
   cursor: pointer;
 }
 
-.thread-summary:hover {
-  text-decoration: underline;
+.thread-summary:hover,
+.thread-summary:focus-visible {
+  background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+  outline: none;
+}
+
+.thread-summary svg {
+  width: 1rem;
+  height: 1rem;
 }
 
 .thread-summary span {

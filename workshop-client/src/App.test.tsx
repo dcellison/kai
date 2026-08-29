@@ -639,6 +639,30 @@ describe("Workshop React client", () => {
     expect(window.location.search).toBe("");
   });
 
+  it("keeps session forgetting in the profile menu and confirms it", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+
+    render(<App />);
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Forget session" })).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Daniel profile" }));
+    await user.click(screen.getByRole("menuitem", { name: /Forget session/ }));
+    const confirmation = screen.getByRole("dialog", { name: "Continue?" });
+    expect(confirmation).toHaveTextContent(
+      "Forget this browser session? You will need to enroll again.",
+    );
+    await user.click(
+      within(confirmation).getByRole("button", { name: "Continue" }),
+    );
+
+    expect(await screen.findByLabelText("Enrollment token")).toBeVisible();
+  });
+
   it("closes the profile menu with Escape", async () => {
     const user = userEvent.setup();
     sessionStorage.setItem(
@@ -1354,7 +1378,7 @@ describe("Workshop React client", () => {
     expect(await screen.findByText(`History for ${channelId}`)).toBeVisible();
   });
 
-  it("creates a channel from the current conversation and opens it", async () => {
+  it("creates a channel from the sidebar and opens it", async () => {
     const user = userEvent.setup();
     sessionStorage.setItem(
       "kai.workshop.read-session.v1",
@@ -1379,8 +1403,9 @@ describe("Workshop React client", () => {
 
     render(<App />);
     expect(await screen.findByText(`History for ${channelId}`)).toBeVisible();
-    await user.click(screen.getByRole("button", { name: "Start channel" }));
-    expect(screen.getByText(/Start from/)).toHaveTextContent("Start from Kai.");
+    expect(screen.queryByRole("button", { name: "Start channel" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Create channel" }));
+    expect(screen.queryByText(/Start from/)).toBeNull();
     await user.type(screen.getByLabelText("Channel name"), "Release planning");
     await user.click(
       within(screen.getByRole("dialog")).getByRole("button", {
@@ -1392,7 +1417,7 @@ describe("Workshop React client", () => {
       expect(createChannel).toHaveBeenCalledWith("existing-session", {
         agentIds: ["agt_00000000000000000000000000000001"],
         name: "Release planning",
-        originChannelId: channelId,
+        originChannelId: null,
       }),
     );
     expect(
@@ -1466,7 +1491,12 @@ describe("Workshop React client", () => {
     });
 
     render(<App />);
-    await user.click(await screen.findByRole("button", { name: /1 reply/ }));
+    const threadButton = await screen.findByRole("button", {
+      name: "Open thread with 1 reply",
+    });
+    expect(threadButton).toHaveTextContent("1 reply");
+    expect(threadButton.querySelector("svg")).not.toBeNull();
+    await user.click(threadButton);
     const context = screen.getByLabelText("Channel context");
     expect(await within(context).findByText("Existing thread reply")).toBeVisible();
     const composer = within(context).getByLabelText("Reply in Wake policy qualification");
@@ -1486,6 +1516,26 @@ describe("Workshop React client", () => {
       null,
       root.messageId,
     );
+  });
+
+  it("shows only a reply icon for a message without replies", async () => {
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId: secondChannelId, token: "existing-session" }),
+    );
+    vi.mocked(loadNavigation).mockResolvedValue(navigationWithGroup());
+    vi.mocked(loadTimeline).mockResolvedValue({
+      messages: [{ ...historyMessage, channelId: secondChannelId }],
+      throughPosition: 25,
+      previousCursor: null,
+    });
+
+    render(<App />);
+    const replyButton = await screen.findByRole("button", {
+      name: "Reply to message",
+    });
+    expect(replyButton).toHaveTextContent("");
+    expect(replyButton.querySelector("svg")).not.toBeNull();
   });
 
   it("shows and dismisses authoritative agent engagement", async () => {
