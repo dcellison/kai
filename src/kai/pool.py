@@ -57,6 +57,15 @@ type RuntimeSelector = int | RuntimeProfileId
 type RuntimePoolKey = int | RuntimeProfileId
 
 
+@dataclass(frozen=True, slots=True)
+class _RoutedRuntimeKey:
+    runtime_profile_id: RuntimeProfileId
+    backend_option_id: str
+
+
+type RuntimeInstanceKey = RuntimePoolKey | _RoutedRuntimeKey
+
+
 def _required_legacy_key(value: int | None) -> int:
     """Narrow an unprotected adapter key after canonical routing is excluded."""
     if value is None:
@@ -91,16 +100,25 @@ class _PreparedRuntimeFingerprint:
 class PreparedBackendExecution:
     """One-shot handle that can dispatch only through its exact prepared runtime."""
 
-    __slots__ = ("_consumed", "_fingerprint", "_instance", "_pool", "_runtime_key")
+    __slots__ = (
+        "_consumed",
+        "_fingerprint",
+        "_instance",
+        "_instance_key",
+        "_pool",
+        "_runtime_selector",
+    )
 
     def __init__(
         self,
         pool: SubprocessPool,
-        runtime_key: RuntimePoolKey,
+        runtime_selector: RuntimePoolKey,
+        instance_key: RuntimeInstanceKey,
         instance: AgentBackend,
     ) -> None:
         self._pool = pool
-        self._runtime_key = runtime_key
+        self._runtime_selector = runtime_selector
+        self._instance_key = instance_key
         self._instance = instance
         self._fingerprint = _runtime_fingerprint(instance)
         self._consumed = False
@@ -276,8 +294,8 @@ class SubprocessPool:
             contexts,
             allowed_services_by_profile=allowed_services_by_profile,
         )
-        self._pool: dict[RuntimePoolKey, AgentBackend] = {}
-        self._last_activity: dict[RuntimePoolKey, float] = {}
+        self._pool: dict[RuntimeInstanceKey, AgentBackend] = {}
+        self._last_activity: dict[RuntimeInstanceKey, float] = {}
         # Pending one-time setup for a freshly-created backend instance.
         # Split into two flags so a command-path workspace resolver call
         # can finish the workspace half without suppressing the DB-
@@ -287,7 +305,7 @@ class SubprocessPool:
         # user's stored model/timeout into the new subprocess.
         self._pending_workspace_restore: set[RuntimePoolKey] = set()
         self._pending_settings_restore: set[RuntimePoolKey] = set()
-        self._in_flight: set[RuntimePoolKey] = set()
+        self._in_flight: set[RuntimeInstanceKey] = set()
         # Canonical backend selection is hydrated from execution state at
         # startup and updated only by the settings authority.  The protected
         # profile remains the policy boundary; this cache merely makes the
@@ -575,7 +593,13 @@ class SubprocessPool:
         self._last_activity[runtime_key] = time.monotonic()
         return self._pool[runtime_key]
 
-    def _create_instance(self, runtime: RuntimeSelector) -> AgentBackend:
+    def _create_instance(
+        self,
+        runtime: RuntimeSelector,
+        *,
+        backend_option_id: str | None = None,
+        model_override: str | None = None,
+    ) -> AgentBackend:
         """
         Create an AgentBackend for a specific user.
 
@@ -606,7 +630,11 @@ class SubprocessPool:
         # this, a per-user backend differing from the global backend can
         # inherit an incompatible global model.
         if protected_profile is not None:
-            option = self._backend_option(runtime)
+            option = (
+                protected_profile.backend_option(backend_option_id)
+                if backend_option_id is not None
+                else self._backend_option(runtime)
+            )
             assert option is not None
             backend = option.backend
             effective_provider = option.provider
@@ -624,9 +652,13 @@ class SubprocessPool:
         # The compatibility cascade remains only for Telegram groups and
         # uninstalled/dev runs that do not resolve a protected profile.
         if protected_profile is not None:
-            option = self._backend_option(runtime)
+            option = (
+                protected_profile.backend_option(backend_option_id)
+                if backend_option_id is not None
+                else self._backend_option(runtime)
+            )
             assert option is not None
-            model = option.model
+            model = model_override or option.model
         else:
             # Per-user model. When the user's effective backend differs
             # from the global one, the global default_model may not be
@@ -841,6 +873,7 @@ class SubprocessPool:
             prepared = PreparedBackendExecution(
                 self,
                 runtime_key,
+                runtime_key,
                 await self._prepare_instance(runtime),
             )
             # Preparation is already part of an accepted canonical run.  Hold
@@ -848,6 +881,74 @@ class SubprocessPool:
             # window so a concurrent settings request cannot invalidate the
             # prepared handle or interrupt that run.
             self._in_flight.add(runtime_key)
+            return prepared
+
+    async def prepare_routed_execution(
+        self,
+        runtime: RuntimeProfileId,
+        backend_option_id: str,
+        model: str,
+    ) -> PreparedBackendExecution:
+        """Bind an alternate authorized option without changing the selected route."""
+        runtime_key, _, profile = self._resolve_runtime(runtime)
+        if profile is None or not isinstance(runtime_key, RuntimeProfileId):
+            raise RuntimeError("Explicit task routing requires a protected runtime profile")
+        option = profile.backend_option(backend_option_id)
+        selected = self._backend_option(runtime)
+        assert selected is not None
+        if option.option_id == selected.option_id:
+            return await self.prepare_execution(runtime)
+        if not validate_model_for_backend_policy(
+            model,
+            option.backend,
+            option.provider,
+            allowed_models=option.allowed_models,
+        ):
+            raise RuntimeError("Routed model is not allowed by the protected backend option")
+
+        instance_key = _RoutedRuntimeKey(runtime_key, option.option_id)
+        async with self._backend_transition_lock(runtime_key):
+            workspace = await self.get_effective_workspace(runtime)
+            instance = self._pool.get(instance_key)
+            if instance is not None:
+                fingerprint = _runtime_fingerprint(instance)
+                expected = PreparedBackendSelection(option.backend, option.provider, model)
+                if fingerprint.selection != expected or fingerprint.workspace.resolve() != workspace.resolve():
+                    await self._shutdown_instance(instance_key, instance, reason="routed runtime changed")
+                    instance = None
+            if instance is None:
+                instance = self._create_instance(
+                    runtime,
+                    backend_option_id=option.option_id,
+                    model_override=model,
+                )
+                if instance.workspace.resolve() != workspace.resolve():
+                    namespace = self._canonical_namespace(runtime)
+                    assert namespace is not None
+                    workspace_config = await sessions.build_canonical_workspace_config(
+                        self._config.get_workspace_config(workspace),
+                        workspace,
+                        namespace,
+                    )
+                    await instance.change_workspace(workspace, workspace_config=workspace_config)
+                # The durable route decision owns the exact model. A workspace
+                # override may have changed it while applying the workspace.
+                instance.model = model
+                namespace = self._canonical_namespace(runtime)
+                assert namespace is not None
+                settings = await sessions.get_canonical_execution_settings(namespace)
+                workspace_timeout = instance.workspace_config.timeout if instance.workspace_config else None
+                if workspace_timeout is None and "timeout" in settings:
+                    instance.timeout_seconds = int(settings["timeout"])
+                self._pool[instance_key] = instance
+            self._last_activity[instance_key] = time.monotonic()
+            prepared = PreparedBackendExecution(
+                self,
+                runtime_key,
+                instance_key,
+                instance,
+            )
+            self._in_flight.add(instance_key)
             return prepared
 
     async def send(
@@ -905,11 +1006,12 @@ class SubprocessPool:
     ) -> AsyncGenerator[StreamEvent]:
         """Dispatch through a prepared handle only while its runtime remains exact."""
         self._validate_prepared(prepared)
-        runtime_key = prepared._runtime_key
+        runtime_key = prepared._runtime_selector
+        instance_key = prepared._instance_key
         _, runtime_config_id, profile = self._resolve_runtime(runtime_key)
         instance = prepared._instance
-        self._last_activity[runtime_key] = time.monotonic()
-        self._in_flight.add(runtime_key)
+        self._last_activity[instance_key] = time.monotonic()
+        self._in_flight.add(instance_key)
         try:
             if profile is not None:
                 runtime_identity = self._contexts_by_runtime.get(runtime_key)
@@ -923,35 +1025,35 @@ class SubprocessPool:
                 yield event
         finally:
             instance.discard_canonical_history()
-            self._in_flight.discard(runtime_key)
-            self._last_activity[runtime_key] = time.monotonic()
+            self._in_flight.discard(instance_key)
+            self._last_activity[instance_key] = time.monotonic()
 
     def _validate_prepared(self, prepared: PreparedBackendExecution) -> None:
-        runtime_key = prepared._runtime_key
-        instance = self._pool.get(runtime_key)
+        instance_key = prepared._instance_key
+        instance = self._pool.get(instance_key)
         if instance is not prepared._instance:
             raise RuntimeError("Prepared backend runtime is no longer current")
-        if runtime_key in self._pending_workspace_restore or runtime_key in self._pending_settings_restore:
+        if instance_key in self._pending_workspace_restore or instance_key in self._pending_settings_restore:
             raise RuntimeError("Prepared backend runtime has pending effective settings")
         if _runtime_fingerprint(instance) != prepared._fingerprint:
             raise RuntimeError("Prepared backend runtime changed before dispatch")
 
     async def _cancel_prepared(self, prepared: PreparedBackendExecution) -> None:
         self._validate_prepared(prepared)
-        runtime_key = prepared._runtime_key
+        instance_key = prepared._instance_key
         instance = prepared._instance
         try:
             await asyncio.wait_for(instance.shutdown(), timeout=_FORCE_KILL_TIMEOUT)
         except Exception:
             instance.force_kill()
-            log.warning("prepared cancellation: shutdown failed for runtime %s, sent SIGKILL", runtime_key)
+            log.warning("prepared cancellation: shutdown failed for runtime %s, sent SIGKILL", instance_key)
         finally:
             # Never remove or stop a replacement installed while the exact
             # prepared runtime was shutting down.
-            if self._pool.get(runtime_key) is instance:
-                self._pool.pop(runtime_key, None)
-                self._last_activity.pop(runtime_key, None)
-            self._in_flight.discard(runtime_key)
+            if self._pool.get(instance_key) is instance:
+                self._pool.pop(instance_key, None)
+                self._last_activity.pop(instance_key, None)
+            self._in_flight.discard(instance_key)
 
     async def _attempt_workspace_restore(self, runtime: RuntimeSelector, instance: AgentBackend) -> Path:
         """Restore the saved workspace into a live instance.
@@ -1149,6 +1251,24 @@ class SubprocessPool:
         runtime_key, _, _ = self._resolve_runtime(runtime)
         return self._pool.get(runtime_key)
 
+    async def _shutdown_instance(
+        self,
+        instance_key: RuntimeInstanceKey,
+        instance: AgentBackend,
+        *,
+        reason: str,
+    ) -> None:
+        try:
+            await asyncio.wait_for(instance.shutdown(), timeout=_FORCE_KILL_TIMEOUT)
+        except Exception:
+            instance.force_kill()
+            log.warning("%s: shutdown failed for runtime %s, sent SIGKILL", reason, instance_key)
+        finally:
+            if self._pool.get(instance_key) is instance:
+                self._pool.pop(instance_key, None)
+                self._last_activity.pop(instance_key, None)
+            self._in_flight.discard(instance_key)
+
     async def force_kill(self, runtime: RuntimeSelector) -> None:
         """
         Kill a specific user's subprocess and remove it from the pool.
@@ -1188,7 +1308,13 @@ class SubprocessPool:
     def is_in_flight(self, runtime: RuntimeSelector) -> bool:
         """Return whether this one runtime currently owns an active send."""
         runtime_key, _, _ = self._resolve_runtime(runtime)
-        return runtime_key in self._in_flight
+        return self._profile_has_in_flight(runtime_key)
+
+    def _profile_has_in_flight(self, runtime_key: RuntimePoolKey) -> bool:
+        return any(
+            key == runtime_key or (isinstance(key, _RoutedRuntimeKey) and key.runtime_profile_id == runtime_key)
+            for key in self._in_flight
+        )
 
     async def select_backend(
         self,
@@ -1209,7 +1335,7 @@ class SubprocessPool:
             raise RuntimeError("Backend selection requires a protected runtime profile")
         option = profile.backend_option(backend_option_id)
         async with self._backend_transition_lock(runtime_key):
-            if runtime_key in self._in_flight:
+            if self._profile_has_in_flight(runtime_key):
                 return False
             await self.force_kill(runtime)
             if commit_selection is not None:

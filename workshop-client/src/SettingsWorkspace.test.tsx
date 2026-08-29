@@ -13,6 +13,7 @@ import {
   loadPreferenceDocument,
   loadPreferenceHistory,
   loadRoutingEligibility,
+  loadRoutingPolicy,
   loadSettingsWorkspace,
   loadWorkspaceConfig,
   PreferenceRevisionConflictError,
@@ -27,6 +28,7 @@ import {
   updateClientPreference,
   updateAppearancePreference,
   updateRuntimeSettings,
+  updateRoutingPolicy,
   updateWorkspaceConfig,
 } from "./api";
 import { SettingsWorkspace } from "./SettingsWorkspace";
@@ -37,6 +39,7 @@ import type {
   WorkshopModelCatalogue,
   WorkshopNotificationPreferences,
   WorkshopRoutingEligibility,
+  WorkshopRoutingPolicy,
   WorkshopClientPreferences,
   WorkshopAppearancePreferences,
   WorkshopSettingsWorkspace,
@@ -55,6 +58,7 @@ vi.mock("./api", async (importOriginal) => {
     loadAppearancePreferences: vi.fn(),
     loadPreferenceHistory: vi.fn(),
     loadRoutingEligibility: vi.fn(),
+    loadRoutingPolicy: vi.fn(),
     loadSettingsWorkspace: vi.fn(),
     loadWorkspaceConfig: vi.fn(),
     restorePreferenceRevision: vi.fn(),
@@ -69,6 +73,7 @@ vi.mock("./api", async (importOriginal) => {
     updateClientPreference: vi.fn(),
     updateAppearancePreference: vi.fn(),
     updateRuntimeSettings: vi.fn(),
+    updateRoutingPolicy: vi.fn(),
     updateWorkspaceConfig: vi.fn(),
   };
 });
@@ -243,6 +248,22 @@ const routingEligibility: WorkshopRoutingEligibility = {
   workspace: "/srv/kai",
 };
 
+const routingPolicy: WorkshopRoutingPolicy = {
+  agentId: routingEligibility.agentId,
+  channelId: session.channelId,
+  entries: (["conversation", "coding", "vision"] as const).map((taskClass) => ({
+    authorizedOptionIds: ["claude:anthropic"],
+    backendOptionId: null,
+    eligibleOptionIds: ["claude:anthropic"],
+    fallback: "selected" as const,
+    revision: 0,
+    taskClass,
+  })),
+  principalId: runtime.principalId,
+  runtimeProfileId: runtime.runtimeProfileId,
+  version: 1,
+};
+
 const workspaceConfig: WorkshopWorkspaceConfig = {
   capabilities: [
     {
@@ -410,6 +431,7 @@ describe("Settings workspace", () => {
     vi.mocked(loadSettingsWorkspace).mockResolvedValue(runtime);
     vi.mocked(loadModelCatalogue).mockResolvedValue(modelCatalogue);
     vi.mocked(loadRoutingEligibility).mockResolvedValue(routingEligibility);
+    vi.mocked(loadRoutingPolicy).mockResolvedValue(routingPolicy);
     vi.mocked(loadGitHubSettings).mockResolvedValue(githubSettings);
     vi.mocked(loadNotificationPreferences).mockResolvedValue(notificationPreferences);
     vi.mocked(loadClientPreferences).mockResolvedValue(clientPreferences);
@@ -603,6 +625,29 @@ describe("Settings workspace", () => {
       expect(loadRoutingEligibility).toHaveBeenLastCalledWith(session, "vision");
     });
     expect(updateRuntimeSettings).not.toHaveBeenCalled();
+  });
+
+  it("opts into an explicit task route without changing the runtime default", async () => {
+    const user = userEvent.setup();
+    vi.mocked(updateRoutingPolicy).mockResolvedValue({
+      ...routingPolicy,
+      entries: routingPolicy.entries.map((entry) => entry.taskClass === "coding"
+        ? { ...entry, backendOptionId: "claude:anthropic", revision: 1 }
+        : entry),
+    });
+    renderSettings();
+
+    await user.selectOptions(await screen.findByLabelText("Explicit route"), "claude:anthropic");
+
+    await waitFor(() => expect(updateRoutingPolicy).toHaveBeenCalledWith(
+      session,
+      "coding",
+      "claude:anthropic",
+      "selected",
+      0,
+    ));
+    expect(updateRuntimeSettings).not.toHaveBeenCalled();
+    expect(screen.getByText(/without changing your selected backend/i)).toBeVisible();
   });
 
   it("saves preference Markdown and reports dirty state", async () => {

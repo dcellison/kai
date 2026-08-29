@@ -17,7 +17,10 @@ from kai.workshop.artifacts import ArtifactMessageNotFoundError, build_agent_pro
 from kai.workshop.conversation_context import assemble_canonical_conversation_context
 from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import AgentId, ChannelId, RunExecutionOwnerId, RunId
-from kai.workshop.protected_execution import PreparedWorkshopExecution
+from kai.workshop.protected_execution import (
+    PreparedWorkshopExecution,
+    ProtectedExecutionRoutingRejected,
+)
 from kai.workshop.run_execution_authority import (
     RunAttemptStatus,
     RunExecutionClaim,
@@ -377,6 +380,36 @@ class WorkshopCanonicalExecutionCoordinator:
                 session_id=response.session_id if response is not None and response.success else None,
                 workspace=str(prepared.workspace),
                 selection=prepared.selection,
+            )
+        except ProtectedExecutionRoutingRejected as rejection:
+            authority = self._authority(rejection.decision.selection)
+            now = self._now()
+            async with self._database_lock:
+                granted = await authority.grant(
+                    run.run_id,
+                    owner_id=RunExecutionOwnerId.new(),
+                    occurred_at=now,
+                    lease_expires_at=now + self._lease_duration,
+                )
+                started = await authority.start(granted.claim, occurred_at=self._now())
+                active.authority = authority
+                active.claim = started.claim
+                active.started = True
+                active.ready.set()
+                active.settling = True
+                settled = await WorkshopRunTerminalTransactionCoordinator(
+                    authority,
+                    delivery_policy=self._delivery_policy,
+                ).fail(
+                    started.claim,
+                    failure_code=TerminalFailureCode.ROUTING_INELIGIBLE,
+                    occurred_at=self._now(),
+                )
+            return CanonicalExecutionResult(
+                CanonicalExecutionDisposition.FAILED,
+                settled.execution.run,
+                settled,
+                selection=rejection.decision.selection,
             )
         except Exception:
             if active.cancellation_requested and active.claim is not None:

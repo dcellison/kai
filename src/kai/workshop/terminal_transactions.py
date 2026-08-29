@@ -65,6 +65,7 @@ class TerminalFailureCode(StrEnum):
     BACKEND_CRASHED = "backend_crashed"
     NO_RESPONSE = "no_response"
     EXECUTION_INTERRUPTED = "execution_interrupted"
+    ROUTING_INELIGIBLE = "routing_ineligible"
     UNKNOWN = "unknown"
 
 
@@ -91,6 +92,9 @@ _FAILURE_MESSAGES = {
     TerminalFailureCode.NO_RESPONSE: "The configured agent returned no response. Kai did not complete this request.",
     TerminalFailureCode.EXECUTION_INTERRUPTED: (
         "Kai was interrupted while the configured agent was working. This request was not retried."
+    ),
+    TerminalFailureCode.ROUTING_INELIGIBLE: (
+        "The requested task route is not eligible under your routing policy. Kai did not dispatch this request."
     ),
     TerminalFailureCode.UNKNOWN: "The configured agent could not complete this request.",
 }

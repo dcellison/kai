@@ -22,6 +22,7 @@ import {
   loadPreferenceHistory,
   loadRun,
   loadRunTrace,
+  loadRoutingPolicy,
   loadSettingsWorkspace,
   loadTimeline,
   loadThreadTimeline,
@@ -62,6 +63,7 @@ vi.mock("./api", async (importOriginal) => {
     loadThreadTimeline: vi.fn(),
     loadRun: vi.fn(),
     loadRunTrace: vi.fn(),
+    loadRoutingPolicy: vi.fn(),
     loadSettingsWorkspace: vi.fn(),
     loadWorkspaceConfig: vi.fn(),
     redeemEnrollment: vi.fn(),
@@ -327,6 +329,21 @@ describe("Workshop React client", () => {
     vi.mocked(createChannel).mockResolvedValue(secondChannelId);
     vi.mocked(dismissChannelAgent).mockResolvedValue(undefined);
     vi.mocked(loadNavigation).mockResolvedValue(navigation);
+    vi.mocked(loadRoutingPolicy).mockResolvedValue({
+      agentId: "agt_00000000000000000000000000000001",
+      channelId,
+      entries: (["conversation", "coding", "vision"] as const).map((taskClass) => ({
+        authorizedOptionIds: ["claude:anthropic"],
+        backendOptionId: null,
+        eligibleOptionIds: ["claude:anthropic"],
+        fallback: "selected" as const,
+        revision: 0,
+        taskClass,
+      })),
+      principalId: navigation.principal.principalId,
+      runtimeProfileId: "rtp_00000000000000000000000000000001",
+      version: 1,
+    });
     vi.mocked(loadAppearancePreferences).mockResolvedValue({
       mutation: null,
       revision: "apr_current",
@@ -1711,6 +1728,48 @@ describe("Workshop React client", () => {
     );
     expect(getRandomValues).toHaveBeenCalledTimes(1);
     expect(screen.getByLabelText("Message Kai")).toHaveValue("");
+  });
+
+  it("submits an enabled explicit task route without changing the default path", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    vi.mocked(loadRoutingPolicy).mockResolvedValueOnce({
+      agentId: "agt_00000000000000000000000000000001",
+      channelId,
+      entries: (["conversation", "coding", "vision"] as const).map((taskClass) => ({
+        authorizedOptionIds: ["claude:anthropic", "codex:openai"],
+        backendOptionId: taskClass === "coding" ? "codex:openai" : null,
+        eligibleOptionIds: ["claude:anthropic", "codex:openai"],
+        fallback: "selected" as const,
+        revision: taskClass === "coding" ? 1 : 0,
+        taskClass,
+      })),
+      principalId: navigation.principal.principalId,
+      runtimeProfileId: "rtp_00000000000000000000000000000001",
+      version: 1,
+    });
+
+    render(<App />);
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+    const route = await screen.findByLabelText("Task route");
+    expect(route).toHaveValue("");
+    await user.selectOptions(route, "coding");
+    await user.type(screen.getByLabelText("Message Kai"), "Implement this change");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(submitCommand).toHaveBeenCalledOnce());
+    expect(submitCommand).toHaveBeenCalledWith(
+      { channelId, token: "existing-session" },
+      expect.stringMatching(/^browser-/),
+      "Implement this change",
+      null,
+      null,
+      "coding",
+    );
+    expect(route).toHaveValue("");
   });
 
   it("submits a file-only command and clears the selected attachment on success", async () => {

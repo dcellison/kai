@@ -11,6 +11,7 @@ from kai.backend import StreamEvent
 from kai.config import VALID_BACKENDS, validate_model_for_backend
 from kai.workshop.conversation_runs import resolve_canonical_conversation_run
 from kai.workshop.domain import RunId, RuntimeProfileId
+from kai.workshop.routing_policy import RunRoutingDecision, WorkshopRoutingPolicyService
 from kai.workshop.run_execution_authority import RunExecutionSelection
 from kai.workshop.run_lifecycle import DurableRun, RunStatus, WorkshopRunLifecycle
 from kai.workshop.runtime_pool import WorkshopRuntimePool
@@ -29,6 +30,15 @@ class ProtectedExecutionPreparationError(RuntimeError):
     """The canonical run cannot safely bind one effective runtime."""
 
 
+class ProtectedExecutionRoutingRejected(ProtectedExecutionPreparationError):
+    """An explicit routed task failed its configured conservative policy."""
+
+    def __init__(self, run: DurableRun, decision: RunRoutingDecision) -> None:
+        super().__init__(f"Explicit task route rejected: {decision.reason_code}")
+        self.run = run
+        self.decision = decision
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedWorkshopExecution:
     run: DurableRun
@@ -36,6 +46,7 @@ class PreparedWorkshopExecution:
     selection: RunExecutionSelection
     workspace: Path
     history_reader_user: str | None
+    routing_decision: RunRoutingDecision
     _runtime: PreparedBackendExecution = field(repr=False, compare=False)
 
     async def stream(self, prompt: AgentPrompt) -> AsyncIterator[StreamEvent]:
@@ -62,6 +73,7 @@ class WorkshopProtectedExecutionPreparationService:
         self,
         store: WorkshopEventStore,
         pool: WorkshopRuntimePool,
+        routing_policy: WorkshopRoutingPolicyService,
         *,
         registered_backend_ids: frozenset[str],
     ) -> None:
@@ -72,6 +84,7 @@ class WorkshopProtectedExecutionPreparationService:
             raise ValueError(f"registered_backend_ids contains unsupported backends: {', '.join(sorted(unknown))}")
         self._store = store
         self._pool = pool
+        self._routing_policy = routing_policy
         self._registered_backend_ids = registered_backend_ids
 
     async def prepare(self, run_id: RunId) -> PreparedWorkshopExecution:
@@ -91,7 +104,17 @@ class WorkshopProtectedExecutionPreparationService:
         ):
             raise ProtectedExecutionPreparationError("Canonical run authority changed after acceptance")
 
-        runtime = await self._pool.prepare_execution(resolution.runtime_profile_id)
+        decision = await self._routing_policy.decide_for_run(
+            run,
+            resolution.runtime_profile_id,
+        )
+        if decision.rejected or decision.selected_backend_option_id is None:
+            raise ProtectedExecutionRoutingRejected(run, decision)
+        runtime = await self._pool.prepare_routed_execution(
+            resolution.runtime_profile_id,
+            decision.selected_backend_option_id,
+            decision.selection.model,
+        )
         prepared = runtime.selection
         if prepared.backend not in self._registered_backend_ids:
             raise ProtectedExecutionPreparationError("Effective backend is not present in the protected registry")
@@ -102,6 +125,9 @@ class WorkshopProtectedExecutionPreparationService:
             provider=prepared.provider or None,
             model=prepared.model,
         )
+        if selection != decision.selection:
+            await runtime.cancel()
+            raise ProtectedExecutionPreparationError("Prepared runtime does not match the durable routing decision")
         profile = self._pool.runtime_profile(resolution.runtime_profile_id)
         return PreparedWorkshopExecution(
             run=run,
@@ -109,5 +135,6 @@ class WorkshopProtectedExecutionPreparationService:
             selection=selection,
             workspace=runtime.workspace,
             history_reader_user=profile.os_user,
+            routing_decision=decision,
             _runtime=runtime,
         )

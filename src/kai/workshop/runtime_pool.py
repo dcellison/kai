@@ -53,6 +53,20 @@ class WorkshopRuntimePool:
         profile_id = self._profiles.resolve(runtime_profile_id).profile_id
         return await self._pool.prepare_execution(profile_id)
 
+    async def prepare_routed_execution(
+        self,
+        runtime_profile_id: str | RuntimeProfileId,
+        backend_option_id: str,
+        model: str,
+    ) -> PreparedBackendExecution:
+        """Prepare an authorized per-option runtime without changing the default."""
+        profile_id = self._profiles.resolve(runtime_profile_id).profile_id
+        return await self._pool.prepare_routed_execution(
+            profile_id,
+            backend_option_id,
+            model,
+        )
+
     def get_model(self, runtime_profile_id: str | RuntimeProfileId) -> str:
         profile_id = self._profiles.resolve(runtime_profile_id).profile_id
         return self._pool.get_model(profile_id)

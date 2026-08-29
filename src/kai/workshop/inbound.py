@@ -22,6 +22,7 @@ from kai.workshop.store import AppendResult, WorkshopEventStore
 
 _TRANSPORT_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 _CLIENT_MESSAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_ROUTING_TASK_CLASSES = frozenset({"conversation", "coding", "vision"})
 
 
 class InboundBindingNotFoundError(LookupError):
@@ -37,6 +38,7 @@ class InboundMessage:
     channel_subject: str
     body: str
     occurred_at: datetime
+    routing_task_class: str | None = None
 
     def __post_init__(self) -> None:
         if not _TRANSPORT_PATTERN.fullmatch(self.transport):
@@ -47,6 +49,8 @@ class InboundMessage:
                 raise ValueError(f"{field_name} must be non-empty without surrounding whitespace")
         if not self.body:
             raise ValueError("body must be non-empty")
+        if self.routing_task_class is not None and self.routing_task_class not in _ROUTING_TASK_CLASSES:
+            raise ValueError("routing_task_class must be conversation, coding, vision, or None")
         if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
             raise ValueError("occurred_at must be timezone-aware")
 
@@ -62,6 +66,7 @@ class ClientInboundMessage:
     occurred_at: datetime
     thread_root_id: MessageId | None = None
     artifact_source_unique_id: str | None = None
+    routing_task_class: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.principal_id, PrincipalId):
@@ -82,6 +87,8 @@ class ClientInboundMessage:
             or len(self.artifact_source_unique_id) > 512
         ):
             raise ValueError("artifact_source_unique_id must be bounded or None")
+        if self.routing_task_class is not None and self.routing_task_class not in _ROUTING_TASK_CLASSES:
+            raise ValueError("routing_task_class must be conversation, coding, vision, or None")
         if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
             raise ValueError("occurred_at must be timezone-aware")
 
@@ -282,6 +289,7 @@ def _inbound_envelope(
             "source": message.transport,
             "transport_update_id": message.update_id,
             "transport_message_id": message.message_id,
+            **({"routing_task_class": message.routing_task_class} if message.routing_task_class is not None else {}),
         },
     )
 
@@ -343,6 +351,8 @@ def _client_inbound_envelope(
     }
     if message.artifact_source_unique_id is not None:
         metadata["artifact_source_unique_id"] = message.artifact_source_unique_id
+    if message.routing_task_class is not None:
+        metadata["routing_task_class"] = message.routing_task_class
     return EventEnvelope.create(
         event_id=EventId.derived(binding.workshop_id, f"client-message-event:{message_id}"),
         event_type=WorkshopEventType.MESSAGE_CREATED,
