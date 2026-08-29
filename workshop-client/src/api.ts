@@ -2932,6 +2932,7 @@ export async function streamTimeline(
       }
       if (event.eventName === "run.lifecycle.changed") {
         const run = parseRun(payload.run, session.channelId);
+        const routingDecision = parseRoutingDecision(payload.routing_decision);
         const transition = payload.transition;
         if (
           !run ||
@@ -2946,7 +2947,7 @@ export async function streamTimeline(
           {
             eventPosition,
             occurredAt: payload.occurred_at,
-            run,
+            run: { ...run, routingDecision },
             transition: transition as WorkshopRunTransition,
           },
           event.eventId,

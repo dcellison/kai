@@ -2766,7 +2766,39 @@ class TestWorkshopTimelineEventStreamHTTPContract:
             message_id,
             occurred_at=_NOW + timedelta(seconds=1),
         )
-        client = await _open_client(store, _Authenticator({"alice-token": alice_id}))
+        await store.connection.execute(
+            "INSERT INTO workshop_run_routing_decisions ("
+            "run_id, runtime_profile_id, requested_task_class, "
+            "requested_backend_option_id, selected_backend_option_id, disposition, "
+            "reason_code, policy_revision, backend, provider, model, evidence_version, decided_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                accepted.run.run_id,
+                profile_id(101),
+                "coding",
+                "opencode:deepseek",
+                "opencode:deepseek",
+                "routed",
+                "configured_route_eligible",
+                1,
+                "opencode",
+                "deepseek",
+                "deepseek-chat",
+                1,
+                "2026-08-11T14:00:01Z",
+            ),
+        )
+        await store.connection.commit()
+        routing_policy = WorkshopRoutingPolicyService(
+            store,
+            object(),  # type: ignore[arg-type]
+            asyncio.Lock(),
+        )
+        client = await _open_client(
+            store,
+            _Authenticator({"alice-token": alice_id}),
+            routing_policy=routing_policy,
+        )
         response = None
         try:
             response = await client.get(
@@ -2794,6 +2826,19 @@ class TestWorkshopTimelineEventStreamHTTPContract:
                     "terminal_code": None,
                     "cancellation_requested_at": None,
                     "result_message_id": None,
+                },
+                "routing_decision": {
+                    "requested_task_class": "coding",
+                    "requested_backend_option_id": "opencode:deepseek",
+                    "selected_backend_option_id": "opencode:deepseek",
+                    "disposition": "routed",
+                    "reason_code": "configured_route_eligible",
+                    "policy_revision": 1,
+                    "backend": "opencode",
+                    "provider": "deepseek",
+                    "model": "deepseek-chat",
+                    "evidence_version": 1,
+                    "decided_at": "2026-08-11T14:00:01Z",
                 },
             }
         finally:

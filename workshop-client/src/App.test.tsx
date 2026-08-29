@@ -1953,6 +1953,19 @@ describe("Workshop React client", () => {
 
     const startedRun: WorkshopRun = {
       ...acceptedRun,
+      routingDecision: {
+        backend: "opencode",
+        decidedAt: "2026-08-13T09:00:00Z",
+        disposition: "routed",
+        evidenceVersion: 1,
+        model: "deepseek-chat",
+        policyRevision: 1,
+        provider: "deepseek",
+        reasonCode: "configured_route_eligible",
+        requestedBackendOptionId: "opencode:deepseek",
+        requestedTaskClass: "coding",
+        selectedBackendOptionId: "opencode:deepseek",
+      },
       startedAt: "2026-08-13T09:00:01Z",
       status: "started",
     };
@@ -1968,19 +1981,25 @@ describe("Workshop React client", () => {
       ),
     );
     expect(await screen.findByText("The agent is working on this request.")).toBeVisible();
+    expect(screen.getByText("Route: routed · coding · opencode:deepseek")).toBeVisible();
 
+    const completedRoutedRun: WorkshopRun = {
+      ...completedRun,
+      routingDecision: startedRun.routingDecision,
+    };
     act(() =>
       handlers?.onRunActivity(
         {
           eventPosition: 32,
           occurredAt: "2026-08-13T09:00:02Z",
-          run: completedRun,
+          run: completedRoutedRun,
           transition: "run.completed",
         },
         "32",
       ),
     );
     expect(await screen.findByText("The agent completed this request.")).toBeVisible();
+    expect(screen.getByText("Route: routed · coding · opencode:deepseek")).toBeVisible();
     expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
     expect(loadRun).not.toHaveBeenCalled();
   });
