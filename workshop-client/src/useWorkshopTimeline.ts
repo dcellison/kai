@@ -83,6 +83,7 @@ export function useWorkshopTimeline(
 ): {
   connection: ConnectionState;
   messages: TimelineMessage[];
+  threadMessages: TimelineMessage[];
   runActivity: WorkshopRunActivity | null;
   runPreview: WorkshopRunPreview | null;
   runTrace: WorkshopRunTraceSignal | null;
@@ -90,6 +91,7 @@ export function useWorkshopTimeline(
   loadEarlier: () => void;
 } {
   const [messages, setMessages] = useState<TimelineMessage[]>([]);
+  const [threadMessages, setThreadMessages] = useState<TimelineMessage[]>([]);
   const [runActivity, setRunActivity] = useState<WorkshopRunActivity | null>(null);
   const [runPreview, setRunPreview] = useState<WorkshopRunPreview | null>(null);
   const [runTrace, setRunTrace] = useState<WorkshopRunTraceSignal | null>(null);
@@ -154,6 +156,7 @@ export function useWorkshopTimeline(
       earlierLoadingRef.current = false;
       setEarlier({ available: false, loading: false, error: null });
       setMessages([]);
+      setThreadMessages([]);
       setRunActivity(null);
       setRunPreview(null);
       setRunTrace(null);
@@ -186,7 +189,8 @@ export function useWorkshopTimeline(
             knownMessageIds = new Set(
               snapshot.messages.map((message) => message.messageId),
             );
-            setMessages(snapshot.messages);
+            setMessages(snapshot.messages.filter((message) => message.threadRootId === null));
+            setThreadMessages([]);
             needsSnapshot = false;
             // Every snapshot starts a fresh backward-paging window; a
             // resynchronization deliberately collapses back to the tail,
@@ -232,7 +236,11 @@ export function useWorkshopTimeline(
                 if (message.authorKind === "agent") {
                   setRunPreview(null);
                 }
-                setMessages((current) => appendUnique(current, message));
+                if (message.threadRootId === null) {
+                  setMessages((current) => appendUnique(current, message));
+                } else {
+                  setThreadMessages((current) => appendUnique(current, message));
+                }
               },
               onRunActivity: (activity, eventId) => {
                 lastEventId = eventId;
@@ -305,5 +313,14 @@ export function useWorkshopTimeline(
     session,
   ]);
 
-  return { connection, messages, runActivity, runPreview, runTrace, earlier, loadEarlier };
+  return {
+    connection,
+    messages,
+    threadMessages,
+    runActivity,
+    runPreview,
+    runTrace,
+    earlier,
+    loadEarlier,
+  };
 }

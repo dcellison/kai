@@ -29,6 +29,7 @@ import {
   loadPreferenceHistory,
   loadRun,
   loadTimeline,
+  loadThreadTimeline,
   loadWorkspaceConfig,
   moveMemoriesScope,
   moveMemoryScope,
@@ -65,8 +66,12 @@ function message(position: number, body = `Message ${position}`): Record<string,
     channel_id: channelId,
     created_at: "2026-08-13T09:00:00Z",
     event_position: position,
+    latest_reply_at: null,
     message_id: `msg_${position.toString().padStart(32, "0")}`,
     mentions: [],
+    reply_count: 0,
+    reply_to_message_id: null,
+    thread_root_id: null,
   };
 }
 
@@ -398,6 +403,50 @@ describe("Workshop client API", () => {
     expect(new Headers(options.headers).get("Authorization")).toBe(
       "Bearer session-secret",
     );
+  });
+
+  it("loads a root-bound thread page and submits a canonical thread reply", async () => {
+    const rootId = "msg_00000000000000000000000000000010";
+    const reply = {
+      ...message(11, "Thread reply"),
+      reply_to_message_id: rootId,
+      thread_root_id: rootId,
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        Response.json({
+          version: 1,
+          channel_id: channelId,
+          thread_root_id: rootId,
+          root: { ...message(10, "Root"), reply_count: 1 },
+          messages: [reply],
+          next_cursor: null,
+          through_position: 11,
+        }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({
+          version: 3,
+          acceptance: "newly_accepted",
+          message_id: "msg_00000000000000000000000000000012",
+          runs: [],
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const page = await loadThreadTimeline(session, rootId);
+    expect(page.root.replyCount).toBe(1);
+    expect(page.messages[0].threadRootId).toBe(rootId);
+    await submitCommand(session, "thread-reply", "Continue", null, rootId);
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      `/v1/channels/${channelId}/commands`,
+    );
+    expect(JSON.parse((fetchMock.mock.calls[1]?.[1] as RequestInit).body as string)).toEqual({
+      body: "Continue",
+      client_message_id: "thread-reply",
+      thread_root_id: rootId,
+    });
   });
 
   it("accepts canonical mention spans without reparsing display names", async () => {

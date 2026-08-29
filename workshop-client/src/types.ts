@@ -3,6 +3,7 @@ export const AGENT_PATTERN = /^agt_[0-9a-f]{32}$/;
 export const PRINCIPAL_PATTERN = /^prn_[0-9a-f]{32}$/;
 export const WORKSHOP_PATTERN = /^wsp_[0-9a-f]{32}$/;
 export const ARTIFACT_PATTERN = /^art_[0-9a-f]{32}$/;
+export const MESSAGE_PATTERN = /^msg_[0-9a-f]{32}$/;
 
 export interface WorkshopSession {
   channelId: string;
@@ -421,6 +422,10 @@ export interface TimelineMessage {
   eventPosition: number;
   mentions: WorkshopMessageMention[];
   messageId: string;
+  replyCount: number;
+  replyToMessageId: string | null;
+  latestReplyAt: string | null;
+  threadRootId: string | null;
 }
 
 export interface WorkshopMessageMention {
@@ -448,6 +453,13 @@ export interface TimelineSnapshot {
   // Walks history older than this page; null when the page reaches the
   // start of the channel.
   previousCursor: string | null;
+}
+
+export interface ThreadTimelineSnapshot {
+  messages: TimelineMessage[];
+  nextCursor: string | null;
+  root: TimelineMessage;
+  throughPosition: number;
 }
 
 export interface CommandSubmissionResult {

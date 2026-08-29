@@ -2,6 +2,7 @@ import type {
   CommandSubmissionResult,
   TimelineMessage,
   TimelineSnapshot,
+  ThreadTimelineSnapshot,
   WorkshopRun,
   WorkshopRunActivity,
   WorkshopRunPreview,
@@ -46,6 +47,7 @@ import type {
   WorkshopArtifactKind,
   WorkshopArtifactSummary,
 } from "./types";
+import { MESSAGE_PATTERN } from "./types";
 import { isWorkshopThemeId } from "./theme";
 import {
   AGENT_PATTERN,
@@ -170,7 +172,11 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
     channel_id: messageChannelId,
     created_at: createdAt,
     event_position: eventPosition,
+    latest_reply_at: latestReplyAt,
     message_id: messageId,
+    reply_count: replyCount,
+    reply_to_message_id: replyToMessageId,
+    thread_root_id: threadRootId,
     mentions: suppliedMentions,
     artifacts: suppliedArtifacts,
   } = value;
@@ -185,6 +191,14 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
     typeof createdAt !== "string" ||
     !Number.isSafeInteger(eventPosition) ||
     typeof messageId !== "string" ||
+    !MESSAGE_PATTERN.test(messageId) ||
+    !Number.isSafeInteger(replyCount) ||
+    (replyCount as number) < 0 ||
+    (replyToMessageId !== null &&
+      (typeof replyToMessageId !== "string" || !MESSAGE_PATTERN.test(replyToMessageId))) ||
+    (threadRootId !== null &&
+      (typeof threadRootId !== "string" || !MESSAGE_PATTERN.test(threadRootId))) ||
+    (latestReplyAt !== null && typeof latestReplyAt !== "string") ||
     !Array.isArray(suppliedMentions) ||
     !Array.isArray(rawArtifacts)
   ) {
@@ -267,6 +281,10 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
     eventPosition: eventPosition as number,
     mentions,
     messageId,
+    replyCount: replyCount as number,
+    replyToMessageId,
+    latestReplyAt,
+    threadRootId,
   };
 }
 
@@ -2194,7 +2212,14 @@ export async function submitCommand(
   clientMessageId: string,
   body: string,
   artifact: File | null = null,
+  threadRootId: string | null = null,
 ): Promise<CommandSubmissionResult> {
+  if (threadRootId !== null && !MESSAGE_PATTERN.test(threadRootId)) {
+    throw new Error("Invalid thread identity.");
+  }
+  if (artifact && threadRootId) {
+    throw new Error("Thread attachments are not available yet.");
+  }
   const request = artifact
     ? (() => {
         const form = new FormData();
@@ -2206,7 +2231,11 @@ export async function submitCommand(
     : {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ body, client_message_id: clientMessageId }),
+        body: JSON.stringify({
+          body,
+          client_message_id: clientMessageId,
+          ...(threadRootId ? { thread_root_id: threadRootId } : {}),
+        }),
       };
   const response = await authorizedFetch(
     session,
@@ -2447,6 +2476,49 @@ export async function loadEarlierTimeline(
     throw new Error("The timeline snapshot changed while it was loading.");
   }
   return page;
+}
+
+export async function loadThreadTimeline(
+  session: WorkshopSession,
+  rootMessageId: string,
+  cursor: string | null = null,
+  signal?: AbortSignal,
+): Promise<ThreadTimelineSnapshot> {
+  if (!MESSAGE_PATTERN.test(rootMessageId)) {
+    throw new Error("Invalid thread identity.");
+  }
+  const query = new URLSearchParams({ limit: "100" });
+  if (cursor) {
+    query.set("cursor", cursor);
+  }
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/threads/${encodeURIComponent(rootMessageId)}?${query}`,
+    { signal },
+  );
+  const payload = await responsePayload(response);
+  if (
+    !response.ok ||
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    payload.channel_id !== session.channelId ||
+    payload.thread_root_id !== rootMessageId ||
+    !Array.isArray(payload.messages) ||
+    !Number.isSafeInteger(payload.through_position)
+  ) {
+    throw new Error(safeErrorMessage(payload, "Could not load this thread."));
+  }
+  const root = parseMessage(payload.root, session.channelId);
+  const messages = payload.messages.map((raw) => parseMessage(raw, session.channelId));
+  if (!root || messages.some((message) => message === null)) {
+    throw new Error("Kai returned an unsupported thread response.");
+  }
+  return {
+    root,
+    messages: messages as TimelineMessage[],
+    nextCursor: typeof payload.next_cursor === "string" ? payload.next_cursor : null,
+    throughPosition: payload.through_position as number,
+  };
 }
 
 export class EventStreamDecoder {

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 42
+WORKSHOP_SCHEMA_VERSION = 43
 
 
 @dataclass(frozen=True, slots=True)
@@ -2100,6 +2100,16 @@ _GROUP_WAKE_POLICY_SCHEMA = SchemaMigration(
     ),
 )
 
+_MESSAGE_THREADS_SCHEMA = SchemaMigration(
+    version=43,
+    name="canonical_message_threads",
+    statements=(
+        "ALTER TABLE messages ADD COLUMN thread_root_id TEXT REFERENCES messages(id) ON DELETE CASCADE",
+        "CREATE INDEX messages_channel_thread_position_idx ON messages "
+        "(channel_id, thread_root_id, created_event_position)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2143,6 +2153,7 @@ _MIGRATIONS = (
     _REUSABLE_GROUP_RUNTIME_ASSIGNMENT_SCHEMA,
     _MESSAGE_MENTIONS_SCHEMA,
     _GROUP_WAKE_POLICY_SCHEMA,
+    _MESSAGE_THREADS_SCHEMA,
 )
 
 

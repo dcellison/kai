@@ -334,6 +334,24 @@ class TestWorkshopTelegramDeliveryAdapter:
             text="Workshop Human via Workshop:\nHello from the browser",
         )
 
+    async def test_thread_activity_is_flattened_as_ordered_ordinary_telegram_messages(self):
+        bot = _successful_bot(1001, 1002)
+        adapter = WorkshopTelegramDeliveryAdapter(bot)
+        human = _claim(mode=WORKSHOP_CLIENT_TEXT_MODE, body="Human thread reply")
+        agent = _claim(body="Agent thread reply")
+
+        await adapter.deliver_fragment(
+            human,
+            _fragment(human, body="Workshop Human via Workshop:\nHuman thread reply"),
+        )
+        await adapter.deliver_fragment(agent, _fragment(agent))
+
+        assert [call.kwargs["text"] for call in bot.send_message.await_args_list] == [
+            "Workshop Human via Workshop:\nHuman thread reply",
+            "Agent thread reply",
+        ]
+        assert all(call.kwargs["chat_id"] == 101 for call in bot.send_message.await_args_list)
+
     async def test_send_only_adapter_rejects_edit_operation_without_calling_telegram(self):
         bot = _successful_bot()
         claim = _claim()

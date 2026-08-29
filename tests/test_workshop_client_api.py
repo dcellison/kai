@@ -27,6 +27,7 @@ from kai.workshop.bootstrap import (
     BootstrapNotificationChannel,
     bootstrap_default_workshop,
 )
+from kai.workshop.channel_lifecycle import WorkshopChannelLifecycleService
 from kai.workshop.client_api import (
     WorkshopEventStreamLimiter,
     register_workshop_command_routes,
@@ -66,7 +67,12 @@ from kai.workshop.github_settings import (
     WorkshopGitHubSettingsAccessDenied,
     WorkshopGitHubSettingsConflict,
 )
-from kai.workshop.inbound import ClientInboundMessage, InboundMessage, record_inbound_message
+from kai.workshop.inbound import (
+    ClientInboundMessage,
+    InboundMessage,
+    record_client_inbound_message_in_transaction,
+    record_inbound_message,
+)
 from kai.workshop.memory_queries import (
     MemoryCreationSnapshot,
     MemoryEditSnapshot,
@@ -649,6 +655,55 @@ async def _record_messages(store: WorkshopEventStore, count: int, *, start: int 
                 _NOW + timedelta(seconds=ordinal),
             ),
         )
+
+
+async def _create_group_channel(
+    store: WorkshopEventStore,
+    principal_id: PrincipalId,
+    direct_channel_id: ChannelId,
+) -> ChannelId:
+    async with store.connection.execute(
+        "SELECT agent_id FROM channel_agents WHERE channel_id = ?",
+        (direct_channel_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    created = await WorkshopChannelLifecycleService(store).create_group(
+        principal_id,
+        name="Thread API",
+        agent_ids=[AgentId(str(row[0]))],
+        origin_channel_id=direct_channel_id,
+    )
+    return created.channel_id
+
+
+async def _record_client_message(
+    store: WorkshopEventStore,
+    principal_id: PrincipalId,
+    channel_id: ChannelId,
+    client_message_id: str,
+    body: str,
+    *,
+    thread_root_id: MessageId | None = None,
+) -> MessageId:
+    await store.connection.execute("BEGIN IMMEDIATE")
+    try:
+        result = await record_client_inbound_message_in_transaction(
+            store,
+            ClientInboundMessage(
+                principal_id,
+                channel_id,
+                client_message_id,
+                body,
+                _NOW,
+                thread_root_id=thread_root_id,
+            ),
+        )
+        await store.connection.commit()
+    except Exception:
+        await store.connection.rollback()
+        raise
+    return MessageId(str(result.event.envelope.aggregate_id))
 
 
 async def _open_client(
@@ -1855,6 +1910,34 @@ class TestWorkshopCommandHTTPContract:
             await client.close()
             await store.close()
 
+    async def test_group_reply_submission_carries_only_the_canonical_thread_root(self, tmp_path: Path):
+        store, alice_id, alice_direct, _, _ = await _open_store(tmp_path / "kai.db")
+        channel_id = await _create_group_channel(store, alice_id, alice_direct)
+        root_id = await _record_client_message(store, alice_id, channel_id, "root", "Root")
+        submitter = _CommandSubmitter()
+        client = await _open_command_client(
+            store,
+            _Authenticator({"alice-token": alice_id}),
+            submitter,
+        )
+        try:
+            response = await client.post(
+                f"/v1/channels/{channel_id}/commands",
+                headers={"Authorization": "Bearer alice-token"},
+                json={
+                    "client_message_id": "thread-reply-1",
+                    "body": "Reply in thread",
+                    "thread_root_id": root_id,
+                },
+            )
+            assert response.status == 202
+            assert len(submitter.messages) == 1
+            assert submitter.messages[0].thread_root_id == root_id
+            assert submitter.messages[0].channel_id == channel_id
+        finally:
+            await client.close()
+            await store.close()
+
     async def test_notification_channel_rejects_command_submission(self, tmp_path: Path):
         store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
         async with store.connection.execute(
@@ -2150,9 +2233,12 @@ class TestWorkshopTimelineHTTPContract:
                         "author_kind": "human",
                         "author_display_name": "Alice",
                         "reply_to_message_id": None,
+                        "thread_root_id": None,
                         "body": "Message 1",
                         "event_position": payload["messages"][0]["event_position"],
                         "created_at": "2026-08-11T14:00:01Z",
+                        "reply_count": 0,
+                        "latest_reply_at": None,
                         "mentions": [],
                         "artifacts": [],
                     }
@@ -2324,6 +2410,90 @@ class TestWorkshopTimelineHTTPContract:
             await store.close()
 
 
+class TestWorkshopThreadTimelineHTTPContract:
+    async def test_pages_one_authorized_thread_and_keeps_channel_timeline_top_level(self, tmp_path: Path):
+        store, alice_id, alice_direct, _, _ = await _open_store(tmp_path / "kai.db")
+        channel_id = await _create_group_channel(store, alice_id, alice_direct)
+        root_id = await _record_client_message(store, alice_id, channel_id, "root", "Root")
+        await _record_client_message(
+            store,
+            alice_id,
+            channel_id,
+            "reply-1",
+            "First reply",
+            thread_root_id=root_id,
+        )
+        await _record_client_message(
+            store,
+            alice_id,
+            channel_id,
+            "reply-2",
+            "Second reply",
+            thread_root_id=root_id,
+        )
+        client = await _open_client(store, _Authenticator({"alice": alice_id}))
+        try:
+            headers = {"Authorization": "Bearer alice"}
+            channel_response = await client.get(f"/v1/channels/{channel_id}/timeline", headers=headers)
+            first_response = await client.get(
+                f"/v1/channels/{channel_id}/threads/{root_id}?limit=1",
+                headers=headers,
+            )
+            first = await first_response.json()
+            second_response = await client.get(
+                f"/v1/channels/{channel_id}/threads/{root_id}?limit=1&cursor={first['next_cursor']}",
+                headers=headers,
+            )
+            second = await second_response.json()
+
+            channel_payload = await channel_response.json()
+            assert channel_response.status == first_response.status == second_response.status == 200
+            assert [message["body"] for message in channel_payload["messages"]] == ["Root"]
+            assert channel_payload["messages"][0]["reply_count"] == 2
+            assert first["thread_root_id"] == root_id
+            assert first["root"]["body"] == "Root"
+            assert [message["body"] for message in first["messages"]] == ["First reply"]
+            assert first["next_cursor"] is not None
+            assert [message["body"] for message in second["messages"]] == ["Second reply"]
+            assert second["messages"][0]["thread_root_id"] == root_id
+            assert second["next_cursor"] is None
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_denies_cross_principal_unknown_and_foreign_roots_without_leaking_state(self, tmp_path: Path):
+        store, alice_id, alice_direct, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        channel_id = await _create_group_channel(store, alice_id, alice_direct)
+        root_id = await _record_client_message(store, alice_id, channel_id, "root", "Root")
+        client = await _open_client(
+            store,
+            _Authenticator({"alice": alice_id, "bob": bob_id}),
+        )
+        try:
+            denied = await client.get(
+                f"/v1/channels/{channel_id}/threads/{root_id}",
+                headers={"Authorization": "Bearer bob"},
+            )
+            unknown = await client.get(
+                f"/v1/channels/{channel_id}/threads/{MessageId.new()}",
+                headers={"Authorization": "Bearer alice"},
+            )
+            invalid = await client.get(
+                f"/v1/channels/{channel_id}/threads/{root_id}?chat_id=101",
+                headers={"Authorization": "Bearer alice"},
+            )
+            assert denied.status == unknown.status == 403
+            assert (
+                await denied.json()
+                == await unknown.json()
+                == {"error": {"code": "access_denied", "message": "Access denied"}}
+            )
+            assert invalid.status == 400
+        finally:
+            await client.close()
+            await store.close()
+
+
 class TestWorkshopTimelineEventStreamHTTPContract:
     async def test_run_activity_is_private_even_when_channel_read_is_allowed(self, tmp_path: Path):
         store, alice_id, alice_channel, bob_id, _ = await _open_store(tmp_path / "kai.db")
@@ -2470,9 +2640,12 @@ class TestWorkshopTimelineEventStreamHTTPContract:
                     "author_kind": "human",
                     "author_display_name": "Alice",
                     "reply_to_message_id": None,
+                    "thread_root_id": None,
                     "body": "Message 1",
                     "event_position": int(str(first["id"])),
                     "created_at": "2026-08-11T14:00:01Z",
+                    "reply_count": 0,
+                    "latest_reply_at": None,
                     "mentions": [],
                     "artifacts": [],
                 },

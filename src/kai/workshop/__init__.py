@@ -91,6 +91,7 @@ from kai.workshop.store import (
 )
 from kai.workshop.timeline import (
     ChannelTimelineAuthorizer,
+    ThreadTimelinePage,
     TimelineAccessDeniedError,
     TimelineCursorError,
     TimelineMessage,
@@ -99,6 +100,7 @@ from kai.workshop.timeline import (
     TimelineUpdateBatch,
     read_channel_timeline,
     read_channel_timeline_updates,
+    read_thread_timeline,
 )
 
 __all__ = [
@@ -162,6 +164,7 @@ __all__ = [
     "RedeemedWorkshopClient",
     "StaleDeliveryLeaseError",
     "StoredEvent",
+    "ThreadTimelinePage",
     "TimelineAccessDeniedError",
     "TimelineCursorError",
     "TimelineMessage",
@@ -183,6 +186,7 @@ __all__ = [
     "WorkshopMembershipId",
     "read_channel_timeline",
     "read_channel_timeline_updates",
+    "read_thread_timeline",
     "record_inbound_artifact",
     "register_workshop_enrollment_routes",
     "register_workshop_read_routes",

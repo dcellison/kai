@@ -24,6 +24,7 @@ import {
   loadRunTrace,
   loadSettingsWorkspace,
   loadTimeline,
+  loadThreadTimeline,
   loadWorkspaceConfig,
   redeemEnrollment,
   streamTimeline,
@@ -58,6 +59,7 @@ vi.mock("./api", async (importOriginal) => {
     loadPreferenceDocument: vi.fn(),
     loadPreferenceHistory: vi.fn(),
     loadTimeline: vi.fn(),
+    loadThreadTimeline: vi.fn(),
     loadRun: vi.fn(),
     loadRunTrace: vi.fn(),
     loadSettingsWorkspace: vi.fn(),
@@ -193,6 +195,10 @@ const historyMessage: TimelineMessage = {
   eventPosition: 25,
   mentions: [],
   messageId: "msg_00000000000000000000000000000025",
+  replyCount: 0,
+  replyToMessageId: null,
+  latestReplyAt: null,
+  threadRootId: null,
 };
 const memoryRecord: WorkshopMemoryRecord = {
   confidence: 1,
@@ -1425,6 +1431,57 @@ describe("Workshop React client", () => {
     );
   });
 
+  it("opens a group-message thread and submits replies against its canonical root", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId: secondChannelId, token: "existing-session" }),
+    );
+    const root = {
+      ...historyMessage,
+      channelId: secondChannelId,
+      replyCount: 1,
+      latestReplyAt: "2026-08-13T09:01:00Z",
+    };
+    const reply = {
+      ...historyMessage,
+      body: "Existing thread reply",
+      channelId: secondChannelId,
+      eventPosition: 26,
+      messageId: "msg_00000000000000000000000000000026",
+      replyToMessageId: root.messageId,
+      threadRootId: root.messageId,
+    };
+    vi.mocked(loadNavigation).mockResolvedValue(navigationWithGroup());
+    vi.mocked(loadTimeline).mockResolvedValue({
+      messages: [root],
+      throughPosition: 26,
+      previousCursor: null,
+    });
+    vi.mocked(loadThreadTimeline).mockResolvedValue({
+      root,
+      messages: [reply],
+      nextCursor: null,
+      throughPosition: 26,
+    });
+
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: /1 reply/ }));
+    const context = screen.getByLabelText("Channel context");
+    expect(await within(context).findByText("Existing thread reply")).toBeVisible();
+    const composer = within(context).getByLabelText("Reply in Wake policy qualification");
+    await user.type(composer, "@Kai continue here{Enter}");
+
+    await waitFor(() => expect(submitCommand).toHaveBeenCalledOnce());
+    expect(submitCommand).toHaveBeenCalledWith(
+      { channelId: secondChannelId, token: "existing-session" },
+      expect.stringMatching(/^browser-/),
+      "@Kai continue here",
+      null,
+      root.messageId,
+    );
+  });
+
   it("shows and dismisses authoritative agent engagement", async () => {
     const user = userEvent.setup();
     sessionStorage.setItem(
@@ -1583,6 +1640,7 @@ describe("Workshop React client", () => {
       "browser-2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a",
       "Hello from Workshop",
       null,
+      null,
     ]);
     expect(vi.mocked(submitCommand).mock.calls[1]).toEqual(
       vi.mocked(submitCommand).mock.calls[0],
@@ -1625,6 +1683,7 @@ describe("Workshop React client", () => {
       "browser-3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b",
       "",
       artifact,
+      null,
     );
     expect(screen.queryByText("notes.txt")).toBeNull();
   });
