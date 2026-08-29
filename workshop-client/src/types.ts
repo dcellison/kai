@@ -484,10 +484,25 @@ export interface TimelineMessage {
   eventPosition: number;
   mentions: WorkshopMessageMention[];
   messageId: string;
+  reactions: WorkshopMessageReaction[];
   replyCount: number;
   replyToMessageId: string | null;
   latestReplyAt: string | null;
   threadRootId: string | null;
+}
+
+export type WorkshopReaction =
+  | "thumbs_up"
+  | "heart"
+  | "laugh"
+  | "celebrate"
+  | "eyes"
+  | "check";
+
+export interface WorkshopMessageReaction {
+  count: number;
+  reactedByViewer: boolean;
+  reaction: WorkshopReaction;
 }
 
 export interface WorkshopMessageMention {

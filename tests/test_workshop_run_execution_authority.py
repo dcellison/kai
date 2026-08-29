@@ -391,7 +391,7 @@ class TestRunExecutionRecovery:
 
             checkpoint = await store.rebuild_projection(CanonicalConversationProjection())
 
-            assert checkpoint.version == 10
+            assert checkpoint.version == 11
             assert (await authority.attempt(started.claim.attempt_id)).status == RunAttemptStatus.STARTED
             assert (await WorkshopRunLifecycle(store).state(accepted.run.run_id)).status == RunStatus.STARTED
         finally:
@@ -411,7 +411,7 @@ class TestRunExecutionMigration:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 44
+            assert await upgraded.schema_version() == 45
             assert "run_attempts" in await upgraded.schema_tables()
             async with upgraded.connection.execute("PRAGMA table_info(runs)") as cursor:
                 columns = {str(row[1]) for row in await cursor.fetchall()}

@@ -28,6 +28,7 @@ import {
   loadWorkspaceConfig,
   redeemEnrollment,
   streamTimeline,
+  setMessageReaction,
   submitCommand,
   switchWorkspace,
 } from "./api";
@@ -66,6 +67,7 @@ vi.mock("./api", async (importOriginal) => {
     loadWorkspaceConfig: vi.fn(),
     redeemEnrollment: vi.fn(),
     streamTimeline: vi.fn(),
+    setMessageReaction: vi.fn(),
     submitCommand: vi.fn(),
     switchWorkspace: vi.fn(),
   };
@@ -195,6 +197,7 @@ const historyMessage: TimelineMessage = {
   eventPosition: 25,
   mentions: [],
   messageId: "msg_00000000000000000000000000000025",
+  reactions: [],
   replyCount: 0,
   replyToMessageId: null,
   latestReplyAt: null,
@@ -326,6 +329,7 @@ describe("Workshop React client", () => {
     vi.mocked(redeemEnrollment).mockResolvedValue("redeemed-session-token");
     vi.mocked(createChannel).mockResolvedValue(secondChannelId);
     vi.mocked(dismissChannelAgent).mockResolvedValue(undefined);
+    vi.mocked(setMessageReaction).mockResolvedValue([]);
     vi.mocked(loadNavigation).mockResolvedValue(navigation);
     vi.mocked(loadAppearancePreferences).mockResolvedValue({
       mutation: null,
@@ -1496,7 +1500,7 @@ describe("Workshop React client", () => {
       name: "Open thread with 1 reply",
     });
     expect(threadButton).toHaveTextContent("1 reply");
-    expect(threadButton.querySelector("svg")).not.toBeNull();
+    expect(threadButton.querySelector("svg")).toBeNull();
     await user.click(threadButton);
     const context = screen.getByLabelText("Channel context");
     expect(await within(context).findByText("Existing thread reply")).toBeVisible();
@@ -1537,6 +1541,58 @@ describe("Workshop React client", () => {
     });
     expect(replyButton).toHaveTextContent("");
     expect(replyButton.querySelector("svg")).not.toBeNull();
+  });
+
+  it("offers monochrome hover actions and toggles a canonical reaction", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId: secondChannelId, token: "existing-session" }),
+    );
+    vi.mocked(loadNavigation).mockResolvedValue(navigationWithGroup());
+    vi.mocked(loadTimeline).mockResolvedValue({
+      messages: [{ ...historyMessage, channelId: secondChannelId }],
+      throughPosition: 25,
+      previousCursor: null,
+    });
+    vi.mocked(setMessageReaction).mockResolvedValueOnce([
+      { count: 1, reactedByViewer: true, reaction: "eyes" },
+    ]).mockResolvedValueOnce([]);
+
+    render(<App />);
+    const actions = await screen.findByRole("group", {
+      name: "Actions for message from Kai",
+    });
+    const reactionAction = within(actions).getByRole("button", {
+      name: "Add reaction",
+    });
+    const replyAction = within(actions).getByRole("button", {
+      name: "Reply to message",
+    });
+    expect(reactionAction.querySelector("svg")).not.toBeNull();
+    expect(replyAction.querySelector("svg")).not.toBeNull();
+
+    await user.click(reactionAction);
+    await user.click(screen.getByRole("menuitemcheckbox", {
+      name: "Add Eyes reaction",
+    }));
+    expect(setMessageReaction).toHaveBeenLastCalledWith(
+      { channelId: secondChannelId, token: "existing-session" },
+      historyMessage.messageId,
+      "eyes",
+      true,
+    );
+
+    const reactionChip = await screen.findByRole("button", {
+      name: "Eyes: 1. Remove your reaction",
+    });
+    await user.click(reactionChip);
+    expect(setMessageReaction).toHaveBeenLastCalledWith(
+      { channelId: secondChannelId, token: "existing-session" },
+      historyMessage.messageId,
+      "eyes",
+      false,
+    );
   });
 
   it("shows and dismisses authoritative agent engagement", async () => {

@@ -921,11 +921,17 @@ button:disabled {
 }
 
 .message-row {
+  position: relative;
   display: grid;
   grid-template-columns: 2.15rem minmax(0, 1fr);
   gap: 0.85rem;
   padding: 1.15rem 1.6rem 1.25rem;
   border-bottom: 1px solid var(--color-border);
+}
+
+.message-row > article {
+  position: relative;
+  min-width: 0;
 }
 
 .message-row.agent {
@@ -1020,6 +1026,128 @@ button:disabled {
   white-space: nowrap;
 }
 
+.message-actions {
+  position: absolute;
+  z-index: 4;
+  top: -0.75rem;
+  right: 0;
+  display: flex;
+  align-items: center;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.42rem;
+  padding: 0.12rem;
+  background: var(--color-panel);
+  box-shadow: 0 0.3rem 1rem color-mix(in srgb, var(--color-shadow-base) 42%, transparent);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-0.2rem);
+  transition: opacity 110ms ease, transform 110ms ease;
+}
+
+.message-row:hover .message-actions,
+.message-row:focus-within .message-actions {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
+}
+
+.message-action-button,
+.reaction-picker button {
+  display: grid;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  border: 0;
+  border-radius: 0.3rem;
+  padding: 0;
+  background: transparent;
+  color: var(--color-text-muted);
+  cursor: pointer;
+}
+
+.message-action-button:hover,
+.message-action-button:focus-visible,
+.reaction-picker button:hover,
+.reaction-picker button:focus-visible {
+  background: color-mix(in srgb, var(--color-text) 8%, transparent);
+  color: var(--color-text);
+  outline: none;
+}
+
+.message-action-button svg {
+  width: 1.05rem;
+  height: 1.05rem;
+}
+
+.reaction-picker-anchor {
+  position: relative;
+}
+
+.reaction-picker {
+  position: absolute;
+  z-index: 6;
+  top: calc(100% + 0.35rem);
+  right: 0;
+  display: flex;
+  gap: 0.1rem;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.42rem;
+  padding: 0.2rem;
+  background: var(--color-panel);
+  box-shadow: 0 0.4rem 1.2rem color-mix(in srgb, var(--color-shadow-base) 48%, transparent);
+}
+
+.reaction-picker button {
+  color: var(--color-text);
+  font-size: 1rem;
+  filter: grayscale(1);
+}
+
+.reaction-picker button[aria-checked="true"] {
+  background: color-mix(in srgb, var(--color-accent) 14%, transparent);
+  color: var(--color-accent);
+}
+
+.message-reactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.65rem;
+}
+
+.message-reactions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  min-height: 1.7rem;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 999px;
+  padding: 0.12rem 0.52rem;
+  background: color-mix(in srgb, var(--color-panel) 80%, transparent);
+  color: var(--color-text-muted);
+  font: 650 0.68rem var(--sans);
+  cursor: pointer;
+}
+
+.message-reactions button span:first-child {
+  filter: grayscale(1);
+}
+
+.message-reactions button:hover,
+.message-reactions button:focus-visible,
+.message-reactions button.active {
+  border-color: color-mix(in srgb, var(--color-accent) 52%, var(--color-border-strong));
+  background: color-mix(in srgb, var(--color-accent) 12%, transparent);
+  color: var(--color-accent);
+  outline: none;
+}
+
+.reaction-error {
+  margin: 0.45rem 0 0;
+  color: var(--color-danger);
+  font-size: 0.68rem;
+}
+
 .thread-summary {
   display: flex;
   align-items: center;
@@ -1048,6 +1176,17 @@ button:disabled {
 .thread-summary svg {
   width: 1rem;
   height: 1rem;
+}
+
+@media (hover: none) {
+  .message-actions {
+    position: static;
+    float: right;
+    margin-top: 0.45rem;
+    opacity: 1;
+    pointer-events: auto;
+    transform: none;
+  }
 }
 
 .thread-summary span {

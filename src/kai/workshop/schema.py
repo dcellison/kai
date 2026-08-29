@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 44
+WORKSHOP_SCHEMA_VERSION = 45
 
 
 @dataclass(frozen=True, slots=True)
@@ -2167,6 +2167,28 @@ _EXPLICIT_TASK_ROUTING_SCHEMA = SchemaMigration(
     ),
 )
 
+_MESSAGE_REACTIONS_SCHEMA = SchemaMigration(
+    version=45,
+    name="canonical_message_reactions",
+    statements=(
+        """
+        CREATE TABLE message_reactions (
+            message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+            principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+            reaction TEXT NOT NULL CHECK (
+                reaction IN ('thumbs_up', 'heart', 'laugh', 'celebrate', 'eyes', 'check')
+            ),
+            created_at TEXT NOT NULL,
+            created_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            PRIMARY KEY (message_id, principal_id, reaction)
+        )
+        """,
+        "CREATE INDEX message_reactions_message_idx ON message_reactions "
+        "(message_id, reaction, created_event_position)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2212,6 +2234,7 @@ _MIGRATIONS = (
     _GROUP_WAKE_POLICY_SCHEMA,
     _MESSAGE_THREADS_SCHEMA,
     _EXPLICIT_TASK_ROUTING_SCHEMA,
+    _MESSAGE_REACTIONS_SCHEMA,
 )
 
 

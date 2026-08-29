@@ -34,6 +34,8 @@ class WorkshopEventType(StrEnum):
     RUNTIME_PROFILE_ASSIGNED = "runtime_profile.assigned"
     RUNTIME_PROFILE_REASSIGNED = "runtime_profile.reassigned"
     MESSAGE_CREATED = "message.created"
+    MESSAGE_REACTION_ADDED = "message.reaction_added"
+    MESSAGE_REACTION_REMOVED = "message.reaction_removed"
     ARTIFACT_CREATED = "artifact.created"
     DELIVERY_REQUESTED = "delivery.requested"
     DELIVERY_SUCCEEDED = "delivery.succeeded"
@@ -159,6 +161,23 @@ class MessageMention:
             raise ValueError("start must be a non-negative integer")
         if not isinstance(self.length, int) or isinstance(self.length, bool) or self.length <= 1:
             raise ValueError("length must include @ and a non-empty display name")
+
+
+@dataclass(frozen=True, slots=True)
+class MessageReactionSummary:
+    """Aggregated reaction state for one message and viewing principal."""
+
+    reaction: str
+    count: int
+    reacted_by_viewer: bool
+
+    def __post_init__(self) -> None:
+        if not self.reaction:
+            raise ValueError("reaction must be non-empty")
+        if not isinstance(self.count, int) or isinstance(self.count, bool) or self.count < 1:
+            raise ValueError("count must be a positive integer")
+        if not isinstance(self.reacted_by_viewer, bool):
+            raise ValueError("reacted_by_viewer must be a boolean")
 
 
 class ArtifactId(OpaqueId):

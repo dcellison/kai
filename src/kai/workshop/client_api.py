@@ -11,7 +11,7 @@ import re
 import secrets
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
@@ -54,6 +54,7 @@ from kai.workshop.client_commands import (
 )
 from kai.workshop.client_events import (
     ClientChannelEventBatch,
+    ClientMessageReactionsEvent,
     ClientRunLifecycleEvent,
     ClientTimelineMessageEvent,
     read_client_channel_events,
@@ -70,7 +71,15 @@ from kai.workshop.client_preferences import (
 )
 from kai.workshop.client_sessions import EnrollmentGrantUnavailableError, WorkshopClientEnrollmentManager
 from kai.workshop.conversation_commands import ConversationCommandAcceptanceError
-from kai.workshop.domain import AgentId, ArtifactId, ChannelId, MessageId, PrincipalId, RunId
+from kai.workshop.domain import (
+    AgentId,
+    ArtifactId,
+    ChannelId,
+    MessageId,
+    MessageReactionSummary,
+    PrincipalId,
+    RunId,
+)
 from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.github_settings import (
     GitHubSettingsAuthority,
@@ -104,6 +113,11 @@ from kai.workshop.memory_queries import (
     WorkshopMemoryQueryService,
     WorkshopMemoryResponseTooLarge,
     WorkshopMemoryValidationError,
+)
+from kai.workshop.message_reactions import (
+    MessageReactionAccessDeniedError,
+    MessageReactionValidationError,
+    set_message_reaction,
 )
 from kai.workshop.model_catalogue import (
     ModelCatalogueAccessDenied,
@@ -183,6 +197,7 @@ from kai.workshop.wake_policy import (
 _TIMELINE_PATH = "/v1/channels/{channel_id}/timeline"
 _THREAD_TIMELINE_PATH = "/v1/channels/{channel_id}/threads/{root_message_id}"
 _TIMELINE_EVENTS_PATH = "/v1/channels/{channel_id}/events"
+_MESSAGE_REACTIONS_PATH = "/v1/channels/{channel_id}/messages/{message_id}/reactions"
 _CLIENT_NAVIGATION_PATH = "/v1/client/navigation"
 _CHANNEL_CREATION_PATH = "/v1/channels"
 _ENROLLMENT_REDEMPTION_PATH = "/v1/client/enrollment/redeem"
@@ -209,6 +224,7 @@ _CLIENT_PREFERENCES_PATH = "/v1/settings/clients"
 _APPEARANCE_PREFERENCES_PATH = "/v1/settings/appearance"
 _MAX_PREFERENCE_UPDATE_BODY_BYTES = MAX_PREFERENCE_BYTES * 6 + 1024
 _MAX_PREFERENCE_RESTORE_BODY_BYTES = 512
+_MAX_REACTION_BODY_BYTES = 256
 _MEMORY_STATS_PATH = "/v1/memory/stats"
 _MEMORY_RECORDS_PATH = "/v1/memory/records"
 _MEMORY_SEARCH_PATH = "/v1/memory/search"
@@ -2738,8 +2754,20 @@ def _serialize_message(message: TimelineMessage) -> dict[str, object]:
             }
             for mention in message.mentions
         ],
+        "reactions": _serialize_reactions(message.reactions),
         "artifacts": [_serialize_artifact(artifact) for artifact in message.artifacts],
     }
+
+
+def _serialize_reactions(reactions: Sequence[MessageReactionSummary]) -> list[dict[str, object]]:
+    return [
+        {
+            "reaction": reaction.reaction,
+            "count": reaction.count,
+            "reacted_by_viewer": reaction.reacted_by_viewer,
+        }
+        for reaction in reactions
+    ]
 
 
 def _serialize_artifact(artifact: ArtifactSummary) -> dict[str, object]:
@@ -3103,6 +3131,68 @@ async def _handle_channel_creation(
     return _json_response(_serialize_created_channel(created), status=201)
 
 
+async def _handle_message_reaction(
+    request: web.Request,
+    *,
+    store: WorkshopEventStore,
+    authenticator: WorkshopClientAuthenticator,
+    request_lock: asyncio.Lock,
+) -> web.Response:
+    """Set one reaction without accepting a caller-supplied identity."""
+    async with request_lock:
+        principal_id = await authenticator.authenticate(request)
+        if not isinstance(principal_id, PrincipalId):
+            response = _error_response(
+                status=401,
+                code="authentication_required",
+                message="Authentication required",
+            )
+            response.headers["WWW-Authenticate"] = "Bearer"
+            return response
+        if (
+            request.query
+            or request.content_type != "application/json"
+            or (request.content_length is not None and request.content_length > _MAX_REACTION_BODY_BYTES)
+        ):
+            return _error_response(status=400, code="invalid_request", message="Invalid reaction request")
+        raw = await request.content.read(_MAX_REACTION_BODY_BYTES + 1)
+        if len(raw) > _MAX_REACTION_BODY_BYTES:
+            return _error_response(status=400, code="invalid_request", message="Invalid reaction request")
+        try:
+            payload = json.loads(raw)
+        except (UnicodeDecodeError, ValueError):
+            payload = None
+        if not isinstance(payload, dict) or set(payload) != {"reaction", "active"}:
+            return _error_response(status=400, code="invalid_request", message="Invalid reaction request")
+        try:
+            channel_id = ChannelId(request.match_info["channel_id"])
+            message_id = MessageId(request.match_info["message_id"])
+            result = await set_message_reaction(
+                store,
+                principal_id=principal_id,
+                channel_id=channel_id,
+                message_id=message_id,
+                reaction=payload["reaction"],
+                active=payload["active"],
+            )
+        except MessageReactionAccessDeniedError:
+            return _error_response(status=403, code="access_denied", message="Access denied")
+        except (MessageReactionValidationError, TypeError, ValueError):
+            return _error_response(status=400, code="invalid_request", message="Invalid reaction request")
+    return _json_response(
+        {
+            "version": 1,
+            "message_id": str(result.message_id),
+            "reaction": result.reaction,
+            "active": result.active,
+            "changed": result.changed,
+            "event_position": result.event_position,
+            "reactions": _serialize_reactions(result.reactions),
+        },
+        status=200,
+    )
+
+
 async def _handle_channel_timeline(
     request: web.Request,
     *,
@@ -3210,6 +3300,21 @@ def _serialize_timeline_event(message: TimelineMessage) -> bytes:
         sort_keys=True,
     )
     return (f"id: {message.event_position}\nevent: timeline.message.created\ndata: {payload}\n\n").encode()
+
+
+def _serialize_message_reactions_event(event: ClientMessageReactionsEvent) -> bytes:
+    payload = json.dumps(
+        {
+            "version": 1,
+            "channel_id": str(event.channel_id),
+            "message_id": str(event.message_id),
+            "reactions": _serialize_reactions(event.reactions),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return (f"id: {event.event_position}\nevent: timeline.message.reactions_changed\ndata: {payload}\n\n").encode()
 
 
 def _serialize_run_lifecycle_event(
@@ -3444,6 +3549,8 @@ async def _handle_channel_event_stream(
                 for event in batch.events:
                     if isinstance(event, ClientTimelineMessageEvent):
                         await response.write(_serialize_timeline_event(event.message))
+                    elif isinstance(event, ClientMessageReactionsEvent):
+                        await response.write(_serialize_message_reactions_event(event))
                     else:
                         decision = (
                             await routing_policy.load_decision(event.run.run_id) if routing_policy is not None else None
@@ -4158,11 +4265,20 @@ def register_workshop_read_routes(
             routing_policy=routing_policy,
         )
 
+    async def handle_message_reaction(request: web.Request) -> web.Response:
+        return await _handle_message_reaction(
+            request,
+            store=store,
+            authenticator=authenticator,
+            request_lock=request_lock,
+        )
+
     app.router.add_get(_CLIENT_NAVIGATION_PATH, handle_client_navigation)
     app.router.add_post(_CHANNEL_CREATION_PATH, handle_channel_creation)
     app.router.add_get(_TIMELINE_PATH, handle_channel_timeline)
     app.router.add_get(_THREAD_TIMELINE_PATH, handle_thread_timeline)
     app.router.add_get(_TIMELINE_EVENTS_PATH, handle_channel_event_stream)
+    app.router.add_put(_MESSAGE_REACTIONS_PATH, handle_message_reaction)
     if preference_documents is not None:
 
         async def handle_preference_document(request: web.Request) -> web.Response:

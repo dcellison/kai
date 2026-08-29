@@ -6,7 +6,15 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from kai.workshop.artifacts import artifacts_for_messages
-from kai.workshop.domain import ChannelId, MessageId, PrincipalId, RunId, WorkshopEventType
+from kai.workshop.domain import (
+    ChannelId,
+    MessageId,
+    MessageReactionSummary,
+    PrincipalId,
+    RunId,
+    WorkshopEventType,
+)
+from kai.workshop.message_reactions import load_message_reactions
 from kai.workshop.run_lifecycle import DurableRun, load_durable_run
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.timeline import (
@@ -28,6 +36,10 @@ _RUN_EVENT_TYPES = (
     WorkshopEventType.RUN_FAILED,
     WorkshopEventType.RUN_CANCELLED,
 )
+_REACTION_EVENT_TYPES = (
+    WorkshopEventType.MESSAGE_REACTION_ADDED,
+    WorkshopEventType.MESSAGE_REACTION_REMOVED,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,7 +59,15 @@ class ClientRunLifecycleEvent:
     occurred_at: datetime
 
 
-type ClientChannelEvent = ClientTimelineMessageEvent | ClientRunLifecycleEvent
+@dataclass(frozen=True, slots=True)
+class ClientMessageReactionsEvent:
+    channel_id: ChannelId
+    message_id: MessageId
+    reactions: tuple[MessageReactionSummary, ...]
+    event_position: int
+
+
+type ClientChannelEvent = ClientTimelineMessageEvent | ClientRunLifecycleEvent | ClientMessageReactionsEvent
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,19 +115,24 @@ async def _latest_relevant_position(
     channel_id: ChannelId,
 ) -> int:
     placeholders = ", ".join("?" for _ in _RUN_EVENT_TYPES)
+    reaction_placeholders = ", ".join("?" for _ in _REACTION_EVENT_TYPES)
     parameters = (
+        *tuple(event_type.value for event_type in _REACTION_EVENT_TYPES),
         channel_id,
         *tuple(event_type.value for event_type in _RUN_EVENT_TYPES),
         channel_id,
         principal_id,
+        channel_id,
     )
     async with store.connection.execute(
         "SELECT COALESCE(MAX(e.position), 0) FROM event_log e "
         "LEFT JOIN messages m ON m.created_event_position = e.position "
         "LEFT JOIN runs r ON r.id = e.aggregate_id "
+        "LEFT JOIN messages reaction_message ON reaction_message.id = e.aggregate_id "
+        f"AND e.event_type IN ({reaction_placeholders}) "
         "WHERE m.channel_id = ? OR (e.aggregate_type = 'run' "
         f"AND e.event_type IN ({placeholders}) AND r.channel_id = ? "
-        "AND r.requested_by_principal_id = ?)",
+        "AND r.requested_by_principal_id = ?) OR reaction_message.channel_id = ?",
         parameters,
     ) as cursor:
         row = await cursor.fetchone()
@@ -148,12 +173,15 @@ async def read_client_channel_events(
         raise TimelineResumeError("Client event resume position is ahead of the event log")
 
     placeholders = ", ".join("?" for _ in _RUN_EVENT_TYPES)
+    reaction_placeholders = ", ".join("?" for _ in _REACTION_EVENT_TYPES)
     parameters = (
+        *tuple(event_type.value for event_type in _REACTION_EVENT_TYPES),
         after_position,
         channel_id,
         *tuple(event_type.value for event_type in _RUN_EVENT_TYPES),
         channel_id,
         principal_id,
+        channel_id,
         limit,
     )
     async with store.connection.execute(
@@ -162,14 +190,17 @@ async def read_client_channel_events(
         "m.author_principal_id, p.kind AS author_kind, p.display_name AS author_display_name, "
         "m.reply_to_message_id, m.thread_root_id, m.body, m.created_at AS message_created_at, "
         "m.mentions_json, "
-        "e.metadata_json AS message_metadata_json, r.id AS run_id "
+        "e.metadata_json AS message_metadata_json, r.id AS run_id, "
+        "reaction_message.id AS reaction_message_id "
         "FROM event_log e "
         "LEFT JOIN messages m ON m.created_event_position = e.position "
         "LEFT JOIN principals p ON p.id = m.author_principal_id "
         "LEFT JOIN runs r ON r.id = e.aggregate_id "
+        "LEFT JOIN messages reaction_message ON reaction_message.id = e.aggregate_id "
+        f"AND e.event_type IN ({reaction_placeholders}) "
         "WHERE e.position > ? AND (m.channel_id = ? OR (e.aggregate_type = 'run' "
         f"AND e.event_type IN ({placeholders}) AND r.channel_id = ? "
-        "AND r.requested_by_principal_id = ?)) "
+        "AND r.requested_by_principal_id = ?) OR reaction_message.channel_id = ?) "
         "ORDER BY e.position ASC LIMIT ?",
         parameters,
     ) as cursor:
@@ -178,6 +209,14 @@ async def read_client_channel_events(
     artifact_map = await artifacts_for_messages(
         store,
         tuple(MessageId(str(row["message_id"])) for row in rows if row["message_id"] is not None),
+    )
+    reaction_message_ids = tuple(
+        MessageId(str(row["reaction_message_id"])) for row in rows if row["reaction_message_id"] is not None
+    )
+    reaction_map = await load_message_reactions(
+        store,
+        message_ids=reaction_message_ids,
+        viewer_principal_id=principal_id,
     )
 
     events: list[ClientChannelEvent] = []
@@ -216,6 +255,18 @@ async def read_client_channel_events(
                         reply_count=0,
                         latest_reply_at=None,
                     )
+                )
+            )
+            continue
+
+        if row["reaction_message_id"] is not None:
+            message_id = MessageId(str(row["reaction_message_id"]))
+            events.append(
+                ClientMessageReactionsEvent(
+                    channel_id=channel_id,
+                    message_id=message_id,
+                    reactions=reaction_map.get(message_id, ()),
+                    event_position=position,
                 )
             )
             continue

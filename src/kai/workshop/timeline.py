@@ -12,7 +12,14 @@ from typing import Protocol
 import aiosqlite
 
 from kai.workshop.artifacts import ArtifactSummary, artifacts_for_messages
-from kai.workshop.domain import ChannelId, MessageId, MessageMention, PrincipalId
+from kai.workshop.domain import (
+    ChannelId,
+    MessageId,
+    MessageMention,
+    MessageReactionSummary,
+    PrincipalId,
+)
+from kai.workshop.message_reactions import load_message_reactions
 from kai.workshop.store import WorkshopEventStore
 
 _CURSOR_PREFIX = "v1."
@@ -58,6 +65,7 @@ class TimelineMessage:
     created_at: datetime
     mentions: tuple[MessageMention, ...] = ()
     artifacts: tuple[ArtifactSummary, ...] = ()
+    reactions: tuple[MessageReactionSummary, ...] = ()
     reply_count: int = 0
     latest_reply_at: datetime | None = None
 
@@ -330,15 +338,28 @@ def _messages_from_rows(rows: list[aiosqlite.Row]) -> tuple[TimelineMessage, ...
     return tuple(messages)
 
 
-async def attach_message_artifacts(
+async def attach_message_details(
     store: WorkshopEventStore,
     messages: tuple[TimelineMessage, ...],
+    principal_id: PrincipalId,
 ) -> tuple[TimelineMessage, ...]:
-    grouped = await artifacts_for_messages(
+    artifact_map = await artifacts_for_messages(
         store,
         tuple(message.message_id for message in messages),
     )
-    return tuple(replace(message, artifacts=grouped.get(message.message_id, ())) for message in messages)
+    reaction_map = await load_message_reactions(
+        store,
+        message_ids=tuple(message.message_id for message in messages),
+        viewer_principal_id=principal_id,
+    )
+    return tuple(
+        replace(
+            message,
+            artifacts=artifact_map.get(message.message_id, ()),
+            reactions=reaction_map.get(message.message_id, ()),
+        )
+        for message in messages
+    )
 
 
 async def _read_forward_page(
@@ -346,6 +367,7 @@ async def _read_forward_page(
     channel_id: ChannelId,
     state: _CursorState,
     limit: int,
+    principal_id: PrincipalId,
 ) -> TimelinePage:
     async with store.connection.execute(
         "SELECT m.id, m.channel_id, m.author_principal_id, p.kind, p.display_name, "
@@ -373,7 +395,7 @@ async def _read_forward_page(
 
     has_more = len(rows) > limit
     page_rows = rows[:limit]
-    messages = await attach_message_artifacts(store, _messages_from_rows(page_rows))
+    messages = await attach_message_details(store, _messages_from_rows(page_rows), principal_id)
     next_cursor = None
     if has_more:
         next_cursor = _encode_cursor(
@@ -391,6 +413,7 @@ async def _read_tail_page(
     channel_id: ChannelId,
     state: _TailCursorState,
     limit: int,
+    principal_id: PrincipalId,
 ) -> TimelinePage:
     # The strict upper bound alone keeps the page inside the snapshot:
     # decoded cursors guarantee before_position <= through_position, and
@@ -416,7 +439,7 @@ async def _read_tail_page(
 
     has_more = len(rows) > limit
     page_rows = list(reversed(rows[:limit]))
-    messages = await attach_message_artifacts(store, _messages_from_rows(page_rows))
+    messages = await attach_message_details(store, _messages_from_rows(page_rows), principal_id)
     previous_cursor = None
     if has_more:
         previous_cursor = _encode_tail_cursor(
@@ -462,8 +485,8 @@ async def read_channel_timeline(
         if isinstance(state, _ThreadCursorState):
             raise TimelineCursorError("Thread cursor cannot page a channel timeline")
         if isinstance(state, _TailCursorState):
-            return await _read_tail_page(store, channel_id, state, limit)
-        return await _read_forward_page(store, channel_id, state, limit)
+            return await _read_tail_page(store, channel_id, state, limit, principal_id)
+        return await _read_forward_page(store, channel_id, state, limit, principal_id)
 
     through_position = await _latest_message_position(store, channel_id)
     if tail:
@@ -474,8 +497,15 @@ async def read_channel_timeline(
             channel_id,
             _TailCursorState(channel_id, through_position + 1, through_position),
             limit,
+            principal_id,
         )
-    return await _read_forward_page(store, channel_id, _CursorState(channel_id, 0, through_position), limit)
+    return await _read_forward_page(
+        store,
+        channel_id,
+        _CursorState(channel_id, 0, through_position),
+        limit,
+        principal_id,
+    )
 
 
 async def _read_thread_root(
@@ -483,6 +513,7 @@ async def _read_thread_root(
     channel_id: ChannelId,
     thread_root_id: MessageId,
     through_position: int,
+    principal_id: PrincipalId,
 ) -> TimelineMessage:
     async with store.connection.execute(
         "SELECT m.id, m.channel_id, m.author_principal_id, p.kind, p.display_name, "
@@ -500,7 +531,7 @@ async def _read_thread_root(
         (through_position, through_position, thread_root_id, channel_id, through_position),
     ) as cursor:
         rows = list(await cursor.fetchall())
-    messages = await attach_message_artifacts(store, _messages_from_rows(rows))
+    messages = await attach_message_details(store, _messages_from_rows(rows), principal_id)
     if len(messages) != 1:
         raise TimelineAccessDeniedError("Thread access denied")
     return messages[0]
@@ -535,7 +566,13 @@ async def read_thread_timeline(
             raise TimelineCursorError("Thread cursor belongs to another thread")
         state = decoded
 
-    root = await _read_thread_root(store, channel_id, thread_root_id, state.through_position)
+    root = await _read_thread_root(
+        store,
+        channel_id,
+        thread_root_id,
+        state.through_position,
+        principal_id,
+    )
     async with store.connection.execute(
         "SELECT m.id, m.channel_id, m.author_principal_id, p.kind, p.display_name, "
         "m.reply_to_message_id, m.thread_root_id, m.body, m.created_event_position, m.created_at, "
@@ -550,7 +587,7 @@ async def read_thread_timeline(
     ) as query_cursor:
         rows = list(await query_cursor.fetchall())
     has_more = len(rows) > limit
-    messages = await attach_message_artifacts(store, _messages_from_rows(rows[:limit]))
+    messages = await attach_message_details(store, _messages_from_rows(rows[:limit]), principal_id)
     next_cursor = None
     if has_more:
         next_cursor = _encode_thread_cursor(
@@ -613,6 +650,6 @@ async def read_channel_timeline_updates(
     ) as query_cursor:
         rows = list(await query_cursor.fetchall())
 
-    messages = await attach_message_artifacts(store, _messages_from_rows(rows))
+    messages = await attach_message_details(store, _messages_from_rows(rows), principal_id)
     next_position = int(rows[-1][8]) if rows else after_position
     return TimelineUpdateBatch(messages, next_position)

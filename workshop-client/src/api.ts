@@ -50,6 +50,8 @@ import type {
   WorkshopMemoryStats,
   WorkshopArtifactKind,
   WorkshopArtifactSummary,
+  WorkshopMessageReaction,
+  WorkshopReaction,
 } from "./types";
 import { MESSAGE_PATTERN } from "./types";
 import { isWorkshopThemeId } from "./theme";
@@ -92,9 +94,55 @@ interface StreamEvent {
 interface StreamHandlers {
   onConnected: () => void;
   onMessage: (message: TimelineMessage, eventId: string) => void;
+  onReactions?: (
+    messageId: string,
+    reactions: WorkshopMessageReaction[],
+    eventId: string,
+  ) => void;
   onRunActivity: (activity: WorkshopRunActivity, eventId: string) => void;
   onRunPreview: (preview: WorkshopRunPreview) => void;
   onRunTrace: (signal: WorkshopRunTraceSignal) => void;
+}
+
+const REACTIONS = new Set<WorkshopReaction>([
+  "thumbs_up",
+  "heart",
+  "laugh",
+  "celebrate",
+  "eyes",
+  "check",
+]);
+
+function parseReactions(value: unknown): WorkshopMessageReaction[] | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  const reactions: WorkshopMessageReaction[] = [];
+  for (const item of value) {
+    if (!isRecord(item)) {
+      return null;
+    }
+    const {
+      count,
+      reacted_by_viewer: reactedByViewer,
+      reaction,
+    } = item;
+    if (
+      typeof reaction !== "string" ||
+      !REACTIONS.has(reaction as WorkshopReaction) ||
+      !Number.isSafeInteger(count) ||
+      (count as number) < 1 ||
+      typeof reactedByViewer !== "boolean"
+    ) {
+      return null;
+    }
+    reactions.push({
+      count: count as number,
+      reactedByViewer,
+      reaction: reaction as WorkshopReaction,
+    });
+  }
+  return reactions;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -183,9 +231,11 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
     reply_to_message_id: replyToMessageId,
     thread_root_id: threadRootId,
     mentions: suppliedMentions,
+    reactions: suppliedReactions,
     artifacts: suppliedArtifacts,
   } = value;
   const rawArtifacts = suppliedArtifacts ?? [];
+  const rawReactions = suppliedReactions ?? [];
   if (
     typeof authorDisplayName !== "string" ||
     typeof authorKind !== "string" ||
@@ -205,6 +255,7 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
       (typeof threadRootId !== "string" || !MESSAGE_PATTERN.test(threadRootId))) ||
     (latestReplyAt !== null && typeof latestReplyAt !== "string") ||
     !Array.isArray(suppliedMentions) ||
+    !Array.isArray(rawReactions) ||
     !Array.isArray(rawArtifacts)
   ) {
     return null;
@@ -275,6 +326,10 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
     });
     previousEnd = (start as number) + (length as number);
   }
+  const reactions = parseReactions(rawReactions);
+  if (reactions === null) {
+    return null;
+  }
   return {
     artifacts,
     authorDisplayName,
@@ -286,6 +341,7 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
     eventPosition: eventPosition as number,
     mentions,
     messageId,
+    reactions,
     replyCount: replyCount as number,
     replyToMessageId,
     latestReplyAt,
@@ -565,6 +621,40 @@ export async function dismissChannelAgent(
   ) {
     throw new Error(safeErrorMessage(payload, "Could not dismiss this agent."));
   }
+}
+
+export async function setMessageReaction(
+  session: WorkshopSession,
+  messageId: string,
+  reaction: WorkshopReaction,
+  active: boolean,
+): Promise<WorkshopMessageReaction[]> {
+  if (!MESSAGE_PATTERN.test(messageId) || !REACTIONS.has(reaction)) {
+    throw new Error("Invalid message reaction.");
+  }
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/messages/${encodeURIComponent(messageId)}/reactions`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reaction, active }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (
+    !response.ok ||
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    payload.message_id !== messageId
+  ) {
+    throw new Error(safeErrorMessage(payload, "Could not update this reaction."));
+  }
+  const reactions = parseReactions(payload.reactions);
+  if (reactions === null) {
+    throw new Error("Kai returned an unsupported reaction response.");
+  }
+  return reactions;
 }
 
 function parseEditableCapabilities(value: unknown): WorkshopEditableCapability[] {
@@ -2925,6 +3015,19 @@ export async function streamTimeline(
           continue;
         }
         handlers.onMessage(message, event.eventId);
+        continue;
+      }
+      if (event.eventName === "timeline.message.reactions_changed") {
+        const messageId = payload.message_id;
+        const reactions = parseReactions(payload.reactions);
+        if (
+          typeof messageId !== "string" ||
+          !MESSAGE_PATTERN.test(messageId) ||
+          reactions === null
+        ) {
+          continue;
+        }
+        handlers.onReactions?.(messageId, reactions, event.eventId);
         continue;
       }
       if (event.eventName === "run.lifecycle.changed") {

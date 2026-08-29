@@ -552,7 +552,7 @@ class CanonicalConversationProjection:
 
     name = "canonical_conversations"
     # Runtime-profile assignments can migrate to stable protected profiles.
-    version = 10
+    version = 11
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -562,6 +562,7 @@ class CanonicalConversationProjection:
             "artifacts",
             "run_attempts",
             "runs",
+            "message_reactions",
             "messages",
             "channel_agent_dismissals",
             "channel_agent_runtime_assignments",
@@ -834,6 +835,43 @@ class CanonicalConversationProjection:
                     "UPDATE messages SET thread_root_id = ? WHERE id = ?",
                     (thread_root, envelope.aggregate_id),
                 )
+        elif envelope.event_type in {
+            WorkshopEventType.MESSAGE_REACTION_ADDED,
+            WorkshopEventType.MESSAGE_REACTION_REMOVED,
+        }:
+            if not isinstance(envelope.aggregate_id, MessageId) or envelope.aggregate_type != "message":
+                raise ValueError("Workshop message reaction requires a typed message aggregate")
+            _require_exact_payload(payload, {"channel_id", "principal_id", "reaction"})
+            channel_id = ChannelId(_required_text(payload, "channel_id"))
+            principal_id = PrincipalId(_required_text(payload, "principal_id"))
+            reaction = _required_text(payload, "reaction")
+            if reaction not in {"thumbs_up", "heart", "laugh", "celebrate", "eyes", "check"}:
+                raise ValueError("Unsupported Workshop message reaction")
+            if envelope.actor_principal_id != principal_id:
+                raise ValueError("Workshop message reaction actor must match its principal")
+            async with connection.execute(
+                "SELECT 1 FROM messages m "
+                "JOIN channel_memberships cm ON cm.channel_id = m.channel_id "
+                "AND cm.principal_id = ? "
+                "WHERE m.id = ? AND m.channel_id = ?",
+                (principal_id, envelope.aggregate_id, channel_id),
+            ) as cursor:
+                if await cursor.fetchone() is None:
+                    raise ValueError("Workshop message reaction requires channel membership")
+            if envelope.event_type == WorkshopEventType.MESSAGE_REACTION_ADDED:
+                await connection.execute(
+                    "INSERT INTO message_reactions "
+                    "(message_id, principal_id, reaction, created_at, created_event_position) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (envelope.aggregate_id, principal_id, reaction, occurred_at, event.position),
+                )
+            else:
+                cursor = await connection.execute(
+                    "DELETE FROM message_reactions WHERE message_id = ? AND principal_id = ? AND reaction = ?",
+                    (envelope.aggregate_id, principal_id, reaction),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("Workshop message reaction removal has no matching reaction")
         elif envelope.event_type == WorkshopEventType.ARTIFACT_CREATED:
             if envelope.event_version not in {1, 2}:
                 raise ValueError("Unsupported Workshop artifact event version")
