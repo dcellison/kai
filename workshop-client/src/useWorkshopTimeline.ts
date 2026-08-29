@@ -15,6 +15,7 @@ import type {
   WorkshopRunPreview,
   WorkshopRunTraceSignal,
   WorkshopSession,
+  WorkshopMessageReaction,
 } from "./types";
 
 const RECONNECT_DELAY_MS = 2000;
@@ -59,6 +60,22 @@ function prependUnique(
   );
 }
 
+function replaceReactions(
+  messages: TimelineMessage[],
+  messageId: string,
+  reactions: WorkshopMessageReaction[],
+): TimelineMessage[] {
+  let changed = false;
+  const next = messages.map((message) => {
+    if (message.messageId !== messageId) {
+      return message;
+    }
+    changed = true;
+    return { ...message, reactions };
+  });
+  return changed ? next : messages;
+}
+
 export interface EarlierHistoryState {
   available: boolean;
   loading: boolean;
@@ -84,14 +101,22 @@ export function useWorkshopTimeline(
   connection: ConnectionState;
   messages: TimelineMessage[];
   threadMessages: TimelineMessage[];
+  reactionUpdates: Record<string, WorkshopMessageReaction[]>;
   runActivity: WorkshopRunActivity | null;
   runPreview: WorkshopRunPreview | null;
   runTrace: WorkshopRunTraceSignal | null;
   earlier: EarlierHistoryState;
   loadEarlier: () => void;
+  updateReactions: (
+    messageId: string,
+    reactions: WorkshopMessageReaction[],
+  ) => void;
 } {
   const [messages, setMessages] = useState<TimelineMessage[]>([]);
   const [threadMessages, setThreadMessages] = useState<TimelineMessage[]>([]);
+  const [reactionUpdates, setReactionUpdates] = useState<
+    Record<string, WorkshopMessageReaction[]>
+  >({});
   const [runActivity, setRunActivity] = useState<WorkshopRunActivity | null>(null);
   const [runPreview, setRunPreview] = useState<WorkshopRunPreview | null>(null);
   const [runTrace, setRunTrace] = useState<WorkshopRunTraceSignal | null>(null);
@@ -108,6 +133,17 @@ export function useWorkshopTimeline(
   const earlierCursorRef = useRef<string | null>(null);
   const earlierLoadingRef = useRef(false);
   const generationRef = useRef(0);
+
+  const updateReactions = useCallback(
+    (messageId: string, reactions: WorkshopMessageReaction[]): void => {
+      setMessages((current) => replaceReactions(current, messageId, reactions));
+      setThreadMessages((current) =>
+        replaceReactions(current, messageId, reactions),
+      );
+      setReactionUpdates((current) => ({ ...current, [messageId]: reactions }));
+    },
+    [],
+  );
 
   const loadEarlier = useCallback((): void => {
     const context = earlierContextRef.current;
@@ -157,6 +193,7 @@ export function useWorkshopTimeline(
       setEarlier({ available: false, loading: false, error: null });
       setMessages([]);
       setThreadMessages([]);
+      setReactionUpdates({});
       setRunActivity(null);
       setRunPreview(null);
       setRunTrace(null);
@@ -191,6 +228,7 @@ export function useWorkshopTimeline(
             );
             setMessages(snapshot.messages.filter((message) => message.threadRootId === null));
             setThreadMessages([]);
+            setReactionUpdates({});
             needsSnapshot = false;
             // Every snapshot starts a fresh backward-paging window; a
             // resynchronization deliberately collapses back to the tail,
@@ -241,6 +279,10 @@ export function useWorkshopTimeline(
                 } else {
                   setThreadMessages((current) => appendUnique(current, message));
                 }
+              },
+              onReactions: (messageId, reactions, eventId) => {
+                lastEventId = eventId;
+                updateReactions(messageId, reactions);
               },
               onRunActivity: (activity, eventId) => {
                 lastEventId = eventId;
@@ -311,16 +353,19 @@ export function useWorkshopTimeline(
     onAuthenticationFailure,
     onChannelAccessFailure,
     session,
+    updateReactions,
   ]);
 
   return {
     connection,
     messages,
     threadMessages,
+    reactionUpdates,
     runActivity,
     runPreview,
     runTrace,
     earlier,
     loadEarlier,
+    updateReactions,
   };
 }

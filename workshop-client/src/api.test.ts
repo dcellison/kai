@@ -41,6 +41,7 @@ import {
   searchMemories,
   restorePreferenceRevision,
   savePreferenceDocument,
+  setMessageReaction,
   submitCommand,
   streamTimeline,
   updateRuntimeSettings,
@@ -1380,6 +1381,39 @@ describe("Workshop client API", () => {
     });
   });
 
+  it("sets a message reaction under session authority", async () => {
+    const messageId = "msg_00000000000000000000000000000001";
+    const fetchMock = vi.fn().mockResolvedValue(
+      Response.json({
+        version: 1,
+        message_id: messageId,
+        reaction: "eyes",
+        active: true,
+        changed: true,
+        event_position: 42,
+        reactions: [
+          { reaction: "eyes", count: 2, reacted_by_viewer: true },
+        ],
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      setMessageReaction(session, messageId, "eyes", true),
+    ).resolves.toEqual([
+      { reaction: "eyes", count: 2, reactedByViewer: true },
+    ]);
+
+    const [path, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(path).toBe(
+      `/v1/channels/${channelId}/messages/${messageId}/reactions`,
+    );
+    expect(JSON.parse(options.body as string)).toEqual({
+      reaction: "eyes",
+      active: true,
+    });
+  });
+
   it("scopes an agent dismissal to a thread when supplied", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       Response.json({ version: 1, dismissed: true, replayed: false }),
@@ -1627,6 +1661,52 @@ describe("Workshop client API", () => {
     expect(headers.get("Authorization")).toBe("Bearer session-secret");
     expect(headers.get("Last-Event-ID")).toBe("30");
     expect(headers.get("X-Kai-Stream-ID")).toMatch(/^[0-9a-f]{32}$/);
+  });
+
+  it("applies live canonical reaction changes", async () => {
+    const messageId = "msg_00000000000000000000000000000031";
+    const event = [
+      "id: 32",
+      "event: timeline.message.reactions_changed",
+      `data: ${JSON.stringify({
+        version: 1,
+        channel_id: channelId,
+        message_id: messageId,
+        reactions: [
+          { reaction: "celebrate", count: 3, reacted_by_viewer: false },
+        ],
+      })}`,
+      "",
+      "",
+    ].join("\n");
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(event));
+        controller.close();
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(stream, { status: 200 })));
+    const onReactions = vi.fn();
+
+    await streamTimeline(
+      session,
+      "31",
+      {
+        onConnected: vi.fn(),
+        onMessage: vi.fn(),
+        onReactions,
+        onRunActivity: vi.fn(),
+        onRunPreview: vi.fn(),
+        onRunTrace: vi.fn(),
+      },
+      new AbortController().signal,
+    );
+
+    expect(onReactions).toHaveBeenCalledWith(
+      messageId,
+      [{ reaction: "celebrate", count: 3, reactedByViewer: false }],
+      "32",
+    );
   });
 
   it("creates the stream identity without secure-context randomUUID", async () => {

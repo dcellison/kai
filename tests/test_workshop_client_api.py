@@ -34,6 +34,7 @@ from kai.workshop.client_api import (
     register_workshop_read_routes,
 )
 from kai.workshop.client_events import (
+    ClientMessageReactionsEvent,
     ClientRunLifecycleEvent,
     ClientTimelineMessageEvent,
     read_client_channel_events,
@@ -103,6 +104,7 @@ from kai.workshop.model_catalogue import (
     ModelCatalogueSnapshot,
 )
 from kai.workshop.notification_preferences import WorkshopNotificationPreferenceService
+from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.routing_eligibility import (
     CapabilityAssessment,
     CapabilitySupport,
@@ -2472,6 +2474,7 @@ class TestWorkshopTimelineHTTPContract:
                         "reply_count": 0,
                         "latest_reply_at": None,
                         "mentions": [],
+                        "reactions": [],
                         "artifacts": [],
                     }
                 ],
@@ -2727,6 +2730,110 @@ class TestWorkshopThreadTimelineHTTPContract:
 
 
 class TestWorkshopTimelineEventStreamHTTPContract:
+    async def test_reactions_are_authorized_canonical_live_and_replayable(self, tmp_path: Path):
+        store, alice_id, alice_channel, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        await _record_messages(store, 1)
+        async with store.connection.execute(
+            "SELECT id FROM messages WHERE channel_id = ? ORDER BY created_event_position DESC LIMIT 1",
+            (alice_channel,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        message_id = MessageId(str(row[0]))
+        client = await _open_client(
+            store,
+            _Authenticator({"alice-token": alice_id, "bob-token": bob_id}),
+        )
+        try:
+            path = f"/v1/channels/{alice_channel}/messages/{message_id}/reactions"
+            added = await client.put(
+                path,
+                headers={"Authorization": "Bearer alice-token"},
+                json={"reaction": "eyes", "active": True},
+            )
+            added_payload = await added.json()
+            replayed = await client.put(
+                path,
+                headers={"Authorization": "Bearer alice-token"},
+                json={"reaction": "eyes", "active": True},
+            )
+            denied = await client.put(
+                path,
+                headers={"Authorization": "Bearer bob-token"},
+                json={"reaction": "eyes", "active": True},
+            )
+            invalid = await client.put(
+                path,
+                headers={"Authorization": "Bearer alice-token"},
+                json={"reaction": "arbitrary", "active": True},
+            )
+            timeline = await client.get(
+                f"/v1/channels/{alice_channel}/timeline",
+                headers={"Authorization": "Bearer alice-token"},
+            )
+            event_position = added_payload["event_position"]
+            events = await read_client_channel_events(
+                store,
+                principal_id=alice_id,
+                channel_id=alice_channel,
+                authorizer=_AllowChannelRead(),
+                after_position=event_position - 1,
+            )
+            stream_response = await client.get(
+                f"/v1/channels/{alice_channel}/events",
+                params={"after_position": str(event_position - 1)},
+                headers={"Authorization": "Bearer alice-token"},
+            )
+            stream_event = await _read_sse_event(stream_response)
+            stream_response.close()
+
+            assert added.status == 200
+            assert added_payload["changed"] is True
+            assert added_payload["reactions"] == [{"reaction": "eyes", "count": 1, "reacted_by_viewer": True}]
+            assert replayed.status == 200
+            assert (await replayed.json())["changed"] is False
+            assert (await replayed.json())["event_position"] is None
+            assert denied.status == 403
+            assert invalid.status == 400
+            assert (await timeline.json())["messages"][0]["reactions"] == added_payload["reactions"]
+            assert len(events.events) == 1
+            assert isinstance(events.events[0], ClientMessageReactionsEvent)
+            assert events.events[0].message_id == message_id
+            assert stream_event == {
+                "id": str(event_position),
+                "event": "timeline.message.reactions_changed",
+                "data": {
+                    "version": 1,
+                    "channel_id": alice_channel,
+                    "message_id": message_id,
+                    "reactions": added_payload["reactions"],
+                },
+            }
+
+            await store.rebuild_projection(CanonicalConversationProjection())
+            rebuilt = await client.get(
+                f"/v1/channels/{alice_channel}/timeline",
+                headers={"Authorization": "Bearer alice-token"},
+            )
+            assert (await rebuilt.json())["messages"][0]["reactions"] == added_payload["reactions"]
+
+            removed = await client.put(
+                path,
+                headers={"Authorization": "Bearer alice-token"},
+                json={"reaction": "eyes", "active": False},
+            )
+            assert removed.status == 200
+            assert (await removed.json())["reactions"] == []
+            await store.rebuild_projection(CanonicalConversationProjection())
+            rebuilt_empty = await client.get(
+                f"/v1/channels/{alice_channel}/timeline",
+                headers={"Authorization": "Bearer alice-token"},
+            )
+            assert (await rebuilt_empty.json())["messages"][0]["reactions"] == []
+        finally:
+            await client.close()
+            await store.close()
+
     async def test_run_activity_is_private_even_when_channel_read_is_allowed(self, tmp_path: Path):
         store, alice_id, alice_channel, bob_id, _ = await _open_store(tmp_path / "kai.db")
         inbound = await record_inbound_message(
@@ -2924,6 +3031,7 @@ class TestWorkshopTimelineEventStreamHTTPContract:
                     "reply_count": 0,
                     "latest_reply_at": None,
                     "mentions": [],
+                    "reactions": [],
                     "artifacts": [],
                 },
             }

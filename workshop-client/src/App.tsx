@@ -26,6 +26,7 @@ import {
   loadSettingsWorkspace,
   loadThreadTimeline,
   redeemEnrollment,
+  setMessageReaction,
   submitCommand,
   switchWorkspace,
 } from "./api";
@@ -48,6 +49,7 @@ import type {
   WorkshopArtifactSummary,
   WorkshopAgentSummary,
   WorkshopAppearancePreferences,
+  WorkshopReaction,
 } from "./types";
 import { CHANNEL_PATTERN } from "./types";
 import { RunTraceCard } from "./RunTraceCard";
@@ -685,21 +687,64 @@ function ConnectionIndicator({
   );
 }
 
+const MESSAGE_REACTIONS: {
+  label: string;
+  reaction: WorkshopReaction;
+  symbol: string;
+}[] = [
+  { label: "Thumbs up", reaction: "thumbs_up", symbol: "👍" },
+  { label: "Heart", reaction: "heart", symbol: "♥" },
+  { label: "Laugh", reaction: "laugh", symbol: "😄" },
+  { label: "Celebrate", reaction: "celebrate", symbol: "🎉" },
+  { label: "Eyes", reaction: "eyes", symbol: "👀" },
+  { label: "Done", reaction: "check", symbol: "✓" },
+];
+
 function MessageItem({
   message,
   notification = false,
   onDownloadArtifact,
   onLoadArtifact,
   onOpenThread,
+  onSetReaction,
 }: {
   message: TimelineMessage;
   notification?: boolean;
   onDownloadArtifact: (artifactId: string) => void;
   onLoadArtifact: (artifactId: string) => Promise<Blob>;
   onOpenThread?: (messageId: string) => void;
+  onSetReaction?: (
+    messageId: string,
+    reaction: WorkshopReaction,
+    active: boolean,
+  ) => Promise<void>;
 }): React.JSX.Element {
+  const [reactionPickerOpen, setReactionPickerOpen] = useState(false);
+  const [reactionPending, setReactionPending] = useState<WorkshopReaction | null>(null);
+  const [reactionError, setReactionError] = useState<string | null>(null);
   const isAgent = message.authorKind === "agent";
   const displayName = message.authorDisplayName || "Unknown author";
+  const reactions = message.reactions ?? [];
+  const setReaction = async (
+    reaction: WorkshopReaction,
+    active: boolean,
+  ): Promise<void> => {
+    if (!onSetReaction || reactionPending !== null) {
+      return;
+    }
+    setReactionPending(reaction);
+    setReactionError(null);
+    try {
+      await onSetReaction(message.messageId, reaction, active);
+      setReactionPickerOpen(false);
+    } catch (caught) {
+      setReactionError(
+        caught instanceof Error ? caught.message : "Could not update this reaction.",
+      );
+    } finally {
+      setReactionPending(null);
+    }
+  };
   if (notification) {
     return (
       <li className="notification-row">
@@ -730,6 +775,70 @@ function MessageItem({
         {displayName.slice(0, 1).toUpperCase()}
       </span>
       <article>
+        {(onOpenThread || onSetReaction) && (
+          <div className="message-actions" role="group" aria-label={`Actions for message from ${displayName}`}>
+            {onSetReaction && (
+              <div className="reaction-picker-anchor">
+                <button
+                  className="message-action-button"
+                  type="button"
+                  aria-label="Add reaction"
+                  aria-expanded={reactionPickerOpen}
+                  title="Add reaction"
+                  onClick={() => {
+                    setReactionError(null);
+                    setReactionPickerOpen((open) => !open);
+                  }}
+                >
+                  <AddReactionIcon />
+                </button>
+                {reactionPickerOpen && (
+                  <div
+                    className="reaction-picker"
+                    role="menu"
+                    aria-label="Choose a reaction"
+                    onKeyDown={(event) => {
+                      if (event.key === "Escape") {
+                        event.preventDefault();
+                        setReactionPickerOpen(false);
+                      }
+                    }}
+                  >
+                    {MESSAGE_REACTIONS.map((option) => {
+                      const active = reactions.some(
+                        (reaction) => reaction.reaction === option.reaction && reaction.reactedByViewer,
+                      );
+                      return (
+                        <button
+                          type="button"
+                          role="menuitemcheckbox"
+                          aria-checked={active}
+                          aria-label={`${active ? "Remove" : "Add"} ${option.label} reaction`}
+                          disabled={reactionPending !== null}
+                          key={option.reaction}
+                          onClick={() => void setReaction(option.reaction, !active)}
+                        >
+                          {option.symbol}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+            {onOpenThread && (
+              <button
+                className="message-action-button"
+                type="button"
+                aria-label="Reply to message"
+                title="Reply"
+                onClick={() => onOpenThread(message.messageId)}
+              >
+                <ReplyIcon />
+              </button>
+            )}
+          </div>
+        )}
         <header className="message-meta">
           <strong>{displayName}</strong>
           <time dateTime={message.createdAt}>
@@ -745,24 +854,44 @@ function MessageItem({
             onLoad={onLoadArtifact}
           />
         ))}
-        {onOpenThread && (
+        {reactions.length > 0 && (
+          <div className="message-reactions" aria-label="Message reactions">
+            {reactions.map((reaction) => {
+              const option = MESSAGE_REACTIONS.find(
+                (candidate) => candidate.reaction === reaction.reaction,
+              );
+              if (!option) {
+                return null;
+              }
+              return (
+                <button
+                  className={reaction.reactedByViewer ? "active" : ""}
+                  type="button"
+                  aria-label={`${option.label}: ${reaction.count}. ${reaction.reactedByViewer ? "Remove your reaction" : "Add your reaction"}`}
+                  aria-pressed={reaction.reactedByViewer}
+                  disabled={!onSetReaction || reactionPending !== null}
+                  key={reaction.reaction}
+                  onClick={() => void setReaction(reaction.reaction, !reaction.reactedByViewer)}
+                >
+                  <span aria-hidden="true">{option.symbol}</span>
+                  <span>{reaction.count}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+        {reactionError && <p className="reaction-error" role="alert">{reactionError}</p>}
+        {onOpenThread && message.replyCount > 0 && (
           <button
             className="thread-summary"
             type="button"
-            aria-label={
-              message.replyCount === 0
-                ? "Reply to message"
-                : `Open thread with ${message.replyCount} ${message.replyCount === 1 ? "reply" : "replies"}`
-            }
-            title={message.replyCount === 0 ? "Reply" : "Open thread"}
+            aria-label={`Open thread with ${message.replyCount} ${message.replyCount === 1 ? "reply" : "replies"}`}
+            title="Open thread"
             onClick={() => onOpenThread(message.messageId)}
           >
-            <ReplyIcon />
-            {message.replyCount > 0 && (
-              <span>
-                {message.replyCount} {message.replyCount === 1 ? "reply" : "replies"}
-              </span>
-            )}
+            <span>
+              {message.replyCount} {message.replyCount === 1 ? "reply" : "replies"}
+            </span>
           </button>
         )}
       </article>
@@ -1082,14 +1211,27 @@ function ReplyIcon(): React.JSX.Element {
       viewBox="0 0 24 24"
     >
       <path
-        d="m9 7-5 5 5 5"
+        d="M20 15a3 3 0 0 1-3 3H9l-5 3V7a3 3 0 0 1 3-3h10a3 3 0 0 1 3 3z"
         stroke="currentColor"
         strokeLinecap="round"
         strokeLinejoin="round"
         strokeWidth="2"
       />
+    </svg>
+  );
+}
+
+function AddReactionIcon(): React.JSX.Element {
+  return (
+    <svg
+      aria-hidden="true"
+      fill="none"
+      focusable="false"
+      viewBox="0 0 24 24"
+    >
+      <circle cx="11" cy="11" r="8" stroke="currentColor" strokeWidth="2" />
       <path
-        d="M4 12h9a7 7 0 0 1 7 7"
+        d="M8 9h.01M14 9h.01M7.5 13.5c1 1.5 2.2 2.2 3.5 2.2s2.5-.7 3.5-2.2M19 15v6M16 18h6"
         stroke="currentColor"
         strokeLinecap="round"
         strokeLinejoin="round"
@@ -1106,7 +1248,9 @@ function ThreadPane({
   onDownloadArtifact,
   onLoadArtifact,
   onLoadThread,
+  onSetReaction,
   onSubmitCommand,
+  reactionUpdates,
   rootMessage,
   runActive,
 }: {
@@ -1116,7 +1260,13 @@ function ThreadPane({
   onDownloadArtifact: (artifactId: string) => void;
   onLoadArtifact: (artifactId: string) => Promise<Blob>;
   onLoadThread: (rootMessageId: string, cursor: string | null, signal?: AbortSignal) => Promise<ThreadTimelineSnapshot>;
+  onSetReaction: (
+    messageId: string,
+    reaction: WorkshopReaction,
+    active: boolean,
+  ) => Promise<void>;
   onSubmitCommand: (clientMessageId: string, body: string, artifact: File | null, threadRootId: string | null) => Promise<CommandSubmissionResult>;
+  reactionUpdates: Record<string, TimelineMessage["reactions"]>;
   rootMessage: TimelineMessage;
   runActive: boolean;
 }): React.JSX.Element {
@@ -1221,16 +1371,27 @@ function ThreadPane({
       <div className="thread-scroll">
         <ol className="thread-message-list">
           <MessageItem
-            message={snapshot?.root ?? rootMessage}
+            message={(() => {
+              const message = snapshot?.root ?? rootMessage;
+              return {
+                ...message,
+                reactions: reactionUpdates[message.messageId] ?? message.reactions,
+              };
+            })()}
             onDownloadArtifact={onDownloadArtifact}
             onLoadArtifact={onLoadArtifact}
+            onSetReaction={onSetReaction}
           />
           {replies.map((message) => (
             <MessageItem
               key={message.messageId}
-              message={message}
+              message={{
+                ...message,
+                reactions: reactionUpdates[message.messageId] ?? message.reactions,
+              }}
               onDownloadArtifact={onDownloadArtifact}
               onLoadArtifact={onLoadArtifact}
+              onSetReaction={onSetReaction}
             />
           ))}
         </ol>
@@ -1299,6 +1460,7 @@ function WorkshopView({
   runActivity,
   runPreview,
   runTrace,
+  reactionUpdates,
   workshop,
   onForget,
   onCancelRun,
@@ -1316,6 +1478,7 @@ function WorkshopView({
   onOpenSettings,
   onSelectMemory,
   onSelectChannel,
+  onSetReaction,
   onSubmitCommand,
   onSwitchWorkspace,
   onSettingsDirtyChange,
@@ -1335,6 +1498,7 @@ function WorkshopView({
   runActivity: WorkshopRunActivity | null;
   runPreview: WorkshopRunPreview | null;
   runTrace: WorkshopRunTraceSignal | null;
+  reactionUpdates: Record<string, TimelineMessage["reactions"]>;
   workshop: WorkshopSummary;
   onForget: () => void;
   onCancelRun: (runId: string) => Promise<WorkshopRun>;
@@ -1356,6 +1520,11 @@ function WorkshopView({
   onOpenSettings: () => void;
   onSelectMemory: (memoryId: string | null) => void;
   onSelectChannel: (channelId: string) => void;
+  onSetReaction: (
+    messageId: string,
+    reaction: WorkshopReaction,
+    active: boolean,
+  ) => Promise<void>;
   onSubmitCommand: (
     clientMessageId: string,
     body: string,
@@ -2435,6 +2604,7 @@ function WorkshopView({
                   notification={channel.kind === "notification"}
                   onDownloadArtifact={onDownloadArtifact}
                   onLoadArtifact={onLoadArtifact}
+                  onSetReaction={onSetReaction}
                   onOpenThread={
                     channel.kind === "group" ? setThreadRootMessageId : undefined
                   }
@@ -2688,7 +2858,9 @@ function WorkshopView({
             onDownloadArtifact={onDownloadArtifact}
             onLoadArtifact={onLoadArtifact}
             onLoadThread={onLoadThread}
+            onSetReaction={onSetReaction}
             onSubmitCommand={onSubmitCommand}
+            reactionUpdates={reactionUpdates}
             rootMessage={threadRootMessage}
             runActive={isRunActive(activeRun)}
           />
@@ -2933,11 +3105,13 @@ function ActiveWorkshopClient({
     connection,
     messages,
     threadMessages,
+    reactionUpdates,
     runActivity,
     runPreview,
     runTrace,
     earlier,
     loadEarlier,
+    updateReactions,
   } =
     useWorkshopTimeline(
       session,
@@ -3026,6 +3200,19 @@ function ActiveWorkshopClient({
       ),
     [session, withAccessHandling],
   );
+  const setSelectedMessageReaction = useCallback(
+    (messageId: string, reaction: WorkshopReaction, active: boolean) =>
+      withAccessHandling(async () => {
+        const reactions = await setMessageReaction(
+          session,
+          messageId,
+          reaction,
+          active,
+        );
+        updateReactions(messageId, reactions);
+      }),
+    [session, updateReactions, withAccessHandling],
+  );
   if (!selected) {
     return <main className="loading-workshop">Workshop access changed.</main>;
   }
@@ -3049,6 +3236,7 @@ function ActiveWorkshopClient({
       runActivity={runActivity}
       runPreview={runPreview}
       runTrace={runTrace}
+      reactionUpdates={reactionUpdates}
       workshop={selected.workshop}
       onForget={onForget}
       onCancelRun={cancelSelectedRun}
@@ -3063,6 +3251,7 @@ function ActiveWorkshopClient({
       onOpenSettings={onOpenSettings}
       onSelectMemory={onSelectMemory}
       onSelectChannel={onSelectChannel}
+      onSetReaction={setSelectedMessageReaction}
       onSubmitCommand={submitSelectedCommand}
       onSwitchWorkspace={switchSelectedWorkspace}
       onSettingsAccessFailure={onChannelAccessFailure}
