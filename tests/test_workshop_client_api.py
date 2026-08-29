@@ -49,6 +49,7 @@ from kai.workshop.client_sessions import (
 )
 from kai.workshop.conversation_commands import ConversationCommandDisposition
 from kai.workshop.domain import (
+    AgentDefinitionId,
     AgentId,
     ChannelId,
     ChannelMembershipId,
@@ -1305,7 +1306,353 @@ class TestWorkshopNavigationHTTPContract:
             await store.close()
 
 
+class TestWorkshopAgentLifecycleHTTPContract:
+    @staticmethod
+    def _draft_payload(*, key: str = "create-researcher") -> dict[str, object]:
+        return {
+            "idempotency_key": key,
+            "handle": "researcher",
+            "display_name": "Researcher",
+            "description": "Find and synthesize evidence.",
+            "presentation": {"avatar": "R"},
+            "purpose": "Research bounded questions.",
+            "instructions": "Find reliable evidence and distinguish fact from inference.",
+            "capabilities": ["text_generation", "tool_activity"],
+        }
+
+    async def test_admin_completes_revisioned_lifecycle_and_archive_preserves_history(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, _, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        client = await _open_client(
+            store,
+            _Authenticator({"alice": alice_id, "bob": bob_id}),
+        )
+        try:
+            response = await client.post(
+                "/v1/client/agents",
+                headers={"Authorization": "Bearer alice"},
+                json=self._draft_payload(),
+            )
+            assert response.status == 201
+            created = (await response.json())["agent"]
+            definition_id = created["definition_id"]
+            assert created["lifecycle_state"] == "draft"
+            assert created["active_revision_id"] is None
+            assert len(created["revisions"]) == 1
+            assert created["created_by_principal_id"] == str(alice_id)
+            assert created["revisions"][0]["created_by_principal_id"] == str(alice_id)
+
+            replay = await client.post(
+                "/v1/client/agents",
+                headers={"Authorization": "Bearer alice"},
+                json=self._draft_payload(),
+            )
+            assert replay.status == 201
+            assert (await replay.json())["agent"] == created
+            conflict = await client.post(
+                "/v1/client/agents",
+                headers={"Authorization": "Bearer alice"},
+                json={**self._draft_payload(), "display_name": "Different"},
+            )
+            assert conflict.status == 409
+            duplicate_handle = await client.post(
+                "/v1/client/agents",
+                headers={"Authorization": "Bearer alice"},
+                json=self._draft_payload(key="different-operation"),
+            )
+            assert duplicate_handle.status == 409
+
+            member_list = await client.get(
+                "/v1/client/agents",
+                headers={"Authorization": "Bearer bob"},
+            )
+            assert member_list.status == 200
+            assert definition_id not in {item["definition_id"] for item in (await member_list.json())["agents"]}
+            denied = await client.post(
+                f"/v1/client/agents/{definition_id}/revisions",
+                headers={"Authorization": "Bearer bob"},
+                json={
+                    "idempotency_key": "member-revision",
+                    "expected_version": created["state_version"],
+                    "purpose": "Not authorized",
+                    "instructions": "This must not be persisted.",
+                    "capabilities": ["text_generation"],
+                },
+            )
+            assert denied.status == 403
+
+            revision_response = await client.post(
+                f"/v1/client/agents/{definition_id}/revisions",
+                headers={"Authorization": "Bearer alice"},
+                json={
+                    "idempotency_key": "revision-two",
+                    "expected_version": created["state_version"],
+                    "purpose": "Research bounded questions with citations.",
+                    "instructions": "Find reliable evidence, cite it, and label inference.",
+                    "capabilities": ["text_generation", "tool_activity"],
+                },
+            )
+            assert revision_response.status == 201
+            revised = (await revision_response.json())["agent"]
+            revision_two_id = revised["revisions"][1]["revision_id"]
+            stale = await client.post(
+                f"/v1/client/agents/{definition_id}/activate",
+                headers={"Authorization": "Bearer alice"},
+                json={
+                    "idempotency_key": "stale-activation",
+                    "expected_version": created["state_version"],
+                    "revision_id": revision_two_id,
+                },
+            )
+            assert stale.status == 409
+
+            activation = await client.post(
+                f"/v1/client/agents/{definition_id}/activate",
+                headers={"Authorization": "Bearer alice"},
+                json={
+                    "idempotency_key": "activate-two",
+                    "expected_version": revised["state_version"],
+                    "revision_id": revision_two_id,
+                },
+            )
+            assert activation.status == 200
+            active = (await activation.json())["agent"]
+            assert active["lifecycle_state"] == "active"
+            assert active["active_revision_id"] == revision_two_id
+            member_detail = await client.get(
+                f"/v1/client/agents/{definition_id}",
+                headers={"Authorization": "Bearer bob"},
+            )
+            assert member_detail.status == 200
+
+            archival = await client.post(
+                f"/v1/client/agents/{definition_id}/archive",
+                headers={"Authorization": "Bearer alice"},
+                json={
+                    "idempotency_key": "archive-researcher",
+                    "expected_version": active["state_version"],
+                },
+            )
+            assert archival.status == 200
+            archived = (await archival.json())["agent"]
+            assert archived["lifecycle_state"] == "archived"
+            assert archived["active_revision_id"] == revision_two_id
+            assert len(archived["revisions"]) == 2
+            assert (
+                await client.get(
+                    f"/v1/client/agents/{definition_id}",
+                    headers={"Authorization": "Bearer bob"},
+                )
+            ).status == 403
+
+            await store.rebuild_projection(CanonicalConversationProjection())
+            replayed = await client.get(
+                f"/v1/client/agents/{definition_id}",
+                headers={"Authorization": "Bearer alice"},
+            )
+            assert replayed.status == 200
+            replayed_agent = (await replayed.json())["agent"]
+            assert replayed_agent["lifecycle_state"] == "archived"
+            assert replayed_agent["active_revision_id"] == revision_two_id
+            assert [item["revision_number"] for item in replayed_agent["revisions"]] == [1, 2]
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_malformed_authority_and_cross_workshop_ids_fail_closed(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, _, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        client = await _open_client(
+            store,
+            _Authenticator({"alice": alice_id, "bob": bob_id}),
+        )
+        try:
+            payload = {**self._draft_payload(key="authority-field"), "principal_id": str(bob_id)}
+            malformed = await client.post(
+                "/v1/client/agents",
+                headers={"Authorization": "Bearer alice"},
+                json=payload,
+            )
+            assert malformed.status == 400
+            unknown = AgentDefinitionId.new()
+            hidden = await client.get(
+                f"/v1/client/agents/{unknown}",
+                headers={"Authorization": "Bearer alice"},
+            )
+            assert hidden.status == 403
+            invalid = await client.get(
+                "/v1/client/agents/not-an-id",
+                headers={"Authorization": "Bearer alice"},
+            )
+            assert invalid.status == 400
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_durable_agent_events_replay_from_canonical_position(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+        client = await _open_client(store, _Authenticator({"alice": alice_id}))
+        try:
+            async with store.connection.execute("SELECT MAX(position) FROM event_log") as cursor:
+                before = int((await cursor.fetchone())[0])
+            created_response = await client.post(
+                "/v1/client/agents",
+                headers={"Authorization": "Bearer alice"},
+                json=self._draft_payload(key="event-replay"),
+            )
+            created = (await created_response.json())["agent"]
+            stream = await client.get(
+                f"/v1/client/agents/events?after_position={before}",
+                headers={
+                    "Authorization": "Bearer alice",
+                    "X-Kai-Stream-ID": "agent-lifecycle-test",
+                },
+            )
+            assert stream.status == 200
+            found: dict[str, object] | None = None
+            for _ in range(20):
+                line = (await stream.content.readline()).decode().strip()
+                if line.startswith("data: "):
+                    candidate = json.loads(line.removeprefix("data: "))
+                    if candidate["definition_id"] == created["definition_id"]:
+                        found = candidate
+                        break
+            assert found is not None
+            assert found["event_type"] == "agent_definition.created"
+            assert isinstance(found["event_position"], int)
+            stream.close()
+
+            impossible = await client.get(
+                "/v1/client/agents/events?after_position=999999999",
+                headers={
+                    "Authorization": "Bearer alice",
+                    "X-Kai-Stream-ID": "agent-lifecycle-invalid-resume",
+                },
+            )
+            assert impossible.status == 409
+            assert (await impossible.json())["error"]["code"] == "resynchronization_required"
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_concurrent_activations_have_one_deterministic_winner(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+        client = await _open_client(store, _Authenticator({"alice": alice_id}))
+        try:
+            created_response = await client.post(
+                "/v1/client/agents",
+                headers={"Authorization": "Bearer alice"},
+                json=self._draft_payload(key="concurrent-agent"),
+            )
+            created = (await created_response.json())["agent"]
+            definition_id = created["definition_id"]
+            first_revision_id = created["revisions"][0]["revision_id"]
+            revision_response = await client.post(
+                f"/v1/client/agents/{definition_id}/revisions",
+                headers={"Authorization": "Bearer alice"},
+                json={
+                    "idempotency_key": "concurrent-revision-two",
+                    "expected_version": created["state_version"],
+                    "purpose": "Provide a second activation candidate.",
+                    "instructions": "Respond using the second immutable revision.",
+                    "capabilities": ["text_generation"],
+                },
+            )
+            revised = (await revision_response.json())["agent"]
+            second_revision_id = revised["revisions"][1]["revision_id"]
+            expected_version = revised["state_version"]
+
+            first, second = await asyncio.gather(
+                client.post(
+                    f"/v1/client/agents/{definition_id}/activate",
+                    headers={"Authorization": "Bearer alice"},
+                    json={
+                        "idempotency_key": "activate-first-concurrently",
+                        "expected_version": expected_version,
+                        "revision_id": first_revision_id,
+                    },
+                ),
+                client.post(
+                    f"/v1/client/agents/{definition_id}/activate",
+                    headers={"Authorization": "Bearer alice"},
+                    json={
+                        "idempotency_key": "activate-second-concurrently",
+                        "expected_version": expected_version,
+                        "revision_id": second_revision_id,
+                    },
+                ),
+            )
+
+            assert sorted((first.status, second.status)) == [200, 409]
+            current_response = await client.get(
+                f"/v1/client/agents/{definition_id}",
+                headers={"Authorization": "Bearer alice"},
+            )
+            current = (await current_response.json())["agent"]
+            assert current["active_revision_id"] in {
+                first_revision_id,
+                second_revision_id,
+            }
+        finally:
+            await client.close()
+            await store.close()
+
+
 class TestWorkshopChannelLifecycleHTTPContract:
+    async def test_archived_agent_cannot_be_enabled_in_a_new_channel(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        async with store.connection.execute(
+            "SELECT agent_id FROM channel_agents WHERE channel_id = ?",
+            (alice_channel,),
+        ) as cursor:
+            agent_id = AgentId(str((await cursor.fetchone())[0]))
+        client = await _open_client(store, _Authenticator({"alice": alice_id}))
+        try:
+            agents_response = await client.get(
+                "/v1/client/agents",
+                headers={"Authorization": "Bearer alice"},
+            )
+            assert agents_response.status == 200
+            definition = next(item for item in (await agents_response.json())["agents"] if item["agent_id"] == agent_id)
+            archived_response = await client.post(
+                f"/v1/client/agents/{definition['definition_id']}/archive",
+                headers={"Authorization": "Bearer alice"},
+                json={
+                    "idempotency_key": "archive-before-channel-enable",
+                    "expected_version": definition["state_version"],
+                },
+            )
+            assert archived_response.status == 200
+
+            response = await client.post(
+                "/v1/channels",
+                headers={"Authorization": "Bearer alice"},
+                json={
+                    "name": "Must not enable archived agent",
+                    "agent_ids": [agent_id],
+                    "origin_channel_id": alice_channel,
+                },
+            )
+
+            assert response.status == 400
+            assert (await response.json())["error"]["code"] == "invalid_request"
+        finally:
+            await client.close()
+            await store.close()
+
     async def test_creates_one_private_canonical_group_without_transport_binding(
         self,
         tmp_path: Path,

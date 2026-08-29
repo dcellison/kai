@@ -97,6 +97,7 @@ class TestEventEnvelope:
             "agent_definition.created",
             "agent_definition.revision_added",
             "agent_definition.revision_activated",
+            "agent_definition.archived",
             "channel.agent_attached",
             "channel.agent_dismissed",
             "runtime_profile.assigned",

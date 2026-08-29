@@ -13,6 +13,7 @@ from kai.workshop.agent_definitions import (
     load_agent_definition_revision,
     render_agent_definition_context,
 )
+from kai.workshop.agent_lifecycle import WorkshopAgentLifecycleService
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.diagnostics import workshop_agent_definition_status
 from kai.workshop.domain import (
@@ -21,6 +22,7 @@ from kai.workshop.domain import (
     AgentId,
     EventEnvelope,
     MessageId,
+    PrincipalId,
     WorkshopEventType,
 )
 from kai.workshop.inbound import InboundMessage, record_inbound_message, resolve_message_mentions
@@ -173,6 +175,63 @@ class TestAgentDefinitionRevisions:
             rendered = render_agent_definition_context(revision)
             assert f"Definition revision: 1 ({revision.revision_id})" in rendered
             assert "does not grant tools, credentials, data access, identity, or permission" in rendered
+        finally:
+            await store.close()
+
+    async def test_archival_disables_new_resolution_but_preserves_run_provenance(
+        self,
+        tmp_path: Path,
+    ):
+        store, agent_id = await _open(tmp_path / "kai.db")
+        try:
+            active = await active_agent_definition_revision(store, agent_id)
+            assert active is not None
+            accepted = await WorkshopRunLifecycle(store).accept(
+                await _record(store, 1), occurred_at=_NOW + timedelta(minutes=1, seconds=1)
+            )
+            assert accepted.run.agent_definition_revision_id == active.revision_id
+            async with store.connection.execute(
+                "SELECT principal_id FROM external_identities "
+                "WHERE provider = 'desktop' AND external_subject = 'human-1'"
+            ) as cursor:
+                principal_row = await cursor.fetchone()
+            assert principal_row is not None
+            principal_id = PrincipalId(str(principal_row[0]))
+            service = WorkshopAgentLifecycleService(store)
+            current = await service.get_visible(principal_id, active.definition_id)
+            archived = await service.archive(
+                principal_id,
+                active.definition_id,
+                idempotency_key="archive-kai-provenance-test",
+                expected_version=current.state_version,
+            )
+            assert archived.lifecycle_state == "archived"
+            assert archived.active_revision_id == active.revision_id
+            assert await active_agent_definition_revision(store, agent_id) is None
+            preserved = await load_agent_definition_revision(store, active.revision_id)
+            assert preserved is not None
+            assert preserved.revision_id == active.revision_id
+            assert preserved.instructions == active.instructions
+            async with store.connection.execute(
+                "SELECT agent_definition_revision_id FROM runs WHERE id = ?",
+                (accepted.run.run_id,),
+            ) as cursor:
+                run_row = await cursor.fetchone()
+            assert run_row is not None
+            assert AgentDefinitionRevisionId(str(run_row[0])) == active.revision_id
+
+            await store.rebuild_projection(CanonicalConversationProjection())
+            replayed_revision = await load_agent_definition_revision(store, active.revision_id)
+            assert replayed_revision is not None
+            assert replayed_revision.revision_id == active.revision_id
+            assert replayed_revision.instructions == active.instructions
+            async with store.connection.execute(
+                "SELECT agent_definition_revision_id FROM runs WHERE id = ?",
+                (accepted.run.run_id,),
+            ) as cursor:
+                replayed_run = await cursor.fetchone()
+            assert replayed_run is not None
+            assert AgentDefinitionRevisionId(str(replayed_run[0])) == active.revision_id
         finally:
             await store.close()
 

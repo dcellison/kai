@@ -189,6 +189,10 @@ class WorkshopChannelLifecycleService:
         async with self._store.connection.execute(
             "SELECT a.id, a.principal_id, ra.runtime_profile_id "
             "FROM agents a "
+            "JOIN agent_definitions ad ON ad.agent_id = a.id "
+            "AND ad.workshop_id = a.workshop_id "
+            "AND ad.lifecycle_state = 'active' "
+            "AND ad.active_revision_id IS NOT NULL "
             "JOIN workshop_memberships agent_wm ON agent_wm.workshop_id = a.workshop_id "
             "AND agent_wm.principal_id = a.principal_id AND agent_wm.role = 'agent' "
             "JOIN channel_agents ca ON ca.agent_id = a.id "
