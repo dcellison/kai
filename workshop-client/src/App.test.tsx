@@ -1471,6 +1471,7 @@ describe("Workshop React client", () => {
     expect(await within(context).findByText("Existing thread reply")).toBeVisible();
     const composer = within(context).getByLabelText("Reply in Wake policy qualification");
     expect(composer).toHaveAttribute("rows", "1");
+    expect(composer).toHaveAttribute("placeholder", "Reply…");
     await user.type(composer, "@Kai continue here");
     const sendReply = within(context).getByRole("button", { name: "Send reply" });
     expect(sendReply).toHaveTextContent("");

@@ -1218,7 +1218,7 @@ function ThreadPane({
           ref={composerRef}
           aria-label={`Reply in ${channelName}`}
           maxLength={50000}
-          placeholder="Reply… Use @name to mention an agent or person."
+          placeholder="Reply…"
           rows={1}
           value={draft}
           disabled={submitting || runActive}
