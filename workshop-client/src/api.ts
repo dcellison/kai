@@ -165,6 +165,7 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
   const {
     author_display_name: authorDisplayName,
     author_kind: authorKind,
+    author_principal_id: authorPrincipalId,
     body,
     channel_id: messageChannelId,
     created_at: createdAt,
@@ -177,6 +178,8 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
   if (
     typeof authorDisplayName !== "string" ||
     typeof authorKind !== "string" ||
+    typeof authorPrincipalId !== "string" ||
+    !PRINCIPAL_PATTERN.test(authorPrincipalId) ||
     typeof body !== "string" ||
     messageChannelId !== channelId ||
     typeof createdAt !== "string" ||
@@ -226,6 +229,7 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
     });
   }
   const mentions = [];
+  const bodyLength = Array.from(body).length;
   let previousEnd = 0;
   for (const rawMention of suppliedMentions) {
     if (!isRecord(rawMention)) {
@@ -239,7 +243,8 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
       typeof principalId !== "string" ||
       !PRINCIPAL_PATTERN.test(principalId) ||
       !Number.isSafeInteger(start) ||
-      (start as number) < previousEnd
+      (start as number) < previousEnd ||
+      (start as number) + (length as number) > bodyLength
     ) {
       return null;
     }
@@ -255,6 +260,7 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
     artifacts,
     authorDisplayName,
     authorKind,
+    authorPrincipalId,
     body,
     channelId,
     createdAt,
@@ -404,11 +410,22 @@ export async function loadNavigation(token: string): Promise<WorkshopNavigation>
           !isRecord(rawAgent) ||
           typeof rawAgent.agent_id !== "string" ||
           !AGENT_PATTERN.test(rawAgent.agent_id) ||
+          typeof rawAgent.principal_id !== "string" ||
+          !PRINCIPAL_PATTERN.test(rawAgent.principal_id) ||
+          typeof rawAgent.engaged !== "boolean" ||
+          (rawAgent.engaged_until !== null &&
+            typeof rawAgent.engaged_until !== "string") ||
           typeof rawAgent.name !== "string"
         ) {
           throw new Error("Kai returned unsupported Workshop navigation.");
         }
-        return { agentId: rawAgent.agent_id, name: rawAgent.name };
+        return {
+          agentId: rawAgent.agent_id,
+          engaged: rawAgent.engaged,
+          engagedUntil: rawAgent.engaged_until,
+          name: rawAgent.name,
+          principalId: rawAgent.principal_id,
+        };
       });
       const participants = rawChannel.participants.map((rawParticipant) => {
         if (
@@ -450,6 +467,74 @@ export async function loadNavigation(token: string): Promise<WorkshopNavigation>
     },
     workshops,
   };
+}
+
+export async function createChannel(
+  token: string,
+  input: {
+    agentIds: string[];
+    name: string;
+    originChannelId: string | null;
+  },
+): Promise<string> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    "/v1/channels",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        agent_ids: input.agentIds,
+        name: input.name,
+        ...(input.originChannelId
+          ? { origin_channel_id: input.originChannelId }
+          : {}),
+      }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not create this channel."));
+  }
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    !isRecord(payload.channel) ||
+    typeof payload.channel.channel_id !== "string" ||
+    !CHANNEL_PATTERN.test(payload.channel.channel_id)
+  ) {
+    throw new Error("Kai returned an unsupported channel creation response.");
+  }
+  return payload.channel.channel_id;
+}
+
+export async function dismissChannelAgent(
+  session: WorkshopSession,
+  agentId: string,
+  clientDismissalId: string,
+): Promise<void> {
+  if (!AGENT_PATTERN.test(agentId)) {
+    throw new Error("Invalid agent identity.");
+  }
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/agents/${encodeURIComponent(agentId)}/dismiss`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ client_dismissal_id: clientDismissalId }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (
+    !response.ok ||
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    payload.dismissed !== true ||
+    typeof payload.replayed !== "boolean"
+  ) {
+    throw new Error(safeErrorMessage(payload, "Could not dismiss this agent."));
+  }
 }
 
 function parseEditableCapabilities(value: unknown): WorkshopEditableCapability[] {

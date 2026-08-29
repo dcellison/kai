@@ -483,6 +483,36 @@ button:disabled {
   margin-top: 0;
 }
 
+.nav-heading-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 1.15rem;
+}
+
+.nav-heading-row .nav-heading {
+  margin-top: 0;
+}
+
+.nav-add-button {
+  width: 1.5rem;
+  height: 1.5rem;
+  margin-right: 0.35rem;
+  border: 1px solid transparent;
+  border-radius: 0.3rem;
+  background: transparent;
+  color: var(--color-text-muted);
+  font: 700 1rem/1 var(--sans);
+  cursor: pointer;
+}
+
+.nav-add-button:hover,
+.nav-add-button:focus-visible {
+  border-color: var(--color-border-strong);
+  color: var(--color-accent);
+  outline: none;
+}
+
 .channel-link,
 .agent-link {
   display: grid;
@@ -566,6 +596,14 @@ button:disabled {
   margin-top: 0.08rem;
   color: var(--color-text-muted);
   font-size: 0.64rem;
+}
+
+.agent-link.engaged .mini-avatar {
+  box-shadow: 0 0 0 1px var(--color-success);
+}
+
+.agent-link.engaged small {
+  color: var(--color-success);
 }
 
 .sidebar-footer {
@@ -1031,6 +1069,19 @@ button:disabled {
   white-space: pre-wrap;
 }
 
+.message-mention {
+  border-radius: 0.24rem;
+  padding: 0.03rem 0.18rem;
+  background: color-mix(in srgb, var(--color-accent) 14%, transparent);
+  color: var(--color-accent);
+  font-weight: 650;
+}
+
+.message-mention-human {
+  background: color-mix(in srgb, var(--color-warning) 14%, transparent);
+  color: var(--color-warning);
+}
+
 .markdown-message h1,
 .markdown-message h2,
 .markdown-message h3,
@@ -1319,9 +1370,49 @@ button:disabled {
 }
 
 .composer-form {
+  position: relative;
   display: flex;
   align-items: flex-end;
   gap: 0.65rem;
+}
+
+.mention-autocomplete {
+  position: absolute;
+  z-index: 30;
+  right: 6.15rem;
+  bottom: calc(100% + 0.4rem);
+  left: 6.15rem;
+  overflow: auto;
+  max-height: 12rem;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.4rem;
+  padding: 0.3rem;
+  background: var(--color-surface-raised);
+  box-shadow: 0 0.8rem 2rem color-mix(in srgb, var(--color-shadow-base) 40%, transparent);
+}
+
+.composer-form .mention-autocomplete button {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  width: 100%;
+  min-height: auto;
+  border: 0;
+  padding: 0.55rem 0.65rem;
+  background: transparent;
+  color: var(--color-text);
+  text-align: left;
+}
+
+.composer-form .mention-autocomplete button.selected,
+.composer-form .mention-autocomplete button:hover {
+  background: color-mix(in srgb, var(--color-accent) 12%, transparent);
+}
+
+.mention-autocomplete span {
+  color: var(--color-text-muted);
+  font-size: 0.65rem;
+  text-transform: capitalize;
 }
 
 .artifact-input {
@@ -1545,6 +1636,97 @@ button:disabled {
   font-size: 0.65rem;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.agent-attention-section ul {
+  display: grid;
+  gap: 0.55rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agent-attention-section li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+.agent-attention-section strong,
+.agent-attention-section small {
+  display: block;
+}
+
+.agent-attention-section small {
+  margin-top: 0.12rem;
+  color: var(--color-text-muted);
+  font-size: 0.65rem;
+}
+
+.agent-attention-section .quiet-button {
+  min-height: auto;
+  padding: 0.36rem 0.55rem;
+  font-size: 0.64rem;
+}
+
+.modal-backdrop {
+  position: fixed;
+  z-index: 100;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: color-mix(in srgb, var(--color-shadow-base) 68%, transparent);
+}
+
+.channel-creation-dialog {
+  width: min(30rem, 100%);
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.55rem;
+  padding: 1.3rem;
+  background: var(--color-surface-raised);
+  box-shadow: 0 1.4rem 4rem color-mix(in srgb, var(--color-shadow-base) 55%, transparent);
+}
+
+.channel-creation-dialog h2 {
+  margin: 0.35rem 0 0.55rem;
+  color: var(--color-text-strong);
+  font-family: var(--serif);
+}
+
+.channel-creation-dialog form,
+.channel-creation-dialog fieldset {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.channel-creation-dialog input[type="text"],
+.channel-creation-dialog input:not([type]) {
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.4rem;
+  padding: 0.65rem 0.75rem;
+  background: var(--color-panel);
+  color: var(--color-text);
+}
+
+.channel-creation-dialog fieldset {
+  margin: 0;
+  border: 1px solid var(--color-border);
+  border-radius: 0.4rem;
+  padding: 0.75rem;
+}
+
+.channel-agent-choice {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.channel-creation-dialog .form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.55rem;
 }
 
 .runtime-settings {

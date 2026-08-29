@@ -15,6 +15,8 @@ import {
   AuthenticationError,
   cancelRun,
   ChannelAccessError,
+  createChannel,
+  dismissChannelAgent,
   loadAppearancePreferences,
   loadNavigation,
   loadNotificationPreferences,
@@ -42,6 +44,7 @@ import type {
   WorkshopSettingsWorkspace,
   WorkshopSummary,
   WorkshopArtifactSummary,
+  WorkshopAgentSummary,
   WorkshopAppearancePreferences,
 } from "./types";
 import { CHANNEL_PATTERN } from "./types";
@@ -703,7 +706,7 @@ function MessageItem({
               {formatTimestamp(message.createdAt)}
             </time>
           </header>
-          <MarkdownMessage body={message.body} />
+          <MarkdownMessage body={message.body} mentions={message.mentions} />
           {message.artifacts.map((artifact) => (
             <ArtifactAttachment
               artifact={artifact}
@@ -728,7 +731,7 @@ function MessageItem({
             {formatTimestamp(message.createdAt)}
           </time>
         </header>
-        <MarkdownMessage body={message.body} />
+        <MarkdownMessage body={message.body} mentions={message.mentions} />
         {message.artifacts.map((artifact) => (
           <ArtifactAttachment
             artifact={artifact}
@@ -874,6 +877,132 @@ function workshopRoleLabel(role: string): string {
   return `Workshop ${role}`;
 }
 
+interface ChannelCreationRequest {
+  agentIds: string[];
+  name: string;
+  originChannelId: string | null;
+}
+
+interface MentionCandidate {
+  displayName: string;
+  kind: "agent" | "human";
+  principalId: string;
+}
+
+interface MentionTrigger {
+  end: number;
+  query: string;
+  start: number;
+}
+
+function findMentionTrigger(value: string, caret: number): MentionTrigger | null {
+  const prefix = value.slice(0, caret);
+  const match = /(?:^|\s)@([^@\n]*)$/.exec(prefix);
+  if (!match) {
+    return null;
+  }
+  const query = match[1];
+  return {
+    end: caret,
+    query,
+    start: caret - query.length - 1,
+  };
+}
+
+function ChannelCreationDialog({
+  agents,
+  initialAgentIds,
+  originChannelId,
+  originName,
+  onCancel,
+  onCreate,
+}: {
+  agents: WorkshopAgentSummary[];
+  initialAgentIds: string[];
+  originChannelId: string | null;
+  originName: string | null;
+  onCancel: () => void;
+  onCreate: (input: ChannelCreationRequest) => Promise<void>;
+}): React.JSX.Element {
+  const [name, setName] = useState("");
+  const [selectedAgentIds, setSelectedAgentIds] = useState<string[]>(() =>
+    initialAgentIds.length > 0
+      ? initialAgentIds
+      : agents[0]
+        ? [agents[0].agentId]
+        : [],
+  );
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const submit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
+    event.preventDefault();
+    const normalizedName = name.trim();
+    if (!normalizedName || selectedAgentIds.length === 0) {
+      setError("A channel name and at least one agent are required.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await onCreate({
+        agentIds: selectedAgentIds,
+        name: normalizedName,
+        originChannelId,
+      });
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not create this channel.");
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="modal-backdrop">
+      <section className="channel-creation-dialog" role="dialog" aria-modal="true" aria-labelledby="create-channel-title">
+        <p className="overline">New conversation space</p>
+        <h2 id="create-channel-title">Create channel</h2>
+        {originName && <p>Start from <strong>{originName}</strong>.</p>}
+        <form onSubmit={(event) => void submit(event)}>
+          <label htmlFor="channel-name">Channel name</label>
+          <input
+            id="channel-name"
+            autoFocus
+            maxLength={200}
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+          />
+          <fieldset>
+            <legend>Agents</legend>
+            {agents.map((agent) => (
+              <label className="channel-agent-choice" key={agent.agentId}>
+                <input
+                  type="checkbox"
+                  checked={selectedAgentIds.includes(agent.agentId)}
+                  onChange={(event) =>
+                    setSelectedAgentIds((current) =>
+                      event.target.checked
+                        ? [...current, agent.agentId]
+                        : current.filter((agentId) => agentId !== agent.agentId),
+                    )
+                  }
+                />
+                <span>{agent.name}</span>
+              </label>
+            ))}
+          </fieldset>
+          {error && <p className="form-error" role="alert">{error}</p>}
+          <div className="form-actions">
+            <button className="primary-button" type="submit" disabled={busy}>
+              {busy ? "Creating…" : "Create channel"}
+            </button>
+            <button className="quiet-button" type="button" onClick={onCancel} disabled={busy}>
+              Cancel
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
 function WorkshopView({
   channel,
   connection,
@@ -891,6 +1020,8 @@ function WorkshopView({
   workshop,
   onForget,
   onCancelRun,
+  onCreateChannel,
+  onDismissAgent,
   onDownloadArtifact,
   onLoadEarlier,
   onLoadArtifact,
@@ -923,6 +1054,8 @@ function WorkshopView({
   workshop: WorkshopSummary;
   onForget: () => void;
   onCancelRun: (runId: string) => Promise<WorkshopRun>;
+  onCreateChannel: (input: ChannelCreationRequest) => Promise<void>;
+  onDismissAgent: (agentId: string, clientDismissalId: string) => Promise<void>;
   onDownloadArtifact: (artifactId: string) => void;
   onLoadEarlier: () => void;
   onLoadArtifact: (artifactId: string) => Promise<Blob>;
@@ -977,10 +1110,21 @@ function WorkshopView({
     useState<string | null>(null);
   const [switchingWorkspace, setSwitchingWorkspace] = useState(false);
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
+  const [channelCreation, setChannelCreation] = useState<{
+    initialAgentIds: string[];
+    originChannelId: string | null;
+    originName: string | null;
+  } | null>(null);
+  const [dismissedAgents, setDismissedAgents] = useState<Record<string, number>>({});
+  const [dismissingAgentId, setDismissingAgentId] = useState<string | null>(null);
+  const [engagementClock, setEngagementClock] = useState(() => Date.now());
+  const [mentionTrigger, setMentionTrigger] = useState<MentionTrigger | null>(null);
+  const [mentionSelection, setMentionSelection] = useState(0);
   const [notificationPreferences, setNotificationPreferences] =
     useState<WorkshopNotificationPreferences | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const pendingComposerCaretRef = useRef<number | null>(null);
   const artifactInputRef = useRef<HTMLInputElement | null>(null);
   const sidebarRef = useRef<HTMLElement | null>(null);
   const profileMenuRef = useRef<HTMLElement | null>(null);
@@ -997,6 +1141,50 @@ function WorkshopView({
   const latestRunActivityRef = useRef<WorkshopRunActivity | null>(runActivity);
   const humanName = navigation.principal.displayName || "You";
   const humanRole = workshopRoleLabel(workshop.role);
+  const availableAgents = useMemo(() => {
+    const unique = new Map<string, WorkshopAgentSummary>();
+    for (const availableChannel of workshop.channels) {
+      for (const agent of availableChannel.agents) {
+        unique.set(agent.agentId, agent);
+      }
+    }
+    return Array.from(unique.values()).sort((left, right) =>
+      left.name.localeCompare(right.name),
+    );
+  }, [workshop.channels]);
+  const mentionCandidates = useMemo(() => {
+    if (channel.kind !== "group" || !mentionTrigger) {
+      return [];
+    }
+    const members = new Map<string, MentionCandidate>();
+    for (const agent of channel.agents) {
+      members.set(agent.principalId, {
+        displayName: agent.name,
+        kind: "agent",
+        principalId: agent.principalId,
+      });
+    }
+    for (const participant of channel.participants) {
+      if (
+        participant.principalId === navigation.principal.principalId ||
+        (participant.kind !== "agent" && participant.kind !== "human")
+      ) {
+        continue;
+      }
+      members.set(participant.principalId, {
+        displayName: participant.displayName,
+        kind: participant.kind,
+        principalId: participant.principalId,
+      });
+    }
+    const query = mentionTrigger.query.trim().toLocaleLowerCase();
+    return Array.from(members.values())
+      .filter(
+        (candidate) =>
+          !query || candidate.displayName.toLocaleLowerCase().startsWith(query),
+      )
+      .sort((left, right) => left.displayName.localeCompare(right.displayName));
+  }, [channel, mentionTrigger, navigation.principal.principalId]);
 
   useEffect(() => {
     if (channel.kind !== "notification") {
@@ -1036,6 +1224,88 @@ function WorkshopView({
   useEffect(() => {
     storeContextWidth(contextWidth);
   }, [contextWidth]);
+
+  useEffect(() => {
+    if (channel.kind !== "group") {
+      return;
+    }
+    const timer = window.setInterval(() => setEngagementClock(Date.now()), 30000);
+    return () => window.clearInterval(timer);
+  }, [channel.kind]);
+
+  const engagedAgents = useMemo(() => {
+    if (channel.kind !== "group") {
+      return [];
+    }
+    return channel.agents.filter((agent) => {
+      const dismissedAt = dismissedAgents[agent.agentId] ?? 0;
+      let engagedUntil = dismissedAt
+        ? 0
+        : agent.engagedUntil
+          ? Date.parse(agent.engagedUntil)
+          : agent.engaged
+            ? engagementClock
+            : 0;
+      for (const message of messages) {
+        const createdAt = Date.parse(message.createdAt);
+        if (!Number.isFinite(createdAt) || createdAt <= dismissedAt) {
+          continue;
+        }
+        if (
+          message.authorPrincipalId === agent.principalId ||
+          message.mentions.some(
+            (mention) =>
+              mention.kind === "agent" &&
+              mention.principalId === agent.principalId,
+          )
+        ) {
+          engagedUntil = Math.max(engagedUntil, createdAt + 900000);
+        }
+      }
+      return engagedUntil > engagementClock && engagedUntil > dismissedAt;
+    });
+  }, [channel.agents, channel.kind, dismissedAgents, engagementClock, messages]);
+
+  const dismissAgent = async (agentId: string): Promise<void> => {
+    if (dismissingAgentId) {
+      return;
+    }
+    setDismissingAgentId(agentId);
+    setSubmissionError(null);
+    try {
+      await onDismissAgent(agentId, createClientMessageId());
+      setDismissedAgents((current) => ({ ...current, [agentId]: Date.now() }));
+      setEngagementClock(Date.now());
+    } catch (caught) {
+      setSubmissionError(
+        caught instanceof Error ? caught.message : "Could not dismiss this agent.",
+      );
+    } finally {
+      setDismissingAgentId(null);
+    }
+  };
+
+  const updateMentionTrigger = (value: string, caret: number): void => {
+    setMentionTrigger(findMentionTrigger(value, caret));
+    setMentionSelection(0);
+  };
+
+  const insertMention = (candidate: MentionCandidate): void => {
+    if (!mentionTrigger) {
+      return;
+    }
+    const insertion = `@${candidate.displayName} `;
+    const nextDraft =
+      draft.slice(0, mentionTrigger.start) +
+      insertion +
+      draft.slice(mentionTrigger.end);
+    const nextCaret = mentionTrigger.start + insertion.length;
+    setDraft(nextDraft);
+    storeDraft(channelId, nextDraft);
+    setPendingMessageId(null);
+    setMentionTrigger(null);
+    pendingComposerCaretRef.current = nextCaret;
+  };
 
   useEffect(() => {
     if (!profileMenuOpen) {
@@ -1123,6 +1393,12 @@ function WorkshopView({
     const borderHeight = composer.offsetHeight - composer.clientHeight;
     composer.style.height = "auto";
     composer.style.height = `${composer.scrollHeight + borderHeight}px`;
+    if (pendingComposerCaretRef.current !== null) {
+      const caret = pendingComposerCaretRef.current;
+      pendingComposerCaretRef.current = null;
+      composer.focus();
+      composer.setSelectionRange(caret, caret);
+    }
   }, [draft, channelId]);
 
   useEffect(() => {
@@ -1569,31 +1845,42 @@ function WorkshopView({
             </>
           )}
 
-          {workshop.channels.some(
-            (availableChannel) => availableChannel.kind === "group",
-          ) && (
-            <>
-              <p className="nav-heading">Channels</p>
-              {workshop.channels
-                .filter((availableChannel) => availableChannel.kind === "group")
-                .map((availableChannel) => (
-                  <button
-                    className={`channel-link ${!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId ? "active" : ""}`}
-                    type="button"
-                    aria-label={channelDisplayName(availableChannel)}
-                    title={channelDisplayName(availableChannel)}
-                    onClick={() => onSelectChannel(availableChannel.channelId)}
-                    key={availableChannel.channelId}
-                  >
-                    <span>{channelSymbol(availableChannel)}</span>
-                    <span>{channelDisplayName(availableChannel)}</span>
-                    {!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId && (
-                      <span className="live-pip" aria-label="Live" />
-                    )}
-                  </button>
-                ))}
-            </>
-          )}
+          <div className="nav-heading-row">
+            <p className="nav-heading">Channels</p>
+            <button
+              className="nav-add-button"
+              type="button"
+              aria-label="Create channel"
+              title="Create channel"
+              onClick={() =>
+                setChannelCreation({
+                  initialAgentIds: [],
+                  originChannelId: null,
+                  originName: null,
+                })
+              }
+            >
+              +
+            </button>
+          </div>
+          {workshop.channels
+            .filter((availableChannel) => availableChannel.kind === "group")
+            .map((availableChannel) => (
+              <button
+                className={`channel-link ${!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId ? "active" : ""}`}
+                type="button"
+                aria-label={channelDisplayName(availableChannel)}
+                title={channelDisplayName(availableChannel)}
+                onClick={() => onSelectChannel(availableChannel.channelId)}
+                key={availableChannel.channelId}
+              >
+                <span>{channelSymbol(availableChannel)}</span>
+                <span>{channelDisplayName(availableChannel)}</span>
+                {!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId && (
+                  <span className="live-pip" aria-label="Live" />
+                )}
+              </button>
+            ))}
 
           {workshop.channels.some(
             (availableChannel) => availableChannel.kind === "notification",
@@ -1625,13 +1912,23 @@ function WorkshopView({
             <>
               <p className="nav-heading">Agents</p>
               {channel.agents.map((agent) => (
-                <div className="agent-link" title={agent.name} key={agent.agentId}>
+                <div
+                  className={`agent-link ${engagedAgents.some((engaged) => engaged.agentId === agent.agentId) ? "engaged" : ""}`}
+                  title={agent.name}
+                  key={agent.agentId}
+                >
                   <span className="mini-avatar">
                     {agent.name.slice(0, 1).toUpperCase()}
                   </span>
                   <span>
                     <strong>{agent.name}</strong>
-                    <small>coding agent</small>
+                    <small>
+                      {engagedAgents.some(
+                        (engaged) => engaged.agentId === agent.agentId,
+                      )
+                        ? "awake"
+                        : "coding agent"}
+                    </small>
                   </span>
                 </div>
               ))}
@@ -1734,6 +2031,21 @@ function WorkshopView({
           </div>
           <div className="conversation-actions">
             <ConnectionIndicator connection={connection} />
+            {channel.kind !== "notification" && (
+              <button
+                className="quiet-button"
+                type="button"
+                onClick={() =>
+                  setChannelCreation({
+                    initialAgentIds: channel.agents.map((agent) => agent.agentId),
+                    originChannelId: channel.channelId,
+                    originName: channelName,
+                  })
+                }
+              >
+                Start channel
+              </button>
+            )}
             <button
               className="quiet-button mobile-settings-button"
               type="button"
@@ -1891,11 +2203,40 @@ function WorkshopView({
                   const nextDraft = event.target.value;
                   setDraft(nextDraft);
                   storeDraft(channelId, nextDraft);
+                  updateMentionTrigger(
+                    nextDraft,
+                    event.target.selectionStart ?? nextDraft.length,
+                  );
                   if (!submitting) {
                     setPendingMessageId(null);
                   }
                 }}
                 onKeyDown={(event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+                  if (mentionTrigger && mentionCandidates.length > 0) {
+                    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                      event.preventDefault();
+                      const direction = event.key === "ArrowDown" ? 1 : -1;
+                      setMentionSelection((selection) =>
+                        (selection + direction + mentionCandidates.length) %
+                        mentionCandidates.length,
+                      );
+                      return;
+                    }
+                    if (event.key === "Escape") {
+                      event.preventDefault();
+                      setMentionTrigger(null);
+                      return;
+                    }
+                    if (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey)) {
+                      event.preventDefault();
+                      insertMention(
+                        mentionCandidates[
+                          Math.min(mentionSelection, mentionCandidates.length - 1)
+                        ],
+                      );
+                      return;
+                    }
+                  }
                   // Enter sends the draft; Shift+Enter inserts a newline. An
                   // Enter that confirms an IME composition must never send,
                   // so composing keystrokes are left to the editor untouched.
@@ -1921,6 +2262,29 @@ function WorkshopView({
                 placeholder={`Message ${channelName}…`}
                 rows={1}
               />
+              {mentionTrigger && mentionCandidates.length > 0 && (
+                <div
+                  className="mention-autocomplete"
+                  role="listbox"
+                  aria-label="Channel members"
+                >
+                  {mentionCandidates.map((candidate, index) => (
+                    <button
+                      className={index === mentionSelection ? "selected" : ""}
+                      type="button"
+                      role="option"
+                      aria-label={`@${candidate.displayName} — ${candidate.kind}`}
+                      aria-selected={index === mentionSelection}
+                      key={candidate.principalId}
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={() => insertMention(candidate)}
+                    >
+                      <strong>@{candidate.displayName}</strong>
+                      <span>{candidate.kind}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
               <button
                 className="send-button"
                 type="submit"
@@ -2023,8 +2387,44 @@ function WorkshopView({
             </p>
           </section>
 
+          {channel.kind === "group" && channel.agents.length > 0 && (
+            <section className="context-section agent-attention-section">
+              <span className="section-number">04</span>
+              <h3>Agent attention</h3>
+              <ul>
+                {channel.agents.map((agent) => {
+                  const engaged = engagedAgents.some(
+                    (candidate) => candidate.agentId === agent.agentId,
+                  );
+                  return (
+                    <li key={agent.agentId}>
+                      <span>
+                        <strong>{agent.name}</strong>
+                        <small>{engaged ? "Awake in this channel" : "Not engaged"}</small>
+                      </span>
+                      {engaged && (
+                        <button
+                          className="quiet-button"
+                          type="button"
+                          disabled={dismissingAgentId === agent.agentId}
+                          onClick={() => void dismissAgent(agent.agentId)}
+                        >
+                          {dismissingAgentId === agent.agentId
+                            ? "Dismissing…"
+                            : "Dismiss"}
+                        </button>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            </section>
+          )}
+
           <section className="context-section trace-section">
-            <span className="section-number">04</span>
+            <span className="section-number">
+              {channel.kind === "group" && channel.agents.length > 0 ? "05" : "04"}
+            </span>
             <h3>Runtime and workspace</h3>
             {settingsWorkspace ? (
               <div className="runtime-settings">
@@ -2067,7 +2467,9 @@ function WorkshopView({
           </section>
 
           <section className="context-section trace-section">
-            <span className="section-number">05</span>
+            <span className="section-number">
+              {channel.kind === "group" && channel.agents.length > 0 ? "06" : "05"}
+            </span>
             <h3>Run inspector</h3>
             <RunTraceCard
               entries={traceEntries}
@@ -2079,6 +2481,19 @@ function WorkshopView({
 
         </div>
       </aside>
+      {channelCreation && (
+        <ChannelCreationDialog
+          agents={availableAgents}
+          initialAgentIds={channelCreation.initialAgentIds}
+          originChannelId={channelCreation.originChannelId}
+          originName={channelCreation.originName}
+          onCancel={() => setChannelCreation(null)}
+          onCreate={async (input) => {
+            await onCreateChannel(input);
+            setChannelCreation(null);
+          }}
+        />
+      )}
         </>
       )}
     </main>
@@ -2132,6 +2547,7 @@ function ActiveWorkshopClient({
   session,
   onAuthenticationFailure,
   onChannelAccessFailure,
+  onCreateChannel,
   onForget,
   onOpenMemory,
   onOpenSettings,
@@ -2144,6 +2560,7 @@ function ActiveWorkshopClient({
   session: WorkshopSession;
   onAuthenticationFailure: (message: string) => void;
   onChannelAccessFailure: (message: string) => void;
+  onCreateChannel: (input: ChannelCreationRequest) => Promise<void>;
   onForget: () => void;
   onOpenMemory: () => void;
   onOpenSettings: () => void;
@@ -2244,6 +2661,13 @@ function ActiveWorkshopClient({
       withAccessHandling(() => switchWorkspace(session, path, revision)),
     [session, withAccessHandling],
   );
+  const dismissSelectedAgent = useCallback(
+    (agentId: string, clientDismissalId: string) =>
+      withAccessHandling(() =>
+        dismissChannelAgent(session, agentId, clientDismissalId),
+      ),
+    [session, withAccessHandling],
+  );
   if (!selected) {
     return <main className="loading-workshop">Workshop access changed.</main>;
   }
@@ -2269,6 +2693,8 @@ function ActiveWorkshopClient({
       workshop={selected.workshop}
       onForget={onForget}
       onCancelRun={cancelSelectedRun}
+      onCreateChannel={onCreateChannel}
+      onDismissAgent={dismissSelectedAgent}
       onLoadRun={loadSelectedRun}
       onLoadRunTrace={loadSelectedRunTrace}
       onLoadSettingsWorkspace={loadSelectedSettingsWorkspace}
@@ -2523,6 +2949,32 @@ function WorkshopApp(): React.JSX.Element {
     writeDestination(nextDestination, "replace");
   }, []);
 
+  const createWorkshopChannel = async (
+    input: ChannelCreationRequest,
+  ): Promise<void> => {
+    if (!session) {
+      throw new Error("Workshop is not connected.");
+    }
+    try {
+      const channelId = await createChannel(session.token, input);
+      const [discovered, appearance] = await Promise.all([
+        loadNavigation(session.token),
+        loadAppearancePreferences({ token: session.token }),
+      ]);
+      adoptNavigation(session.token, discovered, channelId, appearance);
+      const nextDestination: WorkshopDestination = { kind: "conversation" };
+      setDestination(nextDestination);
+      writeDestination(nextDestination, "push");
+    } catch (caught) {
+      if (caught instanceof AuthenticationError) {
+        handleAuthenticationFailure(caught.message);
+      } else if (caught instanceof ChannelAccessError) {
+        handleChannelAccessFailure(caught.message);
+      }
+      throw caught;
+    }
+  };
+
   if (view === "enrollment") {
     return (
       <EnrollmentView
@@ -2547,6 +2999,7 @@ function WorkshopApp(): React.JSX.Element {
       session={session}
       onAuthenticationFailure={handleAuthenticationFailure}
       onChannelAccessFailure={handleChannelAccessFailure}
+      onCreateChannel={createWorkshopChannel}
       onForget={() => forgetSession()}
       onOpenMemory={() => void openMemory()}
       onOpenSettings={openSettings}

@@ -11,7 +11,10 @@ export interface WorkshopSession {
 
 export interface WorkshopAgentSummary {
   agentId: string;
+  engaged: boolean;
+  engagedUntil: string | null;
   name: string;
+  principalId: string;
 }
 
 export interface WorkshopParticipantSummary {
@@ -411,6 +414,7 @@ export interface TimelineMessage {
   artifacts: WorkshopArtifactSummary[];
   authorDisplayName: string;
   authorKind: string;
+  authorPrincipalId: string;
   body: string;
   channelId: string;
   createdAt: string;

@@ -156,7 +156,12 @@ from kai.workshop.timeline import (
     TimelineResumeError,
     read_channel_timeline,
 )
-from kai.workshop.wake_policy import EngagementScope, WakePolicyError, dismiss_channel_agent
+from kai.workshop.wake_policy import (
+    EngagementScope,
+    WakePolicyError,
+    dismiss_channel_agent,
+    resolve_agent_engagements,
+)
 
 _TIMELINE_PATH = "/v1/channels/{channel_id}/timeline"
 _TIMELINE_EVENTS_PATH = "/v1/channels/{channel_id}/events"
@@ -2662,7 +2667,8 @@ async def _handle_client_navigation(
     ) as cursor:
         workshop_rows = list(await cursor.fetchall())
     async with store.connection.execute(
-        "SELECT c.workshop_id, c.id, c.kind, c.name, cm.role, a.id, a.name, "
+        "SELECT c.workshop_id, c.id, c.kind, c.name, cm.role, a.id, "
+        "a.principal_id, a.name, "
         "CASE WHEN cara.id IS NULL THEN 0 ELSE 1 END "
         "FROM channel_memberships cm "
         "JOIN channels c ON c.id = cm.channel_id "
@@ -2716,8 +2722,16 @@ async def _handle_client_navigation(
             assignments = channel["_runtime_assignments"]
             if not isinstance(agents, list) or not isinstance(assignments, list):
                 raise RuntimeError("Workshop navigation channel assembly failed")
-            agents.append({"agent_id": str(row[5]), "name": str(row[6])})
-            assignments.append(bool(row[7]))
+            agents.append(
+                {
+                    "agent_id": str(row[5]),
+                    "principal_id": str(row[6]),
+                    "name": str(row[7]),
+                    "engaged": False,
+                    "engaged_until": None,
+                }
+            )
+            assignments.append(bool(row[8]))
 
     for row in participant_rows:
         workshop_channels = channels_by_workshop.get(str(row[0]))
@@ -2750,6 +2764,21 @@ async def _handle_client_navigation(
                 and len(assignments) == len(agents)
                 and all(assignments)
             )
+            if channel["kind"] == "group":
+                engagement_by_agent = {
+                    engagement.agent_id: engagement
+                    for engagement in await resolve_agent_engagements(
+                        store,
+                        EngagementScope(ChannelId(str(channel["channel_id"]))),
+                        current_at=datetime.now(UTC),
+                    )
+                }
+                for agent in agents:
+                    if not isinstance(agent, dict):
+                        raise RuntimeError("Workshop navigation agent assembly failed")
+                    engagement = engagement_by_agent.get(AgentId(str(agent["agent_id"])))
+                    agent["engaged"] = engagement is not None
+                    agent["engaged_until"] = engagement.expires_at.isoformat() if engagement is not None else None
             visible_channels.append(channel)
         workshops.append(
             {

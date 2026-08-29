@@ -7,6 +7,8 @@ import {
   AuthenticationError,
   cancelRun,
   ChannelAccessError,
+  createChannel,
+  dismissChannelAgent,
   loadAppearancePreferences,
   loadEarlierTimeline,
   loadArtifactBlob,
@@ -42,6 +44,8 @@ vi.mock("./api", async (importOriginal) => {
   return {
     ...original,
     cancelRun: vi.fn(),
+    createChannel: vi.fn(),
+    dismissChannelAgent: vi.fn(),
     loadEarlierTimeline: vi.fn(),
     loadArtifactBlob: vi.fn(),
     loadAppearancePreferences: vi.fn(),
@@ -78,7 +82,15 @@ const navigation: WorkshopNavigation = {
     {
       channels: [
         {
-          agents: [{ agentId: "agt_00000000000000000000000000000001", name: "Kai" }],
+          agents: [
+            {
+              agentId: "agt_00000000000000000000000000000001",
+              engaged: false,
+              engagedUntil: null,
+              name: "Kai",
+              principalId: "prn_00000000000000000000000000000002",
+            },
+          ],
           canSubmitCommands: true,
           channelId,
           kind: "direct",
@@ -93,7 +105,15 @@ const navigation: WorkshopNavigation = {
           role: "owner",
         },
         {
-          agents: [{ agentId: "agt_00000000000000000000000000000001", name: "Kai" }],
+          agents: [
+            {
+              agentId: "agt_00000000000000000000000000000001",
+              engaged: false,
+              engagedUntil: null,
+              name: "Kai",
+              principalId: "prn_00000000000000000000000000000002",
+            },
+          ],
           canSubmitCommands: false,
           channelId: notificationChannelId,
           kind: "notification",
@@ -129,10 +149,44 @@ const navigation: WorkshopNavigation = {
     },
   ],
 };
+
+function navigationWithGroup({
+  engaged = false,
+  name = "Wake policy qualification",
+}: {
+  engaged?: boolean;
+  name?: string;
+} = {}): WorkshopNavigation {
+  const direct = navigation.workshops[0].channels[0];
+  return {
+    ...navigation,
+    workshops: [
+      {
+        ...navigation.workshops[0],
+        channels: [
+          ...navigation.workshops[0].channels,
+          {
+            ...direct,
+            agents: direct.agents.map((agent) => ({
+              ...agent,
+              engaged,
+              engagedUntil: engaged ? "2099-08-28T12:00:00Z" : null,
+            })),
+            channelId: secondChannelId,
+            kind: "group",
+            name,
+            role: "participant",
+          },
+        ],
+      },
+    ],
+  };
+}
 const historyMessage: TimelineMessage = {
   artifacts: [],
   authorDisplayName: "Kai",
   authorKind: "agent",
+  authorPrincipalId: "prn_00000000000000000000000000000002",
   body: "Canonical history is ready.",
   channelId,
   createdAt: "2026-08-13T09:00:00Z",
@@ -264,6 +318,8 @@ describe("Workshop React client", () => {
     handlers = null;
     failStream = null;
     vi.mocked(redeemEnrollment).mockResolvedValue("redeemed-session-token");
+    vi.mocked(createChannel).mockResolvedValue(secondChannelId);
+    vi.mocked(dismissChannelAgent).mockResolvedValue(undefined);
     vi.mocked(loadNavigation).mockResolvedValue(navigation);
     vi.mocked(loadAppearancePreferences).mockResolvedValue({
       mutation: null,
@@ -1284,6 +1340,109 @@ describe("Workshop React client", () => {
 
     await user.click(screen.getByRole("button", { name: "Kai" }));
     expect(await screen.findByText(`History for ${channelId}`)).toBeVisible();
+  });
+
+  it("creates a channel from the current conversation and opens it", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    vi.mocked(loadNavigation)
+      .mockResolvedValueOnce(navigation)
+      .mockResolvedValueOnce(
+        navigationWithGroup({ name: "Release planning" }),
+      );
+    vi.mocked(loadTimeline).mockImplementation(async (selectedSession) => ({
+      messages: [
+        {
+          ...historyMessage,
+          body: `History for ${selectedSession.channelId}`,
+          channelId: selectedSession.channelId,
+        },
+      ],
+      throughPosition: 25,
+      previousCursor: null,
+    }));
+
+    render(<App />);
+    expect(await screen.findByText(`History for ${channelId}`)).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Start channel" }));
+    expect(screen.getByText(/Start from/)).toHaveTextContent("Start from Kai.");
+    await user.type(screen.getByLabelText("Channel name"), "Release planning");
+    await user.click(
+      within(screen.getByRole("dialog")).getByRole("button", {
+        name: "Create channel",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(createChannel).toHaveBeenCalledWith("existing-session", {
+        agentIds: ["agt_00000000000000000000000000000001"],
+        name: "Release planning",
+        originChannelId: channelId,
+      }),
+    );
+    expect(
+      await screen.findByText(`History for ${secondChannelId}`),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Release planning" }),
+    ).toBeVisible();
+  });
+
+  it("inserts member mentions as plain text and submits them canonically", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId: secondChannelId, token: "existing-session" }),
+    );
+    vi.mocked(loadNavigation).mockResolvedValue(navigationWithGroup());
+    vi.mocked(loadTimeline).mockResolvedValue({
+      messages: [{ ...historyMessage, channelId: secondChannelId }],
+      throughPosition: 25,
+      previousCursor: null,
+    });
+
+    render(<App />);
+    const composer = await screen.findByLabelText(
+      "Message Wake policy qualification",
+    );
+    await user.type(composer, "@ka");
+    await user.click(screen.getByRole("option", { name: "@Kai — agent" }));
+    expect(composer).toHaveValue("@Kai ");
+    await user.type(composer, "reply plainly{Enter}");
+
+    await waitFor(() => expect(submitCommand).toHaveBeenCalledOnce());
+    expect(vi.mocked(submitCommand).mock.calls[0]?.[2]).toBe(
+      "@Kai reply plainly",
+    );
+  });
+
+  it("shows and dismisses authoritative agent engagement", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId: secondChannelId, token: "existing-session" }),
+    );
+    vi.mocked(loadNavigation).mockResolvedValue(
+      navigationWithGroup({ engaged: true }),
+    );
+    vi.mocked(loadTimeline).mockResolvedValue({
+      messages: [{ ...historyMessage, channelId: secondChannelId }],
+      throughPosition: 25,
+      previousCursor: null,
+    });
+
+    render(<App />);
+    expect(await screen.findByText("Awake in this channel")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Dismiss" }));
+
+    await waitFor(() => expect(dismissChannelAgent).toHaveBeenCalledOnce());
+    expect(vi.mocked(dismissChannelAgent).mock.calls[0]?.[1]).toBe(
+      "agt_00000000000000000000000000000001",
+    );
+    expect(await screen.findByText("Not engaged")).toBeVisible();
   });
 
   it("groups direct messages and names agent and human conversations by participant", async () => {
