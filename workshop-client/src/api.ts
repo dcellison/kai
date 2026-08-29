@@ -530,9 +530,13 @@ export async function dismissChannelAgent(
   session: WorkshopSession,
   agentId: string,
   clientDismissalId: string,
+  threadRootId: string | null = null,
 ): Promise<void> {
   if (!AGENT_PATTERN.test(agentId)) {
     throw new Error("Invalid agent identity.");
+  }
+  if (threadRootId !== null && !MESSAGE_PATTERN.test(threadRootId)) {
+    throw new Error("Invalid thread root identity.");
   }
   const response = await authorizedFetch(
     session,
@@ -540,7 +544,10 @@ export async function dismissChannelAgent(
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ client_dismissal_id: clientDismissalId }),
+      body: JSON.stringify({
+        client_dismissal_id: clientDismissalId,
+        ...(threadRootId ? { thread_root_id: threadRootId } : {}),
+      }),
     },
   );
   const payload = await responsePayload(response);

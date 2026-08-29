@@ -727,6 +727,13 @@ class CanonicalConversationProjection:
                 dismissal_row = await cursor.fetchone()
             if dismissal_row is None or tuple(dismissal_row) != ("group", envelope.workshop_id):
                 raise ValueError("Workshop agent dismissal must target an attached group agent")
+            if thread_root is not None:
+                async with connection.execute(
+                    "SELECT 1 FROM messages WHERE id = ? AND channel_id = ? AND thread_root_id IS NULL",
+                    (thread_root, envelope.aggregate_id),
+                ) as cursor:
+                    if await cursor.fetchone() is None:
+                        raise ValueError("Workshop agent dismissal must target a root message in its channel")
             await connection.execute(
                 "INSERT INTO channel_agent_dismissals "
                 "(id, channel_id, agent_id, dismissed_by_principal_id, "

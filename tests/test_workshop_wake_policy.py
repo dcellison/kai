@@ -9,6 +9,7 @@ import pytest
 
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.conversation_commands import (
+    ConversationCommandAcceptance,
     ConversationCommandDisposition,
     WorkshopConversationCommandService,
 )
@@ -144,6 +145,8 @@ def _message(
     identity: str,
     body: str,
     occurred_at: datetime,
+    *,
+    thread_root_id: MessageId | None = None,
 ) -> ClientInboundMessage:
     return ClientInboundMessage(
         principal_id=principal_id,
@@ -151,7 +154,14 @@ def _message(
         client_message_id=identity,
         body=body,
         occurred_at=occurred_at,
+        thread_root_id=thread_root_id,
     )
+
+
+def _accepted_message_id(acceptance: ConversationCommandAcceptance) -> MessageId:
+    message_id = acceptance.command.message.event.envelope.aggregate_id
+    assert isinstance(message_id, MessageId)
+    return message_id
 
 
 async def test_group_message_only_and_exact_replay_create_no_run(tmp_path: Path):
@@ -295,6 +305,141 @@ async def test_engagement_expires_and_agent_authored_message_never_wakes(tmp_pat
         await store.append(event)
         await store.project_pending(CanonicalConversationProjection())
         assert (await resolve_message_wake_targets(store, message_id)).agent_ids == ()
+    finally:
+        await store.close()
+
+
+async def test_thread_engagement_wakes_only_followups_in_the_same_thread(tmp_path: Path):
+    store, human_id, group_id, agent_ids = await _open_group_store(tmp_path / "kai.db")
+    try:
+        service = WorkshopConversationCommandService(store)
+        root_a = _accepted_message_id(
+            await service.accept_client(_message(human_id, group_id, "root-a", "Thread A", _NOW - timedelta(seconds=2)))
+        )
+        root_b = _accepted_message_id(
+            await service.accept_client(_message(human_id, group_id, "root-b", "Thread B", _NOW - timedelta(seconds=1)))
+        )
+
+        mentioned = await service.accept_client(
+            _message(
+                human_id,
+                group_id,
+                "thread-a-mention",
+                "@Kai join thread A",
+                _NOW,
+                thread_root_id=root_a,
+            )
+        )
+        same_thread = await service.accept_client(
+            _message(
+                human_id,
+                group_id,
+                "thread-a-followup",
+                "Continue here",
+                _NOW + timedelta(seconds=1),
+                thread_root_id=root_a,
+            )
+        )
+        other_thread = await service.accept_client(
+            _message(
+                human_id,
+                group_id,
+                "thread-b-followup",
+                "Do not wake there",
+                _NOW + timedelta(seconds=2),
+                thread_root_id=root_b,
+            )
+        )
+        top_level = await service.accept_client(
+            _message(human_id, group_id, "top-followup", "Do not wake here", _NOW + timedelta(seconds=3))
+        )
+
+        assert tuple(run.agent_id for run in mentioned.command.runs) == (agent_ids[0],)
+        assert tuple(run.agent_id for run in same_thread.command.runs) == (agent_ids[0],)
+        assert other_thread.command.disposition == ConversationCommandDisposition.MESSAGE_ONLY
+        assert top_level.command.disposition == ConversationCommandDisposition.MESSAGE_ONLY
+        assert (
+            await resolve_agent_engagements(
+                store,
+                EngagementScope(group_id, root_a),
+                current_at=_NOW + timedelta(seconds=3),
+            )
+        )[0].agent_id == agent_ids[0]
+        assert (
+            await resolve_agent_engagements(
+                store,
+                EngagementScope(group_id, root_b),
+                current_at=_NOW + timedelta(seconds=3),
+            )
+            == ()
+        )
+        assert (
+            await resolve_agent_engagements(
+                store,
+                EngagementScope(group_id),
+                current_at=_NOW + timedelta(seconds=3),
+            )
+            == ()
+        )
+    finally:
+        await store.close()
+
+
+async def test_thread_dismissal_and_quiet_window_are_scoped_per_thread(tmp_path: Path):
+    store, human_id, group_id, agent_ids = await _open_group_store(tmp_path / "kai.db")
+    try:
+        service = WorkshopConversationCommandService(store)
+        root_a = _accepted_message_id(
+            await service.accept_client(_message(human_id, group_id, "root-a", "Thread A", _NOW - timedelta(seconds=2)))
+        )
+        root_b = _accepted_message_id(
+            await service.accept_client(_message(human_id, group_id, "root-b", "Thread B", _NOW - timedelta(seconds=1)))
+        )
+        await service.accept_client(
+            _message(human_id, group_id, "mention-a", "@Kai thread A", _NOW, thread_root_id=root_a)
+        )
+        await service.accept_client(
+            _message(
+                human_id,
+                group_id,
+                "mention-b",
+                "@Kai thread B",
+                _NOW + timedelta(seconds=1),
+                thread_root_id=root_b,
+            )
+        )
+
+        await dismiss_channel_agent(
+            store,
+            principal_id=human_id,
+            scope=EngagementScope(group_id, root_a),
+            agent_id=agent_ids[0],
+            client_dismissal_id="dismiss-thread-a",
+            occurred_at=_NOW + timedelta(seconds=2),
+        )
+
+        assert (
+            await resolve_agent_engagements(
+                store,
+                EngagementScope(group_id, root_a),
+                current_at=_NOW + timedelta(seconds=3),
+            )
+            == ()
+        )
+        thread_b = await resolve_agent_engagements(
+            store,
+            EngagementScope(group_id, root_b),
+            current_at=_NOW + timedelta(seconds=3),
+        )
+        assert tuple(item.agent_id for item in thread_b) == (agent_ids[0],)
+        assert (
+            await resolve_agent_engagements(
+                store,
+                EngagementScope(group_id, root_b),
+                current_at=_NOW + timedelta(seconds=902),
+            )
+            == ()
+        )
     finally:
         await store.close()
 
