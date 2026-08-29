@@ -164,7 +164,7 @@ def test_component_styles_are_palette_neutral_and_fully_defined() -> None:
 def test_component_styles_use_readable_scale_without_hiding_context() -> None:
     component_css = _COMPONENT_CSS.read_text()
 
-    assert re.search(r":root\s*\{[^}]*font-size:\s*200%;", component_css, re.DOTALL)
+    assert re.search(r":root\s*\{[^}]*font-size:\s*150%;", component_css, re.DOTALL)
     assert re.search(r"\.context-pane\s*\{\s*display:\s*none", component_css) is None
 
 
