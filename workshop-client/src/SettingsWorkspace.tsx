@@ -11,8 +11,6 @@ import {
   loadNotificationPreferences,
   loadClientPreferences,
   loadModelCatalogue,
-  loadRoutingEligibility,
-  loadRoutingPolicy,
   loadSettingsWorkspace,
   loadWorkspaceConfig,
   PreferenceRevisionConflictError,
@@ -24,7 +22,6 @@ import {
   switchWorkspace,
   upsertOperatorModel,
   updateRuntimeSettings,
-  updateRoutingPolicy,
   updateGitHubSettings,
   updateNotificationPreference,
   updateClientPreference,
@@ -38,9 +35,6 @@ import type {
   WorkshopGitHubSettings,
   WorkshopGitHubSettingsChange,
   WorkshopModelCatalogue,
-  WorkshopRoutingEligibility,
-  WorkshopRoutingPolicy,
-  WorkshopRoutingTaskClass,
   WorkshopNotificationPreferences,
   WorkshopNotificationPreferenceChange,
   WorkshopClientPreferences,
@@ -65,7 +59,6 @@ const VOICE_MODE_LABELS = {
 const SETTINGS_SECTIONS = [
   { id: "settings-section-personal-preferences", label: "Personal preferences" },
   { id: "settings-section-runtime", label: "Runtime settings" },
-  { id: "settings-section-routing", label: "Routing eligibility" },
   { id: "settings-section-workspace", label: "Workspace settings" },
   { id: "settings-section-github", label: "GitHub" },
   { id: "settings-section-notifications", label: "Notification delivery" },
@@ -190,16 +183,6 @@ function SettingsWorkspaceContent({
   const [workspaceModel, setWorkspaceModel] = useState("");
   const [workspaceTimeout, setWorkspaceTimeout] = useState("");
   const [workspacePrompt, setWorkspacePrompt] = useState("");
-
-  const [routingTaskClass, setRoutingTaskClass] =
-    useState<WorkshopRoutingTaskClass>("coding");
-  const [routingEligibility, setRoutingEligibility] =
-    useState<WorkshopRoutingEligibility | null>(null);
-  const [routingPolicy, setRoutingPolicy] = useState<WorkshopRoutingPolicy | null>(null);
-  const [routingLoading, setRoutingLoading] = useState(true);
-  const [routingBusy, setRoutingBusy] = useState(false);
-  const [routingError, setRoutingError] = useState<string | null>(null);
-  const [routingNotice, setRoutingNotice] = useState<string | null>(null);
 
   const [github, setGitHub] = useState<WorkshopGitHubSettings | null>(null);
   const [githubLoading, setGitHubLoading] = useState(true);
@@ -370,59 +353,6 @@ function SettingsWorkspaceContent({
     }
   }, [adoptRuntime, adoptWorkspace, handleAccessFailure, onAuthenticationFailure, session]);
 
-  const refreshRoutingEligibility = useCallback(async (): Promise<void> => {
-    setRoutingLoading(true);
-    setRoutingError(null);
-    try {
-      const [eligibility, policy] = await Promise.all([
-        loadRoutingEligibility(session, routingTaskClass),
-        loadRoutingPolicy(session),
-      ]);
-      setRoutingEligibility(eligibility);
-      setRoutingPolicy(policy);
-    } catch (caught) {
-      if (!handleAccessFailure(caught)) {
-        setRoutingError(errorText(caught, "Could not load routing eligibility."));
-      }
-      setRoutingEligibility(null);
-      setRoutingPolicy(null);
-    } finally {
-      setRoutingLoading(false);
-    }
-  }, [handleAccessFailure, routingTaskClass, session]);
-
-  const saveRoutingPolicy = async (
-    backendOptionId: string | null,
-    fallback: "selected" | "fail_closed",
-  ): Promise<void> => {
-    const entry = routingPolicy?.entries.find((item) => item.taskClass === routingTaskClass);
-    if (!entry || routingBusy) return;
-    setRoutingBusy(true);
-    setRoutingError(null);
-    setRoutingNotice(null);
-    try {
-      const updated = await updateRoutingPolicy(
-        session,
-        routingTaskClass,
-        backendOptionId,
-        fallback,
-        entry.revision,
-      );
-      setRoutingPolicy(updated);
-      setRoutingNotice(
-        backendOptionId === null
-          ? `${routingTaskClass} routing disabled. Your selected backend remains unchanged.`
-          : `${routingTaskClass} requests will use the explicit route without changing your selected backend.`,
-      );
-    } catch (caught) {
-      if (!handleAccessFailure(caught)) {
-        setRoutingError(errorText(caught, "Could not update routing policy."));
-      }
-    } finally {
-      setRoutingBusy(false);
-    }
-  };
-
   useEffect(() => {
     if (!runtime || !runtimeBackend) {
       setModelCatalogue(null);
@@ -592,7 +522,6 @@ function SettingsWorkspaceContent({
   useEffect(() => {
     void refreshPreferences();
     void refreshRuntime();
-    void refreshRoutingEligibility();
     void refreshGitHub();
     void refreshNotifications();
     void refreshClients();
@@ -603,7 +532,6 @@ function SettingsWorkspaceContent({
     refreshGitHub,
     refreshNotifications,
     refreshPreferences,
-    refreshRoutingEligibility,
     refreshRuntime,
   ]);
 
@@ -1344,138 +1272,10 @@ function SettingsWorkspaceContent({
           {runtimeError && runtime && <p className="settings-error" role="alert">{runtimeError}</p>}
         </section>
 
-        <section className="settings-section" id="settings-section-routing">
-          <div>
-            <p className="section-number">03</p>
-            <h2>Routing eligibility</h2>
-            <p>
-              Opt into an explicit backend for each task class. A routed
-              message runs in isolation and never changes your selected
-              backend or its conversation continuity.
-            </p>
-          </div>
-          <div className="routing-eligibility-workspace">
-            <label htmlFor="routing-task-class">Task class</label>
-            <select
-              id="routing-task-class"
-              value={routingTaskClass}
-              onChange={(event) => {
-                setRoutingTaskClass(event.target.value as WorkshopRoutingTaskClass);
-              }}
-            >
-              <option value="conversation">Conversation</option>
-              <option value="coding">Coding</option>
-              <option value="vision">Vision</option>
-            </select>
-            {routingLoading ? (
-              <p role="status">Checking authorized runtimes…</p>
-            ) : routingEligibility ? (
-              <>
-                {routingPolicy && (() => {
-                  const entry = routingPolicy.entries.find(
-                    (item) => item.taskClass === routingTaskClass,
-                  );
-                  if (!entry) return null;
-                  return (
-                    <div className="settings-card routing-policy-editor">
-                      <label htmlFor="routing-policy-target">Explicit route</label>
-                      <select
-                        id="routing-policy-target"
-                        value={entry.backendOptionId ?? ""}
-                        disabled={routingBusy}
-                        onChange={(event) => void saveRoutingPolicy(
-                          event.target.value || null,
-                          entry.fallback,
-                        )}
-                      >
-                        <option value="">Disabled — use selected backend</option>
-                        {routingEligibility.candidates
-                          .filter((candidate) => entry.authorizedOptionIds.includes(candidate.optionId))
-                          .map((candidate) => (
-                            <option value={candidate.optionId} key={candidate.optionId}>
-                              {candidate.backend} · {candidate.provider} · {candidate.modelId}
-                              {candidate.eligible ? "" : " · currently ineligible"}
-                            </option>
-                          ))}
-                      </select>
-                      <label htmlFor="routing-policy-fallback">If the route becomes ineligible</label>
-                      <select
-                        id="routing-policy-fallback"
-                        value={entry.fallback}
-                        disabled={routingBusy || entry.backendOptionId === null}
-                        onChange={(event) => void saveRoutingPolicy(
-                          entry.backendOptionId,
-                          event.target.value as "selected" | "fail_closed",
-                        )}
-                      >
-                        <option value="selected">Use selected backend</option>
-                        <option value="fail_closed">Do not dispatch</option>
-                      </select>
-                    </div>
-                  );
-                })()}
-                <p className="routing-eligibility-summary">
-                  Required: {routingEligibility.requiredCapabilities
-                    .map((item) => item.replaceAll("_", " "))
-                    .join(", ")}
-                </p>
-                <div className="routing-candidate-list">
-                  {routingEligibility.candidates.map((candidate) => (
-                    <article className="settings-card routing-candidate" key={candidate.optionId}>
-                      <div className="routing-candidate-heading">
-                        <div>
-                          <strong>{candidate.backend} · {candidate.provider}</strong>
-                          <small>{candidate.modelId}</small>
-                        </div>
-                        <div className="routing-badges">
-                          {candidate.selected && <span>Current</span>}
-                          <span data-eligible={candidate.eligible}>
-                            {candidate.eligible ? "Eligible" : "Not eligible"}
-                          </span>
-                        </div>
-                      </div>
-                      <dl className="routing-capability-list">
-                        {candidate.capabilities.map((item) => (
-                          <div key={item.capability}>
-                            <dt>{item.capability.replaceAll("_", " ")}</dt>
-                            <dd data-support={item.support}>{item.support}</dd>
-                          </div>
-                        ))}
-                        <div>
-                          <dt>Authorized services</dt>
-                          <dd>{candidate.allowedServices.join(", ") || "None"}</dd>
-                        </div>
-                      </dl>
-                      <ul className="routing-reasons">
-                        {candidate.reasons.map((reason) => (
-                          <li key={`${reason.code}:${reason.detail}`}>{reason.detail}</li>
-                        ))}
-                      </ul>
-                    </article>
-                  ))}
-                </div>
-                {routingNotice && <p className="settings-notice" role="status">{routingNotice}</p>}
-                {routingError && <p className="settings-error" role="alert">{routingError}</p>}
-              </>
-            ) : (
-              <div className="settings-failure">
-                <p role="alert">{routingError ?? "Routing eligibility is unavailable."}</p>
-                <button
-                  className="quiet-button"
-                  type="button"
-                  onClick={() => void refreshRoutingEligibility()}
-                >
-                  Retry
-                </button>
-              </div>
-            )}
-          </div>
-        </section>
-
         {runtime && workspaceConfig && (
           <section className="settings-section" id="settings-section-workspace">
             <div>
-              <p className="section-number">04</p>
+              <p className="section-number">03</p>
               <h2>Workspace settings</h2>
               <p>Choose an existing authorized workspace and manage overrides that apply only within it.</p>
             </div>
@@ -1528,7 +1328,7 @@ function SettingsWorkspaceContent({
         {runtime && !workspaceConfig && !runtimeLoading && (
           <section className="settings-section" id="settings-section-workspace">
             <div>
-              <p className="section-number">04</p>
+              <p className="section-number">03</p>
               <h2>Workspace settings</h2>
               <p>Runtime settings remain available, but workspace-specific overrides could not be loaded.</p>
             </div>
@@ -1541,7 +1341,7 @@ function SettingsWorkspaceContent({
 
         <section className="settings-section" id="settings-section-github">
           <div>
-            <p className="section-number">05</p>
+            <p className="section-number">04</p>
             <h2>GitHub</h2>
             <p>
               Personal notification subscriptions, automation choices, and a
@@ -1780,7 +1580,7 @@ function SettingsWorkspaceContent({
 
         <section className="settings-section" id="settings-section-notifications">
           <div>
-            <p className="section-number">06</p>
+            <p className="section-number">05</p>
             <h2>Notification delivery</h2>
             <p>
               Choose where personal integration notifications appear. Only
@@ -1865,7 +1665,7 @@ function SettingsWorkspaceContent({
 
         <section className="settings-section" id="settings-section-clients">
           <div>
-            <p className="section-number">07</p>
+            <p className="section-number">06</p>
             <h2>Client preferences</h2>
             <p>
               Control presentation on each connected client without changing

@@ -224,7 +224,7 @@ _ALLOWED_MEMORY_LIST_PARAMETERS = _ALLOWED_MEMORY_FILTERS | {"cursor", "limit", 
 _ALLOWED_MEMORY_SEARCH_PARAMETERS = _ALLOWED_MEMORY_FILTERS | {"q", "limit"}
 _ENROLLMENT_REQUEST_FIELDS = frozenset({"enrollment_token", "device_display_name"})
 _COMMAND_REQUIRED_FIELDS = frozenset({"client_message_id", "body"})
-_COMMAND_OPTIONAL_FIELDS = frozenset({"thread_root_id", "task_class"})
+_COMMAND_OPTIONAL_FIELDS = frozenset({"thread_root_id"})
 _ROUTING_POLICY_FIELDS = frozenset({"task_class", "backend_option_id", "fallback", "expected_revision"})
 _SETTINGS_OPERATION_FIELDS = frozenset({"backend", "model", "timeout_seconds", "reset"})
 _SETTINGS_REQUEST_FIELDS = _SETTINGS_OPERATION_FIELDS | {"revision"}
@@ -3614,10 +3614,8 @@ async def _handle_command_submission(
         client_message_id = payload["client_message_id"]
         body = payload["body"]
         raw_thread_root_id = payload.get("thread_root_id")
-        raw_task_class = payload.get("task_class")
     elif request.content_type == "multipart/form-data" and artifact_service is not None:
         raw_thread_root_id = None
-        raw_task_class = None
         try:
             reader = await request.multipart()
             first = await reader.next()
@@ -3631,9 +3629,6 @@ async def _handle_command_submission(
             if not _CLIENT_MESSAGE_ID_PATTERN.fullmatch(client_message_id) or len(body) > 50_000:
                 raise ValueError("invalid multipart command metadata")
             file_field = await reader.next()
-            if isinstance(file_field, BodyPartReader) and file_field.name == "task_class":
-                raw_task_class = await file_field.text()
-                file_field = await reader.next()
             if not isinstance(file_field, BodyPartReader) or file_field.name != "file":
                 raise ValueError("invalid multipart fields")
 
@@ -3688,7 +3683,6 @@ async def _handle_command_submission(
             body=body,
             occurred_at=datetime.now(UTC),
             thread_root_id=thread_root_id,
-            routing_task_class=raw_task_class,
             artifact_source_unique_id=(artifact.source_unique_id if artifact is not None else None),
         )
     except (TypeError, ValueError):

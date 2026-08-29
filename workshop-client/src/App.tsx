@@ -23,7 +23,6 @@ import {
   loadArtifactBlob,
   loadRun,
   loadRunTrace,
-  loadRoutingPolicy,
   loadSettingsWorkspace,
   loadThreadTimeline,
   redeemEnrollment,
@@ -40,8 +39,6 @@ import type {
   WorkshopRunPreview,
   WorkshopRunTracePage,
   WorkshopRunTraceSignal,
-  WorkshopRoutingPolicy,
-  WorkshopRoutingTaskClass,
   WorkshopChannelSummary,
   WorkshopNavigation,
   WorkshopNotificationPreferences,
@@ -1364,7 +1361,6 @@ function WorkshopView({
     body: string,
     artifact: File | null,
     threadRootId: string | null,
-    taskClass?: WorkshopRoutingTaskClass | null,
   ) => Promise<CommandSubmissionResult>;
   onSwitchWorkspace: (
     path: string,
@@ -1417,9 +1413,6 @@ function WorkshopView({
   const [mentionSelection, setMentionSelection] = useState(0);
   const [notificationPreferences, setNotificationPreferences] =
     useState<WorkshopNotificationPreferences | null>(null);
-  const [routingPolicy, setRoutingPolicy] = useState<WorkshopRoutingPolicy | null>(null);
-  const [routingTaskClass, setRoutingTaskClass] =
-    useState<WorkshopRoutingTaskClass | null>(null);
   const [threadRootMessageId, setThreadRootMessageId] = useState<string | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
@@ -1464,22 +1457,6 @@ function WorkshopView({
   useEffect(() => {
     setThreadRootMessageId(null);
   }, [channelId]);
-  useEffect(() => {
-    let active = true;
-    setRoutingTaskClass(null);
-    void loadRoutingPolicy(settingsSession)
-      .then((policy) => {
-        if (active) setRoutingPolicy(policy);
-      })
-      .catch((caught) => {
-        if (!active) return;
-        setRoutingPolicy(null);
-        if (caught instanceof AuthenticationError) {
-          onSettingsAccessFailure(caught.message);
-        }
-      });
-    return () => { active = false; };
-  }, [onSettingsAccessFailure, settingsSession]);
   const availableAgents = useMemo(() => {
     const unique = new Map<string, WorkshopAgentSummary>();
     for (const availableChannel of workshop.channels) {
@@ -2076,18 +2053,11 @@ function WorkshopView({
     try {
       const clientMessageId = pendingMessageId ?? createClientMessageId();
       setPendingMessageId(clientMessageId);
-      const result = await onSubmitCommand(
-        clientMessageId,
-        body,
-        selectedArtifact,
-        null,
-        routingTaskClass,
-      );
+      const result = await onSubmitCommand(clientMessageId, body, selectedArtifact, null);
       setDraft("");
       storeDraft(channelId, "");
       setPendingMessageId(null);
       setSelectedArtifact(null);
-      setRoutingTaskClass(null);
       if (artifactInputRef.current) {
         artifactInputRef.current.value = "";
       }
@@ -2522,17 +2492,6 @@ function WorkshopView({
                 <strong>{activeRun.status}</strong>
                 <span>{formatRunDuration(activeRun, runClock)}</span>
               </div>
-              {activeRun.routingDecision && (
-                <p className="run-routing-decision">
-                  Route: {activeRun.routingDecision.disposition.replaceAll("_", " ")}
-                  {activeRun.routingDecision.requestedTaskClass
-                    ? ` · ${activeRun.routingDecision.requestedTaskClass}`
-                    : ""}
-                  {activeRun.routingDecision.selectedBackendOptionId
-                    ? ` · ${activeRun.routingDecision.selectedBackendOptionId}`
-                    : ""}
-                </p>
-              )}
             </section>
           )}
           {channel.canSubmitCommands ? (
@@ -2557,29 +2516,6 @@ function WorkshopView({
               >
                 <PaperclipIcon />
               </button>
-              {routingPolicy?.entries.some((entry) => entry.backendOptionId !== null) && (
-                <select
-                  className="composer-route-select"
-                  aria-label="Task route"
-                  title="Route this message without changing your selected backend"
-                  value={routingTaskClass ?? ""}
-                  disabled={submitting || isRunActive(activeRun)}
-                  onChange={(event) => setRoutingTaskClass(
-                    event.target.value
-                      ? event.target.value as WorkshopRoutingTaskClass
-                      : null,
-                  )}
-                >
-                  <option value="">Default</option>
-                  {routingPolicy.entries
-                    .filter((entry) => entry.backendOptionId !== null)
-                    .map((entry) => (
-                      <option value={entry.taskClass} key={entry.taskClass}>
-                        {entry.taskClass.slice(0, 1).toUpperCase() + entry.taskClass.slice(1)}
-                      </option>
-                    ))}
-                </select>
-              )}
               <textarea
                 ref={composerRef}
                 aria-label={`Message ${channelName}`}
@@ -3043,12 +2979,9 @@ function ActiveWorkshopClient({
       body: string,
       artifact: File | null,
       threadRootId: string | null,
-      taskClass: WorkshopRoutingTaskClass | null = null,
     ) =>
       withAccessHandling(() =>
-        taskClass
-          ? submitCommand(session, clientMessageId, body, artifact, threadRootId, taskClass)
-          : submitCommand(session, clientMessageId, body, artifact, threadRootId)
+        submitCommand(session, clientMessageId, body, artifact, threadRootId)
       ),
     [session, withAccessHandling],
   );

@@ -2066,7 +2066,7 @@ class TestWorkshopCommandHTTPContract:
             await client.close()
             await store.close()
 
-    async def test_authenticated_member_submits_only_server_scoped_command_fields(
+    async def test_authenticated_member_cannot_supply_a_task_route(
         self,
         tmp_path: Path,
     ):
@@ -2089,21 +2089,55 @@ class TestWorkshopCommandHTTPContract:
             )
             payload = await response.json()
 
-            assert response.status == 202
-            assert payload["version"] == 2
-            assert payload["acceptance"] == "newly_accepted"
-            assert payload["run"]["status"] == "accepted"
-            assert payload["run"]["channel_id"] == alice_channel
-            assert str(payload["message_id"]).startswith("msg_")
-            assert str(payload["run_id"]).startswith("run_")
-            assert len(submitter.messages) == 1
-            submitted = submitter.messages[0]
-            assert submitted.principal_id == alice_id
-            assert submitted.channel_id == alice_channel
-            assert submitted.client_message_id == "browser-command-1"
-            assert submitted.body == "Hello from Workshop"
-            assert submitted.routing_task_class == "coding"
-            assert submitted.occurred_at.tzinfo is not None
+            assert response.status == 400
+            assert payload == {
+                "error": {
+                    "code": "invalid_request",
+                    "message": "Invalid command request",
+                }
+            }
+            assert submitter.messages == []
+            async with store.connection.execute("SELECT COUNT(*) FROM messages") as cursor:
+                assert int((await cursor.fetchone())[0]) == 0
+            async with store.connection.execute("SELECT COUNT(*) FROM runs") as cursor:
+                assert int((await cursor.fetchone())[0]) == 0
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_authenticated_member_cannot_supply_a_multipart_task_route(
+        self,
+        tmp_path: Path,
+    ):
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        service = await _artifact_service(store, tmp_path)
+        submitter = _CommandSubmitter()
+        client = await _open_command_client(
+            store,
+            _Authenticator({"alice-token": alice_id}),
+            submitter,
+            service,
+        )
+        form = FormData()
+        form.add_field("client_message_id", "browser-artifact-route-1")
+        form.add_field("body", "Inspect this")
+        form.add_field("task_class", "coding")
+        form.add_field(
+            "file",
+            b"untrusted routed upload",
+            filename="notes.txt",
+            content_type="text/plain",
+        )
+        try:
+            response = await client.post(
+                f"/v1/channels/{alice_channel}/commands",
+                headers={"Authorization": "Bearer alice-token"},
+                data=form,
+            )
+
+            assert response.status == 400
+            assert submitter.messages == []
+            assert not (tmp_path / "files").exists()
         finally:
             await client.close()
             await store.close()

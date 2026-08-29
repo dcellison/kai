@@ -2455,7 +2455,6 @@ export async function submitCommand(
   body: string,
   artifact: File | null = null,
   threadRootId: string | null = null,
-  taskClass: WorkshopRoutingTaskClass | null = null,
 ): Promise<CommandSubmissionResult> {
   if (threadRootId !== null && !MESSAGE_PATTERN.test(threadRootId)) {
     throw new Error("Invalid thread identity.");
@@ -2468,7 +2467,6 @@ export async function submitCommand(
         const form = new FormData();
         form.append("client_message_id", clientMessageId);
         form.append("body", body);
-        if (taskClass) form.append("task_class", taskClass);
         form.append("file", artifact, artifact.name);
         return { body: form, method: "POST" } satisfies RequestInit;
       })()
@@ -2479,7 +2477,6 @@ export async function submitCommand(
           body,
           client_message_id: clientMessageId,
           ...(threadRootId ? { thread_root_id: threadRootId } : {}),
-          ...(taskClass ? { task_class: taskClass } : {}),
         }),
       };
   const response = await authorizedFetch(

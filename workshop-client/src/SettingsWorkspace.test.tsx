@@ -12,8 +12,6 @@ import {
   loadModelCatalogue,
   loadPreferenceDocument,
   loadPreferenceHistory,
-  loadRoutingEligibility,
-  loadRoutingPolicy,
   loadSettingsWorkspace,
   loadWorkspaceConfig,
   PreferenceRevisionConflictError,
@@ -28,7 +26,6 @@ import {
   updateClientPreference,
   updateAppearancePreference,
   updateRuntimeSettings,
-  updateRoutingPolicy,
   updateWorkspaceConfig,
 } from "./api";
 import { SettingsWorkspace } from "./SettingsWorkspace";
@@ -38,8 +35,6 @@ import type {
   WorkshopGitHubSettings,
   WorkshopModelCatalogue,
   WorkshopNotificationPreferences,
-  WorkshopRoutingEligibility,
-  WorkshopRoutingPolicy,
   WorkshopClientPreferences,
   WorkshopAppearancePreferences,
   WorkshopSettingsWorkspace,
@@ -57,8 +52,6 @@ vi.mock("./api", async (importOriginal) => {
     loadModelCatalogue: vi.fn(),
     loadAppearancePreferences: vi.fn(),
     loadPreferenceHistory: vi.fn(),
-    loadRoutingEligibility: vi.fn(),
-    loadRoutingPolicy: vi.fn(),
     loadSettingsWorkspace: vi.fn(),
     loadWorkspaceConfig: vi.fn(),
     restorePreferenceRevision: vi.fn(),
@@ -73,7 +66,6 @@ vi.mock("./api", async (importOriginal) => {
     updateClientPreference: vi.fn(),
     updateAppearancePreference: vi.fn(),
     updateRuntimeSettings: vi.fn(),
-    updateRoutingPolicy: vi.fn(),
     updateWorkspaceConfig: vi.fn(),
   };
 });
@@ -200,68 +192,6 @@ const modelCatalogue: WorkshopModelCatalogue = {
   },
   runtimeProfileId: runtime.runtimeProfileId,
   stale: false,
-};
-
-const routingEligibility: WorkshopRoutingEligibility = {
-  agentId: "agt_00000000000000000000000000000002",
-  candidates: [
-    {
-      allowedServices: ["perplexity"],
-      backend: "claude",
-      capabilities: [
-        {
-          capability: "text_generation",
-          evidence: "agent_backend_contract_v1",
-          support: "supported",
-        },
-        {
-          capability: "tool_activity",
-          evidence: "agent_backend_contract_v1",
-          support: "supported",
-        },
-        {
-          capability: "workspace_execution",
-          evidence: "protected_workspace",
-          support: "supported",
-        },
-        {
-          capability: "image_input",
-          evidence: "capability_not_advertised",
-          support: "unknown",
-        },
-      ],
-      eligible: true,
-      modelId: "claude-sonnet-4-6",
-      modelSource: "current_selection",
-      optionId: "claude:anthropic",
-      provider: "anthropic",
-      reasons: [{ code: "eligible", detail: "All required capability checks passed." }],
-      selected: true,
-    },
-  ],
-  channelId: session.channelId,
-  principalId: runtime.principalId,
-  requiredCapabilities: ["text_generation", "tool_activity", "workspace_execution"],
-  runtimeProfileId: runtime.runtimeProfileId,
-  taskClass: "coding",
-  version: 1,
-  workspace: "/srv/kai",
-};
-
-const routingPolicy: WorkshopRoutingPolicy = {
-  agentId: routingEligibility.agentId,
-  channelId: session.channelId,
-  entries: (["conversation", "coding", "vision"] as const).map((taskClass) => ({
-    authorizedOptionIds: ["claude:anthropic"],
-    backendOptionId: null,
-    eligibleOptionIds: ["claude:anthropic"],
-    fallback: "selected" as const,
-    revision: 0,
-    taskClass,
-  })),
-  principalId: runtime.principalId,
-  runtimeProfileId: runtime.runtimeProfileId,
-  version: 1,
 };
 
 const workspaceConfig: WorkshopWorkspaceConfig = {
@@ -430,8 +360,6 @@ describe("Settings workspace", () => {
     });
     vi.mocked(loadSettingsWorkspace).mockResolvedValue(runtime);
     vi.mocked(loadModelCatalogue).mockResolvedValue(modelCatalogue);
-    vi.mocked(loadRoutingEligibility).mockResolvedValue(routingEligibility);
-    vi.mocked(loadRoutingPolicy).mockResolvedValue(routingPolicy);
     vi.mocked(loadGitHubSettings).mockResolvedValue(githubSettings);
     vi.mocked(loadNotificationPreferences).mockResolvedValue(notificationPreferences);
     vi.mocked(loadClientPreferences).mockResolvedValue(clientPreferences);
@@ -475,7 +403,7 @@ describe("Settings workspace", () => {
     vi.restoreAllMocks();
   });
 
-  it("navigates all seven settings sections without discarding a preference draft", async () => {
+  it("navigates all six settings sections without discarding a preference draft", async () => {
     const user = userEvent.setup();
     renderSettings();
     const editor = await screen.findByLabelText("Preference Markdown");
@@ -483,7 +411,6 @@ describe("Settings workspace", () => {
     const sectionLabels = [
       "Personal preferences",
       "Runtime settings",
-      "Routing eligibility",
       "Workspace settings",
       "GitHub",
       "Notification delivery",
@@ -493,6 +420,9 @@ describe("Settings workspace", () => {
     for (const label of sectionLabels) {
       expect(within(navigation).getByRole("button", { name: label })).toBeVisible();
     }
+    expect(within(navigation).queryByRole("button", { name: "Routing eligibility" }))
+      .toBeNull();
+    expect(screen.queryByLabelText("Task class")).toBeNull();
     expect(
       within(navigation).getByRole("button", { name: "Personal preferences" }),
     ).toHaveAttribute("aria-current", "location");
@@ -563,7 +493,6 @@ describe("Settings workspace", () => {
     const positions: Record<string, number> = {
       "settings-section-personal-preferences": -500,
       "settings-section-runtime": -300,
-      "settings-section-routing": -200,
       "settings-section-workspace": -100,
       "settings-section-github": 110,
       "settings-section-notifications": 400,
@@ -602,52 +531,6 @@ describe("Settings workspace", () => {
     expect(screen.queryByText(runtime.runtimeProfileId)).not.toBeInTheDocument();
     expect(screen.queryByText("/srv/kai")).not.toBeInTheDocument();
     expect(document.body.innerHTML).not.toContain("/srv/");
-  });
-
-  it("explains authorized routing eligibility without mutating runtime settings", async () => {
-    const user = userEvent.setup();
-    renderSettings();
-
-    expect((await screen.findAllByText("claude · anthropic")).length).toBe(2);
-    expect(screen.getByText("Eligible")).toBeVisible();
-    expect(screen.getByText("All required capability checks passed.")).toBeVisible();
-    expect(screen.getByText("perplexity")).toBeVisible();
-    expect(loadRoutingEligibility).toHaveBeenCalledWith(session, "coding");
-    expect(updateRuntimeSettings).not.toHaveBeenCalled();
-
-    vi.mocked(loadRoutingEligibility).mockResolvedValue({
-      ...routingEligibility,
-      requiredCapabilities: ["text_generation", "image_input"],
-      taskClass: "vision",
-    });
-    await user.selectOptions(screen.getByLabelText("Task class"), "vision");
-    await waitFor(() => {
-      expect(loadRoutingEligibility).toHaveBeenLastCalledWith(session, "vision");
-    });
-    expect(updateRuntimeSettings).not.toHaveBeenCalled();
-  });
-
-  it("opts into an explicit task route without changing the runtime default", async () => {
-    const user = userEvent.setup();
-    vi.mocked(updateRoutingPolicy).mockResolvedValue({
-      ...routingPolicy,
-      entries: routingPolicy.entries.map((entry) => entry.taskClass === "coding"
-        ? { ...entry, backendOptionId: "claude:anthropic", revision: 1 }
-        : entry),
-    });
-    renderSettings();
-
-    await user.selectOptions(await screen.findByLabelText("Explicit route"), "claude:anthropic");
-
-    await waitFor(() => expect(updateRoutingPolicy).toHaveBeenCalledWith(
-      session,
-      "coding",
-      "claude:anthropic",
-      "selected",
-      0,
-    ));
-    expect(updateRuntimeSettings).not.toHaveBeenCalled();
-    expect(screen.getByText(/without changing your selected backend/i)).toBeVisible();
   });
 
   it("saves preference Markdown and reports dirty state", async () => {
