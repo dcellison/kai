@@ -1398,9 +1398,9 @@ class SubprocessPool:
         Use this in command handlers that display the current model
         (like /models) where accuracy matters more than speed.
         """
-        _, chat_id, profile = self._resolve_runtime(runtime)
+        runtime_key, chat_id, profile = self._resolve_runtime(runtime)
         instance = self.get_if_exists(runtime)
-        if instance:
+        if instance and runtime_key not in self._pending_settings_restore:
             return instance.model
         if profile is None:
             defaults = await sessions.resolve_user_defaults(chat_id, self._config)

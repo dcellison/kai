@@ -954,7 +954,27 @@ class TestPropertyAccessors:
         pool = SubprocessPool(config=_make_config(), services_info=[])
         instance = pool.get(111)
         instance.model = "opus"
+        pool._pending_settings_restore.discard(111)
         assert await pool.get_effective_model(111) == "opus"
+
+    @pytest.mark.asyncio
+    async def test_get_effective_model_pending_instance_reads_canonical_setting(self):
+        """A fresh protected instance cannot hide its persisted model override."""
+        pool = SubprocessPool(
+            config=_make_config(default_model="sonnet"),
+            services_info=[],
+            runtime_profiles=profile_registry(111),
+        )
+        instance = pool.get(111)
+        assert instance.model == "gpt-5.6-sol"
+        assert profile_id(111) in pool._pending_settings_restore
+
+        with patch(
+            "kai.pool.sessions.get_canonical_execution_settings",
+            new_callable=AsyncMock,
+            return_value={"model": "gpt-5.5"},
+        ):
+            assert await pool.get_effective_model(111) == "gpt-5.5"
 
     @pytest.mark.asyncio
     async def test_get_effective_model_no_instance(self):
