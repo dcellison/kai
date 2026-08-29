@@ -3816,15 +3816,25 @@ async def _handle_agent_dismissal(
         channel_id = ChannelId(request.match_info["channel_id"])
         agent_id = AgentId(request.match_info["agent_id"])
         payload = await request.json()
-        if not isinstance(payload, dict) or set(payload) != {"client_dismissal_id"}:
+        if (
+            not isinstance(payload, dict)
+            or "client_dismissal_id" not in payload
+            or not set(payload).issubset({"client_dismissal_id", "thread_root_id"})
+        ):
             raise ValueError
         client_dismissal_id = payload["client_dismissal_id"]
+        raw_thread_root_id = payload.get("thread_root_id")
         if not isinstance(client_dismissal_id, str):
+            raise ValueError
+        if raw_thread_root_id is not None and not isinstance(raw_thread_root_id, str):
             raise ValueError
         result = await dismiss_channel_agent(
             store,
             principal_id=principal_id,
-            scope=EngagementScope(channel_id),
+            scope=EngagementScope(
+                channel_id,
+                MessageId(raw_thread_root_id) if raw_thread_root_id is not None else None,
+            ),
             agent_id=agent_id,
             client_dismissal_id=client_dismissal_id,
             occurred_at=datetime.now(UTC),

@@ -28,7 +28,7 @@ class WakePolicyError(RuntimeError, LookupError):
 
 @dataclass(frozen=True, slots=True)
 class EngagementScope:
-    """Conversation scope, ready for thread-specific engagement later."""
+    """One top-level channel conversation or one thread within it."""
 
     channel_id: ChannelId
     thread_root_message_id: MessageId | None = None
@@ -53,9 +53,7 @@ async def resolve_agent_engagements(
     current_at: datetime,
     before_event_position: int | None = None,
 ) -> tuple[AgentEngagement, ...]:
-    """Derive the agents currently engaged in one supported conversation scope."""
-    if scope.thread_root_message_id is not None:
-        raise WakePolicyError("Thread-scoped engagement is not available yet")
+    """Derive the agents currently engaged in one conversation scope."""
     if current_at.tzinfo is None or current_at.utcoffset() is None:
         raise ValueError("current_at must be timezone-aware")
     if before_event_position is not None and before_event_position < 1:
@@ -73,6 +71,13 @@ async def resolve_agent_engagements(
         raise WakePolicyError("Engagement scope channel is unavailable")
     if str(rows[0][0]) != "group":
         return ()
+    if scope.thread_root_message_id is not None:
+        async with store.connection.execute(
+            "SELECT 1 FROM messages WHERE id = ? AND channel_id = ? AND thread_root_id IS NULL",
+            (scope.thread_root_message_id, scope.channel_id),
+        ) as cursor:
+            if await cursor.fetchone() is None:
+                raise WakePolicyError("Engagement scope thread is unavailable")
 
     window_start = current_at - timedelta(seconds=GROUP_AGENT_ENGAGEMENT_WINDOW_SECONDS)
     engaged: list[AgentEngagement] = []
@@ -82,34 +87,51 @@ async def resolve_agent_engagements(
         agent_id = AgentId(str(row[1]))
         agent_principal_id = PrincipalId(str(row[2]))
         position_clause = "AND m.created_event_position < ? " if before_event_position is not None else ""
-        parameters: tuple[object, ...] = (
-            (scope.channel_id, before_event_position) if before_event_position is not None else (scope.channel_id,)
-        ) + (
-            window_start.isoformat(),
-            current_at.isoformat(),
-            agent_principal_id,
-            agent_principal_id,
+        thread_clause = (
+            "AND m.thread_root_id IS NULL " if scope.thread_root_message_id is None else "AND m.thread_root_id = ? "
+        )
+        parameters: list[object] = [scope.channel_id]
+        if before_event_position is not None:
+            parameters.append(before_event_position)
+        if scope.thread_root_message_id is not None:
+            parameters.append(scope.thread_root_message_id)
+        parameters.extend(
+            (
+                window_start.isoformat(),
+                current_at.isoformat(),
+                agent_principal_id,
+                agent_principal_id,
+            )
         )
         async with store.connection.execute(
             "SELECT m.created_at FROM messages m WHERE m.channel_id = ? "
             + position_clause
+            + thread_clause
             + "AND m.created_at >= ? AND m.created_at <= ? "
             "AND (m.author_principal_id = ? OR EXISTS ("
             "SELECT 1 FROM json_each(m.mentions_json) mention "
             "WHERE json_extract(mention.value, '$.kind') = 'agent' "
             "AND json_extract(mention.value, '$.principal_id') = ?)) "
             "ORDER BY m.created_at DESC, m.created_event_position DESC LIMIT 1",
-            parameters,
+            tuple(parameters),
         ) as cursor:
             engagement_row = await cursor.fetchone()
         if engagement_row is None:
             continue
         engaged_at = str(engagement_row[0])
+        dismissal_thread_clause = (
+            "AND thread_root_message_id IS NULL "
+            if scope.thread_root_message_id is None
+            else "AND thread_root_message_id = ? "
+        )
+        dismissal_parameters: list[object] = [scope.channel_id, agent_id]
+        if scope.thread_root_message_id is not None:
+            dismissal_parameters.append(scope.thread_root_message_id)
+        dismissal_parameters.extend((engaged_at, current_at.isoformat()))
         async with store.connection.execute(
             "SELECT 1 FROM channel_agent_dismissals WHERE channel_id = ? "
-            "AND agent_id = ? AND thread_root_message_id IS NULL "
-            "AND dismissed_at >= ? AND dismissed_at <= ? LIMIT 1",
-            (scope.channel_id, agent_id, engaged_at, current_at.isoformat()),
+            "AND agent_id = ? " + dismissal_thread_clause + "AND dismissed_at >= ? AND dismissed_at <= ? LIMIT 1",
+            tuple(dismissal_parameters),
         ) as cursor:
             dismissed = await cursor.fetchone()
         if dismissed is None:
@@ -154,7 +176,7 @@ async def resolve_message_wake_targets(
         raise ValueError("message_id must be a MessageId")
     async with store.connection.execute(
         "SELECT m.channel_id, c.kind, m.author_principal_id, p.kind, "
-        "m.mentions_json, m.created_at, m.created_event_position "
+        "m.mentions_json, m.created_at, m.created_event_position, m.thread_root_id "
         "FROM messages m JOIN channels c ON c.id = m.channel_id "
         "JOIN principals p ON p.id = m.author_principal_id WHERE m.id = ?",
         (message_id,),
@@ -165,10 +187,14 @@ async def resolve_message_wake_targets(
     channel_id = ChannelId(str(row[0]))
     kind = str(row[1])
     author_kind = str(row[3])
+    message_scope = EngagementScope(
+        channel_id,
+        MessageId(str(row[7])) if row[7] is not None else None,
+    )
     if scope is None:
-        scope = EngagementScope(channel_id)
-    if scope.channel_id != channel_id or scope.thread_root_message_id is not None:
-        raise WakePolicyError("Wake policy scope does not match the supported channel scope")
+        scope = message_scope
+    if scope != message_scope:
+        raise WakePolicyError("Wake policy scope does not match the message scope")
     if author_kind != "human":
         return WakeDecision(())
 
@@ -235,6 +261,13 @@ async def dismiss_channel_agent(
         row = await cursor.fetchone()
     if row is None:
         raise WakePolicyError("Agent dismissal requires group membership and an attached agent")
+    if scope.thread_root_message_id is not None:
+        async with store.connection.execute(
+            "SELECT 1 FROM messages WHERE id = ? AND channel_id = ? AND thread_root_id IS NULL",
+            (scope.thread_root_message_id, scope.channel_id),
+        ) as cursor:
+            if await cursor.fetchone() is None:
+                raise WakePolicyError("Agent dismissal thread is unavailable")
     workshop_id = WorkshopId(str(row[0]))
     event_id = EventId.derived(
         scope.channel_id,

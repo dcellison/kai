@@ -1265,6 +1265,29 @@ describe("Workshop client API", () => {
     });
   });
 
+  it("scopes an agent dismissal to a thread when supplied", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      Response.json({ version: 1, dismissed: true, replayed: false }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const threadRootId = "msg_00000000000000000000000000000001";
+
+    await expect(
+      dismissChannelAgent(
+        session,
+        "agt_00000000000000000000000000000001",
+        "browser-dismissal-2",
+        threadRootId,
+      ),
+    ).resolves.toBeUndefined();
+
+    const [, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(options.body as string)).toEqual({
+      client_dismissal_id: "browser-dismissal-2",
+      thread_root_id: threadRootId,
+    });
+  });
+
   it("submits only the opaque id and body under bearer authority", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       Response.json({
