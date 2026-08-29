@@ -10,6 +10,8 @@ import {
   createChannel,
   dismissChannelAgent,
   loadAppearancePreferences,
+  loadAgentDefinitions,
+  loadAgentEnablements,
   loadEarlierTimeline,
   loadArtifactBlob,
   loadNavigation,
@@ -28,12 +30,15 @@ import {
   loadWorkspaceConfig,
   redeemEnrollment,
   streamTimeline,
+  streamAgentChanges,
   setMessageReaction,
   submitCommand,
   switchWorkspace,
 } from "./api";
 import type {
   WorkshopMemoryRecord,
+  WorkshopAgentDefinition,
+  WorkshopAgentEnablement,
   TimelineMessage,
   TimelineSnapshot,
   WorkshopNavigation,
@@ -51,6 +56,8 @@ vi.mock("./api", async (importOriginal) => {
     loadEarlierTimeline: vi.fn(),
     loadArtifactBlob: vi.fn(),
     loadAppearancePreferences: vi.fn(),
+    loadAgentDefinitions: vi.fn(),
+    loadAgentEnablements: vi.fn(),
     loadNavigation: vi.fn(),
     loadNotificationPreferences: vi.fn(),
     loadMemoryDetail: vi.fn(),
@@ -67,6 +74,7 @@ vi.mock("./api", async (importOriginal) => {
     loadWorkspaceConfig: vi.fn(),
     redeemEnrollment: vi.fn(),
     streamTimeline: vi.fn(),
+    streamAgentChanges: vi.fn(),
     setMessageReaction: vi.fn(),
     submitCommand: vi.fn(),
     switchWorkspace: vi.fn(),
@@ -77,6 +85,9 @@ const channelId = "chn_d3dfdfd7df9151ba8a1742b92403faa5";
 const notificationChannelId = "chn_11111111111111111111111111111111";
 const secondChannelId = "chn_22222222222222222222222222222222";
 const humanDirectChannelId = "chn_33333333333333333333333333333333";
+const definitionId = "adf_00000000000000000000000000000001";
+const revisionId = "adr_00000000000000000000000000000001";
+const runtimeProfileId = "rtp_00000000000000000000000000000001";
 const navigation: WorkshopNavigation = {
   principal: {
     displayName: "Daniel",
@@ -202,6 +213,51 @@ const historyMessage: TimelineMessage = {
   replyToMessageId: null,
   latestReplyAt: null,
   threadRootId: null,
+};
+
+const agentDefinition: WorkshopAgentDefinition = {
+  activeRevisionId: revisionId,
+  agentId: "agt_00000000000000000000000000000001",
+  createdAt: "2026-08-29T10:00:00Z",
+  createdByPrincipalId: "prn_00000000000000000000000000000001",
+  definitionId,
+  description: "Kai's base agent definition.",
+  displayName: "Kai",
+  handle: "kai",
+  lifecycleState: "active",
+  presentation: { avatar: "K" },
+  revisions: [
+    {
+      capabilities: ["text_generation", "tool_activity"],
+      createdAt: "2026-08-29T10:00:00Z",
+      createdByPrincipalId: "prn_00000000000000000000000000000001",
+      eventPosition: 10,
+      instructions: "Be useful.",
+      purpose: "General assistance",
+      revisionId,
+      revisionNumber: 1,
+    },
+  ],
+  stateVersion: 2,
+};
+
+const agentEnablement: WorkshopAgentEnablement = {
+  agentId: agentDefinition.agentId,
+  definitionId,
+  directChannelId: channelId,
+  displayName: "Kai",
+  eligibleRuntimes: [
+    {
+      backendOptions: ["claude:anthropic"],
+      displayName: "Daniel's runtime",
+      runtimeProfileId,
+    },
+  ],
+  enablementId: "aen_00000000000000000000000000000001",
+  handle: "kai",
+  lifecycleState: "enabled",
+  runtimeProfileId,
+  stateVersion: 3,
 };
 const memoryRecord: WorkshopMemoryRecord = {
   confidence: 1,
@@ -343,6 +399,8 @@ describe("Workshop React client", () => {
         },
       ],
     });
+    vi.mocked(loadAgentDefinitions).mockResolvedValue([agentDefinition]);
+    vi.mocked(loadAgentEnablements).mockResolvedValue([agentEnablement]);
     vi.mocked(loadNotificationPreferences).mockResolvedValue({
       destinations: [
         {
@@ -456,6 +514,14 @@ describe("Workshop React client", () => {
         streamHandlers.onConnected();
         await new Promise<void>((resolve, reject) => {
           failStream = reject;
+          signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      },
+    );
+    vi.mocked(streamAgentChanges).mockImplementation(
+      async (_token, _position, streamHandlers, signal) => {
+        streamHandlers.onConnected();
+        await new Promise<void>((resolve) => {
           signal.addEventListener("abort", () => resolve(), { once: true });
         });
       },
@@ -1666,7 +1732,29 @@ describe("Workshop React client", () => {
         "Sending messages from Workshop is not available for this conversation yet.",
       ),
     ).toBeVisible();
-    expect(screen.queryByText("Agents")).toBeNull();
+    expect(screen.getByText("Agents")).toBeVisible();
+  });
+
+  it("opens the live agent catalogue and returns to an enabled direct conversation", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    render(<App />);
+
+    await screen.findByText("Canonical history is ready.");
+    await user.click(screen.getByRole("button", { name: "Browse agents" }));
+
+    expect(await screen.findByRole("heading", { name: "Agents", level: 1 })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Kai", level: 2 })).toBeVisible();
+    expect(screen.getByText("Enabled for you")).toBeVisible();
+    expect(screen.getByRole("button", { name: "New agent" })).toBeVisible();
+    expect(streamAgentChanges).toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Open conversation" }));
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+    expect(window.location.search).toBe("");
   });
 
   it("collapses the navigation to labeled icons and restores its layout", async () => {

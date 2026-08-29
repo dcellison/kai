@@ -6,14 +6,22 @@ import {
   PreferenceRevisionConflictError,
   SettingsRevisionConflictError,
   cancelRun,
+  activateAgentRevision,
+  addAgentRevision,
+  archiveAgentDefinition,
   createChannel,
+  createAgentDefinition,
   createMemoryFact,
   deleteMemories,
   deleteMemory,
   deactivateOperatorModel,
   dismissChannelAgent,
+  disableAgentDefinition,
   editMemory,
+  enableAgentDefinition,
   loadArtifactBlob,
+  loadAgentDefinitions,
+  loadAgentEnablements,
   loadAppearancePreferences,
   loadEarlierTimeline,
   loadMemoryDetail,
@@ -44,6 +52,7 @@ import {
   setMessageReaction,
   submitCommand,
   streamTimeline,
+  streamAgentChanges,
   updateRuntimeSettings,
   updateRoutingPolicy,
   updateGitHubSettings,
@@ -58,6 +67,60 @@ import { WORKSHOP_THEME_CATALOG } from "./theme";
 
 const channelId = "chn_d3dfdfd7df9151ba8a1742b92403faa5";
 const session: WorkshopSession = { channelId, token: "session-secret" };
+const agentDefinitionId = "adf_00000000000000000000000000000001";
+const agentRevisionId = "adr_00000000000000000000000000000001";
+const agentEnablementId = "aen_00000000000000000000000000000001";
+const agentId = "agt_00000000000000000000000000000001";
+const runtimeProfileId = "rtp_00000000000000000000000000000001";
+
+function agentDefinitionPayload(): Record<string, unknown> {
+  return {
+    active_revision_id: agentRevisionId,
+    agent_id: agentId,
+    created_at: "2026-08-29T10:00:00Z",
+    created_by_principal_id: "prn_00000000000000000000000000000001",
+    definition_id: agentDefinitionId,
+    description: "A focused coding agent.",
+    display_name: "Builder",
+    handle: "builder",
+    lifecycle_state: "active",
+    presentation: { avatar: "B" },
+    revisions: [
+      {
+        capabilities: ["text_generation", "workspace_execution"],
+        created_at: "2026-08-29T10:00:00Z",
+        created_by_principal_id: "prn_00000000000000000000000000000001",
+        event_position: 91,
+        instructions: "Work carefully.",
+        purpose: "Implement bounded coding tasks.",
+        revision_id: agentRevisionId,
+        revision_number: 1,
+      },
+    ],
+    state_version: 3,
+  };
+}
+
+function agentEnablementPayload(): Record<string, unknown> {
+  return {
+    agent_id: agentId,
+    definition_id: agentDefinitionId,
+    direct_channel_id: channelId,
+    display_name: "Builder",
+    eligible_runtimes: [
+      {
+        backend_options: ["claude:anthropic", "opencode:deepseek"],
+        display_name: "Daniel's runtime",
+        runtime_profile_id: runtimeProfileId,
+      },
+    ],
+    enablement_id: agentEnablementId,
+    handle: "builder",
+    lifecycle_state: "enabled",
+    runtime_profile_id: runtimeProfileId,
+    state_version: 2,
+  };
+}
 
 function message(position: number, body = `Message ${position}`): Record<string, unknown> {
   return {
@@ -1877,5 +1940,162 @@ describe("Workshop client API", () => {
       },
       "32",
     );
+  });
+
+  it("loads strict agent definitions and principal-scoped enablements", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        agents: [agentDefinitionPayload()],
+        version: 1,
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        agents: [agentEnablementPayload()],
+        version: 1,
+      }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const definitions = await loadAgentDefinitions("session-secret");
+    const enablements = await loadAgentEnablements("session-secret");
+
+    expect(definitions).toEqual([
+      expect.objectContaining({
+        definitionId: agentDefinitionId,
+        handle: "builder",
+        lifecycleState: "active",
+      }),
+    ]);
+    expect(enablements).toEqual([
+      expect.objectContaining({
+        definitionId: agentDefinitionId,
+        directChannelId: channelId,
+        lifecycleState: "enabled",
+        runtimeProfileId,
+      }),
+    ]);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/v1/client/agents",
+      expect.objectContaining({ cache: "no-store" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/v1/client/agent-enablement",
+      expect.objectContaining({ cache: "no-store" }),
+    );
+  });
+
+  it("uses versioned agent lifecycle and enablement mutation contracts", async () => {
+    const definitionResponse = () => new Response(JSON.stringify({
+      agent: agentDefinitionPayload(),
+      version: 1,
+    }), { status: 200 });
+    const enablementResponse = () => new Response(JSON.stringify({
+      agent: agentEnablementPayload(),
+      version: 1,
+    }), { status: 200 });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(definitionResponse())
+      .mockResolvedValueOnce(definitionResponse())
+      .mockResolvedValueOnce(definitionResponse())
+      .mockResolvedValueOnce(definitionResponse())
+      .mockResolvedValueOnce(enablementResponse())
+      .mockResolvedValueOnce(enablementResponse());
+    vi.stubGlobal("fetch", fetchMock);
+
+    await createAgentDefinition("session-secret", {
+      avatar: "B",
+      capabilities: ["text_generation"],
+      description: "Builds things.",
+      displayName: "Builder",
+      handle: "builder",
+      idempotencyKey: "create-key",
+      instructions: "Work carefully.",
+      purpose: "Build bounded changes.",
+    });
+    await addAgentRevision("session-secret", agentDefinitionId, {
+      capabilities: ["text_generation", "workspace_execution"],
+      expectedVersion: 3,
+      idempotencyKey: "revision-key",
+      instructions: "Use tests.",
+      purpose: "Build tested changes.",
+    });
+    await activateAgentRevision("session-secret", agentDefinitionId, {
+      expectedVersion: 4,
+      idempotencyKey: "activate-key",
+      revisionId: agentRevisionId,
+    });
+    await archiveAgentDefinition("session-secret", agentDefinitionId, {
+      expectedVersion: 5,
+      idempotencyKey: "archive-key",
+    });
+    await enableAgentDefinition("session-secret", agentDefinitionId, {
+      expectedVersion: null,
+      idempotencyKey: "enable-key",
+      runtimeProfileId,
+    });
+    await disableAgentDefinition("session-secret", agentDefinitionId, {
+      expectedVersion: 2,
+      idempotencyKey: "disable-key",
+    });
+
+    expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
+      "/v1/client/agents",
+      `/v1/client/agents/${agentDefinitionId}/revisions`,
+      `/v1/client/agents/${agentDefinitionId}/activate`,
+      `/v1/client/agents/${agentDefinitionId}/archive`,
+      `/v1/client/agents/${agentDefinitionId}/enable`,
+      `/v1/client/agents/${agentDefinitionId}/disable`,
+    ]);
+    expect(JSON.parse(String(fetchMock.mock.calls[4][1]?.body))).toEqual({
+      idempotency_key: "enable-key",
+      runtime_profile_id: runtimeProfileId,
+    });
+  });
+
+  it("streams typed agent changes over a distinct live connection", async () => {
+    const frame = [
+      "id: 96",
+      "event: agent.enablement.changed",
+      `data: ${JSON.stringify({
+        definition_id: agentDefinitionId,
+        event_position: 96,
+        event_type: "principal_agent.enabled",
+        occurred_at: "2026-08-29T10:05:00Z",
+        revision_id: null,
+        version: 1,
+      })}`,
+      "",
+      "",
+    ].join("\n");
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(frame));
+        controller.close();
+      },
+    });
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(stream, { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const onChanged = vi.fn();
+
+    await streamAgentChanges(
+      "session-secret",
+      "95",
+      { onChanged, onConnected: vi.fn() },
+      new AbortController().signal,
+    );
+
+    expect(onChanged).toHaveBeenCalledWith(
+      expect.objectContaining({
+        definitionId: agentDefinitionId,
+        eventPosition: 96,
+        kind: "enablement",
+      }),
+      "96",
+    );
+    const headers = fetchMock.mock.calls[0][1]?.headers as Headers;
+    expect(headers.get("Last-Event-ID")).toBe("95");
+    expect(headers.get("X-Kai-Stream-ID")).toMatch(/:agents$/);
   });
 });
