@@ -18,6 +18,8 @@ import type {
   WorkshopSettingsMutation,
   WorkshopModelCatalogue,
   WorkshopSettingsWorkspace,
+  WorkshopRoutingEligibility,
+  WorkshopRoutingTaskClass,
   WorkshopWorkspaceConfig,
   WorkshopPreferenceDocument,
   WorkshopPreferenceHistory,
@@ -54,6 +56,7 @@ import {
   ARTIFACT_PATTERN,
   CHANNEL_PATTERN,
   PRINCIPAL_PATTERN,
+  RUNTIME_PROFILE_PATTERN,
   WORKSHOP_PATTERN,
 } from "./types";
 
@@ -754,6 +757,96 @@ function parseSettingsWorkspace(
     },
     workspace: payload.workspace,
     workspaces,
+  };
+}
+
+function parseRoutingEligibility(payload: unknown): WorkshopRoutingEligibility {
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    !["conversation", "coding", "vision"].includes(String(payload.task_class)) ||
+    typeof payload.principal_id !== "string" ||
+    !PRINCIPAL_PATTERN.test(payload.principal_id) ||
+    typeof payload.channel_id !== "string" ||
+    !CHANNEL_PATTERN.test(payload.channel_id) ||
+    typeof payload.agent_id !== "string" ||
+    !AGENT_PATTERN.test(payload.agent_id) ||
+    typeof payload.runtime_profile_id !== "string" ||
+    !RUNTIME_PROFILE_PATTERN.test(payload.runtime_profile_id) ||
+    typeof payload.workspace !== "string" ||
+    !Array.isArray(payload.required_capabilities) ||
+    !payload.required_capabilities.every((item) => typeof item === "string") ||
+    !Array.isArray(payload.candidates)
+  ) {
+    throw new Error("Kai returned unsupported routing eligibility.");
+  }
+  const candidates = payload.candidates.map((rawCandidate) => {
+    if (
+      !isRecord(rawCandidate) ||
+      typeof rawCandidate.option_id !== "string" ||
+      typeof rawCandidate.backend !== "string" ||
+      typeof rawCandidate.provider !== "string" ||
+      !Array.isArray(rawCandidate.allowed_services) ||
+      !rawCandidate.allowed_services.every((item) => typeof item === "string") ||
+      typeof rawCandidate.model_id !== "string" ||
+      !["current_selection", "protected_default"].includes(String(rawCandidate.model_source)) ||
+      typeof rawCandidate.selected !== "boolean" ||
+      typeof rawCandidate.eligible !== "boolean" ||
+      !Array.isArray(rawCandidate.capabilities) ||
+      !Array.isArray(rawCandidate.reasons)
+    ) {
+      throw new Error("Kai returned unsupported routing candidate.");
+    }
+    const capabilities = rawCandidate.capabilities.map((rawCapability) => {
+      if (
+        !isRecord(rawCapability) ||
+        !["image_input", "text_generation", "tool_activity", "workspace_execution"].includes(
+          String(rawCapability.capability),
+        ) ||
+        !["supported", "unsupported", "unknown"].includes(String(rawCapability.support)) ||
+        typeof rawCapability.evidence !== "string"
+      ) {
+        throw new Error("Kai returned unsupported routing capability evidence.");
+      }
+      return {
+        capability: rawCapability.capability as WorkshopRoutingEligibility["candidates"][number]["capabilities"][number]["capability"],
+        evidence: rawCapability.evidence,
+        support: rawCapability.support as "supported" | "unsupported" | "unknown",
+      };
+    });
+    const reasons = rawCandidate.reasons.map((rawReason) => {
+      if (
+        !isRecord(rawReason) ||
+        typeof rawReason.code !== "string" ||
+        typeof rawReason.detail !== "string"
+      ) {
+        throw new Error("Kai returned unsupported routing eligibility reason.");
+      }
+      return { code: rawReason.code, detail: rawReason.detail };
+    });
+    return {
+      allowedServices: rawCandidate.allowed_services,
+      backend: rawCandidate.backend,
+      capabilities,
+      eligible: rawCandidate.eligible,
+      modelId: rawCandidate.model_id,
+      modelSource: rawCandidate.model_source as "current_selection" | "protected_default",
+      optionId: rawCandidate.option_id,
+      provider: rawCandidate.provider,
+      reasons,
+      selected: rawCandidate.selected,
+    };
+  });
+  return {
+    agentId: payload.agent_id,
+    candidates,
+    channelId: payload.channel_id,
+    principalId: payload.principal_id,
+    requiredCapabilities: payload.required_capabilities,
+    runtimeProfileId: payload.runtime_profile_id,
+    taskClass: payload.task_class as WorkshopRoutingTaskClass,
+    version: 1,
+    workspace: payload.workspace,
   };
 }
 
@@ -1759,6 +1852,21 @@ export async function loadSettingsWorkspace(
     );
   }
   return parseSettingsWorkspace(payload, session.channelId);
+}
+
+export async function loadRoutingEligibility(
+  session: WorkshopSession,
+  taskClass: WorkshopRoutingTaskClass,
+): Promise<WorkshopRoutingEligibility> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/routing-eligibility?task_class=${encodeURIComponent(taskClass)}`,
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load routing eligibility."));
+  }
+  return parseRoutingEligibility(payload);
 }
 
 export async function loadModelCatalogue(

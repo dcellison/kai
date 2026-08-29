@@ -503,6 +503,18 @@ class AgentBackend(ABC):
     # require_backend_name() before making backend-specific decisions.
     backend_name: str = ""
 
+    # Versioned backend-neutral facts guaranteed by every registered Kai
+    # harness.  These are interface contracts, not quality rankings.  Model-
+    # dependent facts such as image input deliberately do not appear here;
+    # they require catalogue evidence for the exact model under evaluation.
+    routing_capabilities: frozenset[str] = frozenset(
+        {
+            "text_generation",
+            "tool_activity",
+            "workspace_execution",
+        }
+    )
+
     def stage_canonical_history(self, history: str) -> None:
         """Stage canonical restart context for the next fresh subprocess.
 

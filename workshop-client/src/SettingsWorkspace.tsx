@@ -11,6 +11,7 @@ import {
   loadNotificationPreferences,
   loadClientPreferences,
   loadModelCatalogue,
+  loadRoutingEligibility,
   loadSettingsWorkspace,
   loadWorkspaceConfig,
   PreferenceRevisionConflictError,
@@ -35,6 +36,8 @@ import type {
   WorkshopGitHubSettings,
   WorkshopGitHubSettingsChange,
   WorkshopModelCatalogue,
+  WorkshopRoutingEligibility,
+  WorkshopRoutingTaskClass,
   WorkshopNotificationPreferences,
   WorkshopNotificationPreferenceChange,
   WorkshopClientPreferences,
@@ -59,6 +62,7 @@ const VOICE_MODE_LABELS = {
 const SETTINGS_SECTIONS = [
   { id: "settings-section-personal-preferences", label: "Personal preferences" },
   { id: "settings-section-runtime", label: "Runtime settings" },
+  { id: "settings-section-routing", label: "Routing eligibility" },
   { id: "settings-section-workspace", label: "Workspace settings" },
   { id: "settings-section-github", label: "GitHub" },
   { id: "settings-section-notifications", label: "Notification delivery" },
@@ -183,6 +187,13 @@ function SettingsWorkspaceContent({
   const [workspaceModel, setWorkspaceModel] = useState("");
   const [workspaceTimeout, setWorkspaceTimeout] = useState("");
   const [workspacePrompt, setWorkspacePrompt] = useState("");
+
+  const [routingTaskClass, setRoutingTaskClass] =
+    useState<WorkshopRoutingTaskClass>("coding");
+  const [routingEligibility, setRoutingEligibility] =
+    useState<WorkshopRoutingEligibility | null>(null);
+  const [routingLoading, setRoutingLoading] = useState(true);
+  const [routingError, setRoutingError] = useState<string | null>(null);
 
   const [github, setGitHub] = useState<WorkshopGitHubSettings | null>(null);
   const [githubLoading, setGitHubLoading] = useState(true);
@@ -353,6 +364,21 @@ function SettingsWorkspaceContent({
     }
   }, [adoptRuntime, adoptWorkspace, handleAccessFailure, onAuthenticationFailure, session]);
 
+  const refreshRoutingEligibility = useCallback(async (): Promise<void> => {
+    setRoutingLoading(true);
+    setRoutingError(null);
+    try {
+      setRoutingEligibility(await loadRoutingEligibility(session, routingTaskClass));
+    } catch (caught) {
+      if (!handleAccessFailure(caught)) {
+        setRoutingError(errorText(caught, "Could not load routing eligibility."));
+      }
+      setRoutingEligibility(null);
+    } finally {
+      setRoutingLoading(false);
+    }
+  }, [handleAccessFailure, routingTaskClass, session]);
+
   useEffect(() => {
     if (!runtime || !runtimeBackend) {
       setModelCatalogue(null);
@@ -522,6 +548,7 @@ function SettingsWorkspaceContent({
   useEffect(() => {
     void refreshPreferences();
     void refreshRuntime();
+    void refreshRoutingEligibility();
     void refreshGitHub();
     void refreshNotifications();
     void refreshClients();
@@ -532,6 +559,7 @@ function SettingsWorkspaceContent({
     refreshGitHub,
     refreshNotifications,
     refreshPreferences,
+    refreshRoutingEligibility,
     refreshRuntime,
   ]);
 
@@ -1272,10 +1300,93 @@ function SettingsWorkspaceContent({
           {runtimeError && runtime && <p className="settings-error" role="alert">{runtimeError}</p>}
         </section>
 
+        <section className="settings-section" id="settings-section-routing">
+          <div>
+            <p className="section-number">03</p>
+            <h2>Routing eligibility</h2>
+            <p>
+              Read-only evidence about which of your authorized runtimes can
+              support an explicit task class. Kai does not classify, switch,
+              rank, or invoke a runtime from this report.
+            </p>
+          </div>
+          <div className="routing-eligibility-workspace">
+            <label htmlFor="routing-task-class">Task class</label>
+            <select
+              id="routing-task-class"
+              value={routingTaskClass}
+              onChange={(event) => {
+                setRoutingTaskClass(event.target.value as WorkshopRoutingTaskClass);
+              }}
+            >
+              <option value="conversation">Conversation</option>
+              <option value="coding">Coding</option>
+              <option value="vision">Vision</option>
+            </select>
+            {routingLoading ? (
+              <p role="status">Checking authorized runtimes…</p>
+            ) : routingEligibility ? (
+              <>
+                <p className="routing-eligibility-summary">
+                  Required: {routingEligibility.requiredCapabilities
+                    .map((item) => item.replaceAll("_", " "))
+                    .join(", ")}
+                </p>
+                <div className="routing-candidate-list">
+                  {routingEligibility.candidates.map((candidate) => (
+                    <article className="settings-card routing-candidate" key={candidate.optionId}>
+                      <div className="routing-candidate-heading">
+                        <div>
+                          <strong>{candidate.backend} · {candidate.provider}</strong>
+                          <small>{candidate.modelId}</small>
+                        </div>
+                        <div className="routing-badges">
+                          {candidate.selected && <span>Current</span>}
+                          <span data-eligible={candidate.eligible}>
+                            {candidate.eligible ? "Eligible" : "Not eligible"}
+                          </span>
+                        </div>
+                      </div>
+                      <dl className="routing-capability-list">
+                        {candidate.capabilities.map((item) => (
+                          <div key={item.capability}>
+                            <dt>{item.capability.replaceAll("_", " ")}</dt>
+                            <dd data-support={item.support}>{item.support}</dd>
+                          </div>
+                        ))}
+                        <div>
+                          <dt>Authorized services</dt>
+                          <dd>{candidate.allowedServices.join(", ") || "None"}</dd>
+                        </div>
+                      </dl>
+                      <ul className="routing-reasons">
+                        {candidate.reasons.map((reason) => (
+                          <li key={`${reason.code}:${reason.detail}`}>{reason.detail}</li>
+                        ))}
+                      </ul>
+                    </article>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <div className="settings-failure">
+                <p role="alert">{routingError ?? "Routing eligibility is unavailable."}</p>
+                <button
+                  className="quiet-button"
+                  type="button"
+                  onClick={() => void refreshRoutingEligibility()}
+                >
+                  Retry
+                </button>
+              </div>
+            )}
+          </div>
+        </section>
+
         {runtime && workspaceConfig && (
           <section className="settings-section" id="settings-section-workspace">
             <div>
-              <p className="section-number">03</p>
+              <p className="section-number">04</p>
               <h2>Workspace settings</h2>
               <p>Choose an existing authorized workspace and manage overrides that apply only within it.</p>
             </div>
@@ -1328,7 +1439,7 @@ function SettingsWorkspaceContent({
         {runtime && !workspaceConfig && !runtimeLoading && (
           <section className="settings-section" id="settings-section-workspace">
             <div>
-              <p className="section-number">03</p>
+              <p className="section-number">04</p>
               <h2>Workspace settings</h2>
               <p>Runtime settings remain available, but workspace-specific overrides could not be loaded.</p>
             </div>
@@ -1341,7 +1452,7 @@ function SettingsWorkspaceContent({
 
         <section className="settings-section" id="settings-section-github">
           <div>
-            <p className="section-number">04</p>
+            <p className="section-number">05</p>
             <h2>GitHub</h2>
             <p>
               Personal notification subscriptions, automation choices, and a
@@ -1580,7 +1691,7 @@ function SettingsWorkspaceContent({
 
         <section className="settings-section" id="settings-section-notifications">
           <div>
-            <p className="section-number">05</p>
+            <p className="section-number">06</p>
             <h2>Notification delivery</h2>
             <p>
               Choose where personal integration notifications appear. Only
@@ -1665,7 +1776,7 @@ function SettingsWorkspaceContent({
 
         <section className="settings-section" id="settings-section-clients">
           <div>
-            <p className="section-number">06</p>
+            <p className="section-number">07</p>
             <h2>Client preferences</h2>
             <p>
               Control presentation on each connected client without changing

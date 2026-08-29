@@ -133,6 +133,13 @@ from kai.workshop.preferences import (
     WorkshopPreferenceStorageError,
     WorkshopPreferenceValidationError,
 )
+from kai.workshop.routing_eligibility import (
+    RoutingEligibilityAccessDenied,
+    RoutingEligibilityAuthority,
+    RoutingEligibilityError,
+    RuntimeEligibilityReport,
+    WorkshopRoutingEligibilityService,
+)
 from kai.workshop.run_lifecycle import DurableRun, RunNotFoundError, RunStatus
 from kai.workshop.run_previews import RunPreview, WorkshopRunPreviewRegistry
 from kai.workshop.settings_workspaces import (
@@ -178,6 +185,7 @@ _RUN_STATE_PATH = "/v1/channels/{channel_id}/runs/{run_id}"
 _RUN_TRACE_PATH = "/v1/channels/{channel_id}/runs/{run_id}/trace"
 _RUN_CANCELLATION_PATH = "/v1/channels/{channel_id}/runs/{run_id}/cancel"
 _RUNTIME_SETTINGS_PATH = "/v1/channels/{channel_id}/settings"
+_ROUTING_ELIGIBILITY_PATH = "/v1/channels/{channel_id}/routing-eligibility"
 _MODEL_CATALOGUE_PATH = "/v1/channels/{channel_id}/models"
 _MODEL_CATALOGUE_ADMIN_REFRESH_PATH = "/v1/settings/model-catalogue/refresh-all"
 _ACTIVE_WORKSPACE_PATH = "/v1/channels/{channel_id}/workspace"
@@ -1177,6 +1185,33 @@ async def _authenticate_settings_authority(
     return authority, None
 
 
+async def _authenticate_routing_eligibility_authority(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopRoutingEligibilityService,
+) -> tuple[RoutingEligibilityAuthority | None, web.Response | None]:
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        return None, _error_response(
+            status=401,
+            code="authentication_required",
+            message="Authentication required",
+        )
+    try:
+        channel_id = ChannelId(request.match_info["channel_id"])
+        authority = service.authority_for_principal_channel(principal_id, channel_id)
+    except (KeyError, TypeError, ValueError):
+        return None, _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid channel request",
+        )
+    except RoutingEligibilityAccessDenied:
+        return None, _error_response(status=403, code="access_denied", message="Access denied")
+    return authority, None
+
+
 async def _authenticate_preference_authority(
     request: web.Request,
     *,
@@ -1975,6 +2010,44 @@ async def _handle_runtime_settings(
     )
 
 
+async def _handle_routing_eligibility(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopRoutingEligibilityService,
+) -> web.Response:
+    authority, error = await _authenticate_routing_eligibility_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        if error.status == 401:
+            error.headers["WWW-Authenticate"] = "Bearer"
+        return error
+    assert authority is not None
+    if request.can_read_body or set(request.query) != {"task_class"}:
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid routing eligibility request",
+        )
+    task_classes = request.query.getall("task_class", [])
+    if len(task_classes) != 1:
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid routing eligibility request",
+        )
+    try:
+        report = await service.inspect(authority, task_classes[0])
+    except RoutingEligibilityAccessDenied:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except RoutingEligibilityError as exc:
+        return _error_response(status=400, code="invalid_request", message=str(exc))
+    return _json_response(_serialize_routing_eligibility(report), status=200)
+
+
 async def _handle_runtime_settings_update(
     request: web.Request,
     *,
@@ -2633,6 +2706,41 @@ def _serialize_run(run: DurableRun) -> dict[str, object]:
             _format_timestamp(run.cancellation_requested_at) if run.cancellation_requested_at is not None else None
         ),
         "result_message_id": str(run.result_message_id) if run.result_message_id is not None else None,
+    }
+
+
+def _serialize_routing_eligibility(report: RuntimeEligibilityReport) -> dict[str, object]:
+    return {
+        "version": report.version,
+        "task_class": report.task_class.value,
+        "required_capabilities": [item.value for item in report.required_capabilities],
+        "principal_id": str(report.principal_id),
+        "channel_id": str(report.channel_id),
+        "agent_id": str(report.agent_id),
+        "runtime_profile_id": str(report.runtime_profile_id),
+        "workspace": report.workspace,
+        "candidates": [
+            {
+                "option_id": candidate.option_id,
+                "backend": candidate.backend,
+                "provider": candidate.provider,
+                "allowed_services": list(candidate.allowed_services),
+                "model_id": candidate.model_id,
+                "model_source": candidate.model_source,
+                "selected": candidate.selected,
+                "eligible": candidate.eligible,
+                "capabilities": [
+                    {
+                        "capability": capability.capability.value,
+                        "support": capability.support.value,
+                        "evidence": capability.evidence,
+                    }
+                    for capability in candidate.capabilities
+                ],
+                "reasons": [{"code": reason.code, "detail": reason.detail} for reason in candidate.reasons],
+            }
+            for candidate in report.candidates
+        ],
     }
 
 
@@ -3862,6 +3970,7 @@ def register_workshop_read_routes(
     run_previews: WorkshopRunPreviewRegistry | None = None,
     artifact_service: WorkshopArtifactService | None = None,
     settings_workspaces: WorkshopSettingsWorkspaceService | None = None,
+    routing_eligibility: WorkshopRoutingEligibilityService | None = None,
     memory_queries: WorkshopMemoryQueryService | None = None,
     preference_documents: WorkshopPreferenceService | None = None,
     github_settings: WorkshopGitHubSettingsService | None = None,
@@ -4188,6 +4297,17 @@ def register_workshop_read_routes(
             _WORKSPACE_CONFIG_PATH,
             handle_workspace_config_update,
         )
+    if routing_eligibility is not None:
+
+        async def handle_routing_eligibility(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_routing_eligibility(
+                    request,
+                    authenticator=authenticator,
+                    service=routing_eligibility,
+                )
+
+        app.router.add_get(_ROUTING_ELIGIBILITY_PATH, handle_routing_eligibility)
     if memory_queries is not None:
 
         async def handle_memory_stats(request: web.Request) -> web.Response:

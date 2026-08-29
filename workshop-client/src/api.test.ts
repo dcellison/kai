@@ -27,6 +27,7 @@ import {
   loadClientPreferences,
   loadPreferenceDocument,
   loadPreferenceHistory,
+  loadRoutingEligibility,
   loadRun,
   loadTimeline,
   loadThreadTimeline,
@@ -204,6 +205,42 @@ function modelCataloguePayload(): Record<string, unknown> {
         sources: ["discovered:claude"],
       },
     ],
+  };
+}
+
+function routingEligibilityPayload(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    version: 1,
+    task_class: "coding",
+    required_capabilities: ["text_generation", "tool_activity", "workspace_execution"],
+    principal_id: "prn_00000000000000000000000000000001",
+    channel_id: channelId,
+    agent_id: "agt_00000000000000000000000000000001",
+    runtime_profile_id: "rtp_00000000000000000000000000000001",
+    workspace: "/srv/kai",
+    candidates: [
+      {
+        option_id: "claude:anthropic",
+        backend: "claude",
+        provider: "anthropic",
+        allowed_services: ["perplexity"],
+        model_id: "claude-sonnet-4-6",
+        model_source: "current_selection",
+        selected: true,
+        eligible: true,
+        capabilities: [
+          {
+            capability: "text_generation",
+            support: "supported",
+            evidence: "agent_backend_contract_v1",
+          },
+        ],
+        reasons: [{ code: "eligible", detail: "All required capability checks passed." }],
+      },
+    ],
+    ...overrides,
   };
 }
 
@@ -774,6 +811,35 @@ describe("Workshop client API", () => {
       [`/v1/channels/${channelId}/models`, "PUT"],
       [`/v1/channels/${channelId}/models`, "DELETE"],
     ]);
+  });
+
+  it("loads strict read-only routing eligibility for an explicit task class", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(Response.json(routingEligibilityPayload()));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(loadRoutingEligibility(session, "coding")).resolves.toMatchObject({
+      candidates: [
+        {
+          allowedServices: ["perplexity"],
+          backend: "claude",
+          eligible: true,
+          selected: true,
+        },
+      ],
+      requiredCapabilities: ["text_generation", "tool_activity", "workspace_execution"],
+      taskClass: "coding",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/v1/channels/${channelId}/routing-eligibility?task_class=coding`,
+      expect.objectContaining({ headers: expect.any(Headers) }),
+    );
+
+    fetchMock.mockResolvedValueOnce(Response.json(
+      routingEligibilityPayload({ candidates: [{ backend: "claude" }] }),
+    ));
+    await expect(loadRoutingEligibility(session, "coding")).rejects.toThrow(
+      "Kai returned unsupported routing candidate.",
+    );
   });
 
   it("uses typed workspace mutations and rejects stale settings", async () => {

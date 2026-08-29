@@ -1,6 +1,7 @@
 export const CHANNEL_PATTERN = /^chn_[0-9a-f]{32}$/;
 export const AGENT_PATTERN = /^agt_[0-9a-f]{32}$/;
 export const PRINCIPAL_PATTERN = /^prn_[0-9a-f]{32}$/;
+export const RUNTIME_PROFILE_PATTERN = /^rtp_[0-9a-f]{32}$/;
 export const WORKSHOP_PATTERN = /^wsp_[0-9a-f]{32}$/;
 export const ARTIFACT_PATTERN = /^art_[0-9a-f]{32}$/;
 export const MESSAGE_PATTERN = /^msg_[0-9a-f]{32}$/;
@@ -126,6 +127,35 @@ export interface WorkshopSettingsWorkspace {
   timeoutSeconds: { defaultValue: number; source: string; value: number };
   workspace: string;
   workspaces: WorkshopWorkspaceOption[];
+}
+
+export type WorkshopRoutingTaskClass = "conversation" | "coding" | "vision";
+
+export interface WorkshopRoutingEligibility {
+  agentId: string;
+  candidates: {
+    allowedServices: string[];
+    backend: string;
+    capabilities: {
+      capability: "image_input" | "text_generation" | "tool_activity" | "workspace_execution";
+      evidence: string;
+      support: "supported" | "unsupported" | "unknown";
+    }[];
+    eligible: boolean;
+    modelId: string;
+    modelSource: "current_selection" | "protected_default";
+    optionId: string;
+    provider: string;
+    reasons: { code: string; detail: string }[];
+    selected: boolean;
+  }[];
+  channelId: string;
+  principalId: string;
+  requiredCapabilities: string[];
+  runtimeProfileId: string;
+  taskClass: WorkshopRoutingTaskClass;
+  version: 1;
+  workspace: string;
 }
 
 export interface WorkshopWorkspaceConfig {
