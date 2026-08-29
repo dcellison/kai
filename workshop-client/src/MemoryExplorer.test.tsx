@@ -182,7 +182,6 @@ describe("Workshop Memory explorer", () => {
         initialMemoryId={null}
         onAuthenticationFailure={vi.fn()}
         onClose={vi.fn()}
-        onForget={vi.fn()}
         onSelectMemory={onSelectMemory}
         token="session-secret"
       />,
@@ -211,7 +210,6 @@ describe("Workshop Memory explorer", () => {
         initialMemoryId={null}
         onAuthenticationFailure={vi.fn()}
         onClose={vi.fn()}
-        onForget={vi.fn()}
         onSelectMemory={vi.fn()}
         token="session-secret"
       />,
@@ -268,7 +266,6 @@ describe("Workshop Memory explorer", () => {
         initialMemoryId={episode.memoryId}
         onAuthenticationFailure={vi.fn()}
         onClose={vi.fn()}
-        onForget={vi.fn()}
         onSelectMemory={vi.fn()}
         token="session-secret"
       />,
@@ -294,7 +291,6 @@ describe("Workshop Memory explorer", () => {
         initialMemoryId={fact.memoryId}
         onAuthenticationFailure={vi.fn()}
         onClose={vi.fn()}
-        onForget={vi.fn()}
         onSelectMemory={vi.fn()}
         token="session-secret"
       />,
@@ -316,7 +312,6 @@ describe("Workshop Memory explorer", () => {
         initialMemoryId={null}
         onAuthenticationFailure={onAuthenticationFailure}
         onClose={vi.fn()}
-        onForget={vi.fn()}
         onSelectMemory={vi.fn()}
         token="session-secret"
       />,
@@ -334,7 +329,6 @@ describe("Workshop Memory explorer", () => {
         initialMemoryId={null}
         onAuthenticationFailure={vi.fn()}
         onClose={vi.fn()}
-        onForget={vi.fn()}
         onSelectMemory={vi.fn()}
         token="session-secret"
       />,
@@ -383,7 +377,6 @@ describe("Workshop Memory explorer", () => {
         initialMemoryId={null}
         onAuthenticationFailure={vi.fn()}
         onClose={vi.fn()}
-        onForget={vi.fn()}
         onSelectMemory={vi.fn()}
         token="session-secret"
       />,
@@ -414,7 +407,6 @@ describe("Workshop Memory explorer", () => {
         initialMemoryId={null}
         onAuthenticationFailure={vi.fn()}
         onClose={vi.fn()}
-        onForget={vi.fn()}
         onSelectMemory={vi.fn()}
         token="session-secret"
       />,
@@ -447,7 +439,6 @@ describe("Workshop Memory explorer", () => {
         initialMemoryId={fact.memoryId}
         onAuthenticationFailure={vi.fn()}
         onClose={vi.fn()}
-        onForget={vi.fn()}
         onSelectMemory={vi.fn()}
         token="session-secret"
       />,
@@ -488,7 +479,6 @@ describe("Workshop Memory explorer", () => {
         initialMemoryId={episode.memoryId}
         onAuthenticationFailure={vi.fn()}
         onClose={vi.fn()}
-        onForget={vi.fn()}
         onSelectMemory={vi.fn()}
         token="session-secret"
       />,

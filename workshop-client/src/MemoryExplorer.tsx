@@ -511,14 +511,12 @@ function MemoryExplorerContent({
   initialMemoryId,
   onAuthenticationFailure,
   onClose,
-  onForget,
   onSelectMemory,
   token,
 }: {
   initialMemoryId: string | null;
   onAuthenticationFailure: (message: string) => void;
   onClose: () => void;
-  onForget: () => void;
   onSelectMemory: (memoryId: string | null) => void;
   token: string;
 }): React.JSX.Element {
@@ -855,9 +853,6 @@ function MemoryExplorerContent({
             <button type="button" onClick={() => setEditorDetail("create")}>Add fact…</button>
             <button className="quiet-button memory-mobile-back" type="button" onClick={onClose}>
               Back to conversation
-            </button>
-            <button className="quiet-button" type="button" onClick={onForget}>
-              Forget session
             </button>
           </div>
         </header>
