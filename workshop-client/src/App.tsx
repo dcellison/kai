@@ -67,11 +67,11 @@ const LEGACY_SESSION_KEY = "kai.workshop.read-session.v1";
 const ACTIVE_RUN_KEY = "kai.workshop.active-run.v1";
 const DRAFTS_KEY = "kai.workshop.drafts.v1";
 const VIEWPORTS_KEY = "kai.workshop.timeline-viewports.v1";
-const SIDEBAR_LAYOUT_KEY = "kai.workshop.sidebar-layout.v3";
+const SIDEBAR_LAYOUT_KEY = "kai.workshop.sidebar-layout.v4";
 const TIMELINE_FOLLOW_DISTANCE_PX = 96;
 const UI_SCALE = 1.5;
-const DEFAULT_SIDEBAR_WIDTH_PX = 264 * UI_SCALE;
 const MIN_SIDEBAR_WIDTH_PX = 176 * UI_SCALE;
+const DEFAULT_SIDEBAR_WIDTH_PX = MIN_SIDEBAR_WIDTH_PX;
 const MAX_SIDEBAR_WIDTH_PX = 420 * UI_SCALE;
 const COLLAPSED_SIDEBAR_WIDTH_PX = 56 * UI_SCALE;
 const MEMORY_ID_PATTERN = /^[A-Za-z0-9_-]{1,256}$/;
@@ -159,9 +159,9 @@ function storeSidebarLayout(layout: StoredSidebarLayout): void {
   sessionStorage.setItem(SIDEBAR_LAYOUT_KEY, JSON.stringify(layout));
 }
 
-const CONTEXT_LAYOUT_KEY = "kai.workshop.context-layout.v3";
-const DEFAULT_CONTEXT_WIDTH_PX = 304 * UI_SCALE;
+const CONTEXT_LAYOUT_KEY = "kai.workshop.context-layout.v4";
 const MIN_CONTEXT_WIDTH_PX = 240 * UI_SCALE;
+const DEFAULT_CONTEXT_WIDTH_PX = MIN_CONTEXT_WIDTH_PX;
 const MAX_CONTEXT_WIDTH_PX = 560 * UI_SCALE;
 
 function clampContextWidth(width: number): number {

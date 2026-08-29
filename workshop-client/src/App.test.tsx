@@ -1566,7 +1566,7 @@ describe("Workshop React client", () => {
     expect(screen.getByRole("button", { name: "Kai" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Scott" })).toBeVisible();
     expect(screen.queryByRole("button", { name: "Create channel" })).toBeNull();
-    expect(sessionStorage.getItem("kai.workshop.sidebar-layout.v3")).toContain(
+    expect(sessionStorage.getItem("kai.workshop.sidebar-layout.v4")).toContain(
       '"collapsed":true',
     );
 
@@ -1584,12 +1584,15 @@ describe("Workshop React client", () => {
 
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
     const resizeHandle = screen.getByRole("separator", { name: "Resize navigation" });
+    expect(container.querySelector(".workshop-app")).toHaveStyle(
+      "--channel-sidebar-width: 264px",
+    );
     fireEvent.keyDown(resizeHandle, { key: "ArrowRight" });
 
     expect(container.querySelector(".workshop-app")).toHaveStyle(
-      "--channel-sidebar-width: 420px",
+      "--channel-sidebar-width: 288px",
     );
-    expect(resizeHandle).toHaveAttribute("aria-valuenow", "420");
+    expect(resizeHandle).toHaveAttribute("aria-valuenow", "288");
   });
 
   it("resizes the context pane with an accessible separator", async () => {
@@ -1601,17 +1604,20 @@ describe("Workshop React client", () => {
 
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
     const resizeHandle = screen.getByRole("separator", { name: "Resize channel context" });
+    expect(container.querySelector(".workshop-app")).toHaveStyle(
+      "--context-pane-width: 360px",
+    );
     // The pane sits on the right, so ArrowLeft moves the separator left
     // and widens it.
     fireEvent.keyDown(resizeHandle, { key: "ArrowLeft" });
 
     expect(container.querySelector(".workshop-app")).toHaveStyle(
-      "--context-pane-width: 480px",
+      "--context-pane-width: 384px",
     );
-    expect(resizeHandle).toHaveAttribute("aria-valuenow", "480");
+    expect(resizeHandle).toHaveAttribute("aria-valuenow", "384");
     expect(
-      JSON.parse(sessionStorage.getItem("kai.workshop.context-layout.v3") ?? "null"),
-    ).toEqual({ width: 480 });
+      JSON.parse(sessionStorage.getItem("kai.workshop.context-layout.v4") ?? "null"),
+    ).toEqual({ width: 384 });
   });
 
   it("submits over LAN HTTP and reuses the command identity on retry", async () => {
