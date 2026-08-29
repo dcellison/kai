@@ -12,7 +12,7 @@
   /* Match the readable density of a desktop collaboration client. Because
      component dimensions use rem, this scales type, icons, controls, and
      spacing together instead of enlarging labels in isolation. */
-  font-size: 200%;
+  font-size: 150%;
 }
 
 * {
