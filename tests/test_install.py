@@ -54,6 +54,7 @@ from kai.install import (
     _DarwinServiceGeneration,
     _deployed_adapter_policy_status,
     _deployed_webhook_secret_migration_status,
+    _explicit_task_routing_status,
     _file_checksum,
     _finish_stopping_darwin_generation,
     _generate_env_file,
@@ -10288,6 +10289,26 @@ backends:
             "Workshop model catalogue: active; contexts=1, active=1, refreshed=1, "
             "succeeded=1, failed=0, discovered entries=2, operator entries=1; "
             "diagnostic discovery=disabled"
+        )
+
+    def test_explicit_task_routing_status_reports_policy_and_decision_counts(self, tmp_path):
+        database = tmp_path / "kai.db"
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE workshop_routing_policies (backend_option_id TEXT)")
+            connection.execute("CREATE TABLE workshop_run_routing_decisions (disposition TEXT)")
+            connection.executemany(
+                "INSERT INTO workshop_routing_policies VALUES (?)",
+                (("codex:openai",), (None,)),
+            )
+            connection.executemany(
+                "INSERT INTO workshop_run_routing_decisions VALUES (?)",
+                (("routed",), ("fallback_selected",), ("rejected",), ("selected_default",)),
+            )
+
+        assert _explicit_task_routing_status(database) == (
+            "Workshop explicit task routing: active; policies=2, enabled=1, disabled=1, "
+            "decisions=4, routed=1, fallback=1, rejected=1, selected defaults=1; "
+            "principal defaults=preserved"
         )
 
     def test_apply_initializes_root_private_policy(self, tmp_path, monkeypatch):

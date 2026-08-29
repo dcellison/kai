@@ -9525,6 +9525,7 @@ def _cmd_status() -> None:
         print(_webhook_secret_migration_status(conf_env, source="install.conf artifact"))
 
     print(_runtime_policy_status(RUNTIME_PROFILES_YAML, BACKENDS_YAML))
+    print(_explicit_task_routing_status(Path(data_dir) / "kai.db"))
     print(_model_catalogue_status(Path(data_dir) / "kai.db", RUNTIME_PROFILES_YAML))
     print(
         _runtime_storage_status(
@@ -9636,6 +9637,49 @@ def _runtime_policy_status(policy_path: Path, backend_registry_path: Path) -> st
         f"{prefix} initialized; profiles={len(profiles.profiles)}, backends={backends}, "
         f"runtime kernel=canonical, backend selection=canonical "
         f"({selectable_backends}), archived keys={archived}, removal gate={removal_gate}"
+    )
+
+
+def _explicit_task_routing_status(database_path: Path) -> str:
+    """Report durable explicit-route policy and decision state without mutation."""
+    prefix = "Workshop explicit task routing:"
+    if not database_path.is_file():
+        return f"{prefix} unavailable"
+    try:
+        with sqlite3.connect(database_path) as connection:
+            policy_table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'workshop_routing_policies'"
+            ).fetchone()
+            decision_table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'workshop_run_routing_decisions'"
+            ).fetchone()
+            if policy_table is None or decision_table is None:
+                return f"{prefix} unavailable"
+            policy_counts = connection.execute(
+                "SELECT COUNT(*), "
+                "COALESCE(SUM(CASE WHEN backend_option_id IS NOT NULL THEN 1 ELSE 0 END), 0), "
+                "COALESCE(SUM(CASE WHEN backend_option_id IS NULL THEN 1 ELSE 0 END), 0) "
+                "FROM workshop_routing_policies"
+            ).fetchone()
+            decision_counts = {
+                str(disposition): int(count)
+                for disposition, count in connection.execute(
+                    "SELECT disposition, COUNT(*) FROM workshop_run_routing_decisions GROUP BY disposition"
+                ).fetchall()
+            }
+    except (OSError, sqlite3.Error):
+        return f"{prefix} INVALID"
+    assert policy_counts is not None
+    total_decisions = sum(decision_counts.values())
+    return (
+        f"{prefix} active; policies={int(policy_counts[0])}, "
+        f"enabled={int(policy_counts[1])}, disabled={int(policy_counts[2])}, "
+        f"decisions={total_decisions}, "
+        f"routed={decision_counts.get('routed', 0)}, "
+        f"fallback={decision_counts.get('fallback_selected', 0)}, "
+        f"rejected={decision_counts.get('rejected', 0)}, "
+        f"selected defaults={decision_counts.get('selected_default', 0)}; "
+        "principal defaults=preserved"
     )
 
 

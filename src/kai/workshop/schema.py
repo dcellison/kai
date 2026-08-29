@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 43
+WORKSHOP_SCHEMA_VERSION = 44
 
 
 @dataclass(frozen=True, slots=True)
@@ -2110,6 +2110,63 @@ _MESSAGE_THREADS_SCHEMA = SchemaMigration(
     ),
 )
 
+_EXPLICIT_TASK_ROUTING_SCHEMA = SchemaMigration(
+    version=44,
+    name="explicit_task_routing",
+    statements=(
+        """
+        CREATE TABLE workshop_routing_policies (
+            runtime_profile_id TEXT NOT NULL,
+            task_class TEXT NOT NULL CHECK (
+                task_class IN ('conversation', 'coding', 'vision')
+            ),
+            backend_option_id TEXT CHECK (
+                backend_option_id IS NULL
+                OR length(trim(backend_option_id)) BETWEEN 1 AND 128
+            ),
+            fallback TEXT NOT NULL CHECK (
+                fallback IN ('selected', 'fail_closed')
+            ),
+            revision INTEGER NOT NULL CHECK (revision > 0),
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (runtime_profile_id, task_class)
+        )
+        """,
+        """
+        CREATE TABLE workshop_run_routing_decisions (
+            run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+            runtime_profile_id TEXT NOT NULL,
+            requested_task_class TEXT CHECK (
+                requested_task_class IS NULL
+                OR requested_task_class IN ('conversation', 'coding', 'vision')
+            ),
+            requested_backend_option_id TEXT,
+            selected_backend_option_id TEXT,
+            disposition TEXT NOT NULL CHECK (
+                disposition IN (
+                    'selected_default', 'routed', 'fallback_selected', 'rejected'
+                )
+            ),
+            reason_code TEXT NOT NULL CHECK (
+                length(trim(reason_code)) BETWEEN 1 AND 64
+            ),
+            policy_revision INTEGER CHECK (
+                policy_revision IS NULL OR policy_revision > 0
+            ),
+            backend TEXT NOT NULL CHECK (length(trim(backend)) > 0),
+            provider TEXT,
+            model TEXT NOT NULL CHECK (length(trim(model)) > 0),
+            evidence_version INTEGER NOT NULL CHECK (evidence_version > 0),
+            decided_at TEXT NOT NULL
+        )
+        """,
+        "CREATE INDEX workshop_run_routing_decisions_profile_idx "
+        "ON workshop_run_routing_decisions (runtime_profile_id, decided_at)",
+        "CREATE INDEX workshop_run_routing_decisions_disposition_idx "
+        "ON workshop_run_routing_decisions (disposition, decided_at)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2154,6 +2211,7 @@ _MIGRATIONS = (
     _MESSAGE_MENTIONS_SCHEMA,
     _GROUP_WAKE_POLICY_SCHEMA,
     _MESSAGE_THREADS_SCHEMA,
+    _EXPLICIT_TASK_ROUTING_SCHEMA,
 )
 
 

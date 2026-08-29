@@ -28,6 +28,7 @@ import {
   loadPreferenceDocument,
   loadPreferenceHistory,
   loadRoutingEligibility,
+  loadRoutingPolicy,
   loadRun,
   loadTimeline,
   loadThreadTimeline,
@@ -43,6 +44,7 @@ import {
   submitCommand,
   streamTimeline,
   updateRuntimeSettings,
+  updateRoutingPolicy,
   updateGitHubSettings,
   updateNotificationPreference,
   updateClientPreference,
@@ -241,6 +243,26 @@ function routingEligibilityPayload(
       },
     ],
     ...overrides,
+  };
+}
+
+function routingPolicyPayload(): Record<string, unknown> {
+  return {
+    version: 1,
+    principal_id: "prn_00000000000000000000000000000001",
+    channel_id: channelId,
+    agent_id: "agt_00000000000000000000000000000001",
+    runtime_profile_id: "rtp_00000000000000000000000000000001",
+    entries: [
+      {
+        task_class: "coding",
+        backend_option_id: "claude:anthropic",
+        fallback: "selected",
+        revision: 1,
+        authorized_option_ids: ["claude:anthropic", "codex:openai"],
+        eligible_option_ids: ["claude:anthropic"],
+      },
+    ],
   };
 }
 
@@ -840,6 +862,33 @@ describe("Workshop client API", () => {
     await expect(loadRoutingEligibility(session, "coding")).rejects.toThrow(
       "Kai returned unsupported routing candidate.",
     );
+  });
+
+  it("loads and updates a principal-scoped explicit routing policy", async () => {
+    const fetchMock = vi.fn().mockImplementation(
+      () => Promise.resolve(Response.json(routingPolicyPayload())),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(loadRoutingPolicy(session)).resolves.toMatchObject({
+      entries: [{ backendOptionId: "claude:anthropic", taskClass: "coding" }],
+    });
+    await expect(
+      updateRoutingPolicy(session, "coding", "codex:openai", "fail_closed", 1),
+    ).resolves.toMatchObject({ version: 1 });
+
+    expect(fetchMock.mock.calls[1]).toEqual([
+      `/v1/channels/${channelId}/routing-policy`,
+      expect.objectContaining({
+        body: JSON.stringify({
+          task_class: "coding",
+          backend_option_id: "codex:openai",
+          fallback: "fail_closed",
+          expected_revision: 1,
+        }),
+        method: "PATCH",
+      }),
+    ]);
   });
 
   it("uses typed workspace mutations and rejects stale settings", async () => {

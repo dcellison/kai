@@ -66,6 +66,7 @@ class _FakeExecution:
 
     def __init__(self, events: list[str]) -> None:
         self.events = events
+        self.routing_policy = SimpleNamespace()
 
     async def wait(self) -> None:
         self.events.append("execution:wait")

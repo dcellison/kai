@@ -158,6 +158,38 @@ export interface WorkshopRoutingEligibility {
   workspace: string;
 }
 
+export interface WorkshopRoutingPolicyEntry {
+  authorizedOptionIds: string[];
+  backendOptionId: string | null;
+  eligibleOptionIds: string[];
+  fallback: "selected" | "fail_closed";
+  revision: number;
+  taskClass: WorkshopRoutingTaskClass;
+}
+
+export interface WorkshopRoutingPolicy {
+  agentId: string;
+  channelId: string;
+  entries: WorkshopRoutingPolicyEntry[];
+  principalId: string;
+  runtimeProfileId: string;
+  version: 1;
+}
+
+export interface WorkshopRunRoutingDecision {
+  backend: string;
+  decidedAt: string;
+  disposition: "selected_default" | "routed" | "fallback_selected" | "rejected";
+  evidenceVersion: number;
+  model: string;
+  policyRevision: number | null;
+  provider: string | null;
+  reasonCode: string;
+  requestedBackendOptionId: string | null;
+  requestedTaskClass: WorkshopRoutingTaskClass | null;
+  selectedBackendOptionId: string | null;
+}
+
 export interface WorkshopWorkspaceConfig {
   capabilities: WorkshopEditableCapability[];
   environmentKeys: string[];
@@ -515,6 +547,7 @@ export interface WorkshopRun {
   status: WorkshopRunStatus;
   terminalAt: string | null;
   terminalCode: string | null;
+  routingDecision?: WorkshopRunRoutingDecision | null;
 }
 
 export type WorkshopRunTransition =

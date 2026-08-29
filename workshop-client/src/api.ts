@@ -19,6 +19,8 @@ import type {
   WorkshopModelCatalogue,
   WorkshopSettingsWorkspace,
   WorkshopRoutingEligibility,
+  WorkshopRoutingPolicy,
+  WorkshopRunRoutingDecision,
   WorkshopRoutingTaskClass,
   WorkshopWorkspaceConfig,
   WorkshopPreferenceDocument,
@@ -847,6 +849,89 @@ function parseRoutingEligibility(payload: unknown): WorkshopRoutingEligibility {
     taskClass: payload.task_class as WorkshopRoutingTaskClass,
     version: 1,
     workspace: payload.workspace,
+  };
+}
+
+function parseRoutingPolicy(payload: unknown): WorkshopRoutingPolicy {
+  if (
+    !isRecord(payload) || payload.version !== 1 ||
+    typeof payload.principal_id !== "string" || !PRINCIPAL_PATTERN.test(payload.principal_id) ||
+    typeof payload.channel_id !== "string" || !CHANNEL_PATTERN.test(payload.channel_id) ||
+    typeof payload.agent_id !== "string" || !AGENT_PATTERN.test(payload.agent_id) ||
+    typeof payload.runtime_profile_id !== "string" ||
+    !RUNTIME_PROFILE_PATTERN.test(payload.runtime_profile_id) ||
+    !Array.isArray(payload.entries)
+  ) {
+    throw new Error("Kai returned an unsupported routing policy.");
+  }
+  const entries = payload.entries.map((rawEntry) => {
+    if (
+      !isRecord(rawEntry) ||
+      !["conversation", "coding", "vision"].includes(String(rawEntry.task_class)) ||
+      (rawEntry.backend_option_id !== null && typeof rawEntry.backend_option_id !== "string") ||
+      !["selected", "fail_closed"].includes(String(rawEntry.fallback)) ||
+      typeof rawEntry.revision !== "number" || !Number.isSafeInteger(rawEntry.revision) ||
+      !Array.isArray(rawEntry.authorized_option_ids) ||
+      !rawEntry.authorized_option_ids.every((item) => typeof item === "string") ||
+      !Array.isArray(rawEntry.eligible_option_ids) ||
+      !rawEntry.eligible_option_ids.every((item) => typeof item === "string")
+    ) {
+      throw new Error("Kai returned an unsupported routing policy entry.");
+    }
+    return {
+      authorizedOptionIds: rawEntry.authorized_option_ids,
+      backendOptionId: rawEntry.backend_option_id as string | null,
+      eligibleOptionIds: rawEntry.eligible_option_ids,
+      fallback: rawEntry.fallback as "selected" | "fail_closed",
+      revision: rawEntry.revision,
+      taskClass: rawEntry.task_class as WorkshopRoutingTaskClass,
+    };
+  });
+  return {
+    agentId: payload.agent_id,
+    channelId: payload.channel_id,
+    entries,
+    principalId: payload.principal_id,
+    runtimeProfileId: payload.runtime_profile_id,
+    version: 1,
+  };
+}
+
+function parseRoutingDecision(payload: unknown): WorkshopRunRoutingDecision | null {
+  if (payload === null || payload === undefined) return null;
+  if (
+    !isRecord(payload) ||
+    (payload.requested_task_class !== null &&
+      !["conversation", "coding", "vision"].includes(String(payload.requested_task_class))) ||
+    (payload.requested_backend_option_id !== null &&
+      typeof payload.requested_backend_option_id !== "string") ||
+    (payload.selected_backend_option_id !== null &&
+      typeof payload.selected_backend_option_id !== "string") ||
+    !["selected_default", "routed", "fallback_selected", "rejected"].includes(
+      String(payload.disposition),
+    ) ||
+    typeof payload.reason_code !== "string" ||
+    (payload.policy_revision !== null && typeof payload.policy_revision !== "number") ||
+    typeof payload.backend !== "string" ||
+    (payload.provider !== null && typeof payload.provider !== "string") ||
+    typeof payload.model !== "string" ||
+    typeof payload.evidence_version !== "number" ||
+    typeof payload.decided_at !== "string"
+  ) {
+    throw new Error("Kai returned an unsupported routing decision.");
+  }
+  return {
+    backend: payload.backend,
+    decidedAt: payload.decided_at,
+    disposition: payload.disposition as WorkshopRunRoutingDecision["disposition"],
+    evidenceVersion: payload.evidence_version,
+    model: payload.model,
+    policyRevision: payload.policy_revision as number | null,
+    provider: payload.provider as string | null,
+    reasonCode: payload.reason_code,
+    requestedBackendOptionId: payload.requested_backend_option_id as string | null,
+    requestedTaskClass: payload.requested_task_class as WorkshopRoutingTaskClass | null,
+    selectedBackendOptionId: payload.selected_backend_option_id as string | null,
   };
 }
 
@@ -1869,6 +1954,48 @@ export async function loadRoutingEligibility(
   return parseRoutingEligibility(payload);
 }
 
+export async function loadRoutingPolicy(
+  session: WorkshopSession,
+): Promise<WorkshopRoutingPolicy> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/routing-policy`,
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load routing policy."));
+  }
+  return parseRoutingPolicy(payload);
+}
+
+export async function updateRoutingPolicy(
+  session: WorkshopSession,
+  taskClass: WorkshopRoutingTaskClass,
+  backendOptionId: string | null,
+  fallback: "selected" | "fail_closed",
+  expectedRevision: number,
+): Promise<WorkshopRoutingPolicy> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/routing-policy`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        task_class: taskClass,
+        backend_option_id: backendOptionId,
+        fallback,
+        expected_revision: expectedRevision,
+      }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not update routing policy."));
+  }
+  return parseRoutingPolicy(payload);
+}
+
 export async function loadModelCatalogue(
   session: WorkshopSession,
   optionId: string,
@@ -2328,6 +2455,7 @@ export async function submitCommand(
   body: string,
   artifact: File | null = null,
   threadRootId: string | null = null,
+  taskClass: WorkshopRoutingTaskClass | null = null,
 ): Promise<CommandSubmissionResult> {
   if (threadRootId !== null && !MESSAGE_PATTERN.test(threadRootId)) {
     throw new Error("Invalid thread identity.");
@@ -2340,6 +2468,7 @@ export async function submitCommand(
         const form = new FormData();
         form.append("client_message_id", clientMessageId);
         form.append("body", body);
+        if (taskClass) form.append("task_class", taskClass);
         form.append("file", artifact, artifact.name);
         return { body: form, method: "POST" } satisfies RequestInit;
       })()
@@ -2350,6 +2479,7 @@ export async function submitCommand(
           body,
           client_message_id: clientMessageId,
           ...(threadRootId ? { thread_root_id: threadRootId } : {}),
+          ...(taskClass ? { task_class: taskClass } : {}),
         }),
       };
   const response = await authorizedFetch(
@@ -2433,7 +2563,10 @@ export async function loadRun(
   if (!isRecord(payload) || payload.version !== 1 || !run || run.runId !== runId) {
     throw new Error("Kai returned an unsupported run response.");
   }
-  return run;
+  return {
+    ...run,
+    routingDecision: parseRoutingDecision(payload.routing_decision),
+  };
 }
 
 const TRACE_KINDS = new Set<WorkshopRunTraceKind>(["tool_call", "tool_result", "truncated"]);

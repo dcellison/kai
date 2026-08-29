@@ -17,12 +17,33 @@ from kai.workshop.protected_execution import (
     ProtectedExecutionPreparationError,
     WorkshopProtectedExecutionPreparationService,
 )
+from kai.workshop.routing_policy import (
+    RoutingDecisionDisposition,
+    RunRoutingDecision,
+)
 from kai.workshop.run_execution_authority import RunExecutionSelection, WorkshopRunExecutionAuthority
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.store import WorkshopEventStore
 from tests.workshop_profiles import profile_id, profile_registry
 
 _NOW = datetime(2026, 8, 12, 21, 0, tzinfo=UTC)
+
+
+class _RoutingPolicy:
+    async def decide_for_run(self, run, runtime_profile_id):
+        return RunRoutingDecision(
+            run_id=run.run_id,
+            runtime_profile_id=runtime_profile_id,
+            requested_task_class=None,
+            requested_backend_option_id=None,
+            selected_backend_option_id="codex:openai",
+            disposition=RoutingDecisionDisposition.SELECTED_DEFAULT,
+            reason_code="task_class_not_requested",
+            policy_revision=None,
+            selection=RunExecutionSelection("codex", "gpt-5.6-sol", "openai"),
+            evidence_version=1,
+            decided_at=_NOW,
+        )
 
 
 async def _accepted_run(path: Path, home: Path):
@@ -96,6 +117,7 @@ class TestProtectedExecutionPreparation:
                 prepared = await WorkshopProtectedExecutionPreparationService(
                     store,
                     WorkshopRuntimePool(pool, profiles),
+                    _RoutingPolicy(),  # type: ignore[arg-type]
                     registered_backend_ids=frozenset({"codex"}),
                 ).prepare(run.run_id)
 
@@ -126,6 +148,7 @@ class TestProtectedExecutionPreparation:
                 await WorkshopProtectedExecutionPreparationService(
                     store,
                     WorkshopRuntimePool(pool, profiles),
+                    _RoutingPolicy(),  # type: ignore[arg-type]
                     registered_backend_ids=frozenset({"claude"}),
                 ).prepare(run.run_id)
         finally:
@@ -154,6 +177,7 @@ class TestProtectedExecutionPreparation:
                 await WorkshopProtectedExecutionPreparationService(
                     store,
                     WorkshopRuntimePool(pool, profiles),
+                    _RoutingPolicy(),  # type: ignore[arg-type]
                     registered_backend_ids=frozenset({"claude"}),
                 ).prepare(run.run_id)
             prepare.assert_not_awaited()

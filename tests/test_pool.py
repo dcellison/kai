@@ -1097,6 +1097,66 @@ class TestWorkspaceRestoration:
 
 class TestPreparedExecution:
     @pytest.mark.asyncio
+    async def test_explicit_route_preserves_selected_runtime_and_backend_default(self, tmp_path):
+        runtime_id = profile_id(111)
+        profiles = WorkshopRuntimeProfileRegistry(
+            (
+                ProtectedRuntimeProfile(
+                    profile_id=runtime_id,
+                    display_name="protected",
+                    os_user=None,
+                    backend="codex",
+                    provider="openai",
+                    model="gpt-5.6-sol",
+                    timeout_seconds=120,
+                    allowed_services=(),
+                    home_workspace=tmp_path,
+                    workspace_base=None,
+                    allowed_workspaces=(),
+                    backend_options=(
+                        ProtectedRuntimeBackend("codex", "openai", "gpt-5.6-sol"),
+                        ProtectedRuntimeBackend("claude", "anthropic", "sonnet"),
+                    ),
+                ),
+            ),
+            legacy_runtime_keys={runtime_id: 111},
+        )
+        pool = SubprocessPool(
+            config=_make_config(),
+            services_info=[],
+            runtime_profiles=profiles,
+            internal_api_contexts=_internal_api_contexts(111),
+        )
+        selected = pool.get(runtime_id)
+        selected.shutdown = AsyncMock()
+        pool._pending_workspace_restore.clear()
+        pool._pending_settings_restore.clear()
+
+        with patch(
+            "kai.pool.sessions.get_canonical_execution_settings",
+            new_callable=AsyncMock,
+            return_value={},
+        ):
+            routed = await pool.prepare_routed_execution(
+                runtime_id,
+                "claude:anthropic",
+                "sonnet",
+            )
+
+        assert pool.get_if_exists(runtime_id) is selected
+        assert pool.get_backend_provider(runtime_id) == ("codex", "openai")
+        assert routed.selection.backend == "claude"
+        assert routed.selection.provider == "anthropic"
+        selected.shutdown.assert_not_awaited()
+
+        routed_instance = routed._instance
+        routed_instance.shutdown = AsyncMock()
+        await routed.cancel()
+        routed_instance.shutdown.assert_awaited_once()
+        selected.shutdown.assert_not_awaited()
+        assert pool.get_if_exists(runtime_id) is selected
+
+    @pytest.mark.asyncio
     async def test_preparation_applies_pending_settings_and_binds_exact_runtime(self):
         pool = SubprocessPool(config=_make_config(), services_info=[])
         instance = pool.get(111)

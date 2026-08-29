@@ -115,6 +115,7 @@ from kai.workshop.routing_eligibility import (
     RuntimeEligibilityCandidate,
     RuntimeEligibilityReport,
 )
+from kai.workshop.routing_policy import WorkshopRoutingPolicyService
 from kai.workshop.run_lifecycle import (
     DurableRun,
     RunNotFoundError,
@@ -787,6 +788,7 @@ async def _open_client(
     artifact_service: WorkshopArtifactService | None = None,
     settings_workspaces=None,
     routing_eligibility=None,
+    routing_policy=None,
     memory_queries=None,
     github_settings=None,
     notification_preferences=None,
@@ -807,6 +809,7 @@ async def _open_client(
         artifact_service=artifact_service,
         settings_workspaces=settings_workspaces,
         routing_eligibility=routing_eligibility,
+        routing_policy=routing_policy,
         memory_queries=memory_queries,
         github_settings=github_settings,
         notification_preferences=notification_preferences,
@@ -1602,6 +1605,65 @@ class TestWorkshopRoutingEligibilityHTTPContract:
             await store.close()
 
 
+class TestWorkshopRoutingPolicyHTTPContract:
+    async def test_policy_is_principal_scoped_revisioned_and_strict(self, tmp_path: Path) -> None:
+        store, alice_id, alice_channel, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        eligibility = _RoutingEligibility(alice_id, alice_channel)
+        service = WorkshopRoutingPolicyService(
+            store,
+            eligibility,  # type: ignore[arg-type]
+            asyncio.Lock(),
+        )
+        client = await _open_client(
+            store,
+            _Authenticator({"alice-token": alice_id, "bob-token": bob_id}),
+            routing_policy=service,
+        )
+        path = f"/v1/channels/{alice_channel}/routing-policy"
+        try:
+            loaded = await client.get(path, headers={"Authorization": "Bearer alice-token"})
+            payload = await loaded.json()
+            assert loaded.status == 200
+            assert [entry["task_class"] for entry in payload["entries"]] == [
+                "conversation",
+                "coding",
+                "vision",
+            ]
+            assert all(entry["backend_option_id"] is None for entry in payload["entries"])
+
+            updated = await client.patch(
+                path,
+                headers={"Authorization": "Bearer alice-token"},
+                json={
+                    "task_class": "coding",
+                    "backend_option_id": "claude:anthropic",
+                    "fallback": "fail_closed",
+                    "expected_revision": 0,
+                },
+            )
+            assert updated.status == 200
+            coding = next(entry for entry in (await updated.json())["entries"] if entry["task_class"] == "coding")
+            assert coding["revision"] == 1
+            assert coding["backend_option_id"] == "claude:anthropic"
+
+            conflict = await client.patch(
+                path,
+                headers={"Authorization": "Bearer alice-token"},
+                json={
+                    "task_class": "coding",
+                    "backend_option_id": None,
+                    "fallback": "selected",
+                    "expected_revision": 0,
+                },
+            )
+            forbidden = await client.get(path, headers={"Authorization": "Bearer bob-token"})
+            assert conflict.status == 409
+            assert forbidden.status == 403
+        finally:
+            await client.close()
+            await store.close()
+
+
 class TestWorkshopSettingsWorkspaceHTTPContract:
     async def test_model_catalogue_read_refresh_and_operator_actions_are_canonical(
         self,
@@ -2022,6 +2084,7 @@ class TestWorkshopCommandHTTPContract:
                 json={
                     "client_message_id": "browser-command-1",
                     "body": "Hello from Workshop",
+                    "task_class": "coding",
                 },
             )
             payload = await response.json()
@@ -2039,6 +2102,7 @@ class TestWorkshopCommandHTTPContract:
             assert submitted.channel_id == alice_channel
             assert submitted.client_message_id == "browser-command-1"
             assert submitted.body == "Hello from Workshop"
+            assert submitted.routing_task_class == "coding"
             assert submitted.occurred_at.tzinfo is not None
         finally:
             await client.close()

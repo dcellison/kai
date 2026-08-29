@@ -137,8 +137,17 @@ from kai.workshop.routing_eligibility import (
     RoutingEligibilityAccessDenied,
     RoutingEligibilityAuthority,
     RoutingEligibilityError,
+    RoutingTaskClass,
     RuntimeEligibilityReport,
     WorkshopRoutingEligibilityService,
+)
+from kai.workshop.routing_policy import (
+    RoutingFallback,
+    RoutingPolicyConflictError,
+    RoutingPolicyError,
+    RoutingPolicySnapshot,
+    RunRoutingDecision,
+    WorkshopRoutingPolicyService,
 )
 from kai.workshop.run_lifecycle import DurableRun, RunNotFoundError, RunStatus
 from kai.workshop.run_previews import RunPreview, WorkshopRunPreviewRegistry
@@ -186,6 +195,7 @@ _RUN_TRACE_PATH = "/v1/channels/{channel_id}/runs/{run_id}/trace"
 _RUN_CANCELLATION_PATH = "/v1/channels/{channel_id}/runs/{run_id}/cancel"
 _RUNTIME_SETTINGS_PATH = "/v1/channels/{channel_id}/settings"
 _ROUTING_ELIGIBILITY_PATH = "/v1/channels/{channel_id}/routing-eligibility"
+_ROUTING_POLICY_PATH = "/v1/channels/{channel_id}/routing-policy"
 _MODEL_CATALOGUE_PATH = "/v1/channels/{channel_id}/models"
 _MODEL_CATALOGUE_ADMIN_REFRESH_PATH = "/v1/settings/model-catalogue/refresh-all"
 _ACTIVE_WORKSPACE_PATH = "/v1/channels/{channel_id}/workspace"
@@ -214,7 +224,8 @@ _ALLOWED_MEMORY_LIST_PARAMETERS = _ALLOWED_MEMORY_FILTERS | {"cursor", "limit", 
 _ALLOWED_MEMORY_SEARCH_PARAMETERS = _ALLOWED_MEMORY_FILTERS | {"q", "limit"}
 _ENROLLMENT_REQUEST_FIELDS = frozenset({"enrollment_token", "device_display_name"})
 _COMMAND_REQUIRED_FIELDS = frozenset({"client_message_id", "body"})
-_COMMAND_OPTIONAL_FIELDS = frozenset({"thread_root_id"})
+_COMMAND_OPTIONAL_FIELDS = frozenset({"thread_root_id", "task_class"})
+_ROUTING_POLICY_FIELDS = frozenset({"task_class", "backend_option_id", "fallback", "expected_revision"})
 _SETTINGS_OPERATION_FIELDS = frozenset({"backend", "model", "timeout_seconds", "reset"})
 _SETTINGS_REQUEST_FIELDS = _SETTINGS_OPERATION_FIELDS | {"revision"}
 _MODEL_CATALOGUE_REFRESH_FIELDS = frozenset({"option_id"})
@@ -1189,7 +1200,7 @@ async def _authenticate_routing_eligibility_authority(
     request: web.Request,
     *,
     authenticator: WorkshopClientAuthenticator,
-    service: WorkshopRoutingEligibilityService,
+    service: WorkshopRoutingEligibilityService | WorkshopRoutingPolicyService,
 ) -> tuple[RoutingEligibilityAuthority | None, web.Response | None]:
     principal_id = await authenticator.authenticate(request)
     if not isinstance(principal_id, PrincipalId):
@@ -2048,6 +2059,56 @@ async def _handle_routing_eligibility(
     return _json_response(_serialize_routing_eligibility(report), status=200)
 
 
+async def _handle_routing_policy(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopRoutingPolicyService,
+) -> web.Response:
+    authority, error = await _authenticate_routing_eligibility_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        if error.status == 401:
+            error.headers["WWW-Authenticate"] = "Bearer"
+        return error
+    assert authority is not None
+    if request.query or (request.method == "GET" and request.can_read_body):
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid routing policy request",
+        )
+    try:
+        if request.method == "GET":
+            snapshot = await service.inspect(authority)
+        else:
+            payload = await request.json()
+            if not isinstance(payload, dict) or set(payload) != _ROUTING_POLICY_FIELDS:
+                raise RoutingPolicyError("Invalid routing policy request")
+            if not isinstance(payload["expected_revision"], int):
+                raise RoutingPolicyError("expected_revision must be an integer")
+            raw_option = payload["backend_option_id"]
+            if raw_option is not None and not isinstance(raw_option, str):
+                raise RoutingPolicyError("backend_option_id must be a string or null")
+            snapshot = await service.update(
+                authority,
+                task_class=RoutingTaskClass(payload["task_class"]),
+                backend_option_id=raw_option,
+                fallback=RoutingFallback(payload["fallback"]),
+                expected_revision=payload["expected_revision"],
+            )
+    except RoutingEligibilityAccessDenied:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except RoutingPolicyConflictError as exc:
+        return _error_response(status=409, code="revision_conflict", message=str(exc))
+    except (RoutingPolicyError, TypeError, ValueError) as exc:
+        return _error_response(status=400, code="invalid_request", message=str(exc))
+    return _json_response(_serialize_routing_policy(snapshot), status=200)
+
+
 async def _handle_runtime_settings_update(
     request: web.Request,
     *,
@@ -2741,6 +2802,47 @@ def _serialize_routing_eligibility(report: RuntimeEligibilityReport) -> dict[str
             }
             for candidate in report.candidates
         ],
+    }
+
+
+def _serialize_routing_policy(snapshot: RoutingPolicySnapshot) -> dict[str, object]:
+    return {
+        "version": snapshot.version,
+        "principal_id": str(snapshot.authority.principal_id),
+        "channel_id": str(snapshot.authority.channel_id),
+        "agent_id": str(snapshot.authority.agent_id),
+        "runtime_profile_id": str(snapshot.authority.runtime_profile_id),
+        "entries": [
+            {
+                "task_class": entry.task_class.value,
+                "backend_option_id": entry.backend_option_id,
+                "fallback": entry.fallback.value,
+                "revision": entry.revision,
+                "authorized_option_ids": list(snapshot.authorized_options[entry.task_class]),
+                "eligible_option_ids": list(snapshot.eligible_options[entry.task_class]),
+            }
+            for entry in snapshot.entries
+        ],
+    }
+
+
+def _serialize_routing_decision(decision: RunRoutingDecision | None) -> dict[str, object] | None:
+    if decision is None:
+        return None
+    return {
+        "requested_task_class": (
+            decision.requested_task_class.value if decision.requested_task_class is not None else None
+        ),
+        "requested_backend_option_id": decision.requested_backend_option_id,
+        "selected_backend_option_id": decision.selected_backend_option_id,
+        "disposition": decision.disposition.value,
+        "reason_code": decision.reason_code,
+        "policy_revision": decision.policy_revision,
+        "backend": decision.selection.backend,
+        "provider": decision.selection.provider,
+        "model": decision.selection.model,
+        "evidence_version": decision.evidence_version,
+        "decided_at": _format_timestamp(decision.decided_at),
     }
 
 
@@ -3504,8 +3606,10 @@ async def _handle_command_submission(
         client_message_id = payload["client_message_id"]
         body = payload["body"]
         raw_thread_root_id = payload.get("thread_root_id")
+        raw_task_class = payload.get("task_class")
     elif request.content_type == "multipart/form-data" and artifact_service is not None:
         raw_thread_root_id = None
+        raw_task_class = None
         try:
             reader = await request.multipart()
             first = await reader.next()
@@ -3519,6 +3623,9 @@ async def _handle_command_submission(
             if not _CLIENT_MESSAGE_ID_PATTERN.fullmatch(client_message_id) or len(body) > 50_000:
                 raise ValueError("invalid multipart command metadata")
             file_field = await reader.next()
+            if isinstance(file_field, BodyPartReader) and file_field.name == "task_class":
+                raw_task_class = await file_field.text()
+                file_field = await reader.next()
             if not isinstance(file_field, BodyPartReader) or file_field.name != "file":
                 raise ValueError("invalid multipart fields")
 
@@ -3573,6 +3680,7 @@ async def _handle_command_submission(
             body=body,
             occurred_at=datetime.now(UTC),
             thread_root_id=thread_root_id,
+            routing_task_class=raw_task_class,
             artifact_source_unique_id=(artifact.source_unique_id if artifact is not None else None),
         )
     except (TypeError, ValueError):
@@ -3788,6 +3896,7 @@ async def _handle_run_state(
     authenticator: WorkshopClientAuthenticator,
     submitter: WorkshopClientCommandSubmitter,
     request_lock: asyncio.Lock,
+    routing_policy: WorkshopRoutingPolicyService | None = None,
 ) -> web.Response:
     if request.query:
         return _error_response(status=400, code="invalid_request", message="Invalid run request")
@@ -3799,7 +3908,15 @@ async def _handle_run_state(
     )
     if isinstance(authorized, web.Response):
         return authorized
-    return _json_response({"version": 1, "run": _serialize_run(authorized[2])}, status=200)
+    decision = await routing_policy.load_decision(authorized[2].run_id) if routing_policy is not None else None
+    return _json_response(
+        {
+            "version": 1,
+            "run": _serialize_run(authorized[2]),
+            "routing_decision": _serialize_routing_decision(decision),
+        },
+        status=200,
+    )
 
 
 async def _handle_run_trace(
@@ -3971,6 +4088,7 @@ def register_workshop_read_routes(
     artifact_service: WorkshopArtifactService | None = None,
     settings_workspaces: WorkshopSettingsWorkspaceService | None = None,
     routing_eligibility: WorkshopRoutingEligibilityService | None = None,
+    routing_policy: WorkshopRoutingPolicyService | None = None,
     memory_queries: WorkshopMemoryQueryService | None = None,
     preference_documents: WorkshopPreferenceService | None = None,
     github_settings: WorkshopGitHubSettingsService | None = None,
@@ -4308,6 +4426,18 @@ def register_workshop_read_routes(
                 )
 
         app.router.add_get(_ROUTING_ELIGIBILITY_PATH, handle_routing_eligibility)
+    if routing_policy is not None:
+
+        async def handle_routing_policy(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_routing_policy(
+                    request,
+                    authenticator=authenticator,
+                    service=routing_policy,
+                )
+
+        app.router.add_get(_ROUTING_POLICY_PATH, handle_routing_policy)
+        app.router.add_patch(_ROUTING_POLICY_PATH, handle_routing_policy)
     if memory_queries is not None:
 
         async def handle_memory_stats(request: web.Request) -> web.Response:
@@ -4445,6 +4575,7 @@ def register_workshop_command_routes(
     submitter: WorkshopClientCommandSubmitter,
     request_lock: asyncio.Lock,
     artifact_service: WorkshopArtifactService | None = None,
+    routing_policy: WorkshopRoutingPolicyService | None = None,
 ) -> None:
     """Register the authenticated command boundary on a supplied application."""
 
@@ -4464,6 +4595,7 @@ def register_workshop_command_routes(
             authenticator=authenticator,
             submitter=submitter,
             request_lock=request_lock,
+            routing_policy=routing_policy,
         )
 
     async def handle_run_trace(request: web.Request) -> web.Response:

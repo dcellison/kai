@@ -97,6 +97,7 @@ from kai.workshop.proactive_publication import (
     ProactivePublicationResult,
 )
 from kai.workshop.routing_eligibility import WorkshopRoutingEligibilityService
+from kai.workshop.routing_policy import WorkshopRoutingPolicyService
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
 from kai.workshop.scheduled_jobs import (
     WorkshopScheduledJobAuthority,
@@ -1788,6 +1789,7 @@ async def _register_workshop_client_api(
     artifact_service: WorkshopArtifactService | None = None,
     settings_workspaces: WorkshopSettingsWorkspaceService | None = None,
     routing_eligibility: WorkshopRoutingEligibilityService | None = None,
+    routing_policy: WorkshopRoutingPolicyService | None = None,
     memory_queries: WorkshopMemoryQueryService | None = None,
     preference_documents: WorkshopPreferenceService | None = None,
     github_settings: WorkshopGitHubSettingsService | None = None,
@@ -1828,6 +1830,7 @@ async def _register_workshop_client_api(
             artifact_service=artifact_service,
             settings_workspaces=settings_workspaces,
             routing_eligibility=routing_eligibility,
+            routing_policy=routing_policy,
             memory_queries=memory_queries,
             preference_documents=preference_documents,
             github_settings=github_settings,
@@ -1843,6 +1846,7 @@ async def _register_workshop_client_api(
                 submitter=command_submitter,
                 request_lock=request_lock,
                 artifact_service=artifact_service,
+                routing_policy=routing_policy,
             )
         register_workshop_shell_routes(target)
 
@@ -1911,6 +1915,7 @@ async def start(
             artifact_service=core_services.artifacts,
             settings_workspaces=core_services.settings_workspaces,
             routing_eligibility=getattr(core_services, "routing_eligibility", None),
+            routing_policy=getattr(core_services, "routing_policy", None),
             memory_queries=core_services.memory_queries,
             preference_documents=core_services.preference_documents,
             github_settings=getattr(core_services, "github_settings", None),

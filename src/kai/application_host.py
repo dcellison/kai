@@ -54,6 +54,7 @@ from kai.workshop.proactive_publication import (
     WorkshopProactivePublicationService,
 )
 from kai.workshop.routing_eligibility import WorkshopRoutingEligibilityService
+from kai.workshop.routing_policy import WorkshopRoutingPolicyService
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
@@ -175,6 +176,7 @@ class KaiCoreServices:
     model_discovery_inventory: WorkshopModelDiscoveryInventoryService
     model_catalogue: WorkshopModelCatalogueService
     routing_eligibility: WorkshopRoutingEligibilityService
+    routing_policy: WorkshopRoutingPolicyService
     conversation_runs: WorkshopConversationRunService
     private_text_execution: WorkshopPrivateTextExecutionService
     client_commands: WorkshopClientCommandExecutor
@@ -335,6 +337,12 @@ class KaiApplicationHost:
                     ),
                 },
             )
+            routing_eligibility = WorkshopRoutingEligibilityService(
+                execution_state=self._execution_state,
+                inventory=model_discovery_inventory,
+                catalogue=model_catalogue,
+                runtime_pool=runtime_pool,
+            )
             if self._config.model_catalogue_refresh_interval_s > 0:
                 await model_catalogue.start_periodic_refresh(
                     model_catalogue.operator_authority(),
@@ -347,6 +355,7 @@ class KaiApplicationHost:
                 runtime_pool,
                 registered_backend_ids=self._registered_backend_ids,
                 delivery_policy=delivery_policy,
+                routing_eligibility=routing_eligibility,
             )
             post_run_effects = await WorkshopPostRunEffectService.open_and_start(
                 Path(self._config.session_db_path),
@@ -374,12 +383,6 @@ class KaiApplicationHost:
                 runtime_pool,
                 self._execution_state,
                 model_catalogue,
-            )
-            routing_eligibility = WorkshopRoutingEligibilityService(
-                execution_state=self._execution_state,
-                inventory=model_discovery_inventory,
-                catalogue=model_catalogue,
-                runtime_pool=runtime_pool,
             )
             memory_queries = WorkshopMemoryQueryService(
                 self._config,
@@ -443,6 +446,7 @@ class KaiApplicationHost:
                 model_discovery_inventory=model_discovery_inventory,
                 model_catalogue=model_catalogue,
                 routing_eligibility=routing_eligibility,
+                routing_policy=private_execution.routing_policy,
                 conversation_runs=conversation_runs,
                 private_text_execution=private_execution,
                 client_commands=client_commands,

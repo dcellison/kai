@@ -20,6 +20,16 @@ from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthorit
 from kai.workshop.domain import AgentId, ChannelId, PrincipalId, RuntimeProfileId
 from kai.workshop.execution_coordinator import CanonicalExecutionDisposition
 from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
+from kai.workshop.routing_eligibility import (
+    CapabilityAssessment,
+    CapabilitySupport,
+    EligibilityReason,
+    RoutingEligibilityAuthority,
+    RoutingTaskClass,
+    RuntimeCapability,
+    RuntimeEligibilityCandidate,
+    RuntimeEligibilityReport,
+)
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.scheduled_jobs import (
     WorkshopScheduledJobAuthority,
@@ -116,6 +126,49 @@ class _CanonicalRuntime:
             text_so_far="Scheduled agent answer",
             done=True,
             response=AgentResponse(success=True, text="Scheduled agent answer"),
+        )
+
+
+class _CanonicalRoutingEligibility:
+    def __init__(self, authority: RoutingEligibilityAuthority) -> None:
+        self.authority = authority
+
+    def authority_for_principal_runtime(self, principal_id, runtime_profile_id):
+        assert principal_id == self.authority.principal_id
+        assert runtime_profile_id == self.authority.runtime_profile_id
+        return self.authority
+
+    async def inspect(self, authority, task_class):
+        assert authority == self.authority
+        return RuntimeEligibilityReport(
+            version=1,
+            task_class=RoutingTaskClass(task_class),
+            required_capabilities=(RuntimeCapability.TEXT_GENERATION,),
+            principal_id=authority.principal_id,
+            channel_id=authority.channel_id,
+            agent_id=authority.agent_id,
+            runtime_profile_id=authority.runtime_profile_id,
+            workspace="/workspace",
+            candidates=(
+                RuntimeEligibilityCandidate(
+                    option_id="codex:openai",
+                    backend="codex",
+                    provider="openai",
+                    allowed_services=(),
+                    model_id="gpt-5.6-sol",
+                    model_source="current_selection",
+                    selected=True,
+                    eligible=True,
+                    capabilities=(
+                        CapabilityAssessment(
+                            RuntimeCapability.TEXT_GENERATION,
+                            CapabilitySupport.SUPPORTED,
+                            "test",
+                        ),
+                    ),
+                    reasons=(EligibilityReason("eligible", "test"),),
+                ),
+            ),
         )
 
 
@@ -533,12 +586,29 @@ async def test_agent_firing_completes_through_real_canonical_coordinator(
     )
     await WorkshopConversationDeliveryAuthority(source_store).activate()
     runtime = _CanonicalRuntime(tmp_path)
-    pool = SimpleNamespace(prepare_execution=AsyncMock(return_value=runtime))
+    pool = SimpleNamespace(
+        prepare_execution=AsyncMock(return_value=runtime),
+        prepare_routed_execution=AsyncMock(return_value=runtime),
+    )
+    async with source_store.connection.execute(
+        "SELECT principal_id, channel_id, agent_id, runtime_profile_id FROM workshop_scheduled_jobs WHERE id = ?",
+        (job_id,),
+    ) as cursor:
+        principal_id, channel_id, agent_id, runtime_profile_id = await cursor.fetchone()
+    routing_eligibility = _CanonicalRoutingEligibility(
+        RoutingEligibilityAuthority(
+            PrincipalId(str(principal_id)),
+            ChannelId(str(channel_id)),
+            AgentId(str(agent_id)),
+            RuntimeProfileId(str(runtime_profile_id)),
+        )
+    )
     execution = await WorkshopPrivateTextExecutionService.open_and_start(
         database,
         WorkshopRuntimePool(pool, profile_registry(101)),  # type: ignore[arg-type]
         registered_backend_ids=frozenset({"codex"}),
         delivery_policy=DISABLED_DELIVERY_POLICY,
+        routing_eligibility=routing_eligibility,  # type: ignore[arg-type]
     )
     scheduler = await WorkshopCanonicalScheduler.open_and_start(
         database,

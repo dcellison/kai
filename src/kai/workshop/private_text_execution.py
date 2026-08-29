@@ -24,6 +24,8 @@ from kai.workshop.execution_coordinator import (
 )
 from kai.workshop.inbound import ClientInboundMessage, InboundMessage, ScheduledInboundMessage
 from kai.workshop.protected_execution import WorkshopProtectedExecutionPreparationService
+from kai.workshop.routing_eligibility import WorkshopRoutingEligibilityService
+from kai.workshop.routing_policy import WorkshopRoutingPolicyService
 from kai.workshop.run_lifecycle import WorkshopRunLifecycle
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.store import WorkshopEventStore
@@ -52,12 +54,14 @@ class WorkshopPrivateTextExecutionService:
         command_service: WorkshopConversationCommandService,
         database_lock: asyncio.Lock,
         runtime_pool: WorkshopRuntimePool,
+        routing_policy: WorkshopRoutingPolicyService,
     ) -> None:
         self._store = store
         self._coordinator = coordinator
         self._command_service = command_service
         self._database_lock = database_lock
         self._runtime_pool = runtime_pool
+        self.routing_policy = routing_policy
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._closed = False
@@ -70,14 +74,21 @@ class WorkshopPrivateTextExecutionService:
         *,
         registered_backend_ids: frozenset[str],
         delivery_policy: WorkshopDeliveryBindingPolicy,
+        routing_eligibility: WorkshopRoutingEligibilityService,
     ) -> WorkshopPrivateTextExecutionService:
         store = await WorkshopEventStore.open(database_path)
         database_lock = asyncio.Lock()
+        routing_policy = WorkshopRoutingPolicyService(
+            store,
+            routing_eligibility,
+            database_lock,
+        )
         coordinator = WorkshopCanonicalExecutionCoordinator(
             store,
             WorkshopProtectedExecutionPreparationService(
                 store,
                 runtime_pool,
+                routing_policy,
                 registered_backend_ids=registered_backend_ids,
             ),
             registered_backend_ids=registered_backend_ids,
@@ -96,6 +107,7 @@ class WorkshopPrivateTextExecutionService:
             ),
             database_lock,
             runtime_pool,
+            routing_policy,
         )
         try:
             await coordinator.recover_expired()

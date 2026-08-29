@@ -148,6 +148,22 @@ class WorkshopRoutingEligibilityService:
             namespace.runtime_profile_id,
         )
 
+    def authority_for_principal_runtime(
+        self,
+        principal_id: str | PrincipalId,
+        runtime_profile_id: str | RuntimeProfileId,
+    ) -> RoutingEligibilityAuthority:
+        """Resolve a canonical run assignment independently of its channel."""
+        namespace = self._execution_state.maybe_for_runtime_profile_id(runtime_profile_id)
+        if namespace is None or namespace.principal_id != principal_id:
+            raise RoutingEligibilityAccessDenied("Routing eligibility access denied")
+        return RoutingEligibilityAuthority(
+            namespace.principal_id,
+            namespace.channel_id,
+            namespace.agent_id,
+            namespace.runtime_profile_id,
+        )
+
     async def inspect(
         self,
         authority: RoutingEligibilityAuthority,

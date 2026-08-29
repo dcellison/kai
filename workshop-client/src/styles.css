@@ -1526,6 +1526,17 @@ button:disabled {
   font-size: 0.7rem;
 }
 
+.composer-route-select {
+  max-width: 7.5rem;
+  min-height: calc(0.82rem * 1.5 + 1.4rem + 2px);
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.4rem;
+  padding: 0.55rem 1.7rem 0.55rem 0.55rem;
+  background-color: var(--color-panel);
+  color: var(--color-text-strong);
+  font: 0.72rem var(--sans);
+}
+
 .composer-form textarea {
   /* Height is driven by the auto-grow effect in App.tsx: one line at rest,
      expanding with the draft until this cap, after which it scrolls. */

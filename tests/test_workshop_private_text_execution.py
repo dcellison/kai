@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from kai.backend import AgentResponse, StreamEvent
-from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop, bootstrap_human_principal_id
 from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
 from kai.workshop.domain import ChannelId, PrincipalId
 from kai.workshop.execution_coordinator import (
@@ -20,6 +21,16 @@ from kai.workshop.inbound import ClientInboundMessage, InboundMessage
 from kai.workshop.private_text_execution import (
     RecoverableClientRun,
     WorkshopPrivateTextExecutionService,
+)
+from kai.workshop.routing_eligibility import (
+    CapabilityAssessment,
+    CapabilitySupport,
+    EligibilityReason,
+    RoutingEligibilityAuthority,
+    RoutingTaskClass,
+    RuntimeCapability,
+    RuntimeEligibilityCandidate,
+    RuntimeEligibilityReport,
 )
 from kai.workshop.run_lifecycle import RunStatus
 from kai.workshop.runtime_pool import WorkshopRuntimePool
@@ -63,10 +74,57 @@ class _Runtime:
         )
 
 
-async def _foundation(database: Path) -> None:
+class _Eligibility:
+    def __init__(self, authority: RoutingEligibilityAuthority) -> None:
+        self.authority = authority
+
+    def authority_for_principal_channel(self, principal_id, channel_id):
+        assert principal_id == self.authority.principal_id
+        assert channel_id == self.authority.channel_id
+        return self.authority
+
+    def authority_for_principal_runtime(self, principal_id, runtime_profile_id):
+        assert principal_id == self.authority.principal_id
+        assert runtime_profile_id == self.authority.runtime_profile_id
+        return self.authority
+
+    async def inspect(self, authority, task_class):
+        return RuntimeEligibilityReport(
+            version=1,
+            task_class=RoutingTaskClass(task_class),
+            required_capabilities=(RuntimeCapability.TEXT_GENERATION,),
+            principal_id=authority.principal_id,
+            channel_id=authority.channel_id,
+            agent_id=authority.agent_id,
+            runtime_profile_id=authority.runtime_profile_id,
+            workspace="/workspace",
+            candidates=(
+                RuntimeEligibilityCandidate(
+                    option_id="codex:openai",
+                    backend="codex",
+                    provider="openai",
+                    allowed_services=(),
+                    model_id="gpt-5.6-sol",
+                    model_source="current_selection",
+                    selected=True,
+                    eligible=True,
+                    capabilities=(
+                        CapabilityAssessment(
+                            RuntimeCapability.TEXT_GENERATION,
+                            CapabilitySupport.SUPPORTED,
+                            "test",
+                        ),
+                    ),
+                    reasons=(EligibilityReason("eligible", "test"),),
+                ),
+            ),
+        )
+
+
+async def _foundation(database: Path) -> _Eligibility:
     store = await WorkshopEventStore.open(database)
     try:
-        await bootstrap_default_workshop(
+        result = await bootstrap_default_workshop(
             store,
             (
                 BootstrapHuman(
@@ -80,6 +138,17 @@ async def _foundation(database: Path) -> None:
             ),
         )
         await WorkshopConversationDeliveryAuthority(store).activate()
+        principal_id = bootstrap_human_principal_id(result.workshop_id, "telegram", "101")
+        channel_token = hashlib.sha256(b"telegram\x00101").hexdigest()
+        channel_id = ChannelId.derived(result.workshop_id, f"direct-channel:{channel_token}")
+        return _Eligibility(
+            RoutingEligibilityAuthority(
+                principal_id,
+                channel_id,
+                result.agent_id,
+                profile_id(101),
+            )
+        )
     finally:
         await store.close()
 
@@ -98,14 +167,15 @@ def _message(*, suffix: str = "1") -> InboundMessage:
 
 async def test_owner_accepts_executes_and_atomically_enqueues_terminal_reply(tmp_path: Path):
     database = tmp_path / "kai.db"
-    await _foundation(database)
+    eligibility = await _foundation(database)
     runtime = _Runtime(tmp_path)
-    pool = SimpleNamespace(prepare_execution=AsyncMock(return_value=runtime))
+    pool = SimpleNamespace(prepare_routed_execution=AsyncMock(return_value=runtime))
     service = await WorkshopPrivateTextExecutionService.open_and_start(
         database,
         WorkshopRuntimePool(pool, profile_registry(101)),  # type: ignore[arg-type]
         registered_backend_ids=frozenset({"codex"}),
         delivery_policy=TELEGRAM_DELIVERY_POLICY,
+        routing_eligibility=eligibility,  # type: ignore[arg-type]
     )
     observed: list[str] = []
     try:
@@ -125,7 +195,11 @@ async def test_owner_accepts_executes_and_atomically_enqueues_terminal_reply(tmp
         assert len(runtime.canonical_histories) == 1
         assert "canonical-transcript.ndjson" in runtime.canonical_histories[0]
         assert "untrusted conversation data" in runtime.canonical_histories[0]
-        pool.prepare_execution.assert_awaited_once_with(profile_id(101))
+        pool.prepare_routed_execution.assert_awaited_once_with(
+            profile_id(101),
+            "codex:openai",
+            "gpt-5.6-sol",
+        )
     finally:
         await service.stop()
 
@@ -154,15 +228,16 @@ async def test_owner_accepts_executes_and_atomically_enqueues_terminal_reply(tmp
 
 async def test_owner_routes_stop_to_exact_active_runtime_and_terminal_cancellation(tmp_path: Path):
     database = tmp_path / "kai.db"
-    await _foundation(database)
+    eligibility = await _foundation(database)
     release = asyncio.Event()
     runtime = _Runtime(tmp_path, wait=release)
-    pool = SimpleNamespace(prepare_execution=AsyncMock(return_value=runtime))
+    pool = SimpleNamespace(prepare_routed_execution=AsyncMock(return_value=runtime))
     service = await WorkshopPrivateTextExecutionService.open_and_start(
         database,
         WorkshopRuntimePool(pool, profile_registry(101)),  # type: ignore[arg-type]
         registered_backend_ids=frozenset({"codex"}),
         delivery_policy=TELEGRAM_DELIVERY_POLICY,
+        routing_eligibility=eligibility,  # type: ignore[arg-type]
     )
     try:
         accepted = await service.accept(_message())
@@ -187,7 +262,7 @@ async def test_owner_routes_stop_to_exact_active_runtime_and_terminal_cancellati
 
 async def test_owner_discovers_only_durably_accepted_workshop_client_runs(tmp_path: Path):
     database = tmp_path / "kai.db"
-    await _foundation(database)
+    eligibility = await _foundation(database)
     inspection = await WorkshopEventStore.open(database)
     try:
         async with inspection.connection.execute(
@@ -204,12 +279,13 @@ async def test_owner_discovers_only_durably_accepted_workshop_client_runs(tmp_pa
     finally:
         await inspection.close()
 
-    pool = SimpleNamespace(prepare_execution=AsyncMock())
+    pool = SimpleNamespace(prepare_routed_execution=AsyncMock())
     service = await WorkshopPrivateTextExecutionService.open_and_start(
         database,
         WorkshopRuntimePool(pool, profile_registry(101)),  # type: ignore[arg-type]
         registered_backend_ids=frozenset({"codex"}),
         delivery_policy=TELEGRAM_DELIVERY_POLICY,
+        routing_eligibility=eligibility,  # type: ignore[arg-type]
     )
     try:
         accepted = await service.accept_client(

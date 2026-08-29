@@ -21,6 +21,12 @@ from kai.workshop.execution_coordinator import (
 )
 from kai.workshop.inbound import InboundMessage
 from kai.workshop.projection import CanonicalConversationProjection
+from kai.workshop.protected_execution import ProtectedExecutionRoutingRejected
+from kai.workshop.routing_eligibility import RoutingTaskClass
+from kai.workshop.routing_policy import (
+    RoutingDecisionDisposition,
+    RunRoutingDecision,
+)
 from kai.workshop.run_execution_authority import (
     RunAttemptStatus,
     RunExecutionSelection,
@@ -92,6 +98,30 @@ class _Preparation:
         return self.prepared
 
 
+class _RejectedPreparation:
+    def __init__(self, run) -> None:
+        self.run = run
+
+    async def prepare(self, run_id):
+        assert run_id == self.run.run_id
+        raise ProtectedExecutionRoutingRejected(
+            self.run,
+            RunRoutingDecision(
+                run_id=self.run.run_id,
+                runtime_profile_id=_RUNTIME_PROFILE_ID,
+                requested_task_class=RoutingTaskClass.CODING,
+                requested_backend_option_id="codex:openai",
+                selected_backend_option_id=None,
+                disposition=RoutingDecisionDisposition.REJECTED,
+                reason_code="capability_unknown",
+                policy_revision=1,
+                selection=RunExecutionSelection("codex", "gpt-5.6-sol"),
+                evidence_version=1,
+                decided_at=_NOW,
+            ),
+        )
+
+
 async def _accepted(path: Path, *, suffix: str = "1"):
     store = await WorkshopEventStore.open(path)
     await bootstrap_default_workshop(
@@ -139,6 +169,25 @@ async def _terminal_bodies(store: WorkshopEventStore) -> list[str]:
 
 
 class TestCanonicalExecutionCoordinator:
+    async def test_ineligible_explicit_route_fails_without_backend_dispatch(self, tmp_path: Path):
+        store, run = await _accepted(tmp_path / "kai.db")
+        try:
+            result = await _coordinator(store, _RejectedPreparation(run)).execute(run.run_id)
+
+            assert result.disposition == CanonicalExecutionDisposition.FAILED
+            assert result.run.status == RunStatus.FAILED
+            assert result.run.terminal_code == "routing_ineligible"
+            assert (await _terminal_bodies(store))[-1] == (
+                "The requested task route is not eligible under your routing policy. Kai did not dispatch this request."
+            )
+            async with store.connection.execute(
+                "SELECT status FROM run_attempts WHERE run_id = ?",
+                (run.run_id,),
+            ) as cursor:
+                assert [str(row[0]) for row in await cursor.fetchall()] == ["failed"]
+        finally:
+            await store.close()
+
     async def test_success_uses_stored_prompt_and_starts_before_exact_dispatch(self, tmp_path: Path):
         store, run = await _accepted(tmp_path / "kai.db")
 
