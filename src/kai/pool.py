@@ -44,6 +44,7 @@ from kai.config import (
 from kai.goose import GooseBackend
 from kai.internal_api_auth import InternalAPIAuth
 from kai.workshop.domain import RuntimeProfileId
+from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
 from kai.workspace_utils import is_workspace_allowed
 
 if TYPE_CHECKING:
@@ -53,13 +54,13 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-type RuntimeSelector = int | RuntimeProfileId
-type RuntimePoolKey = int | RuntimeProfileId
+type RuntimeSelector = int | RuntimeProfileId | WorkshopInternalAPIExecutionContext
+type RuntimePoolKey = int | RuntimeProfileId | WorkshopInternalAPIExecutionContext
 
 
 @dataclass(frozen=True, slots=True)
 class _RoutedRuntimeKey:
-    runtime_profile_id: RuntimeProfileId
+    runtime_key: RuntimePoolKey
     backend_option_id: str
 
 
@@ -292,6 +293,7 @@ class SubprocessPool:
                     profile.profile_id: internal_api_contexts.for_runtime_profile(profile.profile_id)
                     for profile in runtime_profiles.profiles
                 }
+                contexts_by_runtime.update({context: context for context in contexts})
         self._internal_api_contexts = internal_api_contexts
         self._protected_internal_api_contexts = config.protected_install
         self._contexts_by_runtime = contexts_by_runtime
@@ -355,6 +357,29 @@ class SubprocessPool:
                     )
                     selected = ""
             self._selected_backends[profile.profile_id] = selected or profile.default_backend_option.option_id
+        for context in tuple(self._contexts_by_runtime.values()):
+            if not isinstance(context, WorkshopInternalAPIExecutionContext):
+                continue
+            self._register_lane_state(context)
+            namespace = self._canonical_namespace(context)
+            assert namespace is not None
+            selected = (
+                (
+                    await sessions.read_canonical_execution_settings(
+                        Path(self._config.session_db_path),
+                        namespace,
+                    )
+                )
+                .get("backend", "")
+                .strip()
+            )
+            profile = self._runtime_profiles.resolve(context.runtime_profile_id)
+            if selected:
+                try:
+                    selected = profile.backend_option(selected).option_id
+                except WorkshopRuntimeProfileError:
+                    selected = ""
+            self._selected_backends[context] = selected or profile.default_backend_option.option_id
 
     def _backend_option(self, runtime: RuntimeSelector):
         runtime_key, _legacy_key, profile = self._resolve_runtime(runtime)
@@ -376,6 +401,15 @@ class SubprocessPool:
 
         if isinstance(runtime, bool):
             raise TypeError("Runtime selector must be a runtime profile ID or integer")
+        if isinstance(runtime, WorkshopInternalAPIExecutionContext):
+            if self._runtime_profiles is None:
+                raise RuntimeError("Canonical runtime lane requires protected runtime policy")
+            profile = self._runtime_profiles.resolve(runtime.runtime_profile_id)
+            primary = self._contexts_by_runtime.get(profile.profile_id)
+            if primary is None or primary.principal_id != runtime.principal_id:
+                raise RuntimeError("Canonical runtime lane does not own the protected profile")
+            self._register_lane_state(runtime)
+            return runtime, self._runtime_profiles.legacy_runtime_key(profile.profile_id), profile
         if isinstance(runtime, RuntimeProfileId):
             if self._runtime_profiles is None:
                 raise RuntimeError("Runtime profile selector requires protected runtime policy")
@@ -393,6 +427,49 @@ class SubprocessPool:
                 raise
             return runtime, runtime, None
         return profile.profile_id, runtime, profile
+
+    def _register_lane_state(self, context: WorkshopInternalAPIExecutionContext) -> None:
+        """Register one isolated lane while inheriting only protected policy."""
+        existing = self._contexts_by_runtime.get(context)
+        if existing is not None and existing != context:
+            raise RuntimeError("Canonical runtime lane conflicts with existing context")
+        self._contexts_by_runtime[context] = context
+        profile = self._runtime_profiles.resolve(context.runtime_profile_id) if self._runtime_profiles else None
+        if profile is not None:
+            self._services_info_by_runtime[context] = list(self._services_info_by_runtime.get(profile.profile_id, []))
+            primary_backend = self._selected_backends.get(
+                profile.profile_id,
+                profile.default_backend_option.option_id,
+            )
+            self._selected_backends.setdefault(context, primary_backend)
+
+    def register_canonical_lane(self, context: WorkshopInternalAPIExecutionContext) -> None:
+        """Make a newly enabled principal-agent lane immediately executable."""
+        self._resolve_runtime(context)
+        self._internal_api_auth.agent_credential_for(context)
+
+    async def rebind_canonical_lane(
+        self,
+        prior: WorkshopInternalAPIExecutionContext,
+        replacement: WorkshopInternalAPIExecutionContext,
+    ) -> None:
+        """Move an idle lane to another owned profile without touching siblings."""
+        # Revoke before process shutdown so even a stubborn child loses its
+        # authority as soon as the canonical lane is rebound.
+        self._internal_api_auth.revoke_agent_context(prior)
+        await self.force_kill(prior)
+        self._contexts_by_runtime.pop(prior, None)
+        self._services_info_by_runtime.pop(prior, None)
+        self._selected_backends.pop(prior, None)
+        self._backend_transition_locks.pop(prior, None)
+        self.register_canonical_lane(replacement)
+
+    async def suspend_canonical_lane(self, context: WorkshopInternalAPIExecutionContext) -> None:
+        """Stop a disabled lane and revoke its current process credential."""
+        # Authorization changes immediately; process cleanup follows and
+        # cannot extend a disabled lane's access if termination is delayed.
+        self._internal_api_auth.revoke_agent_context(context)
+        await self.force_kill(context)
 
     def _protected_profile(self, runtime: RuntimeSelector):
         """Resolve protected policy while preserving the negative-group bridge."""
@@ -420,7 +497,11 @@ class SubprocessPool:
             channel_id=context.channel_id,
             agent_id=context.agent_id,
             runtime_profile_id=context.runtime_profile_id,
-            legacy_runtime_key=self._runtime_profiles.legacy_runtime_key(profile.profile_id),
+            legacy_runtime_key=(
+                self._runtime_profiles.legacy_runtime_key(profile.profile_id)
+                if runtime_key == profile.profile_id
+                else None
+            ),
         )
 
     def get_runtime_profile(self, runtime: RuntimeSelector) -> ProtectedRuntimeProfile | None:
@@ -519,7 +600,8 @@ class SubprocessPool:
                         f"{profile.home_workspace}. Mount or create it, or update the protected runtime profile."
                     )
                 return profile.home_workspace
-            context = self._contexts_by_runtime.get(profile.profile_id)
+            runtime_key, _, _ = self._resolve_runtime(runtime)
+            context = self._contexts_by_runtime.get(runtime_key) or self._contexts_by_runtime.get(profile.profile_id)
             if context is None:
                 raise RuntimeError("Protected runtime has no canonical home owner")
             path = self._config.session_db_path.parent / "home" / str(context.principal_id)
@@ -890,13 +972,13 @@ class SubprocessPool:
 
     async def prepare_routed_execution(
         self,
-        runtime: RuntimeProfileId,
+        runtime: RuntimeSelector,
         backend_option_id: str,
         model: str,
     ) -> PreparedBackendExecution:
         """Bind an alternate authorized option without changing the selected route."""
         runtime_key, _, profile = self._resolve_runtime(runtime)
-        if profile is None or not isinstance(runtime_key, RuntimeProfileId):
+        if profile is None or isinstance(runtime_key, int):
             raise RuntimeError("Explicit task routing requires a protected runtime profile")
         option = profile.backend_option(backend_option_id)
         selected = self._backend_option(runtime)
@@ -1319,7 +1401,7 @@ class SubprocessPool:
 
     def _profile_has_in_flight(self, runtime_key: RuntimePoolKey) -> bool:
         return any(
-            key == runtime_key or (isinstance(key, _RoutedRuntimeKey) and key.runtime_profile_id == runtime_key)
+            key == runtime_key or (isinstance(key, _RoutedRuntimeKey) and key.runtime_key == runtime_key)
             for key in self._in_flight
         )
 

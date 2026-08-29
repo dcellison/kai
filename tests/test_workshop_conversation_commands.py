@@ -389,7 +389,7 @@ class TestConversationCommandReplay:
             checkpoint = await store.rebuild_projection(CanonicalConversationProjection())
             after = await WorkshopRunLifecycle(store).state(before.run.run_id)
 
-            assert checkpoint.version == 13
+            assert checkpoint.version == 14
             assert after == before.run
             async with store.connection.execute("SELECT body FROM messages") as cursor:
                 assert str((await cursor.fetchone())[0]) == _message().body

@@ -47,15 +47,25 @@ class WorkshopInternalAPIContextRegistry:
         contexts: tuple[WorkshopInternalAPIExecutionContext, ...],
     ) -> None:
         by_profile: dict[RuntimeProfileId, WorkshopInternalAPIExecutionContext] = {}
+        by_lane: dict[tuple[PrincipalId, ChannelId, AgentId], WorkshopInternalAPIExecutionContext] = {}
+        ordered: list[WorkshopInternalAPIExecutionContext] = []
         for context in contexts:
             if not isinstance(context, WorkshopInternalAPIExecutionContext):
                 raise TypeError("contexts must contain WorkshopInternalAPIExecutionContext values")
-            if context.runtime_profile_id in by_profile:
-                raise WorkshopInternalAPIContextError("Duplicate internal API runtime profile")
-            by_profile[context.runtime_profile_id] = context
+            key = (context.principal_id, context.channel_id, context.agent_id)
+            if key in by_lane:
+                raise WorkshopInternalAPIContextError("Duplicate internal API execution lane")
+            primary = by_profile.get(context.runtime_profile_id)
+            if primary is not None and primary.principal_id != context.principal_id:
+                raise WorkshopInternalAPIContextError("Runtime profile cannot cross internal API principals")
+            by_profile.setdefault(context.runtime_profile_id, context)
+            by_lane[key] = context
+            ordered.append(context)
         if not by_profile:
             raise WorkshopInternalAPIContextError("At least one internal API execution context is required")
         self._by_profile = by_profile
+        self._by_lane = by_lane
+        self._contexts = ordered
 
     @classmethod
     async def from_store(
@@ -65,7 +75,8 @@ class WorkshopInternalAPIContextRegistry:
     ) -> WorkshopInternalAPIContextRegistry:
         """Load complete, same-workshop direct-channel execution contexts."""
         async with store.connection.execute(
-            "SELECT ra.runtime_profile_id, cm.principal_id, ra.channel_id, ra.agent_id "
+            "SELECT ra.runtime_profile_id, cm.principal_id, ra.channel_id, ra.agent_id, "
+            "ra.created_event_position "
             "FROM channel_agent_runtime_assignments ra "
             "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' "
             "JOIN agents a ON a.id = ra.agent_id AND a.workshop_id = c.workshop_id "
@@ -74,13 +85,13 @@ class WorkshopInternalAPIContextRegistry:
             "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
             "JOIN workshop_memberships wm ON wm.principal_id = p.id "
             "AND wm.workshop_id = c.workshop_id "
-            "ORDER BY ra.runtime_profile_id, cm.principal_id"
+            "ORDER BY ra.runtime_profile_id, ra.created_event_position, cm.principal_id"
         ) as cursor:
             rows = list(await cursor.fetchall())
 
         rows_by_profile: dict[
             RuntimeProfileId,
-            set[tuple[PrincipalId, ChannelId, AgentId]],
+            list[tuple[PrincipalId, ChannelId, AgentId]],
         ] = {}
         for row in rows:
             try:
@@ -94,29 +105,61 @@ class WorkshopInternalAPIContextRegistry:
                 raise WorkshopInternalAPIContextError(
                     "Canonical internal API context contains an invalid opaque identifier"
                 ) from exc
-            rows_by_profile.setdefault(profile_id, set()).add(identity)
+            if identity not in rows_by_profile.setdefault(profile_id, []):
+                rows_by_profile[profile_id].append(identity)
 
         contexts: list[WorkshopInternalAPIExecutionContext] = []
         for profile in runtime_profiles.profiles:
-            identities = rows_by_profile.get(profile.profile_id, set())
-            if len(identities) != 1:
+            identities = rows_by_profile.get(profile.profile_id, [])
+            if not identities or len({item[0] for item in identities}) != 1:
                 raise WorkshopInternalAPIContextError(
-                    "Protected runtime profile must resolve to exactly one canonical internal API context"
+                    "Protected runtime profile must resolve to one canonical human principal"
                 )
-            principal_id, channel_id, agent_id = next(iter(identities))
-            contexts.append(
-                WorkshopInternalAPIExecutionContext(
-                    principal_id=principal_id,
-                    channel_id=channel_id,
-                    agent_id=agent_id,
-                    runtime_profile_id=profile.profile_id,
+            for principal_id, channel_id, agent_id in identities:
+                contexts.append(
+                    WorkshopInternalAPIExecutionContext(
+                        principal_id=principal_id,
+                        channel_id=channel_id,
+                        agent_id=agent_id,
+                        runtime_profile_id=profile.profile_id,
+                    )
                 )
-            )
         return cls(tuple(contexts))
 
     @property
     def contexts(self) -> tuple[WorkshopInternalAPIExecutionContext, ...]:
-        return tuple(sorted(self._by_profile.values(), key=lambda context: context.runtime_profile_id))
+        return tuple(self._contexts)
+
+    def register_context(self, context: WorkshopInternalAPIExecutionContext) -> None:
+        """Register a live principal-agent lane while keeping the profile primary stable."""
+        key = (context.principal_id, context.channel_id, context.agent_id)
+        existing = self._by_lane.get(key)
+        if existing is not None:
+            if existing != context:
+                raise WorkshopInternalAPIContextError("Internal API execution lane conflicts")
+            return
+        primary = self._by_profile.get(context.runtime_profile_id)
+        if primary is None or primary.principal_id != context.principal_id:
+            raise WorkshopInternalAPIContextError("Runtime profile is not owned by this internal API principal")
+        self._by_lane[key] = context
+        self._contexts.append(context)
+
+    def replace_context(
+        self,
+        prior: WorkshopInternalAPIExecutionContext,
+        replacement: WorkshopInternalAPIExecutionContext,
+    ) -> None:
+        """Rebind one live lane to another profile owned by the same human."""
+        key = (prior.principal_id, prior.channel_id, prior.agent_id)
+        if self._by_lane.get(key) != prior or replacement.principal_id != prior.principal_id:
+            raise WorkshopInternalAPIContextError("Internal API context replacement conflicts")
+        if (replacement.principal_id, replacement.channel_id, replacement.agent_id) != key:
+            raise WorkshopInternalAPIContextError("Internal API context identity cannot change")
+        primary = self._by_profile.get(replacement.runtime_profile_id)
+        if primary is None or primary.principal_id != replacement.principal_id:
+            raise WorkshopInternalAPIContextError("Replacement runtime profile is not owned by the principal")
+        self._by_lane[key] = replacement
+        self._contexts[self._contexts.index(prior)] = replacement
 
     def for_runtime_profile(
         self,

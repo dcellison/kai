@@ -62,6 +62,7 @@ from kai.config import (
 )
 from kai.internal_api_auth import InternalAPIAuth, InternalAPIPrincipal, InternalAPIScope
 from kai.job_types import CANONICAL_JOB_TYPES, normalize_job_type
+from kai.workshop.agent_enablement import WorkshopAgentEnablementService
 from kai.workshop.appearance_preferences import WorkshopAppearancePreferenceService
 from kai.workshop.artifacts import MAX_ARTIFACT_BYTES, WorkshopArtifactService
 from kai.workshop.client_api import (
@@ -89,6 +90,7 @@ from kai.workshop.integration_notifications import (
     IntegrationNotification,
     WorkshopIntegrationNotificationService,
 )
+from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
 from kai.workshop.memory_queries import WorkshopMemoryQueryService
 from kai.workshop.notification_preferences import WorkshopNotificationPreferenceService
 from kai.workshop.preferences import WorkshopPreferenceService
@@ -264,6 +266,18 @@ def _reject_internal_identity_selectors(payload: dict) -> None:
 
 def _scheduled_job_authority(principal: InternalAPIPrincipal) -> WorkshopScheduledJobAuthority:
     return WorkshopScheduledJobAuthority(
+        principal.principal_id,
+        principal.channel_id,
+        principal.agent_id,
+        principal.runtime_profile_id,
+    )
+
+
+def _internal_execution_context(
+    principal: InternalAPIPrincipal,
+) -> WorkshopInternalAPIExecutionContext:
+    """Recover the exact canonical lane already bound to one credential."""
+    return WorkshopInternalAPIExecutionContext(
         principal.principal_id,
         principal.channel_id,
         principal.agent_id,
@@ -1231,7 +1245,9 @@ async def _handle_send_file(request: web.Request, principal: InternalAPIPrincipa
     if core_host is None:
         return web.json_response({"error": "No workspace configured"}, status=403)
     try:
-        workspace = str(await core_host.services.runtime_pool.get_effective_workspace(principal.runtime_profile_id))
+        workspace = str(
+            await core_host.services.runtime_pool.get_effective_workspace(_internal_execution_context(principal))
+        )
     except Exception:
         log.exception("Internal file workspace resolution failed")
         return web.json_response({"error": "No workspace configured"}, status=403)
@@ -1465,7 +1481,7 @@ async def _handle_memory_add(request: web.Request, principal: InternalAPIPrincip
     try:
         api_config: Config = request.app[CONFIG_KEY]
         workspace = await request.app[CORE_HOST_KEY].services.runtime_pool.get_effective_workspace(
-            principal.runtime_profile_id
+            _internal_execution_context(principal)
         )
         active_project = detect_active_memory_project(
             workspace,
@@ -1796,6 +1812,7 @@ async def _register_workshop_client_api(
     notification_preferences: WorkshopNotificationPreferenceService | None = None,
     client_preferences: WorkshopClientPreferenceService | None = None,
     appearance_preferences: WorkshopAppearancePreferenceService | None = None,
+    agent_enablement: WorkshopAgentEnablementService | None = None,
 ) -> Callable[[web.Application], None]:
     """Register the client API against the core-owned canonical store.
 
@@ -1837,6 +1854,7 @@ async def _register_workshop_client_api(
             notification_preferences=notification_preferences,
             client_preferences=client_preferences,
             appearance_preferences=appearance_preferences,
+            agent_enablement=agent_enablement,
         )
         if command_submitter is not None:
             register_workshop_command_routes(
@@ -1922,6 +1940,7 @@ async def start(
             notification_preferences=getattr(core_services, "notification_preferences", None),
             client_preferences=getattr(core_services, "client_preferences", None),
             appearance_preferences=getattr(core_services, "appearance_preferences", None),
+            agent_enablement=getattr(core_services, "agent_enablement", None),
         )
 
     _runner = web.AppRunner(

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 46
+WORKSHOP_SCHEMA_VERSION = 47
 
 
 @dataclass(frozen=True, slots=True)
@@ -2242,6 +2242,38 @@ _VERSIONED_AGENT_DEFINITION_SCHEMA = SchemaMigration(
     ),
 )
 
+_PRINCIPAL_AGENT_ENABLEMENT_SCHEMA = SchemaMigration(
+    version=47,
+    name="principal_agent_enablement",
+    statements=(
+        """
+        CREATE TABLE principal_agent_enablements (
+            id TEXT PRIMARY KEY,
+            workshop_id TEXT NOT NULL REFERENCES workshops(id) ON DELETE CASCADE,
+            principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+            agent_definition_id TEXT NOT NULL
+                REFERENCES agent_definitions(id) ON DELETE CASCADE,
+            agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+            direct_channel_id TEXT NOT NULL UNIQUE
+                REFERENCES channels(id) ON DELETE RESTRICT,
+            runtime_profile_id TEXT NOT NULL,
+            lifecycle_state TEXT NOT NULL CHECK (
+                lifecycle_state IN ('enabled', 'disabled')
+            ),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            created_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            last_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            UNIQUE (principal_id, agent_definition_id)
+        )
+        """,
+        "CREATE INDEX principal_agent_enablements_runtime_idx "
+        "ON principal_agent_enablements (runtime_profile_id, principal_id)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2289,6 +2321,7 @@ _MIGRATIONS = (
     _EXPLICIT_TASK_ROUTING_SCHEMA,
     _MESSAGE_REACTIONS_SCHEMA,
     _VERSIONED_AGENT_DEFINITION_SCHEMA,
+    _PRINCIPAL_AGENT_ENABLEMENT_SCHEMA,
 )
 
 

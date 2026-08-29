@@ -52,7 +52,7 @@ async def test_missing_profile_assignment_fails_closed(tmp_path: Path) -> None:
     try:
         with pytest.raises(
             WorkshopInternalAPIContextError,
-            match="exactly one canonical internal API context",
+            match="one canonical human principal",
         ):
             await WorkshopInternalAPIContextRegistry.from_store(
                 store,
@@ -73,7 +73,7 @@ async def test_missing_channel_agent_attachment_fails_closed(tmp_path: Path) -> 
         await store.connection.commit()
         with pytest.raises(
             WorkshopInternalAPIContextError,
-            match="exactly one canonical internal API context",
+            match="one canonical human principal",
         ):
             await WorkshopInternalAPIContextRegistry.from_store(
                 store,
@@ -112,7 +112,7 @@ async def test_ambiguous_direct_channel_ownership_fails_closed(tmp_path: Path) -
 
         with pytest.raises(
             WorkshopInternalAPIContextError,
-            match="exactly one canonical internal API context",
+            match="one canonical human principal",
         ):
             await WorkshopInternalAPIContextRegistry.from_store(
                 store,
@@ -139,7 +139,7 @@ async def test_cross_workshop_agent_assignment_fails_closed(tmp_path: Path) -> N
 
         with pytest.raises(
             WorkshopInternalAPIContextError,
-            match="exactly one canonical internal API context",
+            match="one canonical human principal",
         ):
             await WorkshopInternalAPIContextRegistry.from_store(
                 store,
@@ -161,6 +161,6 @@ def test_duplicate_runtime_profile_contexts_are_rejected() -> None:
 
     with pytest.raises(
         WorkshopInternalAPIContextError,
-        match="Duplicate internal API runtime profile",
+        match="cannot cross internal API principals",
     ):
         WorkshopInternalAPIContextRegistry((context, duplicate_assignment))

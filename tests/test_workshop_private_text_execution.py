@@ -18,6 +18,7 @@ from kai.workshop.execution_coordinator import (
     CanonicalExecutionDisposition,
 )
 from kai.workshop.inbound import ClientInboundMessage, InboundMessage
+from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
 from kai.workshop.private_text_execution import (
     RecoverableClientRun,
     WorkshopPrivateTextExecutionService,
@@ -201,7 +202,12 @@ async def test_owner_accepts_executes_and_atomically_enqueues_terminal_reply(tmp
         assert "canonical-transcript.ndjson" in runtime.canonical_histories[0]
         assert "untrusted conversation data" in runtime.canonical_histories[0]
         pool.prepare_routed_execution.assert_awaited_once_with(
-            profile_id(101),
+            WorkshopInternalAPIExecutionContext(
+                accepted.run.requested_by_principal_id,
+                accepted.run.channel_id,
+                accepted.run.agent_id,
+                profile_id(101),
+            ),
             "codex:openai",
             "gpt-5.6-sol",
         )

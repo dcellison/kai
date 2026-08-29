@@ -123,6 +123,13 @@ class InternalAPIAuth:
         """Return a send-message-only credential for a notification agent."""
         return self._credential_for(self._principal(context, _NOTIFICATION_SCOPES))
 
+    def revoke_agent_context(self, context: WorkshopInternalAPIExecutionContext) -> None:
+        """Revoke the process-local credential for one retired execution lane."""
+        principal = self._agent_principal(context)
+        credential = self._credentials_by_principal.pop(principal, None)
+        if credential is not None:
+            self._principals_by_credential.pop(credential, None)
+
     def authenticate(self, credential: str) -> InternalAPIPrincipal | None:
         """Resolve a credential to its server-owned principal, if valid.
 

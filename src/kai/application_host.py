@@ -19,6 +19,7 @@ from kai.backend_registry import (
 )
 from kai.config import Config, models_for_backend_policy
 from kai.pool import SubprocessPool
+from kai.workshop.agent_enablement import WorkshopAgentEnablementService
 from kai.workshop.appearance_preferences import WorkshopAppearancePreferenceService
 from kai.workshop.artifacts import WorkshopArtifactService
 from kai.workshop.claude_model_discovery import ClaudeModelDiscoveryAdapter
@@ -194,6 +195,7 @@ class KaiCoreServices:
     notification_preferences: WorkshopNotificationPreferenceService
     client_preferences: WorkshopClientPreferenceService
     appearance_preferences: WorkshopAppearancePreferenceService
+    agent_enablement: WorkshopAgentEnablementService
     proactive_publication: WorkshopProactivePublicationService
     integration_notifications: WorkshopIntegrationNotificationService
     github_automation: WorkshopGitHubAutomationService
@@ -408,6 +410,13 @@ class KaiApplicationHost:
                 self._client_voice_capabilities,
             )
             appearance_preferences = await WorkshopAppearancePreferenceService.open(Path(self._config.session_db_path))
+            agent_enablement = WorkshopAgentEnablementService(
+                client_store,
+                self._runtime_profiles,
+                self._execution_state,
+                self._internal_api_contexts,
+                runtime_pool,
+            )
             proactive_publication = WorkshopProactivePublicationService(
                 client_store,
                 artifacts,
@@ -464,6 +473,7 @@ class KaiApplicationHost:
                 notification_preferences=notification_preferences,
                 client_preferences=client_preferences,
                 appearance_preferences=appearance_preferences,
+                agent_enablement=agent_enablement,
                 proactive_publication=proactive_publication,
                 integration_notifications=integration_notifications,
                 github_automation=github_automation,

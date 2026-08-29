@@ -19,6 +19,15 @@ from urllib.parse import quote
 
 from aiohttp import BodyPartReader, web
 
+from kai.workshop.agent_enablement import (
+    PrincipalAgentEnablement,
+    WorkshopAgentEnablementAccessDenied,
+    WorkshopAgentEnablementConflict,
+    WorkshopAgentEnablementError,
+    WorkshopAgentEnablementService,
+    WorkshopAgentEnablementStorageError,
+    WorkshopAgentEnablementValidationError,
+)
 from kai.workshop.agent_lifecycle import (
     AgentDefinitionSnapshot,
     WorkshopAgentLifecycleAccessDenied,
@@ -90,6 +99,7 @@ from kai.workshop.domain import (
     MessageReactionSummary,
     PrincipalId,
     RunId,
+    RuntimeProfileId,
     WorkshopEventType,
 )
 from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
@@ -218,6 +228,10 @@ _AGENT_DEFINITION_PATH = "/v1/client/agents/{definition_id}"
 _AGENT_REVISIONS_PATH = "/v1/client/agents/{definition_id}/revisions"
 _AGENT_ACTIVATION_PATH = "/v1/client/agents/{definition_id}/activate"
 _AGENT_ARCHIVAL_PATH = "/v1/client/agents/{definition_id}/archive"
+_AGENT_ENABLEMENTS_PATH = "/v1/client/agent-enablement"
+_AGENT_ENABLEMENT_PATH = "/v1/client/agents/{definition_id}/enablement"
+_AGENT_ENABLE_PATH = "/v1/client/agents/{definition_id}/enable"
+_AGENT_DISABLE_PATH = "/v1/client/agents/{definition_id}/disable"
 _ENROLLMENT_REDEMPTION_PATH = "/v1/client/enrollment/redeem"
 _COMMAND_SUBMISSION_PATH = "/v1/channels/{channel_id}/commands"
 _AGENT_DISMISSAL_PATH = "/v1/channels/{channel_id}/agents/{agent_id}/dismiss"
@@ -660,6 +674,28 @@ def _serialize_agent_definition(snapshot: AgentDefinitionSnapshot) -> dict[str, 
                 "event_position": revision.event_position,
             }
             for revision in snapshot.revisions
+        ],
+    }
+
+
+def _serialize_agent_enablement(snapshot: PrincipalAgentEnablement) -> dict[str, object]:
+    return {
+        "enablement_id": str(snapshot.enablement_id) if snapshot.enablement_id is not None else None,
+        "definition_id": str(snapshot.definition_id),
+        "agent_id": str(snapshot.agent_id),
+        "handle": snapshot.handle,
+        "display_name": snapshot.display_name,
+        "lifecycle_state": snapshot.lifecycle_state,
+        "direct_channel_id": (str(snapshot.direct_channel_id) if snapshot.direct_channel_id is not None else None),
+        "runtime_profile_id": (str(snapshot.runtime_profile_id) if snapshot.runtime_profile_id is not None else None),
+        "state_version": snapshot.state_version,
+        "eligible_runtimes": [
+            {
+                "runtime_profile_id": str(runtime.runtime_profile_id),
+                "display_name": runtime.display_name,
+                "backend_options": list(runtime.backend_options),
+            }
+            for runtime in snapshot.eligible_runtimes
         ],
     }
 
@@ -2996,7 +3032,7 @@ async def _handle_client_navigation(
     async with store.connection.execute(
         "SELECT c.workshop_id, c.id, c.kind, c.name, cm.role, a.id, "
         "a.principal_id, a.name, "
-        "CASE WHEN cara.id IS NULL THEN 0 ELSE 1 END "
+        "CASE WHEN cara.id IS NULL THEN 0 ELSE 1 END, pae.lifecycle_state "
         "FROM channel_memberships cm "
         "JOIN channels c ON c.id = cm.channel_id "
         "JOIN workshop_memberships wm ON wm.workshop_id = c.workshop_id "
@@ -3005,6 +3041,8 @@ async def _handle_client_navigation(
         "LEFT JOIN agents a ON a.id = ca.agent_id AND a.workshop_id = c.workshop_id "
         "LEFT JOIN channel_agent_runtime_assignments cara "
         "ON cara.channel_id = c.id AND cara.agent_id = a.id "
+        "LEFT JOIN principal_agent_enablements pae ON pae.direct_channel_id = c.id "
+        "AND pae.principal_id = cm.principal_id AND pae.agent_id = a.id "
         "WHERE cm.principal_id = ? "
         "ORDER BY c.workshop_id, "
         "CASE c.kind WHEN 'direct' THEN 0 WHEN 'group' THEN 1 "
@@ -3042,6 +3080,7 @@ async def _handle_client_navigation(
                 "agents": [],
                 "participants": [],
                 "_runtime_assignments": [],
+                "_agent_enablement": str(row[9]) if row[9] is not None else None,
             },
         )
         if row[5] is not None:
@@ -3082,6 +3121,7 @@ async def _handle_client_navigation(
         visible_channels: list[dict[str, object]] = []
         for channel in channels_by_workshop.get(workshop_id, {}).values():
             assignments = channel.pop("_runtime_assignments")
+            enablement = channel.pop("_agent_enablement")
             agents = channel["agents"]
             if not isinstance(assignments, list) or not isinstance(agents, list):
                 raise RuntimeError("Workshop navigation capability assembly failed")
@@ -3090,6 +3130,7 @@ async def _handle_client_navigation(
                 and len(agents) >= 1
                 and len(assignments) == len(agents)
                 and all(assignments)
+                and (channel["kind"] == "group" or enablement == "enabled")
             )
             if channel["kind"] == "group":
                 engagement_by_agent = {
@@ -3433,6 +3474,127 @@ async def _handle_agent_archival(
     except WorkshopAgentLifecycleError as exc:
         return _agent_lifecycle_error_response(exc)
     return _json_response({"version": 1, "agent": _serialize_agent_definition(snapshot)}, status=200)
+
+
+def _agent_enablement_error_response(exc: WorkshopAgentEnablementError) -> web.Response:
+    if isinstance(exc, WorkshopAgentEnablementAccessDenied):
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    if isinstance(exc, WorkshopAgentEnablementValidationError):
+        return _error_response(status=400, code="invalid_request", message=str(exc))
+    if isinstance(exc, WorkshopAgentEnablementConflict):
+        return _error_response(
+            status=409,
+            code="agent_enablement_conflict",
+            message=str(exc),
+        )
+    if isinstance(exc, WorkshopAgentEnablementStorageError):
+        return _error_response(
+            status=503,
+            code="agent_enablement_unavailable",
+            message="Agent enablement is temporarily unavailable",
+        )
+    return _error_response(status=500, code="internal_error", message="Internal server error")
+
+
+async def _handle_agent_enablement_list(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopAgentEnablementService,
+) -> web.Response:
+    principal_id, error = await _authenticate_agent_lifecycle(request, authenticator)
+    if error is not None:
+        return error
+    assert principal_id is not None
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid agent enablement request")
+    try:
+        snapshots = await service.list_for_principal(principal_id)
+    except WorkshopAgentEnablementError as exc:
+        return _agent_enablement_error_response(exc)
+    return _json_response(
+        {"version": 1, "agents": [_serialize_agent_enablement(item) for item in snapshots]},
+        status=200,
+    )
+
+
+async def _handle_agent_enablement_detail(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopAgentEnablementService,
+) -> web.Response:
+    principal_id, error = await _authenticate_agent_lifecycle(request, authenticator)
+    if error is not None:
+        return error
+    assert principal_id is not None
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid agent enablement request")
+    try:
+        snapshot = await service.inspect(principal_id, _agent_definition_id(request))
+    except WorkshopAgentLifecycleError:
+        return _error_response(status=400, code="invalid_request", message="Invalid agent definition")
+    except WorkshopAgentEnablementError as exc:
+        return _agent_enablement_error_response(exc)
+    return _json_response({"version": 1, "agent": _serialize_agent_enablement(snapshot)}, status=200)
+
+
+async def _handle_agent_enablement_mutation(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopAgentEnablementService,
+    enable: bool,
+) -> web.Response:
+    principal_id, error = await _authenticate_agent_lifecycle(request, authenticator)
+    if error is not None:
+        return error
+    assert principal_id is not None
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid agent enablement request")
+    try:
+        payload = await request.json()
+        allowed = (
+            {"idempotency_key", "expected_version", "runtime_profile_id"}
+            if enable
+            else {
+                "idempotency_key",
+                "expected_version",
+            }
+        )
+        required = (
+            {"idempotency_key", "runtime_profile_id"}
+            if enable
+            else {
+                "idempotency_key",
+                "expected_version",
+            }
+        )
+        if not isinstance(payload, dict) or not required.issubset(payload) or not set(payload).issubset(allowed):
+            raise WorkshopAgentEnablementValidationError("Invalid agent enablement payload")
+        definition_id = _agent_definition_id(request)
+        if enable:
+            snapshot = await service.enable(
+                principal_id,
+                definition_id,
+                RuntimeProfileId(payload["runtime_profile_id"]),
+                idempotency_key=payload["idempotency_key"],
+                expected_version=payload.get("expected_version"),
+            )
+        else:
+            snapshot = await service.disable(
+                principal_id,
+                definition_id,
+                idempotency_key=payload["idempotency_key"],
+                expected_version=payload["expected_version"],
+            )
+    except (TypeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid agent enablement request")
+    except WorkshopAgentLifecycleError:
+        return _error_response(status=400, code="invalid_request", message="Invalid agent definition")
+    except WorkshopAgentEnablementError as exc:
+        return _agent_enablement_error_response(exc)
+    return _json_response({"version": 1, "agent": _serialize_agent_enablement(snapshot)}, status=200)
 
 
 async def _handle_message_reaction(
@@ -4677,6 +4839,7 @@ def register_workshop_read_routes(
     notification_preferences: WorkshopNotificationPreferenceService | None = None,
     client_preferences: WorkshopClientPreferenceService | None = None,
     appearance_preferences: WorkshopAppearancePreferenceService | None = None,
+    agent_enablement: WorkshopAgentEnablementService | None = None,
 ) -> None:
     """Register authenticated Workshop client routes on an application."""
     if event_poll_interval <= 0 or event_heartbeat_interval <= 0 or event_authentication_recheck_interval <= 0:
@@ -4818,6 +4981,46 @@ def register_workshop_read_routes(
     app.router.add_post(_AGENT_REVISIONS_PATH, handle_agent_revision_create)
     app.router.add_post(_AGENT_ACTIVATION_PATH, handle_agent_activation)
     app.router.add_post(_AGENT_ARCHIVAL_PATH, handle_agent_archival)
+    if agent_enablement is not None:
+
+        async def handle_agent_enablement_list(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_agent_enablement_list(
+                    request,
+                    authenticator=authenticator,
+                    service=agent_enablement,
+                )
+
+        async def handle_agent_enablement_detail(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_agent_enablement_detail(
+                    request,
+                    authenticator=authenticator,
+                    service=agent_enablement,
+                )
+
+        async def handle_agent_enable(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_agent_enablement_mutation(
+                    request,
+                    authenticator=authenticator,
+                    service=agent_enablement,
+                    enable=True,
+                )
+
+        async def handle_agent_disable(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_agent_enablement_mutation(
+                    request,
+                    authenticator=authenticator,
+                    service=agent_enablement,
+                    enable=False,
+                )
+
+        app.router.add_get(_AGENT_ENABLEMENTS_PATH, handle_agent_enablement_list)
+        app.router.add_get(_AGENT_ENABLEMENT_PATH, handle_agent_enablement_detail)
+        app.router.add_post(_AGENT_ENABLE_PATH, handle_agent_enable)
+        app.router.add_post(_AGENT_DISABLE_PATH, handle_agent_disable)
     app.router.add_get(_TIMELINE_PATH, handle_channel_timeline)
     app.router.add_get(_THREAD_TIMELINE_PATH, handle_thread_timeline)
     app.router.add_get(_TIMELINE_EVENTS_PATH, handle_channel_event_stream)

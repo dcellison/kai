@@ -33,6 +33,9 @@ class WorkshopEventType(StrEnum):
     AGENT_DEFINITION_REVISION_ADDED = "agent_definition.revision_added"
     AGENT_DEFINITION_REVISION_ACTIVATED = "agent_definition.revision_activated"
     AGENT_DEFINITION_ARCHIVED = "agent_definition.archived"
+    PRINCIPAL_AGENT_ENABLED = "principal_agent.enabled"
+    PRINCIPAL_AGENT_DISABLED = "principal_agent.disabled"
+    PRINCIPAL_AGENT_RUNTIME_CHANGED = "principal_agent.runtime_changed"
     CHANNEL_AGENT_ATTACHED = "channel.agent_attached"
     CHANNEL_AGENT_DISMISSED = "channel.agent_dismissed"
     RUNTIME_PROFILE_ASSIGNED = "runtime_profile.assigned"
@@ -139,6 +142,10 @@ class AgentDefinitionRevisionId(OpaqueId):
     prefix = "adr"
 
 
+class AgentEnablementId(OpaqueId):
+    prefix = "aen"
+
+
 class RuntimeProfileId(OpaqueId):
     prefix = "rtp"
 
@@ -240,6 +247,7 @@ _ID_TYPES: dict[str, type[OpaqueId]] = {
         AgentId,
         AgentDefinitionId,
         AgentDefinitionRevisionId,
+        AgentEnablementId,
         ChannelAgentId,
         RuntimeAssignmentId,
         MessageId,

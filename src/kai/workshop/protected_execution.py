@@ -11,6 +11,7 @@ from kai.backend import StreamEvent
 from kai.config import VALID_BACKENDS, validate_model_for_backend
 from kai.workshop.conversation_runs import resolve_canonical_conversation_run
 from kai.workshop.domain import RunId, RuntimeProfileId
+from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
 from kai.workshop.routing_policy import RunRoutingDecision, WorkshopRoutingPolicyService
 from kai.workshop.run_execution_authority import RunExecutionSelection
 from kai.workshop.run_lifecycle import DurableRun, RunStatus, WorkshopRunLifecycle
@@ -113,8 +114,14 @@ class WorkshopProtectedExecutionPreparationService:
         )
         if decision.rejected or decision.selected_backend_option_id is None:
             raise ProtectedExecutionRoutingRejected(run, decision)
+        runtime_authority = WorkshopInternalAPIExecutionContext(
+            principal_id=target.requested_by_principal_id,
+            channel_id=target.channel_id,
+            agent_id=target.agent_id,
+            runtime_profile_id=resolution.runtime_profile_id,
+        )
         runtime = await self._pool.prepare_routed_execution(
-            resolution.runtime_profile_id,
+            runtime_authority,
             decision.selected_backend_option_id,
             decision.selection.model,
         )

@@ -13,6 +13,7 @@ from kai.pool import SubprocessPool
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.conversation_commands import WorkshopConversationCommandService
 from kai.workshop.inbound import InboundMessage
+from kai.workshop.internal_api_contexts import WorkshopInternalAPIContextRegistry
 from kai.workshop.protected_execution import (
     ProtectedExecutionPreparationError,
     WorkshopProtectedExecutionPreparationService,
@@ -93,10 +94,16 @@ async def _accepted_run(path: Path, home: Path):
         },
     )
     profiles = profile_registry(101)
+    internal_api_contexts = await WorkshopInternalAPIContextRegistry.from_store(store, profiles)
     return (
         store,
         accepted.run,
-        SubprocessPool(config=config, services_info=[], runtime_profiles=profiles),
+        SubprocessPool(
+            config=config,
+            services_info=[],
+            runtime_profiles=profiles,
+            internal_api_contexts=internal_api_contexts,
+        ),
         profiles,
     )
 
