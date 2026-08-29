@@ -3212,7 +3212,10 @@ def _serialize_timeline_event(message: TimelineMessage) -> bytes:
     return (f"id: {message.event_position}\nevent: timeline.message.created\ndata: {payload}\n\n").encode()
 
 
-def _serialize_run_lifecycle_event(activity: ClientRunLifecycleEvent) -> bytes:
+def _serialize_run_lifecycle_event(
+    activity: ClientRunLifecycleEvent,
+    routing_decision: RunRoutingDecision | None = None,
+) -> bytes:
     payload = json.dumps(
         {
             "version": 1,
@@ -3221,6 +3224,7 @@ def _serialize_run_lifecycle_event(activity: ClientRunLifecycleEvent) -> bytes:
             "transition": activity.transition.value,
             "occurred_at": _format_timestamp(activity.occurred_at),
             "run": _serialize_run(activity.run),
+            "routing_decision": _serialize_routing_decision(routing_decision),
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -3348,6 +3352,7 @@ async def _handle_channel_event_stream(
     stream_limiter: WorkshopEventStreamLimiter,
     shutdown_event: asyncio.Event,
     run_previews: WorkshopRunPreviewRegistry | None = None,
+    routing_policy: WorkshopRoutingPolicyService | None = None,
 ) -> web.StreamResponse:
     try:
         async with request_lock:
@@ -3440,7 +3445,10 @@ async def _handle_channel_event_stream(
                     if isinstance(event, ClientTimelineMessageEvent):
                         await response.write(_serialize_timeline_event(event.message))
                     else:
-                        await response.write(_serialize_run_lifecycle_event(event))
+                        decision = (
+                            await routing_policy.load_decision(event.run.run_id) if routing_policy is not None else None
+                        )
+                        await response.write(_serialize_run_lifecycle_event(event, decision))
                 position = batch.next_position
                 batch = ClientChannelEventBatch((), position)
                 last_heartbeat = time.monotonic()
@@ -4153,6 +4161,7 @@ def register_workshop_read_routes(
             stream_limiter=stream_limiter,
             shutdown_event=shutdown_event,
             run_previews=run_previews,
+            routing_policy=routing_policy,
         )
 
     app.router.add_get(_CLIENT_NAVIGATION_PATH, handle_client_navigation)
