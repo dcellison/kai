@@ -2325,6 +2325,137 @@ button:disabled {
   gap: 0.75rem;
 }
 
+.routing-eligibility-workspace {
+  min-width: 0;
+}
+
+.routing-eligibility-workspace > label {
+  display: block;
+  margin-bottom: 0.45rem;
+  color: var(--color-text-strong);
+  font-size: 0.72rem;
+  font-weight: 680;
+}
+
+.routing-eligibility-workspace > select {
+  min-height: 2.45rem;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.35rem;
+  padding: 0.55rem 2.3rem 0.55rem 0.65rem;
+  background-color: var(--color-canvas-inset);
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--color-text) 50%),
+    linear-gradient(135deg, var(--color-text) 50%, transparent 50%);
+  background-repeat: no-repeat;
+  background-position:
+    right 1.05rem center,
+    right 0.75rem center;
+  background-size: 0.3rem 0.3rem;
+  color: var(--color-text-strong);
+  font-size: 0.76rem;
+  appearance: none;
+}
+
+.routing-eligibility-summary {
+  margin: 0.7rem 0;
+  color: var(--color-text-muted);
+  font-size: 0.7rem;
+}
+
+.routing-candidate-list {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.routing-candidate-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.routing-candidate-heading strong,
+.routing-candidate-heading small {
+  display: block;
+}
+
+.routing-candidate-heading strong {
+  color: var(--color-text-strong);
+  font-size: 0.76rem;
+}
+
+.routing-candidate-heading small {
+  margin-top: 0.2rem;
+  color: var(--color-text-muted);
+  font: 0.64rem var(--mono);
+}
+
+.routing-badges {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.35rem;
+}
+
+.routing-badges span {
+  border: 1px solid var(--color-border-strong);
+  border-radius: 999px;
+  padding: 0.18rem 0.42rem;
+  color: var(--color-text-muted);
+  font: 0.58rem var(--mono);
+}
+
+.routing-badges span[data-eligible="true"] {
+  border-color: color-mix(in srgb, var(--color-success) 55%, var(--color-border));
+  color: var(--color-success);
+}
+
+.routing-badges span[data-eligible="false"] {
+  border-color: color-mix(in srgb, var(--color-danger) 55%, var(--color-border));
+  color: var(--color-danger);
+}
+
+.routing-capability-list {
+  margin: 0.75rem 0 0;
+}
+
+.routing-capability-list > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  border-top: 1px solid var(--color-border);
+  padding: 0.38rem 0;
+  font-size: 0.64rem;
+}
+
+.routing-capability-list dt {
+  color: var(--color-text-muted);
+  text-transform: capitalize;
+}
+
+.routing-capability-list dd {
+  margin: 0;
+  color: var(--color-text-strong);
+  text-align: right;
+}
+
+.routing-capability-list dd[data-support="supported"] {
+  color: var(--color-success);
+}
+
+.routing-capability-list dd[data-support="unsupported"],
+.routing-capability-list dd[data-support="unknown"] {
+  color: var(--color-warning);
+}
+
+.routing-reasons {
+  margin: 0.6rem 0 0;
+  padding-left: 1rem;
+  color: var(--color-text-muted);
+  font-size: 0.64rem;
+  line-height: 1.5;
+}
+
 .settings-client-preferences {
   display: grid;
   gap: 0.75rem;

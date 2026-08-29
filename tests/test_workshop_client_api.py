@@ -54,6 +54,7 @@ from kai.workshop.domain import (
     MessageId,
     PrincipalId,
     RunId,
+    RuntimeProfileId,
     WorkshopEventType,
 )
 from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
@@ -102,6 +103,18 @@ from kai.workshop.model_catalogue import (
     ModelCatalogueSnapshot,
 )
 from kai.workshop.notification_preferences import WorkshopNotificationPreferenceService
+from kai.workshop.routing_eligibility import (
+    CapabilityAssessment,
+    CapabilitySupport,
+    EligibilityReason,
+    RoutingEligibilityAccessDenied,
+    RoutingEligibilityAuthority,
+    RoutingEligibilityError,
+    RoutingTaskClass,
+    RuntimeCapability,
+    RuntimeEligibilityCandidate,
+    RuntimeEligibilityReport,
+)
 from kai.workshop.run_lifecycle import (
     DurableRun,
     RunNotFoundError,
@@ -546,6 +559,62 @@ class _MemoryQueries:
 
 
 @dataclass
+class _RoutingEligibility:
+    principal_id: PrincipalId
+    channel_id: ChannelId
+    agent_id: AgentId = field(default_factory=AgentId.new)
+    runtime_profile_id: RuntimeProfileId = field(default_factory=RuntimeProfileId.new)
+    calls: list[tuple[RoutingEligibilityAuthority, str]] = field(default_factory=list)
+
+    def authority_for_principal_channel(self, principal_id, channel_id):
+        if principal_id != self.principal_id or channel_id != self.channel_id:
+            raise RoutingEligibilityAccessDenied("denied")
+        return RoutingEligibilityAuthority(
+            principal_id,
+            channel_id,
+            self.agent_id,
+            self.runtime_profile_id,
+        )
+
+    async def inspect(self, authority, task_class):
+        self.calls.append((authority, task_class))
+        try:
+            canonical_task = RoutingTaskClass(task_class)
+        except ValueError as exc:
+            raise RoutingEligibilityError("Unsupported task class") from exc
+        return RuntimeEligibilityReport(
+            version=1,
+            task_class=canonical_task,
+            required_capabilities=(RuntimeCapability.TEXT_GENERATION,),
+            principal_id=self.principal_id,
+            channel_id=self.channel_id,
+            agent_id=self.agent_id,
+            runtime_profile_id=self.runtime_profile_id,
+            workspace="/protected/workspace",
+            candidates=(
+                RuntimeEligibilityCandidate(
+                    option_id="claude:anthropic",
+                    backend="claude",
+                    provider="anthropic",
+                    allowed_services=("perplexity",),
+                    model_id="claude-sonnet-4-6",
+                    model_source="current_selection",
+                    selected=True,
+                    eligible=True,
+                    capabilities=(
+                        CapabilityAssessment(
+                            RuntimeCapability.TEXT_GENERATION,
+                            CapabilitySupport.SUPPORTED,
+                            "agent_backend_contract_v1",
+                        ),
+                    ),
+                    reasons=(EligibilityReason("eligible", "Capability checks passed."),),
+                ),
+            ),
+        )
+
+
+@dataclass
 class _GitHubSettings:
     principal_id: PrincipalId
     calls: list[tuple[str, object]] = field(default_factory=list)
@@ -717,6 +786,7 @@ async def _open_client(
     run_previews: WorkshopRunPreviewRegistry | None = None,
     artifact_service: WorkshopArtifactService | None = None,
     settings_workspaces=None,
+    routing_eligibility=None,
     memory_queries=None,
     github_settings=None,
     notification_preferences=None,
@@ -736,6 +806,7 @@ async def _open_client(
         run_previews=run_previews,
         artifact_service=artifact_service,
         settings_workspaces=settings_workspaces,
+        routing_eligibility=routing_eligibility,
         memory_queries=memory_queries,
         github_settings=github_settings,
         notification_preferences=notification_preferences,
@@ -1463,6 +1534,69 @@ class TestWorkshopChannelLifecycleHTTPContract:
 
             assert unauthenticated.status == 401
             assert malformed.status == 400
+        finally:
+            await client.close()
+            await store.close()
+
+
+class TestWorkshopRoutingEligibilityHTTPContract:
+    async def test_report_is_principal_scoped_strict_and_read_only(self, tmp_path: Path) -> None:
+        store, alice_id, alice_channel, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        service = _RoutingEligibility(alice_id, alice_channel)
+        client = await _open_client(
+            store,
+            _Authenticator({"alice-token": alice_id, "bob-token": bob_id}),
+            routing_eligibility=service,
+        )
+        path = f"/v1/channels/{alice_channel}/routing-eligibility"
+        try:
+            loaded = await client.get(
+                path,
+                headers={"Authorization": "Bearer alice-token"},
+                params={"task_class": "coding"},
+            )
+            payload = await loaded.json()
+
+            assert loaded.status == 200
+            assert payload["task_class"] == "coding"
+            assert payload["principal_id"] == str(alice_id)
+            assert payload["candidates"][0]["allowed_services"] == ["perplexity"]
+            assert payload["candidates"][0]["eligible"] is True
+            assert len(service.calls) == 1
+            assert service.calls[0][0].principal_id == alice_id
+            assert service.calls[0][1] == "coding"
+
+            forbidden = await client.get(
+                path,
+                headers={"Authorization": "Bearer bob-token"},
+                params={"task_class": "coding"},
+            )
+            missing = await client.get(
+                path,
+                headers={"Authorization": "Bearer alice-token"},
+            )
+            duplicate = await client.get(
+                f"{path}?task_class=coding&task_class=vision",
+                headers={"Authorization": "Bearer alice-token"},
+            )
+            body = await client.get(
+                path,
+                headers={"Authorization": "Bearer alice-token"},
+                params={"task_class": "coding"},
+                data="unexpected",
+            )
+            unknown = await client.get(
+                path,
+                headers={"Authorization": "Bearer alice-token"},
+                params={"task_class": "unknown"},
+            )
+
+            assert forbidden.status == 403
+            assert missing.status == 400
+            assert duplicate.status == 400
+            assert body.status == 400
+            assert unknown.status == 400
+            assert len(service.calls) == 2
         finally:
             await client.close()
             await store.close()

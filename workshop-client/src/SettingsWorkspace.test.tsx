@@ -12,6 +12,7 @@ import {
   loadModelCatalogue,
   loadPreferenceDocument,
   loadPreferenceHistory,
+  loadRoutingEligibility,
   loadSettingsWorkspace,
   loadWorkspaceConfig,
   PreferenceRevisionConflictError,
@@ -35,6 +36,7 @@ import type {
   WorkshopGitHubSettings,
   WorkshopModelCatalogue,
   WorkshopNotificationPreferences,
+  WorkshopRoutingEligibility,
   WorkshopClientPreferences,
   WorkshopAppearancePreferences,
   WorkshopSettingsWorkspace,
@@ -52,6 +54,7 @@ vi.mock("./api", async (importOriginal) => {
     loadModelCatalogue: vi.fn(),
     loadAppearancePreferences: vi.fn(),
     loadPreferenceHistory: vi.fn(),
+    loadRoutingEligibility: vi.fn(),
     loadSettingsWorkspace: vi.fn(),
     loadWorkspaceConfig: vi.fn(),
     restorePreferenceRevision: vi.fn(),
@@ -192,6 +195,52 @@ const modelCatalogue: WorkshopModelCatalogue = {
   },
   runtimeProfileId: runtime.runtimeProfileId,
   stale: false,
+};
+
+const routingEligibility: WorkshopRoutingEligibility = {
+  agentId: "agt_00000000000000000000000000000002",
+  candidates: [
+    {
+      allowedServices: ["perplexity"],
+      backend: "claude",
+      capabilities: [
+        {
+          capability: "text_generation",
+          evidence: "agent_backend_contract_v1",
+          support: "supported",
+        },
+        {
+          capability: "tool_activity",
+          evidence: "agent_backend_contract_v1",
+          support: "supported",
+        },
+        {
+          capability: "workspace_execution",
+          evidence: "protected_workspace",
+          support: "supported",
+        },
+        {
+          capability: "image_input",
+          evidence: "capability_not_advertised",
+          support: "unknown",
+        },
+      ],
+      eligible: true,
+      modelId: "claude-sonnet-4-6",
+      modelSource: "current_selection",
+      optionId: "claude:anthropic",
+      provider: "anthropic",
+      reasons: [{ code: "eligible", detail: "All required capability checks passed." }],
+      selected: true,
+    },
+  ],
+  channelId: session.channelId,
+  principalId: runtime.principalId,
+  requiredCapabilities: ["text_generation", "tool_activity", "workspace_execution"],
+  runtimeProfileId: runtime.runtimeProfileId,
+  taskClass: "coding",
+  version: 1,
+  workspace: "/srv/kai",
 };
 
 const workspaceConfig: WorkshopWorkspaceConfig = {
@@ -360,6 +409,7 @@ describe("Settings workspace", () => {
     });
     vi.mocked(loadSettingsWorkspace).mockResolvedValue(runtime);
     vi.mocked(loadModelCatalogue).mockResolvedValue(modelCatalogue);
+    vi.mocked(loadRoutingEligibility).mockResolvedValue(routingEligibility);
     vi.mocked(loadGitHubSettings).mockResolvedValue(githubSettings);
     vi.mocked(loadNotificationPreferences).mockResolvedValue(notificationPreferences);
     vi.mocked(loadClientPreferences).mockResolvedValue(clientPreferences);
@@ -403,7 +453,7 @@ describe("Settings workspace", () => {
     vi.restoreAllMocks();
   });
 
-  it("navigates all six settings sections without discarding a preference draft", async () => {
+  it("navigates all seven settings sections without discarding a preference draft", async () => {
     const user = userEvent.setup();
     renderSettings();
     const editor = await screen.findByLabelText("Preference Markdown");
@@ -411,6 +461,7 @@ describe("Settings workspace", () => {
     const sectionLabels = [
       "Personal preferences",
       "Runtime settings",
+      "Routing eligibility",
       "Workspace settings",
       "GitHub",
       "Notification delivery",
@@ -490,6 +541,7 @@ describe("Settings workspace", () => {
     const positions: Record<string, number> = {
       "settings-section-personal-preferences": -500,
       "settings-section-runtime": -300,
+      "settings-section-routing": -200,
       "settings-section-workspace": -100,
       "settings-section-github": 110,
       "settings-section-notifications": 400,
@@ -528,6 +580,29 @@ describe("Settings workspace", () => {
     expect(screen.queryByText(runtime.runtimeProfileId)).not.toBeInTheDocument();
     expect(screen.queryByText("/srv/kai")).not.toBeInTheDocument();
     expect(document.body.innerHTML).not.toContain("/srv/");
+  });
+
+  it("explains authorized routing eligibility without mutating runtime settings", async () => {
+    const user = userEvent.setup();
+    renderSettings();
+
+    expect((await screen.findAllByText("claude · anthropic")).length).toBe(2);
+    expect(screen.getByText("Eligible")).toBeVisible();
+    expect(screen.getByText("All required capability checks passed.")).toBeVisible();
+    expect(screen.getByText("perplexity")).toBeVisible();
+    expect(loadRoutingEligibility).toHaveBeenCalledWith(session, "coding");
+    expect(updateRuntimeSettings).not.toHaveBeenCalled();
+
+    vi.mocked(loadRoutingEligibility).mockResolvedValue({
+      ...routingEligibility,
+      requiredCapabilities: ["text_generation", "image_input"],
+      taskClass: "vision",
+    });
+    await user.selectOptions(screen.getByLabelText("Task class"), "vision");
+    await waitFor(() => {
+      expect(loadRoutingEligibility).toHaveBeenLastCalledWith(session, "vision");
+    });
+    expect(updateRuntimeSettings).not.toHaveBeenCalled();
   });
 
   it("saves preference Markdown and reports dirty state", async () => {

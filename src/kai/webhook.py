@@ -96,6 +96,7 @@ from kai.workshop.proactive_publication import (
     ProactivePublicationAuthority,
     ProactivePublicationResult,
 )
+from kai.workshop.routing_eligibility import WorkshopRoutingEligibilityService
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
 from kai.workshop.scheduled_jobs import (
     WorkshopScheduledJobAuthority,
@@ -1786,6 +1787,7 @@ async def _register_workshop_client_api(
     run_previews: WorkshopRunPreviewRegistry | None = None,
     artifact_service: WorkshopArtifactService | None = None,
     settings_workspaces: WorkshopSettingsWorkspaceService | None = None,
+    routing_eligibility: WorkshopRoutingEligibilityService | None = None,
     memory_queries: WorkshopMemoryQueryService | None = None,
     preference_documents: WorkshopPreferenceService | None = None,
     github_settings: WorkshopGitHubSettingsService | None = None,
@@ -1825,6 +1827,7 @@ async def _register_workshop_client_api(
             run_previews=run_previews,
             artifact_service=artifact_service,
             settings_workspaces=settings_workspaces,
+            routing_eligibility=routing_eligibility,
             memory_queries=memory_queries,
             preference_documents=preference_documents,
             github_settings=github_settings,
@@ -1907,6 +1910,7 @@ async def start(
             run_previews=core_services.run_previews,
             artifact_service=core_services.artifacts,
             settings_workspaces=core_services.settings_workspaces,
+            routing_eligibility=getattr(core_services, "routing_eligibility", None),
             memory_queries=core_services.memory_queries,
             preference_documents=core_services.preference_documents,
             github_settings=getattr(core_services, "github_settings", None),
