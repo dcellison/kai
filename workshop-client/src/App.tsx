@@ -2063,24 +2063,26 @@ function WorkshopView({
             </>
           )}
 
-          <div className="nav-heading-row">
-            <p className="nav-heading">Channels</p>
-            <button
-              className="nav-add-button"
-              type="button"
-              aria-label="Create channel"
-              title="Create channel"
-              onClick={() =>
-                setChannelCreation({
-                  initialAgentIds: [],
-                  originChannelId: null,
-                  originName: null,
-                })
-              }
-            >
-              <span aria-hidden="true" />
-            </button>
-          </div>
+          {!sidebarLayout.collapsed && (
+            <div className="nav-heading-row">
+              <p className="nav-heading">Channels</p>
+              <button
+                className="nav-add-button"
+                type="button"
+                aria-label="Create channel"
+                title="Create channel"
+                onClick={() =>
+                  setChannelCreation({
+                    initialAgentIds: [],
+                    originChannelId: null,
+                    originName: null,
+                  })
+                }
+              >
+                <span aria-hidden="true" />
+              </button>
+            </div>
+          )}
           {workshop.channels
             .filter((availableChannel) => availableChannel.kind === "group")
             .map((availableChannel) => (
