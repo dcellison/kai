@@ -10,7 +10,19 @@ from typing import Any
 
 import aiosqlite
 
+from kai.workshop.agent_definitions import (
+    MAX_AGENT_DESCRIPTION,
+    MAX_AGENT_DISPLAY_NAME,
+    MAX_AGENT_INSTRUCTIONS,
+    MAX_AGENT_PURPOSE,
+    normalize_agent_handle,
+    validate_agent_capabilities,
+    validate_agent_presentation,
+    validate_agent_text,
+)
 from kai.workshop.domain import (
+    AgentDefinitionId,
+    AgentDefinitionRevisionId,
     AgentId,
     ChannelId,
     MessageId,
@@ -58,8 +70,12 @@ async def _message_mentions_json(
     if not raw_mentions:
         return "[]"
     async with connection.execute(
-        "SELECT p.id, p.kind, p.display_name FROM channel_memberships cm "
-        "JOIN principals p ON p.id = cm.principal_id WHERE cm.channel_id = ?",
+        "SELECT p.id, p.kind, COALESCE(ad.handle, p.display_name) "
+        "FROM channel_memberships cm "
+        "JOIN principals p ON p.id = cm.principal_id "
+        "LEFT JOIN agents a ON a.principal_id = p.id "
+        "LEFT JOIN agent_definitions ad ON ad.agent_id = a.id "
+        "WHERE cm.channel_id = ?",
         (channel_id,),
     ) as cursor:
         members = {PrincipalId(str(row[0])): (str(row[1]), str(row[2])) for row in await cursor.fetchall()}
@@ -106,14 +122,24 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
     occurred_at = envelope.occurred_at.isoformat()
     payload = envelope.payload
     if envelope.event_type == WorkshopEventType.RUN_ACCEPTED:
+        if envelope.event_version not in {1, 2}:
+            raise ValueError("Unsupported Workshop run acceptance event version")
+        keys = {"inbound_message_id", "channel_id", "requested_by_principal_id", "agent_id"}
+        if envelope.event_version == 2:
+            keys.add("agent_definition_revision_id")
         _require_exact_payload(
             payload,
-            {"inbound_message_id", "channel_id", "requested_by_principal_id", "agent_id"},
+            keys,
         )
         inbound_message_id = MessageId(_required_text(payload, "inbound_message_id"))
         channel_id = ChannelId(_required_text(payload, "channel_id"))
         requested_by = PrincipalId(_required_text(payload, "requested_by_principal_id"))
         agent_id = AgentId(_required_text(payload, "agent_id"))
+        revision_id = (
+            AgentDefinitionRevisionId(_required_text(payload, "agent_definition_revision_id"))
+            if envelope.event_version == 2
+            else None
+        )
         async with connection.execute(
             "SELECT c.workshop_id, m.channel_id, m.author_principal_id, ca.agent_id, m.created_at "
             "FROM messages m "
@@ -135,22 +161,52 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
             raise ValueError("Workshop run cannot be accepted before its inbound message")
         if envelope.actor_principal_id != requested_by:
             raise ValueError("Workshop run acceptance actor must be its requesting human")
-        await connection.execute(
-            "INSERT INTO runs "
-            "(id, workshop_id, channel_id, requested_by_principal_id, agent_id, "
-            "inbound_message_id, status, accepted_at, last_event_position) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'accepted', ?, ?)",
-            (
-                envelope.aggregate_id,
-                envelope.workshop_id,
-                channel_id,
-                requested_by,
-                agent_id,
-                inbound_message_id,
-                occurred_at,
-                event.position,
-            ),
-        )
+        if revision_id is not None:
+            async with connection.execute(
+                "SELECT d.agent_id, d.lifecycle_state, d.active_revision_id "
+                "FROM agent_definition_revisions r "
+                "JOIN agent_definitions d ON d.id = r.agent_definition_id "
+                "WHERE r.id = ?",
+                (revision_id,),
+            ) as cursor:
+                definition_row = await cursor.fetchone()
+            if definition_row is None or tuple(definition_row) != (agent_id, "active", revision_id):
+                raise ValueError("Workshop run must bind the agent's active definition revision")
+        if envelope.event_version == 1:
+            await connection.execute(
+                "INSERT INTO runs "
+                "(id, workshop_id, channel_id, requested_by_principal_id, agent_id, "
+                "inbound_message_id, status, accepted_at, last_event_position) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'accepted', ?, ?)",
+                (
+                    envelope.aggregate_id,
+                    envelope.workshop_id,
+                    channel_id,
+                    requested_by,
+                    agent_id,
+                    inbound_message_id,
+                    occurred_at,
+                    event.position,
+                ),
+            )
+        else:
+            await connection.execute(
+                "INSERT INTO runs "
+                "(id, workshop_id, channel_id, requested_by_principal_id, agent_id, "
+                "inbound_message_id, agent_definition_revision_id, status, accepted_at, "
+                "last_event_position) VALUES (?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?)",
+                (
+                    envelope.aggregate_id,
+                    envelope.workshop_id,
+                    channel_id,
+                    requested_by,
+                    agent_id,
+                    inbound_message_id,
+                    revision_id,
+                    occurred_at,
+                    event.position,
+                ),
+            )
         return
 
     async with connection.execute(
@@ -552,11 +608,15 @@ class CanonicalConversationProjection:
 
     name = "canonical_conversations"
     # Runtime-profile assignments can migrate to stable protected profiles.
-    version = 11
+    version = 12
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
             existing_tables = {str(row[0]) for row in await cursor.fetchall()}
+        if "agent_definitions" in existing_tables:
+            # Break the active-revision pointer before deleting immutable
+            # revisions. Replay restores it from the activation event.
+            await connection.execute("UPDATE agent_definitions SET active_revision_id = NULL")
         for table in (
             "deliveries",
             "artifacts",
@@ -570,6 +630,8 @@ class CanonicalConversationProjection:
             "channel_bindings",
             "channel_memberships",
             "channels",
+            "agent_definition_revisions",
+            "agent_definitions",
             "agents",
             "workshop_memberships",
             "external_identities",
@@ -698,6 +760,130 @@ class CanonicalConversationProjection:
                     _required_text(payload, "name"),
                     occurred_at,
                 ),
+            )
+        elif envelope.event_type == WorkshopEventType.AGENT_DEFINITION_CREATED:
+            if (
+                not isinstance(envelope.aggregate_id, AgentDefinitionId)
+                or envelope.aggregate_type != "agent_definition"
+            ):
+                raise ValueError("Workshop agent definition creation requires a typed definition aggregate")
+            _require_exact_payload(
+                payload,
+                {"agent_id", "handle", "display_name", "description", "presentation", "lifecycle_state"},
+            )
+            agent_id = AgentId(_required_text(payload, "agent_id"))
+            handle = normalize_agent_handle(payload.get("handle"))
+            display_name = validate_agent_text(
+                payload.get("display_name"), field="display_name", maximum=MAX_AGENT_DISPLAY_NAME
+            )
+            description = validate_agent_text(
+                payload.get("description"),
+                field="description",
+                maximum=MAX_AGENT_DESCRIPTION,
+                allow_empty=True,
+            )
+            lifecycle_state = _required_text(payload, "lifecycle_state")
+            if lifecycle_state not in {"draft", "active", "archived"}:
+                raise ValueError("Workshop agent definition lifecycle_state is invalid")
+            presentation_json = validate_agent_presentation(payload.get("presentation"))
+            async with connection.execute("SELECT workshop_id FROM agents WHERE id = ?", (agent_id,)) as cursor:
+                agent_row = await cursor.fetchone()
+            if agent_row is None or WorkshopId(str(agent_row[0])) != envelope.workshop_id:
+                raise ValueError("Workshop agent definition must reference an agent in its workshop")
+            await connection.execute(
+                "INSERT INTO agent_definitions "
+                "(id, workshop_id, agent_id, handle, display_name, description, "
+                "presentation_json, lifecycle_state, active_revision_id, created_at, "
+                "created_event_position) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+                (
+                    envelope.aggregate_id,
+                    envelope.workshop_id,
+                    agent_id,
+                    handle,
+                    display_name,
+                    description,
+                    presentation_json,
+                    lifecycle_state,
+                    occurred_at,
+                    event.position,
+                ),
+            )
+        elif envelope.event_type == WorkshopEventType.AGENT_DEFINITION_REVISION_ADDED:
+            if (
+                not isinstance(envelope.aggregate_id, AgentDefinitionRevisionId)
+                or envelope.aggregate_type != "agent_definition_revision"
+            ):
+                raise ValueError("Workshop agent revision creation requires a typed revision aggregate")
+            _require_exact_payload(
+                payload,
+                {"definition_id", "revision_number", "purpose", "instructions", "capabilities"},
+            )
+            definition_id = AgentDefinitionId(_required_text(payload, "definition_id"))
+            revision_number = payload.get("revision_number")
+            if not isinstance(revision_number, int) or isinstance(revision_number, bool) or revision_number < 1:
+                raise ValueError("Workshop agent revision_number must be positive")
+            purpose = validate_agent_text(payload.get("purpose"), field="purpose", maximum=MAX_AGENT_PURPOSE)
+            instructions = validate_agent_text(
+                payload.get("instructions"), field="instructions", maximum=MAX_AGENT_INSTRUCTIONS
+            )
+            capabilities = validate_agent_capabilities(payload.get("capabilities"))
+            async with connection.execute(
+                "SELECT workshop_id FROM agent_definitions WHERE id = ?", (definition_id,)
+            ) as cursor:
+                definition_row = await cursor.fetchone()
+            if definition_row is None or WorkshopId(str(definition_row[0])) != envelope.workshop_id:
+                raise ValueError("Workshop agent revision must reference a definition in its workshop")
+            async with connection.execute(
+                "SELECT COALESCE(MAX(revision_number), 0) FROM agent_definition_revisions "
+                "WHERE agent_definition_id = ?",
+                (definition_id,),
+            ) as cursor:
+                revision_count_row = await cursor.fetchone()
+            assert revision_count_row is not None
+            expected_number = int(revision_count_row[0]) + 1
+            if revision_number != expected_number:
+                raise ValueError("Workshop agent revisions must be sequential")
+            await connection.execute(
+                "INSERT INTO agent_definition_revisions "
+                "(id, agent_definition_id, revision_number, purpose, instructions, "
+                "capabilities_json, created_at, created_event_position) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    envelope.aggregate_id,
+                    definition_id,
+                    revision_number,
+                    purpose,
+                    instructions,
+                    json.dumps(capabilities, separators=(",", ":")),
+                    occurred_at,
+                    event.position,
+                ),
+            )
+        elif envelope.event_type == WorkshopEventType.AGENT_DEFINITION_REVISION_ACTIVATED:
+            if (
+                not isinstance(envelope.aggregate_id, AgentDefinitionId)
+                or envelope.aggregate_type != "agent_definition"
+            ):
+                raise ValueError("Workshop agent revision activation requires a typed definition aggregate")
+            _require_exact_payload(payload, {"revision_id"})
+            revision_id = AgentDefinitionRevisionId(_required_text(payload, "revision_id"))
+            async with connection.execute(
+                "SELECT d.workshop_id, d.lifecycle_state, r.agent_definition_id "
+                "FROM agent_definitions d JOIN agent_definition_revisions r ON r.id = ? "
+                "WHERE d.id = ?",
+                (revision_id, envelope.aggregate_id),
+            ) as cursor:
+                revision_row = await cursor.fetchone()
+            if (
+                revision_row is None
+                or WorkshopId(str(revision_row[0])) != envelope.workshop_id
+                or str(revision_row[1]) != "active"
+                or AgentDefinitionId(str(revision_row[2])) != envelope.aggregate_id
+            ):
+                raise ValueError("Workshop agent revision activation is invalid")
+            await connection.execute(
+                "UPDATE agent_definitions SET active_revision_id = ? WHERE id = ?",
+                (revision_id, envelope.aggregate_id),
             )
         elif envelope.event_type == WorkshopEventType.CHANNEL_AGENT_ATTACHED:
             await connection.execute(

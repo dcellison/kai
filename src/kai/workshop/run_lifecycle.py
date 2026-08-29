@@ -8,6 +8,7 @@ from enum import StrEnum
 
 from kai.workshop.conversation_runs import resolve_canonical_conversation_target
 from kai.workshop.domain import (
+    AgentDefinitionRevisionId,
     AgentId,
     ChannelId,
     EventEnvelope,
@@ -59,6 +60,7 @@ class DurableRun:
     cancellation_code: str | None
     result_message_id: MessageId | None
     last_event_position: int
+    agent_definition_revision_id: AgentDefinitionRevisionId | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,9 +86,17 @@ def _optional_timestamp(value: object) -> datetime | None:
 
 async def load_durable_run(store: WorkshopEventStore, run_id: RunId) -> DurableRun | None:
     """Load one projected durable run without granting any authorization."""
+    async with store.connection.execute("PRAGMA table_info(runs)") as cursor:
+        run_columns = {str(row[1]) for row in await cursor.fetchall()}
+    revision_expression = (
+        "agent_definition_revision_id"
+        if "agent_definition_revision_id" in run_columns
+        else "NULL AS agent_definition_revision_id"
+    )
     async with store.connection.execute(
         "SELECT id, workshop_id, channel_id, requested_by_principal_id, agent_id, "
-        "inbound_message_id, status, accepted_at, started_at, terminal_at, terminal_code, "
+        f"inbound_message_id, {revision_expression}, status, accepted_at, "
+        "started_at, terminal_at, terminal_code, "
         "cancellation_requested_at, cancellation_code, result_message_id, "
         "last_event_position FROM runs WHERE id = ?",
         (run_id,),
@@ -101,15 +111,16 @@ async def load_durable_run(store: WorkshopEventStore, run_id: RunId) -> DurableR
         requested_by_principal_id=PrincipalId(str(row[3])),
         agent_id=AgentId(str(row[4])),
         inbound_message_id=MessageId(str(row[5])),
-        status=RunStatus(str(row[6])),
-        accepted_at=_parse_timestamp(row[7]),
-        started_at=_optional_timestamp(row[8]),
-        terminal_at=_optional_timestamp(row[9]),
-        terminal_code=str(row[10]) if row[10] is not None else None,
-        cancellation_requested_at=_optional_timestamp(row[11]),
-        cancellation_code=str(row[12]) if row[12] is not None else None,
-        result_message_id=MessageId(str(row[13])) if row[13] is not None else None,
-        last_event_position=int(row[14]),
+        agent_definition_revision_id=(AgentDefinitionRevisionId(str(row[6])) if row[6] is not None else None),
+        status=RunStatus(str(row[7])),
+        accepted_at=_parse_timestamp(row[8]),
+        started_at=_optional_timestamp(row[9]),
+        terminal_at=_optional_timestamp(row[10]),
+        terminal_code=str(row[11]) if row[11] is not None else None,
+        cancellation_requested_at=_optional_timestamp(row[12]),
+        cancellation_code=str(row[13]) if row[13] is not None else None,
+        result_message_id=MessageId(str(row[14])) if row[14] is not None else None,
+        last_event_position=int(row[15]),
     )
 
 
@@ -149,6 +160,7 @@ async def _existing_event(
     status: RunStatus,
     actor_principal_id: PrincipalId,
     payload: dict[str, object],
+    event_version: int = 1,
 ) -> StoredEvent | None:
     key = _event_key(run.run_id, status)
     existing = await store.event_by_idempotency_key(key)
@@ -157,7 +169,7 @@ async def _existing_event(
     envelope = existing.envelope
     if (
         envelope.event_type != _event_type(status)
-        or envelope.event_version != 1
+        or envelope.event_version != event_version
         or envelope.workshop_id != run.workshop_id
         or envelope.aggregate_type != "run"
         or envelope.aggregate_id != run.run_id
@@ -239,12 +251,17 @@ class WorkshopRunLifecycle:
                 "requested_by_principal_id": existing_run.requested_by_principal_id,
                 "agent_id": existing_run.agent_id,
             }
+            event_version = 1
+            if existing_run.agent_definition_revision_id is not None:
+                existing_payload["agent_definition_revision_id"] = existing_run.agent_definition_revision_id
+                event_version = 2
             existing_event = await _existing_event(
                 self._store,
                 run=existing_run,
                 status=RunStatus.ACCEPTED,
                 actor_principal_id=existing_run.requested_by_principal_id,
                 payload=existing_payload,
+                event_version=event_version,
             )
             if existing_event is None:
                 raise RunLifecycleConflictError("Durable run is missing its acceptance event")
@@ -265,10 +282,26 @@ class WorkshopRunLifecycle:
             "requested_by_principal_id": target.requested_by_principal_id,
             "agent_id": target.agent_id,
         }
+        async with self._store.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_definitions'"
+        ) as cursor:
+            definitions_supported = await cursor.fetchone() is not None
+        event_version = 1
+        if definitions_supported:
+            async with self._store.connection.execute(
+                "SELECT active_revision_id FROM agent_definitions WHERE agent_id = ? AND lifecycle_state = 'active'",
+                (target.agent_id,),
+            ) as cursor:
+                definition_row = await cursor.fetchone()
+            if definition_row is None or definition_row[0] is None:
+                raise RunLifecycleConflictError("Agent has no active canonical definition revision")
+            definition_revision_id = AgentDefinitionRevisionId(str(definition_row[0]))
+            payload["agent_definition_revision_id"] = definition_revision_id
+            event_version = 2
         event = EventEnvelope.create(
             event_id=EventId.derived(run_id, "accepted"),
             event_type=WorkshopEventType.RUN_ACCEPTED,
-            event_version=1,
+            event_version=event_version,
             workshop_id=target.workshop_id,
             aggregate_type="run",
             aggregate_id=run_id,

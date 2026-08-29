@@ -93,6 +93,7 @@ class TestDurableRunAcceptance:
             assert accepted.event.envelope.actor_principal_id == accepted.run.requested_by_principal_id
             assert accepted.event.envelope.payload == {
                 "agent_id": accepted.run.agent_id,
+                "agent_definition_revision_id": accepted.run.agent_definition_revision_id,
                 "channel_id": accepted.run.channel_id,
                 "inbound_message_id": inbound_id,
                 "requested_by_principal_id": accepted.run.requested_by_principal_id,
@@ -165,7 +166,7 @@ class TestDurableRunReplay:
             checkpoint = await store.rebuild_projection(CanonicalConversationProjection())
             after = await lifecycle.state(before.run_id)
 
-            assert checkpoint.version == 11
+            assert checkpoint.version == 12
             assert after == before
         finally:
             await store.close()
@@ -220,7 +221,7 @@ class TestDurableRunMigration:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 45
+            assert await upgraded.schema_version() == 46
             assert "runs" in await upgraded.schema_tables()
             assert "run_attempts" in await upgraded.schema_tables()
             async with upgraded.connection.execute("SELECT name FROM workshops") as cursor:

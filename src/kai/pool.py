@@ -136,6 +136,11 @@ class PreparedBackendExecution:
         self._pool._validate_prepared(self)
         self._instance.stage_canonical_history(history)
 
+    def stage_canonical_agent_context(self, context: str) -> None:
+        """Stage the run-bound agent revision on this exact runtime."""
+        self._pool._validate_prepared(self)
+        self._instance.stage_canonical_agent_context(context)
+
     def validate_current(self) -> None:
         """Fail before dispatch if the protected runtime selection drifted."""
         self._pool._validate_prepared(self)
@@ -996,6 +1001,7 @@ class SubprocessPool:
                 yield event
         finally:
             instance.discard_canonical_history()
+            instance.discard_canonical_agent_context()
             self._in_flight.discard(runtime_key)
             self._last_activity[runtime_key] = time.monotonic()
 
@@ -1025,6 +1031,7 @@ class SubprocessPool:
                 yield event
         finally:
             instance.discard_canonical_history()
+            instance.discard_canonical_agent_context()
             self._in_flight.discard(instance_key)
             self._last_activity[instance_key] = time.monotonic()
 

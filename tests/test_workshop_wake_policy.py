@@ -14,6 +14,8 @@ from kai.workshop.conversation_commands import (
     WorkshopConversationCommandService,
 )
 from kai.workshop.domain import (
+    AgentDefinitionId,
+    AgentDefinitionRevisionId,
     AgentId,
     ChannelAgentId,
     ChannelId,
@@ -136,6 +138,52 @@ async def _open_group_store(
             ),
         )
     await store.connection.commit()
+    nova_definition_id = AgentDefinitionId.derived(second_agent_id, "definition")
+    nova_revision_id = AgentDefinitionRevisionId.derived(nova_definition_id, "revision:1")
+    for event in (
+        EventEnvelope.create(
+            event_type=WorkshopEventType.AGENT_DEFINITION_CREATED,
+            event_version=1,
+            workshop_id=workshop_id,
+            aggregate_type="agent_definition",
+            aggregate_id=nova_definition_id,
+            occurred_at=_NOW,
+            payload={
+                "agent_id": second_agent_id,
+                "handle": "nova",
+                "display_name": "Nova",
+                "description": "Test agent",
+                "presentation": {"avatar": "N"},
+                "lifecycle_state": "active",
+            },
+        ),
+        EventEnvelope.create(
+            event_type=WorkshopEventType.AGENT_DEFINITION_REVISION_ADDED,
+            event_version=1,
+            workshop_id=workshop_id,
+            aggregate_type="agent_definition_revision",
+            aggregate_id=nova_revision_id,
+            occurred_at=_NOW,
+            payload={
+                "definition_id": nova_definition_id,
+                "revision_number": 1,
+                "purpose": "Exercise multi-agent wake routing.",
+                "instructions": "Respond as Nova when explicitly mentioned.",
+                "capabilities": ["text_generation"],
+            },
+        ),
+        EventEnvelope.create(
+            event_type=WorkshopEventType.AGENT_DEFINITION_REVISION_ACTIVATED,
+            event_version=1,
+            workshop_id=workshop_id,
+            aggregate_type="agent_definition",
+            aggregate_id=nova_definition_id,
+            occurred_at=_NOW,
+            payload={"revision_id": nova_revision_id},
+        ),
+    ):
+        await store.append(event)
+        await store.project_pending(CanonicalConversationProjection())
     return store, human_id, group_id, (first_agent_id, second_agent_id)
 
 

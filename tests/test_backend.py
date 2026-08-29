@@ -2048,16 +2048,17 @@ class TestAssembleTurnContext:
     """Tests for the composed per-turn prompt assembly contract.
 
     The ordering invariant is the contract: marker closest to user text,
-    then session_context, then memory, then workspace_reminder, with the
-    inverse of that order applied via repeated prepends. Backends that
+    then the run-bound agent definition, session context, memory, and
+    workspace reminder, with the inverse of that order applied via repeated
+    prepends. Backends that
     re-implement this locally are exactly the failure mode the helper
     exists to prevent; these tests pin the invariant at the helper level
     so a future backend wire-up has a one-line integration target.
     """
 
     async def test_string_prompt_full_ordering(self, monkeypatch):
-        """All four context layers present, string prompt. Final reading
-        order must be reminder, memory, session, marker, user text, with
+        """All context layers present, string prompt. Final reading
+        order must be reminder, memory, session, definition, marker, user text, with
         only whitespace separating the marker and the user message.
         """
         from kai.backend import USER_MESSAGE_MARKER, assemble_turn_context
@@ -2067,17 +2068,19 @@ class TestAssembleTurnContext:
             "ACTUAL_USER_TEXT",
             chat_id=42,
             session_context="[SESSION]",
+            agent_definition_context="[AGENT DEFINITION]",
             workspace_reminder="[REMINDER]",
         )
         assert isinstance(result, str)
         assert result.count(USER_MESSAGE_MARKER) == 1
         # Inverse-prepend ordering: each subsequent layer lands above
         # the previous one, so the final reading order from top to
-        # bottom is reminder, memory, session, marker, user text.
+        # bottom is reminder, memory, session, definition, marker, user text.
         positions = [
             result.index("[REMINDER]"),
             result.index("[Relevant memories]"),
             result.index("[SESSION]"),
+            result.index("[AGENT DEFINITION]"),
             result.index(USER_MESSAGE_MARKER),
             result.index("ACTUAL_USER_TEXT"),
         ]

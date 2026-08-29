@@ -49,9 +49,13 @@ class _Runtime:
         self.validated = False
         self.cancelled = False
         self.canonical_histories: list[str] = []
+        self.agent_definition_contexts: list[str] = []
 
     def stage_canonical_history(self, history: str) -> None:
         self.canonical_histories.append(history)
+
+    def stage_canonical_agent_context(self, context: str) -> None:
+        self.agent_definition_contexts.append(context)
 
     def validate_current(self) -> None:
         self.validated = True
@@ -88,7 +92,8 @@ class _Eligibility:
         assert runtime_profile_id == self.authority.runtime_profile_id
         return self.authority
 
-    async def inspect(self, authority, task_class):
+    async def inspect(self, authority, task_class, *, additional_required=()):
+        assert not additional_required or additional_required[0].value == "text_generation"
         return RuntimeEligibilityReport(
             version=1,
             task_class=RoutingTaskClass(task_class),

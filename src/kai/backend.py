@@ -538,6 +538,23 @@ class AgentBackend(ABC):
         if hasattr(self, "_canonical_history"):
             del self._canonical_history
 
+    def stage_canonical_agent_context(self, context: str) -> None:
+        """Stage the immutable agent revision bound to the next turn."""
+        if not isinstance(context, str) or not context:
+            raise ValueError("agent definition context must be non-empty text")
+        self._canonical_agent_context = context
+
+    def consume_canonical_agent_context(self) -> str:
+        """Consume a staged per-turn agent definition exactly once."""
+        context = getattr(self, "_canonical_agent_context", "")
+        self.discard_canonical_agent_context()
+        return context
+
+    def discard_canonical_agent_context(self) -> None:
+        """Clear unconsumed definition context after protected dispatch."""
+        if hasattr(self, "_canonical_agent_context"):
+            del self._canonical_agent_context
+
     @abstractmethod
     async def send(
         self,
@@ -1569,6 +1586,7 @@ async def assemble_turn_context(
     chat_id: int | None,
     runtime_identity: AgentRuntimeIdentity | None = None,
     session_context: str = "",
+    agent_definition_context: str = "",
     workspace_reminder: str = "",
     workspace: Path | None = None,
     backend_name: str | None = None,
@@ -1588,13 +1606,15 @@ async def assemble_turn_context(
         workspace_reminder    (topmost)
         semantic memory block
         session_context
+        agent_definition_context
         USER_MESSAGE_MARKER
         user prompt           (bottom; the real message)
 
     `prepend_to_prompt` stacks each prefix ABOVE the existing prompt,
     so the implementation order below is the REVERSE of the reading
     order: marker first (so it lands closest to the user text),
-    session_context second, memory third, reminder last (topmost).
+    agent definition second, session context third, memory fourth, reminder
+    last (topmost).
     This is load-bearing and the single most common way to break the
     invariant; the regression test
     `tests/test_claude.py::test_delimiter_is_closest_prefix_to_user_text`
@@ -1637,6 +1657,12 @@ async def assemble_turn_context(
     # context, not just from recalled memories, so it must be a
     # permanent prompt-shape fixture for interactive backends.
     prompt = prepend_to_prompt(prompt, USER_MESSAGE_MARKER)
+
+    # A run-bound agent definition applies on every turn, including a live
+    # provider session. It is deliberately below host/workspace session
+    # context and never carries authority of its own.
+    if agent_definition_context:
+        prompt = prepend_to_prompt(prompt, agent_definition_context)
 
     # First-session context (AGENTS.md + PREFERENCES.md + recent
     # history + API context) is built by the caller because the

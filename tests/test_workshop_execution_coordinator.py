@@ -62,9 +62,13 @@ class _Prepared:
         self.cancelled = False
         self.reject_validation = False
         self.canonical_histories: list[str] = []
+        self.agent_definition_contexts: list[str] = []
 
     def stage_canonical_history(self, history: str) -> None:
         self.canonical_histories.append(history)
+
+    def stage_agent_definition_context(self, context: str) -> None:
+        self.agent_definition_contexts.append(context)
 
     def validate_current(self) -> None:
         self.validated = True
@@ -223,6 +227,9 @@ class TestCanonicalExecutionCoordinator:
             first_result = await _coordinator(store, _Preparation(first)).execute(first_run.run_id)
             assert first_result.disposition == CanonicalExecutionDisposition.COMPLETED
             assert first.canonical_histories == [""]
+            assert len(first.agent_definition_contexts) == 1
+            assert "Handle: @kai" in first.agent_definition_contexts[0]
+            assert "Definition revision: 1" in first.agent_definition_contexts[0]
 
             second_acceptance = await WorkshopConversationCommandService(store).accept(
                 InboundMessage(

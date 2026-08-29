@@ -29,6 +29,9 @@ class WorkshopEventType(StrEnum):
     CHANNEL_MEMBER_ADDED = "channel.member_added"
     TRANSPORT_CHANNEL_BOUND = "transport.channel_bound"
     AGENT_CREATED = "agent.created"
+    AGENT_DEFINITION_CREATED = "agent_definition.created"
+    AGENT_DEFINITION_REVISION_ADDED = "agent_definition.revision_added"
+    AGENT_DEFINITION_REVISION_ACTIVATED = "agent_definition.revision_activated"
     CHANNEL_AGENT_ATTACHED = "channel.agent_attached"
     CHANNEL_AGENT_DISMISSED = "channel.agent_dismissed"
     RUNTIME_PROFILE_ASSIGNED = "runtime_profile.assigned"
@@ -125,6 +128,14 @@ class ChannelBindingId(OpaqueId):
 
 class AgentId(OpaqueId):
     prefix = "agt"
+
+
+class AgentDefinitionId(OpaqueId):
+    prefix = "adf"
+
+
+class AgentDefinitionRevisionId(OpaqueId):
+    prefix = "adr"
 
 
 class RuntimeProfileId(OpaqueId):
@@ -226,6 +237,8 @@ _ID_TYPES: dict[str, type[OpaqueId]] = {
         ChannelMembershipId,
         ChannelBindingId,
         AgentId,
+        AgentDefinitionId,
+        AgentDefinitionRevisionId,
         ChannelAgentId,
         RuntimeAssignmentId,
         MessageId,

@@ -77,7 +77,8 @@ class _Eligibility:
             raise RuntimeError("access denied")
         return self.authority
 
-    async def inspect(self, authority, task_class):
+    async def inspect(self, authority, task_class, *, additional_required=()):
+        assert not additional_required or additional_required[0].value == "text_generation"
         assert authority == self.authority
         canonical_task = RoutingTaskClass(task_class)
         return RuntimeEligibilityReport(
