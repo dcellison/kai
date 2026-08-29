@@ -19,6 +19,15 @@ from urllib.parse import quote
 
 from aiohttp import BodyPartReader, web
 
+from kai.workshop.agent_lifecycle import (
+    AgentDefinitionSnapshot,
+    WorkshopAgentLifecycleAccessDenied,
+    WorkshopAgentLifecycleConflict,
+    WorkshopAgentLifecycleError,
+    WorkshopAgentLifecycleService,
+    WorkshopAgentLifecycleStorageError,
+    WorkshopAgentLifecycleValidationError,
+)
 from kai.workshop.appearance_preferences import (
     AppearancePreferenceAuthority,
     AppearancePreferenceSnapshot,
@@ -72,6 +81,8 @@ from kai.workshop.client_preferences import (
 from kai.workshop.client_sessions import EnrollmentGrantUnavailableError, WorkshopClientEnrollmentManager
 from kai.workshop.conversation_commands import ConversationCommandAcceptanceError
 from kai.workshop.domain import (
+    AgentDefinitionId,
+    AgentDefinitionRevisionId,
     AgentId,
     ArtifactId,
     ChannelId,
@@ -79,6 +90,7 @@ from kai.workshop.domain import (
     MessageReactionSummary,
     PrincipalId,
     RunId,
+    WorkshopEventType,
 )
 from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.github_settings import (
@@ -200,6 +212,12 @@ _TIMELINE_EVENTS_PATH = "/v1/channels/{channel_id}/events"
 _MESSAGE_REACTIONS_PATH = "/v1/channels/{channel_id}/messages/{message_id}/reactions"
 _CLIENT_NAVIGATION_PATH = "/v1/client/navigation"
 _CHANNEL_CREATION_PATH = "/v1/channels"
+_AGENT_DEFINITIONS_PATH = "/v1/client/agents"
+_AGENT_EVENTS_PATH = "/v1/client/agents/events"
+_AGENT_DEFINITION_PATH = "/v1/client/agents/{definition_id}"
+_AGENT_REVISIONS_PATH = "/v1/client/agents/{definition_id}/revisions"
+_AGENT_ACTIVATION_PATH = "/v1/client/agents/{definition_id}/activate"
+_AGENT_ARCHIVAL_PATH = "/v1/client/agents/{definition_id}/archive"
 _ENROLLMENT_REDEMPTION_PATH = "/v1/client/enrollment/redeem"
 _COMMAND_SUBMISSION_PATH = "/v1/channels/{channel_id}/commands"
 _AGENT_DISMISSAL_PATH = "/v1/channels/{channel_id}/agents/{agent_id}/dismiss"
@@ -263,6 +281,22 @@ _APPEARANCE_PREFERENCE_REQUEST_FIELDS = frozenset({"revision", "theme_id"})
 _MAX_APPEARANCE_PREFERENCE_BODY_BYTES = 1_024
 _CHANNEL_CREATION_REQUEST_FIELDS = frozenset({"name", "agent_ids", "origin_channel_id"})
 _MAX_CHANNEL_CREATION_BODY_BYTES = 8_192
+_AGENT_CREATION_FIELDS = frozenset(
+    {
+        "idempotency_key",
+        "handle",
+        "display_name",
+        "description",
+        "presentation",
+        "purpose",
+        "instructions",
+        "capabilities",
+    }
+)
+_AGENT_REVISION_FIELDS = frozenset({"idempotency_key", "expected_version", "purpose", "instructions", "capabilities"})
+_AGENT_ACTIVATION_FIELDS = frozenset({"idempotency_key", "expected_version", "revision_id"})
+_AGENT_ARCHIVAL_FIELDS = frozenset({"idempotency_key", "expected_version"})
+_MAX_AGENT_LIFECYCLE_BODY_BYTES = 32_768
 _DECIMAL_INTEGER = re.compile(r"^[0-9]+$")
 _CLIENT_MESSAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _EVENT_STREAM_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -594,6 +628,39 @@ def _serialize_created_channel(
             "role": "owner",
             "agent_ids": [str(agent_id) for agent_id in channel.agent_ids],
         },
+    }
+
+
+def _serialize_agent_definition(snapshot: AgentDefinitionSnapshot) -> dict[str, object]:
+    return {
+        "definition_id": str(snapshot.definition_id),
+        "agent_id": str(snapshot.agent_id),
+        "handle": snapshot.handle,
+        "display_name": snapshot.display_name,
+        "description": snapshot.description,
+        "presentation": snapshot.presentation,
+        "lifecycle_state": snapshot.lifecycle_state,
+        "active_revision_id": (str(snapshot.active_revision_id) if snapshot.active_revision_id is not None else None),
+        "state_version": snapshot.state_version,
+        "created_at": snapshot.created_at,
+        "created_by_principal_id": (
+            str(snapshot.created_by_principal_id) if snapshot.created_by_principal_id is not None else None
+        ),
+        "revisions": [
+            {
+                "revision_id": str(revision.revision_id),
+                "revision_number": revision.revision_number,
+                "purpose": revision.purpose,
+                "instructions": revision.instructions,
+                "capabilities": list(revision.capabilities),
+                "created_at": revision.created_at,
+                "created_by_principal_id": (
+                    str(revision.created_by_principal_id) if revision.created_by_principal_id is not None else None
+                ),
+                "event_position": revision.event_position,
+            }
+            for revision in snapshot.revisions
+        ],
     }
 
 
@@ -2710,6 +2777,20 @@ def _parse_event_stream_request(request: web.Request) -> tuple[ChannelId, int | 
     return channel_id, int(value)
 
 
+def _parse_agent_event_stream_request(request: web.Request) -> int | None:
+    if not set(request.query).issubset(_ALLOWED_EVENT_QUERY_PARAMETERS):
+        raise ValueError("Unsupported query parameter")
+    last_event_ids = request.headers.getall("Last-Event-ID", [])
+    if len(last_event_ids) > 1:
+        raise ValueError("Duplicate Last-Event-ID header")
+    value = last_event_ids[0] if last_event_ids else _single_query_value(request, "after_position")
+    if value is None:
+        return None
+    if not _DECIMAL_INTEGER.fullmatch(value):
+        raise ValueError("Invalid agent-event resume position")
+    return int(value)
+
+
 def _event_stream_key(request: web.Request) -> bytes:
     stream_ids = request.headers.getall("X-Kai-Stream-ID", [])
     if len(stream_ids) > 1:
@@ -3131,6 +3212,229 @@ async def _handle_channel_creation(
     return _json_response(_serialize_created_channel(created), status=201)
 
 
+async def _read_agent_lifecycle_payload(
+    request: web.Request,
+    expected_fields: frozenset[str],
+) -> tuple[dict[str, object] | None, web.Response | None]:
+    if request.query or request.content_type != "application/json":
+        return None, _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid agent lifecycle request",
+        )
+    if request.content_length is not None and request.content_length > _MAX_AGENT_LIFECYCLE_BODY_BYTES:
+        return None, _error_response(
+            status=400,
+            code="invalid_request",
+            message="Agent lifecycle request is too large",
+        )
+    raw = await request.content.read(_MAX_AGENT_LIFECYCLE_BODY_BYTES + 1)
+    if len(raw) > _MAX_AGENT_LIFECYCLE_BODY_BYTES:
+        return None, _error_response(
+            status=400,
+            code="invalid_request",
+            message="Agent lifecycle request is too large",
+        )
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, ValueError):
+        payload = None
+    if not isinstance(payload, dict) or set(payload) != expected_fields:
+        return None, _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid agent lifecycle request",
+        )
+    return payload, None
+
+
+async def _authenticate_agent_lifecycle(
+    request: web.Request,
+    authenticator: WorkshopClientAuthenticator,
+) -> tuple[PrincipalId | None, web.Response | None]:
+    principal_id = await authenticator.authenticate(request)
+    if isinstance(principal_id, PrincipalId):
+        return principal_id, None
+    response = _error_response(
+        status=401,
+        code="authentication_required",
+        message="Authentication required",
+    )
+    response.headers["WWW-Authenticate"] = "Bearer"
+    return None, response
+
+
+def _agent_lifecycle_error_response(exc: WorkshopAgentLifecycleError) -> web.Response:
+    if isinstance(exc, WorkshopAgentLifecycleAccessDenied):
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    if isinstance(exc, WorkshopAgentLifecycleValidationError):
+        return _error_response(status=400, code="invalid_request", message=str(exc))
+    if isinstance(exc, WorkshopAgentLifecycleConflict):
+        return _error_response(
+            status=409,
+            code="agent_lifecycle_conflict",
+            message=str(exc),
+        )
+    if isinstance(exc, WorkshopAgentLifecycleStorageError):
+        return _error_response(
+            status=503,
+            code="agent_lifecycle_unavailable",
+            message="Agent lifecycle is temporarily unavailable",
+        )
+    return _error_response(
+        status=409,
+        code="agent_lifecycle_conflict",
+        message="Agent lifecycle conflicted with current state",
+    )
+
+
+def _agent_definition_id(request: web.Request) -> AgentDefinitionId:
+    try:
+        return AgentDefinitionId(request.match_info["definition_id"])
+    except (TypeError, ValueError) as exc:
+        raise WorkshopAgentLifecycleValidationError("Invalid agent definition") from exc
+
+
+async def _handle_agent_definition_list(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopAgentLifecycleService,
+) -> web.Response:
+    principal_id, error = await _authenticate_agent_lifecycle(request, authenticator)
+    if error is not None:
+        return error
+    assert principal_id is not None
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid agent list request")
+    try:
+        definitions = await service.list_visible(principal_id)
+    except WorkshopAgentLifecycleError as exc:
+        return _agent_lifecycle_error_response(exc)
+    return _json_response(
+        {"version": 1, "agents": [_serialize_agent_definition(item) for item in definitions]},
+        status=200,
+    )
+
+
+async def _handle_agent_definition_detail(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopAgentLifecycleService,
+) -> web.Response:
+    principal_id, error = await _authenticate_agent_lifecycle(request, authenticator)
+    if error is not None:
+        return error
+    assert principal_id is not None
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid agent request")
+    try:
+        snapshot = await service.get_visible(principal_id, _agent_definition_id(request))
+    except WorkshopAgentLifecycleError as exc:
+        return _agent_lifecycle_error_response(exc)
+    return _json_response({"version": 1, "agent": _serialize_agent_definition(snapshot)}, status=200)
+
+
+async def _handle_agent_definition_create(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopAgentLifecycleService,
+) -> web.Response:
+    principal_id, error = await _authenticate_agent_lifecycle(request, authenticator)
+    if error is not None:
+        return error
+    assert principal_id is not None
+    payload, error = await _read_agent_lifecycle_payload(request, _AGENT_CREATION_FIELDS)
+    if error is not None:
+        return error
+    assert payload is not None
+    try:
+        snapshot = await service.create_draft(principal_id, **payload)
+    except WorkshopAgentLifecycleError as exc:
+        return _agent_lifecycle_error_response(exc)
+    return _json_response({"version": 1, "agent": _serialize_agent_definition(snapshot)}, status=201)
+
+
+async def _handle_agent_revision_create(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopAgentLifecycleService,
+) -> web.Response:
+    principal_id, error = await _authenticate_agent_lifecycle(request, authenticator)
+    if error is not None:
+        return error
+    assert principal_id is not None
+    payload, error = await _read_agent_lifecycle_payload(request, _AGENT_REVISION_FIELDS)
+    if error is not None:
+        return error
+    assert payload is not None
+    try:
+        snapshot = await service.add_revision(principal_id, _agent_definition_id(request), **payload)
+    except WorkshopAgentLifecycleError as exc:
+        return _agent_lifecycle_error_response(exc)
+    return _json_response({"version": 1, "agent": _serialize_agent_definition(snapshot)}, status=201)
+
+
+async def _handle_agent_activation(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopAgentLifecycleService,
+) -> web.Response:
+    principal_id, error = await _authenticate_agent_lifecycle(request, authenticator)
+    if error is not None:
+        return error
+    assert principal_id is not None
+    payload, error = await _read_agent_lifecycle_payload(request, _AGENT_ACTIVATION_FIELDS)
+    if error is not None:
+        return error
+    assert payload is not None
+    try:
+        try:
+            revision_id = AgentDefinitionRevisionId(payload["revision_id"])  # type: ignore[arg-type]
+        except (TypeError, ValueError) as exc:
+            raise WorkshopAgentLifecycleValidationError("Invalid agent revision") from exc
+        snapshot = await service.activate_revision(
+            principal_id,
+            _agent_definition_id(request),
+            revision_id=revision_id,
+            idempotency_key=payload["idempotency_key"],
+            expected_version=payload["expected_version"],
+        )
+    except WorkshopAgentLifecycleError as exc:
+        return _agent_lifecycle_error_response(exc)
+    return _json_response({"version": 1, "agent": _serialize_agent_definition(snapshot)}, status=200)
+
+
+async def _handle_agent_archival(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopAgentLifecycleService,
+) -> web.Response:
+    principal_id, error = await _authenticate_agent_lifecycle(request, authenticator)
+    if error is not None:
+        return error
+    assert principal_id is not None
+    payload, error = await _read_agent_lifecycle_payload(request, _AGENT_ARCHIVAL_FIELDS)
+    if error is not None:
+        return error
+    assert payload is not None
+    try:
+        snapshot = await service.archive(
+            principal_id,
+            _agent_definition_id(request),
+            idempotency_key=payload["idempotency_key"],
+            expected_version=payload["expected_version"],
+        )
+    except WorkshopAgentLifecycleError as exc:
+        return _agent_lifecycle_error_response(exc)
+    return _json_response({"version": 1, "agent": _serialize_agent_definition(snapshot)}, status=200)
+
+
 async def _handle_message_reaction(
     request: web.Request,
     *,
@@ -3380,6 +3684,175 @@ def _serialize_run_trace_event(run_id: str, channel_id: str, seq: int) -> bytes:
         sort_keys=True,
     )
     return (f"event: run.trace.updated\ndata: {payload}\n\n").encode()
+
+
+async def _read_agent_lifecycle_events(
+    store: WorkshopEventStore,
+    *,
+    workshop_id: str,
+    role: str,
+    after_position: int,
+) -> tuple[tuple[bytes, ...], int]:
+    event_types = (
+        WorkshopEventType.AGENT_DEFINITION_CREATED,
+        WorkshopEventType.AGENT_DEFINITION_REVISION_ADDED,
+        WorkshopEventType.AGENT_DEFINITION_REVISION_ACTIVATED,
+        WorkshopEventType.AGENT_DEFINITION_ARCHIVED,
+    )
+    visible_types = event_types if role == "admin" else event_types[2:]
+    placeholders = ",".join("?" for _ in visible_types)
+    async with store.connection.execute(
+        "SELECT position, event_type, aggregate_id, payload_json, metadata_json, occurred_at "
+        "FROM event_log WHERE workshop_id = ? AND position > ? "
+        f"AND event_type IN ({placeholders}) ORDER BY position LIMIT ?",
+        (workshop_id, after_position, *visible_types, _EVENT_BATCH_SIZE),
+    ) as cursor:
+        rows = list(await cursor.fetchall())
+    serialized: list[bytes] = []
+    position = after_position
+    for row in rows:
+        position = int(row[0])
+        event_type = str(row[1])
+        payload = json.loads(str(row[3]))
+        metadata = json.loads(str(row[4]))
+        definition_id = metadata.get("definition_id")
+        if not isinstance(definition_id, str):
+            if event_type == WorkshopEventType.AGENT_DEFINITION_REVISION_ADDED:
+                definition_id = payload.get("definition_id")
+            else:
+                definition_id = str(row[2])
+        revision_id: str | None = None
+        if event_type == WorkshopEventType.AGENT_DEFINITION_REVISION_ADDED:
+            revision_id = str(row[2])
+        elif event_type == WorkshopEventType.AGENT_DEFINITION_REVISION_ACTIVATED:
+            candidate = payload.get("revision_id")
+            revision_id = candidate if isinstance(candidate, str) else None
+        event_payload = json.dumps(
+            {
+                "version": 1,
+                "event_position": position,
+                "event_type": event_type,
+                "definition_id": definition_id,
+                "revision_id": revision_id,
+                "occurred_at": str(row[5]),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        serialized.append((f"id: {position}\nevent: agent.definition.changed\ndata: {event_payload}\n\n").encode())
+    return tuple(serialized), position
+
+
+async def _handle_agent_event_stream(
+    request: web.Request,
+    *,
+    store: WorkshopEventStore,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopAgentLifecycleService,
+    request_lock: asyncio.Lock,
+    poll_interval: float,
+    heartbeat_interval: float,
+    authentication_recheck_interval: float,
+    stream_limiter: WorkshopEventStreamLimiter,
+    shutdown_event: asyncio.Event,
+) -> web.StreamResponse:
+    try:
+        async with request_lock:
+            principal_id = await authenticator.authenticate(request)
+            if not isinstance(principal_id, PrincipalId):
+                response = _error_response(
+                    status=401,
+                    code="authentication_required",
+                    message="Authentication required",
+                )
+                response.headers["WWW-Authenticate"] = "Bearer"
+                return response
+            after_position = _parse_agent_event_stream_request(request)
+            stream_key = _event_stream_key(request)
+            authority = await service.authority_for(principal_id)
+            async with store.connection.execute("SELECT COALESCE(MAX(position), 0) FROM event_log") as cursor:
+                tip = await cursor.fetchone()
+            assert tip is not None
+            current_tip = int(tip[0])
+            if after_position is None:
+                after_position = current_tip
+            elif after_position > current_tip:
+                return _error_response(
+                    status=409,
+                    code="resynchronization_required",
+                    message="Agent definitions resynchronization required",
+                )
+            events, position = await _read_agent_lifecycle_events(
+                store,
+                workshop_id=str(authority.workshop_id),
+                role=authority.role,
+                after_position=after_position,
+            )
+    except WorkshopAgentLifecycleAccessDenied:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except (TypeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid agent event-stream request")
+
+    claim = stream_limiter.acquire(principal_id, stream_key)
+    if claim is None:
+        response = _error_response(
+            status=429,
+            code="stream_capacity_exceeded",
+            message="Too many active event streams",
+        )
+        response.headers["Retry-After"] = "5"
+        return response
+    response = web.StreamResponse(status=200)
+    try:
+        response.content_type = "text/event-stream"
+        response.charset = "utf-8"
+        _apply_client_security_headers(response)
+        response.headers["X-Accel-Buffering"] = "no"
+        await response.prepare(request)
+        await response.write(f": connected\nretry: {_SSE_RETRY_MILLISECONDS}\n\n".encode())
+        last_heartbeat = time.monotonic()
+        last_authentication_check = last_heartbeat
+        while True:
+            if not stream_limiter.is_current(claim):
+                break
+            transport = request.transport
+            if transport is None or transport.is_closing():
+                break
+            if events:
+                for event in events:
+                    await response.write(event)
+                events = ()
+                last_heartbeat = time.monotonic()
+                continue
+            now = time.monotonic()
+            if now - last_heartbeat >= heartbeat_interval:
+                await response.write(b": keep-alive\n\n")
+                last_heartbeat = now
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=poll_interval)
+                break
+            except TimeoutError:
+                pass
+            async with request_lock:
+                reauthenticate = time.monotonic() - last_authentication_check >= authentication_recheck_interval
+                if reauthenticate:
+                    authenticated = await authenticator.authenticate(request)
+                    if authenticated != principal_id:
+                        break
+                    authority = await service.authority_for(principal_id)
+                    last_authentication_check = time.monotonic()
+                events, position = await _read_agent_lifecycle_events(
+                    store,
+                    workshop_id=str(authority.workshop_id),
+                    role=authority.role,
+                    after_position=position,
+                )
+    except (BrokenPipeError, ConnectionResetError, WorkshopAgentLifecycleAccessDenied):
+        pass
+    finally:
+        stream_limiter.release(claim)
+    return response
 
 
 async def _latest_channel_trace(store: WorkshopEventStore, channel_id: ChannelId) -> tuple[str, int] | None:
@@ -4210,6 +4683,7 @@ def register_workshop_read_routes(
         raise ValueError("Event-stream intervals must be positive")
     stream_limiter = event_stream_limiter or WorkshopEventStreamLimiter()
     channel_lifecycle = WorkshopChannelLifecycleService(store)
+    agent_lifecycle = WorkshopAgentLifecycleService(store)
     shutdown_event = asyncio.Event()
 
     async def stop_event_streams(_app: web.Application) -> None:
@@ -4250,6 +4724,68 @@ def register_workshop_read_routes(
                 service=channel_lifecycle,
             )
 
+    async def handle_agent_definition_list(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_agent_definition_list(
+                request,
+                authenticator=authenticator,
+                service=agent_lifecycle,
+            )
+
+    async def handle_agent_definition_create(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_agent_definition_create(
+                request,
+                authenticator=authenticator,
+                service=agent_lifecycle,
+            )
+
+    async def handle_agent_definition_detail(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_agent_definition_detail(
+                request,
+                authenticator=authenticator,
+                service=agent_lifecycle,
+            )
+
+    async def handle_agent_revision_create(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_agent_revision_create(
+                request,
+                authenticator=authenticator,
+                service=agent_lifecycle,
+            )
+
+    async def handle_agent_activation(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_agent_activation(
+                request,
+                authenticator=authenticator,
+                service=agent_lifecycle,
+            )
+
+    async def handle_agent_archival(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_agent_archival(
+                request,
+                authenticator=authenticator,
+                service=agent_lifecycle,
+            )
+
+    async def handle_agent_event_stream(request: web.Request) -> web.StreamResponse:
+        return await _handle_agent_event_stream(
+            request,
+            store=store,
+            authenticator=authenticator,
+            service=agent_lifecycle,
+            request_lock=request_lock,
+            poll_interval=event_poll_interval,
+            heartbeat_interval=event_heartbeat_interval,
+            authentication_recheck_interval=event_authentication_recheck_interval,
+            stream_limiter=stream_limiter,
+            shutdown_event=shutdown_event,
+        )
+
     async def handle_channel_event_stream(request: web.Request) -> web.StreamResponse:
         return await _handle_channel_event_stream(
             request,
@@ -4275,6 +4811,13 @@ def register_workshop_read_routes(
 
     app.router.add_get(_CLIENT_NAVIGATION_PATH, handle_client_navigation)
     app.router.add_post(_CHANNEL_CREATION_PATH, handle_channel_creation)
+    app.router.add_get(_AGENT_DEFINITIONS_PATH, handle_agent_definition_list)
+    app.router.add_post(_AGENT_DEFINITIONS_PATH, handle_agent_definition_create)
+    app.router.add_get(_AGENT_EVENTS_PATH, handle_agent_event_stream)
+    app.router.add_get(_AGENT_DEFINITION_PATH, handle_agent_definition_detail)
+    app.router.add_post(_AGENT_REVISIONS_PATH, handle_agent_revision_create)
+    app.router.add_post(_AGENT_ACTIVATION_PATH, handle_agent_activation)
+    app.router.add_post(_AGENT_ARCHIVAL_PATH, handle_agent_archival)
     app.router.add_get(_TIMELINE_PATH, handle_channel_timeline)
     app.router.add_get(_THREAD_TIMELINE_PATH, handle_thread_timeline)
     app.router.add_get(_TIMELINE_EVENTS_PATH, handle_channel_event_stream)

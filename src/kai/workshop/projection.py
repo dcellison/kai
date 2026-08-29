@@ -607,8 +607,8 @@ class CanonicalConversationProjection:
     """Rebuild the initial Workshop collaboration records from events."""
 
     name = "canonical_conversations"
-    # Runtime-profile assignments can migrate to stable protected profiles.
-    version = 12
+    # Agent definitions project durable draft, active, and archived lifecycle state.
+    version = 13
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -877,13 +877,35 @@ class CanonicalConversationProjection:
             if (
                 revision_row is None
                 or WorkshopId(str(revision_row[0])) != envelope.workshop_id
-                or str(revision_row[1]) != "active"
+                or str(revision_row[1]) == "archived"
                 or AgentDefinitionId(str(revision_row[2])) != envelope.aggregate_id
             ):
                 raise ValueError("Workshop agent revision activation is invalid")
             await connection.execute(
-                "UPDATE agent_definitions SET active_revision_id = ? WHERE id = ?",
+                "UPDATE agent_definitions SET lifecycle_state = 'active', active_revision_id = ? WHERE id = ?",
                 (revision_id, envelope.aggregate_id),
+            )
+        elif envelope.event_type == WorkshopEventType.AGENT_DEFINITION_ARCHIVED:
+            if (
+                not isinstance(envelope.aggregate_id, AgentDefinitionId)
+                or envelope.aggregate_type != "agent_definition"
+            ):
+                raise ValueError("Workshop agent archival requires a typed definition aggregate")
+            _require_exact_payload(payload, set())
+            async with connection.execute(
+                "SELECT workshop_id, lifecycle_state FROM agent_definitions WHERE id = ?",
+                (envelope.aggregate_id,),
+            ) as cursor:
+                definition_row = await cursor.fetchone()
+            if (
+                definition_row is None
+                or WorkshopId(str(definition_row[0])) != envelope.workshop_id
+                or str(definition_row[1]) == "archived"
+            ):
+                raise ValueError("Workshop agent archival is invalid")
+            await connection.execute(
+                "UPDATE agent_definitions SET lifecycle_state = 'archived' WHERE id = ?",
+                (envelope.aggregate_id,),
             )
         elif envelope.event_type == WorkshopEventType.CHANNEL_AGENT_ATTACHED:
             await connection.execute(

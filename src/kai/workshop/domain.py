@@ -32,6 +32,7 @@ class WorkshopEventType(StrEnum):
     AGENT_DEFINITION_CREATED = "agent_definition.created"
     AGENT_DEFINITION_REVISION_ADDED = "agent_definition.revision_added"
     AGENT_DEFINITION_REVISION_ACTIVATED = "agent_definition.revision_activated"
+    AGENT_DEFINITION_ARCHIVED = "agent_definition.archived"
     CHANNEL_AGENT_ATTACHED = "channel.agent_attached"
     CHANNEL_AGENT_DISMISSED = "channel.agent_dismissed"
     RUNTIME_PROFILE_ASSIGNED = "runtime_profile.assigned"
