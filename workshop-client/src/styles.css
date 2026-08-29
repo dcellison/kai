@@ -1708,7 +1708,7 @@ button:disabled {
   padding: 0.45rem 0.8rem;
   background: var(--color-accent);
   color: var(--color-canvas);
-  font-weight: 720;
+  font: 700 0.72rem var(--sans);
   cursor: pointer;
 }
 
