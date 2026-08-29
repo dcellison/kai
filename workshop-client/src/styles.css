@@ -1108,11 +1108,18 @@ button:disabled {
   color: var(--color-accent);
 }
 
+.message-engagement {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.65rem;
+  margin-top: 0.65rem;
+}
+
 .message-reactions {
   display: flex;
   flex-wrap: wrap;
   gap: 0.35rem;
-  margin-top: 0.65rem;
 }
 
 .message-reactions button {
@@ -1156,7 +1163,6 @@ button:disabled {
   width: fit-content;
   min-width: 2rem;
   min-height: 2rem;
-  margin-top: 0.65rem;
   margin-left: auto;
   border: 0;
   border-radius: 0.35rem;
