@@ -15,7 +15,7 @@ from kai.workshop.agent_definitions import (
 )
 from kai.workshop.agent_lifecycle import WorkshopAgentLifecycleService
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
-from kai.workshop.diagnostics import workshop_agent_definition_status
+from kai.workshop.diagnostics import workshop_agent_authority_status
 from kai.workshop.domain import (
     AgentDefinitionId,
     AgentDefinitionRevisionId,
@@ -86,10 +86,35 @@ class TestAgentDefinitionBootstrap:
 
             await store.rebuild_projection(CanonicalConversationProjection())
             assert await active_agent_definition_revision(store, agent_id) == revision
-            assert workshop_agent_definition_status(tmp_path / "kai.db") == (
-                "Workshop agent definitions: active; agents=1, definitions=1, revisions=2, "
-                "active=1, missing=0, invalid active=0; authority=versioned"
+            assert workshop_agent_authority_status(tmp_path / "kai.db") == (
+                "Workshop agent authority: active; definitions=1 (active=1, draft=0, archived=0), "
+                "revisions=2, enablements=0 (enabled=0), direct channels=0, attachments=0 "
+                "(detached=0), runtime sponsorships=0, delegation trees=0, delegations=0 "
+                "(nonterminal=0); integrity gaps=0 (definitions=0, missing revisions=0, "
+                "stale revisions=0, ambiguous revisions=0, principals=0, handles=0, "
+                "enablements=0, runtime bindings=0, namespaces=0, attachments=0, "
+                "delegations=0); authority=canonical"
             )
+        finally:
+            await store.close()
+
+    async def test_diagnostics_fail_closed_for_invalid_handle_and_active_revision(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, agent_id = await _open(tmp_path / "kai.db")
+        try:
+            await store.connection.execute(
+                "UPDATE agent_definitions SET handle = 'Kai', active_revision_id = NULL WHERE agent_id = ?",
+                (agent_id,),
+            )
+            await store.connection.commit()
+
+            status = workshop_agent_authority_status(tmp_path / "kai.db")
+
+            assert status.startswith("Workshop agent authority: INCOMPLETE;")
+            assert "stale revisions=1" in status
+            assert "handles=1" in status
         finally:
             await store.close()
 
