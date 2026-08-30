@@ -40,6 +40,7 @@ class CanonicalConversationRunResolution:
 
     target: CanonicalConversationRunTarget
     runtime_profile_id: RuntimeProfileId
+    sponsor_principal_id: PrincipalId
 
 
 class ConversationPool(Protocol):
@@ -69,6 +70,20 @@ async def resolve_canonical_conversation_target(
     if not isinstance(inbound_message_id, MessageId):
         raise ValueError("inbound_message_id must be a MessageId")
 
+    async with store.connection.execute("PRAGMA table_info(channel_agents)") as cursor:
+        channel_agent_columns = {str(row[1]) for row in await cursor.fetchall()}
+    sponsorship_supported = "detached_at" in channel_agent_columns
+    attachment_clause = " AND ca.detached_at IS NULL" if sponsorship_supported else ""
+    sponsorship_join = (
+        "LEFT JOIN principal_agent_enablements sponsored "
+        "ON sponsored.principal_id = ca.sponsor_principal_id "
+        "AND sponsored.agent_id = ca.agent_id "
+        "AND sponsored.runtime_profile_id = ca.sponsored_runtime_profile_id "
+        "AND sponsored.lifecycle_state = 'enabled' "
+        if sponsorship_supported
+        else ""
+    )
+    sponsorship_clause = " AND (c.kind = 'direct' OR sponsored.id IS NOT NULL)" if sponsorship_supported else ""
     async with store.connection.execute(
         "SELECT c.workshop_id, m.channel_id, m.author_principal_id, ca.agent_id "
         "FROM messages m "
@@ -76,8 +91,12 @@ async def resolve_canonical_conversation_target(
         "JOIN principals p ON p.id = m.author_principal_id AND p.kind = 'human' "
         "JOIN channel_memberships cm ON cm.channel_id = m.channel_id "
         "AND cm.principal_id = m.author_principal_id "
-        "JOIN channel_agents ca ON ca.channel_id = m.channel_id "
-        "WHERE m.id = ? AND (? IS NULL OR ca.agent_id = ?)",
+        "JOIN channel_agents ca ON ca.channel_id = m.channel_id"
+        + attachment_clause
+        + " "
+        + sponsorship_join
+        + "WHERE m.id = ? AND (? IS NULL OR ca.agent_id = ?)"
+        + sponsorship_clause,
         (inbound_message_id, agent_id, agent_id),
     ) as cursor:
         target_rows = list(await cursor.fetchall())
@@ -117,9 +136,30 @@ async def resolve_canonical_conversation_run(
     except WorkshopRuntimeAssignmentError as exc:
         raise ConversationRunUnavailableError(str(exc)) from exc
 
+    async with store.connection.execute("PRAGMA table_info(channel_agents)") as cursor:
+        channel_agent_columns = {str(row[1]) for row in await cursor.fetchall()}
+    if "sponsor_principal_id" not in channel_agent_columns:
+        raise ConversationRunUnavailableError("Channel agent sponsorship is not available in this schema")
+
+    async with store.connection.execute(
+        "SELECT ca.sponsor_principal_id, ca.sponsored_runtime_profile_id, c.kind "
+        "FROM channel_agents ca JOIN channels c ON c.id = ca.channel_id "
+        "WHERE ca.channel_id = ? AND ca.agent_id = ? AND ca.detached_at IS NULL",
+        (target.channel_id, target.agent_id),
+    ) as cursor:
+        sponsor_row = await cursor.fetchone()
+    if sponsor_row is None or sponsor_row[1] is None or str(sponsor_row[1]) != str(runtime_profile_id):
+        raise ConversationRunUnavailableError("Channel agent has incomplete runtime sponsorship")
+    sponsor_principal_id = sponsor_row[0]
+    if sponsor_principal_id is None and str(sponsor_row[2]) == "direct":
+        sponsor_principal_id = target.requested_by_principal_id
+    if sponsor_principal_id is None:
+        raise ConversationRunUnavailableError("Channel agent has incomplete runtime sponsorship")
+
     return CanonicalConversationRunResolution(
         target=target,
         runtime_profile_id=runtime_profile_id,
+        sponsor_principal_id=PrincipalId(str(sponsor_principal_id)),
     )
 
 

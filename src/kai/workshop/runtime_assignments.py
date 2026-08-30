@@ -87,11 +87,16 @@ async def resolve_channel_runtime_profile(
     else:
         agent_clause = " AND ra.agent_id = ?"
         parameters = (channel_id, agent_id)
+    async with store.connection.execute("PRAGMA table_info(channel_agents)") as cursor:
+        channel_agent_columns = {str(row[1]) for row in await cursor.fetchall()}
+    active_clause = " AND ca.detached_at IS NULL" if "detached_at" in channel_agent_columns else ""
     async with store.connection.execute(
         "SELECT ra.agent_id, ra.runtime_profile_id "
         "FROM channel_agent_runtime_assignments ra "
-        "JOIN channel_agents ca ON ca.channel_id = ra.channel_id AND ca.agent_id = ra.agent_id "
-        "WHERE ra.channel_id = ?" + agent_clause,
+        "JOIN channel_agents ca ON ca.channel_id = ra.channel_id AND ca.agent_id = ra.agent_id"
+        + active_clause
+        + " WHERE ra.channel_id = ?"
+        + agent_clause,
         parameters,
     ) as cursor:
         rows = list(await cursor.fetchall())
@@ -192,6 +197,7 @@ class WorkshopRuntimeAssignmentService:
             "JOIN channels c ON c.workshop_id = wm.workshop_id AND c.id = ? AND c.kind = 'direct' "
             "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.principal_id = p.id "
             "AND cm.role = 'owner' JOIN channel_agents ca ON ca.channel_id = c.id "
+            "AND ca.detached_at IS NULL "
             "WHERE p.id = ? AND p.kind = 'human'",
             (channel_id, principal_id),
         ) as cursor:

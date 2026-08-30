@@ -12,10 +12,11 @@ import aiosqlite
 import pytest
 
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+from kai.workshop.channel_lifecycle import WorkshopChannelLifecycleService
 from kai.workshop.conversation_commands import WorkshopConversationCommandService
 from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
 from kai.workshop.delivery_outbox import STREAMING_FINALIZATION_CONTRACT
-from kai.workshop.domain import ChannelId, MessageId, PrincipalId, RunExecutionOwnerId
+from kai.workshop.domain import AgentId, ChannelId, MessageId, PrincipalId, RunExecutionOwnerId
 from kai.workshop.inbound import ClientInboundMessage, InboundMessage, record_inbound_message
 from kai.workshop.outbound import (
     OutboundMessage,
@@ -209,6 +210,73 @@ async def _started_workshop_only_client_run(
     return store, authority, started.claim
 
 
+async def _started_group_run(
+    path: Path,
+) -> tuple[WorkshopEventStore, WorkshopRunExecutionAuthority, RunExecutionClaim]:
+    store = await WorkshopEventStore.open(path)
+    await bootstrap_default_workshop(
+        store,
+        (
+            BootstrapHuman(
+                display_name="Workshop Human",
+                role="admin",
+                transport="desktop",
+                external_subject="desktop-human",
+                external_channel_id="desktop-human",
+                runtime_profile_id=profile_id(101),
+            ),
+        ),
+    )
+    async with store.connection.execute(
+        "SELECT cm.principal_id, c.id, ca.agent_id FROM channel_memberships cm "
+        "JOIN channels c ON c.id = cm.channel_id AND c.kind = 'direct' "
+        "JOIN channel_agents ca ON ca.channel_id = c.id "
+        "WHERE cm.role = 'owner'"
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    principal_id = PrincipalId(str(row[0]))
+    direct_channel_id = ChannelId(str(row[1]))
+    agent_id = AgentId(str(row[2]))
+    group = await WorkshopChannelLifecycleService(store).create_group(
+        principal_id,
+        name="Shared memory boundary",
+        agent_ids=[agent_id],
+        origin_channel_id=direct_channel_id,
+    )
+    accepted = await WorkshopConversationCommandService(
+        store,
+        delivery_policy=DISABLED_DELIVERY_POLICY,
+    ).accept_client(
+        ClientInboundMessage(
+            principal_id=principal_id,
+            channel_id=group.channel_id,
+            client_message_id="group-command-1",
+            body="@Kai answer without personal memory",
+            occurred_at=_NOW,
+        )
+    )
+    authority = WorkshopRunExecutionAuthority(
+        store,
+        selection_resolver=lambda _run: RunExecutionSelection(
+            "codex",
+            "gpt-5.6-sol",
+        ),
+        registered_backend_ids=frozenset({"codex"}),
+    )
+    granted = await authority.grant(
+        accepted.run.run_id,
+        owner_id=RunExecutionOwnerId.new(),
+        occurred_at=_NOW + timedelta(seconds=2),
+        lease_expires_at=_NOW + timedelta(minutes=2),
+    )
+    started = await authority.start(
+        granted.claim,
+        occurred_at=_NOW + timedelta(seconds=3),
+    )
+    return store, authority, started.claim
+
+
 async def _terminal_rows(store: WorkshopEventStore) -> tuple[int, int, int]:
     counts = []
     for table in ("messages", "delivery_outbox", "delivery_fragments"):
@@ -224,6 +292,34 @@ async def _post_run_effect_count(store: WorkshopEventStore) -> int:
 
 
 class TestAtomicTerminalTransactions:
+    async def test_group_success_never_enqueues_sponsor_personal_memory(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, authority, claim = await _started_group_run(tmp_path / "kai.db")
+        run = await WorkshopRunLifecycle(store).state(claim.run_id)
+        runtime_session = RuntimeSessionSettlement(
+            channel_id=run.channel_id,
+            agent_id=run.agent_id,
+            runtime_profile_id=profile_id(101),
+            selection=RunExecutionSelection("codex", "gpt-5.6-sol"),
+            workspace="/private/tmp/kai-shared-workspace",
+            provider_session_id="shared-provider-session",
+            run_id=run.run_id,
+        )
+        try:
+            result = await WorkshopRunTerminalTransactionCoordinator(authority).complete(
+                claim,
+                body="Shared answer",
+                occurred_at=_NOW + timedelta(seconds=4),
+                runtime_session=runtime_session,
+            )
+
+            assert result.outcome == TerminalOutcome.COMPLETED
+            assert await _post_run_effect_count(store) == 0
+        finally:
+            await store.close()
+
     async def test_success_commits_result_delivery_plan_and_fenced_settlement(self, tmp_path: Path):
         store, authority, claim = await _started_run(tmp_path / "kai.db")
         run = await WorkshopRunLifecycle(store).state(claim.run_id)
@@ -382,7 +478,7 @@ class TestAtomicTerminalTransactions:
 
         upgraded = await WorkshopEventStore.open(database)
         try:
-            assert await upgraded.schema_version() == 47
+            assert await upgraded.schema_version() == 48
             assert await _post_run_effect_count(upgraded) == 1
             async with upgraded.connection.execute(
                 "SELECT status, source_message_id, result_message_id FROM workshop_post_run_effects WHERE run_id = ?",
@@ -395,6 +491,28 @@ class TestAtomicTerminalTransactions:
                 str(run.inbound_message_id),
                 str(result.execution.run.result_message_id),
             )
+            async with upgraded.connection.execute(
+                "SELECT runtime_profile_id, sponsor_principal_id FROM runs WHERE id = ?",
+                (run.run_id,),
+            ) as cursor:
+                assert tuple(await cursor.fetchone()) == (
+                    profile_id(101),
+                    run.requested_by_principal_id,
+                )
+            async with upgraded.connection.execute(
+                "SELECT sponsored_runtime_profile_id, sponsor_principal_id, "
+                "attached_event_position, detached_at FROM channel_agents "
+                "WHERE channel_id = ? AND agent_id = ?",
+                (run.channel_id, run.agent_id),
+            ) as cursor:
+                attachment = await cursor.fetchone()
+            assert attachment is not None
+            assert tuple(attachment[:2]) == (
+                profile_id(101),
+                run.requested_by_principal_id,
+            )
+            assert int(attachment[2]) > 0
+            assert attachment[3] is None
             async with upgraded.connection.execute("PRAGMA foreign_key_list(workshop_post_run_effects)") as cursor:
                 assert await cursor.fetchall() == []
         finally:

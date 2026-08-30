@@ -499,18 +499,33 @@ export async function loadNavigation(token: string): Promise<WorkshopNavigation>
           typeof rawAgent.principal_id !== "string" ||
           !PRINCIPAL_PATTERN.test(rawAgent.principal_id) ||
           typeof rawAgent.engaged !== "boolean" ||
+          typeof rawAgent.available !== "boolean" ||
           (rawAgent.engaged_until !== null &&
             typeof rawAgent.engaged_until !== "string") ||
+          !["private", "shared_channel"].includes(String(rawAgent.memory_scope)) ||
+          (rawAgent.runtime_profile_id !== null &&
+            (typeof rawAgent.runtime_profile_id !== "string" ||
+              !RUNTIME_PROFILE_PATTERN.test(rawAgent.runtime_profile_id))) ||
+          (rawAgent.sponsor_principal_id !== null &&
+            (typeof rawAgent.sponsor_principal_id !== "string" ||
+              !PRINCIPAL_PATTERN.test(rawAgent.sponsor_principal_id))) ||
+          (rawAgent.sponsor_display_name !== null &&
+            typeof rawAgent.sponsor_display_name !== "string") ||
           typeof rawAgent.name !== "string"
         ) {
           throw new Error("Kai returned unsupported Workshop navigation.");
         }
         return {
           agentId: rawAgent.agent_id,
+          available: rawAgent.available,
           engaged: rawAgent.engaged,
           engagedUntil: rawAgent.engaged_until,
+          memoryScope: rawAgent.memory_scope as "private" | "shared_channel",
           name: rawAgent.name,
           principalId: rawAgent.principal_id,
+          runtimeProfileId: rawAgent.runtime_profile_id,
+          sponsorDisplayName: rawAgent.sponsor_display_name,
+          sponsorPrincipalId: rawAgent.sponsor_principal_id,
         };
       });
       const participants = rawChannel.participants.map((rawParticipant) => {
@@ -979,6 +994,59 @@ export async function createChannel(
     throw new Error("Kai returned an unsupported channel creation response.");
   }
   return payload.channel.channel_id;
+}
+
+async function mutateChannelAgent(
+  session: WorkshopSession,
+  agentId: string,
+  operation: "attach" | "detach",
+  clientOperationId: string,
+): Promise<void> {
+  if (!AGENT_PATTERN.test(agentId)) {
+    throw new Error("Invalid agent identity.");
+  }
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/agents/${encodeURIComponent(agentId)}/${operation}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ client_operation_id: clientOperationId }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (
+    !response.ok ||
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    payload.operation !== operation ||
+    typeof payload.changed !== "boolean"
+  ) {
+    throw new Error(
+      safeErrorMessage(
+        payload,
+        operation === "attach"
+          ? "Could not attach this agent."
+          : "Could not detach this agent.",
+      ),
+    );
+  }
+}
+
+export async function attachChannelAgent(
+  session: WorkshopSession,
+  agentId: string,
+  clientOperationId: string,
+): Promise<void> {
+  await mutateChannelAgent(session, agentId, "attach", clientOperationId);
+}
+
+export async function detachChannelAgent(
+  session: WorkshopSession,
+  agentId: string,
+  clientOperationId: string,
+): Promise<void> {
+  await mutateChannelAgent(session, agentId, "detach", clientOperationId);
 }
 
 export async function dismissChannelAgent(

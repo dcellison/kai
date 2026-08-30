@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 
 from kai.backend import StreamEvent
 from kai.config import VALID_BACKENDS, validate_model_for_backend
-from kai.workshop.conversation_runs import resolve_canonical_conversation_run
 from kai.workshop.domain import RunId, RuntimeProfileId
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
 from kai.workshop.routing_policy import RunRoutingDecision, WorkshopRoutingPolicyService
@@ -98,27 +97,29 @@ class WorkshopProtectedExecutionPreparationService:
         if run.status != RunStatus.ACCEPTED or run.cancellation_requested_at is not None:
             raise ProtectedExecutionPreparationError("Only an uncancelled accepted run can prepare execution")
 
-        resolution = await resolve_canonical_conversation_run(self._store, run.inbound_message_id)
-        target = resolution.target
-        if (
-            target.workshop_id != run.workshop_id
-            or target.channel_id != run.channel_id
-            or target.requested_by_principal_id != run.requested_by_principal_id
-            or target.agent_id != run.agent_id
-        ):
-            raise ProtectedExecutionPreparationError("Canonical run authority changed after acceptance")
+        if run.runtime_profile_id is None or run.sponsor_principal_id is None:
+            raise ProtectedExecutionPreparationError("Canonical run is missing its runtime sponsorship snapshot")
+        async with self._store.connection.execute(
+            "SELECT kind FROM channels WHERE id = ? AND workshop_id = ?",
+            (run.channel_id, run.workshop_id),
+        ) as cursor:
+            channel_row = await cursor.fetchone()
+        if channel_row is None or str(channel_row[0]) not in {"direct", "group"}:
+            raise ProtectedExecutionPreparationError("Canonical run channel is unavailable")
+        private_context = str(channel_row[0]) == "direct"
 
         decision = await self._routing_policy.decide_for_run(
             run,
-            resolution.runtime_profile_id,
+            run.runtime_profile_id,
         )
         if decision.rejected or decision.selected_backend_option_id is None:
             raise ProtectedExecutionRoutingRejected(run, decision)
         runtime_authority = WorkshopInternalAPIExecutionContext(
-            principal_id=target.requested_by_principal_id,
-            channel_id=target.channel_id,
-            agent_id=target.agent_id,
-            runtime_profile_id=resolution.runtime_profile_id,
+            principal_id=run.sponsor_principal_id,
+            channel_id=run.channel_id,
+            agent_id=run.agent_id,
+            runtime_profile_id=run.runtime_profile_id,
+            private_context=private_context,
         )
         runtime = await self._pool.prepare_routed_execution(
             runtime_authority,
@@ -138,10 +139,10 @@ class WorkshopProtectedExecutionPreparationService:
         if selection != decision.selection:
             await runtime.cancel()
             raise ProtectedExecutionPreparationError("Prepared runtime does not match the durable routing decision")
-        profile = self._pool.runtime_profile(resolution.runtime_profile_id)
+        profile = self._pool.runtime_profile(run.runtime_profile_id)
         return PreparedWorkshopExecution(
             run=run,
-            runtime_profile_id=resolution.runtime_profile_id,
+            runtime_profile_id=run.runtime_profile_id,
             selection=selection,
             workspace=runtime.workspace,
             history_reader_user=profile.os_user,

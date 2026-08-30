@@ -146,7 +146,7 @@ class TestCanonicalExecutionStateMigration:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 47
+            assert await upgraded.schema_version() == 48
             tables = await upgraded.schema_tables()
             assert {
                 "channel_agent_execution_settings",
@@ -183,7 +183,7 @@ class TestCanonicalExecutionStateMigration:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 47
+            assert await upgraded.schema_version() == 48
             async with upgraded.connection.execute(
                 "SELECT field, value FROM channel_agent_execution_settings"
             ) as cursor:

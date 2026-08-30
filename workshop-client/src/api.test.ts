@@ -5,6 +5,7 @@ import {
   MemoryRevisionConflictError,
   PreferenceRevisionConflictError,
   SettingsRevisionConflictError,
+  attachChannelAgent,
   cancelRun,
   activateAgentRevision,
   addAgentRevision,
@@ -15,6 +16,7 @@ import {
   deleteMemories,
   deleteMemory,
   deactivateOperatorModel,
+  detachChannelAgent,
   dismissChannelAgent,
   disableAgentDefinition,
   editMemory,
@@ -1324,9 +1326,16 @@ describe("Workshop client API", () => {
                   {
                     agent_id: "agt_00000000000000000000000000000001",
                     principal_id: "prn_00000000000000000000000000000002",
+                    available: true,
                     engaged: false,
                     engaged_until: null,
+                    memory_scope: "private",
                     name: "Kai",
+                    runtime_profile_id:
+                      "rtp_00000000000000000000000000000001",
+                    sponsor_display_name: "Daniel",
+                    sponsor_principal_id:
+                      "prn_00000000000000000000000000000001",
                   },
                 ],
                 participants: [
@@ -1356,10 +1365,17 @@ describe("Workshop client API", () => {
               agents: [
                 {
                   agentId: "agt_00000000000000000000000000000001",
+                  available: true,
                   engaged: false,
                   engagedUntil: null,
+                  memoryScope: "private",
                   name: "Kai",
                   principalId: "prn_00000000000000000000000000000002",
+                  runtimeProfileId:
+                    "rtp_00000000000000000000000000000001",
+                  sponsorDisplayName: "Daniel",
+                  sponsorPrincipalId:
+                    "prn_00000000000000000000000000000001",
                 },
               ],
               canSubmitCommands: true,
@@ -1441,6 +1457,43 @@ describe("Workshop client API", () => {
     );
     expect(JSON.parse(options.body as string)).toEqual({
       client_dismissal_id: "browser-dismissal-1",
+    });
+  });
+
+  it("attaches and detaches a channel agent under session authority", async () => {
+    const agentId = "agt_00000000000000000000000000000001";
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        Response.json({ version: 1, operation: "attach", changed: true }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({ version: 1, operation: "detach", changed: true }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await attachChannelAgent(session, agentId, "attach-operation-1");
+    await detachChannelAgent(session, agentId, "detach-operation-1");
+
+    const [attachPath, attachOptions] = fetchMock.mock.calls[0] as [
+      string,
+      RequestInit,
+    ];
+    const [detachPath, detachOptions] = fetchMock.mock.calls[1] as [
+      string,
+      RequestInit,
+    ];
+    expect(attachPath).toBe(
+      `/v1/channels/${channelId}/agents/${agentId}/attach`,
+    );
+    expect(detachPath).toBe(
+      `/v1/channels/${channelId}/agents/${agentId}/detach`,
+    );
+    expect(JSON.parse(attachOptions.body as string)).toEqual({
+      client_operation_id: "attach-operation-1",
+    });
+    expect(JSON.parse(detachOptions.body as string)).toEqual({
+      client_operation_id: "detach-operation-1",
     });
   });
 

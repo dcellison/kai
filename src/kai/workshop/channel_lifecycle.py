@@ -1,4 +1,4 @@
-"""Canonical, transport-independent Workshop channel creation."""
+"""Canonical, transport-independent Workshop channel and agent attachment lifecycle."""
 
 from __future__ import annotations
 
@@ -26,15 +26,15 @@ class WorkshopChannelLifecycleError(RuntimeError):
 
 
 class WorkshopChannelLifecycleAccessDenied(WorkshopChannelLifecycleError):
-    """The principal cannot create a channel in the requested Workshop."""
+    """The principal lacks the requested channel-management authority."""
 
 
 class WorkshopChannelLifecycleValidationError(WorkshopChannelLifecycleError):
-    """A channel creation request is malformed or references unavailable state."""
+    """A channel lifecycle request references malformed or unavailable state."""
 
 
 class WorkshopChannelLifecycleStorageError(WorkshopChannelLifecycleError):
-    """Canonical channel creation could not be persisted atomically."""
+    """A canonical channel lifecycle mutation could not be persisted atomically."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,9 +51,21 @@ class CreatedWorkshopChannel:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkshopChannelAgentAttachment:
+    """One explicit, replayable active group-channel sponsorship."""
+
+    channel_id: ChannelId
+    agent_id: AgentId
+    sponsor_principal_id: PrincipalId
+    runtime_profile_id: RuntimeProfileId
+    changed: bool
+
+
+@dataclass(frozen=True, slots=True)
 class _AgentAttachment:
     agent_id: AgentId
-    principal_id: PrincipalId
+    agent_principal_id: PrincipalId
+    sponsor_principal_id: PrincipalId
     runtime_profile_id: RuntimeProfileId
 
 
@@ -87,8 +99,17 @@ def _normalize_origin(value: object) -> ChannelId | None:
         raise WorkshopChannelLifecycleValidationError("origin_channel_id must be a canonical channel ID") from exc
 
 
+def _normalize_operation_id(value: object) -> str:
+    if not isinstance(value, str):
+        raise WorkshopChannelLifecycleValidationError("client_operation_id must be text")
+    normalized = value.strip()
+    if not normalized or len(normalized) > 200:
+        raise WorkshopChannelLifecycleValidationError("client_operation_id must contain 1 through 200 characters")
+    return normalized
+
+
 class WorkshopChannelLifecycleService:
-    """Create private group channels from canonical client authority."""
+    """Create group channels and manage their explicit agent sponsorships."""
 
     def __init__(self, store: WorkshopEventStore) -> None:
         self._store = store
@@ -118,7 +139,7 @@ class WorkshopChannelLifecycleService:
             )
             channel_id = ChannelId.new()
             now = datetime.now(UTC)
-            events = self._creation_events(
+            for event in self._creation_events(
                 workshop_id=workshop_id,
                 channel_id=channel_id,
                 principal_id=principal_id,
@@ -126,8 +147,7 @@ class WorkshopChannelLifecycleService:
                 origin_channel_id=normalized_origin,
                 attachments=attachments,
                 occurred_at=now,
-            )
-            for event in events:
+            ):
                 result = await self._store.append_in_transaction(event)
                 if not result.inserted:
                     raise WorkshopChannelLifecycleError("New channel event identity unexpectedly already exists")
@@ -149,6 +169,217 @@ class WorkshopChannelLifecycleService:
             owner_principal_id=principal_id,
             agent_ids=tuple(attachment.agent_id for attachment in attachments),
         )
+
+    async def attach_agent(
+        self,
+        principal_id: PrincipalId,
+        channel_id: ChannelId,
+        agent_id: AgentId,
+        *,
+        client_operation_id: object,
+    ) -> WorkshopChannelAgentAttachment:
+        """Attach one enabled agent using the acting owner's direct runtime."""
+        operation_id = _normalize_operation_id(client_operation_id)
+        connection = self._store.connection
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            workshop_id = await self._resolve_managed_group(principal_id, channel_id)
+            idempotency_key = self._attachment_key(
+                channel_id,
+                agent_id,
+                "attach",
+                operation_id,
+            )
+            existing_event = await self._store.event_by_idempotency_key(idempotency_key)
+            if existing_event is not None:
+                result = self._attachment_result_from_event(
+                    existing_event.envelope,
+                    principal_id=principal_id,
+                    workshop_id=workshop_id,
+                    channel_id=channel_id,
+                    agent_id=agent_id,
+                    operation="attach",
+                )
+                await connection.rollback()
+                return result
+
+            attachment = (await self._resolve_agent_attachments(principal_id, workshop_id, (agent_id,)))[0]
+            current = await self._attachment_state(channel_id, agent_id)
+            if current is not None and current[2] is None:
+                raise WorkshopChannelLifecycleValidationError("Agent is already attached to this channel")
+
+            now = datetime.now(UTC)
+            events: list[EventEnvelope] = []
+            if current is None and not await self._has_membership(
+                channel_id,
+                attachment.agent_principal_id,
+            ):
+                events.append(
+                    self._agent_membership_event(
+                        workshop_id,
+                        channel_id,
+                        principal_id,
+                        attachment.agent_principal_id,
+                        occurred_at=now,
+                        operation_id=operation_id,
+                    )
+                )
+            events.append(
+                self._attachment_event(
+                    workshop_id,
+                    channel_id,
+                    principal_id,
+                    attachment.agent_id,
+                    attachment.sponsor_principal_id,
+                    attachment.runtime_profile_id,
+                    occurred_at=now,
+                    operation="attach",
+                    operation_id=operation_id,
+                )
+            )
+            if current is None:
+                events.append(
+                    self._runtime_assignment_event(
+                        workshop_id,
+                        channel_id,
+                        principal_id,
+                        attachment,
+                        occurred_at=now,
+                        reassigned=False,
+                        operation_id=operation_id,
+                    )
+                )
+            elif current[1] != attachment.runtime_profile_id:
+                events.append(
+                    self._runtime_assignment_event(
+                        workshop_id,
+                        channel_id,
+                        principal_id,
+                        attachment,
+                        occurred_at=now,
+                        reassigned=True,
+                        operation_id=operation_id,
+                    )
+                )
+            for event in events:
+                await self._store.append_in_transaction(event)
+            await self._store.project_pending_in_transaction(CanonicalConversationProjection())
+            await connection.commit()
+        except WorkshopChannelLifecycleError:
+            await connection.rollback()
+            raise
+        except Exception as exc:
+            await connection.rollback()
+            raise WorkshopChannelLifecycleStorageError("Agent attachment could not be persisted") from exc
+        return self._attachment_result(channel_id, attachment, changed=True)
+
+    async def detach_agent(
+        self,
+        principal_id: PrincipalId,
+        channel_id: ChannelId,
+        agent_id: AgentId,
+        *,
+        client_operation_id: object,
+    ) -> WorkshopChannelAgentAttachment:
+        """Detach one group agent while retaining its sponsorship history."""
+        operation_id = _normalize_operation_id(client_operation_id)
+        connection = self._store.connection
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            workshop_id = await self._resolve_managed_group(principal_id, channel_id)
+            idempotency_key = self._attachment_key(
+                channel_id,
+                agent_id,
+                "detach",
+                operation_id,
+            )
+            existing_event = await self._store.event_by_idempotency_key(idempotency_key)
+            if existing_event is not None:
+                result = self._attachment_result_from_event(
+                    existing_event.envelope,
+                    principal_id=principal_id,
+                    workshop_id=workshop_id,
+                    channel_id=channel_id,
+                    agent_id=agent_id,
+                    operation="detach",
+                )
+                await connection.rollback()
+                return result
+
+            current = await self._attachment_state(channel_id, agent_id)
+            if current is None:
+                raise WorkshopChannelLifecycleValidationError("Agent is not attached to this channel")
+            sponsor_principal_id, runtime_profile_id, detached_at = current
+            if detached_at is not None:
+                raise WorkshopChannelLifecycleValidationError("Agent is not attached to this channel")
+            await self._store.append_in_transaction(
+                self._attachment_event(
+                    workshop_id,
+                    channel_id,
+                    principal_id,
+                    agent_id,
+                    sponsor_principal_id,
+                    runtime_profile_id,
+                    occurred_at=datetime.now(UTC),
+                    operation="detach",
+                    operation_id=operation_id,
+                )
+            )
+            await self._store.project_pending_in_transaction(CanonicalConversationProjection())
+            await connection.commit()
+        except WorkshopChannelLifecycleError:
+            await connection.rollback()
+            raise
+        except Exception as exc:
+            await connection.rollback()
+            raise WorkshopChannelLifecycleStorageError("Agent detachment could not be persisted") from exc
+        return WorkshopChannelAgentAttachment(
+            channel_id,
+            agent_id,
+            sponsor_principal_id,
+            runtime_profile_id,
+            True,
+        )
+
+    @staticmethod
+    def _attachment_result_from_event(
+        envelope: EventEnvelope,
+        *,
+        principal_id: PrincipalId,
+        workshop_id: WorkshopId,
+        channel_id: ChannelId,
+        agent_id: AgentId,
+        operation: str,
+    ) -> WorkshopChannelAgentAttachment:
+        expected_type = (
+            WorkshopEventType.CHANNEL_AGENT_ATTACHED
+            if operation == "attach"
+            else WorkshopEventType.CHANNEL_AGENT_DETACHED
+        )
+        payload = envelope.payload
+        if (
+            envelope.event_type != expected_type
+            or envelope.workshop_id != workshop_id
+            or envelope.actor_principal_id != principal_id
+            or payload.get("channel_id") != channel_id
+            or payload.get("agent_id") != agent_id
+            or payload.get("sponsor_principal_id") != principal_id
+        ):
+            raise WorkshopChannelLifecycleValidationError(
+                "client_operation_id is already bound to a different channel-agent operation"
+            )
+        try:
+            return WorkshopChannelAgentAttachment(
+                channel_id,
+                agent_id,
+                PrincipalId(str(payload["sponsor_principal_id"])),
+                RuntimeProfileId(str(payload["runtime_profile_id"])),
+                False,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise WorkshopChannelLifecycleValidationError(
+                "Stored channel-agent operation has invalid sponsorship metadata"
+            ) from exc
 
     async def _resolve_workshop(
         self,
@@ -179,6 +410,26 @@ class WorkshopChannelLifecycleService:
             raise WorkshopChannelLifecycleAccessDenied("Channel creation requires one accessible Workshop context")
         return WorkshopId(str(rows[0][0]))
 
+    async def _resolve_managed_group(
+        self,
+        principal_id: PrincipalId,
+        channel_id: ChannelId,
+    ) -> WorkshopId:
+        async with self._store.connection.execute(
+            "SELECT c.workshop_id FROM channels c "
+            "JOIN channel_memberships cm ON cm.channel_id = c.id "
+            "AND cm.principal_id = ? AND cm.role = 'owner' "
+            "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
+            "JOIN workshop_memberships wm ON wm.workshop_id = c.workshop_id "
+            "AND wm.principal_id = cm.principal_id "
+            "WHERE c.id = ? AND c.kind = 'group'",
+            (principal_id, channel_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            raise WorkshopChannelLifecycleAccessDenied("Agent attachment changes require group-channel owner authority")
+        return WorkshopId(str(row[0]))
+
     async def _resolve_agent_attachments(
         self,
         principal_id: PrincipalId,
@@ -195,13 +446,16 @@ class WorkshopChannelLifecycleService:
             "AND ad.active_revision_id IS NOT NULL "
             "JOIN workshop_memberships agent_wm ON agent_wm.workshop_id = a.workshop_id "
             "AND agent_wm.principal_id = a.principal_id AND agent_wm.role = 'agent' "
-            "JOIN channel_agents ca ON ca.agent_id = a.id "
+            "JOIN channel_agents ca ON ca.agent_id = a.id AND ca.detached_at IS NULL "
             "JOIN channels c ON c.id = ca.channel_id AND c.workshop_id = a.workshop_id "
             "AND c.kind = 'direct' "
             "JOIN channel_memberships cm ON cm.channel_id = c.id "
             "AND cm.principal_id = ? AND cm.role = 'owner' "
+            "JOIN principal_agent_enablements pae ON pae.direct_channel_id = c.id "
+            "AND pae.principal_id = cm.principal_id AND pae.agent_id = a.id "
+            "AND pae.lifecycle_state = 'enabled' "
             "JOIN channel_agent_runtime_assignments ra ON ra.channel_id = c.id "
-            "AND ra.agent_id = a.id "
+            "AND ra.agent_id = a.id AND ra.runtime_profile_id = pae.runtime_profile_id "
             f"WHERE a.workshop_id = ? AND a.id IN ({placeholders}) "
             "ORDER BY a.id",
             (principal_id, workshop_id, *agent_ids),
@@ -212,14 +466,39 @@ class WorkshopChannelLifecycleService:
             attachment = _AgentAttachment(
                 AgentId(str(row[0])),
                 PrincipalId(str(row[1])),
+                principal_id,
                 RuntimeProfileId(str(row[2])),
             )
             by_agent.setdefault(attachment.agent_id, []).append(attachment)
         if any(len(by_agent.get(agent_id, ())) != 1 for agent_id in agent_ids):
             raise WorkshopChannelLifecycleValidationError(
-                "Every requested agent must be attached to the creator's direct channel"
+                "Every requested agent must be enabled with one runnable sponsored runtime"
             )
         return tuple(by_agent[agent_id][0] for agent_id in agent_ids)
+
+    async def _attachment_state(
+        self,
+        channel_id: ChannelId,
+        agent_id: AgentId,
+    ) -> tuple[PrincipalId, RuntimeProfileId, str | None] | None:
+        async with self._store.connection.execute(
+            "SELECT sponsor_principal_id, sponsored_runtime_profile_id, detached_at "
+            "FROM channel_agents WHERE channel_id = ? AND agent_id = ?",
+            (channel_id, agent_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        if row[0] is None or row[1] is None:
+            raise WorkshopChannelLifecycleValidationError("Existing attachment has incomplete sponsorship metadata")
+        return PrincipalId(str(row[0])), RuntimeProfileId(str(row[1])), (str(row[2]) if row[2] is not None else None)
+
+    async def _has_membership(self, channel_id: ChannelId, principal_id: PrincipalId) -> bool:
+        async with self._store.connection.execute(
+            "SELECT 1 FROM channel_memberships WHERE channel_id = ? AND principal_id = ?",
+            (channel_id, principal_id),
+        ) as cursor:
+            return await cursor.fetchone() is not None
 
     @staticmethod
     def _creation_events(
@@ -253,79 +532,170 @@ class WorkshopChannelLifecycleService:
                 payload=channel_payload,
                 metadata=metadata,
             ),
-            EventEnvelope.create(
-                event_type=WorkshopEventType.CHANNEL_MEMBER_ADDED,
-                event_version=1,
-                workshop_id=workshop_id,
-                aggregate_type="channel_membership",
-                aggregate_id=ChannelMembershipId.derived(channel_id, f"principal:{principal_id}"),
-                actor_principal_id=principal_id,
+            WorkshopChannelLifecycleService._agent_membership_event(
+                workshop_id,
+                channel_id,
+                principal_id,
+                principal_id,
                 occurred_at=occurred_at,
-                idempotency_key=f"workshop-client:channel:{channel_id}:member:{principal_id}",
-                payload={
-                    "channel_id": channel_id,
-                    "principal_id": principal_id,
-                    "role": "owner",
-                },
-                metadata=metadata,
+                operation_id="created-owner",
+                role="owner",
             ),
         ]
         for attachment in attachments:
             events.extend(
                 (
-                    EventEnvelope.create(
-                        event_type=WorkshopEventType.CHANNEL_MEMBER_ADDED,
-                        event_version=1,
-                        workshop_id=workshop_id,
-                        aggregate_type="channel_membership",
-                        aggregate_id=ChannelMembershipId.derived(
-                            channel_id,
-                            f"principal:{attachment.principal_id}",
-                        ),
-                        actor_principal_id=principal_id,
+                    WorkshopChannelLifecycleService._agent_membership_event(
+                        workshop_id,
+                        channel_id,
+                        principal_id,
+                        attachment.agent_principal_id,
                         occurred_at=occurred_at,
-                        idempotency_key=(f"workshop-client:channel:{channel_id}:member:{attachment.principal_id}"),
-                        payload={
-                            "channel_id": channel_id,
-                            "principal_id": attachment.principal_id,
-                            "role": "participant",
-                        },
-                        metadata=metadata,
+                        operation_id=f"created-{attachment.agent_id}",
                     ),
-                    EventEnvelope.create(
-                        event_type=WorkshopEventType.CHANNEL_AGENT_ATTACHED,
-                        event_version=1,
-                        workshop_id=workshop_id,
-                        aggregate_type="channel_agent",
-                        aggregate_id=ChannelAgentId.derived(
-                            channel_id,
-                            f"agent:{attachment.agent_id}",
-                        ),
-                        actor_principal_id=principal_id,
+                    WorkshopChannelLifecycleService._attachment_event(
+                        workshop_id,
+                        channel_id,
+                        principal_id,
+                        attachment.agent_id,
+                        attachment.sponsor_principal_id,
+                        attachment.runtime_profile_id,
                         occurred_at=occurred_at,
-                        idempotency_key=(f"workshop-client:channel:{channel_id}:agent:{attachment.agent_id}"),
-                        payload={"channel_id": channel_id, "agent_id": attachment.agent_id},
-                        metadata=metadata,
+                        operation="attach",
+                        operation_id="created",
                     ),
-                    EventEnvelope.create(
-                        event_type=WorkshopEventType.RUNTIME_PROFILE_ASSIGNED,
-                        event_version=1,
-                        workshop_id=workshop_id,
-                        aggregate_type="runtime_assignment",
-                        aggregate_id=RuntimeAssignmentId.derived(
-                            channel_id,
-                            f"runtime-profile:{attachment.agent_id}",
-                        ),
-                        actor_principal_id=principal_id,
+                    WorkshopChannelLifecycleService._runtime_assignment_event(
+                        workshop_id,
+                        channel_id,
+                        principal_id,
+                        attachment,
                         occurred_at=occurred_at,
-                        idempotency_key=(f"workshop-client:channel:{channel_id}:runtime:{attachment.agent_id}"),
-                        payload={
-                            "channel_id": channel_id,
-                            "agent_id": attachment.agent_id,
-                            "runtime_profile_id": attachment.runtime_profile_id,
-                        },
-                        metadata=metadata,
+                        reassigned=False,
+                        operation_id="created",
                     ),
                 )
             )
         return tuple(events)
+
+    @staticmethod
+    def _attachment_result(
+        channel_id: ChannelId,
+        attachment: _AgentAttachment,
+        *,
+        changed: bool,
+    ) -> WorkshopChannelAgentAttachment:
+        return WorkshopChannelAgentAttachment(
+            channel_id,
+            attachment.agent_id,
+            attachment.sponsor_principal_id,
+            attachment.runtime_profile_id,
+            changed,
+        )
+
+    @staticmethod
+    def _attachment_key(
+        channel_id: ChannelId,
+        agent_id: AgentId,
+        operation: str,
+        operation_id: str,
+    ) -> str:
+        return f"workshop-client:channel:{channel_id}:agent:{agent_id}:{operation}:{operation_id}"
+
+    @classmethod
+    def _attachment_event(
+        cls,
+        workshop_id: WorkshopId,
+        channel_id: ChannelId,
+        actor_principal_id: PrincipalId,
+        agent_id: AgentId,
+        sponsor_principal_id: PrincipalId,
+        runtime_profile_id: RuntimeProfileId,
+        *,
+        occurred_at: datetime,
+        operation: str,
+        operation_id: str,
+    ) -> EventEnvelope:
+        return EventEnvelope.create(
+            event_type=(
+                WorkshopEventType.CHANNEL_AGENT_ATTACHED
+                if operation == "attach"
+                else WorkshopEventType.CHANNEL_AGENT_DETACHED
+            ),
+            event_version=2 if operation == "attach" else 1,
+            workshop_id=workshop_id,
+            aggregate_type="channel_agent",
+            aggregate_id=ChannelAgentId.derived(channel_id, f"agent:{agent_id}"),
+            actor_principal_id=actor_principal_id,
+            occurred_at=occurred_at,
+            idempotency_key=cls._attachment_key(channel_id, agent_id, operation, operation_id),
+            payload={
+                "channel_id": channel_id,
+                "agent_id": agent_id,
+                "sponsor_principal_id": sponsor_principal_id,
+                "runtime_profile_id": runtime_profile_id,
+            },
+            metadata={"source": "workshop_client"},
+        )
+
+    @staticmethod
+    def _agent_membership_event(
+        workshop_id: WorkshopId,
+        channel_id: ChannelId,
+        actor_principal_id: PrincipalId,
+        member_principal_id: PrincipalId,
+        *,
+        occurred_at: datetime,
+        operation_id: str,
+        role: str = "participant",
+    ) -> EventEnvelope:
+        return EventEnvelope.create(
+            event_type=WorkshopEventType.CHANNEL_MEMBER_ADDED,
+            event_version=1,
+            workshop_id=workshop_id,
+            aggregate_type="channel_membership",
+            aggregate_id=ChannelMembershipId.derived(channel_id, f"principal:{member_principal_id}"),
+            actor_principal_id=actor_principal_id,
+            occurred_at=occurred_at,
+            idempotency_key=(f"workshop-client:channel:{channel_id}:member:{member_principal_id}:{operation_id}"),
+            payload={
+                "channel_id": channel_id,
+                "principal_id": member_principal_id,
+                "role": role,
+            },
+            metadata={"source": "workshop_client"},
+        )
+
+    @staticmethod
+    def _runtime_assignment_event(
+        workshop_id: WorkshopId,
+        channel_id: ChannelId,
+        actor_principal_id: PrincipalId,
+        attachment: _AgentAttachment,
+        *,
+        occurred_at: datetime,
+        reassigned: bool,
+        operation_id: str,
+    ) -> EventEnvelope:
+        return EventEnvelope.create(
+            event_type=(
+                WorkshopEventType.RUNTIME_PROFILE_REASSIGNED
+                if reassigned
+                else WorkshopEventType.RUNTIME_PROFILE_ASSIGNED
+            ),
+            event_version=1,
+            workshop_id=workshop_id,
+            aggregate_type="runtime_assignment",
+            aggregate_id=RuntimeAssignmentId.derived(
+                channel_id,
+                f"runtime-profile:{attachment.agent_id}",
+            ),
+            actor_principal_id=actor_principal_id,
+            occurred_at=occurred_at,
+            idempotency_key=(f"workshop-client:channel:{channel_id}:runtime:{attachment.agent_id}:{operation_id}"),
+            payload={
+                "channel_id": channel_id,
+                "agent_id": attachment.agent_id,
+                "runtime_profile_id": attachment.runtime_profile_id,
+            },
+            metadata={"source": "workshop_client"},
+        )

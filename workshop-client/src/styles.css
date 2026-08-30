@@ -1965,6 +1965,17 @@ button:disabled {
   white-space: nowrap;
 }
 
+.context-section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.context-section-heading h3 {
+  margin-right: auto;
+}
+
 .agent-attention-section ul {
   display: grid;
   gap: 0.55rem;
@@ -2048,6 +2059,17 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 0.55rem;
+}
+
+.channel-agent-choice span,
+.channel-agent-choice small {
+  display: block;
+}
+
+.channel-agent-choice small {
+  margin-top: 0.12rem;
+  color: var(--color-text-muted);
+  font-size: 0.65rem;
 }
 
 .channel-creation-dialog .form-actions {

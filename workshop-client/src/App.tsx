@@ -13,10 +13,12 @@ import {
 
 import {
   AuthenticationError,
+  attachChannelAgent,
   cancelRun,
   ChannelAccessError,
   createChannel,
   dismissChannelAgent,
+  detachChannelAgent,
   loadAppearancePreferences,
   loadAgentEnablements,
   loadNavigation,
@@ -49,6 +51,7 @@ import type {
   WorkshopSummary,
   WorkshopArtifactSummary,
   WorkshopAgentSummary,
+  WorkshopAgentEnablement,
   WorkshopAppearancePreferences,
   WorkshopReaction,
 } from "./types";
@@ -1221,6 +1224,119 @@ function ChannelCreationDialog({
   );
 }
 
+function ChannelAgentManagementDialog({
+  attachedAgents,
+  enablements,
+  onCancel,
+  onSave,
+}: {
+  attachedAgents: WorkshopAgentSummary[];
+  enablements: WorkshopAgentEnablement[];
+  onCancel: () => void;
+  onSave: (agentIds: string[]) => Promise<void>;
+}): React.JSX.Element {
+  const initialIds = useMemo(
+    () => attachedAgents.map((agent) => agent.agentId),
+    [attachedAgents],
+  );
+  const [selectedAgentIds, setSelectedAgentIds] = useState(initialIds);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const choices = useMemo(() => {
+    const byAgent = new Map(
+      enablements
+        .filter((enablement) => enablement.lifecycleState === "enabled")
+        .map((enablement) => [enablement.agentId, enablement]),
+    );
+    for (const agent of attachedAgents) {
+      if (!byAgent.has(agent.agentId)) {
+        byAgent.set(agent.agentId, {
+          agentId: agent.agentId,
+          definitionId: "",
+          directChannelId: null,
+          displayName: agent.name,
+          eligibleRuntimes: [],
+          enablementId: null,
+          handle: agent.name,
+          lifecycleState: "disabled",
+          runtimeProfileId: agent.runtimeProfileId,
+          stateVersion: null,
+        });
+      }
+    }
+    return Array.from(byAgent.values()).sort((left, right) =>
+      left.displayName.localeCompare(right.displayName),
+    );
+  }, [attachedAgents, enablements]);
+  const submit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
+    event.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      await onSave(selectedAgentIds);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not update channel agents.");
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="modal-backdrop">
+      <section className="channel-creation-dialog" role="dialog" aria-modal="true" aria-labelledby="manage-channel-agents-title">
+        <p className="overline">Channel management</p>
+        <h2 id="manage-channel-agents-title">Agents</h2>
+        <p>
+          Attached agents use the runtime explicitly sponsored by your enabled
+          direct agent. Shared channels never inject that sponsor’s personal
+          preferences or memory. Detaching stops new mentions and wakes while
+          preserving messages, completed runs, and any run already accepted.
+        </p>
+        <form onSubmit={(event) => void submit(event)}>
+          <fieldset>
+            <legend>Attached agents</legend>
+            {choices.map((agent) => {
+              const attached = attachedAgents.find((item) => item.agentId === agent.agentId);
+              const enabled = agent.lifecycleState === "enabled";
+              return (
+                <label className="channel-agent-choice" key={agent.agentId}>
+                  <input
+                    type="checkbox"
+                    checked={selectedAgentIds.includes(agent.agentId)}
+                    disabled={!enabled && !attached}
+                    onChange={(event) =>
+                      setSelectedAgentIds((current) =>
+                        event.target.checked
+                          ? [...current, agent.agentId]
+                          : current.filter((agentId) => agentId !== agent.agentId),
+                      )
+                    }
+                  />
+                  <span>
+                    {agent.displayName}
+                    <small>
+                      {attached
+                        ? `${attached.available ? "Available" : "Unavailable"} · sponsored by ${attached.sponsorDisplayName ?? "unknown"}`
+                        : "Available to attach"}
+                    </small>
+                  </span>
+                </label>
+              );
+            })}
+          </fieldset>
+          {error && <p className="form-error" role="alert">{error}</p>}
+          <div className="form-actions">
+            <button className="primary-button" type="submit" disabled={busy}>
+              {busy ? "Saving…" : "Save"}
+            </button>
+            <button className="quiet-button" type="button" onClick={onCancel} disabled={busy}>
+              Cancel
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
 function PaperclipIcon(): React.JSX.Element {
   return (
     <svg
@@ -1300,6 +1416,21 @@ function AddReactionIcon(): React.JSX.Element {
         strokeLinecap="round"
         strokeLinejoin="round"
         strokeWidth="2"
+      />
+    </svg>
+  );
+}
+
+function ManageAgentsIcon(): React.JSX.Element {
+  return (
+    <svg aria-hidden="true" fill="none" focusable="false" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="3" stroke="currentColor" strokeWidth="1.8" />
+      <path
+        d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.1V21H9.6v-.09A1.7 1.7 0 0 0 8.5 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.1-.4H3V9.6h.09A1.7 1.7 0 0 0 4.6 8.5a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.1V3h4v.09A1.7 1.7 0 0 0 15.5 4.6a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.4 9c.14.38.36.72.66 1 .3.28.68.42 1.1.4H21v4h-.09A1.7 1.7 0 0 0 19.4 15Z"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.5"
       />
     </svg>
   );
@@ -1538,9 +1669,11 @@ function WorkshopView({
   workshop,
   onForget,
   onAgentNavigationChanged,
+  onAttachAgent,
   onCancelRun,
   onCreateChannel,
   onDismissAgent,
+  onDetachAgent,
   onDownloadArtifact,
   onLoadEarlier,
   onLoadArtifact,
@@ -1587,9 +1720,11 @@ function WorkshopView({
   workshop: WorkshopSummary;
   onForget: () => void;
   onAgentNavigationChanged: () => Promise<void>;
+  onAttachAgent: (agentId: string, clientOperationId: string) => Promise<void>;
   onCancelRun: (runId: string) => Promise<WorkshopRun>;
   onCreateChannel: (input: ChannelCreationRequest) => Promise<void>;
   onDismissAgent: (agentId: string, clientDismissalId: string) => Promise<void>;
+  onDetachAgent: (agentId: string, clientOperationId: string) => Promise<void>;
   onDownloadArtifact: (artifactId: string) => void;
   onLoadEarlier: () => void;
   onLoadArtifact: (artifactId: string) => Promise<Blob>;
@@ -1669,6 +1804,8 @@ function WorkshopView({
     originChannelId: string | null;
     originName: string | null;
   } | null>(null);
+  const [agentManagement, setAgentManagement] = useState<WorkshopAgentEnablement[] | null>(null);
+  const [agentManagementLoading, setAgentManagementLoading] = useState(false);
   const [dismissedAgents, setDismissedAgents] = useState<Record<string, number>>({});
   const [dismissingAgentId, setDismissingAgentId] = useState<string | null>(null);
   const [engagementClock, setEngagementClock] = useState(() => Date.now());
@@ -1882,6 +2019,40 @@ function WorkshopView({
     } finally {
       setDismissingAgentId(null);
     }
+  };
+
+  const openAgentManagement = async (): Promise<void> => {
+    if (agentManagementLoading) {
+      return;
+    }
+    setAgentManagementLoading(true);
+    setSubmissionError(null);
+    try {
+      setAgentManagement(await loadAgentEnablements(agentToken));
+    } catch (caught) {
+      setSubmissionError(
+        caught instanceof Error ? caught.message : "Could not load available agents.",
+      );
+    } finally {
+      setAgentManagementLoading(false);
+    }
+  };
+
+  const saveAgentManagement = async (agentIds: string[]): Promise<void> => {
+    const current = new Set(channel.agents.map((agent) => agent.agentId));
+    const requested = new Set(agentIds);
+    for (const agentId of current) {
+      if (!requested.has(agentId)) {
+        await onDetachAgent(agentId, createClientMessageId());
+      }
+    }
+    for (const agentId of requested) {
+      if (!current.has(agentId)) {
+        await onAttachAgent(agentId, createClientMessageId());
+      }
+    }
+    await onAgentNavigationChanged();
+    setAgentManagement(null);
   };
 
   const forgetCurrentSession = async (): Promise<void> => {
@@ -3041,10 +3212,25 @@ function WorkshopView({
             </p>
           </section>
 
-          {channel.kind === "group" && channel.agents.length > 0 && (
+          {channel.kind === "group" && (
             <section className="context-section agent-attention-section">
               <span className="section-number">04</span>
-              <h3>Agent attention</h3>
+              <div className="context-section-heading">
+                <h3>Agent attention</h3>
+                {channel.role === "owner" && (
+                  <button
+                    className="panel-icon-button"
+                    type="button"
+                    aria-label="Manage channel agents"
+                    title="Manage channel agents"
+                    disabled={agentManagementLoading}
+                    onClick={() => void openAgentManagement()}
+                  >
+                    <ManageAgentsIcon />
+                  </button>
+                )}
+              </div>
+              {channel.agents.length === 0 && <p>No agents are attached.</p>}
               <ul>
                 {channel.agents.map((agent) => {
                   const engaged = engagedAgents.some(
@@ -3054,7 +3240,19 @@ function WorkshopView({
                     <li key={agent.agentId}>
                       <span>
                         <strong>{agent.name}</strong>
-                        <small>{engaged ? "Awake in this channel" : "Not engaged"}</small>
+                        <small>
+                          {agent.available
+                            ? engaged
+                              ? "Awake in this channel"
+                              : "Available · not engaged"
+                            : "Unavailable until its sponsor re-enables this runtime"}
+                        </small>
+                        <small>
+                          Sponsored by {agent.sponsorDisplayName ?? "unknown"} · shared-channel memory
+                        </small>
+                        {agent.runtimeProfileId && (
+                          <code title={agent.runtimeProfileId}>{agent.runtimeProfileId}</code>
+                        )}
                       </span>
                       {engaged && (
                         <button
@@ -3077,7 +3275,7 @@ function WorkshopView({
 
           <section className="context-section trace-section">
             <span className="section-number">
-              {channel.kind === "group" && channel.agents.length > 0 ? "05" : "04"}
+              {channel.kind === "group" ? "05" : "04"}
             </span>
             <h3>Runtime and workspace</h3>
             {settingsWorkspace ? (
@@ -3122,7 +3320,7 @@ function WorkshopView({
 
           <section className="context-section trace-section">
             <span className="section-number">
-              {channel.kind === "group" && channel.agents.length > 0 ? "06" : "05"}
+              {channel.kind === "group" ? "06" : "05"}
             </span>
             <h3>Run inspector</h3>
             <RunTraceCard
@@ -3147,6 +3345,14 @@ function WorkshopView({
             await onCreateChannel(input);
             setChannelCreation(null);
           }}
+        />
+      )}
+      {agentManagement && (
+        <ChannelAgentManagementDialog
+          attachedAgents={channel.agents}
+          enablements={agentManagement}
+          onCancel={() => setAgentManagement(null)}
+          onSave={saveAgentManagement}
         />
       )}
         </>
@@ -3369,6 +3575,20 @@ function ActiveWorkshopClient({
       ),
     [session, withAccessHandling],
   );
+  const attachSelectedAgent = useCallback(
+    (agentId: string, clientOperationId: string) =>
+      withAccessHandling(() =>
+        attachChannelAgent(session, agentId, clientOperationId),
+      ),
+    [session, withAccessHandling],
+  );
+  const detachSelectedAgent = useCallback(
+    (agentId: string, clientOperationId: string) =>
+      withAccessHandling(() =>
+        detachChannelAgent(session, agentId, clientOperationId),
+      ),
+    [session, withAccessHandling],
+  );
   const setSelectedMessageReaction = useCallback(
     (messageId: string, reaction: WorkshopReaction, active: boolean) =>
       withAccessHandling(async () => {
@@ -3411,10 +3631,12 @@ function ActiveWorkshopClient({
       workshop={selected.workshop}
       onForget={onForget}
       onAgentNavigationChanged={onAgentNavigationChanged}
+      onAttachAgent={attachSelectedAgent}
       onCreateAgent={onCreateAgent}
       onCancelRun={cancelSelectedRun}
       onCreateChannel={onCreateChannel}
       onDismissAgent={dismissSelectedAgent}
+      onDetachAgent={detachSelectedAgent}
       onLoadRun={loadSelectedRun}
       onLoadRunTrace={loadSelectedRunTrace}
       onLoadSettingsWorkspace={loadSelectedSettingsWorkspace}

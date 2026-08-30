@@ -12,6 +12,7 @@ import logging
 import os
 import stat
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -42,6 +43,41 @@ class TestBuildSessionContext:
     def _api(self, secret: str = "test-secret", port: int = 8080) -> ApiContext:
         """Create an ApiContext with sensible defaults."""
         return ApiContext(webhook_port=port, webhook_secret=secret)
+
+    def test_shared_channel_excludes_sponsor_preferences_and_memory(self, tmp_path):
+        workspace = tmp_path / "home"
+        workspace.mkdir()
+        data_dir = tmp_path / "data"
+        principal_id = "prn_00000000000000000000000000000001"
+        preference_dir = data_dir / "preferences" / principal_id
+        memory_dir = data_dir / "memory" / principal_id
+        preference_dir.mkdir(parents=True)
+        memory_dir.mkdir(parents=True)
+        (preference_dir / "PREFERENCES.md").write_text("PRIVATE PREFERENCE")
+        (memory_dir / "MEMORY.md").write_text("PRIVATE MEMORY")
+        runtime_identity = SimpleNamespace(
+            principal_id=principal_id,
+            channel_id="chn_00000000000000000000000000000001",
+            agent_id="agt_00000000000000000000000000000001",
+            runtime_profile_id="rtp_00000000000000000000000000000001",
+            private_context=False,
+        )
+
+        with patch("kai.backend.get_recent_history", return_value=""):
+            result = build_session_context(
+                workspace=workspace,
+                home_workspace=workspace,
+                api=self._api(),
+                workspace_config=None,
+                chat_id=42,
+                runtime_identity=runtime_identity,
+                data_dir=data_dir,
+                memory_enabled=True,
+            )
+
+        assert "[Memory subsystem: unavailable in shared channels]" in result
+        assert "PRIVATE PREFERENCE" not in result
+        assert "PRIVATE MEMORY" not in result
 
     def test_home_workspace_no_identity(self, tmp_path):
         """No identity injection when workspace == home_workspace."""
@@ -2089,6 +2125,33 @@ class TestAssembleTurnContext:
         marker_end = result.index(USER_MESSAGE_MARKER) + len(USER_MESSAGE_MARKER)
         user_start = result.index("ACTUAL_USER_TEXT")
         assert result[marker_end:user_start].strip() == "", repr(result[marker_end:user_start])
+
+    async def test_shared_channel_never_calls_personal_semantic_recall(
+        self,
+        monkeypatch,
+    ):
+        from kai.backend import assemble_turn_context
+
+        fake = _patch_scoped_recall(
+            monkeypatch,
+            rendered_context="PRIVATE SEMANTIC MEMORY",
+        )
+        runtime_identity = SimpleNamespace(
+            principal_id="prn_00000000000000000000000000000001",
+            channel_id="chn_00000000000000000000000000000001",
+            agent_id="agt_00000000000000000000000000000001",
+            runtime_profile_id="rtp_00000000000000000000000000000001",
+            private_context=False,
+        )
+
+        result = await assemble_turn_context(
+            "ACTUAL_USER_TEXT",
+            chat_id=42,
+            runtime_identity=runtime_identity,
+        )
+
+        assert "PRIVATE SEMANTIC MEMORY" not in str(result)
+        fake.assert_not_awaited()
 
     async def test_format_context_receives_raw_query(self, monkeypatch):
         """The search query handed to scoped recall is the original user

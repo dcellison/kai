@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -11,8 +12,10 @@ import pytest
 from kai.config import Config, UserConfig
 from kai.pool import SubprocessPool
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+from kai.workshop.channel_lifecycle import WorkshopChannelLifecycleService
 from kai.workshop.conversation_commands import WorkshopConversationCommandService
-from kai.workshop.inbound import InboundMessage
+from kai.workshop.domain import AgentId, ChannelId, PrincipalId
+from kai.workshop.inbound import ClientInboundMessage, InboundMessage
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIContextRegistry
 from kai.workshop.protected_execution import (
     ProtectedExecutionPreparationError,
@@ -45,6 +48,37 @@ class _RoutingPolicy:
             evidence_version=1,
             decided_at=_NOW,
         )
+
+
+class _PreparedRuntime:
+    def __init__(self, workspace: Path) -> None:
+        self.selection = SimpleNamespace(
+            backend="codex",
+            model="gpt-5.6-sol",
+            provider="openai",
+        )
+        self.workspace = workspace
+
+    async def cancel(self) -> None:
+        return None
+
+
+class _RuntimePool:
+    def __init__(self, workspace: Path) -> None:
+        self.workspace = workspace
+        self.context = None
+
+    async def prepare_routed_execution(
+        self,
+        context,
+        _backend_option_id,
+        _model,
+    ):
+        self.context = context
+        return _PreparedRuntime(self.workspace)
+
+    def runtime_profile(self, _runtime_profile_id):
+        return SimpleNamespace(os_user="daniel")
 
 
 async def _accepted_run(path: Path, home: Path):
@@ -109,6 +143,77 @@ async def _accepted_run(path: Path, home: Path):
 
 
 class TestProtectedExecutionPreparation:
+    async def test_accepted_group_run_keeps_sponsored_shared_runtime_after_detach(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = await WorkshopEventStore.open(tmp_path / "kai.db")
+        await bootstrap_default_workshop(
+            store,
+            (
+                BootstrapHuman(
+                    display_name="Workshop Human",
+                    role="admin",
+                    transport="telegram",
+                    external_subject="101",
+                    external_channel_id="101",
+                    runtime_profile_id=profile_id(101),
+                ),
+            ),
+        )
+        async with store.connection.execute(
+            "SELECT e.principal_id, cb.channel_id, ca.agent_id "
+            "FROM external_identities e JOIN channel_bindings cb "
+            "ON cb.transport = e.provider "
+            "AND cb.external_channel_id = e.external_subject "
+            "JOIN channel_agents ca ON ca.channel_id = cb.channel_id "
+            "WHERE e.provider = 'telegram' AND e.external_subject = '101'"
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        principal_id = PrincipalId(str(row[0]))
+        direct_channel_id = ChannelId(str(row[1]))
+        agent_id = AgentId(str(row[2]))
+        group = await WorkshopChannelLifecycleService(store).create_group(
+            principal_id,
+            name="Shared execution",
+            agent_ids=[agent_id],
+            origin_channel_id=direct_channel_id,
+        )
+        accepted = await WorkshopConversationCommandService(store).accept_client(
+            ClientInboundMessage(
+                principal_id=principal_id,
+                channel_id=group.channel_id,
+                client_message_id="shared-run",
+                body="@Kai keep running",
+                occurred_at=_NOW,
+            )
+        )
+        run = accepted.command.runs[0]
+        await WorkshopChannelLifecycleService(store).detach_agent(
+            principal_id,
+            group.channel_id,
+            agent_id,
+            client_operation_id="detach-after-acceptance",
+        )
+        runtime_pool = _RuntimePool(tmp_path / "shared-home")
+        try:
+            prepared = await WorkshopProtectedExecutionPreparationService(
+                store,
+                runtime_pool,  # type: ignore[arg-type]
+                _RoutingPolicy(),  # type: ignore[arg-type]
+                registered_backend_ids=frozenset({"codex"}),
+            ).prepare(run.run_id)
+
+            assert prepared.run.run_id == run.run_id
+            assert runtime_pool.context is not None
+            assert runtime_pool.context.principal_id == principal_id
+            assert runtime_pool.context.channel_id == group.channel_id
+            assert runtime_pool.context.agent_id == agent_id
+            assert runtime_pool.context.private_context is False
+        finally:
+            await store.close()
+
     async def test_resolves_effective_registered_selection_and_hides_transport_key(self, tmp_path: Path):
         home = tmp_path / "home"
         home.mkdir()

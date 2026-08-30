@@ -16,6 +16,7 @@ from kai.workshop.conversation_commands import (
 from kai.workshop.domain import (
     AgentDefinitionId,
     AgentDefinitionRevisionId,
+    AgentEnablementId,
     AgentId,
     ChannelAgentId,
     ChannelId,
@@ -184,6 +185,104 @@ async def _open_group_store(
     ):
         await store.append(event)
         await store.project_pending(CanonicalConversationProjection())
+    async with store.connection.execute("SELECT MAX(position) FROM event_log") as cursor:
+        latest_event = await cursor.fetchone()
+    assert latest_event is not None
+    definition_event_position = int(latest_event[0])
+    nova_direct_channel = ChannelId.derived(second_agent_id, f"principal:{human_id}")
+    nova_direct_attachment = ChannelAgentId.derived(
+        nova_direct_channel,
+        f"agent:{second_agent_id}",
+    )
+    nova_direct_assignment = RuntimeAssignmentId.derived(
+        nova_direct_channel,
+        f"runtime:{second_agent_id}",
+    )
+    nova_enablement = AgentEnablementId.derived(
+        nova_definition_id,
+        f"principal:{human_id}",
+    )
+    nova_profile = profile_id(202)
+    await store.connection.execute(
+        "INSERT INTO channels (id, workshop_id, kind, name, created_at) VALUES (?, ?, 'direct', 'Nova', ?)",
+        (nova_direct_channel, workshop_id, created_at),
+    )
+    for principal_id, role in (
+        (human_id, "owner"),
+        (second_agent_principal, "participant"),
+    ):
+        await store.connection.execute(
+            "INSERT INTO channel_memberships (id, channel_id, principal_id, role, created_at) VALUES (?, ?, ?, ?, ?)",
+            (
+                ChannelMembershipId.derived(
+                    nova_direct_channel,
+                    f"principal:{principal_id}",
+                ),
+                nova_direct_channel,
+                principal_id,
+                role,
+                created_at,
+            ),
+        )
+    await store.connection.execute(
+        "INSERT INTO channel_agents "
+        "(id, channel_id, agent_id, created_at, sponsor_principal_id, "
+        "sponsored_runtime_profile_id, attached_event_position) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            nova_direct_attachment,
+            nova_direct_channel,
+            second_agent_id,
+            created_at,
+            human_id,
+            nova_profile,
+            definition_event_position,
+        ),
+    )
+    await store.connection.execute(
+        "INSERT INTO channel_agent_runtime_assignments "
+        "(id, channel_id, agent_id, runtime_profile_id, created_at, created_event_position) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            nova_direct_assignment,
+            nova_direct_channel,
+            second_agent_id,
+            nova_profile,
+            created_at,
+            definition_event_position,
+        ),
+    )
+    await store.connection.execute(
+        "INSERT INTO principal_agent_enablements "
+        "(id, workshop_id, principal_id, agent_definition_id, agent_id, "
+        "direct_channel_id, runtime_profile_id, lifecycle_state, created_at, "
+        "updated_at, created_event_position, last_event_position) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 'enabled', ?, ?, ?, ?)",
+        (
+            nova_enablement,
+            workshop_id,
+            human_id,
+            nova_definition_id,
+            second_agent_id,
+            nova_direct_channel,
+            nova_profile,
+            created_at,
+            created_at,
+            definition_event_position,
+            definition_event_position,
+        ),
+    )
+    await store.connection.execute(
+        "UPDATE channel_agents SET sponsor_principal_id = ?, "
+        "sponsored_runtime_profile_id = ? WHERE channel_id = ? AND agent_id = ?",
+        (human_id, first_profile, group_id, first_agent_id),
+    )
+    await store.connection.execute(
+        "UPDATE channel_agents SET sponsor_principal_id = ?, "
+        "sponsored_runtime_profile_id = ? WHERE channel_id = ? AND agent_id = ?",
+        (human_id, nova_profile, group_id, second_agent_id),
+    )
+    await store.connection.commit()
     return store, human_id, group_id, (first_agent_id, second_agent_id)
 
 

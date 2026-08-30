@@ -15,13 +15,8 @@ from kai.workshop.channel_lifecycle import WorkshopChannelLifecycleService
 from kai.workshop.domain import (
     AgentId,
     ChannelId,
-    EventEnvelope,
     MessageId,
     PrincipalId,
-    RuntimeAssignmentId,
-    RuntimeProfileId,
-    WorkshopEventType,
-    WorkshopId,
 )
 from kai.workshop.inbound import (
     ClientInboundMessage,
@@ -38,6 +33,7 @@ from kai.workshop.timeline import (
     read_channel_timeline,
     read_thread_timeline,
 )
+from tests.workshop_profiles import profile_id
 
 _NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
 
@@ -73,8 +69,22 @@ async def _open_store(path: Path) -> tuple[WorkshopEventStore, PrincipalId, Chan
     await bootstrap_default_workshop(
         store,
         (
-            BootstrapHuman("User One", "admin", "telegram", "101", "101"),
-            BootstrapHuman("User Two", "member", "telegram", "202", "202"),
+            BootstrapHuman(
+                "User One",
+                "admin",
+                "telegram",
+                "101",
+                "101",
+                profile_id(101),
+            ),
+            BootstrapHuman(
+                "User Two",
+                "member",
+                "telegram",
+                "202",
+                "202",
+                profile_id(202),
+            ),
         ),
     )
     first_principal, first_channel = await _identity_for(store, "101")
@@ -108,32 +118,12 @@ async def _create_group_channel(
     direct_channel_id: ChannelId,
 ) -> ChannelId:
     async with store.connection.execute(
-        "SELECT ca.agent_id, c.workshop_id FROM channel_agents ca "
-        "JOIN channels c ON c.id = ca.channel_id WHERE ca.channel_id = ?",
+        "SELECT ca.agent_id FROM channel_agents ca WHERE ca.channel_id = ?",
         (direct_channel_id,),
     ) as cursor:
         row = await cursor.fetchone()
     assert row is not None
     agent_id = AgentId(str(row[0]))
-    workshop_id = WorkshopId(str(row[1]))
-    await store.append(
-        EventEnvelope.create(
-            event_type=WorkshopEventType.RUNTIME_PROFILE_ASSIGNED,
-            event_version=1,
-            workshop_id=workshop_id,
-            aggregate_type="runtime_assignment",
-            aggregate_id=RuntimeAssignmentId.derived(direct_channel_id, f"runtime-profile:{agent_id}"),
-            occurred_at=_NOW,
-            idempotency_key=f"thread-test:runtime:{direct_channel_id}",
-            payload={
-                "channel_id": direct_channel_id,
-                "agent_id": agent_id,
-                "runtime_profile_id": RuntimeProfileId.new(),
-            },
-            metadata={"source": "test"},
-        )
-    )
-    await store.project_pending(CanonicalConversationProjection())
     created = await WorkshopChannelLifecycleService(store).create_group(
         principal_id,
         name="Thread tests",

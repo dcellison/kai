@@ -57,6 +57,7 @@ class InternalAPIPrincipal:
     agent_id: AgentId
     runtime_profile_id: RuntimeProfileId
     scopes: frozenset[InternalAPIScope]
+    private_context: bool = True
     allowed_services: frozenset[str] = frozenset()
 
     def allows(self, scope: InternalAPIScope) -> bool:
@@ -154,6 +155,9 @@ class InternalAPIAuth:
         """Build the persistent-agent principal for one canonical context."""
         allowed_services = self._allowed_services_by_profile.get(context.runtime_profile_id, frozenset())
         scopes = set(_PERSISTENT_AGENT_BASE_SCOPES)
+        if not context.private_context:
+            scopes.discard(InternalAPIScope.MEMORY_READ)
+            scopes.discard(InternalAPIScope.MEMORY_ADD)
         if allowed_services:
             scopes.add(InternalAPIScope.SERVICES_CALL)
         return self._principal(
@@ -174,6 +178,7 @@ class InternalAPIAuth:
             agent_id=context.agent_id,
             runtime_profile_id=context.runtime_profile_id,
             scopes=scopes,
+            private_context=context.private_context,
             allowed_services=allowed_services,
         )
 

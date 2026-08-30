@@ -63,6 +63,26 @@ def test_persistent_agent_profile_is_explicit_and_excludes_delete_all() -> None:
     assert not principal.allows(InternalAPIScope.MEMORY_DELETE_ALL)
 
 
+def test_shared_channel_agent_credential_cannot_access_personal_memory() -> None:
+    direct = _context(123)
+    shared = WorkshopInternalAPIExecutionContext(
+        principal_id=direct.principal_id,
+        channel_id=ChannelId("chn_00000000000000000000000000000456"),
+        agent_id=direct.agent_id,
+        runtime_profile_id=direct.runtime_profile_id,
+        private_context=False,
+    )
+    auth = InternalAPIAuth.for_execution_contexts({direct, shared})
+
+    principal = auth.authenticate(auth.agent_credential_for(shared))
+
+    assert principal is not None
+    assert principal.private_context is False
+    assert not principal.allows(InternalAPIScope.MEMORY_READ)
+    assert not principal.allows(InternalAPIScope.MEMORY_ADD)
+    assert principal.allows(InternalAPIScope.MESSAGES_SEND)
+
+
 def test_persistent_agent_service_scope_requires_explicit_names() -> None:
     """Service scope and resources are issued only from the per-user allowlist."""
     context_123 = _context(123)
