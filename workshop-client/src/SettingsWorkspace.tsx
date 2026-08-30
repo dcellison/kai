@@ -1127,8 +1127,9 @@ function SettingsWorkspaceContent({
           {runtimeLoading ? (
             <p role="status">Loading runtime policy…</p>
           ) : runtime ? (
-            <div className="settings-card-grid">
-              {runtimeBackendCapability && (
+            <div className="settings-card-stack">
+              <div className="settings-card-pair">
+                {runtimeBackendCapability && (
                 <form
                   className="settings-card"
                   onSubmit={(event: FormEvent) => {
@@ -1168,15 +1169,16 @@ function SettingsWorkspaceContent({
                     </button>
                   </div>
                 </form>
-              )}
+                )}
 
-              <article className="settings-card policy-card">
-                <p className="settings-card-label">Policy-controlled</p>
-                <dl>
-                  <div><dt>Authorized choices</dt><dd>{runtime.backendOptions.length}</dd></div>
-                </dl>
-                <p>Credentials, identity mappings, executable paths, assignments, and workspace grants remain operator managed.</p>
-              </article>
+                <article className="settings-card policy-card">
+                  <p className="settings-card-label">Policy-controlled</p>
+                  <dl>
+                    <div><dt>Authorized choices</dt><dd>{runtime.backendOptions.length}</dd></div>
+                  </dl>
+                  <p>Credentials, identity mappings, executable paths, assignments, and workspace grants remain operator managed.</p>
+                </article>
+              </div>
 
               <details className="settings-card model-catalogue-card">
                 <summary aria-label="Model catalogue details">
@@ -1295,7 +1297,8 @@ function SettingsWorkspaceContent({
                 </div>
               </details>
 
-              {runtimeModelCapability && (
+              <div className="settings-card-pair">
+                {runtimeModelCapability && (
                 <form
                   className="settings-card"
                   onSubmit={(event: FormEvent) => {
@@ -1317,9 +1320,9 @@ function SettingsWorkspaceContent({
                     )}
                   </div>
                 </form>
-              )}
+                )}
 
-              {runtimeTimeoutCapability && (
+                {runtimeTimeoutCapability && (
                 <form
                   className="settings-card"
                   onSubmit={(event: FormEvent) => {
@@ -1341,7 +1344,8 @@ function SettingsWorkspaceContent({
                     )}
                   </div>
                 </form>
-              )}
+                )}
+              </div>
             </div>
           ) : (
             <div className="settings-failure"><p role="alert">{runtimeError ?? "Runtime settings are unavailable."}</p><button className="quiet-button" type="button" onClick={() => void refreshRuntime()}>Retry</button></div>
@@ -1376,23 +1380,25 @@ function SettingsWorkspaceContent({
                 ))}
               </select>
             </div>
-            <div className="settings-card-grid workspace-overrides">
-              {workspaceModelCapability && (
-                <form className="settings-card" onSubmit={(event) => { event.preventDefault(); void mutateWorkspace({ field: "model", value: workspaceModel }, "Apply this model only to the active workspace? The active runtime may restart."); }}>
-                  <label htmlFor="workspace-model">Workspace model override</label>
-                  {modelControl("workspace-model", workspaceModel, workspaceModelCapability.choices, setWorkspaceModel)}
-                  <p>Effective: <strong>{workspaceConfig.model.value}</strong> · {workspaceConfig.model.source}</p>
-                  <div className="settings-actions"><button className="primary-button" type="submit" disabled={runtimeBusy || workspaceModel === workspaceConfig.model.value}>Apply</button><button className="quiet-button" type="button" disabled={runtimeBusy || !workspaceConfig.overrideFields.includes("model")} onClick={() => void mutateWorkspace({ field: "reset", value: "model" }, "Remove this workspace model override?")}>Reset</button></div>
-                </form>
-              )}
-              {workspaceTimeoutCapability && (
-                <form className="settings-card" onSubmit={(event) => { event.preventDefault(); void mutateWorkspace({ field: "timeout", value: workspaceTimeout }, "Apply this timeout only to the active workspace? The active runtime may restart."); }}>
-                  <label htmlFor="workspace-timeout">Workspace timeout override</label>
-                  <div className="settings-number-input"><input id="workspace-timeout" type="number" min={workspaceTimeoutCapability.minimum ?? undefined} max={workspaceTimeoutCapability.maximum ?? undefined} value={workspaceTimeout} onChange={(event) => setWorkspaceTimeout(event.target.value)} /><span>seconds</span></div>
-                  <p>Effective: <strong>{workspaceConfig.timeoutSeconds.value}s</strong> · {workspaceConfig.timeoutSeconds.source}</p>
-                  <div className="settings-actions"><button className="primary-button" type="submit" disabled={runtimeBusy || !workspaceTimeout || Number(workspaceTimeout) === workspaceConfig.timeoutSeconds.value}>Apply</button><button className="quiet-button" type="button" disabled={runtimeBusy || !workspaceConfig.overrideFields.includes("timeout")} onClick={() => void mutateWorkspace({ field: "reset", value: "timeout" }, "Remove this workspace timeout override?")}>Reset</button></div>
-                </form>
-              )}
+            <div className="settings-card-stack workspace-overrides">
+              <div className="settings-card-pair">
+                {workspaceModelCapability && (
+                  <form className="settings-card" onSubmit={(event) => { event.preventDefault(); void mutateWorkspace({ field: "model", value: workspaceModel }, "Apply this model only to the active workspace? The active runtime may restart."); }}>
+                    <label htmlFor="workspace-model">Workspace model override</label>
+                    {modelControl("workspace-model", workspaceModel, workspaceModelCapability.choices, setWorkspaceModel)}
+                    <p>Effective: <strong>{workspaceConfig.model.value}</strong> · {workspaceConfig.model.source}</p>
+                    <div className="settings-actions"><button className="primary-button" type="submit" disabled={runtimeBusy || workspaceModel === workspaceConfig.model.value}>Apply</button><button className="quiet-button" type="button" disabled={runtimeBusy || !workspaceConfig.overrideFields.includes("model")} onClick={() => void mutateWorkspace({ field: "reset", value: "model" }, "Remove this workspace model override?")}>Reset</button></div>
+                  </form>
+                )}
+                {workspaceTimeoutCapability && (
+                  <form className="settings-card" onSubmit={(event) => { event.preventDefault(); void mutateWorkspace({ field: "timeout", value: workspaceTimeout }, "Apply this timeout only to the active workspace? The active runtime may restart."); }}>
+                    <label htmlFor="workspace-timeout">Workspace timeout override</label>
+                    <div className="settings-number-input"><input id="workspace-timeout" type="number" min={workspaceTimeoutCapability.minimum ?? undefined} max={workspaceTimeoutCapability.maximum ?? undefined} value={workspaceTimeout} onChange={(event) => setWorkspaceTimeout(event.target.value)} /><span>seconds</span></div>
+                    <p>Effective: <strong>{workspaceConfig.timeoutSeconds.value}s</strong> · {workspaceConfig.timeoutSeconds.source}</p>
+                    <div className="settings-actions"><button className="primary-button" type="submit" disabled={runtimeBusy || !workspaceTimeout || Number(workspaceTimeout) === workspaceConfig.timeoutSeconds.value}>Apply</button><button className="quiet-button" type="button" disabled={runtimeBusy || !workspaceConfig.overrideFields.includes("timeout")} onClick={() => void mutateWorkspace({ field: "reset", value: "timeout" }, "Remove this workspace timeout override?")}>Reset</button></div>
+                  </form>
+                )}
+              </div>
               {workspacePromptCapability && (
                 <form className="settings-card prompt-card" onSubmit={(event) => { event.preventDefault(); void mutateWorkspace({ field: "prompt", value: workspacePrompt }, "Apply this system prompt only to the active workspace? The active runtime may restart."); }}>
                   <label htmlFor="workspace-prompt">Workspace system prompt</label>
