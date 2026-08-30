@@ -1761,13 +1761,20 @@ describe("Workshop React client", () => {
     expect(await screen.findByRole("heading", { name: "Agents", level: 1 })).toBeVisible();
     expect(screen.getByRole("heading", { name: "Kai", level: 2 })).toBeVisible();
     expect(screen.getByText("Enabled for you")).toBeVisible();
-    expect(
-      within(screen.getByLabelText("Agents workspace")).getByRole(
-        "button",
-        { name: "Create agent" },
-      ),
-    ).toBeVisible();
-    expect(screen.getByRole("button", { name: "Close agents" })).toBeVisible();
+    const agentWorkspace = within(screen.getByLabelText("Agents workspace"));
+    const createAgent = agentWorkspace.getByRole("button", {
+      name: "Create agent",
+    });
+    const closeAgents = agentWorkspace.getByRole("button", {
+      name: "Close agents",
+    });
+    expect(createAgent).toBeVisible();
+    expect(closeAgents).toBeVisible();
+    expect(createAgent).toHaveClass("agent-panel-icon-button");
+    expect(closeAgents).toHaveClass("agent-panel-icon-button");
+    expect(createAgent.parentElement).toBe(closeAgents.parentElement);
+    expect(createAgent.querySelector("span")).toHaveAttribute("aria-hidden", "true");
+    expect(closeAgents.querySelector("span")).toHaveAttribute("aria-hidden", "true");
     expect(streamAgentChanges).toHaveBeenCalled();
 
     await user.click(screen.getByRole("button", { name: "Start conversation" }));
@@ -1863,7 +1870,11 @@ describe("Workshop React client", () => {
       await screen.findByRole("heading", { name: "Qualification agent settings" }),
     ).toBeVisible();
     expect(screen.queryByText("Personal preferences")).toBeNull();
-    expect(screen.getByRole("button", { name: "Back to agent" })).toBeVisible();
+    const backToAgent = screen.getByRole("button", { name: "Back to agent" });
+    expect(backToAgent).toBeVisible();
+    expect(backToAgent).toHaveClass("agent-panel-icon-button");
+    expect(backToAgent).toHaveTextContent("←");
+    expect(backToAgent.querySelector("span")).toHaveAttribute("aria-hidden", "true");
     expect(
       screen.getByText(/Policy-bounded controls for Qualification agent/),
     ).toBeVisible();
@@ -1879,7 +1890,7 @@ describe("Workshop React client", () => {
       qualificationChannelId,
     );
 
-    await user.click(screen.getByRole("button", { name: "Back to agent" }));
+    await user.click(backToAgent);
     expect(
       await screen.findByRole("heading", { name: "Qualification agent", level: 2 }),
     ).toBeVisible();
