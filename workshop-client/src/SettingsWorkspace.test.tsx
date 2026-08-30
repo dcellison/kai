@@ -335,6 +335,29 @@ function renderSettings(
   );
 }
 
+function renderAgentRuntime(
+  runActive = false,
+  onChannelAccessFailure = vi.fn(),
+  isAdministrator = true,
+): void {
+  render(
+    <SettingsWorkspace
+      agentRuntime
+      inlineAgentRuntime
+      onAuthenticationFailure={vi.fn()}
+      onChannelAccessFailure={onChannelAccessFailure}
+      onClose={vi.fn()}
+      onDirtyChange={vi.fn()}
+      isAdministrator={isAdministrator}
+      principalName="Daniel"
+      roleLabel="Workshop administrator"
+      runtimeLabel="Kai"
+      runActive={runActive}
+      session={session}
+    />,
+  );
+}
+
 async function acceptConfirmation(
   user: ReturnType<typeof userEvent.setup>,
   message: string | RegExp,
@@ -403,15 +426,13 @@ describe("Settings workspace", () => {
     vi.restoreAllMocks();
   });
 
-  it("navigates all six settings sections without discarding a preference draft", async () => {
+  it("navigates principal-wide settings without agent-specific sections", async () => {
     const user = userEvent.setup();
     renderSettings();
     const editor = await screen.findByLabelText("Preference Markdown");
     const navigation = screen.getByRole("navigation", { name: "Settings sections" });
     const sectionLabels = [
       "Personal preferences",
-      "Runtime settings",
-      "Workspace settings",
       "GitHub",
       "Notification delivery",
       "Client preferences",
@@ -421,6 +442,10 @@ describe("Settings workspace", () => {
       expect(within(navigation).getByRole("button", { name: label })).toBeVisible();
     }
     expect(within(navigation).queryByRole("button", { name: "Routing eligibility" }))
+      .toBeNull();
+    expect(within(navigation).queryByRole("button", { name: "Runtime settings" }))
+      .toBeNull();
+    expect(within(navigation).queryByRole("button", { name: "Workspace settings" }))
       .toBeNull();
     expect(screen.queryByLabelText("Task class")).toBeNull();
     expect(
@@ -445,8 +470,8 @@ describe("Settings workspace", () => {
     expect(editor).toHaveValue(`${preference.content}Unsaved navigation draft`);
   });
 
-  it("keeps principal refresh visible while hiding operator actions from members", async () => {
-    renderSettings(vi.fn(), false, vi.fn(), false);
+  it("keeps agent model refresh visible while hiding operator actions from members", async () => {
+    renderAgentRuntime(false, vi.fn(), false);
 
     expect(await screen.findByRole("button", { name: "Refresh models" })).toBeVisible();
     expect(screen.queryByRole("button", { name: "Refresh all contexts" })).toBeNull();
@@ -455,7 +480,7 @@ describe("Settings workspace", () => {
 
   it("refreshes one catalogue or every context without changing runtime settings", async () => {
     const user = userEvent.setup();
-    renderSettings();
+    renderAgentRuntime();
 
     await user.click(await screen.findByRole("button", { name: "Refresh models" }));
     await waitFor(() => {
@@ -492,8 +517,6 @@ describe("Settings workspace", () => {
     } as DOMRect);
     const positions: Record<string, number> = {
       "settings-section-personal-preferences": -500,
-      "settings-section-runtime": -300,
-      "settings-section-workspace": -100,
       "settings-section-github": 110,
       "settings-section-notifications": 400,
       "settings-section-clients": 700,
@@ -514,12 +537,23 @@ describe("Settings workspace", () => {
     );
   });
 
-  it("shows private preferences and policy-bounded settings without protected details", async () => {
+  it("shows private preferences without loading agent runtime settings", async () => {
     renderSettings();
 
     expect(await screen.findByLabelText("Preference Markdown")).toHaveValue(
       preference.content,
     );
+    expect(screen.queryByRole("heading", { name: "Runtime settings" })).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Workspace settings" })).toBeNull();
+    expect(screen.queryByLabelText("Backend")).toBeNull();
+    expect(loadSettingsWorkspace).not.toHaveBeenCalled();
+    expect(loadWorkspaceConfig).not.toHaveBeenCalled();
+  });
+
+  it("shows policy-bounded settings only in the selected agent", async () => {
+    renderAgentRuntime();
+
+    expect(await screen.findByLabelText("Backend")).toHaveValue("claude:anthropic");
     expect(screen.getByLabelText("Backend")).toHaveValue("claude:anthropic");
     expect(screen.getByRole("option", { name: "claude · anthropic" })).toBeVisible();
     expect(screen.getByRole("option", { name: "Kai" })).toBeVisible();
@@ -632,7 +666,7 @@ describe("Settings workspace", () => {
         value: 601,
       },
     });
-    renderSettings();
+    renderAgentRuntime();
     const runtimeTimeout = await screen.findByLabelText("Response timeout");
     await user.clear(runtimeTimeout);
     await user.type(runtimeTimeout, "601");
@@ -684,7 +718,7 @@ describe("Settings workspace", () => {
       },
       revision: "sws_backend",
     });
-    renderSettings();
+    renderAgentRuntime();
     const backend = await screen.findByLabelText("Backend");
 
     await user.selectOptions(backend, "codex:openai");
@@ -700,7 +734,7 @@ describe("Settings workspace", () => {
   });
 
   it("disables backend switching while this principal has an active run", async () => {
-    renderSettings(vi.fn(), true);
+    renderAgentRuntime(true);
 
     expect(await screen.findByLabelText("Backend")).toBeDisabled();
     expect(screen.getByRole("button", { name: "Switch backend" })).toBeDisabled();
@@ -713,7 +747,7 @@ describe("Settings workspace", () => {
       new ChannelAccessError("This session cannot access that Workshop channel."),
     );
 
-    renderSettings(vi.fn(), false, onChannelAccessFailure);
+    renderAgentRuntime(false, onChannelAccessFailure);
 
     expect(await screen.findByLabelText("Backend")).toHaveValue("claude:anthropic");
     expect(screen.getByRole("heading", { name: "Workspace settings" })).toBeVisible();
