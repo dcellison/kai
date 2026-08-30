@@ -65,6 +65,12 @@ const SETTINGS_SECTIONS = [
   { id: "settings-section-clients", label: "Client preferences" },
 ] as const;
 
+const AGENT_RUNTIME_SECTIONS = SETTINGS_SECTIONS.filter(
+  (section) =>
+    section.id === "settings-section-runtime" ||
+    section.id === "settings-section-workspace",
+);
+
 type SettingsSectionId = (typeof SETTINGS_SECTIONS)[number]["id"];
 
 function formatDate(value: string | null): string {
@@ -130,6 +136,7 @@ function errorText(caught: unknown, fallback: string): string {
 }
 
 function SettingsWorkspaceContent({
+  agentRuntime = false,
   onAuthenticationFailure,
   onChannelAccessFailure,
   onClose,
@@ -141,6 +148,7 @@ function SettingsWorkspaceContent({
   runActive,
   session,
 }: {
+  agentRuntime?: boolean;
   onAuthenticationFailure: (message: string) => void;
   onChannelAccessFailure: (message: string) => void;
   onClose: () => void;
@@ -213,8 +221,11 @@ function SettingsWorkspaceContent({
   const [appearanceNotice, setAppearanceNotice] = useState<string | null>(null);
 
   const settingsScrollRef = useRef<HTMLDivElement>(null);
+  const visibleSections = agentRuntime
+    ? AGENT_RUNTIME_SECTIONS
+    : SETTINGS_SECTIONS;
   const [activeSection, setActiveSection] = useState<SettingsSectionId>(
-    SETTINGS_SECTIONS[0].id,
+    agentRuntime ? "settings-section-runtime" : SETTINGS_SECTIONS[0].id,
   );
 
   const preferenceDirty = preference !== null && preferenceDraft !== preference.content;
@@ -242,7 +253,7 @@ function SettingsWorkspaceContent({
     if (!scroll) {
       return;
     }
-    const available = SETTINGS_SECTIONS.flatMap((item) => {
+    const available = visibleSections.flatMap((item) => {
       const element = document.getElementById(item.id);
       return element ? [{ item, element }] : [];
     });
@@ -520,13 +531,16 @@ function SettingsWorkspaceContent({
   }, [handleAccessFailure, session]);
 
   useEffect(() => {
-    void refreshPreferences();
     void refreshRuntime();
-    void refreshGitHub();
-    void refreshNotifications();
-    void refreshClients();
-    void refreshAppearance();
+    if (!agentRuntime) {
+      void refreshPreferences();
+      void refreshGitHub();
+      void refreshNotifications();
+      void refreshClients();
+      void refreshAppearance();
+    }
   }, [
+    agentRuntime,
     refreshAppearance,
     refreshClients,
     refreshGitHub,
@@ -903,18 +917,26 @@ function SettingsWorkspaceContent({
     <section className="settings-workspace" aria-labelledby="settings-title">
       <header className="settings-header">
         <div>
-          <p className="overline">Personal workspace</p>
-          <h1 id="settings-title">Settings</h1>
-          <p>{principalName} · {roleLabel}</p>
+          <p className="overline">
+            {agentRuntime ? "Agent runtime" : "Personal workspace"}
+          </p>
+          <h1 id="settings-title">
+            {agentRuntime ? `${runtimeLabel} settings` : "Settings"}
+          </h1>
+          <p>
+            {agentRuntime
+              ? `Policy-bounded controls for ${runtimeLabel}`
+              : `${principalName} · ${roleLabel}`}
+          </p>
         </div>
         <button className="quiet-button settings-mobile-back" type="button" onClick={onClose}>
-          Back to conversation
+          {agentRuntime ? "Back to agent" : "Back to conversation"}
         </button>
       </header>
 
       <nav className="settings-section-navigation" aria-label="Settings sections">
         <div>
-          {SETTINGS_SECTIONS.map((section) => (
+          {visibleSections.map((section) => (
             <button
               key={section.id}
               type="button"
@@ -928,7 +950,8 @@ function SettingsWorkspaceContent({
       </nav>
 
       <div className="settings-scroll" ref={settingsScrollRef} onScroll={updateActiveSection}>
-        <section className="settings-intro" id="settings-section-personal-preferences">
+        {!agentRuntime && (
+          <section className="settings-intro" id="settings-section-personal-preferences">
           <div>
             <p className="section-number">01</p>
             <h2>Personal preferences</h2>
@@ -1047,15 +1070,19 @@ function SettingsWorkspaceContent({
               </ol>
             </details>
           )}
-        </section>
+          </section>
+        )}
 
         <section className="settings-section" id="settings-section-runtime">
           <div>
-            <p className="section-number">02</p>
+            <p className="section-number">{agentRuntime ? "01" : "02"}</p>
             <h2>Runtime settings</h2>
             <p>
-              Policy-bounded controls for {runtimeLabel}. Changes can restart an
-              active runtime and clear provider-session continuity.
+              {agentRuntime
+                ? `These controls apply only to ${runtimeLabel}. `
+                : `Policy-bounded controls for ${runtimeLabel}. `}
+              Changes can restart an active runtime and clear provider-session
+              continuity.
             </p>
           </div>
           {runtimeLoading ? (
@@ -1275,7 +1302,7 @@ function SettingsWorkspaceContent({
         {runtime && workspaceConfig && (
           <section className="settings-section" id="settings-section-workspace">
             <div>
-              <p className="section-number">03</p>
+              <p className="section-number">{agentRuntime ? "02" : "03"}</p>
               <h2>Workspace settings</h2>
               <p>Choose an existing authorized workspace and manage overrides that apply only within it.</p>
             </div>
@@ -1328,7 +1355,7 @@ function SettingsWorkspaceContent({
         {runtime && !workspaceConfig && !runtimeLoading && (
           <section className="settings-section" id="settings-section-workspace">
             <div>
-              <p className="section-number">03</p>
+              <p className="section-number">{agentRuntime ? "02" : "03"}</p>
               <h2>Workspace settings</h2>
               <p>Runtime settings remain available, but workspace-specific overrides could not be loaded.</p>
             </div>
@@ -1339,7 +1366,9 @@ function SettingsWorkspaceContent({
           </section>
         )}
 
-        <section className="settings-section" id="settings-section-github">
+        {!agentRuntime && (
+          <>
+          <section className="settings-section" id="settings-section-github">
           <div>
             <p className="section-number">04</p>
             <h2>GitHub</h2>
@@ -1765,7 +1794,9 @@ function SettingsWorkspaceContent({
           {clientNotice && <p className="settings-notice" role="status">{clientNotice}</p>}
           {clientError && clients && <p className="settings-error" role="alert">{clientError}</p>}
           </div>
-        </section>
+          </section>
+          </>
+        )}
       </div>
     </section>
   );

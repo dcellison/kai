@@ -1570,6 +1570,9 @@ describe("Workshop React client", () => {
     await user.click(threadButton);
     const context = screen.getByLabelText("Channel context");
     expect(await within(context).findByText("Existing thread reply")).toBeVisible();
+    const closeThread = within(context).getByRole("button", { name: "Close thread" });
+    expect(closeThread).toHaveTextContent("×");
+    expect(closeThread.querySelector("span")).toHaveAttribute("aria-hidden", "true");
     const composer = within(context).getByLabelText("Reply in Wake policy qualification");
     expect(composer).toHaveAttribute("rows", "1");
     expect(composer).toHaveAttribute("placeholder", "Reply…");
@@ -1587,6 +1590,8 @@ describe("Workshop React client", () => {
       null,
       root.messageId,
     );
+    await user.click(closeThread);
+    expect(within(context).queryByText("Existing thread reply")).toBeNull();
   });
 
   it("shows only a reply icon for a message without replies", async () => {
@@ -1735,7 +1740,7 @@ describe("Workshop React client", () => {
     expect(screen.getByText("Agents")).toBeVisible();
   });
 
-  it("opens the live agent catalogue and returns to an enabled direct conversation", async () => {
+  it("opens agent management from the sidebar and starts a direct conversation", async () => {
     const user = userEvent.setup();
     sessionStorage.setItem(
       "kai.workshop.read-session.v1",
@@ -1744,15 +1749,28 @@ describe("Workshop React client", () => {
     render(<App />);
 
     await screen.findByText("Canonical history is ready.");
-    await user.click(screen.getByRole("button", { name: "Browse agents" }));
+    expect(screen.queryByRole("button", { name: "Browse agents" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Create agent" }));
+    expect(
+      await screen.findByRole("heading", { name: "Create agent", level: 2 }),
+    ).toBeVisible();
+    expect(window.location.search).toBe("?view=agents&new=1");
+    await user.click(screen.getAllByRole("button", { name: "Cancel" })[0]);
+    await user.click(screen.getByRole("button", { name: "Manage Kai" }));
 
     expect(await screen.findByRole("heading", { name: "Agents", level: 1 })).toBeVisible();
     expect(screen.getByRole("heading", { name: "Kai", level: 2 })).toBeVisible();
     expect(screen.getByText("Enabled for you")).toBeVisible();
-    expect(screen.getByRole("button", { name: "New agent" })).toBeVisible();
+    expect(
+      within(screen.getByLabelText("Agents workspace")).getByRole(
+        "button",
+        { name: "Create agent" },
+      ),
+    ).toBeVisible();
+    expect(screen.getByRole("button", { name: "Close agents" })).toBeVisible();
     expect(streamAgentChanges).toHaveBeenCalled();
 
-    await user.click(screen.getByRole("button", { name: "Open conversation" }));
+    await user.click(screen.getByRole("button", { name: "Start conversation" }));
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
     expect(window.location.search).toBe("");
   });
@@ -1833,16 +1851,19 @@ describe("Workshop React client", () => {
 
     const { unmount } = render(<App />);
     await screen.findByText("Canonical history is ready.");
-    await user.click(screen.getByRole("button", { name: "Browse agents" }));
     await user.click(
-      within(screen.getByLabelText("Agent catalogue")).getByRole(
-        "button",
-        { name: /Qualification agent/ },
-      ),
+      screen.getByRole("button", { name: "Manage Qualification agent" }),
     );
+    expect(
+      await screen.findByRole("heading", { name: "Qualification agent", level: 2 }),
+    ).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Runtime settings" }));
 
-    expect(await screen.findByRole("heading", { name: "Settings" })).toBeVisible();
+    expect(
+      await screen.findByRole("heading", { name: "Qualification agent settings" }),
+    ).toBeVisible();
+    expect(screen.queryByText("Personal preferences")).toBeNull();
+    expect(screen.getByRole("button", { name: "Back to agent" })).toBeVisible();
     expect(
       screen.getByText(/Policy-bounded controls for Qualification agent/),
     ).toBeVisible();
@@ -1851,16 +1872,28 @@ describe("Workshop React client", () => {
       token: "existing-session",
     });
     expect(window.location.search).toBe(
-      `?view=settings&runtime=${qualificationChannelId}`,
+      `?view=settings&runtime=${qualificationChannelId}` +
+      `&agent=${qualificationDefinition.definitionId}`,
     );
     expect(sessionStorage.getItem("kai.workshop.active-channel.v1")).toContain(
       qualificationChannelId,
     );
 
+    await user.click(screen.getByRole("button", { name: "Back to agent" }));
+    expect(
+      await screen.findByRole("heading", { name: "Qualification agent", level: 2 }),
+    ).toBeVisible();
+    expect(window.location.search).toBe(
+      `?view=agents&agent=${qualificationDefinition.definitionId}`,
+    );
+    await user.click(screen.getByRole("button", { name: "Runtime settings" }));
+
     unmount();
     vi.mocked(loadSettingsWorkspace).mockClear();
     render(<App />);
-    expect(await screen.findByRole("heading", { name: "Settings" })).toBeVisible();
+    expect(
+      await screen.findByRole("heading", { name: "Qualification agent settings" }),
+    ).toBeVisible();
     expect(loadSettingsWorkspace).toHaveBeenCalledWith({
       channelId: qualificationChannelId,
       token: "existing-session",
