@@ -28,7 +28,7 @@ import {
   updateRuntimeSettings,
   updateWorkspaceConfig,
 } from "./api";
-import { SettingsWorkspace } from "./SettingsWorkspace";
+import { AgentRuntimeControls, SettingsWorkspace } from "./SettingsWorkspace";
 import { WORKSHOP_THEME_CATALOG } from "./theme";
 import type {
   WorkshopPreferenceDocument,
@@ -341,13 +341,9 @@ function renderAgentRuntime(
   isAdministrator = true,
 ): void {
   render(
-    <SettingsWorkspace
-      agentRuntime
-      inlineAgentRuntime
+    <AgentRuntimeControls
       onAuthenticationFailure={vi.fn()}
       onChannelAccessFailure={onChannelAccessFailure}
-      onClose={vi.fn()}
-      onDirtyChange={vi.fn()}
       isAdministrator={isAdministrator}
       principalName="Daniel"
       roleLabel="Workshop administrator"
@@ -498,6 +494,10 @@ describe("Settings workspace", () => {
     renderAgentRuntime();
 
     expect(await screen.findByRole("heading", { name: "Runtime settings" })).toBeVisible();
+    const controls = document.getElementById("agent-runtime-settings");
+    expect(controls).toHaveClass("agent-runtime-controls");
+    expect(controls).not.toHaveClass("settings-workspace");
+    expect(controls?.querySelector(".settings-scroll")).toBeNull();
     expect(screen.getByText("01")).toBeVisible();
     expect(screen.getByRole("heading", { name: "Workspace settings" })).toBeVisible();
     expect(screen.getByText("02")).toBeVisible();

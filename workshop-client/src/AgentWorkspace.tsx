@@ -20,9 +20,7 @@ import type {
   WorkshopAgentEnablement,
 } from "./types";
 import { useConfirmation } from "./ConfirmationDialog";
-import { SettingsWorkspace } from "./SettingsWorkspace";
-
-const ignoreDirtyChange = (): void => undefined;
+import { AgentRuntimeControls } from "./SettingsWorkspace";
 
 const CAPABILITIES: {
   description: string;
@@ -911,14 +909,10 @@ export function AgentWorkspace({
               )}
 
               {runtimeSession && selected && (
-                <SettingsWorkspace
-                  agentRuntime
-                  inlineAgentRuntime
+                <AgentRuntimeControls
                   isAdministrator={isAdministrator}
                   onAuthenticationFailure={onAuthenticationFailure}
                   onChannelAccessFailure={onChannelAccessFailure}
-                  onClose={ignoreDirtyChange}
-                  onDirtyChange={ignoreDirtyChange}
                   principalName={principalName}
                   roleLabel={
                     isAdministrator ? "Workshop administrator" : "Workshop member"

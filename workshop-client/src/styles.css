@@ -2708,21 +2708,19 @@ button:disabled {
   background: var(--color-canvas);
 }
 
-.agent-runtime-settings {
-  margin-top: 1rem;
-  overflow: hidden;
-  border: 1px solid var(--color-border);
-  border-radius: 0.5rem;
-  background: var(--color-canvas);
+.agent-runtime-controls {
+  container: agent-runtime / inline-size;
+  min-width: 0;
+  margin-top: 1.15rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--color-border);
 }
 
-.agent-runtime-settings-header {
-  padding: 1rem 1.1rem;
-  border-bottom: 1px solid var(--color-border);
-  background: var(--color-panel);
+.agent-runtime-controls-header {
+  margin-bottom: 0.7rem;
 }
 
-.agent-runtime-settings-header h3 {
+.agent-runtime-controls-header h3 {
   margin: 0;
   color: var(--color-text-strong);
   font-family: var(--serif);
@@ -2730,25 +2728,25 @@ button:disabled {
   font-weight: 560;
 }
 
-.agent-runtime-settings-header > div > p:last-child {
+.agent-runtime-controls-header > div > p:last-child {
   margin: 0.25rem 0 0;
   color: var(--color-text-muted);
   font-size: 0.72rem;
   line-height: 1.55;
 }
 
-.agent-runtime-settings-scroll {
-  overflow: visible;
-  padding: 0;
+.agent-runtime-controls-body {
+  min-width: 0;
 }
 
-.agent-runtime-settings .settings-section {
+.agent-runtime-controls .settings-section {
   display: block;
   max-width: none;
-  padding-block: 0.9rem;
+  margin: 0;
+  padding: 0.8rem 0 1rem;
 }
 
-.agent-runtime-settings .settings-section > div:first-child {
+.agent-runtime-controls .settings-section > div:first-child {
   display: grid;
   grid-template-columns: auto auto minmax(0, 1fr);
   align-items: baseline;
@@ -2757,21 +2755,56 @@ button:disabled {
   margin-bottom: 0.65rem;
 }
 
-.agent-runtime-settings .settings-section > div:first-child .section-number,
-.agent-runtime-settings .settings-section > div:first-child h2,
-.agent-runtime-settings .settings-section > div:first-child > p:last-child {
+.agent-runtime-controls .settings-section > div:first-child .section-number,
+.agent-runtime-controls .settings-section > div:first-child h2,
+.agent-runtime-controls .settings-section > div:first-child > p:last-child {
   margin: 0;
 }
 
-.agent-runtime-settings .workspace-settings-heading,
-.agent-runtime-settings .workspace-overrides,
-.agent-runtime-settings .settings-section > .settings-notice,
-.agent-runtime-settings .settings-section > .settings-error {
+.agent-runtime-controls .workspace-settings-heading,
+.agent-runtime-controls .workspace-overrides,
+.agent-runtime-controls .settings-section > .settings-notice,
+.agent-runtime-controls .settings-section > .settings-error {
   grid-column: auto;
 }
 
-.agent-runtime-settings .workspace-overrides {
+.agent-runtime-controls .workspace-overrides {
   margin-top: 0.75rem;
+}
+
+@container agent-runtime (max-width: 48rem) {
+  .agent-runtime-controls .settings-card-pair {
+    grid-template-columns: 1fr;
+  }
+
+  .agent-runtime-controls .workspace-settings-heading {
+    grid-template-columns: 1fr;
+  }
+
+  .agent-runtime-controls .model-catalogue-card > summary {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .agent-runtime-controls .model-catalogue-summary-status {
+    grid-column: 1 / -1;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-row: 2;
+  }
+
+  .agent-runtime-controls .model-catalogue-disclosure {
+    grid-column: 2;
+    grid-row: 1;
+  }
+}
+
+@container agent-runtime (max-width: 32rem) {
+  .agent-runtime-controls .settings-section > div:first-child {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .agent-runtime-controls .settings-section > div:first-child > p:last-child {
+    grid-column: 1 / -1;
+  }
 }
 
 .settings-header {
@@ -4583,14 +4616,6 @@ button:disabled {
 
   .settings-card-pair {
     grid-template-columns: 1fr;
-  }
-
-  .agent-runtime-settings .settings-section > div:first-child {
-    grid-template-columns: auto minmax(0, 1fr);
-  }
-
-  .agent-runtime-settings .settings-section > div:first-child > p:last-child {
-    grid-column: 1 / -1;
   }
 
   .preference-compare,
