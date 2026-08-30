@@ -494,6 +494,35 @@ describe("Settings workspace", () => {
     expect(screen.queryByLabelText("Operator-managed model ID")).toBeNull();
   });
 
+  it("groups compact agent runtime controls into explicit paired rows", async () => {
+    renderAgentRuntime();
+
+    expect(await screen.findByRole("heading", { name: "Runtime settings" })).toBeVisible();
+    expect(screen.getByText("01")).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Workspace settings" })).toBeVisible();
+    expect(screen.getByText("02")).toBeVisible();
+
+    const backendPair = screen.getByLabelText("Backend").closest(".settings-card-pair");
+    expect(backendPair).not.toBeNull();
+    expect(within(backendPair as HTMLElement).getByText("Policy-controlled")).toBeVisible();
+
+    const runtimePair = screen.getByLabelText("Runtime model").closest(".settings-card-pair");
+    expect(runtimePair).not.toBeNull();
+    expect(within(runtimePair as HTMLElement).getByLabelText("Response timeout")).toBeVisible();
+
+    const workspacePair = screen
+      .getByLabelText("Workspace model override")
+      .closest(".settings-card-pair");
+    expect(workspacePair).not.toBeNull();
+    expect(
+      within(workspacePair as HTMLElement).getByLabelText("Workspace timeout override"),
+    ).toBeVisible();
+
+    const prompt = screen.getByLabelText("Workspace system prompt");
+    expect(prompt.closest(".settings-card-stack")).not.toBeNull();
+    expect(prompt.closest(".settings-card-pair")).toBeNull();
+  });
+
   it("refreshes one catalogue or every context without changing runtime settings", async () => {
     const user = userEvent.setup();
     renderAgentRuntime();

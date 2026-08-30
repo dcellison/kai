@@ -2739,22 +2739,28 @@ button:disabled {
 
 .agent-runtime-settings-scroll {
   overflow: visible;
-  padding: 0 1rem 1rem;
+  padding: 0;
 }
 
 .agent-runtime-settings .settings-section {
   display: block;
   max-width: none;
-  padding-block: 1.5rem;
+  padding-block: 0.9rem;
 }
 
 .agent-runtime-settings .settings-section > div:first-child {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  align-items: baseline;
+  gap: 0.65rem;
   position: static;
-  margin-bottom: 1rem;
+  margin-bottom: 0.65rem;
 }
 
-.agent-runtime-settings #settings-section-runtime > div:first-child {
-  display: none;
+.agent-runtime-settings .settings-section > div:first-child .section-number,
+.agent-runtime-settings .settings-section > div:first-child h2,
+.agent-runtime-settings .settings-section > div:first-child > p:last-child {
+  margin: 0;
 }
 
 .agent-runtime-settings .workspace-settings-heading,
@@ -3115,6 +3121,26 @@ button:disabled {
 .settings-card-grid {
   column-count: 2;
   column-gap: 0.75rem;
+}
+
+.settings-card-stack {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.settings-card-pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 0.75rem;
+}
+
+.settings-card-pair > .settings-card {
+  width: 100%;
+}
+
+.settings-card-pair > .settings-card:only-child {
+  grid-column: 1 / -1;
 }
 
 .settings-client-preferences {
@@ -4553,6 +4579,18 @@ button:disabled {
 
   .settings-card-grid {
     column-count: 1;
+  }
+
+  .settings-card-pair {
+    grid-template-columns: 1fr;
+  }
+
+  .agent-runtime-settings .settings-section > div:first-child {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .agent-runtime-settings .settings-section > div:first-child > p:last-child {
+    grid-column: 1 / -1;
   }
 
   .preference-compare,
