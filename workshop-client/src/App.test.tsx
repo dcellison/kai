@@ -1874,10 +1874,15 @@ describe("Workshop React client", () => {
       agents: [
         {
           agentId: qualificationDefinition.agentId,
+          available: true,
           engaged: false,
           engagedUntil: null,
+          memoryScope: "private",
           name: qualificationDefinition.displayName,
           principalId: "prn_44444444444444444444444444444444",
+          runtimeProfileId: qualificationEnablement.runtimeProfileId,
+          sponsorDisplayName: navigation.principal.displayName,
+          sponsorPrincipalId: navigation.principal.principalId,
         },
       ],
       channelId: qualificationChannelId,
