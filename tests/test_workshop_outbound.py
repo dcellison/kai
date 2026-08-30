@@ -13,9 +13,12 @@ from kai import sessions
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.delivery_outbox import CONVERSATION_REPLY_PURPOSE
 from kai.workshop.domain import (
+    AgentId,
+    ChannelAgentId,
     ChannelBindingId,
     EventEnvelope,
     MessageId,
+    PrincipalId,
     WorkshopEventType,
     WorkshopId,
 )
@@ -177,6 +180,78 @@ class TestOutboundMessage:
         try:
             with pytest.raises(OutboundMessageNotFoundError):
                 await record_outbound_message(store, _outbound(MessageId.new()))
+        finally:
+            await store.close()
+
+    async def test_explicit_agents_can_reply_independently_in_one_channel(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, inbound_id = await _open_with_inbound(tmp_path / "kai.db")
+        try:
+            async with store.connection.execute(
+                "SELECT c.workshop_id, ca.agent_id FROM messages m "
+                "JOIN channels c ON c.id = m.channel_id "
+                "JOIN channel_agents ca ON ca.channel_id = c.id WHERE m.id = ?",
+                (inbound_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            assert row is not None
+            workshop_id = WorkshopId(str(row[0]))
+            first_agent_id = AgentId(str(row[1]))
+            second_principal_id = PrincipalId.new()
+            second_agent_id = AgentId.new()
+            await store.connection.execute(
+                "INSERT INTO principals (id, kind, display_name, created_at) VALUES (?, 'agent', 'Second agent', ?)",
+                (second_principal_id, _NOW.isoformat()),
+            )
+            await store.connection.execute(
+                "INSERT INTO agents (id, workshop_id, principal_id, name, created_at) "
+                "VALUES (?, ?, ?, 'Second agent', ?)",
+                (second_agent_id, workshop_id, second_principal_id, _NOW.isoformat()),
+            )
+            await store.connection.execute(
+                "INSERT INTO channel_agents (id, channel_id, agent_id, created_at) "
+                "SELECT ?, channel_id, ?, ? FROM messages WHERE id = ?",
+                (
+                    ChannelAgentId.new(),
+                    second_agent_id,
+                    _NOW.isoformat(),
+                    inbound_id,
+                ),
+            )
+            await store.connection.commit()
+
+            with pytest.raises(OutboundMessageNotFoundError):
+                await record_outbound_message(store, _outbound(inbound_id))
+            first = await record_outbound_message(
+                store,
+                OutboundMessage(
+                    inbound_id,
+                    "First agent reply",
+                    _NOW + timedelta(seconds=2),
+                    first_agent_id,
+                ),
+            )
+            second = await record_outbound_message(
+                store,
+                OutboundMessage(
+                    inbound_id,
+                    "Second agent reply",
+                    _NOW + timedelta(seconds=3),
+                    second_agent_id,
+                ),
+            )
+
+            assert first.event.envelope.aggregate_id != second.event.envelope.aggregate_id
+            async with store.connection.execute(
+                "SELECT body FROM messages WHERE reply_to_message_id = ? ORDER BY body",
+                (inbound_id,),
+            ) as cursor:
+                assert [str(item[0]) for item in await cursor.fetchall()] == [
+                    "First agent reply",
+                    "Second agent reply",
+                ]
         finally:
             await store.close()
 

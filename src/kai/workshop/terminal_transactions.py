@@ -243,6 +243,7 @@ class WorkshopRunTerminalTransactionCoordinator:
                     in_reply_to_message_id=run.inbound_message_id,
                     body=body,
                     occurred_at=occurred_at,
+                    agent_id=run.agent_id,
                 ),
                 delivery_policy=self._delivery_policy,
                 request_delivery=request_delivery,
