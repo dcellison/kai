@@ -184,10 +184,28 @@ class WorkshopRoutingPolicyService:
             return existing
 
         requested_task = await self._requested_task_class(run)
-        authority = self._eligibility.authority_for_principal_channel(
-            run.requested_by_principal_id,
-            run.channel_id,
-        )
+        async with self._store.connection.execute(
+            "SELECT kind FROM channels WHERE id = ? AND workshop_id = ?",
+            (run.channel_id, run.workshop_id),
+        ) as cursor:
+            channel_row = await cursor.fetchone()
+        if channel_row is None:
+            raise RoutingPolicyError("Run channel is unavailable")
+        shared_channel = str(channel_row[0]) == "group"
+        if shared_channel:
+            if run.sponsor_principal_id is None:
+                raise RoutingPolicyError("Shared-channel run has no runtime sponsor")
+            authority = self._eligibility.authority_for_sponsored_channel(
+                run.sponsor_principal_id,
+                run.channel_id,
+                run.agent_id,
+                runtime_profile_id,
+            )
+        else:
+            authority = self._eligibility.authority_for_principal_channel(
+                run.requested_by_principal_id,
+                run.channel_id,
+            )
         if authority.runtime_profile_id != runtime_profile_id:
             raise RoutingPolicyError("Run does not match canonical routing profile")
         if authority.agent_id != run.agent_id:
@@ -200,10 +218,11 @@ class WorkshopRoutingPolicyService:
             agent_requirements = tuple(RuntimeCapability(value) for value in revision.capabilities)
 
         if requested_task is None:
-            report = await self._eligibility.inspect(
+            report = await self._inspect_run_authority(
                 authority,
                 RoutingTaskClass.CONVERSATION,
                 additional_required=agent_requirements,
+                shared_channel=shared_channel,
             )
             selected = self._selected_candidate(report)
             decision = self._decision(
@@ -220,10 +239,11 @@ class WorkshopRoutingPolicyService:
             )
             return await self._store_decision(decision)
 
-        report = await self._eligibility.inspect(
+        report = await self._inspect_run_authority(
             authority,
             requested_task,
             additional_required=agent_requirements,
+            shared_channel=shared_channel,
         )
         policy = (await self._load_policy_entries(runtime_profile_id)).get(requested_task)
         if policy is None or policy.backend_option_id is None:
@@ -295,6 +315,26 @@ class WorkshopRoutingPolicyService:
             evidence_version=report.version,
         )
         return await self._store_decision(decision)
+
+    async def _inspect_run_authority(
+        self,
+        authority: RoutingEligibilityAuthority,
+        task_class: RoutingTaskClass,
+        *,
+        additional_required: tuple[RuntimeCapability, ...],
+        shared_channel: bool,
+    ) -> RuntimeEligibilityReport:
+        if shared_channel:
+            return await self._eligibility.inspect_sponsored_channel(
+                authority,
+                task_class,
+                additional_required=additional_required,
+            )
+        return await self._eligibility.inspect(
+            authority,
+            task_class,
+            additional_required=additional_required,
+        )
 
     async def load_decision(self, run_id: RunId) -> RunRoutingDecision | None:
         async with self._store.connection.execute(

@@ -159,15 +159,19 @@ class _RuntimePool:
         self.workspace = workspace
         self.selection_reads = 0
         self.selected_backend = ("claude", "anthropic")
+        self.authorities: list[object] = []
 
-    async def get_effective_workspace(self, _runtime_profile_id):
+    async def get_effective_workspace(self, runtime_authority):
+        self.authorities.append(runtime_authority)
         return self.workspace
 
-    async def get_effective_model(self, _runtime_profile_id):
+    async def get_effective_model(self, runtime_authority):
+        self.authorities.append(runtime_authority)
         self.selection_reads += 1
         return "selected-model"
 
-    def get_backend_provider(self, _runtime_profile_id):
+    def get_backend_provider(self, runtime_authority):
+        self.authorities.append(runtime_authority)
         return self.selected_backend
 
     def runtime_profile(self, _runtime_profile_id):
@@ -341,6 +345,48 @@ async def test_cross_principal_authority_and_unknown_task_fail_closed(tmp_path: 
         service.authority_for_principal_channel(_id(PrincipalId, 2), namespace.channel_id)
     with pytest.raises(RoutingEligibilityError, match="Unsupported task class"):
         await service.inspect(authority, "best")
+
+
+@pytest.mark.asyncio
+async def test_sponsored_channel_uses_profile_owner_without_private_lane_access(
+    tmp_path: Path,
+) -> None:
+    namespace = _namespace(1)
+    lane = _lane("claude", "anthropic", selected=True)
+    service, _, pool, _, _ = _service(
+        tmp_path,
+        (lane,),
+        {lane.option_id: _snapshot(namespace, lane, image_input=True)},
+    )
+    group_channel = _id(ChannelId, 20)
+    group_agent = _id(AgentId, 21)
+    authority = service.authority_for_sponsored_channel(
+        namespace.principal_id,
+        group_channel,
+        group_agent,
+        namespace.runtime_profile_id,
+    )
+
+    report = await service.inspect_sponsored_channel(
+        authority,
+        RoutingTaskClass.CONVERSATION,
+    )
+
+    assert report.principal_id == namespace.principal_id
+    assert report.channel_id == group_channel
+    assert report.agent_id == group_agent
+    assert report.runtime_profile_id == namespace.runtime_profile_id
+    assert pool.authorities
+    assert all(getattr(item, "private_context", None) is False for item in pool.authorities)
+    with pytest.raises(RoutingEligibilityAccessDenied):
+        await service.inspect(authority, RoutingTaskClass.CONVERSATION)
+    with pytest.raises(RoutingEligibilityAccessDenied):
+        service.authority_for_sponsored_channel(
+            _id(PrincipalId, 2),
+            group_channel,
+            group_agent,
+            namespace.runtime_profile_id,
+        )
 
 
 def test_image_capability_normalization_accepts_only_explicit_evidence() -> None:
