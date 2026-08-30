@@ -82,10 +82,14 @@ const MEMORY_ID_PATTERN = /^[A-Za-z0-9_-]{1,256}$/;
 
 type WorkshopDestination =
   | { kind: "conversation" }
-  | { kind: "agents"; creating: boolean; definitionId: string | null }
+  | {
+      kind: "agents";
+      creating: boolean;
+      definitionId: string | null;
+      section: "runtime" | null;
+    }
   | { kind: "memory"; memoryId: string | null }
   | {
-      agentDefinitionId: string | null;
       kind: "settings";
       runtimeChannelId: string | null;
     };
@@ -95,11 +99,18 @@ function destinationFromLocation(): WorkshopDestination {
   if (parameters.get("view") === "settings") {
     const runtimeChannelId = parameters.get("runtime");
     const agentDefinitionId = parameters.get("agent");
+    if (
+      agentDefinitionId &&
+      AGENT_DEFINITION_PATTERN.test(agentDefinitionId)
+    ) {
+      return {
+        creating: false,
+        definitionId: agentDefinitionId,
+        kind: "agents",
+        section: "runtime",
+      };
+    }
     return {
-      agentDefinitionId:
-        agentDefinitionId && AGENT_DEFINITION_PATTERN.test(agentDefinitionId)
-          ? agentDefinitionId
-          : null,
       kind: "settings",
       runtimeChannelId:
         runtimeChannelId && CHANNEL_PATTERN.test(runtimeChannelId)
@@ -116,6 +127,7 @@ function destinationFromLocation(): WorkshopDestination {
         definitionId && AGENT_DEFINITION_PATTERN.test(definitionId)
           ? definitionId
           : null,
+      section: parameters.get("section") === "runtime" ? "runtime" : null,
     };
   }
   if (parameters.get("view") !== "memory") {
@@ -138,6 +150,7 @@ function writeDestination(
   url.searchParams.delete("agent");
   url.searchParams.delete("runtime");
   url.searchParams.delete("new");
+  url.searchParams.delete("section");
   if (destination.kind === "memory") {
     url.searchParams.set("view", "memory");
     if (destination.memoryId) {
@@ -148,9 +161,6 @@ function writeDestination(
     if (destination.runtimeChannelId) {
       url.searchParams.set("runtime", destination.runtimeChannelId);
     }
-    if (destination.agentDefinitionId) {
-      url.searchParams.set("agent", destination.agentDefinitionId);
-    }
   } else if (destination.kind === "agents") {
     url.searchParams.set("view", "agents");
     if (destination.definitionId) {
@@ -158,6 +168,9 @@ function writeDestination(
     }
     if (destination.creating) {
       url.searchParams.set("new", "1");
+    }
+    if (destination.section) {
+      url.searchParams.set("section", destination.section);
     }
   }
   window.history[mode === "push" ? "pushState" : "replaceState"](
@@ -1514,7 +1527,6 @@ function WorkshopView({
   threadMessages,
   memoryDestination,
   memoryToken,
-  settingsAgentDefinitionId,
   settingsDestination,
   settingsRuntimeLabel,
   settingsSession,
@@ -1541,7 +1553,6 @@ function WorkshopView({
   onCreateAgent,
   onOpenAgentDefinition,
   onOpenAgentChannel,
-  onOpenAgentRuntimeSettings,
   onOpenSettings,
   onSelectAgent,
   onSelectMemory,
@@ -1555,6 +1566,7 @@ function WorkshopView({
   agentDestination: {
     creating: boolean;
     definitionId: string | null;
+    section: "runtime" | null;
   } | null;
   agentToken: string;
   channel: WorkshopChannelSummary;
@@ -1564,7 +1576,6 @@ function WorkshopView({
   threadMessages: TimelineMessage[];
   memoryDestination: { memoryId: string | null } | null;
   memoryToken: string;
-  settingsAgentDefinitionId: string | null;
   settingsDestination: boolean;
   settingsRuntimeLabel: string;
   settingsSession: WorkshopSession;
@@ -1595,12 +1606,11 @@ function WorkshopView({
   onCreateAgent: () => void;
   onOpenAgentDefinition: (agentId: string) => Promise<void>;
   onOpenAgentChannel: (channelId: string) => Promise<void>;
-  onOpenAgentRuntimeSettings: (
-    channelId: string,
-    definitionId: string,
-  ) => Promise<void>;
   onOpenSettings: () => void;
-  onSelectAgent: (definitionId: string | null) => void;
+  onSelectAgent: (
+    definitionId: string | null,
+    section?: "runtime" | null,
+  ) => void;
   onSelectMemory: (memoryId: string | null) => void;
   onSelectChannel: (channelId: string) => void;
   onSetReaction: (
@@ -2617,8 +2627,10 @@ function WorkshopView({
 
       {agentsOpen && agentDestination ? (
         <AgentWorkspace
+          activeChannelId={channelId}
           initialCreating={agentDestination.creating}
           initialDefinitionId={agentDestination.definitionId}
+          initialSection={agentDestination.section}
           isAdministrator={workshop.role === "admin"}
           onAuthenticationFailure={onMemoryAuthenticationFailure}
           onChannelAccessFailure={onSettingsAccessFailure}
@@ -2626,23 +2638,16 @@ function WorkshopView({
           onCreateAgent={onCreateAgent}
           onNavigationChanged={onAgentNavigationChanged}
           onOpenChannel={onOpenAgentChannel}
-          onOpenRuntimeSettings={onOpenAgentRuntimeSettings}
           onSelectAgent={onSelectAgent}
           principalName={humanName}
+          runActive={isRunActive(activeRun)}
           token={agentToken}
         />
       ) : settingsOpen ? (
         <SettingsWorkspace
-          agentRuntime={settingsAgentDefinitionId !== null}
           onAuthenticationFailure={onMemoryAuthenticationFailure}
           onChannelAccessFailure={onSettingsAccessFailure}
-          onClose={() => {
-            if (settingsAgentDefinitionId) {
-              onSelectAgent(settingsAgentDefinitionId);
-              return;
-            }
-            onSelectChannel(channelId);
-          }}
+          onClose={() => onSelectChannel(channelId)}
           onDirtyChange={onSettingsDirtyChange}
           isAdministrator={workshop.role === "admin"}
           principalName={humanName}
@@ -3203,7 +3208,6 @@ function ActiveWorkshopClient({
   onCreateAgent,
   onOpenAgentDefinition,
   onOpenAgentChannel,
-  onOpenAgentRuntimeSettings,
   onOpenMemory,
   onOpenSettings,
   onSelectChannel,
@@ -3222,14 +3226,13 @@ function ActiveWorkshopClient({
   onCreateAgent: () => void;
   onOpenAgentDefinition: (agentId: string) => Promise<void>;
   onOpenAgentChannel: (channelId: string) => Promise<void>;
-  onOpenAgentRuntimeSettings: (
-    channelId: string,
-    definitionId: string,
-  ) => Promise<void>;
   onOpenMemory: () => void;
   onOpenSettings: () => void;
   onSelectChannel: (channelId: string) => void;
-  onSelectAgent: (definitionId: string | null) => void;
+  onSelectAgent: (
+    definitionId: string | null,
+    section?: "runtime" | null,
+  ) => void;
   onSelectMemory: (memoryId: string | null) => void;
   onSettingsDirtyChange: (dirty: boolean) => void;
 }): React.JSX.Element {
@@ -3395,9 +3398,6 @@ function ActiveWorkshopClient({
       memoryDestination={destination.kind === "memory" ? destination : null}
       memoryToken={session.token}
       settingsDestination={destination.kind === "settings"}
-      settingsAgentDefinitionId={
-        destination.kind === "settings" ? destination.agentDefinitionId : null
-      }
       settingsRuntimeLabel={settingsChannel ? channelDisplayName(settingsChannel) : "assigned runtime"}
       settingsSession={settingsSession}
       navigation={navigation}
@@ -3422,7 +3422,6 @@ function ActiveWorkshopClient({
       onMemoryAuthenticationFailure={onAuthenticationFailure}
       onOpenAgentChannel={onOpenAgentChannel}
       onOpenAgentDefinition={onOpenAgentDefinition}
-      onOpenAgentRuntimeSettings={onOpenAgentRuntimeSettings}
       onOpenMemory={onOpenMemory}
       onOpenSettings={onOpenSettings}
       onSelectMemory={onSelectMemory}
@@ -3666,6 +3665,7 @@ function WorkshopApp(): React.JSX.Element {
   const openAgents = async (
     definitionId: string | null = null,
     creating = false,
+    section: "runtime" | null = null,
   ): Promise<void> => {
     if (
       destination.kind === "settings" &&
@@ -3678,6 +3678,7 @@ function WorkshopApp(): React.JSX.Element {
       creating,
       definitionId,
       kind: "agents",
+      section,
     };
     setDestination(nextDestination);
     writeDestination(nextDestination, "push");
@@ -3685,7 +3686,6 @@ function WorkshopApp(): React.JSX.Element {
 
   const openSettings = (): void => {
     const nextDestination: WorkshopDestination = {
-      agentDefinitionId: null,
       kind: "settings",
       runtimeChannelId: null,
     };
@@ -3699,11 +3699,15 @@ function WorkshopApp(): React.JSX.Element {
     writeDestination(nextDestination, "replace");
   }, []);
 
-  const selectAgent = useCallback((definitionId: string | null): void => {
+  const selectAgent = useCallback((
+    definitionId: string | null,
+    section: "runtime" | null = null,
+  ): void => {
     const nextDestination: WorkshopDestination = {
       creating: false,
       definitionId,
       kind: "agents",
+      section,
     };
     setDestination(nextDestination);
     writeDestination(nextDestination, "replace");
@@ -3784,47 +3788,6 @@ function WorkshopApp(): React.JSX.Element {
     }
   }, [forgetSession, handleChannelAccessFailure, session]);
 
-  const openAgentRuntimeSettings = useCallback(async (
-    channelId: string,
-    definitionId: string,
-  ): Promise<void> => {
-    if (!session) {
-      throw new Error("Workshop is not connected.");
-    }
-    try {
-      const discovered = await loadNavigation(session.token);
-      const target = findNavigationChannel(discovered, channelId)?.channel;
-      if (
-        !target ||
-        target.kind !== "direct" ||
-        !target.canSubmitCommands
-      ) {
-        throw new ChannelAccessError(
-          "This session cannot access that agent's runtime settings.",
-        );
-      }
-      const nextSession = { ...session, channelId };
-      storeWorkshopAccess(nextSession);
-      setAccess({ channelId, token: session.token });
-      setSession(nextSession);
-      setNavigation(discovered);
-      const nextDestination: WorkshopDestination = {
-        agentDefinitionId: definitionId,
-        kind: "settings",
-        runtimeChannelId: channelId,
-      };
-      setDestination(nextDestination);
-      writeDestination(nextDestination, "push");
-    } catch (caught) {
-      if (caught instanceof AuthenticationError) {
-        forgetSession(caught.message);
-      } else if (caught instanceof ChannelAccessError) {
-        handleChannelAccessFailure(caught.message);
-      }
-      throw caught;
-    }
-  }, [forgetSession, handleChannelAccessFailure, session]);
-
   const createWorkshopChannel = async (
     input: ChannelCreationRequest,
   ): Promise<void> => {
@@ -3879,10 +3842,9 @@ function WorkshopApp(): React.JSX.Element {
       onForget={() => forgetSession()}
       onAgentNavigationChanged={refreshAgentNavigation}
       onCreateAgent={() => void openAgents(null, true)}
-      onOpenAgentChannel={openAgentChannel}
-      onOpenAgentDefinition={openAgentDefinition}
-      onOpenAgentRuntimeSettings={openAgentRuntimeSettings}
-      onOpenMemory={() => void openMemory()}
+          onOpenAgentChannel={openAgentChannel}
+          onOpenAgentDefinition={openAgentDefinition}
+          onOpenMemory={() => void openMemory()}
       onOpenSettings={openSettings}
       onSelectChannel={(channelId) => void selectChannel(channelId)}
       onSelectAgent={selectAgent}
