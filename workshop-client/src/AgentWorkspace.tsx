@@ -361,6 +361,7 @@ export function AgentWorkspace({
   onClose,
   onNavigationChanged,
   onOpenChannel,
+  onOpenRuntimeSettings,
   onSelectAgent,
   principalName,
   token,
@@ -372,6 +373,7 @@ export function AgentWorkspace({
   onClose: () => void;
   onNavigationChanged: () => Promise<void>;
   onOpenChannel: (channelId: string) => Promise<void>;
+  onOpenRuntimeSettings: (channelId: string) => Promise<void>;
   onSelectAgent: (definitionId: string | null) => void;
   principalName: string;
   token: string;
@@ -818,6 +820,28 @@ export function AgentWorkspace({
                           }}
                         >
                           Open conversation
+                        </button>
+                      )}
+                    {enablement.lifecycleState === "enabled" &&
+                      enablement.directChannelId && (
+                        <button
+                          className="quiet-button"
+                          type="button"
+                          disabled={busy}
+                          onClick={() => {
+                            const directChannelId = enablement.directChannelId;
+                            if (!directChannelId) {
+                              return;
+                            }
+                            void onOpenRuntimeSettings(directChannelId).catch(
+                              (caught: unknown) => handleError(
+                                caught,
+                                "Could not open this agent's runtime settings.",
+                              ),
+                            );
+                          }}
+                        >
+                          Runtime settings
                         </button>
                       )}
                     {enablement.eligibleRuntimes.length > 0 &&

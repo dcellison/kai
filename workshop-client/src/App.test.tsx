@@ -1757,6 +1757,116 @@ describe("Workshop React client", () => {
     expect(window.location.search).toBe("");
   });
 
+  it("opens runtime settings for the exact enabled agent lane", async () => {
+    const user = userEvent.setup();
+    const qualificationChannelId = "chn_44444444444444444444444444444444";
+    const qualificationDefinition: WorkshopAgentDefinition = {
+      ...agentDefinition,
+      agentId: "agt_44444444444444444444444444444444",
+      definitionId: "adf_44444444444444444444444444444444",
+      displayName: "Qualification agent",
+      handle: "qualification",
+      revisions: agentDefinition.revisions.map((revision) => ({
+        ...revision,
+        revisionId: "adr_44444444444444444444444444444444",
+      })),
+      activeRevisionId: "adr_44444444444444444444444444444444",
+    };
+    const qualificationEnablement: WorkshopAgentEnablement = {
+      ...agentEnablement,
+      agentId: qualificationDefinition.agentId,
+      definitionId: qualificationDefinition.definitionId,
+      directChannelId: qualificationChannelId,
+      displayName: qualificationDefinition.displayName,
+      enablementId: "aen_44444444444444444444444444444444",
+      handle: qualificationDefinition.handle,
+    };
+    const qualificationChannel: WorkshopNavigation["workshops"][number]["channels"][number] = {
+      ...navigation.workshops[0].channels[0],
+      agents: [
+        {
+          agentId: qualificationDefinition.agentId,
+          engaged: false,
+          engagedUntil: null,
+          name: qualificationDefinition.displayName,
+          principalId: "prn_44444444444444444444444444444444",
+        },
+      ],
+      channelId: qualificationChannelId,
+      name: "Qualification agent",
+      participants: [
+        {
+          displayName: qualificationDefinition.displayName,
+          kind: "agent",
+          principalId: "prn_44444444444444444444444444444444",
+        },
+      ],
+    };
+    vi.mocked(loadNavigation).mockResolvedValue({
+      ...navigation,
+      workshops: [
+        {
+          ...navigation.workshops[0],
+          channels: [
+            ...navigation.workshops[0].channels,
+            qualificationChannel,
+          ],
+        },
+      ],
+    });
+    vi.mocked(loadAgentDefinitions).mockResolvedValue([
+      agentDefinition,
+      qualificationDefinition,
+    ]);
+    vi.mocked(loadAgentEnablements).mockResolvedValue([
+      agentEnablement,
+      qualificationEnablement,
+    ]);
+    vi.mocked(loadSettingsWorkspace).mockImplementation(async (selectedSession) => ({
+      ...settingsWorkspace,
+      channelId: selectedSession.channelId,
+    }));
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+
+    const { unmount } = render(<App />);
+    await screen.findByText("Canonical history is ready.");
+    await user.click(screen.getByRole("button", { name: "Browse agents" }));
+    await user.click(
+      within(screen.getByLabelText("Agent catalogue")).getByRole(
+        "button",
+        { name: /Qualification agent/ },
+      ),
+    );
+    await user.click(screen.getByRole("button", { name: "Runtime settings" }));
+
+    expect(await screen.findByRole("heading", { name: "Settings" })).toBeVisible();
+    expect(
+      screen.getByText(/Policy-bounded controls for Qualification agent/),
+    ).toBeVisible();
+    expect(loadSettingsWorkspace).toHaveBeenCalledWith({
+      channelId: qualificationChannelId,
+      token: "existing-session",
+    });
+    expect(window.location.search).toBe(
+      `?view=settings&runtime=${qualificationChannelId}`,
+    );
+    expect(sessionStorage.getItem("kai.workshop.active-channel.v1")).toContain(
+      qualificationChannelId,
+    );
+
+    unmount();
+    vi.mocked(loadSettingsWorkspace).mockClear();
+    render(<App />);
+    expect(await screen.findByRole("heading", { name: "Settings" })).toBeVisible();
+    expect(loadSettingsWorkspace).toHaveBeenCalledWith({
+      channelId: qualificationChannelId,
+      token: "existing-session",
+    });
+  });
+
   it("collapses the navigation to labeled icons and restores its layout", async () => {
     const user = userEvent.setup();
     sessionStorage.setItem(
