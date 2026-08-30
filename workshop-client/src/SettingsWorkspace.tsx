@@ -134,22 +134,9 @@ function errorText(caught: unknown, fallback: string): string {
   return caught instanceof Error ? caught.message : fallback;
 }
 
-function SettingsWorkspaceContent({
-  agentRuntime = false,
-  inlineAgentRuntime = false,
-  onAuthenticationFailure,
-  onChannelAccessFailure,
-  onClose,
-  onDirtyChange,
-  isAdministrator,
-  principalName,
-  roleLabel,
-  runtimeLabel,
-  runActive,
-  session,
-}: {
+type SettingsWorkspaceContentProps = {
   agentRuntime?: boolean;
-  inlineAgentRuntime?: boolean;
+  nativeAgentRuntime?: boolean;
   onAuthenticationFailure: (message: string) => void;
   onChannelAccessFailure: (message: string) => void;
   onClose: () => void;
@@ -160,7 +147,22 @@ function SettingsWorkspaceContent({
   runtimeLabel: string;
   runActive: boolean;
   session: WorkshopSession;
-}): React.JSX.Element {
+};
+
+function SettingsWorkspaceContent({
+  agentRuntime = false,
+  nativeAgentRuntime = false,
+  onAuthenticationFailure,
+  onChannelAccessFailure,
+  onClose,
+  onDirtyChange,
+  isAdministrator,
+  principalName,
+  roleLabel,
+  runtimeLabel,
+  runActive,
+  session,
+}: SettingsWorkspaceContentProps): React.JSX.Element {
   const confirm = useConfirmation();
   const [preference, setPreference] = useState<WorkshopPreferenceDocument | null>(null);
   const [preferenceDraft, setPreferenceDraft] = useState("");
@@ -228,8 +230,8 @@ function SettingsWorkspaceContent({
   const [activeSection, setActiveSection] = useState<SettingsSectionId>(
     agentRuntime ? "settings-section-runtime" : GENERAL_SETTINGS_SECTIONS[0].id,
   );
-  const inlineRuntime = agentRuntime && inlineAgentRuntime;
-  const titleId = inlineRuntime
+  const nativeRuntime = agentRuntime && nativeAgentRuntime;
+  const titleId = nativeRuntime
     ? "agent-runtime-settings-title"
     : "settings-title";
 
@@ -921,24 +923,24 @@ function SettingsWorkspaceContent({
 
   return (
     <section
-      className={inlineRuntime ? "agent-runtime-settings" : "settings-workspace"}
+      className={nativeRuntime ? "agent-runtime-controls" : "settings-workspace"}
       aria-labelledby={titleId}
-      id={inlineRuntime ? "agent-runtime-settings" : undefined}
+      id={nativeRuntime ? "agent-runtime-settings" : undefined}
     >
       <header
-        className={inlineRuntime
-          ? "agent-runtime-settings-header"
+        className={nativeRuntime
+          ? "agent-runtime-controls-header"
           : "settings-header"}
       >
         <div>
           <p className="overline">
-            {inlineRuntime
+            {nativeRuntime
               ? "Your runtime"
               : agentRuntime
                 ? "Agent runtime"
                 : "Personal workspace"}
           </p>
-          {inlineRuntime ? (
+          {nativeRuntime ? (
             <h3 id={titleId}>Runtime and workspace</h3>
           ) : (
             <h1 id={titleId}>
@@ -946,14 +948,14 @@ function SettingsWorkspaceContent({
             </h1>
           )}
           <p>
-            {inlineRuntime
+            {nativeRuntime
               ? `Your policy-bounded controls for ${runtimeLabel}. The shared agent definition remains unchanged.`
               : agentRuntime
               ? `Policy-bounded controls for ${runtimeLabel}`
               : `${principalName} · ${roleLabel}`}
           </p>
         </div>
-        {!inlineRuntime && (
+        {!nativeRuntime && (
           <button
             className="panel-icon-button"
             type="button"
@@ -966,7 +968,7 @@ function SettingsWorkspaceContent({
         )}
       </header>
 
-      {!inlineRuntime && (
+      {!nativeRuntime && (
         <nav className="settings-section-navigation" aria-label="Settings sections">
           <div>
             {visibleSections.map((section) => (
@@ -984,11 +986,11 @@ function SettingsWorkspaceContent({
       )}
 
       <div
-        className={inlineRuntime
-          ? "settings-scroll agent-runtime-settings-scroll"
+        className={nativeRuntime
+          ? "agent-runtime-controls-body"
           : "settings-scroll"}
-        ref={settingsScrollRef}
-        onScroll={updateActiveSection}
+        ref={nativeRuntime ? undefined : settingsScrollRef}
+        onScroll={nativeRuntime ? undefined : updateActiveSection}
       >
         {!agentRuntime && (
           <section className="settings-intro" id="settings-section-personal-preferences">
@@ -1861,11 +1863,30 @@ function SettingsWorkspaceContent({
 }
 
 export function SettingsWorkspace(
-  props: React.ComponentProps<typeof SettingsWorkspaceContent>,
+  props: Omit<SettingsWorkspaceContentProps, "nativeAgentRuntime">,
 ): React.JSX.Element {
   return (
     <ConfirmationProvider>
       <SettingsWorkspaceContent {...props} />
+    </ConfirmationProvider>
+  );
+}
+
+export function AgentRuntimeControls(
+  props: Omit<
+    SettingsWorkspaceContentProps,
+    "agentRuntime" | "nativeAgentRuntime" | "onClose" | "onDirtyChange"
+  >,
+): React.JSX.Element {
+  return (
+    <ConfirmationProvider>
+      <SettingsWorkspaceContent
+        {...props}
+        agentRuntime
+        nativeAgentRuntime
+        onClose={() => undefined}
+        onDirtyChange={() => undefined}
+      />
     </ConfirmationProvider>
   );
 }
