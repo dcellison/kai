@@ -73,9 +73,7 @@ class _Eligibility:
         return self.authority
 
     def authority_for_principal_runtime(self, principal_id, runtime_profile_id):
-        if principal_id != self.authority.principal_id or runtime_profile_id != self.authority.runtime_profile_id:
-            raise RuntimeError("access denied")
-        return self.authority
+        raise AssertionError("Run routing must resolve the exact channel lane")
 
     async def inspect(self, authority, task_class, *, additional_required=()):
         assert not additional_required or additional_required[0].value == "text_generation"
