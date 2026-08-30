@@ -929,9 +929,25 @@ function SettingsWorkspaceContent({
               : `${principalName} · ${roleLabel}`}
           </p>
         </div>
-        <button className="quiet-button settings-mobile-back" type="button" onClick={onClose}>
-          {agentRuntime ? "Back to agent" : "Back to conversation"}
-        </button>
+        {agentRuntime ? (
+          <button
+            className="agent-panel-icon-button"
+            type="button"
+            aria-label="Back to agent"
+            title="Back to agent"
+            onClick={onClose}
+          >
+            <span aria-hidden="true">←</span>
+          </button>
+        ) : (
+          <button
+            className="quiet-button settings-mobile-back"
+            type="button"
+            onClick={onClose}
+          >
+            Back to conversation
+          </button>
+        )}
       </header>
 
       <nav className="settings-section-navigation" aria-label="Settings sections">

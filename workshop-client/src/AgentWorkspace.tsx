@@ -667,31 +667,33 @@ export function AgentWorkspace({
           <span className={`agent-live-state ${liveState}`} role="status">
             {liveState === "connected" ? "Live" : "Connecting"}
           </span>
-          {isAdministrator && (
+          <div className="agent-header-controls">
+            {isAdministrator && (
+              <button
+                className="agent-panel-icon-button"
+                type="button"
+                aria-label="Create agent"
+                title="Create agent"
+                disabled={busy}
+                onClick={() => {
+                  setCreating(true);
+                  setEditingRevision(false);
+                  onCreateAgent();
+                }}
+              >
+                <span aria-hidden="true">+</span>
+              </button>
+            )}
             <button
-              className="agent-header-icon"
+              className="agent-panel-icon-button"
               type="button"
-              aria-label="Create agent"
-              title="Create agent"
-              disabled={busy}
-              onClick={() => {
-                setCreating(true);
-                setEditingRevision(false);
-                onCreateAgent();
-              }}
+              aria-label="Close agents"
+              title="Close agents"
+              onClick={onClose}
             >
-              <span aria-hidden="true">+</span>
+              <span aria-hidden="true">×</span>
             </button>
-          )}
-          <button
-            className="agent-header-icon"
-            type="button"
-            aria-label="Close agents"
-            title="Close agents"
-            onClick={onClose}
-          >
-            <span aria-hidden="true">×</span>
-          </button>
+          </div>
         </div>
       </header>
 
