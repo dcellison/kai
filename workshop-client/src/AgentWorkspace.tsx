@@ -870,20 +870,6 @@ export function AgentWorkspace({
                           Start conversation
                         </button>
                       )}
-                    {enablement.lifecycleState === "enabled" &&
-                      enablement.directChannelId && (
-                        <button
-                          className="quiet-button"
-                          type="button"
-                          disabled={busy}
-                          onClick={() => onSelectAgent(
-                            selected.definitionId,
-                            "runtime",
-                          )}
-                        >
-                          Runtime settings
-                        </button>
-                      )}
                     {enablement.eligibleRuntimes.length > 0 &&
                       (enablement.lifecycleState !== "enabled" ||
                         runtimeProfileId !== enablement.runtimeProfileId) && (

@@ -1893,18 +1893,15 @@ describe("Workshop React client", () => {
       `?view=agents&agent=${qualificationDefinition.definitionId}`,
     );
 
-    await user.click(
-      screen.getByRole("button", { name: "Runtime settings" }),
-    );
-    expect(window.location.search).toBe(
-      `?view=agents&agent=${qualificationDefinition.definitionId}` +
-      "&section=runtime",
-    );
-    expect(sessionStorage.getItem("kai.workshop.active-channel.v1")).not.toContain(
-      qualificationChannelId,
-    );
+    expect(screen.queryByRole("button", { name: "Runtime settings" })).toBeNull();
 
     unmount();
+    window.history.replaceState(
+      null,
+      "",
+      `?view=agents&agent=${qualificationDefinition.definitionId}` +
+        "&section=runtime",
+    );
     vi.mocked(loadSettingsWorkspace).mockClear();
     render(<App />);
     expect(
