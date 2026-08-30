@@ -237,7 +237,7 @@ async def resolve_message_wake_targets(
     explicitly_mentioned = tuple(
         agent_id for agent_id, principal_id in attached if principal_id in mentioned_principals
     )
-    if explicitly_mentioned:
+    if mentioned_principals:
         return WakeDecision(explicitly_mentioned)
 
     current_at = datetime.fromisoformat(str(row[5]).replace("Z", "+00:00")).astimezone(UTC)
