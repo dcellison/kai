@@ -184,10 +184,12 @@ class WorkshopRoutingPolicyService:
             return existing
 
         requested_task = await self._requested_task_class(run)
-        authority = self._eligibility.authority_for_principal_runtime(
+        authority = self._eligibility.authority_for_principal_channel(
             run.requested_by_principal_id,
-            runtime_profile_id,
+            run.channel_id,
         )
+        if authority.runtime_profile_id != runtime_profile_id:
+            raise RoutingPolicyError("Run does not match canonical routing profile")
         if authority.agent_id != run.agent_id:
             raise RoutingPolicyError("Run does not match canonical routing authority")
         agent_requirements: tuple[RuntimeCapability, ...] = ()

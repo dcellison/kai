@@ -136,9 +136,9 @@ class _CanonicalRoutingEligibility:
     def __init__(self, authority: RoutingEligibilityAuthority) -> None:
         self.authority = authority
 
-    def authority_for_principal_runtime(self, principal_id, runtime_profile_id):
+    def authority_for_principal_channel(self, principal_id, channel_id):
         assert principal_id == self.authority.principal_id
-        assert runtime_profile_id == self.authority.runtime_profile_id
+        assert channel_id == self.authority.channel_id
         return self.authority
 
     async def inspect(self, authority, task_class, *, additional_required=()):
