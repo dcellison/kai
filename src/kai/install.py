@@ -9554,6 +9554,7 @@ def _cmd_status() -> None:
         )
     )
     print(workshop_agent_authority_status(Path(data_dir) / "kai.db"))
+    print(_channel_lifecycle_status(Path(data_dir) / "kai.db"))
     print(workshop_delivery_authority_status(Path(data_dir) / "kai.db"))
     print(workshop_runtime_session_status(Path(data_dir) / "kai.db"))
     print(_runtime_key_cutover_status(Path(data_dir) / "kai.db", RUNTIME_PROFILES_YAML))
@@ -10162,6 +10163,58 @@ def _integration_route_status(db_path: Path) -> str:
     if kind not in {"direct", "notification"} or agents != 1:
         return f"{prefix} INCOMPLETE; generic/default=invalid, kind={kind}, agents={agents}"
     return f"{prefix} active; generic/default={kind}, agents={agents}; transport lookup=disabled"
+
+
+def _channel_lifecycle_status(db_path: Path) -> str:
+    """Report reversible group-channel archive projection integrity."""
+    prefix = "Workshop channel lifecycle:"
+    if not db_path.is_file():
+        return f"{prefix} NOT VERIFIED (database unavailable)"
+    try:
+        connection = sqlite3.connect(
+            f"{db_path.resolve().as_uri()}?mode=ro",
+            uri=True,
+        )
+        try:
+            columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(channels)").fetchall()}
+            if not {"archived_at", "lifecycle_event_position"}.issubset(columns):
+                return f"{prefix} pending; reversible archive state unavailable"
+            totals = connection.execute(
+                "SELECT COUNT(*), "
+                "SUM(CASE WHEN archived_at IS NULL THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN archived_at IS NOT NULL THEN 1 ELSE 0 END) "
+                "FROM channels WHERE kind = 'group'"
+            ).fetchone()
+            invalid = int(
+                connection.execute(
+                    "WITH latest AS ("
+                    "SELECT aggregate_id, MAX(position) AS position FROM event_log "
+                    "WHERE aggregate_type = 'channel' "
+                    "AND event_type IN ('channel.archived', 'channel.restored') "
+                    "GROUP BY aggregate_id) "
+                    "SELECT COUNT(*) FROM channels c "
+                    "LEFT JOIN latest l ON l.aggregate_id = c.id "
+                    "LEFT JOIN event_log e ON e.position = l.position "
+                    "WHERE (c.kind != 'group' AND (c.archived_at IS NOT NULL "
+                    "OR c.lifecycle_event_position IS NOT NULL)) "
+                    "OR (c.kind = 'group' AND c.archived_at IS NOT NULL AND ("
+                    "e.event_type IS NULL OR e.event_type != 'channel.archived' "
+                    "OR c.lifecycle_event_position != e.position)) "
+                    "OR (c.kind = 'group' AND c.archived_at IS NULL AND e.position IS NOT NULL "
+                    "AND (e.event_type != 'channel.restored' "
+                    "OR c.lifecycle_event_position != e.position))"
+                ).fetchone()[0]
+            )
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        return f"{prefix} NOT VERIFIED ({exc})"
+    total, active, archived = tuple(int(value or 0) for value in (totals or (0, 0, 0)))
+    status = "active" if invalid == 0 else "INCOMPLETE"
+    return (
+        f"{prefix} {status}; group channels={total}, active={active}, "
+        f"archived={archived}, integrity gaps={invalid}; authority=canonical"
+    )
 
 
 def _internal_api_authority_status(db_path: Path) -> str:

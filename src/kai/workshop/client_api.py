@@ -63,6 +63,7 @@ from kai.workshop.channel_lifecycle import (
     WorkshopChannelAgentAttachment,
     WorkshopChannelLifecycleAccessDenied,
     WorkshopChannelLifecycleError,
+    WorkshopChannelLifecycleMutation,
     WorkshopChannelLifecycleService,
     WorkshopChannelLifecycleStorageError,
     WorkshopChannelLifecycleValidationError,
@@ -223,6 +224,8 @@ _TIMELINE_EVENTS_PATH = "/v1/channels/{channel_id}/events"
 _MESSAGE_REACTIONS_PATH = "/v1/channels/{channel_id}/messages/{message_id}/reactions"
 _CLIENT_NAVIGATION_PATH = "/v1/client/navigation"
 _CHANNEL_CREATION_PATH = "/v1/channels"
+_CHANNEL_ARCHIVAL_PATH = "/v1/channels/{channel_id}/archive"
+_CHANNEL_RESTORATION_PATH = "/v1/channels/{channel_id}/restore"
 _AGENT_DEFINITIONS_PATH = "/v1/client/agents"
 _AGENT_EVENTS_PATH = "/v1/client/agents/events"
 _AGENT_DEFINITION_PATH = "/v1/client/agents/{definition_id}"
@@ -664,6 +667,20 @@ def _serialize_channel_agent_attachment(
             "agent_id": str(attachment.agent_id),
             "sponsor_principal_id": str(attachment.sponsor_principal_id),
             "runtime_profile_id": str(attachment.runtime_profile_id),
+        },
+    }
+
+
+def _serialize_channel_lifecycle_mutation(
+    mutation: WorkshopChannelLifecycleMutation,
+) -> dict[str, object]:
+    return {
+        "version": 1,
+        "channel": {
+            "channel_id": str(mutation.channel_id),
+            "archived": mutation.archived,
+            "changed": mutation.changed,
+            "occurred_at": mutation.occurred_at.isoformat(),
         },
     }
 
@@ -3053,7 +3070,8 @@ async def _handle_client_navigation(
     ) as cursor:
         workshop_rows = list(await cursor.fetchall())
     async with store.connection.execute(
-        "SELECT c.workshop_id, c.id, c.kind, c.name, cm.role, a.id, "
+        "SELECT c.workshop_id, c.id, c.kind, c.name, cm.role, c.archived_at, "
+        "c.lifecycle_event_position, a.id, "
         "a.principal_id, a.name, "
         "CASE WHEN cara.id IS NULL THEN 0 ELSE 1 END, pae.lifecycle_state, "
         "ca.sponsor_principal_id, sponsor.display_name, "
@@ -3112,32 +3130,34 @@ async def _handle_client_navigation(
                 "name": str(row[3]) if row[3] is not None else None,
                 "kind": str(row[2]),
                 "role": str(row[4]),
+                "archived_at": str(row[5]) if row[5] is not None else None,
+                "lifecycle_event_position": int(row[6]) if row[6] is not None else None,
                 "agents": [],
                 "participants": [],
                 "_runtime_assignments": [],
-                "_agent_enablement": str(row[9]) if row[9] is not None else None,
+                "_agent_enablement": str(row[11]) if row[11] is not None else None,
             },
         )
-        if row[5] is not None:
+        if row[7] is not None:
             agents = channel["agents"]
             assignments = channel["_runtime_assignments"]
             if not isinstance(agents, list) or not isinstance(assignments, list):
                 raise RuntimeError("Workshop navigation channel assembly failed")
             agents.append(
                 {
-                    "agent_id": str(row[5]),
-                    "principal_id": str(row[6]),
-                    "name": str(row[7]),
+                    "agent_id": str(row[7]),
+                    "principal_id": str(row[8]),
+                    "name": str(row[9]),
                     "engaged": False,
                     "engaged_until": None,
-                    "sponsor_principal_id": str(row[10]) if row[10] is not None else None,
-                    "sponsor_display_name": str(row[11]) if row[11] is not None else None,
-                    "runtime_profile_id": str(row[12]) if row[12] is not None else None,
-                    "available": bool(row[13]),
+                    "sponsor_principal_id": str(row[12]) if row[12] is not None else None,
+                    "sponsor_display_name": str(row[13]) if row[13] is not None else None,
+                    "runtime_profile_id": str(row[14]) if row[14] is not None else None,
+                    "available": bool(row[15]),
                     "memory_scope": "private" if str(row[2]) == "direct" else "shared_channel",
                 }
             )
-            assignments.append(bool(row[8]))
+            assignments.append(bool(row[10]))
 
     for row in participant_rows:
         workshop_channels = channels_by_workshop.get(str(row[0]))
@@ -3166,7 +3186,8 @@ async def _handle_client_navigation(
             if not isinstance(assignments, list) or not isinstance(agents, list):
                 raise RuntimeError("Workshop navigation capability assembly failed")
             channel["can_submit_commands"] = (
-                channel["kind"] in {"direct", "group"}
+                channel["archived_at"] is None
+                and channel["kind"] in {"direct", "group"}
                 and len(agents) >= 1
                 and len(assignments) == len(agents)
                 and all(assignments)
@@ -3292,6 +3313,86 @@ async def _handle_channel_creation(
             message="Channel creation conflicted with current state",
         )
     return _json_response(_serialize_created_channel(created), status=201)
+
+
+async def _handle_channel_lifecycle_operation(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopChannelLifecycleService,
+    operation: str,
+) -> web.Response:
+    """Archive or restore one authenticated owner's group channel."""
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(
+            status=401,
+            code="authentication_required",
+            message="Authentication required",
+        )
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    if request.query or request.content_type != "application/json":
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid channel lifecycle request",
+        )
+    if request.content_length is not None and request.content_length > _MAX_CHANNEL_AGENT_OPERATION_BODY_BYTES:
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Channel lifecycle request is too large",
+        )
+    raw = await request.content.read(_MAX_CHANNEL_AGENT_OPERATION_BODY_BYTES + 1)
+    try:
+        payload = json.loads(raw)
+        channel_id = ChannelId(request.match_info["channel_id"])
+    except (UnicodeDecodeError, TypeError, ValueError):
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid channel lifecycle request",
+        )
+    if len(raw) > _MAX_CHANNEL_AGENT_OPERATION_BODY_BYTES or (
+        not isinstance(payload, dict) or set(payload) != _CHANNEL_AGENT_OPERATION_FIELDS
+    ):
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid channel lifecycle request",
+        )
+    try:
+        mutation = (
+            await service.archive(
+                principal_id,
+                channel_id,
+                client_operation_id=payload["client_operation_id"],
+            )
+            if operation == "archive"
+            else await service.restore(
+                principal_id,
+                channel_id,
+                client_operation_id=payload["client_operation_id"],
+            )
+        )
+    except WorkshopChannelLifecycleAccessDenied:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except WorkshopChannelLifecycleValidationError as exc:
+        return _error_response(status=409, code="channel_lifecycle_conflict", message=str(exc))
+    except WorkshopChannelLifecycleStorageError:
+        return _error_response(
+            status=503,
+            code="channel_lifecycle_unavailable",
+            message="Channel lifecycle is temporarily unavailable",
+        )
+    except WorkshopChannelLifecycleError:
+        return _error_response(
+            status=409,
+            code="channel_lifecycle_conflict",
+            message="Channel lifecycle conflicted with current state",
+        )
+    return _json_response(_serialize_channel_lifecycle_mutation(mutation), status=200)
 
 
 async def _handle_channel_agent_operation(
@@ -5020,6 +5121,24 @@ def register_workshop_read_routes(
                 service=channel_lifecycle,
             )
 
+    async def handle_channel_archival(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_channel_lifecycle_operation(
+                request,
+                authenticator=authenticator,
+                service=channel_lifecycle,
+                operation="archive",
+            )
+
+    async def handle_channel_restoration(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_channel_lifecycle_operation(
+                request,
+                authenticator=authenticator,
+                service=channel_lifecycle,
+                operation="restore",
+            )
+
     async def handle_channel_agent_attachment(request: web.Request) -> web.Response:
         async with request_lock:
             return await _handle_channel_agent_operation(
@@ -5125,6 +5244,8 @@ def register_workshop_read_routes(
 
     app.router.add_get(_CLIENT_NAVIGATION_PATH, handle_client_navigation)
     app.router.add_post(_CHANNEL_CREATION_PATH, handle_channel_creation)
+    app.router.add_post(_CHANNEL_ARCHIVAL_PATH, handle_channel_archival)
+    app.router.add_post(_CHANNEL_RESTORATION_PATH, handle_channel_restoration)
     app.router.add_post(_AGENT_ATTACHMENT_PATH, handle_channel_agent_attachment)
     app.router.add_post(_AGENT_DETACHMENT_PATH, handle_channel_agent_detachment)
     app.router.add_get(_AGENT_DEFINITIONS_PATH, handle_agent_definition_list)

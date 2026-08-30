@@ -89,10 +89,14 @@ async def resolve_channel_runtime_profile(
         parameters = (channel_id, agent_id)
     async with store.connection.execute("PRAGMA table_info(channel_agents)") as cursor:
         channel_agent_columns = {str(row[1]) for row in await cursor.fetchall()}
+    async with store.connection.execute("PRAGMA table_info(channels)") as cursor:
+        channel_columns = {str(row[1]) for row in await cursor.fetchall()}
     active_clause = " AND ca.detached_at IS NULL" if "detached_at" in channel_agent_columns else ""
+    channel_active_clause = " AND c.archived_at IS NULL" if "archived_at" in channel_columns else ""
     async with store.connection.execute(
         "SELECT ra.agent_id, ra.runtime_profile_id "
         "FROM channel_agent_runtime_assignments ra "
+        "JOIN channels c ON c.id = ra.channel_id" + channel_active_clause + " "
         "JOIN channel_agents ca ON ca.channel_id = ra.channel_id AND ca.agent_id = ra.agent_id"
         + active_clause
         + " WHERE ra.channel_id = ?"

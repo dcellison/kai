@@ -246,7 +246,7 @@ async def _resolve_artifact_message(
     async with store.connection.execute(
         "SELECT c.workshop_id, m.channel_id, m.author_principal_id "
         "FROM messages m "
-        "JOIN channels c ON c.id = m.channel_id "
+        "JOIN channels c ON c.id = m.channel_id AND c.archived_at IS NULL "
         "JOIN principals p ON p.id = m.author_principal_id AND p.kind = ? "
         "WHERE m.id = ?",
         (author_kind, message_id),
@@ -726,6 +726,12 @@ class WorkshopArtifactService:
             raise ValueError("principal_id and channel_id must be canonical identifiers")
         if not isinstance(client_message_id, str) or not client_message_id:
             raise ValueError("client_message_id must be non-empty")
+        async with self._store.connection.execute(
+            "SELECT 1 FROM channels WHERE id = ? AND archived_at IS NULL",
+            (channel_id,),
+        ) as cursor:
+            if await cursor.fetchone() is None:
+                raise ArtifactAccessDeniedError("Archived channels are read-only")
         _, profile_id = await resolve_channel_runtime_profile(self._store, channel_id)
         namespace = self._storage.for_runtime_profile(profile_id)
         if namespace.principal_id != principal_id:

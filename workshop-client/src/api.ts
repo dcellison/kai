@@ -485,6 +485,13 @@ export async function loadNavigation(token: string): Promise<WorkshopNavigation>
           String(rawChannel.kind),
         ) ||
         typeof rawChannel.role !== "string" ||
+        (rawChannel.archived_at !== undefined &&
+          rawChannel.archived_at !== null &&
+          typeof rawChannel.archived_at !== "string") ||
+        (rawChannel.lifecycle_event_position !== undefined &&
+          rawChannel.lifecycle_event_position !== null &&
+          (typeof rawChannel.lifecycle_event_position !== "number" ||
+            !Number.isSafeInteger(rawChannel.lifecycle_event_position))) ||
         typeof rawChannel.can_submit_commands !== "boolean" ||
         !Array.isArray(rawChannel.agents) ||
         !Array.isArray(rawChannel.participants)
@@ -546,9 +553,15 @@ export async function loadNavigation(token: string): Promise<WorkshopNavigation>
       });
       return {
         agents,
+        ...(rawChannel.archived_at === undefined
+          ? {}
+          : { archivedAt: rawChannel.archived_at }),
         canSubmitCommands: rawChannel.can_submit_commands,
         channelId: rawChannel.channel_id,
         kind: rawChannel.kind as "direct" | "group" | "notification",
+        ...(rawChannel.lifecycle_event_position === undefined
+          ? {}
+          : { lifecycleEventPosition: rawChannel.lifecycle_event_position }),
         name: rawChannel.name,
         participants,
         role: rawChannel.role,
@@ -995,6 +1008,62 @@ export async function createChannel(
     throw new Error("Kai returned an unsupported channel creation response.");
   }
   return payload.channel.channel_id;
+}
+
+async function mutateChannelLifecycle(
+  token: string,
+  channelId: string,
+  operation: "archive" | "restore",
+  clientOperationId: string,
+): Promise<void> {
+  if (!CHANNEL_PATTERN.test(channelId)) {
+    throw new Error("Invalid channel identity.");
+  }
+  const response = await authorizedFetch(
+    { channelId, token },
+    `/v1/channels/${encodeURIComponent(channelId)}/${operation}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ client_operation_id: clientOperationId }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (
+    !response.ok ||
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    !isRecord(payload.channel) ||
+    payload.channel.channel_id !== channelId ||
+    payload.channel.archived !== (operation === "archive") ||
+    typeof payload.channel.changed !== "boolean" ||
+    typeof payload.channel.occurred_at !== "string"
+  ) {
+    throw new Error(
+      safeErrorMessage(
+        payload,
+        operation === "archive"
+          ? "Could not archive this channel."
+          : "Could not restore this channel.",
+      ),
+    );
+  }
+}
+
+export async function archiveChannel(
+  token: string,
+  channelId: string,
+  clientOperationId: string,
+): Promise<void> {
+  await mutateChannelLifecycle(token, channelId, "archive", clientOperationId);
+}
+
+export async function restoreChannel(
+  token: string,
+  channelId: string,
+  clientOperationId: string,
+): Promise<void> {
+  await mutateChannelLifecycle(token, channelId, "restore", clientOperationId);
 }
 
 async function mutateChannelAgent(

@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
 import {
+  archiveChannel,
   attachChannelAgent,
   AuthenticationError,
   cancelRun,
@@ -31,6 +32,7 @@ import {
   loadThreadTimeline,
   loadWorkspaceConfig,
   redeemEnrollment,
+  restoreChannel,
   streamTimeline,
   streamAgentChanges,
   setMessageReaction,
@@ -53,6 +55,7 @@ vi.mock("./api", async (importOriginal) => {
   return {
     ...original,
     attachChannelAgent: vi.fn(),
+    archiveChannel: vi.fn(),
     cancelRun: vi.fn(),
     createChannel: vi.fn(),
     detachChannelAgent: vi.fn(),
@@ -77,6 +80,7 @@ vi.mock("./api", async (importOriginal) => {
     loadSettingsWorkspace: vi.fn(),
     loadWorkspaceConfig: vi.fn(),
     redeemEnrollment: vi.fn(),
+    restoreChannel: vi.fn(),
     streamTimeline: vi.fn(),
     streamAgentChanges: vi.fn(),
     setMessageReaction: vi.fn(),
@@ -401,9 +405,11 @@ describe("Workshop React client", () => {
     failStream = null;
     vi.mocked(redeemEnrollment).mockResolvedValue("redeemed-session-token");
     vi.mocked(attachChannelAgent).mockResolvedValue(undefined);
+    vi.mocked(archiveChannel).mockResolvedValue(undefined);
     vi.mocked(createChannel).mockResolvedValue(secondChannelId);
     vi.mocked(detachChannelAgent).mockResolvedValue(undefined);
     vi.mocked(dismissChannelAgent).mockResolvedValue(undefined);
+    vi.mocked(restoreChannel).mockResolvedValue(undefined);
     vi.mocked(setMessageReaction).mockResolvedValue([]);
     vi.mocked(loadNavigation).mockResolvedValue(navigation);
     vi.mocked(loadAppearancePreferences).mockResolvedValue({
@@ -1535,6 +1541,83 @@ describe("Workshop React client", () => {
     expect(
       screen.getByRole("button", { name: "Release planning" }),
     ).toBeVisible();
+  });
+
+  it("archives a group channel read-only and restores it from the archive", async () => {
+    const user = userEvent.setup();
+    const active = navigationWithGroup({
+      name: "Lifecycle qualification",
+      role: "owner",
+    });
+    const archived = {
+      ...active,
+      workshops: active.workshops.map((workshop) => ({
+        ...workshop,
+        channels: workshop.channels.map((candidate) =>
+          candidate.channelId === secondChannelId
+            ? {
+                ...candidate,
+                archivedAt: "2026-08-30T15:00:00Z",
+                canSubmitCommands: false,
+                lifecycleEventPosition: 501,
+              }
+            : candidate,
+        ),
+      })),
+    };
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId: secondChannelId, token: "existing-session" }),
+    );
+    vi.mocked(loadNavigation)
+      .mockResolvedValueOnce(active)
+      .mockResolvedValueOnce(archived)
+      .mockResolvedValueOnce(active);
+    vi.mocked(loadTimeline).mockResolvedValue({
+      messages: [{ ...historyMessage, channelId: secondChannelId }],
+      throughPosition: 25,
+      previousCursor: null,
+    });
+
+    render(<App />);
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Archive channel" }));
+    const confirmation = screen.getByRole("dialog", { name: "Continue?" });
+    await user.click(
+      within(confirmation).getByRole("button", { name: "Continue" }),
+    );
+
+    await waitFor(() => expect(archiveChannel).toHaveBeenCalledOnce());
+    expect(vi.mocked(archiveChannel).mock.calls[0]?.slice(0, 2)).toEqual([
+      "existing-session",
+      secondChannelId,
+    ]);
+    expect(
+      await screen.findByText(/preserved and read-only/),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "Lifecycle qualification" }),
+    ).toBeNull();
+    expect(screen.queryByLabelText("Message Lifecycle qualification")).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Archived channels" }));
+    const archiveDialog = screen.getByRole("dialog", { name: "Archive" });
+    expect(archiveDialog).toHaveTextContent("Lifecycle qualification");
+    await user.click(
+      within(archiveDialog).getByRole("button", {
+        name: "Restore channel Lifecycle qualification",
+      }),
+    );
+
+    await waitFor(() => expect(restoreChannel).toHaveBeenCalledOnce());
+    expect(vi.mocked(restoreChannel).mock.calls[0]?.slice(0, 2)).toEqual([
+      "existing-session",
+      secondChannelId,
+    ]);
+    expect(
+      await screen.findByRole("button", { name: "Lifecycle qualification" }),
+    ).toBeVisible();
+    expect(screen.getByLabelText("Message Lifecycle qualification")).toBeVisible();
   });
 
   it("inserts member mentions as plain text and submits them canonically", async () => {

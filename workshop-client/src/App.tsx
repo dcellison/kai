@@ -13,6 +13,7 @@ import {
 
 import {
   AuthenticationError,
+  archiveChannel,
   attachChannelAgent,
   cancelRun,
   ChannelAccessError,
@@ -29,6 +30,7 @@ import {
   loadSettingsWorkspace,
   loadThreadTimeline,
   redeemEnrollment,
+  restoreChannel,
   setMessageReaction,
   submitCommand,
   switchWorkspace,
@@ -1088,6 +1090,10 @@ function channelSymbol(channel: WorkshopChannelSummary): string {
   return "#";
 }
 
+function channelIsArchived(channel: WorkshopChannelSummary): boolean {
+  return typeof channel.archivedAt === "string";
+}
+
 function workshopRoleLabel(role: string): string {
   if (role === "admin") {
     return "Workshop administrator";
@@ -1337,6 +1343,86 @@ function ChannelAgentManagementDialog({
   );
 }
 
+function ArchivedChannelsDialog({
+  channels,
+  busyChannelId,
+  onClose,
+  onRestore,
+  onView,
+}: {
+  channels: WorkshopChannelSummary[];
+  busyChannelId: string | null;
+  onClose: () => void;
+  onRestore: (channelId: string) => Promise<void>;
+  onView: (channelId: string) => void;
+}): React.JSX.Element {
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section
+        className="channel-creation-dialog channel-archive-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="channel-archive-title"
+      >
+        <header className="channel-archive-header">
+          <div>
+            <p className="overline">Channels</p>
+            <h2 id="channel-archive-title">Archive</h2>
+          </div>
+          <button
+            className="panel-icon-button"
+            type="button"
+            aria-label="Close channel archive"
+            title="Close channel archive"
+            onClick={onClose}
+          >
+            <span aria-hidden="true">×</span>
+          </button>
+        </header>
+        {channels.length === 0 ? (
+          <p className="channel-archive-empty">No archived channels.</p>
+        ) : (
+          <ul className="channel-archive-list">
+            {channels.map((channel) => (
+              <li key={channel.channelId}>
+                <span>
+                  <strong># {channelDisplayName(channel)}</strong>
+                  <small>
+                    Archived {channel.archivedAt ? formatTimestamp(channel.archivedAt) : ""}
+                  </small>
+                </span>
+                <span className="channel-archive-actions">
+                  <button
+                    className="panel-icon-button"
+                    type="button"
+                    aria-label={`View archived channel ${channelDisplayName(channel)}`}
+                    title="View archived channel"
+                    onClick={() => onView(channel.channelId)}
+                  >
+                    <ViewIcon />
+                  </button>
+                  {channel.role === "owner" && (
+                    <button
+                      className="panel-icon-button"
+                      type="button"
+                      aria-label={`Restore channel ${channelDisplayName(channel)}`}
+                      title="Restore channel"
+                      disabled={busyChannelId !== null}
+                      onClick={() => void onRestore(channel.channelId)}
+                    >
+                      <RestoreIcon />
+                    </button>
+                  )}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+    </div>
+  );
+}
+
 function PaperclipIcon(): React.JSX.Element {
   return (
     <svg
@@ -1436,6 +1522,31 @@ function ManageAgentsIcon(): React.JSX.Element {
   );
 }
 
+function ArchiveIcon(): React.JSX.Element {
+  return (
+    <svg aria-hidden="true" fill="none" focusable="false" viewBox="0 0 24 24">
+      <path d="M4 7h16v13H4zM3 4h18v3H3zM9 11h6" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" />
+    </svg>
+  );
+}
+
+function RestoreIcon(): React.JSX.Element {
+  return (
+    <svg aria-hidden="true" fill="none" focusable="false" viewBox="0 0 24 24">
+      <path d="M4 12a8 8 0 1 0 2.34-5.66L4 8.68M4 4v4.68h4.68" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" />
+    </svg>
+  );
+}
+
+function ViewIcon(): React.JSX.Element {
+  return (
+    <svg aria-hidden="true" fill="none" focusable="false" viewBox="0 0 24 24">
+      <path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z" stroke="currentColor" strokeLinejoin="round" strokeWidth="1.8" />
+      <circle cx="12" cy="12" r="2.5" stroke="currentColor" strokeWidth="1.8" />
+    </svg>
+  );
+}
+
 function ThreadPane({
   channelName,
   liveMessages,
@@ -1446,6 +1557,7 @@ function ThreadPane({
   onSetReaction,
   onSubmitCommand,
   reactionUpdates,
+  readOnly,
   rootMessage,
   runActive,
 }: {
@@ -1462,6 +1574,7 @@ function ThreadPane({
   ) => Promise<void>;
   onSubmitCommand: (clientMessageId: string, body: string, artifact: File | null, threadRootId: string | null) => Promise<CommandSubmissionResult>;
   reactionUpdates: Record<string, TimelineMessage["reactions"]>;
+  readOnly: boolean;
   rootMessage: TimelineMessage;
   runActive: boolean;
 }): React.JSX.Element {
@@ -1583,7 +1696,7 @@ function ThreadPane({
             })()}
             onDownloadArtifact={onDownloadArtifact}
             onLoadArtifact={onLoadArtifact}
-            onSetReaction={onSetReaction}
+            onSetReaction={readOnly ? undefined : onSetReaction}
           />
           {replies.map((message) => (
             <MessageItem
@@ -1594,7 +1707,7 @@ function ThreadPane({
               }}
               onDownloadArtifact={onDownloadArtifact}
               onLoadArtifact={onLoadArtifact}
-              onSetReaction={onSetReaction}
+              onSetReaction={readOnly ? undefined : onSetReaction}
             />
           ))}
         </ol>
@@ -1610,6 +1723,9 @@ function ThreadPane({
           </button>
         )}
       </div>
+      {readOnly ? (
+        <p className="archived-read-only">Archived channels are read-only.</p>
+      ) : (
       <form className="composer-form thread-composer" onSubmit={(event) => void submitReply(event)}>
         <textarea
           ref={composerRef}
@@ -1643,6 +1759,7 @@ function ThreadPane({
           <SendIcon />
         </button>
       </form>
+      )}
       {error && <p className="thread-error" role="alert">{error}</p>}
     </div>
   );
@@ -1669,6 +1786,7 @@ function WorkshopView({
   workshop,
   onForget,
   onAgentNavigationChanged,
+  onArchiveChannel,
   onAttachAgent,
   onCancelRun,
   onCreateChannel,
@@ -1687,6 +1805,7 @@ function WorkshopView({
   onOpenAgentDefinition,
   onOpenAgentChannel,
   onOpenSettings,
+  onRestoreChannel,
   onSelectAgent,
   onSelectMemory,
   onSelectChannel,
@@ -1720,6 +1839,7 @@ function WorkshopView({
   workshop: WorkshopSummary;
   onForget: () => void;
   onAgentNavigationChanged: () => Promise<void>;
+  onArchiveChannel: (channelId: string, clientOperationId: string) => Promise<void>;
   onAttachAgent: (agentId: string, clientOperationId: string) => Promise<void>;
   onCancelRun: (runId: string) => Promise<WorkshopRun>;
   onCreateChannel: (input: ChannelCreationRequest) => Promise<void>;
@@ -1742,6 +1862,7 @@ function WorkshopView({
   onOpenAgentDefinition: (agentId: string) => Promise<void>;
   onOpenAgentChannel: (channelId: string) => Promise<void>;
   onOpenSettings: () => void;
+  onRestoreChannel: (channelId: string, clientOperationId: string) => Promise<void>;
   onSelectAgent: (
     definitionId: string | null,
     section?: "runtime" | null,
@@ -1804,6 +1925,8 @@ function WorkshopView({
     originChannelId: string | null;
     originName: string | null;
   } | null>(null);
+  const [archivedChannelsOpen, setArchivedChannelsOpen] = useState(false);
+  const [channelLifecycleBusy, setChannelLifecycleBusy] = useState<string | null>(null);
   const [agentManagement, setAgentManagement] = useState<WorkshopAgentEnablement[] | null>(null);
   const [agentManagementLoading, setAgentManagementLoading] = useState(false);
   const [dismissedAgents, setDismissedAgents] = useState<Record<string, number>>({});
@@ -2053,6 +2176,49 @@ function WorkshopView({
     }
     await onAgentNavigationChanged();
     setAgentManagement(null);
+  };
+
+  const archiveSelectedChannel = async (): Promise<void> => {
+    if (
+      channel.kind !== "group" ||
+      channel.role !== "owner" ||
+      channelIsArchived(channel) ||
+      channelLifecycleBusy ||
+      !await confirm(
+        `Archive #${channelName}? Its history will remain available and you can restore it later.`,
+      )
+    ) {
+      return;
+    }
+    setChannelLifecycleBusy(channelId);
+    setSubmissionError(null);
+    try {
+      await onArchiveChannel(channelId, createClientMessageId());
+    } catch (caught) {
+      setSubmissionError(
+        caught instanceof Error ? caught.message : "Could not archive this channel.",
+      );
+    } finally {
+      setChannelLifecycleBusy(null);
+    }
+  };
+
+  const restoreArchivedChannel = async (archivedChannelId: string): Promise<void> => {
+    if (channelLifecycleBusy) {
+      return;
+    }
+    setChannelLifecycleBusy(archivedChannelId);
+    setSubmissionError(null);
+    try {
+      await onRestoreChannel(archivedChannelId, createClientMessageId());
+      setArchivedChannelsOpen(false);
+    } catch (caught) {
+      setSubmissionError(
+        caught instanceof Error ? caught.message : "Could not restore this channel.",
+      );
+    } finally {
+      setChannelLifecycleBusy(null);
+    }
   };
 
   const forgetCurrentSession = async (): Promise<void> => {
@@ -2625,25 +2791,40 @@ function WorkshopView({
           {!sidebarLayout.collapsed && (
             <div className="nav-heading-row">
               <p className="nav-heading">Channels</p>
-              <button
-                className="nav-add-button"
-                type="button"
-                aria-label="Create channel"
-                title="Create channel"
-                onClick={() =>
-                  setChannelCreation({
-                    initialAgentIds: [],
-                    originChannelId: null,
-                    originName: null,
-                  })
-                }
-              >
-                <span aria-hidden="true" />
-              </button>
+              <div className="nav-heading-actions">
+                <button
+                  className="nav-tool-button"
+                  type="button"
+                  aria-label="Archived channels"
+                  title="Archived channels"
+                  onClick={() => setArchivedChannelsOpen(true)}
+                >
+                  <ArchiveIcon />
+                </button>
+                <button
+                  className="nav-add-button"
+                  type="button"
+                  aria-label="Create channel"
+                  title="Create channel"
+                  onClick={() =>
+                    setChannelCreation({
+                      initialAgentIds: [],
+                      originChannelId: null,
+                      originName: null,
+                    })
+                  }
+                >
+                  <span aria-hidden="true" />
+                </button>
+              </div>
             </div>
           )}
           {workshop.channels
-            .filter((availableChannel) => availableChannel.kind === "group")
+            .filter(
+              (availableChannel) =>
+                availableChannel.kind === "group" &&
+                !channelIsArchived(availableChannel),
+            )
             .map((availableChannel) => (
               <button
                 className={`channel-link ${!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId ? "active" : ""}`}
@@ -2879,7 +3060,9 @@ function WorkshopView({
               </p>
               <h3>Welcome to {channelName}</h3>
               <p>
-                {channel.kind === "notification"
+                {channelIsArchived(channel)
+                  ? "This channel is archived. Its history remains available, but it is read-only until restored."
+                  : channel.kind === "notification"
                   ? "Authenticated GitHub activity appears here live and is delivered to every configured client."
                   : "Messages below come from Kai’s durable conversation history across every connected client."}
               </p>
@@ -2921,9 +3104,11 @@ function WorkshopView({
                   notification={channel.kind === "notification"}
                   onDownloadArtifact={onDownloadArtifact}
                   onLoadArtifact={onLoadArtifact}
-                  onSetReaction={onSetReaction}
+                  onSetReaction={!channelIsArchived(channel) ? onSetReaction : undefined}
                   onOpenThread={
-                    channel.kind === "group" ? setThreadRootMessageId : undefined
+                    channel.kind === "group" && !channelIsArchived(channel)
+                      ? setThreadRootMessageId
+                      : undefined
                   }
                 />
               ))}
@@ -3178,15 +3363,42 @@ function WorkshopView({
             onSetReaction={onSetReaction}
             onSubmitCommand={onSubmitCommand}
             reactionUpdates={reactionUpdates}
+            readOnly={channelIsArchived(channel)}
             rootMessage={threadRootMessage}
             runActive={isRunActive(activeRun)}
           />
         ) : (
         <div className="context-scroll">
-          <header>
-            <p className="overline">Channel context</p>
-            <h2>{symbol} {channelName}</h2>
+          <header className="context-channel-header">
+            <div>
+              <p className="overline">Channel context</p>
+              <h2>{symbol} {channelName}</h2>
+            </div>
+            {channel.kind === "group" && channel.role === "owner" && (
+              <button
+                className="panel-icon-button"
+                type="button"
+                aria-label={!channelIsArchived(channel) ? "Archive channel" : "Restore channel"}
+                title={!channelIsArchived(channel) ? "Archive channel" : "Restore channel"}
+                disabled={channelLifecycleBusy !== null || isRunActive(activeRun)}
+                onClick={() => void (
+                  !channelIsArchived(channel)
+                    ? archiveSelectedChannel()
+                    : restoreArchivedChannel(channelId)
+                )}
+              >
+                {!channelIsArchived(channel) ? <ArchiveIcon /> : <RestoreIcon />}
+              </button>
+            )}
           </header>
+
+          {channelIsArchived(channel) && (
+            <section className="context-section archived-channel-state">
+              <span className="section-number">00</span>
+              <h3>Archived</h3>
+              <p>This channel is preserved and read-only. Restore it to resume activity.</p>
+            </section>
+          )}
 
           <section className="context-section">
             <span className="section-number">01</span>
@@ -3217,7 +3429,7 @@ function WorkshopView({
               <span className="section-number">04</span>
               <div className="context-section-heading">
                 <h3>Agent attention</h3>
-                {channel.role === "owner" && (
+                {channel.role === "owner" && !channelIsArchived(channel) && (
                   <button
                     className="panel-icon-button"
                     type="button"
@@ -3347,6 +3559,22 @@ function WorkshopView({
           }}
         />
       )}
+      {archivedChannelsOpen && (
+        <ArchivedChannelsDialog
+          channels={workshop.channels.filter(
+            (availableChannel) =>
+              availableChannel.kind === "group" &&
+              channelIsArchived(availableChannel),
+          )}
+          busyChannelId={channelLifecycleBusy}
+          onClose={() => setArchivedChannelsOpen(false)}
+          onRestore={restoreArchivedChannel}
+          onView={(archivedChannelId) => {
+            setArchivedChannelsOpen(false);
+            onSelectChannel(archivedChannelId);
+          }}
+        />
+      )}
       {agentManagement && (
         <ChannelAgentManagementDialog
           attachedAgents={channel.agents}
@@ -3407,6 +3635,7 @@ function ActiveWorkshopClient({
   navigation,
   session,
   onAuthenticationFailure,
+  onArchiveChannel,
   onChannelAccessFailure,
   onCreateChannel,
   onForget,
@@ -3416,6 +3645,7 @@ function ActiveWorkshopClient({
   onOpenAgentChannel,
   onOpenMemory,
   onOpenSettings,
+  onRestoreChannel,
   onSelectChannel,
   onSelectAgent,
   onSelectMemory,
@@ -3425,6 +3655,7 @@ function ActiveWorkshopClient({
   navigation: WorkshopNavigation;
   session: WorkshopSession;
   onAuthenticationFailure: (message: string) => void;
+  onArchiveChannel: (channelId: string, clientOperationId: string) => Promise<void>;
   onChannelAccessFailure: (message: string) => void;
   onCreateChannel: (input: ChannelCreationRequest) => Promise<void>;
   onForget: () => void;
@@ -3434,6 +3665,7 @@ function ActiveWorkshopClient({
   onOpenAgentChannel: (channelId: string) => Promise<void>;
   onOpenMemory: () => void;
   onOpenSettings: () => void;
+  onRestoreChannel: (channelId: string, clientOperationId: string) => Promise<void>;
   onSelectChannel: (channelId: string) => void;
   onSelectAgent: (
     definitionId: string | null,
@@ -3631,6 +3863,7 @@ function ActiveWorkshopClient({
       workshop={selected.workshop}
       onForget={onForget}
       onAgentNavigationChanged={onAgentNavigationChanged}
+      onArchiveChannel={onArchiveChannel}
       onAttachAgent={attachSelectedAgent}
       onCreateAgent={onCreateAgent}
       onCancelRun={cancelSelectedRun}
@@ -3646,6 +3879,7 @@ function ActiveWorkshopClient({
       onOpenAgentDefinition={onOpenAgentDefinition}
       onOpenMemory={onOpenMemory}
       onOpenSettings={onOpenSettings}
+      onRestoreChannel={onRestoreChannel}
       onSelectMemory={onSelectMemory}
       onSelectAgent={onSelectAgent}
       onSelectChannel={onSelectChannel}
@@ -4036,6 +4270,40 @@ function WorkshopApp(): React.JSX.Element {
     }
   };
 
+  const changeWorkshopChannelLifecycle = async (
+    channelId: string,
+    clientOperationId: string,
+    operation: "archive" | "restore",
+  ): Promise<void> => {
+    if (!session) {
+      throw new Error("Workshop is not connected.");
+    }
+    try {
+      if (operation === "archive") {
+        await archiveChannel(session.token, channelId, clientOperationId);
+      } else {
+        await restoreChannel(session.token, channelId, clientOperationId);
+      }
+      const [discovered, appearance] = await Promise.all([
+        loadNavigation(session.token),
+        loadAppearancePreferences({ token: session.token }),
+      ]);
+      adoptNavigation(
+        session.token,
+        discovered,
+        operation === "restore" ? channelId : session.channelId,
+        appearance,
+      );
+    } catch (caught) {
+      if (caught instanceof AuthenticationError) {
+        handleAuthenticationFailure(caught.message);
+      } else if (caught instanceof ChannelAccessError) {
+        handleChannelAccessFailure(caught.message);
+      }
+      throw caught;
+    }
+  };
+
   if (view === "enrollment") {
     return (
       <EnrollmentView
@@ -4059,6 +4327,9 @@ function WorkshopApp(): React.JSX.Element {
       navigation={navigation}
       session={session}
       onAuthenticationFailure={handleAuthenticationFailure}
+      onArchiveChannel={(channelId, clientOperationId) =>
+        changeWorkshopChannelLifecycle(channelId, clientOperationId, "archive")
+      }
       onChannelAccessFailure={handleChannelAccessFailure}
       onCreateChannel={createWorkshopChannel}
       onForget={() => forgetSession()}
@@ -4068,6 +4339,9 @@ function WorkshopApp(): React.JSX.Element {
           onOpenAgentDefinition={openAgentDefinition}
           onOpenMemory={() => void openMemory()}
       onOpenSettings={openSettings}
+      onRestoreChannel={(channelId, clientOperationId) =>
+        changeWorkshopChannelLifecycle(channelId, clientOperationId, "restore")
+      }
       onSelectChannel={(channelId) => void selectChannel(channelId)}
       onSelectAgent={selectAgent}
       onSelectMemory={selectMemory}

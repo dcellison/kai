@@ -73,6 +73,7 @@ from kai.workshop.github_settings import (
 )
 from kai.workshop.inbound import (
     ClientInboundMessage,
+    InboundBindingNotFoundError,
     InboundMessage,
     record_client_inbound_message_in_transaction,
     record_inbound_message,
@@ -1267,6 +1268,8 @@ class TestWorkshopNavigationHTTPContract:
                 "name": "Direct",
                 "kind": "direct",
                 "role": "owner",
+                "archived_at": None,
+                "lifecycle_event_position": None,
                 "agents": [
                     {
                         "agent_id": direct["agents"][0]["agent_id"],
@@ -1745,6 +1748,166 @@ class TestWorkshopAgentEnablementHTTPContract:
 
 
 class TestWorkshopChannelLifecycleHTTPContract:
+    async def test_archive_rejects_a_channel_with_a_nonterminal_run(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_direct, _, _ = await _open_store(tmp_path / "kai.db")
+        channel_id = await _create_group_channel(store, alice_id, alice_direct)
+        message_id = await _record_client_message(
+            store,
+            alice_id,
+            channel_id,
+            "active-run",
+            "Remain active.",
+        )
+        async with store.connection.execute(
+            "SELECT agent_id FROM channel_agents WHERE channel_id = ? AND detached_at IS NULL",
+            (channel_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        await WorkshopRunLifecycle(store).accept(
+            message_id,
+            occurred_at=_NOW,
+            agent_id=AgentId(str(row[0])),
+        )
+        client = await _open_client(store, _Authenticator({"alice": alice_id}))
+        try:
+            response = await client.post(
+                f"/v1/channels/{channel_id}/archive",
+                headers={"Authorization": "Bearer alice"},
+                json={"client_operation_id": "archive-active-run"},
+            )
+            assert response.status == 409
+            assert (await response.json())["error"] == {
+                "code": "channel_lifecycle_conflict",
+                "message": "Channel cannot be archived while an agent run is active",
+            }
+            async with store.connection.execute(
+                "SELECT archived_at FROM channels WHERE id = ?",
+                (channel_id,),
+            ) as cursor:
+                assert (await cursor.fetchone())[0] is None
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_owner_archives_reads_and_restores_the_same_channel(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_direct, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        channel_id = await _create_group_channel(store, alice_id, alice_direct)
+        message_id = await _record_client_message(
+            store,
+            alice_id,
+            channel_id,
+            "archive-history",
+            "Preserve this history.",
+        )
+        client = await _open_client(
+            store,
+            _Authenticator({"alice": alice_id, "bob": bob_id}),
+        )
+        path = f"/v1/channels/{channel_id}"
+        try:
+            denied = await client.post(
+                f"{path}/archive",
+                headers={"Authorization": "Bearer bob"},
+                json={"client_operation_id": "bob-archive"},
+            )
+            archived = await client.post(
+                f"{path}/archive",
+                headers={"Authorization": "Bearer alice"},
+                json={"client_operation_id": "alice-archive"},
+            )
+            replayed = await client.post(
+                f"{path}/archive",
+                headers={"Authorization": "Bearer alice"},
+                json={"client_operation_id": "alice-archive"},
+            )
+            assert denied.status == 403
+            assert archived.status == replayed.status == 200
+            archived_payload = await archived.json()
+            assert archived_payload["channel"] | {"occurred_at": "ignored"} == {
+                "channel_id": channel_id,
+                "archived": True,
+                "changed": True,
+                "occurred_at": "ignored",
+            }
+            assert (await replayed.json())["channel"]["changed"] is False
+
+            navigation = await client.get(
+                "/v1/client/navigation",
+                headers={"Authorization": "Bearer alice"},
+            )
+            visible = next(
+                item
+                for item in (await navigation.json())["workshops"][0]["channels"]
+                if item["channel_id"] == channel_id
+            )
+            assert visible["archived_at"] is not None
+            assert isinstance(visible["lifecycle_event_position"], int)
+            assert visible["can_submit_commands"] is False
+
+            timeline = await client.get(
+                f"{path}/timeline",
+                headers={"Authorization": "Bearer alice"},
+            )
+            assert timeline.status == 200
+            assert [item["body"] for item in (await timeline.json())["messages"]] == ["Preserve this history."]
+
+            with pytest.raises(InboundBindingNotFoundError):
+                await store.connection.execute("BEGIN IMMEDIATE")
+                try:
+                    await record_client_inbound_message_in_transaction(
+                        store,
+                        ClientInboundMessage(
+                            alice_id,
+                            channel_id,
+                            "archived-write",
+                            "Must be rejected.",
+                            _NOW,
+                        ),
+                    )
+                finally:
+                    await store.connection.rollback()
+
+            restored = await client.post(
+                f"{path}/restore",
+                headers={"Authorization": "Bearer alice"},
+                json={"client_operation_id": "alice-restore"},
+            )
+            assert restored.status == 200
+            assert (await restored.json())["channel"]["archived"] is False
+            await _record_client_message(
+                store,
+                alice_id,
+                channel_id,
+                "restored-write",
+                "Channel restored.",
+            )
+            await store.rebuild_projection(CanonicalConversationProjection())
+            async with store.connection.execute(
+                "SELECT archived_at, lifecycle_event_position FROM channels WHERE id = ?",
+                (channel_id,),
+            ) as cursor:
+                state = await cursor.fetchone()
+            assert state is not None and state[0] is None and int(state[1]) > 0
+            async with store.connection.execute(
+                "SELECT body FROM messages WHERE channel_id = ? ORDER BY created_event_position",
+                (channel_id,),
+            ) as cursor:
+                assert [str(row[0]) for row in await cursor.fetchall()] == [
+                    "Preserve this history.",
+                    "Channel restored.",
+                ]
+            assert message_id is not None
+        finally:
+            await client.close()
+            await store.close()
+
     async def test_owner_detaches_and_reattaches_sponsored_agent_without_losing_history(
         self,
         tmp_path: Path,

@@ -249,6 +249,9 @@ def _stable_token(message: InboundMessage) -> str:
 
 
 async def _resolve_binding(store: WorkshopEventStore, message: InboundMessage) -> _ResolvedInboundBinding:
+    async with store.connection.execute("PRAGMA table_info(channels)") as cursor:
+        channel_columns = {str(row[1]) for row in await cursor.fetchall()}
+    active_clause = " AND c.archived_at IS NULL" if "archived_at" in channel_columns else ""
     async with store.connection.execute(
         "SELECT c.workshop_id, e.principal_id, c.id, c.kind "
         "FROM external_identities e "
@@ -256,7 +259,7 @@ async def _resolve_binding(store: WorkshopEventStore, message: InboundMessage) -
         "JOIN channel_bindings b ON b.transport = e.provider "
         "JOIN channels c ON c.id = b.channel_id AND c.workshop_id = wm.workshop_id "
         "WHERE e.provider = ? AND e.external_subject = ? "
-        "AND b.transport = ? AND b.external_channel_id = ?",
+        "AND b.transport = ? AND b.external_channel_id = ?" + active_clause,
         (
             message.transport,
             message.sender_subject,
@@ -315,13 +318,16 @@ async def _resolve_client_binding(
     store: WorkshopEventStore,
     message: ClientInboundMessage,
 ) -> _ResolvedInboundBinding:
+    async with store.connection.execute("PRAGMA table_info(channels)") as cursor:
+        channel_columns = {str(row[1]) for row in await cursor.fetchall()}
+    active_clause = " AND c.archived_at IS NULL" if "archived_at" in channel_columns else ""
     async with store.connection.execute(
         "SELECT c.workshop_id FROM channels c "
         "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.principal_id = ? "
         "JOIN workshop_memberships wm ON wm.workshop_id = c.workshop_id "
         "AND wm.principal_id = cm.principal_id "
         "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
-        "WHERE c.id = ?",
+        "WHERE c.id = ?" + active_clause,
         (message.principal_id, message.channel_id),
     ) as cursor:
         rows = list(await cursor.fetchall())
@@ -338,11 +344,14 @@ async def _resolve_scheduled_binding(
     store: WorkshopEventStore,
     message: ScheduledInboundMessage,
 ) -> _ResolvedInboundBinding:
+    async with store.connection.execute("PRAGMA table_info(channels)") as cursor:
+        channel_columns = {str(row[1]) for row in await cursor.fetchall()}
+    active_clause = " AND c.archived_at IS NULL" if "archived_at" in channel_columns else ""
     async with store.connection.execute(
         "SELECT c.workshop_id FROM workshop_scheduled_jobs j "
         "JOIN channels c ON c.id = j.channel_id "
         "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.principal_id = j.principal_id "
-        "WHERE j.id = ? AND j.principal_id = ? AND j.channel_id = ?",
+        "WHERE j.id = ? AND j.principal_id = ? AND j.channel_id = ?" + active_clause,
         (message.job_id, message.principal_id, message.channel_id),
     ) as cursor:
         rows = list(await cursor.fetchall())

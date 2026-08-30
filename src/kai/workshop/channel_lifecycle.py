@@ -62,6 +62,16 @@ class WorkshopChannelAgentAttachment:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkshopChannelLifecycleMutation:
+    """One reversible canonical group-channel lifecycle transition."""
+
+    channel_id: ChannelId
+    archived: bool
+    changed: bool
+    occurred_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class _AgentAttachment:
     agent_id: AgentId
     agent_principal_id: PrincipalId
@@ -113,6 +123,134 @@ class WorkshopChannelLifecycleService:
 
     def __init__(self, store: WorkshopEventStore) -> None:
         self._store = store
+
+    async def archive(
+        self,
+        principal_id: PrincipalId,
+        channel_id: ChannelId,
+        *,
+        client_operation_id: object,
+    ) -> WorkshopChannelLifecycleMutation:
+        """Archive one idle group channel without deleting its history."""
+        return await self._change_archival_state(
+            principal_id,
+            channel_id,
+            archived=True,
+            client_operation_id=client_operation_id,
+        )
+
+    async def restore(
+        self,
+        principal_id: PrincipalId,
+        channel_id: ChannelId,
+        *,
+        client_operation_id: object,
+    ) -> WorkshopChannelLifecycleMutation:
+        """Restore one archived group channel with its identity intact."""
+        return await self._change_archival_state(
+            principal_id,
+            channel_id,
+            archived=False,
+            client_operation_id=client_operation_id,
+        )
+
+    async def _change_archival_state(
+        self,
+        principal_id: PrincipalId,
+        channel_id: ChannelId,
+        *,
+        archived: bool,
+        client_operation_id: object,
+    ) -> WorkshopChannelLifecycleMutation:
+        operation_id = _normalize_operation_id(client_operation_id)
+        operation = "archive" if archived else "restore"
+        connection = self._store.connection
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            workshop_id, archived_at = await self._resolve_managed_group_state(
+                principal_id,
+                channel_id,
+            )
+            idempotency_key = f"workshop-client:channel-lifecycle:{principal_id}:{operation_id}"
+            existing = await self._store.event_by_idempotency_key(idempotency_key)
+            if existing is not None:
+                result = self._archival_result_from_event(
+                    existing.envelope,
+                    principal_id=principal_id,
+                    workshop_id=workshop_id,
+                    channel_id=channel_id,
+                    archived=archived,
+                )
+                await connection.rollback()
+                return result
+            if archived_at is not None and archived:
+                raise WorkshopChannelLifecycleValidationError("Channel is already archived")
+            if archived_at is None and not archived:
+                raise WorkshopChannelLifecycleValidationError("Channel is not archived")
+            if archived:
+                async with connection.execute(
+                    "SELECT COUNT(*) FROM runs WHERE channel_id = ? AND status IN ('accepted', 'started')",
+                    (channel_id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                if row is None or int(row[0]) != 0:
+                    raise WorkshopChannelLifecycleValidationError(
+                        "Channel cannot be archived while an agent run is active"
+                    )
+            now = datetime.now(UTC)
+            event = EventEnvelope.create(
+                event_type=(WorkshopEventType.CHANNEL_ARCHIVED if archived else WorkshopEventType.CHANNEL_RESTORED),
+                event_version=1,
+                workshop_id=workshop_id,
+                aggregate_type="channel",
+                aggregate_id=channel_id,
+                actor_principal_id=principal_id,
+                occurred_at=now,
+                idempotency_key=idempotency_key,
+                payload={},
+                metadata={"source": "workshop_client"},
+            )
+            result = await self._store.append_in_transaction(event)
+            if not result.inserted:
+                raise WorkshopChannelLifecycleError("New channel lifecycle event unexpectedly already exists")
+            await self._store.project_pending_in_transaction(CanonicalConversationProjection())
+            await connection.commit()
+            return WorkshopChannelLifecycleMutation(channel_id, archived, True, now)
+        except WorkshopChannelLifecycleError:
+            await connection.rollback()
+            raise
+        except Exception as exc:
+            await connection.rollback()
+            raise WorkshopChannelLifecycleStorageError(f"Channel {operation} could not be persisted") from exc
+
+    @staticmethod
+    def _archival_result_from_event(
+        envelope: EventEnvelope,
+        *,
+        principal_id: PrincipalId,
+        workshop_id: WorkshopId,
+        channel_id: ChannelId,
+        archived: bool,
+    ) -> WorkshopChannelLifecycleMutation:
+        expected_type = WorkshopEventType.CHANNEL_ARCHIVED if archived else WorkshopEventType.CHANNEL_RESTORED
+        if (
+            envelope.event_type != expected_type
+            or envelope.event_version != 1
+            or envelope.workshop_id != workshop_id
+            or envelope.aggregate_type != "channel"
+            or envelope.aggregate_id != channel_id
+            or envelope.actor_principal_id != principal_id
+            or envelope.payload
+        ):
+            raise WorkshopChannelLifecycleValidationError(
+                "client_operation_id is already bound to a different channel lifecycle operation"
+            )
+        return WorkshopChannelLifecycleMutation(
+            channel_id,
+            archived,
+            False,
+            envelope.occurred_at,
+        )
 
     async def create_group(
         self,
@@ -415,8 +553,21 @@ class WorkshopChannelLifecycleService:
         principal_id: PrincipalId,
         channel_id: ChannelId,
     ) -> WorkshopId:
+        workshop_id, archived_at = await self._resolve_managed_group_state(
+            principal_id,
+            channel_id,
+        )
+        if archived_at is not None:
+            raise WorkshopChannelLifecycleValidationError("Archived channels are read-only")
+        return workshop_id
+
+    async def _resolve_managed_group_state(
+        self,
+        principal_id: PrincipalId,
+        channel_id: ChannelId,
+    ) -> tuple[WorkshopId, str | None]:
         async with self._store.connection.execute(
-            "SELECT c.workshop_id FROM channels c "
+            "SELECT c.workshop_id, c.archived_at FROM channels c "
             "JOIN channel_memberships cm ON cm.channel_id = c.id "
             "AND cm.principal_id = ? AND cm.role = 'owner' "
             "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
@@ -427,8 +578,10 @@ class WorkshopChannelLifecycleService:
         ) as cursor:
             row = await cursor.fetchone()
         if row is None:
-            raise WorkshopChannelLifecycleAccessDenied("Agent attachment changes require group-channel owner authority")
-        return WorkshopId(str(row[0]))
+            raise WorkshopChannelLifecycleAccessDenied(
+                "Channel lifecycle changes require group-channel owner authority"
+            )
+        return WorkshopId(str(row[0])), (str(row[1]) if row[1] is not None else None)
 
     async def _resolve_agent_attachments(
         self,

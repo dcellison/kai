@@ -108,7 +108,7 @@ async def set_message_reaction(
             "JOIN channels c ON c.id = m.channel_id "
             "JOIN channel_memberships cm ON cm.channel_id = c.id "
             "AND cm.principal_id = ? "
-            "WHERE m.id = ? AND m.channel_id = ?",
+            "WHERE m.id = ? AND m.channel_id = ? AND c.archived_at IS NULL",
             (principal_id, message_id, channel_id),
         ) as cursor:
             target = await cursor.fetchone()

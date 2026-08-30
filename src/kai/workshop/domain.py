@@ -26,6 +26,8 @@ class WorkshopEventType(StrEnum):
     PRINCIPAL_CREATED = "principal.created"
     EXTERNAL_IDENTITY_BOUND = "external_identity.bound"
     CHANNEL_CREATED = "channel.created"
+    CHANNEL_ARCHIVED = "channel.archived"
+    CHANNEL_RESTORED = "channel.restored"
     CHANNEL_MEMBER_ADDED = "channel.member_added"
     TRANSPORT_CHANNEL_BOUND = "transport.channel_bound"
     AGENT_CREATED = "agent.created"

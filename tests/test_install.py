@@ -39,6 +39,7 @@ from kai.install import (
     _backend_command_trust_issues,
     _build_migrated_runtime_profiles,
     _capture_darwin_service_generation,
+    _channel_lifecycle_status,
     _check_path,
     _check_service_status,
     _check_traversal,
@@ -5353,6 +5354,28 @@ class TestCmdStatus:
 
         assert _integration_route_status(db_path) == (
             "Workshop integration routing: INCOMPLETE; generic/default=missing"
+        )
+
+    def test_status_reports_canonical_reversible_channel_lifecycle(self, tmp_path):
+        db_path = tmp_path / "kai.db"
+        connection = sqlite3.connect(db_path)
+        connection.executescript(
+            "CREATE TABLE channels (id TEXT PRIMARY KEY, workshop_id TEXT, kind TEXT, "
+            "name TEXT, archived_at TEXT, lifecycle_event_position INTEGER);"
+            "CREATE TABLE event_log (position INTEGER PRIMARY KEY, aggregate_id TEXT, "
+            "aggregate_type TEXT, event_type TEXT);"
+            "INSERT INTO channels VALUES "
+            "('chn_active','wsp_one','group','Active',NULL,NULL),"
+            "('chn_archived','wsp_one','group','Archived','2026-08-30T15:00:00Z',7);"
+            "INSERT INTO event_log VALUES "
+            "(7,'chn_archived','channel','channel.archived');"
+        )
+        connection.commit()
+        connection.close()
+
+        assert _channel_lifecycle_status(db_path) == (
+            "Workshop channel lifecycle: active; group channels=2, active=1, "
+            "archived=1, integrity gaps=0; authority=canonical"
         )
 
     def test_status_reports_canonical_internal_api_context_coverage(self, tmp_path):

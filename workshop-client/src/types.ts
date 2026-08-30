@@ -37,9 +37,11 @@ export type WorkshopChannelKind = "direct" | "group" | "notification";
 
 export interface WorkshopChannelSummary {
   agents: WorkshopAgentSummary[];
+  archivedAt?: string | null;
   canSubmitCommands: boolean;
   channelId: string;
   kind: WorkshopChannelKind;
+  lifecycleEventPosition?: number | null;
   name: string | null;
   participants: WorkshopParticipantSummary[];
   role: string;

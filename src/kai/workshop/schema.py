@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 49
+WORKSHOP_SCHEMA_VERSION = 50
 
 
 @dataclass(frozen=True, slots=True)
@@ -2378,6 +2378,17 @@ _BOUNDED_AGENT_DELEGATION_SCHEMA = SchemaMigration(
     ),
 )
 
+_REVERSIBLE_CHANNEL_ARCHIVAL_SCHEMA = SchemaMigration(
+    version=50,
+    name="reversible_channel_archival",
+    statements=(
+        "ALTER TABLE channels ADD COLUMN archived_at TEXT",
+        "ALTER TABLE channels ADD COLUMN lifecycle_event_position INTEGER "
+        "REFERENCES event_log(position) ON DELETE RESTRICT",
+        "CREATE INDEX channels_archived_idx ON channels (workshop_id, archived_at, kind, name)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2428,6 +2439,7 @@ _MIGRATIONS = (
     _PRINCIPAL_AGENT_ENABLEMENT_SCHEMA,
     _CHANNEL_AGENT_ATTACHMENT_LIFECYCLE_SCHEMA,
     _BOUNDED_AGENT_DELEGATION_SCHEMA,
+    _REVERSIBLE_CHANNEL_ARCHIVAL_SCHEMA,
 )
 
 
