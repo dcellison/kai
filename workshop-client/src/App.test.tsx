@@ -705,7 +705,16 @@ describe("Workshop React client", () => {
     expect(screen.queryByText(settingsWorkspace.workspace)).not.toBeInTheDocument();
     expect(window.location.search).toBe("?view=settings");
 
-    await user.click(screen.getByRole("button", { name: "Back to conversation" }));
+    const backToConversation = screen.getByRole("button", {
+      name: "Back to conversation",
+    });
+    expect(backToConversation).toHaveClass("panel-icon-button");
+    expect(backToConversation).toHaveTextContent("←");
+    expect(backToConversation.querySelector("span")).toHaveAttribute(
+      "aria-hidden",
+      "true",
+    );
+    await user.click(backToConversation);
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
     expect(window.location.search).toBe("");
   });
@@ -1571,6 +1580,7 @@ describe("Workshop React client", () => {
     const context = screen.getByLabelText("Channel context");
     expect(await within(context).findByText("Existing thread reply")).toBeVisible();
     const closeThread = within(context).getByRole("button", { name: "Close thread" });
+    expect(closeThread).toHaveClass("panel-icon-button");
     expect(closeThread).toHaveTextContent("×");
     expect(closeThread.querySelector("span")).toHaveAttribute("aria-hidden", "true");
     const composer = within(context).getByLabelText("Reply in Wake policy qualification");
@@ -1770,8 +1780,8 @@ describe("Workshop React client", () => {
     });
     expect(createAgent).toBeVisible();
     expect(closeAgents).toBeVisible();
-    expect(createAgent).toHaveClass("agent-panel-icon-button");
-    expect(closeAgents).toHaveClass("agent-panel-icon-button");
+    expect(createAgent).toHaveClass("panel-icon-button");
+    expect(closeAgents).toHaveClass("panel-icon-button");
     expect(createAgent.parentElement).toBe(closeAgents.parentElement);
     expect(createAgent.querySelector("span")).toHaveAttribute("aria-hidden", "true");
     expect(closeAgents.querySelector("span")).toHaveAttribute("aria-hidden", "true");
@@ -1872,7 +1882,7 @@ describe("Workshop React client", () => {
     expect(screen.queryByText("Personal preferences")).toBeNull();
     const backToAgent = screen.getByRole("button", { name: "Back to agent" });
     expect(backToAgent).toBeVisible();
-    expect(backToAgent).toHaveClass("agent-panel-icon-button");
+    expect(backToAgent).toHaveClass("panel-icon-button");
     expect(backToAgent).toHaveTextContent("←");
     expect(backToAgent.querySelector("span")).toHaveAttribute("aria-hidden", "true");
     expect(

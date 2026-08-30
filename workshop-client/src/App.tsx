@@ -1418,7 +1418,7 @@ function ThreadPane({
           <h2>{replies.length} {replies.length === 1 ? "reply" : "replies"}</h2>
         </div>
         <button
-          className="thread-close-button"
+          className="panel-icon-button"
           type="button"
           aria-label="Close thread"
           title="Close thread"
