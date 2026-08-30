@@ -11,7 +11,15 @@ from kai.workshop.store import WorkshopEventStore
 
 AGENT_HANDLE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 AGENT_LIFECYCLE_STATES = frozenset({"draft", "active", "archived"})
-AGENT_CAPABILITIES = frozenset({"text_generation", "tool_activity", "workspace_execution", "image_input"})
+AGENT_CAPABILITIES = frozenset(
+    {
+        "text_generation",
+        "tool_activity",
+        "workspace_execution",
+        "image_input",
+        "agent_delegation",
+    }
+)
 MAX_AGENT_DISPLAY_NAME = 80
 MAX_AGENT_DESCRIPTION = 1_000
 MAX_AGENT_PURPOSE = 2_000

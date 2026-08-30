@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 48
+WORKSHOP_SCHEMA_VERSION = 49
 
 
 @dataclass(frozen=True, slots=True)
@@ -2320,6 +2320,64 @@ _CHANNEL_AGENT_ATTACHMENT_LIFECYCLE_SCHEMA = SchemaMigration(
     ),
 )
 
+_BOUNDED_AGENT_DELEGATION_SCHEMA = SchemaMigration(
+    version=49,
+    name="bounded_agent_delegation",
+    statements=(
+        "ALTER TABLE runs ADD COLUMN parent_run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT",
+        "ALTER TABLE runs ADD COLUMN delegation_id TEXT",
+        "CREATE UNIQUE INDEX runs_delegation_idx ON runs (delegation_id) WHERE delegation_id IS NOT NULL",
+        "CREATE INDEX runs_parent_run_idx ON runs (parent_run_id, accepted_at) WHERE parent_run_id IS NOT NULL",
+        """
+        CREATE TABLE agent_delegations (
+            id TEXT PRIMARY KEY,
+            workshop_id TEXT NOT NULL REFERENCES workshops(id) ON DELETE CASCADE,
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            thread_root_id TEXT REFERENCES messages(id) ON DELETE RESTRICT,
+            root_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE RESTRICT,
+            parent_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE RESTRICT,
+            parent_delegation_id TEXT REFERENCES agent_delegations(id) ON DELETE RESTRICT,
+            child_run_id TEXT NOT NULL UNIQUE REFERENCES runs(id) ON DELETE RESTRICT,
+            requesting_principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+            caller_agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
+            target_agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
+            caller_sponsor_principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+            caller_runtime_profile_id TEXT NOT NULL,
+            target_sponsor_principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+            target_runtime_profile_id TEXT NOT NULL,
+            caller_definition_revision_id TEXT NOT NULL
+                REFERENCES agent_definition_revisions(id) ON DELETE RESTRICT,
+            target_definition_revision_id TEXT NOT NULL
+                REFERENCES agent_definition_revisions(id) ON DELETE RESTRICT,
+            request_message_id TEXT NOT NULL UNIQUE REFERENCES messages(id) ON DELETE RESTRICT,
+            response_message_id TEXT REFERENCES messages(id) ON DELETE RESTRICT,
+            task TEXT NOT NULL,
+            context_json TEXT NOT NULL CHECK (
+                json_valid(context_json) AND json_type(context_json) = 'object'
+            ),
+            request_hash TEXT NOT NULL,
+            depth INTEGER NOT NULL CHECK (depth > 0),
+            status TEXT NOT NULL CHECK (
+                status IN ('requested', 'executing', 'completed', 'failed', 'cancelled')
+            ),
+            outcome_code TEXT,
+            created_at TEXT NOT NULL,
+            started_at TEXT,
+            terminal_at TEXT,
+            created_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            last_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT
+        )
+        """,
+        "CREATE INDEX agent_delegations_root_idx ON agent_delegations (root_run_id, created_event_position)",
+        "CREATE INDEX agent_delegations_parent_idx ON agent_delegations (parent_run_id, created_event_position)",
+        "CREATE INDEX agent_delegations_active_idx "
+        "ON agent_delegations (status, created_event_position) "
+        "WHERE status IN ('requested', 'executing')",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2369,6 +2427,7 @@ _MIGRATIONS = (
     _VERSIONED_AGENT_DEFINITION_SCHEMA,
     _PRINCIPAL_AGENT_ENABLEMENT_SCHEMA,
     _CHANNEL_AGENT_ATTACHMENT_LIFECYCLE_SCHEMA,
+    _BOUNDED_AGENT_DELEGATION_SCHEMA,
 )
 
 

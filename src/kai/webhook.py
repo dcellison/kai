@@ -19,6 +19,7 @@ Routes are organized into these groups:
     - /api/services/{name}  - External service proxy (injects auth from .env)
     - /api/send-message     - Publish a proactive canonical text message
     - /api/send-file        - Publish a proactive canonical artifact
+    - /api/agent-delegations - Run one bounded agent-to-agent delegation
     - /api/memory/add       - Store a structured memory (POST)
     - /api/memory/search    - Search memories by query (POST)
     - /api/memory/stats     - Memory statistics for a user (GET)
@@ -62,6 +63,11 @@ from kai.config import (
 )
 from kai.internal_api_auth import InternalAPIAuth, InternalAPIPrincipal, InternalAPIScope
 from kai.job_types import CANONICAL_JOB_TYPES, normalize_job_type
+from kai.workshop.agent_delegation import (
+    AgentDelegationAuthority,
+    AgentDelegationConflict,
+    AgentDelegationDenied,
+)
 from kai.workshop.agent_enablement import WorkshopAgentEnablementService
 from kai.workshop.appearance_preferences import WorkshopAppearancePreferenceService
 from kai.workshop.artifacts import MAX_ARTIFACT_BYTES, WorkshopArtifactService
@@ -250,6 +256,11 @@ _INTERNAL_API_IDENTITY_SELECTORS = frozenset(
         "agent_id",
         "runtime_profile_id",
         "runtime_config_id",
+        "run_id",
+        "parent_run_id",
+        "delegation_id",
+        "sponsor_principal_id",
+        "requesting_principal_id",
     }
 )
 
@@ -1188,6 +1199,77 @@ async def _handle_send_message(request: web.Request, principal: InternalAPIPrinc
     return _proactive_response(result)
 
 
+@_require_internal_api(InternalAPIScope.AGENTS_DELEGATE)
+async def _handle_agent_delegation(
+    request: web.Request,
+    principal: InternalAPIPrincipal,
+) -> web.Response:
+    """Run one explicit delegation from the credential's active attempt."""
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+    if not isinstance(payload, dict):
+        return web.json_response({"error": "Request body must be a JSON object"}, status=400)
+    try:
+        _reject_internal_identity_selectors(payload)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    unsupported = set(payload) - {
+        "target_handle",
+        "task",
+        "context",
+        "idempotency_key",
+    }
+    if unsupported:
+        return web.json_response(
+            {"error": f"Unsupported field: {sorted(unsupported)[0]}"},
+            status=400,
+        )
+    missing = [key for key in ("target_handle", "task", "idempotency_key") if key not in payload]
+    if missing:
+        return web.json_response({"error": f"Missing required field: {missing[0]}"}, status=400)
+    try:
+        result = await request.app[CORE_HOST_KEY].services.agent_delegation.delegate(
+            AgentDelegationAuthority(
+                sponsor_principal_id=principal.principal_id,
+                channel_id=principal.channel_id,
+                caller_agent_id=principal.agent_id,
+                runtime_profile_id=principal.runtime_profile_id,
+            ),
+            target_handle=payload["target_handle"],
+            task=payload["task"],
+            context=payload.get("context"),
+            idempotency_key=payload["idempotency_key"],
+        )
+    except AgentDelegationDenied as exc:
+        status = 400 if exc.code.startswith("invalid_") or exc.code.endswith("_too_large") else 409
+        return web.json_response(
+            {"error": str(exc), "code": exc.code},
+            status=status,
+        )
+    except AgentDelegationConflict as exc:
+        return web.json_response({"error": str(exc), "code": "idempotency_conflict"}, status=409)
+    except Exception:
+        log.exception("Canonical agent delegation failed")
+        return web.json_response({"error": "Agent delegation failed"}, status=500)
+    delegation = result.delegation
+    return web.json_response(
+        {
+            "version": 1,
+            "delegation_id": str(delegation.delegation_id),
+            "child_run_id": str(delegation.child_run_id),
+            "status": delegation.status,
+            "outcome_code": delegation.outcome_code,
+            "response": result.response,
+            "limits": {
+                "depth": delegation.depth,
+                "target_handle": delegation.target_handle,
+            },
+        }
+    )
+
+
 # ── File exchange ────────────────────────────────────────────────────
 
 
@@ -1795,6 +1877,7 @@ def _register_routes(
     app.router.add_patch("/api/jobs/{id}", _handle_update_job)
     app.router.add_post("/api/send-message", _handle_send_message)
     app.router.add_post("/api/send-file", _handle_send_file)
+    app.router.add_post("/api/agent-delegations", _handle_agent_delegation)
 
 
 async def _register_workshop_client_api(

@@ -592,8 +592,8 @@ class WorkshopCanonicalExecutionCoordinator:
         async with (
             self._database_lock,
             self._store.connection.execute(
-                "SELECT body FROM messages WHERE id = ? AND channel_id = ? AND author_principal_id = ?",
-                (run.inbound_message_id, run.channel_id, run.requested_by_principal_id),
+                "SELECT body FROM messages WHERE id = ? AND channel_id = ?",
+                (run.inbound_message_id, run.channel_id),
             ) as cursor,
         ):
             row = await cursor.fetchone()

@@ -571,6 +571,7 @@ export async function loadNavigation(token: string): Promise<WorkshopNavigation>
 }
 
 const AGENT_CAPABILITIES = new Set<WorkshopAgentCapability>([
+  "agent_delegation",
   "image_input",
   "text_generation",
   "tool_activity",

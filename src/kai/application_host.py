@@ -19,6 +19,7 @@ from kai.backend_registry import (
 )
 from kai.config import Config, models_for_backend_policy
 from kai.pool import SubprocessPool
+from kai.workshop.agent_delegation import WorkshopAgentDelegationService
 from kai.workshop.agent_enablement import WorkshopAgentEnablementService
 from kai.workshop.appearance_preferences import WorkshopAppearancePreferenceService
 from kai.workshop.artifacts import WorkshopArtifactService
@@ -136,6 +137,7 @@ class KaiCoreReadiness:
     scheduler: bool
     github_automation: bool
     post_run_effects: bool
+    agent_delegation: bool
 
     @property
     def ready(self) -> bool:
@@ -148,6 +150,7 @@ class KaiCoreReadiness:
                 self.scheduler,
                 self.github_automation,
                 self.post_run_effects,
+                self.agent_delegation,
             )
         )
 
@@ -163,6 +166,7 @@ class KaiCoreReadiness:
                 "scheduler": self.scheduler,
                 "github_automation": self.github_automation,
                 "post_run_effects": self.post_run_effects,
+                "agent_delegation": self.agent_delegation,
             },
         }
 
@@ -200,6 +204,7 @@ class KaiCoreServices:
     integration_notifications: WorkshopIntegrationNotificationService
     github_automation: WorkshopGitHubAutomationService
     post_run_effects: WorkshopPostRunEffectService
+    agent_delegation: WorkshopAgentDelegationService
     delivery_policy: WorkshopDeliveryBindingPolicy
 
 
@@ -256,6 +261,7 @@ class KaiApplicationHost:
             scheduler=services is not None and services.scheduler.readiness.ready,
             github_automation=services is not None and services.github_automation.ready,
             post_run_effects=services is not None and services.post_run_effects.ready,
+            agent_delegation=services is not None and services.agent_delegation.ready,
         )
 
     @property
@@ -281,6 +287,7 @@ class KaiApplicationHost:
         client_preferences: WorkshopClientPreferenceService | None = None
         appearance_preferences: WorkshopAppearancePreferenceService | None = None
         model_catalogue: WorkshopModelCatalogueService | None = None
+        agent_delegation: WorkshopAgentDelegationService | None = None
         try:
             delivery_policy = self._delivery_policy
             subprocess_pool = SubprocessPool(
@@ -369,6 +376,10 @@ class KaiApplicationHost:
                 run_previews=run_previews,
             )
             await client_commands.start()
+            agent_delegation = await WorkshopAgentDelegationService.open_and_start(
+                Path(self._config.session_db_path),
+                private_execution,
+            )
             scheduler = await WorkshopCanonicalScheduler.open_and_start(
                 Path(self._config.session_db_path),
                 private_execution,
@@ -478,6 +489,7 @@ class KaiApplicationHost:
                 integration_notifications=integration_notifications,
                 github_automation=github_automation,
                 post_run_effects=post_run_effects,
+                agent_delegation=agent_delegation,
                 delivery_policy=delivery_policy,
             )
             self._state = KaiApplicationState.READY
@@ -500,6 +512,8 @@ class KaiApplicationHost:
                 await appearance_preferences.close()
             if model_catalogue is not None:
                 await model_catalogue.close()
+            if agent_delegation is not None:
+                await agent_delegation.stop()
             if client_commands is not None:
                 await client_commands.stop()
             if post_run_effects is not None:
@@ -538,6 +552,7 @@ class KaiApplicationHost:
             self.services.scheduler.wait(),
             self.services.github_automation.wait(),
             self.services.post_run_effects.wait(),
+            self.services.agent_delegation.wait(),
             *(adapter.wait() for adapter in self._adapters.values()),
         )
 
@@ -567,6 +582,7 @@ class KaiApplicationHost:
             services.client_preferences.close,
             services.appearance_preferences.close,
             services.model_catalogue.close,
+            services.agent_delegation.stop,
             services.client_commands.stop,
             services.post_run_effects.stop,
             services.client_store.close,

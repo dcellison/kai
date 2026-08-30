@@ -62,6 +62,11 @@ class WorkshopEventType(StrEnum):
     RUN_ATTEMPT_COMPLETED = "run_attempt.completed"
     RUN_ATTEMPT_FAILED = "run_attempt.failed"
     RUN_ATTEMPT_CANCELLED = "run_attempt.cancelled"
+    AGENT_DELEGATION_REQUESTED = "agent_delegation.requested"
+    AGENT_DELEGATION_STARTED = "agent_delegation.started"
+    AGENT_DELEGATION_COMPLETED = "agent_delegation.completed"
+    AGENT_DELEGATION_FAILED = "agent_delegation.failed"
+    AGENT_DELEGATION_CANCELLED = "agent_delegation.cancelled"
 
 
 class OpaqueId(str):
@@ -228,6 +233,10 @@ class RunExecutionOwnerId(OpaqueId):
     prefix = "reo"
 
 
+class AgentDelegationId(OpaqueId):
+    prefix = "dlg"
+
+
 class EventId(OpaqueId):
     prefix = "evt"
 
@@ -258,6 +267,7 @@ _ID_TYPES: dict[str, type[OpaqueId]] = {
         DeliveryAuthorityEpochId,
         RunId,
         RunAttemptId,
+        AgentDelegationId,
         RunExecutionOwnerId,
         EventId,
     )

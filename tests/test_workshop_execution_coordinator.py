@@ -229,7 +229,7 @@ class TestCanonicalExecutionCoordinator:
             assert first.canonical_histories == [""]
             assert len(first.agent_definition_contexts) == 1
             assert "Handle: @kai" in first.agent_definition_contexts[0]
-            assert "Definition revision: 1" in first.agent_definition_contexts[0]
+            assert "Definition revision: 2" in first.agent_definition_contexts[0]
 
             second_acceptance = await WorkshopConversationCommandService(store).accept(
                 InboundMessage(

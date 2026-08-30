@@ -215,7 +215,11 @@ class WorkshopRoutingPolicyService:
             revision = await load_agent_definition_revision(self._store, run.agent_definition_revision_id)
             if revision is None or revision.agent_id != run.agent_id:
                 raise RoutingPolicyError("Run agent definition revision is unavailable")
-            agent_requirements = tuple(RuntimeCapability(value) for value in revision.capabilities)
+            agent_requirements = tuple(
+                RuntimeCapability(value)
+                for value in revision.capabilities
+                if value in {capability.value for capability in RuntimeCapability}
+            )
 
         if requested_task is None:
             report = await self._inspect_run_authority(

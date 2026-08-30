@@ -81,13 +81,13 @@ class TestAgentDefinitionBootstrap:
             assert revision is not None
             assert revision.handle == "kai"
             assert revision.display_name == "Kai"
-            assert revision.revision_number == 1
-            assert revision.capabilities == ("text_generation",)
+            assert revision.revision_number == 2
+            assert revision.capabilities == ("agent_delegation", "text_generation")
 
             await store.rebuild_projection(CanonicalConversationProjection())
             assert await active_agent_definition_revision(store, agent_id) == revision
             assert workshop_agent_definition_status(tmp_path / "kai.db") == (
-                "Workshop agent definitions: active; agents=1, definitions=1, revisions=1, "
+                "Workshop agent definitions: active; agents=1, definitions=1, revisions=2, "
                 "active=1, missing=0, invalid active=0; authority=versioned"
             )
         finally:
@@ -121,7 +121,7 @@ class TestAgentDefinitionRevisions:
             assert revision_one is not None
 
             definition_id = revision_one.definition_id
-            revision_two_id = AgentDefinitionRevisionId.derived(definition_id, "revision:2")
+            revision_two_id = AgentDefinitionRevisionId.derived(definition_id, "revision:3")
             await _append_and_project(
                 store,
                 EventEnvelope.create(
@@ -133,7 +133,7 @@ class TestAgentDefinitionRevisions:
                     occurred_at=_NOW + timedelta(minutes=2),
                     payload={
                         "definition_id": definition_id,
-                        "revision_number": 2,
+                        "revision_number": 3,
                         "purpose": "Exercise the second immutable definition.",
                         "instructions": "Use the second definition without changing older runs.",
                         "capabilities": ["text_generation", "tool_activity"],
@@ -163,7 +163,7 @@ class TestAgentDefinitionRevisions:
                 "SELECT COUNT(*) FROM agent_definition_revisions WHERE agent_definition_id = ?",
                 (definition_id,),
             ) as cursor:
-                assert (await cursor.fetchone())[0] == 2
+                assert (await cursor.fetchone())[0] == 3
         finally:
             await store.close()
 
@@ -173,7 +173,7 @@ class TestAgentDefinitionRevisions:
             revision = await active_agent_definition_revision(store, agent_id)
             assert revision is not None
             rendered = render_agent_definition_context(revision)
-            assert f"Definition revision: 1 ({revision.revision_id})" in rendered
+            assert f"Definition revision: 2 ({revision.revision_id})" in rendered
             assert "does not grant tools, credentials, data access, identity, or permission" in rendered
         finally:
             await store.close()
