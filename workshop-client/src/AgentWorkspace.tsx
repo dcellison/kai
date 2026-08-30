@@ -670,7 +670,7 @@ export function AgentWorkspace({
           <div className="agent-header-controls">
             {isAdministrator && (
               <button
-                className="agent-panel-icon-button"
+                className="panel-icon-button"
                 type="button"
                 aria-label="Create agent"
                 title="Create agent"
@@ -685,7 +685,7 @@ export function AgentWorkspace({
               </button>
             )}
             <button
-              className="agent-panel-icon-button"
+              className="panel-icon-button"
               type="button"
               aria-label="Close agents"
               title="Close agents"
