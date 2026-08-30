@@ -60,6 +60,16 @@ def _require_exact_payload(payload: dict[str, Any], keys: set[str]) -> None:
         raise ValueError(f"Workshop event payload must contain exactly {sorted(keys)!r}")
 
 
+async def _table_has_column(
+    connection: aiosqlite.Connection,
+    table: str,
+    column: str,
+) -> bool:
+    """Support historical-schema qualification without weakening current replay."""
+    async with connection.execute(f"PRAGMA table_info({table})") as cursor:
+        return any(str(row[1]) == column for row in await cursor.fetchall())
+
+
 async def _message_mentions_json(
     connection: aiosqlite.Connection,
     channel_id: ChannelId,
@@ -123,11 +133,13 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
     occurred_at = envelope.occurred_at.isoformat()
     payload = envelope.payload
     if envelope.event_type == WorkshopEventType.RUN_ACCEPTED:
-        if envelope.event_version not in {1, 2}:
+        if envelope.event_version not in {1, 2, 3}:
             raise ValueError("Unsupported Workshop run acceptance event version")
         keys = {"inbound_message_id", "channel_id", "requested_by_principal_id", "agent_id"}
-        if envelope.event_version == 2:
+        if envelope.event_version in {2, 3}:
             keys.add("agent_definition_revision_id")
+        if envelope.event_version == 3:
+            keys.update({"runtime_profile_id", "sponsor_principal_id"})
         _require_exact_payload(
             payload,
             keys,
@@ -138,9 +150,19 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
         agent_id = AgentId(_required_text(payload, "agent_id"))
         revision_id = (
             AgentDefinitionRevisionId(_required_text(payload, "agent_definition_revision_id"))
-            if envelope.event_version == 2
+            if envelope.event_version in {2, 3}
             else None
         )
+        runtime_profile_id = _required_text(payload, "runtime_profile_id") if envelope.event_version == 3 else None
+        sponsor_principal_id = (
+            PrincipalId(_required_text(payload, "sponsor_principal_id")) if envelope.event_version == 3 else None
+        )
+        has_attachment_lifecycle = await _table_has_column(
+            connection,
+            "channel_agents",
+            "detached_at",
+        )
+        active_attachment_clause = " AND ca.detached_at IS NULL" if has_attachment_lifecycle else ""
         async with connection.execute(
             "SELECT c.workshop_id, m.channel_id, m.author_principal_id, ca.agent_id, m.created_at "
             "FROM messages m "
@@ -148,7 +170,9 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
             "JOIN channels c ON c.id = m.channel_id "
             "JOIN channel_memberships cm ON cm.channel_id = m.channel_id "
             "AND cm.principal_id = m.author_principal_id "
-            "JOIN channel_agents ca ON ca.channel_id = m.channel_id AND ca.agent_id = ? "
+            "JOIN channel_agents ca ON ca.channel_id = m.channel_id AND ca.agent_id = ?"
+            + active_attachment_clause
+            + " "
             "JOIN agents a ON a.id = ca.agent_id AND a.workshop_id = c.workshop_id "
             "WHERE m.id = ?",
             (agent_id, inbound_message_id),
@@ -173,6 +197,24 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
                 definition_row = await cursor.fetchone()
             if definition_row is None or tuple(definition_row) != (agent_id, "active", revision_id):
                 raise ValueError("Workshop run must bind the agent's active definition revision")
+        if envelope.event_version == 3:
+            async with connection.execute(
+                "SELECT COALESCE(ca.sponsor_principal_id, CASE WHEN c.kind = 'direct' "
+                "THEN ? ELSE NULL END), ca.sponsored_runtime_profile_id, "
+                "ra.runtime_profile_id FROM channel_agents ca "
+                "JOIN channels c ON c.id = ca.channel_id "
+                "JOIN channel_agent_runtime_assignments ra ON ra.channel_id = ca.channel_id "
+                "AND ra.agent_id = ca.agent_id WHERE ca.channel_id = ? AND ca.agent_id = ? "
+                "AND ca.detached_at IS NULL",
+                (requested_by, channel_id, agent_id),
+            ) as cursor:
+                sponsorship_row = await cursor.fetchone()
+            if sponsorship_row is None or tuple(str(value) for value in sponsorship_row) != (
+                str(sponsor_principal_id),
+                runtime_profile_id,
+                runtime_profile_id,
+            ):
+                raise ValueError("Workshop run must snapshot its active runtime sponsorship")
         if envelope.event_version == 1:
             await connection.execute(
                 "INSERT INTO runs "
@@ -190,7 +232,7 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
                     event.position,
                 ),
             )
-        else:
+        elif envelope.event_version == 2:
             await connection.execute(
                 "INSERT INTO runs "
                 "(id, workshop_id, channel_id, requested_by_principal_id, agent_id, "
@@ -204,6 +246,27 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
                     agent_id,
                     inbound_message_id,
                     revision_id,
+                    occurred_at,
+                    event.position,
+                ),
+            )
+        else:
+            await connection.execute(
+                "INSERT INTO runs "
+                "(id, workshop_id, channel_id, requested_by_principal_id, agent_id, "
+                "inbound_message_id, agent_definition_revision_id, runtime_profile_id, "
+                "sponsor_principal_id, status, accepted_at, last_event_position) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?)",
+                (
+                    envelope.aggregate_id,
+                    envelope.workshop_id,
+                    channel_id,
+                    requested_by,
+                    agent_id,
+                    inbound_message_id,
+                    revision_id,
+                    runtime_profile_id,
+                    sponsor_principal_id,
                     occurred_at,
                     event.position,
                 ),
@@ -933,7 +996,8 @@ class CanonicalConversationProjection:
                 "JOIN agents a ON a.id = d.agent_id JOIN channels c ON c.id = ? "
                 "JOIN channel_memberships hm ON hm.channel_id = c.id AND hm.principal_id = ? "
                 "AND hm.role = 'owner' JOIN channel_agents ca ON ca.channel_id = c.id "
-                "AND ca.agent_id = ? JOIN channel_agent_runtime_assignments ra "
+                "AND ca.agent_id = ? AND ca.detached_at IS NULL "
+                "JOIN channel_agent_runtime_assignments ra "
                 "ON ra.channel_id = c.id AND ra.agent_id = ca.agent_id WHERE d.id = ?",
                 (channel_id, principal_id, agent_id, definition_id),
             ) as cursor:
@@ -1023,15 +1087,134 @@ class CanonicalConversationProjection:
             if cursor.rowcount != 1:
                 raise ValueError("Workshop agent runtime change has no principal agent")
         elif envelope.event_type == WorkshopEventType.CHANNEL_AGENT_ATTACHED:
-            await connection.execute(
-                "INSERT INTO channel_agents (id, channel_id, agent_id, created_at) VALUES (?, ?, ?, ?)",
+            if envelope.event_version not in {1, 2}:
+                raise ValueError("Unsupported Workshop channel-agent attachment event version")
+            keys = {"channel_id", "agent_id"}
+            if envelope.event_version == 2:
+                keys.update({"sponsor_principal_id", "runtime_profile_id"})
+            _require_exact_payload(payload, keys)
+            channel_id = ChannelId(_required_text(payload, "channel_id"))
+            agent_id = AgentId(_required_text(payload, "agent_id"))
+            sponsor_principal_id = (
+                PrincipalId(_required_text(payload, "sponsor_principal_id")) if envelope.event_version == 2 else None
+            )
+            runtime_profile_id = _required_text(payload, "runtime_profile_id") if envelope.event_version == 2 else None
+            if envelope.event_version == 2:
+                if envelope.actor_principal_id is None:
+                    raise ValueError("Workshop channel-agent attachment requires a human actor")
+                async with connection.execute(
+                    "SELECT c.workshop_id FROM channels c "
+                    "JOIN channel_memberships owner ON owner.channel_id = c.id "
+                    "AND owner.principal_id = ? AND owner.role = 'owner' "
+                    "JOIN principal_agent_enablements pae ON pae.principal_id = ? "
+                    "AND pae.agent_id = ? AND pae.runtime_profile_id = ? "
+                    "AND pae.lifecycle_state = 'enabled' "
+                    "JOIN channels direct_channel ON direct_channel.id = pae.direct_channel_id "
+                    "AND direct_channel.kind = 'direct' AND direct_channel.workshop_id = c.workshop_id "
+                    "WHERE c.id = ? AND c.kind = 'group'",
+                    (
+                        envelope.actor_principal_id,
+                        sponsor_principal_id,
+                        agent_id,
+                        runtime_profile_id,
+                        channel_id,
+                    ),
+                ) as cursor:
+                    attachment_row = await cursor.fetchone()
+                if (
+                    attachment_row is None
+                    or str(attachment_row[0]) != str(envelope.workshop_id)
+                    or envelope.actor_principal_id != sponsor_principal_id
+                ):
+                    raise ValueError("Workshop channel-agent attachment has no enabled sponsorship")
+            has_attachment_lifecycle = await _table_has_column(
+                connection,
+                "channel_agents",
+                "detached_at",
+            )
+            attachment_columns = "id, detached_at" if has_attachment_lifecycle else "id, NULL"
+            async with connection.execute(
+                f"SELECT {attachment_columns} FROM channel_agents WHERE channel_id = ? AND agent_id = ?",
+                (channel_id, agent_id),
+            ) as cursor:
+                existing_attachment = await cursor.fetchone()
+            if existing_attachment is None:
+                if has_attachment_lifecycle:
+                    await connection.execute(
+                        "INSERT INTO channel_agents "
+                        "(id, channel_id, agent_id, created_at, sponsor_principal_id, "
+                        "sponsored_runtime_profile_id, attached_event_position) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            envelope.aggregate_id,
+                            channel_id,
+                            agent_id,
+                            occurred_at,
+                            sponsor_principal_id,
+                            runtime_profile_id,
+                            event.position,
+                        ),
+                    )
+                else:
+                    await connection.execute(
+                        "INSERT INTO channel_agents (id, channel_id, agent_id, created_at) VALUES (?, ?, ?, ?)",
+                        (envelope.aggregate_id, channel_id, agent_id, occurred_at),
+                    )
+            elif existing_attachment[1] is not None and envelope.event_version == 2:
+                cursor = await connection.execute(
+                    "UPDATE channel_agents SET sponsor_principal_id = ?, "
+                    "sponsored_runtime_profile_id = ?, attached_event_position = ?, "
+                    "detached_at = NULL, detached_event_position = NULL "
+                    "WHERE id = ? AND channel_id = ? AND agent_id = ?",
+                    (
+                        sponsor_principal_id,
+                        runtime_profile_id,
+                        event.position,
+                        envelope.aggregate_id,
+                        channel_id,
+                        agent_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("Workshop channel-agent reattachment does not match its history")
+            else:
+                raise ValueError("Workshop channel-agent is already attached")
+        elif envelope.event_type == WorkshopEventType.CHANNEL_AGENT_DETACHED:
+            if envelope.event_version != 1:
+                raise ValueError("Unsupported Workshop channel-agent detachment event version")
+            _require_exact_payload(
+                payload,
+                {"channel_id", "agent_id", "sponsor_principal_id", "runtime_profile_id"},
+            )
+            channel_id = ChannelId(_required_text(payload, "channel_id"))
+            agent_id = AgentId(_required_text(payload, "agent_id"))
+            sponsor_principal_id = PrincipalId(_required_text(payload, "sponsor_principal_id"))
+            runtime_profile_id = _required_text(payload, "runtime_profile_id")
+            if envelope.actor_principal_id is None:
+                raise ValueError("Workshop channel-agent detachment requires a human actor")
+            cursor = await connection.execute(
+                "UPDATE channel_agents SET detached_at = ?, detached_event_position = ? "
+                "WHERE id = ? AND channel_id = ? AND agent_id = ? "
+                "AND sponsor_principal_id = ? AND sponsored_runtime_profile_id = ? "
+                "AND detached_at IS NULL AND EXISTS ("
+                "SELECT 1 FROM channels c JOIN channel_memberships owner "
+                "ON owner.channel_id = c.id AND owner.principal_id = ? AND owner.role = 'owner' "
+                "WHERE c.id = channel_agents.channel_id AND c.kind = 'group' "
+                "AND c.workshop_id = ?)",
                 (
-                    envelope.aggregate_id,
-                    _required_text(payload, "channel_id"),
-                    _required_text(payload, "agent_id"),
                     occurred_at,
+                    event.position,
+                    envelope.aggregate_id,
+                    channel_id,
+                    agent_id,
+                    sponsor_principal_id,
+                    runtime_profile_id,
+                    envelope.actor_principal_id,
+                    envelope.workshop_id,
                 ),
             )
+            if cursor.rowcount != 1:
+                raise ValueError("Workshop channel-agent detachment has no matching active attachment")
         elif envelope.event_type == WorkshopEventType.CHANNEL_AGENT_DISMISSED:
             _require_exact_payload(payload, {"agent_id", "thread_root_message_id"})
             agent_id = AgentId(_required_text(payload, "agent_id"))
@@ -1087,15 +1270,41 @@ class CanonicalConversationProjection:
                     event.position,
                 ),
             )
+            if await _table_has_column(
+                connection,
+                "channel_agents",
+                "sponsored_runtime_profile_id",
+            ):
+                await connection.execute(
+                    "UPDATE channel_agents SET sponsored_runtime_profile_id = "
+                    "COALESCE(sponsored_runtime_profile_id, ?), sponsor_principal_id = "
+                    "COALESCE(sponsor_principal_id, ("
+                    "SELECT owner.principal_id FROM channel_agent_runtime_assignments direct_ra "
+                    "JOIN channels direct_channel ON direct_channel.id = direct_ra.channel_id "
+                    "AND direct_channel.kind = 'direct' "
+                    "JOIN channel_memberships owner ON owner.channel_id = direct_channel.id "
+                    "AND owner.role = 'owner' "
+                    "WHERE direct_ra.runtime_profile_id = ? AND direct_ra.agent_id = ? "
+                    "ORDER BY direct_ra.created_event_position LIMIT 1)) "
+                    "WHERE channel_id = ? AND agent_id = ?",
+                    (
+                        _required_text(payload, "runtime_profile_id"),
+                        _required_text(payload, "runtime_profile_id"),
+                        _required_text(payload, "agent_id"),
+                        _required_text(payload, "channel_id"),
+                        _required_text(payload, "agent_id"),
+                    ),
+                )
         elif envelope.event_type == WorkshopEventType.RUNTIME_PROFILE_REASSIGNED:
             channel_id = _required_text(payload, "channel_id")
             agent_id = _required_text(payload, "agent_id")
+            runtime_profile_id = _required_text(payload, "runtime_profile_id")
             cursor = await connection.execute(
                 "UPDATE channel_agent_runtime_assignments "
                 "SET runtime_profile_id = ?, created_event_position = ? "
                 "WHERE id = ? AND channel_id = ? AND agent_id = ?",
                 (
-                    _required_text(payload, "runtime_profile_id"),
+                    runtime_profile_id,
                     event.position,
                     envelope.aggregate_id,
                     channel_id,
@@ -1104,6 +1313,15 @@ class CanonicalConversationProjection:
             )
             if cursor.rowcount != 1:
                 raise ValueError("Workshop runtime reassignment has no matching channel-agent assignment")
+            if await _table_has_column(
+                connection,
+                "channel_agents",
+                "sponsored_runtime_profile_id",
+            ):
+                await connection.execute(
+                    "UPDATE channel_agents SET sponsored_runtime_profile_id = ? WHERE channel_id = ? AND agent_id = ?",
+                    (runtime_profile_id, channel_id, agent_id),
+                )
         elif envelope.event_type == WorkshopEventType.MESSAGE_CREATED:
             reply_to = payload.get("reply_to_message_id")
             if reply_to is not None and not isinstance(reply_to, str):

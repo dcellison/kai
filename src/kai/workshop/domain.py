@@ -37,6 +37,7 @@ class WorkshopEventType(StrEnum):
     PRINCIPAL_AGENT_DISABLED = "principal_agent.disabled"
     PRINCIPAL_AGENT_RUNTIME_CHANGED = "principal_agent.runtime_changed"
     CHANNEL_AGENT_ATTACHED = "channel.agent_attached"
+    CHANNEL_AGENT_DETACHED = "channel.agent_detached"
     CHANNEL_AGENT_DISMISSED = "channel.agent_dismissed"
     RUNTIME_PROFILE_ASSIGNED = "runtime_profile.assigned"
     RUNTIME_PROFILE_REASSIGNED = "runtime_profile.reassigned"

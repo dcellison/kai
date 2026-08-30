@@ -873,6 +873,8 @@ class TestNotificationChatIdMutations:
                 "/v1/channels/{channel_id}/artifacts/{artifact_id}/content",
                 "/v1/channels/{channel_id}/artifacts/{artifact_id}/download",
                 "/v1/channels/{channel_id}/commands",
+                "/v1/channels/{channel_id}/agents/{agent_id}/attach",
+                "/v1/channels/{channel_id}/agents/{agent_id}/detach",
                 "/v1/channels/{channel_id}/agents/{agent_id}/dismiss",
                 "/v1/channels/{channel_id}/runs/{run_id}",
                 "/v1/channels/{channel_id}/runs/{run_id}/cancel",

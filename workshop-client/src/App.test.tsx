@@ -4,10 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
 import {
+  attachChannelAgent,
   AuthenticationError,
   cancelRun,
   ChannelAccessError,
   createChannel,
+  detachChannelAgent,
   dismissChannelAgent,
   loadAppearancePreferences,
   loadAgentDefinitions,
@@ -50,8 +52,10 @@ vi.mock("./api", async (importOriginal) => {
   const original = await importOriginal<typeof import("./api")>();
   return {
     ...original,
+    attachChannelAgent: vi.fn(),
     cancelRun: vi.fn(),
     createChannel: vi.fn(),
+    detachChannelAgent: vi.fn(),
     dismissChannelAgent: vi.fn(),
     loadEarlierTimeline: vi.fn(),
     loadArtifactBlob: vi.fn(),
@@ -100,10 +104,15 @@ const navigation: WorkshopNavigation = {
           agents: [
             {
               agentId: "agt_00000000000000000000000000000001",
+              available: true,
               engaged: false,
               engagedUntil: null,
+              memoryScope: "private",
               name: "Kai",
               principalId: "prn_00000000000000000000000000000002",
+              runtimeProfileId,
+              sponsorDisplayName: "Daniel",
+              sponsorPrincipalId: "prn_00000000000000000000000000000001",
             },
           ],
           canSubmitCommands: true,
@@ -123,10 +132,15 @@ const navigation: WorkshopNavigation = {
           agents: [
             {
               agentId: "agt_00000000000000000000000000000001",
+              available: true,
               engaged: false,
               engagedUntil: null,
+              memoryScope: "private",
               name: "Kai",
               principalId: "prn_00000000000000000000000000000002",
+              runtimeProfileId,
+              sponsorDisplayName: "Daniel",
+              sponsorPrincipalId: "prn_00000000000000000000000000000001",
             },
           ],
           canSubmitCommands: false,
@@ -168,9 +182,11 @@ const navigation: WorkshopNavigation = {
 function navigationWithGroup({
   engaged = false,
   name = "Wake policy qualification",
+  role = "participant",
 }: {
   engaged?: boolean;
   name?: string;
+  role?: string;
 } = {}): WorkshopNavigation {
   const direct = navigation.workshops[0].channels[0];
   return {
@@ -186,11 +202,12 @@ function navigationWithGroup({
               ...agent,
               engaged,
               engagedUntil: engaged ? "2099-08-28T12:00:00Z" : null,
+              memoryScope: "shared_channel",
             })),
             channelId: secondChannelId,
             kind: "group",
             name,
-            role: "participant",
+            role,
           },
         ],
       },
@@ -383,7 +400,9 @@ describe("Workshop React client", () => {
     handlers = null;
     failStream = null;
     vi.mocked(redeemEnrollment).mockResolvedValue("redeemed-session-token");
+    vi.mocked(attachChannelAgent).mockResolvedValue(undefined);
     vi.mocked(createChannel).mockResolvedValue(secondChannelId);
+    vi.mocked(detachChannelAgent).mockResolvedValue(undefined);
     vi.mocked(dismissChannelAgent).mockResolvedValue(undefined);
     vi.mocked(setMessageReaction).mockResolvedValue([]);
     vi.mocked(loadNavigation).mockResolvedValue(navigation);
@@ -1711,7 +1730,41 @@ describe("Workshop React client", () => {
     expect(vi.mocked(dismissChannelAgent).mock.calls[0]?.[1]).toBe(
       "agt_00000000000000000000000000000001",
     );
-    expect(await screen.findByText("Not engaged")).toBeVisible();
+    expect(await screen.findByText("Available · not engaged")).toBeVisible();
+  });
+
+  it("lets a channel owner manage explicit sponsored agent attachments", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId: secondChannelId, token: "existing-session" }),
+    );
+    vi.mocked(loadNavigation).mockResolvedValue(
+      navigationWithGroup({ role: "owner" }),
+    );
+    vi.mocked(loadTimeline).mockResolvedValue({
+      messages: [{ ...historyMessage, channelId: secondChannelId }],
+      throughPosition: 25,
+      previousCursor: null,
+    });
+
+    render(<App />);
+    await user.click(
+      await screen.findByRole("button", { name: "Manage channel agents" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: "Agents" });
+    expect(within(dialog).getByText(/sponsored by Daniel/i)).toBeVisible();
+    const kai = within(dialog).getByRole("checkbox", { name: /Kai/ });
+    expect(kai).toBeChecked();
+    await user.click(kai);
+    await user.click(within(dialog).getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(detachChannelAgent).toHaveBeenCalledOnce());
+    expect(vi.mocked(detachChannelAgent).mock.calls[0]?.slice(0, 2)).toEqual([
+      { channelId: secondChannelId, token: "existing-session" },
+      "agt_00000000000000000000000000000001",
+    ]);
+    expect(attachChannelAgent).not.toHaveBeenCalled();
   });
 
   it("groups direct messages and names agent and human conversations by participant", async () => {
@@ -1821,10 +1874,15 @@ describe("Workshop React client", () => {
       agents: [
         {
           agentId: qualificationDefinition.agentId,
+          available: true,
           engaged: false,
           engagedUntil: null,
+          memoryScope: "private",
           name: qualificationDefinition.displayName,
           principalId: "prn_44444444444444444444444444444444",
+          runtimeProfileId: qualificationEnablement.runtimeProfileId,
+          sponsorDisplayName: navigation.principal.displayName,
+          sponsorPrincipalId: navigation.principal.principalId,
         },
       ],
       channelId: qualificationChannelId,

@@ -6,7 +6,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 
-from kai.workshop.conversation_runs import resolve_canonical_conversation_target
+from kai.workshop.conversation_runs import (
+    ConversationRunUnavailableError,
+    resolve_canonical_conversation_run,
+    resolve_canonical_conversation_target,
+)
 from kai.workshop.domain import (
     AgentDefinitionRevisionId,
     AgentId,
@@ -16,6 +20,7 @@ from kai.workshop.domain import (
     MessageId,
     PrincipalId,
     RunId,
+    RuntimeProfileId,
     WorkshopEventType,
     WorkshopId,
 )
@@ -61,6 +66,8 @@ class DurableRun:
     result_message_id: MessageId | None
     last_event_position: int
     agent_definition_revision_id: AgentDefinitionRevisionId | None = None
+    runtime_profile_id: RuntimeProfileId | None = None
+    sponsor_principal_id: PrincipalId | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,9 +100,14 @@ async def load_durable_run(store: WorkshopEventStore, run_id: RunId) -> DurableR
         if "agent_definition_revision_id" in run_columns
         else "NULL AS agent_definition_revision_id"
     )
+    runtime_expression = "runtime_profile_id" if "runtime_profile_id" in run_columns else "NULL AS runtime_profile_id"
+    sponsor_expression = (
+        "sponsor_principal_id" if "sponsor_principal_id" in run_columns else "NULL AS sponsor_principal_id"
+    )
     async with store.connection.execute(
         "SELECT id, workshop_id, channel_id, requested_by_principal_id, agent_id, "
-        f"inbound_message_id, {revision_expression}, status, accepted_at, "
+        f"inbound_message_id, {revision_expression}, {runtime_expression}, {sponsor_expression}, "
+        "status, accepted_at, "
         "started_at, terminal_at, terminal_code, "
         "cancellation_requested_at, cancellation_code, result_message_id, "
         "last_event_position FROM runs WHERE id = ?",
@@ -112,15 +124,17 @@ async def load_durable_run(store: WorkshopEventStore, run_id: RunId) -> DurableR
         agent_id=AgentId(str(row[4])),
         inbound_message_id=MessageId(str(row[5])),
         agent_definition_revision_id=(AgentDefinitionRevisionId(str(row[6])) if row[6] is not None else None),
-        status=RunStatus(str(row[7])),
-        accepted_at=_parse_timestamp(row[8]),
-        started_at=_optional_timestamp(row[9]),
-        terminal_at=_optional_timestamp(row[10]),
-        terminal_code=str(row[11]) if row[11] is not None else None,
-        cancellation_requested_at=_optional_timestamp(row[12]),
-        cancellation_code=str(row[13]) if row[13] is not None else None,
-        result_message_id=MessageId(str(row[14])) if row[14] is not None else None,
-        last_event_position=int(row[15]),
+        runtime_profile_id=RuntimeProfileId(str(row[7])) if row[7] is not None else None,
+        sponsor_principal_id=PrincipalId(str(row[8])) if row[8] is not None else None,
+        status=RunStatus(str(row[9])),
+        accepted_at=_parse_timestamp(row[10]),
+        started_at=_optional_timestamp(row[11]),
+        terminal_at=_optional_timestamp(row[12]),
+        terminal_code=str(row[13]) if row[13] is not None else None,
+        cancellation_requested_at=_optional_timestamp(row[14]),
+        cancellation_code=str(row[15]) if row[15] is not None else None,
+        result_message_id=MessageId(str(row[16])) if row[16] is not None else None,
+        last_event_position=int(row[17]),
     )
 
 
@@ -255,6 +269,10 @@ class WorkshopRunLifecycle:
             if existing_run.agent_definition_revision_id is not None:
                 existing_payload["agent_definition_revision_id"] = existing_run.agent_definition_revision_id
                 event_version = 2
+            if existing_run.runtime_profile_id is not None and existing_run.sponsor_principal_id is not None:
+                existing_payload["runtime_profile_id"] = existing_run.runtime_profile_id
+                existing_payload["sponsor_principal_id"] = existing_run.sponsor_principal_id
+                event_version = 3
             existing_event = await _existing_event(
                 self._store,
                 run=existing_run,
@@ -272,6 +290,21 @@ class WorkshopRunLifecycle:
             inbound_message_id,
             agent_id,
         )
+        resolution = None
+        try:
+            resolution = await resolve_canonical_conversation_run(
+                self._store,
+                inbound_message_id,
+                agent_id,
+            )
+        except ConversationRunUnavailableError:
+            async with self._store.connection.execute(
+                "SELECT kind FROM channels WHERE id = ?",
+                (target.channel_id,),
+            ) as cursor:
+                channel_row = await cursor.fetchone()
+            if channel_row is None or str(channel_row[0]) != "direct":
+                raise
         run_id = RunId.derived(
             target.workshop_id,
             f"conversation:{inbound_message_id}:{target.agent_id}",
@@ -298,6 +331,10 @@ class WorkshopRunLifecycle:
             definition_revision_id = AgentDefinitionRevisionId(str(definition_row[0]))
             payload["agent_definition_revision_id"] = definition_revision_id
             event_version = 2
+        if resolution is not None:
+            payload["runtime_profile_id"] = resolution.runtime_profile_id
+            payload["sponsor_principal_id"] = resolution.sponsor_principal_id
+            event_version = 3
         event = EventEnvelope.create(
             event_id=EventId.derived(run_id, "accepted"),
             event_type=WorkshopEventType.RUN_ACCEPTED,

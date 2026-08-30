@@ -1274,6 +1274,11 @@ class TestWorkshopNavigationHTTPContract:
                         "name": "Kai",
                         "engaged": False,
                         "engaged_until": None,
+                        "sponsor_principal_id": alice_id,
+                        "sponsor_display_name": "Alice",
+                        "runtime_profile_id": direct["agents"][0]["runtime_profile_id"],
+                        "available": True,
+                        "memory_scope": "private",
                     }
                 ],
                 "participants": [
@@ -1740,6 +1745,133 @@ class TestWorkshopAgentEnablementHTTPContract:
 
 
 class TestWorkshopChannelLifecycleHTTPContract:
+    async def test_owner_detaches_and_reattaches_sponsored_agent_without_losing_history(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_channel, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        channel_id = await _create_group_channel(store, alice_id, alice_channel)
+        message_id = await _record_client_message(
+            store,
+            alice_id,
+            channel_id,
+            "attachment-history",
+            "Keep this channel history.",
+        )
+        async with store.connection.execute(
+            "SELECT agent_id, sponsor_principal_id, sponsored_runtime_profile_id "
+            "FROM channel_agents WHERE channel_id = ?",
+            (channel_id,),
+        ) as cursor:
+            attachment_row = await cursor.fetchone()
+        assert attachment_row is not None
+        agent_id = AgentId(str(attachment_row[0]))
+        runtime_profile_id = str(attachment_row[2])
+        path = f"/v1/channels/{channel_id}/agents/{agent_id}"
+        client = await _open_client(
+            store,
+            _Authenticator({"alice": alice_id, "bob": bob_id}),
+        )
+        try:
+            denied = await client.post(
+                f"{path}/detach",
+                headers={"Authorization": "Bearer bob"},
+                json={"client_operation_id": "bob-detach"},
+            )
+            detached = await client.post(
+                f"{path}/detach",
+                headers={"Authorization": "Bearer alice"},
+                json={"client_operation_id": "alice-detach"},
+            )
+            replayed = await client.post(
+                f"{path}/detach",
+                headers={"Authorization": "Bearer alice"},
+                json={"client_operation_id": "alice-detach"},
+            )
+
+            assert denied.status == 403
+            assert detached.status == replayed.status == 200
+            assert await detached.json() == {
+                "version": 1,
+                "operation": "detach",
+                "changed": True,
+                "attachment": {
+                    "channel_id": channel_id,
+                    "agent_id": agent_id,
+                    "sponsor_principal_id": alice_id,
+                    "runtime_profile_id": runtime_profile_id,
+                },
+            }
+            assert (await replayed.json())["changed"] is False
+
+            navigation = await client.get(
+                "/v1/client/navigation",
+                headers={"Authorization": "Bearer alice"},
+            )
+            visible = next(
+                item
+                for item in (await navigation.json())["workshops"][0]["channels"]
+                if item["channel_id"] == channel_id
+            )
+            assert visible["agents"] == []
+            assert visible["can_submit_commands"] is False
+
+            await store.rebuild_projection(CanonicalConversationProjection())
+            async with store.connection.execute(
+                "SELECT detached_at FROM channel_agents WHERE channel_id = ? AND agent_id = ?",
+                (channel_id, agent_id),
+            ) as cursor:
+                rebuilt_attachment = await cursor.fetchone()
+            assert rebuilt_attachment is not None
+            assert rebuilt_attachment[0] is not None
+
+            attached = await client.post(
+                f"{path}/attach",
+                headers={"Authorization": "Bearer alice"},
+                json={"client_operation_id": "alice-reattach"},
+            )
+            assert attached.status == 200
+            assert (await attached.json())["changed"] is True
+            await store.connection.execute(
+                "UPDATE principal_agent_enablements SET lifecycle_state = 'disabled' "
+                "WHERE principal_id = ? AND agent_id = ?",
+                (alice_id, agent_id),
+            )
+            await store.connection.commit()
+            replayed_attach = await client.post(
+                f"{path}/attach",
+                headers={"Authorization": "Bearer alice"},
+                json={"client_operation_id": "alice-reattach"},
+            )
+            assert replayed_attach.status == 200
+            assert await replayed_attach.json() == {
+                "version": 1,
+                "operation": "attach",
+                "changed": False,
+                "attachment": {
+                    "channel_id": channel_id,
+                    "agent_id": agent_id,
+                    "sponsor_principal_id": alice_id,
+                    "runtime_profile_id": runtime_profile_id,
+                },
+            }
+            async with store.connection.execute(
+                "SELECT detached_at, sponsor_principal_id, "
+                "sponsored_runtime_profile_id FROM channel_agents "
+                "WHERE channel_id = ? AND agent_id = ?",
+                (channel_id, agent_id),
+            ) as cursor:
+                active_attachment = await cursor.fetchone()
+            assert tuple(active_attachment) == (None, alice_id, runtime_profile_id)
+            async with store.connection.execute(
+                "SELECT body FROM messages WHERE id = ?",
+                (message_id,),
+            ) as cursor:
+                assert tuple(await cursor.fetchone()) == ("Keep this channel history.",)
+        finally:
+            await client.close()
+            await store.close()
+
     async def test_archived_agent_cannot_be_enabled_in_a_new_channel(
         self,
         tmp_path: Path,
@@ -1899,6 +2031,11 @@ class TestWorkshopChannelLifecycleHTTPContract:
                     "name": "Kai",
                     "engaged": False,
                     "engaged_until": None,
+                    "sponsor_principal_id": alice_id,
+                    "sponsor_display_name": "Alice",
+                    "runtime_profile_id": visible["agents"][0]["runtime_profile_id"],
+                    "available": True,
+                    "memory_scope": "shared_channel",
                 }
             ]
             assert visible["can_submit_commands"] is True

@@ -60,6 +60,7 @@ from kai.workshop.artifacts import (
 from kai.workshop.authorization import CanonicalChannelAuthorizer
 from kai.workshop.channel_lifecycle import (
     CreatedWorkshopChannel,
+    WorkshopChannelAgentAttachment,
     WorkshopChannelLifecycleAccessDenied,
     WorkshopChannelLifecycleError,
     WorkshopChannelLifecycleService,
@@ -235,6 +236,8 @@ _AGENT_DISABLE_PATH = "/v1/client/agents/{definition_id}/disable"
 _ENROLLMENT_REDEMPTION_PATH = "/v1/client/enrollment/redeem"
 _COMMAND_SUBMISSION_PATH = "/v1/channels/{channel_id}/commands"
 _AGENT_DISMISSAL_PATH = "/v1/channels/{channel_id}/agents/{agent_id}/dismiss"
+_AGENT_ATTACHMENT_PATH = "/v1/channels/{channel_id}/agents/{agent_id}/attach"
+_AGENT_DETACHMENT_PATH = "/v1/channels/{channel_id}/agents/{agent_id}/detach"
 _ARTIFACT_CONTENT_PATH = "/v1/channels/{channel_id}/artifacts/{artifact_id}/content"
 _ARTIFACT_DOWNLOAD_PATH = "/v1/channels/{channel_id}/artifacts/{artifact_id}/download"
 _RUN_STATE_PATH = "/v1/channels/{channel_id}/runs/{run_id}"
@@ -295,6 +298,8 @@ _APPEARANCE_PREFERENCE_REQUEST_FIELDS = frozenset({"revision", "theme_id"})
 _MAX_APPEARANCE_PREFERENCE_BODY_BYTES = 1_024
 _CHANNEL_CREATION_REQUEST_FIELDS = frozenset({"name", "agent_ids", "origin_channel_id"})
 _MAX_CHANNEL_CREATION_BODY_BYTES = 8_192
+_CHANNEL_AGENT_OPERATION_FIELDS = frozenset({"client_operation_id"})
+_MAX_CHANNEL_AGENT_OPERATION_BODY_BYTES = 1_024
 _AGENT_CREATION_FIELDS = frozenset(
     {
         "idempotency_key",
@@ -641,6 +646,24 @@ def _serialize_created_channel(
             "origin_channel_id": (str(channel.origin_channel_id) if channel.origin_channel_id is not None else None),
             "role": "owner",
             "agent_ids": [str(agent_id) for agent_id in channel.agent_ids],
+        },
+    }
+
+
+def _serialize_channel_agent_attachment(
+    attachment: WorkshopChannelAgentAttachment,
+    *,
+    operation: str,
+) -> dict[str, object]:
+    return {
+        "version": 1,
+        "operation": operation,
+        "changed": attachment.changed,
+        "attachment": {
+            "channel_id": str(attachment.channel_id),
+            "agent_id": str(attachment.agent_id),
+            "sponsor_principal_id": str(attachment.sponsor_principal_id),
+            "runtime_profile_id": str(attachment.runtime_profile_id),
         },
     }
 
@@ -3032,17 +3055,25 @@ async def _handle_client_navigation(
     async with store.connection.execute(
         "SELECT c.workshop_id, c.id, c.kind, c.name, cm.role, a.id, "
         "a.principal_id, a.name, "
-        "CASE WHEN cara.id IS NULL THEN 0 ELSE 1 END, pae.lifecycle_state "
+        "CASE WHEN cara.id IS NULL THEN 0 ELSE 1 END, pae.lifecycle_state, "
+        "ca.sponsor_principal_id, sponsor.display_name, "
+        "ca.sponsored_runtime_profile_id, "
+        "CASE WHEN sponsored.id IS NULL THEN 0 ELSE 1 END "
         "FROM channel_memberships cm "
         "JOIN channels c ON c.id = cm.channel_id "
         "JOIN workshop_memberships wm ON wm.workshop_id = c.workshop_id "
         "AND wm.principal_id = cm.principal_id "
-        "LEFT JOIN channel_agents ca ON ca.channel_id = c.id "
+        "LEFT JOIN channel_agents ca ON ca.channel_id = c.id AND ca.detached_at IS NULL "
         "LEFT JOIN agents a ON a.id = ca.agent_id AND a.workshop_id = c.workshop_id "
         "LEFT JOIN channel_agent_runtime_assignments cara "
         "ON cara.channel_id = c.id AND cara.agent_id = a.id "
         "LEFT JOIN principal_agent_enablements pae ON pae.direct_channel_id = c.id "
         "AND pae.principal_id = cm.principal_id AND pae.agent_id = a.id "
+        "LEFT JOIN principals sponsor ON sponsor.id = ca.sponsor_principal_id "
+        "LEFT JOIN principal_agent_enablements sponsored ON sponsored.principal_id = ca.sponsor_principal_id "
+        "AND sponsored.agent_id = ca.agent_id "
+        "AND sponsored.runtime_profile_id = ca.sponsored_runtime_profile_id "
+        "AND sponsored.lifecycle_state = 'enabled' "
         "WHERE cm.principal_id = ? "
         "ORDER BY c.workshop_id, "
         "CASE c.kind WHEN 'direct' THEN 0 WHEN 'group' THEN 1 "
@@ -3059,7 +3090,11 @@ async def _handle_client_navigation(
         "JOIN channel_memberships peer_cm ON peer_cm.channel_id = c.id "
         "AND peer_cm.principal_id != own_cm.principal_id "
         "JOIN principals peer ON peer.id = peer_cm.principal_id "
+        "LEFT JOIN agents peer_agent ON peer_agent.principal_id = peer.id "
+        "LEFT JOIN channel_agents active_agent ON active_agent.channel_id = c.id "
+        "AND active_agent.agent_id = peer_agent.id AND active_agent.detached_at IS NULL "
         "WHERE own_cm.principal_id = ? "
+        "AND (peer.kind != 'agent' OR active_agent.id IS NOT NULL) "
         "ORDER BY c.workshop_id, c.id, lower(peer.display_name), peer.id",
         (principal_id,),
     ) as cursor:
@@ -3095,6 +3130,11 @@ async def _handle_client_navigation(
                     "name": str(row[7]),
                     "engaged": False,
                     "engaged_until": None,
+                    "sponsor_principal_id": str(row[10]) if row[10] is not None else None,
+                    "sponsor_display_name": str(row[11]) if row[11] is not None else None,
+                    "runtime_profile_id": str(row[12]) if row[12] is not None else None,
+                    "available": bool(row[13]),
+                    "memory_scope": "private" if str(row[2]) == "direct" else "shared_channel",
                 }
             )
             assignments.append(bool(row[8]))
@@ -3130,6 +3170,7 @@ async def _handle_client_navigation(
                 and len(agents) >= 1
                 and len(assignments) == len(agents)
                 and all(assignments)
+                and any(isinstance(agent, dict) and bool(agent.get("available")) for agent in agents)
                 and (channel["kind"] == "group" or enablement == "enabled")
             )
             if channel["kind"] == "group":
@@ -3251,6 +3292,79 @@ async def _handle_channel_creation(
             message="Channel creation conflicted with current state",
         )
     return _json_response(_serialize_created_channel(created), status=201)
+
+
+async def _handle_channel_agent_operation(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopChannelLifecycleService,
+    operation: str,
+) -> web.Response:
+    """Attach or detach one explicitly sponsored group-channel agent."""
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(
+            status=401,
+            code="authentication_required",
+            message="Authentication required",
+        )
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    if request.query or request.content_type != "application/json":
+        return _error_response(status=400, code="invalid_request", message="Invalid agent operation request")
+    if request.content_length is not None and request.content_length > _MAX_CHANNEL_AGENT_OPERATION_BODY_BYTES:
+        return _error_response(status=400, code="invalid_request", message="Agent operation request is too large")
+    raw = await request.content.read(_MAX_CHANNEL_AGENT_OPERATION_BODY_BYTES + 1)
+    if len(raw) > _MAX_CHANNEL_AGENT_OPERATION_BODY_BYTES:
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Agent operation request is too large",
+        )
+    try:
+        payload = json.loads(raw)
+        channel_id = ChannelId(request.match_info["channel_id"])
+        agent_id = AgentId(request.match_info["agent_id"])
+    except (UnicodeDecodeError, TypeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid agent operation request")
+    if not isinstance(payload, dict) or set(payload) != _CHANNEL_AGENT_OPERATION_FIELDS:
+        return _error_response(status=400, code="invalid_request", message="Invalid agent operation request")
+    try:
+        if operation == "attach":
+            attachment = await service.attach_agent(
+                principal_id,
+                channel_id,
+                agent_id,
+                client_operation_id=payload["client_operation_id"],
+            )
+        else:
+            attachment = await service.detach_agent(
+                principal_id,
+                channel_id,
+                agent_id,
+                client_operation_id=payload["client_operation_id"],
+            )
+    except WorkshopChannelLifecycleAccessDenied:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except WorkshopChannelLifecycleValidationError as exc:
+        return _error_response(status=400, code="invalid_request", message=str(exc))
+    except WorkshopChannelLifecycleStorageError:
+        return _error_response(
+            status=503,
+            code="channel_agent_operation_unavailable",
+            message="Agent operation is temporarily unavailable",
+        )
+    except WorkshopChannelLifecycleError:
+        return _error_response(
+            status=409,
+            code="channel_agent_operation_conflict",
+            message="Agent operation conflicted with current state",
+        )
+    return _json_response(
+        _serialize_channel_agent_attachment(attachment, operation=operation),
+        status=200,
+    )
 
 
 async def _read_agent_lifecycle_payload(
@@ -4906,6 +5020,24 @@ def register_workshop_read_routes(
                 service=channel_lifecycle,
             )
 
+    async def handle_channel_agent_attachment(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_channel_agent_operation(
+                request,
+                authenticator=authenticator,
+                service=channel_lifecycle,
+                operation="attach",
+            )
+
+    async def handle_channel_agent_detachment(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_channel_agent_operation(
+                request,
+                authenticator=authenticator,
+                service=channel_lifecycle,
+                operation="detach",
+            )
+
     async def handle_agent_definition_list(request: web.Request) -> web.Response:
         async with request_lock:
             return await _handle_agent_definition_list(
@@ -4993,6 +5125,8 @@ def register_workshop_read_routes(
 
     app.router.add_get(_CLIENT_NAVIGATION_PATH, handle_client_navigation)
     app.router.add_post(_CHANNEL_CREATION_PATH, handle_channel_creation)
+    app.router.add_post(_AGENT_ATTACHMENT_PATH, handle_channel_agent_attachment)
+    app.router.add_post(_AGENT_DETACHMENT_PATH, handle_channel_agent_detachment)
     app.router.add_get(_AGENT_DEFINITIONS_PATH, handle_agent_definition_list)
     app.router.add_post(_AGENT_DEFINITIONS_PATH, handle_agent_definition_create)
     app.router.add_get(_AGENT_EVENTS_PATH, handle_agent_event_stream)

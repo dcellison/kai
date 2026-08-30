@@ -59,6 +59,7 @@ class AgentRuntimeIdentity(Protocol):
     channel_id: str
     agent_id: str
     runtime_profile_id: str
+    private_context: bool
 
 
 def _principal_directories(
@@ -707,7 +708,10 @@ def build_session_context(
     # MEMORY.md. Always emit (per-deployment, not per-user) so the
     # routing rule in AGENTS.md / PREFERENCES.md can branch on a
     # uniformly-present signal.
+    private_context = runtime_identity is None or getattr(runtime_identity, "private_context", True)
     mode = "enabled" if memory_enabled else "disabled"
+    if not private_context:
+        mode = "unavailable in shared channels"
     parts.append(f"[Memory subsystem: {mode}]")
 
     # Always inject the per-user PREFERENCES.md as the always-on rule
@@ -720,7 +724,7 @@ def build_session_context(
     # rules before facts on a top-to-bottom scan. When chat_id is None
     # (one-shot CLI invocations) the block is omitted entirely; there
     # is no global-fallback PREFERENCES.md.
-    if runtime_identity is not None or chat_id is not None:
+    if private_context and (runtime_identity is not None or chat_id is not None):
         preference_dirs = _principal_directories(
             data_dir=data_dir,
             namespace="preferences",
@@ -788,7 +792,7 @@ def build_session_context(
     # legacy global path when chat_id is None (local-dev backends
     # with no multi-user config) so nothing regresses on single-user
     # setups that never hit the multi-user pool path.
-    if not memory_enabled:
+    if private_context and not memory_enabled:
         if runtime_identity is not None or chat_id is not None:
             memory_dirs = _principal_directories(
                 data_dir=data_dir,
@@ -1684,7 +1688,8 @@ async def assemble_turn_context(
         if chat_id is not None
         else None
     )
-    if memory_user_id is not None and search_query.strip():
+    private_context = runtime_identity is None or getattr(runtime_identity, "private_context", True)
+    if private_context and memory_user_id is not None and search_query.strip():
         from kai.memory import (
             _emit_recall_log,
             format_scoped_context_with_recall_payload,

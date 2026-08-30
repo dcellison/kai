@@ -60,9 +60,15 @@ async def resolve_agent_engagements(
         raise ValueError("before_event_position must be positive")
     current_at = current_at.astimezone(UTC)
     async with store.connection.execute(
-        "SELECT c.kind, ca.agent_id, a.principal_id FROM channels c "
-        "LEFT JOIN channel_agents ca ON ca.channel_id = c.id "
-        "LEFT JOIN agents a ON a.id = ca.agent_id WHERE c.id = ? "
+        "SELECT c.kind, ca.agent_id, a.principal_id, sponsored.id FROM channels c "
+        "LEFT JOIN channel_agents ca ON ca.channel_id = c.id AND ca.detached_at IS NULL "
+        "LEFT JOIN agents a ON a.id = ca.agent_id "
+        "LEFT JOIN principal_agent_enablements sponsored "
+        "ON sponsored.principal_id = ca.sponsor_principal_id "
+        "AND sponsored.agent_id = ca.agent_id "
+        "AND sponsored.runtime_profile_id = ca.sponsored_runtime_profile_id "
+        "AND sponsored.lifecycle_state = 'enabled' "
+        "WHERE c.id = ? "
         "ORDER BY ca.agent_id",
         (scope.channel_id,),
     ) as cursor:
@@ -82,7 +88,7 @@ async def resolve_agent_engagements(
     window_start = current_at - timedelta(seconds=GROUP_AGENT_ENGAGEMENT_WINDOW_SECONDS)
     engaged: list[AgentEngagement] = []
     for row in rows:
-        if row[1] is None or row[2] is None:
+        if row[1] is None or row[2] is None or row[3] is None:
             continue
         agent_id = AgentId(str(row[1]))
         agent_principal_id = PrincipalId(str(row[2]))
@@ -198,10 +204,20 @@ async def resolve_message_wake_targets(
     if author_kind != "human":
         return WakeDecision(())
 
+    availability_join = ""
+    if kind == "group":
+        availability_join = (
+            "JOIN principal_agent_enablements sponsored "
+            "ON sponsored.principal_id = ca.sponsor_principal_id "
+            "AND sponsored.agent_id = ca.agent_id "
+            "AND sponsored.runtime_profile_id = ca.sponsored_runtime_profile_id "
+            "AND sponsored.lifecycle_state = 'enabled' "
+        )
     async with store.connection.execute(
         "SELECT ca.agent_id, a.principal_id FROM channel_agents ca "
-        "JOIN agents a ON a.id = ca.agent_id WHERE ca.channel_id = ? "
-        "ORDER BY ca.agent_id",
+        "JOIN agents a ON a.id = ca.agent_id "
+        + availability_join
+        + "WHERE ca.channel_id = ? AND ca.detached_at IS NULL ORDER BY ca.agent_id",
         (channel_id,),
     ) as cursor:
         attached = [(AgentId(str(item[0])), PrincipalId(str(item[1]))) for item in await cursor.fetchall()]
@@ -255,6 +271,7 @@ async def dismiss_channel_agent(
         "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.principal_id = ? "
         "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
         "JOIN channel_agents ca ON ca.channel_id = c.id AND ca.agent_id = ? "
+        "AND ca.detached_at IS NULL "
         "WHERE c.id = ? AND c.kind = 'group'",
         (principal_id, agent_id, scope.channel_id),
     ) as cursor:

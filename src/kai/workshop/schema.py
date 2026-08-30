@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 47
+WORKSHOP_SCHEMA_VERSION = 48
 
 
 @dataclass(frozen=True, slots=True)
@@ -2274,6 +2274,52 @@ _PRINCIPAL_AGENT_ENABLEMENT_SCHEMA = SchemaMigration(
     ),
 )
 
+_CHANNEL_AGENT_ATTACHMENT_LIFECYCLE_SCHEMA = SchemaMigration(
+    version=48,
+    name="channel_agent_attachment_lifecycle",
+    statements=(
+        "ALTER TABLE channel_agents ADD COLUMN sponsor_principal_id TEXT REFERENCES principals(id) ON DELETE RESTRICT",
+        "ALTER TABLE channel_agents ADD COLUMN sponsored_runtime_profile_id TEXT",
+        "ALTER TABLE channel_agents ADD COLUMN attached_event_position INTEGER "
+        "REFERENCES event_log(position) ON DELETE RESTRICT",
+        "ALTER TABLE channel_agents ADD COLUMN detached_at TEXT",
+        "ALTER TABLE channel_agents ADD COLUMN detached_event_position INTEGER "
+        "REFERENCES event_log(position) ON DELETE RESTRICT",
+        "UPDATE channel_agents SET attached_event_position = ("
+        "SELECT MAX(position) FROM event_log "
+        "WHERE aggregate_type = 'channel_agent' AND aggregate_id = channel_agents.id "
+        "AND event_type = 'channel.agent_attached')",
+        "UPDATE channel_agents SET sponsored_runtime_profile_id = ("
+        "SELECT runtime_profile_id FROM channel_agent_runtime_assignments ra "
+        "WHERE ra.channel_id = channel_agents.channel_id "
+        "AND ra.agent_id = channel_agents.agent_id)",
+        "UPDATE channel_agents SET sponsor_principal_id = COALESCE(("
+        "SELECT owner.principal_id FROM channel_agent_runtime_assignments current_ra "
+        "JOIN channel_agent_runtime_assignments direct_ra "
+        "ON direct_ra.runtime_profile_id = current_ra.runtime_profile_id "
+        "AND direct_ra.agent_id = current_ra.agent_id "
+        "JOIN channels direct_channel ON direct_channel.id = direct_ra.channel_id "
+        "AND direct_channel.kind = 'direct' "
+        "JOIN channel_memberships owner ON owner.channel_id = direct_channel.id "
+        "AND owner.role = 'owner' "
+        "WHERE current_ra.channel_id = channel_agents.channel_id "
+        "AND current_ra.agent_id = channel_agents.agent_id "
+        "ORDER BY direct_ra.created_event_position LIMIT 1), ("
+        "SELECT migrated.principal_id FROM workshop_execution_state_migrations migrated "
+        "WHERE migrated.runtime_profile_id = channel_agents.sponsored_runtime_profile_id "
+        "LIMIT 1))",
+        "ALTER TABLE runs ADD COLUMN runtime_profile_id TEXT",
+        "ALTER TABLE runs ADD COLUMN sponsor_principal_id TEXT REFERENCES principals(id) ON DELETE RESTRICT",
+        "UPDATE runs SET runtime_profile_id = ("
+        "SELECT runtime_profile_id FROM channel_agent_runtime_assignments ra "
+        "WHERE ra.channel_id = runs.channel_id AND ra.agent_id = runs.agent_id)",
+        "UPDATE runs SET sponsor_principal_id = ("
+        "SELECT sponsor_principal_id FROM channel_agents ca "
+        "WHERE ca.channel_id = runs.channel_id AND ca.agent_id = runs.agent_id)",
+        "CREATE INDEX channel_agents_active_idx ON channel_agents (channel_id, agent_id) WHERE detached_at IS NULL",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2322,6 +2368,7 @@ _MIGRATIONS = (
     _MESSAGE_REACTIONS_SCHEMA,
     _VERSIONED_AGENT_DEFINITION_SCHEMA,
     _PRINCIPAL_AGENT_ENABLEMENT_SCHEMA,
+    _CHANNEL_AGENT_ATTACHMENT_LIFECYCLE_SCHEMA,
 )
 
 

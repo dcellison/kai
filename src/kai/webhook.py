@@ -282,6 +282,7 @@ def _internal_execution_context(
         principal.channel_id,
         principal.agent_id,
         principal.runtime_profile_id,
+        principal.private_context,
     )
 
 

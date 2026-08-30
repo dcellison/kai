@@ -16,10 +16,15 @@ export interface WorkshopSession {
 
 export interface WorkshopAgentSummary {
   agentId: string;
+  available: boolean;
   engaged: boolean;
   engagedUntil: string | null;
+  memoryScope: "private" | "shared_channel";
   name: string;
   principalId: string;
+  runtimeProfileId: string | null;
+  sponsorDisplayName: string | null;
+  sponsorPrincipalId: string | null;
 }
 
 export interface WorkshopParticipantSummary {

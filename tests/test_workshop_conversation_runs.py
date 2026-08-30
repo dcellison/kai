@@ -191,6 +191,7 @@ class TestWorkshopConversationRunService:
                 agent_id=AgentId.new(),
             ),
             runtime_profile_id=profile_id(101),
+            sponsor_principal_id=PrincipalId.new(),
         )
         resolver = AsyncMock(return_value=target)
         pool = MagicMock()
@@ -226,6 +227,7 @@ class TestWorkshopConversationRunService:
                 agent_id=AgentId.new(),
             ),
             runtime_profile_id=profile_id(101),
+            sponsor_principal_id=PrincipalId.new(),
         )
         pool = MagicMock()
         service = WorkshopConversationRunService(pool, AsyncMock(return_value=target))

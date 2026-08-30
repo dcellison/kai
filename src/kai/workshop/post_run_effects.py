@@ -36,12 +36,25 @@ async def enqueue_post_run_effect_in_transaction(
     result_message_id: MessageId,
     runtime_session: RuntimeSessionSettlement,
     occurred_at: datetime,
-) -> bool:
+) -> bool | None:
     """Queue the one common success effect in the terminal transaction."""
     if not store.connection.in_transaction:
         raise RuntimeError("enqueue_post_run_effect_in_transaction requires an active transaction")
     if runtime_session.run_id != run_id:
         raise ValueError("runtime session and post-run effect must identify the same run")
+    async with store.connection.execute(
+        "SELECT c.kind FROM runs r JOIN channels c ON c.id = r.channel_id WHERE r.id = ?",
+        (run_id,),
+    ) as cursor:
+        channel_row = await cursor.fetchone()
+    if channel_row is None:
+        raise ValueError("post-run effect run is unavailable")
+    # Shared channels deliberately have no principal-private semantic-memory
+    # authority. Their canonical transcript remains available as channel and
+    # thread context, but successful turns must not be extracted into the
+    # sponsor's personal memory store.
+    if str(channel_row[0]) == "group":
+        return None
     now = _timestamp(occurred_at)
     cursor = await store.connection.execute(
         "INSERT OR IGNORE INTO workshop_post_run_effects "

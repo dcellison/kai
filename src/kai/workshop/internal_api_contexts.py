@@ -22,6 +22,7 @@ class WorkshopInternalAPIExecutionContext:
     channel_id: ChannelId
     agent_id: AgentId
     runtime_profile_id: RuntimeProfileId
+    private_context: bool = True
 
     @classmethod
     def for_unprotected_runtime(
