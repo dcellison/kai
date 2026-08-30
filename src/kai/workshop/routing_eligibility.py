@@ -199,6 +199,8 @@ class WorkshopRoutingEligibilityService:
             authority.runtime_profile_id,
         )
         workspace = await self._runtime_pool.get_effective_workspace(runtime_authority)
+        selected_backend, selected_provider = self._runtime_pool.get_backend_provider(runtime_authority)
+        selected_option_id = f"{selected_backend}:{selected_provider}"
         selected_model = await self._runtime_pool.get_effective_model(runtime_authority)
         allowed_services = self._runtime_pool.runtime_profile(authority.runtime_profile_id).allowed_services
         catalogue_authority = self._catalogue.authority_for_principal(authority.principal_id)
@@ -207,8 +209,9 @@ class WorkshopRoutingEligibilityService:
         required = tuple(dict.fromkeys((*_TASK_REQUIREMENTS[canonical_task], *additional_required)))
         candidates: list[RuntimeEligibilityCandidate] = []
         for lane in profile.backends:
-            model_id = selected_model if lane.selected else lane.default_model
-            model_source = "current_selection" if lane.selected else "protected_default"
+            selected = lane.option_id == selected_option_id
+            model_id = selected_model if selected else lane.default_model
+            model_source = "current_selection" if selected else "protected_default"
             snapshot: ModelCatalogueSnapshot | None
             try:
                 snapshot = await self._catalogue.inspect(
@@ -223,6 +226,7 @@ class WorkshopRoutingEligibilityService:
                     lane,
                     model_id=model_id,
                     model_source=model_source,
+                    selected=selected,
                     allowed_services=allowed_services,
                     workspace=workspace,
                     required=required,
@@ -247,6 +251,7 @@ class WorkshopRoutingEligibilityService:
         *,
         model_id: str,
         model_source: str,
+        selected: bool,
         allowed_services: tuple[str, ...],
         workspace: Path,
         required: tuple[RuntimeCapability, ...],
@@ -305,7 +310,7 @@ class WorkshopRoutingEligibilityService:
             allowed_services=allowed_services,
             model_id=model_id,
             model_source=model_source,
-            selected=lane.selected,
+            selected=selected,
             eligible=not blocked,
             capabilities=assessments,
             reasons=tuple(reasons),
