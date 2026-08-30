@@ -83,6 +83,21 @@ _OPERATIONAL_STATE_TABLES = {
     "workshop_scheduled_job_migrations",
     "workshop_scheduled_jobs",
 }
+_AGENT_AUTHORITY_TABLES = {
+    "agent_definitions",
+    "agent_definition_revisions",
+    "agent_delegations",
+    "agents",
+    "channel_agent_runtime_assignments",
+    "channel_agents",
+    "channel_memberships",
+    "channels",
+    "principal_agent_enablements",
+    "principals",
+    "runs",
+    "workshop_memberships",
+}
+_AGENT_HANDLE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _TELEGRAM_SUBJECT_PATTERN = re.compile(r"^-?[0-9]+$")
 _SYNTHETIC_ASSISTANT_PATTERN = re.compile(
     r"\[(stopped by user|no response|error: .+)\]",
@@ -188,39 +203,249 @@ def workshop_bootstrap_status(db_path: Path, *, expected_humans: int | None) -> 
     )
 
 
-def workshop_agent_definition_status(db_path: Path) -> str:
-    """Describe versioned agent-definition completeness without exposing content."""
-    prefix = "Workshop agent definitions:"
+def workshop_agent_authority_status(db_path: Path) -> str:
+    """Describe canonical multi-agent authority and integrity without exposing content."""
+    prefix = "Workshop agent authority:"
     if not db_path.is_file():
         return f"{prefix} pending; canonical schema unavailable"
     try:
         connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
         try:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
             tables = {
                 str(row[0])
                 for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
             }
-            if not {"agents", "agent_definitions", "agent_definition_revisions"} <= tables:
+            if not tables >= _AGENT_AUTHORITY_TABLES:
                 return f"{prefix} pending; canonical schema unavailable"
-            agents = _scalar(connection, "SELECT COUNT(*) FROM agents")
             definitions = _scalar(connection, "SELECT COUNT(*) FROM agent_definitions")
             revisions = _scalar(connection, "SELECT COUNT(*) FROM agent_definition_revisions")
             active = _scalar(
                 connection,
-                "SELECT COUNT(*) FROM agent_definitions d "
-                "JOIN agent_definition_revisions r ON r.id = d.active_revision_id "
-                "AND r.agent_definition_id = d.id WHERE d.lifecycle_state = 'active'",
+                "SELECT COUNT(*) FROM agent_definitions WHERE lifecycle_state = 'active'",
+            )
+            drafts = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM agent_definitions WHERE lifecycle_state = 'draft'",
+            )
+            archived = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM agent_definitions WHERE lifecycle_state = 'archived'",
+            )
+            missing_definitions = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM agents a LEFT JOIN agent_definitions d ON d.agent_id = a.id WHERE d.id IS NULL",
+            )
+            missing_revisions = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM agent_definitions d WHERE NOT EXISTS ("
+                "SELECT 1 FROM agent_definition_revisions r WHERE r.agent_definition_id = d.id)",
+            )
+            stale_active_revisions = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM agent_definitions d LEFT JOIN agent_definition_revisions r "
+                "ON r.id = d.active_revision_id AND r.agent_definition_id = d.id WHERE "
+                "(d.lifecycle_state = 'active' AND r.id IS NULL) OR "
+                "(d.lifecycle_state = 'draft' AND d.active_revision_id IS NOT NULL)",
+            )
+            ambiguous_revisions = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM (SELECT d.id, COUNT(r.id) AS revision_count, "
+                "COALESCE(MIN(r.revision_number), 0) AS minimum_revision, "
+                "COALESCE(MAX(r.revision_number), 0) AS maximum_revision "
+                "FROM agent_definitions d LEFT JOIN agent_definition_revisions r "
+                "ON r.agent_definition_id = d.id GROUP BY d.id "
+                "HAVING revision_count > 0 AND "
+                "(minimum_revision != 1 OR maximum_revision != revision_count))",
+            )
+            orphaned_principals = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM agents a LEFT JOIN principals p ON p.id = a.principal_id "
+                "LEFT JOIN workshop_memberships wm ON wm.principal_id = a.principal_id "
+                "AND wm.workshop_id = a.workshop_id WHERE p.kind IS NULL OR p.kind != 'agent' "
+                "OR wm.id IS NULL",
+            )
+            definition_mismatches = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM agent_definitions d LEFT JOIN agents a ON a.id = d.agent_id "
+                "WHERE a.id IS NULL OR a.workshop_id != d.workshop_id",
+            )
+            handles = [str(row[0]) for row in connection.execute("SELECT handle FROM agent_definitions").fetchall()]
+            invalid_handles = sum(not _AGENT_HANDLE_PATTERN.fullmatch(handle) for handle in handles)
+
+            enablements = _scalar(connection, "SELECT COUNT(*) FROM principal_agent_enablements")
+            enabled = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM principal_agent_enablements WHERE lifecycle_state = 'enabled'",
+            )
+            direct_channels = _scalar(
+                connection,
+                "SELECT COUNT(DISTINCT direct_channel_id) FROM principal_agent_enablements "
+                "WHERE lifecycle_state = 'enabled'",
+            )
+            invalid_enablements = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM principal_agent_enablements e "
+                "LEFT JOIN principals hp ON hp.id = e.principal_id "
+                "LEFT JOIN workshop_memberships hwm ON hwm.principal_id = e.principal_id "
+                "AND hwm.workshop_id = e.workshop_id "
+                "LEFT JOIN agent_definitions d ON d.id = e.agent_definition_id "
+                "LEFT JOIN agents a ON a.id = e.agent_id "
+                "LEFT JOIN principals ap ON ap.id = a.principal_id "
+                "LEFT JOIN channels c ON c.id = e.direct_channel_id WHERE "
+                "e.lifecycle_state = 'enabled' AND (hp.kind IS NULL OR hp.kind != 'human' "
+                "OR hwm.id IS NULL OR d.id IS NULL OR d.lifecycle_state != 'active' "
+                "OR d.active_revision_id IS NULL OR d.agent_id != e.agent_id "
+                "OR d.workshop_id != e.workshop_id OR a.workshop_id != e.workshop_id "
+                "OR ap.kind IS NULL OR ap.kind != 'agent' OR c.kind IS NULL OR c.kind != 'direct' "
+                "OR c.workshop_id != e.workshop_id OR (SELECT COUNT(*) FROM channel_memberships cm "
+                "WHERE cm.channel_id = e.direct_channel_id) != 2 "
+                "OR NOT EXISTS (SELECT 1 FROM channel_memberships cm WHERE "
+                "cm.channel_id = e.direct_channel_id AND cm.principal_id = e.principal_id "
+                "AND cm.role = 'owner') OR NOT EXISTS (SELECT 1 FROM channel_memberships cm "
+                "WHERE cm.channel_id = e.direct_channel_id AND cm.principal_id = a.principal_id) "
+                "OR NOT EXISTS (SELECT 1 FROM channel_agents ca WHERE "
+                "ca.channel_id = e.direct_channel_id AND ca.agent_id = e.agent_id "
+                "AND ca.detached_at IS NULL) OR NOT EXISTS (SELECT 1 FROM "
+                "channel_agent_runtime_assignments ra WHERE ra.channel_id = e.direct_channel_id "
+                "AND ra.agent_id = e.agent_id AND ra.runtime_profile_id = e.runtime_profile_id))",
+            )
+            unauthorized_runtime_bindings = _scalar(
+                connection,
+                "WITH runtime_owners AS (SELECT ra.runtime_profile_id, "
+                "COUNT(DISTINCT owner.principal_id) AS owner_count, "
+                "MIN(owner.principal_id) AS owner_id FROM channel_agent_runtime_assignments ra "
+                "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' "
+                "JOIN channel_memberships owner ON owner.channel_id = c.id AND owner.role = 'owner' "
+                "JOIN principals p ON p.id = owner.principal_id AND p.kind = 'human' "
+                "GROUP BY ra.runtime_profile_id) SELECT COUNT(*) "
+                "FROM principal_agent_enablements e LEFT JOIN runtime_owners ro "
+                "ON ro.runtime_profile_id = e.runtime_profile_id WHERE e.lifecycle_state = 'enabled' "
+                "AND (ro.owner_count IS NULL OR ro.owner_count != 1 OR ro.owner_id != e.principal_id)",
+            )
+            namespace_conflicts = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM (SELECT ra.runtime_profile_id FROM "
+                "channel_agent_runtime_assignments ra JOIN channels c ON c.id = ra.channel_id "
+                "AND c.kind = 'direct' JOIN channel_memberships owner ON owner.channel_id = c.id "
+                "AND owner.role = 'owner' JOIN principals p ON p.id = owner.principal_id "
+                "AND p.kind = 'human' GROUP BY ra.runtime_profile_id "
+                "HAVING COUNT(DISTINCT owner.principal_id) > 1)",
+            )
+
+            attachments = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_agents ca JOIN channels c ON c.id = ca.channel_id "
+                "WHERE c.kind = 'group' AND ca.detached_at IS NULL",
+            )
+            detached_attachments = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_agents ca JOIN channels c ON c.id = ca.channel_id "
+                "WHERE c.kind = 'group' AND ca.detached_at IS NOT NULL",
+            )
+            runtime_sponsorships = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_agents WHERE detached_at IS NULL "
+                "AND sponsor_principal_id IS NOT NULL AND sponsored_runtime_profile_id IS NOT NULL",
+            )
+            dangling_attachments = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_agents ca JOIN channels c ON c.id = ca.channel_id "
+                "LEFT JOIN agent_definitions d ON d.agent_id = ca.agent_id "
+                "WHERE c.kind = 'group' AND ca.detached_at IS NULL AND ("
+                "d.id IS NULL OR d.workshop_id != c.workshop_id OR d.lifecycle_state != 'active' "
+                "OR ca.sponsor_principal_id IS NULL OR ca.sponsored_runtime_profile_id IS NULL "
+                "OR NOT EXISTS (SELECT 1 FROM principals p WHERE p.id = ca.sponsor_principal_id "
+                "AND p.kind = 'human') OR NOT EXISTS (SELECT 1 FROM channel_memberships owner "
+                "WHERE owner.channel_id = ca.channel_id AND owner.principal_id = ca.sponsor_principal_id "
+                "AND owner.role = 'owner') OR NOT EXISTS (SELECT 1 FROM "
+                "principal_agent_enablements e WHERE e.principal_id = ca.sponsor_principal_id "
+                "AND e.agent_id = ca.agent_id AND e.runtime_profile_id = "
+                "ca.sponsored_runtime_profile_id AND e.lifecycle_state = 'enabled') "
+                "OR NOT EXISTS (SELECT 1 FROM channel_agent_runtime_assignments ra "
+                "WHERE ra.channel_id = ca.channel_id AND ra.agent_id = ca.agent_id "
+                "AND ra.runtime_profile_id = ca.sponsored_runtime_profile_id))",
+            )
+
+            delegations = _scalar(connection, "SELECT COUNT(*) FROM agent_delegations")
+            delegation_trees = _scalar(
+                connection,
+                "SELECT COUNT(DISTINCT root_run_id) FROM agent_delegations",
+            )
+            nonterminal_delegations = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM agent_delegations WHERE status IN ('requested', 'executing')",
+            )
+            delegation_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM agent_delegations d "
+                "LEFT JOIN channels c ON c.id = d.channel_id "
+                "LEFT JOIN runs root ON root.id = d.root_run_id "
+                "LEFT JOIN runs parent ON parent.id = d.parent_run_id "
+                "LEFT JOIN runs child ON child.id = d.child_run_id "
+                "LEFT JOIN agent_definition_revisions caller_revision "
+                "ON caller_revision.id = d.caller_definition_revision_id "
+                "LEFT JOIN agent_definitions caller_definition "
+                "ON caller_definition.id = caller_revision.agent_definition_id "
+                "LEFT JOIN agent_definition_revisions target_revision "
+                "ON target_revision.id = d.target_definition_revision_id "
+                "LEFT JOIN agent_definitions target_definition "
+                "ON target_definition.id = target_revision.agent_definition_id "
+                "LEFT JOIN agent_delegations prior ON prior.id = d.parent_delegation_id WHERE "
+                "c.workshop_id IS NULL OR c.workshop_id != d.workshop_id "
+                "OR root.workshop_id IS NULL OR root.workshop_id != d.workshop_id "
+                "OR parent.workshop_id IS NULL OR parent.workshop_id != d.workshop_id "
+                "OR child.workshop_id IS NULL OR child.workshop_id != d.workshop_id "
+                "OR parent.channel_id IS NOT d.channel_id OR child.channel_id IS NOT d.channel_id "
+                "OR parent.agent_id IS NOT d.caller_agent_id OR child.agent_id IS NOT d.target_agent_id "
+                "OR child.parent_run_id IS NOT d.parent_run_id OR child.delegation_id IS NOT d.id "
+                "OR parent.sponsor_principal_id IS NOT d.caller_sponsor_principal_id "
+                "OR parent.runtime_profile_id IS NOT d.caller_runtime_profile_id "
+                "OR child.sponsor_principal_id IS NOT d.target_sponsor_principal_id "
+                "OR child.runtime_profile_id IS NOT d.target_runtime_profile_id "
+                "OR caller_definition.agent_id IS NULL "
+                "OR caller_definition.agent_id != d.caller_agent_id "
+                "OR target_definition.agent_id IS NULL "
+                "OR target_definition.agent_id != d.target_agent_id "
+                "OR (d.depth = 1 AND d.parent_delegation_id IS NOT NULL) "
+                "OR (d.depth > 1 AND (prior.id IS NULL OR prior.child_run_id != d.parent_run_id "
+                "OR prior.depth + 1 != d.depth))",
             )
         finally:
             connection.close()
     except (OSError, sqlite3.Error) as exc:
         return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
-    missing = max(agents - definitions, 0)
-    invalid_active = max(definitions - active, 0)
-    state = "active" if agents > 0 and missing == 0 and invalid_active == 0 else "INCOMPLETE"
+    integrity_gaps = sum(
+        (
+            missing_definitions,
+            missing_revisions,
+            stale_active_revisions,
+            ambiguous_revisions,
+            orphaned_principals,
+            definition_mismatches,
+            invalid_handles,
+            invalid_enablements,
+            unauthorized_runtime_bindings,
+            namespace_conflicts,
+            dangling_attachments,
+            delegation_gaps,
+        )
+    )
+    state = "active" if definitions > 0 and integrity_gaps == 0 else "INCOMPLETE"
     return (
-        f"{prefix} {state}; agents={agents}, definitions={definitions}, revisions={revisions}, "
-        f"active={active}, missing={missing}, invalid active={invalid_active}; authority=versioned"
+        f"{prefix} {state}; definitions={definitions} "
+        f"(active={active}, draft={drafts}, archived={archived}), revisions={revisions}, "
+        f"enablements={enablements} (enabled={enabled}), direct channels={direct_channels}, "
+        f"attachments={attachments} (detached={detached_attachments}), "
+        f"runtime sponsorships={runtime_sponsorships}, delegation trees={delegation_trees}, "
+        f"delegations={delegations} (nonterminal={nonterminal_delegations}); "
+        f"integrity gaps={integrity_gaps} (definitions={missing_definitions + definition_mismatches}, "
+        f"missing revisions={missing_revisions}, stale revisions={stale_active_revisions}, "
+        f"ambiguous revisions={ambiguous_revisions}, principals={orphaned_principals}, "
+        f"handles={invalid_handles}, enablements={invalid_enablements}, "
+        f"runtime bindings={unauthorized_runtime_bindings}, namespaces={namespace_conflicts}, "
+        f"attachments={dangling_attachments}, delegations={delegation_gaps}); authority=canonical"
     )
 
 

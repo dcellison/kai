@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -10,10 +11,12 @@ import pytest
 
 from kai.workshop.agent_delegation import (
     AgentDelegationAuthority,
+    AgentDelegationContext,
     AgentDelegationDenied,
     WorkshopAgentDelegationService,
 )
 from kai.workshop.conversation_commands import WorkshopConversationCommandService
+from kai.workshop.diagnostics import workshop_agent_authority_status
 from kai.workshop.domain import (
     MessageId,
     PrincipalId,
@@ -84,6 +87,35 @@ class _CompletingExecution:
         run_id: RunId,
     ) -> CanonicalCancellationDisposition:
         return CanonicalCancellationDisposition.ALREADY_TERMINAL
+
+
+class _CancellableExecution:
+    def __init__(self, authority: WorkshopRunExecutionAuthority) -> None:
+        self._authority = authority
+        self._store = authority.event_store
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def execute(self, run_id: RunId) -> CanonicalExecutionResult:
+        self.started.set()
+        await self.cancelled.wait()
+        run = await WorkshopRunLifecycle(self._store).state(run_id)
+        return CanonicalExecutionResult(CanonicalExecutionDisposition.CANCELLED, run)
+
+    async def run_state(self, run_id: RunId) -> DurableRun:
+        return await WorkshopRunLifecycle(self._store).state(run_id)
+
+    async def request_run_cancellation(
+        self,
+        run_id: RunId,
+    ) -> CanonicalCancellationDisposition:
+        await self._authority.cancel_before_dispatch(
+            run_id,
+            cancellation_code="service_shutdown",
+            occurred_at=datetime.now(UTC),
+        )
+        self.cancelled.set()
+        return CanonicalCancellationDisposition.REQUESTED
 
 
 async def _running_parent(path: Path):
@@ -216,6 +248,19 @@ async def test_explicit_delegation_is_visible_durable_bounded_and_idempotent(
         await store.connection.commit()
 
         assert await service.snapshot(result.delegation.delegation_id) == result.delegation
+        clean = workshop_agent_authority_status(tmp_path / "kai.db")
+        assert clean.startswith("Workshop agent authority: active;")
+        assert "delegation trees=1, delegations=1 (nonterminal=0)" in clean
+        assert "delegations=0); authority=canonical" in clean
+
+        await store.connection.execute(
+            "UPDATE runs SET parent_run_id = NULL WHERE id = ?",
+            (result.delegation.child_run_id,),
+        )
+        await store.connection.commit()
+        damaged = workshop_agent_authority_status(tmp_path / "kai.db")
+        assert damaged.startswith("Workshop agent authority: INCOMPLETE;")
+        assert "delegations=1); authority=canonical" in damaged
     finally:
         await service.stop()
         await store.close()
@@ -241,6 +286,61 @@ async def test_delegation_rejects_cycles_before_creating_any_child_state(
         assert denied.value.code == "cycle"
         async with store.connection.execute("SELECT COUNT(*) FROM agent_delegations") as cursor:
             assert int((await cursor.fetchone())[0]) == 0
+    finally:
+        await service.stop()
+        await store.close()
+
+
+async def test_requested_delegation_resumes_after_service_restart(tmp_path: Path) -> None:
+    store, authority, caller, _parent, _target_agent_id = await _running_parent(tmp_path / "kai.db")
+    execution = _CompletingExecution(authority)
+    seed = WorkshopAgentDelegationService(store, execution)  # type: ignore[arg-type]
+    # Call the acceptance seam directly to simulate a crash after its durable commit.
+    delegation = await seed._accept(
+        caller,
+        target_handle="nova",
+        task="Complete after restart.",
+        context=AgentDelegationContext(),
+        idempotency_key="restart-recovery",
+    )
+    assert delegation.status == "requested"
+
+    recovered = WorkshopAgentDelegationService(store, execution)  # type: ignore[arg-type]
+    await recovered.start()
+    try:
+        for _ in range(100):
+            snapshot = await recovered.snapshot(delegation.delegation_id)
+            if snapshot.status == "completed":
+                break
+            await asyncio.sleep(0.01)
+        assert snapshot.status == "completed"
+        assert execution.executed == [delegation.child_run_id]
+    finally:
+        await recovered.stop()
+        await store.close()
+
+
+async def test_service_shutdown_cancels_the_delegated_child_tree(tmp_path: Path) -> None:
+    store, authority, caller, _parent, _target_agent_id = await _running_parent(tmp_path / "kai.db")
+    execution = _CancellableExecution(authority)
+    service = WorkshopAgentDelegationService(store, execution)  # type: ignore[arg-type]
+    # Seed the durable pre-dispatch boundary before the worker starts.
+    delegation = await service._accept(
+        caller,
+        target_handle="nova",
+        task="Remain active until shutdown.",
+        context=AgentDelegationContext(),
+        idempotency_key="shutdown-cancellation",
+    )
+    await service.start()
+    try:
+        await asyncio.wait_for(execution.started.wait(), timeout=1)
+        await service.stop()
+        snapshot = await service.snapshot(delegation.delegation_id)
+        child = await WorkshopRunLifecycle(store).state(delegation.child_run_id)
+        assert snapshot.status == "cancelled"
+        assert child.status.value == "cancelled"
+        assert execution.cancelled.is_set()
     finally:
         await service.stop()
         await store.close()

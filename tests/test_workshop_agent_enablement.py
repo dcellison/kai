@@ -14,6 +14,7 @@ from kai.workshop.agent_enablement import (
 from kai.workshop.agent_lifecycle import WorkshopAgentLifecycleService
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.client_api import _read_agent_lifecycle_events
+from kai.workshop.diagnostics import workshop_agent_authority_status
 from kai.workshop.domain import AgentDefinitionId, PrincipalId
 from kai.workshop.execution_state import WorkshopExecutionStateRegistry
 from kai.workshop.internal_api_contexts import (
@@ -166,6 +167,31 @@ async def test_runtime_authority_cannot_cross_principals(tmp_path: Path) -> None
             (definition_id,),
         ) as cursor:
             assert int((await cursor.fetchone())[0]) == 0
+    finally:
+        await store.close()
+
+
+async def test_diagnostics_detect_cross_principal_runtime_binding(tmp_path: Path) -> None:
+    store, _service_instance, _execution, _contexts, _runtime_pool = await _service(tmp_path / "kai.db")
+    try:
+        daniel = await _principal(store, "101")
+        scott = await _principal(store, "202")
+        clean = workshop_agent_authority_status(tmp_path / "kai.db")
+        assert clean.startswith("Workshop agent authority: active;")
+        assert "integrity gaps=0" in clean
+
+        await store.connection.execute(
+            "UPDATE principal_agent_enablements SET runtime_profile_id = ? WHERE principal_id = ?",
+            (profile_id(101), scott),
+        )
+        await store.connection.commit()
+
+        status = workshop_agent_authority_status(tmp_path / "kai.db")
+        assert status.startswith("Workshop agent authority: INCOMPLETE;")
+        assert "enablements=1" in status.split("integrity gaps=", 1)[1]
+        assert "runtime bindings=1" in status
+        assert str(daniel) not in status
+        assert str(scott) not in status
     finally:
         await store.close()
 
