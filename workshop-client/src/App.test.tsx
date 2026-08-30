@@ -716,8 +716,18 @@ describe("Workshop React client", () => {
 
     expect(await screen.findByRole("heading", { name: "Settings", level: 1 })).toBeVisible();
     expect(screen.getByText("Workshop administrator")).toBeVisible();
-    expect(screen.getByLabelText("Backend")).toHaveValue("codex:openai");
-    expect(screen.getByRole("option", { name: "codex · openai" })).toBeVisible();
+    expect(screen.queryByLabelText("Backend")).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Runtime settings" })).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Workspace settings" })).toBeNull();
+    const settingsNavigation = screen.getByRole("navigation", {
+      name: "Settings sections",
+    });
+    expect(
+      within(settingsNavigation).queryByRole("button", { name: "Runtime settings" }),
+    ).toBeNull();
+    expect(
+      within(settingsNavigation).queryByRole("button", { name: "Workspace settings" }),
+    ).toBeNull();
     expect(screen.queryByText("PROTECTED_KEY")).not.toBeInTheDocument();
     expect(screen.queryByText(settingsWorkspace.principalId)).not.toBeInTheDocument();
     expect(screen.queryByText(settingsWorkspace.runtimeProfileId)).not.toBeInTheDocument();
