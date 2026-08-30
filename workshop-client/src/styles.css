@@ -2141,21 +2141,57 @@ button:disabled {
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
-  min-height: 4.55rem;
-  padding: 0.72rem 1.5rem;
+  min-height: 3.2rem;
+  padding: 0.42rem 1.1rem;
   border-bottom: 1px solid var(--color-border);
+}
+
+.agent-workspace-header > div:first-child {
+  display: flex;
+  align-items: baseline;
+  min-width: 0;
+  gap: 0.65rem;
 }
 
 .agent-workspace-header h1 {
   margin: 0;
   color: var(--color-text-strong);
-  font: 560 1.35rem var(--serif);
+  font: 560 1.12rem var(--serif);
 }
 
 .agent-workspace-header > div > p:last-child {
-  margin: 0.18rem 0 0;
+  margin: 0;
   color: var(--color-text-muted);
   font-size: 0.68rem;
+}
+
+.agent-header-icon,
+.thread-close-button {
+  display: inline-grid;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  place-items: center;
+  border: 1px solid var(--color-border);
+  border-radius: 0.36rem;
+  background: var(--color-surface-raised);
+  color: var(--color-text-muted);
+  font: 500 1.15rem/1 var(--sans);
+  cursor: pointer;
+}
+
+.agent-header-icon:hover,
+.agent-header-icon:focus-visible,
+.thread-close-button:hover,
+.thread-close-button:focus-visible {
+  border-color: var(--color-accent);
+  color: var(--color-text-strong);
+}
+
+.agent-header-icon:disabled,
+.thread-close-button:disabled {
+  cursor: wait;
+  opacity: 0.55;
 }
 
 .agent-header-actions,

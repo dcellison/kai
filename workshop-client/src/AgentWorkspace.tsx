@@ -354,11 +354,13 @@ function RevisionEditor({
 }
 
 export function AgentWorkspace({
+  initialCreating,
   initialDefinitionId,
   isAdministrator,
   onAuthenticationFailure,
   onChannelAccessFailure,
   onClose,
+  onCreateAgent,
   onNavigationChanged,
   onOpenChannel,
   onOpenRuntimeSettings,
@@ -366,14 +368,19 @@ export function AgentWorkspace({
   principalName,
   token,
 }: {
+  initialCreating: boolean;
   initialDefinitionId: string | null;
   isAdministrator: boolean;
   onAuthenticationFailure: (message: string) => void;
   onChannelAccessFailure: (message: string) => void;
   onClose: () => void;
+  onCreateAgent: () => void;
   onNavigationChanged: () => Promise<void>;
   onOpenChannel: (channelId: string) => Promise<void>;
-  onOpenRuntimeSettings: (channelId: string) => Promise<void>;
+  onOpenRuntimeSettings: (
+    channelId: string,
+    definitionId: string,
+  ) => Promise<void>;
   onSelectAgent: (definitionId: string | null) => void;
   principalName: string;
   token: string;
@@ -384,7 +391,7 @@ export function AgentWorkspace({
   const [selectedDefinitionId, setSelectedDefinitionId] = useState<string | null>(
     initialDefinitionId,
   );
-  const [creating, setCreating] = useState(false);
+  const [creating, setCreating] = useState(initialCreating);
   const [editingRevision, setEditingRevision] = useState(false);
   const [runtimeProfileId, setRuntimeProfileId] = useState("");
   const [loading, setLoading] = useState(true);
@@ -503,6 +510,13 @@ export function AgentWorkspace({
     (item) => item.definitionId === selectedDefinitionId,
   ) ?? null;
   const selectedRevision = selected ? activeRevision(selected) : null;
+
+  useEffect(() => {
+    setCreating(initialCreating);
+    if (initialDefinitionId) {
+      setSelectedDefinitionId(initialDefinitionId);
+    }
+  }, [initialCreating, initialDefinitionId]);
 
   useEffect(() => {
     setEditingRevision(false);
@@ -655,20 +669,28 @@ export function AgentWorkspace({
           </span>
           {isAdministrator && (
             <button
-              className="primary-button"
+              className="agent-header-icon"
               type="button"
+              aria-label="Create agent"
+              title="Create agent"
               disabled={busy}
               onClick={() => {
                 setCreating(true);
                 setEditingRevision(false);
-                onSelectAgent(null);
+                onCreateAgent();
               }}
             >
-              New agent
+              <span aria-hidden="true">+</span>
             </button>
           )}
-          <button className="quiet-button" type="button" onClick={onClose}>
-            Close
+          <button
+            className="agent-header-icon"
+            type="button"
+            aria-label="Close agents"
+            title="Close agents"
+            onClick={onClose}
+          >
+            <span aria-hidden="true">×</span>
           </button>
         </div>
       </header>
@@ -819,7 +841,7 @@ export function AgentWorkspace({
                             );
                           }}
                         >
-                          Open conversation
+                          Start conversation
                         </button>
                       )}
                     {enablement.lifecycleState === "enabled" &&
@@ -833,7 +855,10 @@ export function AgentWorkspace({
                             if (!directChannelId) {
                               return;
                             }
-                            void onOpenRuntimeSettings(directChannelId).catch(
+                            void onOpenRuntimeSettings(
+                              directChannelId,
+                              selected.definitionId,
+                            ).catch(
                               (caught: unknown) => handleError(
                                 caught,
                                 "Could not open this agent's runtime settings.",
