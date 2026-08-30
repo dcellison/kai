@@ -470,10 +470,26 @@ describe("Settings workspace", () => {
     expect(editor).toHaveValue(`${preference.content}Unsaved navigation draft`);
   });
 
-  it("keeps agent model refresh visible while hiding operator actions from members", async () => {
+  it("keeps agent model refresh available in a compact catalogue for members", async () => {
+    const user = userEvent.setup();
     renderAgentRuntime(false, vi.fn(), false);
 
-    expect(await screen.findByRole("button", { name: "Refresh models" })).toBeVisible();
+    const summary = await screen.findByLabelText("Model catalogue details");
+    const catalogue = summary.closest("details");
+    expect(catalogue).not.toBeNull();
+    if (!catalogue) {
+      throw new Error("Model catalogue disclosure is missing");
+    }
+    expect(catalogue).not.toHaveAttribute("open");
+    expect(await within(catalogue).findByText("2")).toBeVisible();
+    expect(within(catalogue).getByText("claude:anthropic")).toBeVisible();
+    expect(within(catalogue).getByText("succeeded")).toBeVisible();
+    expect(within(catalogue).getByText(/Aug 28, 2026/)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Refresh models" })).not.toBeVisible();
+
+    await user.click(summary);
+
+    expect(screen.getByRole("button", { name: "Refresh models" })).toBeVisible();
     expect(screen.queryByRole("button", { name: "Refresh all contexts" })).toBeNull();
     expect(screen.queryByLabelText("Operator-managed model ID")).toBeNull();
   });
@@ -482,6 +498,7 @@ describe("Settings workspace", () => {
     const user = userEvent.setup();
     renderAgentRuntime();
 
+    await user.click(await screen.findByText("Model catalogue"));
     await user.click(await screen.findByRole("button", { name: "Refresh models" }));
     await waitFor(() => {
       expect(refreshModelCatalogue).toHaveBeenCalledWith(session, "claude:anthropic");

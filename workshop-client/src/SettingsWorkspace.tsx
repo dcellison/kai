@@ -1178,28 +1178,39 @@ function SettingsWorkspaceContent({
                 <p>Credentials, identity mappings, executable paths, assignments, and workspace grants remain operator managed.</p>
               </article>
 
-              <article className="settings-card model-catalogue-card">
-                <p className="settings-card-label">Model catalogue</p>
-                <p>
-                  Refreshes inspect provider metadata only. They never run a model,
-                  change your selected model, or interrupt active work.
-                </p>
+              <details className="settings-card model-catalogue-card">
+                <summary aria-label="Model catalogue details">
+                  <span className="model-catalogue-summary-heading">
+                    <span className="settings-card-label">Model catalogue</span>
+                    <span>Provider metadata and operator-managed choices</span>
+                  </span>
+                  <span className="model-catalogue-summary-status">
+                    <span><strong>Backend</strong>{modelCatalogue?.optionId ?? runtime.backendOptionId}</span>
+                    <span><strong>Models</strong>{modelCatalogue ? modelCatalogue.models.length : "—"}</span>
+                    <span>
+                      <strong>Status</strong>
+                      {modelCatalogueLoading
+                        ? "Loading"
+                        : modelCatalogue
+                          ? `${modelCatalogue.refresh?.status ?? "Not refreshed"}${modelCatalogue.stale ? " · stale" : ""}`
+                          : "Unavailable"}
+                    </span>
+                    <span>
+                      <strong>Last refresh</strong>
+                      {formatDate(modelCatalogue?.refresh?.lastSuccessfulRefreshAt ?? null)}
+                    </span>
+                  </span>
+                  <span className="model-catalogue-disclosure" aria-hidden="true">⌄</span>
+                </summary>
+                <div className="model-catalogue-body">
+                  <p>
+                    Refreshes inspect provider metadata only. They never run a model,
+                    change your selected model, or interrupt active work.
+                  </p>
                 {modelCatalogueLoading ? (
                   <p role="status">Loading catalogue…</p>
                 ) : modelCatalogue ? (
                   <>
-                    <dl>
-                      <div><dt>Backend</dt><dd>{modelCatalogue.optionId}</dd></div>
-                      <div><dt>Models</dt><dd>{modelCatalogue.models.length}</dd></div>
-                      <div>
-                        <dt>Status</dt>
-                        <dd>{modelCatalogue.refresh?.status ?? "Not refreshed"}{modelCatalogue.stale ? " · stale" : ""}</dd>
-                      </div>
-                      <div>
-                        <dt>Last successful refresh</dt>
-                        <dd>{formatDate(modelCatalogue.refresh?.lastSuccessfulRefreshAt ?? null)}</dd>
-                      </div>
-                    </dl>
                     <ul className="model-catalogue-list">
                       {modelCatalogue.models.map((model) => (
                         <li key={model.modelId}>
@@ -1281,7 +1292,8 @@ function SettingsWorkspaceContent({
                 {modelCatalogueError && (
                   <p className="settings-error" role="alert">{modelCatalogueError}</p>
                 )}
-              </article>
+                </div>
+              </details>
 
               {runtimeModelCapability && (
                 <form
