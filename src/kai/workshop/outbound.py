@@ -13,6 +13,7 @@ from kai.workshop.delivery_outbox import (
 from kai.workshop.delivery_planning import CanonicalDeliveryIntent, WorkshopDeliveryPlanner
 from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import (
+    AgentId,
     ChannelId,
     DeliveryId,
     EventEnvelope,
@@ -41,6 +42,7 @@ class OutboundMessage:
     in_reply_to_message_id: MessageId
     body: str
     occurred_at: datetime
+    agent_id: AgentId | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.in_reply_to_message_id, MessageId):
@@ -49,6 +51,8 @@ class OutboundMessage:
             raise ValueError("body must be non-empty")
         if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
             raise ValueError("occurred_at must be timezone-aware")
+        if self.agent_id is not None and not isinstance(self.agent_id, AgentId):
+            raise ValueError("agent_id must be an AgentId when provided")
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +79,7 @@ class DeliveryObservation:
 class _ResolvedOutbound:
     workshop_id: WorkshopId
     channel_id: ChannelId
+    agent_id: AgentId
     agent_principal_id: PrincipalId
     recipient_principal_id: PrincipalId
     thread_root_id: MessageId | None
@@ -105,22 +110,27 @@ class OutboundStreamingFinalizationResult:
         return None
 
 
-async def _resolve_outbound(store: WorkshopEventStore, message_id: MessageId) -> _ResolvedOutbound:
+async def _resolve_outbound(
+    store: WorkshopEventStore,
+    message_id: MessageId,
+    agent_id: AgentId | None = None,
+) -> _ResolvedOutbound:
     async with store.connection.execute(
         "SELECT 1 FROM pragma_table_info('messages') WHERE name = 'thread_root_id'"
     ) as schema_cursor:
         has_thread_root = await schema_cursor.fetchone() is not None
     thread_root_expression = "m.thread_root_id" if has_thread_root else "NULL"
     async with store.connection.execute(
-        "SELECT c.workshop_id, m.channel_id, a.principal_id, m.author_principal_id, "
+        "SELECT c.workshop_id, m.channel_id, ca.agent_id, a.principal_id, "
+        "m.author_principal_id, "
         f"{thread_root_expression} "
         "FROM messages m "
         "JOIN principals author ON author.id = m.author_principal_id AND author.kind = 'human' "
         "JOIN channels c ON c.id = m.channel_id "
         "JOIN channel_agents ca ON ca.channel_id = c.id "
         "JOIN agents a ON a.id = ca.agent_id AND a.workshop_id = c.workshop_id "
-        "WHERE m.id = ?",
-        (message_id,),
+        "WHERE m.id = ? AND (? IS NULL OR ca.agent_id = ?)",
+        (message_id, agent_id, agent_id),
     ) as cursor:
         rows = list(await cursor.fetchall())
     if len(rows) != 1:
@@ -128,14 +138,23 @@ async def _resolve_outbound(store: WorkshopEventStore, message_id: MessageId) ->
     return _ResolvedOutbound(
         workshop_id=WorkshopId(str(rows[0][0])),
         channel_id=ChannelId(str(rows[0][1])),
-        agent_principal_id=PrincipalId(str(rows[0][2])),
-        recipient_principal_id=PrincipalId(str(rows[0][3])),
-        thread_root_id=(MessageId(str(rows[0][4])) if rows[0][4] is not None else None),
+        agent_id=AgentId(str(rows[0][2])),
+        agent_principal_id=PrincipalId(str(rows[0][3])),
+        recipient_principal_id=PrincipalId(str(rows[0][4])),
+        thread_root_id=(MessageId(str(rows[0][5])) if rows[0][5] is not None else None),
     )
 
 
-def _outbound_key(message_id: MessageId) -> str:
-    return f"workshop-outbound:v1:{message_id}"
+def _outbound_key(message: OutboundMessage) -> str:
+    if message.agent_id is None:
+        return f"workshop-outbound:v1:{message.in_reply_to_message_id}"
+    return f"workshop-outbound:v2:{message.in_reply_to_message_id}:{message.agent_id}"
+
+
+def _outbound_identity(message: OutboundMessage) -> str:
+    if message.agent_id is None:
+        return str(message.in_reply_to_message_id)
+    return f"{message.in_reply_to_message_id}:agent:{message.agent_id}"
 
 
 def _outbound_payload(binding: _ResolvedOutbound, message: OutboundMessage) -> dict[str, object]:
@@ -149,19 +168,20 @@ def _outbound_payload(binding: _ResolvedOutbound, message: OutboundMessage) -> d
 
 
 def _outbound_envelope(binding: _ResolvedOutbound, message: OutboundMessage) -> EventEnvelope:
+    identity = _outbound_identity(message)
     return EventEnvelope.create(
-        event_id=EventId.derived(binding.workshop_id, f"outbound-message-event:{message.in_reply_to_message_id}"),
+        event_id=EventId.derived(binding.workshop_id, f"outbound-message-event:{identity}"),
         event_type=WorkshopEventType.MESSAGE_CREATED,
         event_version=1,
         workshop_id=binding.workshop_id,
         aggregate_type="message",
         aggregate_id=MessageId.derived(
             binding.workshop_id,
-            f"outbound-message:{message.in_reply_to_message_id}",
+            f"outbound-message:{identity}",
         ),
         actor_principal_id=binding.agent_principal_id,
         occurred_at=message.occurred_at,
-        idempotency_key=_outbound_key(message.in_reply_to_message_id),
+        idempotency_key=_outbound_key(message),
         payload=_outbound_payload(binding, message),
         metadata={"source": "agent"},
     )
@@ -172,8 +192,14 @@ async def _existing_outbound(
     binding: _ResolvedOutbound,
     message: OutboundMessage,
 ) -> AppendResult | None:
-    key = _outbound_key(message.in_reply_to_message_id)
+    key = _outbound_key(message)
     existing = await store.event_by_idempotency_key(key)
+    if existing is None and message.agent_id is not None:
+        legacy_key = f"workshop-outbound:v1:{message.in_reply_to_message_id}"
+        legacy = await store.event_by_idempotency_key(legacy_key)
+        if legacy is not None and legacy.envelope.actor_principal_id == binding.agent_principal_id:
+            existing = legacy
+            key = legacy_key
     if existing is None:
         return None
     if (
@@ -187,7 +213,7 @@ async def _existing_outbound(
 
 async def record_outbound_message(store: WorkshopEventStore, message: OutboundMessage) -> AppendResult:
     """Append one canonical assistant reply to an existing inbound message."""
-    binding = await _resolve_outbound(store, message.in_reply_to_message_id)
+    binding = await _resolve_outbound(store, message.in_reply_to_message_id, message.agent_id)
     existing = await _existing_outbound(store, binding, message)
     if existing is not None:
         await store.project_pending(CanonicalConversationProjection())
@@ -212,7 +238,7 @@ async def record_outbound_message_with_delivery(
     connection = store.connection
     try:
         await connection.execute("BEGIN IMMEDIATE")
-        binding = await _resolve_outbound(store, message.in_reply_to_message_id)
+        binding = await _resolve_outbound(store, message.in_reply_to_message_id, message.agent_id)
         message_result = await _existing_outbound(store, binding, message)
         if message_result is None:
             message_result = await store.append_in_transaction(_outbound_envelope(binding, message))
@@ -284,7 +310,7 @@ async def record_outbound_message_with_streaming_finalization_in_transaction(
         raise RuntimeError(
             "record_outbound_message_with_streaming_finalization_in_transaction requires an active transaction"
         )
-    binding = await _resolve_outbound(store, message.in_reply_to_message_id)
+    binding = await _resolve_outbound(store, message.in_reply_to_message_id, message.agent_id)
     message_result = await _existing_outbound(store, binding, message)
     if message_result is None:
         message_result = await store.append_in_transaction(_outbound_envelope(binding, message))

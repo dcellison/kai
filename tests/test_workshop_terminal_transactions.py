@@ -16,7 +16,14 @@ from kai.workshop.channel_lifecycle import WorkshopChannelLifecycleService
 from kai.workshop.conversation_commands import WorkshopConversationCommandService
 from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
 from kai.workshop.delivery_outbox import STREAMING_FINALIZATION_CONTRACT
-from kai.workshop.domain import AgentId, ChannelId, MessageId, PrincipalId, RunExecutionOwnerId
+from kai.workshop.domain import (
+    AgentId,
+    ChannelAgentId,
+    ChannelId,
+    MessageId,
+    PrincipalId,
+    RunExecutionOwnerId,
+)
 from kai.workshop.inbound import ClientInboundMessage, InboundMessage, record_inbound_message
 from kai.workshop.outbound import (
     OutboundMessage,
@@ -308,6 +315,33 @@ class TestAtomicTerminalTransactions:
             run_id=run.run_id,
         )
         try:
+            second_principal_id = PrincipalId.new()
+            second_agent_id = AgentId.new()
+            await store.connection.execute(
+                "INSERT INTO principals (id, kind, display_name, created_at) VALUES (?, 'agent', 'Second agent', ?)",
+                (second_principal_id, _NOW.isoformat()),
+            )
+            await store.connection.execute(
+                "INSERT INTO agents (id, workshop_id, principal_id, name, created_at) "
+                "VALUES (?, ?, ?, 'Second agent', ?)",
+                (
+                    second_agent_id,
+                    run.workshop_id,
+                    second_principal_id,
+                    _NOW.isoformat(),
+                ),
+            )
+            await store.connection.execute(
+                "INSERT INTO channel_agents (id, channel_id, agent_id, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    ChannelAgentId.new(),
+                    run.channel_id,
+                    second_agent_id,
+                    _NOW.isoformat(),
+                ),
+            )
+            await store.connection.commit()
+
             result = await WorkshopRunTerminalTransactionCoordinator(authority).complete(
                 claim,
                 body="Shared answer",
