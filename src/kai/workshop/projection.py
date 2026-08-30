@@ -72,6 +72,22 @@ async def _table_has_column(
         return any(str(row[1]) == column for row in await cursor.fetchall())
 
 
+async def _require_active_channel(
+    connection: aiosqlite.Connection,
+    channel_id: ChannelId,
+) -> None:
+    """Reject post-archive mutations while replaying current-schema events."""
+    if not await _table_has_column(connection, "channels", "archived_at"):
+        return
+    async with connection.execute(
+        "SELECT archived_at FROM channels WHERE id = ?",
+        (channel_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is None or row[0] is not None:
+        raise ValueError("Archived Workshop channels are read-only")
+
+
 async def _message_mentions_json(
     connection: aiosqlite.Connection,
     channel_id: ChannelId,
@@ -150,6 +166,7 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
         )
         inbound_message_id = MessageId(_required_text(payload, "inbound_message_id"))
         channel_id = ChannelId(_required_text(payload, "channel_id"))
+        await _require_active_channel(connection, channel_id)
         requested_by = PrincipalId(_required_text(payload, "requested_by_principal_id"))
         agent_id = AgentId(_required_text(payload, "agent_id"))
         revision_id = (
@@ -758,6 +775,7 @@ async def _apply_agent_delegation_event(
             },
         )
         channel_id = ChannelId(_required_text(payload, "channel_id"))
+        await _require_active_channel(connection, channel_id)
         thread_value = payload.get("thread_root_id")
         thread_root_id = None if thread_value is None else MessageId(str(thread_value))
         root_run_id = RunId(_required_text(payload, "root_run_id"))
@@ -1019,7 +1037,7 @@ class CanonicalConversationProjection:
 
     name = "canonical_conversations"
     # Agent definitions project durable draft, active, and archived lifecycle state.
-    version = 15
+    version = 16
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -1152,6 +1170,41 @@ class CanonicalConversationProjection:
                     occurred_at,
                 ),
             )
+        elif envelope.event_type in {
+            WorkshopEventType.CHANNEL_ARCHIVED,
+            WorkshopEventType.CHANNEL_RESTORED,
+        }:
+            if envelope.event_version != 1 or envelope.payload:
+                raise ValueError("Workshop channel lifecycle events require an empty v1 payload")
+            if envelope.actor_principal_id is None:
+                raise ValueError("Workshop channel lifecycle events require a human actor")
+            archived = envelope.event_type == WorkshopEventType.CHANNEL_ARCHIVED
+            if archived:
+                async with connection.execute(
+                    "SELECT 1 FROM runs WHERE channel_id = ? AND status IN ('accepted', 'started') LIMIT 1",
+                    (envelope.aggregate_id,),
+                ) as active_cursor:
+                    if await active_cursor.fetchone() is not None:
+                        raise ValueError("Workshop channel cannot be archived with a nonterminal run")
+            cursor = await connection.execute(
+                "UPDATE channels SET archived_at = ?, lifecycle_event_position = ? "
+                "WHERE id = ? AND workshop_id = ? AND kind = 'group' "
+                "AND ((? = 1 AND archived_at IS NULL) OR (? = 0 AND archived_at IS NOT NULL)) "
+                "AND EXISTS (SELECT 1 FROM channel_memberships owner "
+                "WHERE owner.channel_id = channels.id AND owner.principal_id = ? "
+                "AND owner.role = 'owner')",
+                (
+                    occurred_at if archived else None,
+                    event.position,
+                    envelope.aggregate_id,
+                    envelope.workshop_id,
+                    int(archived),
+                    int(archived),
+                    envelope.actor_principal_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Workshop channel lifecycle transition is invalid")
         elif envelope.event_type == WorkshopEventType.CHANNEL_MEMBER_ADDED:
             role = _required_text(payload, "role")
             if role not in {"owner", "participant"}:
@@ -1458,6 +1511,7 @@ class CanonicalConversationProjection:
                 keys.update({"sponsor_principal_id", "runtime_profile_id"})
             _require_exact_payload(payload, keys)
             channel_id = ChannelId(_required_text(payload, "channel_id"))
+            await _require_active_channel(connection, channel_id)
             agent_id = AgentId(_required_text(payload, "agent_id"))
             sponsor_principal_id = (
                 PrincipalId(_required_text(payload, "sponsor_principal_id")) if envelope.event_version == 2 else None
@@ -1551,6 +1605,7 @@ class CanonicalConversationProjection:
                 {"channel_id", "agent_id", "sponsor_principal_id", "runtime_profile_id"},
             )
             channel_id = ChannelId(_required_text(payload, "channel_id"))
+            await _require_active_channel(connection, channel_id)
             agent_id = AgentId(_required_text(payload, "agent_id"))
             sponsor_principal_id = PrincipalId(_required_text(payload, "sponsor_principal_id"))
             runtime_profile_id = _required_text(payload, "runtime_profile_id")
@@ -1587,6 +1642,10 @@ class CanonicalConversationProjection:
                 MessageId(str(thread_root))
             if envelope.actor_principal_id is None:
                 raise ValueError("Workshop agent dismissal requires a human actor")
+            await _require_active_channel(
+                connection,
+                ChannelId(str(envelope.aggregate_id)),
+            )
             async with connection.execute(
                 "SELECT c.kind, c.workshop_id FROM channels c "
                 "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.principal_id = ? "
@@ -1621,6 +1680,10 @@ class CanonicalConversationProjection:
                 ),
             )
         elif envelope.event_type == WorkshopEventType.RUNTIME_PROFILE_ASSIGNED:
+            await _require_active_channel(
+                connection,
+                ChannelId(_required_text(payload, "channel_id")),
+            )
             await connection.execute(
                 "INSERT INTO channel_agent_runtime_assignments "
                 "(id, channel_id, agent_id, runtime_profile_id, created_at, created_event_position) "
@@ -1660,6 +1723,10 @@ class CanonicalConversationProjection:
                     ),
                 )
         elif envelope.event_type == WorkshopEventType.RUNTIME_PROFILE_REASSIGNED:
+            await _require_active_channel(
+                connection,
+                ChannelId(_required_text(payload, "channel_id")),
+            )
             channel_id = _required_text(payload, "channel_id")
             agent_id = _required_text(payload, "agent_id")
             runtime_profile_id = _required_text(payload, "runtime_profile_id")
@@ -1694,6 +1761,7 @@ class CanonicalConversationProjection:
             if thread_root is not None and not isinstance(thread_root, str):
                 raise ValueError("Workshop thread_root_id must be a string or null")
             channel_id = ChannelId(_required_text(payload, "channel_id"))
+            await _require_active_channel(connection, channel_id)
             if thread_root is not None:
                 async with connection.execute(
                     "SELECT m.channel_id, m.thread_root_id, c.kind FROM messages m "
@@ -1748,6 +1816,7 @@ class CanonicalConversationProjection:
                 raise ValueError("Workshop message reaction requires a typed message aggregate")
             _require_exact_payload(payload, {"channel_id", "principal_id", "reaction"})
             channel_id = ChannelId(_required_text(payload, "channel_id"))
+            await _require_active_channel(connection, channel_id)
             principal_id = PrincipalId(_required_text(payload, "principal_id"))
             reaction = _required_text(payload, "reaction")
             if reaction not in {"thumbs_up", "heart", "laugh", "celebrate", "eyes", "check"}:
@@ -1784,6 +1853,7 @@ class CanonicalConversationProjection:
             if envelope.actor_principal_id != created_by:
                 raise ValueError("Workshop artifact actor must match created_by_principal_id")
             channel_id = _required_text(payload, "channel_id")
+            await _require_active_channel(connection, ChannelId(channel_id))
             message_id = _required_text(payload, "message_id")
             async with connection.execute(
                 "SELECT c.workshop_id, m.channel_id, m.author_principal_id, p.kind "

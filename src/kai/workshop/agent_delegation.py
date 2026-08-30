@@ -554,7 +554,7 @@ class WorkshopAgentDelegationService:
 
     async def _active_parent(self, authority: AgentDelegationAuthority) -> _ParentAuthority:
         async with self._store.connection.execute(
-            "SELECT kind FROM channels WHERE id = ?",
+            "SELECT kind FROM channels WHERE id = ? AND archived_at IS NULL",
             (authority.channel_id,),
         ) as cursor:
             channel_row = await cursor.fetchone()

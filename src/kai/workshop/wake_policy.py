@@ -272,7 +272,7 @@ async def dismiss_channel_agent(
         "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
         "JOIN channel_agents ca ON ca.channel_id = c.id AND ca.agent_id = ? "
         "AND ca.detached_at IS NULL "
-        "WHERE c.id = ? AND c.kind = 'group'",
+        "WHERE c.id = ? AND c.kind = 'group' AND c.archived_at IS NULL",
         (principal_id, agent_id, scope.channel_id),
     ) as cursor:
         row = await cursor.fetchone()
