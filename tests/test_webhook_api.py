@@ -26,6 +26,7 @@ from kai.webhook import (
     WORKSHOP_GITHUB_AUTOMATION_KEY,
     WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY,
     WORKSHOP_PRINCIPAL_STORAGE_KEY,
+    _handle_agent_delegation,
     _handle_delete_job,
     _handle_generic,
     _handle_get_job,
@@ -41,7 +42,14 @@ from kai.webhook import (
     _handle_service_call,
     _handle_update_job,
 )
-from kai.workshop.domain import AgentId, ChannelId, MessageId, PrincipalId
+from kai.workshop.domain import (
+    AgentDelegationId,
+    AgentId,
+    ChannelId,
+    MessageId,
+    PrincipalId,
+    RunId,
+)
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
 from kai.workshop.proactive_publication import ProactivePublicationResult
 from kai.workshop.scheduler import WorkshopScheduledJobRegistrationError
@@ -216,6 +224,7 @@ def mock_request(tmp_path):
         CORE_HOST_KEY: SimpleNamespace(
             services=SimpleNamespace(
                 scheduler=_CanonicalSchedulerDouble(),
+                agent_delegation=SimpleNamespace(delegate=AsyncMock()),
                 runtime_pool=SimpleNamespace(
                     get_effective_workspace=AsyncMock(return_value=tmp_path),
                 ),
@@ -235,6 +244,64 @@ def mock_request(tmp_path):
     # Multidict-like query object for GET parameter access
     request.query = {}
     return request
+
+
+# ── POST /api/schedule ────────────────────────────────────────────────
+
+
+class TestAgentDelegation:
+    async def test_credential_binds_authority_and_returns_terminal_result(self, mock_request):
+        service = mock_request.app[CORE_HOST_KEY].services.agent_delegation
+        service.delegate.return_value = SimpleNamespace(
+            delegation=SimpleNamespace(
+                delegation_id=AgentDelegationId.new(),
+                child_run_id=RunId.new(),
+                status="completed",
+                outcome_code="completed",
+                depth=1,
+                target_handle="nova",
+            ),
+            response="Bounded result.",
+        )
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(
+            return_value={
+                "target_handle": "nova",
+                "task": "Return a result.",
+                "context": {"summary": "Shared context only."},
+                "idempotency_key": "delegation-one",
+            }
+        )
+
+        response = await _handle_agent_delegation(mock_request)
+
+        assert response.status == 200
+        body = json.loads(response.body.decode())
+        assert body["status"] == "completed"
+        assert body["response"] == "Bounded result."
+        authority = service.delegate.await_args.args[0]
+        assert authority.sponsor_principal_id == _internal_api_context(123).principal_id
+        assert authority.channel_id == _internal_api_context(123).channel_id
+        assert authority.caller_agent_id == _internal_api_context(123).agent_id
+        assert authority.runtime_profile_id == _internal_api_context(123).runtime_profile_id
+
+    async def test_rejects_caller_selected_run_identity_before_delegating(self, mock_request):
+        service = mock_request.app[CORE_HOST_KEY].services.agent_delegation
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(
+            return_value={
+                "target_handle": "nova",
+                "task": "Return a result.",
+                "idempotency_key": "delegation-one",
+                "parent_run_id": str(RunId.new()),
+            }
+        )
+
+        response = await _handle_agent_delegation(mock_request)
+
+        assert response.status == 400
+        assert "parent_run_id" in json.loads(response.body.decode())["error"]
+        service.delegate.assert_not_awaited()
 
 
 # ── POST /api/schedule ────────────────────────────────────────────────
@@ -3605,6 +3672,7 @@ _NON_OBJECT_HANDLERS = [
         id="generic",
     ),
     pytest.param(_handle_schedule, lambda r: None, id="schedule"),
+    pytest.param(_handle_agent_delegation, lambda r: None, id="agent_delegation"),
     pytest.param(
         _handle_update_job,
         lambda r: r.match_info.update({"id": "1"}),

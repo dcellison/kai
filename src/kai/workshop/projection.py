@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import UTC, datetime
@@ -23,6 +24,7 @@ from kai.workshop.agent_definitions import (
 from kai.workshop.domain import (
     AgentDefinitionId,
     AgentDefinitionRevisionId,
+    AgentDelegationId,
     AgentEnablementId,
     AgentId,
     ChannelId,
@@ -133,13 +135,15 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
     occurred_at = envelope.occurred_at.isoformat()
     payload = envelope.payload
     if envelope.event_type == WorkshopEventType.RUN_ACCEPTED:
-        if envelope.event_version not in {1, 2, 3}:
+        if envelope.event_version not in {1, 2, 3, 4}:
             raise ValueError("Unsupported Workshop run acceptance event version")
         keys = {"inbound_message_id", "channel_id", "requested_by_principal_id", "agent_id"}
-        if envelope.event_version in {2, 3}:
+        if envelope.event_version in {2, 3, 4}:
             keys.add("agent_definition_revision_id")
-        if envelope.event_version == 3:
+        if envelope.event_version in {3, 4}:
             keys.update({"runtime_profile_id", "sponsor_principal_id"})
+        if envelope.event_version == 4:
+            keys.update({"parent_run_id", "delegation_id"})
         _require_exact_payload(
             payload,
             keys,
@@ -150,12 +154,16 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
         agent_id = AgentId(_required_text(payload, "agent_id"))
         revision_id = (
             AgentDefinitionRevisionId(_required_text(payload, "agent_definition_revision_id"))
-            if envelope.event_version in {2, 3}
+            if envelope.event_version in {2, 3, 4}
             else None
         )
-        runtime_profile_id = _required_text(payload, "runtime_profile_id") if envelope.event_version == 3 else None
+        runtime_profile_id = _required_text(payload, "runtime_profile_id") if envelope.event_version in {3, 4} else None
         sponsor_principal_id = (
-            PrincipalId(_required_text(payload, "sponsor_principal_id")) if envelope.event_version == 3 else None
+            PrincipalId(_required_text(payload, "sponsor_principal_id")) if envelope.event_version in {3, 4} else None
+        )
+        parent_run_id = RunId(_required_text(payload, "parent_run_id")) if envelope.event_version == 4 else None
+        delegation_id = (
+            AgentDelegationId(_required_text(payload, "delegation_id")) if envelope.event_version == 4 else None
         )
         has_attachment_lifecycle = await _table_has_column(
             connection,
@@ -163,29 +171,48 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
             "detached_at",
         )
         active_attachment_clause = " AND ca.detached_at IS NULL" if has_attachment_lifecycle else ""
-        async with connection.execute(
-            "SELECT c.workshop_id, m.channel_id, m.author_principal_id, ca.agent_id, m.created_at "
-            "FROM messages m "
-            "JOIN principals p ON p.id = m.author_principal_id AND p.kind = 'human' "
-            "JOIN channels c ON c.id = m.channel_id "
-            "JOIN channel_memberships cm ON cm.channel_id = m.channel_id "
-            "AND cm.principal_id = m.author_principal_id "
-            "JOIN channel_agents ca ON ca.channel_id = m.channel_id AND ca.agent_id = ?"
-            + active_attachment_clause
-            + " "
-            "JOIN agents a ON a.id = ca.agent_id AND a.workshop_id = c.workshop_id "
-            "WHERE m.id = ?",
-            (agent_id, inbound_message_id),
-        ) as cursor:
-            rows = list(await cursor.fetchall())
+        if envelope.event_version == 4:
+            async with connection.execute(
+                "SELECT c.workshop_id, m.channel_id, parent.requested_by_principal_id, "
+                "target.agent_id, m.created_at, caller.principal_id "
+                "FROM messages m "
+                "JOIN principals author ON author.id = m.author_principal_id AND author.kind = 'agent' "
+                "JOIN agents caller ON caller.principal_id = author.id "
+                "JOIN runs parent ON parent.id = ? AND parent.agent_id = caller.id "
+                "AND parent.channel_id = m.channel_id "
+                "JOIN channels c ON c.id = m.channel_id AND c.kind = 'group' "
+                "JOIN channel_agents target ON target.channel_id = m.channel_id AND target.agent_id = ?"
+                + active_attachment_clause.replace("ca.", "target.")
+                + " "
+                "WHERE m.id = ?",
+                (parent_run_id, agent_id, inbound_message_id),
+            ) as cursor:
+                rows = list(await cursor.fetchall())
+        else:
+            async with connection.execute(
+                "SELECT c.workshop_id, m.channel_id, m.author_principal_id, ca.agent_id, m.created_at "
+                "FROM messages m "
+                "JOIN principals p ON p.id = m.author_principal_id AND p.kind = 'human' "
+                "JOIN channels c ON c.id = m.channel_id "
+                "JOIN channel_memberships cm ON cm.channel_id = m.channel_id "
+                "AND cm.principal_id = m.author_principal_id "
+                "JOIN channel_agents ca ON ca.channel_id = m.channel_id AND ca.agent_id = ?"
+                + active_attachment_clause
+                + " "
+                "JOIN agents a ON a.id = ca.agent_id AND a.workshop_id = c.workshop_id "
+                "WHERE m.id = ?",
+                (agent_id, inbound_message_id),
+            ) as cursor:
+                rows = list(await cursor.fetchall())
         expected = (envelope.workshop_id, channel_id, requested_by, agent_id)
         if len(rows) != 1 or tuple(rows[0][:4]) != expected:
             raise ValueError("Workshop run must match one human message and attached channel agent")
         inbound_created_at = _parse_projection_timestamp(rows[0][4])
         if envelope.occurred_at < inbound_created_at:
             raise ValueError("Workshop run cannot be accepted before its inbound message")
-        if envelope.actor_principal_id != requested_by:
-            raise ValueError("Workshop run acceptance actor must be its requesting human")
+        expected_actor = PrincipalId(str(rows[0][5])) if envelope.event_version == 4 and rows else requested_by
+        if envelope.actor_principal_id != expected_actor:
+            raise ValueError("Workshop run acceptance actor does not match its canonical requester")
         if revision_id is not None:
             async with connection.execute(
                 "SELECT d.agent_id, d.lifecycle_state, d.active_revision_id "
@@ -197,7 +224,7 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
                 definition_row = await cursor.fetchone()
             if definition_row is None or tuple(definition_row) != (agent_id, "active", revision_id):
                 raise ValueError("Workshop run must bind the agent's active definition revision")
-        if envelope.event_version == 3:
+        if envelope.event_version in {3, 4}:
             async with connection.execute(
                 "SELECT COALESCE(ca.sponsor_principal_id, CASE WHEN c.kind = 'direct' "
                 "THEN ? ELSE NULL END), ca.sponsored_runtime_profile_id, "
@@ -250,7 +277,7 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
                     event.position,
                 ),
             )
-        else:
+        elif envelope.event_version == 3:
             await connection.execute(
                 "INSERT INTO runs "
                 "(id, workshop_id, channel_id, requested_by_principal_id, agent_id, "
@@ -267,6 +294,29 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
                     revision_id,
                     runtime_profile_id,
                     sponsor_principal_id,
+                    occurred_at,
+                    event.position,
+                ),
+            )
+        else:
+            await connection.execute(
+                "INSERT INTO runs "
+                "(id, workshop_id, channel_id, requested_by_principal_id, agent_id, "
+                "inbound_message_id, agent_definition_revision_id, runtime_profile_id, "
+                "sponsor_principal_id, parent_run_id, delegation_id, status, accepted_at, "
+                "last_event_position) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?)",
+                (
+                    envelope.aggregate_id,
+                    envelope.workshop_id,
+                    channel_id,
+                    requested_by,
+                    agent_id,
+                    inbound_message_id,
+                    revision_id,
+                    runtime_profile_id,
+                    sponsor_principal_id,
+                    parent_run_id,
+                    delegation_id,
                     occurred_at,
                     event.position,
                 ),
@@ -667,12 +717,309 @@ async def _apply_run_attempt_event(connection: aiosqlite.Connection, event: Stor
     )
 
 
+async def _apply_agent_delegation_event(
+    connection: aiosqlite.Connection,
+    event: StoredEvent,
+) -> None:
+    envelope = event.envelope
+    if (
+        not isinstance(envelope.aggregate_id, AgentDelegationId)
+        or envelope.aggregate_type != "agent_delegation"
+        or envelope.event_version != 1
+    ):
+        raise ValueError("Workshop delegation events require a typed v1 delegation aggregate")
+    payload = envelope.payload
+    occurred_at = envelope.occurred_at.isoformat()
+
+    if envelope.event_type == WorkshopEventType.AGENT_DELEGATION_REQUESTED:
+        _require_exact_payload(
+            payload,
+            {
+                "channel_id",
+                "thread_root_id",
+                "root_run_id",
+                "parent_run_id",
+                "parent_delegation_id",
+                "child_run_id",
+                "requesting_principal_id",
+                "caller_agent_id",
+                "target_agent_id",
+                "caller_sponsor_principal_id",
+                "caller_runtime_profile_id",
+                "target_sponsor_principal_id",
+                "target_runtime_profile_id",
+                "caller_definition_revision_id",
+                "target_definition_revision_id",
+                "request_message_id",
+                "task",
+                "context",
+                "request_hash",
+                "depth",
+            },
+        )
+        channel_id = ChannelId(_required_text(payload, "channel_id"))
+        thread_value = payload.get("thread_root_id")
+        thread_root_id = None if thread_value is None else MessageId(str(thread_value))
+        root_run_id = RunId(_required_text(payload, "root_run_id"))
+        parent_run_id = RunId(_required_text(payload, "parent_run_id"))
+        parent_delegation_value = payload.get("parent_delegation_id")
+        parent_delegation_id = (
+            None if parent_delegation_value is None else AgentDelegationId(str(parent_delegation_value))
+        )
+        child_run_id = RunId(_required_text(payload, "child_run_id"))
+        requesting_principal_id = PrincipalId(_required_text(payload, "requesting_principal_id"))
+        caller_agent_id = AgentId(_required_text(payload, "caller_agent_id"))
+        target_agent_id = AgentId(_required_text(payload, "target_agent_id"))
+        caller_sponsor = PrincipalId(_required_text(payload, "caller_sponsor_principal_id"))
+        caller_runtime = _required_text(payload, "caller_runtime_profile_id")
+        target_sponsor = PrincipalId(_required_text(payload, "target_sponsor_principal_id"))
+        target_runtime = _required_text(payload, "target_runtime_profile_id")
+        caller_revision = AgentDefinitionRevisionId(_required_text(payload, "caller_definition_revision_id"))
+        target_revision = AgentDefinitionRevisionId(_required_text(payload, "target_definition_revision_id"))
+        request_message_id = MessageId(_required_text(payload, "request_message_id"))
+        task = _required_text(payload, "task")
+        context = payload.get("context")
+        request_hash = _required_text(payload, "request_hash")
+        depth = payload.get("depth")
+        if not isinstance(context, dict) or set(context) != {"summary", "message_ids"}:
+            raise ValueError("Workshop delegation context must contain only summary and message_ids")
+        summary = context.get("summary")
+        raw_message_ids = context.get("message_ids")
+        if not isinstance(summary, str) or len(summary) > 4_000:
+            raise ValueError("Workshop delegation context summary is invalid")
+        if not isinstance(raw_message_ids, list) or len(raw_message_ids) > 12:
+            raise ValueError("Workshop delegation context message references are invalid")
+        try:
+            context_message_ids = tuple(MessageId(str(item)) for item in raw_message_ids)
+        except ValueError as exc:
+            raise ValueError("Workshop delegation context message references are invalid") from exc
+        if len(set(context_message_ids)) != len(context_message_ids):
+            raise ValueError("Workshop delegation context message references must be unique")
+        if len(task) > 6_000:
+            raise ValueError("Workshop delegation task is too large")
+        if not isinstance(depth, int) or isinstance(depth, bool) or depth < 1:
+            raise ValueError("Workshop delegation depth must be positive")
+        if not _SHA256_PATTERN.fullmatch(request_hash):
+            raise ValueError("Workshop delegation request hash is invalid")
+        async with connection.execute(
+            "SELECT parent.workshop_id, parent.channel_id, parent.requested_by_principal_id, "
+            "parent.agent_id, parent.runtime_profile_id, parent.sponsor_principal_id, "
+            "parent.agent_definition_revision_id, child.channel_id, child.requested_by_principal_id, "
+            "child.agent_id, child.runtime_profile_id, child.sponsor_principal_id, "
+            "child.agent_definition_revision_id, child.parent_run_id, child.delegation_id, "
+            "message.author_principal_id, caller.principal_id, message.thread_root_id, "
+            "message.body, parent.delegation_id, target_definition.handle "
+            "FROM runs parent JOIN runs child ON child.id = ? "
+            "JOIN messages message ON message.id = ? AND message.channel_id = parent.channel_id "
+            "JOIN agents caller ON caller.id = parent.agent_id "
+            "JOIN agent_definitions target_definition ON target_definition.agent_id = child.agent_id "
+            "WHERE parent.id = ?",
+            (child_run_id, request_message_id, parent_run_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        expected = (
+            envelope.workshop_id,
+            channel_id,
+            requesting_principal_id,
+            caller_agent_id,
+            caller_runtime,
+            caller_sponsor,
+            caller_revision,
+            channel_id,
+            requesting_principal_id,
+            target_agent_id,
+            target_runtime,
+            target_sponsor,
+            target_revision,
+            parent_run_id,
+            envelope.aggregate_id,
+        )
+        if row is None or tuple(row[:15]) != expected or row[15] != row[16]:
+            raise ValueError("Workshop delegation does not match its canonical runs and request message")
+        expected_parent_delegation = None if row[19] is None else AgentDelegationId(str(row[19]))
+        if parent_delegation_id != expected_parent_delegation:
+            raise ValueError("Workshop delegation parent identity does not match its parent run")
+        if parent_delegation_id is None:
+            if root_run_id != parent_run_id or depth != 1:
+                raise ValueError("Workshop root delegation lineage is invalid")
+        else:
+            async with connection.execute(
+                "SELECT root_run_id, depth FROM agent_delegations WHERE id = ?",
+                (parent_delegation_id,),
+            ) as cursor:
+                parent_delegation_row = await cursor.fetchone()
+            if (
+                parent_delegation_row is None
+                or root_run_id != RunId(str(parent_delegation_row[0]))
+                or depth != int(parent_delegation_row[1]) + 1
+            ):
+                raise ValueError("Workshop nested delegation lineage is invalid")
+        expected_thread = None if row[17] is None else MessageId(str(row[17]))
+        if thread_root_id != expected_thread:
+            raise ValueError("Workshop delegation thread does not match its request message")
+        if context_message_ids:
+            placeholders = ",".join("?" for _ in context_message_ids)
+            async with connection.execute(
+                f"SELECT id FROM messages WHERE channel_id = ? AND id IN ({placeholders})",
+                (channel_id, *context_message_ids),
+            ) as cursor:
+                found_context = {MessageId(str(item[0])) for item in await cursor.fetchall()}
+            if found_context != set(context_message_ids):
+                raise ValueError("Workshop delegation context references leave the shared channel")
+        normalized_context = {
+            "summary": summary,
+            "message_ids": [str(item) for item in context_message_ids],
+        }
+        target_handle = str(row[20])
+        encoded_request = json.dumps(
+            {
+                "target_handle": target_handle,
+                "task": task,
+                "context": normalized_context,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if hashlib.sha256(encoded_request.encode()).hexdigest() != request_hash:
+            raise ValueError("Workshop delegation request hash does not match its bounded input")
+        expected_body_lines = [
+            f"Delegation request from the current agent to @{target_handle}.",
+            "",
+            "Task:",
+            task,
+        ]
+        if summary:
+            expected_body_lines.extend(("", "Bounded shared context:", summary))
+        if context_message_ids:
+            expected_body_lines.extend(
+                (
+                    "",
+                    "Canonical shared-channel references:",
+                    ", ".join(str(item) for item in context_message_ids),
+                )
+            )
+        expected_body_lines.extend(
+            (
+                "",
+                f"Parent run: {parent_run_id}",
+                "Return the requested result to the calling agent. Do not expose credentials or private memory.",
+            )
+        )
+        if str(row[18]) != "\n".join(expected_body_lines):
+            raise ValueError("Workshop delegation request message does not match its bounded input")
+        if envelope.actor_principal_id != PrincipalId(str(row[16])):
+            raise ValueError("Workshop delegation request actor must be its caller agent")
+        async with connection.execute(
+            "SELECT capabilities_json FROM agent_definition_revisions WHERE id = ?",
+            (caller_revision,),
+        ) as cursor:
+            capability_row = await cursor.fetchone()
+        if capability_row is None or "agent_delegation" not in json.loads(str(capability_row[0])):
+            raise ValueError("Workshop delegation caller revision lacks delegation authority")
+        await connection.execute(
+            "INSERT INTO agent_delegations "
+            "(id, workshop_id, channel_id, thread_root_id, root_run_id, parent_run_id, "
+            "parent_delegation_id, child_run_id, requesting_principal_id, caller_agent_id, "
+            "target_agent_id, caller_sponsor_principal_id, caller_runtime_profile_id, "
+            "target_sponsor_principal_id, target_runtime_profile_id, "
+            "caller_definition_revision_id, target_definition_revision_id, request_message_id, "
+            "task, context_json, request_hash, depth, status, created_at, "
+            "created_event_position, last_event_position) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "'requested', ?, ?, ?)",
+            (
+                envelope.aggregate_id,
+                envelope.workshop_id,
+                channel_id,
+                thread_root_id,
+                root_run_id,
+                parent_run_id,
+                parent_delegation_id,
+                child_run_id,
+                requesting_principal_id,
+                caller_agent_id,
+                target_agent_id,
+                caller_sponsor,
+                caller_runtime,
+                target_sponsor,
+                target_runtime,
+                caller_revision,
+                target_revision,
+                request_message_id,
+                task,
+                json.dumps(context, separators=(",", ":"), sort_keys=True),
+                request_hash,
+                depth,
+                occurred_at,
+                event.position,
+                event.position,
+            ),
+        )
+        return
+
+    async with connection.execute(
+        "SELECT d.status, d.child_run_id, d.target_agent_id, a.principal_id, r.status, "
+        "r.result_message_id FROM agent_delegations d "
+        "JOIN agents a ON a.id = d.target_agent_id "
+        "JOIN runs r ON r.id = d.child_run_id WHERE d.id = ?",
+        (envelope.aggregate_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is None or envelope.actor_principal_id != PrincipalId(str(row[3])):
+        raise ValueError("Workshop delegation transition actor must be its target agent")
+    if RunId(_required_text(payload, "child_run_id")) != RunId(str(row[1])):
+        raise ValueError("Workshop delegation transition identifies the wrong child run")
+    if envelope.event_type == WorkshopEventType.AGENT_DELEGATION_STARTED:
+        _require_exact_payload(payload, {"child_run_id"})
+        if str(row[0]) != "requested" or str(row[4]) not in {"accepted", "started"}:
+            raise ValueError("Workshop delegation can start only once with a nonterminal child run")
+        await connection.execute(
+            "UPDATE agent_delegations SET status = 'executing', started_at = ?, last_event_position = ? WHERE id = ?",
+            (occurred_at, event.position, envelope.aggregate_id),
+        )
+        return
+
+    if envelope.event_type not in {
+        WorkshopEventType.AGENT_DELEGATION_COMPLETED,
+        WorkshopEventType.AGENT_DELEGATION_FAILED,
+        WorkshopEventType.AGENT_DELEGATION_CANCELLED,
+    }:
+        raise ValueError("Unsupported Workshop delegation event type")
+    _require_exact_payload(payload, {"child_run_id", "outcome_code", "response_message_id"})
+    outcome_code = _required_text(payload, "outcome_code")
+    response_value = payload.get("response_message_id")
+    response_message_id = None if response_value is None else MessageId(str(response_value))
+    terminal_status = {
+        WorkshopEventType.AGENT_DELEGATION_COMPLETED.value: "completed",
+        WorkshopEventType.AGENT_DELEGATION_FAILED.value: "failed",
+        WorkshopEventType.AGENT_DELEGATION_CANCELLED.value: "cancelled",
+    }[str(envelope.event_type)]
+    if str(row[0]) not in {"requested", "executing"} or str(row[4]) != terminal_status:
+        raise ValueError("Workshop delegation terminal state does not match its child run")
+    expected_response = None if row[5] is None else MessageId(str(row[5]))
+    if response_message_id != expected_response:
+        raise ValueError("Workshop delegation response does not match its child run result")
+    await connection.execute(
+        "UPDATE agent_delegations SET status = ?, outcome_code = ?, response_message_id = ?, "
+        "terminal_at = ?, last_event_position = ? WHERE id = ?",
+        (
+            terminal_status,
+            outcome_code,
+            response_message_id,
+            occurred_at,
+            event.position,
+            envelope.aggregate_id,
+        ),
+    )
+
+
 class CanonicalConversationProjection:
     """Rebuild the initial Workshop collaboration records from events."""
 
     name = "canonical_conversations"
     # Agent definitions project durable draft, active, and archived lifecycle state.
-    version = 14
+    version = 15
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -681,9 +1028,16 @@ class CanonicalConversationProjection:
             # Break the active-revision pointer before deleting immutable
             # revisions. Replay restores it from the activation event.
             await connection.execute("UPDATE agent_definitions SET active_revision_id = NULL")
+        if "runs" in existing_tables and await _table_has_column(
+            connection,
+            "runs",
+            "parent_run_id",
+        ):
+            await connection.execute("UPDATE runs SET parent_run_id = NULL")
         for table in (
             "deliveries",
             "artifacts",
+            "agent_delegations",
             "run_attempts",
             "runs",
             "message_reactions",
@@ -720,6 +1074,16 @@ class CanonicalConversationProjection:
             WorkshopEventType.RUN_CANCELLED,
         }:
             await _apply_run_event(connection, event)
+            return
+
+        if envelope.event_type in {
+            WorkshopEventType.AGENT_DELEGATION_REQUESTED,
+            WorkshopEventType.AGENT_DELEGATION_STARTED,
+            WorkshopEventType.AGENT_DELEGATION_COMPLETED,
+            WorkshopEventType.AGENT_DELEGATION_FAILED,
+            WorkshopEventType.AGENT_DELEGATION_CANCELLED,
+        }:
+            await _apply_agent_delegation_event(connection, event)
             return
 
         if envelope.event_type in {

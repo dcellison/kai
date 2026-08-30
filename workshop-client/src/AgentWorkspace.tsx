@@ -49,6 +49,12 @@ const CAPABILITIES: {
     label: "Image input",
     value: "image_input",
   },
+  {
+    description:
+      "Delegate bounded tasks to other active agents in a shared channel.",
+    label: "Agent delegation",
+    value: "agent_delegation",
+  },
 ];
 
 interface DefinitionFormState {

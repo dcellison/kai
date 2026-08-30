@@ -297,6 +297,34 @@ async def bootstrap_default_workshop(
             aggregate_id=definition_id,
             payload={"revision_id": revision_id},
         )
+        delegation_revision_id = AgentDefinitionRevisionId.derived(
+            definition_id,
+            "revision:2",
+        )
+        await ensure(
+            idempotency_key=_idempotency_key("agent-definition-revision", "kai:2"),
+            event_type=WorkshopEventType.AGENT_DEFINITION_REVISION_ADDED,
+            aggregate_type="agent_definition_revision",
+            aggregate_id=delegation_revision_id,
+            payload={
+                "definition_id": definition_id,
+                "revision_number": 2,
+                "purpose": "Serve as a general-purpose personal AI assistant in Kai Workshop.",
+                "instructions": (
+                    "Act as Kai. Help the current principal with the task in the current "
+                    "Workshop conversation while following all higher-priority host, "
+                    "operator, workspace, and principal instructions."
+                ),
+                "capabilities": ["agent_delegation", "text_generation"],
+            },
+        )
+        await ensure(
+            idempotency_key=_idempotency_key("agent-definition-activation", "kai:2"),
+            event_type=WorkshopEventType.AGENT_DEFINITION_REVISION_ACTIVATED,
+            aggregate_type="agent_definition",
+            aggregate_id=definition_id,
+            payload={"revision_id": delegation_revision_id},
+        )
 
     for human in ordered_humans:
         token = _stable_token(human.transport, human.external_subject)

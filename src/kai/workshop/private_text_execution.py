@@ -225,9 +225,23 @@ class WorkshopPrivateTextExecutionService:
         self,
         run_id: RunId,
     ) -> CanonicalCancellationDisposition:
-        """Cancel one canonical run after authorization at the caller boundary."""
+        """Cancel one canonical run and every active delegated descendant."""
         if self._closed:
             raise RuntimeError("Workshop private-text execution service is closed")
+        async with (
+            self._database_lock,
+            self._store.connection.execute(
+                "WITH RECURSIVE descendants(id, depth) AS ("
+                "SELECT id, 1 FROM runs WHERE parent_run_id = ? "
+                "UNION ALL SELECT child.id, parent.depth + 1 FROM runs child "
+                "JOIN descendants parent ON child.parent_run_id = parent.id) "
+                "SELECT id FROM descendants ORDER BY depth DESC, id",
+                (run_id,),
+            ) as cursor,
+        ):
+            descendants = tuple(RunId(str(row[0])) for row in await cursor.fetchall())
+        for child_run_id in descendants:
+            await self._coordinator.request_cancellation(child_run_id)
         return await self._coordinator.request_cancellation(run_id)
 
     async def request_transport_cancellation(

@@ -29,6 +29,7 @@ class InternalAPIScope(StrEnum):
     MEMORY_READ = "memory:read"
     MEMORY_ADD = "memory:add"
     MEMORY_DELETE_ALL = "memory:delete-all"
+    AGENTS_DELEGATE = "agents:delegate"
 
 
 # Keep the persistent-agent base profile explicit. Constructing it from the
@@ -43,6 +44,7 @@ _PERSISTENT_AGENT_BASE_SCOPES = frozenset(
         InternalAPIScope.FILES_SEND,
         InternalAPIScope.MEMORY_READ,
         InternalAPIScope.MEMORY_ADD,
+        InternalAPIScope.AGENTS_DELEGATE,
     }
 )
 _NOTIFICATION_SCOPES = frozenset({InternalAPIScope.MESSAGES_SEND})

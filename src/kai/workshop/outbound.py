@@ -133,6 +133,25 @@ async def _resolve_outbound(
         (message_id, agent_id, agent_id),
     ) as cursor:
         rows = list(await cursor.fetchall())
+    if not rows and agent_id is not None:
+        async with store.connection.execute(
+            "SELECT c.workshop_id, m.channel_id, r.agent_id, target.principal_id, "
+            "r.requested_by_principal_id, "
+            f"{thread_root_expression} "
+            "FROM messages m "
+            "JOIN principals author ON author.id = m.author_principal_id "
+            "AND author.kind = 'agent' "
+            "JOIN runs r ON r.inbound_message_id = m.id AND r.agent_id = ? "
+            "AND r.delegation_id IS NOT NULL "
+            "JOIN agent_delegations d ON d.id = r.delegation_id "
+            "AND d.request_message_id = m.id AND d.child_run_id = r.id "
+            "JOIN channels c ON c.id = m.channel_id "
+            "JOIN agents target ON target.id = r.agent_id "
+            "AND target.workshop_id = c.workshop_id "
+            "WHERE m.id = ?",
+            (agent_id, message_id),
+        ) as cursor:
+            rows = list(await cursor.fetchall())
     if len(rows) != 1:
         raise OutboundMessageNotFoundError("Inbound message and agent binding do not resolve uniquely")
     return _ResolvedOutbound(

@@ -13,6 +13,7 @@ from kai.workshop.conversation_runs import (
 )
 from kai.workshop.domain import (
     AgentDefinitionRevisionId,
+    AgentDelegationId,
     AgentId,
     ChannelId,
     EventEnvelope,
@@ -68,6 +69,8 @@ class DurableRun:
     agent_definition_revision_id: AgentDefinitionRevisionId | None = None
     runtime_profile_id: RuntimeProfileId | None = None
     sponsor_principal_id: PrincipalId | None = None
+    parent_run_id: RunId | None = None
+    delegation_id: AgentDelegationId | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,9 +107,12 @@ async def load_durable_run(store: WorkshopEventStore, run_id: RunId) -> DurableR
     sponsor_expression = (
         "sponsor_principal_id" if "sponsor_principal_id" in run_columns else "NULL AS sponsor_principal_id"
     )
+    parent_expression = "parent_run_id" if "parent_run_id" in run_columns else "NULL AS parent_run_id"
+    delegation_expression = "delegation_id" if "delegation_id" in run_columns else "NULL AS delegation_id"
     async with store.connection.execute(
         "SELECT id, workshop_id, channel_id, requested_by_principal_id, agent_id, "
         f"inbound_message_id, {revision_expression}, {runtime_expression}, {sponsor_expression}, "
+        f"{parent_expression}, {delegation_expression}, "
         "status, accepted_at, "
         "started_at, terminal_at, terminal_code, "
         "cancellation_requested_at, cancellation_code, result_message_id, "
@@ -126,15 +132,17 @@ async def load_durable_run(store: WorkshopEventStore, run_id: RunId) -> DurableR
         agent_definition_revision_id=(AgentDefinitionRevisionId(str(row[6])) if row[6] is not None else None),
         runtime_profile_id=RuntimeProfileId(str(row[7])) if row[7] is not None else None,
         sponsor_principal_id=PrincipalId(str(row[8])) if row[8] is not None else None,
-        status=RunStatus(str(row[9])),
-        accepted_at=_parse_timestamp(row[10]),
-        started_at=_optional_timestamp(row[11]),
-        terminal_at=_optional_timestamp(row[12]),
-        terminal_code=str(row[13]) if row[13] is not None else None,
-        cancellation_requested_at=_optional_timestamp(row[14]),
-        cancellation_code=str(row[15]) if row[15] is not None else None,
-        result_message_id=MessageId(str(row[16])) if row[16] is not None else None,
-        last_event_position=int(row[17]),
+        parent_run_id=RunId(str(row[9])) if row[9] is not None else None,
+        delegation_id=AgentDelegationId(str(row[10])) if row[10] is not None else None,
+        status=RunStatus(str(row[11])),
+        accepted_at=_parse_timestamp(row[12]),
+        started_at=_optional_timestamp(row[13]),
+        terminal_at=_optional_timestamp(row[14]),
+        terminal_code=str(row[15]) if row[15] is not None else None,
+        cancellation_requested_at=_optional_timestamp(row[16]),
+        cancellation_code=str(row[17]) if row[17] is not None else None,
+        result_message_id=MessageId(str(row[18])) if row[18] is not None else None,
+        last_event_position=int(row[19]),
     )
 
 
@@ -273,6 +281,10 @@ class WorkshopRunLifecycle:
                 existing_payload["runtime_profile_id"] = existing_run.runtime_profile_id
                 existing_payload["sponsor_principal_id"] = existing_run.sponsor_principal_id
                 event_version = 3
+            if existing_run.parent_run_id is not None and existing_run.delegation_id is not None:
+                existing_payload["parent_run_id"] = existing_run.parent_run_id
+                existing_payload["delegation_id"] = existing_run.delegation_id
+                event_version = 4
             existing_event = await _existing_event(
                 self._store,
                 run=existing_run,

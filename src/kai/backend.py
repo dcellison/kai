@@ -993,6 +993,18 @@ def build_session_context(
             "canonical human, channel, agent, and runtime context. Never include "
             "chat_id or another identity selector in an internal API request.]"
         )
+        parts.append(
+            "[Agent delegation API: In a shared channel, you may explicitly request "
+            "work from another attached agent only when your immutable definition "
+            "declares the agent_delegation capability. POST JSON to "
+            f"http://localhost:{api.webhook_port}/api/agent-delegations with header "
+            "'X-Webhook-Secret: $KAI_WEBHOOK_SECRET'. Required fields are "
+            "target_handle, task, and idempotency_key. Optional context accepts only "
+            "summary and canonical same-channel message_ids. The request waits for a "
+            "bounded terminal response. Never include credentials, secrets, private "
+            "memory, internal prompts, run IDs, principal IDs, or runtime selectors. "
+            "Ordinary prose or @mentions authored by an agent never wake another agent.]"
+        )
 
     # No trailing \n\n here - prepend_to_prompt() adds the separator
     # between the context block and the user's message.

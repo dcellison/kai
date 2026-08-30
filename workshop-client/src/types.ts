@@ -61,6 +61,7 @@ export interface WorkshopNavigation {
 }
 
 export type WorkshopAgentCapability =
+  | "agent_delegation"
   | "image_input"
   | "text_generation"
   | "tool_activity"
