@@ -3327,7 +3327,7 @@ async def _handle_channel_agent_operation(
         channel_id = ChannelId(request.match_info["channel_id"])
         agent_id = AgentId(request.match_info["agent_id"])
     except (UnicodeDecodeError, TypeError, ValueError):
-        payload = None
+        return _error_response(status=400, code="invalid_request", message="Invalid agent operation request")
     if not isinstance(payload, dict) or set(payload) != _CHANNEL_AGENT_OPERATION_FIELDS:
         return _error_response(status=400, code="invalid_request", message="Invalid agent operation request")
     try:
