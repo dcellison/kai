@@ -2630,13 +2630,29 @@ button:disabled {
 }
 
 .agent-runtime-settings .settings-section {
-  grid-template-columns: minmax(11rem, 0.3fr) minmax(0, 1fr);
-  gap: clamp(1rem, 3vw, 2.5rem);
+  display: block;
+  max-width: none;
   padding-block: 1.5rem;
 }
 
 .agent-runtime-settings .settings-section > div:first-child {
   position: static;
+  margin-bottom: 1rem;
+}
+
+.agent-runtime-settings #settings-section-runtime > div:first-child {
+  display: none;
+}
+
+.agent-runtime-settings .workspace-settings-heading,
+.agent-runtime-settings .workspace-overrides,
+.agent-runtime-settings .settings-section > .settings-notice,
+.agent-runtime-settings .settings-section > .settings-error {
+  grid-column: auto;
+}
+
+.agent-runtime-settings .workspace-overrides {
+  margin-top: 0.75rem;
 }
 
 .settings-header {
