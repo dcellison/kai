@@ -27,6 +27,15 @@ Follow the existing pattern exactly:
 - Inner Claude CLI flags: verify with `claude --help` before use; use `--settings` for settings.json options
 - Pyright strict: use assert-narrowing for Optional, helper functions for @property returns
 
+## Workshop UI
+
+- Keep navigation controls consistent and visually quiet: no background or
+  border at rest, with subtle hover and keyboard-focus feedback.
+- Prefer a familiar icon over a text button when the icon communicates the
+  same action. Preserve an accessible label and tooltip for every icon-only
+  control.
+- If the appropriate icon is ambiguous, ask Daniel before implementing it.
+
 ## Don'ts
 
 - Don't manually re-register the Telegram webhook. Just restart the service.
