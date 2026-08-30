@@ -165,6 +165,35 @@ class WorkshopRoutingEligibilityService:
             namespace.runtime_profile_id,
         )
 
+    def authority_for_sponsored_channel(
+        self,
+        principal_id: str | PrincipalId,
+        channel_id: str | ChannelId,
+        agent_id: str | AgentId,
+        runtime_profile_id: str | RuntimeProfileId,
+    ) -> RoutingEligibilityAuthority:
+        """Bind a durable shared-channel sponsorship to its protected owner."""
+        try:
+            canonical_principal = principal_id if isinstance(principal_id, PrincipalId) else PrincipalId(principal_id)
+            canonical_channel = channel_id if isinstance(channel_id, ChannelId) else ChannelId(channel_id)
+            canonical_agent = agent_id if isinstance(agent_id, AgentId) else AgentId(agent_id)
+            canonical_profile = (
+                runtime_profile_id
+                if isinstance(runtime_profile_id, RuntimeProfileId)
+                else RuntimeProfileId(runtime_profile_id)
+            )
+        except (TypeError, ValueError) as exc:
+            raise RoutingEligibilityAccessDenied("Routing eligibility access denied") from exc
+        namespace = self._execution_state.maybe_for_runtime_profile_id(canonical_profile)
+        if namespace is None or namespace.principal_id != canonical_principal:
+            raise RoutingEligibilityAccessDenied("Routing eligibility access denied")
+        return RoutingEligibilityAuthority(
+            canonical_principal,
+            canonical_channel,
+            canonical_agent,
+            canonical_profile,
+        )
+
     async def inspect(
         self,
         authority: RoutingEligibilityAuthority,
@@ -172,17 +201,55 @@ class WorkshopRoutingEligibilityService:
         *,
         additional_required: tuple[RuntimeCapability, ...] = (),
     ) -> RuntimeEligibilityReport:
+        return await self._inspect(
+            authority,
+            task_class,
+            additional_required=additional_required,
+            sponsored_channel=False,
+        )
+
+    async def inspect_sponsored_channel(
+        self,
+        authority: RoutingEligibilityAuthority,
+        task_class: str | RoutingTaskClass,
+        *,
+        additional_required: tuple[RuntimeCapability, ...] = (),
+    ) -> RuntimeEligibilityReport:
+        """Inspect an already accepted shared-channel sponsorship without private state."""
+        return await self._inspect(
+            authority,
+            task_class,
+            additional_required=additional_required,
+            sponsored_channel=True,
+        )
+
+    async def _inspect(
+        self,
+        authority: RoutingEligibilityAuthority,
+        task_class: str | RoutingTaskClass,
+        *,
+        additional_required: tuple[RuntimeCapability, ...],
+        sponsored_channel: bool,
+    ) -> RuntimeEligibilityReport:
         canonical_task = _task_class(task_class)
         namespace = self._execution_state.maybe_for_principal_channel(
             authority.principal_id,
             authority.channel_id,
         )
-        if (
-            namespace is None
-            or namespace.principal_id != authority.principal_id
-            or namespace.channel_id != authority.channel_id
-            or namespace.agent_id != authority.agent_id
-        ):
+        profile_owner = self._execution_state.maybe_for_runtime_profile_id(
+            authority.runtime_profile_id,
+        )
+        exact_private_lane = (
+            namespace is not None
+            and namespace.principal_id == authority.principal_id
+            and namespace.channel_id == authority.channel_id
+            and namespace.agent_id == authority.agent_id
+            and namespace.runtime_profile_id == authority.runtime_profile_id
+        )
+        exact_sponsor = (
+            sponsored_channel and profile_owner is not None and profile_owner.principal_id == authority.principal_id
+        )
+        if not exact_private_lane and not exact_sponsor:
             raise RoutingEligibilityAccessDenied("Routing eligibility access denied")
         profiles = self._inventory.for_principal(authority.principal_id)
         profile = next(
@@ -197,6 +264,7 @@ class WorkshopRoutingEligibilityService:
             authority.channel_id,
             authority.agent_id,
             authority.runtime_profile_id,
+            private_context=not sponsored_channel,
         )
         workspace = await self._runtime_pool.get_effective_workspace(runtime_authority)
         selected_backend, selected_provider = self._runtime_pool.get_backend_provider(runtime_authority)

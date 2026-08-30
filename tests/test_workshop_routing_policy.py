@@ -12,6 +12,7 @@ from kai.workshop.bootstrap import (
     bootstrap_default_workshop,
     bootstrap_human_principal_id,
 )
+from kai.workshop.channel_lifecycle import WorkshopChannelLifecycleService
 from kai.workshop.conversation_commands import WorkshopConversationCommandService
 from kai.workshop.domain import ChannelId
 from kai.workshop.inbound import ClientInboundMessage
@@ -66,6 +67,7 @@ class _Eligibility:
             _candidate("claude:anthropic", selected=True, eligible=True),
             _candidate("codex:openai", selected=False, eligible=True),
         )
+        self.sponsored_inspections = 0
 
     def authority_for_principal_channel(self, principal_id, channel_id):
         if principal_id != self.authority.principal_id or channel_id != self.authority.channel_id:
@@ -74,6 +76,19 @@ class _Eligibility:
 
     def authority_for_principal_runtime(self, principal_id, runtime_profile_id):
         raise AssertionError("Run routing must resolve the exact channel lane")
+
+    def authority_for_sponsored_channel(
+        self,
+        principal_id,
+        channel_id,
+        agent_id,
+        runtime_profile_id,
+    ):
+        assert principal_id == self.authority.principal_id
+        assert channel_id == self.authority.channel_id
+        assert agent_id == self.authority.agent_id
+        assert runtime_profile_id == self.authority.runtime_profile_id
+        return self.authority
 
     async def inspect(self, authority, task_class, *, additional_required=()):
         assert not additional_required or additional_required[0].value == "text_generation"
@@ -89,6 +104,20 @@ class _Eligibility:
             runtime_profile_id=authority.runtime_profile_id,
             workspace="/workspace",
             candidates=self.candidates,
+        )
+
+    async def inspect_sponsored_channel(
+        self,
+        authority,
+        task_class,
+        *,
+        additional_required=(),
+    ):
+        self.sponsored_inspections += 1
+        return await self.inspect(
+            authority,
+            task_class,
+            additional_required=additional_required,
         )
 
 
@@ -240,5 +269,51 @@ async def test_policy_revision_conflicts_and_default_messages_preserve_selection
         decision = await service.decide_for_run(run, profile_id(101))
         assert decision.disposition == RoutingDecisionDisposition.SELECTED_DEFAULT
         assert decision.selected_backend_option_id == "claude:anthropic"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_group_run_routes_through_immutable_sponsor_authority(tmp_path: Path) -> None:
+    store, _, direct_authority, _, _ = await _fixture(
+        tmp_path / "kai.db",
+        task_class=None,
+    )
+    try:
+        group = await WorkshopChannelLifecycleService(store).create_group(
+            direct_authority.principal_id,
+            name="Sponsored routing",
+            agent_ids=[direct_authority.agent_id],
+            origin_channel_id=direct_authority.channel_id,
+        )
+        accepted = await WorkshopConversationCommandService(store).accept_client(
+            ClientInboundMessage(
+                principal_id=direct_authority.principal_id,
+                channel_id=group.channel_id,
+                client_message_id="sponsored-routing-policy-test",
+                body="@Kai run through the sponsor",
+                occurred_at=_NOW,
+            )
+        )
+        run = accepted.command.runs[0]
+        authority = RoutingEligibilityAuthority(
+            direct_authority.principal_id,
+            group.channel_id,
+            direct_authority.agent_id,
+            profile_id(101),
+        )
+        eligibility = _Eligibility(authority)
+        service = WorkshopRoutingPolicyService(
+            store,
+            eligibility,  # type: ignore[arg-type]
+            asyncio.Lock(),
+        )
+
+        decision = await service.decide_for_run(run, profile_id(101))
+
+        assert run.sponsor_principal_id == direct_authority.principal_id
+        assert decision.disposition == RoutingDecisionDisposition.SELECTED_DEFAULT
+        assert decision.selected_backend_option_id == "claude:anthropic"
+        assert eligibility.sponsored_inspections == 1
     finally:
         await store.close()
