@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -368,6 +369,56 @@ async def test_mentions_route_exclusively_and_support_multiple_agents(tmp_path: 
             ConversationCommandDisposition.TERMINAL_REPLAY,
             ConversationCommandDisposition.READY_REPLAY,
         }
+    finally:
+        await store.close()
+
+
+async def test_detached_agent_mention_does_not_wake_an_engaged_attached_agent(
+    tmp_path: Path,
+):
+    store, human_id, group_id, agent_ids = await _open_group_store(tmp_path / "kai.db")
+    try:
+        service = WorkshopConversationCommandService(store)
+        await service.accept_client(_message(human_id, group_id, "engage-kai", "@Kai stay", _NOW))
+        await store.connection.execute(
+            "UPDATE channel_agents SET detached_at = ? WHERE channel_id = ? AND agent_id = ?",
+            ((_NOW + timedelta(seconds=1)).isoformat(), group_id, agent_ids[1]),
+        )
+        await store.connection.commit()
+
+        detached = await service.accept_client(
+            _message(
+                human_id,
+                group_id,
+                "mention-detached",
+                "@Nova hello?",
+                _NOW + timedelta(seconds=2),
+            )
+        )
+
+        assert detached.command.disposition == ConversationCommandDisposition.MESSAGE_ONLY
+        assert detached.command.runs == ()
+        message_id = _accepted_message_id(detached)
+        async with store.connection.execute(
+            "SELECT mentions_json FROM messages WHERE id = ?",
+            (message_id,),
+        ) as cursor:
+            mention_row = await cursor.fetchone()
+        async with store.connection.execute(
+            "SELECT principal_id FROM agents WHERE id = ?",
+            (agent_ids[1],),
+        ) as cursor:
+            principal_row = await cursor.fetchone()
+        assert mention_row is not None
+        assert principal_row is not None
+        assert json.loads(str(mention_row[0])) == [
+            {
+                "kind": "agent",
+                "length": len("@Nova"),
+                "principal_id": str(principal_row[0]),
+                "start": 0,
+            }
+        ]
     finally:
         await store.close()
 
