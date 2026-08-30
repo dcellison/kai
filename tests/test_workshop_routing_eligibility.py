@@ -158,6 +158,7 @@ class _RuntimePool:
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace
         self.selection_reads = 0
+        self.selected_backend = ("claude", "anthropic")
 
     async def get_effective_workspace(self, _runtime_profile_id):
         return self.workspace
@@ -165,6 +166,9 @@ class _RuntimePool:
     async def get_effective_model(self, _runtime_profile_id):
         self.selection_reads += 1
         return "selected-model"
+
+    def get_backend_provider(self, _runtime_profile_id):
+        return self.selected_backend
 
     def runtime_profile(self, _runtime_profile_id):
         return SimpleNamespace(allowed_services=("perplexity",))
@@ -221,6 +225,27 @@ async def test_report_explains_all_five_authorized_backends_without_switching(tm
     assert len(catalogue.inspected) == 5
     assert all(option_id != ungranted.option_id for _, _, option_id in catalogue.inspected)
     assert not hasattr(pool, "select_backend")
+
+
+@pytest.mark.asyncio
+async def test_report_uses_exact_lane_selection_instead_of_profile_inventory(tmp_path: Path) -> None:
+    namespace = _namespace(1)
+    claude = _lane("claude", "anthropic")
+    codex = _lane("codex", "openai", selected=True)
+    lanes = (claude, codex)
+    snapshots = {lane.option_id: _snapshot(namespace, lane, image_input=True) for lane in lanes}
+    service, authority, pool, *_ = _service(tmp_path, lanes, snapshots)
+    pool.selected_backend = ("claude", "anthropic")
+
+    report = await service.inspect(authority, RoutingTaskClass.CONVERSATION)
+
+    by_option = {candidate.option_id: candidate for candidate in report.candidates}
+    assert by_option["claude:anthropic"].selected is True
+    assert by_option["claude:anthropic"].model_id == "selected-model"
+    assert by_option["claude:anthropic"].model_source == "current_selection"
+    assert by_option["codex:openai"].selected is False
+    assert by_option["codex:openai"].model_id == "codex-default"
+    assert by_option["codex:openai"].model_source == "protected_default"
 
 
 @pytest.mark.asyncio
