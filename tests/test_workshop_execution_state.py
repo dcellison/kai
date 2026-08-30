@@ -9,7 +9,12 @@ import pytest
 from kai import sessions
 from kai.workshop.bootstrap import BootstrapHuman
 from kai.workshop.diagnostics import workshop_execution_state_status
-from kai.workshop.execution_state import WorkshopExecutionStateError
+from kai.workshop.domain import AgentId, ChannelId, PrincipalId
+from kai.workshop.execution_state import (
+    WorkshopExecutionStateError,
+    WorkshopExecutionStateNamespace,
+    WorkshopExecutionStateRegistry,
+)
 from kai.workshop.store import WorkshopEventStore
 from tests.workshop_profiles import profile_id, profile_registry
 
@@ -40,6 +45,55 @@ async def database(tmp_path: Path):
 
 
 class TestCanonicalExecutionStateMigration:
+    def test_principal_authority_survives_multiple_lanes_on_one_profile(self) -> None:
+        principal_id = PrincipalId.new()
+        primary = WorkshopExecutionStateNamespace(
+            principal_id,
+            ChannelId.new(),
+            AgentId.new(),
+            profile_id(101),
+            101,
+        )
+        enabled_agent = WorkshopExecutionStateNamespace(
+            principal_id,
+            ChannelId.new(),
+            AgentId.new(),
+            profile_id(101),
+            None,
+        )
+
+        registry = WorkshopExecutionStateRegistry((primary, enabled_agent))
+
+        assert registry.maybe_for_principal_id(str(principal_id)) == primary
+        assert (
+            registry.maybe_for_principal_channel(
+                principal_id,
+                enabled_agent.channel_id,
+            )
+            == enabled_agent
+        )
+
+    def test_principal_authority_remains_ambiguous_across_profiles(self) -> None:
+        principal_id = PrincipalId.new()
+        first = WorkshopExecutionStateNamespace(
+            principal_id,
+            ChannelId.new(),
+            AgentId.new(),
+            profile_id(101),
+            101,
+        )
+        second = WorkshopExecutionStateNamespace(
+            principal_id,
+            ChannelId.new(),
+            AgentId.new(),
+            profile_id(202),
+            202,
+        )
+
+        registry = WorkshopExecutionStateRegistry((first, second))
+
+        assert registry.maybe_for_principal_id(str(principal_id)) is None
+
     async def test_replaces_execution_and_workspace_settings_in_one_canonical_transaction(
         self,
         database: Path,

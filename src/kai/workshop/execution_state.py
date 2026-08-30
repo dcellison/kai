@@ -65,10 +65,12 @@ class WorkshopExecutionStateRegistry:
             if namespace.legacy_runtime_key is not None:
                 by_legacy_key[namespace.legacy_runtime_key] = namespace
             by_profile.setdefault(namespace.runtime_profile_id, namespace)
-            if namespace.principal_id in by_principal:
-                by_principal[namespace.principal_id] = None
-            else:
+            if namespace.principal_id not in by_principal:
                 by_principal[namespace.principal_id] = namespace
+            else:
+                principal_owner = by_principal[namespace.principal_id]
+                if principal_owner is not None and principal_owner.runtime_profile_id != namespace.runtime_profile_id:
+                    by_principal[namespace.principal_id] = None
             if lane_key in by_principal_channel:
                 by_principal_channel[lane_key] = None
             else:
@@ -190,6 +192,7 @@ class WorkshopExecutionStateRegistry:
         return self.maybe_for_legacy_runtime_key(runtime_config_id)
 
     def maybe_for_principal_id(self, principal_id: str) -> WorkshopExecutionStateNamespace | None:
+        """Resolve the principal's one protected profile across any number of lanes."""
         try:
             canonical_id = PrincipalId(principal_id)
         except (TypeError, ValueError):
