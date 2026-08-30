@@ -20,6 +20,9 @@ import type {
   WorkshopAgentEnablement,
 } from "./types";
 import { useConfirmation } from "./ConfirmationDialog";
+import { SettingsWorkspace } from "./SettingsWorkspace";
+
+const ignoreDirtyChange = (): void => undefined;
 
 const CAPABILITIES: {
   description: string;
@@ -354,8 +357,10 @@ function RevisionEditor({
 }
 
 export function AgentWorkspace({
+  activeChannelId,
   initialCreating,
   initialDefinitionId,
+  initialSection,
   isAdministrator,
   onAuthenticationFailure,
   onChannelAccessFailure,
@@ -363,13 +368,15 @@ export function AgentWorkspace({
   onCreateAgent,
   onNavigationChanged,
   onOpenChannel,
-  onOpenRuntimeSettings,
   onSelectAgent,
   principalName,
+  runActive,
   token,
 }: {
+  activeChannelId: string;
   initialCreating: boolean;
   initialDefinitionId: string | null;
+  initialSection: "runtime" | null;
   isAdministrator: boolean;
   onAuthenticationFailure: (message: string) => void;
   onChannelAccessFailure: (message: string) => void;
@@ -377,12 +384,12 @@ export function AgentWorkspace({
   onCreateAgent: () => void;
   onNavigationChanged: () => Promise<void>;
   onOpenChannel: (channelId: string) => Promise<void>;
-  onOpenRuntimeSettings: (
-    channelId: string,
-    definitionId: string,
-  ) => Promise<void>;
-  onSelectAgent: (definitionId: string | null) => void;
+  onSelectAgent: (
+    definitionId: string | null,
+    section?: "runtime" | null,
+  ) => void;
   principalName: string;
+  runActive: boolean;
   token: string;
 }): React.JSX.Element {
   const confirm = useConfirmation();
@@ -510,6 +517,11 @@ export function AgentWorkspace({
     (item) => item.definitionId === selectedDefinitionId,
   ) ?? null;
   const selectedRevision = selected ? activeRevision(selected) : null;
+  const runtimeSession = useMemo(() => (
+    enablement?.lifecycleState === "enabled" && enablement.directChannelId
+      ? { channelId: enablement.directChannelId, token }
+      : null
+  ), [enablement?.directChannelId, enablement?.lifecycleState, token]);
 
   useEffect(() => {
     setCreating(initialCreating);
@@ -529,6 +541,18 @@ export function AgentWorkspace({
       "",
     );
   }, [enablement?.eligibleRuntimes, enablement?.runtimeProfileId]);
+
+  useEffect(() => {
+    if (initialSection !== "runtime" || !runtimeSession) {
+      return;
+    }
+    const scroll = window.setTimeout(() => {
+      document.getElementById("agent-runtime-settings")?.scrollIntoView?.({
+        block: "start",
+      });
+    }, 0);
+    return () => window.clearTimeout(scroll);
+  }, [initialSection, runtimeSession]);
 
   const selectAgent = (definitionId: string): void => {
     setSelectedDefinitionId(definitionId);
@@ -852,21 +876,10 @@ export function AgentWorkspace({
                           className="quiet-button"
                           type="button"
                           disabled={busy}
-                          onClick={() => {
-                            const directChannelId = enablement.directChannelId;
-                            if (!directChannelId) {
-                              return;
-                            }
-                            void onOpenRuntimeSettings(
-                              directChannelId,
-                              selected.definitionId,
-                            ).catch(
-                              (caught: unknown) => handleError(
-                                caught,
-                                "Could not open this agent's runtime settings.",
-                              ),
-                            );
-                          }}
+                          onClick={() => onSelectAgent(
+                            selected.definitionId,
+                            "runtime",
+                          )}
                         >
                           Runtime settings
                         </button>
@@ -903,6 +916,27 @@ export function AgentWorkspace({
                     )}
                   </div>
                 </section>
+              )}
+
+              {runtimeSession && selected && (
+                <SettingsWorkspace
+                  agentRuntime
+                  inlineAgentRuntime
+                  isAdministrator={isAdministrator}
+                  onAuthenticationFailure={onAuthenticationFailure}
+                  onChannelAccessFailure={onChannelAccessFailure}
+                  onClose={ignoreDirtyChange}
+                  onDirtyChange={ignoreDirtyChange}
+                  principalName={principalName}
+                  roleLabel={
+                    isAdministrator ? "Workshop administrator" : "Workshop member"
+                  }
+                  runtimeLabel={selected.displayName}
+                  runActive={
+                    activeChannelId === runtimeSession.channelId && runActive
+                  }
+                  session={runtimeSession}
+                />
               )}
 
               {selectedRevision ? (

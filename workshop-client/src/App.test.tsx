@@ -1874,50 +1874,76 @@ describe("Workshop React client", () => {
     expect(
       await screen.findByRole("heading", { name: "Qualification agent", level: 2 }),
     ).toBeVisible();
-    await user.click(screen.getByRole("button", { name: "Runtime settings" }));
-
     expect(
-      await screen.findByRole("heading", { name: "Qualification agent settings" }),
+      await screen.findByRole("heading", {
+        name: "Runtime and workspace",
+        level: 3,
+      }),
     ).toBeVisible();
     expect(screen.queryByText("Personal preferences")).toBeNull();
-    const backToAgent = screen.getByRole("button", { name: "Back to agent" });
-    expect(backToAgent).toBeVisible();
-    expect(backToAgent).toHaveClass("panel-icon-button");
-    expect(backToAgent).toHaveTextContent("←");
-    expect(backToAgent.querySelector("span")).toHaveAttribute("aria-hidden", "true");
+    expect(screen.queryByRole("button", { name: "Back to agent" })).toBeNull();
     expect(
-      screen.getByText(/Policy-bounded controls for Qualification agent/),
+      screen.getByText(/Your policy-bounded controls for Qualification agent/),
     ).toBeVisible();
     expect(loadSettingsWorkspace).toHaveBeenCalledWith({
       channelId: qualificationChannelId,
       token: "existing-session",
     });
     expect(window.location.search).toBe(
-      `?view=settings&runtime=${qualificationChannelId}` +
-      `&agent=${qualificationDefinition.definitionId}`,
-    );
-    expect(sessionStorage.getItem("kai.workshop.active-channel.v1")).toContain(
-      qualificationChannelId,
-    );
-
-    await user.click(backToAgent);
-    expect(
-      await screen.findByRole("heading", { name: "Qualification agent", level: 2 }),
-    ).toBeVisible();
-    expect(window.location.search).toBe(
       `?view=agents&agent=${qualificationDefinition.definitionId}`,
     );
-    await user.click(screen.getByRole("button", { name: "Runtime settings" }));
+
+    await user.click(
+      screen.getByRole("button", { name: "Runtime settings" }),
+    );
+    expect(window.location.search).toBe(
+      `?view=agents&agent=${qualificationDefinition.definitionId}` +
+      "&section=runtime",
+    );
+    expect(sessionStorage.getItem("kai.workshop.active-channel.v1")).not.toContain(
+      qualificationChannelId,
+    );
 
     unmount();
     vi.mocked(loadSettingsWorkspace).mockClear();
     render(<App />);
     expect(
-      await screen.findByRole("heading", { name: "Qualification agent settings" }),
+      await screen.findByRole("heading", {
+        name: "Runtime and workspace",
+        level: 3,
+      }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("heading", { name: "Qualification agent", level: 2 }),
     ).toBeVisible();
     expect(loadSettingsWorkspace).toHaveBeenCalledWith({
       channelId: qualificationChannelId,
       token: "existing-session",
+    });
+
+    unmount();
+    window.history.replaceState(
+      null,
+      "",
+      `?view=settings&runtime=${qualificationChannelId}` +
+        `&agent=${qualificationDefinition.definitionId}`,
+    );
+    vi.mocked(loadSettingsWorkspace).mockClear();
+    render(<App />);
+    expect(
+      await screen.findByRole("heading", {
+        name: "Runtime and workspace",
+        level: 3,
+      }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("heading", { name: "Qualification agent", level: 2 }),
+    ).toBeVisible();
+    await waitFor(() => {
+      expect(loadSettingsWorkspace).toHaveBeenCalledWith({
+        channelId: qualificationChannelId,
+        token: "existing-session",
+      });
     });
   });
 

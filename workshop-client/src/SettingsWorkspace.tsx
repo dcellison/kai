@@ -137,6 +137,7 @@ function errorText(caught: unknown, fallback: string): string {
 
 function SettingsWorkspaceContent({
   agentRuntime = false,
+  inlineAgentRuntime = false,
   onAuthenticationFailure,
   onChannelAccessFailure,
   onClose,
@@ -149,6 +150,7 @@ function SettingsWorkspaceContent({
   session,
 }: {
   agentRuntime?: boolean;
+  inlineAgentRuntime?: boolean;
   onAuthenticationFailure: (message: string) => void;
   onChannelAccessFailure: (message: string) => void;
   onClose: () => void;
@@ -227,6 +229,10 @@ function SettingsWorkspaceContent({
   const [activeSection, setActiveSection] = useState<SettingsSectionId>(
     agentRuntime ? "settings-section-runtime" : SETTINGS_SECTIONS[0].id,
   );
+  const inlineRuntime = agentRuntime && inlineAgentRuntime;
+  const titleId = inlineRuntime
+    ? "agent-runtime-settings-title"
+    : "settings-title";
 
   const preferenceDirty = preference !== null && preferenceDraft !== preference.content;
   const preferenceBytes = useMemo(
@@ -914,48 +920,76 @@ function SettingsWorkspaceContent({
   );
 
   return (
-    <section className="settings-workspace" aria-labelledby="settings-title">
-      <header className="settings-header">
+    <section
+      className={inlineRuntime ? "agent-runtime-settings" : "settings-workspace"}
+      aria-labelledby={titleId}
+      id={inlineRuntime ? "agent-runtime-settings" : undefined}
+    >
+      <header
+        className={inlineRuntime
+          ? "agent-runtime-settings-header"
+          : "settings-header"}
+      >
         <div>
           <p className="overline">
-            {agentRuntime ? "Agent runtime" : "Personal workspace"}
+            {inlineRuntime
+              ? "Your runtime"
+              : agentRuntime
+                ? "Agent runtime"
+                : "Personal workspace"}
           </p>
-          <h1 id="settings-title">
-            {agentRuntime ? `${runtimeLabel} settings` : "Settings"}
-          </h1>
+          {inlineRuntime ? (
+            <h3 id={titleId}>Runtime and workspace</h3>
+          ) : (
+            <h1 id={titleId}>
+              {agentRuntime ? `${runtimeLabel} settings` : "Settings"}
+            </h1>
+          )}
           <p>
-            {agentRuntime
+            {inlineRuntime
+              ? `Your policy-bounded controls for ${runtimeLabel}. The shared agent definition remains unchanged.`
+              : agentRuntime
               ? `Policy-bounded controls for ${runtimeLabel}`
               : `${principalName} · ${roleLabel}`}
           </p>
         </div>
-        <button
-          className="panel-icon-button"
-          type="button"
-          aria-label={agentRuntime ? "Back to agent" : "Back to conversation"}
-          title={agentRuntime ? "Back to agent" : "Back to conversation"}
-          onClick={onClose}
-        >
-          <span aria-hidden="true">←</span>
-        </button>
+        {!inlineRuntime && (
+          <button
+            className="panel-icon-button"
+            type="button"
+            aria-label={agentRuntime ? "Back to agent" : "Back to conversation"}
+            title={agentRuntime ? "Back to agent" : "Back to conversation"}
+            onClick={onClose}
+          >
+            <span aria-hidden="true">←</span>
+          </button>
+        )}
       </header>
 
-      <nav className="settings-section-navigation" aria-label="Settings sections">
-        <div>
-          {visibleSections.map((section) => (
-            <button
-              key={section.id}
-              type="button"
-              aria-current={activeSection === section.id ? "location" : undefined}
-              onClick={() => navigateToSection(section.id)}
-            >
-              {section.label}
-            </button>
-          ))}
-        </div>
-      </nav>
+      {!inlineRuntime && (
+        <nav className="settings-section-navigation" aria-label="Settings sections">
+          <div>
+            {visibleSections.map((section) => (
+              <button
+                key={section.id}
+                type="button"
+                aria-current={activeSection === section.id ? "location" : undefined}
+                onClick={() => navigateToSection(section.id)}
+              >
+                {section.label}
+              </button>
+            ))}
+          </div>
+        </nav>
+      )}
 
-      <div className="settings-scroll" ref={settingsScrollRef} onScroll={updateActiveSection}>
+      <div
+        className={inlineRuntime
+          ? "settings-scroll agent-runtime-settings-scroll"
+          : "settings-scroll"}
+        ref={settingsScrollRef}
+        onScroll={updateActiveSection}
+      >
         {!agentRuntime && (
           <section className="settings-intro" id="settings-section-personal-preferences">
           <div>
