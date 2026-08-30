@@ -1,5 +1,8 @@
 export const CHANNEL_PATTERN = /^chn_[0-9a-f]{32}$/;
 export const AGENT_PATTERN = /^agt_[0-9a-f]{32}$/;
+export const AGENT_DEFINITION_PATTERN = /^adf_[0-9a-f]{32}$/;
+export const AGENT_REVISION_PATTERN = /^adr_[0-9a-f]{32}$/;
+export const AGENT_ENABLEMENT_PATTERN = /^aen_[0-9a-f]{32}$/;
 export const PRINCIPAL_PATTERN = /^prn_[0-9a-f]{32}$/;
 export const RUNTIME_PROFILE_PATTERN = /^rtp_[0-9a-f]{32}$/;
 export const WORKSHOP_PATTERN = /^wsp_[0-9a-f]{32}$/;
@@ -50,6 +53,69 @@ export interface WorkshopNavigation {
     principalId: string;
   };
   workshops: WorkshopSummary[];
+}
+
+export type WorkshopAgentCapability =
+  | "image_input"
+  | "text_generation"
+  | "tool_activity"
+  | "workspace_execution";
+
+export type WorkshopAgentLifecycleState = "draft" | "active" | "archived";
+export type WorkshopAgentEnablementState = "available" | "enabled" | "disabled";
+
+export interface WorkshopAgentRevision {
+  capabilities: WorkshopAgentCapability[];
+  createdAt: string;
+  createdByPrincipalId: string | null;
+  eventPosition: number;
+  instructions: string;
+  purpose: string;
+  revisionId: string;
+  revisionNumber: number;
+}
+
+export interface WorkshopAgentDefinition {
+  activeRevisionId: string | null;
+  agentId: string;
+  createdAt: string;
+  createdByPrincipalId: string | null;
+  definitionId: string;
+  description: string;
+  displayName: string;
+  handle: string;
+  lifecycleState: WorkshopAgentLifecycleState;
+  presentation: { avatar?: string };
+  revisions: WorkshopAgentRevision[];
+  stateVersion: number;
+}
+
+export interface WorkshopAgentRuntimeOption {
+  backendOptions: string[];
+  displayName: string;
+  runtimeProfileId: string;
+}
+
+export interface WorkshopAgentEnablement {
+  agentId: string;
+  definitionId: string;
+  directChannelId: string | null;
+  displayName: string;
+  eligibleRuntimes: WorkshopAgentRuntimeOption[];
+  enablementId: string | null;
+  handle: string;
+  lifecycleState: WorkshopAgentEnablementState;
+  runtimeProfileId: string | null;
+  stateVersion: number | null;
+}
+
+export interface WorkshopAgentChangeSignal {
+  definitionId: string;
+  eventPosition: number;
+  eventType: string;
+  kind: "definition" | "enablement";
+  occurredAt: string;
+  revisionId: string | null;
 }
 
 export interface WorkshopModelOption {

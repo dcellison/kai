@@ -13,6 +13,7 @@ from kai.workshop.agent_enablement import (
 )
 from kai.workshop.agent_lifecycle import WorkshopAgentLifecycleService
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+from kai.workshop.client_api import _read_agent_lifecycle_events
 from kai.workshop.domain import AgentDefinitionId, PrincipalId
 from kai.workshop.execution_state import WorkshopExecutionStateRegistry
 from kai.workshop.internal_api_contexts import (
@@ -203,5 +204,61 @@ async def test_disable_and_reenable_preserve_direct_channel(tmp_path: Path) -> N
             (enabled.direct_channel_id,),
         ) as cursor:
             assert int((await cursor.fetchone())[0]) == 1
+    finally:
+        await store.close()
+
+
+async def test_agent_event_doorbells_are_scoped_to_the_enabled_principal(
+    tmp_path: Path,
+) -> None:
+    store, service, _execution, _contexts, _runtime_pool = await _service(tmp_path / "kai.db")
+    try:
+        daniel = await _principal(store, "101")
+        scott = await _principal(store, "202")
+        definition_id = await _active_specialist(store, daniel)
+        async with store.connection.execute(
+            "SELECT workshop_id FROM workshop_memberships WHERE principal_id = ?",
+            (daniel,),
+        ) as cursor:
+            workshop_row = await cursor.fetchone()
+        assert workshop_row is not None
+        workshop_id = str(workshop_row[0])
+        async with store.connection.execute("SELECT COALESCE(MAX(position), 0) FROM event_log") as cursor:
+            before = int((await cursor.fetchone())[0])
+
+        await service.enable(
+            daniel,
+            definition_id,
+            profile_id(101),
+            idempotency_key="daniel-doorbell",
+        )
+        await service.enable(
+            scott,
+            definition_id,
+            profile_id(202),
+            idempotency_key="scott-doorbell",
+        )
+
+        daniel_events, daniel_position = await _read_agent_lifecycle_events(
+            store,
+            workshop_id=workshop_id,
+            principal_id=daniel,
+            role="admin",
+            after_position=before,
+        )
+        scott_events, scott_position = await _read_agent_lifecycle_events(
+            store,
+            workshop_id=workshop_id,
+            principal_id=scott,
+            role="member",
+            after_position=before,
+        )
+
+        assert len(daniel_events) == len(scott_events) == 1
+        assert b"event: agent.enablement.changed" in daniel_events[0]
+        assert b"event: agent.enablement.changed" in scott_events[0]
+        assert str(definition_id).encode() in daniel_events[0]
+        assert str(definition_id).encode() in scott_events[0]
+        assert daniel_position == scott_position
     finally:
         await store.close()

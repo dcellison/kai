@@ -3852,22 +3852,31 @@ async def _read_agent_lifecycle_events(
     store: WorkshopEventStore,
     *,
     workshop_id: str,
+    principal_id: PrincipalId,
     role: str,
     after_position: int,
 ) -> tuple[tuple[bytes, ...], int]:
-    event_types = (
+    definition_event_types = (
         WorkshopEventType.AGENT_DEFINITION_CREATED,
         WorkshopEventType.AGENT_DEFINITION_REVISION_ADDED,
         WorkshopEventType.AGENT_DEFINITION_REVISION_ACTIVATED,
         WorkshopEventType.AGENT_DEFINITION_ARCHIVED,
     )
-    visible_types = event_types if role == "admin" else event_types[2:]
-    placeholders = ",".join("?" for _ in visible_types)
+    enablement_event_types = (
+        WorkshopEventType.PRINCIPAL_AGENT_ENABLED,
+        WorkshopEventType.PRINCIPAL_AGENT_DISABLED,
+        WorkshopEventType.PRINCIPAL_AGENT_RUNTIME_CHANGED,
+    )
+    queried_types = definition_event_types + enablement_event_types
+    visible_definition_types = (
+        frozenset(definition_event_types) if role == "admin" else frozenset(definition_event_types[2:])
+    )
+    placeholders = ",".join("?" for _ in queried_types)
     async with store.connection.execute(
         "SELECT position, event_type, aggregate_id, payload_json, metadata_json, occurred_at "
         "FROM event_log WHERE workshop_id = ? AND position > ? "
         f"AND event_type IN ({placeholders}) ORDER BY position LIMIT ?",
-        (workshop_id, after_position, *visible_types, _EVENT_BATCH_SIZE),
+        (workshop_id, after_position, *queried_types, _EVENT_BATCH_SIZE),
     ) as cursor:
         rows = list(await cursor.fetchall())
     serialized: list[bytes] = []
@@ -3877,6 +3886,14 @@ async def _read_agent_lifecycle_events(
         event_type = str(row[1])
         payload = json.loads(str(row[3]))
         metadata = json.loads(str(row[4]))
+        if event_type in definition_event_types:
+            if event_type not in visible_definition_types:
+                continue
+            event_name = "agent.definition.changed"
+        else:
+            if payload.get("principal_id") != str(principal_id):
+                continue
+            event_name = "agent.enablement.changed"
         definition_id = metadata.get("definition_id")
         if not isinstance(definition_id, str):
             if event_type == WorkshopEventType.AGENT_DEFINITION_REVISION_ADDED:
@@ -3902,7 +3919,7 @@ async def _read_agent_lifecycle_events(
             separators=(",", ":"),
             sort_keys=True,
         )
-        serialized.append((f"id: {position}\nevent: agent.definition.changed\ndata: {event_payload}\n\n").encode())
+        serialized.append((f"id: {position}\nevent: {event_name}\ndata: {event_payload}\n\n").encode())
     return tuple(serialized), position
 
 
@@ -3948,6 +3965,7 @@ async def _handle_agent_event_stream(
             events, position = await _read_agent_lifecycle_events(
                 store,
                 workshop_id=str(authority.workshop_id),
+                principal_id=principal_id,
                 role=authority.role,
                 after_position=after_position,
             )
@@ -4007,6 +4025,7 @@ async def _handle_agent_event_stream(
                 events, position = await _read_agent_lifecycle_events(
                     store,
                     workshop_id=str(authority.workshop_id),
+                    principal_id=principal_id,
                     role=authority.role,
                     after_position=position,
                 )

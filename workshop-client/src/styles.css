@@ -85,6 +85,7 @@ button:disabled {
 }
 
 .primary-button,
+.danger-button,
 .quiet-button {
   min-height: 2.6rem;
   border-radius: 0.35rem;
@@ -107,6 +108,16 @@ button:disabled {
 .primary-button:hover:not(:disabled) {
   border-color: var(--color-accent-hover);
   background: var(--color-accent-hover);
+}
+
+.danger-button {
+  border: 1px solid var(--color-danger);
+  background: transparent;
+  color: var(--color-danger);
+}
+
+.danger-button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--color-danger) 12%, transparent);
 }
 
 .quiet-button {
@@ -2105,8 +2116,433 @@ button:disabled {
   grid-template-columns: var(--channel-sidebar-width, 16.5rem) minmax(0, 1fr);
 }
 
+.workshop-app.agents-open,
 .workshop-app.settings-open {
   grid-template-columns: var(--channel-sidebar-width, 16.5rem) minmax(0, 1fr);
+}
+
+.agent-manager-link.active {
+  background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+}
+
+/* Agent catalogue and principal bindings */
+
+.agent-workspace {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--color-canvas);
+}
+
+.agent-workspace-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  min-height: 4.55rem;
+  padding: 0.72rem 1.5rem;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.agent-workspace-header h1 {
+  margin: 0;
+  color: var(--color-text-strong);
+  font: 560 1.35rem var(--serif);
+}
+
+.agent-workspace-header > div > p:last-child {
+  margin: 0.18rem 0 0;
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+}
+
+.agent-header-actions,
+.agent-detail-title-row,
+.agent-section-heading,
+.agent-archive-row,
+.agent-editor-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.agent-live-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.38rem;
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+}
+
+.agent-live-state::before {
+  width: 0.42rem;
+  height: 0.42rem;
+  border-radius: 50%;
+  background: var(--color-warning);
+  content: "";
+}
+
+.agent-live-state.connected::before {
+  background: var(--color-success);
+}
+
+.agent-workspace-body {
+  display: grid;
+  grid-template-columns: minmax(14rem, 0.32fr) minmax(0, 1fr);
+  min-height: 0;
+}
+
+.agent-catalogue {
+  min-width: 0;
+  overflow-y: auto;
+  padding: 0.75rem;
+  border-right: 1px solid var(--color-border);
+  background: var(--color-panel);
+}
+
+.agent-catalogue ul,
+.agent-revision-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agent-catalogue button {
+  display: grid;
+  grid-template-columns: 2.25rem minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.65rem;
+  width: 100%;
+  margin-bottom: 0.25rem;
+  padding: 0.65rem;
+  border: 1px solid transparent;
+  border-radius: 0.42rem;
+  background: transparent;
+  color: var(--color-text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.agent-catalogue button:hover,
+.agent-catalogue button:focus-visible,
+.agent-catalogue button.active {
+  border-color: var(--color-border-strong);
+  background: color-mix(in srgb, var(--color-accent) 8%, transparent);
+  outline: none;
+}
+
+.agent-catalogue button > span:nth-child(2) {
+  min-width: 0;
+}
+
+.agent-catalogue strong,
+.agent-catalogue small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-catalogue strong {
+  color: var(--color-text-strong);
+  font-size: 0.76rem;
+}
+
+.agent-catalogue small {
+  margin-top: 0.08rem;
+  color: var(--color-text-muted);
+  font-size: 0.64rem;
+}
+
+.agent-catalogue-avatar,
+.agent-detail-avatar {
+  display: inline-grid;
+  place-items: center;
+  border-radius: 0.42rem;
+  background: color-mix(in srgb, var(--color-success) 15%, transparent);
+  color: var(--color-success);
+  font-family: var(--serif);
+  font-weight: 720;
+}
+
+.agent-catalogue-avatar {
+  width: 2.2rem;
+  height: 2.2rem;
+  font-size: 0.85rem;
+}
+
+.agent-detail {
+  min-width: 0;
+  overflow-y: auto;
+  padding: clamp(1.2rem, 3vw, 3rem);
+}
+
+.agent-detail > * {
+  max-width: 62rem;
+  margin-inline: auto;
+}
+
+.agent-detail-identity {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 1rem;
+  padding-bottom: 1.4rem;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.agent-detail-avatar {
+  width: 4rem;
+  height: 4rem;
+  font-size: 1.5rem;
+}
+
+.agent-detail h2,
+.agent-detail h3 {
+  margin: 0;
+  color: var(--color-text-strong);
+}
+
+.agent-detail h2 {
+  font: 560 1.5rem var(--serif);
+}
+
+.agent-detail h3 {
+  font-size: 0.88rem;
+}
+
+.agent-detail p {
+  line-height: 1.55;
+}
+
+.agent-handle {
+  margin: 0.15rem 0;
+  color: var(--color-accent);
+  font: 0.72rem var(--mono);
+}
+
+.agent-status {
+  display: inline-block;
+  padding: 0.2rem 0.42rem;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 999px;
+  color: var(--color-text-muted);
+  font-size: 0.56rem;
+  font-weight: 720;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.agent-status.active,
+.agent-status.enabled {
+  border-color: color-mix(in srgb, var(--color-success) 45%, transparent);
+  color: var(--color-success);
+}
+
+.agent-status.archived {
+  color: var(--color-danger);
+}
+
+.agent-authority-note,
+.agent-enablement-card,
+.agent-active-revision,
+.agent-admin-controls,
+.agent-archived-note {
+  margin-top: 1rem;
+  padding: 1rem;
+  border: 1px solid var(--color-border);
+  border-radius: 0.5rem;
+  background: var(--color-panel);
+}
+
+.agent-authority-note {
+  border-left: 3px solid var(--color-special);
+}
+
+.agent-authority-note p,
+.agent-archive-row p,
+.agent-revision-editor > p {
+  margin: 0.3rem 0 0;
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+}
+
+.agent-enablement-card label,
+.agent-editor > label,
+.agent-editor-grid > label,
+.agent-revision-editor > label {
+  display: grid;
+  gap: 0.35rem;
+  margin-top: 0.75rem;
+  color: var(--color-text-strong);
+  font-size: 0.68rem;
+  font-weight: 680;
+}
+
+.agent-enablement-card select,
+.agent-editor input,
+.agent-editor textarea,
+.agent-revision-editor textarea {
+  width: 100%;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.35rem;
+  padding: 0.62rem 0.7rem;
+  background: var(--color-canvas-inset);
+  color: var(--color-text-strong);
+  font: inherit;
+}
+
+.agent-enablement-card select:focus-visible,
+.agent-editor input:focus-visible,
+.agent-editor textarea:focus-visible,
+.agent-revision-editor textarea:focus-visible {
+  border-color: var(--color-accent);
+  outline: 2px solid color-mix(in srgb, var(--color-accent) 30%, transparent);
+  outline-offset: 1px;
+}
+
+.agent-capability-tags,
+.agent-enablement-card .form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.8rem;
+}
+
+.agent-capability-tags span {
+  padding: 0.25rem 0.5rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+  color: var(--color-accent);
+  font-size: 0.6rem;
+}
+
+.agent-section-heading,
+.agent-editor-heading {
+  align-items: flex-start;
+  margin-bottom: 0.75rem;
+}
+
+.agent-revision-list li {
+  display: grid;
+  grid-template-columns: minmax(8rem, 0.25fr) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.75rem 0;
+  border-top: 1px solid var(--color-border);
+}
+
+.agent-revision-list small {
+  display: block;
+  margin-top: 0.15rem;
+  color: var(--color-text-muted);
+  font-size: 0.6rem;
+}
+
+.agent-revision-list p {
+  margin: 0;
+  font-size: 0.68rem;
+}
+
+.agent-archive-row {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--color-border);
+}
+
+.agent-editor-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.agent-field-hint {
+  color: var(--color-text-muted);
+  font-size: 0.6rem;
+  font-weight: 400;
+}
+
+.agent-handle-input {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.35rem;
+  padding-left: 0.7rem;
+  background: var(--color-canvas-inset);
+  color: var(--color-text-muted);
+}
+
+.agent-handle-input input {
+  border: 0;
+  background: transparent;
+  outline: none;
+}
+
+.agent-capability-choices {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.5rem;
+  margin: 1rem 0 0;
+  border: 1px solid var(--color-border);
+  border-radius: 0.45rem;
+  padding: 0.8rem;
+}
+
+.agent-capability-choices legend {
+  color: var(--color-text-strong);
+  font-size: 0.68rem;
+  font-weight: 680;
+}
+
+.agent-capability-choices > p {
+  grid-column: 1 / -1;
+  margin: 0 0 0.35rem;
+  color: var(--color-text-muted);
+  font-size: 0.64rem;
+}
+
+.agent-capability-choices label {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.5rem;
+  padding: 0.55rem;
+  border-radius: 0.35rem;
+  background: color-mix(in srgb, var(--color-text) 4%, transparent);
+  cursor: pointer;
+}
+
+.agent-capability-choices strong,
+.agent-capability-choices small {
+  display: block;
+}
+
+.agent-capability-choices small {
+  margin-top: 0.12rem;
+  color: var(--color-text-muted);
+  font-size: 0.6rem;
+}
+
+.agent-empty-detail,
+.agent-state-copy {
+  color: var(--color-text-muted);
+  text-align: center;
+}
+
+.agent-empty-detail {
+  padding: 5rem 1rem;
+}
+
+.agent-empty-detail > span {
+  color: var(--color-special);
+  font: 2rem var(--serif);
+}
+
+.agent-workspace-error {
+  margin-top: 1rem;
+  color: var(--color-danger);
 }
 
 /* Principal-owned settings workspace */
@@ -2753,6 +3189,7 @@ button:disabled {
 }
 
 @media (max-width: 1120px) {
+  .workshop-app.agents-open,
   .workshop-app.settings-open {
     grid-template-columns: var(--channel-sidebar-width, 15rem) minmax(0, 1fr);
   }
@@ -2765,6 +3202,31 @@ button:disabled {
 }
 
 @media (max-width: 920px) {
+  .agent-workspace-body {
+    display: block;
+    overflow-y: auto;
+  }
+
+  .agent-catalogue {
+    max-height: 18rem;
+    overflow-y: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .agent-detail {
+    overflow: visible;
+  }
+
+  .agent-editor-grid,
+  .agent-capability-choices {
+    grid-template-columns: 1fr;
+  }
+
+  .agent-capability-choices > p {
+    grid-column: auto;
+  }
+
   .settings-intro,
   .settings-section {
     display: block;
@@ -3754,6 +4216,7 @@ button:disabled {
     grid-template-columns: minmax(0, 1fr);
   }
 
+  .workshop-app.agents-open,
   .workshop-app.settings-open {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -3762,6 +4225,7 @@ button:disabled {
     display: none;
   }
 
+  .agent-workspace,
   .memory-workspace,
   .settings-workspace {
     grid-column: 1;
@@ -4044,3 +4508,23 @@ button:disabled {
   color: var(--color-warning);
   font: 0.68rem/1.5 var(--mono);
 }
+  .agent-workspace-header {
+    align-items: flex-start;
+    flex-direction: column;
+    padding-inline: 1rem;
+  }
+
+  .agent-header-actions {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .agent-revision-list li {
+    grid-template-columns: 1fr;
+  }
+
+  .agent-archive-row,
+  .agent-editor-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }

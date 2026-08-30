@@ -51,7 +51,7 @@ import type {
   WorkshopAppearancePreferences,
   WorkshopReaction,
 } from "./types";
-import { CHANNEL_PATTERN } from "./types";
+import { AGENT_DEFINITION_PATTERN, CHANNEL_PATTERN } from "./types";
 import { RunTraceCard } from "./RunTraceCard";
 import { useRunTrace } from "./useRunTrace";
 import { useWorkshopTimeline } from "./useWorkshopTimeline";
@@ -60,6 +60,7 @@ import { MarkdownMessage } from "./MarkdownMessage";
 import { startArtifactDownload } from "./artifactDownload";
 import { MemoryExplorer } from "./MemoryExplorer";
 import { SettingsWorkspace } from "./SettingsWorkspace";
+import { AgentWorkspace } from "./AgentWorkspace";
 import { applyWorkshopTheme, clearWorkshopThemeHint } from "./theme";
 import { ConfirmationProvider, useConfirmation } from "./ConfirmationDialog";
 
@@ -80,6 +81,7 @@ const MEMORY_ID_PATTERN = /^[A-Za-z0-9_-]{1,256}$/;
 
 type WorkshopDestination =
   | { kind: "conversation" }
+  | { kind: "agents"; definitionId: string | null }
   | { kind: "memory"; memoryId: string | null }
   | { kind: "settings" };
 
@@ -87,6 +89,16 @@ function destinationFromLocation(): WorkshopDestination {
   const parameters = new URLSearchParams(window.location.search);
   if (parameters.get("view") === "settings") {
     return { kind: "settings" };
+  }
+  if (parameters.get("view") === "agents") {
+    const definitionId = parameters.get("agent");
+    return {
+      kind: "agents",
+      definitionId:
+        definitionId && AGENT_DEFINITION_PATTERN.test(definitionId)
+          ? definitionId
+          : null,
+    };
   }
   if (parameters.get("view") !== "memory") {
     return { kind: "conversation" };
@@ -105,6 +117,7 @@ function writeDestination(
   const url = new URL(window.location.href);
   url.searchParams.delete("view");
   url.searchParams.delete("memory");
+  url.searchParams.delete("agent");
   if (destination.kind === "memory") {
     url.searchParams.set("view", "memory");
     if (destination.memoryId) {
@@ -112,6 +125,11 @@ function writeDestination(
     }
   } else if (destination.kind === "settings") {
     url.searchParams.set("view", "settings");
+  } else if (destination.kind === "agents") {
+    url.searchParams.set("view", "agents");
+    if (destination.definitionId) {
+      url.searchParams.set("agent", destination.definitionId);
+    }
   }
   window.history[mode === "push" ? "pushState" : "replaceState"](
     null,
@@ -1450,6 +1468,8 @@ function ThreadPane({
 }
 
 function WorkshopView({
+  agentDestination,
+  agentToken,
   channel,
   connection,
   earlier,
@@ -1467,6 +1487,7 @@ function WorkshopView({
   reactionUpdates,
   workshop,
   onForget,
+  onAgentNavigationChanged,
   onCancelRun,
   onCreateChannel,
   onDismissAgent,
@@ -1479,7 +1500,10 @@ function WorkshopView({
   onLoadThread,
   onMemoryAuthenticationFailure,
   onOpenMemory,
+  onOpenAgentChannel,
+  onOpenAgents,
   onOpenSettings,
+  onSelectAgent,
   onSelectMemory,
   onSelectChannel,
   onSetReaction,
@@ -1488,6 +1512,8 @@ function WorkshopView({
   onSettingsDirtyChange,
   onSettingsAccessFailure,
 }: {
+  agentDestination: { definitionId: string | null } | null;
+  agentToken: string;
   channel: WorkshopChannelSummary;
   connection: ConnectionState;
   earlier: EarlierHistoryState;
@@ -1505,6 +1531,7 @@ function WorkshopView({
   reactionUpdates: Record<string, TimelineMessage["reactions"]>;
   workshop: WorkshopSummary;
   onForget: () => void;
+  onAgentNavigationChanged: () => Promise<void>;
   onCancelRun: (runId: string) => Promise<WorkshopRun>;
   onCreateChannel: (input: ChannelCreationRequest) => Promise<void>;
   onDismissAgent: (agentId: string, clientDismissalId: string) => Promise<void>;
@@ -1521,7 +1548,10 @@ function WorkshopView({
   ) => Promise<ThreadTimelineSnapshot>;
   onMemoryAuthenticationFailure: (message: string) => void;
   onOpenMemory: () => void;
+  onOpenAgentChannel: (channelId: string) => Promise<void>;
+  onOpenAgents: () => void;
   onOpenSettings: () => void;
+  onSelectAgent: (definitionId: string | null) => void;
   onSelectMemory: (memoryId: string | null) => void;
   onSelectChannel: (channelId: string) => void;
   onSetReaction: (
@@ -1544,9 +1574,10 @@ function WorkshopView({
 }): React.JSX.Element {
   const confirm = useConfirmation();
   const channelId = channel.channelId;
+  const agentsOpen = agentDestination !== null;
   const memoryOpen = memoryDestination !== null;
   const settingsOpen = settingsDestination;
-  const auxiliaryWorkspaceOpen = memoryOpen || settingsOpen;
+  const auxiliaryWorkspaceOpen = agentsOpen || memoryOpen || settingsOpen;
   const channelName = channelDisplayName(channel);
   const symbol = channelSymbol(channel);
   const [draft, setDraft] = useState(() => restoreDraft(channelId));
@@ -1641,6 +1672,26 @@ function WorkshopView({
       left.name.localeCompare(right.name),
     );
   }, [workshop.channels]);
+  const enabledAgentChannels = useMemo(
+    () =>
+      workshop.channels
+        .filter(
+          (availableChannel) =>
+            availableChannel.kind === "direct" &&
+            availableChannel.canSubmitCommands &&
+            availableChannel.agents.length === 1,
+        )
+        .map((availableChannel) => ({
+          agent: availableChannel.agents[0],
+          channelId: availableChannel.channelId,
+        }))
+        .filter(
+          (item): item is { agent: WorkshopAgentSummary; channelId: string } =>
+            item.agent !== undefined,
+        )
+        .sort((left, right) => left.agent.name.localeCompare(right.agent.name)),
+    [workshop.channels],
+  );
   const mentionCandidates = useMemo(() => {
     if (channel.kind !== "group" || !mentionTrigger) {
       return [];
@@ -2268,7 +2319,7 @@ function WorkshopView({
 
   return (
     <main
-      className={`workshop-app ${memoryOpen ? "memory-open" : ""} ${settingsOpen ? "settings-open" : ""} ${sidebarLayout.collapsed ? "sidebar-collapsed" : ""} ${resizingSidebar || resizingContext ? "pane-resizing" : ""}`}
+      className={`workshop-app ${agentsOpen ? "agents-open" : ""} ${memoryOpen ? "memory-open" : ""} ${settingsOpen ? "settings-open" : ""} ${sidebarLayout.collapsed ? "sidebar-collapsed" : ""} ${resizingSidebar || resizingContext ? "pane-resizing" : ""}`}
       style={{
         "--channel-sidebar-width": `${
           sidebarLayout.collapsed
@@ -2406,32 +2457,57 @@ function WorkshopView({
             </>
           )}
 
-          {channel.agents.length > 0 && (
-            <>
+          {!sidebarLayout.collapsed && (
+            <div className="nav-heading-row">
               <p className="nav-heading">Agents</p>
-              {channel.agents.map((agent) => (
-                <div
-                  className={`agent-link ${engagedAgents.some((engaged) => engaged.agentId === agent.agentId) ? "engaged" : ""}`}
-                  title={agent.name}
-                  key={agent.agentId}
-                >
-                  <span className="mini-avatar">
-                    {agent.name.slice(0, 1).toUpperCase()}
-                  </span>
-                  <span>
-                    <strong>{agent.name}</strong>
-                    <small>
-                      {engagedAgents.some(
-                        (engaged) => engaged.agentId === agent.agentId,
-                      )
-                        ? "awake"
-                        : "coding agent"}
-                    </small>
-                  </span>
-                </div>
-              ))}
-            </>
+              <button
+                className="nav-add-button"
+                type="button"
+                aria-label="Open agent manager"
+                title="Open agent manager"
+                onClick={onOpenAgents}
+              >
+                <span aria-hidden="true" />
+              </button>
+            </div>
           )}
+          <button
+            className={`agent-link agent-manager-link ${agentsOpen ? "active" : ""}`}
+            type="button"
+            aria-label="Browse agents"
+            title="Browse agents"
+            onClick={onOpenAgents}
+          >
+            <span className="mini-avatar" aria-hidden="true">@</span>
+            <span>
+              <strong>Browse agents</strong>
+              <small>Definitions and access</small>
+            </span>
+          </button>
+          {enabledAgentChannels.map(({ agent, channelId: agentChannelId }) => (
+            <button
+              className={`agent-link ${engagedAgents.some((engaged) => engaged.agentId === agent.agentId) ? "engaged" : ""}`}
+              type="button"
+              title={`Open ${agent.name}`}
+              aria-label={`Open direct conversation with ${agent.name}`}
+              onClick={() => onSelectChannel(agentChannelId)}
+              key={agent.agentId}
+            >
+              <span className="mini-avatar">
+                {agent.name.slice(0, 1).toUpperCase()}
+              </span>
+              <span>
+                <strong>{agent.name}</strong>
+                <small>
+                  {engagedAgents.some(
+                    (engaged) => engaged.agentId === agent.agentId,
+                  )
+                    ? "awake"
+                    : "enabled"}
+                </small>
+              </span>
+            </button>
+          ))}
         </nav>
 
         <footer
@@ -2501,7 +2577,20 @@ function WorkshopView({
         )}
       </aside>
 
-      {settingsOpen ? (
+      {agentsOpen && agentDestination ? (
+        <AgentWorkspace
+          initialDefinitionId={agentDestination.definitionId}
+          isAdministrator={workshop.role === "admin"}
+          onAuthenticationFailure={onMemoryAuthenticationFailure}
+          onChannelAccessFailure={onSettingsAccessFailure}
+          onClose={() => onSelectChannel(channelId)}
+          onNavigationChanged={onAgentNavigationChanged}
+          onOpenChannel={onOpenAgentChannel}
+          onSelectAgent={onSelectAgent}
+          principalName={humanName}
+          token={agentToken}
+        />
+      ) : settingsOpen ? (
         <SettingsWorkspace
           onAuthenticationFailure={onMemoryAuthenticationFailure}
           onChannelAccessFailure={onSettingsAccessFailure}
@@ -3062,9 +3151,13 @@ function ActiveWorkshopClient({
   onChannelAccessFailure,
   onCreateChannel,
   onForget,
+  onAgentNavigationChanged,
+  onOpenAgentChannel,
+  onOpenAgents,
   onOpenMemory,
   onOpenSettings,
   onSelectChannel,
+  onSelectAgent,
   onSelectMemory,
   onSettingsDirtyChange,
 }: {
@@ -3075,9 +3168,13 @@ function ActiveWorkshopClient({
   onChannelAccessFailure: (message: string) => void;
   onCreateChannel: (input: ChannelCreationRequest) => Promise<void>;
   onForget: () => void;
+  onAgentNavigationChanged: () => Promise<void>;
+  onOpenAgentChannel: (channelId: string) => Promise<void>;
+  onOpenAgents: () => void;
   onOpenMemory: () => void;
   onOpenSettings: () => void;
   onSelectChannel: (channelId: string) => void;
+  onSelectAgent: (definitionId: string | null) => void;
   onSelectMemory: (memoryId: string | null) => void;
   onSettingsDirtyChange: (dirty: boolean) => void;
 }): React.JSX.Element {
@@ -3119,7 +3216,7 @@ function ActiveWorkshopClient({
   } =
     useWorkshopTimeline(
       session,
-      selected !== null,
+      selected !== null && destination.kind !== "agents",
       onAuthenticationFailure,
       onChannelAccessFailure,
     );
@@ -3223,6 +3320,8 @@ function ActiveWorkshopClient({
 
   return (
     <WorkshopView
+      agentDestination={destination.kind === "agents" ? destination : null}
+      agentToken={session.token}
       channel={selected.channel}
       connection={connection}
       earlier={earlier}
@@ -3243,6 +3342,7 @@ function ActiveWorkshopClient({
       reactionUpdates={reactionUpdates}
       workshop={selected.workshop}
       onForget={onForget}
+      onAgentNavigationChanged={onAgentNavigationChanged}
       onCancelRun={cancelSelectedRun}
       onCreateChannel={onCreateChannel}
       onDismissAgent={dismissSelectedAgent}
@@ -3251,9 +3351,12 @@ function ActiveWorkshopClient({
       onLoadSettingsWorkspace={loadSelectedSettingsWorkspace}
       onLoadThread={loadSelectedThread}
       onMemoryAuthenticationFailure={onAuthenticationFailure}
+      onOpenAgentChannel={onOpenAgentChannel}
+      onOpenAgents={onOpenAgents}
       onOpenMemory={onOpenMemory}
       onOpenSettings={onOpenSettings}
       onSelectMemory={onSelectMemory}
+      onSelectAgent={onSelectAgent}
       onSelectChannel={onSelectChannel}
       onSetReaction={setSelectedMessageReaction}
       onSubmitCommand={submitSelectedCommand}
@@ -3490,6 +3593,22 @@ function WorkshopApp(): React.JSX.Element {
     writeDestination(nextDestination, "push");
   };
 
+  const openAgents = async (): Promise<void> => {
+    if (
+      destination.kind === "settings" &&
+      settingsDirty &&
+      !await confirm("Discard unsaved preference changes?")
+    ) {
+      return;
+    }
+    const nextDestination: WorkshopDestination = {
+      definitionId: null,
+      kind: "agents",
+    };
+    setDestination(nextDestination);
+    writeDestination(nextDestination, "push");
+  };
+
   const openSettings = (): void => {
     const nextDestination: WorkshopDestination = { kind: "settings" };
     setDestination(nextDestination);
@@ -3501,6 +3620,71 @@ function WorkshopApp(): React.JSX.Element {
     setDestination(nextDestination);
     writeDestination(nextDestination, "replace");
   }, []);
+
+  const selectAgent = useCallback((definitionId: string | null): void => {
+    const nextDestination: WorkshopDestination = {
+      definitionId,
+      kind: "agents",
+    };
+    setDestination(nextDestination);
+    writeDestination(nextDestination, "replace");
+  }, []);
+
+  const refreshAgentNavigation = useCallback(async (): Promise<void> => {
+    if (!session) {
+      return;
+    }
+    try {
+      const discovered = await loadNavigation(session.token);
+      const current = findNavigationChannel(discovered, session.channelId);
+      const selected = current ?? preferredNavigationChannel(discovered, null);
+      if (!selected) {
+        throw new Error("This Workshop account has no accessible channels.");
+      }
+      if (!current) {
+        const nextSession = { ...session, channelId: selected.channel.channelId };
+        storeWorkshopAccess(nextSession);
+        setAccess({ channelId: nextSession.channelId, token: nextSession.token });
+        setSession(nextSession);
+      }
+      setNavigation(discovered);
+    } catch (caught) {
+      if (caught instanceof AuthenticationError) {
+        forgetSession(caught.message);
+      } else {
+        throw caught;
+      }
+    }
+  }, [forgetSession, session]);
+
+  const openAgentChannel = useCallback(async (channelId: string): Promise<void> => {
+    if (!session) {
+      throw new Error("Workshop is not connected.");
+    }
+    try {
+      const discovered = await loadNavigation(session.token);
+      if (!findNavigationChannel(discovered, channelId)) {
+        throw new ChannelAccessError(
+          "This session cannot access that agent conversation.",
+        );
+      }
+      const nextSession = { ...session, channelId };
+      storeWorkshopAccess(nextSession);
+      setAccess({ channelId, token: session.token });
+      setSession(nextSession);
+      setNavigation(discovered);
+      const nextDestination: WorkshopDestination = { kind: "conversation" };
+      setDestination(nextDestination);
+      writeDestination(nextDestination, "push");
+    } catch (caught) {
+      if (caught instanceof AuthenticationError) {
+        forgetSession(caught.message);
+      } else if (caught instanceof ChannelAccessError) {
+        handleChannelAccessFailure(caught.message);
+      }
+      throw caught;
+    }
+  }, [forgetSession, handleChannelAccessFailure, session]);
 
   const createWorkshopChannel = async (
     input: ChannelCreationRequest,
@@ -3554,9 +3738,13 @@ function WorkshopApp(): React.JSX.Element {
       onChannelAccessFailure={handleChannelAccessFailure}
       onCreateChannel={createWorkshopChannel}
       onForget={() => forgetSession()}
+      onAgentNavigationChanged={refreshAgentNavigation}
+      onOpenAgentChannel={openAgentChannel}
+      onOpenAgents={() => void openAgents()}
       onOpenMemory={() => void openMemory()}
       onOpenSettings={openSettings}
       onSelectChannel={(channelId) => void selectChannel(channelId)}
+      onSelectAgent={selectAgent}
       onSelectMemory={selectMemory}
       onSettingsDirtyChange={setSettingsDirty}
     />

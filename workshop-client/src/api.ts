@@ -52,11 +52,18 @@ import type {
   WorkshopArtifactSummary,
   WorkshopMessageReaction,
   WorkshopReaction,
+  WorkshopAgentCapability,
+  WorkshopAgentChangeSignal,
+  WorkshopAgentDefinition,
+  WorkshopAgentEnablement,
 } from "./types";
 import { MESSAGE_PATTERN } from "./types";
 import { isWorkshopThemeId } from "./theme";
 import {
   AGENT_PATTERN,
+  AGENT_DEFINITION_PATTERN,
+  AGENT_ENABLEMENT_PATTERN,
+  AGENT_REVISION_PATTERN,
   ARTIFACT_PATTERN,
   CHANNEL_PATTERN,
   PRINCIPAL_PATTERN,
@@ -546,6 +553,393 @@ export async function loadNavigation(token: string): Promise<WorkshopNavigation>
     },
     workshops,
   };
+}
+
+const AGENT_CAPABILITIES = new Set<WorkshopAgentCapability>([
+  "image_input",
+  "text_generation",
+  "tool_activity",
+  "workspace_execution",
+]);
+
+function parseAgentCapabilities(value: unknown): WorkshopAgentCapability[] | null {
+  if (!Array.isArray(value) || value.length === 0) {
+    return null;
+  }
+  const capabilities: WorkshopAgentCapability[] = [];
+  for (const item of value) {
+    if (
+      typeof item !== "string" ||
+      !AGENT_CAPABILITIES.has(item as WorkshopAgentCapability) ||
+      capabilities.includes(item as WorkshopAgentCapability)
+    ) {
+      return null;
+    }
+    capabilities.push(item as WorkshopAgentCapability);
+  }
+  return capabilities;
+}
+
+function parseAgentDefinition(value: unknown): WorkshopAgentDefinition | null {
+  if (
+    !isRecord(value) ||
+    typeof value.definition_id !== "string" ||
+    !AGENT_DEFINITION_PATTERN.test(value.definition_id) ||
+    typeof value.agent_id !== "string" ||
+    !AGENT_PATTERN.test(value.agent_id) ||
+    typeof value.handle !== "string" ||
+    typeof value.display_name !== "string" ||
+    typeof value.description !== "string" ||
+    !isRecord(value.presentation) ||
+    Object.keys(value.presentation).some((key) => key !== "avatar") ||
+    (value.presentation.avatar !== undefined &&
+      typeof value.presentation.avatar !== "string") ||
+    !["draft", "active", "archived"].includes(String(value.lifecycle_state)) ||
+    (value.active_revision_id !== null &&
+      (typeof value.active_revision_id !== "string" ||
+        !AGENT_REVISION_PATTERN.test(value.active_revision_id))) ||
+    !Number.isSafeInteger(value.state_version) ||
+    (value.state_version as number) < 1 ||
+    typeof value.created_at !== "string" ||
+    (value.created_by_principal_id !== null &&
+      (typeof value.created_by_principal_id !== "string" ||
+        !PRINCIPAL_PATTERN.test(value.created_by_principal_id))) ||
+    !Array.isArray(value.revisions)
+  ) {
+    return null;
+  }
+  const revisions = value.revisions.map((rawRevision) => {
+    if (
+      !isRecord(rawRevision) ||
+      typeof rawRevision.revision_id !== "string" ||
+      !AGENT_REVISION_PATTERN.test(rawRevision.revision_id) ||
+      !Number.isSafeInteger(rawRevision.revision_number) ||
+      (rawRevision.revision_number as number) < 1 ||
+      typeof rawRevision.purpose !== "string" ||
+      typeof rawRevision.instructions !== "string" ||
+      typeof rawRevision.created_at !== "string" ||
+      (rawRevision.created_by_principal_id !== null &&
+        (typeof rawRevision.created_by_principal_id !== "string" ||
+          !PRINCIPAL_PATTERN.test(rawRevision.created_by_principal_id))) ||
+      !Number.isSafeInteger(rawRevision.event_position) ||
+      (rawRevision.event_position as number) < 1
+    ) {
+      return null;
+    }
+    const capabilities = parseAgentCapabilities(rawRevision.capabilities);
+    if (!capabilities) {
+      return null;
+    }
+    return {
+      capabilities,
+      createdAt: rawRevision.created_at,
+      createdByPrincipalId: rawRevision.created_by_principal_id,
+      eventPosition: rawRevision.event_position as number,
+      instructions: rawRevision.instructions,
+      purpose: rawRevision.purpose,
+      revisionId: rawRevision.revision_id,
+      revisionNumber: rawRevision.revision_number as number,
+    };
+  });
+  if (revisions.some((revision) => revision === null)) {
+    return null;
+  }
+  return {
+    activeRevisionId: value.active_revision_id,
+    agentId: value.agent_id,
+    createdAt: value.created_at,
+    createdByPrincipalId: value.created_by_principal_id,
+    definitionId: value.definition_id,
+    description: value.description,
+    displayName: value.display_name,
+    handle: value.handle,
+    lifecycleState: value.lifecycle_state as WorkshopAgentDefinition["lifecycleState"],
+    presentation: value.presentation as { avatar?: string },
+    revisions: revisions as WorkshopAgentDefinition["revisions"],
+    stateVersion: value.state_version as number,
+  };
+}
+
+function parseAgentEnablement(value: unknown): WorkshopAgentEnablement | null {
+  if (
+    !isRecord(value) ||
+    (value.enablement_id !== null &&
+      (typeof value.enablement_id !== "string" ||
+        !AGENT_ENABLEMENT_PATTERN.test(value.enablement_id))) ||
+    typeof value.definition_id !== "string" ||
+    !AGENT_DEFINITION_PATTERN.test(value.definition_id) ||
+    typeof value.agent_id !== "string" ||
+    !AGENT_PATTERN.test(value.agent_id) ||
+    typeof value.handle !== "string" ||
+    typeof value.display_name !== "string" ||
+    !["available", "enabled", "disabled"].includes(
+      String(value.lifecycle_state),
+    ) ||
+    (value.direct_channel_id !== null &&
+      (typeof value.direct_channel_id !== "string" ||
+        !CHANNEL_PATTERN.test(value.direct_channel_id))) ||
+    (value.runtime_profile_id !== null &&
+      (typeof value.runtime_profile_id !== "string" ||
+        !RUNTIME_PROFILE_PATTERN.test(value.runtime_profile_id))) ||
+    (value.state_version !== null &&
+      (!Number.isSafeInteger(value.state_version) ||
+        (value.state_version as number) < 1)) ||
+    !Array.isArray(value.eligible_runtimes)
+  ) {
+    return null;
+  }
+  const eligibleRuntimes = value.eligible_runtimes.map((rawRuntime) => {
+    if (
+      !isRecord(rawRuntime) ||
+      typeof rawRuntime.runtime_profile_id !== "string" ||
+      !RUNTIME_PROFILE_PATTERN.test(rawRuntime.runtime_profile_id) ||
+      typeof rawRuntime.display_name !== "string" ||
+      !Array.isArray(rawRuntime.backend_options) ||
+      rawRuntime.backend_options.some((option) => typeof option !== "string")
+    ) {
+      return null;
+    }
+    return {
+      backendOptions: rawRuntime.backend_options as string[],
+      displayName: rawRuntime.display_name,
+      runtimeProfileId: rawRuntime.runtime_profile_id,
+    };
+  });
+  if (eligibleRuntimes.some((runtime) => runtime === null)) {
+    return null;
+  }
+  return {
+    agentId: value.agent_id,
+    definitionId: value.definition_id,
+    directChannelId: value.direct_channel_id,
+    displayName: value.display_name,
+    eligibleRuntimes: eligibleRuntimes as WorkshopAgentEnablement["eligibleRuntimes"],
+    enablementId: value.enablement_id,
+    handle: value.handle,
+    lifecycleState: value.lifecycle_state as WorkshopAgentEnablement["lifecycleState"],
+    runtimeProfileId: value.runtime_profile_id,
+    stateVersion: value.state_version as number | null,
+  };
+}
+
+async function agentMutation(
+  token: string,
+  path: string,
+  body: Record<string, unknown>,
+  fallback: string,
+): Promise<WorkshopAgentDefinition> {
+  const response = await authorizedFetch({ channelId: "", token }, path, {
+    body: JSON.stringify(body),
+    headers: { "Content-Type": "application/json" },
+    method: "POST",
+  });
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, fallback));
+  }
+  const agent = isRecord(payload) && payload.version === 1
+    ? parseAgentDefinition(payload.agent)
+    : null;
+  if (!agent) {
+    throw new Error("Kai returned an unsupported agent definition.");
+  }
+  return agent;
+}
+
+async function enablementMutation(
+  token: string,
+  path: string,
+  body: Record<string, unknown>,
+): Promise<WorkshopAgentEnablement> {
+  const response = await authorizedFetch({ channelId: "", token }, path, {
+    body: JSON.stringify(body),
+    headers: { "Content-Type": "application/json" },
+    method: "POST",
+  });
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not update this agent."));
+  }
+  const agent = isRecord(payload) && payload.version === 1
+    ? parseAgentEnablement(payload.agent)
+    : null;
+  if (!agent) {
+    throw new Error("Kai returned unsupported agent enablement state.");
+  }
+  return agent;
+}
+
+export async function loadAgentDefinitions(
+  token: string,
+): Promise<WorkshopAgentDefinition[]> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    "/v1/client/agents",
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load agents."));
+  }
+  if (!isRecord(payload) || payload.version !== 1 || !Array.isArray(payload.agents)) {
+    throw new Error("Kai returned unsupported agent definitions.");
+  }
+  const agents = payload.agents.map(parseAgentDefinition);
+  if (agents.some((agent) => agent === null)) {
+    throw new Error("Kai returned unsupported agent definitions.");
+  }
+  return agents as WorkshopAgentDefinition[];
+}
+
+export async function loadAgentEnablements(
+  token: string,
+): Promise<WorkshopAgentEnablement[]> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    "/v1/client/agent-enablement",
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load agent access."));
+  }
+  if (!isRecord(payload) || payload.version !== 1 || !Array.isArray(payload.agents)) {
+    throw new Error("Kai returned unsupported agent enablement state.");
+  }
+  const agents = payload.agents.map(parseAgentEnablement);
+  if (agents.some((agent) => agent === null)) {
+    throw new Error("Kai returned unsupported agent enablement state.");
+  }
+  return agents as WorkshopAgentEnablement[];
+}
+
+export interface AgentDefinitionDraftInput {
+  avatar: string;
+  capabilities: WorkshopAgentCapability[];
+  description: string;
+  displayName: string;
+  handle: string;
+  idempotencyKey: string;
+  instructions: string;
+  purpose: string;
+}
+
+export async function createAgentDefinition(
+  token: string,
+  input: AgentDefinitionDraftInput,
+): Promise<WorkshopAgentDefinition> {
+  return agentMutation(
+    token,
+    "/v1/client/agents",
+    {
+      capabilities: input.capabilities,
+      description: input.description,
+      display_name: input.displayName,
+      handle: input.handle,
+      idempotency_key: input.idempotencyKey,
+      instructions: input.instructions,
+      presentation: input.avatar.trim() ? { avatar: input.avatar.trim() } : {},
+      purpose: input.purpose,
+    },
+    "Could not create this agent.",
+  );
+}
+
+export async function addAgentRevision(
+  token: string,
+  definitionId: string,
+  input: {
+    capabilities: WorkshopAgentCapability[];
+    expectedVersion: number;
+    idempotencyKey: string;
+    instructions: string;
+    purpose: string;
+  },
+): Promise<WorkshopAgentDefinition> {
+  return agentMutation(
+    token,
+    `/v1/client/agents/${encodeURIComponent(definitionId)}/revisions`,
+    {
+      capabilities: input.capabilities,
+      expected_version: input.expectedVersion,
+      idempotency_key: input.idempotencyKey,
+      instructions: input.instructions,
+      purpose: input.purpose,
+    },
+    "Could not save this agent revision.",
+  );
+}
+
+export async function activateAgentRevision(
+  token: string,
+  definitionId: string,
+  input: {
+    expectedVersion: number;
+    idempotencyKey: string;
+    revisionId: string;
+  },
+): Promise<WorkshopAgentDefinition> {
+  return agentMutation(
+    token,
+    `/v1/client/agents/${encodeURIComponent(definitionId)}/activate`,
+    {
+      expected_version: input.expectedVersion,
+      idempotency_key: input.idempotencyKey,
+      revision_id: input.revisionId,
+    },
+    "Could not activate this agent revision.",
+  );
+}
+
+export async function archiveAgentDefinition(
+  token: string,
+  definitionId: string,
+  input: { expectedVersion: number; idempotencyKey: string },
+): Promise<WorkshopAgentDefinition> {
+  return agentMutation(
+    token,
+    `/v1/client/agents/${encodeURIComponent(definitionId)}/archive`,
+    {
+      expected_version: input.expectedVersion,
+      idempotency_key: input.idempotencyKey,
+    },
+    "Could not archive this agent.",
+  );
+}
+
+export async function enableAgentDefinition(
+  token: string,
+  definitionId: string,
+  input: {
+    expectedVersion: number | null;
+    idempotencyKey: string;
+    runtimeProfileId: string;
+  },
+): Promise<WorkshopAgentEnablement> {
+  return enablementMutation(
+    token,
+    `/v1/client/agents/${encodeURIComponent(definitionId)}/enable`,
+    {
+      ...(input.expectedVersion === null
+        ? {}
+        : { expected_version: input.expectedVersion }),
+      idempotency_key: input.idempotencyKey,
+      runtime_profile_id: input.runtimeProfileId,
+    },
+  );
+}
+
+export async function disableAgentDefinition(
+  token: string,
+  definitionId: string,
+  input: { expectedVersion: number; idempotencyKey: string },
+): Promise<WorkshopAgentEnablement> {
+  return enablementMutation(
+    token,
+    `/v1/client/agents/${encodeURIComponent(definitionId)}/disable`,
+    {
+      expected_version: input.expectedVersion,
+      idempotency_key: input.idempotencyKey,
+    },
+  );
 }
 
 export async function createChannel(
@@ -2899,6 +3293,93 @@ export class EventStreamDecoder {
     return eventName
       ? { data: data.join("\n"), eventId, eventName }
       : null;
+  }
+}
+
+export async function streamAgentChanges(
+  token: string,
+  lastEventId: string | null,
+  handlers: {
+    onChanged: (signal: WorkshopAgentChangeSignal, eventId: string) => void;
+    onConnected: () => void;
+  },
+  signal: AbortSignal,
+): Promise<void> {
+  const headers = new Headers();
+  if (lastEventId !== null) {
+    headers.set("Last-Event-ID", lastEventId);
+  }
+  headers.set("X-Kai-Stream-ID", `${eventStreamId()}:agents`);
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    "/v1/client/agents/events",
+    { headers, signal },
+  );
+  if (response.status === 409) {
+    throw new ResynchronizationRequired();
+  }
+  if (!response.ok || !response.body) {
+    const payload = await responsePayload(response);
+    throw new Error(
+      safeErrorMessage(payload, "Live agent updates are unavailable."),
+    );
+  }
+
+  handlers.onConnected();
+  const reader = response.body.getReader();
+  const textDecoder = new TextDecoder();
+  const eventDecoder = new EventStreamDecoder();
+  while (!signal.aborted) {
+    const { done, value } = await reader.read();
+    if (done) {
+      return;
+    }
+    for (const event of eventDecoder.push(textDecoder.decode(value, { stream: true }))) {
+      if (
+        (event.eventName !== "agent.definition.changed" &&
+          event.eventName !== "agent.enablement.changed") ||
+        !event.eventId ||
+        !/^\d+$/.test(event.eventId)
+      ) {
+        continue;
+      }
+      let payload: unknown;
+      try {
+        payload = JSON.parse(event.data);
+      } catch {
+        continue;
+      }
+      const eventPosition = Number(event.eventId);
+      if (
+        !isRecord(payload) ||
+        payload.version !== 1 ||
+        payload.event_position !== eventPosition ||
+        !Number.isSafeInteger(eventPosition) ||
+        typeof payload.event_type !== "string" ||
+        typeof payload.definition_id !== "string" ||
+        !AGENT_DEFINITION_PATTERN.test(payload.definition_id) ||
+        (payload.revision_id !== null &&
+          (typeof payload.revision_id !== "string" ||
+            !AGENT_REVISION_PATTERN.test(payload.revision_id))) ||
+        typeof payload.occurred_at !== "string"
+      ) {
+        continue;
+      }
+      handlers.onChanged(
+        {
+          definitionId: payload.definition_id,
+          eventPosition,
+          eventType: payload.event_type,
+          kind:
+            event.eventName === "agent.definition.changed"
+              ? "definition"
+              : "enablement",
+          occurredAt: payload.occurred_at,
+          revisionId: payload.revision_id,
+        },
+        event.eventId,
+      );
+    }
   }
 }
 
