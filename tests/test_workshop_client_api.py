@@ -54,11 +54,14 @@ from kai.workshop.domain import (
     AgentId,
     ChannelId,
     ChannelMembershipId,
+    EventEnvelope,
     MessageId,
     PrincipalId,
     RunId,
     RuntimeProfileId,
     WorkshopEventType,
+    WorkshopId,
+    WorkshopMembershipId,
 )
 from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.execution_state import WorkshopExecutionStateRegistry
@@ -1752,6 +1755,255 @@ class TestWorkshopAgentEnablementHTTPContract:
 
 
 class TestWorkshopChannelLifecycleHTTPContract:
+    async def test_membership_change_emits_private_live_navigation_signal(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_direct, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        channel_id = await _create_group_channel(store, alice_id, alice_direct)
+        client = await _open_client(store, _Authenticator({"alice": alice_id, "bob": bob_id}))
+        try:
+            async with store.connection.execute("SELECT MAX(position) FROM event_log") as cursor:
+                before = int((await cursor.fetchone())[0])
+            added = await client.post(
+                f"/v1/channels/{channel_id}/members/{bob_id}/add",
+                headers={"Authorization": "Bearer alice"},
+                json={"client_operation_id": "live-add-bob", "expected_state_version": 0},
+            )
+            assert added.status == 200
+            stream = await client.get(
+                f"/v1/client/agents/events?after_position={before}",
+                headers={
+                    "Authorization": "Bearer bob",
+                    "X-Kai-Stream-ID": "membership-navigation-test",
+                },
+            )
+            assert stream.status == 200
+            event_name = ""
+            payload: dict[str, object] | None = None
+            for _ in range(20):
+                line = (await stream.content.readline()).decode().strip()
+                if line.startswith("event: "):
+                    event_name = line.removeprefix("event: ")
+                if line.startswith("data: "):
+                    candidate = json.loads(line.removeprefix("data: "))
+                    if candidate["event_type"] == "channel.member_added":
+                        payload = candidate
+                        break
+            assert event_name == "workshop.navigation.changed"
+            assert payload is not None
+            assert payload["definition_id"] is None
+            stream.close()
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_owner_adds_and_removes_human_with_idempotent_optimistic_authority(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_direct, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        channel_id = await _create_group_channel(store, alice_id, alice_direct)
+        client = await _open_client(store, _Authenticator({"alice": alice_id, "bob": bob_id}))
+        path = f"/v1/channels/{channel_id}/members"
+        try:
+            initial = await client.get(path, headers={"Authorization": "Bearer alice"})
+            assert initial.status == 200
+            initial_payload = await initial.json()
+            assert initial_payload["state_version"] == 0
+            assert [(item["display_name"], item["role"]) for item in initial_payload["members"]] == [("Alice", "owner")]
+            assert [(item["display_name"], item["handle"]) for item in initial_payload["eligible_humans"]] == [
+                ("Bob", "bob")
+            ]
+
+            denied_before_add = await client.get(path, headers={"Authorization": "Bearer bob"})
+            assert denied_before_add.status == 403
+            add_body = {"client_operation_id": "add-bob", "expected_state_version": 0}
+            added = await client.post(
+                f"{path}/{bob_id}/add",
+                headers={"Authorization": "Bearer alice"},
+                json=add_body,
+            )
+            retried = await client.post(
+                f"{path}/{bob_id}/add",
+                headers={"Authorization": "Bearer alice"},
+                json=add_body,
+            )
+            assert added.status == retried.status == 200
+            added_payload = await added.json()
+            retried_payload = await retried.json()
+            assert added_payload["changed"] is True
+            assert retried_payload["changed"] is False
+            assert added_payload["state_version"] == retried_payload["state_version"]
+            membership_version = added_payload["state_version"]
+
+            bob_members = await client.get(path, headers={"Authorization": "Bearer bob"})
+            assert bob_members.status == 200
+            bob_payload = await bob_members.json()
+            assert bob_payload["can_manage"] is False
+            assert bob_payload["eligible_humans"] == []
+            assert {item["display_name"] for item in bob_payload["members"]} == {"Alice", "Bob"}
+
+            participant_denied = await client.post(
+                f"{path}/{alice_id}/remove",
+                headers={"Authorization": "Bearer bob"},
+                json={"client_operation_id": "bob-removes-owner", "expected_state_version": membership_version},
+            )
+            owner_immutable = await client.post(
+                f"{path}/{alice_id}/remove",
+                headers={"Authorization": "Bearer alice"},
+                json={"client_operation_id": "owner-self-remove", "expected_state_version": membership_version},
+            )
+            stale = await client.post(
+                f"{path}/{bob_id}/remove",
+                headers={"Authorization": "Bearer alice"},
+                json={"client_operation_id": "stale-remove", "expected_state_version": 0},
+            )
+            assert participant_denied.status == 403
+            assert owner_immutable.status == 409
+            assert "ownership is immutable" in (await owner_immutable.json())["error"]["message"]
+            assert stale.status == 409
+
+            removed = await client.post(
+                f"{path}/{bob_id}/remove",
+                headers={"Authorization": "Bearer alice"},
+                json={
+                    "client_operation_id": "remove-bob",
+                    "expected_state_version": membership_version,
+                },
+            )
+            assert removed.status == 200
+            removed_payload = await removed.json()
+            assert removed_payload["changed"] is True
+            assert removed_payload["member"]["role"] is None
+            assert removed_payload["state_version"] > membership_version
+            assert (await client.get(path, headers={"Authorization": "Bearer bob"})).status == 403
+
+            removal_stream = await client.get(
+                f"/v1/client/agents/events?after_position={membership_version}",
+                headers={
+                    "Authorization": "Bearer bob",
+                    "X-Kai-Stream-ID": "membership-removal-navigation-test",
+                },
+            )
+            assert removal_stream.status == 200
+            removal_payload: dict[str, object] | None = None
+            for _ in range(20):
+                line = (await removal_stream.content.readline()).decode().strip()
+                if line.startswith("data: "):
+                    candidate = json.loads(line.removeprefix("data: "))
+                    if candidate["event_type"] == "channel.member_removed":
+                        removal_payload = candidate
+                        break
+            assert removal_payload is not None
+            assert removal_payload["definition_id"] is None
+            removal_stream.close()
+
+            navigation = await client.get(
+                "/v1/client/navigation",
+                headers={"Authorization": "Bearer bob"},
+            )
+            assert navigation.status == 200
+            assert all(
+                channel["channel_id"] != str(channel_id)
+                for workshop in (await navigation.json())["workshops"]
+                for channel in workshop["channels"]
+            )
+
+            await store.rebuild_projection(CanonicalConversationProjection())
+            replayed = await client.get(path, headers={"Authorization": "Bearer alice"})
+            assert replayed.status == 200
+            assert [item["display_name"] for item in (await replayed.json())["members"]] == ["Alice"]
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_membership_rejects_direct_archived_and_non_workshop_targets(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_direct, bob_id, bob_direct = await _open_store(tmp_path / "kai.db")
+        channel_id = await _create_group_channel(store, alice_id, alice_direct)
+        bob_owned_channel = await _create_group_channel(store, bob_id, bob_direct)
+        other_workshop_id = WorkshopId.new()
+        outsider_id = PrincipalId.new()
+        for event in (
+            EventEnvelope.create(
+                event_type=WorkshopEventType.WORKSHOP_CREATED,
+                event_version=1,
+                workshop_id=other_workshop_id,
+                aggregate_type="workshop",
+                aggregate_id=other_workshop_id,
+                occurred_at=_NOW,
+                payload={"name": "Other"},
+            ),
+            EventEnvelope.create(
+                event_type=WorkshopEventType.PRINCIPAL_CREATED,
+                event_version=2,
+                workshop_id=other_workshop_id,
+                aggregate_type="principal",
+                aggregate_id=outsider_id,
+                occurred_at=_NOW,
+                payload={"kind": "human", "display_name": "Outside", "handle": "outside"},
+            ),
+            EventEnvelope.create(
+                event_type=WorkshopEventType.WORKSHOP_MEMBER_ADDED,
+                event_version=1,
+                workshop_id=other_workshop_id,
+                aggregate_type="workshop_membership",
+                aggregate_id=WorkshopMembershipId.new(),
+                occurred_at=_NOW,
+                payload={"principal_id": outsider_id, "role": "admin"},
+            ),
+        ):
+            await store.append(event)
+        await store.project_pending(CanonicalConversationProjection())
+        client = await _open_client(store, _Authenticator({"alice": alice_id}))
+        headers = {"Authorization": "Bearer alice"}
+        body = {"client_operation_id": "membership-boundary", "expected_state_version": 0}
+        try:
+            direct = await client.get(
+                f"/v1/channels/{alice_direct}/members",
+                headers=headers,
+            )
+            outsider = await client.post(
+                f"/v1/channels/{channel_id}/members/{outsider_id}/add",
+                headers=headers,
+                json=body,
+            )
+            assert direct.status == 403
+            assert outsider.status == 409
+            assert (await outsider.json())["error"]["message"] == "Human is not eligible for this Workshop channel"
+            admin_snapshot = await client.get(
+                f"/v1/channels/{bob_owned_channel}/members",
+                headers=headers,
+            )
+            assert admin_snapshot.status == 200
+            assert (await admin_snapshot.json())["can_manage"] is True
+
+            archived = await client.post(
+                f"/v1/channels/{channel_id}/archive",
+                headers=headers,
+                json={"client_operation_id": "archive-membership"},
+            )
+            assert archived.status == 200
+            snapshot = await client.get(
+                f"/v1/channels/{channel_id}/members",
+                headers=headers,
+            )
+            assert snapshot.status == 200
+            assert (await snapshot.json())["can_manage"] is False
+            mutation = await client.post(
+                f"/v1/channels/{channel_id}/members/{bob_id}/add",
+                headers=headers,
+                json={"client_operation_id": "archived-add", "expected_state_version": 0},
+            )
+            assert mutation.status == 409
+            assert (await mutation.json())["error"]["message"] == "Archived channels are read-only"
+        finally:
+            await client.close()
+            await store.close()
+
     async def test_archive_rejects_a_channel_with_a_nonterminal_run(
         self,
         tmp_path: Path,

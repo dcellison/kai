@@ -1096,7 +1096,7 @@ class CanonicalConversationProjection:
 
     name = "canonical_conversations"
     # Agent definitions project durable draft, active, and archived lifecycle state.
-    version = 17
+    version = 18
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -1288,16 +1288,105 @@ class CanonicalConversationProjection:
             role = _required_text(payload, "role")
             if role not in {"owner", "participant"}:
                 raise ValueError("Workshop channel member role must be 'owner' or 'participant'")
+            channel_id = _required_text(payload, "channel_id")
+            principal_id = _required_text(payload, "principal_id")
+            if envelope.event_version == 2:
+                if role != "participant" or envelope.actor_principal_id is None:
+                    raise ValueError("Dynamic Workshop membership additions require a human participant and actor")
+                async with connection.execute(
+                    "SELECT c.kind, c.archived_at, target.kind, "
+                    "EXISTS(SELECT 1 FROM workshop_memberships target_wm "
+                    "WHERE target_wm.workshop_id = c.workshop_id AND target_wm.principal_id = ?) AS target_member, "
+                    "(EXISTS(SELECT 1 FROM channel_memberships owner "
+                    "WHERE owner.channel_id = c.id AND owner.principal_id = ? AND owner.role = 'owner') OR "
+                    "EXISTS(SELECT 1 FROM workshop_memberships admin_wm "
+                    "WHERE admin_wm.workshop_id = c.workshop_id AND admin_wm.principal_id = ? "
+                    "AND admin_wm.role = 'admin')) AS authorized "
+                    "FROM channels c JOIN principals target ON target.id = ? "
+                    "WHERE c.id = ? AND c.workshop_id = ?",
+                    (
+                        principal_id,
+                        envelope.actor_principal_id,
+                        envelope.actor_principal_id,
+                        principal_id,
+                        channel_id,
+                        envelope.workshop_id,
+                    ),
+                ) as cursor:
+                    authority = await cursor.fetchone()
+                if (
+                    authority is None
+                    or str(authority[0]) != "group"
+                    or authority[1] is not None
+                    or str(authority[2]) != "human"
+                    or not bool(authority[3])
+                    or not bool(authority[4])
+                ):
+                    raise ValueError("Dynamic Workshop membership addition is unauthorized or invalid")
+            elif envelope.event_version != 1:
+                raise ValueError("Unsupported Workshop channel membership addition event version")
             await connection.execute(
                 "INSERT INTO channel_memberships "
                 "(id, channel_id, principal_id, role, created_at) VALUES (?, ?, ?, ?, ?)",
                 (
                     envelope.aggregate_id,
-                    _required_text(payload, "channel_id"),
-                    _required_text(payload, "principal_id"),
+                    channel_id,
+                    principal_id,
                     role,
                     occurred_at,
                 ),
+            )
+            if envelope.event_version == 2:
+                await connection.execute(
+                    "UPDATE channels SET membership_event_position = ? WHERE id = ?",
+                    (event.position, channel_id),
+                )
+        elif envelope.event_type == WorkshopEventType.CHANNEL_MEMBER_REMOVED:
+            if envelope.event_version != 1 or envelope.actor_principal_id is None:
+                raise ValueError("Workshop channel membership removal requires a human actor and v1 event")
+            channel_id = _required_text(payload, "channel_id")
+            principal_id = _required_text(payload, "principal_id")
+            role = _required_text(payload, "role")
+            if role != "participant":
+                raise ValueError("Workshop channel membership removal is limited to participants")
+            async with connection.execute(
+                "SELECT c.kind, c.archived_at, target.kind, cm.role, "
+                "(EXISTS(SELECT 1 FROM channel_memberships owner "
+                "WHERE owner.channel_id = c.id AND owner.principal_id = ? AND owner.role = 'owner') OR "
+                "EXISTS(SELECT 1 FROM workshop_memberships admin_wm "
+                "WHERE admin_wm.workshop_id = c.workshop_id AND admin_wm.principal_id = ? "
+                "AND admin_wm.role = 'admin')) AS authorized "
+                "FROM channels c JOIN channel_memberships cm ON cm.channel_id = c.id "
+                "AND cm.principal_id = ? JOIN principals target ON target.id = cm.principal_id "
+                "WHERE c.id = ? AND c.workshop_id = ?",
+                (
+                    envelope.actor_principal_id,
+                    envelope.actor_principal_id,
+                    principal_id,
+                    channel_id,
+                    envelope.workshop_id,
+                ),
+            ) as cursor:
+                authority = await cursor.fetchone()
+            if (
+                authority is None
+                or str(authority[0]) != "group"
+                or authority[1] is not None
+                or str(authority[2]) != "human"
+                or str(authority[3]) != "participant"
+                or not bool(authority[4])
+            ):
+                raise ValueError("Workshop membership removal is unauthorized or invalid")
+            cursor = await connection.execute(
+                "DELETE FROM channel_memberships WHERE id = ? AND channel_id = ? "
+                "AND principal_id = ? AND role = 'participant'",
+                (envelope.aggregate_id, channel_id, principal_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Workshop membership removal has no matching participant")
+            await connection.execute(
+                "UPDATE channels SET membership_event_position = ? WHERE id = ?",
+                (event.position, channel_id),
             )
         elif envelope.event_type == WorkshopEventType.TRANSPORT_CHANNEL_BOUND:
             await connection.execute(

@@ -7,6 +7,7 @@ import {
   SettingsRevisionConflictError,
   attachChannelAgent,
   cancelRun,
+  changeChannelMember,
   activateAgentRevision,
   addAgentRevision,
   archiveAgentDefinition,
@@ -22,6 +23,7 @@ import {
   editMemory,
   enableAgentDefinition,
   loadArtifactBlob,
+  loadChannelMembers,
   loadAgentDefinitions,
   loadAgentEnablements,
   loadAppearancePreferences,
@@ -2156,5 +2158,109 @@ describe("Workshop client API", () => {
     const headers = fetchMock.mock.calls[0][1]?.headers as Headers;
     expect(headers.get("Last-Event-ID")).toBe("95");
     expect(headers.get("X-Kai-Stream-ID")).toMatch(/:agents$/);
+  });
+
+  it("loads and changes canonical human channel membership", async () => {
+    const targetPrincipalId = "prn_00000000000000000000000000000003";
+    const membershipResponse = new Response(JSON.stringify({
+      archived: false,
+      can_manage: true,
+      channel_id: channelId,
+      eligible_humans: [{
+        display_name: "Scott",
+        handle: "scott",
+        principal_id: targetPrincipalId,
+        role: null,
+      }],
+      members: [{
+        display_name: "Daniel",
+        handle: "daniel",
+        principal_id: "prn_00000000000000000000000000000001",
+        role: "owner",
+      }],
+      state_version: 88,
+      version: 1,
+      workshop_id: "wsp_00000000000000000000000000000001",
+    }), { status: 200 });
+    const mutationResponse = new Response(JSON.stringify({
+      changed: true,
+      operation: "add",
+      state_version: 89,
+      version: 1,
+    }), { status: 200 });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(membershipResponse)
+      .mockResolvedValueOnce(mutationResponse);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const membership = await loadChannelMembers(session);
+    const stateVersion = await changeChannelMember(
+      session,
+      targetPrincipalId,
+      "add",
+      membership.stateVersion,
+      "membership-operation",
+    );
+
+    expect(membership.members[0]).toEqual(expect.objectContaining({
+      handle: "daniel",
+      role: "owner",
+    }));
+    expect(membership.eligibleHumans[0]).toEqual(expect.objectContaining({
+      handle: "scott",
+      role: null,
+    }));
+    expect(stateVersion).toBe(89);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(`/v1/channels/${channelId}/members`);
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      `/v1/channels/${channelId}/members/${targetPrincipalId}/add`,
+    );
+    expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toEqual({
+      client_operation_id: "membership-operation",
+      expected_state_version: 88,
+    });
+  });
+
+  it("streams privacy-safe navigation changes for channel membership", async () => {
+    const frame = [
+      "id: 97",
+      "event: workshop.navigation.changed",
+      `data: ${JSON.stringify({
+        definition_id: null,
+        event_position: 97,
+        event_type: "channel.member_added",
+        occurred_at: "2026-08-31T10:05:00Z",
+        revision_id: null,
+        version: 1,
+      })}`,
+      "",
+      "",
+    ].join("\n");
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(frame));
+        controller.close();
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(stream, { status: 200 }),
+    ));
+    const onChanged = vi.fn();
+
+    await streamAgentChanges(
+      "session-secret",
+      "96",
+      { onChanged, onConnected: vi.fn() },
+      new AbortController().signal,
+    );
+
+    expect(onChanged).toHaveBeenCalledWith(
+      expect.objectContaining({
+        definitionId: null,
+        eventPosition: 97,
+        kind: "navigation",
+      }),
+      "97",
+    );
   });
 });

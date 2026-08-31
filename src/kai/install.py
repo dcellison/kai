@@ -10179,7 +10179,7 @@ def _channel_lifecycle_status(db_path: Path) -> str:
         )
         try:
             columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(channels)").fetchall()}
-            if not {"archived_at", "lifecycle_event_position"}.issubset(columns):
+            if not {"archived_at", "lifecycle_event_position", "membership_event_position"}.issubset(columns):
                 return f"{prefix} pending; reversible archive state unavailable"
             totals = connection.execute(
                 "SELECT COUNT(*), "
@@ -10207,15 +10207,45 @@ def _channel_lifecycle_status(db_path: Path) -> str:
                     "OR c.lifecycle_event_position != e.position))"
                 ).fetchone()[0]
             )
+            human_counts = connection.execute(
+                "SELECT COUNT(*), "
+                "SUM(CASE WHEN cm.role = 'owner' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN cm.role = 'participant' THEN 1 ELSE 0 END) "
+                "FROM channel_memberships cm JOIN channels c ON c.id = cm.channel_id "
+                "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
+                "WHERE c.kind = 'group'"
+            ).fetchone()
+            membership_invalid = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM channels c WHERE c.kind = 'group' AND ("
+                    "(SELECT COUNT(*) FROM channel_memberships cm JOIN principals p "
+                    "ON p.id = cm.principal_id AND p.kind = 'human' "
+                    "WHERE cm.channel_id = c.id AND cm.role = 'owner') != 1 OR "
+                    "EXISTS(SELECT 1 FROM channel_memberships cm JOIN principals p "
+                    "ON p.id = cm.principal_id AND p.kind = 'human' "
+                    "LEFT JOIN workshop_memberships wm ON wm.workshop_id = c.workshop_id "
+                    "AND wm.principal_id = cm.principal_id "
+                    "LEFT JOIN human_handles hh ON hh.workshop_id = c.workshop_id "
+                    "AND hh.principal_id = cm.principal_id WHERE cm.channel_id = c.id "
+                    "AND (wm.principal_id IS NULL OR hh.principal_id IS NULL)) OR "
+                    "(c.membership_event_position IS NOT NULL AND NOT EXISTS("
+                    "SELECT 1 FROM event_log e WHERE e.position = c.membership_event_position "
+                    "AND e.aggregate_type = 'channel_membership' "
+                    "AND e.event_type IN ('channel.member_added', 'channel.member_removed'))))"
+                ).fetchone()[0]
+            )
         finally:
             connection.close()
     except sqlite3.Error as exc:
         return f"{prefix} NOT VERIFIED ({exc})"
     total, active, archived = tuple(int(value or 0) for value in (totals or (0, 0, 0)))
-    status = "active" if invalid == 0 else "INCOMPLETE"
+    humans, owners, participants = tuple(int(value or 0) for value in (human_counts or (0, 0, 0)))
+    gaps = invalid + membership_invalid
+    status = "active" if gaps == 0 else "INCOMPLETE"
     return (
         f"{prefix} {status}; group channels={total}, active={active}, "
-        f"archived={archived}, integrity gaps={invalid}; authority=canonical"
+        f"archived={archived}, human members={humans} (owners={owners}, participants={participants}), "
+        f"integrity gaps={gaps}; authority=canonical"
     )
 
 

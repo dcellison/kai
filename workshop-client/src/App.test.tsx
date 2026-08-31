@@ -8,6 +8,7 @@ import {
   attachChannelAgent,
   AuthenticationError,
   cancelRun,
+  changeChannelMember,
   ChannelAccessError,
   createChannel,
   detachChannelAgent,
@@ -17,6 +18,7 @@ import {
   loadAgentEnablements,
   loadEarlierTimeline,
   loadArtifactBlob,
+  loadChannelMembers,
   loadNavigation,
   loadNotificationPreferences,
   loadMemoryDetail,
@@ -57,11 +59,13 @@ vi.mock("./api", async (importOriginal) => {
     attachChannelAgent: vi.fn(),
     archiveChannel: vi.fn(),
     cancelRun: vi.fn(),
+    changeChannelMember: vi.fn(),
     createChannel: vi.fn(),
     detachChannelAgent: vi.fn(),
     dismissChannelAgent: vi.fn(),
     loadEarlierTimeline: vi.fn(),
     loadArtifactBlob: vi.fn(),
+    loadChannelMembers: vi.fn(),
     loadAppearancePreferences: vi.fn(),
     loadAgentDefinitions: vi.fn(),
     loadAgentEnablements: vi.fn(),
@@ -534,6 +538,30 @@ describe("Workshop React client", () => {
       status: "cancelled",
       terminalCode: "requested_by_human",
     });
+    vi.mocked(loadChannelMembers).mockResolvedValue({
+      archived: false,
+      canManage: true,
+      channelId: secondChannelId,
+      eligibleHumans: [
+        {
+          displayName: "Scott",
+          handle: "scott",
+          principalId: "prn_00000000000000000000000000000003",
+          role: null,
+        },
+      ],
+      members: [
+        {
+          displayName: "Daniel",
+          handle: "daniel",
+          principalId: "prn_00000000000000000000000000000001",
+          role: "owner",
+        },
+      ],
+      stateVersion: 0,
+      workshopId: "wsp_00000000000000000000000000000001",
+    });
+    vi.mocked(changeChannelMember).mockResolvedValue(201);
     vi.mocked(submitCommand).mockResolvedValue({
       acceptance: "newly_accepted",
       messageId: "msg_00000000000000000000000000000030",
@@ -1689,6 +1717,46 @@ describe("Workshop React client", () => {
     );
     expect(composer).toHaveValue("@scott ");
     expect(screen.queryByRole("option", { name: /Daniel/ })).toBeNull();
+  });
+
+  it("lets a channel owner add an eligible human member", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId: secondChannelId, token: "existing-session" }),
+    );
+    vi.mocked(loadNavigation).mockResolvedValue(
+      navigationWithGroup({ role: "owner" }),
+    );
+    vi.mocked(loadTimeline).mockResolvedValue({
+      messages: [{ ...historyMessage, channelId: secondChannelId }],
+      throughPosition: 25,
+      previousCursor: null,
+    });
+
+    render(<App />);
+    await user.click(
+      await screen.findByRole("button", { name: "Manage channel members" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: "People" });
+    const daniel = within(dialog).getByRole("checkbox", { name: /Daniel/ });
+    const scott = within(dialog).getByRole("checkbox", { name: /Scott/ });
+    expect(daniel).toBeChecked();
+    expect(daniel).toBeDisabled();
+    expect(scott).not.toBeChecked();
+
+    await user.click(scott);
+    await user.click(within(dialog).getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(changeChannelMember).toHaveBeenCalledOnce());
+    expect(changeChannelMember).toHaveBeenCalledWith(
+      { channelId: secondChannelId, token: "existing-session" },
+      "prn_00000000000000000000000000000003",
+      "add",
+      0,
+      expect.stringMatching(/^browser-/),
+    );
+    expect(loadNavigation).toHaveBeenCalledTimes(2);
   });
 
   it("opens a group-message thread and submits replies against its canonical root", async () => {
