@@ -8,23 +8,53 @@ on:
     branches: [main]
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      client: ${{ steps.scope.outputs.client }}
+      full: ${{ steps.scope.outputs.full }}
+      dependency: ${{ steps.scope.outputs.dependency }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Select validation scope
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            git diff --name-only "$BASE_SHA" "$HEAD_SHA" |
+              python3 scripts/ci_change_scope.py
+          else
+            python3 scripts/ci_change_scope.py --force-full
+          fi
+
   check:
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        if: needs.changes.outputs.client == 'true'
 
       - uses: actions/setup-node@v7
+        if: needs.changes.outputs.client == 'true'
         with:
           node-version: "22"
           cache: npm
           cache-dependency-path: workshop-client/package-lock.json
 
       - uses: actions/setup-python@v7
+        if: needs.changes.outputs.full == 'true'
         with:
           python-version: "3.13"
           cache: pip
 
       - name: Install dependencies
+        if: needs.changes.outputs.full == 'true'
         run: |
           python -m pip install --upgrade \
             --constraint requirements/constraints.txt pip setuptools
@@ -32,34 +62,48 @@ jobs:
             --constraint requirements/constraints.txt -e '.[dev,telegram,totp]'
 
       - name: Install Workshop client dependencies
+        if: needs.changes.outputs.client == 'true'
         run: npm ci --prefix workshop-client
 
       - name: Check Workshop client
+        if: needs.changes.outputs.client == 'true'
         run: make client-check
 
       - name: Validate install constraints
+        if: needs.changes.outputs.full == 'true'
         run: make BIN= check-install-constraints
 
       - name: Lint and format check
+        if: needs.changes.outputs.full == 'true'
         run: make BIN= check
 
       - name: Type check
+        if: needs.changes.outputs.full == 'true'
         run: make BIN= typecheck
 
       - name: Run tests
+        if: needs.changes.outputs.full == 'true'
         run: make BIN= test
 
+      - name: Confirm documentation-only fast path
+        if: needs.changes.outputs.client != 'true' && needs.changes.outputs.full != 'true'
+        run: echo "No runtime validation is required for documentation-only changes."
+
   core-workshop:
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        if: needs.changes.outputs.full == 'true'
 
       - uses: actions/setup-python@v7
+        if: needs.changes.outputs.full == 'true'
         with:
           python-version: "3.13"
           cache: pip
 
       - name: Install base without Telegram
+        if: needs.changes.outputs.full == 'true'
         run: |
           python -m pip install --upgrade \
             --constraint requirements/constraints.txt pip setuptools
@@ -67,6 +111,7 @@ jobs:
             --constraint requirements/constraints.txt -e '.[dev,totp]'
 
       - name: Prove the Telegram-free architecture and runtime boundary
+        if: needs.changes.outputs.full == 'true'
         run: |
           python -m pytest -v \
             tests/test_adapter_architecture.py \
@@ -84,3 +129,7 @@ jobs:
             tests/test_workshop_scheduler.py::test_workshop_only_agent_job_uses_canonical_execution \
             tests/test_workshop_scheduler.py::test_disabled_telegram_adapter_does_not_enqueue_retained_reminder_binding \
             tests/test_workshop_github_notifications.py::TestWorkshopIntegrationNotificationService::test_route_records_without_resolving_any_transport_binding
+
+      - name: Confirm non-backend fast path
+        if: needs.changes.outputs.full != 'true'
+        run: echo "No backend architecture validation is required for this change scope."
